@@ -92,8 +92,13 @@ from omnigent.onboarding.harness_install import (
     ui_install_key,
 )
 from omnigent.onboarding.harness_readiness import (
-    configured_harness_map,
-    harness_is_configured,
+    HarnessProbeKey,
+    HarnessProbeSpec,
+    availability_allows_launch,
+    configured_harness_probe_specs,
+    harness_probe_spec,
+    probe_harness_availability,
+    probe_harness_launchability,
 )
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
 from omnigent.process_logging import (
@@ -148,17 +153,6 @@ def _coerce_int(value: object) -> int:
 HARNESS_READINESS_REFRESH_INTERVAL_S = 5.0
 # Auth changes and removals need the full, potentially expensive readiness map.
 HARNESS_READINESS_FULL_REFRESH_INTERVAL_S = 60.0
-
-
-def _unavailable_harness_became_ready(
-    previous: Mapping[str, HarnessAvailability],
-) -> bool:
-    """Detect newly available binaries; auth changes wait for the full refresh."""
-    return any(
-        (availability is False or availability == HARNESS_BINARY_MISSING)
-        and harness_is_configured(harness)
-        for harness, availability in previous.items()
-    )
 
 
 def _runner_log_dir() -> Path:
@@ -344,8 +338,13 @@ _LOOPBACK_REFUSED_FATAL_ATTEMPTS = 30
 # endpoint that accepts and never speaks is functionally down.
 _SILENT_CONNECT_ESCALATE_ATTEMPTS = 10
 
-# Capability discovery is advisory and must not delay the host channel forever.
-_HOST_CAPABILITY_INIT_TIMEOUT_S = 15.0
+# Harness probes are subprocess-heavy; parallelize distinct harnesses without
+# flooding the machine. Fresh startup results accelerate the first launch while
+# short negative/error windows let a just-installed CLI recover quickly.
+_HARNESS_PROBE_CONCURRENCY = 4
+_HARNESS_PROBE_POSITIVE_TTL_S = 60.0
+_HARNESS_PROBE_NEGATIVE_TTL_S = 5.0
+_HARNESS_LAUNCH_PROBE_TIMEOUT_S = 12.0
 
 # Host-environment variables a spawned runner is allowed to inherit.
 # Deliberately an allowlist (not ``{**os.environ}``): the host runs as the
@@ -775,6 +774,19 @@ def _paginate_list_dir(
 
 
 @dataclass
+class _HarnessProbeEntry:
+    """Cached readiness plus one shared in-flight probe for a harness key."""
+
+    generation: int = 0
+    availability: HarnessAvailability | None = None
+    checked_at: float = 0.0
+    task: asyncio.Task[HarnessAvailability] | None = None
+    launchable: bool | None = None
+    launch_checked_at: float = 0.0
+    launch_task: asyncio.Task[bool] | None = None
+
+
+@dataclass
 class _RunnerHandle:
     """A spawned runner subprocess and where its output lands.
 
@@ -836,6 +848,11 @@ class HostProcess:
         self._configured_harnesses: dict[str, HarnessAvailability] | None = None
         self._gateway_inference: dict[str, bool] | None = None
         self._capabilities_initialized = False
+        self._capability_discovery_task: asyncio.Task[None] | None = None
+        self._harness_probe_entries: dict[HarnessProbeKey, _HarnessProbeEntry] = {}
+        self._harness_probe_tasks: set[asyncio.Task[Any]] = set()
+        self._harness_probe_epoch = 0
+        self._harness_probe_semaphore = asyncio.Semaphore(_HARNESS_PROBE_CONCURRENCY)
         # Consecutive login-page redirects; reset by a successful upgrade.
         self._login_redirect_streak = 0
         # Reset by a successful upgrade or non-auth error; bounds fresh-host refresh retries.
@@ -1323,16 +1340,43 @@ class HostProcess:
         # first turn dies confusingly inside the executor. ``None`` (an
         # older server, or a session with no resolvable harness) skips the
         # check so version skew fails open.
-        if frame.harness is not None and not harness_is_configured(frame.harness):
-            return HostLaunchRunnerResultFrame(
-                request_id=frame.request_id,
-                status="failed",
-                error=(
-                    f"harness {frame.harness!r} is not configured on host "
-                    f"{self._identity.name!r} — {harness_setup_hint(frame.harness)}"
-                ),
-                error_code=HARNESS_NOT_CONFIGURED_ERROR_CODE,
-            )
+        if frame.harness is not None:
+            spec = harness_probe_spec(frame.harness)
+            try:
+                launchable = await asyncio.wait_for(
+                    asyncio.shield(self._probe_harness_launchability(spec)),
+                    timeout=_HARNESS_LAUNCH_PROBE_TIMEOUT_S,
+                )
+            except TimeoutError:
+                return HostLaunchRunnerResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error=(
+                        f"timed out while inspecting harness {frame.harness!r} "
+                        f"on host {self._identity.name!r}"
+                    ),
+                    error_code=HARNESS_NOT_CONFIGURED_ERROR_CODE,
+                )
+            except Exception as exc:  # noqa: BLE001 — probe failure becomes a launch result
+                return HostLaunchRunnerResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error=(
+                        f"could not inspect harness {frame.harness!r} on host "
+                        f"{self._identity.name!r}: {exc}"
+                    ),
+                    error_code=HARNESS_NOT_CONFIGURED_ERROR_CODE,
+                )
+            if not launchable:
+                return HostLaunchRunnerResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error=(
+                        f"harness {frame.harness!r} is not configured on host "
+                        f"{self._identity.name!r} — {harness_setup_hint(frame.harness)}"
+                    ),
+                    error_code=HARNESS_NOT_CONFIGURED_ERROR_CODE,
+                )
 
         workspace = Path(frame.workspace).expanduser()
         if not workspace.is_dir():
@@ -1988,16 +2032,16 @@ class HostProcess:
         """Handle a ``host.install_harness`` request from the server.
 
         Runs the same installer :func:`try_install_harness_cli` (hence
-        ``omnigent setup``) uses, then recomputes readiness so the result frame
-        carries a fresh ``configured_harnesses`` map. The ``ui_install_key``
+        ``omnigent setup``) uses. The async dispatcher invalidates and attaches
+        a fresh readiness snapshot after this core succeeds. The ``ui_install_key``
         guard re-checks the allowlist as defence in depth against a spoofed
         frame. Idempotent: an already-installed CLI skips the install. Runs off
         the event loop (it shells out / probes ``PATH``).
 
         :param frame: The install request frame. ``frame.harness`` is a UI
             harness identifier, e.g. ``"claude"``.
-        :returns: Result frame with ``status`` ``"ok"``/``"failed"``, the
-            refreshed readiness map on success, and a reason on failure.
+        :returns: Core result with ``status`` ``"ok"``/``"failed"``; the
+            dispatcher adds refreshed readiness on success.
         """
         key = ui_install_key(frame.harness)
         if key is None:
@@ -2013,8 +2057,6 @@ class HostProcess:
             return HostInstallHarnessResultFrame(
                 request_id=frame.request_id,
                 status="ok",
-                configured_harnesses=configured_harness_map(),
-                gateway_inference=gateway_inference_map(),
             )
         installed, reason = try_install_harness_cli(key)
         if not installed:
@@ -2027,8 +2069,6 @@ class HostProcess:
         return HostInstallHarnessResultFrame(
             request_id=frame.request_id,
             status="ok",
-            configured_harnesses=configured_harness_map(),
-            gateway_inference=gateway_inference_map(),
         )
 
     def _handle_store_secret(self, frame: HostStoreSecretFrame) -> HostStoreSecretResultFrame:
@@ -2039,9 +2079,8 @@ class HostProcess:
         :func:`adopt_env_credential`) the ``omnigent setup`` wizard's
         "add a key / gateway" path uses — the secret goes to the OS keychain
         (else ``~/.omnigent/secrets.json``) and ``config.yaml`` gets a
-        ``providers:`` entry referencing it, never the raw secret. Then it
-        recomputes readiness so the result frame flips the badge (yellow →
-        green) without a reconnect.
+        ``providers:`` entry referencing it, never the raw secret. The async
+        dispatcher invalidates and attaches fresh readiness after the write.
 
         The ``ui_install_key`` guard re-checks the allowlist as defence in depth
         against a spoofed frame — only the UI-auth families (Claude/Codex/Pi)
@@ -2050,8 +2089,8 @@ class HostProcess:
 
         :param frame: The store-secret request. ``frame.harness`` is a UI
             harness id; ``frame.kind`` is ``"key"`` / ``"gateway"`` / ``"adopt"``.
-        :returns: Result with ``status`` ``"ok"``/``"failed"``, refreshed
-            readiness on success, and a non-secret reason on failure.
+        :returns: Core result with ``status`` ``"ok"``/``"failed"`` and a
+            non-secret reason on failure; dispatch adds readiness on success.
         """
         # Resolve the harness to a provider family, re-checking the allowlist.
         # claude→anthropic, codex→openai; pi consumes both and prefers anthropic
@@ -2129,8 +2168,6 @@ class HostProcess:
         return HostStoreSecretResultFrame(
             request_id=frame.request_id,
             status="ok",
-            configured_harnesses=configured_harness_map(),
-            gateway_inference=gateway_inference_map(),
         )
 
     def _handle_detect_credentials(
@@ -2557,24 +2594,239 @@ class HostProcess:
             ],
         )
 
+    def _harness_probe_entry(self, key: HarnessProbeKey) -> _HarnessProbeEntry:
+        """Return the daemon-lifetime cache entry for one semantic harness."""
+        return self._harness_probe_entries.setdefault(key, _HarnessProbeEntry())
+
+    async def _run_harness_probe(
+        self,
+        spec: HarnessProbeSpec,
+    ) -> HarnessAvailability:
+        """Run one readiness probe off-loop under bounded parallelism."""
+        async with self._harness_probe_semaphore:
+            with self._host_subprocess_op():
+                return await asyncio.to_thread(
+                    probe_harness_availability,
+                    spec.canonical,
+                )
+
+    async def _run_harness_launch_probe(
+        self,
+        spec: HarnessProbeSpec,
+    ) -> bool:
+        """Run the launch-only gate without waiting for picker auth checks."""
+        async with self._harness_probe_semaphore:
+            with self._host_subprocess_op():
+                return await asyncio.to_thread(
+                    probe_harness_launchability,
+                    spec.canonical,
+                )
+
+    def _finish_harness_launch_probe(
+        self,
+        key: HarnessProbeKey,
+        generation: int,
+        task: asyncio.Task[bool],
+    ) -> None:
+        """Publish a launch-gate result when its generation is current."""
+        entry = self._harness_probe_entries.get(key)
+        if entry is None or entry.launch_task is not task:
+            return
+        entry.launch_task = None
+        if task.cancelled() or entry.generation != generation:
+            return
+        try:
+            launchable = task.result()
+        except Exception:  # noqa: BLE001 — waiters receive the probe failure
+            return
+        entry.launchable = launchable
+        entry.launch_checked_at = asyncio.get_running_loop().time()
+
+    def _start_harness_launch_probe(
+        self,
+        spec: HarnessProbeSpec,
+    ) -> asyncio.Task[bool]:
+        """Start or join the launch-only single-flight for *spec*."""
+        entry = self._harness_probe_entry(spec.key)
+        if entry.launch_task is not None:
+            return entry.launch_task
+        generation = entry.generation
+        task = asyncio.create_task(
+            self._run_harness_launch_probe(spec),
+            name=f"host-harness-launch-probe:{':'.join(spec.key)}",
+        )
+        entry.launch_task = task
+        self._harness_probe_tasks.add(task)
+        task.add_done_callback(self._harness_probe_tasks.discard)
+        task.add_done_callback(
+            lambda completed, key=spec.key, gen=generation: self._finish_harness_launch_probe(
+                key, gen, completed
+            )
+        )
+        return task
+
+    async def _probe_harness_launchability(
+        self,
+        spec: HarnessProbeSpec,
+        *,
+        force: bool = False,
+    ) -> bool:
+        """Return a cached authoritative launch verdict or share its probe."""
+        entry = self._harness_probe_entry(spec.key)
+        launchable = entry.launchable
+        if launchable is not None and not force:
+            ttl = _HARNESS_PROBE_POSITIVE_TTL_S if launchable else _HARNESS_PROBE_NEGATIVE_TTL_S
+            if asyncio.get_running_loop().time() - entry.launch_checked_at <= ttl:
+                return launchable
+        return await asyncio.shield(self._start_harness_launch_probe(spec))
+
+    def _finish_harness_probe(
+        self,
+        key: HarnessProbeKey,
+        generation: int,
+        task: asyncio.Task[HarnessAvailability],
+    ) -> None:
+        """Publish a completed probe only if its generation is still current."""
+        entry = self._harness_probe_entries.get(key)
+        if entry is None or entry.task is not task:
+            return
+        entry.task = None
+        if task.cancelled() or entry.generation != generation:
+            return
+        try:
+            availability = task.result()
+        except Exception:  # noqa: BLE001 — waiters receive the probe failure
+            return
+        entry.availability = availability
+        entry.checked_at = asyncio.get_running_loop().time()
+
+    def _start_harness_probe(
+        self,
+        spec: HarnessProbeSpec,
+    ) -> asyncio.Task[HarnessAvailability]:
+        """Start or join the single in-flight probe for *spec*."""
+        entry = self._harness_probe_entry(spec.key)
+        if entry.task is not None:
+            return entry.task
+        generation = entry.generation
+        task = asyncio.create_task(
+            self._run_harness_probe(spec),
+            name=f"host-harness-probe:{':'.join(spec.key)}",
+        )
+        entry.task = task
+        self._harness_probe_tasks.add(task)
+        task.add_done_callback(self._harness_probe_tasks.discard)
+        task.add_done_callback(
+            lambda completed, key=spec.key, gen=generation: self._finish_harness_probe(
+                key, gen, completed
+            )
+        )
+        return task
+
+    async def _probe_harness(
+        self,
+        spec: HarnessProbeSpec,
+        *,
+        force: bool = False,
+    ) -> HarnessAvailability:
+        """Return a fresh-enough result, sharing concurrent probe work."""
+        entry = self._harness_probe_entry(spec.key)
+        availability = entry.availability
+        if availability is not None and not force:
+            ttl = (
+                _HARNESS_PROBE_POSITIVE_TTL_S
+                if availability_allows_launch(availability)
+                else _HARNESS_PROBE_NEGATIVE_TTL_S
+            )
+            if asyncio.get_running_loop().time() - entry.checked_at <= ttl:
+                return availability
+        return await asyncio.shield(self._start_harness_probe(spec))
+
+    def _invalidate_all_harness_probes(self) -> None:
+        """Invalidate all results after install or provider-config mutation."""
+        self._harness_probe_epoch += 1
+        for entry in self._harness_probe_entries.values():
+            entry.generation += 1
+            entry.availability = None
+            entry.checked_at = 0.0
+            entry.task = None
+            entry.launchable = None
+            entry.launch_checked_at = 0.0
+            entry.launch_task = None
+
+    async def _refresh_capabilities_after_mutation(
+        self,
+    ) -> tuple[dict[str, HarnessAvailability] | None, dict[str, bool] | None]:
+        """Return a post-mutation snapshot that cannot join stale probes."""
+        self._invalidate_all_harness_probes()
+        while True:
+            epoch = self._harness_probe_epoch
+            configured, gateway = await asyncio.gather(
+                self._probe_configured_harnesses(startup=False, force=True),
+                self._probe_gateway_inference(startup=False),
+            )
+            if epoch == self._harness_probe_epoch:
+                self._configured_harnesses = configured
+                self._gateway_inference = gateway
+                return configured, gateway
+
+    def _has_unknown_harness_probe_results(self) -> bool:
+        """Return whether any advertised harness lacks a completed result."""
+        return any(
+            self._harness_probe_entries.get(spec.key) is None
+            or self._harness_probe_entries[spec.key].availability is None
+            for spec in configured_harness_probe_specs()
+        )
+
     async def _probe_configured_harnesses(
         self,
         *,
         startup: bool,
+        force: bool = False,
     ) -> dict[str, HarnessAvailability] | None:
-        """Collect harness readiness without letting a probe break the channel."""
-        try:
-            return await asyncio.to_thread(configured_harness_map)
-        except Exception as exc:
-            _logger.exception("Host harness readiness probe failed")
-            if startup:
-                print(
-                    "⚠ Could not inspect installed harnesses; the host will "
-                    f"connect with harness readiness unknown: {exc}",
-                    file=sys.stderr,
-                    flush=True,
+        """Probe unique harnesses concurrently and assemble one full snapshot."""
+        specs = configured_harness_probe_specs()
+        remaining = iter(specs)
+        results: dict[HarnessProbeKey, HarnessAvailability | Exception] = {}
+
+        async def _worker() -> None:
+            for spec in remaining:
+                try:
+                    # Publish the launch-only verdict first. A launch arriving
+                    # during discovery joins this stage and never waits for the
+                    # picker-only authentication probe that follows.
+                    await self._probe_harness_launchability(spec, force=force)
+                    results[spec.key] = await self._probe_harness(spec, force=force)
+                except Exception as exc:  # noqa: BLE001 — preserve per-harness failure
+                    results[spec.key] = exc
+
+        workers = [
+            asyncio.create_task(_worker(), name=f"host-harness-probe-worker:{idx}")
+            for idx in range(min(_HARNESS_PROBE_CONCURRENCY, len(specs)))
+        ]
+        await asyncio.gather(*workers)
+
+        snapshot: dict[str, HarnessAvailability] = {}
+        for spec in specs:
+            result = results[spec.key]
+            if isinstance(result, BaseException):
+                _logger.error(
+                    "Host harness readiness probe failed for %s: %s",
+                    spec.canonical,
+                    result,
+                    exc_info=(type(result), result, result.__traceback__),
                 )
-            return None
+                if startup:
+                    print(
+                        f"⚠ Could not inspect harness {spec.canonical!r}; "
+                        f"readiness is unknown: {result}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                continue
+            for spelling in spec.spellings:
+                snapshot[spelling] = result
+        return snapshot or None
 
     async def _probe_gateway_inference(self, *, startup: bool) -> dict[str, bool] | None:
         """Collect gateway metadata without letting a probe break the channel."""
@@ -2592,30 +2844,17 @@ class HostProcess:
             return None
 
     async def _initialize_capabilities(self) -> None:
-        """Build the initial capability snapshot once, before any handshake."""
+        """Build capabilities in the background without delaying connection."""
         if self._capabilities_initialized:
             return
-        try:
-            configured, gateway = await asyncio.wait_for(
-                asyncio.gather(
-                    self._probe_configured_harnesses(startup=True),
-                    self._probe_gateway_inference(startup=True),
-                ),
-                timeout=_HOST_CAPABILITY_INIT_TIMEOUT_S,
-            )
-        except TimeoutError:
-            configured = gateway = None
-            _logger.error(
-                "Host capability discovery exceeded %.0fs; continuing with unknown metadata",
-                _HOST_CAPABILITY_INIT_TIMEOUT_S,
-            )
-            print(
-                "⚠ Host capability discovery timed out; connecting with readiness unknown.",
-                file=sys.stderr,
-                flush=True,
-            )
-        self._configured_harnesses = configured
-        self._gateway_inference = gateway
+        epoch = self._harness_probe_epoch
+        configured, gateway = await asyncio.gather(
+            self._probe_configured_harnesses(startup=True),
+            self._probe_gateway_inference(startup=True),
+        )
+        if epoch == self._harness_probe_epoch:
+            self._configured_harnesses = configured
+            self._gateway_inference = gateway
         self._capabilities_initialized = True
 
     async def run(self) -> None:
@@ -2630,10 +2869,14 @@ class HostProcess:
             authorization / outdated server, or a loopback server that
             kept refusing connections (the local server is gone).
         """
-        # Capability probes may shell out or inspect local config, so perform
-        # them once during daemon initialization. They are advisory: a broken
-        # harness is reported as unknown and must not prevent registration.
-        await self._initialize_capabilities()
+        # Capability discovery is advisory. Start it once, but connect
+        # immediately; hello reports the snapshot available at send time and
+        # the live readiness loop publishes the completed map later.
+        if self._capability_discovery_task is None:
+            self._capability_discovery_task = asyncio.create_task(
+                self._initialize_capabilities(),
+                name="host-capability-discovery",
+            )
 
         # Reap orphaned harness/tool grandchildren that reparent here when a
         # runner dies (this host is PID 1 in a container, or a subreaper
@@ -2804,6 +3047,16 @@ class HostProcess:
         finally:
             # Await the cancellations: a bare cancel() leaves the tasks
             # pending at loop close ("Task was destroyed but it is pending!").
+            if self._capability_discovery_task is not None:
+                self._capability_discovery_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._capability_discovery_task
+                self._capability_discovery_task = None
+            for task in list(self._harness_probe_tasks):
+                task.cancel()
+            for task in list(self._harness_probe_tasks):
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
             if self._reaper_task is not None:
                 self._reaper_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -3073,7 +3326,13 @@ class HostProcess:
             flush=True,
         )
 
-        readiness_task = asyncio.create_task(self._harness_readiness_loop(ws))
+        readiness_task = asyncio.create_task(
+            self._harness_readiness_loop(
+                ws,
+                reported_configured=hello.configured_harnesses,
+                reported_gateway=hello.gateway_inference,
+            )
+        )
         try:
             while True:
                 raw = await ws.recv()
@@ -3101,32 +3360,70 @@ class HostProcess:
     async def _harness_readiness_loop(
         self,
         ws: websockets.asyncio.client.ClientConnection,
+        *,
+        reported_configured: dict[str, HarnessAvailability] | None,
+        reported_gateway: dict[str, bool] | None,
     ) -> None:
-        """Refresh advisory capabilities without endangering the tunnel."""
-        configured = self._configured_harnesses
-        gateway = self._gateway_inference
+        """Publish background discovery, then refresh cached capabilities."""
+        configured = reported_configured
+        gateway = reported_gateway
+
+        # Discovery may finish between constructing hello and starting this
+        # task. Compare against what hello actually carried, not the current
+        # cache, so the completed result cannot be lost in that race.
+        discovery = self._capability_discovery_task
+        if discovery is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.shield(discovery)
+        latest = self._configured_harnesses
+        latest_gateway = self._gateway_inference
+        if latest is not None and (latest != configured or latest_gateway != gateway):
+            await ws.send(
+                encode_host_frame(
+                    HostHarnessReadinessFrame(
+                        configured_harnesses=latest,
+                        gateway_inference=latest_gateway,
+                    )
+                )
+            )
+            configured = latest
+            gateway = latest_gateway
+
         loop = asyncio.get_running_loop()
         next_quick = loop.time() + HARNESS_READINESS_REFRESH_INTERVAL_S
         next_full = loop.time() + HARNESS_READINESS_FULL_REFRESH_INTERVAL_S
         while True:
             await asyncio.sleep(max(0.0, min(next_quick, next_full) - loop.time()))
             now = loop.time()
-            refresh_full = configured is None or now >= next_full
+            full_refresh = now >= next_full
+            quick_refresh = (
+                configured is None
+                or self._has_unknown_harness_probe_results()
+                or any(
+                    value is False or value == HARNESS_BINARY_MISSING
+                    for value in (configured or {}).values()
+                )
+            )
             if now >= next_quick:
                 next_quick = now + HARNESS_READINESS_REFRESH_INTERVAL_S
-                if not refresh_full and configured is not None:
-                    try:
-                        refresh_full = await asyncio.to_thread(
-                            _unavailable_harness_became_ready, configured
-                        )
-                    except Exception:
-                        _logger.exception("Host harness quick readiness probe failed")
-            if not refresh_full:
+            elif not full_refresh:
+                continue
+            if not full_refresh and not quick_refresh:
                 continue
 
-            latest = await self._probe_configured_harnesses(startup=False)
-            latest_gateway = await self._probe_gateway_inference(startup=False)
-            next_full = now + HARNESS_READINESS_FULL_REFRESH_INTERVAL_S
+            epoch = self._harness_probe_epoch
+            if full_refresh:
+                latest, latest_gateway = await asyncio.gather(
+                    self._probe_configured_harnesses(startup=False, force=True),
+                    self._probe_gateway_inference(startup=False),
+                )
+                next_full = now + HARNESS_READINESS_FULL_REFRESH_INTERVAL_S
+            else:
+                latest = await self._probe_configured_harnesses(startup=False)
+                latest_gateway = gateway
+
+            if epoch != self._harness_probe_epoch:
+                continue
             new_configured = latest if latest is not None else configured
             new_gateway = latest_gateway if latest_gateway is not None else gateway
             if new_configured is None:
@@ -3279,11 +3576,19 @@ class HostProcess:
             # The installer shells out (npm) and can run for minutes, so run
             # it off the event loop and reply when it completes.
             install_result = await asyncio.to_thread(self._handle_install_harness, frame)
+            if install_result.status == "ok":
+                configured, gateway = await self._refresh_capabilities_after_mutation()
+                install_result.configured_harnesses = configured
+                install_result.gateway_inference = gateway
             await ws.send(encode_host_frame(install_result))
         elif isinstance(frame, HostStoreSecretFrame):
             # The credential write touches the OS keychain / config file, so run
             # it off the event loop and reply when it completes.
             secret_result = await asyncio.to_thread(self._handle_store_secret, frame)
+            if secret_result.status == "ok":
+                configured, gateway = await self._refresh_capabilities_after_mutation()
+                secret_result.configured_harnesses = configured
+                secret_result.gateway_inference = gateway
             await ws.send(encode_host_frame(secret_result))
         elif isinstance(frame, HostDetectCredentialsFrame):
             # Ambient detection may probe files / a localhost socket, so run it

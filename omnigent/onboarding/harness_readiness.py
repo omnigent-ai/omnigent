@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import omnigent.onboarding.gemini_auth as _gemini_auth
 import omnigent.onboarding.kimi_auth as _kimi_auth
@@ -35,6 +36,7 @@ from omnigent.harness_aliases import HARNESS_ALIASES, canonicalize_harness
 from omnigent.harness_availability import (
     CODEX_CANONICAL_HARNESSES,
     HARNESS_BINARY_MISSING,
+    HARNESS_NEEDS_AUTH,
     HARNESS_VERSION_TOO_LOW,
     HarnessAvailability,
 )
@@ -445,6 +447,96 @@ def _harness_availability(canonical: str) -> HarnessAvailability:
     return _harness_availability_core(canonical)
 
 
+HarnessProbeKey = tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class HarnessProbeSpec:
+    """One semantic readiness probe and the spellings it serves."""
+
+    key: HarnessProbeKey
+    canonical: str
+    spellings: tuple[str, ...]
+
+
+def _probe_key_for_canonical(canonical: str) -> HarnessProbeKey:
+    """Return the cache key for an already-normalized harness spelling."""
+    if _is_codex_family_harness(canonical):
+        return ("codex",)
+    return ("harness", canonical)
+
+
+def harness_probe_key(harness: str) -> HarnessProbeKey:
+    """Return the semantic cache key shared by equivalent spellings."""
+    return _probe_key_for_canonical(_canonical_harness(harness))
+
+
+def harness_probe_spec(harness: str) -> HarnessProbeSpec:
+    """Build a probe spec for one launch-request harness spelling."""
+    canonical = _canonical_harness(harness)
+    return HarnessProbeSpec(
+        key=_probe_key_for_canonical(canonical),
+        canonical=canonical,
+        spellings=(harness,),
+    )
+
+
+def _configured_harness_spellings() -> set[str]:
+    """Return every spelling included in the host readiness snapshot."""
+    spellings: set[str] = set(_HARNESS_FAMILY)
+    spellings.update(valid_harnesses())
+    spellings.update(harness_install_keys())
+    spellings.update(_EXECUTOR_TYPE_HARNESS_ALIASES)
+    spellings.update(HARNESS_ALIASES)
+    spellings.update(_PI_HARNESSES)
+    spellings.update(_OPENCODE_HARNESSES)
+    spellings.update(_CURSOR_NATIVE_HARNESSES)
+    spellings.update(_KIRO_NATIVE_HARNESSES)
+    spellings.update(_GOOSE_NATIVE_HARNESSES)
+    spellings.update(_KIMI_NATIVE_HARNESSES)
+    spellings.update(_HERMES_NATIVE_HARNESSES)
+    spellings.update(_QWEN_HARNESSES)
+    spellings.update({CURSOR_KEY, KIMI_SURFACE, GOOSE_KEY, HERMES_KEY, COPILOT_KEY})
+    return spellings
+
+
+def configured_harness_probe_specs() -> tuple[HarnessProbeSpec, ...]:
+    """Return deterministic unique probes for a complete readiness map."""
+    grouped: dict[HarnessProbeKey, tuple[str, set[str]]] = {}
+    for spelling in sorted(_configured_harness_spellings()):
+        canonical = _canonical_harness(spelling)
+        key = _probe_key_for_canonical(canonical)
+        existing = grouped.get(key)
+        if existing is None:
+            grouped[key] = (canonical, {spelling})
+        else:
+            existing[1].add(spelling)
+    return tuple(
+        HarnessProbeSpec(key=key, canonical=canonical, spellings=tuple(sorted(spellings)))
+        for key, (canonical, spellings) in sorted(grouped.items())
+    )
+
+
+def probe_harness_availability(harness: str) -> HarnessAvailability:
+    """Run the picker-facing readiness probe for one canonical harness."""
+    return _harness_availability(_canonical_harness(harness))
+
+
+def probe_harness_launchability(harness: str) -> bool:
+    """Run the authoritative launch gate without picker-only auth checks."""
+    return _harness_availability_core(harness) is True
+
+
+def availability_allows_launch(availability: HarnessAvailability) -> bool:
+    """Map picker readiness onto the existing launch-gate semantics.
+
+    ``needs-auth`` is launchable because native CLI login/provider failures are
+    intentionally surfaced by the harness at runtime; missing/old binaries and
+    credential-gated SDK surfaces remain blocked.
+    """
+    return availability is True or availability == HARNESS_NEEDS_AUTH
+
+
 def harness_is_configured(harness: str) -> bool:
     """Return whether *harness* can be launched on this machine.
 
@@ -506,14 +598,14 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     spellings.update(_QWEN_HARNESSES)
     spellings.add(CURSOR_KEY)
     spellings.add(KIMI_SURFACE)
-    spellings.add(GOOSE_KEY)  # headless Goose (``goose acp``) gates on the goose binary
-    spellings.add(HERMES_KEY)  # Hermes Agent wraps the ``hermes`` CLI
+    spellings.add(GOOSE_KEY)
+    spellings.add(HERMES_KEY)
     spellings.add(COPILOT_KEY)
-    availability_cache: dict[tuple[str, ...], HarnessAvailability] = {}
+    availability_cache: dict[HarnessProbeKey, HarnessAvailability] = {}
     result: dict[str, HarnessAvailability] = {}
     for spelling in spellings:
         canonical = _canonical_harness(spelling)
-        cache_key = ("codex",) if _is_codex_family_harness(canonical) else ("harness", canonical)
+        cache_key = _probe_key_for_canonical(canonical)
         if cache_key not in availability_cache:
             availability_cache[cache_key] = _harness_availability(canonical)
         result[spelling] = availability_cache[cache_key]

@@ -404,7 +404,13 @@ async def test_host_tunnel_refreshes_harness_readiness_without_reconnect(
         {
             "type": "websocket.receive",
             "text": encode_host_frame(
-                HostHarnessReadinessFrame(configured_harnesses={"pi": True})
+                HostHarnessReadinessFrame(
+                    configured_harnesses={
+                        "pi": True,
+                        "codex-native": "needs-auth",
+                        "claude-native": "binary-missing",
+                    }
+                )
             ),
         }
     )
@@ -412,7 +418,11 @@ async def test_host_tunnel_refreshes_harness_readiness_without_reconnect(
     async def _wait_until_ready() -> None:
         while True:
             host = store.get_host(_HOST_ID)
-            if host is not None and host.configured_harnesses == {"pi": True}:
+            if host is not None and host.configured_harnesses == {
+                "pi": True,
+                "codex-native": "needs-auth",
+                "claude-native": "binary-missing",
+            }:
                 return
             await asyncio.sleep(0.01)
 
@@ -420,7 +430,11 @@ async def test_host_tunnel_refreshes_harness_readiness_without_reconnect(
 
     conn = registry.get(_HOST_ID)
     assert conn is not None
-    assert conn.hello.configured_harnesses == {"pi": True}
+    assert conn.hello.configured_harnesses == {
+        "pi": True,
+        "codex-native": "needs-auth",
+        "claude-native": "binary-missing",
+    }
     assert updates == [_HOST_ID]
 
 

@@ -227,8 +227,10 @@ def test_claude_ready_via_configured_provider_without_cli_login(
         "omnigent.onboarding.harness_readiness._family_provider_configured", lambda _h: True
     )
 
-    def _must_not_probe(_key: str, **_kw: object) -> bool:
-        raise AssertionError("CLI login probed despite a configured provider")
+    def _must_not_probe(key: str, **_kw: object) -> bool:
+        if key == "anthropic":
+            raise AssertionError("Claude login probed despite a configured provider")
+        return False
 
     monkeypatch.setattr(hi, "harness_cli_logged_in", _must_not_probe)
     assert configured_harness_map()["claude-native"] is True
@@ -513,6 +515,26 @@ def test_configured_harness_map_probes_codex_readiness_once(
     assert result["codex"] == "needs-auth"
     assert result["codex-native"] == "needs-auth"
     assert result["native-codex"] == "needs-auth"
+
+
+def test_probe_specs_deduplicate_codex_aliases() -> None:
+    """Parallel host discovery retains the existing Codex family collapse."""
+    from omnigent.onboarding.harness_readiness import configured_harness_probe_specs
+
+    codex_specs = [spec for spec in configured_harness_probe_specs() if spec.key == ("codex",)]
+    assert len(codex_specs) == 1
+    assert {"codex", "codex-native", "native-codex"}.issubset(codex_specs[0].spellings)
+
+
+def test_picker_availability_maps_to_launch_policy() -> None:
+    """Auth warnings launch, while missing and outdated binaries remain blocked."""
+    from omnigent.onboarding.harness_readiness import availability_allows_launch
+
+    assert availability_allows_launch(True)
+    assert availability_allows_launch("needs-auth")
+    assert not availability_allows_launch(False)
+    assert not availability_allows_launch("binary-missing")
+    assert not availability_allows_launch("version-too-low")
 
 
 def test_kimi_readiness_keys_off_binary_and_credential(

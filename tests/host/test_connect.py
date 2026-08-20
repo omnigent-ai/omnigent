@@ -11,7 +11,7 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from websockets.datastructures import Headers
@@ -760,10 +760,9 @@ async def test_handle_launch_refuses_unconfigured_harness(
     host = _make_host_process()
     workspace = tmp_path / "project"
     workspace.mkdir()
-    # Patch the symbol connect.py imported, with the real function's
-    # signature; the workspace exists so ONLY the harness check can fail.
+    # The workspace exists so only the cached per-harness probe can fail.
     monkeypatch.setattr(
-        "omnigent.host.connect.harness_is_configured",
+        "omnigent.host.connect.probe_harness_launchability",
         lambda harness: False,
     )
 
@@ -805,7 +804,7 @@ async def test_handle_launch_native_cursor_message_points_at_cursor_installer(
     workspace = tmp_path / "project"
     workspace.mkdir()
     monkeypatch.setattr(
-        "omnigent.host.connect.harness_is_configured",
+        "omnigent.host.connect.probe_harness_launchability",
         lambda harness: False,
     )
 
@@ -844,7 +843,7 @@ async def test_handle_launch_configured_harness_proceeds_to_spawn(
     workspace = tmp_path / "project"
     workspace.mkdir()
     monkeypatch.setattr(
-        "omnigent.host.connect.harness_is_configured",
+        "omnigent.host.connect.probe_harness_launchability",
         lambda harness: True,
     )
 
@@ -897,16 +896,12 @@ async def test_handle_launch_without_harness_skips_check(
     workspace = tmp_path / "project"
     workspace.mkdir()
 
-    def _must_not_be_called(harness: str) -> bool:
-        """Fail the test if the readiness check runs for harness=None.
-
-        :param harness: The harness the production code passed.
-        :returns: Never returns.
-        """
-        raise AssertionError("harness_is_configured must not be called when frame.harness is None")
+    def _must_not_be_called(harness: str) -> object:
+        """Fail the test if the readiness probe runs for harness=None."""
+        raise AssertionError("readiness probe must not run when frame.harness is None")
 
     monkeypatch.setattr(
-        "omnigent.host.connect.harness_is_configured",
+        "omnigent.host.connect.probe_harness_launchability",
         _must_not_be_called,
     )
 
@@ -1022,6 +1017,23 @@ class _FakeTunnel:
         raise ConnectionError("test disconnect")
 
 
+class _HoldingTunnel:
+    """Tunnel that stays open while background readiness publishes updates."""
+
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+        self.sent_event = asyncio.Event()
+        self._closed = asyncio.Event()
+
+    async def send(self, data: str) -> None:
+        self.sent.append(data)
+        self.sent_event.set()
+
+    async def recv(self) -> str:
+        await self._closed.wait()
+        raise ConnectionError("test closed")
+
+
 class _ConnectionErrorTunnel:
     """Tunnel that returns one server connection error after host.hello."""
 
@@ -1073,16 +1085,6 @@ async def test_live_host_refreshes_harness_readiness_without_reconnect(
     The refresh now runs in :meth:`HostProcess._harness_readiness_loop`, off the
     receive loop, so a slow probe can never stall the tunnel keepalive.
     """
-    readiness = iter(({"pi": True},))
-    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", lambda: {"codex": True})
-    monkeypatch.setattr(
-        "omnigent.host.connect.configured_harness_map",
-        lambda: next(readiness),
-    )
-    monkeypatch.setattr(
-        "omnigent.host.connect.harness_is_configured",
-        lambda harness: harness == "pi",
-    )
     monkeypatch.setattr(
         "omnigent.host.connect.HARNESS_READINESS_REFRESH_INTERVAL_S",
         0.01,
@@ -1090,9 +1092,21 @@ async def test_live_host_refreshes_harness_readiness_without_reconnect(
     host = _make_host_process()
     host._configured_harnesses = {"pi": False}
     host._gateway_inference = {"codex": True}
+
+    async def _ready(*, startup: bool, force: bool = False) -> dict[str, bool]:
+        del startup, force
+        return {"pi": True}
+
+    monkeypatch.setattr(host, "_probe_configured_harnesses", _ready)
     ws = _RecordingWS()
 
-    task = asyncio.create_task(host._harness_readiness_loop(ws))
+    task = asyncio.create_task(
+        host._harness_readiness_loop(
+            ws,
+            reported_configured={"pi": False},
+            reported_gateway={"codex": True},
+        )
+    )
     try:
         await asyncio.wait_for(ws.first_send.wait(), timeout=2.0)
     finally:
@@ -1109,12 +1123,6 @@ async def test_live_host_full_refresh_detects_auth_completion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The full-refresh fallback catches readiness changes beyond binary installs."""
-    readiness = iter(({"codex": True},))
-    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", lambda: {"codex": True})
-    monkeypatch.setattr(
-        "omnigent.host.connect.configured_harness_map",
-        lambda: next(readiness),
-    )
     monkeypatch.setattr(
         "omnigent.host.connect.HARNESS_READINESS_FULL_REFRESH_INTERVAL_S",
         0.01,
@@ -1122,9 +1130,22 @@ async def test_live_host_full_refresh_detects_auth_completion(
     host = _make_host_process()
     host._configured_harnesses = {"codex": "needs-auth"}
     host._gateway_inference = {"codex": True}
+
+    async def _ready(*, startup: bool, force: bool = False) -> dict[str, bool]:
+        del startup, force
+        return {"codex": True}
+
+    monkeypatch.setattr(host, "_probe_configured_harnesses", _ready)
+    monkeypatch.setattr(host, "_probe_gateway_inference", AsyncMock(return_value={"codex": True}))
     ws = _RecordingWS()
 
-    task = asyncio.create_task(host._harness_readiness_loop(ws))
+    task = asyncio.create_task(
+        host._harness_readiness_loop(
+            ws,
+            reported_configured={"codex": "needs-auth"},
+            reported_gateway={"codex": True},
+        )
+    )
     try:
         await asyncio.wait_for(ws.first_send.wait(), timeout=2.0)
     finally:
@@ -1147,8 +1168,6 @@ async def test_live_host_does_not_repeat_unchanged_readiness(
         calls["n"] += 1
         return {"codex": "needs-auth"}
 
-    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", _unchanged_map)
-    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", lambda: {"codex": True})
     monkeypatch.setattr(
         "omnigent.host.connect.HARNESS_READINESS_FULL_REFRESH_INTERVAL_S",
         0.01,
@@ -1156,9 +1175,22 @@ async def test_live_host_does_not_repeat_unchanged_readiness(
     host = _make_host_process()
     host._configured_harnesses = {"codex": "needs-auth"}
     host._gateway_inference = {"codex": True}
+
+    async def _ready(*, startup: bool, force: bool = False) -> dict[str, str]:
+        del startup, force
+        return _unchanged_map()
+
+    monkeypatch.setattr(host, "_probe_configured_harnesses", _ready)
+    monkeypatch.setattr(host, "_probe_gateway_inference", AsyncMock(return_value={"codex": True}))
     ws = _RecordingWS()
 
-    task = asyncio.create_task(host._harness_readiness_loop(ws))
+    task = asyncio.create_task(
+        host._harness_readiness_loop(
+            ws,
+            reported_configured={"codex": "needs-auth"},
+            reported_gateway={"codex": True},
+        )
+    )
     try:
         # Let at least two full refreshes recompute-and-compare before stopping.
         for _ in range(400):
@@ -1179,23 +1211,32 @@ async def test_live_host_repushes_when_only_gateway_inference_changes(
     """A gateway-inference flip alone must reach the server, readiness unchanged."""
     gateway = iter(({"codex": False}, {"codex": True}))
     monkeypatch.setattr(
-        "omnigent.host.connect.configured_harness_map",
-        lambda: {"codex": True},
-    )
-    monkeypatch.setattr(
-        "omnigent.host.connect.gateway_inference_map",
-        lambda: next(gateway, {"codex": True}),
-    )
-    monkeypatch.setattr(
         "omnigent.host.connect.HARNESS_READINESS_FULL_REFRESH_INTERVAL_S",
         0.01,
     )
     host = _make_host_process()
     host._configured_harnesses = {"codex": True}
     host._gateway_inference = {"codex": False}
+
+    async def _ready(*, startup: bool, force: bool = False) -> dict[str, bool]:
+        del startup, force
+        return {"codex": True}
+
+    async def _gateway(*, startup: bool) -> dict[str, bool]:
+        del startup
+        return next(gateway, {"codex": True})
+
+    monkeypatch.setattr(host, "_probe_configured_harnesses", _ready)
+    monkeypatch.setattr(host, "_probe_gateway_inference", _gateway)
     ws = _RecordingWS()
 
-    task = asyncio.create_task(host._harness_readiness_loop(ws))
+    task = asyncio.create_task(
+        host._harness_readiness_loop(
+            ws,
+            reported_configured={"codex": True},
+            reported_gateway={"codex": False},
+        )
+    )
     try:
         await asyncio.wait_for(ws.first_send.wait(), timeout=2.0)
     finally:
@@ -1207,6 +1248,271 @@ async def test_live_host_repushes_when_only_gateway_inference_changes(
     assert refresh.configured_harnesses == {"codex": True}
     assert refresh.gateway_inference == {"codex": True}
     _cleanup_host(host)
+
+
+async def test_parallel_probes_share_inflight_work_with_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Independent harnesses overlap and a real launch joins its probe."""
+    from omnigent.onboarding.harness_readiness import HarnessProbeSpec
+
+    specs = (
+        HarnessProbeSpec(("harness", "alpha"), "alpha", ("alpha",)),
+        HarnessProbeSpec(("harness", "beta"), "beta", ("beta",)),
+    )
+    entered = threading.Barrier(3)
+    release = threading.Event()
+    calls: list[str] = []
+
+    def _probe(harness: str) -> bool:
+        calls.append(harness)
+        entered.wait(timeout=2.0)
+        release.wait(timeout=2.0)
+        return False
+
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_probe_specs", lambda: specs)
+    monkeypatch.setattr("omnigent.host.connect.probe_harness_launchability", _probe)
+    monkeypatch.setattr("omnigent.host.connect.probe_harness_availability", lambda harness: False)
+    host = _make_host_process()
+
+    discovery = asyncio.create_task(host._probe_configured_harnesses(startup=False))
+    await asyncio.to_thread(entered.wait, 2.0)
+    assert sorted(calls) == ["alpha", "beta"]
+
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    launch = asyncio.create_task(
+        host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="shared_launch",
+                binding_token="token",
+                workspace=str(workspace),
+                harness="alpha",
+            )
+        )
+    )
+    await asyncio.sleep(0)
+    assert not launch.done()
+    assert calls.count("alpha") == 1
+    release.set()
+
+    snapshot, launch_result = await asyncio.gather(discovery, launch)
+    assert snapshot == {"alpha": False, "beta": False}
+    assert launch_result.error_code == HARNESS_NOT_CONFIGURED_ERROR_CODE
+    assert calls.count("alpha") == 1
+
+
+async def test_harness_probe_parallelism_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the configured number of subprocess-heavy probes run at once."""
+    from omnigent.onboarding.harness_readiness import HarnessProbeSpec
+
+    monkeypatch.setattr("omnigent.host.connect._HARNESS_PROBE_CONCURRENCY", 2)
+    specs = tuple(
+        HarnessProbeSpec(("harness", name), name, (name,)) for name in ("alpha", "beta", "gamma")
+    )
+    lock = threading.Lock()
+    two_entered = threading.Event()
+    release = threading.Event()
+    active = 0
+    max_active = 0
+    calls: list[str] = []
+
+    def _probe(harness: str) -> bool:
+        nonlocal active, max_active
+        with lock:
+            calls.append(harness)
+            active += 1
+            max_active = max(max_active, active)
+            if active == 2:
+                two_entered.set()
+        release.wait(timeout=2.0)
+        with lock:
+            active -= 1
+        return True
+
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_probe_specs", lambda: specs)
+    monkeypatch.setattr("omnigent.host.connect.probe_harness_launchability", _probe)
+    monkeypatch.setattr("omnigent.host.connect.probe_harness_availability", lambda harness: True)
+    host = _make_host_process()
+    probing = asyncio.create_task(host._probe_configured_harnesses(startup=False))
+
+    assert await asyncio.to_thread(two_entered.wait, 2.0)
+    await asyncio.sleep(0.02)
+    assert len(calls) == 2
+    release.set()
+    assert await probing == {"alpha": True, "beta": True, "gamma": True}
+    assert max_active == 2
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "ttl_name"),
+    [
+        (True, False, "_HARNESS_PROBE_POSITIVE_TTL_S"),
+        (False, True, "_HARNESS_PROBE_NEGATIVE_TTL_S"),
+    ],
+)
+async def test_harness_probe_cache_expires(
+    monkeypatch: pytest.MonkeyPatch,
+    first: bool,
+    second: bool,
+    ttl_name: str,
+) -> None:
+    """Positive and negative launch cache entries both refresh after TTL."""
+    import omnigent.host.connect as connect_module
+    from omnigent.onboarding.harness_readiness import harness_probe_spec
+
+    values = iter((first, second))
+    calls = 0
+
+    def _probe(_harness: str) -> bool:
+        nonlocal calls
+        calls += 1
+        return next(values)
+
+    monkeypatch.setattr("omnigent.host.connect.probe_harness_launchability", _probe)
+    host = _make_host_process()
+    spec = harness_probe_spec("codex")
+
+    assert await host._probe_harness_launchability(spec) is first
+    entry = host._harness_probe_entries[spec.key]
+    entry.launch_checked_at -= getattr(connect_module, ttl_name) + 1.0
+    assert await host._probe_harness_launchability(spec) is second
+    assert calls == 2
+
+
+async def test_mutation_generation_rejects_stale_probe_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pre-mutation probe cannot overwrite the post-mutation result."""
+    from omnigent.onboarding.harness_readiness import harness_probe_spec
+
+    started = threading.Event()
+    release = threading.Event()
+    calls = 0
+
+    def _probe(_harness: str) -> bool:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            started.set()
+            release.wait(timeout=2.0)
+            return False
+        return True
+
+    monkeypatch.setattr("omnigent.host.connect.probe_harness_availability", _probe)
+    host = _make_host_process()
+    spec = harness_probe_spec("codex")
+    stale = asyncio.create_task(host._probe_harness(spec))
+    await asyncio.to_thread(started.wait, 2.0)
+
+    host._invalidate_all_harness_probes()
+    assert await host._probe_harness(spec) is True
+    release.set()
+    assert await stale is False
+    assert await host._probe_harness(spec) is True
+    assert calls == 2
+
+
+async def test_failed_probe_is_not_cached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed single-flight releases waiters and the next request retries."""
+    from omnigent.onboarding.harness_readiness import harness_probe_spec
+
+    calls = 0
+
+    def _probe(_harness: str) -> bool:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise PermissionError("probe denied")
+        return True
+
+    monkeypatch.setattr("omnigent.host.connect.probe_harness_availability", _probe)
+    host = _make_host_process()
+    spec = harness_probe_spec("codex")
+
+    with pytest.raises(PermissionError, match="probe denied"):
+        await host._probe_harness(spec)
+    assert await host._probe_harness(spec) is True
+    assert calls == 2
+
+
+async def test_launch_probe_failure_sends_structured_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Probe exceptions produce a reply and leave the tunnel usable."""
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    def _probe(_harness: str) -> bool:
+        raise PermissionError("cannot execute codex")
+
+    monkeypatch.setattr("omnigent.host.connect.probe_harness_launchability", _probe)
+    host = _make_host_process()
+    ws = _RecordingWS()
+    await host._dispatch_host_frame(
+        ws,  # type: ignore[arg-type]
+        HostLaunchRunnerFrame(
+            request_id="launch_probe_failure",
+            binding_token="token",
+            workspace=str(workspace),
+            harness="codex",
+        ),
+    )
+
+    result = decode_host_frame(ws.sent[0])
+    assert isinstance(result, HostLaunchRunnerResultFrame)
+    assert result.status == "failed"
+    assert result.error_code == HARNESS_NOT_CONFIGURED_ERROR_CODE
+    assert "cannot execute codex" in (result.error or "")
+    assert host._runners == {}
+
+    await host._dispatch_host_frame(  # type: ignore[arg-type]
+        ws,
+        HostStatFrame(request_id="still_usable", path=str(workspace)),
+    )
+    assert len(ws.sent) == 2
+
+
+async def test_launch_probe_timeout_sends_structured_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow probe fails the launch without blocking the receive loop."""
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    release = threading.Event()
+
+    def _probe(_harness: str) -> bool:
+        release.wait(timeout=2.0)
+        return True
+
+    monkeypatch.setattr("omnigent.host.connect.probe_harness_launchability", _probe)
+    monkeypatch.setattr("omnigent.host.connect._HARNESS_LAUNCH_PROBE_TIMEOUT_S", 0.01)
+    host = _make_host_process()
+
+    result = await host._handle_launch(
+        HostLaunchRunnerFrame(
+            request_id="launch_probe_timeout",
+            binding_token="token",
+            workspace=str(workspace),
+            harness="codex",
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == HARNESS_NOT_CONFIGURED_ERROR_CODE
+    assert "timed out" in (result.error or "")
+    release.set()
+    tasks = [
+        entry.launch_task for entry in host._harness_probe_entries.values() if entry.launch_task
+    ]
+    await asyncio.gather(*tasks)
 
 
 async def test_handle_launch_immediate_exit_reports_exit_code_and_log_tail(
@@ -1481,27 +1787,125 @@ async def test_unreported_exit_flushes_after_reconnect(
     assert host._unreported_exits == {}
 
 
-async def test_capability_probe_timeout_does_not_block_connection(
+async def test_run_connects_while_capability_discovery_is_blocked(
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A hung startup probe degrades to unknown metadata after its deadline."""
+    """The daemon enters its connection loop before capability probes finish."""
+    host = _host()
+    release = asyncio.Event()
+    readiness_started = asyncio.Event()
+    gateway_started = asyncio.Event()
+    connect_called = asyncio.Event()
+
+    async def _readiness(*, startup: bool, force: bool = False) -> dict[str, bool]:
+        del startup, force
+        readiness_started.set()
+        await release.wait()
+        return {"codex": True}
+
+    async def _gateway(*, startup: bool) -> dict[str, bool]:
+        del startup
+        gateway_started.set()
+        await release.wait()
+        return {"codex": True}
+
+    async def _connect() -> None:
+        connect_called.set()
+        await asyncio.gather(readiness_started.wait(), gateway_started.wait())
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(host, "_probe_configured_harnesses", _readiness)
+    monkeypatch.setattr(host, "_probe_gateway_inference", _gateway)
+    monkeypatch.setattr(host, "_connect_and_serve", _connect)
+
+    await asyncio.wait_for(host.run(), timeout=1.0)
+    assert connect_called.is_set()
+    assert readiness_started.is_set()
+    assert gateway_started.is_set()
+
+
+async def test_capability_discovery_does_not_block_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hello is sent with unknown metadata while discovery is still running."""
     host = _make_host_process()
     never = asyncio.Event()
 
-    async def _blocked(*, startup: bool) -> None:
+    async def _blocked_readiness(*, startup: bool, force: bool = False) -> dict[str, bool]:
+        del startup, force
+        await never.wait()
+        return {"codex": True}
+
+    async def _blocked_gateway(*, startup: bool) -> dict[str, bool]:
         del startup
         await never.wait()
+        return {"codex": True}
 
-    monkeypatch.setattr(host, "_probe_configured_harnesses", _blocked)
-    monkeypatch.setattr(host, "_probe_gateway_inference", _blocked)
-    monkeypatch.setattr("omnigent.host.connect._HOST_CAPABILITY_INIT_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(host, "_probe_configured_harnesses", _blocked_readiness)
+    monkeypatch.setattr(host, "_probe_gateway_inference", _blocked_gateway)
+    discovery = asyncio.create_task(host._initialize_capabilities())
+    host._capability_discovery_task = discovery
+    tunnel = _FakeTunnel()
 
-    await host._initialize_capabilities()
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type]
 
-    assert host._configured_harnesses is None
-    assert host._gateway_inference is None
-    assert "capability discovery timed out" in capsys.readouterr().err
+    hello = decode_host_frame(tunnel.sent[0])
+    assert isinstance(hello, HostHelloFrame)
+    assert hello.configured_harnesses is None
+    assert hello.gateway_inference is None
+    assert not discovery.done()
+    discovery.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await discovery
+
+
+async def test_completed_background_discovery_updates_connected_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hello with unknown metadata is followed by one complete snapshot."""
+    host = _make_host_process()
+    release = asyncio.Event()
+
+    async def _readiness(*, startup: bool, force: bool = False) -> dict[str, bool]:
+        del startup, force
+        await release.wait()
+        return {"claude-native": True, "codex-native": False}
+
+    async def _gateway(*, startup: bool) -> dict[str, bool]:
+        del startup
+        await release.wait()
+        return {"claude-native": True}
+
+    monkeypatch.setattr(host, "_probe_configured_harnesses", _readiness)
+    monkeypatch.setattr(host, "_probe_gateway_inference", _gateway)
+    discovery = asyncio.create_task(host._initialize_capabilities())
+    host._capability_discovery_task = discovery
+    tunnel = _HoldingTunnel()
+    serving = asyncio.create_task(host._serve_frames(tunnel))  # type: ignore[arg-type]
+
+    while not tunnel.sent:
+        await tunnel.sent_event.wait()
+        tunnel.sent_event.clear()
+    hello = decode_host_frame(tunnel.sent[0])
+    assert isinstance(hello, HostHelloFrame)
+    assert hello.configured_harnesses is None
+
+    release.set()
+    for _ in range(100):
+        if len(tunnel.sent) >= 2:
+            break
+        await asyncio.sleep(0.01)
+    refresh = decode_host_frame(tunnel.sent[1])
+    assert isinstance(refresh, HostHarnessReadinessFrame)
+    assert refresh.configured_harnesses == {
+        "claude-native": True,
+        "codex-native": False,
+    }
+
+    serving.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await serving
 
 
 async def test_capability_probe_failure_does_not_block_registration(
@@ -1510,10 +1914,16 @@ async def test_capability_probe_failure_does_not_block_registration(
 ) -> None:
     """Optional startup discovery fails visibly but hello still reaches the server."""
 
-    def _denied() -> dict[str, bool]:
+    from omnigent.onboarding.harness_readiness import harness_probe_spec
+
+    def _denied(_harness: str) -> bool:
         raise PermissionError(13, "Permission denied", "/usr/local/bin/codex")
 
-    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", _denied)
+    monkeypatch.setattr(
+        "omnigent.host.connect.configured_harness_probe_specs",
+        lambda: (harness_probe_spec("codex"),),
+    )
+    monkeypatch.setattr("omnigent.host.connect.probe_harness_availability", _denied)
     monkeypatch.setattr(
         "omnigent.host.connect.gateway_inference_map",
         lambda: {"codex": False},
@@ -2862,26 +3272,17 @@ def test_handle_create_dir_expands_tilde(tmp_path: Path, monkeypatch) -> None:
 # ── host.install_harness handler ────────────────────────
 
 
-def test_handle_install_harness_success_returns_refreshed_readiness(
+def test_handle_install_harness_success_runs_installer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    A successful install returns ``ok`` and the recomputed readiness map.
-
-    The server flips the UI badge off this map, so the handler must run the
-    installer and then re-probe readiness, returning the fresh result.
+    A successful core install returns ``ok``; async dispatch refreshes readiness.
     """
     import omnigent.host.connect as connect
 
     # Not yet installed, so the handler runs the installer.
     monkeypatch.setattr(connect, "harness_cli_installed", lambda key: False)
     monkeypatch.setattr(connect, "try_install_harness_cli", lambda key: (True, None))
-    monkeypatch.setattr(
-        connect,
-        "configured_harness_map",
-        lambda: {"claude-native": True, "codex-native": "needs-auth"},
-    )
-
     host = _make_host_process()
     result = host._handle_install_harness(
         HostInstallHarnessFrame(request_id="i1", harness="claude")
@@ -2890,7 +3291,7 @@ def test_handle_install_harness_success_returns_refreshed_readiness(
     assert isinstance(result, HostInstallHarnessResultFrame)
     assert result.status == "ok"
     assert result.error is None
-    assert result.configured_harnesses == {"claude-native": True, "codex-native": "needs-auth"}
+    assert result.configured_harnesses is None
 
 
 def test_handle_install_harness_already_installed_skips_installer(
@@ -2912,7 +3313,6 @@ def test_handle_install_harness_already_installed_skips_installer(
         raise AssertionError("installer ran despite the harness already being installed")
 
     monkeypatch.setattr(connect, "try_install_harness_cli", _must_not_install)
-    monkeypatch.setattr(connect, "configured_harness_map", lambda: {"opencode-native": True})
 
     host = _make_host_process()
     result = host._handle_install_harness(
@@ -2920,7 +3320,57 @@ def test_handle_install_harness_already_installed_skips_installer(
     )
 
     assert result.status == "ok"
+    assert result.configured_harnesses is None
+
+
+async def test_install_dispatch_returns_post_mutation_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Install dispatch invalidates a stale result before its response."""
+    import omnigent.host.connect as connect
+    from omnigent.onboarding.harness_readiness import HarnessProbeSpec
+
+    spec = HarnessProbeSpec(
+        ("harness", "opencode-native"),
+        "opencode-native",
+        ("opencode-native",),
+    )
+    state = {"ready": False}
+    picker_calls = 0
+    launch_calls = 0
+
+    def _probe(_harness: str) -> bool:
+        nonlocal picker_calls
+        picker_calls += 1
+        return state["ready"]
+
+    def _launch_probe(_harness: str) -> bool:
+        nonlocal launch_calls
+        launch_calls += 1
+        return state["ready"]
+
+    monkeypatch.setattr(connect, "harness_cli_installed", lambda key: True)
+    monkeypatch.setattr(connect, "configured_harness_probe_specs", lambda: (spec,))
+    monkeypatch.setattr(connect, "probe_harness_availability", _probe)
+    monkeypatch.setattr(connect, "probe_harness_launchability", _launch_probe)
+    host = _make_host_process()
+    monkeypatch.setattr(host, "_probe_gateway_inference", AsyncMock(return_value={"codex": False}))
+    assert await host._probe_harness_launchability(spec) is False
+    assert await host._probe_harness(spec) is False
+    state["ready"] = True
+    ws = _RecordingWS()
+
+    await host._dispatch_host_frame(  # type: ignore[arg-type]
+        ws,
+        HostInstallHarnessFrame(request_id="install_refresh", harness="opencode"),
+    )
+
+    result = decode_host_frame(ws.sent[0])
+    assert isinstance(result, HostInstallHarnessResultFrame)
     assert result.configured_harnesses == {"opencode-native": True}
+    assert result.gateway_inference == {"codex": False}
+    assert picker_calls == 2
+    assert launch_calls == 2
 
 
 def test_handle_install_harness_failure_surfaces_reason(
@@ -2975,15 +3425,10 @@ def test_handle_install_harness_rejects_non_allowlisted(
     assert result.configured_harnesses is None
 
 
-def test_handle_store_secret_key_writes_and_returns_readiness(
+def test_handle_store_secret_key_writes_credential(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A key store-secret request calls the core and returns fresh readiness.
-
-    The handler is a thin wrapper: resolve family, call the non-interactive
-    core, then recompute readiness so the server flips the badge (yellow →
-    green) without a reconnect.
-    """
+    """A key store-secret request calls the non-interactive write core."""
     import omnigent.host.connect as connect
     from omnigent.onboarding.harness_auth import StoreCredentialResult
 
@@ -2994,7 +3439,6 @@ def test_handle_store_secret_key_writes_and_returns_readiness(
         return StoreCredentialResult(True, "anthropic", None)
 
     monkeypatch.setattr(connect, "store_harness_credential", _store)
-    monkeypatch.setattr(connect, "configured_harness_map", lambda: {"claude-native": True})
 
     host = _make_host_process()
     result = host._handle_store_secret(
@@ -3008,7 +3452,7 @@ def test_handle_store_secret_key_writes_and_returns_readiness(
     )
     assert isinstance(result, HostStoreSecretResultFrame)
     assert result.status == "ok"
-    assert result.configured_harnesses == {"claude-native": True}
+    assert result.configured_harnesses is None
     # The core was called with the resolved family + the frame's fields.
     assert calls == [
         {
@@ -3020,6 +3464,65 @@ def test_handle_store_secret_key_writes_and_returns_readiness(
             "wire_api": None,
         }
     ]
+
+
+async def test_store_secret_dispatch_returns_post_mutation_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Credential writes invalidate readiness before returning to the UI."""
+    import omnigent.host.connect as connect
+    from omnigent.onboarding.harness_auth import StoreCredentialResult
+    from omnigent.onboarding.harness_readiness import HarnessProbeSpec
+
+    spec = HarnessProbeSpec(
+        ("harness", "claude-native"),
+        "claude-native",
+        ("claude-native",),
+    )
+    state = {"availability": "needs-auth"}
+    picker_calls = 0
+    launch_calls = 0
+
+    def _probe(_harness: str) -> object:
+        nonlocal picker_calls
+        picker_calls += 1
+        return state["availability"]
+
+    def _launch_probe(_harness: str) -> bool:
+        nonlocal launch_calls
+        launch_calls += 1
+        return True
+
+    monkeypatch.setattr(
+        connect,
+        "store_harness_credential",
+        lambda **kwargs: StoreCredentialResult(True, "anthropic", None),
+    )
+    monkeypatch.setattr(connect, "configured_harness_probe_specs", lambda: (spec,))
+    monkeypatch.setattr(connect, "probe_harness_availability", _probe)
+    monkeypatch.setattr(connect, "probe_harness_launchability", _launch_probe)
+    host = _make_host_process()
+    monkeypatch.setattr(host, "_probe_gateway_inference", AsyncMock(return_value={}))
+    assert await host._probe_harness_launchability(spec) is True
+    assert await host._probe_harness(spec) == "needs-auth"
+    state["availability"] = True
+    ws = _RecordingWS()
+
+    await host._dispatch_host_frame(  # type: ignore[arg-type]
+        ws,
+        HostStoreSecretFrame(
+            request_id="credential_refresh",
+            harness="claude",
+            kind="key",
+            secret_value="sk-ant-test",
+        ),
+    )
+
+    result = decode_host_frame(ws.sent[0])
+    assert isinstance(result, HostStoreSecretResultFrame)
+    assert result.configured_harnesses == {"claude-native": True}
+    assert picker_calls == 2
+    assert launch_calls == 2
 
 
 def test_handle_store_secret_pi_maps_to_anthropic_family(
@@ -3036,7 +3539,6 @@ def test_handle_store_secret_pi_maps_to_anthropic_family(
         return StoreCredentialResult(True, "anthropic", None)
 
     monkeypatch.setattr(connect, "store_harness_credential", _store)
-    monkeypatch.setattr(connect, "configured_harness_map", lambda: {"pi": True})
 
     host = _make_host_process()
     result = host._handle_store_secret(
@@ -3067,7 +3569,6 @@ def test_handle_store_secret_adopt_calls_adopt_core(
             DetectedCredential(family="openai", source="$OPENAI_API_KEY", env_var="OPENAI_API_KEY")
         ],
     )
-    monkeypatch.setattr(connect, "configured_harness_map", lambda: {"codex-native": True})
 
     host = _make_host_process()
     result = host._handle_store_secret(
@@ -3107,7 +3608,6 @@ def test_handle_store_secret_pi_adopt_uses_detected_family_not_harness(
             DetectedCredential(family="openai", source="$OPENAI_API_KEY", env_var="OPENAI_API_KEY")
         ],
     )
-    monkeypatch.setattr(connect, "configured_harness_map", lambda: {"pi": True})
 
     host = _make_host_process()
     result = host._handle_store_secret(
@@ -4003,7 +4503,7 @@ async def test_accepted_connect_resets_loopback_refused_streak(
     monkeypatch.setattr("omnigent.host.connect._LOOPBACK_REFUSED_FATAL_ATTEMPTS", 3)
     # The accepted connect sends a real hello; skip its slow CLI probes —
     # only the streak accounting is under test here.
-    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", dict)
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_probe_specs", tuple)
     refused = _refused_exc()
     # 2 refusals (one short of fatal), an accepted upgrade (its tunnel
     # drops on first recv), then refusals repeating until fatal.
@@ -4154,7 +4654,7 @@ async def test_silent_connect_streak_escalates_and_slows_reconnects(
     monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
     monkeypatch.setattr("omnigent.host.connect._RECONNECT_CAP_S", 0.0)
     monkeypatch.setattr("omnigent.host.connect._SILENT_CONNECT_ESCALATE_ATTEMPTS", 3)
-    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", dict)
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_probe_specs", tuple)
     monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", dict)
     spy = _ConnectSpy([None, None, None, None, None, asyncio.CancelledError()])
     _patch_connect(monkeypatch, spy)
@@ -4183,7 +4683,7 @@ async def test_inbound_frame_resets_silent_connect_streak(
     monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
     monkeypatch.setattr("omnigent.host.connect._RECONNECT_CAP_S", 0.0)
     monkeypatch.setattr("omnigent.host.connect._SILENT_CONNECT_ESCALATE_ATTEMPTS", 3)
-    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", dict)
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_probe_specs", tuple)
     monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", dict)
     spy = _ConnectSpy([None, None, 1, None, None, asyncio.CancelledError()])
     _patch_connect(monkeypatch, spy)
@@ -4232,30 +4732,29 @@ async def test_retryable_connection_error_escapes_live_receive_path() -> None:
     assert host._frame_tasks == set()
 
 
-async def test_capabilities_are_initialized_once_across_reconnects(
+async def test_capabilities_are_initialized_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Reconnect handshakes reuse startup metadata instead of rerunning probes."""
-    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    """Repeated initialization calls reuse the daemon-lifetime snapshot."""
     calls = {"readiness": 0, "gateway": 0}
+    host = _host()
 
-    def _readiness() -> dict[str, bool]:
+    async def _readiness(*, startup: bool, force: bool = False) -> dict[str, bool]:
+        del startup, force
         calls["readiness"] += 1
         return {"pi": True}
 
-    def _gateway() -> dict[str, bool]:
+    async def _gateway(*, startup: bool) -> dict[str, bool]:
+        del startup
         calls["gateway"] += 1
         return {"codex": True}
 
-    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", _readiness)
-    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", _gateway)
-    spy = _ConnectSpy([None, None, asyncio.CancelledError()])
-    _patch_connect(monkeypatch, spy)
-    host = _host()
+    monkeypatch.setattr(host, "_probe_configured_harnesses", _readiness)
+    monkeypatch.setattr(host, "_probe_gateway_inference", _gateway)
 
-    await host.run()
+    await host._initialize_capabilities()
+    await host._initialize_capabilities()
 
-    assert spy.call_count == 3
     assert calls == {"readiness": 1, "gateway": 1}
 
 
