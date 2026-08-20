@@ -8372,6 +8372,58 @@ def test_session_usage_data_extracts_cumulative_tokens() -> None:
     assert "cumulative_cache_read_input_tokens" not in data
 
 
+def test_session_usage_data_prefers_effective_context_window() -> None:
+    """
+    ``tokenUsage.modelContextWindow`` (Codex 0.147+) wins over the legacy
+    nested ``total.contextWindow`` for the context ring.
+
+    The effective window is the catalog window minus agent reserves; sizing
+    the meter against the catalog window under-reports usage badly on
+    reserved-window models (observed 20% web UI vs 79% Codex terminal for the
+    same session, #5025).
+    """
+    params = {
+        "threadId": "thread_123",
+        "tokenUsage": {
+            "total": {
+                "inputTokens": 206_533,
+                "outputTokens": 250,
+                "contextWindow": 1_050_000,
+            },
+            "last": {"inputTokens": 206_533, "outputTokens": 10, "contextWindow": 1_050_000},
+            "modelContextWindow": 258_400,
+        },
+    }
+    data = codex_native_forwarder._session_usage_data_from_params(params)
+    assert data is not None
+    assert data["context_window"] == 258_400
+    assert data["context_tokens"] == 206_533
+
+    # Legacy-only frame (older CLI): the nested field still works.
+    legacy = {
+        "threadId": "thread_123",
+        "tokenUsage": {
+            "total": {"inputTokens": 1000, "outputTokens": 5, "contextWindow": 200_000},
+        },
+    }
+    data = codex_native_forwarder._session_usage_data_from_params(legacy)
+    assert data is not None
+    assert data["context_window"] == 200_000
+
+    # A null/unusable modelContextWindow falls back rather than dropping the
+    # window entirely (0.147 marks the field optional in its protocol).
+    null_window = {
+        "threadId": "thread_123",
+        "tokenUsage": {
+            "total": {"inputTokens": 1000, "outputTokens": 5, "contextWindow": 200_000},
+            "modelContextWindow": None,
+        },
+    }
+    data = codex_native_forwarder._session_usage_data_from_params(null_window)
+    assert data is not None
+    assert data["context_window"] == 200_000
+
+
 def test_session_usage_data_forwards_cached_input_tokens() -> None:
     """
     ``cachedInputTokens`` is forwarded as ``cumulative_cache_read_input_tokens``

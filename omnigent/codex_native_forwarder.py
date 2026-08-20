@@ -6278,7 +6278,6 @@ def _session_usage_data_from_params(params: _JsonObject) -> dict[str, int] | Non
     if not isinstance(total, dict):
         return None
     cumulative_input_tokens = total.get("inputTokens")
-    context_window = total.get("contextWindow")
     output_tokens = total.get("outputTokens")
     cached_input_tokens = total.get("cachedInputTokens")
     data: dict[str, int] = {}
@@ -6312,6 +6311,16 @@ def _session_usage_data_from_params(params: _JsonObject) -> dict[str, int] | Non
         data["context_tokens"] = cumulative_input_tokens
     if isinstance(output_tokens, int) and output_tokens >= 0:
         data["cumulative_output_tokens"] = output_tokens
+    # Codex 0.147+ reports the EFFECTIVE window (model context window minus
+    # agent reserves) as ``tokenUsage.modelContextWindow``; the legacy nested
+    # ``total.contextWindow`` carried the raw catalog window. Prefer the
+    # effective field — sizing the meter against the catalog window
+    # under-reports usage badly on reserved-window models (observed 20% in
+    # the web UI vs 79% in the Codex terminal for the same session, #5025) —
+    # and keep the legacy nested field as the fallback for older CLIs.
+    context_window = token_usage.get("modelContextWindow")
+    if not isinstance(context_window, int) or context_window <= 0:
+        context_window = total.get("contextWindow")
     if isinstance(context_window, int) and context_window > 0:
         data["context_window"] = context_window
     if not data:
