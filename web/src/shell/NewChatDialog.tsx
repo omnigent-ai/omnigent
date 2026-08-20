@@ -4110,6 +4110,14 @@ export function NewChatLandingScreen() {
               projectId={configProjectId}
               projectName={selectedProject}
               config={storedProjectConfig}
+              // Gate editing until the config resolves: the PATCH replaces the
+              // whole blob, so a write before the name→id and config have loaded
+              // would wipe the project's other defaults. A label-only folder
+              // (`configProjectId === null`) has no first-class config to lose.
+              configReady={
+                !projectListLoading &&
+                (configProjectId === null || storedProjectConfig !== undefined)
+              }
             />
           ) : (
             <BrandLogo variant="eyes" className="h-14 w-auto shrink-0" />

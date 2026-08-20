@@ -241,7 +241,9 @@ async def test_session_projects_surfaces_config_icon(
     ).json()
     # A config without an icon key surfaces None (default folder glyph).
     plain = (
-        await project_client.post("/v1/projects", json={"name": "Plain", "config": {"host_id": "h"}})
+        await project_client.post(
+            "/v1/projects", json={"name": "Plain", "config": {"host_id": "h"}}
+        )
     ).json()
 
     resp = await project_client.get("/v1/sessions/projects")

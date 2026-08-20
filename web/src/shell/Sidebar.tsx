@@ -4000,7 +4000,14 @@ function ProjectFolderMenu({
   const { data: iconConfig, isLoading: iconConfigLoading } = useProjectConfig(
     menuOpen || iconOpen ? projectId : null,
   );
+  // The config PATCH replaces the whole blob, so a set/remove must merge onto a
+  // fully-loaded config or it silently wipes the other defaults. "Ready" means
+  // the config actually resolved (`!== undefined` — `isLoading` alone is false
+  // on a query *error* too, leaving no data to merge onto) — except a
+  // label-only folder (`projectId === null`), whose base is legitimately `{}`.
+  const configReady = projectId === null || iconConfig !== undefined;
   const setIcon = (native: string) => {
+    if (!configReady) return;
     updateConfig.mutate(
       { id: projectId, name: projectName, config: { ...(iconConfig ?? {}), icon: native } },
       {
@@ -4012,6 +4019,7 @@ function ProjectFolderMenu({
     );
   };
   const removeIcon = () => {
+    if (!configReady) return;
     const next = { ...(iconConfig ?? {}) };
     delete next.icon;
     updateConfig.mutate({ id: projectId, name: projectName, config: next });
@@ -4071,7 +4079,7 @@ function ProjectFolderMenu({
           {icon ? (
             <DropdownMenuItem
               data-testid="remove-project-icon"
-              disabled={iconConfigLoading}
+              disabled={!configReady}
               onSelect={removeIcon}
             >
               <SmileIcon className="size-3.5" />
@@ -4171,12 +4179,16 @@ function ProjectFolderMenu({
           <DialogHeader>
             <DialogTitle>Choose an icon</DialogTitle>
           </DialogHeader>
-          {iconConfigLoading ? (
+          {configReady ? (
+            <EmojiPicker onSelect={setIcon} />
+          ) : iconConfigLoading ? (
             <div className="flex h-[420px] w-[352px] items-center justify-center">
               <Loader2Icon className="size-5 animate-spin text-muted-foreground" />
             </div>
           ) : (
-            <EmojiPicker onSelect={setIcon} />
+            <div className="flex h-[420px] w-[352px] items-center justify-center px-6 text-center text-ui text-muted-foreground">
+              Couldn&apos;t load this project&apos;s settings. Close and try again.
+            </div>
           )}
         </DialogContent>
       </Dialog>

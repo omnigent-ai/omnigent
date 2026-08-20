@@ -46,21 +46,32 @@ export function EmojiPicker({ onSelect }: { onSelect: (native: string) => void }
  * through the project's `config.icon`, merging so the other stored defaults
  * (host / workspace / agent) survive an icon change or removal. A label-only
  * folder (`projectId === null`) is promoted on demand by the mutation.
+ *
+ * `configReady` gates editing: the PATCH replaces the whole config blob, so a
+ * write before the config has loaded would merge onto `{}` and silently wipe
+ * those defaults. The caller passes `true` only once the config has resolved
+ * (or when there's no first-class config to lose).
  */
 export function ProjectLandingIcon({
   projectId,
   projectName,
   config,
+  configReady,
 }: {
   projectId: string | null;
   projectName: string;
   config: ProjectConfig | undefined;
+  configReady: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const update = useUpdateProjectConfig();
   const icon = config?.icon;
 
+  const openPicker = () => {
+    if (configReady) setOpen(true);
+  };
   const save = (native: string) => {
+    if (!configReady) return;
     update.mutate({
       id: projectId,
       name: projectName,
@@ -69,6 +80,7 @@ export function ProjectLandingIcon({
     setOpen(false);
   };
   const clear = () => {
+    if (!configReady) return;
     const next = { ...(config ?? {}) };
     delete next.icon;
     update.mutate({ id: projectId, name: projectName, config: next });
@@ -84,7 +96,9 @@ export function ProjectLandingIcon({
           variant="ghost"
           size="icon-xs"
           aria-label="Change project icon"
-          onClick={() => setOpen(true)}
+          data-testid="project-icon-edit"
+          disabled={!configReady}
+          onClick={openPicker}
         >
           <PencilIcon className="size-3.5" />
         </Button>
@@ -94,6 +108,8 @@ export function ProjectLandingIcon({
             variant="ghost"
             size="icon-xs"
             aria-label="Remove project icon"
+            data-testid="project-icon-remove"
+            disabled={!configReady}
             onClick={clear}
           >
             <Trash2Icon className="size-3.5" />
@@ -104,8 +120,9 @@ export function ProjectLandingIcon({
         <PopoverAnchor asChild>
           <button
             type="button"
-            aria-label="Change project icon"
-            onClick={() => setOpen((o) => !o)}
+            aria-label="Project icon"
+            data-testid="project-icon-tile"
+            onClick={openPicker}
             className={cn(
               "flex size-14 items-center justify-center rounded-xl transition-colors",
               icon ? "bg-muted" : "bg-tag-pink",
