@@ -1656,12 +1656,18 @@ describe("Composer — queued-message flush gating", () => {
     });
 
     // Idle + a waiting head, but unreachable → the effect must not flush.
-    const { rerender } = render(<Composer {...composerProps({ unreachable: true })} />);
+    // Wrapped in TooltipProvider since the queued-message strip renders the
+    // steer button's tooltip.
+    const { rerender } = renderWithTooltips(<Composer {...composerProps({ unreachable: true })} />);
     await waitFor(() => expect(sendSpy).not.toHaveBeenCalled());
     expect(useChatStore.getState().queuedMessages).toHaveLength(1);
 
     // Becomes reachable → the effect re-fires and drains the head.
-    rerender(<Composer {...composerProps({ unreachable: false })} />);
+    rerender(
+      <TooltipProvider>
+        <Composer {...composerProps({ unreachable: false })} />
+      </TooltipProvider>,
+    );
     await waitFor(() => expect(sendSpy).toHaveBeenCalledTimes(1));
     expect(sendSpy.mock.calls[0]!.slice(0, 2)).toEqual(["held", "agent_xyz"]);
     expect(useChatStore.getState().queuedMessages).toHaveLength(0);

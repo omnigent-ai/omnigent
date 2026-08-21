@@ -104,7 +104,7 @@ function QueuedRow({
               <ArrowUpIcon className="size-3.5" aria-hidden="true" />
             </button>
           </TooltipTrigger>
-          <TooltipContent side="bottom">Steer</TooltipContent>
+          <TooltipContent side="top">Send now</TooltipContent>
         </Tooltip>
       ) : null}
       <button
