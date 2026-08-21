@@ -109,6 +109,7 @@ import type {
 import { uploadFile } from "@/lib/filesApi";
 import type { ActiveResponse } from "./types";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
+import { claudePermissionModeFromSession } from "@/lib/claudePermissionMode";
 import { codexPlanModeFromSession } from "@/lib/codexPlanMode";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { getOmnigentHostConfig } from "@/lib/host";
@@ -360,6 +361,15 @@ export interface ConversationState {
    * web toggle or native Codex TUI events. False for non-Codex sessions.
    */
   codexPlanMode: boolean;
+  /**
+   * Permission mode of a running claude-native session, e.g. ``"auto"``.
+   * Hydrated from ``omnigent.claude_native.permission_mode`` on bind
+   * (falling back to the launch flag) and updated by the composer's mode
+   * picker. Empty string when unknown — a non-Claude session, or a mode set
+   * via ``permissions.defaultMode`` that never reaches the launch args. The
+   * composer hides the picker rather than showing a guessed mode.
+   */
+  claudePermissionMode: string;
   /**
    * True when older items exist before the loaded history window. Binds
    * hydrate only the most recent page (see `fetchSessionItemsPage`);
@@ -738,6 +748,13 @@ export interface ChatActions {
    * active conversation.
    */
   setCodexPlanMode: (enabled: boolean) => Promise<void>;
+  /**
+   * Switch a running claude-native session's permission mode (e.g. to
+   * ``"auto"``). Rejects when the live TUI could not reach the mode, so
+   * callers surface the error rather than assuming the switch landed.
+   * No-ops when there is no active conversation.
+   */
+  setClaudePermissionMode: (mode: string) => Promise<void>;
   /**
    * Fetch the next page of older messages and prepend them to `blocks`.
    *
@@ -1282,6 +1299,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   costControlModeOverride: null,
   subagentRoutingOverride: null,
   codexPlanMode: false,
+  claudePermissionMode: "",
   hasMoreHistory: false,
   loadingMoreHistory: false,
   oldestItemId: null,
@@ -2259,6 +2277,24 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
+  setClaudePermissionMode: async (mode) => {
+    const { conversationId } = get();
+    if (!conversationId) return;
+    const previous = get().claudePermissionMode;
+    // Pinned for the same reason as `setCostControlMode` — see there.
+    const patchSet = setterFor(conversationId);
+    // Optimistic, then reconciled against the mode the server confirms the
+    // pane landed on — which may differ from what was asked.
+    patchSet({ claudePermissionMode: mode });
+    try {
+      const session = await updateSession(conversationId, { claudePermissionMode: mode });
+      patchSet({ claudePermissionMode: claudePermissionModeFromSession(session) ?? "" });
+    } catch (err) {
+      patchSet({ claudePermissionMode: previous });
+      throw err;
+    }
+  },
+
   loadMoreHistory: async () => {
     const { conversationId, oldestItemId, loadingMoreHistory, hasMoreHistory, historyGeneration } =
       get();
@@ -2866,6 +2902,7 @@ function sessionBindingPatch(
   | "costControlModeOverride"
   | "subagentRoutingOverride"
   | "codexPlanMode"
+  | "claudePermissionMode"
   | "contextWindow"
   | "gitBranch"
   | "skills"
@@ -2892,6 +2929,9 @@ function sessionBindingPatch(
     costControlModeOverride: session.costControlModeOverride ?? null,
     subagentRoutingOverride: session.subagentRoutingOverride ?? null,
     codexPlanMode: codexPlanModeFromSession(session),
+    claudePermissionMode: isNativeWrapper(wrapper)
+      ? (claudePermissionModeFromSession(session) ?? "")
+      : "",
     contextWindow: session.contextWindow ?? null,
     gitBranch: session.gitBranch ?? null,
     skills: session.skills ?? [],
@@ -5125,6 +5165,13 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       ) {
         useChatStore.setState({ selectedEffort: event.reasoningEffort });
       }
+      return;
+    case "session_permission_mode":
+      // Pane-driven (in-TUI shift+tab) or UI-driven; either way the server
+      // has confirmed this is the session's live mode.
+      applyToNamedConversation(event.conversationId, {
+        claudePermissionMode: event.permissionMode,
+      });
       return;
     case "session_collaboration_mode":
       // A Codex /plan switch made in either the web UI or native TUI.

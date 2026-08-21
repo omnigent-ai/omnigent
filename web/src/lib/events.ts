@@ -559,6 +559,18 @@ export interface SessionCollaborationModeEvent {
 }
 
 /**
+ * `session.permission_mode` — active claude-native permission-mode switch.
+ *
+ * Emitted when the web picker switches the mode, and when the Claude
+ * forwarder sees the pane's footer change (a shift+tab pressed in the TUI).
+ */
+export interface SessionPermissionModeEvent {
+  type: "session_permission_mode";
+  conversationId: string;
+  permissionMode: string;
+}
+
+/**
  * `session.agent_changed` — the session's bound agent was switched in
  * place (switch-agent route).
  *
@@ -919,6 +931,7 @@ export type StreamEvent =
   | SessionTitleEvent
   | SessionReasoningEffortEvent
   | SessionCollaborationModeEvent
+  | SessionPermissionModeEvent
   | SessionAgentChangedEvent
   | SessionTodosEvent
   | SessionTerminalPendingEvent

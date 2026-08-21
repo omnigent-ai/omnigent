@@ -1863,6 +1863,10 @@ export function useRenameProject() {
           if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
         }),
       );
+      // Return the resolved id so a caller promoting a label-only folder can
+      // target the just-created row for a follow-up write instead of passing
+      // the stale `null` and re-creating it (which 409s on the duplicate name).
+      return projectId;
     },
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });

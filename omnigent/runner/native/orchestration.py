@@ -6486,8 +6486,8 @@ async def _auto_create_claude_terminal(
     # or to resolve a Default launch that would otherwise pass no ``--model``
     # and leave the model to invisible CLI-private state.
     if session_model_override or launch_model is None:
-        from omnigent.claude_native import claude_launch_catalog
-        from omnigent.model_catalog_store import catalog_contains, default_row
+        from omnigent.claude_native import claude_catalog_serves_model, claude_launch_catalog
+        from omnigent.model_catalog_store import default_row
 
         launch_catalog: list[dict[str, object]] | None = None
         try:
@@ -6501,9 +6501,11 @@ async def _auto_create_claude_terminal(
                 resolve_claude_native_model_selection(session_model_override, claude_config)
                 or session_model_override
             )
+            # A pane's ``/model`` persists the exact id it runs; the catalog
+            # may spell that model only by its family alias.
             if not (
-                catalog_contains(launch_catalog, session_model_override)
-                or catalog_contains(launch_catalog, resolved_request)
+                claude_catalog_serves_model(launch_catalog, session_model_override, claude_config)
+                or claude_catalog_serves_model(launch_catalog, resolved_request, claude_config)
             ):
                 raise click.ClickException(
                     f"the requested model {session_model_override!r} is not in this "

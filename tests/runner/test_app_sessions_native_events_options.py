@@ -273,6 +273,189 @@ async def test_events_effort_change_on_non_native_session_is_204_noop(
 
 
 @pytest.mark.asyncio
+async def test_events_permission_mode_change_on_native_session_switches_and_echoes_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``permission_mode_change`` cycles the pane and returns the settled mode.
+
+    Claude Code's ``--permission-mode`` is launch-only, so the runner drives
+    the TUI's shift+tab cycle via the bridge. The 200 body echoes the mode the
+    pane actually landed on — the Omnigent server persists that value, so a
+    regression returning 204 (or dropping the body) would leave the web UI
+    showing a mode the session isn't in.
+    """
+    from omnigent.spec.types import ExecutorSpec
+
+    calls: list[str] = []
+
+    def _fake_set_mode(bridge_dir: Any, *, mode: str, timeout_s: float) -> str:
+        """Record the requested mode; report it as reached."""
+        del bridge_dir, timeout_s
+        calls.append(mode)
+        return mode
+
+    monkeypatch.setattr(claude_native_bridge, "set_permission_mode", _fake_set_mode)
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the native spec for any agent_id."""
+        del agent_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": "2f77519bd9daa4e9bc2df649fe468500",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            "/v1/sessions/2f77519bd9daa4e9bc2df649fe468500/events",
+            json={"type": "permission_mode_change", "permission_mode": "auto"},
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"permission_mode": "auto"}
+    assert calls == ["auto"], f"Expected one switch to auto, got {calls!r}"
+
+
+@pytest.mark.asyncio
+async def test_events_permission_mode_change_returns_503_when_mode_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A failed switch surfaces 503 so the label is never persisted.
+
+    ``auto`` is only in the shift+tab cycle for accounts that have the mode.
+    The Omnigent server treats a non-2xx as "the pane did not move" and skips
+    persisting the label, so this must not report success.
+    """
+    from omnigent.spec.types import ExecutorSpec
+
+    def _fake_set_mode(bridge_dir: Any, *, mode: str, timeout_s: float) -> str:
+        """Fail the way an unreachable mode does."""
+        del bridge_dir, mode, timeout_s
+        raise RuntimeError("The mode is not available in this session's cycle.")
+
+    monkeypatch.setattr(claude_native_bridge, "set_permission_mode", _fake_set_mode)
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the native spec for any agent_id."""
+        del agent_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": "3f88519bd9daa4e9bc2df649fe468511",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            "/v1/sessions/3f88519bd9daa4e9bc2df649fe468511/events",
+            json={"type": "permission_mode_change", "permission_mode": "auto"},
+        )
+
+    assert resp.status_code == 503, resp.text
+    body = resp.json()
+    # The error CODE names the failure category; the runner deliberately
+    # redacts exception text from client-facing details (the cause is logged
+    # server-side instead), so the detail is the fixed safe string.
+    assert body.get("error") == "claude_native_permission_mode_failed", body
+
+
+@pytest.mark.asyncio
+async def test_events_permission_mode_change_on_non_native_session_is_204_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Only claude-native sessions act on ``permission_mode_change``.
+
+    No other harness has Claude's shift+tab cycle, so the dispatch must
+    short-circuit before reaching the bridge.
+    """
+    from omnigent.spec.types import ExecutorSpec
+
+    def _fake_set_mode(bridge_dir: Any, *, mode: str, timeout_s: float) -> str:
+        """Fail the test if a non-native session reaches the bridge."""
+        del bridge_dir, mode, timeout_s
+        raise AssertionError(
+            "set_permission_mode must never be called for non-claude-native sessions."
+        )
+
+    monkeypatch.setattr(claude_native_bridge, "set_permission_mode", _fake_set_mode)
+
+    default_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the default spec for any agent_id."""
+        del agent_id
+        return default_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": "4f99519bd9daa4e9bc2df649fe468522",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            "/v1/sessions/4f99519bd9daa4e9bc2df649fe468522/events",
+            json={"type": "permission_mode_change", "permission_mode": "auto"},
+        )
+
+    assert resp.status_code == 204, (
+        f"Non-native permission_mode_change must 204 no-op; got {resp.status_code}: {resp.text}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_events_compact_on_native_session_types_slash_command(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

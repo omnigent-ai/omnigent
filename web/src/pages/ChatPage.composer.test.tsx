@@ -1147,6 +1147,58 @@ describe("Composer Codex Plan-mode control", () => {
   });
 });
 
+describe("Composer claude-native permission mode", () => {
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+    useChatStore.setState({ claudePermissionMode: "" });
+  });
+
+  it("shows the Permissions row inside the gear modal", async () => {
+    useChatStore.setState({ conversationId: "conv_test", claudePermissionMode: "auto" });
+
+    renderWithTooltips(<Composer {...composerProps({ showClaudePermissionMode: true })} />);
+    fireEvent.click(screen.getByTestId("composer-config-gear"));
+
+    expect(await screen.findByTestId("composer-config-modal")).toBeTruthy();
+    const row = screen.getByTestId("composer-config-permission-mode");
+    // Trigger shows the label only — the description belongs to the open list.
+    expect(row).toHaveTextContent("Auto");
+    expect(row).not.toHaveTextContent("classifier");
+  });
+
+  it("omits the Permissions row when the mode could not be determined", async () => {
+    // Claude only renders its mode footer in some pane states (a todo list
+    // displaces it), so an unknown mode must not be shown as a guess.
+    useChatStore.setState({ conversationId: "conv_test", claudePermissionMode: "" });
+
+    renderWithTooltips(<Composer {...composerProps({ showClaudePermissionMode: true })} />);
+    fireEvent.click(screen.getByTestId("composer-config-gear"));
+
+    expect(await screen.findByTestId("composer-config-modal")).toBeTruthy();
+    expect(screen.queryByTestId("composer-config-permission-mode")).toBeNull();
+  });
+
+  it("keeps the gear reachable when the mode is the only config row", () => {
+    // A Claude session with no model/effort/routing knobs must still open the
+    // gear, since the permission mode lives behind it.
+    useChatStore.setState({ conversationId: "conv_test", claudePermissionMode: "auto" });
+
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showClaudePermissionMode: true,
+          showModels: false,
+          showEffort: false,
+          costRoutingEligible: false,
+        })}
+      />,
+    );
+
+    expect(screen.getByTestId("composer-config-gear")).toBeInTheDocument();
+  });
+});
+
 describe("slashCommandMatches", () => {
   it("matches the leaf segment after a namespace prefix", () => {
     expect(slashCommandMatches("/superpowers:using-superpowers", "using-superpowers")).toBe(true);

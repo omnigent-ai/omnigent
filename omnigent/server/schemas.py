@@ -1980,6 +1980,15 @@ class UpdateSessionRequest(BaseModel):
         ``"plan"`` enters Plan mode and ``"default"`` returns to Default
         mode for subsequent Codex turns. Only valid for sessions stamped
         with the codex-native wrapper label. Omitted leaves unchanged.
+    :param permission_mode: Claude-native permission mode to switch a
+        running session to, e.g. ``"auto"``. Only the modes Claude Code's
+        shift+tab cycle can reach are accepted (``default``,
+        ``acceptEdits``, ``plan``, ``auto``) — ``dontAsk`` and
+        ``bypassPermissions`` are launch-only. Only valid for sessions
+        stamped with the claude-native wrapper label. Unlike the other
+        fields here the switch is applied by the live TUI, so a failure
+        to reach the mode is surfaced as an error rather than persisted.
+        Omitted leaves unchanged.
     :param cost_control_mode_override: Per-session cost-control
         switch: ``"on"`` activates the spec's configured cost-control
         mode, ``"off"`` disables cost control for this session.
@@ -2037,6 +2046,7 @@ class UpdateSessionRequest(BaseModel):
     reasoning_effort: str | None = None
     model_override: str | None = None
     collaboration_mode: str | None = None
+    permission_mode: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
     external_session_id: str | None = None
@@ -2822,6 +2832,29 @@ class SessionCollaborationModeEvent(_SSEEventBase):
     type: Literal["session.collaboration_mode"]
     conversation_id: str
     mode: str
+
+
+class SessionPermissionModeEvent(_SSEEventBase):
+    """
+    Active permission-mode update from a claude-native session.
+
+    Emitted after the web UI switches the mode, and after the Claude forwarder
+    observes a different mode in the pane footer — a shift+tab pressed inside
+    the TUI, which Omnigent has no other way to see. Lets the composer's mode
+    picker track the pane without a reload.
+
+    :param type: Always ``"session.permission_mode"``.
+    :param conversation_id: Session identifier, e.g. ``"conv_abc123"``.
+    :param permission_mode: The active mode, e.g. ``"auto"`` or ``"plan"``.
+
+    Category: **transient** (SSE-only). The server also writes
+    ``omnigent.claude_native.permission_mode`` on the conversation labels, so
+    reconnecting clients restore the same state from the session snapshot.
+    """
+
+    type: Literal["session.permission_mode"]
+    conversation_id: str
+    permission_mode: str
 
 
 class SessionAgentChangedEvent(_SSEEventBase):
@@ -4216,6 +4249,7 @@ ServerStreamEvent = Annotated[
     | SessionTitleEvent
     | SessionReasoningEffortEvent
     | SessionCollaborationModeEvent
+    | SessionPermissionModeEvent
     | SessionAgentChangedEvent
     | SessionTodosEvent
     | SessionTerminalPendingEvent
