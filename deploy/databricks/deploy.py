@@ -791,7 +791,7 @@ def _ensure_app_sp_uc_traversal(
     ):
         _log(f"granting {priv} on {kind} {fqn} → app SP {app_sp}")
         payload = _json.dumps({"changes": [{"principal": app_sp, "add": [priv]}]})
-        subprocess.run(
+        proc = subprocess.run(
             [
                 "databricks",
                 "grants",
@@ -802,10 +802,27 @@ def _ensure_app_sp_uc_traversal(
                 "--json",
                 payload,
             ],
-            check=True,
+            check=False,
             capture_output=True,
             text=True,
         )
+        if proc.returncode != 0:
+            # A traversal grant is a convenience step, not the correctness
+            # gate: the SP often already has traversal through group
+            # inheritance, and on a shared/governed catalog the deployer
+            # routinely lacks MANAGE on the catalog — both fail this call on
+            # a workspace where the app would boot fine. The post-deploy
+            # app-boot smoke check in main() remains the real gate. Warn and
+            # continue; a missing databricks CLI surfaces as FileNotFoundError
+            # from subprocess.run and still aborts (#4999).
+            detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+            detail_line = detail[-1] if detail else f"exit {proc.returncode}"
+            _log(
+                f"WARNING: could not grant {priv} on {kind} {fqn} to the app SP "
+                f"({detail_line}). The SP may already have traversal via group "
+                "inheritance, or the deployer lacks MANAGE on the catalog. "
+                "Continuing — the app-boot smoke check will prove volume access."
+            )
 
 
 def main() -> int:
