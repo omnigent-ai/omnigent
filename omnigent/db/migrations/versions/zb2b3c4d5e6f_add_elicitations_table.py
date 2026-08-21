@@ -1,7 +1,7 @@
 """add elicitations table
 
 Revision ID: zb2b3c4d5e6f
-Revises: za2b3c4d5e6f
+Revises: za1b2c3d4e5f
 Create Date: 2026-08-21 00:00:00.000000
 
 Adds the ``elicitations`` table: one row per approval prompt still waiting on a
@@ -31,7 +31,7 @@ from alembic import op
 from omnigent.db.db_models import Uuid16
 
 revision: str = "zb2b3c4d5e6f"
-down_revision: str | None = "za2b3c4d5e6f"
+down_revision: str | None = "za1b2c3d4e5f"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

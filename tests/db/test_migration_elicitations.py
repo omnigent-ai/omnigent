@@ -69,6 +69,6 @@ def test_downgrade_drops_the_table(tmp_path: Path) -> None:
             {"conv": bytes(16), "event": b"{}"},
         )
 
-    _downgrade(uri, engine, "za2b3c4d5e6f")
+    _downgrade(uri, engine, "za1b2c3d4e5f")
 
     assert "elicitations" not in sa.inspect(engine).get_table_names()
