@@ -113,6 +113,7 @@ function loadMainHarness({
       expandDatabricksWorkspaceUrl: async (url) => url,
     },
     "./workspace-chrome": { registerWorkspaceChromeHide: () => {} },
+    "./workspace-root-bounce": { registerWorkspaceRootBounce: () => {} },
     "./omnigent_cli": {
       isExecutableFile: () => false,
       resolveCliPath: () => null,
@@ -213,6 +214,26 @@ function findMenuItem(menu, id) {
   }
   return null;
 }
+
+describe("new session menu action", () => {
+  it("routes Cmd/Ctrl+N to the current window without replacing the New Window action", (t) => {
+    const harness = loadMainHarness();
+    t.after(harness.cleanup);
+
+    harness.api.buildMenu();
+    const menu = harness.calls.setApplicationMenu.at(-1);
+    const newSessionItem = findMenuItem(menu, "new_session");
+    const newWindowItem = findMenuItem(menu, "new_window");
+
+    assert.equal(newSessionItem.label, "New Session");
+    assert.equal(newSessionItem.accelerator, "CmdOrCtrl+N");
+    assert.equal(newWindowItem.accelerator, undefined);
+
+    newSessionItem.click();
+
+    assert.deepEqual(harness.calls.sent, [{ channel: "omnigent:open-path", payload: "/" }]);
+  });
+});
 
 describe("auto-update main-process wiring", () => {
   it("preserves unrelated settings keys when writing update config", (t) => {

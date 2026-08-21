@@ -5915,6 +5915,48 @@ def test_model_env_round_trips_the_launch_vocabulary(
     }
 
 
+def test_record_model_vocabulary_backfills_a_runner_prepared_bridge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The runner path records the vocabulary AFTER preparing the bridge.
+
+    The runner prepares the bridge before it resolves the provider config,
+    so the pins and launch model land via a second write — and must read
+    back exactly as the CLI path's prepare-time record does.
+    """
+    from omnigent.claude_native_bridge import (
+        read_launch_model,
+        read_model_env,
+        record_model_vocabulary,
+    )
+
+    root = tmp_path / "root"
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", root)
+
+    bridge_dir = prepare_bridge_dir("conv_abc", workspace=tmp_path)
+    assert read_model_env(bridge_dir) == {}
+
+    record_model_vocabulary(
+        bridge_dir,
+        launch_env={
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-4-8",
+            "ANTHROPIC_BASE_URL": "https://example.invalid",
+        },
+        launch_model="databricks-claude-opus-4-8",
+    )
+    assert read_model_env(bridge_dir) == {
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-4-8",
+    }
+    assert read_launch_model(bridge_dir) == "databricks-claude-opus-4-8"
+
+    # A bare subscription launch records nothing and disturbs nothing.
+    record_model_vocabulary(bridge_dir, launch_env=None, launch_model=None)
+    assert read_model_env(bridge_dir) == {
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-4-8",
+    }
+
+
 def test_model_env_is_empty_without_a_ucode_launch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

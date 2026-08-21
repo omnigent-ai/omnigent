@@ -62,6 +62,8 @@ import {
   MODEL_SELECT_DEFAULT,
   MODEL_SELECT_SMART,
   RoutingModelSelect,
+  defaultModelLabel,
+  nativeModelLabel,
 } from "@/components/HarnessConfigControls";
 import { ProjectLandingIcon } from "@/components/ProjectIconPicker";
 import {
@@ -420,22 +422,6 @@ function createdHarnessOptions({
     options.routing = costControlMode === "on" ? "on" : "off";
   }
   return Object.keys(options).length > 0 ? options : null;
-}
-
-function displayModelId(option: Pick<NativeModelOption, "id">): string {
-  return option.id;
-}
-
-function displayModelName(option: Pick<NativeModelOption, "id" | "displayName">): string {
-  return option.displayName ?? option.id;
-}
-
-function defaultModelLabel(
-  options: readonly Pick<NativeModelOption, "id" | "displayName" | "isDefault">[],
-  display: (option: Pick<NativeModelOption, "id" | "displayName">) => string,
-): string {
-  const dflt = options.find((option) => option.isDefault);
-  return dflt ? `Default (${display(dflt)})` : "Default";
 }
 
 /** Use a local-friendly label only when the desktop shell proves the host id is this machine. */
@@ -1524,8 +1510,10 @@ function HarnessConfigModal({
   pickedModel,
   claudeModelOptions,
   claudeModelsLoading,
+  claudeModelsError,
   codexModelOptions,
   codexModelsLoading,
+  codexModelsError,
   piModelOptions,
   piModelsLoading,
   pickedEffort,
@@ -1556,8 +1544,10 @@ function HarnessConfigModal({
   pickedModel: string;
   claudeModelOptions: readonly Pick<NativeModelOption, "id" | "displayName" | "isDefault">[];
   claudeModelsLoading: boolean;
+  claudeModelsError: string | null;
   codexModelOptions: readonly Pick<NativeModelOption, "id" | "displayName" | "isDefault">[];
   codexModelsLoading: boolean;
+  codexModelsError: string | null;
   piModelOptions: readonly { id: string; displayName: string }[];
   piModelsLoading: boolean;
   pickedEffort: string;
@@ -1632,11 +1622,11 @@ function HarnessConfigModal({
   const configTitleName = autoNative ? SMART_ROUTING_LABEL : agent.display_name;
   const modelValue = smartRoutingOn ? MODEL_SELECT_SMART : draftModel || MODEL_SELECT_DEFAULT;
   const claudeModelSelectOptions = useMemo(
-    () => claudeModelOptions.map((m) => ({ id: m.id, label: displayModelName(m) })),
+    () => claudeModelOptions.map((m) => ({ id: m.id, label: nativeModelLabel(m) })),
     [claudeModelOptions],
   );
   const codexModelSelectOptions = useMemo(
-    () => codexModelOptions.map((m) => ({ id: m.id, label: displayModelId(m) })),
+    () => codexModelOptions.map((m) => ({ id: m.id, label: nativeModelLabel(m) })),
     [codexModelOptions],
   );
   const onModelChange = (value: string) => {
@@ -1772,6 +1762,7 @@ function HarnessConfigModal({
                   offerSmartRouting={smartRoutingEligible}
                   testId="new-chat-landing-config-model"
                   models={claudeModelSelectOptions}
+                  defaultLabel={defaultModelLabel(claudeModelOptions)}
                   contentClassName="[&_[data-slot=select-item]]:pl-2.5"
                 >
                   {claudeModelsLoading && (
@@ -1779,7 +1770,7 @@ function HarnessConfigModal({
                   )}
                   {!claudeModelsLoading && claudeModelOptions.length === 0 && (
                     <div className="px-2.5 py-1 text-sm text-muted-foreground">
-                      Models unavailable
+                      {claudeModelsError ?? "Models unavailable"}
                     </div>
                   )}
                 </RoutingModelSelect>
@@ -1842,7 +1833,7 @@ function HarnessConfigModal({
                   offerSmartRouting={smartRoutingEligible}
                   testId="new-chat-landing-config-model"
                   models={codexModelSelectOptions}
-                  defaultLabel={defaultModelLabel(codexModelOptions, displayModelId)}
+                  defaultLabel={defaultModelLabel(codexModelOptions)}
                   contentClassName="[&_[data-slot=select-item]]:pl-2.5"
                 >
                   {codexModelsLoading && (
@@ -1850,7 +1841,7 @@ function HarnessConfigModal({
                   )}
                   {!codexModelsLoading && codexModelOptions.length === 0 && (
                     <div className="px-2.5 py-1 text-sm text-muted-foreground">
-                      Models unavailable
+                      {codexModelsError ?? "Models unavailable"}
                     </div>
                   )}
                 </RoutingModelSelect>
@@ -2244,16 +2235,16 @@ export function NewChatLandingScreen() {
   const [sandboxProvider, setSandboxProvider] = useState<string | null>(
     () => landingDraft?.sandboxProvider ?? null,
   );
-  const { data: hostClaudeModelOptions, isLoading: hostClaudeModelsLoading } = useHostModelOptions(
-    selectedHostId,
-    "claude-native",
-    !sandboxSelected,
-  );
-  const { data: hostCodexModelOptions, isLoading: hostCodexModelsLoading } = useHostModelOptions(
-    selectedHostId,
-    "codex-native",
-    !sandboxSelected,
-  );
+  const {
+    data: hostClaudeModelOptions,
+    isLoading: hostClaudeModelsLoading,
+    error: hostClaudeModelsError,
+  } = useHostModelOptions(selectedHostId, "claude-native", !sandboxSelected);
+  const {
+    data: hostCodexModelOptions,
+    isLoading: hostCodexModelsLoading,
+    error: hostCodexModelsError,
+  } = useHostModelOptions(selectedHostId, "codex-native", !sandboxSelected);
   const { data: hostPiModelOptions, isLoading: hostPiModelsLoading } = useHostModelOptions(
     selectedHostId,
     "pi-native",
@@ -2269,6 +2260,9 @@ export function NewChatLandingScreen() {
         : (hostClaudeModelOptions ?? []).map((option) => ({
             id: option.id,
             displayName: option.displayName ?? option.id,
+            // Keep the catalog's default marker: the Default row names the
+            // model a bare launch truly runs, for claude exactly as codex.
+            isDefault: option.isDefault,
           })),
     [hostClaudeModelOptions, sandboxSelected],
   );
@@ -2903,7 +2897,8 @@ export function NewChatLandingScreen() {
     if (supportsPermissionMode) {
       const modelValue = routingOn
         ? SMART_ROUTING_LABEL
-        : (claudeModelOptions.find((m) => m.id === pickedModel)?.displayName ?? "Default");
+        : (claudeModelOptions.find((m) => m.id === pickedModel)?.displayName ??
+          defaultModelLabel(claudeModelOptions));
       // Routing picks the model + effort per turn, so mirror the modal's frozen
       // Effort row: an em-dash when routing is on, else the picked level.
       const effortValue = routingOn
@@ -2936,15 +2931,16 @@ export function NewChatLandingScreen() {
           ? CODEX_NATIVE_BYPASS_APPROVAL_OPTION.label
           : (CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.label ??
             approvalMode);
+      const pickedCodexRow = codexModelOptions.find((m) => m.id === pickedModel);
       const modelRows =
         routingOn || !isCodex
           ? routingRow
           : [
               {
                 label: "Model",
-                value:
-                  codexModelOptions.find((m) => m.id === pickedModel)?.id ??
-                  defaultModelLabel(codexModelOptions, displayModelId),
+                value: pickedCodexRow
+                  ? nativeModelLabel(pickedCodexRow)
+                  : defaultModelLabel(codexModelOptions),
               },
             ];
       return [...modelRows, { label: "Approval", value: approvalValue }];
@@ -4580,9 +4576,15 @@ export function NewChatLandingScreen() {
                     claudeModelsLoading={
                       !sandboxSelected && selectedHostId !== null && hostClaudeModelsLoading
                     }
+                    claudeModelsError={
+                      !sandboxSelected ? (hostClaudeModelsError?.message ?? null) : null
+                    }
                     codexModelOptions={codexModelOptions}
                     codexModelsLoading={
                       !sandboxSelected && selectedHostId !== null && hostCodexModelsLoading
+                    }
+                    codexModelsError={
+                      !sandboxSelected ? (hostCodexModelsError?.message ?? null) : null
                     }
                     piModelOptions={piModelOptions}
                     piModelsLoading={

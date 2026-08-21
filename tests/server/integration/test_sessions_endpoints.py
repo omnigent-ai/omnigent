@@ -5845,14 +5845,15 @@ async def test_post_external_model_change_publishes_session_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    ``external_model_change`` persists ``model_override`` and posts a
-    typed SessionModelEvent.
+    ``external_model_change`` persists ``reported_model`` and posts a
+    typed SessionModelEvent, verbatim.
 
-    The claude-native forwarder posts this when the user switches model
-    inside the Claude Code terminal (``/model`` command or in-TUI
-    picker), so the web picker reflects it live (the SSE event) and on
-    reload (the persisted override). Asserts the exact published event
-    type + payload and the persisted snapshot value.
+    A native forwarder posts this with the model the harness is actually
+    on — the launch's own report, or an in-pane switch — in the
+    harness's own spelling. The value must land VERBATIM on the
+    snapshot's ``llm_model`` (the display authority) while the user's
+    request (``model_override``) stays untouched: reports and requests
+    are separate roles.
     """
     published: list[tuple[str, dict[str, Any]]] = []
     monkeypatch.setattr(
@@ -5864,18 +5865,20 @@ async def test_post_external_model_change_publishes_session_model(
 
     resp = await client.post(
         f"/v1/sessions/{session['id']}/events",
-        json={"type": "external_model_change", "data": {"model": "opus"}},
+        json={"type": "external_model_change", "data": {"model": "claude-opus-4-8[1m]"}},
     )
     assert resp.status_code == 202, resp.text
     assert resp.json() == {"queued": False}
 
     assert [event["type"] for _, event in published] == ["session.model"]
     assert published[0][1]["conversation_id"] == session["id"]
-    assert published[0][1]["model"] == "opus"
+    assert published[0][1]["model"] == "claude-opus-4-8[1m]"
 
-    # Persisted so a reload restores the picker selection.
+    # Persisted verbatim so a reload restores the display; the request
+    # slot is untouched.
     snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
-    assert snapshot["model_override"] == "opus"
+    assert snapshot["llm_model"] == "claude-opus-4-8[1m]"
+    assert snapshot["model_override"] is None
 
 
 async def test_post_external_model_change_dedupes_when_unchanged(
@@ -5883,13 +5886,13 @@ async def test_post_external_model_change_dedupes_when_unchanged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    A repeat ``external_model_change`` for the already-persisted model
+    A repeat ``external_model_change`` for the already-reported model
     is a no-op: no second ``session.model`` event, no redundant write.
 
-    This is the web→TUI round-trip — the web PATCH set ``model_override``
-    to ``"opus"`` and injected ``/model opus``, then the forwarder
-    echoes the resulting transcript model back. Without server-side
-    dedupe the picker would re-render on its own write.
+    Forwarders re-observe on every poll, so the steady state is the same
+    value arriving repeatedly; the server dedupes by equality against
+    ``reported_model``. A PATCH-written request does NOT suppress a
+    report — requests and reports are separate roles.
     """
     published: list[tuple[str, dict[str, Any]]] = []
     monkeypatch.setattr(
@@ -5899,21 +5902,28 @@ async def test_post_external_model_change_dedupes_when_unchanged(
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
 
-    # Seed the override the way a web picker PATCH would (silent: no
-    # runner forward needed for the test session).
+    # A PATCH-written request must not become the dedupe baseline: the
+    # first report still publishes even when it matches the request.
     patch = await client.patch(
         f"/v1/sessions/{session['id']}",
-        json={"model_override": "opus", "silent": True},
+        json={"model_override": "claude-opus-4-8", "silent": True},
     )
     assert patch.status_code == 200, patch.text
+
+    first = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_model_change", "data": {"model": "claude-opus-4-8"}},
+    )
+    assert first.status_code == 202, first.text
+    assert [event["type"] for _, event in published] == ["session.model"]
     published.clear()
 
     resp = await client.post(
         f"/v1/sessions/{session['id']}/events",
-        json={"type": "external_model_change", "data": {"model": "opus"}},
+        json={"type": "external_model_change", "data": {"model": "claude-opus-4-8"}},
     )
     assert resp.status_code == 202, resp.text
-    # Already on "opus" — nothing re-published.
+    # Already reported — nothing re-published.
     assert [event["type"] for _, event in published] == []
 
 
@@ -6691,7 +6701,15 @@ async def test_patch_model_override_surfaces_a_refused_native_forward(
 
     async def _runner_refused(*_args: Any, **_kwargs: Any) -> _RunnerForwardResult:
         """The runner is up and answered that it could not drive the pane."""
-        return _RunnerForwardResult(status_code=503, body="claude_native_model_failed")
+        return _RunnerForwardResult(
+            status_code=503,
+            body=json.dumps(
+                {
+                    "error": "claude_native_model_unconfirmed",
+                    "detail": "the terminal did not confirm the switch to opus within 10s",
+                }
+            ),
+        )
 
     monkeypatch.setattr(
         "omnigent.server.routes.sessions._forward_session_change_to_runner",
@@ -6717,6 +6735,8 @@ async def test_patch_model_override_surfaces_a_refused_native_forward(
     ]
     assert len(errors) == 1, f"Expected one visible failure notice; got {published!r}"
     assert "opus" in errors[0]["error"]["message"]
+    # The runner's own detail (the concrete cause) rides into the notice.
+    assert "did not confirm the switch" in errors[0]["error"]["message"]
 
 
 async def test_patch_model_override_stays_quiet_when_no_runner_answers(

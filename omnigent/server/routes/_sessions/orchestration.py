@@ -1221,7 +1221,13 @@ def _accumulate_session_usage(
     llm_model = (
         usage_model
         if isinstance(usage_model, str) and usage_model
-        else (conv.model_override if conv and conv.model_override else _resolve_llm_model(conv))
+        else (
+            conv.reported_model
+            if conv and conv.reported_model
+            else (
+                conv.model_override if conv and conv.model_override else _resolve_llm_model(conv)
+            )
+        )
     )
     if llm_model:
         if isinstance(provider_cost, (int, float)):
@@ -4253,7 +4259,12 @@ async def _refresh_stale_native_model_options(
     if inflight is None:
         endpoint = _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER[_CLAUDE_NATIVE_WRAPPER_LABEL_VALUE]
         inflight = asyncio.create_task(
-            _load_model_options(runner_client, session_id, f"/v1/sessions/{session_id}/{endpoint}")
+            _load_model_options(
+                runner_client,
+                session_id,
+                f"/v1/sessions/{session_id}/model-options",
+                fallback_path=f"/v1/sessions/{session_id}/{endpoint}",
+            )
         )
         _model_options_inflight[session_id] = inflight
         inflight.add_done_callback(
@@ -8977,8 +8988,16 @@ async def _fetch_model_options(
     if cached is not None and session_id not in _model_options_stale:
         return cached
     if session_id not in _model_options_inflight:
-        path = f"/v1/sessions/{session_id}/{endpoint}"
-        task = asyncio.create_task(_load_model_options(runner_client, session_id, path))
+        # Unified route first; the harness-named route is the fallback for
+        # an older runner (deprecated aliases, removed in 0.11.0).
+        task = asyncio.create_task(
+            _load_model_options(
+                runner_client,
+                session_id,
+                f"/v1/sessions/{session_id}/model-options",
+                fallback_path=f"/v1/sessions/{session_id}/{endpoint}",
+            )
+        )
         _model_options_inflight[session_id] = task
 
         def _clear_runner_options_inflight(_task: asyncio.Task[None]) -> None:
@@ -9209,6 +9228,12 @@ async def _get_session_snapshot(
                     )
         except Exception:  # noqa: BLE001
             pass
+    # The harness's own report is the display authority: when a session has
+    # a verbatim ``reported_model``, it supersedes the spec-derived value on
+    # the wire's ``llm_model`` field (the web renders and highlights only
+    # from this).
+    if conv.reported_model:
+        llm_model = conv.reported_model
     # Skills are runner-owned: the bound runner discovers them against its
     # own filesystem (bundled skills + host skills under the session's
     # workspace and ``~/.claude/skills/``) — the host where the harness

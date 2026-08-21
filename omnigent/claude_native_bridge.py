@@ -1248,6 +1248,48 @@ def read_model_env(bridge_dir: Path) -> dict[str, str]:
     }
 
 
+def record_model_vocabulary(
+    bridge_dir: Path,
+    *,
+    launch_env: Mapping[str, str] | None,
+    launch_model: str | None,
+) -> None:
+    """
+    Persist the launch's model vocabulary after the bridge dir exists.
+
+    The runner prepares the bridge before it resolves the provider config,
+    so the vocabulary (alias pins + custom slot) and the launch model land
+    here in a second write once known — the same keys
+    :func:`prepare_bridge_dir` records on the CLI path, so
+    :func:`read_model_env` / :func:`read_launch_model` serve both paths
+    identically.
+
+    :param bridge_dir: Bridge directory path.
+    :param launch_env: The resolved launch env (pins + custom slot), or
+        ``None`` for a bare subscription launch.
+    :param launch_model: The model the launch pins via ``--model``, or
+        ``None``.
+    :returns: None.
+    """
+    config = _read_json_file(bridge_dir / _CONFIG_FILE)
+    if not isinstance(config, dict):
+        return
+    model_env = {
+        key: launch_env[key]
+        for key in MODEL_VOCABULARY_ENV_VARS
+        if launch_env is not None and launch_env.get(key)
+    }
+    changed = False
+    if model_env and config.get("model_env") != model_env:
+        config["model_env"] = model_env
+        changed = True
+    if launch_model and config.get("launch_model") != launch_model:
+        config["launch_model"] = launch_model
+        changed = True
+    if changed:
+        _write_json_file(bridge_dir / _CONFIG_FILE, config)
+
+
 def read_bridge_id(bridge_dir: Path) -> str | None:
     """
     Read the opaque bridge id from bridge config.
@@ -3522,6 +3564,38 @@ def set_permission_mode(
         f"{_MODE_CYCLE_MAX_PRESSES} times and only reached {sorted(set(seen))}. "
         "The mode is not available in this session's cycle."
     )
+
+
+def confirm_dialog_if_open(bridge_dir: Path, *, hint: str) -> bool:
+    """
+    Accept the *hint* dialog iff it is on screen RIGHT NOW; never blind-Enter.
+
+    Loop-safe building block for watchers that outlive a single injection
+    (a mid-turn ``/model`` queues in Claude's composer and pops its confirm
+    dialog only when the turn settles — minutes later). Unlike
+    :func:`_confirm_tui_dialog` there is no timeout fallback Enter, so
+    calling this every few seconds can never type into a surface that is
+    not the named dialog.
+
+    :param bridge_dir: Bridge directory path.
+    :param hint: Text the dialog renders, e.g.
+        :data:`SWITCH_MODEL_DIALOG_HINT`.
+    :returns: ``True`` when the dialog was on screen and confirmed.
+    """
+    try:
+        info = _wait_for_tmux_info(bridge_dir, timeout_s=1.0)
+    except (RuntimeError, OSError):
+        return False
+    socket_path = info["socket_path"]
+    tmux_target = info["tmux_target"]
+    try:
+        pane = _capture_pane(socket_path, tmux_target)
+        if hint not in pane:
+            return False
+        _confirm_and_verify_dialog_closed(socket_path, tmux_target, hint=hint)
+    except (RuntimeError, OSError):
+        return False
+    return True
 
 
 def _confirm_and_verify_dialog_closed(

@@ -29,7 +29,7 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus, InvalidURI
 from omnigent._platform import IS_POSIX, WINDOWS_ENV_PASSTHROUGH
 from omnigent.env_credentials import env_names_with_omnigent_prefix
 from omnigent.gateway_inference import gateway_inference_map
-from omnigent.harness_aliases import canonicalize_harness
+from omnigent.harness_aliases import canonicalize_harness, is_claude_sdk_harness_name
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
 from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.frames import (
@@ -327,15 +327,19 @@ def _connection_refused(exc: BaseException) -> bool:
 
 
 _RECONNECT_BASE_S = 0.5
-_RECONNECT_CAP_S = 10.0
+_RECONNECT_CAP_S = 3.0
 _RECONNECT_JITTER = 0.5
+# Keep first startup tolerant of a cold server, but do not spend the library's
+# full default timeout on each reconnect after an established tunnel drops.
+_INITIAL_CONNECT_OPEN_TIMEOUT_S = 10.0
+_RECONNECT_OPEN_TIMEOUT_S = 3.0
 # Fresh hosts get a short auth-retry window for Databricks OAuth refreshes.
 # Established hosts retry auth failures indefinitely to preserve sessions.
 _MAX_CONSECUTIVE_AUTH_ERRORS = 3
 # Consecutive connection-refused failures against a loopback server before the
 # host exits (~5 minutes at the backoff cap). Refused on loopback means no
 # process listens on the port — the local server is gone, not unreachable.
-_LOOPBACK_REFUSED_FATAL_ATTEMPTS = 30
+_LOOPBACK_REFUSED_FATAL_ATTEMPTS = 100
 
 # Consecutive accepted-then-silent connections (upgrade completed, then the
 # socket died without one inbound frame) before the reconnect loop treats the
@@ -772,6 +776,19 @@ def _paginate_list_dir(
         entries=page,
         has_more=has_more,
     )
+
+
+@dataclass(frozen=True)
+class ModelOptionsResult:
+    """One resolved model listing: picker rows + the settable-but-unlisted ids.
+
+    :param models: Verbatim catalog rows (id/model/displayName/isDefault…).
+    :param routable_models: Ids a launch can pin that the picker does not
+        list (older generations the endpoint still serves).
+    """
+
+    models: list[dict[str, object]]
+    routable_models: list[str]
 
 
 @dataclass
@@ -2226,6 +2243,70 @@ class HostProcess:
             payload=payload,
         )
 
+    async def _prewarm_model_options(self) -> None:
+        """
+        Fill the on-disk model catalogs for the probing harnesses at boot.
+
+        Runs both harness probes CONCURRENTLY, as detached background work —
+        nothing (the tunnel, registration, readiness reporting, launches)
+        ever waits on this. A picker request racing the boot probe joins the
+        same single-flight probe through the shared store instead of
+        starting a second one.
+
+        :returns: None. Probe failures are absorbed by the probe wrappers.
+        """
+        await asyncio.gather(
+            self._probed_codex_model_options(),
+            self._probed_claude_model_options(),
+            return_exceptions=True,
+        )
+
+    async def _probed_codex_model_options(self) -> ModelOptionsResult | None:
+        """
+        Store-backed harness-truth Codex listing, or ``None`` on failure.
+
+        Every launch shape is answered from the shared on-disk catalog
+        (probed from the configured Codex binary on a miss). There is no
+        curated fallback: no catalog means an honest empty answer.
+
+        :returns: The catalog listing, or ``None`` when unavailable.
+        """
+        from omnigent.codex_native_app_server import codex_launch_catalog
+
+        try:
+            rows = await codex_launch_catalog()
+        except Exception:  # noqa: BLE001 — no catalog, never a crash
+            _logger.warning("Codex model catalog unavailable", exc_info=True)
+            return None
+        if rows is None:
+            return None
+        routable = [row["id"] for row in rows if isinstance(row.get("id"), str) and row["id"]]
+        return ModelOptionsResult(models=rows, routable_models=routable)
+
+    async def _probed_claude_model_options(self) -> ModelOptionsResult | None:
+        """
+        Store-backed harness-truth Claude listing, or ``None`` on failure.
+
+        The shared catalog is keyed by the resolved launch config's
+        fingerprint — the same file the runner reads at launch and serves in
+        the session gear, so the pre-launch picker and the session cannot
+        drift.
+
+        :returns: The catalog listing, or ``None`` when unavailable.
+        """
+        from omnigent.claude_native import claude_launch_catalog, resolve_native_claude_config
+
+        try:
+            config = await asyncio.to_thread(resolve_native_claude_config, spec=None)
+            rows = await claude_launch_catalog(config)
+        except Exception:  # noqa: BLE001 — no catalog, never a crash
+            _logger.warning("Claude model catalog unavailable", exc_info=True)
+            return None
+        if rows is None:
+            return None
+        routable = list(config.routable_models) if config is not None else []
+        return ModelOptionsResult(models=rows, routable_models=routable)
+
     async def _handle_model_options(
         self,
         frame: HostModelOptionsFrame,
@@ -2240,107 +2321,23 @@ class HostProcess:
         """
         harness = canonicalize_harness(frame.harness) or frame.harness
         if harness == "codex-native":
-            try:
-                from omnigent.codex_native_app_server import (
-                    discover_codex_model_options,
-                    resolve_native_codex_launch,
-                )
-                from omnigent.model_catalog import (
-                    is_direct_openai_provider,
-                    list_models_for_worker,
-                    resolve_catalog_model,
-                    resolve_model_provider,
-                )
-                from omnigent.spec.types import AgentSpec, ExecutorSpec
-
-                launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
-                spec = AgentSpec(
-                    spec_version=1,
-                    name="codex-native-prelaunch",
-                    executor=ExecutorSpec(
-                        type="omnigent",
-                        config={
-                            "harness": "codex-native",
-                            **({"profile": launch.profile} if launch.profile else {}),
-                        },
-                    ),
-                )
-                listing = await asyncio.to_thread(list_models_for_worker, spec, "codex-native")
-                default_model = launch.model
-                if default_model is None and launch.profile is not None:
-                    default_model = (
-                        await asyncio.to_thread(
-                            resolve_catalog_model,
-                            "databricks",
-                            family="openai",
-                        )
-                    ).model_id
-                default_id = (
-                    default_model if default_model in {m.id for m in listing.models} else None
-                )
-                provider = (
-                    resolve_model_provider(spec, "codex-native")
-                    if listing.source == "openai-compatible"
-                    else None
-                )
-                models: list[dict[str, object]]
-                if provider is not None and is_direct_openai_provider(provider):
-                    available_ids = {model.id for model in listing.models}
-                    models = []
-                    seen: set[str] = set()
-                    selected_default = False
-                    try:
-                        codex_options = await discover_codex_model_options()
-                    except Exception:
-                        _logger.exception("Failed to discover Codex-compatible pre-launch models")
-                        codex_options = []
-                    for option in codex_options:
-                        raw_id = option.get("model") or option.get("id")
-                        if (
-                            not isinstance(raw_id, str)
-                            or raw_id not in available_ids
-                            or raw_id in seen
-                        ):
-                            continue
-                        seen.add(raw_id)
-                        display_name = option.get("displayName")
-                        is_default = raw_id == default_id or (
-                            default_model is None
-                            and not selected_default
-                            and option.get("isDefault") is True
-                        )
-                        selected_default = selected_default or is_default
-                        models.append(
-                            {
-                                "id": raw_id,
-                                "displayName": (
-                                    display_name
-                                    if isinstance(display_name, str) and display_name
-                                    else raw_id
-                                ),
-                                **({"isDefault": True} if is_default else {}),
-                            }
-                        )
-                else:
-                    models = [
-                        {
-                            "id": model.id,
-                            "displayName": model.id,
-                            **({"isDefault": True} if model.id == default_id else {}),
-                        }
-                        for model in listing.models
-                    ]
-            except Exception:
-                _logger.exception("Failed to resolve pre-launch Codex model options")
+            # Harness-truth lane: every launch shape is answered from the
+            # shared catalog, probed from the configured Codex binary itself.
+            # No curated fallback and no serving-endpoints listing — a probe
+            # that cannot run yields an honest empty answer with the reason.
+            probed = await self._probed_codex_model_options()
+            if probed is not None:
                 return HostModelOptionsResultFrame(
                     request_id=frame.request_id,
-                    status="failed",
-                    error="failed to resolve Codex model options",
+                    status="ok",
+                    models=probed.models,
+                    routable_models=probed.routable_models,
                 )
             return HostModelOptionsResultFrame(
                 request_id=frame.request_id,
                 status="ok",
-                models=models,
+                models=[],
+                error="the codex model probe failed — see the host log",
             )
 
         if harness == "pi-native":
@@ -2361,34 +2358,67 @@ class HostProcess:
                 models=pi_models,
             )
 
+        if is_claude_sdk_harness_name(harness):
+            # SDK-mode Claude is a pass-through client with no model catalog
+            # of its own, so the endpoint listing IS the harness truth — the
+            # ids are already in the exact spelling the SDK sends.
+            try:
+                from omnigent.model_catalog import list_models_for_worker
+                from omnigent.spec.types import AgentSpec, ExecutorSpec
+
+                sdk_spec = AgentSpec(
+                    spec_version=1,
+                    name="claude-sdk-prelaunch",
+                    executor=ExecutorSpec(
+                        type="omnigent",
+                        config={"harness": "claude-sdk"},
+                    ),
+                )
+                listing = await asyncio.to_thread(list_models_for_worker, sdk_spec, "claude-sdk")
+            except Exception:
+                _logger.exception("Failed to resolve pre-launch Claude SDK model options")
+                return HostModelOptionsResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error="failed to resolve Claude SDK model options",
+                )
+            if not listing.models:
+                # Subscription / CLI-login providers list nothing endpoint-side.
+                # The SDK drives the claude CLI, so the CLI's own probed rows
+                # (its aliases resolve inside the harness) are the truth here.
+                probed = await self._probed_claude_model_options()
+                if probed is not None:
+                    return HostModelOptionsResultFrame(
+                        request_id=frame.request_id,
+                        status="ok",
+                        models=probed.models,
+                        routable_models=probed.routable_models,
+                    )
+            return HostModelOptionsResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                models=[{"id": model.id, "displayName": model.id} for model in listing.models],
+                routable_models=[model.id for model in listing.models],
+            )
         if harness != "claude-native":
             return HostModelOptionsResultFrame(
                 request_id=frame.request_id,
                 status="failed",
                 error=f"model options are unsupported for harness {frame.harness!r}",
             )
-        try:
-            from omnigent.claude_native import (
-                claude_native_model_options,
-                resolve_native_claude_config,
-            )
-
-            config = await asyncio.to_thread(resolve_native_claude_config, spec=None)
-            models = await asyncio.to_thread(claude_native_model_options, config)
-        except Exception:
-            _logger.exception("Failed to resolve pre-launch Claude model options")
+        probed = await self._probed_claude_model_options()
+        if probed is not None:
             return HostModelOptionsResultFrame(
                 request_id=frame.request_id,
-                status="failed",
-                error="failed to resolve Claude model options",
+                status="ok",
+                models=probed.models,
+                routable_models=probed.routable_models,
             )
         return HostModelOptionsResultFrame(
             request_id=frame.request_id,
             status="ok",
-            models=models,
-            # The picker names the newest model of each family; the endpoint
-            # serves older generations too, and a launch takes an exact id.
-            routable_models=list(config.routable_models) if config is not None else [],
+            models=[],
+            error="the claude model probe failed — see the host log",
         )
 
     @staticmethod
@@ -2913,6 +2943,11 @@ class HostProcess:
                 additional_headers=headers,
                 max_size=100 * 1024 * 1024,
                 ssl=ssl_ctx,
+                open_timeout=(
+                    _RECONNECT_OPEN_TIMEOUT_S
+                    if self._ever_connected
+                    else _INITIAL_CONNECT_OPEN_TIMEOUT_S
+                ),
                 # Align the host->server tunnel's protocol keepalive to the same
                 # 90 s app-level budget as the runner tunnel (not the 20 s library
                 # default that drops a busy-but-healthy tunnel with 1011 — #1116).
@@ -3073,7 +3108,18 @@ class HostProcess:
             flush=True,
         )
 
+        # Readiness refresh runs in its own task, never on this receive loop:
+        # a harness probe that blocks (a hung CLI ``--version`` / ``auth
+        # status``) must not delay ``ws.recv()`` or the inline keepalive pong
+        # the server's watchdog counts as liveness, or it closes the tunnel
+        # with ``4003 ping timeout``.
         readiness_task = asyncio.create_task(self._harness_readiness_loop(ws))
+        # Warm the pre-launch model listings once a server can actually ask
+        # for them, so the first picker open is served from cache instead of
+        # waiting on a harness probe. Cache-fresh reconnects are a no-op.
+        prewarm_task = asyncio.create_task(
+            self._prewarm_model_options(), name="host-model-options-prewarm"
+        )
         try:
             while True:
                 raw = await ws.recv()
@@ -3094,6 +3140,9 @@ class HostProcess:
                     # _runner_lifecycle_lock in _dispatch_host_frame.
                     self._start_frame_task(ws, raw)
         finally:
+            prewarm_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await prewarm_task
             readiness_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await readiness_task
@@ -3302,7 +3351,20 @@ class HostProcess:
             fs_result = await asyncio.to_thread(self._handle_fs_request, frame)
             await ws.send(encode_host_frame(fs_result))
         elif isinstance(frame, HostModelOptionsFrame):
-            await ws.send(encode_host_frame(await self._handle_model_options(frame)))
+            # Every dispatched frame already runs on its own task (see
+            # _start_frame_task), so a cold harness probe here cannot stall
+            # the receive loop — answer inline, with a crash converted to an
+            # honest failed frame so the server's request future settles.
+            try:
+                options_result = await self._handle_model_options(frame)
+            except Exception:
+                _logger.exception("Model options resolution crashed for %r", frame.harness)
+                options_result = HostModelOptionsResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error=f"model options resolution crashed for {frame.harness!r}",
+                )
+            await ws.send(encode_host_frame(options_result))
 
 
 def run_host_process(

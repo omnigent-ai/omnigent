@@ -2145,28 +2145,32 @@ async def _persist_external_model_change(
     conversation_store: ConversationStore,
 ) -> None:
     """
-    Persist and broadcast a model switch made inside the terminal.
+    Persist and broadcast the model the harness reports it is running.
 
-    Mirrors a ``/model`` change typed into a claude-native session's
-    Claude Code pane (or picked via its in-TUI model picker) onto the
-    Omnigent session: writes ``model_override`` so the value survives reload
-    and publishes a ``session.model`` SSE event so the web picker
-    updates live. Unlike the PATCH path
-    (:func:`update_session`), this deliberately does NOT forward a
-    ``model_change`` back to the runner — the terminal is already on
-    the model, so re-injecting ``/model`` would loop.
+    Mirrors a harness-side model report — the launch's own model, or a
+    ``/model`` change made inside the pane — onto the Omnigent session:
+    writes ``reported_model`` VERBATIM (the harness's own spelling,
+    never collapsed to a picker alias) so the value survives reload,
+    and publishes a ``session.model`` SSE event so every surface
+    re-renders from it. The user's request (``model_override``) is
+    deliberately untouched: requests and reports are separate roles,
+    and only reports are ever displayed. Unlike the PATCH path
+    (:func:`update_session`), this does NOT forward a ``model_change``
+    back to the runner — the terminal is already on the model, so
+    re-injecting ``/model`` would loop.
 
-    No-ops (no write, no event) when the observed model already equals
-    the persisted ``model_override`` — the common case on the web→TUI
-    round-trip where the web PATCH set the override moments earlier.
+    No-ops (no write, no event) when the reported model already equals
+    the persisted ``reported_model`` — the steady state between real
+    changes, since forwarders re-observe on every poll.
 
     :param session_id: Session/conversation identifier, e.g.
         ``"conv_abc123"``.
     :param conv: Conversation row for ``session_id`` (read at the route
-        boundary); ``conv.model_override`` is the dedupe baseline.
+        boundary); ``conv.reported_model`` is the dedupe baseline.
     :param body: External model-change event body. ``data.model`` must
-        be a non-empty string tier alias, e.g. ``"opus"``.
-    :param conversation_store: Store used to upsert ``model_override``.
+        be a non-empty string — the harness's verbatim model, e.g.
+        ``"claude-opus-4-8[1m]"`` or ``"gpt-5.6-luna"``.
+    :param conversation_store: Store used to upsert ``reported_model``.
     :raises OmnigentError: If ``data.model`` is missing or not a
         non-empty string.
     """
@@ -2177,12 +2181,12 @@ async def _persist_external_model_change(
             code=ErrorCode.INVALID_INPUT,
         )
     model = raw_model.strip()
-    if conv.model_override == model:
+    if conv.reported_model == model:
         return
     await asyncio.to_thread(
         conversation_store.update_conversation,
         session_id,
-        model_override=model,
+        reported_model=model,
     )
     event = SessionModelEvent(
         type="session.model",
@@ -5338,6 +5342,13 @@ def _surface_model_change_forward_failure(
     if 200 <= runner_result.status_code < 300:
         return
     reason = f"the runner returned status {runner_result.status_code}"
+    # The runner's own detail names the concrete cause (e.g. "a dialog may
+    # be open in the pane"); carry it into the visible notice when present.
+    with contextlib.suppress(ValueError, TypeError):
+        parsed_body = json.loads(runner_result.body)
+        detail = parsed_body.get("detail") if isinstance(parsed_body, dict) else None
+        if isinstance(detail, str) and detail.strip():
+            reason = f"{reason} ({detail.strip()})"
     _logger.warning(
         "Model change not applied to the terminal for session=%s model=%r: %s (body=%s)",
         session_id,
@@ -9367,14 +9378,19 @@ async def _load_model_options(
     runner_client: httpx.AsyncClient,
     session_id: str,
     path: str,
+    fallback_path: str | None = None,
 ) -> None:
     """
     Background single-flight fetch of a session's native model catalog.
 
     :param runner_client: HTTP client pointed at the bound runner.
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
-    :param path: Runner route to query, e.g.
-        ``"/v1/sessions/conv_abc/cursor-model-options"``.
+    :param path: Runner route to query — the unified
+        ``"/v1/sessions/conv_abc/model-options"``.
+    :param fallback_path: Legacy harness-named route to fall back to when
+        *path* 404s (an older runner without the unified route), e.g.
+        ``"/v1/sessions/conv_abc/cursor-model-options"``. ``None`` disables
+        the fallback.
     """
     # Read the retry schedule off the facade so tests patching
     # ``sessions._MODEL_OPTIONS_RETRY_DELAYS_S`` reach this impl.
@@ -9388,6 +9404,11 @@ async def _load_model_options(
             _logger.debug("Runner model-options query failed for %s", session_id)
             return
         if resp.status_code != 200:
+            # An older runner has no unified route; drop to the harness-named
+            # one without consuming a retry.
+            if resp.status_code == 404 and fallback_path and path != fallback_path:
+                path = fallback_path
+                continue
             # 503 means the native backend (Codex app-server bridge / cursor
             # login) is still booting. Keep the background single-flight alive
             # so the web picker fills without a second manual refresh.
@@ -9517,7 +9538,10 @@ def prefetch_session_routing_catalogs(
         options_task = asyncio.create_task(
             _run_catalog_prefetch(
                 _load_model_options(
-                    runner_client, session_id, f"/v1/sessions/{session_id}/{endpoint}"
+                    runner_client,
+                    session_id,
+                    f"/v1/sessions/{session_id}/model-options",
+                    fallback_path=f"/v1/sessions/{session_id}/{endpoint}",
                 ),
                 session_id,
             )

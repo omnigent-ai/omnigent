@@ -544,6 +544,167 @@ def test_build_codex_native_server_bypass_emits_full_access_config(
     assert 'sandbox_mode="danger-full-access"' in app_server.config_overrides
 
 
+@pytest.mark.parametrize(
+    ("model", "expected_pin"),
+    [
+        pytest.param(None, "gpt-5.4-mini", id="default-launch"),
+        pytest.param("gpt-5.5", "gpt-5.5", id="explicit-pick"),
+    ],
+)
+def test_build_codex_native_server_pins_profile_resolved_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    model: str | None,
+    expected_pin: str,
+) -> None:
+    """
+    A profile launch pins the model it routes to, in codex's own spelling.
+
+    A launch naming no model still gets a concrete model from the profile's
+    catalog via ``-c model=``, which outranks the ``config.toml`` copied from
+    the user's shared home. Leaving ``pinned_model`` unset there let the
+    forwarder mirror the shared file's stale model back as this session's
+    ``model_override`` (live-caught: a session running
+    ``databricks-gpt-5-6-luna`` reported the shared file's ``gpt-5.4``).
+    The pin uses codex's spelling because that is the vocabulary
+    ``config.toml`` and every reader of it — including the web catalog's
+    row ids — compare in.
+    """
+    from omnigent import codex_native_app_server
+
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server._find_codex_cli",
+        lambda: sys.executable,
+    )
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "_databricks_launch_materialization",
+        lambda *, model, profile: codex_native_app_server._DatabricksLaunchMaterialization(
+            config_overrides=[f'model="{model or "databricks-gpt-5-4-mini"}"'],
+            model=model or "databricks-gpt-5-4-mini",
+            host="https://ws.example",
+        ),
+    )
+
+    app_server = build_codex_native_server(
+        socket_path=tmp_path / "codex.sock",
+        codex_home=tmp_path / "codex-home",
+        cwd=tmp_path,
+        model=model,
+        profile="oss",
+        bridge_dir=tmp_path / "bridge",
+        ap_server_url=None,
+        ap_auth_headers={},
+    )
+
+    assert app_server.pinned_model == expected_pin
+
+
+@pytest.mark.parametrize(
+    ("model", "profile", "extra_overrides"),
+    [
+        # Subscription: an explicit pick and a catalog-resolved Default.
+        ("gpt-5.5", None, ['model_provider="openai"']),
+        ("gpt-5.6-terra", None, ['model_provider="openai"']),
+        # cli-config: the user's own provider table rides the config copy.
+        ("gpt-5.5", None, ['model_provider="Databricks"']),
+        # Databricks profile: Default and an explicit pick.
+        (None, "oss", None),
+        ("databricks-gpt-5-5", "oss", None),
+    ],
+)
+def test_launch_argv_and_config_pin_name_the_same_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    model: str | None,
+    profile: str | None,
+    extra_overrides: list[str] | None,
+) -> None:
+    """
+    The argv ``-c model=`` and the config copy's pin never drift apart.
+
+    Both artifacts are written from one resolved value, on EVERY provider
+    shape and for Default and explicit picks alike — the structural end of
+    the stale-config-line class where a copied ``model =`` governed a
+    session the argv never named. On the profile shape the file
+    deliberately holds codex's own spelling (the vocabulary its readers
+    compare in) while argv carries the wire spelling; the guard asserts
+    they name the same model, and byte-identity everywhere else.
+    """
+    from omnigent import codex_native_app_server
+    from omnigent.codex_model_vocabulary import comparable_model_id
+
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server._find_codex_cli",
+        lambda: sys.executable,
+    )
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "_databricks_launch_materialization",
+        lambda *, model, profile: codex_native_app_server._DatabricksLaunchMaterialization(
+            config_overrides=[f'model="{model or "databricks-gpt-5-6-luna"}"'],
+            model=model or "databricks-gpt-5-6-luna",
+            host="https://ws.example",
+        ),
+    )
+
+    app_server = build_codex_native_server(
+        socket_path=tmp_path / "codex.sock",
+        codex_home=tmp_path / "codex-home",
+        cwd=tmp_path,
+        model=model,
+        profile=profile,
+        bridge_dir=tmp_path / "bridge",
+        ap_server_url=None,
+        ap_auth_headers={},
+        extra_config_overrides=list(extra_overrides) if extra_overrides else None,
+    )
+
+    argv_models = [
+        override.split("=", 1)[1]
+        for override in app_server.config_overrides
+        if override.split("=", 1)[0] == "model"
+    ]
+    assert len(argv_models) == 1, app_server.config_overrides
+    argv_model = json.loads(argv_models[0]) if argv_models[0].startswith('"') else argv_models[0]
+    pinned = app_server.pinned_model
+    assert pinned, "every launch must pin a model"
+    assert comparable_model_id(argv_model) == comparable_model_id(pinned)
+    if profile is None:
+        assert argv_model == pinned
+
+
+async def test_codex_launch_catalog_reads_the_store_then_probes_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The launch catalog is store-first; a miss probes once and persists."""
+    from omnigent import codex_native_app_server
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "resolve_native_codex_launch",
+        lambda *, model, spec=None: codex_native_app_server.NativeCodexLaunch(
+            config_overrides=['model_provider="openai"'], model=model, profile=None
+        ),
+    )
+    calls: list[int] = []
+
+    async def _fake_probe(*, codex_path: str | None = None) -> list[dict[str, object]]:
+        del codex_path
+        calls.append(1)
+        return [{"id": "gpt-5.6-terra", "model": "gpt-5.6-terra", "isDefault": True}]
+
+    monkeypatch.setattr(codex_native_app_server, "probe_codex_model_options", _fake_probe)
+
+    first = await codex_native_app_server.codex_launch_catalog()
+    second = await codex_native_app_server.codex_launch_catalog()
+    assert first == second
+    assert first == [{"id": "gpt-5.6-terra", "model": "gpt-5.6-terra", "isDefault": True}]
+    assert len(calls) == 1, "the second read must come from the store, not a re-probe"
+
+
 def _test_app_server(
     tmp_path: Path,
     codex_home: Path,
@@ -1789,6 +1950,214 @@ async def test_codex_native_launch_config_reads_the_auto_harness_flag(
         config = await _codex_native_launch_config(session_id="conv_abc", server_client=client)
 
     assert config.auto_harness is expected
+
+
+async def test_probe_codex_model_options_uses_launch_config_and_marks_default(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The probe boots Codex with the session-launch materialization.
+
+    Harness truth: the probe's rows are Codex's own ``model/list`` output
+    under the same Databricks routing a session launch gets — provider
+    overrides passed as ``-c`` args, ``DATABRICKS_HOST`` in env, a
+    persistent probe home — reduced to a single default marker naming the
+    launch-pinned model.
+    """
+    from omnigent import codex_native_app_server
+
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "resolve_native_codex_launch",
+        lambda *, model: codex_native_app_server.NativeCodexLaunch(
+            config_overrides=[],
+            model=None,
+            profile="oss",
+        ),
+    )
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "_databricks_launch_materialization",
+        lambda *, model, profile: codex_native_app_server._DatabricksLaunchMaterialization(
+            config_overrides=[
+                'model="databricks-gpt-5-4"',
+                'model_provider="omnigent_databricks"',
+            ],
+            model="databricks-gpt-5-4",
+            host="https://ws.example",
+        ),
+    )
+    monkeypatch.setattr(codex_native_app_server, "_clean_codex_env", lambda: {"PATH": "/bin"})
+
+    captured: dict[str, object] = {}
+
+    class _FakeProcess:
+        pid = None
+        returncode: int | None = None
+
+        def terminate(self) -> None:
+            self.returncode = 0
+
+        def kill(self) -> None:
+            self.returncode = -1
+
+        async def wait(self) -> int:
+            self.returncode = 0 if self.returncode is None else self.returncode
+            return self.returncode
+
+    async def _fake_start(
+        *,
+        codex_path: str,
+        listen_url: str,
+        env: dict[str, str],
+        cwd: Path,
+        config_overrides: tuple[str, ...] = (),
+    ) -> _FakeProcess:
+        captured["codex_path"] = codex_path
+        captured["env"] = dict(env)
+        captured["cwd"] = cwd
+        captured["config_overrides"] = list(config_overrides)
+        return _FakeProcess()
+
+    async def _fake_wait(process: object, port: int) -> None:
+        del process, port
+
+    class _FakeClient:
+        def __init__(self, *, ws_url: str, client_name: str) -> None:
+            assert client_name == "omnigent-codex-model-probe"
+
+        async def connect(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+        async def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
+            assert method == "model/list"
+            return {
+                "result": {
+                    "data": [
+                        {"id": "gpt-5.6-sol", "displayName": "Sol", "isDefault": True},
+                        {"id": "gpt-5.4", "displayName": "gpt-5.4"},
+                    ],
+                    "nextCursor": None,
+                }
+            }
+
+    monkeypatch.setattr(
+        codex_native_app_server, "_start_codex_model_discovery_process", _fake_start
+    )
+    monkeypatch.setattr(codex_native_app_server, "_wait_for_discovery_listener", _fake_wait)
+    monkeypatch.setattr(codex_native_app_server, "CodexAppServerClient", _FakeClient)
+
+    rows = await codex_native_app_server.probe_codex_model_options(codex_path="/test/codex")
+
+    # The launch-pinned model wins the (single) default marker, in either
+    # spelling; Codex's own flag on sol is dropped.
+    assert rows == [
+        {"id": "gpt-5.6-sol", "displayName": "Sol"},
+        {"id": "gpt-5.4", "displayName": "gpt-5.4", "isDefault": True},
+    ]
+    assert captured["config_overrides"] == [
+        'model="databricks-gpt-5-4"',
+        'model_provider="omnigent_databricks"',
+    ]
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["DATABRICKS_HOST"] == "https://ws.example"
+    # Persistent probe home under the omnigent cache, not a fresh temp dir.
+    assert str(tmp_path / ".omnigent" / "cache" / "codex-model-probe") in env["CODEX_HOME"]
+    assert Path(env["CODEX_HOME"]).is_dir()
+
+
+async def test_probe_codex_model_options_probes_every_launch_shape(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A non-Databricks launch still probes, with its own overrides verbatim.
+
+    The plain Codex-login shape carries no ``DATABRICKS_HOST`` and no
+    provider overrides beyond what the launch resolved (here the dismissal
+    pin), and with no launch-pinned model Codex's own default marker
+    stands.
+    """
+    from omnigent import codex_native_app_server
+
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "resolve_native_codex_launch",
+        lambda *, model: codex_native_app_server.NativeCodexLaunch(
+            config_overrides=['model_provider="openai"'],
+            model=None,
+            profile=None,
+        ),
+    )
+    monkeypatch.setattr(codex_native_app_server, "_clean_codex_env", lambda: {"PATH": "/bin"})
+    captured: dict[str, object] = {}
+
+    class _FakeProcess:
+        pid = None
+        returncode: int | None = None
+
+        def terminate(self) -> None:
+            self.returncode = 0
+
+        def kill(self) -> None:
+            self.returncode = -1
+
+        async def wait(self) -> int:
+            self.returncode = 0 if self.returncode is None else self.returncode
+            return self.returncode
+
+    async def _fake_start(
+        *,
+        codex_path: str,
+        listen_url: str,
+        env: dict[str, str],
+        cwd: Path,
+        config_overrides: tuple[str, ...] = (),
+    ) -> _FakeProcess:
+        captured["env"] = dict(env)
+        captured["config_overrides"] = list(config_overrides)
+        return _FakeProcess()
+
+    async def _fake_wait(process: object, port: int) -> None:
+        del process, port
+
+    class _FakeClient:
+        def __init__(self, *, ws_url: str, client_name: str) -> None:
+            del ws_url, client_name
+
+        async def connect(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+        async def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
+            del method, params
+            return {
+                "result": {
+                    "data": [{"id": "gpt-5.6-sol", "isDefault": True}, {"id": "gpt-5.5"}],
+                    "nextCursor": None,
+                }
+            }
+
+    monkeypatch.setattr(
+        codex_native_app_server, "_start_codex_model_discovery_process", _fake_start
+    )
+    monkeypatch.setattr(codex_native_app_server, "_wait_for_discovery_listener", _fake_wait)
+    monkeypatch.setattr(codex_native_app_server, "CodexAppServerClient", _FakeClient)
+
+    rows = await codex_native_app_server.probe_codex_model_options(codex_path="/test/codex")
+
+    assert rows == [{"id": "gpt-5.6-sol", "isDefault": True}, {"id": "gpt-5.5"}]
+    assert captured["config_overrides"] == ['model_provider="openai"']
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert "DATABRICKS_HOST" not in env
 
 
 def test_resolve_databricks_codex_model_matches_servable_ids() -> None:

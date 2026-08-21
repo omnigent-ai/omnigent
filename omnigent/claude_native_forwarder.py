@@ -496,16 +496,15 @@ class _ForwardDedupeState:
     :param usage: Last ``message.usage`` snapshot POSTed via
         ``external_session_usage``, or ``None`` if none yet.
     :param context_window: Last context-window POSTed, or ``None``.
-    :param observed_model: Last tier alias seen in the transcript,
-        sticky across polls (the incremental window often carries no
-        fresh ``message.model``), e.g. ``"opus"``. ``None`` until first
-        seen.
-    :param posted_model: Last tier alias POSTed via
-        ``external_model_change``. Seeded from the first observation
-        WITHOUT a POST so a passive spawn default never overwrites a
-        pending silent model handoff; only a later in-TUI switch is
-        mirrored. Left behind ``observed_model`` on a failed POST so the
-        next poll retries. ``None`` until the first observation.
+    :param observed_model: Last VERBATIM model seen (statusLine or
+        transcript), sticky across polls (the incremental window often
+        carries no fresh ``message.model``), e.g.
+        ``"claude-opus-4-8[1m]"``. ``None`` until first seen.
+    :param posted_model: Last verbatim model POSTed via
+        ``external_model_change``. Every observation posts — the first
+        one is the launch report that seeds the session's
+        ``reported_model``. Left behind ``observed_model`` on a failed
+        POST so the next poll retries. ``None`` until the first post.
     :param posted_cost: Last DISPLAY cost (USD) POSTed as
         ``cumulative_cost_usd`` — the statusLine total ``S`` verbatim.
         ``None`` until the first cost post. Used to dedupe so a steady
@@ -3593,19 +3592,18 @@ async def _forward_available_items(
                 _http_status_for_log(exc),
                 exc_info=True,
             )
-    # Mirror a TUI-side `/model` switch to the web picker. The transcript
-    # records the resolved concrete id (e.g. "claude-opus-4-8"); collapse
-    # it to the picker's tier alias. This transcript-derived observation
-    # only fires when a turn produces a fresh ``message.model``, so it lags
-    # an in-pane switch by one turn — the per-poll statusLine sync
-    # (:func:`_forward_model_from_status`) is the primary, low-latency
-    # source; this stays as a fallback for cold-resume before the first
-    # statusLine render. Both share ``dedupe`` so neither double-posts.
+    # Report the transcript's model verbatim. This transcript-derived
+    # observation only fires when a turn produces a fresh
+    # ``message.model``, so it lags an in-pane switch by one turn — the
+    # per-poll statusLine sync (:func:`_forward_model_from_status`) is the
+    # primary, low-latency source; this stays as a fallback for cold-resume
+    # before the first statusLine render. Both share ``dedupe`` so neither
+    # double-posts.
     await _post_model_change_if_new(
         client,
         session_id=session_id,
         dedupe=dedupe,
-        alias=_model_alias_for(result.latest_model),
+        model=result.latest_model,
     )
     # Mirror a TUI-side `/rename` to the web session list. Claude writes the
     # operator's title as a `custom-title` metadata record, which renders no
@@ -4198,40 +4196,6 @@ def _gen_ai_usage_tokens(usage: Mapping[str, float | str] | None) -> dict[str, i
     return tokens
 
 
-def _model_alias_for(model: str | None) -> str | None:
-    """
-    Collapse a concrete Claude model id to the picker's tier alias.
-
-    The web model picker speaks Claude Code's version-agnostic aliases
-    (``"fable"`` / ``"opus"`` / ``"sonnet"`` / ``"haiku"``), plus the one
-    extra concrete-id slot ``"sonnet_5"`` (see
-    :data:`omnigent.claude_native._UCODE_CLAUDE_CUSTOM_TIER`) for the newer
-    Sonnet generation offered alongside the default ``"sonnet"`` tier; the
-    transcript records the resolved concrete id (e.g.
-    ``"claude-opus-4-8"`` or ``"databricks-claude-sonnet-5"``).
-    Mapping to the tier keeps the mirrored value in the picker's
-    vocabulary and makes a web→TUI round-trip a no-op. The older Sonnet
-    (``sonnet-4-6``) collapses to the generic ``"sonnet"`` alias — it is the
-    default that row is bound to.
-
-    :param model: Concrete model id from the transcript, e.g.
-        ``"claude-opus-4-8"``; ``None`` when none observed yet.
-    :returns: ``"fable"`` / ``"opus"`` / ``"sonnet"`` / ``"sonnet_5"`` /
-        ``"haiku"`` when the id carries a known tier token, else ``None``
-        (the caller skips the post rather than surface an id the picker
-        can't render).
-    """
-    if not model:
-        return None
-    lowered = model.lower()
-    if "sonnet-5" in lowered or "sonnet_5" in lowered:
-        return "sonnet_5"
-    for tier in ("fable", "opus", "sonnet", "haiku"):
-        if tier in lowered:
-            return tier
-    return None
-
-
 async def _post_external_permission_mode_change(
     client: httpx.AsyncClient,
     *,
@@ -4318,13 +4282,15 @@ async def _post_external_model_change(
     """
     Post one ``external_model_change`` event to the Sessions API.
 
-    Lets the web model picker reflect a model switch made inside the
-    Claude Code terminal (a ``/model`` command or the in-TUI picker).
+    Reports the model the pane is actually on — the launch's own model
+    included — so every surface renders the harness's truth.
 
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id, e.g.
         ``"conv_abc123"``.
-    :param model: Tier alias the session is now on, e.g. ``"opus"``.
+    :param model: The harness's VERBATIM model, e.g.
+        ``"claude-opus-4-8[1m]"`` — never collapsed to a picker alias
+        (a family word claims a generation the pane may not be on).
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
     resp = await client.post(
@@ -4419,39 +4385,35 @@ async def _post_model_change_if_new(
     *,
     session_id: str,
     dedupe: _ForwardDedupeState,
-    alias: str | None,
+    model: str | None,
 ) -> None:
     """
-    Mirror an observed model tier alias to ``model_override``, deduped.
+    Report the observed model to ``reported_model``, verbatim and deduped.
 
     Shared by the transcript-driven path (:func:`_forward_available_items`)
     and the statusLine-driven per-poll path
-    (:func:`_forward_model_from_status`). The FIRST observation is the
-    session's spawn default, not a switch, so it seeds the dedupe baseline
-    WITHOUT posting (posting it could clobber a pending silent model
-    handoff). Every later change posts ``external_model_change``. Both
-    callers pass the same ``dedupe`` so whichever observes a switch first
-    posts it and the other no-ops. Best-effort: a failed POST leaves
-    ``posted_model`` behind ``observed_model`` so the next poll retries.
+    (:func:`_forward_model_from_status`). EVERY observation posts — the
+    first one is the launch report that seeds the session's
+    ``reported_model``, so surfaces show the pane's truth within seconds
+    of spawn; the server dedupes by equality, so a steady model costs one
+    POST total. Both callers pass the same ``dedupe`` so whichever
+    observes a change first posts it and the other no-ops. Best-effort: a
+    failed POST leaves ``posted_model`` behind ``observed_model`` so the
+    next poll retries.
 
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
     :param dedupe: Shared per-session dedupe state; mutated in place.
-    :param alias: Tier alias just observed (``"opus"`` / ``"sonnet"`` /
-        …), or ``None`` when this source carried no recognizable model on
-        this poll. ``observed_model`` is sticky across polls, so passing
-        ``None`` does NOT clear it — it just means "no fresh observation,"
-        and a previously-observed-but-unposted model is still reconciled
-        (retried) here.
+    :param model: The harness's verbatim model just observed (e.g.
+        ``"claude-opus-4-8[1m]"``), or ``None`` when this source carried
+        no model on this poll. ``observed_model`` is sticky across
+        polls, so passing ``None`` does NOT clear it — it just means "no
+        fresh observation," and a previously-observed-but-unposted model
+        is still reconciled (retried) here.
     """
-    if alias is not None:
-        dedupe.observed_model = alias
+    if model is not None:
+        dedupe.observed_model = model
     if dedupe.observed_model is None or dedupe.observed_model == dedupe.posted_model:
-        return
-    if dedupe.posted_model is None:
-        # First observation = the spawn default; seed the baseline without
-        # posting so it can't clobber a pending silent model handoff.
-        dedupe.posted_model = dedupe.observed_model
         return
     try:
         await _post_external_model_change(
@@ -4478,7 +4440,7 @@ async def _forward_model_from_status(
     dedupe: _ForwardDedupeState,
 ) -> None:
     """
-    Mirror the statusLine-reported active model to ``model_override`` each poll.
+    Report the statusLine's active model to ``reported_model`` each poll.
 
     Claude Code rewrites the statusLine stdin on every TUI render — including
     right after an in-pane ``/model`` switch, BEFORE the next turn runs. The
@@ -4490,8 +4452,9 @@ async def _forward_model_from_status(
     turn later, which is what happened when the model was derived solely
     from the next turn's transcript ``message.model``.
 
-    Best-effort and idempotent: shares ``dedupe`` with the transcript path,
-    so a no-op when the model is unchanged.
+    The value posts VERBATIM — the harness's own spelling, never collapsed
+    to a picker alias. Best-effort and idempotent: shares ``dedupe`` with
+    the transcript path, so a no-op when the model is unchanged.
 
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
@@ -4502,12 +4465,11 @@ async def _forward_model_from_status(
     if status_state is None:
         return
     model = status_state.get("model")
-    alias = _model_alias_for(model if isinstance(model, str) else None)
     await _post_model_change_if_new(
         client,
         session_id=session_id,
         dedupe=dedupe,
-        alias=alias,
+        model=model.strip() if isinstance(model, str) and model.strip() else None,
     )
 
 

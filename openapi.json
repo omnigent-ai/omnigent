@@ -4779,7 +4779,7 @@
         "type": "object"
       },
       "SessionModelEvent": {
-        "description": "Active-model update from a terminal-backed integration.\n\nEmitted after an `external_model_change` POST from the\n`omnigent claude` transcript forwarder when the model is\nswitched inside the Claude Code terminal (a `/model` command or\nthe in-TUI picker). Lets the web model picker reflect a TUI-side\nswitch without a reload.",
+        "description": "Active-model report from a terminal-backed integration.\n\nEmitted after an `external_model_change` POST from a native\nforwarder \u2014 the launch's own model report, or a switch made inside\nthe pane (a `/model` command or the in-TUI picker). Every surface\nre-renders its model display from this.",
         "properties": {
           "conversation_id": {
             "description": "Session identifier, e.g. `\"conv_abc123\"`.",
@@ -4787,7 +4787,7 @@
             "type": "string"
           },
           "model": {
-            "description": "Tier alias the session is now on, e.g. `\"opus\"` \u2014 Claude Code's version-agnostic alias, matching the picker's vocabulary (not a pinned `\"claude-opus-4-8\"` id). Category: **transient** (SSE-only). The server also writes `model_override` on the conversation, so on reconnect clients restore the selection from the snapshot's `model_override` rather than from a replayed event.",
+            "description": "The model the harness reports the session is on, VERBATIM in the harness's own spelling, e.g. `\"claude-opus-4-8[1m]\"` or `\"gpt-5.6-luna\"` \u2014 never collapsed to a picker alias. Category: **transient** (SSE-only). The server also writes `reported_model` on the conversation (served on the snapshot's `llm_model`), so on reconnect clients restore the display from the snapshot rather than from a replayed event.",
             "title": "Model",
             "type": "string"
           },
@@ -5420,7 +5420,7 @@
                 "type": "null"
               }
             ],
-            "description": "The LLM model identifier from the bound agent's spec, e.g. `\"anthropic/claude-sonnet-4-6\"`. `None` when the agent has no explicit `llm:` block or the agent cannot be looked up.",
+            "description": "The model this session is actually on. When the harness has reported one (`reported_model`, written by `external_model_change`), that verbatim value serves here and is the only model value clients display; otherwise the bound agent spec's model, e.g. `\"anthropic/claude-sonnet-4-6\"`. `None` when neither exists.",
             "title": "Llm Model"
           },
           "mcp_startup": {
@@ -8263,10 +8263,7 @@
               "application/json": {
                 "schema": {
                   "additionalProperties": {
-                    "items": {
-                      "additionalProperties": true,
-                      "type": "object"
-                    },
+                    "items": {},
                     "type": "array"
                   },
                   "title": "Response Get Host Model Options V1 Hosts  Host Id  Harnesses  Harness  Model Options Get",

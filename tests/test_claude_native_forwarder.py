@@ -3501,54 +3501,92 @@ async def test_forwarder_does_not_mirror_when_hook_payload_lacks_session_id(
     assert "PATCH" not in methods, f"unexpected PATCH(es): {drained}"
 
 
-@pytest.mark.parametrize(
-    ("model", "expected"),
-    [
-        ("claude-opus-4-8", "opus"),
-        ("anthropic/claude-opus-4-7", "opus"),
-        # The default Sonnet (4.6) collapses to the generic "sonnet" alias —
-        # the row it is bound to.
-        ("databricks-claude-sonnet-4-6", "sonnet"),
-        ("claude-sonnet-4-6", "sonnet"),
-        ("claude-haiku-4-5", "haiku"),
-        # Fable (the tier above Opus) collapses to its own alias — a miss
-        # here means a TUI switch to claude-fable-5 never reaches the picker.
-        ("claude-fable-5", "fable"),
-        ("databricks-claude-fable-5", "fable"),
-        # Sonnet 5 routes to its own opt-in picker slot, not the generic
-        # "sonnet" row — both ids contain the substring "sonnet", so a miss
-        # here means a TUI switch to the newer Sonnet generation would
-        # wrongly light up the default-Sonnet row instead.
-        ("anthropic/claude-sonnet-5", "sonnet_5"),
-        ("databricks-claude-sonnet-5", "sonnet_5"),
-        # Unknown family or empty → None (don't surface an unrenderable id).
-        ("gpt-5-4-mini", None),
-        ("", None),
-        (None, None),
-    ],
-)
-def test_model_alias_for_collapses_concrete_id_to_tier_alias(
-    model: str | None, expected: str | None
+@pytest.mark.asyncio
+async def test_forward_model_from_status_posts_the_status_model_verbatim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    ``_model_alias_for`` maps a concrete transcript model id to the
-    picker's tier alias so a TUI ``/model`` switch lands on a picker
-    row. Covers Anthropic + Databricks-gateway id shapes and the
-    no-match / empty cases (caller skips the post on ``None``).
+    The statusLine's model posts VERBATIM — the harness's own spelling,
+    never collapsed to a picker alias — and dedupes on repeat polls.
+
+    A family collapse here is how a routed Opus 4.9 rendered as the
+    ``opus`` row holding 4.8; the verbatim report is what makes the web's
+    exact-match highlight truthful for every generation and provider
+    spelling.
     """
-    assert forwarder._model_alias_for(model) == expected
+    monkeypatch.setattr(
+        forwarder,
+        "read_claude_context_state",
+        lambda _bridge_dir: {"model": "databricks-claude-opus-4-9", "context_window_size": 200000},
+    )
+    requests: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(202, json={})
+
+    dedupe = forwarder._ForwardDedupeState()
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        await forwarder._forward_model_from_status(
+            client, session_id="conv_abc", bridge_dir=tmp_path, dedupe=dedupe
+        )
+        await forwarder._forward_model_from_status(
+            client, session_id="conv_abc", bridge_dir=tmp_path, dedupe=dedupe
+        )
+
+    model_posts = [r for r in requests if r["type"] == "external_model_change"]
+    assert model_posts == [
+        {"type": "external_model_change", "data": {"model": "databricks-claude-opus-4-9"}}
+    ]
+    assert dedupe.posted_model == "databricks-claude-opus-4-9"
 
 
 @pytest.mark.asyncio
-async def test_forwarder_mirrors_tui_model_switch_after_baseline(tmp_path: Path) -> None:
+async def test_model_reports_keep_generation_and_context_marker(tmp_path: Path) -> None:
     """
-    A TUI-side ``/model`` switch is POSTed as ``external_model_change``;
-    the spawn-default baseline is NOT (seed-first).
+    Reports preserve the generation and the ``[1m]`` marker byte-for-byte.
 
-    The first assistant entry establishes the baseline model silently —
-    so a passive spawn default never clobbers a pending silent model
-    handoff — and a later assistant entry on a different model posts a
-    single ``external_model_change`` carrying the normalized tier alias.
+    Two same-family models of different generations (a routed 4.9 beside a
+    pinned 4.8) and a 1M-context variant must each post as themselves —
+    any normalization would let the record claim a model the pane is not
+    on.
+    """
+    requests: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(202, json={})
+
+    dedupe = forwarder._ForwardDedupeState()
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        for model in (
+            "databricks-claude-opus-4-8",
+            "databricks-claude-opus-4-9",
+            "databricks-claude-opus-4-9[1m]",
+        ):
+            await forwarder._post_model_change_if_new(
+                client, session_id="conv_abc", dedupe=dedupe, model=model
+            )
+
+    assert [r["data"]["model"] for r in requests] == [
+        "databricks-claude-opus-4-8",
+        "databricks-claude-opus-4-9",
+        "databricks-claude-opus-4-9[1m]",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_forwarder_reports_the_launch_model_then_a_switch(tmp_path: Path) -> None:
+    """
+    EVERY observation posts, verbatim: the first is the launch report.
+
+    The first assistant entry names the model the session spawned on —
+    posting it is what seeds ``reported_model`` so surfaces show the
+    pane's truth within seconds of launch — and a later assistant entry
+    on a different model posts that new model, byte-for-byte.
     """
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
@@ -3607,9 +3645,10 @@ async def test_forwarder_mirrors_tui_model_switch_after_baseline(tmp_path: Path)
             retry_tracker=retry_tracker,
             dedupe=dedupe,
         )
-        # First observation seeds the baseline WITHOUT posting a change.
-        assert "external_model_change" not in [r["type"] for r in requests]
-        assert dedupe.posted_model == "opus"
+        # The first observation IS the launch report — posted verbatim.
+        launch_posts = [r for r in requests if r["type"] == "external_model_change"]
+        assert [p["data"] for p in launch_posts] == [{"model": "claude-opus-4-8"}]
+        assert dedupe.posted_model == "claude-opus-4-8"
 
         # User switches model inside the terminal.
         with transcript_path.open("a", encoding="utf-8") as fh:
@@ -3627,8 +3666,8 @@ async def test_forwarder_mirrors_tui_model_switch_after_baseline(tmp_path: Path)
 
     model_posts = [r for r in requests if r["type"] == "external_model_change"]
     assert len(model_posts) == 1
-    assert model_posts[0]["data"] == {"model": "sonnet_5"}
-    assert dedupe.posted_model == "sonnet_5"
+    assert model_posts[0]["data"] == {"model": "claude-sonnet-5"}
+    assert dedupe.posted_model == "claude-sonnet-5"
 
 
 @pytest.mark.asyncio
@@ -3866,25 +3905,25 @@ async def test_forwarder_retries_model_post_after_transient_failure(tmp_path: Pa
                 dedupe=dedupe,
             )
 
-        # Poll 1: baseline "opus" seeded, no model POST.
+        # Poll 1: the launch report is attempted and fails transiently.
         await _poll()
-        assert model_posts == []
-        assert dedupe.posted_model == "opus"
+        assert model_posts == [{"model": "claude-opus-4-8"}]
+        assert dedupe.posted_model is None  # NOT advanced — POST failed
+        assert dedupe.observed_model == "claude-opus-4-8"  # but remembered
 
-        # Poll 2: user switches to Sonnet 5; the POST fails transiently.
-        with transcript_path.open("a", encoding="utf-8") as fh:
-            fh.write(_assistant("a2", "claude-sonnet-5") + "\n")
-        await _poll()
-        assert model_posts == [{"model": "sonnet_5"}]  # attempted once
-        assert dedupe.posted_model == "opus"  # NOT advanced — POST failed
-        assert dedupe.observed_model == "sonnet_5"  # but remembered
-
-        # Poll 3: a plain user turn (no message.model) still retries.
+        # Poll 2: a plain user turn (no message.model) still retries the drop.
         with transcript_path.open("a", encoding="utf-8") as fh:
             fh.write(_user("u1") + "\n")
         await _poll()
-        assert model_posts == [{"model": "sonnet_5"}, {"model": "sonnet_5"}]  # retried
-        assert dedupe.posted_model == "sonnet_5"  # now committed
+        assert model_posts == [{"model": "claude-opus-4-8"}, {"model": "claude-opus-4-8"}]
+        assert dedupe.posted_model == "claude-opus-4-8"  # now committed
+
+        # Poll 3: a TUI switch posts the new model verbatim.
+        with transcript_path.open("a", encoding="utf-8") as fh:
+            fh.write(_assistant("a2", "claude-sonnet-5") + "\n")
+        await _poll()
+        assert model_posts[-1] == {"model": "claude-sonnet-5"}
+        assert dedupe.posted_model == "claude-sonnet-5"
 
 
 @pytest.mark.asyncio

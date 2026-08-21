@@ -10950,6 +10950,12 @@ def _run_databricks_browser_login(workspace_host: str, org_id: str | None = None
         the workspace rejects it).
     :raises click.ClickException: When the Databricks CLI binary is
         missing or the login exits non-zero.
+
+    The login writes to a ``.databrickscfg`` profile named after the
+    workspace's first DNS label (e.g. ``acme`` for
+    ``acme.cloud.databricks.com``), keeping distinct workspaces off the
+    shared ``DEFAULT`` profile. The OAuth grant itself stays host-keyed,
+    so :func:`_databricks_workspace_token` still resolves it by host.
     """
     databricks_bin = shutil.which("databricks")
     if databricks_bin is None:
@@ -10958,14 +10964,21 @@ def _run_databricks_browser_login(workspace_host: str, org_id: str | None = None
             "Install it first: https://docs.databricks.com/dev-tools/cli/install.html"
         )
     login_host = _host_with_org(workspace_host, org_id)
-    click.echo(f"Opening browser to log in to {login_host} ...")
+    # Pin the grant to a profile named for the workspace's first DNS label so
+    # distinct workspaces don't clobber each other under the CLI's ``DEFAULT``.
+    from urllib.parse import urlsplit
+
+    split = urlsplit(workspace_host.rstrip("/"))
+    host = split.hostname or split.netloc or split.path
+    profile = host.split(".")[0]
+    click.echo(f"Opening browser to log in to {login_host} (profile {profile}) ...")
     result = subprocess.run(
-        [databricks_bin, "auth", "login", "--host", login_host],
+        [databricks_bin, "auth", "login", "--host", login_host, "--profile", profile],
         check=False,
     )
     if result.returncode != 0:
         raise click.ClickException(
-            f"`databricks auth login --host {login_host}` failed "
+            f"`databricks auth login --host {login_host} --profile {profile}` failed "
             f"(exit {result.returncode}). If the workspace is unreachable from "
             "this machine (VPN / IP access lists), resolve that and retry."
         )

@@ -342,9 +342,23 @@ def read_codex_config_model(bridge_dir: Path) -> str | None:
     :returns: The top-level ``model`` from ``config.toml`` (e.g.
         ``"gpt-5.4"``), or ``None`` when undeterminable.
     """
-    config_path = codex_home_for_bridge_dir(bridge_dir) / "config.toml"
+    return read_codex_home_config_model(codex_home_for_bridge_dir(bridge_dir))
+
+
+def read_codex_home_config_model(codex_home: Path) -> str | None:
+    """
+    Read the active model straight from a session's ``CODEX_HOME``.
+
+    Same value and fail-safe behaviour as :func:`read_codex_config_model`,
+    for callers that hold the ``CODEX_HOME`` path (e.g. a live bridge
+    state) rather than the bridge directory.
+
+    :param codex_home: The session's private ``CODEX_HOME`` directory.
+    :returns: The top-level ``model`` from ``config.toml`` (e.g.
+        ``"gpt-5.4"``), or ``None`` when undeterminable.
+    """
     try:
-        data = tomllib.loads(config_path.read_text())
+        data = tomllib.loads((codex_home / "config.toml").read_text())
     except (OSError, tomllib.TOMLDecodeError):
         return None
     model = data.get("model")

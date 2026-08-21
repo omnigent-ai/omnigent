@@ -3768,6 +3768,37 @@ async def _auto_create_codex_terminal(
     from omnigent.inner.codex_executor import _find_codex_cli
 
     _codex_cli_path = _find_codex_cli()
+    # Explicit launches (model-flows design §4): validate an explicit request
+    # against the shared catalog, and give a Default launch on codex's own
+    # login the ACCOUNT's real default — so the ``model =`` line copied from
+    # the user's shared config can never govern a session (the stale-gpt-5.4
+    # 400 class). Profile-backed shapes already resolve their default at
+    # materialization time and are left alone.
+    if launch_config.model_override or (
+        _codex_launch.model is None and _codex_launch.profile is None
+    ):
+        from dataclasses import replace as _dataclass_replace
+
+        from omnigent.codex_native_app_server import codex_launch_catalog
+        from omnigent.model_catalog_store import catalog_contains, default_row
+
+        _codex_catalog = await codex_launch_catalog(codex_path=_codex_cli_path)
+        if launch_config.model_override and _codex_catalog:
+            if not catalog_contains(_codex_catalog, launch_config.model_override):
+                raise click.ClickException(
+                    f"the requested model {launch_config.model_override!r} is not in "
+                    "this host's current model list — it may have changed since the "
+                    "pick. Pick again from the model menu."
+                )
+        if _codex_launch.model is None and _codex_launch.profile is None and _codex_catalog:
+            _catalog_default = default_row(_codex_catalog)
+            _default_id = (
+                str(_catalog_default.get("id") or _catalog_default.get("model") or "") or None
+                if _catalog_default is not None
+                else None
+            )
+            if _default_id:
+                _codex_launch = _dataclass_replace(_codex_launch, model=_default_id)
     # Cancel any surviving forwarder first so its teardown closes the OLD app-server,
     # not the one registered below — and so it can't mirror alongside the new one.
     await _cancel_auto_forwarder_task(session_id)
@@ -6450,6 +6481,41 @@ async def _auto_create_claude_terminal(
         or (claude_config.model if claude_config is not None else None),
         claude_config,
     )
+    # Explicit launches (model-flows design §4): consult the shared catalog
+    # only when it can change the outcome — to validate an explicit request,
+    # or to resolve a Default launch that would otherwise pass no ``--model``
+    # and leave the model to invisible CLI-private state.
+    if session_model_override or launch_model is None:
+        from omnigent.claude_native import claude_launch_catalog
+        from omnigent.model_catalog_store import catalog_contains, default_row
+
+        launch_catalog: list[dict[str, object]] | None = None
+        try:
+            launch_catalog = await claude_launch_catalog(claude_config)
+        except Exception:  # noqa: BLE001 — no catalog means no validation/default
+            _logger.warning(
+                "claude launch catalog unavailable for session=%s", session_id, exc_info=True
+            )
+        if session_model_override and launch_catalog:
+            resolved_request = (
+                resolve_claude_native_model_selection(session_model_override, claude_config)
+                or session_model_override
+            )
+            if not (
+                catalog_contains(launch_catalog, session_model_override)
+                or catalog_contains(launch_catalog, resolved_request)
+            ):
+                raise click.ClickException(
+                    f"the requested model {session_model_override!r} is not in this "
+                    "host's current model list — it may have changed since the pick. "
+                    "Pick again from the model menu."
+                )
+        if launch_model is None and launch_catalog:
+            catalog_default = default_row(launch_catalog)
+            if catalog_default is not None:
+                launch_model = (
+                    str(catalog_default.get("model") or catalog_default.get("id") or "") or None
+                )
     # Give an exact launch model (a Smart Routing pick is resolved before the
     # terminal exists) a spelling of its own in the picker, so a later
     # ``/model`` can return to it instead of stepping onto whatever the family
@@ -6461,6 +6527,18 @@ async def _auto_create_claude_terminal(
         claude_config = claude_config_with_launch_model_pinned(claude_config, launch_model)
     if record_launch_config is not None:
         record_launch_config(session_id, claude_config)
+    # Persist the vocabulary + launch model onto the bridge so mid-session
+    # ``/model`` conversion reads THIS session's pins, not the runner's
+    # ambient env (the CLI path records these at prepare time; the runner
+    # resolves its config only after the bridge exists).
+    from omnigent.claude_native_bridge import record_model_vocabulary
+
+    await asyncio.to_thread(
+        record_model_vocabulary,
+        bridge_dir,
+        launch_env=claude_config.env if claude_config is not None else None,
+        launch_model=launch_model,
+    )
     _logger.info(
         "Claude terminal provider config resolved: session=%s configured=%s "
         "env_keys=%s api_key_helper_set=%s model_set=%s launch_model=%s",

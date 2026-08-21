@@ -1730,8 +1730,12 @@ async def _drive_codex_model(base_url: str, session_id: str) -> None:
             )
             await _open_entry_config(page, "ag_codex_e2e")
             model = page.get_by_test_id("new-chat-landing-config-model")
-            await expect(model).to_contain_text("Default (gpt-live-default)")
-            await _pick_config_select(page, "new-chat-landing-config-model", "gpt-live-fast")
+            # The Default row names the catalog's default by its DISPLAY name —
+            # the same shared labeling the in-session gear uses.
+            await expect(model).to_contain_text("Default (GPT Live Default)")
+            # Codex options render decorated display names (same as claude),
+            # so pick by the display name; the create still sends the id.
+            await _pick_config_select(page, "new-chat-landing-config-model", "GPT Live Fast")
             await _save_config(page)
 
             await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
