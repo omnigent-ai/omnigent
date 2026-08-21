@@ -1,0 +1,9 @@
+# Codegraph MCP server for the pi worker — see the polly root
+# tools/mcp/codegraph.yaml for the full story. Pi is an SDK-path harness, so
+# these tools arrive through the runner MCP bridge as `codegraph__<tool>`.
+# Missing CLI / unindexed repo degrade gracefully to normal search.
+name: codegraph
+description: Symbol search, call graphs, and impact analysis over the repo's .codegraph index.
+transport: stdio
+command: codegraph
+args: [serve, --mcp]

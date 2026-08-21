@@ -1,0 +1,10 @@
+# Codegraph MCP server for the opencode worker — see the polly root
+# tools/mcp/codegraph.yaml for the full story. opencode-native translates
+# spec MCP declarations into opencode.json's `mcp` block, so opencode
+# connects to this server directly. Missing CLI / unindexed repo degrade
+# gracefully to normal search.
+name: codegraph
+description: Symbol search, call graphs, and impact analysis over the repo's .codegraph index.
+transport: stdio
+command: codegraph
+args: [serve, --mcp]

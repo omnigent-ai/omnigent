@@ -43,5 +43,12 @@ repository-specific technical question.
   the registry, or check deterministic external status. It must not answer the
   user's substantive question from its own direct file reads, shell output,
   connector fetches, or terminal scrollback.
+- Codegraph sharpens task packets without breaking that rule: when
+  `codegraph__*` tools are available and the repo has a `.codegraph/` index,
+  one `codegraph__codegraph_search` / `codegraph__codegraph_explore` call may
+  be used to SCOPE a task (name the symbols/files the worker should start
+  from) — never to answer the question itself. When the repo is indexed, say
+  so in each task packet: workers that have codegraph (MCP tools or the
+  `codegraph` CLI) lead with it instead of a grep-and-read loop.
 - Keep task scopes narrow enough that each worker can return a concise report
   with evidence. Broad investigations should be split into parallel subtasks.

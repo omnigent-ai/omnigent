@@ -41,6 +41,18 @@ prompt: |
   EXPLORE / SEARCH — answer a specific question, read-only:
   - Read only what you need; edit nothing. Answer with file:line evidence.
 
+  CODEGRAPH — optional code intelligence; orient with it before grepping. If
+  codegraph MCP tools (`codegraph_explore`, `codegraph_search`,
+  `codegraph_callers`, ...) are in your tool list, lead with them — one
+  explore call usually replaces a whole grep-and-read loop. Otherwise, if the
+  `codegraph` CLI is on PATH and the repo has a `.codegraph/` index, use the
+  CLI: `codegraph query <term>` finds symbols, `codegraph
+  callers|callees|impact <symbol>` walks the call graph, `codegraph affected
+  <files>` lists impacted tests. In a fresh worktree the index may live in
+  the main checkout (`--path <repo>`) and may lag your branch — verify
+  file:line by reading before you cite or edit. No codegraph available →
+  skip it silently and search normally.
+
   Always return a clear, structured result: for IMPLEMENT, what you changed
   (file:line) and how you verified it; for REVIEW / EXPLORE, your findings.
   Note anything that did not fit the task.
