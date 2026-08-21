@@ -68,6 +68,7 @@ def test_plugin_state_loads_builtins() -> None:
     assert isinstance(state, SandboxProviderPluginState)
     assert "modal" in state
     assert "blaxel" in state
+    assert "opensandbox" in state
     assert "kubernetes" in state
 
 
@@ -94,6 +95,7 @@ def test_available_providers_returns_builtins() -> None:
     names = available_providers()
     assert "modal" in names
     assert "blaxel" in names
+    assert "opensandbox" in names
     assert "kubernetes" in names
 
 

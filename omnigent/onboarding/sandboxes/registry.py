@@ -162,6 +162,11 @@ def _builtin_contribution() -> SandboxProviderContribution:
                 name="e2b",
                 launcher_class="omnigent.onboarding.sandboxes.e2b:E2BSandboxLauncher",
             ),
+            "opensandbox": SandboxProviderMetadata(
+                name="opensandbox",
+                launcher_class="omnigent.onboarding.sandboxes.opensandbox:OpenSandboxLauncher",
+                managed_token_ttl_s=25 * 3600,
+            ),
             "openshell": SandboxProviderMetadata(
                 name="openshell",
                 launcher_class="omnigent.onboarding.sandboxes.openshell:OpenShellSandboxLauncher",
