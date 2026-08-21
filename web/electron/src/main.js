@@ -50,6 +50,7 @@ const { registerWorkspaceRootBounce } = require("./workspace-root-bounce");
 const { createBrowserViewRegistry } = require("./browserViewRegistry");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { registerBrowserIpc } = require("./browserIpc");
+const { isDeveloperModeEnabled } = require("./developer_mode");
 const { registerSessionExpiryReload } = require("./session-expiry");
 const { decideWindowOpen, stripCrossOriginOpenerHeaders, WEB_SCHEMES } = require("./popupPolicy");
 const omnigentCli = require("./omnigent_cli");
@@ -91,6 +92,21 @@ const POPUP_PRELOAD = path.join(__dirname, "popup_preload.js");
 
 /** Absolute path to the app icon (PNG works for the macOS dock at runtime). */
 const ICON_PNG = path.join(__dirname, "..", "icons", "icon.png");
+
+/**
+ * Development builds always expose debugging. Packaged macOS builds require
+ * `defaults write ai.omnigent.desktop DeveloperMode -bool true` before launch.
+ */
+function developerModeEnabled() {
+  return isDeveloperModeEnabled({
+    isPackaged: app.isPackaged,
+    platform: process.platform,
+    getUserDefault:
+      typeof systemPreferences.getUserDefault === "function"
+        ? systemPreferences.getUserDefault.bind(systemPreferences)
+        : undefined,
+  });
+}
 
 /**
  * Quit-safety timeouts (see the before-quit handler near the end of this
@@ -1076,6 +1092,9 @@ function createWindow(targetUrl, opts = {}) {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
+      // Packaged builds expose DevTools only after the macOS user explicitly
+      // opts in through the DeveloperMode user default.
+      devTools: developerModeEnabled(),
       // Electron passes HTML5 drag-drop through to the page by default (no
       // native handler intercepts it), so images drop onto the composer
       // textbox with no extra work.
@@ -1930,7 +1949,7 @@ function buildMenu() {
     ],
   });
   // Standard View roles (Reload/zoom/fullscreen). Developer Tools lives in
-  // the Debug menu (dev only), so this menu is identical in dev and release.
+  // the opt-in Debug menu, so this menu is identical in normal releases.
   template.push({
     label: "View",
     submenu: [
@@ -1946,14 +1965,11 @@ function buildMenu() {
   });
   template.push({ role: "windowMenu" });
 
-  // Debug menu (dev only, !app.isPackaged): consolidates every debug-only /
-  // non-production affordance behind a single top-level menu — the macOS
-  // notification-sound settings (sound playback uses `afplay`, so macOS-only)
-  // and the developer tools. Restart-to-update now lives in the production
-  // Server menu (it's a needed install path, not a debug affordance, once the
-  // UpdateBanner toast is dismissible). Hidden in the shipped .app. Placed
-  // last so it never displaces the standard menus users expect.
-  if (!app.isPackaged) {
+  // Consolidate non-production affordances behind one top-level menu. It is
+  // always present in development and can be explicitly enabled in a packaged
+  // macOS app through the DeveloperMode user default. Restart-to-update stays
+  // in the production Server menu because it is a normal install path.
+  if (developerModeEnabled()) {
     /** @type {Electron.MenuItemConstructorOptions[]} */
     const debugSubmenu = [];
 

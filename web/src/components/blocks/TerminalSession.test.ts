@@ -15,9 +15,14 @@ import {
   TerminalSession,
   WHEEL_REPORTS_MAX_PER_EVENT,
   applyTerminalCopy,
+  decodeTerminalClipboardBase64,
+  hadRecentTerminalInput,
   isUnexpectedTerminalClose,
   loadWebglRenderer,
   openTerminalLink,
+  parseOsc52Clipboard,
+  parseTerminalClipboardMessage,
+  parseTerminalOsc52Capability,
   sgrWheelReports,
   shouldEchoSynchronously,
   terminalTheme,
@@ -122,6 +127,53 @@ describe("applyTerminalCopy", () => {
     expect(applyTerminalCopy(event, "")).toBe(false);
     expect(setData).not.toHaveBeenCalled();
     expect(preventDefault).not.toHaveBeenCalled();
+  });
+});
+
+describe("tmux clipboard parsing", () => {
+  function utf8Base64(text: string): string {
+    const bytes = new TextEncoder().encode(text);
+    return btoa(String.fromCharCode(...bytes));
+  }
+
+  it("decodes bounded UTF-8 base64", () => {
+    expect(decodeTerminalClipboardBase64(utf8Base64("hello λ\nworld"))).toBe("hello λ\nworld");
+    expect(decodeTerminalClipboardBase64("not base64")).toBeNull();
+    expect(decodeTerminalClipboardBase64("")).toBeNull();
+  });
+
+  it("accepts tmux OSC 52 writes but rejects reads and other selections", () => {
+    const encoded = utf8Base64("copied");
+    expect(parseOsc52Clipboard(`;${encoded}`)).toBe("copied");
+    expect(parseOsc52Clipboard(`c;${encoded}`)).toBe("copied");
+    expect(parseOsc52Clipboard("c;?")).toBeNull();
+    expect(parseOsc52Clipboard(`p;${encoded}`)).toBeNull();
+  });
+
+  it("accepts only the clipboard-write websocket schema", () => {
+    const encoded = utf8Base64("from control mode");
+    expect(
+      parseTerminalClipboardMessage(
+        JSON.stringify({ type: "clipboard-write", encoding: "base64", data: encoded }),
+      ),
+    ).toBe("from control mode");
+    expect(
+      parseTerminalClipboardMessage(JSON.stringify({ type: "resize", data: encoded })),
+    ).toBeNull();
+    expect(parseTerminalClipboardMessage("not json")).toBeNull();
+    expect(
+      parseTerminalOsc52Capability(
+        JSON.stringify({ type: "osc52-clipboard-capability", enabled: true }),
+      ),
+    ).toBe(true);
+    expect(parseTerminalOsc52Capability(JSON.stringify({ type: "resize" }))).toBeNull();
+  });
+
+  it("requires positive, recent input timing", () => {
+    expect(hadRecentTerminalInput(9000, 10_000)).toBe(true);
+    expect(hadRecentTerminalInput(0, 100)).toBe(false);
+    expect(hadRecentTerminalInput(1000, 10_000)).toBe(false);
+    expect(hadRecentTerminalInput(2000, 1000)).toBe(false);
   });
 });
 
@@ -475,7 +527,13 @@ describe("TerminalSession", () => {
     vi.restoreAllMocks();
   });
 
-  function makeSession(onActivity?: () => void, onInput?: () => void) {
+  function makeSession(
+    onActivity?: () => void,
+    onInput?: () => void,
+    clipboardEnabled = true,
+    onClipboardRequest?: (text: string) => void,
+    nativeSelection = false,
+  ) {
     const states: ConnectionState[] = [];
     const container = document.createElement("div");
     document.body.appendChild(container);
@@ -486,6 +544,9 @@ describe("TerminalSession", () => {
       false,
       onActivity,
       onInput,
+      nativeSelection,
+      clipboardEnabled,
+      onClipboardRequest,
     );
     return { session, states, container, socket: FakeWebSocket.instances.at(-1)! };
   }
@@ -560,6 +621,77 @@ describe("TerminalSession", () => {
 
     socket.emit("message", { data: "text frame" });
     expect(onActivity).toHaveBeenCalledTimes(1); // unchanged — text ignored
+    session.dispose();
+  });
+
+  it("handles PTY OSC 52 but does not trust raw control-mode pane OSC", async () => {
+    vi.spyOn(performance, "now").mockReturnValue(10_000);
+    const ptyClipboard = vi.fn();
+    const pty = makeSession(undefined, undefined, true, ptyClipboard);
+    (pty.session as unknown as { lastUserInputAt: number }).lastUserInputAt = 9000;
+    const sequence = `\x1b]52;;${btoa("from pty")}\x07`;
+    const ptyTerm = (pty.session as unknown as { term: Terminal }).term;
+    ptyTerm.focus();
+    pty.socket.emit("message", {
+      data: JSON.stringify({ type: "osc52-clipboard-capability", enabled: true }),
+    });
+    await new Promise<void>((resolve) => {
+      ptyTerm.write(sequence, resolve);
+    });
+    expect(ptyClipboard).toHaveBeenCalledWith("from pty");
+    pty.session.dispose();
+
+    const controlClipboard = vi.fn();
+    const control = makeSession(undefined, undefined, true, controlClipboard, true);
+    (control.session as unknown as { lastUserInputAt: number }).lastUserInputAt = 9000;
+    const controlTerm = (control.session as unknown as { term: Terminal }).term;
+    controlTerm.focus();
+    control.socket.emit("message", {
+      data: JSON.stringify({ type: "osc52-clipboard-capability", enabled: true }),
+    });
+    await new Promise<void>((resolve) => {
+      controlTerm.write(sequence, resolve);
+    });
+    expect(controlClipboard).not.toHaveBeenCalled();
+    control.session.dispose();
+  });
+
+  it("forwards validated clipboard frames only after recent input", () => {
+    vi.spyOn(performance, "now").mockReturnValue(10_000);
+    const onClipboardRequest = vi.fn();
+    const { socket, session } = makeSession(undefined, undefined, true, onClipboardRequest);
+    (session as unknown as { lastUserInputAt: number }).lastUserInputAt = 9000;
+    const encoded = btoa("copied text");
+
+    socket.emit("message", {
+      data: JSON.stringify({ type: "clipboard-write", encoding: "base64", data: encoded }),
+    });
+    expect(onClipboardRequest).toHaveBeenCalledWith("copied text");
+
+    (session as unknown as { lastUserInputAt: number }).lastUserInputAt = 1000;
+    socket.emit("message", {
+      data: JSON.stringify({ type: "clipboard-write", encoding: "base64", data: encoded }),
+    });
+    socket.emit("message", { data: '{"type":"unknown"}' });
+    expect(onClipboardRequest).toHaveBeenCalledTimes(1);
+    session.dispose();
+  });
+
+  it("does not forward clipboard frames when the surface is disabled", () => {
+    vi.spyOn(performance, "now").mockReturnValue(10_000);
+    const onClipboardRequest = vi.fn();
+    const { socket, session } = makeSession(undefined, undefined, false, onClipboardRequest);
+    (session as unknown as { lastUserInputAt: number }).lastUserInputAt = 9000;
+    (session as unknown as { term: Terminal }).term.focus();
+
+    socket.emit("message", {
+      data: JSON.stringify({
+        type: "clipboard-write",
+        encoding: "base64",
+        data: btoa("secret"),
+      }),
+    });
+    expect(onClipboardRequest).not.toHaveBeenCalled();
     session.dispose();
   });
 

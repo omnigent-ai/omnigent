@@ -110,6 +110,26 @@ Open another view with **Server → New Window** (`Cmd/Ctrl+N`). It clones the
 focused window's current URL onto a new window against the same server, so two
 conversations can be watched at once.
 
+## Debugging a packaged macOS build
+
+Developer Tools are disabled by default in the production app. To opt in, quit
+Omnigent, set its macOS user default, and reopen it:
+
+```bash
+defaults write ai.omnigent.desktop DeveloperMode -bool true
+```
+
+The **Debug → Developer Tools** menu is then available in the packaged app. To
+turn production debugging off again, quit Omnigent and remove the override:
+
+```bash
+defaults delete ai.omnigent.desktop DeveloperMode
+```
+
+Development (`pnpm --dir web/electron dev`) builds keep Developer Tools enabled
+without this preference. The override is intentionally macOS-only and does not
+relax production update security checks.
+
 The native enhancements live on the web side in
 [`../src/lib/nativeBridge.ts`](../src/lib/nativeBridge.ts). It detects the
 Electron shell at runtime (the preload exposes `window.omnigentDesktop`
@@ -374,7 +394,7 @@ From `web/electron/`:
 ```bash
 pnpm run build             # current platform
 pnpm run build:mac         # .dmg + .zip (signed if an identity is available, not notarized)
-pnpm run build:mac:release # .dmg + .zip, signed + notarized (requires credentials, see below)
+pnpm run build:mac:release # .dmg + .zip; app and DMG signed + notarized (see below)
 pnpm run build:linux       # AppImage + .deb
 pnpm run build:win         # NSIS installer
 ```
@@ -394,7 +414,7 @@ build:
 | ------------------------------------------------------------------ | -------------------------------------------------------------------- |
 | none                                                               | ad-hoc–signed app; runs locally, other Macs see a Gatekeeper warning |
 | Developer ID cert                                                  | signed app; downloads still warn until notarized                     |
-| Developer ID cert + Apple notarization creds (`build:mac:release`) | signed + notarized; installs cleanly everywhere                      |
+| Developer ID cert + Apple notarization creds (`build:mac:release`) | app and DMG signed + notarized; installs cleanly everywhere          |
 
 ### 1. Get a signing certificate
 
@@ -446,17 +466,21 @@ then:
 pnpm run build:mac:release
 ```
 
-This is the same build with `mac.notarize=true` switched on; expect the
-notarization step to add a few minutes (Apple-side processing). Verify the
+This release build signs and notarizes the app first so both the DMG and ZIP
+contain a trusted app. It then signs each finished DMG, submits it to Apple,
+and staples and validates the resulting ticket. Expect the notarization steps
+to add a few minutes per architecture (Apple-side processing). Verify the
 result with:
 
 ```bash
 spctl -a -vv dist/mac-arm64/Omnigent.app   # → "accepted, source=Notarized Developer ID"
+codesign --verify --verbose=2 dist/Omnigent-*-arm64.dmg
+xcrun stapler validate -v dist/Omnigent-*-arm64.dmg
 ```
 
-`build:mac:release` **fails loudly** if signing or notarization
-credentials are missing — that's intentional, so a release artifact can't
-silently ship unsigned.
+`build:mac:release` **fails loudly** if signing or notarization credentials
+are missing, if Apple rejects a DMG, or if stapling fails. That's intentional,
+so a release artifact can't silently ship unsigned or unnotarized.
 
 ## Getting a server to point at
 

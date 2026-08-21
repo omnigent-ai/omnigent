@@ -341,6 +341,11 @@ _MAX_CONSECUTIVE_AUTH_ERRORS = 3
 # process listens on the port — the local server is gone, not unreachable.
 _LOOPBACK_REFUSED_FATAL_ATTEMPTS = 100
 
+# Consecutive post-connect 401/403 rejections (~5 min at the backoff cap)
+# before the retry loop escalates from "check your VPN" to a re-auth prompt.
+# Operator-facing only — the host keeps retrying and never exits.
+_AUTH_REJECT_ESCALATE_ATTEMPTS = 30
+
 # Consecutive accepted-then-silent connections (upgrade completed, then the
 # socket died without one inbound frame) before the reconnect loop treats the
 # endpoint as unhealthy: it stops using the prompt "recycle" cadence and
@@ -1271,18 +1276,37 @@ class HostProcess:
                 self._auth_retry_streak < _MAX_CONSECUTIVE_AUTH_ERRORS
             )
             if should_retry:
-                _logger.warning("%s Retrying — check your VPN/network.", cause)
-            if should_retry and self._auth_retry_streak == 1:
-                # The warning above lands only in the CLI log file; print once
-                # per outage so a foreground `omnigent host` isn't silent.
-                print(
-                    f"⚠ {cause} Retrying — this usually means the VPN or "
-                    "network dropped. It will reconnect automatically once "
-                    "connectivity returns.",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            if should_retry:
+                # A sustained streak (vs. a brief VPN blip) means the credential
+                # is very likely permanently rejected: escalate the operator
+                # signal and name re-auth, but keep retrying so a real outage
+                # self-heals.
+                if (
+                    self._auth_retry_streak >= _AUTH_REJECT_ESCALATE_ATTEMPTS
+                    and self._auth_retry_streak % _AUTH_REJECT_ESCALATE_ATTEMPTS == 0
+                ):
+                    escalated = (
+                        f"{cause} The server has rejected it "
+                        f"{self._auth_retry_streak} times in a row — this is no "
+                        "longer a transient network blip. If it persists, the "
+                        "stored credential is likely no longer valid: run "
+                        f"`omnigent login {self._server_url}` and restart the "
+                        "host. Still retrying."
+                    )
+                    _logger.warning("%s", escalated)
+                    print(f"⚠ {escalated}", file=sys.stderr, flush=True)
+                else:
+                    _logger.warning("%s Retrying — check your VPN/network.", cause)
+                    if self._auth_retry_streak == 1:
+                        # The warning above lands only in the CLI log file;
+                        # print once per outage so a foreground `omnigent host`
+                        # isn't silent.
+                        print(
+                            f"⚠ {cause} Retrying — this usually means the VPN or "
+                            "network dropped. It will reconnect automatically "
+                            "once connectivity returns.",
+                            file=sys.stderr,
+                            flush=True,
+                        )
                 return None
         if status == 401:
             return HostConnectError(
@@ -1293,6 +1317,20 @@ class HostProcess:
                 + self._login_fix_hint()
             )
         if status == 403:
+            # An expired stored login is the common way to land here: the
+            # token loader yields nothing, the dial goes out
+            # unauthenticated, and the server's refusal looks like an
+            # authorization or version-skew problem. Name the real cause.
+            from omnigent.cli_auth import stored_token_status
+
+            if stored_token_status(self._server_url) == "expired":
+                return HostConnectError(
+                    "Connection refused (HTTP 403): your stored login "
+                    f"session for {self._server_url} has EXPIRED, so the "
+                    "tunnel was dialed without credentials. Run `omnigent "
+                    f"login {self._server_url}` to re-authenticate, then "
+                    "restart the host."
+                )
             return HostConnectError(
                 "Connection refused (HTTP 403): the server repeatedly rejected the host "
                 "tunnel. Either your "

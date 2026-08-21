@@ -42,6 +42,12 @@ describe("setup clipboard IPC wiring", () => {
   });
 });
 
+describe("production developer-mode wiring (src/main.js)", () => {
+  it("uses the same opt-in to enable the shell window's DevTools capability", () => {
+    assert.match(liveCode, /webPreferences:\s*\{[\s\S]{0,400}devTools:\s*developerModeEnabled\(\)/);
+  });
+});
+
 describe("workspace root bounce wiring (src/main.js)", () => {
   it("registers the bounce against the window's current pinned origin", () => {
     assert.match(
