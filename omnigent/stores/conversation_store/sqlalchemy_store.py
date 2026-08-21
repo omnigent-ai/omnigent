@@ -38,7 +38,6 @@ from omnigent.db.db_models import (
     SqlProject,
     SqlSessionPermission,
     SqlUserDailyCost,
-    SqlUserPeriodCost,
     current_workspace_id,
     uuid_to_bytes,
 )
@@ -1710,13 +1709,13 @@ class SqlAlchemyConversationStore(ConversationStore):
             # transaction (race-safe under SERIALIZABLE / SQLite's
             # single-writer semantics).
             existing = session.get(
-                SqlUserPeriodCost, (current_workspace_id(), user_id, period, harness_key)
+                SqlUserDailyCost, (current_workspace_id(), user_id, period, harness_key)
             )
             if existing is None:
                 session.add(
-                    SqlUserPeriodCost(
+                    SqlUserDailyCost(
                         user_id=user_id,
-                        period=period,
+                        day_utc=period,
                         harness=harness_key,
                         cost_usd=delta_usd,
                         updated_at=now,
@@ -1764,22 +1763,22 @@ class SqlAlchemyConversationStore(ConversationStore):
         if dialect == "sqlite":
             from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-            stmt = sqlite_insert(SqlUserPeriodCost)
+            stmt = sqlite_insert(SqlUserDailyCost)
         else:
             from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-            stmt = pg_insert(SqlUserPeriodCost)
+            stmt = pg_insert(SqlUserDailyCost)
         stmt = stmt.values(
             user_id=user_id,
-            period=period,
+            day_utc=period,
             harness=harness,
             cost_usd=delta_usd,
             updated_at=now,
         )
         stmt = stmt.on_conflict_do_update(
-            index_elements=["workspace_id", "user_id", "period", "harness"],
+            index_elements=["workspace_id", "user_id", "day_utc", "harness"],
             set_={
-                "cost_usd": SqlUserPeriodCost.cost_usd + stmt.excluded.cost_usd,
+                "cost_usd": SqlUserDailyCost.cost_usd + stmt.excluded.cost_usd,
                 "updated_at": stmt.excluded.updated_at,
             },
         )
@@ -1799,7 +1798,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         harness_key = CROSS_HARNESS_SENTINEL if harness is None else harness
         with self._session("get_period_cost") as session:
             row = session.get(
-                SqlUserPeriodCost, (current_workspace_id(), user_id, period, harness_key)
+                SqlUserDailyCost, (current_workspace_id(), user_id, period, harness_key)
             )
             return float(row.cost_usd) if row is not None else 0.0
 
@@ -1821,7 +1820,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         harness_key = CROSS_HARNESS_SENTINEL if harness is None else harness
         with self._session("sum_period_cost") as session:
             row = session.get(
-                SqlUserPeriodCost, (current_workspace_id(), user_id, period, harness_key)
+                SqlUserDailyCost, (current_workspace_id(), user_id, period, harness_key)
             )
             return float(row.cost_usd) if row is not None else 0.0
 
@@ -1847,7 +1846,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         harness_key = CROSS_HARNESS_SENTINEL if harness is None else harness
         with self._session("get_period_cost_state") as session:
             row = session.get(
-                SqlUserPeriodCost, (current_workspace_id(), user_id, period, harness_key)
+                SqlUserDailyCost, (current_workspace_id(), user_id, period, harness_key)
             )
             if row is None:
                 return {"cost_usd": 0.0, "ask_approved_usd": 0.0}
@@ -1892,14 +1891,14 @@ class SqlAlchemyConversationStore(ConversationStore):
                 if dialect == "sqlite":
                     from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-                    stmt = sqlite_insert(SqlUserPeriodCost)
+                    stmt = sqlite_insert(SqlUserDailyCost)
                 else:
                     from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-                    stmt = pg_insert(SqlUserPeriodCost)
+                    stmt = pg_insert(SqlUserDailyCost)
                 stmt = stmt.values(
                     user_id=user_id,
-                    period=period,
+                    day_utc=period,
                     harness=harness_key,
                     cost_usd=0.0,
                     ask_approved_usd=ask_approved_usd,
@@ -1908,7 +1907,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # On conflict touch only the approval (+ stamp) — never
                 # the accumulated cost.
                 stmt = stmt.on_conflict_do_update(
-                    index_elements=["workspace_id", "user_id", "period", "harness"],
+                    index_elements=["workspace_id", "user_id", "day_utc", "harness"],
                     set_={
                         "ask_approved_usd": stmt.excluded.ask_approved_usd,
                         "updated_at": stmt.excluded.updated_at,
@@ -1918,13 +1917,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                 return
             # Generic dialect fallback — SELECT-then-INSERT/UPDATE.
             existing = session.get(
-                SqlUserPeriodCost, (current_workspace_id(), user_id, period, harness_key)
+                SqlUserDailyCost, (current_workspace_id(), user_id, period, harness_key)
             )
             if existing is None:
                 session.add(
-                    SqlUserPeriodCost(
+                    SqlUserDailyCost(
                         user_id=user_id,
-                        period=period,
+                        day_utc=period,
                         harness=harness_key,
                         cost_usd=0.0,
                         ask_approved_usd=ask_approved_usd,

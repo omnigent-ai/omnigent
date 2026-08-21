@@ -1320,35 +1320,47 @@ class SqlUserDailyCost(OmnigentBase):
     """
     SQLAlchemy model for the ``user_daily_cost`` table.
 
-    A running per-user, per-UTC-day rollup of LLM spend, used by
-    cost-aware policies (e.g. the "downgrade expensive model once a
-    user has spent >$X today" sample policy) to read a user's
-    accumulated daily cost as a single O(1) point lookup instead of
-    aggregating the per-session ``conversations.session_usage`` blobs
-    on every policy evaluation.
+    A running per-user, per-period, per-harness rollup of LLM spend,
+    used by cost-aware policies (e.g. the "downgrade expensive model once
+    a user has spent >$X this month" policy) to read a user's accumulated
+    period cost as a single O(1) point lookup instead of aggregating the
+    per-session ``conversations.session_usage`` blobs on every policy
+    evaluation.
 
-    One row per ``(user_id, day_utc)``. Incremented (UPSERT
-    ``cost_usd = cost_usd + delta``) at each turn boundary from the
-    cost write sites — but only when the session runs under at least
-    one policy, so the table is never touched in deployments that
-    have no policies configured (this keeps the shared server code
-    inert against a database that lacks this table).
+    One row per ``(user_id, day_utc, harness)``. Incremented (UPSERT
+    ``cost_usd = cost_usd + delta``) at each turn boundary from the cost
+    write sites **unconditionally** on every priced turn (not gated on
+    whether policies are configured). Deployments must run the migration
+    before this code ships.
+
+    The ``harness`` column enables two budget modes:
+    - Per-harness budgets: read cost for a specific harness (e.g.
+      ``harness="codex-native"``).
+    - Cross-harness budgets: use the sentinel value
+      :const:`CROSS_HARNESS_SENTINEL` (``"__all__"``) to sum cost
+      across all harnesses for a user+period.
 
     :param user_id: The user the cost is attributed to — the session
         creator (``LEVEL_OWNER`` grantee), e.g.
         ``"alice@example.com"``.
-    :param day_utc: The UTC calendar day the spend occurred, as an
-        ISO date string ``"YYYY-MM-DD"``, e.g. ``"2026-06-05"``.
-        Bucketed by the turn's wall-clock time, so a session spanning
-        midnight splits its cost across both days correctly.
-    :param cost_usd: Cumulative USD spend for this user on this day.
-        Starts at the first turn's delta and grows by each subsequent
-        turn's delta.
+    :param day_utc: The time period the spend occurred, formatted according
+        to the granularity: ``"YYYY-MM-DD"`` (day), ``"YYYY-Www"`` (week,
+        ISO week number), ``"YYYY-MM"`` (month), ``"YYYY-Qq"`` (quarter),
+        or ``"YYYY"`` (year). E.g. ``"2026-08-21"``, ``"2026-W34"``,
+        ``"2026-08"``, ``"2026-Q3"``, ``"2026"``. Bucketed by the turn's
+        wall-clock time.
+    :param harness: The harness that executed the turn, e.g.
+        ``"codex-native"``, ``"claude-sdk"``. Set to
+        :const:`CROSS_HARNESS_SENTINEL` (``"__all__"``) for cross-harness
+        budgets that sum cost across all harnesses.
+    :param cost_usd: Cumulative USD spend for this user in this period on
+        this harness. Starts at the first turn's delta and grows by each
+        subsequent turn's delta.
     :param ask_approved_usd: Highest soft warning checkpoint (USD) the
-        user has already approved continuing past for this day — read
-        and written by the per-user daily cost-budget policy so an
-        approved checkpoint prompts at most once per day (across all of
-        the user's sessions), not once per session. ``0.0`` (the
+        user has already approved continuing past for this period+harness
+        — read and written by the per-user period cost-budget policy so
+        an approved checkpoint prompts at most once per period (across all
+        of the user's sessions), not once per session. ``0.0`` (the
         server default) means no checkpoint approved yet.
     :param updated_at: Unix epoch seconds of the last increment.
     """
@@ -1365,71 +1377,6 @@ class SqlUserDailyCost(OmnigentBase):
     )
     user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     day_utc: Mapped[str] = mapped_column(String(10), primary_key=True)
-    cost_usd: Mapped[float] = mapped_column(Float, nullable=False)
-    ask_approved_usd: Mapped[float] = mapped_column(Float, nullable=False, server_default="0")
-    updated_at: Mapped[int] = mapped_column(Integer)
-
-
-class SqlUserPeriodCost(OmnigentBase):
-    """
-    SQLAlchemy model for the ``user_period_cost`` table.
-
-    A running per-user, per-period, per-harness rollup of LLM spend,
-    used by cost-aware policies (e.g. the "downgrade expensive model once
-    a user has spent >$X this month" policy) to read a user's accumulated
-    monthly cost as a single O(1) point lookup instead of aggregating the
-    per-session ``conversations.session_usage`` blobs on every policy
-    evaluation.
-
-    One row per ``(user_id, period, harness)``. Incremented (UPSERT
-    ``cost_usd = cost_usd + delta``) at each turn boundary from the cost
-    write sites **unconditionally** on every priced turn (not gated on
-    whether policies are configured). Deployments must run the migration
-    before this code ships.
-
-    The ``harness`` column enables two budget modes:
-    - Per-harness budgets: read cost for a specific harness (e.g.
-      ``harness="codex-native"``).
-    - Cross-harness budgets: sum cost across all harnesses for a user+period
-      (``GROUP BY user_id, period``).
-
-    :param user_id: The user the cost is attributed to — the session
-        creator (``LEVEL_OWNER`` grantee), e.g.
-        ``"alice@example.com"``.
-    :param period: The time period the spend occurred, formatted according
-        to the granularity: ``"YYYY-MM-DD"`` (day), ``"YYYY-Www"`` (week,
-        ISO week number), ``"YYYY-MM"`` (month), ``"YYYY-Qq"`` (quarter),
-        or ``"YYYY"`` (year). E.g. ``"2026-06"``, ``"2026-W25"``,
-        ``"2026-Q2"``, ``"2026"``. Bucketed by the turn's wall-clock time.
-    :param harness: The harness that executed the turn, e.g.
-        ``"codex-native"``, ``"claude-sdk"``. Set to
-        :const:`CROSS_HARNESS_SENTINEL` (``"__all__"``) for cross-harness
-        budgets that sum cost across all harnesses. This sentinel is used
-        instead of NULL because ``harness`` is part of the PRIMARY KEY.
-    :param cost_usd: Cumulative USD spend for this user in this month on
-        this harness. Starts at the first turn's delta and grows by each
-        subsequent turn's delta.
-    :param ask_approved_usd: Highest soft warning checkpoint (USD) the
-        user has already approved continuing past for this period+harness
-        — read and written by the per-user period cost-budget policy so
-        an approved checkpoint prompts at most once per period (across all
-        of the user's sessions), not once per session. ``0.0`` (the
-        server default) means no checkpoint approved yet.
-    :param updated_at: Unix epoch seconds of the last increment.
-    """
-
-    __tablename__ = "user_period_cost"
-
-    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
-    workspace_id: Mapped[int] = mapped_column(
-        BigInteger,
-        primary_key=True,
-        nullable=False,
-        server_default="0",
-        default=current_workspace_id,
-    )
-    user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
-    period: Mapped[str] = mapped_column(String(10), primary_key=True)
     harness: Mapped[str] = mapped_column(
         String(64),
         primary_key=True,
