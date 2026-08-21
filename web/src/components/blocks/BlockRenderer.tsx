@@ -608,10 +608,9 @@ function TurnWorkedFold({
       data-testid="turn-worked-fold"
     >
       <div ref={rowRef} className={cn("turn-fold-row", animateCollapse && "turn-fold-row-enter")}>
-        <CollapsibleTrigger className="flex w-full cursor-pointer items-center gap-1 py-0.5 text-left text-muted-foreground text-sm transition-colors hover:text-foreground">
+        <CollapsibleTrigger className="flex cursor-pointer items-center gap-2 rounded-sm py-1 text-left text-muted-foreground text-sm outline-none transition-colors hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50">
           <span className="shrink-0">{label}</span>
-          <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-data-[state=open]/turn-fold:rotate-90" />
-          <span aria-hidden className="ml-1 flex-1 border-border border-t" />
+          <ChevronRightIcon className="size-2.5 shrink-0 transition-transform group-data-[state=open]/turn-fold:rotate-90" />
         </CollapsibleTrigger>
       </div>
       {/* Height animation lives in index.css (it needs Radix's measured
@@ -624,7 +623,14 @@ function TurnWorkedFold({
       <CollapsibleContent
         className={cn("turn-fold-content", userOpened && "turn-fold-content-instant")}
       >
-        <div className="flex flex-col gap-2">{children}</div>
+        <div className="relative flex flex-col gap-2 pt-2 pl-4">
+          <span
+            aria-hidden
+            className="absolute top-2 bottom-0 left-1 w-px bg-border"
+            data-testid="turn-worked-fold-pin-line"
+          />
+          {children}
+        </div>
       </CollapsibleContent>
     </Collapsible>
   );
