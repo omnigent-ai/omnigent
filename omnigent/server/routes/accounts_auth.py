@@ -306,11 +306,15 @@ def create_accounts_auth_router(
         # against a row that exists. Defensive-coding the dereference
         # would only mask a SqlAlchemy bug, which we want to surface.
         assert user is not None
-        body_payload = {
+        body_payload: dict[str, object] = {
             "token": session_jwt,
             "expires_in": _session_max_age,
             "user": {"id": user.id, "is_admin": user.is_admin},
         }
+        # Browser login must never receive refresh material — only CLI/device
+        # flows do (via /auth/cli-poll or device-grant callback). This is
+        # enforced server-side so an XSS or form-hijack cannot obtain
+        # long-lived unattended credentials.
         resp = JSONResponse(status_code=200, content=body_payload)
         _set_session_cookie(
             resp,

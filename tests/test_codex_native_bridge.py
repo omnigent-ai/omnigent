@@ -20,6 +20,7 @@ from omnigent.codex_native_bridge import (
     read_bridge_startup_error,
     read_bridge_state,
     read_codex_config_model,
+    read_codex_home_config_model,
     read_mcp_startup,
     read_policy_hook_config,
     settle_pending_mcp_startup,
@@ -119,6 +120,18 @@ def test_read_codex_config_model_returns_top_level_model(bridge_dir: Path) -> No
     _write_config(bridge_dir, 'model_provider = "databricks"\nmodel = "gpt-5.4"\n')
 
     assert read_codex_config_model(bridge_dir) == "gpt-5.4"
+
+
+def test_read_codex_home_config_model_reads_a_codex_home_directly(bridge_dir: Path) -> None:
+    """A ``CODEX_HOME`` path yields the same model as the bridge-dir reader.
+
+    The runner's model-options endpoint holds the live bridge state's
+    ``codex_home``, not the bridge dir, and needs the session's model to
+    mark which catalog row this session actually launched on.
+    """
+    _write_config(bridge_dir, 'model = "gpt-5.6-luna"\n')
+
+    assert read_codex_home_config_model(codex_home_for_bridge_dir(bridge_dir)) == "gpt-5.6-luna"
 
 
 def test_read_codex_config_model_none_when_missing(bridge_dir: Path) -> None:

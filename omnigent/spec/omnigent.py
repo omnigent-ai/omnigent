@@ -1670,10 +1670,9 @@ def _translate_executor_from_def(
         of the supported set so an empty string fails
         hard there.
     :param raw_executor: Optional raw YAML ``executor:`` mapping.
-        When present, ``use_responses`` (``bool | None``) is read
-        from it and forwarded into ``executor.config["use_responses"]``
-        so the openai-agents harness subprocess reads the correct
-        API surface (chat/completions vs. responses). The omnigent
+        When present, OpenAI Agents SDK wire settings are forwarded
+        into ``executor.config`` so the harness subprocess reads the
+        correct API surface and reasoning replay policy. The omnigent
         loader silently drops unknown fields on its own
         :class:`~omnigent.inner.datamodel.ExecutorSpec`, so we
         have to recover this field from the raw dict here.
@@ -1749,9 +1748,8 @@ def _translate_executor_from_def(
         "harness": harness,
         "profile": profile,
     }
-    # ``use_responses`` and ``acp_agent`` are not fields on the omnigent inner
-    # ExecutorSpec (the loader drops unknown keys), so read them from the raw
-    # YAML dict and carry them forward explicitly.
+    # These are not fields on the omnigent inner ExecutorSpec, so read them
+    # from the raw YAML dict and carry them forward explicitly.
     # The openai-agents harness spawn-env builder reads
     # ``spec.executor.config["use_responses"]`` to set
     # ``HARNESS_OPENAI_AGENTS_USE_RESPONSES``, which controls
@@ -1761,6 +1759,8 @@ def _translate_executor_from_def(
         use_responses_raw = raw_executor.get("use_responses")
         if use_responses_raw is not None:
             config["use_responses"] = bool(use_responses_raw)
+        if "reasoning_item_id_policy" in raw_executor:
+            config["reasoning_item_id_policy"] = raw_executor["reasoning_item_id_policy"]
         if "acp_agent" in raw_executor:
             config["acp_agent"] = raw_executor["acp_agent"]
     # ``auth`` is now parsed by the loader into OmniExecutorSpec.auth;

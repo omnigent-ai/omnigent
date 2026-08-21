@@ -20,6 +20,7 @@ Tool categories:
 from __future__ import annotations
 
 import asyncio
+import base64
 import dataclasses
 import json
 import logging
@@ -604,9 +605,239 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
 # sys_os_write, e.g. following the ``build-omnigent`` skill).
 _AGENT_CONFIG_SUBDIR = ".omnigent/agent-configs"
 
-# Broad page size for the sys_agent_list fan-out reads. Orchestrators want
-# the full launchable surface in one call, not a 20-row default page.
+# Broad internal page size for discovery fan-out reads.
 _AGENT_LIST_PAGE_LIMIT = 1000
+
+_DISCOVERY_LIST_MAX_LIMIT = 100
+# Match the existing default ceiling for ``sys_os_shell`` output. Discovery
+# tools stay below the same Omnigent-owned budget instead of guessing a
+# harness-specific limit.
+_DISCOVERY_LIST_OUTPUT_MAX_CHARS = 100_000
+_DISCOVERY_CURSOR_MAX_CHARS = 40_000
+_DISCOVERY_START = "start"
+_DISCOVERY_AT = "at"
+_DISCOVERY_END = "end"
+_DiscoveryState = tuple[str, str | None]
+
+
+def _discovery_list_window(
+    args: _JsonObject,
+    tool_name: str,
+    page_sections: tuple[str, ...],
+    filters: _JsonObject,
+) -> tuple[int | None, dict[str, _DiscoveryState], bool] | str:
+    """Validate discovery pagination and decode its opaque continuation cursor."""
+    limit = args.get("limit")
+    if "limit" in args and (
+        not isinstance(limit, int)
+        or isinstance(limit, bool)
+        or not 1 <= limit <= _DISCOVERY_LIST_MAX_LIMIT
+    ):
+        return json.dumps(
+            {
+                "error": (
+                    f"{tool_name}: 'limit' must be an integer between 1 and "
+                    f"{_DISCOVERY_LIST_MAX_LIMIT}"
+                )
+            }
+        )
+    cursor = args.get("cursor")
+    state: dict[str, _DiscoveryState] = dict.fromkeys(page_sections, (_DISCOVERY_START, None))
+    if cursor is None:
+        return cast(int | None, limit), state, False
+    if not isinstance(cursor, str) or not cursor:
+        return json.dumps({"error": f"{tool_name}: 'cursor' must be a non-empty string"})
+    if len(cursor) > _DISCOVERY_CURSOR_MAX_CHARS:
+        return json.dumps({"error": f"{tool_name}: pagination cursor is too long"})
+    try:
+        padding = "=" * (-len(cursor) % 4)
+        raw = base64.b64decode(cursor + padding, altchars=b"-_", validate=True)
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return json.dumps({"error": f"{tool_name}: invalid pagination cursor"})
+    if not isinstance(payload, dict) or set(payload) != {"v", "tool", "filters", "sections"}:
+        return json.dumps({"error": f"{tool_name}: invalid pagination cursor"})
+    if payload.get("v") != 1:
+        return json.dumps({"error": f"{tool_name}: invalid pagination cursor"})
+    if payload.get("tool") != tool_name:
+        return json.dumps({"error": f"{tool_name}: cursor was minted by a different tool"})
+    if payload.get("filters") != filters:
+        return json.dumps({"error": f"{tool_name}: cursor uses different filter arguments"})
+    sections = payload.get("sections")
+    if not isinstance(sections, dict) or set(sections) != set(page_sections):
+        return json.dumps({"error": f"{tool_name}: invalid pagination cursor"})
+    for name in state:
+        value = sections.get(name)
+        if not isinstance(value, list) or len(value) != 2:
+            return json.dumps({"error": f"{tool_name}: invalid pagination cursor"})
+        tag, position = value
+        if tag in {_DISCOVERY_START, _DISCOVERY_END}:
+            if position is not None:
+                return json.dumps({"error": f"{tool_name}: invalid pagination cursor"})
+        elif tag == _DISCOVERY_AT:
+            if not isinstance(position, str) or not position:
+                return json.dumps({"error": f"{tool_name}: invalid pagination cursor"})
+        else:
+            return json.dumps({"error": f"{tool_name}: invalid pagination cursor"})
+        state[name] = (tag, cast(str | None, position))
+    return cast(int | None, limit), state, True
+
+
+def _encode_discovery_cursor(
+    tool_name: str,
+    filters: _JsonObject,
+    state: dict[str, _DiscoveryState],
+) -> str | None:
+    """Serialize a discovery continuation cursor without exposing its shape."""
+    payload = json.dumps(
+        {
+            "v": 1,
+            "tool": tool_name,
+            "filters": filters,
+            "sections": {name: list(value) for name, value in state.items()},
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    cursor = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+    return cursor if len(cursor) <= _DISCOVERY_CURSOR_MAX_CHARS else None
+
+
+@dataclass(frozen=True)
+class _DiscoveryPage:
+    """Rows and continuation state from one discovery source."""
+
+    rows: list[_JsonObject]
+    has_more: bool
+    next_after: str | None = None
+    failed: bool = False
+
+
+def _parse_discovery_page(body: object) -> _DiscoveryPage:
+    """Validate the server envelope before trusting its continuation state."""
+    if not isinstance(body, dict):
+        return _DiscoveryPage([], False, failed=True)
+    data = body.get("data")
+    if not isinstance(data, list):
+        return _DiscoveryPage([], False, failed=True)
+    rows: list[_JsonObject] = []
+    for row in data:
+        if not isinstance(row, dict):
+            return _DiscoveryPage([], False, failed=True)
+        row_id = row.get("id")
+        if not isinstance(row_id, str) or not row_id:
+            return _DiscoveryPage([], False, failed=True)
+        rows.append(row)
+    has_more = body.get("has_more", False)
+    last_id = body.get("last_id")
+    if not isinstance(has_more, bool):
+        return _DiscoveryPage([], False, failed=True)
+    if last_id is not None and (not isinstance(last_id, str) or not last_id):
+        return _DiscoveryPage([], False, failed=True)
+    if has_more and last_id is None:
+        return _DiscoveryPage([], False, failed=True)
+    return _DiscoveryPage(rows, has_more, cast(str | None, last_id))
+
+
+def _bounded_discovery_result(
+    sections: dict[str, list[_JsonObject]],
+    *,
+    limit: int | None,
+    cursor_state: dict[str, _DiscoveryState],
+    continued: bool,
+    source_pages: dict[str, _DiscoveryPage],
+    page_sections: tuple[str, ...] | None = None,
+    tool_name: str,
+    filters: _JsonObject,
+) -> str:
+    """Keep a small legacy result intact, otherwise return a fitting page."""
+    complete = json.dumps(sections)
+    if (
+        limit is None
+        and not continued
+        and not any(page.failed for page in source_pages.values())
+        and not any(page.has_more for page in source_pages.values())
+        and len(complete) <= _DISCOVERY_LIST_OUTPUT_MAX_CHARS
+    ):
+        return complete
+
+    requested_limit = limit or _DISCOVERY_LIST_MAX_LIMIT
+    paged = page_sections or tuple(sections)
+
+    def _candidate(candidate_limit: int) -> str | None:
+        page = dict(sections)
+        has_more: dict[str, bool] = {}
+        next_state = dict(cursor_state)
+        for name in paged:
+            rows = sections[name]
+            page_rows = rows[:candidate_limit]
+            page[name] = page_rows
+            source_page = source_pages[name]
+            if source_page.failed:
+                # A failed read proves neither progress nor exhaustion. Keep
+                # the incoming position so the continuation retries it.
+                has_more[name] = True
+                continue
+            has_more[name] = len(rows) > candidate_limit or source_page.has_more
+            if not has_more[name]:
+                next_state[name] = (_DISCOVERY_END, None)
+            elif page_rows:
+                if name == "local_configs":
+                    position = _optional_string(page_rows[-1].get("path"))
+                else:
+                    identifier = "agent_id" if name == "builtins" else "session_id"
+                    position = _optional_string(page_rows[-1].get(identifier))
+                if position is not None:
+                    next_state[name] = (_DISCOVERY_AT, position)
+            elif source_page.has_more and source_page.next_after is not None:
+                next_state[name] = (_DISCOVERY_AT, source_page.next_after)
+        metadata: dict[str, object] = {
+            "limit": candidate_limit,
+            "has_more": has_more,
+        }
+        if any(has_more.values()):
+            cursor = _encode_discovery_cursor(tool_name, filters, next_state)
+            if cursor is None:
+                return None
+            metadata["next_cursor"] = cursor
+        return json.dumps({**page, "page": metadata})
+
+    # Cursor size depends on the last returned row, so serialized page size is
+    # not monotonic in the row limit. Check the bounded public range directly.
+    for candidate_limit in range(requested_limit, 0, -1):
+        candidate = _candidate(candidate_limit)
+        if candidate is not None and len(candidate) <= _DISCOVERY_LIST_OUTPUT_MAX_CHARS:
+            return candidate
+
+    empty_page = _candidate(0)
+    if empty_page is None:
+        return json.dumps(
+            {
+                "error": (
+                    f"Discovery continuation exceeds the {_DISCOVERY_CURSOR_MAX_CHARS}-character "
+                    "cursor limit."
+                )
+            }
+        )
+    if len(empty_page) > _DISCOVERY_LIST_OUTPUT_MAX_CHARS:
+        kind = "fixed_section"
+        oversized_sections = [
+            name for name, rows in sections.items() if name not in paged and rows
+        ]
+    else:
+        kind = "paginated_row"
+        oversized_sections = [name for name in paged if sections[name]]
+    return json.dumps(
+        {
+            "error": (
+                f"Discovery result exceeds the {_DISCOVERY_LIST_OUTPUT_MAX_CHARS}-character "
+                "output limit even at the smallest page."
+            ),
+            "page": {"has_more": {name: source_pages[name].has_more for name in paged}},
+            "oversized": {"kind": kind, "sections": oversized_sections},
+        }
+    )
+
 
 # Union of all locally-dispatched tools.
 _ALL_LOCAL_TOOLS = (
@@ -3738,7 +3969,24 @@ async def _execute_session_query_tool(
         return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
 
     if tool_name == "sys_session_list":
-        return await _session_list_via_rest(conversation_id, server_client, args.get("agent_name"))
+        agent_name = args.get("agent_name")
+        window = _discovery_list_window(
+            args,
+            tool_name,
+            ("sessions",),
+            {"agent_name": agent_name if isinstance(agent_name, str) and agent_name else None},
+        )
+        if isinstance(window, str):
+            return window
+        limit, cursor_state, continued = window
+        return await _session_list_via_rest(
+            conversation_id,
+            server_client,
+            agent_name,
+            limit=limit,
+            cursor_state=cursor_state,
+            continued=continued,
+        )
     if tool_name == "sys_session_get_history":
         return await _session_get_history_via_rest(args, server_client)
     if tool_name == "sys_session_get_info":
@@ -4051,11 +4299,23 @@ async def _execute_agent_tool(
     if server_client is None:
         return json.dumps({"error": f"{tool_name} requires server access"})
     if tool_name == "sys_agent_list":
+        window = _discovery_list_window(
+            args,
+            tool_name,
+            ("builtins", "session_agents", "local_configs"),
+            {},
+        )
+        if isinstance(window, str):
+            return window
+        limit, cursor_state, continued = window
         return await _agent_list_via_rest(
             server_client,
             agent_spec=agent_spec,
             conversation_id=conversation_id,
             runner_workspace=runner_workspace,
+            limit=limit,
+            cursor_state=cursor_state,
+            continued=continued,
         )
     session_id = args.get("session_id")
     if not isinstance(session_id, str) or not session_id:
@@ -4232,9 +4492,12 @@ async def _agent_download_via_rest(
 async def _agent_list_fetch(
     path: str,
     server_client: httpx.AsyncClient,
-) -> list[_JsonObject]:
+    *,
+    after: str | None,
+    limit: int,
+) -> _DiscoveryPage:
     """
-    Fetch one page of a paginated list endpoint, returning its ``data``.
+    Fetch one cursor page of a paginated list endpoint.
 
     Best-effort: returns ``[]`` on transport error or non-200 so a single
     failing source degrades ``sys_agent_list`` to "that section is empty"
@@ -4243,21 +4506,24 @@ async def _agent_list_fetch(
     :param path: The list endpoint path, e.g. ``"/v1/agents"`` or
         ``"/v1/sessions"``.
     :param server_client: HTTP client pointed at the Omnigent server.
-    :returns: The ``data`` list from the paginated response (possibly
-        empty).
+    :param after: Server cursor from the previous page, if any.
+    :param limit: Maximum number of source rows to fetch.
+    :returns: Rows and server continuation metadata.
     """
     try:
-        resp = await server_client.get(
-            path,
-            params={"limit": _AGENT_LIST_PAGE_LIMIT, "order": "desc"},
-            timeout=30.0,
-        )
+        params: dict[str, str | int] = {"limit": limit, "order": "desc"}
+        if after is not None:
+            params["after"] = after
+        resp = await server_client.get(path, params=params, timeout=30.0)
     except Exception:  # noqa: BLE001
-        return []
+        return _DiscoveryPage([], False, failed=True)
     if resp.status_code != 200:
-        return []
-    body = _string_object_dict(resp.json())
-    return _json_object_list(body.get("data")) if body is not None else []
+        return _DiscoveryPage([], False, failed=True)
+    try:
+        body = resp.json()
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return _DiscoveryPage([], False, failed=True)
+    return _parse_discovery_page(body)
 
 
 def _scan_local_agent_configs(configs_dir: Path) -> list[_JsonObject]:
@@ -4419,6 +4685,9 @@ async def _agent_list_via_rest(
     agent_spec: AgentSpec | None,
     conversation_id: str | None,
     runner_workspace: Path | None,
+    limit: int | None,
+    cursor_state: dict[str, _DiscoveryState],
+    continued: bool,
 ) -> str:
     """
     List launchable agents across built-ins, session-bound, and local.
@@ -4448,19 +4717,70 @@ async def _agent_list_via_rest(
         resolution of the local-config scan.
     :param conversation_id: The caller's session id, for os_env cwd.
     :param runner_workspace: The runner workspace, authoritative cwd.
-    :returns: JSON ``{builtins, session_agents, local_configs}``.
+    :param limit: Optional maximum rows returned from each source. When
+        omitted, the complete legacy result is preserved while it fits.
+    :param cursor_state: Opaque continuation positions for each source.
+    :returns: The legacy complete JSON result while it fits, otherwise a
+        bounded page with continuation metadata.
     """
-    builtins_raw = await _agent_list_fetch("/v1/agents", server_client)
-    sessions_raw = await _agent_list_fetch("/v1/sessions", server_client)
+    source_limit = limit or _AGENT_LIST_PAGE_LIMIT
+    builtins_page = (
+        _DiscoveryPage([], False)
+        if cursor_state["builtins"][0] == _DISCOVERY_END
+        else await _agent_list_fetch(
+            "/v1/agents",
+            server_client,
+            after=cursor_state["builtins"][1],
+            limit=source_limit,
+        )
+    )
+    sessions_page = (
+        _DiscoveryPage([], False)
+        if cursor_state["session_agents"][0] == _DISCOVERY_END
+        else await _agent_list_fetch(
+            "/v1/sessions",
+            server_client,
+            after=cursor_state["session_agents"][1],
+            limit=source_limit,
+        )
+    )
     spec = _effective_runner_os_env_spec(agent_spec, conversation_id, runner_workspace)
     assert spec.cwd is not None
     configs_dir = Path(spec.cwd) / _AGENT_CONFIG_SUBDIR
     local_configs = await asyncio.to_thread(_scan_local_agent_configs, configs_dir)
-    listing = _project_agent_list(builtins_raw, sessions_raw, local_configs)
+    local_state, local_after = cursor_state["local_configs"]
+    if local_state == _DISCOVERY_END:
+        remaining_configs = []
+    elif local_after is not None:
+        remaining_configs = [
+            row for row in local_configs if str(row.get("path", "")) > local_after
+        ]
+    else:
+        remaining_configs = local_configs
+    listing = _project_agent_list(
+        builtins_page.rows,
+        sessions_page.rows,
+        remaining_configs[:source_limit],
+    )
     listing["builtins"] = _in_spawn_family(
         listing["builtins"], await _spawn_family(server_client, conversation_id)
     )
-    return json.dumps(listing)
+    return _bounded_discovery_result(
+        listing,
+        limit=limit,
+        cursor_state=cursor_state,
+        continued=continued,
+        tool_name="sys_agent_list",
+        filters={},
+        source_pages={
+            "builtins": builtins_page,
+            "session_agents": sessions_page,
+            "local_configs": _DiscoveryPage(
+                listing["local_configs"],
+                len(listing["local_configs"]) < len(remaining_configs),
+            ),
+        },
+    )
 
 
 def _project_agent_list(
@@ -4511,6 +4831,10 @@ async def _session_list_via_rest(
     conversation_id: str,
     server_client: httpx.AsyncClient,
     agent_name: object = None,
+    *,
+    limit: int | None,
+    cursor_state: dict[str, _DiscoveryState],
+    continued: bool,
 ) -> str:
     """
     Return the two-view session list: ``sub_agents`` + global ``sessions``.
@@ -4528,11 +4852,33 @@ async def _session_list_via_rest(
     :param server_client: HTTP client pointed at the Omnigent server.
     :param agent_name: Optional agent-name filter for the global
         ``sessions`` view; ignored for ``sub_agents``.
-    :returns: JSON ``{"sub_agents": [...], "sessions": [...]}``.
+    :param limit: Optional maximum rows returned from the global sessions view. When
+        omitted, the complete legacy result is preserved while it fits.
+    :param cursor_state: Opaque continuation position for the global sessions view.
+    :returns: The legacy complete JSON result while it fits, otherwise a
+        bounded page with continuation metadata.
     """
     sub_agents = await _collect_sub_agents(conversation_id, server_client)
-    sessions = await _collect_global_sessions(server_client, agent_name)
-    return json.dumps({"sub_agents": sub_agents, "sessions": sessions})
+    sessions_page = (
+        _DiscoveryPage([], False)
+        if cursor_state["sessions"][0] == _DISCOVERY_END
+        else await _collect_global_sessions(
+            server_client,
+            agent_name,
+            after=cursor_state["sessions"][1],
+            limit=limit or _AGENT_LIST_PAGE_LIMIT,
+        )
+    )
+    return _bounded_discovery_result(
+        {"sub_agents": cast(list[_JsonObject], sub_agents), "sessions": sessions_page.rows},
+        limit=limit,
+        cursor_state=cursor_state,
+        continued=continued,
+        tool_name="sys_session_list",
+        filters={"agent_name": agent_name if isinstance(agent_name, str) and agent_name else None},
+        source_pages={"sessions": sessions_page},
+        page_sections=("sessions",),
+    )
 
 
 async def _rename_current_session_via_rest(
@@ -4668,7 +5014,10 @@ async def _resolve_runner_online_map(
 async def _collect_global_sessions(
     server_client: httpx.AsyncClient,
     agent_name: object,
-) -> list[_JsonObject]:
+    *,
+    after: str | None,
+    limit: int,
+) -> _DiscoveryPage:
     """
     Fetch the global session list via ``GET /v1/sessions``, with connectivity.
 
@@ -4683,38 +5032,50 @@ async def _collect_global_sessions(
     :param server_client: HTTP client pointed at the Omnigent server.
     :param agent_name: Optional agent-name filter; applied only when a
         non-empty string.
-    :returns: The projected global session entries.
+    :param after: Server cursor from the previous page, if any.
+    :param limit: Maximum number of source rows to fetch.
+    :returns: Projected global session entries and continuation metadata.
     """
-    params: dict[str, str | int] = {"limit": _AGENT_LIST_PAGE_LIMIT, "order": "desc"}
+    params: dict[str, str | int] = {"limit": limit, "order": "desc"}
     if isinstance(agent_name, str) and agent_name:
         params["agent_name"] = agent_name
+    if after is not None:
+        params["after"] = after
     try:
         resp = await server_client.get("/v1/sessions", params=params, timeout=30.0)
     except Exception:  # noqa: BLE001
-        return []
+        return _DiscoveryPage([], False, failed=True)
     if resp.status_code != 200:
-        return []
-    body = _string_object_dict(resp.json())
-    if body is None:
-        return []
-    rows = _json_object_list(body.get("data"))
+        return _DiscoveryPage([], False, failed=True)
+    try:
+        body = resp.json()
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return _DiscoveryPage([], False, failed=True)
+    page = _parse_discovery_page(body)
+    if page.failed:
+        return page
+    rows = page.rows
     online = await _resolve_runner_online_map(rows, server_client)
-    return [
-        {
-            "session_id": r.get("id"),
-            # Hide the internal ``-native-ui`` wrapper name (e.g.
-            # ``pi-native-ui`` -> ``Pi``) in the global listing too, matching
-            # ``sys_session_get_info``. The server-side ``agent_name`` filter
-            # above still receives the caller's raw argument unchanged.
-            "agent_name": public_agent_name(_optional_string(r.get("agent_name"))),
-            "title": r.get("title"),
-            "status": r.get("status"),
-            "runner_id": r.get("runner_id"),
-            "runner_online": online.get(_optional_string(r.get("runner_id")) or ""),
-            "parent_session_id": r.get("parent_session_id"),
-        }
-        for r in rows
-    ]
+    return _DiscoveryPage(
+        [
+            {
+                "session_id": r.get("id"),
+                # Hide the internal ``-native-ui`` wrapper name (e.g.
+                # ``pi-native-ui`` -> ``Pi``) in the global listing too, matching
+                # ``sys_session_get_info``. The server-side ``agent_name`` filter
+                # above still receives the caller's raw argument unchanged.
+                "agent_name": public_agent_name(_optional_string(r.get("agent_name"))),
+                "title": r.get("title"),
+                "status": r.get("status"),
+                "runner_id": r.get("runner_id"),
+                "runner_online": online.get(_optional_string(r.get("runner_id")) or ""),
+                "parent_session_id": r.get("parent_session_id"),
+            }
+            for r in rows
+        ],
+        page.has_more,
+        page.next_after,
+    )
 
 
 def _child_rows_to_entries(

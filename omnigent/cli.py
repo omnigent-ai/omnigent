@@ -1781,6 +1781,98 @@ def _set_log_to_stderr(
     return value
 
 
+def _finish_cli_profile(profiler: Any, output_path: Path) -> None:  # type: ignore[explicit-any]
+    """Stop a requested cProfile run and render a focused bottleneck summary."""
+    import pstats
+
+    profiler.disable()
+    profiler.dump_stats(output_path)
+    stats = pstats.Stats(profiler)
+    stats_state = vars(stats)
+    raw_stats = cast(
+        dict[tuple[str, int, str], tuple[int, int, float, float, object]],
+        stats_state["stats"],
+    )
+    total_time = float(stats_state["total_tt"])
+    total_calls = int(stats_state["total_calls"])
+    primitive_calls = int(stats_state["prim_calls"])
+    package_root = Path(__file__).resolve().parent
+    source_root = package_root.parent
+
+    # (filename, line, function, primitive calls, total calls, self, cumulative)
+    rows = [(*key, cc, nc, tt, ct) for key, (cc, nc, tt, ct, _) in raw_stats.items()]
+
+    def _location(filename: str, line: int, function: str) -> str:
+        path = Path(filename).resolve()
+        try:
+            display = str(path.relative_to(source_root))
+        except ValueError:
+            display = path.name
+        return f"{display}:{line}({function})"
+
+    def _duration(seconds: float) -> str:
+        if seconds < 0.01:
+            return f"{seconds * 1_000:.2f} ms"
+        if seconds < 1:
+            return f"{seconds * 1_000:.1f} ms"
+        return f"{seconds:.3f} s"
+
+    def _print_rows(
+        title: str,
+        selected: list[tuple[str, int, str, int, int, float, float]],
+    ) -> None:
+        click.echo(f"\n{title}", err=True)
+        click.echo(f"  {'self':>9}  {'cumulative':>10}  {'calls':>9}  function", err=True)
+        for filename, line, function, primitive, calls, self_time, cumulative in selected[:10]:
+            call_count = str(calls) if calls == primitive else f"{calls}/{primitive}"
+            click.echo(
+                f"  {_duration(self_time):>9}  {_duration(cumulative):>10}  "
+                f"{call_count:>9}  {_location(filename, line, function)}",
+                err=True,
+            )
+
+    omnigent_rows = [
+        row for row in rows if Path(row[0]).resolve().is_relative_to(package_root) and row[6] > 0
+    ]
+    omnigent_rows.sort(key=lambda row: row[6], reverse=True)
+    self_time_rows = [row for row in omnigent_rows if row[5] > 0]
+    self_time_rows.sort(key=lambda row: row[5], reverse=True)
+
+    click.echo(
+        f"\nCLI profile: {_duration(total_time)}, "
+        f"{total_calls:,} calls ({primitive_calls:,} primitive)",
+        err=True,
+    )
+    _print_rows("Top Omnigent call paths", omnigent_rows)
+    _print_rows("Top Omnigent functions by self time", self_time_rows)
+    click.echo(f"\nFull profile data: {output_path}", err=True)
+
+
+def _start_cli_profile(
+    ctx: click.Context,
+    _param: click.Parameter,
+    value: bool,
+) -> bool:
+    """Start cProfile early and finish it after the selected command exits."""
+    if not value:
+        return value
+
+    import cProfile
+
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    microseconds = time.time_ns() // 1_000 % 1_000_000
+    profile_dir = data_dir() / "profiles"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    output_path = profile_dir / (f"omnigent-cli-{timestamp}-{microseconds:06d}-{os.getpid()}.prof")
+    profiler = cProfile.Profile()
+    profiler.enable()
+    ctx.call_on_close(lambda: _finish_cli_profile(profiler, output_path))
+    # Click closes callbacks last-in-first-out, so measurement stops before
+    # rendering the summary above.
+    ctx.call_on_close(profiler.disable)
+    return value
+
+
 def _extract_global_logging_flags(argv: list[str]) -> tuple[list[str], bool, bool]:
     """Remove global logging flags before run-shorthand rewriting."""
     debug_logging = False
@@ -1801,6 +1893,17 @@ def _extract_global_logging_flags(argv: list[str]) -> tuple[list[str], bool, boo
 
 
 @click.group(cls=_OmnigentCLI)
+@click.option(
+    "--profiling",
+    is_flag=True,
+    is_eager=True,
+    expose_value=False,
+    callback=_start_cli_profile,
+    help=(
+        "Profile CLI execution, print a summary, and write a timestamped .prof file. "
+        "Place before COMMAND."
+    ),
+)
 @click.option(
     "--debug",
     "debug_logging",
@@ -2031,7 +2134,17 @@ def main() -> None:
     # intentionally tiny (currently only help/version); runner flags live on
     # ``run``. Treat a leading non-top-level flag as bare-run shorthand so
     # users can type the natural no-AGENT launcher form.
-    if argv and argv[0].startswith("-") and argv[0] not in {"--help", "-h", "--version"}:
+    if (
+        argv
+        and argv[0].startswith("-")
+        and argv[0]
+        not in {
+            "--help",
+            "-h",
+            "--version",
+            "--profiling",
+        }
+    ):
         argv = ["run", *argv]
 
     # Shorthand: ``omnigent myagent.yaml [opts]`` → ``run myagent.yaml [opts]``.
@@ -2200,6 +2313,10 @@ def _is_removed_ad_hoc_invocation(argv: list[str]) -> bool:
     # should go through click so the user sees the click group's
     # help listing subcommands, not the legacy argparse help.
     if argv[0] in {"--help", "-h", "--version"}:
+        return False
+    # A root profiling flag may precede an eager help/version flag or stand
+    # alone. These are valid Click invocations, not removed ad-hoc chat.
+    if all(token in {"--profiling", "--help", "-h", "--version"} for token in argv):
         return False
     # Skip leading flags to find the first positional. If all
     # tokens are flags (e.g. ``omnigent --system-prompt "..."``),
@@ -2863,6 +2980,7 @@ def _spawn_host_daemon_process(
             proc = subprocess.Popen(
                 args,
                 env=env,
+                stdin=subprocess.DEVNULL,
                 stdout=log_fh,
                 stderr=log_fh,
                 **_proc.spawn_kwargs(),
@@ -10950,6 +11068,12 @@ def _run_databricks_browser_login(workspace_host: str, org_id: str | None = None
         the workspace rejects it).
     :raises click.ClickException: When the Databricks CLI binary is
         missing or the login exits non-zero.
+
+    The login writes to a ``.databrickscfg`` profile named after the
+    workspace's first DNS label (e.g. ``acme`` for
+    ``acme.cloud.databricks.com``), keeping distinct workspaces off the
+    shared ``DEFAULT`` profile. The OAuth grant itself stays host-keyed,
+    so :func:`_databricks_workspace_token` still resolves it by host.
     """
     databricks_bin = shutil.which("databricks")
     if databricks_bin is None:
@@ -10958,14 +11082,21 @@ def _run_databricks_browser_login(workspace_host: str, org_id: str | None = None
             "Install it first: https://docs.databricks.com/dev-tools/cli/install.html"
         )
     login_host = _host_with_org(workspace_host, org_id)
-    click.echo(f"Opening browser to log in to {login_host} ...")
+    # Pin the grant to a profile named for the workspace's first DNS label so
+    # distinct workspaces don't clobber each other under the CLI's ``DEFAULT``.
+    from urllib.parse import urlsplit
+
+    split = urlsplit(workspace_host.rstrip("/"))
+    host = split.hostname or split.netloc or split.path
+    profile = host.split(".")[0]
+    click.echo(f"Opening browser to log in to {login_host} (profile {profile}) ...")
     result = subprocess.run(
-        [databricks_bin, "auth", "login", "--host", login_host],
+        [databricks_bin, "auth", "login", "--host", login_host, "--profile", profile],
         check=False,
     )
     if result.returncode != 0:
         raise click.ClickException(
-            f"`databricks auth login --host {login_host}` failed "
+            f"`databricks auth login --host {login_host} --profile {profile}` failed "
             f"(exit {result.returncode}). If the workspace is unreachable from "
             "this machine (VPN / IP access lists), resolve that and retry."
         )
@@ -11188,6 +11319,9 @@ def login(server_url: str) -> None:
                 token=token,
                 user_id=user_id,
                 expires_at=_time.time() + expires_in,
+                # Login-issued refresh grant (newer servers) — lets the
+                # host/CLI renew past session expiry unattended.
+                refresh_token=result.get("refresh_token"),
             )
             click.echo(f"Logged in as {user_id}")
             _remember_default_server(server)
@@ -11267,6 +11401,7 @@ def _accounts_login(server: str) -> None:
         token=token,
         user_id=user_id,
         expires_at=_time.time() + expires_in,
+        refresh_token=body.get("refresh_token"),
     )
     click.echo(f"Logged in as {user_id}.")
 

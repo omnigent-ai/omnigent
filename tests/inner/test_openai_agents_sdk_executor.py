@@ -445,6 +445,65 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
 
         _run(_t())
 
+    def test_reasoning_item_id_policy_defaults_to_sdk_behavior(self):
+        async def _t():
+            _FakeRunner.last_calls = []
+            _FakeRunner.next_result = _FakeResult(events=[], final_output="done")
+            executor = OpenAIAgentsSDKExecutor(client=object(), model="gpt-test")
+            with patch(
+                "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                return_value=_fake_agents_sdk(),
+            ):
+                _ = [
+                    event
+                    async for event in executor.run_turn(
+                        [{"role": "user", "content": "hi"}],
+                        [],
+                        "Be helpful.",
+                    )
+                ]
+
+            run_config = _FakeRunner.last_calls[0]["run_config"]
+            self.assertNotIn("reasoning_item_id_policy", run_config.kwargs)
+
+        _run(_t())
+
+    def test_reasoning_item_id_policy_is_configurable(self):
+        async def _t():
+            for policy in ("preserve", "omit"):
+                with self.subTest(policy=policy):
+                    _FakeRunner.last_calls = []
+                    _FakeRunner.next_result = _FakeResult(events=[], final_output="done")
+                    executor = OpenAIAgentsSDKExecutor(
+                        client=object(),
+                        model="gpt-test",
+                        reasoning_item_id_policy=policy,
+                    )
+                    with patch(
+                        "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                        return_value=_fake_agents_sdk(),
+                    ):
+                        _ = [
+                            event
+                            async for event in executor.run_turn(
+                                [{"role": "user", "content": "hi"}],
+                                [],
+                                "Be helpful.",
+                            )
+                        ]
+
+                    run_config = _FakeRunner.last_calls[0]["run_config"]
+                    self.assertEqual(run_config.kwargs["reasoning_item_id_policy"], policy)
+
+        _run(_t())
+
+    def test_reasoning_item_id_policy_rejects_invalid_value(self):
+        with self.assertRaisesRegex(ValueError, "reasoning_item_id_policy"):
+            OpenAIAgentsSDKExecutor(
+                client=object(),
+                reasoning_item_id_policy="invalid",  # type: ignore[arg-type]
+            )
+
     def test_sanitize_replay_item_drops_long_ids(self):
         item = {
             "type": "message",

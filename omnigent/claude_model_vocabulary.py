@@ -55,6 +55,21 @@ CUSTOM_MODEL_OPTION_ENV_VAR = "ANTHROPIC_CUSTOM_MODEL_OPTION"
 #: takes — so it is not part of the vocabulary below.
 CUSTOM_MODEL_OPTION_NAME_ENV_VAR = "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"
 
+#: BACK-COMPAT. Omnigent's picker-row id for the custom slot. Named for the
+#: model the slot first carried (Sonnet 5, which had no family alias of its
+#: own), but a Smart Routing launch pins ITS model there, so the id does not
+#: describe the contents — read the slot, never this name. Sessions persist
+#: it as a model override, so retiring it needs a migration; slated for
+#: removal in 0.10.0 along with the row, once the ``sonnet`` pin is Sonnet 5.
+LEGACY_CUSTOM_SLOT_ROW_ID = "sonnet_5"
+
+#: BACK-COMPAT. Spellings the pre-0.10 substring test read as "this is the
+#: custom slot's model", kept because :func:`normalized_model_id` does not
+#: fold a vendor-prefixed ``anthropic/claude-sonnet-5`` onto the catalog id
+#: the slot holds. Consulted only after an exact match misses; retired with
+#: :data:`LEGACY_CUSTOM_SLOT_ROW_ID` in 0.10.0.
+LEGACY_CUSTOM_SLOT_SPELLINGS: tuple[str, ...] = ("sonnet-5", "sonnet_5")
+
 #: Launch-env keys that define this session's model vocabulary.
 MODEL_VOCABULARY_ENV_VARS: tuple[str, ...] = (
     *ALIAS_MODEL_ENV_VARS.values(),
@@ -162,6 +177,14 @@ def claude_model_alias(
     candidate = model.strip().lower()
     if candidate in CLAUDE_MODEL_ALIASES:
         return candidate
+    # Bracket variants of the family aliases (``sonnet[1m]``) are settable
+    # aliases in their own right — the harness enumerates them in /model's
+    # usage line and resolves the marker itself (the family pin plus the
+    # marker on a pinned env). Stepping one down to its family would
+    # silently drop the marker; refusing it blocks a switch the pane accepts.
+    base, bracket, marker = candidate.partition("[")
+    if bracket and marker.endswith("]") and base in CLAUDE_MODEL_ALIASES:
+        return candidate
     pins = alias_pins(env)
     normalized = normalized_model_id(model)
     for alias, pinned in pins.items():
@@ -202,4 +225,14 @@ def claude_model_command_arg(
     custom = environ.get(CUSTOM_MODEL_OPTION_ENV_VAR, "").strip()
     if custom and normalized_model_id(custom) == normalized_model_id(model):
         return custom
+    candidate = model.strip()
+    if not alias_pins(env) and candidate.lower().startswith("claude-"):
+        # A full Anthropic model id names an EXACT generation, and ``/model``
+        # on an unpinned (canonical-endpoint) session accepts full ids
+        # verbatim — the same spelling the harness's own enumeration
+        # resolves. Stepping down to the family alias here would switch to
+        # claude's CURRENT generation of that family instead (picking
+        # "Opus 4.8 (1M context)" used to type ``/model opus`` and land on
+        # Opus 5).
+        return candidate
     return claude_model_alias(model, env)

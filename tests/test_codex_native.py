@@ -7477,6 +7477,106 @@ async def test_prepare_codex_terminal_via_daemon_creates_runner_and_ensures_term
 
 
 @pytest.mark.asyncio
+async def test_prepare_codex_terminal_via_daemon_overlaps_create_and_host_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A fresh launch runs session create and the host-online poll concurrently.
+
+    Against a remote server the create costs ~2s and the host poll ~0.6s, and
+    running them back to back paid both. The host wait must therefore start
+    before the create finishes, and a fresh launch must not wait for the host a
+    second time afterwards.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    order: list[str] = []
+    host_waits = 0
+
+    async def fake_create(
+        client: object,
+        bundle: bytes,
+        *,
+        bridge_id: str | None,
+        terminal_launch_args: list[str] | None = None,
+    ) -> str:
+        """Record the create window, yielding so a concurrent wait can start."""
+        del client, bundle, bridge_id, terminal_launch_args
+        order.append("create:start")
+        await asyncio.sleep(0)
+        order.append("create:end")
+        return "conv_new"
+
+    async def fake_host_online(client: object, host_id: str, *, timeout_s: float) -> None:
+        """Record the host-wait window and count how often it is entered."""
+        nonlocal host_waits
+        del client, host_id, timeout_s
+        host_waits += 1
+        order.append("host:start")
+        await asyncio.sleep(0)
+        order.append("host:end")
+
+    async def fake_launch(
+        client: object,
+        *,
+        host_id: str,
+        session_id: str,
+        workspace: str,
+        fresh: bool = False,
+    ) -> str:
+        """Stand in for the runner launch."""
+        del client, host_id, session_id, workspace, fresh
+        return "runner_new"
+
+    async def fake_runner_online(client: object, runner_id: str, *, timeout_s: float) -> None:
+        """Pretend the runner connected."""
+        del client, runner_id, timeout_s
+
+    async def fake_bind(client: object, session_id: str, runner_id: str) -> None:
+        """Skip the re-bind PATCH."""
+        del client, session_id, runner_id
+
+    async def fake_ensure(client: object, session_id: str) -> None:
+        """Skip the terminal ensure request."""
+        del client, session_id
+
+    async def fake_terminal_ready(
+        client: object, session_id: str, *, timeout_s: float
+    ) -> codex_native.LaunchedCodexTerminal:
+        """Return a ready terminal without polling."""
+        del client, session_id, timeout_s
+        return codex_native.LaunchedCodexTerminal(
+            terminal_id="terminal_codex_main",
+            tmux_socket=None,
+            tmux_target=None,
+        )
+
+    monkeypatch.setattr(codex_native, "_create_codex_session", fake_create)
+    monkeypatch.setattr(codex_native, "wait_for_host_online", fake_host_online)
+    monkeypatch.setattr(codex_native, "launch_or_reuse_daemon_runner", fake_launch)
+    monkeypatch.setattr(codex_native, "wait_for_runner_online", fake_runner_online)
+    monkeypatch.setattr(codex_native, "_bind_session_runner", fake_bind)
+    monkeypatch.setattr(codex_native, "_ensure_codex_terminal_on_runner", fake_ensure)
+    monkeypatch.setattr(codex_native, "_wait_for_codex_terminal_ready", fake_terminal_ready)
+
+    prepared = await codex_native._prepare_codex_terminal_via_daemon(
+        base_url="https://example.com",
+        headers={},
+        session_id=None,
+        session_bundle=b"bundle",
+        codex_args=(),
+        model=None,
+        host_id="host_local",
+        workspace="/repo",
+    )
+
+    assert prepared.session_id == "conv_new"
+    assert order.index("host:start") < order.index("create:end")
+    assert host_waits == 1
+
+
+@pytest.mark.asyncio
 async def test_prepare_codex_terminal_via_daemon_live_resume_skips_config_patch(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

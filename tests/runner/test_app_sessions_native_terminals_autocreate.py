@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import click
 import httpx
 import pytest
 
@@ -3182,3 +3183,122 @@ def test_routed_spawn_launch_args_need_a_router() -> None:
     assert note and tools
     assert _routed_spawn_launch_args(True, router_started=False) == (None, ())
     assert _routed_spawn_launch_args(False) == (None, ())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["subscription", "gateway"])
+async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_override(
+    endpoint: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A persisted canonical id the catalog lists only by family still launches.
+
+    A live ``/model`` persists the pane's exact id (``claude-opus-4-8``) while
+    the catalog spells that family as alias rows and the 1M default. On a
+    canonical endpoint the relaunch must pass the id through as ``--model``
+    rather than refuse the resume; a gateway, which routes only its own
+    spellings, keeps refusing it.
+    """
+    from omnigent.claude_native import ClaudeNativeUcodeConfig
+
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+
+    async def _no_op_forwarder(**kwargs: Any) -> None:
+        del kwargs
+
+    monkeypatch.setattr(
+        "omnigent.claude_native_forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+    prefix = "" if endpoint == "subscription" else "system.ai."
+    catalog = [
+        {"id": "opus", "model": f"{prefix}claude-opus-5", "displayName": "Opus 5"},
+        {
+            "id": f"{prefix}claude-opus-4-8[1m]",
+            "model": f"{prefix}claude-opus-4-8[1m]",
+            "displayName": "Opus 4.8 (1M context)",
+            "isDefault": True,
+        },
+    ]
+
+    async def _catalog(config: object) -> list[dict[str, object]]:
+        del config
+        return catalog
+
+    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", _catalog)
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        """Captures the launched terminal spec."""
+
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            """Record the spec and return a terminal resource view."""
+            del terminal_name, session_key
+            captured["spec"] = spec
+            return SessionResourceView(
+                id="terminal_claude_main",
+                type="terminal",
+                session_id=session_id,
+                name="claude:main",
+                metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+            )
+
+    def _handle_request(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"model_override": "claude-opus-4-8", "labels": {}})
+
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server",
+        transport=httpx.MockTransport(_handle_request),
+    )
+    config = (
+        None
+        if endpoint == "subscription"
+        else ClaudeNativeUcodeConfig(
+            env={"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"},
+            api_key_helper="printf %s sk-gateway",
+            model="system.ai.claude-opus-5",
+        )
+    )
+
+    async def _resolve() -> ClaudeNativeUcodeConfig | None:
+        return config
+
+    session_id = "0f2d3d5c9a6b4e1f8c7d6e5f4a3b2c1d"
+    if endpoint == "subscription":
+        await _auto_create_claude_terminal(
+            session_id,
+            _FakeResourceRegistry(),
+            lambda _sid, _evt: None,
+            server_client=fake_client,
+            resolve_launch_config=_resolve,
+        )
+        args = captured["spec"].args
+        assert args[args.index("--model") + 1] == "claude-opus-4-8"
+    else:
+        with pytest.raises(click.ClickException, match="not in this host's current model list"):
+            await _auto_create_claude_terminal(
+                session_id,
+                _FakeResourceRegistry(),
+                lambda _sid, _evt: None,
+                server_client=fake_client,
+                resolve_launch_config=_resolve,
+            )
+        assert "spec" not in captured, "a refused launch must not start a terminal"
+
+    await fake_client.aclose()

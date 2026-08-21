@@ -20,7 +20,7 @@
     "test": "node --test",
     "build": "electron-builder",
     "build:mac": "electron-builder --mac",
-    "build:mac:release": "electron-builder --mac -c.mac.notarize=true",
+    "build:mac:release": "OMNIGENT_NOTARIZE_DMG=true electron-builder --mac -c.mac.notarize=true -c.dmg.sign=true",
     "build:linux": "electron-builder --linux",
     "build:win": "electron-builder --win",
     "build:overlay": "pnpm --filter web run build:overlay",
@@ -57,6 +57,7 @@
       }
     ],
     "afterPack": "build/afterPack.js",
+    "afterAllArtifactBuild": "build/afterAllArtifactBuild.js",
     "files": [
       "src/**/*",
       "setup/**/*",

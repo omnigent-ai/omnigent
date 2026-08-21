@@ -1674,7 +1674,7 @@ describe("unboundSessionResumableInApp", () => {
 // client must show no routing control at all, and neither must one while the
 // `/v1/info` probe is still in flight.
 describe("routing eligibility gates", () => {
-  function info(smartRouting: boolean): ServerInfo {
+  function info(smartRouting: boolean, sources?: { external: boolean; oss: boolean }): ServerInfo {
     return {
       accounts_enabled: false,
       single_user: false,
@@ -1687,7 +1687,7 @@ describe("routing eligibility gates", () => {
       public_sharing_enabled: true,
       server_version: null,
       smart_routing_enabled: smartRouting,
-      smart_routing_sources: { external: smartRouting, oss: smartRouting },
+      smart_routing_sources: sources ?? { external: smartRouting, oss: smartRouting },
       features: {},
       harness_install_enabled: false,
       installable_harnesses: [],
@@ -1725,8 +1725,30 @@ describe("routing eligibility gates", () => {
     expect(isSubagentRoutingEligible("loading", nativeSession)).toBe(false);
   });
 
-  it("a native terminal session is excluded from cost routing but not subagent routing", () => {
-    expect(isCostRoutingEligible(info(true), nativeSession)).toBe(false);
+  it("a native pane follows the per-family router sources for cost routing", () => {
+    // The judge answers for any family, gateway-backed or not.
+    expect(isCostRoutingEligible(info(true, { external: false, oss: true }), nativeSession)).toBe(
+      true,
+    );
+    // External-only: the family must be gateway-backed on the session's host.
+    const externalOnly = info(true, { external: true, oss: false });
+    expect(
+      isCostRoutingEligible(externalOnly, nativeSession, {
+        gateway_inference: { "claude-native": false },
+      }),
+    ).toBe(false);
+    expect(
+      isCostRoutingEligible(externalOnly, nativeSession, {
+        gateway_inference: { "claude-native": true },
+      }),
+    ).toBe(true);
+    // An absent host row reads as backed (older host / no row), like the
+    // landing's gate.
+    expect(isCostRoutingEligible(externalOnly, nativeSession)).toBe(true);
+    // No router at all: the option is withheld.
+    expect(isCostRoutingEligible(info(true, { external: false, oss: false }), nativeSession)).toBe(
+      false,
+    );
     expect(isSubagentRoutingEligible(info(true), nativeSession)).toBe(true);
   });
 

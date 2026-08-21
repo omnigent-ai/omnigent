@@ -3907,8 +3907,10 @@ async def test_sys_list_models_dispatches_locally_with_static_provider(
 
     With a subscription default (static — no HTTP), the payload must
     carry one row per declared sub-agent plus ``self``, each in the
-    documented ``{source, verified, models, note}`` shape with the
-    curated claude ids surviving the claude-family filter.
+    documented ``{source, verified, models, note}`` shape. Subscription
+    listings enumerate nothing pre-launch (the curated stand-ins are
+    gone; live harness probes are the source of truth), so the row is
+    an honest empty listing, not a failure shape.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tmp_path: Per-test temp dir for the isolated provider config.
@@ -3931,17 +3933,10 @@ async def test_sys_list_models_dispatches_locally_with_static_provider(
     worker = payload["worker"]
     assert worker["source"] == "static"
     assert worker["verified"] is False
-    # The curated claude aliases survive the claude-family filter — the
-    # exact ids an orchestrator may pass back as args.model.
-    assert [m["id"] for m in worker["models"]] == [
-        "claude-fable-5",
-        "claude-opus-5",
-        "claude-opus-4-8",
-        "claude-sonnet-5",
-        "claude-sonnet-4-6",
-        "claude-haiku-4-5",
-    ]
-    assert worker["note"]
+    # No curated stand-ins: a path that cannot probe reports nothing
+    # rather than a plausible-but-stale list.
+    assert worker["models"] == []
+    assert "probing the harness" in worker["note"]
 
 
 @pytest.mark.asyncio
@@ -6242,11 +6237,9 @@ async def test_sys_agent_get_projects_agent_metadata() -> None:
 @pytest.mark.asyncio
 async def test_sys_agent_list_degrades_when_sources_fail(tmp_path: Path) -> None:
     """
-    A failing source degrades to an empty section rather than failing the
-    whole call. Here the server 500s both list endpoints and no local
-    config dir exists, so all three sections come back empty — but the
-    tool still returns a well-formed result. If a source error
-    propagated, the tool would return an ``error`` instead.
+    A failing source degrades to an empty, retryable section rather than
+    failing the whole call or claiming that the source is exhausted. Here
+    the server 500s both list endpoints and no local config dir exists.
 
     :param tmp_path: Workspace dir with no agent-config subdir.
     """
@@ -6268,7 +6261,15 @@ async def test_sys_agent_list_degrades_when_sources_fail(tmp_path: Path) -> None
         )
 
     info = json.loads(output)
-    assert info == {"builtins": [], "session_agents": [], "local_configs": []}
+    assert info["builtins"] == []
+    assert info["session_agents"] == []
+    assert info["local_configs"] == []
+    assert info["page"]["has_more"] == {
+        "builtins": True,
+        "session_agents": True,
+        "local_configs": False,
+    }
+    assert isinstance(info["page"]["next_cursor"], str)
 
 
 @pytest.mark.asyncio

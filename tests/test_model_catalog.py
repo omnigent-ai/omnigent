@@ -34,7 +34,7 @@ from omnigent.model_catalog import (
     resolve_model_provider,
     spec_harness,
 )
-from omnigent.model_fallbacks import CODEX_DEFAULT_MODEL, static_model_fallback
+from omnigent.model_fallbacks import _SMART_ROUTING_FALLBACKS, CODEX_DEFAULT_MODEL
 from omnigent.model_metadata import (
     ModelCapability,
     ModelCostTier,
@@ -904,7 +904,11 @@ def test_anthropic_api_listing_uses_api_key_headers(
 def test_subscription_listing_is_static_and_unverified(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A subscription CLI yields the curated static list, ``verified=False``.
+    """A subscription CLI yields an empty static listing, ``verified=False``.
+
+    The curated stand-in lists are gone: the live harness probes are the
+    source of truth, so this path honestly reports nothing rather than a
+    plausible-but-stale catalog.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tmp_path: Per-test temp dir.
@@ -917,30 +921,16 @@ def test_subscription_listing_is_static_and_unverified(
     listing = list_models_for_worker(_worker_spec("claude-native"), "claude-native")
     assert listing.source == "static"
     assert listing.verified is False
-    # Exactly the curated claude tiers — these are aliases, not a live list.
-    assert [m.id for m in listing.models] == [
-        "claude-fable-5",
-        "claude-opus-5",
-        "claude-opus-4-8",
-        "claude-sonnet-5",
-        "claude-sonnet-4-6",
-        "claude-haiku-4-5",
-    ]
-    assert "CLI login" in listing.note
-    assert listing.static_fallback is not None
-    assert listing.static_fallback.owner == "Claude subscription adapter"
+    assert listing.models == ()
+    assert "probing the harness" in listing.note
     payload = model_catalog._listing_payload(listing)
-    assert payload["static_fallback"] == {
-        "owner": "Claude subscription adapter",
-        "provenance": "Omnigent's release-curated Claude Code alias catalog",
-        "discovery_gap": "Claude subscription logins expose no model-listing API",
-    }
+    assert "static_fallback" not in payload
 
 
 def test_cli_config_listing_is_static_and_unverified(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A cli-config provider yields the codex curated list, not a dead row.
+    """A cli-config provider yields an empty static listing, not a dead row.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tmp_path: Per-test temp dir.
@@ -954,70 +944,38 @@ def test_cli_config_listing_is_static_and_unverified(
     listing = list_models_for_worker(_worker_spec("codex-native"), "codex-native")
     assert listing.source == "static"
     assert listing.verified is False
-    assert [m.id for m in listing.models] == [
-        "gpt-5.6-sol",
-        "gpt-5.6-luna",
-        "gpt-5.6-terra",
-        "gpt-5.5",
-    ]
-    # The note must say the CLI resolves the credential itself — this row
-    # is a working worker, not a credentials preflight failure.
-    assert "resolved by the CLI at launch" in listing.note
+    assert listing.models == ()
+    # The note must keep this a working worker, not a credentials preflight
+    # failure — the CLI enumerates and authenticates from its own config.
+    assert "the CLI's own config" in listing.note
     assert "cannot run here" not in listing.note
-    assert listing.static_fallback is not None
-    assert listing.static_fallback.owner == "Codex CLI-config adapter"
 
 
-@pytest.mark.parametrize(
-    ("provider_kind", "cli"),
-    [
-        ("subscription", "claude"),
-        ("subscription", "codex"),
-        ("cli-config", "codex"),
-    ],
-)
-def test_static_model_fallbacks_document_ownership(
-    provider_kind: str,
-    cli: str,
-) -> None:
-    """Every registered fallback explains who owns it and why it exists."""
-    fallback = static_model_fallback(provider_kind, cli)
+@pytest.mark.parametrize("table_key", sorted(_SMART_ROUTING_FALLBACKS))
+def test_static_model_fallbacks_document_ownership(table_key: str) -> None:
+    """Every remaining static model table explains who owns it and why.
 
-    assert fallback is not None
+    The picker fallbacks are gone (live probes replaced them); Smart
+    Routing's operational tables are what's left, and each must carry its
+    auditable ownership record.
+    """
+    fallback = _SMART_ROUTING_FALLBACKS[table_key]
+
     assert fallback.model_ids
     assert fallback.owner
     assert fallback.provenance
     assert fallback.discovery_gap
 
 
-@pytest.mark.parametrize("provider_kind", ["subscription", "cli-config"])
-def test_codex_catalog_ids_are_spelled_the_way_codex_accepts(provider_kind: str) -> None:
-    """Codex's catalogs carry its dotted slugs, not the hyphenated serving ids.
-
-    Codex's own backend 400s on ``gpt-5-6-sol``; only ``gpt-5.6-sol`` reaches a
-    ChatGPT-account login. The two spellings still compare equal, so a routed
-    arm keeps matching either way.
-
-    :param provider_kind: The registered provider kind under test.
-    """
-    fallback = static_model_fallback(provider_kind, "codex")
-    assert fallback is not None
-    for model_id in fallback.model_ids:
-        assert not model_id.startswith("databricks-"), model_id
-        assert codex_spawn_model(model_id) == model_id, (
-            f"{model_id!r} is not codex's own spelling for itself"
-        )
-
-
 def test_codex_default_model_names_a_concrete_variant() -> None:
-    """The codex launch default is a tiered model, not a bare family alias.
+    """The codex launch default is codex's own spelling of a tiered model.
 
-    The bundled OpenAI catalog's newest row is ``gpt-5.6``, which codex rejects
-    as a family name; a default must name a variant its backend serves.
+    The bundled OpenAI catalog's newest row is ``gpt-5.6``, which codex
+    rejects as a family name, and codex's backend 400s the hyphenated
+    Databricks serving spelling — the default must be a dotted concrete
+    variant codex serves.
     """
-    fallback = static_model_fallback("subscription", "codex")
-    assert fallback is not None
-    assert CODEX_DEFAULT_MODEL in fallback.model_ids
+    assert not CODEX_DEFAULT_MODEL.startswith("databricks-")
     assert codex_spawn_model(CODEX_DEFAULT_MODEL) == CODEX_DEFAULT_MODEL
     # A bare family alias has no tier segment after the dotted version.
     assert re.fullmatch(r"gpt-\d+\.\d+", CODEX_DEFAULT_MODEL) is None
@@ -1331,7 +1289,8 @@ def test_catalog_isolates_per_worker_failures(
     # The subscription rows (claude worker + the claude-sdk brain) are
     # unaffected by the gateway outage.
     assert catalog["worker"]["source"] == "static"
-    assert next(m["id"] for m in catalog["worker"]["models"]) == "claude-fable-5"
+    assert catalog["worker"]["models"] == []
+    assert "probing the harness" in catalog["worker"]["note"]
     assert catalog["self"]["source"] == "static"
     # The broken worker degrades informatively instead of crashing the tool.
     assert catalog["codex"]["source"] == "none"

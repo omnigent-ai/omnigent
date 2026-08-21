@@ -5,7 +5,8 @@
 // down on the matching detach.
 //
 // Wire protocol (mirrors `omnigent/server/routes/terminal_attach.py`):
-//   - Server → client: binary frames, raw PTY bytes → `term.write`.
+//   - Server → client: binary frames, raw PTY bytes → `term.write`; text
+//     frames for JSON control messages (currently tmux clipboard writes).
 //   - Client → server: binary frames for keystrokes (`term.onData`);
 //     text frames for JSON control messages (currently only resize).
 
@@ -304,6 +305,94 @@ export function applyTerminalCopy(
   return true;
 }
 
+/** Largest tmux selection accepted for a browser clipboard write. */
+export const TERMINAL_CLIPBOARD_MAX_BYTES = 1024 * 1024;
+/** A tmux copy notification must closely follow input on this attachment. */
+export const TERMINAL_CLIPBOARD_INPUT_WINDOW_MS = 5000;
+
+const STRICT_BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
+/** Decode one bounded, canonical base64 terminal clipboard payload. */
+export function decodeTerminalClipboardBase64(encoded: string): string | null {
+  if (
+    encoded.length === 0 ||
+    encoded.length > Math.ceil(TERMINAL_CLIPBOARD_MAX_BYTES / 3) * 4 ||
+    encoded.length % 4 !== 0 ||
+    !STRICT_BASE64_RE.test(encoded)
+  ) {
+    return null;
+  }
+  let binary: string;
+  try {
+    binary = atob(encoded);
+  } catch {
+    return null;
+  }
+  if (binary.length === 0 || binary.length > TERMINAL_CLIPBOARD_MAX_BYTES) return null;
+  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}
+
+/** Parse a tmux-compatible OSC 52 clipboard-set payload. */
+export function parseOsc52Clipboard(data: string): string | null {
+  const separator = data.indexOf(";");
+  if (separator < 0) return null;
+  const selector = data.slice(0, separator);
+  const encoded = data.slice(separator + 1);
+  // tmux uses the empty selector; `c` is the standard system clipboard.
+  if ((selector !== "" && selector !== "c") || encoded === "?") return null;
+  return decodeTerminalClipboardBase64(encoded);
+}
+
+/** Parse the strict server→browser clipboard control-message schema. */
+export function parseTerminalClipboardMessage(message: string): string | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(message);
+  } catch {
+    return null;
+  }
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    (value as { type?: unknown }).type !== "clipboard-write" ||
+    (value as { encoding?: unknown }).encoding !== "base64" ||
+    typeof (value as { data?: unknown }).data !== "string"
+  ) {
+    return null;
+  }
+  return decodeTerminalClipboardBase64((value as { data: string }).data);
+}
+
+/** Parse the server's explicit PTY OSC 52 trust capability. */
+export function parseTerminalOsc52Capability(message: string): boolean | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(message);
+  } catch {
+    return null;
+  }
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    (value as { type?: unknown }).type !== "osc52-clipboard-capability" ||
+    typeof (value as { enabled?: unknown }).enabled !== "boolean"
+  ) {
+    return null;
+  }
+  return (value as { enabled: boolean }).enabled;
+}
+
+/** Whether a clipboard event is attributable to recent input on this attach. */
+export function hadRecentTerminalInput(lastInputAt: number, now: number): boolean {
+  return (
+    lastInputAt > 0 && now >= lastInputAt && now - lastInputAt <= TERMINAL_CLIPBOARD_INPUT_WINDOW_MS
+  );
+}
+
+/** Listener for tmux copy-mode text destined for the user's clipboard. */
+export type TerminalClipboardListener = (text: string) => void;
+
 /**
  * Ceiling on synthesized wheel reports for a single DOM wheel event, so a
  * page-mode or pathological delta can't flood the input channel.
@@ -442,6 +531,12 @@ export class TerminalSession {
   private readonly listenerCtl: AbortController;
   private readonly resizeObserver: ResizeObserver;
   private readonly dataDispose: { dispose: () => void };
+  private readonly osc52Dispose: { dispose: () => void };
+  private readonly onClipboardRequest?: TerminalClipboardListener;
+  /** Whether this visible, interactive attach may write the local clipboard. */
+  private clipboardEnabled: boolean;
+  /** Explicit server capability; defaults off so old/unknown servers fail safe. */
+  private osc52ClipboardEnabled = false;
   /** ``performance.now()`` of the last keystroke; gates the echo fast path. */
   private lastUserInputAt = 0;
   /** Guards {@link dispose} so calling it twice is a safe no-op. */
@@ -476,6 +571,8 @@ export class TerminalSession {
    *     workaround and the custom ``copy`` listener are skipped. When
    *     ``false`` (PTY transport, the default), tmux runs with ``mouse on``
    *     and captures drags, so both workarounds stay wired.
+   * :param clipboardEnabled: Whether tmux copies may write the local clipboard.
+   * :param onClipboardRequest: Receives validated tmux copy-mode text.
    */
   constructor(
     container: HTMLElement,
@@ -485,7 +582,11 @@ export class TerminalSession {
     onActivity?: TerminalActivityListener,
     onInput?: TerminalInputListener,
     nativeSelection = false,
+    clipboardEnabled = true,
+    onClipboardRequest?: TerminalClipboardListener,
   ) {
+    this.clipboardEnabled = clipboardEnabled;
+    this.onClipboardRequest = onClipboardRequest;
     // Read the user's code-font preference (Settings → Appearance) at
     // construction; a mid-session change is applied live via setFont(). The
     // xterm.js defaults (15px, no theme) feel out of place inside the app
@@ -513,6 +614,18 @@ export class TerminalSession {
       macOptionClickForcesSelection: !nativeSelection,
       // Opt into xterm's proposed APIs, matching openui's terminal setup.
       allowProposedApi: true,
+    });
+    // PTY tmux clients emit OSC 52 after copy-mode commits. Consume only
+    // bounded write requests; clipboard reads/queries are deliberately absent.
+    this.osc52Dispose = this.term.parser.registerOscHandler(52, (data) => {
+      // Control mode forwards raw pane output, so accepting pane OSC 52 there
+      // would bypass tmux's `set-clipboard external` trust boundary. Its copy
+      // path is the typed websocket message emitted from tmux notifications.
+      if (!nativeSelection && this.osc52ClipboardEnabled) {
+        const text = parseOsc52Clipboard(data);
+        if (text !== null) this.requestClipboardWrite(text);
+      }
+      return true;
     });
     this.fit = new FitAddon();
     this.term.loadAddon(this.fit);
@@ -584,9 +697,16 @@ export class TerminalSession {
             lastActivityTs = now;
             onActivity?.();
           }
+        } else if (typeof ev.data === "string") {
+          const capability = parseTerminalOsc52Capability(ev.data);
+          if (capability !== null) {
+            this.osc52ClipboardEnabled = capability;
+          } else {
+            const text = parseTerminalClipboardMessage(ev.data);
+            if (text !== null) this.requestClipboardWrite(text);
+            // Unknown text frames stay ignored for protocol forward compatibility.
+          }
         }
-        // Server doesn't currently send text frames; ignore if it ever
-        // does so they aren't interpreted as terminal output.
       },
       { signal },
     );
@@ -672,6 +792,11 @@ export class TerminalSession {
     this.term.options.theme = terminalTheme(isDark);
   }
 
+  /** Enable clipboard bridging only for the visible, interactive surface. */
+  setClipboardEnabled(enabled: boolean): void {
+    this.clipboardEnabled = enabled;
+  }
+
   /**
    * Give the terminal keyboard focus. The WS-open handler focuses
    * automatically, but that call is a browser no-op while the surface is
@@ -712,6 +837,7 @@ export class TerminalSession {
     this.listenerCtl.abort();
     this.resizeObserver.disconnect();
     this.dataDispose.dispose();
+    this.osc52Dispose.dispose();
     try {
       this.ws.close();
     } catch {
@@ -734,6 +860,16 @@ export class TerminalSession {
    * Correctness never depends on the private API; it only shaves a frame
    * off the echo when present.
    */
+  private requestClipboardWrite(text: string): void {
+    if (
+      !this.clipboardEnabled ||
+      !hadRecentTerminalInput(this.lastUserInputAt, performance.now())
+    ) {
+      return;
+    }
+    this.onClipboardRequest?.(text);
+  }
+
   private writeOutput(bytes: Uint8Array): void {
     if (shouldEchoSynchronously(bytes.length, performance.now() - this.lastUserInputAt)) {
       // eslint-disable-next-line no-underscore-dangle

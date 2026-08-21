@@ -613,11 +613,34 @@ def _make_auth_token_factory(
         """
         # Check stored OIDC token first.
         if resolved_server_url:
-            from omnigent.cli_auth import load_token
+            from omnigent.cli_auth import (
+                REFRESH_MIN_REMAINING_SECONDS,
+                load_token,
+                refresh_stored_token,
+            )
 
-            oidc_token = load_token(resolved_server_url)
+            # Require enough remaining life that the token cannot lapse
+            # mid-handshake; a token inside that window falls through to
+            # the renewal path below rather than being used and rejected.
+            oidc_token = load_token(
+                resolved_server_url,
+                min_remaining_seconds=REFRESH_MIN_REMAINING_SECONDS,
+            )
             if oidc_token:
                 return oidc_token
+            # Expired or near-lapse: renew from the login-issued refresh
+            # grant when one exists. This is what keeps an unattended host
+            # alive past session-JWT expiry — the tunnel rebuilds headers
+            # through this factory on every reconnect.
+            refreshed = refresh_stored_token(resolved_server_url)
+            if refreshed:
+                return refreshed
+            # Nothing to renew with: a near-expiry token that has NOT
+            # actually lapsed still authenticates, so prefer it over
+            # falling through to no credential at all.
+            still_valid = load_token(resolved_server_url)
+            if still_valid:
+                return still_valid
         return _sdk_token()
 
     # Probe once to check if a user credential is available.

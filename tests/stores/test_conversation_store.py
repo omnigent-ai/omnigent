@@ -334,6 +334,39 @@ def test_update_title(conversation_store: SqlAlchemyConversationStore) -> None:
     )
 
 
+def test_reported_model_round_trips_beside_the_request(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    ``reported_model`` (the harness's verbatim report) persists in the
+    override blob independently of ``model_override`` (the user's
+    request): writing one never disturbs the other, and both read back
+    byte-for-byte.
+    """
+    conv = conversation_store.create_conversation()
+    reported = conversation_store.update_conversation(
+        conv.id, reported_model="claude-opus-4-8[1m]"
+    )
+    assert reported is not None
+    assert reported.reported_model == "claude-opus-4-8[1m]"
+    assert reported.model_override is None
+
+    requested = conversation_store.update_conversation(conv.id, model_override="sonnet")
+    assert requested is not None
+    assert requested.model_override == "sonnet"
+    assert requested.reported_model == "claude-opus-4-8[1m]"
+
+    # Clearing the request leaves the report untouched.
+    cleared = conversation_store.update_conversation(conv.id, _unset_model_override=True)
+    assert cleared is not None
+    assert cleared.model_override is None
+    assert cleared.reported_model == "claude-opus-4-8[1m]"
+
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.reported_model == "claude-opus-4-8[1m]"
+
+
 def test_update_archived_round_trip(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
