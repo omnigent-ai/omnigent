@@ -2726,8 +2726,14 @@ class SqlAlchemyConversationStore(ConversationStore):
                 row.session_overrides = _encode_session_overrides(overrides)
                 ap_changed = True
             if archived is not None:
+                # Only set archived_at on the false/null → true transition to
+                # preserve the original archive timestamp. Idempotent re-archive
+                # PATCHes shouldn't reset the retention clock.
+                if archived and not row.archived:
+                    row.archived_at = now
+                elif not archived:
+                    row.archived_at = None
                 row.archived = archived
-                row.archived_at = now if archived else None
                 ap_changed = True
             if ap_changed:
                 row.updated_at = now
