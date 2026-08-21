@@ -138,6 +138,7 @@ import {
   type WorkspacePanelDefault,
 } from "@/lib/workspacePanelPreferences";
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
+import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import {
   DEFAULT_HIDE_UNCONFIGURED_HARNESSES,
   readHideUnconfiguredHarnesses,
@@ -229,6 +230,7 @@ export function SettingsPage() {
   return (
     <PageScroll contentClassName="px-8" extraBottom="2.5rem">
       {section === "appearance" && <AppearanceSection />}
+      {section === "chat" && <ChatSection />}
       {section === "git" && <GitSection />}
       {section === "shortcuts" && <ShortcutsSection />}
       {section === "account" && hasAuthSession && <AccountSection />}
@@ -969,6 +971,52 @@ function GitSection() {
     <Section title="Git" description="Configure how Omnigent works with Git.">
       <div className="flex flex-col gap-8">
         <DefaultBaseBranchControl />
+      </div>
+    </Section>
+  );
+}
+
+/**
+ * Opt-in dispatch for messages sent while the agent is working: when on, a
+ * follow-up is steered into the running turn (POSTed now) instead of parking in
+ * the queue strip to auto-send at idle. Off by default so type-ahead keeps its
+ * editable, reorderable queue.
+ */
+function AlwaysSteerControl() {
+  const [value, setValue] = useState(() => readAlwaysSteer());
+  const labelId = useId();
+  const toggle = useCallback((next: boolean) => {
+    setValue(next);
+    writeAlwaysSteer(next);
+  }, []);
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <div className="flex flex-col">
+        <span id={labelId} className="text-sm font-medium">
+          Always steer
+        </span>
+        <span className="text-sm text-muted-foreground">
+          Send follow-ups straight into the running turn instead of queuing them. The agent folds
+          each one into its current work where the harness supports it, otherwise at the next turn.
+        </span>
+      </div>
+      <Switch
+        aria-labelledby={labelId}
+        checked={value}
+        onCheckedChange={toggle}
+        data-testid="always-steer-toggle"
+        className="mt-0.5 shrink-0"
+      />
+    </div>
+  );
+}
+
+/** Chat behavior settings. */
+function ChatSection() {
+  return (
+    <Section title="Chat" description="Configure how Omnigent handles your messages.">
+      <div className="flex flex-col gap-8">
+        <AlwaysSteerControl />
       </div>
     </Section>
   );
