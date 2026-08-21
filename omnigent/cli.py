@@ -7806,9 +7806,14 @@ def run(
         model = _global_cfg.get("model")
     if harness is None and not direct_server_cli:
         from omnigent.harness_startup_config import resolve_harness_config
+        from omnigent.native_coding_agents import native_coding_agent_for_harness
 
         harness_default, _ = resolve_harness_config(_global_cfg)
-        harness = harness_default
+        # A ``*-native`` default names the TUI a bare ``run`` opens, and the TUI
+        # ignores an agent spec, so leave the harness unset and let the spec's own
+        # ``executor`` harness stand instead of rejecting the run over it.
+        if target is None or native_coding_agent_for_harness(harness_default) is None:
+            harness = harness_default
 
     # First-run smart defaults: a bare `run` with no AGENT, no --harness, and no
     # explicit persisted default → derive a harness from the *current* creds

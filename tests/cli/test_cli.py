@@ -6511,6 +6511,91 @@ def test_run_agent_with_native_terminal_harness_is_rejected() -> None:
         )
 
 
+def test_run_agent_ignores_native_terminal_harness_config_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A config ``harness.default: claude-native`` must not reject ``run AGENT``.
+
+    Asserts ``harness=None`` reaches ``run_chat``: a forwarded value would
+    overwrite ``executor.config.harness`` when the override bundle is
+    materialized, so only ``None`` lets the spec's own harness stand.
+    """
+    spec = tmp_path / "my-agent"
+    spec.mkdir()
+    (spec / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "spec_version": 1,
+                "name": "my-agent",
+                "prompt": "hi",
+                "executor": {"type": "omnigent", "config": {"harness": "pi"}},
+            }
+        )
+    )
+    monkeypatch.setattr(
+        "omnigent.cli._load_effective_config",
+        lambda: {"harness": {"default": "claude-native"}},
+    )
+    run_chat = Mock()
+    monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
+
+    result = CliRunner().invoke(cli, ["run", str(spec)])
+
+    assert result.exit_code == 0, result.output
+    assert run_chat.call_args.kwargs["harness"] is None
+
+
+def test_run_agent_still_inherits_non_native_harness_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A non-native ``harness.default`` is still inherited by ``run AGENT``.
+
+    Only a native terminal default is skipped; narrowing the guard to
+    ``target is None`` would silently drop every other configured default.
+    """
+    spec = tmp_path / "my-agent"
+    spec.mkdir()
+    (spec / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "spec_version": 1,
+                "name": "my-agent",
+                "prompt": "hi",
+                "executor": {"type": "omnigent"},
+            }
+        )
+    )
+    monkeypatch.setattr(
+        "omnigent.cli._load_effective_config",
+        lambda: {"harness": {"default": "claude-sdk"}},
+    )
+    run_chat = Mock()
+    monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
+
+    result = CliRunner().invoke(cli, ["run", str(spec)])
+
+    assert result.exit_code == 0, result.output
+    assert run_chat.call_args.kwargs["harness"] == "claude-sdk"
+
+
+def test_run_agent_with_explicit_native_terminal_harness_flag_still_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``run AGENT --harness claude-native`` still fails loud (the flag is explicit)."""
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    run_chat = Mock()
+    monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
+
+    result = CliRunner().invoke(
+        cli,
+        ["run", "tests/resources/examples/hello_world.yaml", "--harness", "claude-native"],
+    )
+
+    assert result.exit_code != 0
+    assert "ignores an AGENT spec" in result.output
+    run_chat.assert_not_called()
+
+
 # ── omnigent setup: Qwen Code drill-in (_manage_qwen_harness) ────────────
 
 
