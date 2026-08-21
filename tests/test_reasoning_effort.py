@@ -95,9 +95,9 @@ def test_none_and_empty_clear_effort() -> None:
     "model",
     ["glm-5-2", "databricks-glm-5-2", "system.ai.glm-5-2", "GLM-5-2", "system.ai.glm-5.2"],
 )
-@pytest.mark.parametrize("effort", ["xhigh", "max"])
+@pytest.mark.parametrize("effort", ["xhigh", "max", "ultra"])
 def test_glm_clamps_unsupported_effort_to_medium(model: str, effort: str) -> None:
-    """Every GLM spelling coerces xhigh/max down to medium."""
+    """Every GLM spelling coerces every above-high rung (xhigh/max/ultra) to medium."""
     assert clamp_effort_for_model(effort, model) == "medium"
 
 

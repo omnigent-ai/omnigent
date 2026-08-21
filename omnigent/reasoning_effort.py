@@ -67,8 +67,10 @@ def unsupported_effort_message(effort: str, provider: str, supported: Iterable[s
 # above stay frozen: they are the wire APIs' own vocabularies.
 _MODEL_EFFORT_FALLBACK: Mapping[str, str] = MappingProxyType({"glm-5-2": "medium"})
 # Efforts a fallback model cannot accept, so a pinned high value coerces down.
+# GLM tops out at ``high``, so every rung above it (``xhigh``/``max``/``ultra``)
+# is unsupported.
 _MODEL_EFFORT_UNSUPPORTED: Mapping[str, frozenset[str]] = MappingProxyType(
-    {"glm-5-2": frozenset({"xhigh", "max"})}
+    {"glm-5-2": frozenset({"xhigh", "max", "ultra"})}
 )
 
 
