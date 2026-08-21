@@ -7573,9 +7573,9 @@ def _execute_skill_tool(
     """
     Runner-local handler for ``load_skill`` and ``read_skill_file``.
 
-    Instantiates the tool with the agent spec's bundled skills
-    plus host-scope discovery from the runner workspace, then
-    invokes it.
+    Both tools are built from one registry — the agent spec's bundled
+    skills merged with host-scope discovery from the runner workspace —
+    so anything ``load_skill`` can load, ``read_skill_file`` can read.
 
     :param tool_name: ``"load_skill"`` or ``"read_skill_file"``.
     :param args: Parsed JSON arguments from the LLM.
@@ -7595,15 +7595,14 @@ def _execute_skill_tool(
     # agent's own bundle to ship a skills/ directory.
     bundled_skills = _inject_orchestrator_skills(bundled_skills, agent_spec)
 
-    tool: Tool
-    if tool_name == "load_skill":
-        tool = LoadSkillTool(
-            bundled_skills,
-            agent_root=runner_workspace,
-            skills_filter=skills_filter,
-        )
-    else:
-        tool = ReadSkillFileTool(bundled_skills)
+    # Both tools must resolve the same registry: a skill load_skill can load
+    # from host scope must have its files readable too.
+    load_tool = LoadSkillTool(
+        bundled_skills,
+        agent_root=runner_workspace,
+        skills_filter=skills_filter,
+    )
+    tool: Tool = load_tool if tool_name == "load_skill" else ReadSkillFileTool(load_tool.skills)
 
     arguments_json = json.dumps(args)
     from omnigent.tools.base import ToolContext

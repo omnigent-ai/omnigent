@@ -146,3 +146,62 @@ def test_load_skill_schema_lists_skill_names(
     desc = schema["function"]["description"]
     assert "summarize" in desc
     assert "code-review" in desc
+
+
+def test_list_skill_resources_includes_root_level_files(tmp_path: Path) -> None:
+    """Auxiliary docs beside SKILL.md are readable resources."""
+    from omnigent.tools.builtins.load_skill import list_skill_resources
+
+    skill_dir = tmp_path / "codebase-design"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("body")
+    (skill_dir / "DEEPENING.md").write_text("deepening")
+    (skill_dir / "DESIGN-IT-TWICE.md").write_text("twice")
+    skill = SkillSpec(
+        name="codebase-design",
+        description="Designs codebases.",
+        content="body",
+        skill_dir=skill_dir,
+    )
+
+    assert list_skill_resources(skill) == ["DEEPENING.md", "DESIGN-IT-TWICE.md"]
+
+
+def test_list_skill_resources_excludes_skill_md_and_dotfiles(tmp_path: Path) -> None:
+    """SKILL.md is the skill itself, and dotfiles are not content."""
+    from omnigent.tools.builtins.load_skill import list_skill_resources
+
+    skill_dir = tmp_path / "example"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("body")
+    (skill_dir / ".DS_Store").write_text("junk")
+    skill = SkillSpec(
+        name="example",
+        description="An example.",
+        content="body",
+        skill_dir=skill_dir,
+    )
+
+    assert list_skill_resources(skill) == []
+
+
+def test_list_skill_resources_lists_root_files_before_subdirs(tmp_path: Path) -> None:
+    """Root files come first; subdir entries keep their relative paths."""
+    from omnigent.tools.builtins.load_skill import list_skill_resources
+
+    skill_dir = tmp_path / "example"
+    (skill_dir / "references").mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("body")
+    (skill_dir / "EXTRA.md").write_text("extra")
+    (skill_dir / "references" / "style-guide.md").write_text("style")
+    skill = SkillSpec(
+        name="example",
+        description="An example.",
+        content="body",
+        skill_dir=skill_dir,
+    )
+
+    assert list_skill_resources(skill) == [
+        "EXTRA.md",
+        "references/style-guide.md",
+    ]
