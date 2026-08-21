@@ -102,6 +102,7 @@ import {
 } from "@/components/SlashCommandMenu";
 import { setPendingInitialPrompt } from "@/store/chatStore";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
+import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { CliCommandBlock } from "./CliCommandBlock";
 import { WorkspacePicker, isNavigablePath } from "./WorkspacePicker";
@@ -2093,6 +2094,7 @@ export function NewChatLandingScreen() {
   const [message, setMessage] = useState<string>(() => landingDraft?.message ?? "");
   // Composer text captured when voice dictation starts, so Esc can revert to it.
   const voiceSnapshotRef = useRef("");
+  const isCoarsePointer = useIsCoarsePointer();
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   // Declared after textareaRef so dictation can place the caret after the
   // text it inserts (and insert at the caret rather than the draft's end).
@@ -4316,8 +4318,11 @@ export function NewChatLandingScreen() {
                     return;
                   }
                 }
-                // Enter sends; Shift+Enter inserts a newline.
-                if (e.key === "Enter" && !e.shiftKey) {
+                // Enter sends; Shift+Enter inserts a newline. On touch-primary
+                // devices there is no practical Shift+Enter and an accidental
+                // submit is unrecoverable, so Enter only inserts a newline and
+                // sending stays an explicit tap on the send button (#4943).
+                if (e.key === "Enter" && !e.shiftKey && !isCoarsePointer) {
                   e.preventDefault();
                   // The mention menu is briefly closed while its listing loads;
                   // swallow Enter so the in-progress "@dir/" token isn't sent.
