@@ -28,6 +28,7 @@ import mimetypes
 import os
 import re
 import tempfile
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -316,6 +317,15 @@ _SHARE_PUBLIC_POLICY = "public"
 # ``__web_researcher`` sub-agent, then reuses
 # ``_execute_subagent_tool``.
 _WEB_FETCH_TOOLS = frozenset({"web_fetch"})
+
+# How long ``web_fetch`` waits for its researcher before giving up. The tool
+# promises page content in its own result, so it holds the parent's tool loop
+# until the child is terminal; the child's own ``max_iterations=5`` bounds a
+# healthy run well inside this. On expiry the call returns an error and the
+# late result falls back to the parent inbox.
+_WEB_FETCH_RESULT_TIMEOUT = 300.0
+# Gap between polls of the child's terminal status while waiting.
+_SUBAGENT_RESULT_POLL_INTERVAL = 0.05
 
 # Priority 5f.1b: web_search — the first-party search builtin. Runner-local
 # so a non-OpenAI model's web_search function call resolves to the spec's
@@ -1825,6 +1835,72 @@ async def _execute_list_models_tool(*, agent_spec: AgentSpec | None) -> str:
     return json.dumps(catalog)
 
 
+async def _await_subagent_result(
+    child_session_id: str,
+    *,
+    agent: str,
+    title: str,
+    timeout: float,
+) -> str:
+    """
+    Block until a dispatched child is terminal and return its result.
+
+    Used by tools that promise the child's work in their own result rather
+    than a handle the caller polls for. The child's terminal payload is
+    suppressed inbox-side for the duration (see ``deliver_to_inbox``), so
+    the text returned here is the only copy the parent gets.
+
+    On expiry the inbox route is re-armed and the caller gets an error: the
+    child is still running, and its late result must land somewhere.
+
+    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
+    :param agent: Sub-agent name, used in the caller-visible messages.
+    :param title: Child instance title, used in the same messages.
+    :param timeout: Seconds to wait before giving up, e.g. ``300.0``.
+    :returns: The child's output on success, or an ``Error: ...`` string
+        describing a failed, cancelled, untracked, or too-slow child.
+    """
+    from omnigent.runner import app as _runner_app
+
+    deadline = time.monotonic() + timeout
+    while True:
+        entry = _runner_app.get_subagent_work(child_session_id)
+        if entry is None:
+            return (
+                f"Error: sub-agent {agent!r} title {title!r} stopped being "
+                "tracked before it returned a result; the work did not complete."
+            )
+        if entry.status in _runner_app._SUBAGENT_TERMINAL_STATUSES:
+            break
+        if time.monotonic() >= deadline:
+            _runner_app.restore_subagent_inbox_delivery(child_session_id)
+            return (
+                f"Error: sub-agent {agent!r} title {title!r} timed out after "
+                f"{timeout:.0f}s without returning a result. It is still "
+                "running; call sys_read_inbox later to collect the result. "
+                "Do not treat this as an answer."
+            )
+        try:
+            await asyncio.sleep(_SUBAGENT_RESULT_POLL_INTERVAL)
+        except asyncio.CancelledError:
+            # The waiting turn is going away, so nothing will consume this
+            # result inline. Hand the child back to the inbox route before
+            # unwinding, or a child that outlives the cancellation reports
+            # into a queue that was told to drop it.
+            _runner_app.restore_subagent_inbox_delivery(child_session_id)
+            raise
+
+    if entry.status != "completed":
+        detail = entry.output or "no error detail reported"
+        return f"Error: sub-agent {agent!r} title {title!r} {entry.status}: {detail}"
+    output = entry.output
+    if output is None or not output.strip():
+        return (
+            f"Error: sub-agent {agent!r} title {title!r} completed without returning any content."
+        )
+    return output
+
+
 async def _execute_subagent_tool(
     args: _JsonObject,
     *,
@@ -1833,6 +1909,7 @@ async def _execute_subagent_tool(
     agent_spec: AgentSpec | None = None,
     publish_event: Callable[[str, _JsonObject], None] | None = None,
     session_inbox: asyncio.Queue[_JsonObject] | None = None,
+    await_result: float | None = None,
 ) -> str:
     """
     Dispatch a sub-agent tool call (``sys_session_send``).
@@ -1858,7 +1935,12 @@ async def _execute_subagent_tool(
         discovery events to the parent stream.
     :param session_inbox: Parent session's inbox queue for async
         completion delivery.
-    :returns: JSON child-session handle, or an error string.
+    :param await_result: Seconds to wait for the child's result before
+        returning, for callers that promise the work in their own tool
+        result (``web_fetch``). ``None`` keeps the async contract: the
+        handle returns immediately and the result arrives inbox-side.
+    :returns: The child's result when ``await_result`` is set, otherwise a
+        JSON child-session handle; an error string on failure.
     """
     # Lazy import to avoid circular dependency at module load.
     from omnigent.runner import app as _runner_app
@@ -2278,6 +2360,7 @@ async def _execute_subagent_tool(
         title=session_name,
         wrapper_label=child_wrapper_label,
         created_by=dispatch_created_by,
+        deliver_to_inbox=await_result is None,
     )
     _publish_child_launching_update(
         parent_session_id=conversation_id,
@@ -2344,6 +2427,14 @@ async def _execute_subagent_tool(
         if teardown_warning is not None:
             return f"{error}\n{teardown_warning}"
         return error
+
+    if await_result is not None:
+        return await _await_subagent_result(
+            child_session_id,
+            agent=str(sub_agent_name),
+            title=session_name,
+            timeout=await_result,
+        )
 
     # Return the structured handle mirrored from ``spawn.py``. The debug panel
     # parses this to discover child sessions in the sidebar.
@@ -2976,6 +3067,12 @@ async def _execute_web_fetch_tool(
     ``_execute_subagent_tool`` ultimately exercises via
     ``POST /v1/sessions``.
 
+    Waits for the researcher and returns its findings as the tool result.
+    ``web_fetch`` advertises page content to the model and reports itself
+    as synchronous, so a launching handle here let the turn answer from
+    training knowledge while the research was still pending — and hid a
+    failed researcher behind a handle that read like progress.
+
     :param args: Parsed LLM arguments — ``query`` (required) and
         optional ``url``.
     :param server_client: httpx client pointed at the Omnigent server.
@@ -2985,8 +3082,8 @@ async def _execute_web_fetch_tool(
         ``_execute_subagent_tool`` to resolve the sub-agent.
     :param task_id: Calling task id; used to discriminate parallel
         ``web_fetch`` invocations from the same parent.
-    :param session_inbox: Parent inbox queue for delayed sub-agent
-        completion delivery.
+    :param session_inbox: Parent inbox queue, used as the fallback route
+        when the researcher outruns the tool's wait budget.
     :returns: The researcher's findings, or an error string.
     """
     from omnigent.tools.builtins.web_fetch import (
@@ -3017,6 +3114,7 @@ async def _execute_web_fetch_tool(
         agent_spec=agent_spec,
         publish_event=publish_event,
         session_inbox=session_inbox,
+        await_result=_WEB_FETCH_RESULT_TIMEOUT,
     )
 
 
