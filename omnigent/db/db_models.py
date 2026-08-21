@@ -44,6 +44,11 @@ _UUID_HEX_LEN = 32
 # strips exactly these (so old URLs/clients keep resolving) and nothing else —
 # an unknown prefix fails loud rather than silently storing a wrong-typed id's
 # hex tail (e.g. a ``resp_``/``runner_token_`` value mis-passed to a uuid column).
+# Sentinel value for cross-harness period cost budgets. The `harness` column
+# is part of the PRIMARY KEY, so it cannot be NULL on PostgreSQL. Cross-harness
+# budgets (which sum cost across all harnesses) use this sentinel instead of NULL.
+CROSS_HARNESS_SENTINEL = "__all__"
+
 _LEGACY_ID_PREFIXES = frozenset(
     {
         "ag",
@@ -1397,9 +1402,10 @@ class SqlUserPeriodCost(OmnigentBase):
         or ``"YYYY"`` (year). E.g. ``"2026-06"``, ``"2026-W25"``,
         ``"2026-Q2"``, ``"2026"``. Bucketed by the turn's wall-clock time.
     :param harness: The harness that executed the turn, e.g.
-        ``"codex-native"``, ``"claude-sdk"``. ``NULL`` when the harness
-        is unknown or unstamped (the cost is still tracked, but cannot
-        be scoped to a specific harness for per-harness budgets).
+        ``"codex-native"``, ``"claude-sdk"``. Set to
+        :const:`CROSS_HARNESS_SENTINEL` (``"__all__"``) for cross-harness
+        budgets that sum cost across all harnesses. This sentinel is used
+        instead of NULL because ``harness`` is part of the PRIMARY KEY.
     :param cost_usd: Cumulative USD spend for this user in this month on
         this harness. Starts at the first turn's delta and grows by each
         subsequent turn's delta.
@@ -1424,7 +1430,9 @@ class SqlUserPeriodCost(OmnigentBase):
     )
     user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     period: Mapped[str] = mapped_column(String(10), primary_key=True)
-    harness: Mapped[str | None] = mapped_column(String(64), primary_key=True, nullable=True)
+    harness: Mapped[str] = mapped_column(
+        String(64), primary_key=True, nullable=False, server_default=text(f"'{CROSS_HARNESS_SENTINEL}'")
+    )
     cost_usd: Mapped[float] = mapped_column(Float, nullable=False)
     ask_approved_usd: Mapped[float] = mapped_column(Float, nullable=False, server_default="0")
     updated_at: Mapped[int] = mapped_column(Integer)

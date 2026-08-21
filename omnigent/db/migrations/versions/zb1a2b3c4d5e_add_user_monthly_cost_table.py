@@ -16,11 +16,13 @@ The ``period`` column supports multiple granularities:
 - Quarter: ``"YYYY-Qq"`` (e.g. ``"2026-Q3"``)
 - Year: ``"YYYY"`` (e.g. ``"2026"``)
 
-The ``harness`` column (nullable) enables two budget modes:
+The ``harness`` column enables two budget modes:
 - Per-harness budgets: read cost for a specific harness (e.g.
   ``harness="codex-native"``).
-- Cross-harness budgets: sum cost across all harnesses for a user+period
-  (``GROUP BY user_id, period``).
+- Cross-harness budgets: use the sentinel value ``"__all__"`` to sum cost
+  across all harnesses for a user+period. This sentinel is used instead of
+  NULL because ``harness`` is part of the PRIMARY KEY (PostgreSQL does not
+  allow NULL in PK columns).
 
 This is a brand-new table (not a column on existing tables), so it does
 not affect deployments whose database lacks it: the server only ever
@@ -53,7 +55,7 @@ def upgrade() -> None:
         ),
         sa.Column("user_id", sa.String(128), nullable=False),
         sa.Column("period", sa.String(10), nullable=False),
-        sa.Column("harness", sa.String(64), nullable=True),
+        sa.Column("harness", sa.String(64), nullable=False, server_default="'__all__'"),
         sa.Column("cost_usd", sa.Float(), nullable=False, server_default="0"),
         sa.Column("ask_approved_usd", sa.Float(), nullable=False, server_default="0"),
         sa.Column("updated_at", sa.Integer(), nullable=False),

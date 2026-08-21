@@ -26,6 +26,7 @@ from sqlalchemy.sql.selectable import Subquery
 from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
 from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
+    CROSS_HARNESS_SENTINEL,
     LABEL_VALUE_MAX_LEN,
     SqlAgent,
     SqlComment,
@@ -1688,30 +1689,33 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param period: UTC month as ``"YYYY-MM"``, e.g. ``"2026-06"``.
         :param delta_usd: USD amount to add; ``<= 0`` is a no-op.
         :param harness: The harness executing the turn, e.g.
-            ``"codex-native"``. ``None`` when unknown/unstamped.
+            ``"codex-native"``. ``None`` for cross-harness budgets (converted
+            to the sentinel value internally).
         """
         if delta_usd <= 0:
             return
+        # Convert None → sentinel for cross-harness budgets (harness is part of PK, cannot be NULL)
+        harness_key = CROSS_HARNESS_SENTINEL if harness is None else harness
         now = now_epoch()
         with self._session("add_period_cost") as session:
             dialect = session.bind.dialect.name if session.bind is not None else ""
             if dialect in ("sqlite", "postgresql"):
                 self._upsert_monthly_cost_dialect(
-                    session, dialect, user_id, period, harness, delta_usd, now
+                    session, dialect, user_id, period, harness_key, delta_usd, now
                 )
                 return
             # Generic dialect fallback — SELECT-then-INSERT/UPDATE in one
             # transaction (race-safe under SERIALIZABLE / SQLite's
             # single-writer semantics).
             existing = session.get(
-                SqlUserPeriodCost, (current_workspace_id(), user_id, period, harness)
+                SqlUserPeriodCost, (current_workspace_id(), user_id, period, harness_key)
             )
             if existing is None:
                 session.add(
                     SqlUserPeriodCost(
                         user_id=user_id,
                         period=period,
-                        harness=harness,
+                        harness=harness_key,
                         cost_usd=delta_usd,
                         updated_at=now,
                     )
@@ -1788,13 +1792,14 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param user_id: The user to read, e.g. ``"alice@example.com"``.
         :param period: UTC month as ``"YYYY-MM"``, e.g. ``"2026-06"``.
         :param harness: The harness to read, e.g. ``"codex-native"``.
-            ``None`` means unknown/unstamped harness.
+            ``None`` for cross-harness budgets.
         :returns: The accumulated ``cost_usd``, or ``0.0`` when no row
             exists for ``(user_id, period, harness)``.
         """
+        harness_key = CROSS_HARNESS_SENTINEL if harness is None else harness
         with self._session("get_period_cost") as session:
             row = session.get(
-                SqlUserPeriodCost, (current_workspace_id(), user_id, period, harness)
+                SqlUserPeriodCost, (current_workspace_id(), user_id, period, harness_key)
             )
             return float(row.cost_usd) if row is not None else 0.0
 
@@ -1802,30 +1807,25 @@ class SqlAlchemyConversationStore(ConversationStore):
         self, user_id: str, period: str, harness: str | None = None
     ) -> float:
         """
-        Sum a user's LLM spend for a month, optionally scoped to a harness.
+        Return a user's LLM spend for a period and harness.
 
-        When ``harness`` is ``None``, sums across all harnesses (including
-        ``NULL`` harness rows) for cross-harness budgets. When ``harness``
-        is set, returns only that harness's cost for per-harness budgets.
+        For cross-harness budgets (``harness=None``), reads the single row
+        with ``harness="__all__"`` that accumulates cost across all harnesses.
+        For per-harness budgets, reads the specific harness row.
 
         :param user_id: The user to read, e.g. ``"alice@example.com"``.
         :param period: UTC month as ``"YYYY-MM"``, e.g. ``"2026-06"``.
-        :param harness: Optional harness filter. ``None`` sums across all
-            harnesses; a specific value (e.g. ``"codex-native"``) sums only
-            that harness.
-        :returns: The summed ``cost_usd``, or ``0.0`` when no rows exist.
+        :param harness: Optional harness filter. ``None`` for cross-harness
+            budgets; a specific value (e.g. ``"codex-native"``) for per-harness.
+        :returns: The ``cost_usd``, or ``0.0`` when no row exists.
         """
+        # Cross-harness budgets read the sentinel row; per-harness read specific harness
+        harness_key = CROSS_HARNESS_SENTINEL if harness is None else harness
         with self._session("sum_period_cost") as session:
-            stmt = (
-                select(func.coalesce(func.sum(SqlUserPeriodCost.cost_usd), 0.0))
-                .where(SqlUserPeriodCost.workspace_id == current_workspace_id())
-                .where(SqlUserPeriodCost.user_id == user_id)
-                .where(SqlUserPeriodCost.period == period)
+            row = session.get(
+                SqlUserPeriodCost, (current_workspace_id(), user_id, period, harness_key)
             )
-            if harness is not None:
-                stmt = stmt.where(SqlUserPeriodCost.harness == harness)
-            total = session.execute(stmt).scalar_one()
-            return float(total or 0.0)
+            return float(row.cost_usd) if row is not None else 0.0
 
     def get_period_cost_state(
         self, user_id: str, period: str, harness: str | None = None
@@ -1840,13 +1840,14 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param user_id: The user to read, e.g. ``"alice@example.com"``.
         :param period: UTC month as ``"YYYY-MM"``, e.g. ``"2026-06"``.
         :param harness: The harness to read, e.g. ``"codex-native"``.
-            ``None`` means unknown/unstamped harness.
+            ``None`` for cross-harness budgets.
         :returns: ``{"cost_usd": <float>, "ask_approved_usd": <float>}``;
             both ``0.0`` when no row exists for ``(user_id, period, harness)``.
         """
+        harness_key = CROSS_HARNESS_SENTINEL if harness is None else harness
         with self._session("get_period_cost_state") as session:
             row = session.get(
-                SqlUserPeriodCost, (current_workspace_id(), user_id, period, harness)
+                SqlUserPeriodCost, (current_workspace_id(), user_id, period, harness_key)
             )
             if row is None:
                 return {"cost_usd": 0.0, "ask_approved_usd": 0.0}
@@ -1878,8 +1879,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param ask_approved_usd: The crossed checkpoint value (USD) the
             user approved continuing past, e.g. ``0.05``.
         :param harness: The harness the approval is for, e.g.
-            ``"codex-native"``. ``None`` when unknown/unstamped.
+            ``"codex-native"``. ``None`` for cross-harness budgets.
         """
+        harness_key = CROSS_HARNESS_SENTINEL if harness is None else harness
         now = now_epoch()
         with self._session("set_period_ask_approved") as session:
             dialect = session.bind.dialect.name if session.bind is not None else ""
@@ -1898,7 +1900,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 stmt = stmt.values(
                     user_id=user_id,
                     period=period,
-                    harness=harness,
+                    harness=harness_key,
                     cost_usd=0.0,
                     ask_approved_usd=ask_approved_usd,
                     updated_at=now,
@@ -1916,14 +1918,14 @@ class SqlAlchemyConversationStore(ConversationStore):
                 return
             # Generic dialect fallback — SELECT-then-INSERT/UPDATE.
             existing = session.get(
-                SqlUserPeriodCost, (current_workspace_id(), user_id, period, harness)
+                SqlUserPeriodCost, (current_workspace_id(), user_id, period, harness_key)
             )
             if existing is None:
                 session.add(
                     SqlUserPeriodCost(
                         user_id=user_id,
                         period=period,
-                        harness=harness,
+                        harness=harness_key,
                         cost_usd=0.0,
                         ask_approved_usd=ask_approved_usd,
                         updated_at=now,
