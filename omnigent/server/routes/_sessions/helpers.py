@@ -17,6 +17,7 @@ import urllib.parse
 import weakref
 from collections import deque
 from collections.abc import (
+    AsyncGenerator,
     AsyncIterator,
     Awaitable,
     Callable,
@@ -7588,6 +7589,97 @@ async def _evaluate_output_policy(
     }
 
 
+async def _iter_session_events(
+    is_disconnected: Callable[[], Awaitable[bool]],
+    session_id: str,
+    on_subscribed: Callable[[], Awaitable[Iterable[dict[str, Any]]]] | None = None,
+    viewer_user_id: str | None = None,
+    viewer_idle: bool = False,
+    presence_root_id: str | None = None,
+) -> AsyncGenerator[tuple[str, dict[str, Any]], None]:
+    """
+    Yield validated ``(event_type, payload)`` pairs from the live stream.
+
+    Transport-agnostic core shared by the SSE route (via
+    :func:`_stream_live_events`, which SSE-formats each pair) and the
+    per-conversation event WebSocket (which ``json.dumps`` each pair).
+    Owns presence registration, the :func:`session_stream.subscribe`
+    live-tail with snapshot hooks, and ``ServerStreamEvent`` validation
+    at the wire boundary.
+
+    Unlike the SSE wrapper this yields NO ``[DONE]`` sentinel — the
+    end-of-iteration IS the terminal signal, and each transport encodes
+    it in its own idiom (SSE ``data: [DONE]``, WS a normal close). A
+    subscriber-queue overflow ends the iteration WITHOUT any terminal
+    marker so both transports treat it as a dropped stream and the client
+    reconnects through the persisted snapshot.
+
+    :param is_disconnected: Async predicate polled on each event to
+        detect client disconnect; the SSE route passes
+        ``request.is_disconnected`` and the WS route a receive-loop
+        flag. Kept as a callable so this core depends on neither the
+        FastAPI ``Request`` nor the ``WebSocket`` type.
+    :param session_id: Session/conversation identifier whose stream to
+        subscribe to, e.g. ``"conv_abc123"``.
+    :param on_subscribed: Optional snapshot-on-connect hook forwarded to
+        :func:`session_stream.subscribe`; see :func:`_stream_live_events`.
+    :param viewer_user_id: Presence identity for this stream's lifetime,
+        or ``None`` to skip presence tracking.
+    :param viewer_idle: Connect-time idle flag; ignored when
+        *viewer_user_id* is ``None``.
+    :param presence_root_id: Root conversation of the session tree;
+        required when *viewer_user_id* is set.
+    :returns: An async iterator of ``(event_type, validated_payload)``.
+    :raises ValueError: If *viewer_user_id* is set without
+        *presence_root_id*.
+    :raises session_stream.SubscriberOverflowError: propagated so the
+        transport wrappers can decide how to end the stream.
+    """
+    presence_token: str | None = None
+    if viewer_user_id is not None:
+        if presence_root_id is None:
+            raise ValueError("presence_root_id is required when viewer_user_id is set")
+        presence_token = presence.connect(
+            presence_root_id, session_id, viewer_user_id, viewer_idle
+        )
+    try:
+        # ``aclosing`` propagates outer ``aclose`` into ``subscribe``;
+        # a bare ``async for`` would leave the subscriber slot until GC.
+        async with contextlib.aclosing(
+            session_stream.subscribe(
+                session_id,
+                heartbeat_interval_s=_SESSION_STREAM_HEARTBEAT_INTERVAL_S,
+                ready_event={"type": "session.heartbeat"},
+                # In-flight text replay must be captured synchronously at slot
+                # registration (before ``ready_event`` suspends), not in the
+                # async ``on_subscribed`` hook, or window deltas double-render.
+                # Resource state stays in ``on_subscribed`` — it needs
+                # awaits and is not dedup-sensitive.
+                pre_ready_snapshot=lambda: inflight_text.snapshot_for(session_id),
+                on_subscribed=on_subscribed,
+            )
+        ) as live_events:
+            async for event in live_events:
+                if await is_disconnected():
+                    break
+                event_type = event.get("type")
+                if not isinstance(event_type, str):
+                    raise ValueError(
+                        f"session stream event missing string ``type`` field: {event!r}",
+                    )
+                validated = _SERVER_STREAM_EVENT_ADAPTER.validate_python(event)
+                yield event_type, validated.model_dump()
+    finally:
+        # The non-None checks besides presence_token's are type
+        # narrowing only: a minted token implies both were set above.
+        if (
+            presence_token is not None
+            and viewer_user_id is not None
+            and presence_root_id is not None
+        ):
+            presence.disconnect(presence_root_id, viewer_user_id, presence_token)
+
+
 async def _stream_live_events(
     request: Request,
     session_id: str,
@@ -7670,40 +7762,22 @@ async def _stream_live_events(
     # fans out to ALREADY-subscribed co-viewers, while this stream
     # learns the full list (self included) from the snapshot-on-connect
     # presence event — full-state events make that ordering race benign.
-    presence_token: str | None = None
-    if viewer_user_id is not None:
-        if presence_root_id is None:
-            raise ValueError("presence_root_id is required when viewer_user_id is set")
-        presence_token = presence.connect(
-            presence_root_id, session_id, viewer_user_id, viewer_idle
-        )
+    # The shared core (:func:`_iter_session_events`) owns presence,
+    # subscribe, and validation; this wrapper only SSE-formats each pair
+    # and appends the ``[DONE]`` sentinel on clean completion.
     try:
-        # ``aclosing`` propagates outer ``aclose`` into ``subscribe``;
-        # a bare ``async for`` would leave the subscriber slot until GC.
         async with contextlib.aclosing(
-            session_stream.subscribe(
+            _iter_session_events(
+                request.is_disconnected,
                 session_id,
-                heartbeat_interval_s=_SESSION_STREAM_HEARTBEAT_INTERVAL_S,
-                ready_event={"type": "session.heartbeat"},
-                # In-flight text replay must be captured synchronously at slot
-                # registration (before ``ready_event`` suspends), not in the
-                # async ``on_subscribed`` hook, or window deltas double-render.
-                # Resource state stays in ``on_subscribed`` — it needs
-                # awaits and is not dedup-sensitive.
-                pre_ready_snapshot=lambda: inflight_text.snapshot_for(session_id),
                 on_subscribed=on_subscribed,
+                viewer_user_id=viewer_user_id,
+                viewer_idle=viewer_idle,
+                presence_root_id=presence_root_id,
             )
-        ) as live_events:
-            async for event in live_events:
-                if await request.is_disconnected():
-                    break
-                event_type = event.get("type")
-                if not isinstance(event_type, str):
-                    raise ValueError(
-                        f"session stream event missing string ``type`` field: {event!r}",
-                    )
-                validated = _SERVER_STREAM_EVENT_ADAPTER.validate_python(event)
-                yield _format_sse(event_type, validated.model_dump())
+        ) as events:
+            async for event_type, payload in events:
+                yield _format_sse(event_type, payload)
     except session_stream.SubscriberOverflowError:
         _logger.warning(
             "session stream subscriber overflowed for %s; closing for snapshot reconnect",
@@ -7713,15 +7787,6 @@ async def _stream_live_events(
         # Normal completion only — never yield from ``finally`` (aclose /
         # GeneratorExit would raise ``async generator ignored GeneratorExit``).
         yield "data: [DONE]\n\n"
-    finally:
-        # The non-None checks besides presence_token's are type
-        # narrowing only: a minted token implies both were set above.
-        if (
-            presence_token is not None
-            and viewer_user_id is not None
-            and presence_root_id is not None
-        ):
-            presence.disconnect(presence_root_id, viewer_user_id, presence_token)
 
 
 def _validate_terminal_launch_args(value: list[str] | None) -> list[str] | None:
@@ -9702,6 +9767,7 @@ __all__ = [
     "_invalidate_runner_backed_snapshot_state",
     "_is_codex_native_subagent",
     "_is_kiro_native_session",
+    "_iter_session_events",
     "_last_task_error_from_labels",
     "_latest_assistant_text_from_store",
     "_latest_message_preview",

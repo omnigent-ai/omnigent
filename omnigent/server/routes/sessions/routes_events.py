@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import secrets
 import weakref
 from collections.abc import Callable
@@ -12,6 +14,10 @@ import httpx
 from fastapi import (
     APIRouter,
     Request,
+    WebSocket,
+    WebSocketDisconnect,
+    WebSocketException,
+    status,
 )
 from fastapi.responses import StreamingResponse
 
@@ -135,6 +141,7 @@ from omnigent.server.routes._sessions.helpers import (
     _get_runner_client_for_resource_access,
     _handle_external_session_todos,
     _is_codex_native_subagent,
+    _iter_session_events,
     _launch_runner_on_host,
     _persist_external_assistant_message,
     _persist_external_codex_approval_mode_change,
@@ -1833,84 +1840,7 @@ def register_events_routes(
         )
 
         async def _resource_snapshot() -> list[dict[str, Any]]:
-            """Gather current resource state to emit as snapshot-on-connect.
-
-            Best-effort: every runner-touching gather is time-boxed and
-            guarded so a slow/unavailable runner never blocks the live
-            tail. Terminals arrive as ``session.resource.created`` (the
-            same shape the web's live handler already consumes); child
-            sessions as ``session.child_session.updated``; changed files
-            as a single invalidate that triggers a client refetch.
-
-            The in-flight assistant-text replay is NOT read here: it is
-            dedup-sensitive and must be captured synchronously at slot
-            registration via ``subscribe``'s ``pre_ready_snapshot`` hook,
-            before ``ready_event`` suspends. The resource
-            gathers below need awaits and are not dedup-sensitive, so they
-            stay in this async hook.
-            """
-            events: list[dict[str, Any]] = []
-            try:
-                page = await asyncio.to_thread(
-                    conversation_store.list_conversations,
-                    limit=100,
-                    kind="sub_agent",
-                    parent_conversation_id=session_id,
-                    order="desc",
-                    sort_by="created_at",
-                )
-                summaries = await _child_session_summaries_from_conversations(
-                    page.data,
-                    session_id,
-                    conversation_store,
-                )
-                for summary in summaries:
-                    events.append(
-                        {
-                            "type": "session.child_session.updated",
-                            "conversation_id": session_id,
-                            "child_session_id": summary.id,
-                            "child": summary.model_dump(mode="json"),
-                        }
-                    )
-            except Exception:
-                _logger.debug("snapshot: child sessions failed for %s", session_id, exc_info=True)
-            if runner_client is not None:
-                try:
-                    resp = await asyncio.wait_for(
-                        # order=asc: the web cache appends each replayed
-                        # ``created`` event, so the replay must arrive in
-                        # creation order or the session's own terminal (always
-                        # created first) lands behind later agent-launched
-                        # ones. limit=1000 (the runner endpoint max) keeps the
-                        # oldest-first window from dropping the newest
-                        # terminals past the default page of 20.
-                        runner_client.get(
-                            f"/v1/sessions/{session_id}/resources/terminals",
-                            params={"order": "asc", "limit": "1000"},
-                        ),
-                        timeout=_SNAPSHOT_RUNNER_TIMEOUT_S,
-                    )
-                    if resp.status_code == 200:
-                        for item in resp.json().get("data", []):
-                            events.append({"type": "session.resource.created", "resource": item})
-                except Exception:
-                    _logger.debug("snapshot: terminals failed for %s", session_id, exc_info=True)
-            # Tell the client to (re)fetch the changed-files list rather
-            # than fetching it here (avoids a second runner round-trip).
-            events.append(
-                {
-                    "type": "session.changed_files.invalidated",
-                    "session_id": session_id,
-                    "environment_id": "default",
-                }
-            )
-            # Current viewer list (full state, includes this stream's own
-            # registration) so a joiner never waits for the next presence
-            # edge to learn who's here. Scoped to the session tree's root
-            # so a sub-agent page sees viewers of every agent in the tree.
-            events.append(presence.snapshot(conv.root_conversation_id, session_id))
-            return events
+            return await _build_resource_snapshot(session_id, conv, runner_client)
 
         return StreamingResponse(
             _stream_live_events(
@@ -1942,6 +1872,220 @@ def register_events_routes(
                 "X-Accel-Buffering": "no",
             },
         )
+
+    async def _build_resource_snapshot(
+        session_id: str,
+        conv: Any,
+        runner_client: httpx.AsyncClient | None,
+    ) -> list[dict[str, Any]]:
+        """Gather current resource state to emit as snapshot-on-connect.
+
+        Shared by the SSE route (``GET /sessions/{id}/stream``) and the
+        event WebSocket (``WS /sessions/{id}/stream/ws``).
+
+        Best-effort: every runner-touching gather is time-boxed and
+        guarded so a slow/unavailable runner never blocks the live
+        tail. Terminals arrive as ``session.resource.created`` (the
+        same shape the web's live handler already consumes); child
+        sessions as ``session.child_session.updated``; changed files
+        as a single invalidate that triggers a client refetch.
+
+        The in-flight assistant-text replay is NOT read here: it is
+        dedup-sensitive and must be captured synchronously at slot
+        registration via ``subscribe``'s ``pre_ready_snapshot`` hook,
+        before ``ready_event`` suspends. The resource
+        gathers below need awaits and are not dedup-sensitive, so they
+        stay in this async hook.
+        """
+        events: list[dict[str, Any]] = []
+        try:
+            page = await asyncio.to_thread(
+                conversation_store.list_conversations,
+                limit=100,
+                kind="sub_agent",
+                parent_conversation_id=session_id,
+                order="desc",
+                sort_by="created_at",
+            )
+            summaries = await _child_session_summaries_from_conversations(
+                page.data,
+                session_id,
+                conversation_store,
+            )
+            for summary in summaries:
+                events.append(
+                    {
+                        "type": "session.child_session.updated",
+                        "conversation_id": session_id,
+                        "child_session_id": summary.id,
+                        "child": summary.model_dump(mode="json"),
+                    }
+                )
+        except Exception:
+            _logger.debug("snapshot: child sessions failed for %s", session_id, exc_info=True)
+        if runner_client is not None:
+            try:
+                resp = await asyncio.wait_for(
+                    # order=asc: the web cache appends each replayed
+                    # ``created`` event, so the replay must arrive in
+                    # creation order or the session's own terminal (always
+                    # created first) lands behind later agent-launched
+                    # ones. limit=1000 (the runner endpoint max) keeps the
+                    # oldest-first window from dropping the newest
+                    # terminals past the default page of 20.
+                    runner_client.get(
+                        f"/v1/sessions/{session_id}/resources/terminals",
+                        params={"order": "asc", "limit": "1000"},
+                    ),
+                    timeout=_SNAPSHOT_RUNNER_TIMEOUT_S,
+                )
+                if resp.status_code == 200:
+                    for item in resp.json().get("data", []):
+                        events.append({"type": "session.resource.created", "resource": item})
+            except Exception:
+                _logger.debug("snapshot: terminals failed for %s", session_id, exc_info=True)
+        # Tell the client to (re)fetch the changed-files list rather
+        # than fetching it here (avoids a second runner round-trip).
+        events.append(
+            {
+                "type": "session.changed_files.invalidated",
+                "session_id": session_id,
+                "environment_id": "default",
+            }
+        )
+        # Current viewer list (full state, includes this stream's own
+        # registration) so a joiner never waits for the next presence
+        # edge to learn who's here. Scoped to the session tree's root
+        # so a sub-agent page sees viewers of every agent in the tree.
+        events.append(presence.snapshot(conv.root_conversation_id, session_id))
+        return events
+
+    # ── WS /sessions/{session_id}/stream/ws ────────────────────────
+
+    @router.websocket("/sessions/{session_id}/stream/ws")
+    async def stream_session_ws(
+        websocket: WebSocket,
+        session_id: str,
+        idle: bool = False,
+    ) -> None:
+        """
+        Per-conversation event stream over a WebSocket.
+
+        Functional twin of ``GET /sessions/{session_id}/stream`` — same
+        live-tail contract, same snapshot-on-connect, same presence
+        semantics — carried over a WebSocket so it rides the browser's
+        separate (effectively unbounded) WS connection pool instead of
+        the ~6-per-origin HTTP/1.1 pool the SSE stream competes in. With
+        several tabs open the SSE streams alone can exhaust that HTTP
+        pool and stall every other request; this endpoint is the web
+        client's default, with the SSE route kept as a fallback.
+
+        Protocol: the server pushes one JSON text frame per event
+        (``{"type": ..., ...}`` — the same ``ServerStreamEvent`` payloads
+        the SSE route emits). The client sends nothing after the
+        handshake; a normal close is the analog of the SSE ``[DONE]``
+        sentinel. Like the SSE stream this does NOT replay history —
+        clients reconcile via ``GET /v1/sessions/{id}`` and dedupe by
+        item id.
+
+        :param websocket: The incoming FastAPI :class:`WebSocket`.
+        :param session_id: Session/conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :param idle: Presence idle flag from the query string, matching
+            the SSE route's ``idle`` param. An idle flip mid-view arrives
+            as a reconnect carrying the new value.
+        """
+        user_id = auth_provider.get_user_id(websocket) if auth_provider is not None else None
+        # An unauthenticated socket must not probe session ids; reject the
+        # handshake before accept (mirrors the session-updates gate).
+        if permission_store is not None and user_id is None:
+            raise WebSocketException(
+                code=status.WS_1008_POLICY_VIOLATION,
+                reason="authentication required",
+            )
+        # Access failures surface as HTTP-shaped OmnigentError (403/404); a
+        # pre-accept WebSocket can only reject via WebSocketException, so map
+        # both to a policy-violation close (the same code the auth gate uses).
+        try:
+            access = await _require_access_and_level(
+                user_id, session_id, LEVEL_READ, permission_store, conversation_store
+            )
+        except OmnigentError as exc:
+            raise WebSocketException(
+                code=status.WS_1008_POLICY_VIOLATION,
+                reason=str(exc.code),
+            ) from exc
+        conv = access.conversation
+        if conv is None:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is None:
+                raise WebSocketException(
+                    code=status.WS_1008_POLICY_VIOLATION,
+                    reason="session not found",
+                )
+        runner_client = await _get_runner_client(session_id, runner_router)
+        await _ensure_runner_relay_ready(
+            session_id,
+            conv.runner_id,
+            runner_client,
+            conversation_store,
+        )
+        await websocket.accept()
+
+        # A concurrent receive loop is the WS analog of the SSE route's
+        # ``request.is_disconnected()`` poll: a browser tab close / navigation
+        # surfaces as ``WebSocketDisconnect`` here, flipping the flag so the
+        # emit loop stops at its next event instead of blocking on a dead
+        # socket until the next heartbeat write fails.
+        disconnected = asyncio.Event()
+
+        async def _watch_disconnect() -> None:
+            try:
+                while True:
+                    await websocket.receive_text()
+            except WebSocketDisconnect:
+                disconnected.set()
+
+        async def _resource_snapshot() -> list[dict[str, Any]]:
+            return await _build_resource_snapshot(session_id, conv, runner_client)
+
+        async def _is_disconnected() -> bool:
+            return disconnected.is_set()
+
+        recv_task = asyncio.create_task(_watch_disconnect(), name="session-stream-ws-recv")
+        try:
+            async with contextlib.aclosing(
+                _iter_session_events(
+                    _is_disconnected,
+                    session_id,
+                    on_subscribed=_resource_snapshot,
+                    viewer_user_id=_attribution_user(user_id),
+                    viewer_idle=idle,
+                    presence_root_id=conv.root_conversation_id,
+                )
+            ) as events:
+                async for _event_type, payload in events:
+                    if disconnected.is_set():
+                        break
+                    await websocket.send_text(json.dumps(payload))
+        except session_stream.SubscriberOverflowError:
+            # A dropped-transport signal: end WITHOUT a clean [DONE]-equivalent
+            # so the client reconnects and reconciles from the snapshot. Close
+            # with a going-away code rather than a normal 1000.
+            _logger.warning(
+                "session stream ws subscriber overflowed for %s; closing for reconnect",
+                session_id,
+            )
+            with contextlib.suppress(RuntimeError):
+                await websocket.close(code=status.WS_1001_GOING_AWAY)
+        except WebSocketDisconnect:
+            pass
+        finally:
+            recv_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await recv_task
+            with contextlib.suppress(RuntimeError):
+                await websocket.close()
 
     # ── DELETE /sessions/{session_id} ──────────────────────────────
 

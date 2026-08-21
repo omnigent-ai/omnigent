@@ -90,6 +90,7 @@ import {
   type SseStreamResult,
 } from "@/lib/sse";
 import { clearSseLog, pushSseEvent } from "@/lib/sseEventLog";
+import { streamSessionEventsWs, type WsStreamResult } from "@/lib/sessionEventSocket";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { sessionItemsQueryKey } from "@/hooks/useSessionItems";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
@@ -3899,8 +3900,48 @@ if (typeof window !== "undefined") {
   window.addEventListener("online", () => recycleStreamIfStale());
 }
 
+/** localStorage key that overrides the built-in event-stream transport. */
+const EVENT_STREAM_TRANSPORT_KEY = "omnigent.eventStream.transport";
+
 /**
- * Own the session SSE stream for the lifetime of a bound conversation,
+ * Whether the event stream should ride a WebSocket instead of the SSE fetch.
+ *
+ * WebSocket is the default: it uses the browser's separate, effectively
+ * unbounded WS connection pool, so many open tabs no longer exhaust the
+ * ~6-per-origin HTTP/1.1 pool and stall unrelated requests. Set
+ * `VITE_EVENT_STREAM_TRANSPORT=sse` at build time to force the legacy SSE
+ * fallback (e.g. a deployment whose ingress can't proxy this WebSocket).
+ *
+ * A `omnigent.eventStream.transport` localStorage value (`"ws"` / `"sse"`)
+ * overrides the build-time default for the current browser, so a transport
+ * can be flipped for one tab without a rebuild — used to diagnose a
+ * suspected transport issue in a deployed build, and by the e2e suite to
+ * exercise whichever transport a given test targets.
+ */
+function eventStreamUsesWebSocket(): boolean {
+  try {
+    const override = window.localStorage.getItem(EVENT_STREAM_TRANSPORT_KEY);
+    if (override === "ws") return true;
+    if (override === "sse") return false;
+  } catch {
+    // Storage can throw in private-mode / sandboxed frames; fall through
+    // to the build-time default.
+  }
+  return import.meta.env.VITE_EVENT_STREAM_TRANSPORT !== "sse";
+}
+
+/**
+ * Consecutive WS opens that closed before delivering a single event before we
+ * give up. The WS handshake collapses a 401/403/404 into an opaque abnormal
+ * close, so — unlike the SSE preflight, which sees the status directly — the
+ * only signal of a permanently-broken/forbidden session is "connects, then
+ * immediately closes empty" repeating. This cap bounds that loop; a transient
+ * proxy blip recovers well within it.
+ */
+const MAX_WS_EMPTY_OPENS = 8;
+
+/**
+ * Own the session event stream for the lifetime of a bound conversation,
  * reconnecting transparently across drops.
  *
  * One connection at a time: open `/stream`, pump it via
@@ -3937,6 +3978,10 @@ export async function startStreamPump(
   // established stream — failed opens leave it false so a recovered first
   // connect is still treated as initial, not a reconnect.
   let hasConnected = false;
+  // WS-only: consecutive opens that closed before any event (see
+  // MAX_WS_EMPTY_OPENS). Reset the moment a WS delivers its first event.
+  let wsEmptyOpens = 0;
+  const useWebSocket = eventStreamUsesWebSocket();
   // A reconnect loop is inherently sequential — open → pump → reconnect —
   // so its awaits cannot be parallelized; no-await-in-loop doesn't apply.
   /* eslint-disable no-await-in-loop */
@@ -3971,6 +4016,76 @@ export async function startStreamPump(
       streamAttemptActivity.set(attempt, Date.now());
       try {
         const idle = presenceIdle.idleNow();
+
+        // WebSocket transport: the browser can't preflight a WS handshake for
+        // a status code the way the SSE fetch does, so open + pump in one step
+        // and infer a permanently-broken/forbidden session from repeated
+        // empty opens (MAX_WS_EMPTY_OPENS). Reconnect/backoff/reconcile is
+        // otherwise identical to the SSE path below.
+        if (useWebSocket) {
+          const reconnecting = hasConnected;
+          const wsResult: WsStreamResult = { sawCleanClose: false };
+          let sawEvent = false;
+          const wsEvents = (async function* () {
+            for await (const ev of streamSessionEventsWs(id, attempt.signal, { idle }, wsResult)) {
+              if (!sawEvent) {
+                sawEvent = true;
+                // A live connection: mark connected and reset both the
+                // backoff and the empty-open guard.
+                hasConnected = true;
+                failedOpens = 0;
+                consecutive404s = 0;
+                wsEmptyOpens = 0;
+                presenceIdle.noteReported(idle);
+                if (reconnecting) {
+                  dropEphemeralInFlightBlocks(id, set);
+                } else {
+                  // Fresh connection (not a reconnect) — clear any stale event
+                  // log from a previous stream bind so the debug panel starts
+                  // clean, same as the SSE path.
+                  clearSseLog(id);
+                }
+              }
+              yield ev;
+            }
+          })();
+          // Start the pump, then reconcile the snapshot concurrently on a
+          // reconnect (race-safe via itemId dedup) — same order as the SSE
+          // path. A snapshot fetch against a session that never reopened is
+          // harmless (deduped / 404s without effect).
+          const pumpPromise = pumpParsedEvents(
+            id,
+            wsEvents,
+            controller,
+            set,
+            get,
+            () => wsResult.sawCleanClose,
+          );
+          if (reconnecting) {
+            await reconcileOnReconnect(id, set, get);
+          }
+          let reason = await pumpPromise;
+          if (reason === "aborted" && !controller.signal.aborted) {
+            reason = "dropped";
+          }
+          if (reason !== "dropped") break;
+          if (!sawEvent) {
+            // Connected (or failed to) and closed without a single event.
+            // Repeated, this is a permanent failure the WS handshake hid.
+            wsEmptyOpens += 1;
+            if (wsEmptyOpens > MAX_WS_EMPTY_OPENS) {
+              console.warn(
+                `Session ${id}: event WebSocket closed empty ${wsEmptyOpens}x, giving up`,
+              );
+              finalizeActive(set, "failed", "event stream unavailable", null);
+              set({ sessionStatus: "failed", status: "idle" });
+              break;
+            }
+            failedOpens += 1;
+          }
+          continue;
+        }
+
         let streamRes: Response;
         try {
           streamRes = await openSessionStream(id, attempt.signal, { idle });
@@ -4464,9 +4579,38 @@ export async function pumpStreamEvents(
   get: Getter,
   scheduler: FrameScheduler = createRafScheduler(),
 ): Promise<StreamEndReason> {
-  const stream = new BlockStream();
+  // SSE wrapper over the transport-agnostic core: parse the byte body into
+  // typed events, then let the parser's `[DONE]` sentinel decide clean-close
+  // vs transport-drop. The event WebSocket path (`pumpParsedEvents`) supplies
+  // its own already-parsed event iterable and clean-close predicate.
   const sseResult: SseStreamResult = { sawDone: false };
   const rawEvents = parseSseStream(body, sseResult);
+  return pumpParsedEvents(id, rawEvents, controller, set, get, () => sseResult.sawDone, scheduler);
+}
+
+/**
+ * Transport-agnostic core of the event pump: tap `session.*` side effects,
+ * reduce blocks through `BlockStream`, and batch-commit to `state.blocks`.
+ * Shared by {@link pumpStreamEvents} (SSE byte body) and the event WebSocket
+ * transport, which both produce an `AsyncIterable<StreamEvent>`.
+ *
+ * @param rawEvents - Parsed typed events from either transport.
+ * @param sawCleanClose - Called once the iterable ends to distinguish a
+ *   deliberate server close (`"server_closed"`, don't reconnect) from a
+ *   transport drop (`"dropped"`, reconnect). For SSE this reflects the
+ *   `[DONE]` sentinel; for WS, a normal (1000) close frame.
+ * @returns Why the connection ended — see {@link StreamEndReason}.
+ */
+export async function pumpParsedEvents(
+  id: string,
+  rawEvents: AsyncIterable<StreamEvent>,
+  controller: AbortController,
+  set: Setter,
+  get: Getter,
+  sawCleanClose: () => boolean,
+  scheduler: FrameScheduler = createRafScheduler(),
+): Promise<StreamEndReason> {
+  const stream = new BlockStream();
   // Tap the raw event stream for `session.*` side effects (sessionStatus,
   // pending-message promotion, interrupted decoration) before handing it
   // to the BlockStream reducer. The reducer is intentionally pure
@@ -4725,7 +4869,7 @@ export async function pumpStreamEvents(
     // a deliberate server close (`[DONE]`) or a transport drop without it
     // (idle proxy disconnect / the Apps ~5-min cap) decides reconnection.
     flush();
-    return sseResult.sawDone ? "server_closed" : "dropped";
+    return sawCleanClose() ? "server_closed" : "dropped";
   } catch (err) {
     if (err instanceof Error && err.name === "AbortError") return "aborted";
     if (isConversationDisposed(id)) return "switched";

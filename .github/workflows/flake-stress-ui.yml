@@ -271,6 +271,10 @@ jobs:
         # never run it under xdist or alongside the live server.
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+          # Pin the event-stream transport to SSE: this suite drives the SSE
+          # transport directly and Playwright header auth cannot ride a WS
+          # handshake. See e2e-ui.yml for the full rationale.
+          VITE_EVENT_STREAM_TRANSPORT: sse
         run: |
           pnpm install --frozen-lockfile --filter web
           pnpm --filter web run build

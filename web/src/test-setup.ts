@@ -1,6 +1,15 @@
 import "@testing-library/jest-dom/vitest";
 import { vi } from "vitest";
 
+// Default the event-stream transport to SSE in tests. Production defaults to
+// the WebSocket (it dodges the ~6-per-origin HTTP/1.1 pool), but the extensive
+// `startStreamPump` reconnect/bind suite drives the SSE fetch path by mocking
+// `openSessionStream`, and that fallback still ships. The WebSocket transport
+// has its own dedicated coverage (`sessionEventSocket.test.ts` +
+// `tests/server/routes/test_session_stream_ws.py`). A WS-branch test can
+// override this per-case with `vi.stubEnv("VITE_EVENT_STREAM_TRANSPORT", ...)`.
+vi.stubEnv("VITE_EVENT_STREAM_TRANSPORT", "sse");
+
 // The @lobehub icon packages have broken nested-module resolution
 // under vitest; stub presentational glyphs so component modules that
 // import them can still load in tests. (The Antigravity glyph additionally
