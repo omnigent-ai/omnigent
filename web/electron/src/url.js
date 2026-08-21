@@ -26,6 +26,14 @@
    */
   const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
 
+  function isLoopbackServer(serverUrl) {
+    try {
+      return LOCAL_HOSTS.has(new URL(serverUrl).hostname);
+    } catch {
+      return false;
+    }
+  }
+
   /**
    * The scheme a schemeless input should default to: http:// for loopback
    * hosts (local dev is plain http), https:// for everything else (the pasted
@@ -358,6 +366,7 @@
 
   return {
     LOCAL_HOSTS,
+    isLoopbackServer,
     defaultSchemeFor,
     normalizeUrl,
     normalizeRecentServers,

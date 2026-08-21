@@ -443,7 +443,7 @@
     <script>
       // Shared URL helpers (electron/src/url.js), exposed as window.omnigentUrl
       // — the same module the main process uses, so the two never drift.
-      const { isPlainHttpRemote, serverDisplayLabel } = window.omnigentUrl;
+      const { serverDisplayLabel } = window.omnigentUrl;
       // Uses the Electron preload bridge (electron/src/preload.js).
       const setup = window.omnigentSetup;
       const input = document.getElementById("url");
@@ -550,27 +550,19 @@
         })
         .catch(() => {});
 
-      // The exact URL value the user has already been warned about — a
-      // second Connect click on the same value proceeds; editing the input
-      // re-arms the warning.
-      let warnedFor = null;
-
       async function connect() {
         err.textContent = "";
         const value = input.value;
-        if (isPlainHttpRemote(value) && warnedFor !== value) {
-          warnedFor = value;
-          err.textContent =
-            "Warning: unencrypted http:// to a remote host — anyone on the " +
-            "network path can act as this server. Click Connect again to proceed.";
-          return;
-        }
         button.disabled = true;
         try {
-          // setServerUrl persists the URL and navigates this window to it —
-          // after which the server's SPA takes over the window. Connecting this
-          // machine as a runner is done later from the host menu, not here.
-          await setup.setServerUrl(value);
+          // setServerUrl authenticates, then persists the URL and navigates this
+          // window to it. Connecting this machine as a runner is done later from
+          // the host menu, not here.
+          const result = await setup.setServerUrl(value);
+          if (result && result.loaded === false) {
+            err.textContent = result.error || "Could not connect to the server.";
+            button.disabled = false;
+          }
         } catch (e) {
           err.textContent = String(e && e.message ? e.message : e);
           button.disabled = false;
@@ -587,7 +579,8 @@
       // connects this window to it through the normal flow. It
       // needs the local omnigent CLI, so we detect the CLI on load and, when
       // it's missing, show install instructions plus a way to point at the
-      // binary. Remote Connect never depends on the CLI.
+      // binary. Remote sign-in uses the system browser in-process and does not
+      // require the local CLI.
       const startLocalBtn = document.getElementById("start-local");
       const localSection = document.getElementById("local-section");
       const cliGear = document.getElementById("cli-gear");
@@ -714,10 +707,11 @@
               // window loads the server and this page goes away. Connecting this
               // machine as a runner is done later from the host menu.
               input.value = result.url;
-              await setup.setServerUrl(result.url);
-              return;
+              const loadResult = await setup.setServerUrl(result.url);
+              if (loadResult?.loaded === true) return;
+            } else {
+              err.textContent = (result && result.error) || "Could not start the local server.";
             }
-            err.textContent = (result && result.error) || "Could not start the local server.";
           } catch (e) {
             err.textContent = String(e && e.message ? e.message : e);
           }

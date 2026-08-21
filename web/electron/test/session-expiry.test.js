@@ -9,8 +9,14 @@
 
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
+const { EventEmitter } = require("node:events");
 
-const { isLoginRedirect, registerSessionExpiryReload } = require("../src/session-expiry");
+const {
+  isLoginRedirect,
+  isOidcLoginNavigation,
+  registerSessionExpiryReload,
+  registerOidcSessionExpiryHandoff,
+} = require("../src/session-expiry");
 
 describe("isLoginRedirect", () => {
   it("matches a 303 redirect to the login page", () => {
@@ -143,5 +149,160 @@ describe("registerSessionExpiryReload", () => {
     ses.emit({ ...LOGIN_REDIRECT, url: "not a url" });
 
     assert.deepEqual(reloaded, []);
+  });
+});
+
+describe("self-hosted OIDC session expiry", () => {
+  it("matches only the pinned server's exact OIDC login route", () => {
+    assert.equal(
+      isOidcLoginNavigation(
+        "https://server.example/auth/login?return_to=%2Fc%2Fcurrent",
+        "https://server.example",
+      ),
+      true,
+    );
+    assert.equal(
+      isOidcLoginNavigation(
+        "https://server.example/base/auth/login?return_to=%2Fc%2Fcurrent",
+        "https://server.example/base",
+      ),
+      true,
+    );
+    assert.equal(
+      isOidcLoginNavigation("https://server.example/login", "https://server.example"),
+      false,
+    );
+    assert.equal(
+      isOidcLoginNavigation("https://idp.example/auth/login", "https://server.example"),
+      false,
+    );
+    assert.equal(
+      isOidcLoginNavigation(
+        "https://server.example/baseball/auth/login",
+        "https://server.example/base",
+      ),
+      false,
+    );
+    assert.equal(
+      isOidcLoginNavigation(
+        "https://server.example:444/base/auth/login",
+        "https://server.example/base",
+      ),
+      false,
+    );
+  });
+
+  it("blocks live-renderer login navigation and preserves the exact current route", async () => {
+    class FakeWebContents extends EventEmitter {
+      getURL() {
+        return "https://server.example/c/current?tab=artifacts#latest";
+      }
+    }
+    const webContents = new FakeWebContents();
+    const handoffs = [];
+    registerOidcSessionExpiryHandoff(
+      webContents,
+      () => "https://server.example",
+      async (params) => handoffs.push(params),
+    );
+    const event = {
+      prevented: false,
+      preventDefault() {
+        this.prevented = true;
+      },
+    };
+
+    webContents.emit(
+      "will-navigate",
+      event,
+      "https://server.example/auth/login?return_to=%2Fc%2Fcurrent",
+    );
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+
+    assert.equal(event.prevented, true);
+    assert.deepEqual(handoffs, [
+      {
+        serverUrl: "https://server.example",
+        returnUrl: "https://server.example/c/current?tab=artifacts#latest",
+      },
+    ]);
+  });
+
+  it("also blocks a main-frame redirect but ignores subframes", async () => {
+    class FakeWebContents extends EventEmitter {
+      getURL() {
+        return "https://server.example/c/current";
+      }
+    }
+    const webContents = new FakeWebContents();
+    let handoffs = 0;
+    registerOidcSessionExpiryHandoff(
+      webContents,
+      () => "https://server.example",
+      async () => {
+        handoffs += 1;
+      },
+    );
+    const mainEvent = {
+      prevented: false,
+      preventDefault() {
+        this.prevented = true;
+      },
+    };
+    const subframeEvent = {
+      prevented: false,
+      preventDefault() {
+        this.prevented = true;
+      },
+    };
+
+    webContents.emit(
+      "will-redirect",
+      subframeEvent,
+      "https://server.example/auth/login",
+      false,
+      false,
+    );
+    webContents.emit("will-redirect", mainEvent, "https://server.example/auth/login", false, true);
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+
+    assert.equal(subframeEvent.prevented, false);
+    assert.equal(mainEvent.prevented, true);
+    assert.equal(handoffs, 1);
+  });
+
+  it("deduplicates repeated expiry navigation while a handoff is in flight", async () => {
+    class FakeWebContents extends EventEmitter {
+      getURL() {
+        return "https://server.example/base/c/current";
+      }
+    }
+    const webContents = new FakeWebContents();
+    const pending = Promise.withResolvers();
+    let handoffs = 0;
+    registerOidcSessionExpiryHandoff(
+      webContents,
+      () => "https://server.example/base",
+      async () => {
+        handoffs += 1;
+        await pending.promise;
+      },
+    );
+    const event = () => ({ preventDefault() {} });
+
+    webContents.emit("will-navigate", event(), "https://server.example/base/auth/login");
+    webContents.emit("will-navigate", event(), "https://server.example/base/auth/login");
+    await new Promise(setImmediate);
+    assert.equal(handoffs, 1);
+
+    pending.resolve();
+    await new Promise(setImmediate);
+    webContents.emit("will-navigate", event(), "https://server.example/base/auth/login");
+    await new Promise(setImmediate);
+    assert.equal(handoffs, 2);
   });
 });
