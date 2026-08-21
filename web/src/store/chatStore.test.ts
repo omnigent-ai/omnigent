@@ -7970,6 +7970,73 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
+  it("clears a stale worktree-setup band on reconnect, with no navigation", async () => {
+    // WHY: the band is hydrated from the `omnigent.worktree_setup` label, and
+    // the terminal `session.worktree_setup.*` edge only ever arrives live. A
+    // stream that dropped while setup was running therefore left "Running
+    // setup script…" on screen forever — the reconnect refetched items but
+    // never re-derived the band, so it took clicking to another session and
+    // back to clear. The reconnect has to re-derive it from the snapshot.
+    seedSession("conv_wt_band", []);
+    sessionLabels.set("conv_wt_band", { "omnigent.worktree_setup": "done" });
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_wt_band",
+      abortController: controller,
+      // What the user is staring at: the band the dead socket stranded.
+      worktreeSetup: { state: "running", command: "bun install", reason: null, outputTail: null },
+    });
+
+    const loop = startStreamPump("conv_wt_band", controller, setState, getState);
+    await drainAsync();
+    expect(sinks).toHaveLength(1);
+    // Still showing while the first connection is healthy — the band is not
+    // being cleared by the initial bind, which never ran here.
+    expect(useChatStore.getState().worktreeSetup?.state).toBe("running");
+
+    // The socket dies without a terminal edge (the exact regression: the
+    // server's unmodelled event killed the stream mid-setup).
+    sinks[0]!.close();
+    await drainAsync(2);
+    expect(sinks).toHaveLength(2);
+
+    expect(useChatStore.getState().worktreeSetup).toBeNull();
+
+    const last = sinks[1]!;
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
+    await loop;
+  });
+
+  it("keeps a failed worktree-setup band across a reconnect", async () => {
+    // WHY: the counterpart to the clear — a fail-open setup leaves a degraded
+    // workspace, and re-deriving from labels must not erase that explanation.
+    seedSession("conv_wt_failed", []);
+    sessionLabels.set("conv_wt_failed", { "omnigent.worktree_setup": "failed" });
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_wt_failed",
+      abortController: controller,
+      worktreeSetup: { state: "running", command: "bun install", reason: null, outputTail: null },
+    });
+
+    const loop = startStreamPump("conv_wt_failed", controller, setState, getState);
+    await drainAsync();
+    sinks[0]!.close();
+    await drainAsync(2);
+
+    expect(useChatStore.getState().worktreeSetup?.state).toBe("failed");
+
+    const last = sinks[1]!;
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
+    await loop;
+  });
+
   it("keeps a heartbeat-alive stream connected across many stall windows", async () => {
     seedSession("conv_hb", []);
     const sinks = routeStreamOpens();

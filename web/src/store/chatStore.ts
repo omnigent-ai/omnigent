@@ -2903,6 +2903,11 @@ function sessionBindingPatch(
     // own) so reopening a session mid-setup still shows the band; the SSE
     // edges take over from there. `done` is not worth a band, so it hydrates
     // as cleared.
+    // Ordering caveat: `bindStream` starts the pump before awaiting this
+    // snapshot, so a terminal edge landing in that window can be overwritten
+    // by a `running` label read moments earlier. Both read the same label, so
+    // the window is narrow, and the next reconnect re-derives the band from a
+    // fresh snapshot (see `reconnectStatusPatch`).
     worktreeSetup: worktreeSetupFromLabels(session.labels),
   };
 }
@@ -3479,6 +3484,11 @@ function reconnectStatusPatch(session: Session, s: ChatState): Partial<ChatState
   // Recover the background-shell tally across the gap too, so the spinner
   // returns to "N background tasks still running" rather than vanishing on reconnect.
   patch.backgroundTaskCount = session.backgroundTaskCount ?? 0;
+  // Re-derive the worktree-setup band from the snapshot's labels. The band is
+  // label-hydrated (see `worktreeSetupFromLabels`), so a stream that dropped
+  // while setup was running would otherwise keep showing it until the user
+  // navigated away and back — the terminal SSE edge died with the socket.
+  patch.worktreeSetup = worktreeSetupFromLabels(session.labels);
   if (session.contextWindow != null) patch.contextWindow = session.contextWindow;
   if (session.lastTotalTokens != null) patch.tokensUsed = session.lastTotalTokens;
   if (session.totalCostUsd != null) patch.sessionCostUsd = session.totalCostUsd;

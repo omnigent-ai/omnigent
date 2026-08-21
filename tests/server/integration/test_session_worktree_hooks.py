@@ -579,3 +579,140 @@ async def _await_setup_settled_or_skip(client: httpx.AsyncClient, session_id: st
     resp = await client.get(f"/v1/sessions/{session_id}")
     if (resp.json().get("labels") or {}).get(_SETUP_LABEL) is not None:
         await _await_setup_settled(client, session_id)
+
+
+async def _read_sse_events(
+    app: FastAPI,
+    session_id: str,
+    *,
+    until: str,
+    timeout_s: float = 5.0,
+) -> list[str]:
+    """Drive the real SSE route as an ASGI call, collecting ``event:`` names.
+
+    Not via the test client: ``httpx.ASGITransport`` buffers the whole
+    response body, so it can never return from an endless SSE response.
+    Calling the app directly reads frames as the route writes them, which
+    is the whole point here — the regression was frames that never
+    reached the socket.
+
+    :param app: The FastAPI app under test.
+    :param session_id: Session whose stream to open.
+    :param until: Event name to stop at (inclusive).
+    :param timeout_s: How long to read before failing.
+    :returns: The event names seen, in arrival order.
+    """
+    seen: list[str] = []
+    stop = asyncio.Event()
+    statuses: list[int] = []
+
+    async def _receive() -> dict[str, Any]:
+        """Report a client disconnect only once the reader is satisfied."""
+        await stop.wait()
+        return {"type": "http.disconnect"}
+
+    async def _send(message: dict[str, Any]) -> None:
+        """Scrape ``event:`` lines out of the route's response body chunks."""
+        if message["type"] == "http.response.start":
+            statuses.append(message["status"])
+        elif message["type"] == "http.response.body":
+            for line in message.get("body", b"").decode().splitlines():
+                if line.startswith("event: "):
+                    seen.append(line.removeprefix("event: ").strip())
+                    if seen[-1] == until:
+                        stop.set()
+
+    path = f"/v1/sessions/{session_id}/stream"
+    scope: dict[str, Any] = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"host", b"test")],
+        "client": ("127.0.0.1", 5555),
+        "server": ("test", 80),
+    }
+    task = asyncio.create_task(app(scope, _receive, _send))  # type: ignore[arg-type]
+    try:
+        await asyncio.wait_for(stop.wait(), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        pytest.fail(f"never saw {until!r} on the stream; got {seen} (status {statuses})")
+    finally:
+        stop.set()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+    assert statuses == [200], f"stream route returned {statuses}"
+    return seen
+
+
+async def test_setup_events_reach_a_connected_client_over_sse(
+    register_hook_host: RegisterHost,
+    client: httpx.AsyncClient,
+    app: FastAPI,
+) -> None:
+    """A client watching the stream is told when setup finishes.
+
+    End-to-end regression for the band that never cleared: the terminal
+    ``session.worktree_setup.completed`` frame has to cross the real SSE
+    route. It previously failed the writer's union validation INSIDE the
+    streaming generator, dropping the client's whole connection — so the
+    label-hydrated "running setup script" band survived the reconnect and
+    only cleared when the user navigated to another session and back.
+
+    The hook is held on a gate so the stream is open while setup is still
+    running, exactly the window the user sees.
+    """
+    gate = asyncio.Event()
+    register_hook_host(hook_gate=gate)
+    await _create_project(client, "Hooked-sse", {"worktree_post_create_command": "sleep 30"})
+    agent = await create_test_agent(client, name="hook-sse-agent")
+
+    resp = await _create_session_in_project(
+        client, agent["id"], "Hooked-sse", {"branch_name": "feature/sse"}
+    )
+    assert resp.status_code == 201, resp.text
+    session_id = resp.json()["id"]
+
+    reader = asyncio.create_task(
+        _read_sse_events(app, session_id, until="session.worktree_setup.completed")
+    )
+    # Let the reader subscribe before the hook settles, then release it.
+    await asyncio.sleep(0.2)
+    gate.set()
+
+    assert "session.worktree_setup.completed" in await reader
+    assert await _await_setup_settled(client, session_id) == "done"
+
+
+async def test_late_subscriber_is_told_setup_already_finished(
+    register_hook_host: RegisterHost,
+    client: httpx.AsyncClient,
+    app: FastAPI,
+) -> None:
+    """Subscribing after setup settled still converges the band.
+
+    ``session_stream`` has no replay and the setup command starts inside
+    the create request, so a client that connects a moment later misses
+    the terminal edge entirely. Snapshot-on-connect has to resupply it
+    from the ``omnigent.worktree_setup`` label, or the band hydrates as
+    "running" and never clears.
+    """
+    register_hook_host()
+    await _create_project(client, "Hooked-late", {"worktree_post_create_command": "bun install"})
+    agent = await create_test_agent(client, name="hook-late-agent")
+
+    resp = await _create_session_in_project(
+        client, agent["id"], "Hooked-late", {"branch_name": "feature/late"}
+    )
+    session_id = resp.json()["id"]
+    # Settle FIRST: every live edge is published before the stream opens.
+    assert await _await_setup_settled(client, session_id) == "done"
+
+    seen = await _read_sse_events(app, session_id, until="session.worktree_setup.completed")
+    assert "session.worktree_setup.completed" in seen

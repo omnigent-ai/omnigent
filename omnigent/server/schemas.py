@@ -3027,6 +3027,71 @@ class SessionMcpStartupEvent(_SSEEventBase):
     servers: dict[str, McpServerStartup]
 
 
+class SessionWorktreeSetupInProgressEvent(_SSEEventBase):
+    """
+    A project's post-create worktree setup command started running.
+
+    Sessions born into a project with a ``worktree_post_create_command``
+    run it in the fresh worktree before the first turn dispatches. The
+    web UI shows a "running setup script" band for the duration, so the
+    session does not read as hung while dependencies install.
+
+    :param type: Always ``"session.worktree_setup.in_progress"``.
+    :param command: The script being run, e.g. ``"bun install"``; the
+        client summarizes it to one line. ``None`` on the
+        snapshot-on-connect replay, which recovers the state from the
+        session's labels and no longer has the command text.
+
+    Category: **transient** (SSE + snapshot-on-connect). The durable
+    copy is the ``omnigent.worktree_setup`` label, which the session
+    snapshot projects for clients that load mid-setup.
+    """
+
+    type: Literal["session.worktree_setup.in_progress"]
+    command: str | None = None
+
+
+class SessionWorktreeSetupCompletedEvent(_SSEEventBase):
+    """
+    A project's post-create worktree setup command finished cleanly.
+
+    Terminal counterpart to
+    :class:`SessionWorktreeSetupInProgressEvent`; clients clear the band
+    on receipt. Also emitted by snapshot-on-connect for a session whose
+    label already reads ``done``, so a client that subscribed after the
+    command finished still converges instead of holding a stale band.
+
+    :param type: Always ``"session.worktree_setup.completed"``.
+
+    Category: **transient** (SSE + snapshot-on-connect).
+    """
+
+    type: Literal["session.worktree_setup.completed"]
+
+
+class SessionWorktreeSetupFailedEvent(_SSEEventBase):
+    """
+    A project's post-create worktree setup command failed or timed out.
+
+    Advisory: the hook is fail-open, so the session is usable either
+    way, and a durable ``error`` item carries the same news across a
+    refresh. Clients keep a band explaining the degraded workspace.
+
+    :param type: Always ``"session.worktree_setup.failed"``.
+    :param reason: One-line cause, e.g. ``"the command timed out and
+        was killed"``. ``None`` on the snapshot-on-connect replay,
+        which recovers only the state from the session's labels.
+    :param output_tail: Last 10 KB of the command's combined output.
+        ``None`` on the snapshot-on-connect replay.
+
+    Category: **transient** (SSE + snapshot-on-connect).
+    """
+
+    type: Literal["session.worktree_setup.failed"]
+    reason: str | None = None
+    output_tail: str | None = None
+
+
 class SessionSkillsEvent(_SSEEventBase):
     """
     Signal that a session's runner-owned skills have resolved.
@@ -4249,6 +4314,9 @@ ServerStreamEvent = Annotated[
     | SessionTerminalPendingEvent
     | SessionSandboxStatusEvent
     | SessionMcpStartupEvent
+    | SessionWorktreeSetupInProgressEvent
+    | SessionWorktreeSetupCompletedEvent
+    | SessionWorktreeSetupFailedEvent
     | SessionSkillsEvent
     | SessionModelOptionsEvent
     | SessionInputConsumedEvent

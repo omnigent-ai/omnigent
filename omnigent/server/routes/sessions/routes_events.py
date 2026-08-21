@@ -165,6 +165,7 @@ from omnigent.server.routes._sessions.helpers import (
     _stop_session_via_runner,
     _stream_live_events,
     _wait_for_runner_client,
+    _worktree_setup_snapshot_event,
 )
 from omnigent.server.routes._sessions.orchestration import (
     _best_effort_stop,
@@ -1748,6 +1749,17 @@ def register_events_routes(
                     "environment_id": "default",
                 }
             )
+            # Current worktree-setup edge, if the session has one. The
+            # setup command starts inside the create request and the stream
+            # has no replay, so a client that subscribes a moment later
+            # would never see the terminal edge and would hold the
+            # "running setup script" band forever.
+            try:
+                setup_event = await _worktree_setup_snapshot_event(conversation_store, session_id)
+                if setup_event is not None:
+                    events.append(setup_event)
+            except Exception:
+                _logger.debug("snapshot: worktree setup failed for %s", session_id, exc_info=True)
             # Current viewer list (full state, includes this stream's own
             # registration) so a joiner never waits for the next presence
             # edge to learn who's here. Scoped to the session tree's root

@@ -7423,9 +7423,11 @@ async def _stream_live_events(
     immediately (a bare ``async for`` would defer that to GC).
 
     Each emitted dict is validated against
-    :data:`ServerStreamEvent` at the wire boundary so a runtime
-    that publishes an unmodelled ``type`` fails loud rather than
-    serializing an unknown event verbatim.
+    :data:`ServerStreamEvent` at the wire boundary so an unknown
+    event is never serialized verbatim. A dict that fails validation
+    is logged and skipped, not raised: an unmodelled ``type`` must
+    not tear down a live stream, which would leave the client stuck
+    on stale state with no ``[DONE]`` until it navigates away.
 
     The subscribe call passes a ``ready_event`` heartbeat plus
     ``heartbeat_interval_s``. The ready heartbeat is yielded
@@ -7505,7 +7507,21 @@ async def _stream_live_events(
                     raise ValueError(
                         f"session stream event missing string ``type`` field: {event!r}",
                     )
-                validated = _SERVER_STREAM_EVENT_ADAPTER.validate_python(event)
+                try:
+                    validated = _SERVER_STREAM_EVENT_ADAPTER.validate_python(event)
+                except ValidationError:
+                    # An unmodelled or malformed event costs one frame, not the
+                    # whole stream: raising here kills the generator mid-flight,
+                    # so the client never sees ``[DONE]`` and sits on whatever
+                    # state it had until the user navigates away. Skip the frame
+                    # and stay live — loudly, so the drift still gets fixed.
+                    _logger.exception(
+                        "session stream event does not match ServerStreamEvent; "
+                        "dropping the frame for %s (type=%r)",
+                        session_id,
+                        event_type,
+                    )
+                    continue
                 yield _format_sse(event_type, validated.model_dump())
     except session_stream.SubscriberOverflowError:
         _logger.warning(
@@ -8016,6 +8032,42 @@ async def _set_worktree_setup_state(
             session_id,
             exc_info=True,
         )
+
+
+async def _worktree_setup_snapshot_event(
+    conversation_store: ConversationStore,
+    session_id: str,
+) -> dict[str, Any] | None:
+    """
+    Rebuild the current worktree-setup edge for snapshot-on-connect.
+
+    ``session_stream`` has no replay, and setup starts inside the create
+    request — before the client can subscribe. A client that connects a
+    moment late would otherwise never learn the command finished and
+    would hold the "running setup script" band forever. Derived from the
+    same ``omnigent.worktree_setup`` label the live edges write, so
+    there is one source of truth; the label has no command text or
+    failure reason, hence the optional payload fields.
+
+    :param conversation_store: Store used to re-read the state label.
+        Read fresh here (not from the route's earlier fetch) so a
+        setup that settled while the request was still handshaking is
+        reported as settled.
+    :param session_id: Session/conversation identifier.
+    :returns: The event dict to replay, or ``None`` for a session with
+        no setup command.
+    """
+    conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    if conv is None:
+        return None
+    state = (conv.labels or {}).get(_WORKTREE_SETUP_LABEL_KEY)
+    if state == _WORKTREE_SETUP_RUNNING:
+        return {"type": "session.worktree_setup.in_progress", "command": None}
+    if state == _WORKTREE_SETUP_DONE:
+        return {"type": "session.worktree_setup.completed"}
+    if state == _WORKTREE_SETUP_FAILED:
+        return {"type": "session.worktree_setup.failed", "reason": None, "output_tail": None}
+    return None
 
 
 async def _persist_worktree_setup_transcript(

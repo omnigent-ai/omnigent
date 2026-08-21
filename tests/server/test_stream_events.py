@@ -30,6 +30,9 @@ from omnigent.server.schemas import (
     SessionModelOptionsEvent,
     SessionSkillsEvent,
     SessionStatusEvent,
+    SessionWorktreeSetupCompletedEvent,
+    SessionWorktreeSetupFailedEvent,
+    SessionWorktreeSetupInProgressEvent,
     is_known_event,
 )
 
@@ -122,6 +125,15 @@ def test_emit_sites_referenced_by_grep_are_all_in_the_union() -> None:
         repo_root / "omnigent/runtime/llm_retry.py",
         repo_root / "omnigent/runtime/tool_retry.py",
         repo_root / "omnigent/server/routes/sessions.py",
+        # The session route package's helpers publish session-scoped
+        # lifecycle events too. Omitting them is how the three
+        # ``session.worktree_setup.*`` literals shipped unmodelled: the
+        # SSE writer's boundary validation then killed the whole stream
+        # mid-setup, so the "running setup script" band never cleared.
+        repo_root / "omnigent/server/routes/_sessions/helpers.py",
+        repo_root / "omnigent/server/routes/_sessions/orchestration.py",
+        repo_root / "omnigent/server/routes/sessions/routes_events.py",
+        repo_root / "omnigent/server/routes/hosts.py",
     ]
     pattern = re.compile(r'"type":\s*"(response\.[^"]+|session\.[^"]+)"')
     found: set[str] = set()
@@ -329,6 +341,94 @@ def test_session_model_options_event_round_trips_through_union() -> None:
     # clients would never be told to refetch the cache-warmed snapshot.
     assert isinstance(parsed, SessionModelOptionsEvent)
     assert parsed.conversation_id == "conv_abc"
+
+
+def test_worktree_setup_events_round_trip_through_union() -> None:
+    """The three ``session.worktree_setup.*`` edges route via the discriminator.
+
+    Regression: these were published by the post-create worktree hook but
+    never registered in the union, so the SSE writer's boundary
+    validation raised INSIDE the streaming generator and dropped the
+    client's whole connection mid-setup — the "running setup script" band
+    then sat there until the user navigated away and back.
+
+    Pins the exact payloads ``_publish_worktree_setup_*`` sends.
+    """
+    in_progress = _ADAPTER.validate_python(
+        {"type": "session.worktree_setup.in_progress", "command": "bun install"}
+    )
+    assert isinstance(in_progress, SessionWorktreeSetupInProgressEvent)
+    assert in_progress.command == "bun install"
+
+    completed = _ADAPTER.validate_python({"type": "session.worktree_setup.completed"})
+    assert isinstance(completed, SessionWorktreeSetupCompletedEvent)
+
+    failed = _ADAPTER.validate_python(
+        {
+            "type": "session.worktree_setup.failed",
+            "reason": "the command timed out and was killed",
+            "output_tail": "installing…",
+        }
+    )
+    assert isinstance(failed, SessionWorktreeSetupFailedEvent)
+    assert failed.reason == "the command timed out and was killed"
+    assert failed.output_tail == "installing…"
+
+
+def test_worktree_setup_events_accept_the_label_only_snapshot_shape() -> None:
+    """Snapshot-on-connect replays the edges without command / reason text.
+
+    ``_worktree_setup_snapshot_event`` rebuilds the current edge from the
+    ``omnigent.worktree_setup`` label, which stores only the state. If
+    the payload fields were required, the late-subscriber replay would
+    fail validation and be dropped — exactly the frame a client that
+    connected after setup finished depends on.
+    """
+    running = _ADAPTER.validate_python(
+        {"type": "session.worktree_setup.in_progress", "command": None}
+    )
+    assert isinstance(running, SessionWorktreeSetupInProgressEvent)
+    assert running.command is None
+    failed = _ADAPTER.validate_python(
+        {"type": "session.worktree_setup.failed", "reason": None, "output_tail": None}
+    )
+    assert isinstance(failed, SessionWorktreeSetupFailedEvent)
+    assert failed.reason is None
+
+
+def test_worktree_setup_publishers_emit_union_valid_payloads() -> None:
+    """Each ``_publish_worktree_setup_*`` helper produces an accepted dict.
+
+    Couples the publishers to the union directly: a renamed or added
+    payload field on either side fails here rather than at runtime in the
+    middle of a live stream.
+    """
+    from omnigent.runtime import session_stream as cs
+    from omnigent.server.routes._sessions.helpers import (
+        _publish_worktree_setup_completed,
+        _publish_worktree_setup_failed,
+        _publish_worktree_setup_in_progress,
+    )
+
+    captured: list[dict[str, Any]] = []
+    real_publish = cs.publish
+    cs.publish = lambda _conv, event: captured.append(event)  # type: ignore[assignment]
+    try:
+        _publish_worktree_setup_in_progress("conv_abc", "bun install")
+        _publish_worktree_setup_completed("conv_abc")
+        _publish_worktree_setup_failed("conv_abc", "exited 1", "boom\n")
+    finally:
+        cs.publish = real_publish  # type: ignore[assignment]
+
+    assert [e["type"] for e in captured] == [
+        "session.worktree_setup.in_progress",
+        "session.worktree_setup.completed",
+        "session.worktree_setup.failed",
+    ]
+    parsed = [_ADAPTER.validate_python(e) for e in captured]
+    assert isinstance(parsed[0], SessionWorktreeSetupInProgressEvent)
+    assert isinstance(parsed[1], SessionWorktreeSetupCompletedEvent)
+    assert isinstance(parsed[2], SessionWorktreeSetupFailedEvent)
 
 
 def test_session_created_event_basic_fields() -> None:

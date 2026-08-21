@@ -1006,6 +1006,19 @@
             "description": "Fixed resource type, always `\"conversation.deleted\"`.",
             "title": "Object",
             "type": "string"
+          },
+          "pre_delete_hook": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Outcome of the project's worktree teardown command when one ran, e.g. `{\"exit_code\": 1, \"timed_out\": False, \"output_tail\": \"\u2026\", \"error\": None}`. `None` when the project configures no teardown command (or the session had no worktree). The hook is fail-open, so a non-zero result here still means the session was deleted \u2014 the UI surfaces it as a toast because the session row is gone and nothing can be persisted against it.",
+            "title": "Pre Delete Hook"
           }
         },
         "required": [
@@ -1264,6 +1277,33 @@
         "title": "CreateSessionPolicyRequest",
         "type": "object"
       },
+      "CreateSessionWorktreeRequest": {
+        "description": "Request body for `POST /v1/sessions/{id}/worktrees`.\n\nCreates an extra worktree off the session's OWN repository, under the\nproject's configured worktree root, and runs the project's setup\nscript in it. Backs the `sys_worktree_create` agent tool: the repo\nis not a parameter, so an agent can only ever branch the repository\nits own session already works in.",
+        "properties": {
+          "base_branch": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional base ref to fork from, e.g. `\"main\"`. `None` forks from the CALLING session's own branch \u2014 an orchestrator working in its own worktree is the base its fan-out should build on \u2014 falling back to the repository's `HEAD` for a session that has no branch of its own.",
+            "title": "Base Branch"
+          },
+          "branch_name": {
+            "description": "New branch to create and check out, e.g. `\"polly/auth-refactor\"`. Validated against git ref-format rules.",
+            "title": "Branch Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "branch_name"
+        ],
+        "title": "CreateSessionWorktreeRequest",
+        "type": "object"
+      },
       "CreatedEvent": {
         "description": "Initial event emitted at the start of every streaming response.\n\nCarries the freshly-allocated\n`omnigent.server.schemas.ResponseObject` (status will\nbe `\"queued\"` or `\"in_progress\"` depending on whether the\ntask started immediately).",
         "properties": {
@@ -1314,6 +1354,27 @@
           "day"
         ],
         "title": "DailyCost",
+        "type": "object"
+      },
+      "DeleteSessionWorktreeRequest": {
+        "description": "Request body for `DELETE /v1/sessions/{id}/worktrees`.\n\nRemoves a worktree of the session's own repository, after running the\nproject's teardown script in it. Backs `sys_worktree_remove`.",
+        "properties": {
+          "delete_branch": {
+            "default": false,
+            "description": "When `True`, also delete the branch that was checked out there. Defaults to `False`, so an unpushed branch survives a removed worktree. Refused when the branch's commits are not yet reachable from the calling session's own branch \u2014 an agent must not destroy work it has not integrated.",
+            "title": "Delete Branch",
+            "type": "boolean"
+          },
+          "worktree_path": {
+            "description": "The worktree to remove, as returned by `POST /v1/sessions/{id}/worktrees`, e.g. `\"/Users/alice/myrepo/.worktrees/polly-auth-refactor\"`. Must be a linked worktree of the session's repository \u2014 never its main work tree, and never the session's own workspace.",
+            "title": "Worktree Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "worktree_path"
+        ],
+        "title": "DeleteSessionWorktreeRequest",
         "type": "object"
       },
       "ElicitationRequestEvent": {
@@ -3497,6 +3558,9 @@
             "session.terminal_pending": "#/components/schemas/SessionTerminalPendingEvent",
             "session.todos": "#/components/schemas/SessionTodosEvent",
             "session.usage": "#/components/schemas/SessionUsageEvent",
+            "session.worktree_setup.completed": "#/components/schemas/SessionWorktreeSetupCompletedEvent",
+            "session.worktree_setup.failed": "#/components/schemas/SessionWorktreeSetupFailedEvent",
+            "session.worktree_setup.in_progress": "#/components/schemas/SessionWorktreeSetupInProgressEvent",
             "turn.cancelled": "#/components/schemas/TurnCancelledEvent",
             "turn.completed": "#/components/schemas/TurnCompletedEvent",
             "turn.failed": "#/components/schemas/TurnFailedEvent",
@@ -3534,6 +3598,15 @@
           },
           {
             "$ref": "#/components/schemas/SessionMcpStartupEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionWorktreeSetupInProgressEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionWorktreeSetupCompletedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionWorktreeSetupFailedEvent"
           },
           {
             "$ref": "#/components/schemas/SessionSkillsEvent"
@@ -5997,6 +6070,129 @@
           "conversation_id"
         ],
         "title": "SessionUsageEvent",
+        "type": "object"
+      },
+      "SessionWorktreeSetupCompletedEvent": {
+        "description": "A project's post-create worktree setup command finished cleanly.\n\nTerminal counterpart to\n`SessionWorktreeSetupInProgressEvent`; clients clear the band\non receipt. Also emitted by snapshot-on-connect for a session whose\nlabel already reads `done`, so a client that subscribed after the\ncommand finished still converges instead of holding a stale band.",
+        "properties": {
+          "sequence_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.worktree_setup.completed",
+            "description": "Always `\"session.worktree_setup.completed\"`. Category: **transient** (SSE + snapshot-on-connect).",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "title": "SessionWorktreeSetupCompletedEvent",
+        "type": "object"
+      },
+      "SessionWorktreeSetupFailedEvent": {
+        "description": "A project's post-create worktree setup command failed or timed out.\n\nAdvisory: the hook is fail-open, so the session is usable either\nway, and a durable `error` item carries the same news across a\nrefresh. Clients keep a band explaining the degraded workspace.",
+        "properties": {
+          "output_tail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Last 10 KB of the command's combined output. `None` on the snapshot-on-connect replay. Category: **transient** (SSE + snapshot-on-connect).",
+            "title": "Output Tail"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "One-line cause, e.g. `\"the command timed out and was killed\"`. `None` on the snapshot-on-connect replay, which recovers only the state from the session's labels.",
+            "title": "Reason"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.worktree_setup.failed",
+            "description": "Always `\"session.worktree_setup.failed\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "title": "SessionWorktreeSetupFailedEvent",
+        "type": "object"
+      },
+      "SessionWorktreeSetupInProgressEvent": {
+        "description": "A project's post-create worktree setup command started running.\n\nSessions born into a project with a `worktree_post_create_command`\nrun it in the fresh worktree before the first turn dispatches. The\nweb UI shows a \"running setup script\" band for the duration, so the\nsession does not read as hung while dependencies install.",
+        "properties": {
+          "command": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "The script being run, e.g. `\"bun install\"`; the client summarizes it to one line. `None` on the snapshot-on-connect replay, which recovers the state from the session's labels and no longer has the command text. Category: **transient** (SSE + snapshot-on-connect). The durable copy is the `omnigent.worktree_setup` label, which the session snapshot projects for clients that load mid-setup.",
+            "title": "Command"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.worktree_setup.in_progress",
+            "description": "Always `\"session.worktree_setup.in_progress\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "title": "SessionWorktreeSetupInProgressEvent",
         "type": "object"
       },
       "SetCodexGoalRequest": {
@@ -8943,7 +9139,7 @@
             }
           },
           {
-            "description": "Opt-in git cleanup, as a query param (`?delete_branch=true`). When `True` and the session has a server-created worktree (`git_branch` set), the host removes the worktree directory and deletes its branch (`git worktree remove --force` then `git branch -D`). Ignored for sessions with no worktree. Best-effort: a cleanup failure does not block the delete. Defaults to `False` (worktree and branch left untouched). See designs/SESSION_GIT_WORKTREE.md.",
+            "description": "Opt-in git cleanup, as a query param (`?delete_branch=true`). When `True` and the session has a server-created worktree (`git_branch` set), the host removes the worktree directory and deletes its branch (`git worktree remove --force` then `git branch -D`). Ignored for sessions with no worktree. Best-effort: a cleanup failure does not block the delete. Defaults to `False` (worktree and branch left untouched). See designs/SESSION_GIT_WORKTREE.md. When the session's project configures `worktree_pre_delete_command`, that teardown command runs on the host first; its outcome is reported in `pre_delete_hook` and never blocks the delete.",
             "in": "query",
             "name": "delete_branch",
             "required": false,
@@ -12454,6 +12650,108 @@
           }
         },
         "summary": "Switch Session Agent",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/worktrees": {
+      "delete": {
+        "description": "Remove a worktree of the calling session's repository.\n\nRuns the project's teardown script first, then removes the\ndirectory. Refuses anything that is not a linked worktree of this\nsession's repository, and refuses the session's own workspace\n(which would pull the tree out from under the running agent).\n\n**Parameters**\n\n- `body` \u2014 `worktree_path` plus optional `delete_branch`.\n\n**Returns:** `{\"object\", \"worktree_path\", \"deleted\", \"teardown\"}`, where `teardown` is `None` when the project configures no teardown script.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 unknown session; `invalid_input` when the path is not a removable worktree of this repository; `conflict` when the host is unreachable.",
+        "operationId": "delete_session_worktree_v1_sessions__session_id__worktrees_delete",
+        "parameters": [
+          {
+            "description": "The calling session, which supplies both the repository and the authority.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeleteSessionWorktreeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Session Worktree",
+        "tags": [
+          "sessions"
+        ]
+      },
+      "post": {
+        "description": "Create a worktree off the calling session's repository.\n\nPlaces it under the project's `worktree_root`, forks it from the\nCALLING session's own branch by default, and runs the project's\nsetup script in it, reporting the script's outcome in the response\nrather than only on the session's event stream \u2014 the caller here\nis an agent, and this is its tool result.\n\n**Parameters**\n\n- `body` \u2014 `branch_name` plus an optional `base_branch`.\n\n**Returns:** `{\"object\", \"worktree_path\", \"branch\", \"base_branch\", \"setup\"}`, where `setup` is `None` when the project configures no setup script.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 unknown session; `invalid_input` for a bad branch name or a host-reported git failure (duplicate branch, bad base ref); `conflict` when the session has no workspace or its host is unreachable.",
+        "operationId": "create_session_worktree_v1_sessions__session_id__worktrees_post",
+        "parameters": [
+          {
+            "description": "The calling session, which supplies the repository, the default base branch, and the authority.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSessionWorktreeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Session Worktree",
         "tags": [
           "sessions"
         ]
