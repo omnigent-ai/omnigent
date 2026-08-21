@@ -2827,7 +2827,7 @@ def create_app(
                     "the server and its trusted client(s) to restrict initiation "
                     "to authorized clients. See designs/DEVICE_AUTH.md.",
                 )
-        elif device_grant_store is not None:
+        elif isinstance(auth_provider, UnifiedAuthProvider) and device_grant_store is not None:
             # No device flow, but login-issued refresh grants still need
             # their token/revoke endpoints — in OIDC mode and in accounts
             # mode without the flag alike.
