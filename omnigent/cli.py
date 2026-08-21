@@ -5,7 +5,6 @@ from __future__ import annotations
 import concurrent.futures
 import contextlib
 import copy
-import hashlib
 import json
 import logging
 import os
@@ -56,6 +55,18 @@ from omnigent.config import (
     load_local_config,
 )
 from omnigent.harness_aliases import canonicalize_harness
+from omnigent.host.daemon_lifecycle import (
+    daemon_record_path as _daemon_record_path_for,
+)
+from omnigent.host.daemon_lifecycle import (
+    daemon_registry_dir as _daemon_registry_dir_for,
+)
+from omnigent.host.daemon_lifecycle import (
+    normalize_daemon_target as _normalize_daemon_target_impl,
+)
+from omnigent.host.daemon_lifecycle import (
+    record_flock_is_held as _record_flock_is_held,
+)
 from omnigent.host.local_server import (
     _DEFAULT_LOCAL_PORT,
     _pid_alive,
@@ -2403,6 +2414,11 @@ class _HostDaemonRecord:
         ``None`` for legacy records written before config-signature
         tracking existed; a ``None`` signature is never treated as a
         config mismatch (we can't know what it was started with).
+    :param uses_flock: Whether the daemon holds the lifecycle flock on its
+        record (see :mod:`omnigent.host.daemon_lifecycle`). ``True`` lets a
+        free lock be read as "owner dead" during reuse; ``False`` (legacy
+        records from before the guard) falls back to a PID check so a live
+        pre-flock daemon is never reaped.
     """
 
     pid: int
@@ -2414,6 +2430,7 @@ class _HostDaemonRecord:
     host_id: str | None = None
     resolved_server_url: str | None = None
     config_sig: str | None = None
+    uses_flock: bool = False
 
 
 @dataclass(frozen=True)
@@ -2520,7 +2537,7 @@ def _normalize_daemon_target(server_url: str | None) -> str:
     :returns: ``"local"`` for local mode, otherwise the URL without a
         trailing slash.
     """
-    return _LOCAL_DAEMON_MARKER if not server_url else server_url.rstrip("/")
+    return _normalize_daemon_target_impl(server_url)
 
 
 def _daemon_host_online(record: _HostDaemonRecord, *, timeout_s: float = 2.0) -> bool:
@@ -2571,7 +2588,7 @@ def _daemon_registry_dir() -> Path:
     :returns: Registry directory path, e.g.
         ``Path("~/.omnigent/daemons")``.
     """
-    return _HOST_PID_PATH.parent / "daemons"
+    return _daemon_registry_dir_for(_HOST_PID_PATH.parent)
 
 
 def _daemon_record_path(target: str) -> Path:
@@ -2582,8 +2599,7 @@ def _daemon_record_path(target: str) -> Path:
         ``"https://example.databricksapps.com"`` or ``"local"``.
     :returns: JSON registry path for the target.
     """
-    digest = hashlib.sha256(target.encode("utf-8")).hexdigest()[:16]
-    return _daemon_registry_dir() / f"{digest}.json"
+    return _daemon_record_path_for(target, base_dir=_HOST_PID_PATH.parent)
 
 
 def _record_from_json(raw: _HostJsonObject) -> _HostDaemonRecord | None:
@@ -2615,6 +2631,7 @@ def _record_from_json(raw: _HostJsonObject) -> _HostDaemonRecord | None:
     host_id = raw.get("host_id")
     resolved_server_url = raw.get("resolved_server_url")
     config_sig = raw.get("config_sig")
+    uses_flock = raw.get("uses_flock")
     return _HostDaemonRecord(
         pid=pid,
         target=target,
@@ -2629,6 +2646,7 @@ def _record_from_json(raw: _HostJsonObject) -> _HostDaemonRecord | None:
             else None
         ),
         config_sig=config_sig if isinstance(config_sig, str) and config_sig else None,
+        uses_flock=uses_flock is True,
     )
 
 
@@ -2870,11 +2888,44 @@ class _DaemonReuseDecision:
     config_changed: bool
 
 
+def _daemon_owner_is_live(record: _HostDaemonRecord, target: str) -> bool:
+    """Whether the daemon that wrote *record* is still alive.
+
+    Prefers the record's flock over ``os.kill(pid, 0)``: the kernel drops the
+    lock the instant the owner dies, so a held lock is a live daemon and a free
+    lock is a dead one even if the PID was recycled by an unrelated process.
+
+    - Lock held → alive. Reuse it.
+    - Lock free → the owner is gone, but only trust that for a daemon that
+      actually takes the lock (``uses_flock``) and has had time to: a freshly
+      recorded daemon may not have grabbed it yet, so within the reuse grace a
+      live PID still counts as starting up. Past the grace, a free lock with a
+      live PID is a reused-PID zombie, not the daemon.
+    - Can't probe the lock (no ``fcntl``, unreadable), or a legacy record that
+      predates the guard → fall back to the PID check.
+
+    :param record: Existing daemon record for *target*.
+    :param target: Normalized daemon target, e.g. ``"local"``.
+    :returns: ``True`` if the daemon should be treated as alive.
+    """
+    held = _record_flock_is_held(_daemon_record_path(target))
+    if held is True:
+        return True
+    if held is False and record.uses_flock:
+        if not _pid_alive(record.pid):
+            return False
+        # Live PID, free lock: starting up (grace) vs. reused-PID zombie (aged).
+        return (time.time() - record.started_at) < _DAEMON_REUSE_MIN_AGE_S
+    return _pid_alive(record.pid)
+
+
 def _reuse_existing_daemon_record(target: str) -> _DaemonReuseDecision:
     """
     Decide whether an existing daemon for *target* can be reused.
 
-    Reuse requires more than a live PID: a daemon whose process is alive
+    Liveness is judged by the record's flock (see :func:`_daemon_owner_is_live`)
+    so a stale record whose PID was recycled is not mistaken for a live daemon.
+    Reuse requires more than a live owner: a daemon whose process is alive
     but whose server tunnel is down (server restart, ungraceful death,
     flapping tunnel) is a zombie — the host reads ``offline`` and the
     caller would poll until timeout. And a daemon spawned under a
@@ -2897,7 +2948,7 @@ def _reuse_existing_daemon_record(target: str) -> _DaemonReuseDecision:
     existing = _find_daemon_record(target)
     if existing is None:
         return _DaemonReuseDecision(reuse=False, config_changed=False)
-    if not _pid_alive(existing.pid):
+    if not _daemon_owner_is_live(existing, target):
         _delete_daemon_record(existing)
         return _DaemonReuseDecision(reuse=False, config_changed=False)
 
@@ -3017,6 +3068,7 @@ def _persist_spawned_daemon(
             started_at=int(time.time()),
             host_id=_load_existing_host_id(),
             config_sig=config_sig,
+            uses_flock=True,
         )
     )
     _HOST_PID_PATH.write_text(f"{spawned.pid}\n{target}\n")
@@ -3049,6 +3101,7 @@ def _foreground_daemon_record(
         host_id=host_id,
         resolved_server_url=server_url.rstrip("/") if mode == "local" else None,
         config_sig=server_config_signature(include_features=mode == "local"),
+        uses_flock=True,
     )
 
 
@@ -3056,18 +3109,25 @@ def _live_daemon_conflict(record: _HostDaemonRecord) -> _HostDaemonRecord | None
     """
     Find a live daemon that already serves a foreground record target.
 
+    Liveness uses the record flock (see :func:`_daemon_owner_is_live`) so a
+    stale record whose PID was recycled is not reported as a live conflict.
+
     :param record: Foreground daemon record this process wants to claim.
     :returns: Conflicting live record, or ``None``.
     """
     existing = _find_daemon_record(record.target)
-    if existing is not None and existing.pid != record.pid and _pid_alive(existing.pid):
+    if (
+        existing is not None
+        and existing.pid != record.pid
+        and _daemon_owner_is_live(existing, record.target)
+    ):
         return existing
     if record.mode == "server" and record.server_url is not None:
         local_record = _find_daemon_record(_LOCAL_DAEMON_MARKER)
         if (
             local_record is not None
             and local_record.pid != record.pid
-            and _pid_alive(local_record.pid)
+            and _daemon_owner_is_live(local_record, _LOCAL_DAEMON_MARKER)
             and local_record.resolved_server_url == record.server_url.rstrip("/")
         ):
             return local_record
@@ -8292,7 +8352,7 @@ def host(
         # (or a headless invocation) fails loud with the command to run.
         if remote_mode:
             _ensure_databricks_server_auth(server, non_interactive=non_interactive)
-        run_host_process(server_url=server)
+        run_host_process(server_url=server, daemon_target=target)
         stopped_cleanly = True
     except KeyboardInterrupt:
         # Ctrl-C is the normal way to stop the foreground daemon — swallow it
