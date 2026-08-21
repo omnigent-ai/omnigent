@@ -3195,7 +3195,10 @@ def _load_or_create_host_id() -> str | None:
 
     try:
         return load_or_create_host_identity(CONFIG_PATH).host_id
-    except OSError:
+    except (OSError, ValueError):
+        # OSError: identity file unwritable. ValueError: a malformed persisted /
+        # env host_id — a foreground host has nothing to key on, so degrade to
+        # None; the loud fail-fast is on the `omnigent host` connect path.
         return None
 
 
