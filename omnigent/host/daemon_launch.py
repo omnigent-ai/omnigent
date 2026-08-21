@@ -236,10 +236,13 @@ async def launch_or_reuse_daemon_runner(
     :returns: The bound runner id, e.g. ``"runner_abc123"``.
     :raises click.ClickException: If the launch request fails.
     """
+    from omnigent.cli_auth import send_rehealing_wrong_replica
+
     if fresh:
         existing = None
     else:
-        snap = await client.get(f"/v1/sessions/{url_component(session_id)}")
+        snap_req = client.build_request("GET", f"/v1/sessions/{url_component(session_id)}")
+        snap = await send_rehealing_wrong_replica(client, snap_req)
         existing = _json_body(snap).get("runner_id") if snap.status_code == 200 else None
     if isinstance(existing, str) and existing:
         if await runner_is_online(client, existing):
@@ -259,15 +262,23 @@ async def launch_or_reuse_daemon_runner(
     # fails. Retry transient 409s across the reconnect window so
     # high-latency / reconnecting setups start reliably. Bounded, so a
     # genuinely-offline host still fails reasonably fast.
+    #
+    # A distinct failure is a wrong-replica landing (400): the host IS online,
+    # but the slice-keyed launch reached a replica that doesn't hold its tunnel
+    # (a tunnel that drifted across a server rebalance). That is not transient —
+    # `send_rehealing_wrong_replica` heals it in place by reissuing the launch
+    # without the key, so it never surfaces to the 409 backoff below.
     _RETRY_DELAYS_S = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.0, 3.0)  # ~16.5s budget
     for attempt in range(len(_RETRY_DELAYS_S) + 1):
         if attempt:
             await asyncio.sleep(_RETRY_DELAYS_S[attempt - 1])
-        resp = await client.post(
+        launch_req = client.build_request(
+            "POST",
             f"/v1/hosts/{url_component(host_id)}/runners",
             json={"session_id": session_id, "workspace": workspace},
             timeout=60.0,
         )
+        resp = await send_rehealing_wrong_replica(client, launch_req)
         if resp.status_code < 400:
             break
         transient = resp.status_code == 409 and "offline" in error_text(resp).lower()

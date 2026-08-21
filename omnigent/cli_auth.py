@@ -31,6 +31,8 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from omnigent.errors import ErrorCode
+
 if TYPE_CHECKING:
     import httpx
 
@@ -549,6 +551,84 @@ OMNIGENT_SLICE_KEY_HEADER = "X-Databricks-Omnigent-Slice-Key"
 # request-header builder that keys off it (rather than in the browser-link
 # helpers, which only borrow it).
 WORKSPACE_API_PATH = "/api/2.0/omnigent"
+
+
+def is_wrong_replica_response(resp: httpx.Response) -> bool:
+    """Whether *resp* is a wrong-replica miss to re-address without the key.
+
+    A host-sharded request carries the slice key (:data:`OMNIGENT_SLICE_KEY_HEADER`)
+    so it lands on the replica holding that host's tunnels. When the tunnel has
+    drifted onto another replica — e.g. it re-dialed across a server rebalance
+    while the key still hashes to the old replica — the request reaches a replica
+    without the tunnel and the server answers ``400 {"error": {"code":
+    "wrong_replica"}}``. The request itself is valid; the fix is to reissue it
+    WITHOUT the key (see :data:`~omnigent.errors.ErrorCode.WRONG_REPLICA`).
+
+    Keys off the distinct error code, not the bare 400 — an ``invalid_input`` 400
+    (or a non-JSON SPA-fallback 400) is a real client error, not a routing miss.
+
+    :param resp: A response received on a slice-keyed client.
+    :returns: True only for the wrong-replica code carried on a 400.
+    """
+    if resp.status_code != 400:
+        return False
+    try:
+        body = resp.json()
+    except ValueError:
+        return False
+    error = body.get("error") if isinstance(body, dict) else None
+    return isinstance(error, dict) and error.get("code") == ErrorCode.WRONG_REPLICA
+
+
+async def send_rehealing_wrong_replica(
+    client: httpx.AsyncClient, request: httpx.Request
+) -> httpx.Response:
+    """Send *request*, re-addressing a wrong-replica miss without the slice key.
+
+    Sends *request* as built (slice-keyed, from the client's baked-in headers).
+    On a :func:`is_wrong_replica_response` 400 — the keyed request landed on a
+    replica that does not hold the host's tunnel — reissues it ONCE with the
+    slice-key header dropped, reaching the host via the server's default route.
+    This is the Python client's analogue of the UI fetch path's keyless
+    re-address on a ``wrong_replica`` 400.
+
+    Exactly one re-address is attempted, and only when the request actually
+    carried a key whose body can be replayed: a wrong-replica miss is a stable
+    routing fact (resending the same keyed bytes hits the same wrong replica —
+    only dropping the key changes the routing), so a single keyless reissue is
+    both necessary and sufficient. A request with no key, or a streaming body
+    already consumed by the first send, is returned unhealed.
+
+    :param client: The (slice-keyed) client the request was built from; supplies
+        the transport and per-request auth for both sends.
+    :param request: A request built via ``client.build_request(...)`` so the
+        client's default headers (the slice key included) are already merged in.
+    :returns: The first response when it is not a wrong-replica miss, else the
+        keyless reissue's response.
+    """
+    import httpx
+
+    resp = await client.send(request)
+    if not is_wrong_replica_response(resp):
+        return resp
+    if OMNIGENT_SLICE_KEY_HEADER not in request.headers:
+        return resp
+    try:
+        content = request.content
+    except httpx.RequestNotRead:
+        # A streaming body is already consumed by the first send; a partial
+        # replay would corrupt the request, so surface the miss unhealed.
+        return resp
+    headers = httpx.Headers(request.headers)
+    del headers[OMNIGENT_SLICE_KEY_HEADER]
+    keyless = httpx.Request(
+        request.method,
+        request.url,
+        headers=headers,
+        content=content,
+        extensions=request.extensions,
+    )
+    return await client.send(keyless)
 
 
 def is_workspace_hosted_url(base_url: str) -> bool:

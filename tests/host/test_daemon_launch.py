@@ -15,9 +15,14 @@ import click
 import httpx
 import pytest
 
-from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
+from omnigent.cli_auth import (
+    OMNIGENT_SLICE_KEY_HEADER,
+    is_wrong_replica_response,
+    send_rehealing_wrong_replica,
+)
 from omnigent.host import daemon_launch
 from omnigent.host.daemon_launch import (
+    launch_or_reuse_daemon_runner,
     open_daemon_client,
     runner_is_online,
     wait_for_host_online,
@@ -392,3 +397,134 @@ async def test_open_daemon_client_no_slice_key_without_host() -> None:
     """A hostless (local) session leaves routing to the default fallback."""
     async with open_daemon_client("https://ws.example.com/api/2.0/omnigent", {}, None) as client:
         assert OMNIGENT_SLICE_KEY_HEADER not in client.headers
+
+
+def _wrong_replica_body() -> dict[str, object]:
+    """The server's ``400`` wrong-replica error body."""
+    return {"error": {"code": "wrong_replica", "message": "host is on another replica"}}
+
+
+class _WrongReplicaUntilKeyless:
+    """Launch handler: 400 wrong_replica while keyed, 200 once the key is dropped.
+
+    Mirrors a host whose tunnel drifted onto another replica — the slice-keyed
+    launch lands on the wrong replica (400 wrong_replica) until the client
+    re-addresses without the key and reaches the host via the default route.
+    """
+
+    def __init__(self) -> None:
+        self.keyed_launches = 0
+        self.keyless_launches = 0
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and "/v1/sessions/" in request.url.path:
+            return httpx.Response(200, json={})  # no runner bound → launch a fresh one
+        if request.method == "POST" and request.url.path.endswith("/runners"):
+            if OMNIGENT_SLICE_KEY_HEADER in request.headers:
+                self.keyed_launches += 1
+                return httpx.Response(400, json=_wrong_replica_body())
+            self.keyless_launches += 1
+            return httpx.Response(200, json={"runner_id": "runner_healed"})
+        return httpx.Response(404, json={"error": {"code": "not_found"}})
+
+
+async def test_launch_reissues_without_slice_key_on_wrong_replica() -> None:
+    """A wrong-replica launch self-heals by re-addressing keyless.
+
+    The reported ``host is on another replica`` failure: a slice-keyed launch
+    lands on a replica without the host's tunnel. Rather than aborting the
+    session start, the launch is reissued without the key and succeeds — one
+    keyed miss, then one keyless success, no manual ``omnigent stop`` needed.
+    """
+    handler = _WrongReplicaUntilKeyless()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://test",
+        headers={OMNIGENT_SLICE_KEY_HEADER: "host_abc123"},
+    ) as client:
+        runner_id = await launch_or_reuse_daemon_runner(
+            client,
+            host_id="host_abc123",
+            session_id="conv_abc123",
+            workspace="/w",
+        )
+    assert runner_id == "runner_healed"
+    assert handler.keyed_launches == 1
+    assert handler.keyless_launches == 1
+
+
+async def test_send_rehealing_wrong_replica_drops_key_and_replays_body() -> None:
+    """The keyless reissue drops only the key and preserves method + body."""
+    seen: list[tuple[bool, bytes]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        keyed = OMNIGENT_SLICE_KEY_HEADER in request.headers
+        seen.append((keyed, request.content))
+        if keyed:
+            return httpx.Response(400, json=_wrong_replica_body())
+        return httpx.Response(200, json={"runner_id": "runner_ok"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://test",
+        headers={OMNIGENT_SLICE_KEY_HEADER: "host_abc123"},
+    ) as client:
+        request = client.build_request("POST", "/v1/hosts/h/runners", json={"session_id": "s"})
+        resp = await send_rehealing_wrong_replica(client, request)
+
+    assert resp.status_code == 200
+    assert [keyed for keyed, _ in seen] == [True, False]
+    # Same bytes on the replay — a wrong-replica miss is valid, just misrouted.
+    assert seen[0][1] == seen[1][1]
+
+
+async def test_send_rehealing_wrong_replica_passes_non_wrong_replica_through() -> None:
+    """A plain 400 (real client error) is surfaced, never re-addressed."""
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(400, json={"error": {"code": "invalid_input", "message": "bad"}})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://test",
+        headers={OMNIGENT_SLICE_KEY_HEADER: "host_abc123"},
+    ) as client:
+        request = client.build_request("POST", "/v1/hosts/h/runners", json={})
+        resp = await send_rehealing_wrong_replica(client, request)
+
+    assert resp.status_code == 400
+    assert calls == 1  # not retried
+
+
+async def test_send_rehealing_wrong_replica_no_key_is_not_retried() -> None:
+    """Without a key there is nothing to drop, so a 400 is returned as-is."""
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(400, json=_wrong_replica_body())
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        request = client.build_request("POST", "/v1/hosts/h/runners", json={})
+        resp = await send_rehealing_wrong_replica(client, request)
+
+    assert resp.status_code == 400
+    assert calls == 1
+
+
+def test_is_wrong_replica_response_keys_off_code_not_status() -> None:
+    """Only the wrong-replica code on a 400 counts — not any 400, not other codes."""
+    assert is_wrong_replica_response(httpx.Response(400, json=_wrong_replica_body()))
+    assert not is_wrong_replica_response(
+        httpx.Response(400, json={"error": {"code": "invalid_input"}})
+    )
+    # Wrong-replica maps to 400; the same code on another status is a mismatch.
+    assert not is_wrong_replica_response(httpx.Response(409, json=_wrong_replica_body()))
+    # SPA HTML fallback (non-JSON body) must not be mistaken for a routing miss.
+    assert not is_wrong_replica_response(httpx.Response(400, text="<!doctype html>"))
