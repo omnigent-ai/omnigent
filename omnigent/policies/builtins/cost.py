@@ -1230,13 +1230,12 @@ POLICY_REGISTRY: list[dict[str, object]] = [
         "kind": "factory",
         "name": "Per-User Period Cost Budget",
         "description": "Gates the session OWNER's cumulative LLM spend across all their "
-        "sessions for a configurable time period (day, week, month, quarter, or year). Supports "
-        "optional per-harness budgets (non-day periods only). Once a hard period limit is reached "
-        "DENY (the whole turn at the request phase, or each tool call) while still on an "
-        "expensive model (prompting a /model downgrade), and ASK for approval at each soft "
-        "warning checkpoint (request + tool-call phases, remembered per user+period+harness). "
-        "Reads event.context.user_daily_cost for day periods or "
-        "event.context.user_period_cost for others.",
+        "sessions for a configurable time period (day, week, month, quarter, or year). "
+        "Once a hard period limit is reached, DENY (the whole turn at the request phase, "
+        "or each tool call) while still on an expensive model (prompting a /model downgrade), "
+        "and ASK for approval at each soft warning checkpoint (request + tool-call phases, "
+        "remembered per user+period). Reads event.context.user_daily_cost for day periods "
+        "or event.context.user_period_cost for others.",
         "params_schema": {
             "type": "object",
             "properties": {
@@ -1256,7 +1255,7 @@ POLICY_REGISTRY: list[dict[str, object]] = [
                     "items": {"type": "number"},
                     "description": "Optional soft period warning checkpoints in USD; asks for "
                     "approval the first time the period's spend crosses each (every value must "
-                    "be < max_cost_usd). Approval is remembered per user+period+harness.",
+                    "be < max_cost_usd). Approval is remembered per user+period.",
                 },
                 "expensive_models": {
                     "type": "array",
@@ -1265,13 +1264,6 @@ POLICY_REGISTRY: list[dict[str, object]] = [
                     "tiers blocked once over the period budget. Omit (or pass []) for a true "
                     "hard stop that blocks all models; pass a non-empty list for a downgrade "
                     "gate that only blocks the named tiers.",
-                },
-                "harness": {
-                    "type": "string",
-                    "description": "Optional harness filter for per-harness budgets (e.g. "
-                    "'codex-native'). When set, only that harness's cost counts. Only "
-                    "supported for non-day periods (week/month/quarter/year); omit for "
-                    "cross-harness budgets or when using period='day'.",
                 },
             },
             "required": ["period", "max_cost_usd"],

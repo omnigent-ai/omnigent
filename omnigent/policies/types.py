@@ -170,13 +170,13 @@ class EvaluationContext:
         cost-budget policy is configured) — ``None`` otherwise, so
         sessions without that policy pay no owner/daily-cost lookup.
         Surfaced as ``event["context"]["user_daily_cost"]``.
-    :param user_period_cost: The session owner's per-UTC-month cost
-        rollup, shape
+    :param user_period_cost: The session owner's period cost rollup
+        (week/month/quarter/year), shape
         ``{"cost_usd": <float>, "ask_approved_usd": <float>, "harness": <str | None>}``,
         read from the ``user_period_cost`` store at engine-build time.
-        Injected ONLY when a policy needs it (the per-user monthly
+        Injected ONLY when a policy needs it (a per-user period
         cost-budget policy is configured) — ``None`` otherwise, so
-        sessions without that policy pay no owner/monthly-cost lookup.
+        sessions without that policy pay no owner/period-cost lookup.
         Surfaced as ``event["context"]["user_period_cost"]``.
     :param model: The model the session is currently using —
         the conversation's ``model_override`` when set (e.g. via

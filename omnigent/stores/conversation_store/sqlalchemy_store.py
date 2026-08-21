@@ -1677,7 +1677,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         harness: str | None = None,
     ) -> None:
         """
-        Atomically increment a user's monthly LLM spend for a harness.
+        Atomically increment a user's period LLM spend for a harness.
 
         UPSERT atomic increment (``cost_usd = cost_usd + :delta``) so
         concurrent turns never lose updates. Other dialects fall back
@@ -1686,7 +1686,9 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         :param user_id: The user the cost is attributed to (session
             creator), e.g. ``"alice@example.com"``.
-        :param period: UTC month as ``"YYYY-MM"``, e.g. ``"2026-06"``.
+        :param period: Time period string, format depends on granularity:
+            ``"YYYY-Www"`` (week), ``"YYYY-MM"`` (month), ``"YYYY-Qq"`` (quarter),
+            or ``"YYYY"`` (year). E.g. ``"2026-W34"``, ``"2026-08"``, ``"2026-Q3"``.
         :param delta_usd: USD amount to add; ``<= 0`` is a no-op.
         :param harness: The harness executing the turn, e.g.
             ``"codex-native"``. ``None`` for cross-harness budgets (converted
@@ -1827,14 +1829,16 @@ class SqlAlchemyConversationStore(ConversationStore):
         self, user_id: str, period: str, harness: str | None = None
     ) -> dict[str, float]:
         """
-        Return a user's monthly cost rollup state for one UTC month and harness.
+        Return a user's period cost rollup state for one period and harness.
 
-        Reads both fields the per-user monthly cost-budget policy needs in
+        Reads both fields the per-user period cost-budget policy needs in
         a single point lookup: the accumulated spend and the highest
-        soft checkpoint already approved that month for that harness.
+        soft checkpoint already approved for that period and harness.
 
         :param user_id: The user to read, e.g. ``"alice@example.com"``.
-        :param period: UTC month as ``"YYYY-MM"``, e.g. ``"2026-06"``.
+        :param period: Time period string, format depends on granularity:
+            ``"YYYY-Www"`` (week), ``"YYYY-MM"`` (month), ``"YYYY-Qq"`` (quarter),
+            or ``"YYYY"`` (year). E.g. ``"2026-W34"``, ``"2026-08"``, ``"2026-Q3"``.
         :param harness: The harness to read, e.g. ``"codex-native"``.
             ``None`` for cross-harness budgets.
         :returns: ``{"cost_usd": <float>, "ask_approved_usd": <float>}``;
