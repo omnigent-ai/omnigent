@@ -2060,7 +2060,7 @@ function ArchivedSection() {
                   variant="destructive"
                   disabled={bulkDelete.isPending}
                   onClick={() => {
-                    bulkDelete.mutate(expiredSessions.map((c) => c.id));
+                    bulkDelete.mutate({ ids: expiredSessions.map((c) => c.id) });
                     setDeleteExpiredOpen(false);
                   }}
                 >
