@@ -84,6 +84,56 @@ class ForkHistory(str, Enum):
     PREAMBLE = "preamble"  # replay prior turns as a text preamble (server-backed vendors)
 
 
+class Support(str, Enum):
+    """How a feature is provided, when it is provided at all.
+
+    The distinction that a plain bool cannot carry: a feature can be present
+    because the vendor implements it, or present because Omnigent emulates it
+    for a vendor that does not. Those are different things to a user deciding
+    which harness to reach for, and different work to a contributor closing a
+    gap.
+    """
+
+    NATIVE = "native"  # the vendor harness provides it directly
+    SHIMMED = "shimmed"  # Omnigent emulates it over a harness that lacks it
+    UNAVAILABLE = "unavailable"  # not reachable on this harness; needs vendor work
+    UNKNOWN = "unknown"  # not yet declared or verified
+
+
+@dataclass(frozen=True)
+class FeatureSupport:
+    """One feature's support on one harness.
+
+    :param support: Whether it is native, shimmed, unavailable, or undeclared.
+    :param mode: Vendor-specific detail — which mechanism provides it, or which
+        events a hook family covers, e.g. ``"PreToolUse,PostToolUse"``.
+    :param limitations: What does not work, in a sentence. A ``native`` cell
+        with a caveat is more useful than a ``shimmed`` one without.
+    :param last_verified: Bench run id and date behind a live-verified claim,
+        e.g. ``"bench-2026-08-20/run-14"``. ``None`` means the value is
+        declared from the code rather than observed.
+    """
+
+    support: Support = Support.UNKNOWN
+    mode: str | None = None
+    limitations: str | None = None
+    last_verified: str | None = None
+
+    def as_dict(self) -> dict[str, str | None]:
+        """Return a JSON-serializable view for the ``/v1/harnesses`` catalog."""
+        return {
+            "support": self.support.value,
+            "mode": self.mode,
+            "limitations": self.limitations,
+            "last_verified": self.last_verified,
+        }
+
+
+#: Default for an undeclared feature. Shared so every harness that has not
+#: declared one points at the same object rather than allocating a new one.
+UNKNOWN_SUPPORT = FeatureSupport()
+
+
 @dataclass(frozen=True)
 class HarnessCapabilities:
     """The declared feature set one harness supports.
@@ -119,6 +169,20 @@ class HarnessCapabilities:
     :param shell_tool_prompt: The prompt the bench sends to provoke that tool.
         Must contain the ``omnigent-bench-ok`` placeholder the probe token-swaps.
         ``None`` skips the probe.
+    :param skills: Whether an agent on this harness can load an Omnigent skill
+        (``load_skill`` / ``read_skill_file`` over a ``SKILL.md`` directory).
+        This is about reaching *Omnigent's* skills, not about whether the
+        vendor ships a skills feature of its own — an agent author writes one
+        skill and needs to know which harnesses will see it.
+    :param hooks: Whether Omnigent can interpose on the harness's tool calls.
+        ``mode`` names the events covered, since this is a family rather than
+        one switch, e.g. ``"PreToolUse"``.
+    :param mcp: Whether an MCP server declared in the agent YAML is callable
+        from this harness.
+    :param plan_mode: Whether the harness can be held in a read-only planning
+        phase — proposing a change without making it. Deliberately not the
+        vendor's UI mode of the same name, nor a policy that denies writes:
+        those are different things that have been conflated before.
     """
 
     integration_mode: IntegrationMode
@@ -137,8 +201,12 @@ class HarnessCapabilities:
     fork_history: ForkHistory = ForkHistory.NONE
     shell_tool_name: str | None = None
     shell_tool_prompt: str | None = None
+    skills: FeatureSupport = UNKNOWN_SUPPORT
+    hooks: FeatureSupport = UNKNOWN_SUPPORT
+    mcp: FeatureSupport = UNKNOWN_SUPPORT
+    plan_mode: FeatureSupport = UNKNOWN_SUPPORT
 
-    def as_dict(self) -> dict[str, str | bool | None]:
+    def as_dict(self) -> dict[str, str | bool | None | dict[str, str | None]]:
         """Return a JSON-serializable view for the ``/v1/harnesses`` catalog."""
         return {
             "integration_mode": self.integration_mode.value,
@@ -157,4 +225,8 @@ class HarnessCapabilities:
             "fork_history": self.fork_history.value,
             "shell_tool_name": self.shell_tool_name,
             "shell_tool_prompt": self.shell_tool_prompt,
+            "skills": self.skills.as_dict(),
+            "hooks": self.hooks.as_dict(),
+            "mcp": self.mcp.as_dict(),
+            "plan_mode": self.plan_mode.as_dict(),
         }
