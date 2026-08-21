@@ -466,7 +466,43 @@ async function postMcpToolsCall(config, toolName, args, rpcId, extraParams) {
         },
       };
     }
-    return { json: await resp.json() };
+    // A 200 with a non-JSON body is an authenticating edge answering the
+    // route with a sign-in page (a reverse proxy or IdP in front of the
+    // server). resp.json() would throw a SyntaxError whose message quotes the
+    // body — leaking sign-in document text (CSRF/state values, tenant ids)
+    // into a tool result — and reads as an unactionable parse error. Classify
+    // it as the auth/edge failure it is, naming no body, header, or URL (#4997).
+    const contentType = resp.headers ? resp.headers.get("content-type") : null;
+    if (contentType && !contentType.toLowerCase().includes("json")) {
+      return {
+        piResult: {
+          content: [
+            {
+              type: "text",
+              text: "Omnigent tool call failed: the server answered with a non-JSON response; authentication may be required (a sign-in page or proxy intercepted the request). Re-authenticate and retry.",
+            },
+          ],
+          isError: true,
+        },
+      };
+    }
+    let json;
+    try {
+      json = await resp.json();
+    } catch (_err) {
+      return {
+        piResult: {
+          content: [
+            {
+              type: "text",
+              text: "Omnigent tool call failed: the server answered 200 with an unparseable body; authentication may be required (a sign-in page or proxy intercepted the request). Re-authenticate and retry.",
+            },
+          ],
+          isError: true,
+        },
+      };
+    }
+    return { json };
   } catch (err) {
     return {
       piResult: {
