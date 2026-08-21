@@ -1914,6 +1914,113 @@ async def test_run_turn_method_error_emits_retryable_executor_error() -> None:
     assert "shell command crashed" in error_events[0].message
 
 
+async def test_run_turn_emits_correlated_codex_builtin_tool_events() -> None:
+    """Expose built-in shell and file items without re-executing either tool."""
+
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo",
+        cwd="/tmp/workspace",
+        env={},
+        tool_executor=None,
+    )
+    session.start = AsyncMock()
+    session._proc = _FakeProcess()
+    session.thread_id = "thread-1"
+    session._request = AsyncMock(return_value={"result": {"turn": {"id": "turn-1"}}})
+
+    command_item = {
+        "id": "command-1",
+        "type": "commandExecution",
+        "command": "pwd",
+        "cwd": "/tmp/workspace",
+    }
+    await session._events.put(
+        {
+            "method": "item/started",
+            "params": {"turnId": "turn-1", "item": command_item},
+        }
+    )
+    await session._events.put(
+        {
+            "method": "item/completed",
+            "params": {
+                "turnId": "turn-1",
+                "item": {
+                    **command_item,
+                    "aggregatedOutput": "/tmp/workspace\n",
+                    "exitCode": 0,
+                    "durationMs": 12,
+                },
+            },
+        }
+    )
+    await session._events.put(
+        {
+            "method": "item/completed",
+            "params": {
+                "turnId": "turn-1",
+                "item": {
+                    "id": "file-1",
+                    "type": "fileChange",
+                    "status": "completed",
+                    "changes": [{"path": "/tmp/workspace/result.txt", "kind": {"type": "add"}}],
+                },
+            },
+        }
+    )
+    await session._events.put(
+        {
+            "method": "item/completed",
+            "params": {
+                "turnId": "turn-1",
+                "item": {
+                    "id": "message-1",
+                    "type": "agentMessage",
+                    "phase": "final_answer",
+                    "text": "done",
+                },
+            },
+        }
+    )
+
+    events = [
+        event
+        async for event in session.run_turn(
+            messages=[{"role": "user", "content": "inspect and edit"}],
+            tools=[],
+            system_prompt="",
+            model="gpt-5.4-mini",
+            cwd=".",
+            sandbox="workspace-write",
+        )
+    ]
+
+    tool_events = [
+        event for event in events if isinstance(event, (ToolCallRequest, ToolCallComplete))
+    ]
+    assert [event.name for event in tool_events] == [
+        "shell",
+        "shell",
+        "apply_patch",
+        "apply_patch",
+    ]
+    assert [event.metadata["call_id"] for event in tool_events] == [
+        "command-1",
+        "command-1",
+        "file-1",
+        "file-1",
+    ]
+    assert isinstance(tool_events[0], ToolCallRequest)
+    assert tool_events[0].args == {"command": "pwd", "cwd": "/tmp/workspace"}
+    assert isinstance(tool_events[1], ToolCallComplete)
+    assert tool_events[1].result == "/tmp/workspace\n"
+    assert tool_events[1].status is ToolCallStatus.SUCCESS
+    assert isinstance(tool_events[2], ToolCallRequest)
+    assert tool_events[2].args == {"path": "/tmp/workspace/result.txt"}
+    assert isinstance(events[-1], TurnComplete)
+    assert events[-1].response == "done"
+
+
 async def test_run_turn_refuses_to_adopt_stale_final_answer_event() -> None:
     """Adopt fallback must drop a stale final-answer item rather
     than adopt it as the new turn's response.

@@ -737,6 +737,11 @@ class ExecutorAdapter(HarnessApp):
             # (unpaiable — they'd render a ghost card). Internally-run tools (e.g. antigravity)
             # stamp real ids and are the sole output source; they must not be suppressed.
             call_id = _call_id_from_metadata(getattr(event, "metadata", None)) or ""
+            # Internally executed tools have no later dispatch callback to drain
+            # their observed request identity. Remove it when their correlated
+            # completion arrives so a later dynamic tool cannot reuse it.
+            with contextlib.suppress(ValueError):
+                self._pending_mcp_call_ids.remove(call_id)
             if not call_id or call_id in self._dispatched_call_ids:
                 return
             item: dict[str, Any] = {
