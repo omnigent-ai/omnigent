@@ -47,6 +47,7 @@ from .executor import (
     ToolSpec,
     TurnComplete,
     classify_tool_result,
+    describe_exception,
     split_transient_tail,
 )
 from .open_responses_sdk import (
@@ -92,6 +93,7 @@ RawToolItem: TypeAlias = Any  # type: ignore[explicit-any]
 # an optional import at type-check time — the executor only constructs
 # one when instantiated.
 AsyncOpenAIClient: TypeAlias = Any  # type: ignore[explicit-any]
+ReasoningItemIdPolicy: TypeAlias = Literal["preserve", "omit"]
 
 # Tool executor callable wired in by ``omnigent.Session``. The result
 # is JSON-ish (dict[str, Any]) but the static type leaks ``Any`` through
@@ -130,7 +132,12 @@ def _normalize_responses_items_for_chat(
     for item in items:
         if item.get("type") == "message":
             raw_content = item.get("content")
-            if isinstance(raw_content, list):
+            if item.get("role") == "assistant" and isinstance(raw_content, str):
+                # The chat converter iterates assistant content expecting
+                # blocks, so a plain string is walked character by character and
+                # each one indexed. User strings take a different branch there.
+                item = {**item, "content": [{"type": "output_text", "text": raw_content}]}
+            elif isinstance(raw_content, list):
                 normalized_content = _normalize_content_blocks_for_chat(raw_content)
                 if normalized_content is not raw_content:
                     item = {**item, "content": normalized_content}
@@ -499,7 +506,12 @@ def _get_openai_async_client(
             **retry_kwargs,
         )
 
-    allow_ambient_databricks = model is None or model.startswith("databricks-")
+    # An unpinned model is not a Databricks signal: it means "use the
+    # provider's default", which run_turn resolves from the model catalog.
+    # Treating it as Databricks-hosted sent credential-less OpenAI agents into
+    # ambient Databricks auth, surfacing an "install databricks-sdk" error at
+    # users who never configured Databricks.
+    allow_ambient_databricks = model is not None and model.startswith("databricks-")
 
     # An explicit Databricks profile is authoritative; model-service names
     # are opaque Unity Catalog identifiers such as catalog.schema.service.
@@ -551,8 +563,9 @@ def _get_openai_async_client(
     # Without an explicit profile, only legacy Databricks model names opt in
     # to ambient Databricks credentials.
     if not profile and not allow_ambient_databricks:
+        target = f"for model {model!r}" if model is not None else "and no model is pinned"
         raise ValueError(
-            f"No provider credentials were configured for model {model!r}. "
+            f"No provider credentials were configured {target}. "
             "Set OPENAI_API_KEY (and optionally OPENAI_BASE_URL), configure a "
             "Databricks profile, or use a 'databricks-' prefixed model name "
             "for legacy automatic Databricks routing."
@@ -1014,11 +1027,14 @@ class OpenAIAgentsSDKExecutor(Executor):
         base_url_override: str | None = None,
         gateway_host: str | None = None,
         gateway_auth_command: str | None = None,
+        reasoning_item_id_policy: ReasoningItemIdPolicy | None = None,
     ) -> None:
         """Create an OpenAIAgentsSDKExecutor.
 
         :param client: A preconfigured ``openai.AsyncOpenAI`` client.  When
-            ``None`` the executor calls :func:`_get_openai_async_client`.
+            ``None`` the executor calls :func:`_get_openai_async_client` and
+            closes the resulting client when the executor is closed. An
+            injected client remains owned by the caller.
         :param profile: Optional ``~/.databrickscfg`` profile name for the
             Databricks fallback path, e.g. ``"<your-profile>"``.
         :param api_key: Direct OpenAI-compatible API key, e.g.
@@ -1057,7 +1073,15 @@ class OpenAIAgentsSDKExecutor(Executor):
             ``"databricks auth token --host https://example.databricks.com ..."``
             or ``"printf %s sk-..."``. Set from
             ``HARNESS_OPENAI_AGENTS_GATEWAY_AUTH_COMMAND``.
+        :param reasoning_item_id_policy: Optional Responses API replay policy.
+            ``"preserve"`` retains reasoning item IDs; ``"omit"`` is available
+            for legacy providers that reject orphaned reasoning items. ``None``
+            leaves the setting unspecified and uses the SDK default.
+        :raises ValueError: If *reasoning_item_id_policy* is not ``"preserve"``
+            or ``"omit"``.
         """
+        if reasoning_item_id_policy not in (None, "preserve", "omit"):
+            raise ValueError("reasoning_item_id_policy must be 'preserve', 'omit', or unset")
         self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
         raw_client = (
             client
@@ -1082,9 +1106,11 @@ class OpenAIAgentsSDKExecutor(Executor):
         self._client = (
             _wrap_client_for_reasoning_models(raw_client) if not use_responses else raw_client
         )
+        self._owns_client = client is None
         self._profile = profile
         self._use_responses = use_responses
         self._model_override = model
+        self._reasoning_item_id_policy = reasoning_item_id_policy
         self._databricks = _is_databricks_openai_client(self._client)
         self._tool_executor: ToolExecutor | None = None
         self._session_states: dict[str, _AgentsSessionState] = {}
@@ -1174,6 +1200,12 @@ class OpenAIAgentsSDKExecutor(Executor):
 
     async def close_session(self, session_key: str) -> None:
         self._session_states.pop(session_key, None)
+
+    async def close(self) -> None:
+        """Release session state and the client created by this executor."""
+        self._session_states.clear()
+        if self._owns_client:
+            await self._client.close()
 
     async def interrupt_session(self, session_key: str) -> bool:
         """
@@ -1472,7 +1504,7 @@ class OpenAIAgentsSDKExecutor(Executor):
                 cfg.extra.get("reasoning_effort"), "OpenAI Agents SDK", OPENAI_AGENTS_EFFORTS
             )
         except ValueError as exc:
-            yield ExecutorError(message=str(exc), retryable=False)
+            yield ExecutorError(message=describe_exception(exc), retryable=False)
             return
 
         state = self._get_or_create_session_state(agents_sdk, session_key)
@@ -1504,13 +1536,15 @@ class OpenAIAgentsSDKExecutor(Executor):
             max_tokens=max_tokens,
         )
         current_item_count = len(await state.sdk_session.get_items())
-        run_config = agents_sdk.RunConfig(
-            model=model,
-            model_provider=provider,
-            tracing_disabled=True,
-            reasoning_item_id_policy="omit",
-            call_model_input_filter=self._filter_model_input,
-        )
+        run_config_kwargs: dict[str, object] = {
+            "model": model,
+            "model_provider": provider,
+            "tracing_disabled": True,
+            "call_model_input_filter": self._filter_model_input,
+        }
+        if self._reasoning_item_id_policy is not None:
+            run_config_kwargs["reasoning_item_id_policy"] = self._reasoning_item_id_policy
+        run_config = agents_sdk.RunConfig(**run_config_kwargs)
         max_turns = 1 if stepwise_internal_turns else int(cfg.extra.get("max_turns", 1000))
 
         # ── LLM_REQUEST policy evaluation ────────────────────────

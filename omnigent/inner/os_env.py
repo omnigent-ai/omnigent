@@ -42,6 +42,7 @@ from .sandbox import (
     cleanup_private_tmpdir,
     create_private_tmpdir,
     get_backend,
+    reachable_roots,
     resolve_sandbox,
     set_temp_env,
     with_additional_write_roots,
@@ -1118,6 +1119,9 @@ def _assert_within_reach(
     """Confine a file-tool op to *cwd*, extended by declared sandbox grants.
 
     Replaces the historical cwd-only guard at the read / write / edit sites.
+    The grants come from :func:`omnigent.inner.sandbox.reachable_roots`, which
+    is also what the filesystem APIs advertise as reachable, so what is
+    enforced here and what a caller is told it can reach cannot drift apart.
     *resolved* is already canonicalised by :func:`_resolve_path` (symlinks
     followed, ``..`` collapsed) and every grant root is canonicalised at
     resolve time, so a symlink or ``..`` chain whose real target leaves both
@@ -1164,18 +1168,13 @@ def _assert_within_reach(
     :raises PermissionError: If *resolved* is outside *cwd* and no grant of
         the required kind covers it.
     """
-    resolved_cwd = cwd.resolve()
-    if _is_within(resolved, resolved_cwd):
-        return
-    # Write grants (directories + single files) admit both reads and writes.
-    if any(_is_within(resolved, root) for root in policy.write_roots):
-        return
-    if any(resolved == grant for grant in policy.write_files):
-        return
-    # Read grants admit reads only.
-    if not need_write and policy.read_roots is not None:
-        if any(_is_within(resolved, root) for root in policy.read_roots):
+    for root in reachable_roots(cwd, policy):
+        # Read grants admit reads only; write grants admit both.
+        if need_write and root.access != "write":
+            continue
+        if root.contains(resolved):
             return
+    resolved_cwd = cwd.resolve()
     kind = "write" if need_write else "read"
     raise PermissionError(
         f"Access to '{resolved}' is blocked: path is outside the "

@@ -24,6 +24,7 @@ import {
   AlertTriangleIcon,
   ArrowLeftIcon,
   CheckIcon,
+  ChevronDownIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
   CloudOffIcon,
@@ -806,6 +807,8 @@ function FileViewerBody({
     key: string;
     /** Accessible name for the inline icon button. */
     label: string;
+    /** Text label for the inline icon button. */
+    textLabel?: string;
     /** Tooltip + dropdown row text; falls back to `label` when omitted. */
     tooltip?: string;
     icon: ReactNode;
@@ -876,6 +879,7 @@ function FileViewerBody({
     toolbarActions.push({
       key: "md-view-mode",
       label: `View mode: ${activeMode.label}`,
+      textLabel: activeMode.label,
       tooltip: "View mode",
       icon: activeMode.icon,
       options: modeOptions,
@@ -1091,11 +1095,13 @@ function FileViewerBody({
                   <Button
                     type="button"
                     variant="ghost"
-                    size="icon-sm"
+                    size={action.textLabel ? "sm" : "icon-sm"}
                     aria-label={action.label}
                     tabIndex={interactive ? undefined : -1}
                   >
                     {action.icon}
+                    {action.textLabel}
+                    <ChevronDownIcon />
                   </Button>
                 </DropdownMenuTrigger>
               </TooltipTrigger>
@@ -1107,7 +1113,7 @@ function FileViewerBody({
             {action.options.map((option) => (
               <DropdownMenuItem
                 key={option.key}
-                className={cn("whitespace-nowrap", option.active && "bg-muted dark:bg-muted/50")}
+                className={cn("whitespace-nowrap")}
                 onSelect={interactive ? option.onSelect : undefined}
               >
                 {option.icon}

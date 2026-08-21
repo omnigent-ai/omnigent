@@ -135,12 +135,18 @@ function stateDir() {
 let cachedHostId = null;
 
 /**
- * This machine's Omnigent host id (e.g. "host_ab12…"), read from the machine
- * identity in `config.yaml` (`host: host_id:`, written by
+ * This machine's Omnigent host id (bare 32-char hex, e.g. "ab12…"), read from
+ * the machine identity in `config.yaml` (`host: host_id:`, written by
  * omnigent/host/identity.py) — instant, no subprocess. Present once generated,
  * even before connecting to any server. Returns null when no id exists yet;
  * after the first connect it resolves. Lets the renderer match "this machine"
  * against the server's /v1/hosts list and select it after an auto-connect.
+ *
+ * Installs predating the drop of the `host_` prefix still hold the legacy
+ * spelling on disk, while /v1/hosts always reports the bare form (`hosts.host_id`
+ * is a Uuid16 column). The renderer compares these as plain strings — it is the
+ * one consumer the server's own prefix-tolerance can't rescue — so strip the
+ * prefix here, mirroring `_normalize_host_id` in omnigent/host/identity.py.
  *
  * @returns {string | null}
  */
@@ -149,7 +155,7 @@ function localHostId() {
   try {
     const parsed = yaml.load(fs.readFileSync(path.join(localConfigDir(), "config.yaml"), "utf8"));
     const id = parsed && typeof parsed === "object" ? parsed.host?.host_id : null;
-    if (typeof id === "string" && id) cachedHostId = id;
+    if (typeof id === "string" && id) cachedHostId = id.replace(/^host_/, "");
   } catch {
     // No config yet, or unparseable.
   }
@@ -426,14 +432,17 @@ function serverAuthed(serverUrl) {
  * Run `omnigent login <serverUrl>` to authenticate the CLI to a server. It's a
  * no-op when the server needs no auth (header mode), opens the system browser
  * for OIDC / Databricks, and fails fast for password (TTY) modes when run
- * without a terminal. Long timeout to allow the interactive browser flow.
+ * without a terminal. The default timeout is generous (~300s) so a human
+ * completing the browser sign-in isn't SIGKILLed mid-flow — the CLI's own OIDC
+ * ticket deadline (300s, `_CLI_LOGIN_TIMEOUT_SECONDS` in omnigent/cli.py)
+ * governs first.
  *
  * @param {string} cliPath
  * @param {string} serverUrl
  * @param {{ timeoutMs?: number }} [opts]
  * @returns {Promise<{ ok: boolean, output: string }>}
  */
-async function loginServer(cliPath, serverUrl, { timeoutMs = 180000 } = {}) {
+async function loginServer(cliPath, serverUrl, { timeoutMs = 305000 } = {}) {
   const res = await runCli(cliPath, ["login", serverUrl], { timeoutMs });
   return { ok: res.code === 0, output: (res.stdout || res.stderr).trim() };
 }
@@ -773,6 +782,53 @@ async function probeHostTunnel(serverUrl, hostId, { timeoutMs = 2000 } = {}) {
 }
 
 /**
+ * Whether the CLI is authenticated to `serverUrl` right now, decided by the same
+ * signal the Python side trusts to gate a connect: a single `GET
+ * {serverUrl}/v1/me`. A 200 means authed; anything else (a 401, or a
+ * Databricks-edge 302 to the workspace OAuth page) means a login is needed —
+ * mirroring `_ensure_databricks_server_auth()` and the `login` command in
+ * omnigent/cli.py, so the desktop and CLI agree on "is auth needed?".
+ *
+ * Sends a stored session token ({@link bearerTokenFor}) when one exists, so an
+ * already-authed OIDC/accounts server answers 200 and we skip a needless
+ * `omnigent login`. A Databricks-pointer login stores no in-process token (the
+ * SDK mints one per request), so the probe is unauthenticated and returns
+ * not-authed — which correctly defers to `omnigent login`, itself browserless
+ * while the workspace grant is still live and refreshable.
+ *
+ * `redirect: "manual"` so a Databricks 302 is never followed into a 200 login
+ * page — an opaque redirect surfaces as a non-200 status, which is the answer we
+ * want. `reachable:false` (a thrown fetch) lets the caller skip a doomed login
+ * and let the connect attempt raise its own, clearer error. Never throws.
+ *
+ * @param {string} serverUrl
+ * @param {{ timeoutMs?: number }} [opts]
+ * @returns {Promise<{ authed: boolean, reachable: boolean }>}
+ */
+async function probeServerAuth(serverUrl, { timeoutMs = 10000 } = {}) {
+  if (typeof serverUrl !== "string" || serverUrl === "") {
+    return { authed: false, reachable: false };
+  }
+  const headers = {};
+  const token = bearerTokenFor(serverUrl);
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const base = serverUrl.replace(/\/+$/, "");
+  try {
+    const resp = await fetch(`${base}/v1/me`, {
+      headers,
+      redirect: "manual",
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    return { authed: resp.status === 200, reachable: true };
+  } catch {
+    // Unreachable / timed out — can't confirm auth. Report unreachable so the
+    // caller lets the connect attempt surface its own error rather than forcing
+    // a login that can't complete against a dead server.
+    return { authed: false, reachable: false };
+  }
+}
+
+/**
  * This machine's connection to `serverUrl`, resolved WITHOUT the slow `omnigent
  * host status` subprocess: daemon metadata + process state come from the
  * on-disk registry ({@link readDaemonRecords}), and tunnel health from one
@@ -893,6 +949,7 @@ module.exports = {
   stopLocalServer,
   stopHost,
   serverAuthed,
+  probeServerAuth,
   loginServer,
   matchesServer,
   daemonRegistryDir,

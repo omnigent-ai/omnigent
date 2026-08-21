@@ -15,12 +15,30 @@ import click
 import httpx
 import pytest
 
+from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
 from omnigent.host import daemon_launch
 from omnigent.host.daemon_launch import (
+    open_daemon_client,
     runner_is_online,
     wait_for_host_online,
     wait_for_runner_online,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Isolate the machine's own host identity and runner slice-key env.
+
+    ``databricks_request_headers`` (reached via ``open_daemon_client`` with no
+    explicit host) falls back to the CLI's own host_id, so on a machine that IS
+    a host (a persisted ``~/.omnigent/config.yaml`` ``host:`` section) the
+    "no slice key" assertions would pick up that ambient identity.
+    """
+    monkeypatch.setattr(
+        "omnigent.host.identity.load_host_identity_if_present",
+        lambda *a, **k: None,
+    )
+    monkeypatch.delenv("OMNIGENT_RUNNER_SLICE_KEY", raising=False)
 
 
 class _FlakyThenOnline:
@@ -344,3 +362,33 @@ async def test_wait_for_host_online_tolerates_html_fallback_then_online(
         await wait_for_host_online(client, "host_abc123", timeout_s=5.0)
     # 3 = 2 HTML-fallback polls + the one that observed JSON "online".
     assert handler.requests_seen == 3
+
+
+async def test_open_daemon_client_pins_slice_key_on_workspace_mount() -> None:
+    """On the workspace mount the client is pinned to the host's replica.
+
+    The host_id routing header is baked into the client's default headers, so
+    every request it makes — the launch, runner-status polls, and the
+    session/terminal ops (including a resume reattach check that runs before
+    the launch) — reaches the replica holding the host's tunnels. Base headers
+    are preserved.
+    """
+    async with open_daemon_client(
+        "https://ws.example.com/api/2.0/omnigent",
+        {"Authorization": "Bearer t"},
+        "host_abc123",
+    ) as client:
+        assert client.headers.get(OMNIGENT_SLICE_KEY_HEADER) == "host_abc123"
+        assert client.headers.get("Authorization") == "Bearer t"
+
+
+async def test_open_daemon_client_no_slice_key_off_workspace() -> None:
+    """An unsharded server has no sharding layer, so no key is baked."""
+    async with open_daemon_client("http://test", {}, "host_abc123") as client:
+        assert OMNIGENT_SLICE_KEY_HEADER not in client.headers
+
+
+async def test_open_daemon_client_no_slice_key_without_host() -> None:
+    """A hostless (local) session leaves routing to the default fallback."""
+    async with open_daemon_client("https://ws.example.com/api/2.0/omnigent", {}, None) as client:
+        assert OMNIGENT_SLICE_KEY_HEADER not in client.headers

@@ -236,6 +236,7 @@ from omnigent.server.routes._sessions.common import (
     _EXTERNAL_SESSION_STATUS_TYPE as _EXTERNAL_SESSION_STATUS_TYPE,
     _EXTERNAL_SESSION_STATUS_VALUES as _EXTERNAL_SESSION_STATUS_VALUES,
     _EXTERNAL_SESSION_SUPERSEDED_TYPE as _EXTERNAL_SESSION_SUPERSEDED_TYPE,
+    _EXTERNAL_SESSION_TITLE_TYPE as _EXTERNAL_SESSION_TITLE_TYPE,
     _EXTERNAL_SESSION_TODOS_TYPE as _EXTERNAL_SESSION_TODOS_TYPE,
     _EXTERNAL_SESSION_USAGE_TYPE as _EXTERNAL_SESSION_USAGE_TYPE,
     _EXTERNAL_STATUS_ASSISTANT_SCAN_LIMIT as _EXTERNAL_STATUS_ASSISTANT_SCAN_LIMIT,
@@ -286,6 +287,7 @@ from omnigent.server.routes._sessions.common import (
     _SNAPSHOT_RUNNER_TIMEOUT_S as _SNAPSHOT_RUNNER_TIMEOUT_S,
     _STOP_RUNNER_RESULT_TIMEOUT_S as _STOP_RUNNER_RESULT_TIMEOUT_S,
     _STOP_SESSION_TYPE as _STOP_SESSION_TYPE,
+    _RETRY_SESSION_TYPE as _RETRY_SESSION_TYPE,
     _SUBAGENT_FORWARD_RECONNECT_WAIT_S as _SUBAGENT_FORWARD_RECONNECT_WAIT_S,
     _TERMINAL_RESPONSE_EVENT_TYPES as _TERMINAL_RESPONSE_EVENT_TYPES,
     _TURN_ACTOR_LABEL as _TURN_ACTOR_LABEL,
@@ -436,6 +438,7 @@ from omnigent.server.routes._sessions.helpers import (
     _persist_external_model_change as _persist_external_model_change,
     _persist_external_model_options as _persist_external_model_options,
     _persist_external_reasoning_effort_change as _persist_external_reasoning_effort_change,
+    _persist_external_session_title as _persist_external_session_title,
     _persist_external_subagent_start as _persist_external_subagent_start,
     _persist_native_policy_notice as _persist_native_policy_notice,
     _persist_policy_deny_sentinel as _persist_policy_deny_sentinel,
@@ -593,6 +596,7 @@ from omnigent.server.routes._sessions.helpers import (
 # Higher-layer orchestration flows (runner relay, session-event dispatch,
 # native-terminal launch, MCP tool calls) live in _sessions.orchestration.
 from omnigent.server.routes._sessions.orchestration import (
+    RUNNER_DISCONNECT_GRACE_S as RUNNER_DISCONNECT_GRACE_S,
     _accumulate_session_usage as _accumulate_session_usage,
     _best_effort_stop as _best_effort_stop,
     _bind_and_launch_managed_runner as _bind_and_launch_managed_runner,

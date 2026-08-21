@@ -12,6 +12,9 @@ function loadMainHarness({
   forceDevUpdateConfig = false,
   dialogResponses = [{ response: 1, checkboxChecked: false }],
   serverShutdown = () => Promise.resolve(),
+  isPackaged = false,
+  platform = process.platform,
+  developerMode = false,
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-update-test-"));
   fs.writeFileSync(path.join(userData, "settings.json"), JSON.stringify(settings), "utf8");
@@ -61,7 +64,7 @@ function loadMainHarness({
 
   const electron = {
     app: {
-      isPackaged: false,
+      isPackaged,
       getPath: (name) => (name === "userData" ? userData : userData),
       setName: () => {},
       requestSingleInstanceLock: () => true,
@@ -103,7 +106,10 @@ function loadMainHarness({
     screen: {},
     session: { defaultSession: {} },
     shell: {},
-    systemPreferences: {},
+    systemPreferences: {
+      getUserDefault: (key, type) =>
+        key === "DeveloperMode" && type === "boolean" ? developerMode : false,
+    },
   };
 
   const localRequires = {
@@ -113,6 +119,7 @@ function loadMainHarness({
       expandDatabricksWorkspaceUrl: async (url) => url,
     },
     "./workspace-chrome": { registerWorkspaceChromeHide: () => {} },
+    "./workspace-root-bounce": { registerWorkspaceRootBounce: () => {} },
     "./omnigent_cli": {
       isExecutableFile: () => false,
       resolveCliPath: () => null,
@@ -154,6 +161,7 @@ function loadMainHarness({
     module,
     process: {
       ...process,
+      platform,
       env: {
         ...process.env,
         // No OMNIGENT_FORCE_DEV_UPDATE_CONFIG injection: main.js now derives
@@ -213,6 +221,67 @@ function findMenuItem(menu, id) {
   }
   return null;
 }
+
+function hasDebugMenu(menu) {
+  return menu.template.some((item) => item.label === "Debug");
+}
+
+describe("new session menu action", () => {
+  it("routes Cmd/Ctrl+N to the current window without replacing the New Window action", (t) => {
+    const harness = loadMainHarness();
+    t.after(harness.cleanup);
+
+    harness.api.buildMenu();
+    const menu = harness.calls.setApplicationMenu.at(-1);
+    const newSessionItem = findMenuItem(menu, "new_session");
+    const newWindowItem = findMenuItem(menu, "new_window");
+
+    assert.equal(newSessionItem.label, "New Session");
+    assert.equal(newSessionItem.accelerator, "CmdOrCtrl+N");
+    assert.equal(newWindowItem.accelerator, undefined);
+
+    newSessionItem.click();
+
+    assert.deepEqual(harness.calls.sent, [{ channel: "omnigent:open-path", payload: "/" }]);
+  });
+});
+
+describe("developer-mode menu wiring", () => {
+  it("keeps the Debug menu in development builds", (t) => {
+    const harness = loadMainHarness({ isPackaged: false, platform: "linux" });
+    t.after(harness.cleanup);
+
+    harness.api.buildMenu();
+
+    assert.equal(hasDebugMenu(harness.calls.setApplicationMenu.at(-1)), true);
+  });
+
+  it("hides the Debug menu in packaged builds by default", (t) => {
+    const harness = loadMainHarness({
+      isPackaged: true,
+      platform: "darwin",
+      developerMode: false,
+    });
+    t.after(harness.cleanup);
+
+    harness.api.buildMenu();
+
+    assert.equal(hasDebugMenu(harness.calls.setApplicationMenu.at(-1)), false);
+  });
+
+  it("shows the Debug menu when a packaged macOS build opts in", (t) => {
+    const harness = loadMainHarness({
+      isPackaged: true,
+      platform: "darwin",
+      developerMode: true,
+    });
+    t.after(harness.cleanup);
+
+    harness.api.buildMenu();
+
+    assert.equal(hasDebugMenu(harness.calls.setApplicationMenu.at(-1)), true);
+  });
+});
 
 describe("auto-update main-process wiring", () => {
   it("preserves unrelated settings keys when writing update config", (t) => {

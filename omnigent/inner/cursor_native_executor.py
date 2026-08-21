@@ -32,6 +32,7 @@ from omnigent.inner.executor import (
     Message,
     ToolSpec,
     TurnComplete,
+    describe_exception,
 )
 
 logger = logging.getLogger(__name__)
@@ -105,7 +106,7 @@ class CursorNativeExecutor(Executor):
             async with self._inject_lock:
                 await asyncio.to_thread(inject_user_message, self._bridge_dir, content=text)
         except RuntimeError as exc:
-            yield ExecutorError(message=str(exc))
+            yield ExecutorError(message=describe_exception(exc))
             return
         # Injection landed — now it's safe to consume the preamble so later
         # turns inject the plain user text.

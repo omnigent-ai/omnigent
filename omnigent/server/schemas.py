@@ -246,7 +246,7 @@ class AgentObject(BaseModel):
         phases. Empty list when the spec declares no policies
         or when the bundle cannot be loaded.
     :param skills: Skills bundled in the agent spec
-        (``skills/<name>/SKILL.md``). Lets the Web UI's
+        (``skills/<dir>/SKILL.md``). Lets the Web UI's
         new-session composer offer a slash-command menu before a
         session (and its runner) exists. Host-discovered skills
         are runner-owned, so they are NOT listed here — the
@@ -808,6 +808,7 @@ class ChildSessionSummary(BaseModel):
     object: str = "child_session"
     parent_session_id: str
     title: str | None = None
+    task_summary: str | None = None
     tool: str | None = None
     session_name: str | None = None
     kind: str = "sub_agent"
@@ -1291,6 +1292,10 @@ class SessionCreateRequest(BaseModel):
         host launch flow (generate binding token, write runner_id,
         send launch frame). ``None`` for CLI-initiated sessions.
         Must be ``None`` when ``host_type`` is ``"managed"``.
+    :param sandbox_provider: Which configured sandbox provider to
+        provision on, e.g. ``"modal"`` — one of the names ``GET /v1/info``
+        reports in ``sandbox_providers``. Only valid with
+        ``host_type: "managed"``; ``None`` takes the server's first.
     :param workspace: Where the session works. For external hosts:
         an absolute path on the host where the runner should start,
         e.g. ``"/Users/corey/universe/src/foo"``. Required when
@@ -1383,6 +1388,7 @@ class SessionCreateRequest(BaseModel):
     sub_agent_name: str | None = None
     host_type: Literal["external", "managed"] = "external"
     host_id: str | None = None
+    sandbox_provider: str | None = None
     workspace: str | None = None
     git: SessionGitOptions | None = None
     terminal_launch_args: list[str] | None = None
@@ -1450,7 +1456,13 @@ class SessionCreateRequest(BaseModel):
                         "host_type 'managed' takes a git repository URL "
                         f"(optionally '#<branch>') as workspace: {exc}"
                     ) from exc
-        elif self.workspace is not None and is_repo_workspace(self.workspace):
+            return self
+        if self.sandbox_provider is not None:
+            raise ValueError(
+                "sandbox_provider only applies to host_type 'managed' — "
+                "external hosts are not server-provisioned"
+            )
+        if self.workspace is not None and is_repo_workspace(self.workspace):
             raise ValueError(
                 "a repository-URL workspace requires host_type 'managed' — "
                 "external hosts take an absolute path on the host"
@@ -1708,10 +1720,13 @@ class SessionResponse(BaseModel):
         permission level on this session: ``1`` = read, ``2`` =
         edit, ``3`` = manage. ``None`` when permissions are
         disabled (single-user mode without a permission store).
-    :param llm_model: The LLM model identifier from the bound
-        agent's spec, e.g. ``"anthropic/claude-sonnet-4-6"``.
-        ``None`` when the agent has no explicit ``llm:`` block or
-        the agent cannot be looked up.
+    :param llm_model: The model this session is actually on. When the
+        harness has reported one (``reported_model``, written by
+        ``external_model_change``), that verbatim value serves here
+        and is the only model value clients display; otherwise the
+        bound agent spec's model, e.g.
+        ``"anthropic/claude-sonnet-4-6"``. ``None`` when neither
+        exists.
     :param harness: The bound agent's canonical harness, e.g.
         ``"claude-sdk"`` or ``"openai-agents"``. Lets the client
         render the active credential for the correct provider
@@ -2427,6 +2442,17 @@ class SessionUsage(BaseModel):
     title: str | None = None
     cost_usd: float = 0.0
     models: dict[str, float] = Field(default_factory=dict)
+    harness: str | None = None
+    other_harnesses: list[str] | None = None
+    llm_model: str | None = None
+    agent_name: str | None = None
+
+
+class DailyCost(BaseModel):
+    """One day's LLM spend for the daily timeline chart."""
+
+    day: str
+    cost_usd: float = 0.0
 
 
 class UsageReport(BaseModel):
@@ -2459,6 +2485,7 @@ class UsageReport(BaseModel):
     cost_last_7d: float = 0.0
     cost_last_30d: float = 0.0
     total_cost_usd: float = 0.0
+    daily_costs: list[DailyCost] = Field(default_factory=list)
     sessions: list[SessionUsage] = Field(default_factory=list)
 
 
@@ -2701,29 +2728,52 @@ class SessionUsageEvent(_SSEEventBase):
 
 class SessionModelEvent(_SSEEventBase):
     """
-    Active-model update from a terminal-backed integration.
+    Active-model report from a terminal-backed integration.
 
-    Emitted after an ``external_model_change`` POST from the
-    ``omnigent claude`` transcript forwarder when the model is
-    switched inside the Claude Code terminal (a ``/model`` command or
-    the in-TUI picker). Lets the web model picker reflect a TUI-side
-    switch without a reload.
+    Emitted after an ``external_model_change`` POST from a native
+    forwarder — the launch's own model report, or a switch made inside
+    the pane (a ``/model`` command or the in-TUI picker). Every surface
+    re-renders its model display from this.
 
     :param type: Always ``"session.model"``.
     :param conversation_id: Session identifier, e.g. ``"conv_abc123"``.
-    :param model: Tier alias the session is now on, e.g. ``"opus"`` —
-        Claude Code's version-agnostic alias, matching the picker's
-        vocabulary (not a pinned ``"claude-opus-4-8"`` id).
+    :param model: The model the harness reports the session is on,
+        VERBATIM in the harness's own spelling, e.g.
+        ``"claude-opus-4-8[1m]"`` or ``"gpt-5.6-luna"`` — never
+        collapsed to a picker alias.
 
     Category: **transient** (SSE-only). The server also writes
-    ``model_override`` on the conversation, so on reconnect clients
-    restore the selection from the snapshot's ``model_override`` rather
-    than from a replayed event.
+    ``reported_model`` on the conversation (served on the snapshot's
+    ``llm_model``), so on reconnect clients restore the display from
+    the snapshot rather than from a replayed event.
     """
 
     type: Literal["session.model"]
     conversation_id: str
     model: str
+
+
+class SessionTitleEvent(_SSEEventBase):
+    """
+    Session-title update from a terminal-backed integration.
+
+    Emitted after an ``external_session_title`` POST from the
+    ``omnigent claude`` transcript forwarder when the operator renames
+    the session inside the Claude Code pane (``/rename``). Lets the web
+    session list show the new name without a reload.
+
+    :param type: Always ``"session.title"``.
+    :param conversation_id: Session identifier, e.g. ``"conv_abc123"``.
+    :param title: Title the session is now on, e.g. ``"auth-refactor"``.
+
+    Category: **transient** (SSE-only). The server also writes ``title``
+    on the conversation, so on reconnect clients restore the name from
+    the session snapshot rather than from a replayed event.
+    """
+
+    type: Literal["session.title"]
+    conversation_id: str
+    title: str
 
 
 class SessionReasoningEffortEvent(_SSEEventBase):
@@ -3225,17 +3275,13 @@ class OutputTextDeltaEvent(_SSEEventBase):
     :param type: Always ``"response.output_text.delta"``.
     :param delta: The text fragment for this chunk, e.g.
         ``"Hello"``.
-    :param message_id: For terminal-observed streaming (claude-native),
-        the vendor's stable per-message id, e.g.
-        ``"2ca51d97-2f0f-493a-aed7-85a5b56c5747"``. Lets the web UI scope
-        an in-flight buffer to one assistant message and reconcile it
-        against the final item. ``None`` for ordinary in-process task
-        streaming, where deltas already group by the active response.
+    :param message_id: For native terminal streaming, the provider's stable
+        per-message id, e.g. ``"2ca51d97-2f0f-493a-aed7-85a5b56c5747"``.
+        ``None`` for ordinary in-process task streaming, where deltas group
+        by the active response.
     :param index: 0-based chunk order within the message, e.g. ``3``.
-        ``None`` when not terminal-observed streaming.
-    :param final: ``True`` on the last chunk of a terminal-observed
-        message; ``None`` otherwise. Signals the web UI that no further
-        chunks for ``message_id`` will arrive.
+        Used to suppress repeated chunks; ``None`` for in-process streaming.
+    :param final: Optional provider completion marker for the message.
     """
 
     type: Literal["response.output_text.delta"]
@@ -4167,6 +4213,7 @@ ServerStreamEvent = Annotated[
     SessionStatusEvent
     | SessionUsageEvent
     | SessionModelEvent
+    | SessionTitleEvent
     | SessionReasoningEffortEvent
     | SessionCollaborationModeEvent
     | SessionAgentChangedEvent
@@ -4355,10 +4402,14 @@ class SessionProjectSummary(BaseModel):
     :param id: First-class project id when one exists, or ``None`` for a
         label-only project not yet promoted to the ``projects`` table.
     :param name: Project name (the folder's display name and union key).
+    :param icon: The project's chosen emoji icon (a unicode grapheme), read
+        from its ``config``; ``None`` when unset or for a label-only folder,
+        so the sidebar falls back to the default folder glyph.
     """
 
     id: str | None = None
     name: str
+    icon: str | None = None
 
 
 class CreateProjectRequest(BaseModel):

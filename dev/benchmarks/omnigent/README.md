@@ -68,6 +68,21 @@ an empty DB they self-seed a small fallback session over HTTP (the
 `external_conversation_item` event — appends items without starting a task), so
 they still work with no runner or LLM.
 
+### Hook spawn (no server)
+
+| Journey | Operation timed |
+| --- | --- |
+| `native_hook_spawn` | Spawn the per-chunk `MessageDisplay` hook exactly as Claude Code does — isolated interpreter, module entrypoint, JSON payload on stdin |
+
+Claude Code **blocks its TUI** on command hooks, so one hook subprocess's
+lifetime is user-visible streaming latency, and the same interpreter+import
+cost fronts every statusline refresh and per-tool-call policy hook. The
+journey needs no server or runner; registering it here rides hook spawn cost
+on the same nightly/release regression comparison as everything else
+(`omnigent/__init__` re-exports lazily so this stays ~interpreter-sized). The
+import-graph side of the guarantee is pinned deterministically by
+`tests/test_claude_native_message_display_hook.py`.
+
 ### Full-turn (runner + mock LLM)
 
 These drive a real agent turn end-to-end — `POST …/events` → server → **runner**

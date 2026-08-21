@@ -473,9 +473,10 @@ export function ProjectSettingsDialog({
             <Button
               type="submit"
               data-testid="project-settings-save"
-              disabled={updateConfig.isPending || isLoading || loadFailed}
+              loading={updateConfig.isPending}
+              disabled={isLoading || loadFailed}
             >
-              {updateConfig.isPending ? "Saving…" : "Save"}
+              Save
             </Button>
           </DialogFooter>
         </form>

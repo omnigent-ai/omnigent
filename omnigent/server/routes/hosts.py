@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import secrets
 from typing import Any
 
@@ -45,16 +44,16 @@ from omnigent.onboarding.harness_install import (
     ui_install_key,
     ui_installable_harnesses,
 )
-from omnigent.process_logging import env_truthy
 from omnigent.runner.identity import token_bound_runner_id
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import AuthProvider
+from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import resolve_host_launch
 from omnigent.server.schemas import SessionGitOptions
 from omnigent.stores import AgentStore, ConversationStore
-from omnigent.stores.host_store import HostStore, host_is_live
+from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
 
 _logger = logging.getLogger(__name__)
@@ -80,10 +79,31 @@ _MODEL_OPTIONS_TIMEOUT_S = 15.0
 # headroom) keeps a genuine slow install from timing out at the server while
 # the host is still succeeding — a "504 but actually installed" outcome.
 _INSTALL_HARNESS_TIMEOUT_S = 420.0
-# Env var that opts a deployment into the UI harness-install feature (default
-# off). Named once here and shared by the route (this file) and the /v1/info
-# flag in app.py so the two reads can never diverge on a typo.
-HARNESS_INSTALL_ENABLED_ENV = "OMNIGENT_HARNESS_INSTALL_ENABLED"
+
+
+def _host_absent_error(host: Host) -> OmnigentError:
+    """Classify a "host not on this replica" miss for a host-scoped route.
+
+    Every ``/v1/hosts/{id}/*`` route reaches the host over its live tunnel in
+    the local (this-replica) ``HostRegistry``. When replicas are sharded by
+    host, a request keyed to ``host_id`` can land on a replica that doesn't
+    hold the tunnel — the same wrong-replica case ``RunnerRouter`` handles for
+    runner dispatch (see ``_runner_absent_code``). Tell the two apart using the
+    host record the caller already loaded:
+
+    - still **live** (online + fresh heartbeat) → up on some replica, just not
+      here → :data:`~ErrorCode.WRONG_REPLICA` (400) so the client re-addresses
+      WITHOUT the key.
+    - otherwise → genuinely offline → ``CONFLICT`` (409).
+
+    :param host: The host's persistent record (owner-checked by the caller).
+    :returns: The ``OmnigentError`` to raise; the global handler maps its code
+        to the HTTP status and the ``{"error": {"code": ...}}`` body the
+        client's re-address matches on.
+    """
+    if host_is_live(host):
+        return OmnigentError("host is on another replica", code=ErrorCode.WRONG_REPLICA)
+    return OmnigentError("host is offline", code=ErrorCode.CONFLICT)
 
 
 async def _proxy_model_options(
@@ -529,6 +549,7 @@ def create_hosts_router(
     permission_store: PermissionStore | None = None,
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
+    feature_flags: FeatureFlags | None = None,
 ) -> APIRouter:
     """Build the router for host REST endpoints.
 
@@ -549,8 +570,11 @@ def create_hosts_router(
         :func:`omnigent.server.app.create_app` always supplies it.
     :param agent_cache: Agent-spec cache used to read the agent's
         ``os_env.cwd`` boundary. Paired with ``agent_store``.
+    :param feature_flags: Immutable deployment release-feature snapshot.
+        When omitted, resolves ``OMNIGENT_FEATURES`` at router construction.
     :returns: A FastAPI router with host endpoints.
     """
+    flags = feature_flags or resolve_feature_flags()
     router = APIRouter()
 
     @router.get("/hosts")
@@ -657,7 +681,7 @@ def create_hosts_router(
         request: Request,
         host_id: str,
         harness: str,
-    ) -> dict[str, list[dict[str, Any]]]:
+    ) -> dict[str, list[Any]]:
         """Return pre-launch model choices resolved by the selected host.
 
         A preview of the host's ambient default catalog, not a binding
@@ -672,7 +696,7 @@ def create_hosts_router(
             raise HTTPException(status_code=403, detail="not your host")
         conn = host_registry.get(host.host_id)
         if conn is None:
-            raise HTTPException(status_code=409, detail="host is offline")
+            raise _host_absent_error(host)
 
         result = await _proxy_model_options(
             host_registry=host_registry,
@@ -685,7 +709,22 @@ def create_hosts_router(
                 detail=str(result.get("error") or "host model-options lookup failed"),
             )
         models = result.get("models")
-        return {"models": models if isinstance(models, list) else []}
+        routable = result.get("routable_models")
+        payload: dict[str, Any] = {
+            "models": models if isinstance(models, list) else [],
+            # Every id the harness's endpoint routes: the picker names one
+            # row per model, while a launch takes an exact id.
+            "routable_models": (
+                [m for m in routable if isinstance(m, str)] if isinstance(routable, list) else []
+            ),
+        }
+        # An honest empty answer carries the reason (e.g. "the codex model
+        # probe failed — see the host log") so the picker can say WHY it is
+        # empty instead of a generic "Models unavailable".
+        error = result.get("error")
+        if isinstance(error, str) and error:
+            payload["error"] = error
+        return payload
 
     @router.post("/hosts/{host_id}/runners")
     async def launch_runner(
@@ -1097,7 +1136,7 @@ def create_hosts_router(
 
         conn = host_registry.get(host.host_id)
         if conn is None:
-            raise HTTPException(status_code=409, detail="host is offline")
+            raise _host_absent_error(host)
 
         result = await _proxy_list_dir(
             host_registry=host_registry,
@@ -1188,7 +1227,7 @@ def create_hosts_router(
 
         conn = host_registry.get(host.host_id)
         if conn is None:
-            raise HTTPException(status_code=409, detail="host is offline")
+            raise _host_absent_error(host)
 
         result = await _proxy_create_dir(
             host_registry=host_registry,
@@ -1231,8 +1270,8 @@ def create_hosts_router(
         may install onto it. Scoped to the UI-installable allowlist (claude,
         codex, pi, opencode, qwen) — curl/brew and interactive-auth harnesses
         are refused. The whole route is gated behind
-        ``OMNIGENT_HARNESS_INSTALL_ENABLED`` (default off): when disabled it
-        returns 404 so the feature is invisible until opted in.
+        ``harness_install`` in ``OMNIGENT_FEATURES`` (default off): when
+        disabled it returns 404 so the feature is invisible until opted in.
 
         Concurrent requests for the same (host, harness) coalesce onto one
         in-flight install so a double-click can't fire two global npm installs.
@@ -1250,9 +1289,9 @@ def create_hosts_router(
             caller is not the host owner, 409 when the host is offline, 502 on
             a host-side install failure, 504 on host timeout.
         """
-        # Feature flag (default off): a disabled route is indistinguishable
-        # from a non-existent one, so the feature is fully dark until opted in.
-        if not env_truthy(os.environ.get(HARNESS_INSTALL_ENABLED_ENV)):
+        # A disabled route is indistinguishable from a non-existent one, so
+        # the feature is fully dark until the deployment opts in.
+        if not flags.enabled(Feature.HARNESS_INSTALL):
             raise HTTPException(status_code=404, detail="not found")
 
         # Allowlist (400) is checked before the ownership check (403) so error
@@ -1276,7 +1315,7 @@ def create_hosts_router(
 
         conn = host_registry.get(host.host_id)
         if conn is None:
-            raise HTTPException(status_code=409, detail="host is offline")
+            raise _host_absent_error(host)
 
         # Coalesce concurrent installs of the same harness FAMILY onto one
         # in-flight request so a double-click (or `codex` + `codex-native`, which
@@ -1342,7 +1381,7 @@ def create_hosts_router(
         Backs the Web UI setup dialog's "Add a credential" action so a user can
         configure a Claude / Codex / Pi credential on a connected host without a
         terminal. Owner-scoped, allowlisted, and gated behind
-        ``OMNIGENT_HARNESS_INSTALL_ENABLED`` exactly like the install route
+        ``harness_install`` release feature exactly like the install route
         (404 when disabled). The host daemon does the write with the same
         non-interactive core the ``omnigent setup`` wizard uses.
 
@@ -1366,7 +1405,7 @@ def create_hosts_router(
             the owner, 409 when offline, 502 on host-side failure, 504 on
             timeout.
         """
-        if not env_truthy(os.environ.get(HARNESS_INSTALL_ENABLED_ENV)):
+        if not flags.enabled(Feature.HARNESS_INSTALL):
             raise HTTPException(status_code=404, detail="not found")
 
         # Allowlist before ownership (403) so error codes can't enumerate
@@ -1392,7 +1431,7 @@ def create_hosts_router(
 
         conn = host_registry.get(host.host_id)
         if conn is None:
-            raise HTTPException(status_code=409, detail="host is offline")
+            raise _host_absent_error(host)
 
         frame = HostStoreSecretFrame(
             request_id=secrets.token_hex(8),
@@ -1459,7 +1498,7 @@ def create_hosts_router(
         :raises HTTPException: 404 when disabled or host unknown, 403 when not
             the owner, 409 when offline, 502/504 on host failure/timeout.
         """
-        if not env_truthy(os.environ.get(HARNESS_INSTALL_ENABLED_ENV)):
+        if not flags.enabled(Feature.HARNESS_INSTALL):
             raise HTTPException(status_code=404, detail="not found")
 
         user_id = require_user(request, auth_provider)
@@ -1472,7 +1511,7 @@ def create_hosts_router(
 
         conn = host_registry.get(host.host_id)
         if conn is None:
-            raise HTTPException(status_code=409, detail="host is offline")
+            raise _host_absent_error(host)
 
         result = await _proxy_detect_credentials(host_registry=host_registry, host_conn=conn)
         return {
@@ -1528,7 +1567,7 @@ def create_hosts_router(
 
         conn = host_registry.get(host.host_id)
         if conn is None:
-            raise HTTPException(status_code=409, detail="host is offline")
+            raise _host_absent_error(host)
 
         try:
             worktrees = await list_worktrees_on_host(
