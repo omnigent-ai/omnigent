@@ -3992,6 +3992,11 @@ async def _post_external_conversation_item(
                     "item_type": item.item_type,
                     "item_data": item.data,
                     "response_id": item.response_id,
+                    # Server-side idempotency key: the forwarder retries a
+                    # timed-out POST it cannot know the disposition of, so
+                    # the server derives the item's id from this and treats
+                    # a re-post as a no-op instead of a duplicate.
+                    "source_id": item.source_id,
                 },
             },
         )

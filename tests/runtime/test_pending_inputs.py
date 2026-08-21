@@ -330,3 +330,25 @@ def test_stale_entries_evicted_after_ttl(monkeypatch: pytest.MonkeyPatch) -> Non
     # Past the TTL: the lazy sweep on the next access evicts the ghost.
     clock["t"] = 1000.0 + pending_inputs._TTL_S + 0.1
     assert pending_inputs.snapshot_for("conv_a") == []
+
+
+def test_restore_returns_a_drained_entry_to_the_front() -> None:
+    """A restored entry reclaims the head of the FIFO.
+
+    Compensation for a drain whose persist deduplicated (the entry
+    belongs to the NEXT user message): the entry was the oldest when
+    drained, so it must come back ahead of everything queued after it.
+    """
+    first = pending_inputs.record("conv_r", [_text_block("first")])
+    second = pending_inputs.record("conv_r", [_text_block("second")])
+
+    drained = pending_inputs.resolve_oldest("conv_r")
+    assert drained is not None and drained.pending_id == first
+
+    pending_inputs.restore("conv_r", drained)
+    order = [e["pending_id"] for e in pending_inputs.snapshot_for("conv_r")]
+    assert order == [first, second]
+
+    # The restored entry drains again as the oldest.
+    redrained = pending_inputs.resolve_oldest("conv_r")
+    assert redrained is not None and redrained.pending_id == first
