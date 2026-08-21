@@ -145,6 +145,24 @@ snapshot limit (10 MB). If a wheel exceeds it, rebuild with
 `--skip-web-ui` or reduce the wheel size; uv lockfiles cannot point at
 UC Volume wheel paths because `uv lock` validates path sources locally.
 
+### Deploying without OpenTelemetry
+
+The default deploy enables OTel end to end (the
+`opentelemetry-instrument` wrapper, `OTEL_TRACES_SAMPLER=always_on`,
+and platform export to `<otel_table_schema>.otel_{logs,metrics,spans}`).
+On a workspace without an OTel collector or without UC tables outside
+default storage (the platform export API rejects default-storage
+tables), add `--no-otel`:
+
+```bash
+uv run python deploy/databricks/deploy.py     --app-name omnigent     --profile <your-profile>     --lakebase-branch projects/omnigent/branches/production     --lakebase-database projects/omnigent/branches/production/databases/databricks-postgres     --volume-name main.omnigent.artifacts     --no-otel
+```
+
+`--no-otel` deploys with a plain `python app.py` command,
+`OTEL_TRACES_SAMPLER=always_off`, and no platform export destinations —
+no span-export failures against `localhost:4317`, no dependency on
+UC tables. Existing (default) deploys are byte-for-byte unchanged.
+
 Re-running is safe — every step is idempotent.
 
 Release features are off by default. Enable one or more for the whole app by

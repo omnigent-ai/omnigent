@@ -576,6 +576,16 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--no-otel",
+        action="store_true",
+        help=(
+            "Deploy without OpenTelemetry: no opentelemetry-instrument "
+            "wrapper, OTEL_TRACES_SAMPLER=always_off, and no platform "
+            "telemetry export destinations. For workspaces without an OTel "
+            "collector or without UC tables outside default storage (#4998)."
+        ),
+    )
+    parser.add_argument(
         "--target",
         default="prod",
         help=(
@@ -741,8 +751,32 @@ def _ensure_compute_size(
     )
 
 
+def _otel_destinations_var(otel_table_schema: str) -> str:
+    """Platform telemetry export destinations as a JSON-encoded list var.
+
+    Kept in one place so the enabled and disabled shapes provably mirror
+    databricks.yml's default (a single unity_catalog entry; empty list
+    disables the platform export without any conditional syntax DAB's
+    bundle templates do not support).
+    """
+    import json
+
+    return json.dumps(
+        [
+            {
+                "unity_catalog": {
+                    "logs_table": f"{otel_table_schema}.otel_logs",
+                    "metrics_table": f"{otel_table_schema}.otel_metrics",
+                    "traces_table": f"{otel_table_schema}.otel_spans",
+                }
+            }
+        ]
+    )
+
+
 def _bundle_vars(args: argparse.Namespace) -> list[str]:
     """CLI args to pass to `databricks bundle` as --var pairs."""
+    no_otel = getattr(args, "no_otel", False)
     return [
         "--var",
         f"app_name={args.app_name}",
@@ -756,6 +790,13 @@ def _bundle_vars(args: argparse.Namespace) -> list[str]:
         f"otel_table_schema={args.otel_table_schema}",
         "--var",
         f"features={args.features}",
+        "--var",
+        'otel_command='
+        + ('["python", "app.py"]' if no_otel else '["opentelemetry-instrument", "python", "app.py"]'),
+        "--var",
+        f"otel_traces_sampler={'always_off' if no_otel else 'always_on'}",
+        "--var",
+        "otel_destinations=" + ("[]" if no_otel else _otel_destinations_var(args.otel_table_schema)),
     ]
 
 

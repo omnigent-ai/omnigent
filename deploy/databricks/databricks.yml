@@ -24,6 +24,23 @@ variables:
   features:
     description: "Comma-separated deployment-wide release features."
     default: ""
+  otel_command:
+    description: >
+      App entry command. Default enables the opentelemetry-instrument
+      wrapper; deploy.py --no-otel overrides it to plain python for
+      workspaces without an OTel collector (#4998).
+    default: '["opentelemetry-instrument", "python", "app.py"]'
+  otel_traces_sampler:
+    description: >
+      OTEL_TRACES_SAMPLER for the wrapper. Inert without the wrapper;
+      deploy.py --no-otel sets always_off for belt-and-braces.
+    default: always_on
+  otel_destinations:
+    description: >
+      Platform telemetry export destinations (JSON list). Default routes
+      logs/metrics/spans to the otel_table_schema tables; deploy.py
+      --no-otel passes an empty list to disable platform export.
+    default: '[{"unity_catalog": {"logs_table": "main.omnigent_logs.otel_logs", "metrics_table": "main.omnigent_logs.otel_metrics", "traces_table": "main.omnigent_logs.otel_spans"}}]'
 
 resources:
   apps:
@@ -39,14 +56,14 @@ resources:
       # set it out-of-band via apps.create_update in deploy.py before
       # the bundle deploy runs.
       config:
-        command: ["opentelemetry-instrument", "python", "app.py"]
+        command: ${var.otel_command}
         env:
           - name: AP_LAKEBASE_ENDPOINT
             value_from: postgres
           - name: AP_ARTIFACT_VOLUME_PATH
             value_from: artifact_volume
           - name: OTEL_TRACES_SAMPLER
-            value: 'always_on'
+            value: "${var.otel_traces_sampler}"
           - name: OMNIGENT_FEATURES
             value: "${var.features}"
       resources:
@@ -82,8 +99,7 @@ targets:
           # in default storage ("Cannot export App telemetry to tables in
           # default storage"), so this requires a workspace with a custom
           # storage location — drop this block if yours has none.
-          telemetry_export_destinations:
-            - unity_catalog:
-                logs_table: ${var.otel_table_schema}.otel_logs
-                metrics_table: ${var.otel_table_schema}.otel_metrics
-                traces_table: ${var.otel_table_schema}.otel_spans
+          # Empty when deploy.py --no-otel is used (destinations as a
+          # JSON-encoded list var; empty list disables platform export
+          # without any conditional syntax DAB doesn't support).
+          telemetry_export_destinations: ${var.otel_destinations}
