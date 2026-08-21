@@ -5,7 +5,8 @@
 // ExecutionLogsPanel / FilesPanelDrawer — those open at ~50 % by default
 // while the inline panel starts at a compact sidebar width.
 
-import { useCallback, useEffect, useReducer, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useReducer, useRef, useSyncExternalStore } from "react";
+import { useInputCapabilities } from "@/hooks/useInputCapabilities";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 
 const MIN_WIDTH_PX = 240;
@@ -14,6 +15,31 @@ const MAX_WIDTH_RATIO = 0.99;
 const CHAT_MIN_WIDTH_PX = 480;
 /** Visual gap between the chat column and the rail. */
 const GAP_PX = 8;
+// The handle is a dedicated flex gutter between chat and panel, outside both
+// scroll containers. The painted `w-1` strip is centered in a small layout
+// gutter, with tightly bounded overhangs that avoid owning either surface.
+const PAINTED_STRIP_PX = 4;
+const COARSE_GUTTER_PX = 12;
+const FINE_GUTTER_PX = 10;
+const CHAT_SLIVER_PX = 6;
+const PANEL_SLIVER_PX = 8;
+
+function gutterStyle(isCoarse: boolean): React.CSSProperties {
+  const gutter = isCoarse ? COARSE_GUTTER_PX : FINE_GUTTER_PX;
+  const panelPad = PANEL_SLIVER_PX + gutter - PAINTED_STRIP_PX;
+  return {
+    touchAction: "none",
+    boxSizing: "content-box",
+    // Absolute positioning resolves the negative end margin against the panel
+    // seam. Keep only the bounded sliver on the transcript side; place the
+    // gutter footprint inward so transcript scrolling retains the next pixel.
+    paddingLeft: CHAT_SLIVER_PX,
+    paddingRight: panelPad,
+    marginLeft: -CHAT_SLIVER_PX,
+    marginRight: -(PAINTED_STRIP_PX + panelPad),
+    backgroundClip: "content-box",
+  };
+}
 
 // ~36 % of viewport, clamped [420, 600] — ~30 % wider than the prior default so
 // the first manual open lands at a comfortable working width.
@@ -131,8 +157,8 @@ function getServerSnapshot(): number | null {
  * inline panel doesn't disturb the push-panel widths (TerminalsPanel etc.).
  *
  * Returns the current pixel width and handle props to spread onto the resize
- * handle element. Intended for desktop-only use — callers should not render
- * the handle on mobile.
+ * handle element. Drag uses pointer events with capture so touch/stylus work
+ * the same as mouse. Callers should not render the handle on mobile.
  *
  * `sessionId` scopes the persisted width: each conversation remembers its own
  * rail width. Pass `null` when there is no active conversation (the panel then
@@ -147,7 +173,9 @@ export function useResizableInlinePanel(
   sessionId: string | null,
   minWidthPx = MIN_WIDTH_PX,
   reservedPx = 0,
+  enabled = true,
 ) {
+  const { coarsePrimary } = useInputCapabilities();
   const raw = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
   // On a session switch the module store still holds the previous session's
   // width until the effect below re-seeds it after commit. Derive this render's
@@ -163,16 +191,13 @@ export function useResizableInlinePanel(
   // Clamped at render time only — the store keeps the user's preferred width, so
   // a temporary squeeze (sidebar opening) is undone when the space returns.
   const resolvedWidth = clamp(effectiveRaw ?? defaultWidthPx(), minWidthPx, reservedPx);
-  // Drives the drag listeners' lifecycle: they mount only while a drag is
-  // live, so there's no idle window-level mousemove handler firing during
-  // ordinary page use.
-  const [isDragging, setIsDragging] = useState(false);
   // `resolvedWidth` reads `window.innerWidth` at render, but a viewport resize
   // that leaves the stored (no-reserve) width unchanged wouldn't otherwise
   // re-render — so the render-time reserve clamp would go stale and the chat
   // could dip below its minimum on a shrink. This tick forces a recompute on
   // every resize regardless of whether the stored width moved.
   const [, bumpViewport] = useReducer((n: number) => n + 1, 0);
+  const activePointerIdRef = useRef<number | null>(null);
   const overlayRef = useRef<HTMLDivElement | null>(null);
   const minWidthRef = useRef(minWidthPx);
   minWidthRef.current = minWidthPx;
@@ -180,9 +205,9 @@ export function useResizableInlinePanel(
   reservedRef.current = reservedPx;
 
   // While dragging, a transparent full-window overlay sits above the panel so
-  // the pointer stream keeps reaching the parent document. Without it, dragging
-  // over a cross-origin/sandboxed iframe (e.g. the HTML preview) routes mousemove
-  // /mouseup into the frame, the parent never sees mouseup, and the drag sticks.
+  // the pointer stream keeps reaching the parent document. Capture continues
+  // moves off the handle, but without the overlay a drag over a cross-origin
+  // iframe (e.g. the HTML preview) can still lose the stream on some engines.
   const addDragOverlay = useCallback(() => {
     if (overlayRef.current || typeof document === "undefined") return;
     const el = document.createElement("div");
@@ -196,13 +221,6 @@ export function useResizableInlinePanel(
     overlayRef.current?.remove();
     overlayRef.current = null;
   }, []);
-
-  // Load the active session's saved width into the module store (and re-load
-  // when it changes) so the live store and the drag handlers operate on the
-  // right session.
-  useEffect(() => {
-    loadSession(sessionId);
-  }, [sessionId]);
 
   // Re-clamp on viewport resize so the panel can't overflow a shrunken window.
   // Re-derive the effective width from the persisted preference so widening the
@@ -227,19 +245,93 @@ export function useResizableInlinePanel(
   // The resolvedWidth formula already enforces the visual minimum. No effect
   // needed — this lets the panel shrink back when minWidthPx drops.
 
-  const onMouseDown = useCallback(
-    (e: React.MouseEvent) => {
+  const endDrag = useCallback(
+    (persist: boolean) => {
+      if (activePointerIdRef.current === null) return;
+      activePointerIdRef.current = null;
+      if (persist) persistStoredWidth();
+      removeDragOverlay();
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    },
+    [removeDragOverlay],
+  );
+
+  // A session switch removes the old panel identity even when the next
+  // session also renders a rail. Abort before re-seeding so a late pointerup
+  // cannot persist the old drag into the new conversation.
+  useEffect(() => {
+    endDrag(false);
+    loadSession(sessionId);
+  }, [endDrag, sessionId]);
+
+  const onPointerDown = useCallback(
+    (e: React.PointerEvent<HTMLElement>) => {
+      // First pointer wins; secondary buttons do not start a resize.
+      if (!enabled || resolvedWidth === 0) return;
+      if (activePointerIdRef.current !== null) return;
+      if (e.button !== 0) return;
+      try {
+        e.currentTarget.setPointerCapture(e.pointerId);
+      } catch {
+        return;
+      }
       e.preventDefault();
-      setIsDragging(true);
+      activePointerIdRef.current = e.pointerId;
       addDragOverlay();
       document.body.style.cursor = "col-resize";
       document.body.style.userSelect = "none";
     },
-    [addDragOverlay],
+    [addDragOverlay, enabled, resolvedWidth],
   );
+
+  const onPointerMove = useCallback((e: React.PointerEvent<HTMLElement>) => {
+    if (e.pointerId !== activePointerIdRef.current) return;
+    // Live width only; persist once on release to avoid a storage write per move.
+    setStoredWidth(clamp(window.innerWidth - e.clientX, minWidthRef.current, reservedRef.current));
+  }, []);
+
+  const onPointerUp = useCallback(
+    (e: React.PointerEvent<HTMLElement>) => {
+      if (e.pointerId !== activePointerIdRef.current) return;
+      endDrag(true);
+      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      }
+    },
+    [endDrag],
+  );
+
+  const onPointerCancel = useCallback(
+    (e: React.PointerEvent<HTMLElement>) => {
+      if (e.pointerId !== activePointerIdRef.current) return;
+      endDrag(false);
+    },
+    [endDrag],
+  );
+
+  useEffect(() => {
+    const onDocumentPointerUp = (e: PointerEvent) => {
+      if (e.pointerId === activePointerIdRef.current) endDrag(true);
+    };
+    const onDocumentPointerCancel = (e: PointerEvent) => {
+      if (e.pointerId === activePointerIdRef.current) endDrag(false);
+    };
+    document.addEventListener("pointerup", onDocumentPointerUp);
+    document.addEventListener("pointercancel", onDocumentPointerCancel);
+    return () => {
+      document.removeEventListener("pointerup", onDocumentPointerUp);
+      document.removeEventListener("pointercancel", onDocumentPointerCancel);
+    };
+  }, [endDrag]);
+
+  useEffect(() => {
+    if (!enabled || resolvedWidth === 0) endDrag(false);
+  }, [enabled, endDrag, resolvedWidth]);
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
+      if (!enabled || resolvedWidth === 0) return;
       const step = 20;
       if (e.key === "ArrowLeft") {
         e.preventDefault();
@@ -255,62 +347,28 @@ export function useResizableInlinePanel(
         );
       }
     },
-    [resolvedWidth],
+    [enabled, resolvedWidth],
   );
 
-  // Drag listeners live only while a drag is active — no idle window-level
-  // mousemove handler during ordinary use. Moves are coalesced through a
-  // single rAF so a burst of mousemove events yields at most one width update
-  // per frame (setStoredWidth already dedupes equal values).
-  useEffect(() => {
-    if (!isDragging) return;
-    let frame = 0;
-    let pending: number | null = null;
-
-    function flush() {
-      frame = 0;
-      if (pending === null) return;
-      setStoredWidth(clamp(pending, minWidthRef.current, reservedRef.current));
-      pending = null;
-    }
-
-    function onMouseMove(e: MouseEvent) {
-      pending = window.innerWidth - e.clientX;
-      if (frame === 0) frame = requestAnimationFrame(flush);
-    }
-
-    function stop() {
-      if (frame !== 0) cancelAnimationFrame(frame);
-      flush();
-      setIsDragging(false);
-      removeDragOverlay();
-      persistStoredWidth();
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-    }
-
-    window.addEventListener("mousemove", onMouseMove);
-    window.addEventListener("mouseup", stop);
-    return () => {
-      if (frame !== 0) cancelAnimationFrame(frame);
-      window.removeEventListener("mousemove", onMouseMove);
-      window.removeEventListener("mouseup", stop);
-      // Unmounted mid-drag (panel closed via tab switch): reset the cursor and
-      // drop the overlay so it can't swallow later clicks.
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-      removeDragOverlay();
-    };
-  }, [isDragging, removeDragOverlay]);
+  useEffect(() => () => endDrag(false), [endDrag]);
 
   return {
     panelWidth: resolvedWidth,
     handleProps: {
-      onMouseDown,
+      onPointerDown,
+      onPointerMove,
+      onPointerUp,
+      onPointerCancel,
+      onLostPointerCapture: onPointerCancel,
       onKeyDown,
+      style: gutterStyle(coarsePrimary),
       role: "separator" as const,
       "aria-orientation": "vertical" as const,
       "aria-label": "Resize panel",
+      "aria-valuenow": resolvedWidth,
+      "aria-valuemin": Math.min(minWidthPx, resolvedWidth),
+      "aria-valuemax": clamp(Number.POSITIVE_INFINITY, minWidthPx, reservedPx),
+      "aria-disabled": !enabled || resolvedWidth === 0,
       tabIndex: 0,
     },
   };

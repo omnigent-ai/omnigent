@@ -6,21 +6,26 @@
 //      `onDoubleClick`), gated on edit permission.
 // See ConversationRow / ConversationEditRow in Sidebar.tsx.
 
-import { useSyncExternalStore } from "react";
+import { type ReactElement, type ReactNode, useSyncExternalStore } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import {
+  act,
+  cleanup,
+  createEvent,
+  fireEvent,
+  render,
+  screen,
+  within,
+} from "@testing-library/react";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import type * as IdentityModule from "@/lib/identity";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 
-// Controllable rename mutation so the double-click test can assert the
-// committed title was forwarded to the PATCH. `isMobile` toggles the mocked
-// `useIsMobileViewport` so a test can render the row on a mobile viewport (the
-// project flyout is disabled there). Declared via vi.hoisted so the vi.mock
-// factories (hoisted above imports) can reference them.
+// Hoisted controls drive row mutations, viewport layout, and coarse-pointer
+// capability independently inside mock factories.
 const mocks = vi.hoisted(() => {
   // Tiny reactive store for the server-authoritative pinned set, so a quick-pin
   // click re-renders the sidebar (mirrors the real query's refetch). Holds ids;
@@ -49,6 +54,7 @@ const mocks = vi.hoisted(() => {
     // it keeps showing the new title until the PATCH settles.
     rename: { mutate: vi.fn(), isSuccess: false, isError: false },
     isMobile: false,
+    anyCoarse: false,
     // Projects surfaced by the picker + the move-to-project mutation, so the
     // mobile in-place project view test can assert both the list and the pick.
     projects: [] as string[],
@@ -59,6 +65,13 @@ const mocks = vi.hoisted(() => {
     viewerId: "viewer@example.com" as string | null,
     conversations: [] as unknown[],
     pinnedStore,
+    // Archive + stop mutations, so the swipe tests can assert the swipe→archive
+    // path drives the same stop→archive handler the kebab uses.
+    archive: { mutate: vi.fn() },
+    stopSession: { mutate: vi.fn() },
+    // Stop-and-delete, so the swipe→delete test can assert the row deletes only
+    // after the confirm dialog is accepted.
+    del: { mutate: vi.fn(), reset: vi.fn() },
   };
 });
 
@@ -69,12 +82,21 @@ vi.mock("@/hooks/useIsMobileViewport", () => ({
   useIsMobileViewport: () => mocks.isMobile,
 }));
 
+vi.mock("@/hooks/useInputCapabilities", () => ({
+  useInputCapabilities: () => ({
+    coarsePrimary: mocks.anyCoarse,
+    anyCoarse: mocks.anyCoarse,
+    hoverPrimary: !mocks.anyCoarse,
+    hasTouch: mocks.anyCoarse,
+  }),
+}));
+
 vi.mock("@/hooks/useConversations", () => ({
   useConversations: vi.fn(),
   useConnectedConversations: () => [],
   useStopAndDeleteConversation: () => ({
-    mutate: vi.fn(),
-    reset: vi.fn(),
+    mutate: mocks.del.mutate,
+    reset: mocks.del.reset,
     isPending: false,
     isError: false,
     variables: undefined,
@@ -100,12 +122,12 @@ vi.mock("@/hooks/useConversations", () => ({
   PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
   useRenameConversation: () => mocks.rename,
   useLeaveSession: () => mocks.leave,
-  useArchiveConversation: () => ({ mutate: vi.fn() }),
+  useArchiveConversation: () => mocks.archive,
   useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkMoveToProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useStopSession: () => ({ mutate: vi.fn() }),
+  useStopSession: () => mocks.stopSession,
   useProjects: () => ({ data: mocks.projects.map((name: string) => ({ id: `p_${name}`, name })) }),
   // A non-empty `useProjects` renders a project folder, which queries its
   // sessions — return the collapsed (disabled) shape so the folder is inert
@@ -148,8 +170,55 @@ vi.mock("@/lib/identity", async (importOriginal) => ({
   resolveIdentity: () => Promise.resolve(mocks.viewerId),
 }));
 
+// Settings uses a Radix Select portal that jsdom cannot drive. Render a native
+// select so these tests can exercise the real swipe preference control.
+vi.mock("@/components/ui/select", async () => {
+  const { Children, isValidElement } = await import("react");
+  const SelectTrigger = ({ children }: { children?: ReactNode }) => children;
+  // The trigger carries the data-testid the tests query for; lift it onto the
+  // native <select> and keep the trigger itself out of the option list.
+  const isTrigger = (child: ReactNode): child is ReactElement<{ "data-testid"?: string }> =>
+    isValidElement(child) && child.type === SelectTrigger;
+  const Select = ({
+    value,
+    onValueChange,
+    children,
+  }: {
+    value: string;
+    onValueChange: (value: string) => void;
+    children: ReactNode;
+  }) => {
+    const kids = Children.toArray(children);
+    return (
+      <select
+        data-testid={kids.find(isTrigger)?.props["data-testid"]}
+        value={value}
+        onChange={(event) => onValueChange(event.target.value)}
+      >
+        {kids.filter((child) => !isTrigger(child))}
+      </select>
+    );
+  };
+  return {
+    Select,
+    SelectTrigger,
+    SelectValue: () => null,
+    SelectContent: ({ children }: { children: ReactNode }) => children,
+    SelectItem: ({ value, children }: { value: string; children: ReactNode }) => (
+      <option value={value}>{typeof children === "string" ? children : value}</option>
+    ),
+  };
+});
+
 import { type Conversation, useConversations } from "@/hooks/useConversations";
 import { resetReadStateForTests, seedReadState } from "@/hooks/useUnseenConversations";
+import {
+  readSwipeActions,
+  type SwipeAction,
+  type SwipeDirection,
+  writeSwipeActions,
+} from "@/lib/swipeActionPreferences";
+import { SettingsPage } from "@/pages/SettingsPage";
 import { Sidebar } from "./Sidebar";
 
 const useConvMock = vi.mocked(useConversations);
@@ -214,6 +283,12 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
   };
 }
 
+// Exposes the router's current pathname so tests can assert whether a click on
+// a row link actually navigated (e.g. the swipe suite's trailing-click guard).
+function LocationProbe() {
+  return <div data-testid="location-probe">{useLocation().pathname}</div>;
+}
+
 // `activeId` mounts the sidebar at `/c/:conversationId` (via a matching
 // Route so `useParams` populates), making that row the active one — the
 // rest of the suite renders at `/` where no row is active. `info` pins the
@@ -236,6 +311,7 @@ function renderSidebar(activeId?: string, info?: ServerInfo) {
             ) : (
               sidebar
             )}
+            <LocationProbe />
           </MemoryRouter>
         </TooltipProvider>
       </QueryClientProvider>
@@ -250,15 +326,49 @@ function renderSidebar(activeId?: string, info?: ServerInfo) {
   return Object.assign(view, { rerenderSidebar: () => view.rerender(makeUi()) });
 }
 
+// Pick an action for one direction through the real Appearance settings control
+// (the Radix Select is mocked to a native <select> above), then unmount so the
+// sidebar can render against the preference the page just wrote.
+function chooseSwipeActionInSettings(direction: SwipeDirection, action: SwipeAction) {
+  render(
+    <TooltipProvider>
+      <MemoryRouter initialEntries={["/settings/appearance"]}>
+        <SettingsPage />
+      </MemoryRouter>
+    </TooltipProvider>,
+  );
+  fireEvent.change(screen.getByTestId(`swipe-action-${direction}`), { target: { value: action } });
+  cleanup();
+}
+
 beforeEach(() => {
   mocks.rename.mutate.mockReset();
   mocks.rename.isSuccess = false;
   mocks.rename.isError = false;
   mocks.moveToProject.mutate.mockReset();
   mocks.leave.mutate.mockReset();
+  // Resolve archive callbacks synchronously so the transient "Archiving…"
+  // status row settles back to the interactive row within the test.
+  mocks.archive.mutate.mockReset();
+  mocks.archive.mutate.mockImplementation(
+    (_args: unknown, opts?: { onSuccess?: () => void; onSettled?: () => void }) => {
+      opts?.onSuccess?.();
+      opts?.onSettled?.();
+    },
+  );
+  // The stop that precedes archiving (runArchive) fires its `onSettled` once
+  // the runner stop resolves; invoke it synchronously so the follow-on
+  // archive.mutate runs in tests.
+  mocks.stopSession.mutate.mockReset();
+  mocks.stopSession.mutate.mockImplementation((_id: string, opts?: { onSettled?: () => void }) => {
+    opts?.onSettled?.();
+  });
+  mocks.del.mutate.mockReset();
+  mocks.del.reset.mockReset();
   mocks.projects = [];
-  // Default every test to the desktop viewport; the mobile flyout test opts in.
+  // Default to a desktop viewport with no coarse pointer; cases opt in independently.
   mocks.isMobile = false;
+  mocks.anyCoarse = false;
   useConvMock.mockReset();
   localStorage.clear();
   // Reset the server pinned set between tests.
@@ -269,7 +379,13 @@ beforeEach(() => {
   mockConversations([CONV]);
 });
 
-afterEach(cleanup);
+afterEach(async () => {
+  cleanup();
+  // dnd-kit removes its capture-phase click blocker on a delayed task.
+  await new Promise((resolve) => {
+    setTimeout(resolve, 60);
+  });
+});
 
 describe("quick pin/unpin hover button", () => {
   it("keeps the row full-width and the trailing controls inset from the right edge", () => {
@@ -899,6 +1015,93 @@ describe("mark as unread", () => {
 });
 
 describe("right-click context menu", () => {
+  it("returns focus after a desktop context menu closes at a narrow viewport", () => {
+    mocks.isMobile = true;
+    renderSidebar();
+    const link = screen.getByRole("link", { name: /My Session/ });
+
+    fireEvent.contextMenu(link);
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+    fireEvent.keyDown(screen.getByTestId("rename-conversation"), { key: "Escape" });
+
+    expect(link).toHaveFocus();
+  });
+
+  it("does not force focus to the row after a touch long-press menu closes", () => {
+    vi.useFakeTimers();
+    try {
+      mocks.isMobile = true;
+      mocks.anyCoarse = true;
+      renderSidebar();
+      const link = screen.getByRole("link", { name: /My Session/ });
+      const pointer = {
+        pointerId: 1,
+        pointerType: "touch",
+        isPrimary: true,
+        button: 0,
+        clientX: 200,
+        clientY: 100,
+      };
+
+      fireEvent.pointerDown(link, pointer);
+      act(() => vi.advanceTimersByTime(400));
+      expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+
+      fireEvent.keyDown(screen.getByTestId("rename-conversation"), { key: "Escape" });
+
+      expect(screen.queryByTestId("rename-conversation")).toBeNull();
+      expect(link).not.toHaveFocus();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("dismisses a touch-opened menu when the same finger drags away", async () => {
+    mocks.isMobile = true;
+    mocks.anyCoarse = true;
+    writeSwipeActions({ left: "archive", right: "delete" });
+    renderSidebar();
+
+    const link = screen.getByRole("link", { name: /My Session/ });
+    fireEvent.pointerDown(link, {
+      pointerId: 1,
+      pointerType: "touch",
+      isPrimary: true,
+      button: 0,
+      clientX: 200,
+      clientY: 100,
+    });
+    await act(
+      () =>
+        new Promise((resolve) => {
+          setTimeout(resolve, 750);
+        }),
+    );
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+
+    fireEvent.pointerMove(link, {
+      pointerId: 1,
+      pointerType: "touch",
+      isPrimary: true,
+      clientX: 20,
+      clientY: 100,
+    });
+    fireEvent.pointerUp(link, {
+      pointerId: 1,
+      pointerType: "touch",
+      isPrimary: true,
+      clientX: 20,
+      clientY: 100,
+    });
+    // The production browser follows pointerup with touchend; dnd-kit's
+    // TouchSensor detaches from that native touch event.
+    fireEvent.touchEnd(link, { touches: [] });
+
+    expect(screen.queryByTestId("rename-conversation")).toBeNull();
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    expect(mocks.del.mutate).not.toHaveBeenCalled();
+  });
+
   it("opens the same action items as the kebab and drives the same handlers", () => {
     renderSidebar();
 
@@ -1043,17 +1246,697 @@ describe("right-click context menu", () => {
   });
 });
 
+describe("touch swipe actions", () => {
+  // jsdom has no real touch, so drive the gesture with pointer events. The row
+  // handlers gate on a primary, non-mouse pointer (see useRowSwipe); default
+  // jsdom PointerEvents omit those, so set them explicitly. A swipe is a
+  // down → horizontal move past the commit threshold → up on the row's <li>.
+  const POINTER = { pointerId: 1, isPrimary: true, pointerType: "touch" as const };
+
+  beforeEach(() => {
+    mocks.anyCoarse = true;
+  });
+
+  // Drag the row and hold at `dx`, so a test can inspect the reveal mid-gesture.
+  // `release` finishes it, carrying the same dx the drag ended on.
+  function pointerEventAt(
+    type: "pointerDown" | "pointerMove" | "pointerUp",
+    target: Element,
+    init: Record<string, unknown>,
+    timeStamp: number,
+  ) {
+    const event = createEvent[type](target, { ...POINTER, ...init });
+    Object.defineProperty(event, "timeStamp", { value: timeStamp });
+    fireEvent(target, event);
+  }
+
+  function pointerUpWithoutUsableX(target: Element, timeStamp: number) {
+    const event = createEvent.pointerUp(target, POINTER);
+    Object.defineProperties(event, {
+      clientX: { value: Number.NaN },
+      timeStamp: { value: timeStamp },
+    });
+    fireEvent(target, event);
+  }
+
+  function moveSwipeRow(dx: number, durationMs = 500) {
+    const link = screen.getByRole("link", { name: /My Session/ });
+    const li = link.closest("li")!;
+    pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
+    // First move locks the axis; the second carries it past the commit point.
+    pointerEventAt(
+      "pointerMove",
+      li,
+      { clientX: 100 + Math.sign(dx) * 20, clientY: 100 },
+      1_000 + durationMs / 2,
+    );
+    pointerEventAt("pointerMove", li, { clientX: 100 + dx, clientY: 100 }, 1_000 + durationMs);
+    return {
+      li,
+      release() {
+        pointerEventAt("pointerUp", li, { clientX: 100 + dx, clientY: 100 }, 1_000 + durationMs);
+        // Include the browser's trailing click, un-prevented: the row itself
+        // must suppress it (see the trailing-click tests) — never the test.
+        fireEvent.click(link);
+      },
+    };
+  }
+
+  function swipeRow(dx: number, durationMs = 500) {
+    moveSwipeRow(dx, durationMs).release();
+  }
+
+  // The reveal sitting behind the row is inert and shows only the icon for the
+  // action that direction commits to.
+  function expectRevealIcons(li: Element, icons: { shows: string; hides: string }) {
+    const reveal = within(li as HTMLElement).getByTestId("conversation-swipe-reveal");
+    expect(reveal).toHaveClass("pointer-events-none");
+    expect(reveal.querySelector(icons.shows)).not.toBeNull();
+    expect(reveal.querySelector(icons.hides)).toBeNull();
+  }
+
+  it("maps the Settings swipe-left selection to the row's left-swipe action", () => {
+    chooseSwipeActionInSettings("left", "delete");
+    expect(readSwipeActions()).toEqual({ left: "delete", right: "none" });
+
+    renderSidebar();
+    swipeRow(-90);
+
+    expect(screen.getByText("Delete conversation?")).toBeInTheDocument();
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    expect(mocks.del.mutate).toHaveBeenCalledTimes(1);
+  });
+
+  it("maps the Settings swipe-right selection to the row's right-swipe action", () => {
+    chooseSwipeActionInSettings("right", "archive");
+    expect(readSwipeActions()).toEqual({ left: "archive", right: "archive" });
+
+    renderSidebar();
+    swipeRow(90);
+
+    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+    expect(mocks.del.mutate).not.toHaveBeenCalled();
+    expect(screen.queryByText("Delete conversation?")).toBeNull();
+  });
+
+  it("reveals the same action that fires in both configured directions", () => {
+    writeSwipeActions({ left: "delete", right: "archive" });
+    renderSidebar();
+
+    const leftSwipe = moveSwipeRow(-90);
+    expectRevealIcons(leftSwipe.li, { shows: ".lucide-trash-2", hides: ".lucide-archive" });
+    leftSwipe.release();
+    expect(screen.getByText("Delete conversation?")).toBeInTheDocument();
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    const rightSwipe = moveSwipeRow(90);
+    expectRevealIcons(rightSwipe.li, { shows: ".lucide-archive", hides: ".lucide-trash-2" });
+    rightSwipe.release();
+    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("Delete conversation?")).toBeNull();
+  });
+
+  it("runs the archive path when swiping the archive-configured direction", () => {
+    // Default: swipe-left → archive. Swipe left past the commit threshold.
+    renderSidebar();
+
+    swipeRow(-90);
+
+    // Archiving is a single PATCH — the server stops the runner once the flag
+    // commits, so a client-side stop would race it (see runArchive).
+    expect(mocks.archive.mutate).toHaveBeenCalledWith(
+      { id: "conv_1", archived: true },
+      expect.anything(),
+    );
+    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+    expect(mocks.stopSession.mutate).not.toHaveBeenCalled();
+    // Archive never routes through delete.
+    expect(mocks.del.mutate).not.toHaveBeenCalled();
+  });
+
+  it("opens the delete confirm dialog (no immediate delete) when swiping the delete direction", () => {
+    // Map swipe-right → delete, then swipe right.
+    writeSwipeActions({ left: "archive", right: "delete" });
+    renderSidebar();
+
+    swipeRow(90);
+
+    // The confirm dialog opens — delete stays behind it, so no mutation yet.
+    expect(screen.getByText("Delete conversation?")).toBeInTheDocument();
+    expect(mocks.del.mutate).not.toHaveBeenCalled();
+
+    // Confirming in the dialog fires the same delete the kebab flow uses.
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    expect(mocks.del.mutate).toHaveBeenCalledWith({ id: "conv_1", deleteBranch: false });
+    expect(mocks.del.mutate).toHaveBeenCalledTimes(1);
+  });
+
+  it("suppresses the trailing click after a committed swipe so it doesn't navigate", () => {
+    // Browsers can synthesize a click on the row link after the drag; the
+    // row's click-capture guard must swallow it (no test-side preventDefault),
+    // or a swipe-to-archive would also open the session it just archived.
+    renderSidebar();
+    expect(screen.getByTestId("location-probe")).toHaveTextContent("/");
+
+    swipeRow(-90);
+
+    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("location-probe")).toHaveTextContent(/^\/$/);
+  });
+
+  it("suppresses the trailing click after a below-threshold swipe as well", () => {
+    // Even an uncommitted (beyond-slop) swipe is a drag, not a tap — its
+    // trailing click must not navigate either.
+    renderSidebar();
+
+    swipeRow(-40);
+
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    expect(screen.getByTestId("location-probe")).toHaveTextContent(/^\/$/);
+  });
+
+  it("keeps a plain tap navigating (the suppression is scoped to swipes)", () => {
+    renderSidebar();
+
+    fireEvent.click(screen.getByRole("link", { name: /My Session/ }));
+
+    expect(screen.getByTestId("location-probe")).toHaveTextContent("/c/conv_1");
+  });
+
+  it("shows the unarchive glyph when swiping an archived row", () => {
+    // runArchive toggles, so on an archived row the gesture restores the
+    // session — the reveal must mirror the kebab's Unarchive affordance, not
+    // promise a re-archive.
+    mockConversations([{ ...CONV, archived: true }]);
+    renderSidebar();
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByTestId("session-filter-archived"));
+
+    const swipe = moveSwipeRow(-90);
+    expectRevealIcons(swipe.li, {
+      shows: ".lucide-archive-restore",
+      hides: ".lucide-archive",
+    });
+    swipe.release();
+
+    // Releasing runs the same toggle the kebab's Unarchive item uses.
+    expect(mocks.archive.mutate).toHaveBeenCalledWith({ id: "conv_1", archived: false });
+  });
+
+  it("claims the horizontal touch axis only while a swipe action is configured", () => {
+    // With an action armed, the row must override touch-action so the browser
+    // doesn't take the horizontal pan mid-gesture...
+    const { unmount } = renderSidebar();
+    const li = () => screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+    expect(li()).toHaveClass("touch-pan-y");
+    unmount();
+
+    // ...but with BOTH directions inert there is no gesture to protect, so the
+    // override is dropped and the browser keeps its own horizontal gestures.
+    writeSwipeActions({ left: "none", right: "none" });
+    renderSidebar();
+    expect(li()).not.toHaveClass("touch-pan-y");
+  });
+
+  it("does nothing when swiping a direction mapped to none", () => {
+    // Default: swipe-right → none. Swipe right; nothing should fire.
+    renderSidebar();
+
+    swipeRow(90);
+
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    expect(mocks.del.mutate).not.toHaveBeenCalled();
+    expect(screen.queryByText("Delete conversation?")).toBeNull();
+  });
+
+  it("supports both directions mapped to the same action", () => {
+    // Both directions archive — a swipe either way runs the archive path.
+    writeSwipeActions({ left: "archive", right: "archive" });
+    const firstRender = renderSidebar();
+
+    swipeRow(90);
+    expect(mocks.archive.mutate).toHaveBeenCalledWith(
+      { id: "conv_1", archived: true },
+      expect.anything(),
+    );
+
+    mocks.archive.mutate.mockClear();
+    firstRender.unmount();
+    renderSidebar();
+    swipeRow(-90);
+    expect(mocks.archive.mutate).toHaveBeenCalledWith(
+      { id: "conv_1", archived: true },
+      expect.anything(),
+    );
+  });
+
+  it("keeps the action captured when the gesture began if Settings changes mid-swipe", () => {
+    renderSidebar();
+
+    const swipe = moveSwipeRow(-90);
+    expectRevealIcons(swipe.li, { shows: ".lucide-archive", hides: ".lucide-trash-2" });
+    act(() => writeSwipeActions({ left: "delete", right: "none" }));
+    expectRevealIcons(swipe.li, { shows: ".lucide-archive", hides: ".lucide-trash-2" });
+    swipe.release();
+
+    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("Delete conversation?")).toBeNull();
+  });
+
+  it("uses pointer-down eligibility when settings disable swipe before a pending release", () => {
+    renderSidebar();
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+
+    pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
+    act(() => writeSwipeActions({ left: "none", right: "none" }));
+    pointerEventAt("pointerUp", li, { clientX: 20, clientY: 100 }, 1_500);
+
+    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+  });
+
+  it("bounds raw swipe-move rendering to one animation frame", () => {
+    const frames: FrameRequestCallback[] = [];
+    const requestFrame = vi
+      .spyOn(window, "requestAnimationFrame")
+      .mockImplementation((callback) => (frames.push(callback), frames.length));
+    const cancelFrame = vi.spyOn(window, "cancelAnimationFrame").mockImplementation(() => {});
+    renderSidebar();
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+
+    pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
+    pointerEventAt("pointerMove", li, { clientX: 80, clientY: 100 }, 1_010);
+    pointerEventAt("pointerMove", li, { clientX: 60, clientY: 100 }, 1_020);
+    pointerEventAt("pointerMove", li, { clientX: 40, clientY: 100 }, 1_030);
+
+    expect(requestFrame).toHaveBeenCalledTimes(1);
+    expect(frames).toHaveLength(1);
+    act(() => frames[0](1_040));
+    expect(li.querySelector('[style*="margin-right"]')).toHaveStyle({ marginRight: "60px" });
+    requestFrame.mockRestore();
+    cancelFrame.mockRestore();
+  });
+
+  it("releases the armed touch guard when an ineligible row yields to scroll", () => {
+    vi.useFakeTimers();
+    mockConversations([{ ...CONV, owner: "other@example.com" }]);
+    renderSidebar();
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByTestId("session-filter-shared"));
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+
+    pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
+    act(() => vi.advanceTimersByTime(400));
+    pointerEventAt("pointerMove", li, { clientX: 115, clientY: 100 }, 1_410);
+    const touchMove = new TouchEvent("touchmove", { bubbles: true, cancelable: true });
+    document.dispatchEvent(touchMove);
+    const prevented = touchMove.defaultPrevented;
+    vi.useRealTimers();
+
+    expect(prevented).toBe(false);
+  });
+
+  it("does not fire the action for a short swipe below the commit threshold", () => {
+    renderSidebar();
+
+    // Past the activation lock (20px) but short of the commit distance (72px).
+    swipeRow(-40);
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { dx: -50, action: "archive" },
+    { dx: 50, action: "delete" },
+  ] as const)("commits a fast short flick toward $action", ({ dx, action }) => {
+    writeSwipeActions({ left: "archive", right: "delete" });
+    renderSidebar();
+
+    swipeRow(dx, 50);
+
+    if (action === "archive") {
+      expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+      expect(screen.queryByText("Delete conversation?")).toBeNull();
+    } else {
+      expect(screen.getByText("Delete conversation?")).toBeInTheDocument();
+      expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    }
+  });
+
+  it.each([
+    { dx: -50, action: "archive" },
+    { dx: 50, action: "delete" },
+  ] as const)("commits a pause-then-fast flick toward $action", ({ dx, action }) => {
+    writeSwipeActions({ left: "archive", right: "delete" });
+    renderSidebar();
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+
+    pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
+    // The pause must not dilute the velocity of the final 50ms movement window.
+    pointerEventAt("pointerMove", li, { clientX: 100, clientY: 100 }, 1_500);
+    pointerEventAt("pointerMove", li, { clientX: 100 + Math.sign(dx) * 20, clientY: 100 }, 1_525);
+    pointerEventAt("pointerMove", li, { clientX: 100 + dx, clientY: 100 }, 1_550);
+    pointerEventAt("pointerUp", li, { clientX: 100 + dx, clientY: 100 }, 1_550);
+
+    if (action === "archive") {
+      expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+      expect(screen.queryByText("Delete conversation?")).toBeNull();
+    } else {
+      expect(screen.getByText("Delete conversation?")).toBeInTheDocument();
+      expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    }
+  });
+
+  it("commits when the final release-only segment crosses the distance threshold", () => {
+    renderSidebar();
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+
+    pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
+    pointerEventAt("pointerMove", li, { clientX: 80, clientY: 100 }, 1_300);
+    pointerEventAt("pointerMove", li, { clientX: 40, clientY: 100 }, 1_500);
+    pointerEventAt("pointerUp", li, { clientX: 20, clientY: 100 }, 1_700);
+
+    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+  });
+
+  it("promotes a pending release-only gesture and commits by distance", () => {
+    renderSidebar();
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+
+    pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
+    pointerEventAt("pointerUp", li, { clientX: 20, clientY: 100 }, 1_500);
+
+    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { dx: -50, action: "archive" },
+    { dx: 50, action: "delete" },
+  ] as const)("promotes a pending release-only flick toward $action", ({ dx, action }) => {
+    writeSwipeActions({ left: "archive", right: "delete" });
+    renderSidebar();
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+
+    pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
+    pointerEventAt("pointerUp", li, { clientX: 100 + dx, clientY: 100 }, 1_050);
+
+    if (action === "archive") {
+      expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+      expect(screen.queryByText("Delete conversation?")).toBeNull();
+    } else {
+      expect(screen.getByText("Delete conversation?")).toBeInTheDocument();
+      expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    }
+  });
+
+  it.each([
+    { dx: -80, dy: 90 },
+    { dx: 80, dy: 80 },
+  ])("does not promote a pending $dx,$dy release without horizontal intent", ({ dx, dy }) => {
+    writeSwipeActions({ left: "archive", right: "delete" });
+    renderSidebar();
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+
+    pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
+    pointerEventAt("pointerUp", li, { clientX: 100 + dx, clientY: 100 + dy }, 1_050);
+
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    expect(screen.queryByText("Delete conversation?")).toBeNull();
+  });
+
+  it.each([
+    { dx: -50, action: "archive" },
+    { dx: 50, action: "delete" },
+  ] as const)("commits a release-only short flick toward $action", ({ dx, action }) => {
+    writeSwipeActions({ left: "archive", right: "delete" });
+    renderSidebar();
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+
+    pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
+    pointerEventAt("pointerMove", li, { clientX: 100 + Math.sign(dx) * 20, clientY: 100 }, 1_500);
+    pointerEventAt("pointerUp", li, { clientX: 100 + dx, clientY: 100 }, 1_550);
+
+    if (action === "archive") {
+      expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+      expect(screen.queryByText("Delete conversation?")).toBeNull();
+    } else {
+      expect(screen.getByText("Delete conversation?")).toBeInTheDocument();
+      expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    }
+  });
+
+  it("uses the release-time direction and snapshot action after a reversal", () => {
+    writeSwipeActions({ left: "archive", right: "delete" });
+    renderSidebar();
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+
+    pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
+    pointerEventAt("pointerMove", li, { clientX: 80, clientY: 100 }, 1_300);
+    pointerEventAt("pointerMove", li, { clientX: 40, clientY: 100 }, 1_500);
+    act(() => writeSwipeActions({ left: "delete", right: "archive" }));
+    pointerEventAt("pointerUp", li, { clientX: 180, clientY: 100 }, 1_550);
+
+    expect(screen.getByText("Delete conversation?")).toBeInTheDocument();
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+  });
+
+  it("does not commit a noisy slow release-only segment", () => {
+    renderSidebar();
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+
+    pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
+    pointerEventAt("pointerMove", li, { clientX: 80, clientY: 100 }, 1_300);
+    pointerEventAt("pointerMove", li, { clientX: 45, clientY: 100 }, 1_350);
+    pointerEventAt("pointerUp", li, { clientX: 50, clientY: 100 }, 1_400);
+
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    expect(screen.queryByText("Delete conversation?")).toBeNull();
+  });
+
+  it("does not create a flick from an unusable pointer-up coordinate", () => {
+    renderSidebar();
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+
+    pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
+    pointerEventAt("pointerMove", li, { clientX: 80, clientY: 100 }, 1_300);
+    pointerEventAt("pointerMove", li, { clientX: 50, clientY: 100 }, 1_500);
+    pointerUpWithoutUsableX(li, 1_510);
+
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+  });
+
+  it("does not commit a stale distance when the pointer-up coordinate is unusable", () => {
+    renderSidebar();
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+
+    pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
+    pointerEventAt("pointerMove", li, { clientX: 80, clientY: 100 }, 1_300);
+    pointerEventAt("pointerMove", li, { clientX: 20, clientY: 100 }, 1_500);
+    pointerUpWithoutUsableX(li, 1_510);
+
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+  });
+
+  it.each([-50, 50] as const)("does not commit a single-event short swipe at %dpx", (dx) => {
+    writeSwipeActions({ left: "archive", right: "delete" });
+    renderSidebar();
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+
+    pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
+    pointerEventAt("pointerMove", li, { clientX: 100 + dx, clientY: 100 }, 1_500);
+    pointerEventAt("pointerUp", li, { clientX: 100 + dx, clientY: 100 }, 1_510);
+
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    expect(screen.queryByText("Delete conversation?")).toBeNull();
+  });
+
+  it.each([-50, 50] as const)("does not commit a noisy slow short swipe at %dpx", (dx) => {
+    writeSwipeActions({ left: "archive", right: "delete" });
+    renderSidebar();
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+    const direction = Math.sign(dx);
+
+    pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
+    pointerEventAt("pointerMove", li, { clientX: 100 + direction * 20, clientY: 100 }, 1_300);
+    pointerEventAt("pointerMove", li, { clientX: 100 + direction * 55, clientY: 100 }, 1_350);
+    pointerEventAt("pointerMove", li, { clientX: 100 + dx, clientY: 100 }, 1_400);
+    pointerEventAt("pointerUp", li, { clientX: 100 + dx, clientY: 100 }, 1_400);
+
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    expect(screen.queryByText("Delete conversation?")).toBeNull();
+  });
+
+  it.each([-40, 40] as const)("does not commit a slow short drag at %dpx", (dx) => {
+    writeSwipeActions({ left: "archive", right: "delete" });
+    renderSidebar();
+
+    swipeRow(dx, 500);
+
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    expect(screen.queryByText("Delete conversation?")).toBeNull();
+  });
+
+  it("does not treat fast vertical-dominant travel as a flick", () => {
+    writeSwipeActions({ left: "archive", right: "delete" });
+    renderSidebar();
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+
+    pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
+    pointerEventAt("pointerMove", li, { clientX: 140, clientY: 160 }, 1_025);
+    pointerEventAt("pointerUp", li, { clientX: 140, clientY: 160 }, 1_050);
+
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    expect(screen.queryByText("Delete conversation?")).toBeNull();
+  });
+
+  it("resets an armed swipe when pointer capture is unexpectedly lost", () => {
+    const frames: FrameRequestCallback[] = [];
+    const requestFrame = vi
+      .spyOn(window, "requestAnimationFrame")
+      .mockImplementation((callback) => (frames.push(callback), frames.length));
+    renderSidebar();
+
+    const link = screen.getByRole("link", { name: /My Session/ });
+    const li = link.closest("li")!;
+    fireEvent.pointerDown(li, { ...POINTER, clientX: 200, clientY: 100 });
+    fireEvent.pointerMove(li, { ...POINTER, clientX: 180, clientY: 100 });
+    fireEvent.pointerMove(li, { ...POINTER, clientX: 100, clientY: 100 });
+    act(() => frames[0](performance.now()));
+    expect(li.querySelector('[style*="margin-right"]')).toHaveStyle({
+      marginRight: "81.33333333333333px",
+    });
+
+    fireEvent.lostPointerCapture(li, POINTER);
+
+    expect(li.querySelector('[style*="margin-right"]')).toBeNull();
+    fireEvent.pointerUp(li, { ...POINTER, clientX: 100, clientY: 100 });
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    expect(mocks.del.mutate).not.toHaveBeenCalled();
+    requestFrame.mockRestore();
+  });
+
+  it.each([
+    { deltaX: -90, action: "delete" },
+    { deltaX: 90, action: "archive" },
+  ] as const)(
+    "ignores a descendant's implicit capture loss before completing $action",
+    ({ deltaX, action }) => {
+      writeSwipeActions({ left: "delete", right: "archive" });
+      renderSidebar();
+
+      const link = screen.getByRole("link", { name: /My Session/ });
+      const li = link.closest("li")!;
+      let captured = false;
+      li.setPointerCapture = () => {
+        captured = true;
+      };
+      li.hasPointerCapture = () => captured;
+      li.releasePointerCapture = () => {
+        captured = false;
+      };
+      fireEvent.pointerDown(link, { ...POINTER, clientX: 200, clientY: 100 });
+      fireEvent.pointerMove(link, {
+        ...POINTER,
+        clientX: 200 + Math.sign(deltaX) * 20,
+        clientY: 100,
+      });
+      fireEvent.lostPointerCapture(link, POINTER);
+      expect(captured).toBe(true);
+      fireEvent.pointerMove(li, { ...POINTER, clientX: 200 + deltaX, clientY: 100 });
+      fireEvent.pointerUp(li, { ...POINTER, clientX: 200 + deltaX, clientY: 100 });
+      expect(captured).toBe(false);
+
+      if (action === "delete") {
+        expect(screen.getByText("Delete conversation?")).toBeInTheDocument();
+      } else {
+        expect(mocks.archive.mutate).toHaveBeenCalledWith(
+          { id: "conv_1", archived: true },
+          expect.anything(),
+        );
+      }
+    },
+  );
+
+  it("does not fire at 71px, immediately below the commit boundary", () => {
+    renderSidebar();
+
+    swipeRow(-71);
+
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+  });
+
+  it("fires exactly once at the 72px commit boundary", () => {
+    renderSidebar();
+
+    swipeRow(-72);
+
+    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+  });
+
+  it("commits the configured action on a wide viewport with a coarse pointer", () => {
+    expect(mocks.isMobile).toBe(false);
+    expect(mocks.anyCoarse).toBe(true);
+    renderSidebar();
+
+    swipeRow(-90);
+    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores touch swipes when only fine pointers are available", () => {
+    mocks.anyCoarse = false;
+    renderSidebar();
+
+    swipeRow(-90);
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+  });
+
+  it("ignores non-touch pointers when a coarse pointer also exists", () => {
+    // A touchscreen laptop's pen and mouse paths remain inert.
+    renderSidebar();
+
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+    for (const [pointerId, pointerType] of ["pen", "mouse"].entries()) {
+      const pointer = { pointerId, isPrimary: true, pointerType };
+      fireEvent.pointerDown(li, { ...pointer, clientX: 100, clientY: 100 });
+      fireEvent.pointerMove(li, { ...pointer, clientX: 120, clientY: 100 });
+      fireEvent.pointerMove(li, { ...pointer, clientX: 190, clientY: 100 });
+      fireEvent.pointerUp(li, { ...pointer, clientX: 190, clientY: 100 });
+    }
+
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    expect(mocks.del.mutate).not.toHaveBeenCalled();
+  });
+
+  it("yields a primarily-vertical drag to scroll (no action)", () => {
+    // A mostly-vertical move is scroll intent — the gesture bails and never
+    // fires, even though it travels well past the commit distance horizontally.
+    renderSidebar();
+
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+    fireEvent.pointerDown(li, { ...POINTER, clientX: 100, clientY: 100 });
+    // First move is dominated by the vertical axis → decided="other".
+    fireEvent.pointerMove(li, { ...POINTER, clientX: 105, clientY: 140 });
+    fireEvent.pointerMove(li, { ...POINTER, clientX: 10, clientY: 180 });
+    fireEvent.pointerUp(li, { ...POINTER, clientX: 10, clientY: 180 });
+
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    expect(mocks.del.mutate).not.toHaveBeenCalled();
+  });
+});
+
 describe("sharing kill switch", () => {
   it("disables the row's Share item for a manager when sharing_mode is off", () => {
-    // CONV is owner-level (permission_level null → canManage), yet a server
-    // reporting sharing_mode off must gray out Share for everyone.
     mockConversations([CONV]);
     renderSidebar(undefined, serverInfo({ sharing_mode: "off" }));
-
     fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
-
-    // Radix marks a disabled menu item with data-disabled; the enabled
-    // (on / read_only) branch renders a plain selectable item without it.
     expect(screen.getByTestId("share-conversation")).toHaveAttribute("data-disabled");
   });
 

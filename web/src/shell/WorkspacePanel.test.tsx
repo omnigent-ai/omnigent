@@ -85,6 +85,7 @@ function renderWorkspace(
     selectedTerminalKey?: string | null;
     maximized?: boolean;
     liveness?: SessionLiveness;
+    handleProps?: React.HTMLAttributes<HTMLDivElement> & { tabIndex: number };
   } = {},
 ) {
   const openFileViewer = vi.fn();
@@ -98,7 +99,7 @@ function renderWorkspace(
       <WorkspacePanel
         conversationId="conv_ws"
         width={360}
-        handleProps={{ tabIndex: 0 }}
+        handleProps={overrides.handleProps ?? { tabIndex: 0 }}
         rightRailTab={overrides.rightRailTab ?? "files"}
         onRightRailTabChange={onRightRailTabChange}
         showFilesPanel
@@ -671,5 +672,97 @@ describe("WorkspacePanel browser tab", () => {
     expect(screen.getByTestId("browser-pane-stub")).toBeInTheDocument();
     // And the file scope views are not mounted in that branch.
     expect(screen.queryByTestId("files-panel-stub")).toBeNull();
+  });
+});
+
+// ── Resize handle geometry ────────────────────────────────────────────────────
+
+describe("WorkspacePanel resize handle geometry", () => {
+  const handleStyle = {
+    touchAction: "none",
+    boxSizing: "content-box",
+    paddingLeft: 10,
+    paddingRight: 12,
+    marginLeft: -6,
+    marginRight: -8,
+    backgroundClip: "content-box",
+  } as React.CSSProperties;
+
+  it("positions the resize target over the seam without consuming flex width", () => {
+    renderWorkspace({
+      handleProps: {
+        tabIndex: 0,
+        role: "separator",
+        "aria-label": "Resize panel",
+        style: handleStyle,
+      },
+    });
+
+    const panel = screen.getByRole("complementary", { name: "Workspace" });
+    const separator = screen.getByRole("separator", { name: "Resize panel" });
+
+    expect(separator).toHaveAttribute("data-workspace-panel-resize-gutter");
+    expect(separator.nextElementSibling).toBe(panel);
+    expect(panel).toHaveClass("md:overflow-hidden");
+    expect(panel).not.toContainElement(separator);
+    expect(separator).toHaveClass("md:absolute", "md:inset-y-0");
+    expect(separator).toHaveClass("z-50");
+    expect(panel).toHaveClass("z-40");
+    expect(separator).not.toHaveClass("shrink-0");
+    expect(separator.style.right).toBe("360px");
+  });
+
+  it("keeps adjacent scroll surfaces outside the gutter ownership", () => {
+    const onPointerDown = vi.fn();
+    renderWorkspace({
+      handleProps: {
+        tabIndex: 0,
+        role: "separator",
+        "aria-label": "Resize panel",
+        style: handleStyle,
+        onPointerDown,
+      },
+    });
+
+    const separator = screen.getByRole("separator", { name: "Resize panel" });
+    expect(Math.abs(parseFloat(separator.style.marginLeft))).toBeLessThanOrEqual(6);
+    expect(Math.abs(parseFloat(separator.style.marginRight))).toBeLessThanOrEqual(8);
+
+    const filesTab = screen.getByRole("tab", { name: "Files" });
+    fireEvent.pointerDown(filesTab, { pointerId: 1, button: 0 });
+    fireEvent.pointerDown(screen.getByTestId("files-panel-stub"), { pointerId: 2, button: 0 });
+    expect(onPointerDown).not.toHaveBeenCalled();
+  });
+
+  it("keeps the visible resize strip byte-identical", () => {
+    renderWorkspace({
+      handleProps: {
+        tabIndex: 0,
+        role: "separator",
+        "aria-label": "Resize panel",
+        style: handleStyle,
+      },
+    });
+
+    const separator = screen.getByRole("separator", { name: "Resize panel" });
+    expect(separator.className).toBe(
+      "z-50 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:absolute md:inset-y-0 md:block",
+    );
+    expect(separator.style.boxSizing).toBe("content-box");
+    expect(separator.style.backgroundClip).toBe("content-box");
+  });
+
+  it("does not render the gutter when the hook marks it disabled", () => {
+    renderWorkspace({
+      handleProps: {
+        tabIndex: 0,
+        role: "separator",
+        "aria-label": "Resize panel",
+        "aria-disabled": true,
+        style: handleStyle,
+      },
+    });
+
+    expect(screen.queryByRole("separator", { name: "Resize panel" })).toBeNull();
   });
 });

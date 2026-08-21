@@ -10,6 +10,7 @@
 // the sidebar — so the store is just a persisted, viewport-clamped width.
 
 import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
+import { useInputCapabilities } from "@/hooks/useInputCapabilities";
 import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSizePreferences";
 
 // Default 320px (20rem) — wider than the old fixed ``md:w-64`` (256px) sidebar
@@ -19,6 +20,25 @@ import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSi
 const DEFAULT_WIDTH_PX = 320;
 const MIN_WIDTH_PX = 220;
 const MAX_WIDTH_RATIO = 0.5;
+const PAINTED_STRIP_PX = 4; // must match the handle's `w-1` class
+const COARSE_GUTTER_PX = 8;
+const FINE_GUTTER_PX = 6;
+const INWARD_SLIVER_PX = 8;
+const OUTWARD_SLIVER_PX = 10;
+
+function gutterStyle(coarsePointer: boolean): React.CSSProperties {
+  const gutter = coarsePointer ? COARSE_GUTTER_PX : FINE_GUTTER_PX;
+  const inset = (gutter - PAINTED_STRIP_PX) / 2;
+  return {
+    touchAction: "none",
+    boxSizing: "content-box",
+    paddingInlineStart: INWARD_SLIVER_PX + inset,
+    paddingInlineEnd: OUTWARD_SLIVER_PX + inset,
+    marginInlineStart: -INWARD_SLIVER_PX,
+    marginInlineEnd: -OUTWARD_SLIVER_PX,
+    backgroundClip: "content-box",
+  };
+}
 
 function clamp(w: number): number {
   // No viewport available off the DOM (SSR / node test env) — this runs during
@@ -89,9 +109,12 @@ export function resetSidebarWidthStoreForTesting(): void {
  * mobile (where the sidebar is a full-screen overlay).
  */
 export function useResizableSidebar() {
+  const { coarsePrimary } = useInputCapabilities();
   const raw = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
   const width = clamp(raw ?? DEFAULT_WIDTH_PX);
-  const dragging = useRef(false);
+  const activePointerId = useRef<number | null>(null);
+  const activeHandle = useRef<HTMLElement | null>(null);
+  const dragCleanup = useRef<(() => void) | null>(null);
 
   // Re-clamp on viewport resize so a shrunken window pulls the sidebar back
   // under the ceiling; widening re-derives from the persisted preference so the
@@ -104,12 +127,94 @@ export function useResizableSidebar() {
     return () => window.removeEventListener("resize", onResize);
   }, []);
 
-  const onMouseDown = useCallback((e: React.MouseEvent) => {
-    e.preventDefault();
-    dragging.current = true;
-    document.body.style.cursor = "col-resize";
-    document.body.style.userSelect = "none";
+  // No iframe shield: the sidebar never adjoins the preview iframe, so capture suffices.
+  const finishDrag = useCallback((commit: boolean) => {
+    const pointerId = activePointerId.current;
+    const handle = activeHandle.current;
+    if (pointerId === null) return;
+    activePointerId.current = null;
+    activeHandle.current = null;
+    dragCleanup.current?.();
+    dragCleanup.current = null;
+    if (commit) {
+      persistWidth(storedWidth);
+    }
+    try {
+      if (handle?.hasPointerCapture(pointerId)) {
+        handle.releasePointerCapture(pointerId);
+      }
+    } catch {
+      // The handle may already be detached when a responsive render gate flips.
+    }
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
   }, []);
+
+  const onPointerDown = useCallback(
+    (e: React.PointerEvent<HTMLElement>) => {
+      // First pointer wins; a right/middle mouse press doesn't start a drag.
+      if (activePointerId.current !== null) return;
+      if (e.button !== 0) return;
+
+      try {
+        e.currentTarget.setPointerCapture(e.pointerId);
+      } catch {
+        return;
+      }
+
+      e.preventDefault();
+      const handle = e.currentTarget;
+      const pointerId = e.pointerId;
+      activePointerId.current = pointerId;
+      activeHandle.current = handle;
+
+      function onDocumentPointerUp(event: PointerEvent) {
+        if (event.pointerId === activePointerId.current) finishDrag(true);
+      }
+
+      function onDocumentPointerCancel(event: PointerEvent) {
+        if (event.pointerId === activePointerId.current) finishDrag(false);
+      }
+
+      const observer = new MutationObserver(() => {
+        if (activeHandle.current && !activeHandle.current.isConnected) {
+          finishDrag(false);
+        }
+      });
+      observer.observe(document.documentElement, { childList: true, subtree: true });
+      document.addEventListener("pointerup", onDocumentPointerUp);
+      document.addEventListener("pointercancel", onDocumentPointerCancel);
+      dragCleanup.current = () => {
+        observer.disconnect();
+        document.removeEventListener("pointerup", onDocumentPointerUp);
+        document.removeEventListener("pointercancel", onDocumentPointerCancel);
+      };
+      document.body.style.cursor = "col-resize";
+      document.body.style.userSelect = "none";
+    },
+    [finishDrag],
+  );
+
+  const onPointerMove = useCallback((e: React.PointerEvent<HTMLElement>) => {
+    if (e.pointerId !== activePointerId.current) return;
+    setStoredWidth(clamp(e.clientX));
+  }, []);
+
+  const onPointerUp = useCallback(
+    (e: React.PointerEvent<HTMLElement>) => {
+      if (e.pointerId !== activePointerId.current) return;
+      finishDrag(true);
+    },
+    [finishDrag],
+  );
+
+  const onPointerCancel = useCallback(
+    (e: React.PointerEvent<HTMLElement>) => {
+      if (e.pointerId !== activePointerId.current) return;
+      finishDrag(false);
+    },
+    [finishDrag],
+  );
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -126,46 +231,29 @@ export function useResizableSidebar() {
     [width],
   );
 
-  useEffect(() => {
-    function onMouseMove(e: MouseEvent) {
-      if (!dragging.current) return;
-      // Left panel: width is the cursor's distance from the viewport's left
-      // edge. Update the live width only; persist once on release to avoid a
-      // synchronous localStorage write per mousemove.
-      setStoredWidth(clamp(e.clientX));
-    }
-
-    function onMouseUp() {
-      if (!dragging.current) return;
-      dragging.current = false;
-      persistWidth(storedWidth);
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-    }
-
-    window.addEventListener("mousemove", onMouseMove);
-    window.addEventListener("mouseup", onMouseUp);
-    return () => {
-      window.removeEventListener("mousemove", onMouseMove);
-      window.removeEventListener("mouseup", onMouseUp);
-      if (dragging.current) {
-        dragging.current = false;
-        document.body.style.cursor = "";
-        document.body.style.userSelect = "";
-      }
-    };
-  }, []);
+  useEffect(() => () => finishDrag(false), [finishDrag]);
 
   return {
     /** Current sidebar width in px (already viewport-clamped). */
     width,
     handleProps: {
-      onMouseDown,
+      onPointerDown,
+      onPointerMove,
+      onPointerUp,
+      onPointerCancel,
+      onLostPointerCapture: onPointerCancel,
       onKeyDown,
       role: "separator" as const,
       "aria-orientation": "vertical" as const,
       "aria-label": "Resize sidebar",
+      "aria-valuenow": width,
+      "aria-valuemin": MIN_WIDTH_PX,
+      "aria-valuemax":
+        typeof window === "undefined"
+          ? width
+          : Math.max(MIN_WIDTH_PX, window.innerWidth * MAX_WIDTH_RATIO),
       tabIndex: 0,
+      style: gutterStyle(coarsePrimary),
     },
   };
 }

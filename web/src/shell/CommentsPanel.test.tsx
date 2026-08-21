@@ -7,7 +7,7 @@
 //   4. No link button is rendered when onCopyCommentLink is omitted.
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Comment } from "@/hooks/useComments";
 import { getCurrentAuthorId } from "@/lib/identity";
 import type { ActiveSelection } from "./codeViewerHelpers";
@@ -22,6 +22,16 @@ vi.mock("@/lib/identity", () => ({
   getCurrentAuthorId: vi.fn<() => string | null>(() => null),
 }));
 const mockGetCurrentAuthorId = vi.mocked(getCurrentAuthorId);
+const originalMatchMedia = window.matchMedia;
+
+function setDesktopViewport(matches: boolean): void {
+  window.matchMedia = vi.fn((query: string) => ({
+    matches: query === "(min-width: 768px)" ? matches : false,
+    media: query,
+    addEventListener: () => {},
+    removeEventListener: () => {},
+  })) as unknown as typeof window.matchMedia;
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -68,7 +78,12 @@ function renderPanel(
   );
 }
 
-afterEach(cleanup);
+beforeEach(() => setDesktopViewport(true));
+
+afterEach(() => {
+  cleanup();
+  window.matchMedia = originalMatchMedia;
+});
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -408,21 +423,22 @@ describe("CommentsPanel show more / less", () => {
 //
 // The panel is resizable on desktop via a left-edge drag handle, and stacks
 // full-width (no inline width, no handle) on a narrow/mobile viewport. Desktop
-// vs mobile is decided from window.innerWidth (jsdom defaults to 1024 ≥ md).
+// vs mobile is decided from the canonical md media query.
 
 describe("CommentsPanel resize affordance", () => {
   it("renders a resize handle and applies an inline width on desktop", () => {
     renderPanel([makeComment("c1")], []);
 
-    // The separator is the drag handle; its parent is the panel root, which
+    // The separator is the divider gutter preceding the panel root, which
     // gets an explicit pixel width (default 240px) so it can be dragged wider.
     const handle = screen.getByRole("separator", { name: "Resize comments panel" });
-    expect((handle.parentElement as HTMLElement).style.width).toBe("240px");
+    expect((handle.nextElementSibling as HTMLElement).style.width).toBe("240px");
   });
 
   it("omits the handle and inline width on a narrow (mobile) viewport", () => {
     const orig = window.innerWidth;
     Object.defineProperty(window, "innerWidth", { configurable: true, value: 500 });
+    setDesktopViewport(false);
     try {
       renderPanel([makeComment("c1")], []);
       // No drag handle, and the panel falls back to the w-full class (no inline width).
@@ -509,5 +525,75 @@ describe("CommentsPanel active-comment reveal", () => {
     // The Addressed tab must become active so the card is rendered; its body
     // ("Comment c2") is then in the document.
     expect(screen.getByText("Comment c2")).toBeInTheDocument();
+  });
+});
+
+// ── Resize handle geometry ────────────────────────────────────────────────────
+
+describe("CommentsPanel resize divider gutter", () => {
+  // jsdom has no layout engine, so these tests pin the structural invariants
+  // that produce the geometry in a real browser: the gutter must be a flex
+  // sibling BEFORE the panel root (i.e. between the viewer and the panel in
+  // FileViewer's row) and outside every scroll/clip container, with its hit
+  // overhang capped on both sides.
+  const getSeparator = () => screen.getByRole("separator", { name: "Resize comments panel" });
+  const dragOverlayPresent = () =>
+    [...document.body.children].some(
+      (c) => c instanceof HTMLElement && c.style.zIndex === "2147483647",
+    );
+
+  it("renders the gutter between the viewer and the panel, outside both scroll containers", () => {
+    const { container } = renderPanel([makeComment("c1")], []);
+    const separator = getSeparator();
+
+    // First child of the split row slot, immediately followed by the panel
+    // root — so in FileViewer's flex row it sits between viewer and panel.
+    expect(container.firstElementChild).toBe(separator);
+    const panelRoot = separator.nextElementSibling as HTMLElement;
+    expect(panelRoot).not.toBeNull();
+    expect(panelRoot.contains(separator)).toBe(false);
+
+    // The panel root clips its own content again; the gutter must sit outside
+    // every clipping/scrolling ancestor or its hit slivers would be cut off.
+    expect(panelRoot.className).toMatch(/overflow-hidden/);
+    expect(separator.closest(".overflow-hidden, .overflow-y-auto")).toBeNull();
+  });
+
+  it("caps the hit overhang over the viewer and the panel content", () => {
+    renderPanel([makeComment("c1")], [makeComment("c2", "addressed")]);
+    const style = getSeparator().style;
+
+    // Slivers: ≤10px over the viewer (a 14px scrollbar keeps its majority),
+    // ≤8px inward (within the panel's 12px content gutter).
+    expect(-parseFloat(style.marginLeft)).toBeLessThanOrEqual(10);
+    expect(-parseFloat(style.marginRight)).toBeLessThanOrEqual(8);
+
+    // Pressing and tapping a tab must interact with the tab, not the handle:
+    // no drag overlay appears and the tab actually switches.
+    const addressedTab = screen.getByRole("button", { name: /addressed/i });
+    fireEvent.pointerDown(addressedTab);
+    expect(dragOverlayPresent()).toBe(false);
+    fireEvent.click(addressedTab);
+    expect(screen.getByText("Comment c2")).toBeInTheDocument();
+  });
+
+  it("keeps the painted strip slim inside the gutter's layout footprint", () => {
+    renderPanel([], []);
+    const separator = getSeparator();
+    const style = separator.style;
+
+    // 4px painted strip (w-1, content-box background); the layout footprint
+    // is the slim gutter itself — padding minus the cancelling margins.
+    expect(separator.className).toMatch(/\bw-1\b/);
+    expect(style.boxSizing).toBe("content-box");
+    expect(style.backgroundClip).toBe("content-box");
+    const footprint =
+      4 +
+      parseFloat(style.paddingLeft) +
+      parseFloat(style.paddingRight) +
+      parseFloat(style.marginLeft) +
+      parseFloat(style.marginRight);
+    expect(footprint).toBeLessThanOrEqual(8);
+    expect(footprint).toBeGreaterThan(0);
   });
 });

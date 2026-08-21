@@ -4746,17 +4746,12 @@ export function Composer({
   // On mobile, programmatic focus immediately summons the software keyboard.
   // Keep desktop's fast-type affordance, but let mobile users explicitly tap
   // the composer when switching back from Terminal or changing sessions.
-  const [isMobile, setIsMobile] = useState(
-    () => typeof window !== "undefined" && window.matchMedia("(max-width: 767px)").matches,
-  );
+  // "Mobile" is deliberately the canonical layout predicate (not provably
+  // at md+), so the keyboard-suppression boundary tracks the shell's layout
+  // pivot rather than a bespoke 767px threshold.
+  const isMobile = useIsMobileViewport();
   const isMobileRef = useRef(isMobile);
   isMobileRef.current = isMobile;
-  useEffect(() => {
-    const mq = window.matchMedia("(max-width: 767px)");
-    const handler = (e: MediaQueryListEvent) => setIsMobile(e.matches);
-    mq.addEventListener("change", handler);
-    return () => mq.removeEventListener("change", handler);
-  }, []);
 
   useEffect(() => {
     const restored = conversationId ? sessionDrafts.get(conversationId) : undefined;

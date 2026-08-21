@@ -147,130 +147,161 @@ export function CommentsPanel({
   }, [activeSelection, tab]);
 
   return (
-    <div
-      ref={containerRef}
-      style={isDesktop && width != null ? { width } : undefined}
-      className="relative flex shrink-0 flex-col overflow-hidden border-border w-full h-64 border-t md:h-auto md:border-t-0 md:border-l"
-    >
-      {/* Resize handle — desktop only (mobile stacks the panel full-width below) */}
+    <>
+      {/* Divider gutter owning the resize interaction — desktop only (mobile
+          stacks the panel full-width below). A real flex child BETWEEN the
+          viewer and the panel, outside both scroll containers, so its
+          invisible hit slivers overhang each neighbor by only a few px
+          instead of sitting over the viewer's scrollbar or the panel's
+          header/tabs/cards. */}
       {isDesktop && (
         <div
           {...handleProps}
-          className="absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors"
+          className="relative z-10 w-1 shrink-0 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors"
         />
       )}
-      {/* Header — fixed height so layout doesn't shift when button is hidden */}
-      <div className="flex h-11 shrink-0 items-center justify-between px-3 border-b border-border">
-        <span className="text-sm font-semibold">Comments</span>
-        {tab === "open" && (
-          <Button
-            type="button"
-            variant="outline"
-            size="xs"
-            className="rounded-full px-3 gap-1.5"
-            disabled={!canAddress || comments.length === 0 || addressPending}
-            onClick={onAddressAll}
-          >
-            <WandSparklesIcon className="size-3.5" />
-            Address All
-          </Button>
-        )}
-      </div>
-
-      {/* Tabs */}
-      <div className="flex shrink-0 border-b border-border">
-        {TABS.map((t) => {
-          const count = t === "open" ? comments.length : addressedComments.length;
-          return (
-            <button
-              key={t}
+      <div
+        ref={containerRef}
+        style={isDesktop && width != null ? { width } : undefined}
+        className="relative flex shrink-0 flex-col overflow-hidden border-border w-full h-64 border-t md:h-auto md:border-t-0 md:border-l"
+      >
+        {/* Header — fixed height so layout doesn't shift when button is hidden */}
+        <div className="flex h-11 shrink-0 items-center justify-between px-3 border-b border-border">
+          <span className="text-sm font-semibold">Comments</span>
+          {tab === "open" && (
+            <Button
               type="button"
-              className={cn(
-                "flex-1 py-1.5 text-sm font-medium capitalize transition-colors cursor-pointer",
-                tab === t
-                  ? "border-b-2 border-primary text-foreground"
-                  : "text-muted-foreground hover:text-foreground",
-              )}
-              onClick={() => setTab(t)}
+              variant="outline"
+              size="xs"
+              className="rounded-full px-3 gap-1.5"
+              disabled={!canAddress || comments.length === 0 || addressPending}
+              onClick={onAddressAll}
             >
-              {t === "open" ? "Open" : "Addressed"}
-              {count > 0 && (
-                <span className="ml-1 rounded-full bg-muted px-1.5 py-0.5 text-[10px] tabular-nums">
-                  {count}
-                </span>
-              )}
-            </button>
-          );
-        })}
-      </div>
-
-      {!canEdit && (
-        <div className="shrink-0 border-b border-border px-3 py-2 text-sm text-muted-foreground">
-          You have read-only access to this session.
+              <WandSparklesIcon className="size-3.5" />
+              Address All
+            </Button>
+          )}
         </div>
-      )}
 
-      <div className="flex-1 overflow-y-auto">
-        {/* Input section — shown when text is selected with no existing comment at same range and user can edit */}
-        {tab === "open" &&
-          activeSelection != null &&
-          !comments.some(
-            (c) =>
-              c.start_index === activeSelection.start_index &&
-              c.end_index === activeSelection.end_index,
-          ) &&
-          (canEdit ? (
-            <div className="space-y-2 border-b border-border px-3 py-2">
-              {activeSelection.anchor_content && (
-                <div className="truncate rounded bg-muted/40 px-2 py-1 font-mono text-[10px] text-muted-foreground">
-                  <span className="text-foreground/60">Selection: </span>
-                  {displayAnchorContent(activeSelection.anchor_content).split("\n")[0]}
-                </div>
-              )}
-              <textarea
-                ref={addCommentTextareaRef}
-                className="w-full resize-none rounded border border-border bg-background px-2 py-1.5 text-sm placeholder:text-muted-foreground"
-                rows={3}
-                placeholder="Add a comment…"
-                value={body}
-                onChange={(e) => {
-                  setBody(e.target.value);
-                  if (pendingBodyRef) pendingBodyRef.current = e.target.value;
-                }}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && !e.shiftKey && body.trim()) {
-                    e.preventDefault();
+        {/* Tabs */}
+        <div className="flex shrink-0 border-b border-border">
+          {TABS.map((t) => {
+            const count = t === "open" ? comments.length : addressedComments.length;
+            return (
+              <button
+                key={t}
+                type="button"
+                className={cn(
+                  "flex-1 py-1.5 text-sm font-medium capitalize transition-colors cursor-pointer",
+                  tab === t
+                    ? "border-b-2 border-primary text-foreground"
+                    : "text-muted-foreground hover:text-foreground",
+                )}
+                onClick={() => setTab(t)}
+              >
+                {t === "open" ? "Open" : "Addressed"}
+                {count > 0 && (
+                  <span className="ml-1 rounded-full bg-muted px-1.5 py-0.5 text-[10px] tabular-nums">
+                    {count}
+                  </span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+
+        {!canEdit && (
+          <div className="shrink-0 border-b border-border px-3 py-2 text-sm text-muted-foreground">
+            You have read-only access to this session.
+          </div>
+        )}
+
+        <div className="flex-1 overflow-y-auto">
+          {/* Input section — shown when text is selected with no existing comment at same range and user can edit */}
+          {tab === "open" &&
+            activeSelection != null &&
+            !comments.some(
+              (c) =>
+                c.start_index === activeSelection.start_index &&
+                c.end_index === activeSelection.end_index,
+            ) &&
+            (canEdit ? (
+              <div className="space-y-2 border-b border-border px-3 py-2">
+                {activeSelection.anchor_content && (
+                  <div className="truncate rounded bg-muted/40 px-2 py-1 font-mono text-[10px] text-muted-foreground">
+                    <span className="text-foreground/60">Selection: </span>
+                    {displayAnchorContent(activeSelection.anchor_content).split("\n")[0]}
+                  </div>
+                )}
+                <textarea
+                  ref={addCommentTextareaRef}
+                  className="w-full resize-none rounded border border-border bg-background px-2 py-1.5 text-sm placeholder:text-muted-foreground"
+                  rows={3}
+                  placeholder="Add a comment…"
+                  value={body}
+                  onChange={(e) => {
+                    setBody(e.target.value);
+                    if (pendingBodyRef) pendingBodyRef.current = e.target.value;
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && !e.shiftKey && body.trim()) {
+                      e.preventDefault();
+                      onAddComment(body.trim());
+                      setBody("");
+                      if (pendingBodyRef) pendingBodyRef.current = "";
+                    }
+                  }}
+                />
+                <Button
+                  type="button"
+                  size="xs"
+                  className="w-full"
+                  disabled={!body.trim()}
+                  onClick={() => {
                     onAddComment(body.trim());
                     setBody("");
                     if (pendingBodyRef) pendingBodyRef.current = "";
-                  }
-                }}
-              />
-              <Button
-                type="button"
-                size="xs"
-                className="w-full"
-                disabled={!body.trim()}
-                onClick={() => {
-                  onAddComment(body.trim());
-                  setBody("");
-                  if (pendingBodyRef) pendingBodyRef.current = "";
-                }}
-              >
-                Add Comment
-              </Button>
-            </div>
-          ) : null)}
+                  }}
+                >
+                  Add Comment
+                </Button>
+              </div>
+            ) : null)}
 
-        {/* Comment list */}
-        {tab === "open" ? (
-          comments.length === 0 ? (
+          {/* Comment list */}
+          {tab === "open" ? (
+            comments.length === 0 ? (
+              <div className="flex items-center justify-center p-8 text-sm text-muted-foreground">
+                No open comments.
+              </div>
+            ) : (
+              <div className="space-y-2 p-3">
+                {comments.map((c) => {
+                  const isSelected =
+                    activeSelection?.start_index === c.start_index &&
+                    activeSelection?.end_index === c.end_index;
+                  return (
+                    <CommentCard
+                      key={c.id}
+                      comment={c}
+                      isSelected={isSelected}
+                      cardRef={isSelected ? selectedCardRef : undefined}
+                      onClick={() => onClickComment(c)}
+                      onDelete={canModify(c) ? () => onDeleteComment(c.id) : undefined}
+                      onEdit={canModify(c) ? (newBody) => onEditComment(c.id, newBody) : undefined}
+                      onCopyLink={onCopyCommentLink ? () => onCopyCommentLink(c.id) : undefined}
+                    />
+                  );
+                })}
+              </div>
+            )
+          ) : addressedComments.length === 0 ? (
             <div className="flex items-center justify-center p-8 text-sm text-muted-foreground">
-              No open comments.
+              No addressed comments.
             </div>
           ) : (
             <div className="space-y-2 p-3">
-              {comments.map((c) => {
+              {addressedComments.map((c) => {
                 const isSelected =
                   activeSelection?.start_index === c.start_index &&
                   activeSelection?.end_index === c.end_index;
@@ -280,40 +311,16 @@ export function CommentsPanel({
                     comment={c}
                     isSelected={isSelected}
                     cardRef={isSelected ? selectedCardRef : undefined}
-                    onClick={() => onClickComment(c)}
                     onDelete={canModify(c) ? () => onDeleteComment(c.id) : undefined}
-                    onEdit={canModify(c) ? (newBody) => onEditComment(c.id, newBody) : undefined}
                     onCopyLink={onCopyCommentLink ? () => onCopyCommentLink(c.id) : undefined}
                   />
                 );
               })}
             </div>
-          )
-        ) : addressedComments.length === 0 ? (
-          <div className="flex items-center justify-center p-8 text-sm text-muted-foreground">
-            No addressed comments.
-          </div>
-        ) : (
-          <div className="space-y-2 p-3">
-            {addressedComments.map((c) => {
-              const isSelected =
-                activeSelection?.start_index === c.start_index &&
-                activeSelection?.end_index === c.end_index;
-              return (
-                <CommentCard
-                  key={c.id}
-                  comment={c}
-                  isSelected={isSelected}
-                  cardRef={isSelected ? selectedCardRef : undefined}
-                  onDelete={canModify(c) ? () => onDeleteComment(c.id) : undefined}
-                  onCopyLink={onCopyCommentLink ? () => onCopyCommentLink(c.id) : undefined}
-                />
-              );
-            })}
-          </div>
-        )}
+          )}
+        </div>
       </div>
-    </div>
+    </>
   );
 }
 
