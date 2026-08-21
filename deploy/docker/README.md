@@ -60,6 +60,44 @@ server startup so a typo cannot silently produce the wrong rollout. To roll
 back, remove the key (or empty the variable), run `docker compose up -d` again,
 and reload the web app.
 
+## Extra built-in agents
+
+`OMNIGENT_BUILTIN_AGENT_DIRS` seeds extra agents that are always available
+to every user, on top of the packaged claude-native-ui / codex-native-ui /
+polly set. It's a colon-separated (`os.pathsep`) list of paths; each entry
+is either a single-file agent spec (`some-agent.yaml`) or a bundle
+directory, and the resulting agent's name is that path's file stem or
+directory name.
+
+The path is resolved INSIDE the container, so bind-mount the host
+directory that holds your spec(s) and point the env var at the mounted
+path, not the host path. Neither the mount nor the env var is wired into
+`docker-compose.yaml` by default — add both yourself:
+
+```yaml
+# In docker-compose.yaml, on the omnigent service:
+    environment:
+      OMNIGENT_BUILTIN_AGENT_DIRS: "${OMNIGENT_BUILTIN_AGENT_DIRS:-}"
+    volumes:
+      - artifact-data:/data
+      - ./agents:/agents:ro    # host directory holding your agent spec(s)
+```
+
+```dotenv
+# In .env:
+OMNIGENT_BUILTIN_AGENT_DIRS=/agents/my-agent.yaml
+```
+
+```bash
+docker compose up -d
+docker compose logs omnigent | grep "built-in agent"
+```
+
+A bad or missing path is logged and skipped rather than failing startup —
+the packaged built-ins still seed. Registration runs once, at startup
+only (there's no live reload), so recreate the container
+(`docker compose up -d`) after adding or editing a spec.
+
 ## Multi-user mode (accounts — default)
 
 Built-in accounts auth: no IdP to register, no proxy to host.
@@ -256,6 +294,7 @@ trusts whatever value reaches it.
 | `OMNIGENT_AUTH_HEADER` | `X-Forwarded-Email` | Header-mode only: name of the trusted identity header. Set for proxies that use another name, e.g. `Cf-Access-Authenticated-User-Email` (Cloudflare Access). |
 | `OMNIGENT_AUTH_HEADER_STRIP_PREFIX` | unset (strip nothing) | Header-mode only: prefix removed from the identity header value. Set to `accounts.google.com:` for Google IAP's `X-Goog-Authenticated-User-Email`. |
 | `OMNIGENT_OIDC_*` | unset | OIDC config — required in oidc mode (issuer set, or `AUTH_PROVIDER=oidc`). See `.env.example`. |
+| `OMNIGENT_BUILTIN_AGENT_DIRS` | unset | Colon-separated paths (in-container) to extra always-available built-in agents, seeded once at startup. See [Extra built-in agents](#extra-built-in-agents). |
 | `PYPI_INDEX_URL` | `https://pypi.org/simple` | Build-time PyPI index — override only behind a corporate proxy. |
 
 `DATABASE_URL` and `ARTIFACT_DIR` are computed by compose and
