@@ -224,6 +224,11 @@ def _build_event(ctx: EvaluationContext) -> PolicyEvent:
             # only when the per-user daily cost-budget policy is present;
             # empty dict otherwise (that policy treats it as $0 → never trips).
             "user_daily_cost": dict(ctx.user_daily_cost) if ctx.user_daily_cost else {},
+            # The session owner's per-UTC-month cost rollup
+            # ({"cost_usd", "ask_approved_usd", "harness"}), injected by the engine
+            # only when the per-user monthly cost-budget policy is present;
+            # empty dict otherwise (that policy treats it as $0 → never trips).
+            "user_period_cost": dict(ctx.user_period_cost) if ctx.user_period_cost else {},
             # The session's current model (model_override or spec llm.model),
             # injected by the engine. ``None`` when undeterminable — cost
             # policies treat that as "cannot confirm a cheaper model".

@@ -883,6 +883,219 @@ def subagent_cost_budget(
     return evaluate
 
 
+def user_period_cost_budget(
+    period: str,
+    max_cost_usd: float,
+    ask_thresholds_usd: list[float] | None = None,
+    expensive_models: list[str] | None = None,
+    harness: str | None = None,
+) -> PolicyCallable:
+    """Factory: gate on the session OWNER's per-period LLM spend (USD).
+
+    Unified policy that supports different time periods (day, week, month,
+    quarter, year) with optional per-harness budgets. Identical gating logic to
+    :func:`user_daily_cost_budget`, but configurable for different granularities.
+
+    The budget is the session owner's **cumulative spend across all their
+    sessions for the current period (UTC)** instead of this one session's
+    spend. It reads ``event["context"]["user_daily_cost"]`` for day periods
+    or ``event["context"]["user_period_cost"]`` for other periods.
+
+    - **Soft (`ask_thresholds_usd`)**: the first time the owner's period
+      spend crosses a checkpoint, the turn (request phase) or tool call
+      (tool-call phase) is parked for approval (ASK). The approval is
+      recorded **per user+period+harness** (in the appropriate store table
+      via a reserved ``state_updates`` key the engine routes), so an
+      approved checkpoint won't re-prompt the user again that period —
+      including from a different session. A decline blocks that one turn /
+      tool call and re-asks next time.
+    - **Hard (`max_cost_usd`)**: once the owner's period spend reaches
+      the limit, DENY every tool call while the session is on an
+      ``expensive_models`` model (a ``/model`` downgrade gate, not a
+      stop); ALLOW once on a cheaper model.
+
+    When ``harness`` is ``None`` (the default), the budget is
+    **cross-harness**: cost is summed across all harnesses. When
+    ``harness`` is set (e.g. ``"codex-native"``), the budget is
+    **per-harness**: only that harness's cost counts, and approvals are
+    scoped to that harness.
+
+    Abstains (ALLOW) on every other phase, and whenever the period cost
+    is ``0.0`` (no spend recorded, no owner, or pricing unavailable).
+
+    :param period: Time period granularity: ``"day"``, ``"week"``,
+        ``"month"``, ``"quarter"``, or ``"year"``. ``"day"`` reads from
+        ``user_daily_cost`` context; all others read from
+        ``user_period_cost`` context.
+    :param max_cost_usd: Hard period limit in USD. Must be ``> 0``.
+    :param ask_thresholds_usd: Optional soft period warning checkpoints
+        in USD, e.g. ``[1.0, 2.5]``. Each value must be ``> 0`` and
+        ``< max_cost_usd``. ``None`` / ``[]`` disables the soft gate.
+    :param expensive_models: Optional case-insensitive substring tokens
+        for the model tiers blocked once over the period limit. ``None``
+        (the default) or ``[]`` makes the hard cap a true hard stop —
+        all models are blocked once the limit is reached. Pass an
+        explicit non-empty list for a downgrade gate that only blocks the
+        named tiers.
+    :param harness: Optional harness filter for per-harness budgets.
+        ``None`` (the default) sums cost across all harnesses.
+        A specific value (e.g. ``"codex-native"``) gates only that
+        harness's cost. **Only supported for non-day periods**; daily
+        budgets are currently cross-harness only.
+    :returns: A policy callable implementing the per-user period budget.
+    :raises ValueError: If ``period`` is not valid, if ``max_cost_usd`` is
+        not positive, if any ``ask_thresholds_usd`` value is not in
+        ``(0, max_cost_usd)``, if any ``expensive_models`` entry is not a
+        non-empty string, or if ``harness`` is set for ``period="day"``
+        (not yet supported).
+    """
+    if period not in ("day", "week", "month", "quarter", "year"):
+        raise ValueError(
+            f"period must be 'day', 'week', 'month', 'quarter', or 'year', got {period!r}"
+        )
+    if period == "day" and harness is not None:
+        raise ValueError(
+            "per-harness budgets are not yet supported for period='day'; "
+            "only period='month' supports the harness parameter"
+        )
+    if max_cost_usd <= 0:
+        raise ValueError(f"max_cost_usd must be > 0, got {max_cost_usd!r}")
+    thresholds = sorted({float(t) for t in (ask_thresholds_usd or [])})
+    for t in thresholds:
+        if not (0 < t < max_cost_usd):
+            raise ValueError(
+                f"each ask_thresholds_usd value must be in "
+                f"(0, max_cost_usd={max_cost_usd}), got {t!r}"
+            )
+    cfg = _resolve_expensive_models(expensive_models)
+
+    # Select the context key and state key based on period
+    if period == "day":
+        context_key = "user_daily_cost"
+        state_key = USER_DAILY_ASK_APPROVED_STATE_KEY
+        period_label = "daily"
+        period_noun = "day"
+    else:
+        # All non-day periods use user_period_cost context
+        from omnigent.policies.schema import USER_PERIOD_ASK_APPROVED_STATE_KEY
+
+        context_key = "user_period_cost"
+        state_key = USER_PERIOD_ASK_APPROVED_STATE_KEY
+        # Map period to human-readable labels
+        period_labels = {
+            "week": ("weekly", "week"),
+            "month": ("monthly", "month"),
+            "quarter": ("quarterly", "quarter"),
+            "year": ("yearly", "year"),
+        }
+        period_label, period_noun = period_labels.get(period, (period, period))
+
+    def _read_period_cost(event: PolicyEvent) -> float:
+        """Read the owner's period cost from the event context."""
+        context = event.get("context") or {}
+        period_data = context.get(context_key) or {}
+        raw = period_data.get("cost_usd", 0.0)
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _read_period_approved(event: PolicyEvent) -> float:
+        """Read the highest approved checkpoint for this period."""
+        context = event.get("context") or {}
+        period_data = context.get(context_key) or {}
+        raw = period_data.get("ask_approved_usd", 0.0)
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _read_period_owner(event: PolicyEvent) -> str | None:
+        """Read the session owner from the period context."""
+        context = event.get("context") or {}
+        period_data = context.get(context_key) or {}
+        owner = period_data.get("user_id")
+        return owner if isinstance(owner, str) and owner else None
+
+    def evaluate(event: PolicyEvent) -> PolicyResponse:
+        """Evaluate the per-user period cost budget for a request or tool call.
+
+        Mirrors :func:`user_daily_cost_budget`'s ``evaluate`` exactly,
+        reading the owner's period spend / approval instead of only daily,
+        and recording an approved checkpoint to the user+period store
+        (reserved ``state_updates`` key) rather than ``session_state``.
+
+        :param event: Policy event dict.
+        :returns: DENY when over the period budget on an expensive model;
+            ASK when a new period soft checkpoint is newly crossed; ALLOW
+            otherwise.
+        """
+        phase = event.get("type")
+        if not isinstance(phase, str) or phase not in _GATED_PHASES:
+            return _ALLOW
+        context = event.get("context") or {}
+        if _usage_is_unpriced(context.get("usage") or {}):
+            if not (event.get("session_state") or {}).get(_UNPRICED_APPROVED_KEY):
+                return _UNPRICED_ASK
+            return _ALLOW
+        cost = _read_period_cost(event)
+        owner = _read_period_owner(event)
+        if cfg.hard_cap_enabled and cost >= max_cost_usd:
+            if _model_blocked_over_budget(
+                _current_model(event),
+                cfg.expensive_tokens,
+                cfg.exclude_tokens,
+                block_all=cfg.block_all_models,
+            ):
+                return {
+                    "result": "DENY",
+                    "reason": _over_budget_deny_reason(
+                        cost,
+                        max_cost_usd,
+                        cfg.expensive_tokens,
+                        _current_harness(event),
+                        phase=phase,
+                        policy_label=f"per-user {period_label} cost-budget",
+                        budget_label=f"{period_label} cost budget",
+                        subject_user=owner,
+                        block_all=cfg.block_all_models,
+                    ),
+                }
+            return _ALLOW
+        # Soft ASK fires on both gated phases — each has a server-side
+        # approval round-trip that persists the checkpoint on accept.
+        if thresholds:
+            crossed = max((t for t in thresholds if cost >= t), default=None)
+            if crossed is not None:
+                approved_up_to = _read_period_approved(event)
+                if crossed > approved_up_to:
+                    spend_subject = (
+                        f"{owner}'s spend this {period_noun}" if owner else f"This {period_noun}'s spend"
+                    )
+                    harness_note = f" on {harness}" if harness else ""
+                    return {
+                        "result": "ASK",
+                        "reason": (
+                            f"{spend_subject}{harness_note} ${cost:.2f} passed the ${crossed:.2f} "
+                            f"{period_label} warning threshold ({period_label} limit ${max_cost_usd:.2f}). "
+                            f"Continue?"
+                        ),
+                        # Reserved key — the engine routes this to the
+                        # appropriate period store (user_daily_cost or
+                        # user_monthly_cost), applied only on approve.
+                        "state_updates": [
+                            {
+                                "key": state_key,
+                                "action": "set",
+                                "value": crossed,
+                            },
+                        ],
+                    }
+        return _ALLOW
+
+    return evaluate
+
+
 # ── Registry ─────────────────────────────────────────────────────────────────
 
 POLICY_REGISTRY: list[dict[str, object]] = [
@@ -996,5 +1209,56 @@ POLICY_REGISTRY: list[dict[str, object]] = [
             "required": [],
         },
         "internal_only": True,
+    },
+    {
+        "handler": "omnigent.policies.builtins.cost.user_period_cost_budget",
+        "kind": "factory",
+        "name": "Per-User Period Cost Budget",
+        "description": "Gates the session OWNER's cumulative LLM spend across all their "
+        "sessions for a configurable time period (day, week, month, quarter, or year). Supports "
+        "optional per-harness budgets (non-day periods only). Once a hard period limit is reached "
+        "DENY (the whole turn at the request phase, or each tool call) while still on an expensive "
+        "model (prompting a /model downgrade), and ASK for approval at each soft warning checkpoint "
+        "(request + tool-call phases, remembered per user+period+harness). Reads "
+        "event.context.user_daily_cost for day periods or event.context.user_period_cost for others.",
+        "params_schema": {
+            "type": "object",
+            "properties": {
+                "period": {
+                    "type": "string",
+                    "enum": ["day", "week", "month", "quarter", "year"],
+                    "description": "Time period granularity. 'day' reads from user_daily_cost "
+                    "context; all others read from user_period_cost context.",
+                },
+                "max_cost_usd": {
+                    "type": "number",
+                    "description": "Hard period limit in USD; once the owner's spend for the "
+                    "period reaches it, tool calls are blocked while on an expensive model.",
+                },
+                "ask_thresholds_usd": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "description": "Optional soft period warning checkpoints in USD; asks for "
+                    "approval the first time the period's spend crosses each (every value must "
+                    "be < max_cost_usd). Approval is remembered per user+period+harness.",
+                },
+                "expensive_models": {
+                    "type": "array",
+                    "items": {"type": "string", "x-enum-source": "models"},
+                    "description": "Optional case-insensitive substring tokens for the model "
+                    "tiers blocked once over the period budget. Omit (or pass []) for a true "
+                    "hard stop that blocks all models; pass a non-empty list for a downgrade "
+                    "gate that only blocks the named tiers.",
+                },
+                "harness": {
+                    "type": "string",
+                    "description": "Optional harness filter for per-harness budgets (e.g. "
+                    "'codex-native'). When set, only that harness's cost counts. Only supported "
+                    "for non-day periods (week/month/quarter/year); omit for cross-harness budgets "
+                    "or when using period='day'.",
+                },
+            },
+            "required": ["period", "max_cost_usd"],
+        },
     },
 ]

@@ -170,6 +170,14 @@ class EvaluationContext:
         cost-budget policy is configured) — ``None`` otherwise, so
         sessions without that policy pay no owner/daily-cost lookup.
         Surfaced as ``event["context"]["user_daily_cost"]``.
+    :param user_period_cost: The session owner's per-UTC-month cost
+        rollup, shape
+        ``{"cost_usd": <float>, "ask_approved_usd": <float>, "harness": <str | None>}``,
+        read from the ``user_period_cost`` store at engine-build time.
+        Injected ONLY when a policy needs it (the per-user monthly
+        cost-budget policy is configured) — ``None`` otherwise, so
+        sessions without that policy pay no owner/monthly-cost lookup.
+        Surfaced as ``event["context"]["user_period_cost"]``.
     :param model: The model the session is currently using —
         the conversation's ``model_override`` when set (e.g. via
         a mid-session ``/model`` change), else the agent spec's
@@ -212,6 +220,7 @@ class EvaluationContext:
     usage: dict[str, float] | None = None
     subtree_usage: dict[str, float] | None = None
     user_daily_cost: dict[str, float | str] | None = None
+    user_period_cost: dict[str, float | str | None] | None = None
     model: str | None = None
     harness: str | None = None
     labels: dict[str, str] | None = None
