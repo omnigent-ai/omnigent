@@ -1783,9 +1783,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         )
         session.execute(stmt)
 
-    def get_period_cost(
-        self, user_id: str, period: str, harness: str | None = None
-    ) -> float:
+    def get_period_cost(self, user_id: str, period: str, harness: str | None = None) -> float:
         """
         Return a user's accumulated LLM spend for one UTC month and harness.
 
@@ -1803,9 +1801,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             return float(row.cost_usd) if row is not None else 0.0
 
-    def sum_period_cost(
-        self, user_id: str, period: str, harness: str | None = None
-    ) -> float:
+    def sum_period_cost(self, user_id: str, period: str, harness: str | None = None) -> float:
         """
         Return a user's LLM spend for a period and harness.
 

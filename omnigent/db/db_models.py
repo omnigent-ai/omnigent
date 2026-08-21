@@ -1431,7 +1431,10 @@ class SqlUserPeriodCost(OmnigentBase):
     user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     period: Mapped[str] = mapped_column(String(10), primary_key=True)
     harness: Mapped[str] = mapped_column(
-        String(64), primary_key=True, nullable=False, server_default=text(f"'{CROSS_HARNESS_SENTINEL}'")
+        String(64),
+        primary_key=True,
+        nullable=False,
+        server_default=text(f"'{CROSS_HARNESS_SENTINEL}'"),
     )
     cost_usd: Mapped[float] = mapped_column(Float, nullable=False)
     ask_approved_usd: Mapped[float] = mapped_column(Float, nullable=False, server_default="0")
