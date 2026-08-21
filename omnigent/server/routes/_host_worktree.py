@@ -146,6 +146,7 @@ async def create_worktree_on_host(
     repo_path: str,
     branch_name: str,
     base_branch: str | None,
+    worktree_root: str | None = None,
 ) -> CreatedWorktree:
     """
     Send a ``host.create_worktree`` frame and await the result.
@@ -159,6 +160,9 @@ async def create_worktree_on_host(
     :param branch_name: New branch to create, e.g. ``"feature/login"``.
     :param base_branch: Optional base ref, e.g. ``"main"``. ``None``
         branches from the repo's current ``HEAD``.
+    :param worktree_root: The project's configured directory to place
+        the worktree under, e.g. ``".worktrees"``. ``None`` leaves the
+        host on its built-in sibling layout.
     :returns: The created worktree's path and branch.
     :raises WorktreeHostUnavailableError: If the host connection drops
         or doesn't respond within :data:`_WORKTREE_TIMEOUT_S`.
@@ -171,6 +175,7 @@ async def create_worktree_on_host(
             repo_path=repo_path,
             branch_name=branch_name,
             base_branch=base_branch,
+            worktree_root=worktree_root,
         )
     )
     result = await _await_host_worktree_result(
@@ -199,6 +204,7 @@ async def remove_worktree_on_host(
     worktree_path: str,
     branch: str | None,
     delete_branch: bool,
+    require_merged_into: str | None = None,
 ) -> None:
     """
     Send a ``host.remove_worktree`` frame and await the result.
@@ -213,9 +219,13 @@ async def remove_worktree_on_host(
         deletion.
     :param delete_branch: When ``True``, delete ``branch`` after
         removing the worktree directory.
+    :param require_merged_into: Ref the branch's commits must already be
+        reachable from before it may be deleted, e.g. the requesting
+        agent's own branch. ``None`` deletes unconditionally.
     :raises WorktreeHostUnavailableError: If the host connection drops
         or doesn't respond within :data:`_WORKTREE_TIMEOUT_S`.
-    :raises WorktreeProxyError: If the host reports a removal failure.
+    :raises WorktreeProxyError: If the host reports a removal failure,
+        including a refusal to delete an unmerged branch.
     """
     request_id = secrets.token_hex(8)
     frame = encode_host_frame(
@@ -224,6 +234,7 @@ async def remove_worktree_on_host(
             worktree_path=worktree_path,
             branch=branch,
             delete_branch=delete_branch,
+            require_merged_into=require_merged_into,
         )
     )
     result = await _await_host_worktree_result(

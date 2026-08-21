@@ -332,6 +332,61 @@ describe("ProjectSettingsDialog", () => {
     );
   });
 
+  it("seeds and saves the worktree location, trimmed", async () => {
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { worktree_root: ".worktrees" },
+    });
+    renderDialog();
+    const field = () => screen.getByTestId("project-settings-worktree-root") as HTMLInputElement;
+    await waitFor(() => expect(field().value).toBe(".worktrees"));
+
+    fireEvent.change(field(), { target: { value: "  ../worktrees " } });
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", { worktree_root: "../worktrees" }),
+    );
+  });
+
+  it("stores no worktree location when the field is left blank", async () => {
+    // Blank must clear the key, not store an empty string the server would
+    // then try to resolve into a directory.
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { worktree_root: ".worktrees" },
+    });
+    renderDialog();
+    const field = () => screen.getByTestId("project-settings-worktree-root") as HTMLInputElement;
+    await waitFor(() => expect(field().value).toBe(".worktrees"));
+
+    fireEvent.change(field(), { target: { value: "   " } });
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", {}));
+  });
+
+  it("keeps the worktree location independent of the random-worktree toggle", async () => {
+    // The location applies to every worktree Omnigent creates for the project
+    // — including one an agent asks for via sys_worktree_create — so it must
+    // not be dropped when the composer default is off.
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+    renderDialog();
+    await waitFor(() =>
+      expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(
+        false,
+      ),
+    );
+
+    fireEvent.change(screen.getByTestId("project-settings-worktree-root"), {
+      target: { value: ".worktrees" },
+    });
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", { worktree_root: ".worktrees" }),
+    );
+  });
+
   it("blocks Save (does not clear defaults) when the config load fails", async () => {
     // A transient GET failure must NOT be read as "no config" — otherwise
     // saving the blank draft would send `{}` and wipe the stored defaults.

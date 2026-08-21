@@ -1,8 +1,9 @@
-"""Tests for reading worktree lifecycle commands out of a project's config.
+"""Tests for reading a project's worktree settings out of its config.
 
 ``projects.config`` is an opaque, client-written JSON object, so the parsing in
 ``omnigent.server.worktree_hooks`` is the boundary that decides whether a hook
-runs at all. These cover the "unset" spellings and the timeout clamp.
+runs at all and where worktrees land. These cover the "unset" spellings, the
+timeout clamp, and the worktree-root fallback.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from omnigent.host.git_worktree import DEFAULT_HOOK_TIMEOUT_S, MAX_HOOK_TIMEOUT_
 from omnigent.server.worktree_hooks import (
     NO_HOOKS,
     hook_config_from_project_config,
+    worktree_root_from_project_config,
 )
 
 
@@ -98,3 +100,40 @@ def test_non_string_command_is_ignored() -> None:
     """A hand-edited config holding the wrong type reads as unset, not a crash."""
     config = hook_config_from_project_config({"worktree_post_create_command": 42})
     assert config is NO_HOOKS
+
+
+# ── worktree_root ────────────────────────────────────────────
+
+
+def test_worktree_root_unset_spellings() -> None:
+    """No key, a blank string, or the wrong type all mean "built-in layout"."""
+    assert worktree_root_from_project_config(None) is None
+    assert worktree_root_from_project_config({}) is None
+    assert worktree_root_from_project_config({"worktree_root": ""}) is None
+    assert worktree_root_from_project_config({"worktree_root": "   "}) is None
+    assert worktree_root_from_project_config({"worktree_root": 42}) is None
+
+
+def test_worktree_root_is_trimmed_and_passed_through() -> None:
+    """A usable value survives verbatim — the host does the path resolution."""
+    assert worktree_root_from_project_config({"worktree_root": "  .worktrees "}) == ".worktrees"
+    assert worktree_root_from_project_config({"worktree_root": "{repo}-worktrees"}) == (
+        "{repo}-worktrees"
+    )
+
+
+def test_unusable_worktree_root_degrades_to_the_builtin_layout() -> None:
+    """A typo must not fail the session create it hangs off.
+
+    The read happens mid-create, so an unusable value falls back to the
+    built-in layout (with a server-side warning) rather than raising.
+    """
+    assert worktree_root_from_project_config({"worktree_root": "{branch}"}) is None
+    assert worktree_root_from_project_config({"worktree_root": "wt\x00"}) is None
+
+
+def test_worktree_root_is_independent_of_the_hook_commands() -> None:
+    """A project can configure the location without configuring any script."""
+    config = {"worktree_root": ".worktrees"}
+    assert worktree_root_from_project_config(config) == ".worktrees"
+    assert hook_config_from_project_config(config) is NO_HOOKS

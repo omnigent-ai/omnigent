@@ -38,6 +38,19 @@ MAX_HOOK_TIMEOUT_S: float = 3600.0
 # Max directory-collision suffixes (``-2`` .. ``-N``) before giving up.
 _MAX_DIR_COLLISION_SUFFIX: int = 50
 
+#: Placeholder a project's ``worktree_root`` may use for the repo directory
+#: name, e.g. ``"{repo}-worktrees"`` → ``"myrepo-worktrees"``. The branch
+#: segment is always appended by us, so there is deliberately no ``{branch}``.
+WORKTREE_ROOT_REPO_PLACEHOLDER: str = "{repo}"
+
+# Any other ``{...}`` in a configured root is a typo (e.g. ``{branch}``) and
+# is rejected rather than turned into a literal directory name.
+_WORKTREE_ROOT_PLACEHOLDER = re.compile(r"\{[^}]*\}")
+
+# Bound on a configured root so a pathological value can't be fed to the
+# filesystem. Generous: real values are a handful of segments.
+_WORKTREE_ROOT_MAX_LEN: int = 512
+
 # Chars git refuses in a ref: space, control chars, ``~^:?*[\``, DEL.
 # (``..``, leading ``-``/``.``, ``/`` edges, ``.lock``, ``@{`` are
 # checked separately.)
@@ -280,24 +293,100 @@ def _local_branch_exists(repo_root: str, branch_name: str) -> bool:
     )
 
 
-def _resolve_worktree_path(repo_root: str, branch_name: str) -> Path:
-    """Compute a collision-free sibling worktree directory path.
+def validate_worktree_root(root: str) -> None:
+    """Check a project's configured worktree root before it reaches a path.
 
-    Places the worktree at
-    ``<parent-of-repo-root>/<repo-name>-worktrees/<sanitized-branch>``,
-    appending a numeric suffix if that path already exists on disk.
+    Rejects the values that would silently produce a nonsense directory
+    rather than an error: an unknown ``{...}`` placeholder (a ``{branch}``
+    typo would otherwise create a literal ``{branch}`` dir), a NUL, and an
+    absurd length. Traversal is deliberately NOT rejected — ``../wt`` is a
+    legitimate way to ask for a sibling directory, and the value comes from
+    the project owner, who can already run arbitrary code through the
+    lifecycle hooks.
+
+    :param root: The configured value, e.g. ``"{repo}-worktrees"``,
+        ``".worktrees"``, or ``"/data/worktrees"``.
+    :raises WorktreeError: If the value cannot be used as a directory.
+    """
+    if not root.strip():
+        raise WorktreeError("worktree root must not be empty")
+    if len(root) > _WORKTREE_ROOT_MAX_LEN:
+        raise WorktreeError(f"worktree root must be at most {_WORKTREE_ROOT_MAX_LEN} characters")
+    if "\x00" in root:
+        raise WorktreeError("worktree root must not contain a NUL byte")
+    unknown = [
+        found
+        for found in _WORKTREE_ROOT_PLACEHOLDER.findall(root)
+        if found != WORKTREE_ROOT_REPO_PLACEHOLDER
+    ]
+    if unknown:
+        raise WorktreeError(
+            f"unknown placeholder {unknown[0]} in worktree root; "
+            f"only {WORKTREE_ROOT_REPO_PLACEHOLDER} is supported "
+            "(the branch name is always appended)"
+        )
+
+
+def _resolve_worktree_root(repo_root: Path, worktree_root: str | None) -> Path:
+    """Resolve the directory new worktrees for a repo are placed under.
+
+    ``None`` keeps the built-in layout, a sibling
+    ``<repo-name>-worktrees`` directory. A configured value expands
+    :data:`WORKTREE_ROOT_REPO_PLACEHOLDER` and, when relative, resolves
+    against the REPO ROOT — so ``".worktrees"`` is inside the checkout and
+    ``"../wt"`` is a sibling of it. ``..`` is collapsed textually rather
+    than with :meth:`Path.resolve`, so a repo reached through a symlink
+    keeps the path the user picked.
+
+    :param repo_root: Absolute repo work-tree root, e.g.
+        ``Path("/Users/alice/myrepo")``.
+    :param worktree_root: The project's configured root, already passed
+        through :func:`validate_worktree_root`, or ``None`` for the
+        built-in layout.
+    :returns: The directory to place worktrees under, e.g.
+        ``Path("/Users/alice/myrepo-worktrees")``.
+    :raises WorktreeError: If the value resolves to the repo root itself
+        (which would put checkouts directly inside the repo).
+    """
+    if worktree_root is None:
+        return repo_root.parent / f"{repo_root.name}-worktrees"
+    expanded = worktree_root.strip().replace(WORKTREE_ROOT_REPO_PLACEHOLDER, repo_root.name)
+    candidate = Path(expanded).expanduser()
+    if not candidate.is_absolute():
+        candidate = repo_root / candidate
+    normalized = Path(os.path.normpath(candidate))
+    if normalized == Path(os.path.normpath(repo_root)):
+        raise WorktreeError(
+            f"worktree root {worktree_root!r} resolves to the repository root; "
+            "choose a subdirectory (e.g. '.worktrees') or a sibling (e.g. '../worktrees')"
+        )
+    return normalized
+
+
+def _resolve_worktree_path(
+    repo_root: str,
+    branch_name: str,
+    worktree_root: str | None = None,
+) -> Path:
+    """Compute a collision-free worktree directory path.
+
+    Places the worktree at ``<resolved-root>/<sanitized-branch>``,
+    appending a numeric suffix if that path already exists on disk. The
+    root is the project's configured ``worktree_root`` or, when unset,
+    the built-in sibling ``<repo-name>-worktrees`` directory.
 
     :param repo_root: Absolute repo work-tree root, e.g.
         ``"/Users/alice/myrepo"``.
     :param branch_name: Validated branch name, e.g.
         ``"feature/login"``.
+    :param worktree_root: The project's configured root, e.g.
+        ``".worktrees"``. ``None`` uses the built-in layout.
     :returns: A path that does not yet exist, e.g.
         ``Path("/Users/alice/myrepo-worktrees/feature-login")``.
-    :raises WorktreeError: If no free path is found within
-        :data:`_MAX_DIR_COLLISION_SUFFIX` attempts.
+    :raises WorktreeError: If the configured root is unusable, or no free
+        path is found within :data:`_MAX_DIR_COLLISION_SUFFIX` attempts.
     """
-    root = Path(repo_root)
-    base_dir = root.parent / f"{root.name}-worktrees"
+    base_dir = _resolve_worktree_root(Path(repo_root), worktree_root)
     dirname = _sanitize_dirname(branch_name)
     candidate = base_dir / dirname
     if not candidate.exists():
@@ -369,12 +458,13 @@ def create_worktree(
     repo_path: str,
     branch_name: str,
     base_branch: str | None = None,
+    worktree_root: str | None = None,
 ) -> CreatedWorktree:
     """Create a git worktree with a new branch checked out.
 
-    Resolves the repo root, picks a collision-free sibling directory,
-    and runs ``git worktree add -b`` (fetching once if ``base_branch``
-    isn't locally resolvable).
+    Resolves the repo root, picks a collision-free directory under the
+    project's worktree root, and runs ``git worktree add -b`` (fetching
+    once if ``base_branch`` isn't locally resolvable).
 
     :param repo_path: Absolute path inside the source repo — the
         directory the user picked, e.g. ``"/Users/alice/myrepo"``.
@@ -382,18 +472,25 @@ def create_worktree(
         ``"feature/login"``.
     :param base_branch: Optional base ref, e.g. ``"main"``. ``None``
         branches from the repo's current ``HEAD``.
+    :param worktree_root: The project's configured worktree root, e.g.
+        ``".worktrees"`` or ``"{repo}-worktrees"``. ``None`` uses the
+        built-in sibling layout.
     :returns: The created worktree's path and branch.
-    :raises WorktreeError: If the branch name is invalid, the path is
-        not a git repo, the base ref can't be resolved, or
-        ``git worktree add`` fails (e.g. the branch already exists).
+    :raises WorktreeError: If the branch name or worktree root is
+        invalid, the path is not a git repo, the base ref can't be
+        resolved, or ``git worktree add`` fails (e.g. the branch already
+        exists).
     """
     validate_branch_name(branch_name)
+    if worktree_root is not None:
+        validate_worktree_root(worktree_root)
     # Always create the worktree off the MAIN work tree, even when
     # ``repo_path`` is itself a linked worktree (e.g. the fork-resume
     # picker prefilled a worktree as the source). Otherwise the new
     # worktree would nest under the picked worktree
     # (``…/feature-worktrees/<branch>``); resolving to the main repo keeps
-    # all worktrees as siblings (``…/myrepo-worktrees/<branch>``).
+    # every worktree under one root, and makes a repo-relative
+    # ``worktree_root`` mean the same directory from any worktree.
     repo_root = _main_work_tree(repo_path)
     # Friendly pre-check before git's raw "branch already exists" error.
     # We don't reuse the existing worktree: two sessions sharing one
@@ -404,7 +501,7 @@ def create_worktree(
         )
     if base_branch is not None:
         _ensure_base_resolvable(repo_root, base_branch)
-    worktree_path = _resolve_worktree_path(repo_root, branch_name)
+    worktree_path = _resolve_worktree_path(repo_root, branch_name, worktree_root)
     worktree_path.parent.mkdir(parents=True, exist_ok=True)
 
     add_args = ["worktree", "add", "-b", branch_name, str(worktree_path)]
@@ -444,11 +541,46 @@ def _main_repo_for_worktree(worktree_path: str) -> str:
     return str(common_dir.parent)
 
 
+def _require_branch_merged(repo_root: str, branch: str, merged_into: str) -> None:
+    """Refuse to proceed unless ``branch`` is contained in ``merged_into``.
+
+    ``git branch -d``'s own safety check compares against the CURRENT
+    HEAD, and branch deletion runs from the main work tree — so it would
+    ask "merged into the main checkout?" when the question we need
+    answered is "merged into the caller's branch?". ``merge-base
+    --is-ancestor`` asks that directly.
+
+    :param repo_root: Main repo work tree to run git in.
+    :param branch: Branch about to be deleted, e.g. ``"polly/task-1"``.
+    :param merged_into: Ref its commits must be reachable from, e.g.
+        ``"polly/session"``.
+    :raises WorktreeError: If the branch is not contained in
+        ``merged_into``, or either ref cannot be resolved.
+    """
+    # --end-of-options so a ref starting with '-' can't inject a git flag.
+    result = _run_git(
+        ["merge-base", "--is-ancestor", "--end-of-options", branch, merged_into],
+        cwd=repo_root,
+    )
+    if result.returncode == 0:
+        return
+    # Exit 1 is the clean "not an ancestor" answer; anything else (128) means a
+    # ref did not resolve, which is also a refusal but a different message.
+    if result.returncode == 1:
+        raise WorktreeError(
+            f"refusing to delete branch {branch!r}: its commits are not in "
+            f"{merged_into!r} yet, so the work would be lost. Integrate it "
+            f"first, or remove the worktree without deleting the branch."
+        )
+    raise _git_error(f"could not check whether {branch!r} is merged", result)
+
+
 def remove_worktree(
     *,
     worktree_path: str,
     branch: str | None = None,
     delete_branch: bool = False,
+    require_merged_into: str | None = None,
 ) -> None:
     """Remove a git worktree and optionally delete its branch.
 
@@ -464,10 +596,20 @@ def remove_worktree(
         deletion.
     :param delete_branch: When ``True``, run ``git branch -D`` on
         ``branch`` after removing the worktree directory.
-    :raises WorktreeError: If the worktree path is missing/invalid, or
-        a git command fails.
+    :param require_merged_into: Ref the branch's commits must already be
+        reachable from before it may be deleted, e.g. the caller's own
+        branch. ``None`` deletes unconditionally — for a human who asked
+        for exactly that. Checked BEFORE the worktree is removed, so a
+        refusal leaves everything intact.
+    :raises WorktreeError: If the worktree path is missing/invalid, the
+        branch is not yet merged into ``require_merged_into``, or a git
+        command fails.
     """
     main_repo = _main_repo_for_worktree(worktree_path)
+    if delete_branch and branch is not None and require_merged_into is not None:
+        # Before the removal, not after: a refusal must not leave the caller
+        # with the worktree already gone.
+        _require_branch_merged(main_repo, branch, require_merged_into)
     remove_result = _run_git(
         ["worktree", "remove", "--force", worktree_path],
         cwd=main_repo,

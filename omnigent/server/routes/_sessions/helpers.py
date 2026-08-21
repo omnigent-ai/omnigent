@@ -281,6 +281,7 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
+    PROJECT_LABEL_KEY,
     ConversationNotFoundError,
     NameAlreadyExistsError,
 )
@@ -7682,6 +7683,7 @@ async def _create_session_worktree(
     source_repo: str | None,
     git: SessionGitOptions,
     request: Request,
+    worktree_root: str | None = None,
 ) -> CreatedWorktree:
     """
     Create a git worktree on the host for a new session branch.
@@ -7699,6 +7701,8 @@ async def _create_session_worktree(
     :param git: Validated git options (``branch_name``, optional
         ``base_branch``).
     :param request: FastAPI request carrying the host registry.
+    :param worktree_root: The project's configured worktree root, e.g.
+        ``".worktrees"``. ``None`` uses the host's built-in layout.
     :returns: The created worktree's ``worktree_path`` (to store as
         ``workspace``) and ``branch`` (to store as ``git_branch``).
     :raises OmnigentError: ``invalid_input`` for a bad branch name,
@@ -7733,6 +7737,7 @@ async def _create_session_worktree(
             repo_path=source_repo,
             branch_name=git.branch_name,
             base_branch=git.base_branch,
+            worktree_root=worktree_root,
         )
     except WorktreeHostUnavailableError as exc:
         # Host offline / unresponsive — infra, not user input.
@@ -8358,6 +8363,42 @@ async def _maybe_start_post_create_worktree_setup(
         host_registry=host_registry,
     )
     return None
+
+
+async def _worktree_root_for_create(
+    *,
+    labels: dict[str, str] | None,
+    user_id: str | None,
+    request: Request,
+) -> str | None:
+    """
+    Resolve the project's worktree root for a session being created.
+
+    The worktree is created BEFORE the conversation row exists, so the
+    project is resolved from the create request's ``omni_project`` label
+    (the create body's only project handle — the first-class
+    ``project_id`` is written by a follow-up PATCH) rather than from a
+    session row, which would resolve nothing and silently fall back to
+    the built-in layout.
+
+    :param labels: ``body.labels``, which may carry ``omni_project``.
+    :param user_id: The creating user, for the owner-scoped lookup.
+    :param request: FastAPI request carrying ``app.state``.
+    :returns: The configured root, e.g. ``".worktrees"``, or ``None`` to
+        leave the host on its built-in layout.
+    """
+    from omnigent.server.worktree_hooks import (
+        project_config_for_name,
+        worktree_root_from_project_config,
+    )
+
+    config = await asyncio.to_thread(
+        project_config_for_name,
+        project_name=(labels or {}).get(PROJECT_LABEL_KEY),
+        user_id=user_id,
+        project_store=getattr(request.app.state, "project_store", None),
+    )
+    return worktree_root_from_project_config(config)
 
 
 def _resolve_subagent_spec(
@@ -10189,6 +10230,7 @@ __all__ = [
     "_validated_subagent_routing_override",
     "_wait_for_managed_runner_tunnel",
     "_wait_for_runner_client",
+    "_worktree_root_for_create",
     "announce_hosts_changed",
     "cancel_managed_launch_tasks",
     "prefetch_session_routing_catalogs",

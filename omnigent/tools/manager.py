@@ -592,7 +592,8 @@ class ToolManager:
 
     def _register_os_env_tools(self) -> None:
         """
-        Register ``sys_os_*`` tools when the spec declares ``os_env``.
+        Register ``sys_os_*`` (and ``sys_worktree_*``) when the spec
+        declares ``os_env``.
 
         When a pre-resolved :class:`OSEnvironment` was provided to
         the constructor (from ``SessionResourceRegistry``), that
@@ -627,6 +628,34 @@ class ToolManager:
                     f"earlier registration before re-enabling os_env."
                 )
             self._tools[tool.name()] = tool
+        self._register_worktree_tools()
+
+    def _register_worktree_tools(self) -> None:
+        """
+        Register ``sys_worktree_*`` alongside the ``sys_os_*`` tools.
+
+        Deliberately not its own opt-in: an agent with a shell in a repo
+        can already run ``git worktree add``, so these grant no new
+        authority — they are the supported way to do what it would
+        otherwise do by hand, honoring the project's worktree location and
+        lifecycle scripts. Gating them separately would just mean the
+        hand-rolled path stays the default.
+
+        :raises ValueError: If a ``sys_worktree_*`` name collides with an
+            already-registered tool.
+        """
+        from omnigent.tools.builtins.worktree import (
+            SysWorktreeCreateTool,
+            SysWorktreeRemoveTool,
+        )
+
+        for _cls in (SysWorktreeCreateTool, SysWorktreeRemoveTool):
+            if _cls.name() in self._tools:
+                raise ValueError(
+                    f"sys_worktree_* tool {_cls.name()!r} collides with an "
+                    f"already-registered tool."
+                )
+            self._tools[_cls.name()] = _cls()
 
     def _register_terminal_tools(self) -> None:
         """

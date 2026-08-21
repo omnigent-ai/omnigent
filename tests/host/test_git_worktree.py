@@ -17,10 +17,12 @@ import pytest
 from omnigent.host.git_worktree import (
     CreatedWorktree,
     WorktreeError,
+    _resolve_worktree_root,
     create_worktree,
     list_worktrees,
     remove_worktree,
     validate_branch_name,
+    validate_worktree_root,
 )
 
 # Deterministic identity + config so the tests don't depend on the
@@ -396,3 +398,279 @@ def test_validate_branch_name_rejects_bad(bad: str) -> None:
 def test_validate_branch_name_accepts_good(good: str) -> None:
     """Well-formed branch names pass validation."""
     validate_branch_name(good)  # must not raise
+
+
+# ── Project-configured worktree root ─────────────────────────
+
+
+def test_configured_root_relative_to_repo_puts_worktree_inside_the_checkout(
+    git_repo: Path,
+) -> None:
+    """A relative root resolves against the repo root, e.g. ``.worktrees``."""
+    created = create_worktree(
+        repo_path=str(git_repo),
+        branch_name="feature/login",
+        worktree_root=".worktrees",
+    )
+    assert created.worktree_path == str(git_repo / ".worktrees" / "feature-login")
+    assert _current_branch(Path(created.worktree_path)) == "feature/login"
+
+
+def test_configured_root_can_point_outside_the_repo(git_repo: Path) -> None:
+    """``../wt`` is a sibling of the repo — the way to collapse several tools' layouts."""
+    created = create_worktree(
+        repo_path=str(git_repo),
+        branch_name="wip",
+        worktree_root="../wt",
+    )
+    assert created.worktree_path == str(git_repo.parent / "wt" / "wip")
+
+
+def test_configured_root_expands_the_repo_placeholder(git_repo: Path) -> None:
+    """``{repo}`` becomes the repo directory name, so one value fits every project."""
+    created = create_worktree(
+        repo_path=str(git_repo),
+        branch_name="wip",
+        worktree_root="../{repo}-trees",
+    )
+    assert created.worktree_path == str(git_repo.parent / "myrepo-trees" / "wip")
+
+
+def test_configured_absolute_root_is_used_verbatim(git_repo: Path, tmp_path: Path) -> None:
+    """An absolute root is not re-anchored on the repo."""
+    root = tmp_path / "elsewhere"
+    created = create_worktree(
+        repo_path=str(git_repo),
+        branch_name="wip",
+        worktree_root=str(root),
+    )
+    assert created.worktree_path == str(root / "wip")
+
+
+def test_configured_root_is_honored_from_a_linked_worktree(git_repo: Path) -> None:
+    """A repo-relative root means the same directory from inside any worktree.
+
+    Otherwise the second worktree would nest under the first, which is the
+    scattering this setting exists to stop.
+    """
+    first = create_worktree(
+        repo_path=str(git_repo),
+        branch_name="one",
+        worktree_root=".worktrees",
+    )
+    second = create_worktree(
+        repo_path=first.worktree_path,
+        branch_name="two",
+        worktree_root=".worktrees",
+    )
+    assert second.worktree_path == str(git_repo / ".worktrees" / "two")
+
+
+def test_configured_root_still_avoids_collisions(git_repo: Path) -> None:
+    """Two branches sanitizing to one dir name still get distinct directories.
+
+    ``a/b`` and ``a-b`` are different branches but the same sanitized
+    directory, so the numeric suffix has to apply under a configured root
+    exactly as it does under the built-in one.
+    """
+    first = create_worktree(repo_path=str(git_repo), branch_name="a/b", worktree_root=".worktrees")
+    second = create_worktree(
+        repo_path=str(git_repo), branch_name="a-b", worktree_root=".worktrees"
+    )
+    assert first.worktree_path == str(git_repo / ".worktrees" / "a-b")
+    assert second.worktree_path == str(git_repo / ".worktrees" / "a-b-2")
+
+
+def test_unset_root_keeps_the_builtin_sibling_layout(git_repo: Path) -> None:
+    """``None`` behaves exactly as before the setting existed."""
+    created = create_worktree(repo_path=str(git_repo), branch_name="wip", worktree_root=None)
+    assert created.worktree_path == str(git_repo.parent / "myrepo-worktrees" / "wip")
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        "   ",
+        "{branch}",
+        "{repo}/{branch}",
+        "wt\x00",
+        "x" * 513,
+    ],
+)
+def test_validate_worktree_root_rejects_unusable(bad: str) -> None:
+    """A root that would silently produce a nonsense directory is rejected."""
+    with pytest.raises(WorktreeError):
+        validate_worktree_root(bad)
+
+
+@pytest.mark.parametrize("same_as_repo", [".", "./", "../myrepo"])
+def test_resolving_a_root_onto_the_repo_root_is_refused(same_as_repo: str) -> None:
+    """These are valid path syntax but resolve to the checkout itself."""
+    with pytest.raises(WorktreeError, match="repository root"):
+        _resolve_worktree_root(Path("/home/u/myrepo"), same_as_repo)
+
+
+@pytest.mark.parametrize(
+    "good",
+    [".worktrees", "../wt", "{repo}-worktrees", "/abs/wt", "a/b/c", "~/wt"],
+)
+def test_validate_worktree_root_accepts_reasonable(good: str) -> None:
+    """Ordinary layouts, including traversal to a sibling, are allowed."""
+    validate_worktree_root(good)  # must not raise
+
+
+def test_configured_root_rejecting_the_repo_root_itself(git_repo: Path) -> None:
+    """``.`` would put checkouts directly in the repo — refused with a hint."""
+    with pytest.raises(WorktreeError, match="repository root"):
+        create_worktree(repo_path=str(git_repo), branch_name="wip", worktree_root=".")
+
+
+def test_worktree_can_fork_from_a_branch_checked_out_in_another_worktree(
+    git_repo: Path,
+) -> None:
+    """A fan-out worktree can be based on the orchestrator's live worktree.
+
+    git refuses to CHECK OUT one branch in two worktrees, but using it as a
+    start-point for a new branch is fine. This is what lets a fan-out inherit
+    the orchestrator's commits instead of forking from the main checkout's
+    stale HEAD.
+    """
+    # The "orchestrator" worktree, with a commit the main checkout lacks.
+    orchestrator = create_worktree(repo_path=str(git_repo), branch_name="polly/session")
+    orchestrator_path = Path(orchestrator.worktree_path)
+    (orchestrator_path / "plan.md").write_text("the plan")
+    _git(orchestrator_path, "add", ".")
+    _git(orchestrator_path, "commit", "-q", "-m", "orchestrator work")
+    orchestrator_head = _rev_parse(orchestrator_path)
+    assert orchestrator_head != _rev_parse(git_repo)
+
+    # A worker worktree forked from the orchestrator's branch, requested from
+    # INSIDE the orchestrator's worktree (as the tool does).
+    worker = create_worktree(
+        repo_path=str(orchestrator_path),
+        branch_name="polly/task-1",
+        base_branch="polly/session",
+    )
+    worker_path = Path(worker.worktree_path)
+
+    # Same commit, so the orchestrator's work is present in the worker's tree.
+    assert _rev_parse(worker_path) == orchestrator_head
+    assert (worker_path / "plan.md").read_text() == "the plan"
+    # And it is a sibling of the MAIN repo, not nested in the orchestrator's tree.
+    assert worker_path == git_repo.parent / "myrepo-worktrees" / "polly-task-1"
+
+
+def test_worktree_without_a_base_forks_from_the_main_checkout(git_repo: Path) -> None:
+    """Documents the behavior the server's default exists to avoid.
+
+    With no base ref, git resolves the start-point from the MAIN work tree —
+    so a worktree requested from inside another worktree silently loses that
+    worktree's commits. The server therefore defaults the base to the calling
+    session's own branch.
+    """
+    orchestrator = create_worktree(repo_path=str(git_repo), branch_name="polly/session")
+    orchestrator_path = Path(orchestrator.worktree_path)
+    (orchestrator_path / "plan.md").write_text("the plan")
+    _git(orchestrator_path, "add", ".")
+    _git(orchestrator_path, "commit", "-q", "-m", "orchestrator work")
+
+    worker = create_worktree(repo_path=str(orchestrator_path), branch_name="unanchored")
+
+    assert _rev_parse(Path(worker.worktree_path)) == _rev_parse(git_repo)
+    assert not (Path(worker.worktree_path) / "plan.md").exists()
+
+
+def test_delete_branch_refused_when_its_work_is_not_merged(git_repo: Path) -> None:
+    """An unmerged branch is not deletable, and the worktree survives too.
+
+    This is the guard that keeps a fan-out's output from being destroyed by a
+    cleanup step that runs before integration.
+    """
+    orchestrator = create_worktree(repo_path=str(git_repo), branch_name="polly/session")
+    worker = create_worktree(
+        repo_path=str(git_repo), branch_name="polly/task-1", base_branch="polly/session"
+    )
+    worker_path = Path(worker.worktree_path)
+    (worker_path / "feature.txt").write_text("the work")
+    _git(worker_path, "add", ".")
+    _git(worker_path, "commit", "-q", "-m", "task work")
+
+    with pytest.raises(WorktreeError, match="not in 'polly/session' yet"):
+        remove_worktree(
+            worktree_path=str(worker_path),
+            branch="polly/task-1",
+            delete_branch=True,
+            require_merged_into="polly/session",
+        )
+
+    # The refusal is checked BEFORE removal, so nothing was destroyed.
+    assert worker_path.is_dir()
+    assert _branch_exists(git_repo, "polly/task-1")
+    assert Path(orchestrator.worktree_path).is_dir()
+
+
+def test_delete_branch_allowed_once_its_work_is_merged(git_repo: Path) -> None:
+    """After integration the branch is redundant, so cleanup proceeds."""
+    orchestrator = create_worktree(repo_path=str(git_repo), branch_name="polly/session")
+    orchestrator_path = Path(orchestrator.worktree_path)
+    worker = create_worktree(
+        repo_path=str(git_repo), branch_name="polly/task-1", base_branch="polly/session"
+    )
+    worker_path = Path(worker.worktree_path)
+    (worker_path / "feature.txt").write_text("the work")
+    _git(worker_path, "add", ".")
+    _git(worker_path, "commit", "-q", "-m", "task work")
+
+    # The orchestrator integrates the task into its OWN branch.
+    _git(orchestrator_path, "merge", "--no-ff", "--no-edit", "polly/task-1")
+    assert (orchestrator_path / "feature.txt").read_text() == "the work"
+
+    remove_worktree(
+        worktree_path=str(worker_path),
+        branch="polly/task-1",
+        delete_branch=True,
+        require_merged_into="polly/session",
+    )
+    assert not worker_path.exists()
+    assert not _branch_exists(git_repo, "polly/task-1")
+    # The integrated work is still in the orchestrator's tree.
+    assert (orchestrator_path / "feature.txt").read_text() == "the work"
+
+
+def test_delete_branch_stays_unconditional_without_a_merge_requirement(
+    git_repo: Path,
+) -> None:
+    """A human deleting a session's worktree is deliberate — no guard.
+
+    Passing no ``require_merged_into`` keeps the pre-existing ``git branch -D``
+    behaviour the UI's "delete session and its worktree" flow relies on.
+    """
+    created = create_worktree(repo_path=str(git_repo), branch_name="scratch")
+    worktree_path = Path(created.worktree_path)
+    (worktree_path / "wip.txt").write_text("unmerged")
+    _git(worktree_path, "add", ".")
+    _git(worktree_path, "commit", "-q", "-m", "unmerged work")
+
+    remove_worktree(worktree_path=str(worktree_path), branch="scratch", delete_branch=True)
+    assert not worktree_path.exists()
+    assert not _branch_exists(git_repo, "scratch")
+
+
+def test_merge_requirement_ignored_when_the_branch_is_kept(git_repo: Path) -> None:
+    """The guard only gates branch DELETION, not worktree removal."""
+    created = create_worktree(repo_path=str(git_repo), branch_name="keep-me")
+    worktree_path = Path(created.worktree_path)
+    (worktree_path / "wip.txt").write_text("unmerged")
+    _git(worktree_path, "add", ".")
+    _git(worktree_path, "commit", "-q", "-m", "unmerged work")
+
+    remove_worktree(
+        worktree_path=str(worktree_path),
+        branch="keep-me",
+        delete_branch=False,
+        require_merged_into="main",
+    )
+    assert not worktree_path.exists()
+    # The branch — and its unmerged commit — survive.
+    assert _branch_exists(git_repo, "keep-me")

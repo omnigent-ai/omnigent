@@ -302,6 +302,7 @@ from omnigent.server.routes._sessions.helpers import (
     _validated_subagent_routing_override,
     _wait_for_managed_runner_tunnel,
     _wait_for_runner_client,
+    _worktree_root_for_create,
 )
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.schemas import (
@@ -7853,6 +7854,14 @@ async def _create_session_from_existing_agent(
                 source_repo=canonical_workspace,
                 git=body.git,
                 request=request,
+                # The project's worktree root, resolved from the REQUEST (the
+                # conversation row does not exist yet) so every worktree in a
+                # project lands in the same directory.
+                worktree_root=await _worktree_root_for_create(
+                    labels=body.labels,
+                    user_id=user_id,
+                    request=request,
+                ),
             )
             canonical_workspace = created_worktree.worktree_path
             git_branch = created_worktree.branch

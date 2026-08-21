@@ -45,6 +45,7 @@ from omnigent.server.schemas import (
 from omnigent.spec.types import (
     StateUpdate,
 )
+from omnigent.stores.conversation_store import WORKTREE_SETUP_LABEL_KEY
 
 # Pinned to the historical module path so log records keep landing on the
 # ``omnigent.server.routes.sessions`` logger after the split into this package.
@@ -240,8 +241,10 @@ _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY: str = "omnigent.last_task_error_remediat
 # ``"running"`` while the host runs it, ``"done"`` / ``"failed"`` after. Read by
 # the first-turn gate (which must not dispatch into a half-prepared worktree)
 # and projected into the session snapshot so a reload mid-setup still shows the
-# "running setup command" indicator. Absent for sessions with no hook.
-_WORKTREE_SETUP_LABEL_KEY: str = "omnigent.worktree_setup"
+# "running setup command" indicator. Absent for sessions with no hook. The key
+# is shared with the runner (``sys_session_get_info``), so it is defined once in
+# the store's label vocabulary.
+_WORKTREE_SETUP_LABEL_KEY: str = WORKTREE_SETUP_LABEL_KEY
 
 _WORKTREE_SETUP_RUNNING: str = "running"
 _WORKTREE_SETUP_DONE: str = "done"

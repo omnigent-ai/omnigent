@@ -65,6 +65,7 @@ from omnigent.session_lifecycle import (
     is_session_closed,
     title_without_closed_marker,
 )
+from omnigent.stores.conversation_store import WORKTREE_SETUP_LABEL_KEY
 from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.builtins._arguments import parse_json_object_arguments
@@ -296,6 +297,14 @@ _SESSION_QUERY_TOOLS = frozenset(
 
 _SESSION_SELF_WRITE_TOOLS = frozenset({SysSessionRenameTool.name()})
 
+# Worktree lifecycle. Dispatched through the server (POST/DELETE
+# /v1/sessions/{id}/worktrees) rather than run locally with git, because the
+# project's worktree location and its setup/teardown scripts are server-owned
+# — running git here would reproduce exactly the scattered, hook-less
+# worktrees these tools exist to replace. The repo is never a parameter: the
+# server takes it from the calling session.
+_WORKTREE_TOOLS = frozenset({"sys_worktree_create", "sys_worktree_remove"})
+
 # Grantee sentinel for an anonymous, public read-only share. Mirrors the
 # server's RESERVED_USER_PUBLIC; only specs with
 # ``agent_session_sharing: public`` may grant it (enforced in
@@ -461,6 +470,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _POLICY_TOOLS
     | _SCHEDULED_TASK_TOOLS
     | _TERMINAL_TOOLS
+    | _WORKTREE_TOOLS
     # ``browser_*`` must ride the native relay: the Omnigent desktop app
     # runs native (claude/codex/pi) sessions, which ignore ``request.tools``
     # and see ONLY this relay surface — without this union member the
@@ -633,6 +643,7 @@ _ALL_LOCAL_TOOLS = (
     | _AGENT_TOOLS
     | _POLICY_TOOLS
     | _SCHEDULED_TASK_TOOLS
+    | _WORKTREE_TOOLS
 )
 _PLACEHOLDER_CWDS = (None, "", ".", "./")
 
@@ -3776,6 +3787,21 @@ async def _runner_online_or_none(
     return online if isinstance(online, bool) else None
 
 
+def _worktree_setup_state(snap: _JsonObject) -> str | None:
+    """
+    Read a session snapshot's worktree-setup progress label.
+
+    :param snap: The ``GET /v1/sessions/{id}`` snapshot.
+    :returns: ``"running"``, ``"done"``, ``"failed"``, or ``None`` when
+        the project configures no setup script (the label is absent).
+    """
+    labels = snap.get("labels")
+    if not isinstance(labels, dict):
+        return None
+    state = labels.get(WORKTREE_SETUP_LABEL_KEY)
+    return state if isinstance(state, str) and state else None
+
+
 async def _session_get_info_via_rest(
     args: _JsonObject,
     conversation_id: str,
@@ -3788,7 +3814,8 @@ async def _session_get_info_via_rest(
     caller's own ``conversation_id`` when omitted), fetches the session
     snapshot, and projects the metadata fields — status, title, agent
     binding, runner binding, host, reasoning effort, effective model,
-    parent linkage, workspace / git branch, persisted last-activity time,
+    parent linkage, workspace / git branch, the project's worktree-setup
+    progress, persisted last-activity time,
     and the outstanding approval prompts (the prompts themselves plus a
     count). Runner connectivity
     is resolved best-effort via
@@ -3857,6 +3884,11 @@ async def _session_get_info_via_rest(
             "model": snap.get("model_override") or snap.get("llm_model"),
             "workspace": snap.get("workspace"),
             "git_branch": snap.get("git_branch"),
+            # Whether the project's worktree setup script ran for this session:
+            # "running" / "done" / "failed", or None when the project configures
+            # none. Without this an agent has no way to know its worktree was
+            # prepared — or that setup FAILED and the tree is half-installed.
+            "worktree_setup": _worktree_setup_state(snap),
             # The outstanding approval prompts themselves (original
             # elicitation-request event dicts), plus a count for quick
             # status checks. Surfacing the prompts — not just a tally —
@@ -3896,6 +3928,96 @@ def _omnigent_error_message(resp: httpx.Response) -> str | None:
             if isinstance(message, str) and message:
                 return message
     return None
+
+
+# A create runs the project's setup script inline, so this must outlast the
+# largest project hook timeout (3600 s) plus the server's own reply margins —
+# otherwise a slow ``bun install`` would surface as a client-side timeout
+# instead of the server's real answer.
+_WORKTREE_TOOL_TIMEOUT_S: float = 3720.0
+
+
+async def _execute_worktree_tool(
+    tool_name: str,
+    args: _JsonObject,
+    *,
+    conversation_id: str | None,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    """
+    Create or remove a worktree via the session's worktree routes.
+
+    Proxies ``POST``/``DELETE /v1/sessions/{id}/worktrees``, which take
+    the repository from the calling session — so no repo path crosses
+    this boundary and an agent can only branch its own workspace. The
+    server's response carries the project's setup/teardown script result,
+    which is returned verbatim: this is the tool result, and it is the
+    only place the agent ever gets to see whether the hook ran.
+
+    :param tool_name: ``"sys_worktree_create"`` or
+        ``"sys_worktree_remove"``.
+    :param args: Parsed tool arguments.
+    :param conversation_id: The calling session, which supplies both the
+        repository and the authority. ``None`` leaves nothing to derive
+        either from (returns an error string).
+    :param server_client: HTTP client pointed at the Omnigent server;
+        ``None`` if unavailable (returns an error string).
+    :returns: The server's JSON object, or a JSON error object.
+    """
+    if server_client is None:
+        return json.dumps({"error": f"{tool_name} requires server access"})
+    if conversation_id is None:
+        return json.dumps({"error": f"{tool_name} requires a session id"})
+    url = f"/v1/sessions/{conversation_id}/worktrees"
+    if tool_name == "sys_worktree_create":
+        branch_name = args.get("branch_name")
+        if not isinstance(branch_name, str) or not branch_name.strip():
+            return json.dumps(
+                {"error": "sys_worktree_create requires a non-empty 'branch_name' string"}
+            )
+        base_branch = args.get("base_branch")
+        method = "POST"
+        payload: _JsonObject = {
+            "branch_name": branch_name.strip(),
+            "base_branch": (
+                base_branch.strip()
+                if isinstance(base_branch, str) and base_branch.strip()
+                else None
+            ),
+        }
+    else:
+        worktree_path = args.get("worktree_path")
+        if not isinstance(worktree_path, str) or not worktree_path.strip():
+            return json.dumps(
+                {"error": "sys_worktree_remove requires a non-empty 'worktree_path' string"}
+            )
+        method = "DELETE"
+        payload = {
+            "worktree_path": worktree_path.strip(),
+            "delete_branch": bool(args.get("delete_branch")),
+        }
+    try:
+        resp = await server_client.request(
+            method,
+            url,
+            json=payload,
+            timeout=_WORKTREE_TOOL_TIMEOUT_S,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"{tool_name} failed: {exc}"})
+    if resp.status_code == 404:
+        return json.dumps({"error": "session_not_found", "session_id": conversation_id})
+    if resp.status_code in (401, 403):
+        return json.dumps({"error": "access_denied", "session_id": conversation_id})
+    if resp.status_code >= 400:
+        detail = _omnigent_error_message(resp)
+        return json.dumps(
+            {"error": detail or f"{tool_name} returned {resp.status_code}"},
+        )
+    try:
+        return json.dumps(resp.json())
+    except ValueError:
+        return json.dumps({"error": f"{tool_name} returned a non-JSON body"})
 
 
 async def _session_share_via_rest(
@@ -5197,6 +5319,13 @@ async def execute_tool(
                 conversation_id=conversation_id,
                 server_client=server_client,
                 agent_spec=agent_spec,
+            )
+        elif tool_name in _WORKTREE_TOOLS:
+            output = await _execute_worktree_tool(
+                tool_name,
+                args,
+                conversation_id=conversation_id,
+                server_client=server_client,
             )
         elif tool_name in _WEB_FETCH_TOOLS:
             output = await _execute_web_fetch_tool(

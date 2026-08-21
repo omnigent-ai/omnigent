@@ -532,6 +532,29 @@ async def test_launch_runner_runs_setup_command_before_the_runner_starts(
     assert cap.order == ["create", "hook:post_create", "launch"]
 
 
+async def test_launch_runner_places_the_worktree_under_the_project_root(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+) -> None:
+    """The project's ``worktree_root`` applies on this path too.
+
+    A runner-launch worktree and a composer-created one must land in the
+    same directory, or the project setting only half-works.
+    """
+    cap = register_host()
+    session_id = await _filed_bare_session(
+        client,
+        "wt-launch-root-agent",
+        "Launch-rooted",
+        {"worktree_root": ".worktrees"},
+    )
+
+    resp = await _launch(client, session_id, git={"branch_name": "feature/rooted"})
+    assert resp.status_code == 200, resp.text
+    assert len(cap.create) == 1
+    assert cap.create[0].worktree_root == ".worktrees"
+
+
 async def test_launch_runner_skips_setup_command_on_a_lost_bind(
     register_host: RegisterHost,
     client: httpx.AsyncClient,

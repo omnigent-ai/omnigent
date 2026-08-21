@@ -2414,6 +2414,7 @@ class HostProcess:
                     repo_path=frame.repo_path,
                     branch_name=frame.branch_name,
                     base_branch=frame.base_branch,
+                    worktree_root=frame.worktree_root,
                 )
         except WorktreeError as exc:
             return HostCreateWorktreeResultFrame(
@@ -2455,6 +2456,7 @@ class HostProcess:
                     worktree_path=frame.worktree_path,
                     branch=frame.branch,
                     delete_branch=frame.delete_branch,
+                    require_merged_into=frame.require_merged_into,
                 )
         except WorktreeError as exc:
             return HostRemoveWorktreeResultFrame(

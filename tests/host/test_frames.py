@@ -977,6 +977,7 @@ def test_create_worktree_frame_round_trip() -> None:
         repo_path="/Users/alice/myrepo",
         branch_name="feature/login",
         base_branch="main",
+        worktree_root=".worktrees",
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostCreateWorktreeFrame)
@@ -993,6 +994,19 @@ def test_create_worktree_frame_optional_base_defaults_none() -> None:
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostCreateWorktreeFrame)
     assert decoded.base_branch is None
+
+
+def test_create_worktree_frame_absent_worktree_root_decodes_as_none() -> None:
+    """An older server omits ``worktree_root``; the host must read that as
+    "use the built-in layout" rather than failing the frame."""
+    encoded = encode_host_frame(
+        HostCreateWorktreeFrame(request_id="req_wt_3", repo_path="/repo", branch_name="wip")
+    )
+    payload = json.loads(encoded)
+    del payload["worktree_root"]
+    decoded = decode_host_frame(json.dumps(payload))
+    assert isinstance(decoded, HostCreateWorktreeFrame)
+    assert decoded.worktree_root is None
 
 
 def test_create_worktree_result_frame_round_trip() -> None:
@@ -1037,10 +1051,32 @@ def test_remove_worktree_frame_round_trip() -> None:
         worktree_path="/Users/alice/myrepo-worktrees/feature-login",
         branch="feature/login",
         delete_branch=True,
+        require_merged_into="polly/session",
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostRemoveWorktreeFrame)
     assert decoded == original
+
+
+def test_remove_worktree_frame_absent_merge_requirement_decodes_as_none() -> None:
+    """An older server omits ``require_merged_into``.
+
+    The host must read that as "delete unconditionally" — the behaviour that
+    predates the field — rather than failing the frame.
+    """
+    encoded = encode_host_frame(
+        HostRemoveWorktreeFrame(
+            request_id="req_rm_2",
+            worktree_path="/repo-worktrees/x",
+            branch="x",
+            delete_branch=True,
+        )
+    )
+    payload = json.loads(encoded)
+    del payload["require_merged_into"]
+    decoded = decode_host_frame(json.dumps(payload))
+    assert isinstance(decoded, HostRemoveWorktreeFrame)
+    assert decoded.require_merged_into is None
 
 
 def test_remove_worktree_frame_non_bool_delete_branch_raises() -> None:

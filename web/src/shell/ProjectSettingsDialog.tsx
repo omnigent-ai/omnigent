@@ -6,8 +6,8 @@
 // Scope mirrors what the composer prefills today: host, workspace, agent,
 // whether new sessions start in a fresh git worktree, and the base branch a
 // worktree forks from (which overrides the user-global default in Settings ›
-// Git) — plus the two worktree lifecycle scripts, which are the one group the
-// SERVER reads and executes rather than prefilling.
+// Git) — plus the worktree location and the two lifecycle scripts, which are the
+// one group the SERVER reads and acts on rather than prefilling.
 // Model / reasoning-effort / harness are per-agent run config,
 // deliberately out of scope here. The host and agent pickers reuse the
 // composer's components; the working directory reuses its filesystem browser
@@ -174,6 +174,9 @@ export function ProjectSettingsDialog({
   const [baseBranch, setBaseBranch] = useState("");
   const [agentId, setAgentId] = useState<string | null>(null);
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
+  // Directory new worktrees are created under. Server-read, like the scripts
+  // below. Blank keeps the built-in `<repo>-worktrees` sibling layout.
+  const [worktreeRoot, setWorktreeRoot] = useState("");
   // Worktree lifecycle scripts the HOST runs (unlike every other field here,
   // which is only a composer prefill). Each may be one command or a multi-line
   // script. Blank stores nothing, which turns the hook off. The timeout is
@@ -226,6 +229,7 @@ export function ProjectSettingsDialog({
     setBaseBranch(c.base_branch ?? "");
     setAgentId(c.agent_id ?? null);
     setWorkspaceOpen(false);
+    setWorktreeRoot(c.worktree_root ?? "");
     setPostCreateCommand(c.worktree_post_create_command ?? "");
     setPreDeleteCommand(c.worktree_pre_delete_command ?? "");
     setHookTimeout(
@@ -258,6 +262,11 @@ export function ProjectSettingsDialog({
     // invisible default after the toggle is turned off.
     const base = useWorktree ? trimOrUndef(baseBranch) : undefined;
     if (base) config.base_branch = base;
+    // Where worktrees go. Independent of the worktree toggle, like the scripts:
+    // it applies to any worktree Omnigent creates for this project, however that
+    // create was started (composer, runner launch, or an agent's worktree tool).
+    const root = trimOrUndef(worktreeRoot);
+    if (root) config.worktree_root = root;
     // Worktree lifecycle scripts. Kept independent of the worktree toggle:
     // a session can start in an existing worktree the composer created without
     // this project default being on, and the pre-delete command still applies.
@@ -470,6 +479,22 @@ export function ProjectSettingsDialog({
               />
             </Field>
           )}
+
+          <Field
+            label="Worktree location"
+            hint="Directory new worktrees are created in. Relative to the repo root; {repo} is its name. Blank uses <repo>-worktrees next to it."
+            htmlFor="project-settings-worktree-root"
+          >
+            <input
+              id="project-settings-worktree-root"
+              data-testid="project-settings-worktree-root"
+              className="w-full rounded-md border bg-transparent px-3 py-2 font-mono text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
+              placeholder="e.g. .worktrees or ../worktrees"
+              value={worktreeRoot}
+              onChange={(e) => setWorktreeRoot(e.target.value)}
+              disabled={isLoading}
+            />
+          </Field>
 
           <ScriptField
             label="Worktree setup script"

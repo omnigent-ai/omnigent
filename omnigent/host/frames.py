@@ -454,12 +454,17 @@ class HostCreateWorktreeFrame:
     :param branch_name: New branch to create, e.g. ``"feature/login"``.
     :param base_branch: Optional base ref, e.g. ``"main"``. ``None``
         branches from ``HEAD``.
+    :param worktree_root: The project's configured directory to place the
+        worktree under, e.g. ``".worktrees"`` (repo-relative) or
+        ``"/data/worktrees"``. ``None`` — including from a server too old
+        to send it — uses the host's built-in sibling layout.
     """
 
     request_id: str
     repo_path: str
     branch_name: str
     base_branch: str | None = None
+    worktree_root: str | None = None
 
 
 @dataclass
@@ -502,12 +507,17 @@ class HostRemoveWorktreeFrame:
     :param delete_branch: When ``True``, ``git branch -D`` after
         removing the directory; when ``False``, remove only the
         directory.
+    :param require_merged_into: Ref the branch's commits must already be
+        reachable from before it may be deleted, e.g. the requesting
+        agent's own branch. ``None`` — including from a server too old to
+        send it — deletes unconditionally.
     """
 
     request_id: str
     worktree_path: str
     branch: str | None = None
     delete_branch: bool = False
+    require_merged_into: str | None = None
 
 
 @dataclass
@@ -1133,6 +1143,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "repo_path": frame.repo_path,
                 "branch_name": frame.branch_name,
                 "base_branch": frame.base_branch,
+                "worktree_root": frame.worktree_root,
             }
         )
     if isinstance(frame, HostCreateWorktreeResultFrame):
@@ -1154,6 +1165,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "worktree_path": frame.worktree_path,
                 "branch": frame.branch,
                 "delete_branch": frame.delete_branch,
+                "require_merged_into": frame.require_merged_into,
             }
         )
     if isinstance(frame, HostRemoveWorktreeResultFrame):
@@ -1696,6 +1708,7 @@ def _decode_create_worktree(msg: _JsonObject) -> HostCreateWorktreeFrame:
         repo_path=_required_str(msg, "repo_path"),
         branch_name=_required_str(msg, "branch_name"),
         base_branch=_optional_nullable_str(msg, "base_branch"),
+        worktree_root=_optional_nullable_str(msg, "worktree_root"),
     )
 
 
@@ -1730,6 +1743,7 @@ def _decode_remove_worktree(msg: _JsonObject) -> HostRemoveWorktreeFrame:
         worktree_path=_required_str(msg, "worktree_path"),
         branch=_optional_nullable_str(msg, "branch"),
         delete_branch=delete_branch,
+        require_merged_into=_optional_nullable_str(msg, "require_merged_into"),
     )
 
 

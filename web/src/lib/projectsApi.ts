@@ -18,8 +18,8 @@ import { authenticatedFetch } from "./identity";
  * slot". The server persists the object whole, so adding a purely client-read
  * key here needs no backend change.
  *
- * Exception: the `worktree_*_command` keys ARE read by the server (it runs them
- * on the host around worktree creation/removal — see
+ * Exception: the `worktree_root` and `worktree_*_command` keys ARE read by the
+ * server (it places worktrees and runs the commands on the host — see
  * `omnigent/server/worktree_hooks.py`), so their names are a shared contract.
  */
 export interface ProjectConfig {
@@ -44,10 +44,18 @@ export interface ProjectConfig {
    */
   base_branch?: string;
   /**
+   * Directory every new worktree in this project is created under, e.g.
+   * `.worktrees` (inside the checkout), `../worktrees` (a sibling of it), or an
+   * absolute path. `{repo}` expands to the repo directory name. A relative value
+   * resolves against the repo root. Unset uses the built-in
+   * `<repo>-worktrees` sibling layout. Blank is never stored. Server-read.
+   */
+  worktree_root?: string;
+  /**
    * Shell command the host runs in a newly created worktree, before the first
    * turn starts (dependency install, `.env` copy). Blank is never stored
-   * (treated the same as unset). Unlike the keys above this one is read by the
-   * SERVER, not just prefilled into the composer.
+   * (treated the same as unset). Unlike the composer-default keys above this one
+   * is read by the SERVER.
    */
   worktree_post_create_command?: string;
   /**

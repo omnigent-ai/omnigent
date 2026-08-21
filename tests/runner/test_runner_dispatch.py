@@ -9590,3 +9590,59 @@ async def test_factor3_new_message_lands_in_real_buffer(
     assert buffered
     assert buffered[-1]["content"] == "second message"
     assert buffered[-1]["conversation_id"] == conv
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("labels", "expected"),
+    [
+        ({"omnigent.worktree_setup": "done"}, "done"),
+        ({"omnigent.worktree_setup": "failed"}, "failed"),
+        ({"omnigent.worktree_setup": "running"}, "running"),
+        # No project setup script configured, so no label at all.
+        ({}, None),
+        ({"omnigent.pinned": "1"}, None),
+    ],
+)
+async def test_sys_session_get_info_reports_worktree_setup_state(
+    labels: dict[str, str],
+    expected: str | None,
+) -> None:
+    """
+    The agent needs to know whether its worktree was prepared.
+
+    A project's setup script is otherwise reported only on the event stream
+    and in the web transcript, neither of which the agent reads — so an
+    agent asked to verify setup, or hitting a missing dependency after a
+    FAILED setup, has nothing to go on and debugs the wrong thing.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_caller",
+                    "status": "idle",
+                    "created_at": 1,
+                    "updated_at": 2,
+                    "runner_id": None,
+                    "pending_elicitations": [],
+                    "labels": labels,
+                },
+            )
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments="{}",
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    assert json.loads(output)["worktree_setup"] == expected

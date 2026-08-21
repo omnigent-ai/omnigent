@@ -533,6 +533,43 @@ async def test_pre_delete_hook_skipped_without_delete_branch(
     assert [h for h in cap.hooks if h.hook == "pre_delete"] == []
 
 
+async def test_composer_create_places_the_worktree_under_the_project_root(
+    register_hook_host: RegisterHost,
+    client: httpx.AsyncClient,
+) -> None:
+    """A project's ``worktree_root`` reaches the host on the session-create path.
+
+    The worktree is created BEFORE the conversation row exists, so the root
+    has to be resolved from the create REQUEST (its ``omni_project`` label)
+    — reading it off the session row would resolve nothing and silently fall
+    back to the built-in layout.
+    """
+    cap = register_hook_host()
+    await _create_project(client, "Rooted", {"worktree_root": ".worktrees"})
+    agent = await create_test_agent(client, name="hook-root-agent")
+
+    resp = await _create_session_in_project(
+        client, agent["id"], "Rooted", {"branch_name": "feature/login"}
+    )
+    assert resp.status_code == 201, resp.text
+    assert len(cap.create) == 1
+    assert cap.create[0].worktree_root == ".worktrees"
+
+
+async def test_composer_create_without_a_project_root_sends_none(
+    register_hook_host: RegisterHost,
+    client: httpx.AsyncClient,
+) -> None:
+    """An unfiled session leaves the host on its built-in layout."""
+    cap = register_hook_host()
+    agent = await create_test_agent(client, name="hook-unfiled-agent")
+
+    resp = await _create_session_in_project(client, agent["id"], None, {"branch_name": "wip"})
+    assert resp.status_code == 201, resp.text
+    assert len(cap.create) == 1
+    assert cap.create[0].worktree_root is None
+
+
 async def _await_setup_settled_or_skip(client: httpx.AsyncClient, session_id: str) -> None:
     """Wait out a post-create hook if this project configured one.
 

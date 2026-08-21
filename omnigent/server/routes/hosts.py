@@ -821,7 +821,16 @@ def create_hosts_router(
                     WorktreeProxyError,
                     create_worktree_on_host,
                 )
+                from omnigent.server.worktree_hooks import worktree_root_for_conversation
 
+                # The project's worktree root, so a runner-launch worktree
+                # lands in the same directory as a create-path one.
+                worktree_root = await asyncio.to_thread(
+                    worktree_root_for_conversation,
+                    conv=target.conv,
+                    user_id=user_id,
+                    project_store=getattr(request.app.state, "project_store", None),
+                )
                 try:
                     worktree = await create_worktree_on_host(
                         host_registry=host_registry,
@@ -829,6 +838,7 @@ def create_hosts_router(
                         repo_path=workspace,
                         branch_name=body.git.branch_name,
                         base_branch=body.git.base_branch,
+                        worktree_root=worktree_root,
                     )
                 except WorktreeHostUnavailableError as exc:
                     # Host offline / unresponsive — infra, not user input.
