@@ -27,6 +27,8 @@ from __future__ import annotations
 
 from playwright.sync_api import Page, ViewportSize, expect
 
+from tests.e2e_ui.conftest import open_right_rail
+
 # A phone-sized viewport: the Android shell is a mobile surface, and the narrow
 # width is where the sidebar behaves as an overlay drawer (the
 # ``[data-android-native]`` drawer rules this change adds). The
@@ -132,6 +134,66 @@ def test_no_android_tag_or_fold_in_plain_browser(
     # The web app never injects --omnigent-android-safe-area-*, so with
     # env(safe-area-inset-top) also 0 here the shared inset stays 0.
     assert page.evaluate(_READ_SAFE_TOP_PX) == "0px"
+
+
+# Inject all four OS insets the way the shell does (distinct per edge, so an
+# edge-for-edge mapping error can't cancel out): status bar top, gesture-nav
+# bottom, display-cutout left/right.
+_INJECT_FOUR_EDGE_INSETS = """
+() => {
+  const s = document.documentElement.style;
+  s.setProperty('--omnigent-android-safe-area-top', '17px');
+  s.setProperty('--omnigent-android-safe-area-bottom', '23px');
+  s.setProperty('--omnigent-android-safe-area-left', '11px');
+  s.setProperty('--omnigent-android-safe-area-right', '13px');
+}
+"""
+
+_READ_RAIL_PADDING = """
+() => {
+  const rail = document.querySelector('aside[aria-label="Workspace"]');
+  if (!rail) return null;
+  const cs = getComputedStyle(rail);
+  return {
+    top: cs.paddingTop,
+    bottom: cs.paddingBottom,
+    left: cs.paddingLeft,
+    right: cs.paddingRight,
+  };
+}
+"""
+
+
+def test_workspace_rail_folds_inset_on_all_four_edges(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The md+ Workspace rail pads itself by the injected OS inset, edge for edge.
+
+    The rail only exists at desktop width (hidden below 48rem), outside the
+    mobile drawer rules, so it needs its own safe-area rule: on a landscape
+    phone / tablet with a display cutout its content would otherwise start
+    under the cutout and the gesture-nav bar. Asserts the full chain: injected
+    bridge -> ``data-android-native`` -> the ``--omnigent-android-safe-area-*``
+    fold -> computed four-edge padding on the real rail.
+
+    :param page: Playwright page fixture (fresh context per test).
+    :param seeded_session: ``(base_url, session_id)`` of a runner-bound session.
+    """
+    base_url, session_id = seeded_session
+
+    page.set_viewport_size({"width": 1280, "height": 800})
+    page.add_init_script(_ANDROID_SHELL_INIT_SCRIPT)
+    page.goto(f"{base_url}/c/{session_id}")
+    open_right_rail(page)
+
+    page.evaluate(_INJECT_FOUR_EDGE_INSETS)
+    assert page.evaluate(_READ_RAIL_PADDING) == {
+        "top": "17px",
+        "bottom": "23px",
+        "left": "11px",
+        "right": "13px",
+    }
 
 
 # Bridge stub that also CAPTURES the notification-activation callback the SPA

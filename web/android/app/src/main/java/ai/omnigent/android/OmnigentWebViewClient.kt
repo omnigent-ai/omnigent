@@ -11,10 +11,11 @@ import android.webkit.WebViewClient
 
 /**
  * Signals [onPageReady] once a pinned-origin page finishes loading and decides
- * where the login flow runs: inline for servers matching [usesInWebViewAuth],
- * otherwise handed to the system browser via [onLoginRequired]. A landing on a
- * bare Databricks workspace root is bounced to the workspace's `/omnigent`
- * mount (see [workspaceRootTarget]).
+ * where the login flow runs. Matching Digital Asset Links allow Auth Tab when
+ * [shouldUseAuthTabLogin] permits it. Otherwise legacy Databricks origins stay
+ * inline and every other origin keeps its RFC 8252 system-browser flow. A
+ * landing on a bare Databricks workspace root is bounced to the workspace's
+ * `/omnigent` mount (see [workspaceRootTarget]).
  *
  * The facade is normally registered with `addDocumentStartJavaScript` in
  * `MainActivity`. Older WebViews that support the message listener but not
@@ -28,6 +29,10 @@ class OmnigentWebViewClient(
     private val shouldInjectBridgeAtPageReady: () -> Boolean,
     private val onPageReady: (url: String?) -> Unit,
     private val onLoginRequired: () -> Unit,
+    private val authTabCapability: () -> Boolean? = { false },
+    private val onAuthTabCapabilityRequired: () -> Unit = {},
+    private val shouldUseAuthTabLogin: () -> Boolean = { false },
+    private val onProxyLoginRequired: () -> Unit = {},
 ) : WebViewClient() {
     // Bare-root -> /omnigent bounces since the last app page loaded; see
     // workspaceRootTarget for why they're capped.
@@ -57,7 +62,23 @@ class OmnigentWebViewClient(
         // load of the pinned server (e.g. it's offline), NOT an IdP redirect —
         // don't misread it as a bounce and pop the browser. Mirror the http(s)
         // gate in shouldOverrideUrlLoading.
-        if (isHttpScheme(scheme) && origin != pinned && !usesInWebViewAuth(pinned)) {
+        if (isHttpScheme(scheme) && origin != pinned) {
+            val usesInlineFallback = usesInWebViewAuth(pinned)
+            val capability = authTabCapability()
+            if (capability == null && !usesInlineFallback) {
+                authLog("off-origin landing $origin -> asset links probe")
+                view.stopLoading()
+                onAuthTabCapabilityRequired()
+                return
+            }
+            if (capability == true && shouldUseAuthTabLogin()) {
+                authLog("off-origin landing $origin -> auth tab")
+                view.stopLoading()
+                onProxyLoginRequired()
+                return
+            }
+            if (usesInlineFallback) return
+
             // Log origin only, never the full URL (carries OAuth state/PKCE).
             authLog("off-origin landing $origin -> login")
             view.stopLoading()
@@ -150,19 +171,27 @@ class OmnigentWebViewClient(
 
         authLog("off-origin nav $origin gesture=${request.hasGesture()}")
 
-        // In-WebView auth: the IdP flow runs inline — safe because the native
-        // bridge is origin-allowlisted to the pinned origin by WebView itself, so
-        // the IdP page can't reach it. Only a gesture from a pinned-origin page is
-        // an external link; once we're on the IdP's own pages its navigations
-        // (sign-in buttons, form posts, tenant hops) are all gesture-driven and
-        // must stay inline or the flow ejects to the browser mid-login.
-        if (usesInWebViewAuth(pinned)) {
-            if (originOf(view.url) == pinned && request.hasGesture()) {
-                runCatching { view.context.startActivity(Intent(Intent.ACTION_VIEW, url)) }
-                return true
-            }
-            return false
+        // A gesture from the app page is an external link, never a login bounce.
+        if (originOf(view.url) == pinned && request.hasGesture()) {
+            runCatching { view.context.startActivity(Intent(Intent.ACTION_VIEW, url)) }
+            return true
         }
+
+        val usesInlineFallback = usesInWebViewAuth(pinned)
+        val capability = authTabCapability()
+        if (capability == null && !usesInlineFallback) {
+            onAuthTabCapabilityRequired()
+            return true
+        }
+
+        if (capability == true && shouldUseAuthTabLogin()) {
+            onProxyLoginRequired()
+            return true
+        }
+
+        // Only legacy in-WebView-auth origins fall back inline. The bridge is
+        // origin-allowlisted, so their IdP pages cannot reach it.
+        if (usesInlineFallback) return false
 
         // System-browser auth. A user gesture is an external link -> hand to the
         // system browser. A server redirect is the login flow bouncing to the IdP.

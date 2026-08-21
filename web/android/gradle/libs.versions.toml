@@ -6,6 +6,8 @@ agp = "9.1.1"
 androidxCore = "1.18.0"
 androidxActivity = "1.12.4"
 androidxWebkit = "1.15.0"
+# 1.9.0 is the first stable line with the Auth Tab API (androidx.browser.auth).
+androidxBrowser = "1.9.0"
 # AppCompat 1.8.x is currently in preview; stick with the latest stable 1.7.x.
 androidxAppcompat = "1.7.1"
 junit = "4.13.2"
@@ -24,6 +26,7 @@ androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = 
 androidx-activity = { group = "androidx.activity", name = "activity-ktx", version.ref = "androidxActivity" }
 androidx-appcompat = { group = "androidx.appcompat", name = "appcompat", version.ref = "androidxAppcompat" }
 androidx-webkit = { group = "androidx.webkit", name = "webkit", version.ref = "androidxWebkit" }
+androidx-browser = { group = "androidx.browser", name = "browser", version.ref = "androidxBrowser" }
 junit = { group = "junit", name = "junit", version.ref = "junit" }
 robolectric = { group = "org.robolectric", name = "robolectric", version.ref = "robolectric" }
 androidx-test-core = { group = "androidx.test", name = "core", version.ref = "androidxTestCore" }

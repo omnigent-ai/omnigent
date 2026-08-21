@@ -9,6 +9,12 @@
 
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
 
+    <queries>
+        <intent>
+            <action android:name="android.support.customtabs.action.CustomTabsService" />
+        </intent>
+    </queries>
+
     <!--
       allowBackup=false: the WebView cookie store holds the authenticated
       __Host-ap_session cookie, so cloud Auto Backup and `adb backup` would
@@ -46,6 +52,12 @@
             android:name=".ConnectActivity"
             android:exported="false"
             android:windowSoftInputMode="adjustResize" />
+
+        <!--
+          Deliberately NO intent filter for /auth/native-callback: Auth Tab
+          verifies each server's HTTPS Digital Asset Links and returns the
+          callback only through its Activity-result channel (see NativeAuth).
+        -->
     </application>
 
 </manifest>

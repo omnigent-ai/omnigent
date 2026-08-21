@@ -12,6 +12,14 @@ import { UI_FONT_SIZE_DEFAULT, UI_FONT_SIZE_MAX, UI_FONT_SIZE_MIN } from "./lib/
 // Relative to the vitest root (web/) — import.meta.url is not a file://
 // URL inside vitest's module graph, so it can't locate the file.
 const cssSource = readFileSync("src/index.css", "utf8");
+const nativeBridgeSource = readFileSync(
+  "android/app/src/main/java/ai/omnigent/android/NativeBridgeScript.kt",
+  "utf8",
+);
+
+// Innermost `selector { ... }` blocks with their match indices, shared by
+// every rule-extraction below so the block grammar lives in one place.
+const cssBlocks = [...cssSource.matchAll(/[^{}]+\{[^{}]*\}/g)];
 
 /* Regression test for the "transparent dropdown in prod" bug.
  *
@@ -40,16 +48,23 @@ const TARGETS = {
 const UNPREFIXED_DECL = /(?<![-\w])backdrop-filter\s*:/;
 const WEBKIT_DECL = /-webkit-backdrop-filter\s*:/;
 
+/** The selector text of an extracted rule block, minus any leading comment. */
+function selectorOf(rule: string): string {
+  return rule
+    .slice(0, rule.indexOf("{"))
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .trim();
+}
+
 /** Innermost `selector { ... }` blocks that declare backdrop-filter. */
-function extractBackdropFilterRules(css: string): string[] {
-  const blocks = css.match(/[^{}]+\{[^{}]*\}/g) ?? [];
+function extractBackdropFilterRules(): string[] {
   // Require a `:` so blocks that merely mention backdrop-filter in a
   // comment (e.g. the dark-token block) are not treated as glass rules.
-  return blocks.filter((block) => UNPREFIXED_DECL.test(block));
+  return cssBlocks.map(([block]) => block).filter((block) => UNPREFIXED_DECL.test(block));
 }
 
 describe("index.css backdrop-filter glass rules", () => {
-  const rules = extractBackdropFilterRules(cssSource);
+  const rules = extractBackdropFilterRules();
 
   it("has the glass rules this test exists to protect", () => {
     // 2 today: the bg-card frosted surfaces and the popover/menu rule.
@@ -93,12 +108,8 @@ describe("index.css backdrop-filter glass rules", () => {
  */
 describe("index.css bg-card glass rule selector", () => {
   // The selector of the rule declaring the bg-card glass border/blur.
-  const cardRule = extractBackdropFilterRules(cssSource).find((rule) => rule.includes(".bg-card"))!;
-  // Strip comments preceding the selector in the extracted block.
-  const selector = cardRule
-    .slice(0, cardRule.indexOf("{"))
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .trim();
+  const cardRule = extractBackdropFilterRules().find((rule) => rule.includes(".bg-card"))!;
+  const selector = selectorOf(cardRule);
 
   function makeAside(): HTMLElement {
     const dark = document.createElement("div");
@@ -133,6 +144,289 @@ describe("index.css bg-card glass rule selector", () => {
   });
 });
 
+const workspaceAttribute = /\[\s*aria-label\s*=\s*("Workspace"|'Workspace'|Workspace)\s*\]/;
+// Rules that style the rail itself — the docked-panel rule mentions the rail
+// only inside :not(...) (to exempt nested panels), so strip those first.
+const workspaceRules = cssBlocks.filter(([block]) =>
+  workspaceAttribute.test(selectorOf(block).replace(/:not\([^)]*\)/g, "")),
+);
+const dockedPanelRule =
+  cssBlocks.find(
+    ([block]) =>
+      block.includes('[data-testid="execution-logs-panel"]') &&
+      block.includes("--omnigent-safe-top") &&
+      block.includes(":not("),
+  )?.[0] ?? "";
+const workspaceSafeAreaRules = workspaceRules.filter(([block]) =>
+  block.includes("--omnigent-safe-top"),
+);
+const workspaceSafeAreaRule = workspaceSafeAreaRules[0]?.[0] ?? "";
+const workspaceSelector = selectorOf(workspaceSafeAreaRule);
+const workspaceCss = workspaceRules.map(([block]) => block).join("\n");
+const fullHeightPanelRule =
+  cssBlocks.find(
+    ([block]) => block.includes(".conversations-sidebar") && block.includes("--omnigent-safe-top"),
+  )?.[0] ?? "";
+const rootSafeAreaRule =
+  cssBlocks.find(
+    ([block]) => block.includes(":root") && block.includes("--omnigent-safe-top"),
+  )?.[0] ?? "";
+
+const nativeInsetMatch = nativeBridgeSource.match(
+  /internal val insetStyles: String\s*=\s*"""([\s\S]*?)"""\.trimIndent\(\)/,
+);
+const nativeInsetCss = trimIndent(nativeInsetMatch?.[1] ?? "");
+// Test DOMs don't evaluate media queries, so the padding assertions run on
+// the flattened rules; the phone-width guard is asserted structurally below.
+const nativeInsetFlatCss = nativeInsetCss.replace(/@media[^{]*\{((?:[^{}]*\{[^{}]*\})*)\}/g, "$1");
+
+const FULL_HEIGHT_PANEL_TARGETS = [
+  { className: "conversations-sidebar" },
+  { testId: "execution-logs-panel" },
+  { testId: "file-viewer" },
+  { testId: "files-panel-drawer" },
+  { testId: "terminals-panel" },
+  { testId: "subagents-panel-drawer" },
+  { testId: "todos-panel-drawer" },
+] as const;
+
+function trimIndent(value: string): string {
+  const lines = value
+    .replace(/^\n/, "")
+    .replace(/\n\s*$/, "")
+    .split("\n");
+  const indents = lines
+    .filter((line) => line.trim())
+    .map((line) => line.match(/^\s*/)?.[0].length ?? 0);
+  const indent = Math.min(...indents);
+  return lines.map((line) => line.slice(indent)).join("\n");
+}
+
+/* The Workspace rules key on `aria-label="Workspace"`, so a stub <aside>
+ * carries the selector⇄DOM contract; the source assertion in the suite below
+ * pins the real component to the same label without coupling a CSS test to
+ * the component's full prop surface and data hooks. */
+function renderWorkspace(platform: "android" | "ios"): HTMLElement {
+  const shell = document.createElement("div");
+  shell.setAttribute(`data-${platform}-native`, "");
+  const aside = document.createElement("aside");
+  aside.setAttribute("aria-label", "Workspace");
+  shell.appendChild(aside);
+  document.body.appendChild(shell);
+  return aside;
+}
+
+/** Runs `assertions` with `css` applied to the document, then removes it. */
+function withStyle(css: string, assertions: () => void): void {
+  const style = document.createElement("style");
+  style.textContent = css;
+  document.head.appendChild(style);
+  try {
+    assertions();
+  } finally {
+    style.remove();
+  }
+}
+
+/** The four safe-area vars must land on the element's padding, edge for edge. */
+function expectSafeAreaPadding(element: HTMLElement, variableFallback: string): void {
+  const computed = getComputedStyle(element);
+  expect(computed.paddingTop).toBe(`var(--omnigent-safe-top${variableFallback})`);
+  expect(computed.paddingBottom).toBe(`var(--omnigent-safe-bottom${variableFallback})`);
+  expect(computed.paddingLeft).toBe(`var(--omnigent-safe-left${variableFallback})`);
+  expect(computed.paddingRight).toBe(`var(--omnigent-safe-right${variableFallback})`);
+}
+
+function assertWorkspacePadding(
+  css: string,
+  platform: "android" | "ios",
+  variableFallback = "",
+): void {
+  withStyle(css, () => {
+    const aside = renderWorkspace(platform);
+    try {
+      expectSafeAreaPadding(aside, variableFallback);
+    } finally {
+      aside.parentElement?.remove();
+    }
+  });
+}
+
+function assertFullHeightPanelPadding(css: string, variableFallback = ""): void {
+  withStyle(css, () => {
+    const shell = document.createElement("div");
+    shell.setAttribute("data-android-native", "");
+    document.body.appendChild(shell);
+    try {
+      for (const target of FULL_HEIGHT_PANEL_TARGETS) {
+        const panel = document.createElement("div");
+        if ("className" in target) panel.className = target.className;
+        if ("testId" in target) panel.dataset.testid = target.testId;
+        shell.appendChild(panel);
+        expectSafeAreaPadding(panel, variableFallback);
+      }
+    } finally {
+      shell.remove();
+    }
+  });
+}
+
+// Comments and quoted strings blanked out (index-preserving), so brace
+// counting can't be fooled by braces inside string or comment text.
+const cssDepthSource = cssSource.replace(
+  /\/\*[\s\S]*?\*\/|"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'/g,
+  (match) => " ".repeat(match.length),
+);
+
+/** Brace nesting depth at a source index; 0 is top level. */
+function braceDepthAt(sourceIndex: number): number {
+  const prefix = cssDepthSource.slice(0, sourceIndex);
+  return (prefix.match(/\{/g)?.length ?? 0) - (prefix.match(/\}/g)?.length ?? 0);
+}
+
+describe("index.css native safe-area layout", () => {
+  it("folds Android and browser safe areas on both lateral edges", () => {
+    withStyle(rootSafeAreaRule, () => {
+      const computed = getComputedStyle(document.documentElement);
+      expect(computed.getPropertyValue("--omnigent-safe-left")).toContain(
+        "--omnigent-android-safe-area-left",
+      );
+      expect(computed.getPropertyValue("--omnigent-safe-right")).toContain(
+        "--omnigent-android-safe-area-right",
+      );
+    });
+  });
+
+  it("keeps the Workspace rule at the top level", () => {
+    expect(workspaceSafeAreaRule, "the Workspace safe-area rule is gone").not.toBe("");
+    expect(workspaceSafeAreaRules).toHaveLength(1);
+    expect(braceDepthAt(workspaceSafeAreaRules[0]?.index ?? -1)).toBe(0);
+  });
+
+  it.each(["android", "ios"] as const)(
+    "computes four-edge padding on the Workspace rail in the %s shell",
+    (platform) => assertWorkspacePadding(workspaceCss, platform),
+  );
+
+  it("keeps the Workspace aria-label on the rail component", () => {
+    // The stub <aside> in renderWorkspace stands in for WorkspacePanel; this
+    // pins the real component to the label the CSS selector keys on.
+    const source = readFileSync("src/shell/WorkspacePanel.tsx", "utf8");
+    expect(source).toMatch(/<aside[\s\S]{0,600}?aria-label="Workspace"/);
+  });
+
+  it("computes four-edge padding on every full-height native panel", () => {
+    assertFullHeightPanelPadding(fullHeightPanelRule);
+  });
+
+  it("fails its layout contract when a later padding shorthand wins", () => {
+    expect(workspaceSelector).not.toBe("");
+    expect(() =>
+      assertWorkspacePadding(`${workspaceCss}\n${workspaceSelector}{padding:0}`, "android"),
+    ).toThrow();
+  });
+
+  it("does not double-count app-owned bar footprints", () => {
+    expect(workspaceSafeAreaRule).not.toMatch(/--omnigent-(?:inset|native)-/);
+  });
+
+  it("pads docked right-edge panels on every edge but the content side", () => {
+    // At md+ these panels replace the rail in the same slot: right edge at
+    // the window edge, content to their left — so no padding-left.
+    expect(dockedPanelRule, "the docked-panel safe-area rule is gone").not.toBe("");
+    expect(dockedPanelRule).not.toContain("padding-left");
+    withStyle(dockedPanelRule, () => {
+      const shell = document.createElement("div");
+      shell.setAttribute("data-android-native", "");
+      const panel = document.createElement("div");
+      panel.dataset.testid = "execution-logs-panel";
+      shell.appendChild(panel);
+      document.body.appendChild(shell);
+      try {
+        const computed = getComputedStyle(panel);
+        expect(computed.paddingTop).toBe("var(--omnigent-safe-top)");
+        expect(computed.paddingBottom).toBe("var(--omnigent-safe-bottom)");
+        expect(computed.paddingRight).toBe("var(--omnigent-safe-right)");
+        expect(computed.paddingLeft).toBe("0");
+      } finally {
+        shell.remove();
+      }
+    });
+  });
+
+  it("exempts panels nested inside the already-padded rail from the docked rule", () => {
+    withStyle(dockedPanelRule, () => {
+      const shell = document.createElement("div");
+      shell.setAttribute("data-android-native", "");
+      const rail = document.createElement("aside");
+      rail.setAttribute("aria-label", "Workspace");
+      const panel = document.createElement("div");
+      panel.dataset.testid = "file-viewer";
+      rail.appendChild(panel);
+      shell.appendChild(rail);
+      document.body.appendChild(shell);
+      try {
+        // The rail already pads all four edges; padding the nested viewer
+        // again would double the inset.
+        expect(getComputedStyle(panel).paddingTop).toBe("0");
+      } finally {
+        shell.remove();
+      }
+    });
+  });
+});
+
+describe("Android injected safe-area layout", () => {
+  it("exposes the production inset stylesheet to the layout test", () => {
+    expect(nativeInsetMatch, "NativeBridgeScript.insetStyles is gone").not.toBeNull();
+    expect(nativeInsetCss).not.toBe("");
+    // insetStyles is interpolated into a JS template literal at runtime;
+    // these characters would break the injected script, not these tests.
+    expect(nativeInsetCss).not.toContain("`");
+    expect(nativeInsetCss).not.toContain("${");
+  });
+
+  it("computes four-edge padding on the Workspace rail", () => {
+    assertWorkspacePadding(nativeInsetFlatCss, "android", ", 0px");
+  });
+
+  it("computes four-edge padding on every full-height panel", () => {
+    assertFullHeightPanelPadding(nativeInsetFlatCss, ", 0px");
+  });
+
+  it("scopes the panel rule to phone widths but keeps the Workspace rule global", () => {
+    // Mirrors index.css: the full-height panels are phone drawers, while the
+    // Workspace rail only exists at md+ — an unscoped panel rule would
+    // double-pad panels docked inside the already-padded rail.
+    const media = nativeInsetCss.match(/^@media \(width < 48rem\)\{(.*)\}$/m);
+    expect(media?.[1], "panel rule lost its phone-width media guard").toContain(
+      ".conversations-sidebar",
+    );
+    expect(nativeInsetCss).toMatch(/^aside\[aria-label="Workspace"\]/m);
+  });
+
+  it("pads docked md+ panels on every edge but the content side", () => {
+    // Mirrors the index.css docked-panel rule for pre-shell servers: right
+    // edge at the window edge, content to the left, rail descendants exempt.
+    const media = nativeInsetCss.match(/^@media \(width >= 48rem\)\{(.*)\}$/m);
+    expect(media?.[1], "docked-panel rule lost from the injected sheet").toContain(
+      "execution-logs-panel",
+    );
+    expect(media?.[1]).toContain(':not(aside[aria-label="Workspace"] *)');
+    expect(media?.[1]).not.toContain("padding-left");
+  });
+
+  it("pads the md+ conversations sidebar on every edge but the content side", () => {
+    // At md+ the sidebar is a pinned column at the left screen edge; its
+    // right edge faces content, so it gets top/bottom/left insets only.
+    const rules = nativeInsetCss.match(/^@media \(width >= 48rem\)\{.*\}$/gm);
+    const sidebar = rules?.find((rule) => rule.includes(".conversations-sidebar"));
+    expect(sidebar, "md+ sidebar rule lost from the injected sheet").toBeDefined();
+    expect(sidebar).toContain("padding-left");
+    expect(sidebar).not.toContain("padding-right");
+  });
+});
+
 /* Regression test for the "table link column collapses to ~2ch" bug.
  *
  * Streamdown styles links with `wrap-anywhere`, which also drops the
@@ -143,16 +437,14 @@ describe("index.css bg-card glass rule selector", () => {
  * applying to cells only, and never leaks into prose links.
  */
 describe("index.css table link wrapping rule", () => {
-  const rule = (cssSource.match(/[^{}]+\{[^{}]*\}/g) ?? []).find(
-    (block) => block.includes('[data-streamdown="table-cell"]') && /overflow-wrap\s*:/.test(block),
-  );
+  const rule = cssBlocks.find(
+    ([block]) =>
+      block.includes('[data-streamdown="table-cell"]') && /overflow-wrap\s*:/.test(block),
+  )?.[0];
 
   // Derived lazily: a missing rule must fail the assertions below with a
   // readable message, not crash at collection time.
-  const selector = (rule ?? "")
-    .slice(0, rule ? rule.indexOf("{") : 0)
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .trim();
+  const selector = selectorOf(rule ?? "");
 
   it("has the rule this test exists to protect", () => {
     expect(rule, "the table-cell link wrapping rule is gone from index.css").toBeDefined();

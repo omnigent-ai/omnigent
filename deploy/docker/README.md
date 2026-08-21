@@ -244,6 +244,54 @@ stripping any inbound copy of the identity header from the client
 request — otherwise any visitor can spoof an identity. The server
 trusts whatever value reaches it.
 
+### Android Auth Tab behind a front door
+
+To let the Android shell finish a self-managed front-door login in Auth Tab,
+run the server in header mode and make the front door forward a per-user access
+token. The token header defaults to `X-Forwarded-Access-Token`; set
+`OMNIGENT_FORWARDED_TOKEN_HEADER` when the proxy uses another name. oauth2-proxy
+and Cloudflare Access do not forward such a token by default.
+
+Set the Auth Tab variables together; setting only the app list makes startup
+fail loudly:
+
+```bash
+OMNIGENT_AUTH_PROVIDER=header
+OMNIGENT_FORWARDED_TOKEN_HEADER=X-Forwarded-Access-Token
+OMNIGENT_NATIVE_AUTH_BASE_URL=https://omnigent.example.com
+OMNIGENT_ANDROID_AUTH_TAB_APPS='[{"package_name":"ai.omnigent.android","sha256_cert_fingerprints":["REPLACE_WITH_SIGNING_CERT_SHA256"]}]'
+```
+
+The configured origin must be the same origin users enter in the Android app.
+Your reverse proxy must pass the public host in `Host` or `X-Forwarded-Host` and
+serve `/.well-known/assetlinks.json` anonymously with a matching app entry; keep
+`/auth/*` protected. Verify from a client with no cookies or Authorization:
+
+```bash
+origin=https://omnigent.example.com
+package_name=ai.omnigent.android
+fingerprint=REPLACE_WITH_SIGNING_CERT_SHA256
+curl --fail --silent --show-error \
+  "$origin/.well-known/assetlinks.json" |
+  jq -e --arg package "$package_name" --arg fingerprint "$fingerprint" \
+    'type == "array" and any(.[];
+      (((.relation // []) | index("delegate_permission/common.handle_all_urls")) != null) and
+      .target.namespace == "android_app" and
+      .target.package_name == $package and
+      (((.target.sha256_cert_fingerprints // []) | index($fingerprint)) != null))'
+```
+
+Header mode produces `exchange=tab`, which can cross the front door in the
+authenticated browser and relay the forwarded token. An `oidc` or `accounts`
+server behind a front door produces `exchange=post`; the native POST has no
+front-door browser session, so that combination cannot complete. A directly
+reachable `oidc`/`accounts` origin can use Auth Tab with the two Auth Tab
+variables, but its existing RFC 8252 system-browser login already works, so this
+is a UX alternative rather than a login fix.
+
+Direct Databricks Apps origins cannot expose the file anonymously and keep the
+Android shell's #4296 inline login fallback.
+
 ## Environment variables
 
 | Variable | Default | Purpose |
@@ -255,6 +303,9 @@ trusts whatever value reaches it.
 | `OMNIGENT_AUTH_PROVIDER` | unset | Escape hatch to pin a mode explicitly: `header` / `accounts` / `oidc`. Overrides the `AUTH_ENABLED` auto-selection. |
 | `OMNIGENT_AUTH_HEADER` | `X-Forwarded-Email` | Header-mode only: name of the trusted identity header. Set for proxies that use another name, e.g. `Cf-Access-Authenticated-User-Email` (Cloudflare Access). |
 | `OMNIGENT_AUTH_HEADER_STRIP_PREFIX` | unset (strip nothing) | Header-mode only: prefix removed from the identity header value. Set to `accounts.google.com:` for Google IAP's `X-Goog-Authenticated-User-Email`. |
+| `OMNIGENT_FORWARDED_TOKEN_HEADER` | `X-Forwarded-Access-Token` | Header-mode Android Auth Tab only: header carrying the per-user access token relayed through `exchange=tab`. The front door must inject and protect it explicitly. |
+| `OMNIGENT_NATIVE_AUTH_BASE_URL` | unset | Android Auth Tab public HTTPS origin. Must be set together with `OMNIGENT_ANDROID_AUTH_TAB_APPS` and match `Host`/`X-Forwarded-Host`. |
+| `OMNIGENT_ANDROID_AUTH_TAB_APPS` | unset | JSON package/fingerprint allowlist served through Digital Asset Links. Must be set together with `OMNIGENT_NATIVE_AUTH_BASE_URL`. |
 | `OMNIGENT_OIDC_*` | unset | OIDC config — required in oidc mode (issuer set, or `AUTH_PROVIDER=oidc`). See `.env.example`. |
 | `PYPI_INDEX_URL` | `https://pypi.org/simple` | Build-time PyPI index — override only behind a corporate proxy. |
 

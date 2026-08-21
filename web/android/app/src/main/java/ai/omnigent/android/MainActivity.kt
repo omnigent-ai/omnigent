@@ -25,6 +25,7 @@ import android.widget.TextView
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.browser.auth.AuthTabIntent
 import androidx.core.content.ContextCompat
 import androidx.core.content.getSystemService
 import androidx.core.graphics.Insets
@@ -36,6 +37,33 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.webkit.ScriptHandler
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
+
+internal fun systemSafeAreaInsets(insets: WindowInsetsCompat): Insets =
+    insets.getInsets(
+        WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout(),
+    )
+
+internal fun androidSafeAreaScript(
+    insets: Insets,
+    density: Float,
+): String =
+    """
+    (() => {
+      const s = document.documentElement.style;
+      const top = '${insets.top / density}px';
+      const bottom = '${insets.bottom / density}px';
+      const left = '${insets.left / density}px';
+      const right = '${insets.right / density}px';
+      s.setProperty('--omnigent-safe-top', top);
+      s.setProperty('--omnigent-safe-bottom', bottom);
+      s.setProperty('--omnigent-safe-left', left);
+      s.setProperty('--omnigent-safe-right', right);
+      s.setProperty('--omnigent-android-safe-area-top', top);
+      s.setProperty('--omnigent-android-safe-area-bottom', bottom);
+      s.setProperty('--omnigent-android-safe-area-left', left);
+      s.setProperty('--omnigent-android-safe-area-right', right);
+    })();
+    """.trimIndent()
 
 /**
  * The single WebView host. Mirrors the iOS `WebShellView` + `OmnigentWebView`:
@@ -51,6 +79,28 @@ class MainActivity : AppCompatActivity() {
     private lateinit var blobSaver: BlobSaver
     private val loginManager = OidcLoginManager()
     private var pinnedOrigin: String? = null
+    private var currentServerUrl: String? = null
+
+    // Auth Tab login for servers whose auth fronts them with a browser
+    // redirect chain. The launcher must be registered
+    // before RESUMED, hence the field initializer; the provider is resolved
+    // once and every launch is pinned to that exact package.
+    private val authTabLauncher =
+        AuthTabIntent.registerActivityResultLauncher(this) { result ->
+            onAuthTabOutcome(result.resultCode, result.resultUri)
+        }
+    internal val authTabFlow = AuthTabFlow()
+    private val nativeExchange = NativeAuthExchange()
+    private val authTabCapabilityProbe by lazy { AuthTabCapabilityProbe(this) }
+    private val authTabProviderPackage by lazy { AuthTabSupport.providerPackage(this) }
+    internal var authTabProviderPackageForTest: (() -> String?)? = null
+    internal var authTabOriginCapable: Boolean? = null
+    private var authTabCapabilityPending = false
+
+    // One-shot downgrade after an Auth Tab flow is dismissed or fails, so a
+    // bounce -> tab -> cancel -> bounce cycle can't loop. Reset only on an
+    // explicit reload or server switch, where a fixed server deserves a retry.
+    internal var authTabFellBack = false
 
     // Bridge-dependent work deferred until the page (and its injected emit
     // callbacks) exist — see onPageReady.
@@ -119,6 +169,7 @@ class MainActivity : AppCompatActivity() {
         }
         val serverUrl = store.currentServerUrl()
         pinnedOrigin = originOf(serverUrl)
+        currentServerUrl = serverUrl
 
         // Application context for the long-lived helpers so the WebView's bridge
         // reference chain can't pin this Activity.
@@ -144,6 +195,14 @@ class MainActivity : AppCompatActivity() {
                         },
                         onPageReady = ::onPageReady,
                         onLoginRequired = ::startLogin,
+                        authTabCapability = { authTabOriginCapable },
+                        onAuthTabCapabilityRequired = ::probeAuthTabCapability,
+                        shouldUseAuthTabLogin = {
+                            authTabOriginCapable == true && !authTabFellBack &&
+                                resolvedAuthTabProviderPackage() != null &&
+                                loginAttempts < MAX_LOGIN_ATTEMPTS
+                        },
+                        onProxyLoginRequired = ::startProxyLogin,
                     )
                 webChromeClient =
                     OmnigentWebChromeClient(
@@ -194,7 +253,7 @@ class MainActivity : AppCompatActivity() {
         // alone (unreliable < API 30 and across OEM builds). Cached so the first
         // post-load emit (in onPageReady) isn't lost to the pre-load race.
         ViewCompat.setOnApplyWindowInsetsListener(webView) { view, insets ->
-            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            val bars = systemSafeAreaInsets(insets)
             val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
             // Edge-to-edge (setDecorFitsSystemWindows=false, above) neutralizes the
             // manifest's adjustResize: the window no longer shrinks when the IME
@@ -282,7 +341,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        applySystemBarContrast()
+        applySystemBarContrast(newConfig)
         if (::webView.isInitialized) {
             // Notify matchMedia listeners without reloading the SPA.
             webView.dispatchConfigurationChanged(newConfig)
@@ -329,9 +388,12 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun applySystemBarContrast() {
+    // Takes the configuration explicitly because onConfigurationChanged
+    // delivers the NEW config before this Activity's cached
+    // `resources.configuration` necessarily reflects it.
+    private fun applySystemBarContrast(config: Configuration = resources.configuration) {
         val isLightMode =
-            resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK !=
+            config.uiMode and Configuration.UI_MODE_NIGHT_MASK !=
                 Configuration.UI_MODE_NIGHT_YES
         WindowInsetsControllerCompat(window, window.decorView).apply {
             isAppearanceLightStatusBars = isLightMode
@@ -372,6 +434,211 @@ class MainActivity : AppCompatActivity() {
         historyCleared = false
     }
 
+    private fun resolvedAuthTabProviderPackage(): String? =
+        authTabProviderPackageForTest?.invoke() ?: authTabProviderPackage
+
+    private fun probeAuthTabCapability() {
+        val origin = pinnedOrigin ?: return
+        if (authTabCapabilityPending) return
+        if (usesInWebViewAuth(origin)) {
+            authTabOriginCapable = false
+            return
+        }
+        if (resolvedAuthTabProviderPackage() == null) {
+            authTabOriginCapable = false
+            fallBackFromAuthTab("no Auth Tab provider")
+            return
+        }
+        authTabCapabilityPending = true
+        authTabCapabilityProbe.probe(origin) { supported ->
+            authTabCapabilityPending = false
+            if (isDestroyed || isFinishing || origin != pinnedOrigin) return@probe
+            authTabOriginCapable = supported
+            authLog("asset links probe $origin -> ${if (supported) "available" else "unavailable"}")
+            when {
+                supported && resolvedAuthTabProviderPackage() != null -> {
+                    startProxyLogin()
+                }
+
+                else -> {
+                    fallBackFromAuthTab("Auth Tab capability unavailable")
+                }
+            }
+        }
+    }
+
+    /**
+     * Start a login in the Auth Tab: open the server's
+     * `/auth/native-complete` there, let whatever fronts the server (a
+     * front-door auth proxy, its IdP hops) run in a real browser context,
+     * and receive the completion redirect back through
+     * [handleAuthTabResult]. Triggered by [OmnigentWebViewClient] when a
+     * capable server bounces off-origin and an Auth Tab is available.
+     */
+    internal fun startProxyLogin() {
+        val origin = pinnedOrigin ?: return
+        if (authTabFlow.inFlight) return
+        if (loginAttempts >= MAX_LOGIN_ATTEMPTS) {
+            authLog("auth tab attempts exhausted ($loginAttempts) — not retrying")
+            return
+        }
+        val providerPackage = resolvedAuthTabProviderPackage()
+        if (providerPackage == null) {
+            fallBackFromAuthTab("no Auth Tab provider")
+            return
+        }
+        val callback = NativeAuth.callback(origin)
+        if (callback == null) {
+            fallBackFromAuthTab("auth tab requires an HTTPS server origin")
+            return
+        }
+        val url = authTabFlow.begin(origin, packageName) ?: return
+        loginAttempts++
+        historyCleared = false
+        authLog("proxy login -> auth tab") // URL carries package selector + PKCE, no credential
+        try {
+            AuthTabSupport.launchIntent(providerPackage).launch(
+                authTabLauncher,
+                url,
+                callback.host,
+                callback.path,
+            )
+        } catch (_: Exception) {
+            // No browser able to take the launch — abandon the flow and use
+            // the origin's established fallback.
+            authTabFlow.cancel()
+            fallBackFromAuthTab("auth tab launch failed")
+        }
+    }
+
+    /** Advance the login with an Auth Tab result, or use the established fallback. */
+    internal fun onAuthTabOutcome(
+        resultCode: Int,
+        resultUri: Uri?,
+    ) {
+        if (isDestroyed || isFinishing || !::webView.isInitialized) return
+        if (resultCode != AuthTabIntent.RESULT_OK) {
+            // Dismissed, or the tab failed — includes the transition case of a
+            // server without /auth/native-complete (login completes but no
+            // redirect ever fires, so the user closes the tab).
+            authTabFlow.cancel()
+            fallBackFromAuthTab("auth tab result=$resultCode")
+            return
+        }
+        // The tab is gone either way, so an unmatched callback (wrong state, a
+        // server-reported error, the pinned server changed mid-flow) must
+        // abandon the flow — leaving it armed would wedge every later login
+        // behind the in-flight check.
+        when (val outcome = authTabFlow.handleCallback(resultUri, pinnedOrigin)) {
+            null -> {
+                authTabFlow.cancel()
+                fallBackFromAuthTab("auth tab callback unmatched")
+            }
+
+            is AuthTabFlow.Outcome.LaunchExchangeTab -> {
+                // Front-door server: exchange rides a second, silently
+                // authenticated browser hop (a native POST can't cross the
+                // proxy). The same launcher receives the final callback.
+                authLog("auth tab -> exchange hop")
+                val callback = pinnedOrigin?.let(NativeAuth::callback)
+                if (callback == null) {
+                    authTabFlow.cancel()
+                    fallBackFromAuthTab("exchange tab lost HTTPS callback origin")
+                    return
+                }
+                val providerPackage = resolvedAuthTabProviderPackage()
+                if (providerPackage == null) {
+                    authTabFlow.cancel()
+                    fallBackFromAuthTab("exchange tab lost Auth Tab provider")
+                    return
+                }
+                try {
+                    AuthTabSupport.launchIntent(providerPackage).launch(
+                        authTabLauncher,
+                        outcome.url,
+                        callback.host,
+                        callback.path,
+                    )
+                } catch (_: Exception) {
+                    authTabFlow.cancel()
+                    fallBackFromAuthTab("exchange tab launch failed")
+                }
+            }
+
+            is AuthTabFlow.Outcome.ExchangePost -> {
+                authLog("auth tab -> exchange post")
+                nativeExchange.exchange(outcome) { auth ->
+                    if (isDestroyed || isFinishing || !::webView.isInitialized) {
+                        return@exchange
+                    }
+                    // Re-check the origin: the exchange ran async and a server
+                    // switch may have landed meanwhile.
+                    authTabFlow.cancel()
+                    if (auth == null || outcome.origin != pinnedOrigin) {
+                        fallBackFromAuthTab("code exchange failed")
+                    } else {
+                        applyNativeAuthResult(auth)
+                    }
+                }
+            }
+
+            is AuthTabFlow.Outcome.Complete -> {
+                applyNativeAuthResult(outcome.result)
+            }
+        }
+    }
+
+    private fun applyNativeAuthResult(auth: NativeAuth.Result) {
+        when (auth.tokenType) {
+            NativeAuth.TOKEN_TYPE_SESSION -> {
+                if (!installSessionCookie(auth.token)) {
+                    fallBackFromAuthTab("session token rejected")
+                }
+            }
+
+            NativeAuth.TOKEN_TYPE_BEARER -> {
+                bootstrapWithBearer(auth.token)
+            }
+        }
+    }
+
+    /**
+     * Reload the pinned server presenting the relayed front-door token as a
+     * Bearer on the main-frame request. The front door accepts it the way it
+     * accepts any programmatic access, letting the shell back in without the
+     * browser's cookie jar.
+     */
+    private fun bootstrapWithBearer(token: String) {
+        val url = currentServerUrl ?: return
+        authLog("auth tab -> bearer bootstrap (token len=${token.length})")
+        webView.loadUrl(url, mapOf("Authorization" to "Bearer $token"))
+    }
+
+    /** Route an Auth Tab failure through the origin's established login surface. */
+    private fun fallBackFromAuthTab(reason: String) {
+        if (usesInWebViewAuth(pinnedOrigin)) {
+            fallBackToInlineLogin(reason)
+            return
+        }
+        authLog("auth tab fallback -> system browser ($reason)")
+        authTabFellBack = true
+        startLogin()
+    }
+
+    /** Reload a legacy in-WebView-auth server so its redirect chain stays inline. */
+    private fun fallBackToInlineLogin(reason: String) {
+        authLog("auth tab fallback -> inline ($reason)")
+        authTabFellBack = true
+        currentServerUrl?.let { webView.loadUrl(it) }
+    }
+
+    private fun resetAuthTabCapability(origin: String?) {
+        authTabCapabilityProbe.forget(origin)
+        authTabFellBack = false
+        authTabOriginCapable = null
+        authTabCapabilityPending = false
+    }
+
     /**
      * Bridge the session from the browser into the WebView: the polled JWT is
      * exactly the session-cookie value, so set it as the cookie (the browser's
@@ -383,20 +650,49 @@ class MainActivity : AppCompatActivity() {
      * rules, so we both attempt a reorder-to-front (works within the grace
      * period) AND post a "tap to return" notification as the reliable path back.
      */
-    private fun onSessionToken(token: String) {
+    internal fun onSessionToken(
+        loginOrigin: String,
+        token: String,
+    ) {
+        // A server switch can land between starting a login and its poll
+        // completing; a token minted for another origin must never be
+        // injected into the current one.
+        if (loginOrigin != pinnedOrigin) {
+            authLog("onSessionToken: origin changed since login started — dropping token")
+            return
+        }
         // The poll can land after the activity is gone (it ran on a background
         // thread up to 5 min) — never touch a destroyed WebView.
         if (isDestroyed || isFinishing || !::webView.isInitialized) return
+        if (!installSessionCookie(token)) return
+        startActivity(
+            Intent(this, MainActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+        )
+        notifications.notify(
+            title = getString(R.string.signed_in_title),
+            body = getString(R.string.signed_in_body),
+            navigatePath = "/",
+        )
+    }
+
+    /**
+     * Install [token] as the WebView session cookie and reload. Shared by
+     * the browser-poll login (which additionally foregrounds the app) and
+     * the Auth Tab completion (already foreground — the result resumed us).
+     * Returns false when the token was rejected before any cookie write.
+     */
+    private fun installSessionCookie(token: String): Boolean {
         // Defense-in-depth: the token is interpolated into the cookie string, so a
         // value carrying ';' or whitespace could smuggle in cookie attributes
         // (e.g. Domain=, defeating the __Host- prefix). A real session token is an
         // HS256 JWT — three base64url segments — which never contains those, so
         // this only ever rejects a malformed/hostile value, never a valid login.
         if (!isJwtShaped(token)) {
-            authLog("onSessionToken: token not JWT-shaped — rejecting")
-            return
+            authLog("installSessionCookie: token not JWT-shaped — rejecting")
+            return false
         }
-        val origin = pinnedOrigin ?: return
+        val origin = pinnedOrigin ?: return false
         val secure = origin.startsWith("https://")
         // Matches the server's session_cookie_name: __Host- prefix on HTTPS.
         val name = if (secure) "__Host-ap_session" else "ap_session"
@@ -425,15 +721,7 @@ class MainActivity : AppCompatActivity() {
             cookies.flush()
             webView.loadUrl(origin)
         }
-        startActivity(
-            Intent(this, MainActivity::class.java)
-                .addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or Intent.FLAG_ACTIVITY_SINGLE_TOP),
-        )
-        notifications.notify(
-            title = getString(R.string.signed_in_title),
-            body = getString(R.string.signed_in_body),
-            navigatePath = "/",
-        )
+        return true
     }
 
     /**
@@ -480,6 +768,7 @@ class MainActivity : AppCompatActivity() {
         pendingMicRequest?.deny()
         pendingMicRequest = null
         loginManager.shutdown()
+        nativeExchange.shutdown()
         if (::blobSaver.isInitialized) blobSaver.shutdown()
         if (::webView.isInitialized) {
             removeBridge()
@@ -519,11 +808,20 @@ class MainActivity : AppCompatActivity() {
         serverUrl: String,
         newOrigin: String,
     ) {
+        loginManager.cancel() // a login for the old origin must not outlive the switch
+        val previousOrigin = pinnedOrigin
         removeBridge()
         pinnedOrigin = newOrigin
+        currentServerUrl = serverUrl
         pageLoaded = false
         historyCleared = false
         loginAttempts = 0
+        // A login for the previous server can't complete on the new one:
+        // the flow's origin binding would reject its callback anyway, but
+        // drop it eagerly so a fresh login can start immediately.
+        authTabFlow.cancel()
+        authTabCapabilityProbe.forget(previousOrigin)
+        resetAuthTabCapability(newOrigin)
         (switchButton as? TextView)?.text = hostLabelOf(serverUrl)
         installBridge()
         webView.loadUrl(serverUrl)
@@ -571,6 +869,7 @@ class MainActivity : AppCompatActivity() {
         popup.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 3 -> {
+                    resetAuthTabCapability(pinnedOrigin)
                     webView.reload()
                     true
                 }
@@ -644,7 +943,7 @@ class MainActivity : AppCompatActivity() {
         // pins to a user-supplied server whose web build may PRE-DATE the Android
         // shell's CSS — it can't be assumed to carry the `[data-android-native]`
         // fold:
-        //   1. `--omnigent-safe-top/bottom` — the app's OWN base inset vars. Every
+        //   1. `--omnigent-safe-*` — the app's OWN base inset vars. Every
         //      build already derives `--omnigent-inset-*` and its layout from
         //      these, defaulting them to `env(safe-area-inset-*)`, which Android
         //      WebView reports as 0. Setting them inline (highest priority)
@@ -658,21 +957,7 @@ class MainActivity : AppCompatActivity() {
         // the safe area there would mis-assign it to a bar-footprint variable.
         val bars = lastInsets ?: return
         val d = resources.displayMetrics.density
-        val js =
-            """
-            (() => {
-              const s = document.documentElement.style;
-              const top = '${bars.top / d}px';
-              const bottom = '${bars.bottom / d}px';
-              s.setProperty('--omnigent-safe-top', top);
-              s.setProperty('--omnigent-safe-bottom', bottom);
-              s.setProperty('--omnigent-android-safe-area-top', top);
-              s.setProperty('--omnigent-android-safe-area-bottom', bottom);
-              s.setProperty('--omnigent-android-safe-area-left', '${bars.left / d}px');
-              s.setProperty('--omnigent-android-safe-area-right', '${bars.right / d}px');
-            })();
-            """.trimIndent()
-        webView.evaluateJavascript(js, null)
+        webView.evaluateJavascript(androidSafeAreaScript(bars, d), null)
     }
 
     private fun hasPermission(permission: String): Boolean =

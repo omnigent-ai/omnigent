@@ -95,6 +95,11 @@ services:
       #   "header"   — read X-Forwarded-Email from a trusted proxy;
       #                requests missing the header are rejected (401)
       OMNIGENT_AUTH_PROVIDER: "${OMNIGENT_AUTH_PROVIDER:-}"
+      # Android Auth Tab callback ownership. These must be set together;
+      # leaving both blank keeps the completion route mounted with a readable
+      # configuration error instead of a browser-stranding 404.
+      OMNIGENT_NATIVE_AUTH_BASE_URL: "${OMNIGENT_NATIVE_AUTH_BASE_URL:-}"
+      OMNIGENT_ANDROID_AUTH_TAB_APPS: "${OMNIGENT_ANDROID_AUTH_TAB_APPS:-}"
 
       # OIDC config — consumed when OIDC mode is active (AUTH_ENABLED=1
       # with OMNIGENT_OIDC_ISSUER set, or AUTH_PROVIDER=oidc). Required

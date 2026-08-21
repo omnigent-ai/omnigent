@@ -194,6 +194,14 @@
     env(safe-area-inset-bottom, 0px),
     var(--omnigent-android-safe-area-bottom, 0px)
   );
+  --omnigent-safe-left: max(
+    env(safe-area-inset-left, 0px),
+    var(--omnigent-android-safe-area-left, 0px)
+  );
+  --omnigent-safe-right: max(
+    env(safe-area-inset-right, 0px),
+    var(--omnigent-android-safe-area-right, 0px)
+  );
   --omnigent-native-top-bar: 0px; /* set by native bridge (px) */
   --omnigent-native-bottom-bar: 0px; /* set by native bridge (px) */
   --omnigent-top-bar-visible: 0; /* web-owned 0|1 */
@@ -927,6 +935,7 @@ aside[aria-label="Workspace"][data-maximized] {
   :is([data-ios-native], [data-android-native])
     :is(
       .conversations-sidebar,
+      [data-testid="execution-logs-panel"],
       [data-testid="file-viewer"],
       [data-testid="files-panel-drawer"],
       [data-testid="terminals-panel"],
@@ -935,6 +944,45 @@ aside[aria-label="Workspace"][data-maximized] {
     ) {
     padding-top: var(--omnigent-safe-top);
     padding-bottom: var(--omnigent-safe-bottom);
+    padding-left: var(--omnigent-safe-left);
+    padding-right: var(--omnigent-safe-right);
+  }
+}
+
+/* The Workspace rail only exists at md+, outside the mobile-only inset rules
+ * above. It is already hidden below md, so no media wrapper is needed. */
+:is([data-ios-native], [data-android-native]) aside[aria-label="Workspace"] {
+  padding-top: var(--omnigent-safe-top);
+  padding-bottom: var(--omnigent-safe-bottom);
+  padding-left: var(--omnigent-safe-left);
+  padding-right: var(--omnigent-safe-right);
+}
+
+/* Docked right-edge panels replace the rail in the same md+ slot, so they
+ * need the rail's safe-area treatment — except the left edge (content sits
+ * there) and panels nested inside the already-padded rail (double inset). */
+@media (width >= 48rem) {
+  :is([data-ios-native], [data-android-native])
+    :is(
+      [data-testid="execution-logs-panel"],
+      [data-testid="file-viewer"],
+      [data-testid="terminals-panel"]
+    ):not(aside[aria-label="Workspace"] *) {
+    padding-top: var(--omnigent-safe-top);
+    padding-bottom: var(--omnigent-safe-bottom);
+    padding-right: var(--omnigent-safe-right);
+  }
+}
+
+/* At md+ the conversations sidebar is a pinned column on the left screen
+ * edge, so it needs the safe-area treatment on its exposed edges — top,
+ * bottom, and left. Content sits at its right edge, so no right inset.
+ * Android-only: iOS md+ (iPad) keeps its current layout untouched. */
+@media (width >= 48rem) {
+  [data-android-native] .conversations-sidebar {
+    padding-top: var(--omnigent-safe-top);
+    padding-bottom: var(--omnigent-safe-bottom);
+    padding-left: var(--omnigent-safe-left);
   }
 }
 

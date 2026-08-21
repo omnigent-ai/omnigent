@@ -30,6 +30,120 @@ structural equivalent of the iOS bridge's frame-origin + `isMainFrame` check:
 the transport object is never delivered to a sandboxed / cross-origin
 agent-HTML iframe, so an injected artifact can't reach the native surface.
 
+## Auth Tab server association
+
+Self-managed header-mode servers behind a same-origin front door can run login
+in an Android Auth Tab when the proxy also forwards a per-user token. The
+callback is honored only if the browser's Digital Asset Links check succeeds.
+That check is a client-side browser control; the server cannot verify which
+Android app opened `/auth/native-complete`. In particular,
+`client_package` is an untrusted query parameter: another app can copy the
+allowlisted package string and make the authenticated server allocate a flow.
+It still needs the state/PKCE verifier and a browser-approved callback to obtain
+the credential.
+
+The shell does not classify this flow by hostname. On the first off-origin
+login bounce for a server origin, it anonymously probes
+`/.well-known/assetlinks.json`, caches the result for that origin, and selects
+Auth Tab only when an HTTP 200 response contains an Android-app entry matching
+the running package, signing certificate, and `handle_all_urls` relation. A
+failed probe preserves the inline fallback for Databricks origins; other server
+types keep their existing system-browser login path. The probe is only a launch
+hint; the browser's Digital Asset Links verification remains authoritative.
+
+Configure the public HTTPS origin plus the installed app's package and signing
+certificate in the non-secret server config:
+
+```yaml
+native_auth_base_url: https://omnigent.example.com
+android_auth_tab_apps:
+  - package_name: ai.omnigent.android
+    sha256_cert_fingerprints:
+      - "REPLACE_WITH_PLAY_OR_APK_SIGNING_CERT_SHA256"
+```
+
+No official release-signing fingerprint is stored in this repository; a human
+release operator must replace the placeholder. Use the app-signing certificate
+fingerprint (not the upload certificate when Play App Signing is enabled);
+self-built APKs use the certificate that signed that APK. Hosted entrypoints
+also accept `OMNIGENT_NATIVE_AUTH_BASE_URL` and
+`OMNIGENT_ANDROID_AUTH_TAB_APPS` (the app list encoded as JSON). The configured
+base URL must be the same origin users enter in the Android shell. Callback
+locations are built from this value only after its host matches the request's
+`Host`/`X-Forwarded-Host`; a mismatch is logged and refused.
+
+### Make Digital Asset Links anonymous at the front door
+
+The browser fetches
+`https://<native_auth_base_url>/.well-known/assetlinks.json` without the user's
+front-door cookie. Configure the operator-managed edge/front door to bypass
+authentication for the exact `GET`/`HEAD` path
+`/.well-known/assetlinks.json` and serve the JSON with HTTP 200; keep every
+other path, including `/auth/*`, protected. The app already serves the
+configured JSON at that path, so a reverse proxy can pass the request through,
+or the edge can serve the same static body directly.
+
+Run this from a machine with no browser session, cookies, or Authorization
+header:
+
+```bash
+origin=https://omnigent.example.com
+package_name=ai.omnigent.android
+fingerprint=REPLACE_WITH_SIGNING_CERT_SHA256
+status="$(curl --silent --show-error --output /tmp/assetlinks.json \
+  --write-out '%{http_code}' "$origin/.well-known/assetlinks.json")"
+test "$status" = 200
+jq -e --arg package "$package_name" --arg fingerprint "$fingerprint" \
+  'type == "array" and any(.[];
+    (((.relation // []) | index("delegate_permission/common.handle_all_urls")) != null) and
+    .target.namespace == "android_app" and
+    .target.package_name == $package and
+    (((.target.sha256_cert_fingerprints // []) | index($fingerprint)) != null))' \
+  /tmp/assetlinks.json
+```
+
+A `200 []`, redirect to login, or any 401/403 response is a failed reachability check.
+Without the anonymous exemption, the Android shell uses the origin's established
+fallback: inline for direct Databricks Apps origins, RFC 8252 system browser for
+other origins.
+
+Databricks Apps does not provide public/anonymous access or a customer
+path-level authentication exemption (see the
+[Databricks Apps permissions documentation](https://docs.databricks.com/aws/en/dev-tools/databricks-apps/permissions)).
+Therefore a direct `*.databricksapps.com` origin always takes the inline
+fallback. Auth Tab requires an operator-managed same-origin front door/custom
+domain that can expose this exact file anonymously while protecting the app.
+
+The allowlist is empty by default. Missing configuration, a package/signature
+mismatch, or a verification timeout returns the shell to that established
+fallback; there is no custom-scheme fallback.
+
+### Human verification with a self-managed front door
+
+0. Run Omnigent in header auth mode (`OMNIGENT_AUTH_PROVIDER=header`). Configure
+   the front door to forward a per-user access token in
+   `X-Forwarded-Access-Token`, or set `OMNIGENT_FORWARDED_TOKEN_HEADER` to its
+   actual header name. oauth2-proxy and Cloudflare Access do not forward this
+   token by default. Header mode is the only front-door deployment that selects
+   `exchange=tab`; an `oidc`/`accounts` server behind a front door selects
+   `exchange=post` and cannot complete through that front door.
+1. Put Omnigent behind `https://omnigent.example.com`, and exempt only
+   `/.well-known/assetlinks.json` from front-door authentication.
+2. Build a debug APK with `./gradlew assembleDebug`, read the debug variant's
+   SHA-256 from `./gradlew signingReport`, and set `native_auth_base_url` plus
+   `android_auth_tab_apps` using package `ai.omnigent.android` and that
+   debug-keystore fingerprint.
+3. Run the anonymous `curl` + `jq` check above from a clean machine or incognito
+   network client; it must exit zero.
+4. Install that debug APK, enter `https://omnigent.example.com` as the server,
+   clear any existing front-door session, and start login.
+5. Confirm `adb logcat -s OmnigentAuth` contains `asset links probe ... -> available`
+   followed by `proxy login -> auth tab`, then complete login and verify the SPA
+   loads authenticated in the WebView.
+6. Remove the anonymous exemption, return `[]`, or publish a non-matching
+   fingerprint; choose **Reload**, repeat login, and confirm the shell takes the
+   established fallback instead of launching Auth Tab.
+
 ## Scope (first version)
 
 Provides native setup chrome (server entry + recent servers via
