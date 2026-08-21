@@ -45,6 +45,7 @@ from omnigent.server.schemas import (
 from omnigent.spec.types import (
     StateUpdate,
 )
+from omnigent.stores.conversation_store import WORKTREE_SETUP_LABEL_KEY
 
 # Pinned to the historical module path so log records keep landing on the
 # ``omnigent.server.routes.sessions`` logger after the split into this package.
@@ -234,6 +235,20 @@ _LAST_TASK_ERROR_CAUSE_LABEL_KEY: str = "omnigent.last_task_error_cause"
 
 
 _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY: str = "omnigent.last_task_error_remediation"
+
+
+# Progress of a project's post-create worktree setup command for this session:
+# ``"running"`` while the host runs it, ``"done"`` / ``"failed"`` after. Read by
+# the first-turn gate (which must not dispatch into a half-prepared worktree)
+# and projected into the session snapshot so a reload mid-setup still shows the
+# "running setup command" indicator. Absent for sessions with no hook. The key
+# is shared with the runner (``sys_session_get_info``), so it is defined once in
+# the store's label vocabulary.
+_WORKTREE_SETUP_LABEL_KEY: str = WORKTREE_SETUP_LABEL_KEY
+
+_WORKTREE_SETUP_RUNNING: str = "running"
+_WORKTREE_SETUP_DONE: str = "done"
+_WORKTREE_SETUP_FAILED: str = "failed"
 
 
 _LABEL_VALUE_MAX_LEN: int = LABEL_VALUE_MAX_LEN
@@ -613,6 +628,11 @@ _runner_relay_tasks: dict[str, _RelayHandle] = {}
 _deferred_elicitation_clear_tasks: set[asyncio.Task[None]] = set()
 
 
+# Strong refs to detached post-create worktree-setup hook tasks, so a long
+# dependency install is never garbage-collected mid-run.
+_worktree_hook_tasks: set[asyncio.Task[None]] = set()
+
+
 _MODEL_TOKEN_KEYS = (
     "input_tokens",
     "output_tokens",
@@ -899,6 +919,10 @@ __all__ = [
     "_UI_ADDED_AGENT_TITLE_PREFIX",
     "_UPLOAD_READ_CHUNK_BYTES",
     "_WATCHER_TASKS",
+    "_WORKTREE_SETUP_DONE",
+    "_WORKTREE_SETUP_FAILED",
+    "_WORKTREE_SETUP_LABEL_KEY",
+    "_WORKTREE_SETUP_RUNNING",
     "_MirroredToolCall",
     "_PendingPolicyAskWrites",
     "_RelayHandle",
@@ -933,6 +957,7 @@ __all__ = [
     "_session_status_cache",
     "_session_terminal_pending_cache",
     "_session_todos_cache",
+    "_worktree_hook_tasks",
     "get_server_host_registry",
     "get_server_runner_router",
     "set_server_host_registry",

@@ -42,6 +42,15 @@ prompt: |
   EXPLORE / SEARCH — answer a specific question, read-only:
   - Read only what you need; edit nothing. Answer with file:line evidence.
 
+  CODEGRAPH — when codegraph MCP tools (`codegraph_explore`,
+  `codegraph_search`, `codegraph_callers`, ...) are in your tool list (this
+  spec declares a codegraph MCP server), lead with them to orient: one
+  explore call usually replaces a whole grep-and-read loop, and
+  callers/callees/impact answer call-graph questions grep can't. They need
+  the repo to have a `.codegraph/` index — a missing-index error just means
+  search normally. The index may lag your branch; verify file:line by reading
+  before you cite or edit.
+
   Always return a clear, structured result: for IMPLEMENT, what you changed
   (file:line) and how you verified it; for REVIEW / EXPLORE, your findings.
   Note anything that did not fit the task.

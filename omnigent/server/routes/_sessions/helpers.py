@@ -56,6 +56,7 @@ from omnigent.entities import (
 )
 from omnigent.entities.conversation import (
     ITEM_TYPE_TO_DATA_CLS,
+    TerminalCommandData,
     parse_item_data,
 )
 from omnigent.entities.permission import SessionPermission
@@ -111,7 +112,7 @@ from omnigent.server.managed_hosts import (
 from omnigent.server.routes._auth_helpers import (
     require_access as _require_access,
 )
-from omnigent.server.routes._host_worktree import CreatedWorktree
+from omnigent.server.routes._host_worktree import CreatedWorktree, WorktreeHookOutcome
 from omnigent.server.routes._session_create_validation import (
     validate_existing_host_workspace,
 )
@@ -188,6 +189,10 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _TURN_ACTOR_LABEL,
     _UI_ADDED_AGENT_TITLE_PREFIX,
     _UPLOAD_READ_CHUNK_BYTES,
+    _WORKTREE_SETUP_DONE,
+    _WORKTREE_SETUP_FAILED,
+    _WORKTREE_SETUP_LABEL_KEY,
+    _WORKTREE_SETUP_RUNNING,
     COST_CONTROL_OVERRIDE_VALUES,
     SUBAGENT_ROUTING_OVERRIDE_VALUES,
     _catalog_prefetch_tasks,
@@ -210,6 +215,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_status_cache,
     _session_terminal_pending_cache,
     _session_todos_cache,
+    _worktree_hook_tasks,
     build_policy_engine,
     get_agent_cache,
     get_caps,
@@ -261,6 +267,7 @@ from omnigent.server.schemas import (
     SkillSummary,
     ToolOutputDeltaEvent,
 )
+from omnigent.server.worktree_hooks import POST_CREATE_HOOK
 from omnigent.session_lifecycle import (
     labels_with_closed_status,
     title_without_closed_marker,
@@ -274,6 +281,7 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
+    PROJECT_LABEL_KEY,
     ConversationNotFoundError,
     NameAlreadyExistsError,
 )
@@ -7675,6 +7683,7 @@ async def _create_session_worktree(
     source_repo: str | None,
     git: SessionGitOptions,
     request: Request,
+    worktree_root: str | None = None,
 ) -> CreatedWorktree:
     """
     Create a git worktree on the host for a new session branch.
@@ -7692,6 +7701,8 @@ async def _create_session_worktree(
     :param git: Validated git options (``branch_name``, optional
         ``base_branch``).
     :param request: FastAPI request carrying the host registry.
+    :param worktree_root: The project's configured worktree root, e.g.
+        ``".worktrees"``. ``None`` uses the host's built-in layout.
     :returns: The created worktree's ``worktree_path`` (to store as
         ``workspace``) and ``branch`` (to store as ``git_branch``).
     :raises OmnigentError: ``invalid_input`` for a bad branch name,
@@ -7726,6 +7737,7 @@ async def _create_session_worktree(
             repo_path=source_repo,
             branch_name=git.branch_name,
             base_branch=git.base_branch,
+            worktree_root=worktree_root,
         )
     except WorktreeHostUnavailableError as exc:
         # Host offline / unresponsive — infra, not user input.
@@ -7796,6 +7808,597 @@ async def _remove_session_worktree_best_effort(
             worktree_path,
             exc_info=True,
         )
+
+
+# ── User-defined worktree lifecycle hooks ────────────────────
+#
+# A project can configure a post-create setup command and a pre-delete
+# teardown command (see :mod:`omnigent.server.worktree_hooks`). The HOST runs
+# them in the worktree; this section owns the server-side orchestration:
+# progress state, live events, durable transcript items, and the first-turn
+# gate. Both hooks are fail-open — a failure is surfaced, never fatal.
+
+# How often the first-turn gate re-reads the setup state. Small enough that a
+# fast hook barely delays the first turn, large enough not to spin the store.
+_WORKTREE_SETUP_POLL_INTERVAL_S: float = 0.25
+
+# Epoch seconds after which a ``running`` setup state is considered stale.
+# Without it, a server restart mid-hook would leave the label at ``running``
+# forever and wedge every future turn on the gate below.
+_WORKTREE_SETUP_DEADLINE_LABEL_KEY: str = "omnigent.worktree_setup_deadline"
+
+# Slack over the hook's own timeout before the gate gives up and fails open.
+_WORKTREE_SETUP_GATE_MARGIN_S: float = 45.0
+
+# Error code on the durable banner a failed/timed-out setup command leaves.
+_WORKTREE_SETUP_FAILED_CODE: str = "worktree_setup_failed"
+
+
+@dataclass
+class _WorktreeHookRun:
+    """
+    Server-side outcome of one worktree lifecycle command.
+
+    :param outcome: What the host reported, or ``None`` when the hook
+        never ran (host offline, worktree gone).
+    :param error: Why the hook could not run, e.g.
+        ``"host 'host_a1' connection lost"``. ``None`` when it ran.
+    """
+
+    outcome: WorktreeHookOutcome | None
+    error: str | None
+
+    @property
+    def failure_reason(self) -> str | None:
+        """
+        One-line description of the failure, or ``None`` on success.
+
+        :returns: Human-readable reason suitable for a banner / toast.
+        """
+        if self.error is not None:
+            return self.error
+        outcome = self.outcome
+        if outcome is None:  # pragma: no cover — error is set whenever outcome is None
+            return "the command did not run"
+        if outcome.timed_out:
+            return "the command timed out and was killed"
+        if outcome.exit_code != 0:
+            return f"the command exited with status {outcome.exit_code}"
+        return None
+
+
+def _hook_result_payload(run: _WorktreeHookRun) -> dict[str, object]:
+    """
+    Project a hook run into the wire shape clients render.
+
+    :param run: The completed hook run.
+    :returns: ``{"exit_code", "timed_out", "output_tail", "error"}``.
+    """
+    outcome = run.outcome
+    return {
+        "exit_code": outcome.exit_code if outcome is not None else None,
+        "timed_out": outcome.timed_out if outcome is not None else False,
+        "output_tail": outcome.output_tail if outcome is not None else "",
+        "error": run.error,
+    }
+
+
+async def _run_worktree_hook_for_session(
+    *,
+    conv: Conversation,
+    hook: str,
+    command: str,
+    timeout_seconds: float,
+    host_registry: Any,
+) -> _WorktreeHookRun:
+    """
+    Run one worktree lifecycle command on the session's host.
+
+    :param conv: The session row; supplies the host, the worktree path
+        (``workspace``) and the branch.
+    :param hook: ``"post_create"`` or ``"pre_delete"``.
+    :param command: The project's configured command, e.g.
+        ``"bun install"``.
+    :param timeout_seconds: The project's clamped hook timeout.
+    :param host_registry: The live ``HostRegistry``, or ``None`` when
+        host support is not wired (then the hook cannot run).
+    :returns: The run's outcome, or an ``error`` explaining why it could
+        not run. Never raises — both hooks are fail-open.
+    """
+    from omnigent.server.routes._host_worktree import (
+        WorktreeProxyError,
+        run_worktree_hook_on_host,
+    )
+
+    if conv.host_id is None or conv.workspace is None:  # pragma: no cover — gated by callers
+        return _WorktreeHookRun(outcome=None, error="the session has no host-bound worktree")
+    if host_registry is None:
+        return _WorktreeHookRun(outcome=None, error="host support is not configured")
+    host_conn = host_registry.get(conv.host_id)
+    if host_conn is None:
+        return _WorktreeHookRun(
+            outcome=None,
+            error=f"host {conv.host_id!r} is offline",
+        )
+    try:
+        outcome = await run_worktree_hook_on_host(
+            host_registry=host_registry,
+            host_conn=host_conn,
+            command=command,
+            worktree_path=conv.workspace,
+            hook=hook,
+            branch=conv.git_branch,
+            timeout_seconds=timeout_seconds,
+        )
+    except WorktreeProxyError as exc:
+        # Covers both the host-unavailable subclass and a hook the host
+        # could not start at all. Fail open: the caller carries on.
+        return _WorktreeHookRun(outcome=None, error=exc.message)
+    return _WorktreeHookRun(outcome=outcome, error=None)
+
+
+def _publish_worktree_setup_in_progress(session_id: str, command: str) -> None:
+    """
+    Announce that the project's setup script is running for a session.
+
+    :param session_id: Session/conversation identifier, e.g.
+        ``"conv_abc123"``.
+    :param command: The script being run; the client summarizes it to one
+        line for the indicator.
+    """
+    session_stream.publish(
+        session_id,
+        {"type": "session.worktree_setup.in_progress", "command": command},
+    )
+
+
+def _publish_worktree_setup_completed(session_id: str) -> None:
+    """
+    Announce that the project's setup script finished successfully.
+
+    :param session_id: Session/conversation identifier.
+    """
+    session_stream.publish(session_id, {"type": "session.worktree_setup.completed"})
+
+
+def _publish_worktree_setup_failed(session_id: str, reason: str, output_tail: str) -> None:
+    """
+    Announce that the project's setup script failed or timed out.
+
+    The session is usable either way (fail-open); clients dismiss the
+    indicator and surface the reason.
+
+    :param session_id: Session/conversation identifier.
+    :param reason: One-line cause, e.g. ``"the command timed out and was
+        killed"``.
+    :param output_tail: Last 10 KB of the command's combined output.
+    """
+    session_stream.publish(
+        session_id,
+        {
+            "type": "session.worktree_setup.failed",
+            "reason": reason,
+            "output_tail": output_tail,
+        },
+    )
+
+
+async def _set_worktree_setup_state(
+    conversation_store: ConversationStore,
+    session_id: str,
+    state: str,
+    *,
+    deadline: float | None = None,
+) -> None:
+    """
+    Record the post-create setup progress for a session.
+
+    Stored as labels (upsert-per-key) rather than ``session_state``,
+    whose whole-column writes the runner's policy engine also owns.
+
+    :param conversation_store: Store used for the label upsert.
+    :param session_id: Session/conversation identifier.
+    :param state: ``"running"``, ``"done"``, or ``"failed"``.
+    :param deadline: Epoch seconds after which a ``"running"`` state is
+        stale, so a server restart mid-hook can't wedge the first-turn
+        gate. ``None`` clears it (the settled states).
+    """
+    updates = {
+        _WORKTREE_SETUP_LABEL_KEY: state,
+        _WORKTREE_SETUP_DEADLINE_LABEL_KEY: "" if deadline is None else f"{deadline:.0f}",
+    }
+    try:
+        await asyncio.to_thread(conversation_store.set_labels, session_id, updates)
+    except Exception:  # noqa: BLE001 — advisory state; never fail the caller
+        _logger.warning(
+            "Could not record worktree setup state %r for session %s",
+            state,
+            session_id,
+            exc_info=True,
+        )
+
+
+async def _persist_worktree_setup_transcript(
+    conversation_store: ConversationStore,
+    session_id: str,
+    command: str,
+    run: _WorktreeHookRun,
+) -> None:
+    """
+    Record the setup script and its output in the session transcript.
+
+    A successful run leaves a collapsed script + expandable output pair
+    (the same ``terminal_command`` items a runner-side ``!cmd`` produces,
+    so no new renderer is needed). A failure additionally leaves a
+    durable ``type="error"`` banner, so the degraded state survives a
+    refresh instead of living only in a toast.
+
+    :param conversation_store: Store used for the append.
+    :param session_id: Session/conversation identifier.
+    :param command: The command that ran.
+    :param run: Its outcome.
+    """
+    output = run.outcome.output_tail if run.outcome is not None else ""
+    # One response id groups the command with its output, the way a runner-side
+    # ``!cmd`` pair is grouped.
+    hook_response_id = generate_task_id()
+    items = [
+        NewConversationItem(
+            type="terminal_command",
+            response_id=hook_response_id,
+            data=TerminalCommandData(kind="input", input=command),
+        ),
+        NewConversationItem(
+            type="terminal_command",
+            response_id=hook_response_id,
+            data=TerminalCommandData(kind="output", stdout=output or None),
+        ),
+    ]
+    try:
+        persisted = await asyncio.to_thread(conversation_store.append, session_id, items)
+    except Exception:  # noqa: BLE001 — transcript record is advisory
+        _logger.warning(
+            "Could not persist worktree setup transcript for session %s",
+            session_id,
+            exc_info=True,
+        )
+        return
+    for item in persisted:
+        _publish_external_conversation_item(session_id, item)
+
+    reason = run.failure_reason
+    if reason is None:
+        return
+    error = ErrorData(
+        source="execution",
+        code=_WORKTREE_SETUP_FAILED_CODE,
+        message=(
+            f"The project's worktree setup script did not finish: {reason}. "
+            "The session is usable; re-run it yourself if the workspace "
+            "needs it."
+        ),
+    )
+    persisted_error = await _relay_persist_error_once(
+        conversation_store,
+        session_id,
+        NewConversationItem(
+            type="error",
+            response_id=generate_task_id(),
+            data=error,
+        ),
+    )
+    if persisted_error == "persisted":
+        _publish_error_event(session_id, error)
+
+
+async def _run_post_create_worktree_hook(
+    *,
+    session_id: str,
+    conv: Conversation,
+    command: str,
+    timeout_seconds: float,
+    conversation_store: ConversationStore,
+    host_registry: Any,
+) -> _WorktreeHookRun:
+    """
+    Run a project's post-create setup command and record the outcome.
+
+    The caller has already marked the session ``running`` (before its
+    response returned) so the first-turn gate can never miss the window.
+    This publishes the in-progress event, runs the hook, then settles the
+    state, publishes the terminal event, and persists the transcript.
+
+    :param session_id: Session/conversation identifier.
+    :param conv: The session row (host, worktree path, branch).
+    :param command: The project's configured setup command.
+    :param timeout_seconds: The project's clamped hook timeout.
+    :param conversation_store: Store for labels and transcript items.
+    :param host_registry: Live ``HostRegistry``.
+    :returns: The run, for callers that surface it synchronously.
+    """
+    _publish_worktree_setup_in_progress(session_id, command)
+    run = await _run_worktree_hook_for_session(
+        conv=conv,
+        hook=POST_CREATE_HOOK,
+        command=command,
+        timeout_seconds=timeout_seconds,
+        host_registry=host_registry,
+    )
+    reason = run.failure_reason
+    await _set_worktree_setup_state(
+        conversation_store,
+        session_id,
+        _WORKTREE_SETUP_DONE if reason is None else _WORKTREE_SETUP_FAILED,
+    )
+    if reason is None:
+        _publish_worktree_setup_completed(session_id)
+    else:
+        _publish_worktree_setup_failed(
+            session_id,
+            reason,
+            run.outcome.output_tail if run.outcome is not None else "",
+        )
+    await _persist_worktree_setup_transcript(conversation_store, session_id, command, run)
+    return run
+
+
+async def _begin_post_create_worktree_setup(
+    *,
+    session_id: str,
+    conversation_store: ConversationStore,
+    timeout_seconds: float,
+) -> None:
+    """
+    Mark a session as "setup running" before its create response returns.
+
+    Done synchronously on the create path so a first message posted
+    immediately after the response always observes the gate — scheduling
+    the hook alone would leave a window where the label is still absent.
+
+    :param session_id: Session/conversation identifier.
+    :param conversation_store: Store used for the label upsert.
+    :param timeout_seconds: The project's clamped hook timeout; sets the
+        staleness deadline the gate honors.
+    """
+    await _set_worktree_setup_state(
+        conversation_store,
+        session_id,
+        _WORKTREE_SETUP_RUNNING,
+        deadline=time.time() + timeout_seconds + _WORKTREE_SETUP_GATE_MARGIN_S,
+    )
+
+
+def _schedule_post_create_worktree_hook(
+    *,
+    session_id: str,
+    conv: Conversation,
+    command: str,
+    timeout_seconds: float,
+    conversation_store: ConversationStore,
+    host_registry: Any,
+) -> None:
+    """
+    Run a post-create setup command in the background.
+
+    The create response must not wait on a dependency install, so the
+    hook is detached; the first-turn gate is what keeps the agent from
+    starting in a half-prepared worktree.
+
+    :param session_id: Session/conversation identifier.
+    :param conv: The session row (host, worktree path, branch).
+    :param command: The project's configured setup command.
+    :param timeout_seconds: The project's clamped hook timeout.
+    :param conversation_store: Store for labels and transcript items.
+    :param host_registry: Live ``HostRegistry``.
+    """
+
+    async def _run() -> None:
+        try:
+            await _run_post_create_worktree_hook(
+                session_id=session_id,
+                conv=conv,
+                command=command,
+                timeout_seconds=timeout_seconds,
+                conversation_store=conversation_store,
+                host_registry=host_registry,
+            )
+        except Exception:  # noqa: BLE001 — a detached task must not die silently
+            _logger.exception(
+                "Post-create worktree hook crashed for session %s",
+                session_id,
+            )
+            # Never leave the gate closed on an unexpected error.
+            await _set_worktree_setup_state(conversation_store, session_id, _WORKTREE_SETUP_FAILED)
+
+    task = asyncio.create_task(_run(), name=f"worktree-setup-{session_id}")
+    _worktree_hook_tasks.add(task)
+    task.add_done_callback(_worktree_hook_tasks.discard)
+
+
+async def _await_worktree_setup(
+    session_id: str,
+    conversation_store: ConversationStore,
+) -> None:
+    """
+    Block until a session's post-create setup command has settled.
+
+    The first-turn gate: an agent must not start in a worktree whose
+    dependencies are still installing. Fails open in every direction — a
+    session with no hook returns immediately, and a ``running`` state
+    past its recorded deadline (a server that restarted mid-hook) is
+    treated as settled rather than wedging the session forever.
+
+    :param session_id: Session/conversation identifier.
+    :param conversation_store: Store used to re-read the state labels.
+    """
+    while True:
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            return
+        labels = conv.labels or {}
+        if labels.get(_WORKTREE_SETUP_LABEL_KEY) != _WORKTREE_SETUP_RUNNING:
+            return
+        raw_deadline = labels.get(_WORKTREE_SETUP_DEADLINE_LABEL_KEY) or ""
+        try:
+            deadline = float(raw_deadline)
+        except ValueError:
+            deadline = 0.0
+        if time.time() >= deadline:
+            _logger.warning(
+                "Worktree setup for session %s is past its deadline; dispatching the turn anyway",
+                session_id,
+            )
+            return
+        await asyncio.sleep(_WORKTREE_SETUP_POLL_INTERVAL_S)
+
+
+async def _run_pre_delete_worktree_hook(
+    *,
+    conv: Conversation,
+    user_id: str | None,
+    request: Request,
+) -> dict[str, object] | None:
+    """
+    Run the project's teardown command before a worktree is removed.
+
+    Fail-open: the caller deletes the worktree regardless of the outcome.
+    The session row is about to disappear, so nothing is persisted — the
+    result rides back in the DELETE response for the UI to toast.
+
+    :param conv: The session row being deleted (host, worktree, branch).
+    :param user_id: The deleting user, for the owner-scoped project
+        lookup.
+    :param request: FastAPI request carrying ``app.state``.
+    :returns: ``{"exit_code", "timed_out", "output_tail", "error"}``, or
+        ``None`` when the project configures no teardown command.
+    """
+    from omnigent.server.worktree_hooks import (
+        PRE_DELETE_HOOK,
+        hook_config_for_conversation,
+    )
+
+    project_store = getattr(request.app.state, "project_store", None)
+    config = await asyncio.to_thread(
+        hook_config_for_conversation,
+        conv=conv,
+        user_id=user_id,
+        project_store=project_store,
+    )
+    if config.pre_delete_command is None:
+        return None
+    run = await _run_worktree_hook_for_session(
+        conv=conv,
+        hook=PRE_DELETE_HOOK,
+        command=config.pre_delete_command,
+        timeout_seconds=config.timeout_seconds,
+        host_registry=getattr(request.app.state, "host_registry", None),
+    )
+    if run.failure_reason is not None:
+        _logger.warning(
+            "Pre-delete worktree hook for session %s did not succeed: %s",
+            conv.id,
+            run.failure_reason,
+        )
+    return _hook_result_payload(run)
+
+
+async def _maybe_start_post_create_worktree_setup(
+    *,
+    conv: Conversation,
+    user_id: str | None,
+    conversation_store: ConversationStore,
+    request: Request,
+    run_inline: bool = False,
+) -> _WorktreeHookRun | None:
+    """
+    Start the project's setup command for a newly created worktree.
+
+    Called from every path that CREATES a worktree (never from bind-mode,
+    which adopts a worktree the user already prepared, and never from
+    create-rollback, where the worktree is being destroyed).
+
+    :param conv: The session row bound to the new worktree.
+    :param user_id: The creating user, for the owner-scoped project
+        lookup.
+    :param conversation_store: Store for labels and transcript items.
+    :param request: FastAPI request carrying ``app.state``.
+    :param run_inline: When ``True``, await the hook instead of detaching
+        it — the runner-launch path, which must not spawn a runner into a
+        half-prepared worktree and has no first-turn gate of its own.
+    :returns: The completed run when ``run_inline``; ``None`` otherwise
+        (including when the project configures no setup command).
+    """
+    from omnigent.server.worktree_hooks import hook_config_for_conversation
+
+    project_store = getattr(request.app.state, "project_store", None)
+    config = await asyncio.to_thread(
+        hook_config_for_conversation,
+        conv=conv,
+        user_id=user_id,
+        project_store=project_store,
+    )
+    if config.post_create_command is None:
+        return None
+    host_registry = getattr(request.app.state, "host_registry", None)
+    if run_inline:
+        return await _run_post_create_worktree_hook(
+            session_id=conv.id,
+            conv=conv,
+            command=config.post_create_command,
+            timeout_seconds=config.timeout_seconds,
+            conversation_store=conversation_store,
+            host_registry=host_registry,
+        )
+    await _begin_post_create_worktree_setup(
+        session_id=conv.id,
+        conversation_store=conversation_store,
+        timeout_seconds=config.timeout_seconds,
+    )
+    _schedule_post_create_worktree_hook(
+        session_id=conv.id,
+        conv=conv,
+        command=config.post_create_command,
+        timeout_seconds=config.timeout_seconds,
+        conversation_store=conversation_store,
+        host_registry=host_registry,
+    )
+    return None
+
+
+async def _worktree_root_for_create(
+    *,
+    labels: dict[str, str] | None,
+    user_id: str | None,
+    request: Request,
+) -> str | None:
+    """
+    Resolve the project's worktree root for a session being created.
+
+    The worktree is created BEFORE the conversation row exists, so the
+    project is resolved from the create request's ``omni_project`` label
+    (the create body's only project handle — the first-class
+    ``project_id`` is written by a follow-up PATCH) rather than from a
+    session row, which would resolve nothing and silently fall back to
+    the built-in layout.
+
+    :param labels: ``body.labels``, which may carry ``omni_project``.
+    :param user_id: The creating user, for the owner-scoped lookup.
+    :param request: FastAPI request carrying ``app.state``.
+    :returns: The configured root, e.g. ``".worktrees"``, or ``None`` to
+        leave the host on its built-in layout.
+    """
+    from omnigent.server.worktree_hooks import (
+        project_config_for_name,
+        worktree_root_from_project_config,
+    )
+
+    config = await asyncio.to_thread(
+        project_config_for_name,
+        project_name=(labels or {}).get(PROJECT_LABEL_KEY),
+        user_id=user_id,
+        project_store=getattr(request.app.state, "project_store", None),
+    )
+    return worktree_root_from_project_config(config)
 
 
 def _resolve_subagent_spec(
@@ -9432,6 +10035,7 @@ __all__ = [
     "_attachment_disposition",
     "_authorize_bundled_parent_and_inherit_runner",
     "_await_settled_managed_launch",
+    "_await_worktree_setup",
     "_background_task_delivery_status",
     "_build_actor",
     "_build_evaluation_context",
@@ -9492,6 +10096,7 @@ __all__ = [
     "_load_model_options",
     "_load_model_options_from_host",
     "_load_runner_skills",
+    "_maybe_start_post_create_worktree_setup",
     "_mcp_error_response",
     "_mcp_input_required_response",
     "_mcp_ok_response",
@@ -9564,6 +10169,9 @@ __all__ = [
     "_publish_session_superseded",
     "_publish_status",
     "_publish_terminal_pending",
+    "_publish_worktree_setup_completed",
+    "_publish_worktree_setup_failed",
+    "_publish_worktree_setup_in_progress",
     "_query_host_runner_status",
     "_read_state_entry",
     "_read_upload_capped",
@@ -9590,6 +10198,7 @@ __all__ = [
     "_resource_event_item_from_sse",
     "_routing_decision_item_from_sse",
     "_run_compact_locked",
+    "_run_pre_delete_worktree_hook",
     "_same_provider_family",
     "_same_provider_family_impl",
     "_seed_missing_title",
@@ -9621,6 +10230,7 @@ __all__ = [
     "_validated_subagent_routing_override",
     "_wait_for_managed_runner_tunnel",
     "_wait_for_runner_client",
+    "_worktree_root_for_create",
     "announce_hosts_changed",
     "cancel_managed_launch_tasks",
     "prefetch_session_routing_catalogs",

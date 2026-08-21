@@ -61,6 +61,8 @@ class HostFrameKind(str, Enum):
     REMOVE_WORKTREE_RESULT = "host.remove_worktree_result"
     LIST_WORKTREES = "host.list_worktrees"
     LIST_WORKTREES_RESULT = "host.list_worktrees_result"
+    RUN_WORKTREE_HOOK = "host.run_worktree_hook"
+    RUN_WORKTREE_HOOK_RESULT = "host.run_worktree_hook_result"
     CREATE_DIR = "host.create_dir"
     CREATE_DIR_RESULT = "host.create_dir_result"
     INSTALL_HARNESS = "host.install_harness"
@@ -452,12 +454,17 @@ class HostCreateWorktreeFrame:
     :param branch_name: New branch to create, e.g. ``"feature/login"``.
     :param base_branch: Optional base ref, e.g. ``"main"``. ``None``
         branches from ``HEAD``.
+    :param worktree_root: The project's configured directory to place the
+        worktree under, e.g. ``".worktrees"`` (repo-relative) or
+        ``"/data/worktrees"``. ``None`` — including from a server too old
+        to send it — uses the host's built-in sibling layout.
     """
 
     request_id: str
     repo_path: str
     branch_name: str
     base_branch: str | None = None
+    worktree_root: str | None = None
 
 
 @dataclass
@@ -500,12 +507,17 @@ class HostRemoveWorktreeFrame:
     :param delete_branch: When ``True``, ``git branch -D`` after
         removing the directory; when ``False``, remove only the
         directory.
+    :param require_merged_into: Ref the branch's commits must already be
+        reachable from before it may be deleted, e.g. the requesting
+        agent's own branch. ``None`` — including from a server too old to
+        send it — deletes unconditionally.
     """
 
     request_id: str
     worktree_path: str
     branch: str | None = None
     delete_branch: bool = False
+    require_merged_into: str | None = None
 
 
 @dataclass
@@ -559,6 +571,71 @@ class HostListWorktreesResultFrame:
     request_id: str
     status: str
     worktrees: list[_JsonObject] | None = None
+    error: str | None = None
+
+
+@dataclass
+class HostRunWorktreeHookFrame:
+    """Server → host: run a project's worktree lifecycle command.
+
+    The script is user-authored project config; the host writes it to a
+    file and runs it in the worktree directory. Both lifecycle points are
+    fail-open, so a non-zero exit is reported in the result rather than
+    being an error.
+
+    :param request_id: Correlates the result, e.g. ``"req_wt_hook_1"``.
+    :param command: Script to run — one line (``"bun install"``) or many,
+        optionally opening with a shebang that picks its interpreter.
+    :param worktree_path: Directory to run in, e.g.
+        ``"/Users/alice/myrepo-worktrees/feature-login"``.
+    :param hook: Lifecycle point — ``"post_create"`` or
+        ``"pre_delete"``. Exported as ``OMNIGENT_HOOK``.
+    :param repo_path: Main repo work tree, e.g.
+        ``"/Users/alice/myrepo"``. ``None`` omits
+        ``OMNIGENT_REPO_PATH``.
+    :param branch: Branch checked out in the worktree, e.g.
+        ``"feature/login"``.
+    :param base_branch: Base ref the branch forked from, e.g. ``"main"``.
+    :param timeout_seconds: Bound on the run; the host clamps it to
+        1–3600 s and defaults to 300 s when ``None``.
+    """
+
+    request_id: str
+    command: str
+    worktree_path: str
+    hook: str
+    repo_path: str | None = None
+    branch: str | None = None
+    base_branch: str | None = None
+    timeout_seconds: float | None = None
+
+
+@dataclass
+class HostRunWorktreeHookResultFrame:
+    """Host → server: outcome of a worktree lifecycle command.
+
+    ``status: "ok"`` means the hook RAN — it does not mean it succeeded;
+    read ``exit_code`` / ``timed_out`` for that. ``status: "failed"``
+    means the hook could not be started at all (e.g. the worktree
+    directory is gone).
+
+    :param request_id: Correlates to the
+        :class:`HostRunWorktreeHookFrame`, e.g. ``"req_wt_hook_1"``.
+    :param status: ``"ok"`` or ``"failed"``.
+    :param exit_code: The command's exit status, e.g. ``0``. ``None``
+        when it timed out or never started.
+    :param timed_out: ``True`` when the hook exceeded its timeout and
+        its process group was killed.
+    :param output_tail: Last 10 KB of combined stdout+stderr.
+    :param error: Why the hook could not be started, when ``status`` is
+        ``"failed"``. ``None`` otherwise.
+    """
+
+    request_id: str
+    status: str
+    exit_code: int | None = None
+    timed_out: bool = False
+    output_tail: str = ""
     error: str | None = None
 
 
@@ -869,6 +946,8 @@ HostFrame = (
     | HostRemoveWorktreeResultFrame
     | HostListWorktreesFrame
     | HostListWorktreesResultFrame
+    | HostRunWorktreeHookFrame
+    | HostRunWorktreeHookResultFrame
     | HostCreateDirFrame
     | HostCreateDirResultFrame
     | HostInstallHarnessFrame
@@ -1064,6 +1143,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "repo_path": frame.repo_path,
                 "branch_name": frame.branch_name,
                 "base_branch": frame.base_branch,
+                "worktree_root": frame.worktree_root,
             }
         )
     if isinstance(frame, HostCreateWorktreeResultFrame):
@@ -1085,6 +1165,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "worktree_path": frame.worktree_path,
                 "branch": frame.branch,
                 "delete_branch": frame.delete_branch,
+                "require_merged_into": frame.require_merged_into,
             }
         )
     if isinstance(frame, HostRemoveWorktreeResultFrame):
@@ -1111,6 +1192,32 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "request_id": frame.request_id,
                 "status": frame.status,
                 "worktrees": frame.worktrees,
+                "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostRunWorktreeHookFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.RUN_WORKTREE_HOOK.value,
+                "request_id": frame.request_id,
+                "command": frame.command,
+                "worktree_path": frame.worktree_path,
+                "hook": frame.hook,
+                "repo_path": frame.repo_path,
+                "branch": frame.branch,
+                "base_branch": frame.base_branch,
+                "timeout_seconds": frame.timeout_seconds,
+            }
+        )
+    if isinstance(frame, HostRunWorktreeHookResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.RUN_WORKTREE_HOOK_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "exit_code": frame.exit_code,
+                "timed_out": frame.timed_out,
+                "output_tail": frame.output_tail,
                 "error": frame.error,
             }
         )
@@ -1331,6 +1438,10 @@ def _decode_known_host_frame(
             return _decode_list_worktrees(msg)
         case HostFrameKind.LIST_WORKTREES_RESULT:
             return _decode_list_worktrees_result(msg)
+        case HostFrameKind.RUN_WORKTREE_HOOK:
+            return _decode_run_worktree_hook(msg)
+        case HostFrameKind.RUN_WORKTREE_HOOK_RESULT:
+            return _decode_run_worktree_hook_result(msg)
         case HostFrameKind.CREATE_DIR:
             return _decode_create_dir(msg)
         case HostFrameKind.CREATE_DIR_RESULT:
@@ -1597,6 +1708,7 @@ def _decode_create_worktree(msg: _JsonObject) -> HostCreateWorktreeFrame:
         repo_path=_required_str(msg, "repo_path"),
         branch_name=_required_str(msg, "branch_name"),
         base_branch=_optional_nullable_str(msg, "base_branch"),
+        worktree_root=_optional_nullable_str(msg, "worktree_root"),
     )
 
 
@@ -1631,6 +1743,7 @@ def _decode_remove_worktree(msg: _JsonObject) -> HostRemoveWorktreeFrame:
         worktree_path=_required_str(msg, "worktree_path"),
         branch=_optional_nullable_str(msg, "branch"),
         delete_branch=delete_branch,
+        require_merged_into=_optional_nullable_str(msg, "require_merged_into"),
     )
 
 
@@ -1680,6 +1793,54 @@ def _decode_list_worktrees_result(
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),
         worktrees=raw,
+        error=_optional_nullable_str(msg, "error"),
+    )
+
+
+def _decode_run_worktree_hook(msg: _JsonObject) -> HostRunWorktreeHookFrame:
+    """Decode a host.run_worktree_hook request frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.run_worktree_hook frame.
+    :raises ValueError: If ``timeout_seconds`` is present but not a
+        number.
+    """
+    raw_timeout = msg.get("timeout_seconds")
+    if raw_timeout is not None and not isinstance(raw_timeout, (int, float)):
+        raise ValueError("frame field must be a number or null: 'timeout_seconds'")
+    return HostRunWorktreeHookFrame(
+        request_id=_required_str(msg, "request_id"),
+        command=_required_str(msg, "command"),
+        worktree_path=_required_str(msg, "worktree_path"),
+        hook=_required_str(msg, "hook"),
+        repo_path=_optional_nullable_str(msg, "repo_path"),
+        branch=_optional_nullable_str(msg, "branch"),
+        base_branch=_optional_nullable_str(msg, "base_branch"),
+        timeout_seconds=None if raw_timeout is None else float(raw_timeout),
+    )
+
+
+def _decode_run_worktree_hook_result(
+    msg: _JsonObject,
+) -> HostRunWorktreeHookResultFrame:
+    """Decode a host.run_worktree_hook_result frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.run_worktree_hook_result frame.
+    :raises ValueError: If ``exit_code`` is present but not an int.
+    """
+    raw_code = msg.get("exit_code")
+    if raw_code is not None and not isinstance(raw_code, int):
+        raise ValueError("frame field must be an int or null: 'exit_code'")
+    output_tail = msg.get("output_tail", "")
+    if not isinstance(output_tail, str):
+        raise ValueError("frame field must be a string: 'output_tail'")
+    return HostRunWorktreeHookResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        exit_code=raw_code,
+        timed_out=bool(msg.get("timed_out", False)),
+        output_tail=output_tail,
         error=_optional_nullable_str(msg, "error"),
     )
 

@@ -234,6 +234,7 @@ from omnigent.server.routes._sessions.helpers import (
     _load_model_options,
     _load_model_options_from_host,
     _load_runner_skills,
+    _maybe_start_post_create_worktree_setup,
     _mcp_error_response,
     _mcp_input_required_response,
     _mcp_ok_response,
@@ -301,6 +302,7 @@ from omnigent.server.routes._sessions.helpers import (
     _validated_subagent_routing_override,
     _wait_for_managed_runner_tunnel,
     _wait_for_runner_client,
+    _worktree_root_for_create,
 )
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.schemas import (
@@ -7852,6 +7854,14 @@ async def _create_session_from_existing_agent(
                 source_repo=canonical_workspace,
                 git=body.git,
                 request=request,
+                # The project's worktree root, resolved from the REQUEST (the
+                # conversation row does not exist yet) so every worktree in a
+                # project lands in the same directory.
+                worktree_root=await _worktree_root_for_create(
+                    labels=body.labels,
+                    user_id=user_id,
+                    request=request,
+                ),
             )
             canonical_workspace = created_worktree.worktree_path
             git_branch = created_worktree.branch
@@ -8176,6 +8186,23 @@ async def _create_session_from_existing_agent(
             )
     except Exception:  # noqa: BLE001
         pass
+
+    # Project-configured worktree setup command. Gated on
+    # ``created_worktree_path``: a bind-mode session adopts a worktree the user
+    # already prepared, so re-running setup in it is not ours to do. Detached —
+    # the create response must not wait on a dependency install; the first-turn
+    # gate in POST /events is what keeps the agent out of a half-prepared tree.
+    # Re-read the row so the ``omni_project`` label the create just stamped is
+    # visible to the project lookup.
+    if created_worktree_path is not None:
+        conv_for_hook = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+        if conv_for_hook is not None:
+            await _maybe_start_post_create_worktree_setup(
+                conv=conv_for_hook,
+                user_id=user_id,
+                conversation_store=conversation_store,
+                request=request,
+            )
 
     if body.initial_items:
         runner_client = await _get_runner_client(conv.id, runner_router)

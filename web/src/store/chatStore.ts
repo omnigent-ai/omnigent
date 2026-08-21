@@ -77,6 +77,7 @@ import type {
   SessionInputConsumedEvent,
   SessionViewer,
   StreamEvent,
+  WorktreeSetupState,
 } from "@/lib/events";
 import { createPresenceIdleTracker } from "@/lib/presenceIdle";
 import { conversationRegistry, type ConversationEntry } from "./conversationRegistry";
@@ -528,6 +529,19 @@ export interface ConversationState {
    * harness reports no MCP startup.
    */
   mcpStartup: Record<string, McpServerStartup> | null;
+  /**
+   * The project's post-create worktree setup command for this session while it
+   * matters. `state: "running"` drives the "Running setup command…" band (the
+   * first turn is gated on it server-side); `"failed"` keeps the reason around
+   * for the band's failure line — the durable error item in the transcript is
+   * what survives a refresh. `null` for every session with no setup command.
+   */
+  worktreeSetup: {
+    state: WorktreeSetupState;
+    command: string | null;
+    reason: string | null;
+    outputTail: string | null;
+  } | null;
 
   // Internal mutable bookkeeping. NOT meant to be subscribed to.
   abortController: AbortController | null;
@@ -1275,6 +1289,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   viewers: [],
   sandboxStatus: null,
   mcpStartup: null,
+  worktreeSetup: null,
   abortController: null,
   historyGeneration: 0,
 
@@ -2858,6 +2873,7 @@ function sessionBindingPatch(
   | "terminalPending"
   | "sandboxStatus"
   | "mcpStartup"
+  | "worktreeSetup"
 > {
   const wrapper = session.labels?.["omnigent.wrapper"];
   return {
@@ -2883,7 +2899,31 @@ function sessionBindingPatch(
     terminalPending: session.terminalPending ?? false,
     sandboxStatus: session.sandboxStatus ?? null,
     mcpStartup: session.mcpStartup ?? null,
+    // Hydrated from the persisted session label (not a snapshot field of its
+    // own) so reopening a session mid-setup still shows the band; the SSE
+    // edges take over from there. `done` is not worth a band, so it hydrates
+    // as cleared.
+    worktreeSetup: worktreeSetupFromLabels(session.labels),
   };
+}
+
+/**
+ * Read the worktree-setup band state out of a session's labels.
+ *
+ * The server records progress as `omnigent.worktree_setup` (see
+ * `_WORKTREE_SETUP_LABEL_KEY`) because the first-turn gate needs it durably.
+ * A settled `done` needs no band; a settled `failed` keeps one so a reload
+ * mid-session still explains the degraded workspace.
+ *
+ * @param labels - The session's labels, or undefined.
+ * @returns The band state, or `null` when there is nothing to show.
+ */
+function worktreeSetupFromLabels(
+  labels: Record<string, string> | undefined,
+): ChatState["worktreeSetup"] {
+  const state = labels?.["omnigent.worktree_setup"];
+  if (state !== "running" && state !== "failed") return null;
+  return { state, command: null, reason: null, outputTail: null };
 }
 
 /**
@@ -5096,6 +5136,22 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       applyToConversation({ mcpStartup: allReady ? null : event.servers });
       return;
     }
+    case "session_worktree_setup":
+      // Mirror the project's worktree setup progress. `done` clears the band
+      // (nothing left to say); `failed` keeps the reason so the band can
+      // explain the degraded workspace next to the durable error item.
+      applyToConversation({
+        worktreeSetup:
+          event.state === "done"
+            ? null
+            : {
+                state: event.state,
+                command: event.command,
+                reason: event.reason,
+                outputTail: event.outputTail,
+              },
+      });
+      return;
     case "session_usage": {
       // Apply only fields that arrived; a window-only broadcast must
       // not clobber tokensUsed (and vice versa), and a cost-only

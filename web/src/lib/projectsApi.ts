@@ -15,8 +15,12 @@ import { authenticatedFetch } from "./identity";
 /**
  * Default session settings a project stores, pre-filled into the new-chat
  * composer. All fields optional — an unset key means "no default for this
- * slot". The vocabulary is client-owned; the server persists the object whole
- * and never acts on it, so adding a key here needs no backend change.
+ * slot". The server persists the object whole, so adding a purely client-read
+ * key here needs no backend change.
+ *
+ * Exception: the `worktree_root` and `worktree_*_command` keys ARE read by the
+ * server (it places worktrees and runs the commands on the host — see
+ * `omnigent/server/worktree_hooks.py`), so their names are a shared contract.
  */
 export interface ProjectConfig {
   /** Default host id, or the sandbox sentinel. */
@@ -39,6 +43,31 @@ export interface ProjectConfig {
    * is never stored (treated the same as unset).
    */
   base_branch?: string;
+  /**
+   * Directory every new worktree in this project is created under, e.g.
+   * `.worktrees` (inside the checkout), `../worktrees` (a sibling of it), or an
+   * absolute path. `{repo}` expands to the repo directory name. A relative value
+   * resolves against the repo root. Unset uses the built-in
+   * `<repo>-worktrees` sibling layout. Blank is never stored. Server-read.
+   */
+  worktree_root?: string;
+  /**
+   * Shell command the host runs in a newly created worktree, before the first
+   * turn starts (dependency install, `.env` copy). Blank is never stored
+   * (treated the same as unset). Unlike the composer-default keys above this one
+   * is read by the SERVER.
+   */
+  worktree_post_create_command?: string;
+  /**
+   * Shell command the host runs in a worktree just before Omnigent removes it
+   * (stop a dev server, drop a database). Blank is never stored. Server-read.
+   */
+  worktree_pre_delete_command?: string;
+  /**
+   * Timeout in seconds shared by both worktree commands. Clamped server-side
+   * to 1–3600; unset means the 300 s default.
+   */
+  worktree_hook_timeout_seconds?: number;
 }
 
 /** A first-class project. Mirrors the `ProjectObject` response shape. */

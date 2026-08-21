@@ -85,6 +85,14 @@ CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox"
 # and the web client mirrors the literal as ``PROJECT_LABEL_KEY``.
 PROJECT_LABEL_KEY = "omni_project"
 
+# Progress of the project's post-create worktree setup script for a session:
+# ``"running"`` while the host runs it, then ``"done"`` / ``"failed"``. Absent
+# for a session whose project configures no setup script. Lives here rather
+# than in the route package because three unrelated readers need it: the
+# first-turn gate, the web session snapshot, and ``sys_session_get_info`` —
+# which is how the AGENT learns its worktree was prepared (or wasn't).
+WORKTREE_SETUP_LABEL_KEY = "omnigent.worktree_setup"
+
 # Reserved label-key PREFIX that records whether a session is "pinned" in the
 # sidebar. Pins are PER-USER: the stored key is ``omnigent.pinned.<user_id>``
 # (see :func:`pinned_label_key`), so pinning a session shared with others does

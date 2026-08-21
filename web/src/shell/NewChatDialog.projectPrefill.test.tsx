@@ -15,7 +15,7 @@ import { useProjectConfig, useProjects } from "@/hooks/useConversations";
 import type { ProjectConfig } from "@/lib/projectsApi";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import type { HostWorktree } from "@/hooks/useHostWorktrees";
-import { NewChatLandingScreen } from "./NewChatDialog";
+import { NewChatLandingScreen, resetLandingDraft } from "./NewChatDialog";
 
 // A `?project=` visit prefills the composer from the project's STORED config
 // (host / working directory / agent / worktree). A field the config leaves
@@ -103,6 +103,28 @@ function setProjectConfig(config: ProjectConfig | undefined, isLoading = false):
   >);
 }
 
+/** Per-project stored configs; an id with no entry reads as "no config",
+ *  matching the real hook (which fetches nothing for a null id). */
+function setProjectConfigs(byId: Record<string, ProjectConfig>): void {
+  vi.mocked(useProjectConfig).mockImplementation(
+    (id) =>
+      ({ data: id === null ? undefined : byId[id], isLoading: false }) as ReturnType<
+        typeof useProjectConfig
+      >,
+  );
+}
+
+/** Open the composer's project chip and pick an entry by its label. */
+function pickProject(label: string): void {
+  // Radix dropdowns open on pointerdown (a bare click doesn't in jsdom).
+  fireEvent.pointerDown(screen.getByTestId("new-chat-landing-project-chip"), { button: 0 });
+  fireEvent.click(screen.getByText(label));
+}
+
+function workspaceChipText(): string {
+  return screen.getByTestId("new-chat-landing-workspace-chip").textContent ?? "";
+}
+
 function setProjects(
   data: { id: string | null; name: string }[] | undefined,
   isLoading = false,
@@ -149,6 +171,7 @@ async function submitAndReadBody(): Promise<Record<string, unknown>> {
 beforeEach(() => {
   navigateMock.mockReset();
   vi.mocked(authenticatedFetch).mockReset();
+  resetLandingDraft();
   searchParams = new URLSearchParams("project=Alpha");
   localStorage.clear();
   // A recent on the host that the generic seeding would use when the config
@@ -269,6 +292,38 @@ describe("NewChatLandingScreen project prefill", () => {
     const body = await submitAndReadBody();
     expect(body.workspace).toBe(BETA_REPO);
     expect(body.agent_id).toBe("ag_other");
+  });
+
+  it("drops a stale draft from another project's visit so its repo can't shadow this one", async () => {
+    const BETA_REPO = "/Users/corey/projects/beta";
+    vi.mocked(useProjectConfig).mockImplementation((id) => {
+      const data =
+        id === "proj_beta"
+          ? { host_id: "host_1", workspace: BETA_REPO }
+          : { host_id: "host_1", workspace: REPO };
+      return { data, isLoading: false } as ReturnType<typeof useProjectConfig>;
+    });
+    // Visit Beta's composer, let its config seed, then leave WITHOUT
+    // submitting — the unmount preserves the composer state as the
+    // module-scoped landing draft.
+    searchParams = new URLSearchParams("project=Beta");
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("beta"),
+    );
+    cleanup();
+
+    // A later visit to Alpha's composer must bind Alpha's stored repo, not
+    // resurrect Beta's draft (the prefill fills empty slots only, so a
+    // restored draft would win — and point any new worktree at Beta's repo).
+    searchParams = new URLSearchParams("project=Alpha");
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
+    );
+    const body = await submitAndReadBody();
+    expect(body.host_id).toBe("host_1");
+    expect(body.workspace).toBe(REPO);
   });
 
   it("reseeds the SAME project after its stored defaults change (edited then re-opened)", async () => {
@@ -394,6 +449,22 @@ describe("NewChatLandingScreen project prefill", () => {
     expect(body.git).toBeUndefined();
   });
 
+  it("warns instead of silently rebinding when the project's host is offline", async () => {
+    // The configured host is offline, so its workspace is dropped and the
+    // generic defaults bind the session to the last-used repo. That must be
+    // visible in the composer — an unannounced rebinding is invisible once the
+    // session exists.
+    vi.mocked(useHosts).mockReturnValue({
+      data: [host(), host({ host_id: "host_off", name: "sleepy", status: "offline" })],
+    } as ReturnType<typeof useHosts>);
+    setProjectConfig({ host_id: "host_off", workspace: "/somewhere" });
+    renderLanding();
+
+    const warning = await screen.findByTestId("new-chat-landing-project-host-offline");
+    expect(warning.textContent).toContain("sleepy");
+    expect(warning.textContent).toContain("Alpha");
+  });
+
   it("still seeds the recent workspace when the worktree probe errors", async () => {
     // A non-400 failure from /worktrees leaves the hook's data undefined for
     // good. The seed must fall back to the candidate as-is (treat the probe
@@ -417,5 +488,114 @@ describe("NewChatLandingScreen project prefill", () => {
     // Seeded the recent path as-is; no redirect, no fabricated fork.
     expect(body.workspace).toBe(LINKED_WORKTREE);
     expect(body.git).toBeUndefined();
+  });
+});
+
+// Picking a project in the composer's chip must set the session up the same
+// way the sidebar pencil does. Without this the chip only FILES the session:
+// the location keeps whatever the host-global recents seeded, so a session in
+// project A happily starts in project B's checkout.
+describe("NewChatLandingScreen project chip", () => {
+  beforeEach(() => {
+    // A plain new chat (no `?project=`): the generic defaults seed the last
+    // used workspace, whichever project it belonged to.
+    searchParams = new URLSearchParams("");
+    setProjectConfigs({ proj_alpha: { host_id: "host_1", workspace: REPO } });
+  });
+
+  it("applies the picked project's stored host and working directory", async () => {
+    renderLanding();
+    await waitFor(() => expect(workspaceChipText()).toContain("foo"));
+
+    pickProject("Alpha");
+
+    await waitFor(() => expect(workspaceChipText()).toContain("alpha"));
+    const body = await submitAndReadBody();
+    expect(body.host_id).toBe("host_1");
+    expect(body.workspace).toBe(REPO);
+    // Still filed under the picked project.
+    expect((body.labels as Record<string, string>).omni_project).toBe("Alpha");
+  });
+
+  it("creates a fresh worktree when the picked project opts in", async () => {
+    setProjectConfigs({
+      proj_alpha: { host_id: "host_1", workspace: REPO, use_worktree: true },
+    });
+    renderLanding();
+    await waitFor(() => expect(workspaceChipText()).toContain("foo"));
+
+    pickProject("Alpha");
+
+    await waitFor(() => expect(workspaceChipText()).toContain("alpha"));
+    const body = await submitAndReadBody();
+    expect(body.workspace).toBe(REPO);
+    expect((body.git as { branch_name: string }).branch_name).toMatch(/^worktree-[0-9a-f]{8}$/);
+  });
+
+  it("keeps the typed message when a project is picked", async () => {
+    renderLanding();
+    await waitFor(() => expect(workspaceChipText()).toContain("foo"));
+    const input = screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: "fix the flaky test" } });
+
+    pickProject("Alpha");
+
+    // The location is re-seeded; what the user wrote is not touched.
+    await waitFor(() => expect(workspaceChipText()).toContain("alpha"));
+    expect(input.value).toBe("fix the flaky test");
+  });
+
+  it("falls back to the generic defaults for a project with no stored config", async () => {
+    // Beta has no config: the pick still resets the seedable slots, and the
+    // generic defaults refill them (last host + most recent workspace).
+    renderLanding();
+    await waitFor(() => expect(workspaceChipText()).toContain("foo"));
+
+    pickProject("Beta");
+
+    const body = await submitAndReadBody();
+    expect(body.host_id).toBe("host_1");
+    expect(body.workspace).toBe(RECENT_WORKSPACE);
+    expect(body.git).toBeUndefined();
+    expect((body.labels as Record<string, string>).omni_project).toBe("Beta");
+  });
+
+  it("keeps the location when the chip is cleared back to no project", async () => {
+    renderLanding();
+    await waitFor(() => expect(workspaceChipText()).toContain("foo"));
+    pickProject("Alpha");
+    await waitFor(() => expect(workspaceChipText()).toContain("alpha"));
+
+    // Unfiling the session is a filing change, not a "set me up elsewhere"
+    // request — the working directory the user is looking at stays put.
+    pickProject("No project");
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-project-chip").textContent).toContain(
+        "No project",
+      ),
+    );
+    expect(workspaceChipText()).toContain("alpha");
+    const body = await submitAndReadBody();
+    expect(body.workspace).toBe(REPO);
+    expect(body.labels).toBeUndefined();
+  });
+
+  it("re-seeds when switching from one picked project to another", async () => {
+    const BETA_REPO = "/Users/corey/projects/beta";
+    setProjectConfigs({
+      proj_alpha: { host_id: "host_1", workspace: REPO },
+      proj_beta: { host_id: "host_1", workspace: BETA_REPO },
+    });
+    renderLanding();
+    await waitFor(() => expect(workspaceChipText()).toContain("foo"));
+
+    pickProject("Alpha");
+    await waitFor(() => expect(workspaceChipText()).toContain("alpha"));
+    pickProject("Beta");
+
+    await waitFor(() => expect(workspaceChipText()).toContain("beta"));
+    const body = await submitAndReadBody();
+    expect(body.workspace).toBe(BETA_REPO);
   });
 });

@@ -1,0 +1,16 @@
+# Codegraph MCP server — symbol search, call graphs, and impact analysis over
+# a pre-built knowledge graph (npm: @colbymchenry/codegraph). Auto-discovered
+# from tools/mcp/ (omnigent/spec/parser.py:_discover_mcp_servers); no
+# config.yaml reference needed. Tools reach the model namespaced as
+# `codegraph__<tool>`, e.g. `codegraph__codegraph_explore`.
+#
+# The stdio subprocess spawns with cwd = the session workspace and resolves
+# the nearest `.codegraph/` index from there (run `codegraph init` in the repo
+# to build one). If the CLI is missing the connection fails; if the repo is
+# unindexed each call returns an explanatory error — either way the agent
+# falls back to normal search, so this server is safe to ship enabled.
+name: codegraph
+description: Symbol search, call graphs, and impact analysis over the repo's .codegraph index.
+transport: stdio
+command: codegraph
+args: [serve, --mcp]

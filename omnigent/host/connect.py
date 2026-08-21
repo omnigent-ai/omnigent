@@ -61,6 +61,8 @@ from omnigent.host.frames import (
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
+    HostRunWorktreeHookFrame,
+    HostRunWorktreeHookResultFrame,
     HostStatFrame,
     HostStatResultFrame,
     HostStopRunnerFrame,
@@ -75,6 +77,7 @@ from omnigent.host.git_worktree import (
     create_worktree,
     list_worktrees,
     remove_worktree,
+    run_worktree_hook,
 )
 from omnigent.host.identity import HostIdentity, load_or_create_host_identity
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
@@ -2411,6 +2414,7 @@ class HostProcess:
                     repo_path=frame.repo_path,
                     branch_name=frame.branch_name,
                     base_branch=frame.base_branch,
+                    worktree_root=frame.worktree_root,
                 )
         except WorktreeError as exc:
             return HostCreateWorktreeResultFrame(
@@ -2452,6 +2456,7 @@ class HostProcess:
                     worktree_path=frame.worktree_path,
                     branch=frame.branch,
                     delete_branch=frame.delete_branch,
+                    require_merged_into=frame.require_merged_into,
                 )
         except WorktreeError as exc:
             return HostRemoveWorktreeResultFrame(
@@ -2509,6 +2514,59 @@ class HostProcess:
                 }
                 for wt in worktrees
             ],
+        )
+
+    async def _handle_run_worktree_hook(
+        self,
+        frame: HostRunWorktreeHookFrame,
+    ) -> HostRunWorktreeHookResultFrame:
+        """Handle a ``host.run_worktree_hook`` request from the server.
+
+        Runs the project's user-defined lifecycle command in a worker
+        thread so the tunnel loop keeps servicing pings. A non-zero exit
+        is a successful *run* (``status: "ok"``) — both hooks are
+        fail-open and the server decides what to surface.
+
+        :param frame: The run-hook request frame.
+        :returns: Result frame with the exit code, timeout flag, and the
+            captured output tail, or ``status: "failed"`` when the hook
+            could not be started at all.
+        """
+        try:
+            # Pause the orphan reaper while the hook's subprocess tree runs —
+            # its children are direct children of this host but not tracked
+            # runners, so the reaper must not wait() them out from under
+            # subprocess (see _handle_create_worktree).
+            with self._host_subprocess_op():
+                result = await asyncio.to_thread(
+                    run_worktree_hook,
+                    command=frame.command,
+                    worktree_path=frame.worktree_path,
+                    repo_path=frame.repo_path,
+                    branch=frame.branch,
+                    base_branch=frame.base_branch,
+                    hook=frame.hook,
+                    timeout_seconds=frame.timeout_seconds,
+                )
+        except WorktreeError as exc:
+            return HostRunWorktreeHookResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=exc.message,
+            )
+        _logger.info(
+            "Ran %s worktree hook in %s (exit=%s, timed_out=%s)",
+            frame.hook,
+            frame.worktree_path,
+            result.exit_code,
+            result.timed_out,
+        )
+        return HostRunWorktreeHookResultFrame(
+            request_id=frame.request_id,
+            status="ok",
+            exit_code=result.exit_code,
+            timed_out=result.timed_out,
+            output_tail=result.output_tail,
         )
 
     async def run(self) -> None:
@@ -3129,6 +3187,8 @@ class HostProcess:
             await ws.send(encode_host_frame(await self._handle_remove_worktree(frame)))
         elif isinstance(frame, HostListWorktreesFrame):
             await ws.send(encode_host_frame(await self._handle_list_worktrees(frame)))
+        elif isinstance(frame, HostRunWorktreeHookFrame):
+            await ws.send(encode_host_frame(await self._handle_run_worktree_hook(frame)))
         elif isinstance(frame, HostFsRequestFrame):
             # Git status and directory walks can block, so run the read
             # off the event loop and reply when it completes.

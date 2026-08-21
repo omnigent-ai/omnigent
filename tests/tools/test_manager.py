@@ -1239,3 +1239,26 @@ def test_web_search_does_not_emit_web_search_preview_for_databricks_model() -> N
         f"databricks-gpt-5-4 — Databricks does not support this tool type "
         f"and rejects the request with HTTP 400. Got schema: {schema!r}"
     )
+
+
+def test_worktree_tools_register_with_the_os_env_grant() -> None:
+    """``sys_worktree_*`` rides the ``os_env`` opt-in.
+
+    An agent with a shell in a repo can already run ``git worktree add``, so
+    these carry no new authority — and gating them separately would leave the
+    hand-rolled path as the default, which is what they exist to replace.
+    """
+    spec = _make_spec()
+    mgr = ToolManager(spec, os_env=cast(Any, SimpleNamespace()))
+    mgr.start()
+    names = {schema["function"]["name"] for schema in mgr.get_tool_schemas()}
+    assert {"sys_worktree_create", "sys_worktree_remove"} <= names
+
+
+def test_worktree_tools_absent_without_an_os_env() -> None:
+    """An agent with no OS environment has no repository to branch."""
+    mgr = ToolManager(_make_spec())
+    mgr.start()
+    names = {schema["function"]["name"] for schema in mgr.get_tool_schemas()}
+    assert "sys_worktree_create" not in names
+    assert "sys_worktree_remove" not in names

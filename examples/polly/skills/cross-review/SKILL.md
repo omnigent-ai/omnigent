@@ -11,10 +11,17 @@ anyone needs to read through.
 
 ## Procedure
 1. Get the task's diff — `sys_os_shell("gh pr diff <pr>")` (or
-   `git -C .worktrees/<task_id> diff main...HEAD`).
-2. Run the deterministic gates first — tests / lint / typecheck via
-   `sys_os_shell`. If red, re-dispatch the implementer to drive it green first;
-   don't involve the reviewer yet.
+   `git -C <worktree_path> diff main...HEAD`, using the path the registry
+   recorded from `sys_worktree_create`).
+2. Run the deterministic gates first — at the CHEAPEST tier that answers the
+   question. If the repo documents a tiered/quick gate (e.g. a
+   `docs/agents/testing-tiers.md`, or a `test:quick` / `ci` script), run THAT
+   via `sys_os_shell`, not the full heavy suites; and if the PR's CI is already
+   reporting, read it (`gh pr checks <pr>`) instead of re-running the same
+   suites locally. Full integration/browser/e2e suites belong to the PR's CI at
+   ready-for-review — do not re-run them locally on every review loop. If the
+   gate is red, re-dispatch the implementer to drive it green first; don't
+   involve the reviewer yet.
    If a pytest result's count must be recorded or reconciled, collect ground
    truth with `python -m pytest --collect-only -q <same files>` against the
    exact file set/command/commit the implementer reported. Never use
@@ -46,8 +53,10 @@ anyone needs to read through.
    updates its existing PR. A new title would spawn a fresh worker with no
    memory of the task. Then loop to step 1.
 6. When gates are green AND there are zero blocking issues, the PR passes
-   review — mark it ready in the registry (with its PR URL) and leave it for
-   the human to merge. polly does NOT merge it.
+   review — mark it ready in the registry (with its PR URL) and leave the PR
+   itself for the human to merge. polly does NOT merge the PR. If this task came
+   from `fanout`, hand back to that skill's integration step, which merges the
+   task's branch into polly's own worktree (never into `main`).
 7. If the contract can't be satisfied after a few loops, stop and escalate to
    the user with specifics.
 
@@ -66,3 +75,9 @@ anyone needs to read through.
   reviewer edit never reaches the deliverable.
 - Non-blocking issues / suggestions go in the registry as follow-ups; they
   don't block the PR.
+- A reviewer that has codegraph (MCP tools or the `codegraph` CLI) can judge
+  the diff's blast radius without the worktree: when the repo has a
+  `.codegraph/` index, say so in the review packet so the reviewer runs
+  callers/impact on the changed symbols against the main checkout instead of
+  guessing from diff context alone. The index reflects the main checkout, not
+  the implementer's branch — it supplements the diff, never replaces it.

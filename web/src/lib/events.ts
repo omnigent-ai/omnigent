@@ -638,6 +638,28 @@ export interface SessionMcpStartupEvent {
   servers: Record<string, McpServerStartup>;
 }
 
+/** Progress of a project's worktree setup command for a session. */
+export type WorktreeSetupState = "running" | "done" | "failed";
+
+/**
+ * `session.worktree_setup.*` — progress of the project's post-create worktree
+ * setup command (`worktree_post_create_command`). The host runs it in the new
+ * worktree and the first turn waits for it, so the session page shows a
+ * "preparing" band while `state === "running"`. A `failed` state is advisory:
+ * the session is usable either way (the hook is fail-open), and a durable error
+ * item carries the same news across a refresh.
+ */
+export interface SessionWorktreeSetupEvent {
+  type: "session_worktree_setup";
+  state: WorktreeSetupState;
+  /** The command being run; only present on the `running` edge. */
+  command: string | null;
+  /** One-line cause on `failed`; `null` otherwise. */
+  reason: string | null;
+  /** Last 10 KB of the command's combined output on `failed`; `null` otherwise. */
+  outputTail: string | null;
+}
+
 /**
  * `session.input.consumed` — a queued input item was persisted into
  * conversation history. Used to backfill optimistic user-bubble
@@ -910,6 +932,7 @@ export type StreamEvent =
   | SessionTerminalPendingEvent
   | SessionSandboxStatusEvent
   | SessionMcpStartupEvent
+  | SessionWorktreeSetupEvent
   | SessionInputConsumedEvent
   | SessionInterruptedEvent
   | SessionCreatedEvent

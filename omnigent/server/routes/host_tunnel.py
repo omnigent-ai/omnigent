@@ -41,6 +41,7 @@ from omnigent.host.frames import (
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusResultFrame,
+    HostRunWorktreeHookResultFrame,
     HostStatResultFrame,
     HostStopRunnerResultFrame,
     HostStoreSecretResultFrame,
@@ -614,6 +615,20 @@ async def _receive_loop(
                     {
                         "status": frame.status,
                         "worktrees": frame.worktrees,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostRunWorktreeHookResultFrame):
+            hook_future = conn.pending_worktree_hooks.pop(frame.request_id, None)
+            if hook_future is not None and not hook_future.done():
+                hook_future.set_result(
+                    {
+                        "status": frame.status,
+                        "exit_code": frame.exit_code,
+                        "timed_out": frame.timed_out,
+                        "output_tail": frame.output_tail,
                         "error": frame.error,
                     }
                 )

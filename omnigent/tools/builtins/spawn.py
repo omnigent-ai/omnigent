@@ -599,7 +599,8 @@ class SysSessionGetInfoTool(Tool):
     model), not just the caller's spawn subtree. Reports lifecycle
     status, title, agent binding (id + name), runner binding and live
     connectivity, host, reasoning effort, effective model, parent
-    linkage, workspace / git branch, persisted last-activity time, and
+    linkage, workspace / git branch, whether the project's worktree setup
+    script has finished, persisted last-activity time, and
     the count of outstanding approval prompts. Comparing
     ``last_activity_at`` across polls distinguishes a running session that
     is advancing from one whose persisted output has stalled. For the
@@ -628,7 +629,9 @@ class SysSessionGetInfoTool(Tool):
             "Return a session's metadata: lifecycle status, title, "
             "agent binding (id/name), runner binding + connectivity, "
             "host, reasoning effort, model, parent session, workspace, "
-            "persisted last-activity time, and outstanding approval "
+            "worktree_setup (running/done/failed for the project's worktree "
+            "setup script, or null when it has none), persisted "
+            "last-activity time, and outstanding approval "
             "prompts. Global read — any "
             "session you can access. Pass session_id to target another "
             "session; omit it to describe your own. Metadata only — "

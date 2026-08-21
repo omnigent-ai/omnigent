@@ -121,6 +121,7 @@ from omnigent.server.routes._sessions.helpers import (
     SessionLiveness,
     _apply_pending_policy_ask_writes,
     _await_settled_managed_launch,
+    _await_worktree_setup,
     _background_task_delivery_status,
     _build_actor,
     _build_skill_slash_command_policy_body,
@@ -158,6 +159,7 @@ from omnigent.server.routes._sessions.helpers import (
     _remove_session_worktree_best_effort,
     _require_external_status_forward,
     _run_compact_locked,
+    _run_pre_delete_worktree_hook,
     _signal_harness_elicitation_resolved_by_id,
     _stop_session_host_runner,
     _stop_session_via_runner,
@@ -1145,6 +1147,13 @@ def register_events_routes(
         # message, even if we reused the original binding instead of launching
         # a replacement.
         _runner_needs_session_init = False
+        # First-turn gate: when the session's project configured a worktree
+        # setup command, the agent must not start until it has settled —
+        # otherwise the first turn reads a half-installed tree. No-op for every
+        # session without a hook, and fails open on a stale state (see
+        # ``_await_worktree_setup``). Placed before the runner is resolved so a
+        # slow setup doesn't burn the runner connect grace.
+        await _await_worktree_setup(session_id, conversation_store)
         # Item event (message, function_call_output, etc.).
         if conv.host_id is not None and await _maybe_wake_stale_resumable_managed_sandbox(
             session_id=session_id,
@@ -1806,7 +1815,10 @@ def register_events_routes(
             Ignored for sessions with no worktree. Best-effort: a
             cleanup failure does not block the delete. Defaults to
             ``False`` (worktree and branch left untouched). See
-            designs/SESSION_GIT_WORKTREE.md.
+            designs/SESSION_GIT_WORKTREE.md. When the session's project
+            configures ``worktree_pre_delete_command``, that teardown
+            command runs on the host first; its outcome is reported in
+            ``pre_delete_hook`` and never blocks the delete.
         :returns: A :class:`ConversationDeleted` confirmation.
         :raises OmnigentError: 404 if no session or no access,
             403 if insufficient permissions.
@@ -1872,12 +1884,23 @@ def register_events_routes(
         # Opt-in git worktree cleanup: only when delete_branch=true and
         # the session has a server-created worktree. Runs after runner
         # teardown; best-effort (designs/SESSION_GIT_WORKTREE.md).
+        pre_delete_hook: dict[str, object] | None = None
         if (
             delete_branch
             and conv.git_branch is not None
             and conv.workspace is not None
             and conv.host_id is not None
         ):
+            # Project-configured teardown command, run BEFORE the worktree is
+            # removed (a dev server holding the directory open has to stop
+            # first). Fail-open: the removal below runs regardless, and the
+            # result rides back in the response for the UI to toast — the
+            # session row is about to be gone, so nothing can be persisted.
+            pre_delete_hook = await _run_pre_delete_worktree_hook(
+                conv=conv,
+                user_id=user_id,
+                request=request,
+            )
             await _remove_session_worktree_best_effort(
                 host_id=conv.host_id,
                 worktree_path=conv.workspace,
@@ -1964,4 +1987,4 @@ def register_events_routes(
             )
         except Exception:
             pass
-        return ConversationDeleted(id=session_id)
+        return ConversationDeleted(id=session_id, pre_delete_hook=pre_delete_hook)

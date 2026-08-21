@@ -1184,6 +1184,10 @@ def create_app(
     app.state.host_registry = host_registry
     app.state.host_store = host_store
     app.state.agent_store = agent_store
+    # Reachable from any route: the session lifecycle reads a project's stored
+    # config to resolve its worktree setup / teardown commands (see
+    # ``omnigent.server.worktree_hooks``).
+    app.state.project_store = project_store
     app.state.sandbox_config = sandbox_config
     # Admin roster: the config ``admins:`` list (canonical) union'd with the
     # runtime-editable ``<data_dir>/admins`` file. Built once here so BOTH the

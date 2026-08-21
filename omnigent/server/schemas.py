@@ -687,11 +687,20 @@ class ConversationDeleted(BaseModel):
     :param object: Fixed resource type, always
         ``"conversation.deleted"``.
     :param deleted: Always ``True``.
+    :param pre_delete_hook: Outcome of the project's worktree teardown
+        command when one ran, e.g.
+        ``{"exit_code": 1, "timed_out": False, "output_tail": "…",
+        "error": None}``. ``None`` when the project configures no
+        teardown command (or the session had no worktree). The hook is
+        fail-open, so a non-zero result here still means the session was
+        deleted — the UI surfaces it as a toast because the session row
+        is gone and nothing can be persisted against it.
     """
 
     id: str
     object: str = "conversation.deleted"
     deleted: bool = True
+    pre_delete_hook: dict[str, Any] | None = None
 
 
 class ConversationRef(BaseModel):
@@ -1245,6 +1254,53 @@ class SessionGitOptions(BaseModel):
         if self.existing_worktree and self.base_branch is not None:
             raise ValueError("base_branch cannot be set when existing_worktree is true")
         return self
+
+
+class CreateSessionWorktreeRequest(BaseModel):
+    """
+    Request body for ``POST /v1/sessions/{id}/worktrees``.
+
+    Creates an extra worktree off the session's OWN repository, under the
+    project's configured worktree root, and runs the project's setup
+    script in it. Backs the ``sys_worktree_create`` agent tool: the repo
+    is not a parameter, so an agent can only ever branch the repository
+    its own session already works in.
+
+    :param branch_name: New branch to create and check out, e.g.
+        ``"polly/auth-refactor"``. Validated against git ref-format
+        rules.
+    :param base_branch: Optional base ref to fork from, e.g. ``"main"``.
+        ``None`` forks from the CALLING session's own branch — an
+        orchestrator working in its own worktree is the base its fan-out
+        should build on — falling back to the repository's ``HEAD`` for a
+        session that has no branch of its own.
+    """
+
+    branch_name: str
+    base_branch: str | None = None
+
+
+class DeleteSessionWorktreeRequest(BaseModel):
+    """
+    Request body for ``DELETE /v1/sessions/{id}/worktrees``.
+
+    Removes a worktree of the session's own repository, after running the
+    project's teardown script in it. Backs ``sys_worktree_remove``.
+
+    :param worktree_path: The worktree to remove, as returned by
+        ``POST /v1/sessions/{id}/worktrees``, e.g.
+        ``"/Users/alice/myrepo/.worktrees/polly-auth-refactor"``. Must be
+        a linked worktree of the session's repository — never its main
+        work tree, and never the session's own workspace.
+    :param delete_branch: When ``True``, also delete the branch that was
+        checked out there. Defaults to ``False``, so an unpushed branch
+        survives a removed worktree. Refused when the branch's commits
+        are not yet reachable from the calling session's own branch —
+        an agent must not destroy work it has not integrated.
+    """
+
+    worktree_path: str
+    delete_branch: bool = False
 
 
 class SessionCreateRequest(BaseModel):

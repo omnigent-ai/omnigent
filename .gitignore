@@ -86,3 +86,4 @@ omnigent/server/static/web-ui/
 # DAB local state directory (created by `databricks bundle deploy`).
 deploy/databricks/.databricks/
 web/package-lock.json
+.gstack/

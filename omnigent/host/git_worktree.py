@@ -8,8 +8,12 @@ designs/SESSION_GIT_WORKTREE.md.
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
 import subprocess
+import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,8 +21,35 @@ from pathlib import Path
 # host's tunnel loop.
 _GIT_TIMEOUT_S: float = 120.0
 
+# Bound on the combined stdout+stderr a lifecycle hook reports back. Only
+# the TAIL is kept: a failing `bun install` puts the actionable error at the
+# end, and an unbounded capture would push megabytes of progress output
+# through the tunnel and into a conversation item.
+HOOK_OUTPUT_TAIL_BYTES: int = 10 * 1024
+
+# Clamp for a project's configured hook timeout, and the default when none
+# is configured. Mirrors the harness-install subprocess bound (300 s) so a
+# dependency install has room without letting a hook wedge a session for an
+# unbounded time.
+DEFAULT_HOOK_TIMEOUT_S: float = 300.0
+MIN_HOOK_TIMEOUT_S: float = 1.0
+MAX_HOOK_TIMEOUT_S: float = 3600.0
+
 # Max directory-collision suffixes (``-2`` .. ``-N``) before giving up.
 _MAX_DIR_COLLISION_SUFFIX: int = 50
+
+#: Placeholder a project's ``worktree_root`` may use for the repo directory
+#: name, e.g. ``"{repo}-worktrees"`` → ``"myrepo-worktrees"``. The branch
+#: segment is always appended by us, so there is deliberately no ``{branch}``.
+WORKTREE_ROOT_REPO_PLACEHOLDER: str = "{repo}"
+
+# Any other ``{...}`` in a configured root is a typo (e.g. ``{branch}``) and
+# is rejected rather than turned into a literal directory name.
+_WORKTREE_ROOT_PLACEHOLDER = re.compile(r"\{[^}]*\}")
+
+# Bound on a configured root so a pathological value can't be fed to the
+# filesystem. Generous: real values are a handful of segments.
+_WORKTREE_ROOT_MAX_LEN: int = 512
 
 # Chars git refuses in a ref: space, control chars, ``~^:?*[\``, DEL.
 # (``..``, leading ``-``/``.``, ``/`` edges, ``.lock``, ``@{`` are
@@ -262,24 +293,100 @@ def _local_branch_exists(repo_root: str, branch_name: str) -> bool:
     )
 
 
-def _resolve_worktree_path(repo_root: str, branch_name: str) -> Path:
-    """Compute a collision-free sibling worktree directory path.
+def validate_worktree_root(root: str) -> None:
+    """Check a project's configured worktree root before it reaches a path.
 
-    Places the worktree at
-    ``<parent-of-repo-root>/<repo-name>-worktrees/<sanitized-branch>``,
-    appending a numeric suffix if that path already exists on disk.
+    Rejects the values that would silently produce a nonsense directory
+    rather than an error: an unknown ``{...}`` placeholder (a ``{branch}``
+    typo would otherwise create a literal ``{branch}`` dir), a NUL, and an
+    absurd length. Traversal is deliberately NOT rejected — ``../wt`` is a
+    legitimate way to ask for a sibling directory, and the value comes from
+    the project owner, who can already run arbitrary code through the
+    lifecycle hooks.
+
+    :param root: The configured value, e.g. ``"{repo}-worktrees"``,
+        ``".worktrees"``, or ``"/data/worktrees"``.
+    :raises WorktreeError: If the value cannot be used as a directory.
+    """
+    if not root.strip():
+        raise WorktreeError("worktree root must not be empty")
+    if len(root) > _WORKTREE_ROOT_MAX_LEN:
+        raise WorktreeError(f"worktree root must be at most {_WORKTREE_ROOT_MAX_LEN} characters")
+    if "\x00" in root:
+        raise WorktreeError("worktree root must not contain a NUL byte")
+    unknown = [
+        found
+        for found in _WORKTREE_ROOT_PLACEHOLDER.findall(root)
+        if found != WORKTREE_ROOT_REPO_PLACEHOLDER
+    ]
+    if unknown:
+        raise WorktreeError(
+            f"unknown placeholder {unknown[0]} in worktree root; "
+            f"only {WORKTREE_ROOT_REPO_PLACEHOLDER} is supported "
+            "(the branch name is always appended)"
+        )
+
+
+def _resolve_worktree_root(repo_root: Path, worktree_root: str | None) -> Path:
+    """Resolve the directory new worktrees for a repo are placed under.
+
+    ``None`` keeps the built-in layout, a sibling
+    ``<repo-name>-worktrees`` directory. A configured value expands
+    :data:`WORKTREE_ROOT_REPO_PLACEHOLDER` and, when relative, resolves
+    against the REPO ROOT — so ``".worktrees"`` is inside the checkout and
+    ``"../wt"`` is a sibling of it. ``..`` is collapsed textually rather
+    than with :meth:`Path.resolve`, so a repo reached through a symlink
+    keeps the path the user picked.
+
+    :param repo_root: Absolute repo work-tree root, e.g.
+        ``Path("/Users/alice/myrepo")``.
+    :param worktree_root: The project's configured root, already passed
+        through :func:`validate_worktree_root`, or ``None`` for the
+        built-in layout.
+    :returns: The directory to place worktrees under, e.g.
+        ``Path("/Users/alice/myrepo-worktrees")``.
+    :raises WorktreeError: If the value resolves to the repo root itself
+        (which would put checkouts directly inside the repo).
+    """
+    if worktree_root is None:
+        return repo_root.parent / f"{repo_root.name}-worktrees"
+    expanded = worktree_root.strip().replace(WORKTREE_ROOT_REPO_PLACEHOLDER, repo_root.name)
+    candidate = Path(expanded).expanduser()
+    if not candidate.is_absolute():
+        candidate = repo_root / candidate
+    normalized = Path(os.path.normpath(candidate))
+    if normalized == Path(os.path.normpath(repo_root)):
+        raise WorktreeError(
+            f"worktree root {worktree_root!r} resolves to the repository root; "
+            "choose a subdirectory (e.g. '.worktrees') or a sibling (e.g. '../worktrees')"
+        )
+    return normalized
+
+
+def _resolve_worktree_path(
+    repo_root: str,
+    branch_name: str,
+    worktree_root: str | None = None,
+) -> Path:
+    """Compute a collision-free worktree directory path.
+
+    Places the worktree at ``<resolved-root>/<sanitized-branch>``,
+    appending a numeric suffix if that path already exists on disk. The
+    root is the project's configured ``worktree_root`` or, when unset,
+    the built-in sibling ``<repo-name>-worktrees`` directory.
 
     :param repo_root: Absolute repo work-tree root, e.g.
         ``"/Users/alice/myrepo"``.
     :param branch_name: Validated branch name, e.g.
         ``"feature/login"``.
+    :param worktree_root: The project's configured root, e.g.
+        ``".worktrees"``. ``None`` uses the built-in layout.
     :returns: A path that does not yet exist, e.g.
         ``Path("/Users/alice/myrepo-worktrees/feature-login")``.
-    :raises WorktreeError: If no free path is found within
-        :data:`_MAX_DIR_COLLISION_SUFFIX` attempts.
+    :raises WorktreeError: If the configured root is unusable, or no free
+        path is found within :data:`_MAX_DIR_COLLISION_SUFFIX` attempts.
     """
-    root = Path(repo_root)
-    base_dir = root.parent / f"{root.name}-worktrees"
+    base_dir = _resolve_worktree_root(Path(repo_root), worktree_root)
     dirname = _sanitize_dirname(branch_name)
     candidate = base_dir / dirname
     if not candidate.exists():
@@ -351,12 +458,13 @@ def create_worktree(
     repo_path: str,
     branch_name: str,
     base_branch: str | None = None,
+    worktree_root: str | None = None,
 ) -> CreatedWorktree:
     """Create a git worktree with a new branch checked out.
 
-    Resolves the repo root, picks a collision-free sibling directory,
-    and runs ``git worktree add -b`` (fetching once if ``base_branch``
-    isn't locally resolvable).
+    Resolves the repo root, picks a collision-free directory under the
+    project's worktree root, and runs ``git worktree add -b`` (fetching
+    once if ``base_branch`` isn't locally resolvable).
 
     :param repo_path: Absolute path inside the source repo — the
         directory the user picked, e.g. ``"/Users/alice/myrepo"``.
@@ -364,18 +472,25 @@ def create_worktree(
         ``"feature/login"``.
     :param base_branch: Optional base ref, e.g. ``"main"``. ``None``
         branches from the repo's current ``HEAD``.
+    :param worktree_root: The project's configured worktree root, e.g.
+        ``".worktrees"`` or ``"{repo}-worktrees"``. ``None`` uses the
+        built-in sibling layout.
     :returns: The created worktree's path and branch.
-    :raises WorktreeError: If the branch name is invalid, the path is
-        not a git repo, the base ref can't be resolved, or
-        ``git worktree add`` fails (e.g. the branch already exists).
+    :raises WorktreeError: If the branch name or worktree root is
+        invalid, the path is not a git repo, the base ref can't be
+        resolved, or ``git worktree add`` fails (e.g. the branch already
+        exists).
     """
     validate_branch_name(branch_name)
+    if worktree_root is not None:
+        validate_worktree_root(worktree_root)
     # Always create the worktree off the MAIN work tree, even when
     # ``repo_path`` is itself a linked worktree (e.g. the fork-resume
     # picker prefilled a worktree as the source). Otherwise the new
     # worktree would nest under the picked worktree
     # (``…/feature-worktrees/<branch>``); resolving to the main repo keeps
-    # all worktrees as siblings (``…/myrepo-worktrees/<branch>``).
+    # every worktree under one root, and makes a repo-relative
+    # ``worktree_root`` mean the same directory from any worktree.
     repo_root = _main_work_tree(repo_path)
     # Friendly pre-check before git's raw "branch already exists" error.
     # We don't reuse the existing worktree: two sessions sharing one
@@ -386,7 +501,7 @@ def create_worktree(
         )
     if base_branch is not None:
         _ensure_base_resolvable(repo_root, base_branch)
-    worktree_path = _resolve_worktree_path(repo_root, branch_name)
+    worktree_path = _resolve_worktree_path(repo_root, branch_name, worktree_root)
     worktree_path.parent.mkdir(parents=True, exist_ok=True)
 
     add_args = ["worktree", "add", "-b", branch_name, str(worktree_path)]
@@ -426,11 +541,46 @@ def _main_repo_for_worktree(worktree_path: str) -> str:
     return str(common_dir.parent)
 
 
+def _require_branch_merged(repo_root: str, branch: str, merged_into: str) -> None:
+    """Refuse to proceed unless ``branch`` is contained in ``merged_into``.
+
+    ``git branch -d``'s own safety check compares against the CURRENT
+    HEAD, and branch deletion runs from the main work tree — so it would
+    ask "merged into the main checkout?" when the question we need
+    answered is "merged into the caller's branch?". ``merge-base
+    --is-ancestor`` asks that directly.
+
+    :param repo_root: Main repo work tree to run git in.
+    :param branch: Branch about to be deleted, e.g. ``"polly/task-1"``.
+    :param merged_into: Ref its commits must be reachable from, e.g.
+        ``"polly/session"``.
+    :raises WorktreeError: If the branch is not contained in
+        ``merged_into``, or either ref cannot be resolved.
+    """
+    # --end-of-options so a ref starting with '-' can't inject a git flag.
+    result = _run_git(
+        ["merge-base", "--is-ancestor", "--end-of-options", branch, merged_into],
+        cwd=repo_root,
+    )
+    if result.returncode == 0:
+        return
+    # Exit 1 is the clean "not an ancestor" answer; anything else (128) means a
+    # ref did not resolve, which is also a refusal but a different message.
+    if result.returncode == 1:
+        raise WorktreeError(
+            f"refusing to delete branch {branch!r}: its commits are not in "
+            f"{merged_into!r} yet, so the work would be lost. Integrate it "
+            f"first, or remove the worktree without deleting the branch."
+        )
+    raise _git_error(f"could not check whether {branch!r} is merged", result)
+
+
 def remove_worktree(
     *,
     worktree_path: str,
     branch: str | None = None,
     delete_branch: bool = False,
+    require_merged_into: str | None = None,
 ) -> None:
     """Remove a git worktree and optionally delete its branch.
 
@@ -446,10 +596,20 @@ def remove_worktree(
         deletion.
     :param delete_branch: When ``True``, run ``git branch -D`` on
         ``branch`` after removing the worktree directory.
-    :raises WorktreeError: If the worktree path is missing/invalid, or
-        a git command fails.
+    :param require_merged_into: Ref the branch's commits must already be
+        reachable from before it may be deleted, e.g. the caller's own
+        branch. ``None`` deletes unconditionally — for a human who asked
+        for exactly that. Checked BEFORE the worktree is removed, so a
+        refusal leaves everything intact.
+    :raises WorktreeError: If the worktree path is missing/invalid, the
+        branch is not yet merged into ``require_merged_into``, or a git
+        command fails.
     """
     main_repo = _main_repo_for_worktree(worktree_path)
+    if delete_branch and branch is not None and require_merged_into is not None:
+        # Before the removal, not after: a refusal must not leave the caller
+        # with the worktree already gone.
+        _require_branch_merged(main_repo, branch, require_merged_into)
     remove_result = _run_git(
         ["worktree", "remove", "--force", worktree_path],
         cwd=main_repo,
@@ -460,3 +620,239 @@ def remove_worktree(
         branch_result = _run_git(["branch", "-D", branch], cwd=main_repo)
         if branch_result.returncode != 0:
             raise _git_error("git branch -D failed", branch_result)
+
+
+@dataclass
+class WorktreeHookResult:
+    """Outcome of a user-defined worktree lifecycle command.
+
+    :param exit_code: The shell's exit status, e.g. ``0`` on success.
+        ``None`` when the hook timed out (killed before it could report
+        one).
+    :param timed_out: ``True`` when the hook exceeded its timeout and its
+        process group was killed.
+    :param output_tail: Last :data:`HOOK_OUTPUT_TAIL_BYTES` of the
+        combined stdout+stderr, decoded lossily, e.g.
+        ``"bun install v1.1.0\\n..."``. Empty when the hook printed
+        nothing.
+    """
+
+    exit_code: int | None
+    timed_out: bool
+    output_tail: str
+
+
+def clamp_hook_timeout(seconds: float | None) -> float:
+    """Clamp a configured hook timeout into the supported range.
+
+    :param seconds: The project's configured timeout in seconds, e.g.
+        ``600``. ``None`` (or a non-finite / non-positive value) selects
+        :data:`DEFAULT_HOOK_TIMEOUT_S`.
+    :returns: A timeout within
+        [:data:`MIN_HOOK_TIMEOUT_S`, :data:`MAX_HOOK_TIMEOUT_S`].
+    """
+    if seconds is None:
+        return DEFAULT_HOOK_TIMEOUT_S
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError):
+        return DEFAULT_HOOK_TIMEOUT_S
+    if value != value or value <= 0:  # NaN or non-positive
+        return DEFAULT_HOOK_TIMEOUT_S
+    return max(MIN_HOOK_TIMEOUT_S, min(MAX_HOOK_TIMEOUT_S, value))
+
+
+def _hook_script_argv(command: str, script_dir: Path) -> list[str]:
+    """Write a hook's script to a file and build the argv that runs it.
+
+    The configured value is a SCRIPT, not a single command line: it may
+    span many lines and may open with a shebang. Writing it to a file
+    rather than passing it as ``sh -c <string>`` is what makes both work
+    — ``cmd /c`` cannot accept embedded newlines at all, and under
+    ``sh -c`` a ``#!/usr/bin/env bash`` line is just a comment, so
+    bash-only syntax would fail on a ``sh``-is-dash host.
+
+    A leading shebang wins: the file is made executable and exec'd
+    directly, so the author's chosen interpreter runs it. Without one it
+    is fed to ``/bin/sh``, which keeps a one-liner behaving exactly as
+    before.
+
+    :param command: The configured script, e.g. ``"bun install"`` or
+        ``"#!/bin/bash\\nset -euo pipefail\\nbun install\\n"``.
+    :param script_dir: Directory to write the script into — a private
+        temp dir, never the worktree, so the script can't show up as an
+        untracked file in the user's repo.
+    :returns: argv for :class:`subprocess.Popen`, e.g.
+        ``["/bin/sh", "/tmp/omnigent-hook-x/hook"]``.
+    """
+    if sys.platform == "win32":  # pragma: no cover — POSIX CI
+        path = script_dir / "omnigent-hook.cmd"
+        # cmd.exe is CRLF-only, and `@echo off` keeps the batch file from
+        # echoing every line into the captured output.
+        body = command.replace("\r\n", "\n").replace("\n", "\r\n")
+        # newline="" disables Python's own translation, which would otherwise
+        # turn each "\r\n" written here into "\r\r\n" on Windows.
+        path.write_text(f"@echo off\r\n{body}\r\n", encoding="utf-8", newline="")
+        comspec = os.environ.get("COMSPEC", "cmd.exe")
+        return [comspec, "/c", str(path)]
+    path = script_dir / "omnigent-hook"
+    # newline="" keeps the script's own line endings verbatim.
+    path.write_text(
+        command if command.endswith("\n") else f"{command}\n",
+        encoding="utf-8",
+        newline="",
+    )
+    if command.startswith("#!"):
+        path.chmod(0o700)
+        return [str(path)]
+    return ["/bin/sh", str(path)]
+
+
+def _hook_env(
+    *,
+    worktree_path: str,
+    repo_path: str | None,
+    branch: str | None,
+    base_branch: str | None,
+    hook: str,
+) -> dict[str, str]:
+    """Build the hook's environment: the daemon's env plus hook context.
+
+    :param worktree_path: The worktree the hook runs in, e.g.
+        ``"/Users/alice/myrepo-worktrees/feature-login"``.
+    :param repo_path: Main repo work tree, e.g. ``"/Users/alice/myrepo"``.
+        ``None`` omits ``OMNIGENT_REPO_PATH``.
+    :param branch: Branch checked out in the worktree, e.g.
+        ``"feature/login"``. ``None`` omits ``OMNIGENT_BRANCH``.
+    :param base_branch: Base ref the branch forked from, e.g. ``"main"``.
+        ``None`` omits ``OMNIGENT_BASE_BRANCH``.
+    :param hook: Which lifecycle point is running, ``"post_create"`` or
+        ``"pre_delete"``.
+    :returns: The child's environment mapping.
+    """
+    env = dict(os.environ)
+    env["OMNIGENT_WORKTREE_PATH"] = worktree_path
+    env["OMNIGENT_HOOK"] = hook
+    if repo_path is not None:
+        env["OMNIGENT_REPO_PATH"] = repo_path
+    if branch is not None:
+        env["OMNIGENT_BRANCH"] = branch
+    if base_branch is not None:
+        env["OMNIGENT_BASE_BRANCH"] = base_branch
+    return env
+
+
+def _kill_hook_process_group(proc: subprocess.Popen[bytes]) -> None:
+    """Kill a timed-out hook and everything it spawned.
+
+    A hook is a shell command, so the interesting children (``npm``, a
+    dev server) are grandchildren; killing only the shell would leave
+    them running. On POSIX the hook is started in its own process group
+    (``start_new_session``) so one ``killpg`` reaps the tree; Windows has
+    no equivalent, so only the shell is killed.
+
+    :param proc: The still-running hook process.
+    """
+    if sys.platform == "win32":  # pragma: no cover — POSIX CI
+        proc.kill()
+        return
+    import signal
+
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        # Already gone, or the group is not ours — fall back to the
+        # direct kill so we never leave the handle un-reaped.
+        proc.kill()
+
+
+def run_worktree_hook(
+    *,
+    command: str,
+    worktree_path: str,
+    repo_path: str | None = None,
+    branch: str | None = None,
+    base_branch: str | None = None,
+    hook: str,
+    timeout_seconds: float | None = None,
+) -> WorktreeHookResult:
+    """Run a user-defined worktree lifecycle script in a worktree.
+
+    Writes ``command`` to a private temp script and runs it with the
+    worktree as the cwd, capturing the combined stdout+stderr tail. Never
+    raises for a failing script — the exit code is part of the result,
+    because both lifecycle hooks are fail-open.
+
+    :param command: The configured script — one command
+        (``"bun install"``) or many lines, optionally opening with a
+        shebang that selects its interpreter. Whitespace-only is a
+        programming error (callers treat blank as unset) and raises.
+    :param worktree_path: Directory to run in, e.g.
+        ``"/Users/alice/myrepo-worktrees/feature-login"``.
+    :param repo_path: Main repo work tree, exported as
+        ``OMNIGENT_REPO_PATH``.
+    :param branch: Branch in the worktree, exported as
+        ``OMNIGENT_BRANCH``.
+    :param base_branch: Base ref, exported as
+        ``OMNIGENT_BASE_BRANCH``.
+    :param hook: ``"post_create"`` or ``"pre_delete"``, exported as
+        ``OMNIGENT_HOOK``.
+    :param timeout_seconds: Bound on the run; clamped by
+        :func:`clamp_hook_timeout`.
+    :returns: Exit code, timeout flag, and the captured output tail.
+    :raises WorktreeError: If ``command`` is blank, ``worktree_path`` is
+        not a directory, or the interpreter could not be started.
+    """
+    if not command.strip():
+        raise WorktreeError("worktree hook script must not be empty")
+    if not Path(worktree_path).is_dir():
+        raise WorktreeError(f"worktree path is not a directory: {worktree_path}")
+    timeout = clamp_hook_timeout(timeout_seconds)
+    env = _hook_env(
+        worktree_path=worktree_path,
+        repo_path=repo_path,
+        branch=branch,
+        base_branch=base_branch,
+        hook=hook,
+    )
+    # The script file must outlive the run, so the temp dir is removed only
+    # after the process is reaped (including the timeout path below).
+    script_dir = Path(tempfile.mkdtemp(prefix="omnigent-hook-"))
+    try:
+        try:
+            argv = _hook_script_argv(command, script_dir)
+        except OSError as exc:
+            raise WorktreeError(f"could not write the worktree hook script: {exc}") from exc
+        try:
+            proc = subprocess.Popen(
+                argv,
+                cwd=worktree_path,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                # Own process group so a timeout can kill the whole tree.
+                start_new_session=sys.platform != "win32",
+            )
+        except OSError as exc:
+            raise WorktreeError(f"could not start worktree hook: {exc}") from exc
+
+        timed_out = False
+        try:
+            raw, _ = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _kill_hook_process_group(proc)
+            # The pipe is still open on the killed children; drain what was
+            # produced so the user sees where the hook got stuck.
+            try:
+                raw, _ = proc.communicate(timeout=10.0)
+            except subprocess.TimeoutExpired:  # pragma: no cover — defensive
+                raw = b""
+        tail = (raw or b"")[-HOOK_OUTPUT_TAIL_BYTES:].decode("utf-8", errors="replace")
+        return WorktreeHookResult(
+            exit_code=None if timed_out else proc.returncode,
+            timed_out=timed_out,
+            output_tail=tail,
+        )
+    finally:
+        shutil.rmtree(script_dir, ignore_errors=True)
