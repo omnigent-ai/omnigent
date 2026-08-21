@@ -263,6 +263,41 @@ describe("terminalKeyEventPayload", () => {
     expect(payload).toBe("\x1b[13;2u");
   });
 
+  it("maps macOS Cmd line shortcuts to their readline control bytes", () => {
+    // WHY: Option+key works because xterm encodes Alt as ESC-prefixes, but
+    // Cmd (metaKey) combos reach neither xterm nor the PTY — native-terminal
+    // line editing (delete to start / home / end) silently did nothing (#5029).
+    expect(
+      terminalKeyEventPayload(keyEvent({ key: "Backspace", metaKey: true })),
+    ).toBe("\x15");
+    expect(
+      terminalKeyEventPayload(keyEvent({ key: "ArrowLeft", metaKey: true })),
+    ).toBe("\x01");
+    expect(
+      terminalKeyEventPayload(keyEvent({ key: "ArrowRight", metaKey: true })),
+    ).toBe("\x05");
+  });
+
+  it("keeps browser-owned Cmd combos off the mapping", () => {
+    // Cmd+C/V/K/R (copy/paste/clear/reload) and every Cmd combo with another
+    // modifier must keep their browser meaning — only the bare three
+    // line-editing combos are synthesized.
+    expect(terminalKeyEventPayload(keyEvent({ key: "c", metaKey: true }))).toBeNull();
+    expect(terminalKeyEventPayload(keyEvent({ key: "v", metaKey: true }))).toBeNull();
+    expect(terminalKeyEventPayload(keyEvent({ key: "k", metaKey: true }))).toBeNull();
+    expect(terminalKeyEventPayload(keyEvent({ key: "r", metaKey: true }))).toBeNull();
+    // Meta combined with another modifier (e.g. Cmd+Shift+Backspace, or a
+    // Windows-flag AltGr-adjacent event) stays on the default path.
+    expect(
+      terminalKeyEventPayload(keyEvent({ key: "Backspace", metaKey: true, shiftKey: true })),
+    ).toBeNull();
+    expect(
+      terminalKeyEventPayload(keyEvent({ key: "ArrowLeft", metaKey: true, altKey: true })),
+    ).toBeNull();
+    // Plain, unmodified keys never hit the mapping either.
+    expect(terminalKeyEventPayload(keyEvent({ key: "Backspace" }))).toBeNull();
+  });
+
   it("leaves plain Enter on xterm's default path", () => {
     expect(terminalKeyEventPayload(keyEvent({ key: "Enter" }))).toBeNull();
   });
