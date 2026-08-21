@@ -11,6 +11,8 @@ without needing a running HTTP server.
 
 from __future__ import annotations
 
+import json
+
 from omnigent.entities import Comment
 from omnigent.server.routes.comments import _format_message
 
@@ -225,3 +227,50 @@ def test_format_message_anchor_content_is_stripped() -> None:
     assert '"indented line"' in result, (
         f"Expected stripped anchor_content in bullet, got: {result!r}"
     )
+
+
+def test_format_message_decodes_rendered_preview_anchor() -> None:
+    """Rendered preview comments expose useful text and region, not protocol data."""
+    prefix = "__OMNIGENT_RENDERED_PREVIEW_ANCHOR__:"
+    comment = _make_comment(
+        path="report.ipynb",
+        start_index=1_139_701_368,
+        end_index=1_139_701_398,
+        body="Remove this part",
+        anchor_content=prefix
+        + json.dumps(
+            {
+                "surface": "notebook",
+                "region": "cell:0:source",
+                "start": 50,
+                "end": 80,
+                "text": "This notebook has two parts:\n\n",
+            }
+        ),
+    )
+
+    result = _format_message([comment])
+
+    assert (
+        '• "This notebook has two parts:" (notebook preview, cell:0:source): Remove this part'
+        in result
+    )
+    assert prefix not in result
+    assert "offset 1139701368" not in result
+
+
+def test_format_message_preserves_malformed_rendered_preview_anchor() -> None:
+    """Malformed preview payloads keep the legacy raw-anchor and offset format."""
+    prefix = "__OMNIGENT_RENDERED_PREVIEW_ANCHOR__:"
+    comment = _make_comment(
+        path="report.ipynb",
+        start_index=10,
+        end_index=20,
+        body="Check this",
+        anchor_content=prefix + json.dumps({"surface": "notebook", "text": "Sales"}),
+    )
+
+    result = _format_message([comment])
+
+    assert prefix in result
+    assert "(offset 10–20): Check this" in result

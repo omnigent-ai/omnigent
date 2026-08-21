@@ -147,6 +147,7 @@ import { getSeenCommentIds } from "@/hooks/useSeenComments";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { classifyAndRemapComments, FileViewer } from "./FileViewer";
 import { encodePdfAnchor } from "./pdfCommentHelpers";
+import { encodeRenderedPreviewAnchor } from "./RenderedPreviewCommentSurface";
 import { writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import type { ChangedSort } from "./FlatFileList";
 
@@ -866,6 +867,27 @@ describe("classifyAndRemapComments", () => {
     });
 
     const result = classifyAndRemapComments([c], "%PDF-1.4 binary bytes");
+
+    expect(result.open).toHaveLength(1);
+    expect(result.open[0]).toEqual(c);
+  });
+
+  it("skips source-offset remapping for rendered preview anchors", () => {
+    const anchor = encodeRenderedPreviewAnchor({
+      surface: "notebook",
+      region: "cell:0:source",
+      start: 0,
+      end: 5,
+      text: "Sales",
+    });
+    const c = makeAnchoredComment({
+      id: "c_notebook",
+      start_index: anchor.start_index,
+      end_index: anchor.end_index,
+      anchor_content: anchor.anchor_content,
+    });
+
+    const result = classifyAndRemapComments([c], anchor.anchor_content);
 
     expect(result.open).toHaveLength(1);
     expect(result.open[0]).toEqual(c);

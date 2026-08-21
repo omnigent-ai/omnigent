@@ -98,6 +98,7 @@ import {
 import { CommentsPanel, type ActiveSelection } from "./CommentsPanel";
 import { useScrollRestore } from "./useScrollRestore";
 import { isPdfAnchor } from "./pdfCommentHelpers";
+import { isRenderedPreviewAnchor } from "./RenderedPreviewCommentSurface";
 
 // Monaco diff is heavy (~MBs + worker); load it only when the diff view is
 // actually shown.
@@ -135,9 +136,8 @@ export function classifyAndRemapComments(
       open.push(c);
       continue;
     }
-    // PDF anchors store geometry in anchor_content; byte-offset remapping does
-    // not apply to binary PDF content.
-    if (isPdfAnchor(c.anchor_content)) {
+    // Opaque preview anchors do not contain source-file text offsets.
+    if (isPdfAnchor(c.anchor_content) || isRenderedPreviewAnchor(c.anchor_content)) {
       open.push(c);
       continue;
     }

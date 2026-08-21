@@ -1870,6 +1870,7 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
             socket_path=str(tmp_path / "app-server.sock"),
             thread_id="thread_old",
             codex_home=str(tmp_path / "codex-home"),
+            cwd=str(tmp_path / "workspace"),
         ),
     )
     fake_client = _FakeCodexAppServerClient()
@@ -2004,6 +2005,7 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
     # clobbered unix path — otherwise the executor would dial a dead unix
     # socket after /clear and steering/interrupt would silently fail.
     assert state.socket_path == "ws://127.0.0.1:9876"
+    assert state.cwd == str(tmp_path / "workspace")
     assert fake_client.requests == [
         ("thread/resume", {"threadId": "thread_old", "excludeTurns": True}),
         ("thread/resume", {"threadId": "thread_new", "excludeTurns": True}),
