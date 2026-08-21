@@ -46,6 +46,7 @@ from omnigent.cli_config import (
     _run_configure_harnesses_interactive,
     _warn_missing_harness_dependencies,
 )
+from omnigent.cli_invocation import WRAPPER_COMMAND_ENV, cli_invocation
 from omnigent.cli_native import register_native_commands as _register_native_commands
 from omnigent.cli_sandbox import lakebox as _lakebox_alias_group
 from omnigent.cli_sandbox import sandbox as _sandbox_group
@@ -570,7 +571,7 @@ def _migrate_legacy_state_dir() -> None:
         if legacy_pid is not None and _pid_alive(legacy_pid):
             click.echo(
                 f"Note: found pre-rename state at {legacy_src} but a host daemon "
-                "is still running from it; skipping migration. Run `omnigent stop` "
+                f"is still running from it; skipping migration. Run `{cli_invocation()} stop` "
                 "and re-run to migrate, or move it manually to ~/.omnigent.",
                 err=True,
             )
@@ -1742,7 +1743,8 @@ class _OmnigentCLI(click.Group):
             formatter.write_paragraph()
             formatter.write_text(
                 _cli_style(
-                    "Some harnesses need an optional extra — run `omnigent setup` to enable them.",
+                    f"Some harnesses need an optional extra — run `{cli_invocation()} setup` "
+                    "to enable them.",
                     dim=True,
                 )
             )
@@ -2034,7 +2036,6 @@ def _warn_deprecated_harness_path_env_vars() -> None:
 
 
 REQUIRE_WRAPPER_ENV = "OMNIGENT_REQUIRE_WRAPPER"
-WRAPPER_COMMAND_ENV = "OMNIGENT_WRAPPER_COMMAND"
 WRAPPER_BYPASS_ENV = "OMNIGENT_WRAPPER_BYPASS"
 
 
@@ -2156,7 +2157,7 @@ def main() -> None:
     if argv and _is_server_url(argv[0]):
         click.echo(
             "Error: server URLs must be passed with --server. "
-            f"Use `omnigent run --server {argv[0]}`.",
+            f"Use `{cli_invocation()} run --server {argv[0]}`.",
             err=True,
         )
         raise SystemExit(2)
@@ -2164,8 +2165,8 @@ def main() -> None:
     if _is_removed_ad_hoc_invocation(argv):
         click.echo(
             "Error: top-level ad-hoc chat was removed. Use "
-            "`omnigent run <agent.yaml>` or "
-            "`omnigent run --harness <harness>`.",
+            f"`{cli_invocation()} run <agent.yaml>` or "
+            f"`{cli_invocation()} run --harness <harness>`.",
             err=True,
         )
         raise SystemExit(2)
@@ -3094,7 +3095,7 @@ def _claim_foreground_daemon_record(
         raise click.ClickException(
             "A host daemon is already running for this server "
             f"(pid={conflict.pid}, target={conflict.target}). "
-            f"Run `omnigent host status` to inspect it or `{stop_command}` "
+            f"Run `{cli_invocation()} host status` to inspect it or `{stop_command}` "
             "to stop it first."
         )
     previous = _find_daemon_record(record.target)
@@ -3436,9 +3437,9 @@ def _exit_for_auth_mode_change(base_url: str) -> None:
             "(it may have opened automatically),",
             err=True,
         )
-        click.echo("  then re-run `omnigent run` to start.", err=True)
+        click.echo(f"  then re-run `{cli_invocation()} run` to start.", err=True)
     else:
-        click.echo("  Re-run `omnigent run` to start.", err=True)
+        click.echo(f"  Re-run `{cli_invocation()} run` to start.", err=True)
     click.echo("", err=True)
     raise SystemExit(0)
 
@@ -4322,7 +4323,7 @@ def server_start() -> None:
     :returns: None.
     """
     click.echo(
-        "omnigent: `server start` is deprecated; use `omnigent server --background`.",
+        f"omnigent: `server start` is deprecated; use `{cli_invocation()} server --background`.",
         err=True,
     )
     _run_background_server()
@@ -4409,7 +4410,7 @@ def server_status(json_output: bool) -> None:
     default=False,
     help=(
         "Never prompt for sign-in. When the server requires auth and you "
-        "are not logged in, fail with the `omnigent login` hint instead of "
+        f"are not logged in, fail with the `{cli_invocation()} login` hint instead of "
         "launching the browser login flow. Use this in scripts and CI."
     ),
 )
@@ -4436,7 +4437,7 @@ def start(server: str | None, non_interactive: bool) -> None:
     """
     _run_background_host(
         _resolve_host_server(server),
-        stop_command="omnigent stop",
+        stop_command=f"{cli_invocation()} stop",
         non_interactive=non_interactive,
     )
 
@@ -4954,7 +4955,9 @@ def _upgrade_vcs_install(
         return
     # Couldn't read the new commit — the re-pull ran, but don't assert a
     # result we can't confirm.
-    click.echo("Re-pulled the git ref. Run `omni upgrade --check` to confirm.")
+    click.echo(
+        f"Re-pulled the git ref. Run `{cli_invocation(name='omni')} upgrade --check` to confirm."
+    )
 
 
 def _upgrade_to_nightly(
@@ -5029,8 +5032,8 @@ def _upgrade_to_nightly(
         if info.detected_installer == "pip":
             click.echo(
                 "omnigent was installed with pip, and pip does not record which "
-                "extras were requested. `omni upgrade --nightly` cannot preserve "
-                "them safely, so install the nightly manually:\n\n"
+                f"extras were requested. `{cli_invocation(name='omni')} upgrade --nightly` "
+                "cannot preserve them safely, so install the nightly manually:\n\n"
                 f"    pip install --force-reinstall '{manual}'\n"
                 "    # or, if you need extras:\n"
                 f"    pip install --force-reinstall '{manual}#egg=omnigent[your,extras,here]'"
@@ -5040,8 +5043,8 @@ def _upgrade_to_nightly(
             click.echo(
                 "omnigent was installed with `uv pip`, not `uv tool install`. "
                 "`uv pip` does not record which extras were requested, so "
-                "`omni upgrade --nightly` cannot preserve them safely. Install "
-                "the nightly manually:\n\n"
+                f"`{cli_invocation(name='omni')} upgrade --nightly` cannot preserve them "
+                "safely. Install the nightly manually:\n\n"
                 f"    uv pip install --force-reinstall '{manual}'\n"
                 "    # or, if you need extras:\n"
                 f"    uv pip install --force-reinstall '{manual}#egg=omnigent[your,extras,here]'"
@@ -5084,7 +5087,7 @@ def _upgrade_to_nightly(
     if new_version is None:
         click.echo(
             "Ran the upgrade command, but couldn't confirm the installed version. "
-            "Run `omni upgrade --nightly --check` to verify."
+            f"Run `{cli_invocation(name='omni')} upgrade --nightly --check` to verify."
         )
         return
     raise click.ClickException(
@@ -5208,7 +5211,7 @@ def upgrade(
     if _find_repo_root() is not None:
         raise click.ClickException(
             "This is a source checkout — update it with `git pull` (and reinstall "
-            "dependencies), not `omni upgrade`."
+            f"dependencies), not `{cli_invocation(name='omni')} upgrade`."
         )
     info = _read_installed_wheel_info()
     if info is None:
@@ -5217,7 +5220,8 @@ def upgrade(
         )
     if info.is_editable:
         raise click.ClickException(
-            "This is an editable install — update it with `git pull`, not `omni upgrade`."
+            "This is an editable install — update it with `git pull`, "
+            f"not `{cli_invocation(name='omni')} upgrade`."
         )
 
     # Nightly channel: resolved from git tags, not the index, and applies to
@@ -5259,8 +5263,8 @@ def upgrade(
         if info.detected_installer == "pip":
             click.echo(
                 "omnigent was installed with pip, and pip does not record which extras "
-                "were requested. `omni upgrade` cannot preserve them safely, so you "
-                "should upgrade manually:\n\n"
+                f"were requested. `{cli_invocation(name='omni')} upgrade` cannot preserve them "
+                "safely, so you should upgrade manually:\n\n"
                 "    pip install -U omnigent\n"
                 "    # or, if you need extras:\n"
                 "    pip install -U 'omnigent[your,extras,here]'"
@@ -5270,7 +5274,8 @@ def upgrade(
             click.echo(
                 "omnigent was installed with `uv pip`, not `uv tool install`. "
                 "`uv pip` does not record which extras were requested, so "
-                "`omni upgrade` cannot preserve them safely. Upgrade manually:\n\n"
+                f"`{cli_invocation(name='omni')} upgrade` cannot preserve them safely. "
+                "Upgrade manually:\n\n"
                 "    uv pip install -U omnigent\n"
                 "    # or, if you need extras:\n"
                 "    uv pip install -U 'omnigent[your,extras,here]'"
@@ -5350,7 +5355,7 @@ def upgrade(
     if new_version is None:
         click.echo(
             "Ran the upgrade command, but couldn't confirm the installed version. "
-            "Run `omni upgrade --check` to verify."
+            f"Run `{cli_invocation(name='omni')} upgrade --check` to verify."
         )
         return
     expected_version = target_version or latest
@@ -6525,13 +6530,18 @@ _RESUME_HELP = (
 )
 _CONTINUE_HELP = "Continue the most recent conversation for this agent."
 _NO_SESSION_HELP = "Use a fresh temporary local session store for this run."
+
+
 #: ``run --smart-routing`` is gone; the flag survives only to say where routing
 #: moved. Remove the option (and the check that raises this) in 0.11.
-_RUN_SMART_ROUTING_REMOVED = (
-    "CLI smart routing is per-harness first-message only; use the web UI for "
-    "router-picked harnesses. Run `omnigent claude --smart-routing` or "
-    "`omnigent codex --smart-routing` to route this harness's first typed message."
-)
+def _run_smart_routing_removed() -> str:
+    # Wrapper resolved at call time so the hint honors OMNIGENT_WRAPPER_COMMAND.
+    return (
+        "CLI smart routing is per-harness first-message only; use the web UI for "
+        f"router-picked harnesses. Run `{cli_invocation()} claude --smart-routing` or "
+        f"`{cli_invocation()} codex --smart-routing` to route this harness's first typed message."
+    )
+
 
 _FORK_HELP = "Fork an existing session by id and open the REPL on the fork."
 _LOG_HELP = "Write a JSON dump of the conversation to ~/.omnigent/logs/ on exit."
@@ -7222,7 +7232,7 @@ def _dispatch_run(
     if target is not None and _is_server_url(target):
         raise click.ClickException(
             "Server URLs are no longer accepted as the AGENT argument. "
-            f"Use `omnigent run --server {target}` instead."
+            f"Use `{cli_invocation()} run --server {target}` instead."
         )
 
     if target is None:
@@ -7506,13 +7516,13 @@ def _require_live_conversation(
         raise click.ClickException(
             f"Couldn't reach a server at {base_url}: {_host_error_text(result.body)}. "
             "`attach` never starts a server — check the URL, or start one with "
-            "`omnigent run`."
+            f"`{cli_invocation()} run`."
         )
     if result.status_code != 200:
         raise click.ClickException(
             f"No live session '{conversation_id}' on {base_url} "
-            f"(server returned {result.status_code}). Run `omnigent host status` "
-            "to list live sessions, or `omnigent run <agent.yaml>` to start one."
+            f"(server returned {result.status_code}). Run `{cli_invocation()} host status` "
+            f"to list live sessions, or `{cli_invocation()} run <agent.yaml>` to start one."
         )
 
 
@@ -7567,14 +7577,14 @@ def attach(
     if base_url is None:
         raise click.ClickException(
             "No server to attach to. `attach` joins a LIVE session on a running "
-            "server — start one with `omnigent run`, or point at one with "
+            f"server — start one with `{cli_invocation()} run`, or point at one with "
             "`--server <url>`."
         )
     if conversation is None:
         raise click.ClickException(
             "Nothing to attach to: `attach` joins a LIVE session by id. "
-            f"Run `omnigent host status` to list sessions on {base_url}, or "
-            "`omnigent run <agent.yaml>` to start a new one."
+            f"Run `{cli_invocation()} host status` to list sessions on {base_url}, or "
+            f"`{cli_invocation()} run <agent.yaml>` to start a new one."
         )
     _require_live_conversation(base_url=base_url, conversation_id=conversation)
     auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
@@ -7612,7 +7622,7 @@ def attach(
     is_flag=True,
     default=False,
     hidden=True,
-    help="[REMOVED] Use `omnigent claude|codex --smart-routing` or the web UI.",
+    help=f"[REMOVED] Use `{cli_invocation()} claude|codex --smart-routing` or the web UI.",
 )
 @click.option(
     "--from-openclaw",
@@ -7661,7 +7671,7 @@ def attach(
         "remote --server with. Sets DATABRICKS_CONFIG_PROFILE so the SDK "
         "credential chain (service-principal M2M, PAT, OAuth) resolves that "
         "profile. Use for headless service-principal access to a Databricks "
-        "App without a prior `omnigent login`."
+        f"App without a prior `{cli_invocation()} login`."
     ),
 )
 @click.option(
@@ -7682,7 +7692,7 @@ def attach(
     default=False,
     help=(
         "Register this machine as a host with the remote server "
-        "(inline equivalent of `omnigent host`). Requires --server."
+        f"(inline equivalent of `{cli_invocation()} host`). Requires --server."
     ),
 )
 def run(
@@ -7739,7 +7749,7 @@ def run(
     # Rejected before anything is resolved: `run` never routed in-harness, and
     # its create-time route is gone.
     if smart_routing:
-        raise click.ClickException(_RUN_SMART_ROUTING_REMOVED)
+        raise click.ClickException(_run_smart_routing_removed())
     # Apply config defaults for any value the user did not pass explicitly.
     # Explicit CLI args always take precedence; project-local config overrides
     # global config, which provides user-level defaults.
@@ -8164,9 +8174,9 @@ def _host_stop_command(explicit_server: str | None) -> str:
     :returns: A copy-pasteable command, e.g. ``"omnigent host stop"``.
     """
     if explicit_server is None:
-        return "omnigent host stop"
+        return f"{cli_invocation()} host stop"
     stop_target = explicit_server if explicit_server else '""'
-    return f"omnigent host stop --server {stop_target}"
+    return f"{cli_invocation()} host stop --server {stop_target}"
 
 
 @cli.group("host", cls=_HostGroup, invoke_without_command=True)
@@ -8190,7 +8200,7 @@ def _host_stop_command(explicit_server: str | None) -> str:
     default=False,
     help=(
         "Never prompt for sign-in. When the server requires auth and you "
-        "are not logged in, fail with the `omnigent login` hint instead of "
+        f"are not logged in, fail with the `{cli_invocation()} login` hint instead of "
         "launching the browser login flow. Use this in scripts and CI."
     ),
 )
@@ -9662,8 +9672,8 @@ def _print_config_defaults() -> None:
     local_cfg = {k: v for k, v in _load_local_config().items() if k in _GLOBAL_CONFIG_KEYS}
     if not global_cfg and not local_cfg:
         click.echo(
-            "  (none set — `omnigent config set key=value` for project,\n"
-            "   or `omnigent config set --global key=value` for user-level)"
+            f"  (none set — `{cli_invocation()} config set key=value` for project,\n"
+            f"   or `{cli_invocation()} config set --global key=value` for user-level)"
         )
         return
     global_path = _effective_global_config_path()
@@ -9702,17 +9712,17 @@ class _ConfigGroup(click.Group):
         :returns: A hint string for a recognized legacy form, else ``None``.
         """
         if first == "--list":
-            return "`config --list` is now `omnigent config list`."
+            return f"`config --list` is now `{cli_invocation()} config list`."
         if first == "--unset":
-            return "`config --unset KEY` is now `omnigent config unset KEY`."
+            return f"`config --unset KEY` is now `{cli_invocation()} config unset KEY`."
         if first == "--global":
             return (
                 "`--global` now goes on the subcommand — "
-                "`omnigent config set --global KEY=VALUE` or "
-                "`omnigent config unset --global KEY`."
+                f"`{cli_invocation()} config set --global KEY=VALUE` or "
+                f"`{cli_invocation()} config unset --global KEY`."
             )
         if "=" in first and not first.startswith("-"):
-            return f"setting defaults is now `omnigent config set {first}`."
+            return f"setting defaults is now `{cli_invocation()} config set {first}`."
         return None
 
     def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
@@ -9841,8 +9851,8 @@ def slack(ctx: click.Context, background: bool) -> None:
     if existing is not None:
         raise click.ClickException(
             f"A background Slack bot is already running (pid {existing.pid}). "
-            "Stop it first with `omni integration slack stop`, or view it with "
-            "`omni integration slack status`."
+            f"Stop it first with `{cli_invocation(name='omni')} integration slack stop`, "
+            f"or view it with `{cli_invocation(name='omni')} integration slack status`."
         )
     # Foreground: inherit stdio, block until the bot exits (Ctrl-C). Config
     # comes from the inherited environment only (no .env loading — matches
@@ -10067,7 +10077,7 @@ def setup(internal_beta: bool) -> None:
         except ImportError:
             raise click.ClickException(
                 "Databricks internal-beta setup is not available in this build. "
-                "Run `omnigent setup` for the standard model/credential setup."
+                f"Run `{cli_invocation()} setup` for the standard model/credential setup."
             ) from None
         # Internal-beta routing mints workspace OAuth tokens via
         # databricks-sdk at runtime, and the SDK ships in the `databricks`
@@ -10115,7 +10125,9 @@ def setup(internal_beta: bool) -> None:
             }
         )
         click.echo(f"Set default_agent={agent_path} in {_GLOBAL_CONFIG_PATH}")
-        click.echo("Type `omnigent claude` to get started with Claude Code on omnigent.")
+        click.echo(
+            f"Type `{cli_invocation()} claude` to get started with Claude Code on omnigent."
+        )
         return
 
     # --no-internal-beta: the standard model/credential picker. It warns
@@ -11789,7 +11801,7 @@ def _reject_reserved_kiro_resume_args(kiro_args: tuple[str, ...]) -> None:
     if any(arg == flag or arg.startswith(f"{flag}=") for arg in kiro_args for flag in reserved):
         raise click.UsageError(
             "Kiro resume flags are reserved for Omnigent resume handling; use "
-            "`omnigent kiro --resume [CONVERSATION]` instead."
+            f"`{cli_invocation()} kiro --resume [CONVERSATION]` instead."
         )
 
 

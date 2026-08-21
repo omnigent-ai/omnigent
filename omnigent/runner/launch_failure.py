@@ -18,6 +18,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from omnigent.cli_invocation import cli_invocation
+
 __all__ = [
     "FailureDiagnosis",
     "classify_terminal_failure",
@@ -124,7 +126,7 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
                 "The host couldn't find the agent's CLI on its PATH, so the terminal "
                 "exited before the session could start."
             ),
-            remediation="Install the harness on the host (e.g. run `omnigent setup`).",
+            remediation=f"Install the harness on the host (e.g. run `{cli_invocation()} setup`).",
         ),
     ),
     _TerminalMatcher(
@@ -137,7 +139,8 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
                 "host — it needs to be logged in before it can run a session."
             ),
             remediation=(
-                "Sign the agent in on the host (e.g. run its `/login`, or `omnigent login`)."
+                f"Sign the agent in on the host (e.g. run its `/login`, "
+                f"or `{cli_invocation()} login`)."
             ),
         ),
     ),
