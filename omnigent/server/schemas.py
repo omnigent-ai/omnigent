@@ -1928,6 +1928,11 @@ class SessionResponse(BaseModel):
     git_branch: str | None = None
     archived: bool = False
     todos: list[dict[str, Any]] = Field(default_factory=list)
+    # Streamed-so-far assistant text of a turn still in flight (e.g. parked
+    # on an elicitation): the live preview is transient and the durable items
+    # are withheld until the turn settles, so a cold-load refetch during the
+    # park would otherwise lose the antecedent prose (#4984).
+    inflight_text_events: list[dict[str, Any]] = Field(default_factory=list)
     skills: list[SkillSummary] = Field(default_factory=list)
     model_options: list[NativeModelOption] = Field(default_factory=list)
     terminal_pending: bool = False
