@@ -23,10 +23,7 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    sqlite = op.get_bind().dialect.name == "sqlite"
-    with op.batch_alter_table(
-        "conversations", recreate="always" if sqlite else "auto"
-    ) as batch_op:
+    with op.batch_alter_table("conversations", recreate="auto") as batch_op:
         batch_op.add_column(sa.Column("archived_at", sa.Integer(), nullable=True))
 
     # Backfill: approximate archive time with updated_at for already-archived rows.
@@ -45,8 +42,5 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    sqlite = op.get_bind().dialect.name == "sqlite"
-    with op.batch_alter_table(
-        "conversations", recreate="always" if sqlite else "auto"
-    ) as batch_op:
+    with op.batch_alter_table("conversations", recreate="auto") as batch_op:
         batch_op.drop_column("archived_at")

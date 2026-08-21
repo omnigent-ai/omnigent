@@ -2117,7 +2117,7 @@ function ArchivedSection() {
   const [project, setProject] = useState<string | undefined>(undefined);
   const [retentionDays, setRetentionDays] = useState<number | null>(() => readRetentionDays());
   const [deleteExpiredOpen, setDeleteExpiredOpen] = useState(false);
-  const del = useStopAndDeleteConversation();
+  const bulkDelete = useBulkDeleteConversations();
 
   const namesQuery = useArchivedProjectNames();
   const projectNames = useMemo(() => namesQuery.data ?? [], [namesQuery.data]);
@@ -2213,7 +2213,7 @@ function ArchivedSection() {
       <div className="mb-4 flex flex-wrap items-center gap-x-6 gap-y-2">
         <div className="flex items-center gap-2">
           <label htmlFor="archived-retention" className="text-ui text-muted-foreground">
-            Auto-delete
+            Mark as expired after
           </label>
           <Select
             value={retentionDaysToSelectValue(retentionDays)}
@@ -2225,7 +2225,7 @@ function ArchivedSection() {
           >
             <SelectTrigger
               id="archived-retention"
-              aria-label="Auto-delete archived sessions after"
+              aria-label="Mark archived sessions as expired after"
               data-testid="archived-retention"
               className="w-40"
             >
@@ -2302,14 +2302,15 @@ function ArchivedSection() {
             {expiredSessions.length === 1
               ? "1 expired session"
               : `${expiredSessions.length} expired sessions`}{" "}
-            past the {retentionDays}-day retention period.
+            {listQuery.hasNextPage ? "on loaded pages " : ""}past the {retentionDays}-day retention
+            period.
           </span>
           <Button
             type="button"
             variant="destructive"
             size="sm"
             data-testid="delete-expired"
-            disabled={del.isPending}
+            disabled={bulkDelete.isPending}
             onClick={() => setDeleteExpiredOpen(true)}
           >
             Delete expired
@@ -2322,25 +2323,29 @@ function ArchivedSection() {
                   {expiredSessions.length === 1
                     ? "1 archived session"
                     : `${expiredSessions.length} archived sessions`}{" "}
-                  older than {retentionDays} days will be permanently deleted. This cannot be
-                  undone.
+                  older than {retentionDays} days {listQuery.hasNextPage ? "on loaded pages " : ""}
+                  will be permanently deleted. This cannot be undone.
+                  {listQuery.hasNextPage && (
+                    <span className="mt-2 block text-sm">
+                      Note: More archived sessions may exist on unfetched pages. Click "Load more"
+                      to see all expired sessions before deleting.
+                    </span>
+                  )}
                 </DialogDescription>
               </DialogHeader>
               <DialogFooter>
                 <Button
                   variant="ghost"
                   onClick={() => setDeleteExpiredOpen(false)}
-                  disabled={del.isPending}
+                  disabled={bulkDelete.isPending}
                 >
                   Cancel
                 </Button>
                 <Button
                   variant="destructive"
-                  disabled={del.isPending}
+                  disabled={bulkDelete.isPending}
                   onClick={() => {
-                    for (const conv of expiredSessions) {
-                      del.mutate({ id: conv.id });
-                    }
+                    bulkDelete.mutate(expiredSessions.map((c) => c.id));
                     setDeleteExpiredOpen(false);
                   }}
                 >
