@@ -279,6 +279,125 @@ def test_provider_launch_returns_env_and_args(tmp_path: Path) -> None:
     assert (agent_dir / "models.json").exists()
 
 
+def test_provider_launch_preserves_matching_global_pi_model_metadata(tmp_path: Path) -> None:
+    """Managed local sessions keep Pi's Qwen controls, limits, and thinking default."""
+    global_agent = tmp_path / "global-pi"
+    global_agent.mkdir()
+    (global_agent / "settings.json").write_text(
+        json.dumps({"defaultThinkingLevel": "medium"}),
+        encoding="utf-8",
+    )
+    (global_agent / "models.json").write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "metatron": {
+                        "baseUrl": "http://metatron:8000/v1",
+                        "api": "openai-completions",
+                        "apiKey": "global-key-must-not-copy",
+                        "compat": {
+                            "supportsDeveloperRole": False,
+                            "thinkingFormat": "chat-template",
+                            "chatTemplateKwargs": {
+                                "enable_thinking": {"$var": "thinking.enabled"},
+                                "reasoning_effort": {"$var": "thinking.effort"},
+                            },
+                        },
+                        "models": [
+                            {
+                                "id": "qwen3.8-27b",
+                                "name": "Qwen3.8 27B",
+                                "reasoning": True,
+                                "contextWindow": 150000,
+                                "maxTokens": 32768,
+                                "thinkingLevelMap": {"medium": "medium"},
+                            }
+                        ],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="http://metatron:8000/v1/",
+        api="openai-completions",
+        model="qwen3.8-27b",
+        api_key="managed-key",
+        auth_header=False,
+    )
+    agent_dir = tmp_path / "managed-pi"
+
+    _env, args = creds.pi_native_provider_launch(
+        agent_dir,
+        provider,
+        global_agent_dir=global_agent,
+    )
+
+    rendered = json.loads((agent_dir / "models.json").read_text(encoding="utf-8"))
+    managed = rendered["providers"]["omnigent"]
+    assert managed["apiKey"] == "managed-key"
+    assert managed["compat"]["thinkingFormat"] == "chat-template"
+    assert managed["models"] == [
+        {
+            "id": "qwen3.8-27b",
+            "name": "Qwen3.8 27B",
+            "reasoning": True,
+            "contextWindow": 150000,
+            "maxTokens": 32768,
+            "thinkingLevelMap": {"medium": "medium"},
+        }
+    ]
+    settings = json.loads((agent_dir / "settings.json").read_text(encoding="utf-8"))
+    assert settings["defaultThinkingLevel"] == "medium"
+    assert args == ["--provider", "omnigent", "--model", "qwen3.8-27b"]
+
+
+def test_provider_launch_does_not_copy_metadata_from_another_endpoint(tmp_path: Path) -> None:
+    """Model IDs alone do not make unrelated Pi providers trusted metadata sources."""
+    global_agent = tmp_path / "global-pi"
+    global_agent.mkdir()
+    (global_agent / "settings.json").write_text(
+        json.dumps({"defaultThinkingLevel": "medium"}),
+        encoding="utf-8",
+    )
+    (global_agent / "models.json").write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "other": {
+                        "baseUrl": "https://other.example.com/v1",
+                        "api": "openai-completions",
+                        "models": [{"id": "qwen3.8-27b", "reasoning": True}],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="http://metatron:8000/v1",
+        api="openai-completions",
+        model="qwen3.8-27b",
+        api_key="managed-key",
+        auth_header=False,
+    )
+    agent_dir = tmp_path / "managed-pi"
+
+    creds.pi_native_provider_launch(
+        agent_dir,
+        provider,
+        global_agent_dir=global_agent,
+    )
+
+    rendered = json.loads((agent_dir / "models.json").read_text(encoding="utf-8"))
+    assert rendered["providers"]["omnigent"]["models"] == [{"id": "qwen3.8-27b"}]
+    settings = json.loads((agent_dir / "settings.json").read_text(encoding="utf-8"))
+    assert settings["defaultThinkingLevel"] is None
+
+
 def test_pi_native_provider_launch_namespaced_model_uses_qualified_arg(
     tmp_path: Path,
 ) -> None:

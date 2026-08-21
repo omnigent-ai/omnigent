@@ -27,7 +27,7 @@ import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, NotRequired, TypeAlias, TypedDict, TypeGuard
+from typing import TYPE_CHECKING, NotRequired, TypeAlias, TypedDict, TypeGuard, cast
 from urllib.parse import urlparse
 
 from omnigent import model_catalog
@@ -137,6 +137,8 @@ class _PiProviderCompat(TypedDict):
     supportsStrictMode: bool
     supportsReasoningEffort: bool
     supportsUsageInStreaming: bool
+    thinkingFormat: NotRequired[str]
+    chatTemplateKwargs: NotRequired[dict[str, object]]
 
 
 class _PiProviderPayload(TypedDict):
@@ -1117,24 +1119,89 @@ def write_pi_models_config(
     return models_path
 
 
+def _merge_global_pi_model_metadata(
+    rendered: _PiModelsConfig,
+    global_agent_dir: Path,
+) -> _PiModelsConfig:
+    """Reuse matching model and compatibility metadata from the user's Pi config."""
+    path = global_agent_dir / "models.json"
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return rendered
+    raw_providers = raw.get("providers") if isinstance(raw, dict) else None
+    if not isinstance(raw_providers, dict):
+        return rendered
+
+    providers: dict[str, _PiProviderPayload] = {}
+    for provider_id, generated in rendered["providers"].items():
+        copied: _PiProviderPayload = {
+            **generated,
+            "models": [cast(_PiModelEntry, dict(model)) for model in generated["models"]],
+        }
+        base_url = generated["baseUrl"].rstrip("/")
+        api = generated["api"]
+        for candidate in raw_providers.values():
+            if not isinstance(candidate, dict):
+                continue
+            candidate_base = candidate.get("baseUrl")
+            if (
+                not isinstance(candidate_base, str)
+                or candidate_base.rstrip("/") != base_url
+                or candidate.get("api") != api
+            ):
+                continue
+            candidate_models = candidate.get("models")
+            if not isinstance(candidate_models, list):
+                continue
+            metadata_by_id = {
+                model.get("id"): model
+                for model in candidate_models
+                if isinstance(model, dict) and isinstance(model.get("id"), str)
+            }
+            matched = False
+            merged_models: list[_PiModelEntry] = []
+            for model in copied["models"]:
+                metadata = metadata_by_id.get(model["id"])
+                if metadata is None:
+                    merged_models.append(model)
+                    continue
+                matched = True
+                merged_models.append(cast(_PiModelEntry, {**metadata, **model}))
+            if not matched:
+                continue
+            copied["models"] = merged_models
+            compat = candidate.get("compat")
+            if isinstance(compat, dict):
+                copied["compat"] = cast(_PiProviderCompat, compat)
+            break
+        providers[provider_id] = copied
+    return {"providers": providers}
+
+
 def pi_native_provider_launch(
     agent_dir: Path,
     provider: PiProviderConfig,
     *,
     selection: str | None = None,
+    global_agent_dir: Path | None = None,
 ) -> tuple[dict[str, str], list[str]]:
     """Write the managed config and return the launch env + CLI args for Pi.
 
     :param agent_dir: The managed Pi config dir for this session.
     :param provider: The resolved provider config.
     :param selection: Optional picker value used to select a generated provider.
+    :param global_agent_dir: Pi config root to inherit model metadata and settings from.
     :returns: ``(env, args)`` — the env vars to merge into the terminal spec
         (relocating Pi's config dir) and the ``--provider``/``--model`` args to
         append to the Pi command.
     """
     # Render once and reuse: rendering logs how an uncataloged model was routed,
     # and this function both writes the config and reads it back for --provider.
-    rendered = provider.to_models_config()
+    from omnigent.inner.pi_settings import DEFAULT_PI_AGENT_DIR
+
+    global_root = global_agent_dir or DEFAULT_PI_AGENT_DIR
+    rendered = _merge_global_pi_model_metadata(provider.to_models_config(), global_root)
     # Resolve which provider the selected model lives in. Non-Claude models
     # (GLM, GPT, Llama…) are in secondary providers; Claude models are in the
     # primary provider. Read the rendered config so family fallbacks agree.
@@ -1160,17 +1227,21 @@ def pi_native_provider_launch(
                 model_provider_id = extra_id
                 break
     write_pi_models_config(agent_dir, provider, rendered)
-    # Copy the user's global Pi settings but suppress defaultThinkingLevel.
-    # In TUI mode Pi applies the setting from ~/.pi/agent/settings.json; for
-    # non-Claude models via openai-completions, any thinking level causes the
-    # Databricks gateway to return 400 (reasoning_effort is sent even when
-    # supportsReasoningEffort is false in the compat block, because TUI mode
-    # applies the session-level thinking before the compat check fires).
-    # Passing None in the overlay makes _deep_merge_settings write null for the
-    # key; Pi's getDefaultThinkingLevel() returns null (falsy) → no thinking.
+    selected_provider = rendered["providers"][model_provider_id]
+    selected_entry = next(
+        model for model in selected_provider["models"] if model["id"] == selected_model
+    )
+    supports_thinking = selected_entry.get("reasoning") is True
+    # Pi's global thinking default is valid only when its matching model metadata
+    # survived into the managed config. Other models stay off as before.
+    overlay = None if supports_thinking else {"defaultThinkingLevel": None}
     from omnigent.inner.pi_settings import prepare_managed_pi_agent_dir
 
-    prepare_managed_pi_agent_dir(agent_dir, overlay={"defaultThinkingLevel": None})
+    prepare_managed_pi_agent_dir(
+        agent_dir,
+        overlay=overlay,
+        global_agent_dir=global_root,
+    )
     env = {PI_CODING_AGENT_DIR_ENV_VAR: str(agent_dir)}
     # When the model id contains a "/" Pi's arg parser splits on the first
     # slash and treats the left part as a provider name, overriding
