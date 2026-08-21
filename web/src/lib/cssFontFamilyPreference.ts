@@ -102,16 +102,16 @@ export interface CssFontFamilyPreferenceConfig {
 /** The read/write/apply trio for one CSS-variable-backed font family. */
 export interface CssFontFamilyPreference {
   /** Read the persisted family ("" = default). Never throws. */
-  read(): string;
+  read: () => string;
   /** Persist the family; returns the normalized name written ("" cleared it). */
-  write(name: string): string;
+  write: (name: string) => string;
   /**
    * Apply the family to the style root's CSS variable. An empty name removes
    * the property (restoring the fallback stack); a catalog name also kicks a
    * fire-and-forget webfont load so the glyphs arrive (font-display: swap paints
    * the swap). This is the single source of the DOM side-effect.
    */
-  apply(name: string): void;
+  apply: (name: string) => void;
 }
 
 /**
