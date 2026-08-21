@@ -7931,6 +7931,48 @@ def _confirm_background_host_registered(record: _HostDaemonRecord) -> None:
         time.sleep(0.2)
 
 
+def _stdin_is_tty() -> bool:
+    """Whether stdin is an interactive terminal.
+
+    A one-line seam over ``sys.stdin.isatty()`` so callers gating an
+    interactive-only action stay readable and tests can force the answer.
+
+    :returns: ``True`` when stdin is a TTY.
+    """
+    return sys.stdin.isatty()
+
+
+def _maybe_open_host_web_ui(server_url: str, *, non_interactive: bool) -> None:
+    """Open the Omnigent web UI in the browser when a host comes up.
+
+    Honors the shared ``auto_open_conversation`` setting — the same switch
+    ``omnigent run`` reads — defaulting ON when the user has not configured
+    it, so ``host``/``start`` open the web page without extra setup while
+    still respecting an explicit ``auto_open_conversation: false``. Skips in
+    ``--non-interactive`` (scripts/CI). A failed open (headless box, no
+    browser) falls back to printing the URL instead of raising.
+
+    :param server_url: Resolved server URL the host serves/connects to, e.g.
+        ``"http://127.0.0.1:6767"`` or ``"https://ws/api/2.0/omnigent"``.
+    :param non_interactive: When ``True``, never open a browser.
+    """
+    # Mirror the adjacent sign-in flow: a pipe/CI/systemd context has no one
+    # watching a browser, so treat "no TTY" like --non-interactive.
+    if non_interactive or not _stdin_is_tty():
+        return
+    if _resolve_auto_open_conversation_setting(_load_effective_config()) is False:
+        return
+    from omnigent.conversation_browser import display_server_url, open_conversation_url
+
+    web_url = display_server_url(server_url)
+    try:
+        opened = open_conversation_url(web_url)
+    except OSError:
+        opened = False
+    if not opened:
+        click.echo(f"Open the Omnigent web UI: {web_url}", err=True)
+
+
 def _run_background_host(
     server: str | None,
     *,
@@ -8008,6 +8050,7 @@ def _run_background_host(
     click.echo()
     click.echo(_cli_style("Stop it with:", dim=True))
     click.echo(f"  {_cli_style(stop_command, bold=True)}")
+    _maybe_open_host_web_ui(server_url, non_interactive=non_interactive)
 
 
 def _echo_host_field(label: str, value: str) -> None:
@@ -8163,6 +8206,9 @@ def host(
         # (or a headless invocation) fails loud with the command to run.
         if remote_mode:
             _ensure_databricks_server_auth(server, non_interactive=non_interactive)
+        # Open the web UI before the daemon blocks in the foreground, so the
+        # user lands in Omnigent web without a second command.
+        _maybe_open_host_web_ui(server, non_interactive=non_interactive)
         run_host_process(server_url=server)
         stopped_cleanly = True
     except KeyboardInterrupt:

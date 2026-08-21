@@ -944,3 +944,153 @@ def test_start_hosts_on_explicit_server(
             "https://example.databricksapps.com",
         ]
     ]
+
+
+# ── auto-open web UI ──────────────────────────────────────────────
+
+
+def test_host_opens_web_ui_when_interactive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Foreground ``omnigent host`` opens the web UI before it blocks.
+
+    The daemon otherwise occupies the terminal, so a user had to open a
+    second tab to reach the web app. On an interactive terminal, with the
+    default (unconfigured) ``auto_open_conversation``, the local server's
+    URL is opened once, before the blocking loop starts.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr("omnigent.cli._stdin_is_tty", lambda: True)
+    opened: list[str] = []
+
+    with (
+        patch(
+            "omnigent.cli.ensure_local_omnigent_server",
+            lambda: LocalServerStartup(url="http://127.0.0.1:8123", spawned=False),
+        ),
+        patch("omnigent.host.connect.run_host_process", lambda server_url, **kwargs: None),
+        patch(
+            "omnigent.conversation_browser.open_conversation_url",
+            lambda url: opened.append(url) or True,
+        ),
+    ):
+        result = CliRunner().invoke(cli, ["host"])
+
+    assert result.exit_code == 0, result.output
+    # The local server's own URL is the web UI's URL.
+    assert opened == ["http://127.0.0.1:8123"]
+
+
+def test_host_skips_web_ui_when_non_interactive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--non-interactive`` never opens a browser, even on a TTY (scripts/CI)."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr("omnigent.cli._stdin_is_tty", lambda: True)
+    opened: list[str] = []
+
+    with (
+        patch(
+            "omnigent.cli.ensure_local_omnigent_server",
+            lambda: LocalServerStartup(url="http://127.0.0.1:8123", spawned=False),
+        ),
+        patch("omnigent.host.connect.run_host_process", lambda server_url, **kwargs: None),
+        patch(
+            "omnigent.conversation_browser.open_conversation_url",
+            lambda url: opened.append(url) or True,
+        ),
+    ):
+        result = CliRunner().invoke(cli, ["host", "--non-interactive"])
+
+    assert result.exit_code == 0, result.output
+    assert opened == []
+
+
+def test_host_skips_web_ui_without_tty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A non-terminal context (pipe / nohup / systemd) never opens a browser.
+
+    ``webbrowser.open`` would otherwise shell out to ``xdg-open`` with no
+    display, so "no TTY" is treated like ``--non-interactive``.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr("omnigent.cli._stdin_is_tty", lambda: False)
+    opened: list[str] = []
+
+    with (
+        patch(
+            "omnigent.cli.ensure_local_omnigent_server",
+            lambda: LocalServerStartup(url="http://127.0.0.1:8123", spawned=False),
+        ),
+        patch("omnigent.host.connect.run_host_process", lambda server_url, **kwargs: None),
+        patch(
+            "omnigent.conversation_browser.open_conversation_url",
+            lambda url: opened.append(url) or True,
+        ),
+    ):
+        result = CliRunner().invoke(cli, ["host"])
+
+    assert result.exit_code == 0, result.output
+    assert opened == []
+
+
+def test_host_respects_auto_open_conversation_disabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit ``auto_open_conversation: false`` suppresses the open on a TTY."""
+    (tmp_path / "config.yaml").write_text("auto_open_conversation: false\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr("omnigent.cli._stdin_is_tty", lambda: True)
+    opened: list[str] = []
+
+    with (
+        patch(
+            "omnigent.cli.ensure_local_omnigent_server",
+            lambda: LocalServerStartup(url="http://127.0.0.1:8123", spawned=False),
+        ),
+        patch("omnigent.host.connect.run_host_process", lambda server_url, **kwargs: None),
+        patch(
+            "omnigent.conversation_browser.open_conversation_url",
+            lambda url: opened.append(url) or True,
+        ),
+    ):
+        result = CliRunner().invoke(cli, ["host"])
+
+    assert result.exit_code == 0, result.output
+    assert opened == []
+
+
+def test_start_opens_web_ui_when_interactive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``omnigent start`` opens the web UI after the background daemon registers.
+
+    ``start`` brings up the local server (which serves the web UI) and
+    returns; on a TTY it also opens that server's URL in the browser.
+    """
+    _patch_background_host_spawn(monkeypatch, tmp_path)
+    monkeypatch.setattr("omnigent.cli._stdin_is_tty", lambda: True)
+    opened: list[str] = []
+
+    with patch(
+        "omnigent.conversation_browser.open_conversation_url",
+        lambda url: opened.append(url) or True,
+    ):
+        result = CliRunner().invoke(cli, ["start"])
+
+    assert result.exit_code == 0, result.output
+    # The daemon-owned local server URL (see _patch_background_host_spawn).
+    assert opened == ["http://127.0.0.1:6767"]
