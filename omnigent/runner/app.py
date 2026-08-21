@@ -5685,11 +5685,17 @@ def create_runner_app(
         _background_tasks.add(_wake_task)
 
     def _rewake_parent_if_inbox_stranded(parent_session_id: str) -> None:
+        inbox = _session_inboxes.get(parent_session_id)
+        drained = inbox is None or inbox.empty()
+        if drained:
+            # A drained inbox ends the stranding episode, so the recorded
+            # re-wake no longer describes outstanding work; forget it or a
+            # later episode's matching notice is wrongly deduped.
+            _last_rewake_notice.pop(parent_session_id, None)
         if parent_session_id not in _subagent_wake_pending:
             return
         _subagent_wake_pending.discard(parent_session_id)
-        inbox = _session_inboxes.get(parent_session_id)
-        if inbox is None or inbox.empty():
+        if drained:
             return
         entries = list_subagent_work(parent_session_id)
         if not entries:

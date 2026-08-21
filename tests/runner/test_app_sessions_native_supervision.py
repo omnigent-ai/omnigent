@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import uuid
 from typing import Any
 
@@ -1997,6 +1998,175 @@ async def test_repeat_identical_recovery_wake_is_suppressed() -> None:
         f"Expected the repeat recovery wake to be suppressed (4 wakes total), "
         f"got {len(server_client.wake_posts)}."
     )
+
+
+@pytest.mark.asyncio
+async def test_recovery_wake_fires_again_for_an_episode_after_a_full_drain() -> None:
+    """
+    A full inbox drain ends the stranding episode, so dedupe must not carry over.
+
+    ``_last_rewake_notice`` suppresses a recovery wake that repeats the previous
+    one verbatim (see
+    ``test_repeat_identical_recovery_wake_is_suppressed``). That record describes
+    *outstanding* work, so it goes stale the moment the parent drains: a later
+    fan-out round that happens to produce the same label and pending count is a
+    genuinely new stranding episode and is still owed its nudge. Without
+    clearing the record on drain the parent is left holding undelivered results
+    with the wake flag cleared — nothing re-arms it once every child has
+    finished, which is the exact strand ``_rewake_parent_if_inbox_stranded``
+    exists to break.
+
+    Sequence (wake counts bracketed), all children sharing the ``gp/fanout``
+    label so the notices can match. Episode 1: (1) child A completes idle →
+    wake [1]; (2) parent turn T1 starts, child B completes mid-T1 → wake [2],
+    re-arming the flag; (3) T1 ends → recovery wake [3] ``… 2 results``,
+    recorded. (4) Turn T2 drains BOTH items and ends with the inbox empty —
+    episode over. Episode 2: (5) child C completes → wake [4]; (6) turn T3
+    starts, child D completes mid-T3 → wake [5], count back to 2. (7) T3 ends →
+    the recovery wake reads ``… 2 results``, matching step 3, but the drain in
+    step 4 cleared the record, so it MUST still fire → wake [6]. Carrying the
+    record across the drain yields 5 and a parent stranded on 2 results — the
+    discriminator.
+    """
+    from omnigent.runner import app as runner_app
+
+    parent_id = "a1b2c3d4e5f60718293a4b5c6d7e8f01"
+    child_a = "11112c8b90d34e6fa7c1b2d3e4f50617"
+    child_b = "22222d9c81e45f70b8d2c3e4f5061728"
+    child_c = "33333e0d92f560810c9e4d5a6b172839"
+    child_d = "44444f1e03a671920dae5e6b7c28394a"
+    children = (child_a, child_b, child_c, child_d)
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    server_client = _WakeRecordingServerClient(parent_id)
+    gate = asyncio.Event()
+    harness_client = _BlockingHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_drain"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_drain"}}),
+        ],
+        gate,
+    )
+    pm = _FakeProcessManager(harness_client)  # type: ignore[arg-type]
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    runner_app._session_inboxes_ref[parent_id] = session_inbox
+    for child in children:
+        runner_app.register_subagent_work(
+            parent_session_id=parent_id,
+            child_session_id=child,
+            agent="gp",
+            title="fanout",
+        )
+
+    async def _start_blocking_parent_turn() -> None:
+        """Post a parent message and wait for the (blocking) turn to start.
+
+        ``post_seen`` resolves only after ``_run_turn_bg`` clears the wake flag,
+        so callers know the flag is clear before completing a child.
+        """
+        harness_client.post_seen.clear()
+        parent_resp = await client.post(
+            f"/v1/sessions/{parent_id}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "c1d2e3f4a5b60718293a4b5c6d7e8f90",
+                "model": "test-agent",
+                "harness": "openai-agents",
+                "content": [{"type": "input_text", "text": "wake notice"}],
+            },
+        )
+        assert parent_resp.status_code == 202, parent_resp.text
+        await asyncio.wait_for(harness_client.post_seen.wait(), timeout=5.0)
+
+    async def _complete_child(child_id: str, output: str) -> None:
+        resp = await client.post(
+            f"/v1/sessions/{child_id}/events",
+            json={"type": "external_session_status", "data": {"status": "idle", "output": output}},
+        )
+        assert resp.status_code == 204, resp.text
+
+    async def _wait_turn_idle() -> None:
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while app.state.has_active_work():
+            if asyncio.get_running_loop().time() > deadline:
+                raise AssertionError("parent turn did not end within 5s")
+            await asyncio.sleep(0.01)
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    try:
+        async with _runner_client(app) as client:
+            # Episode 1, steps 1-3: strand the inbox at 2 and take the recovery
+            # wake, which records "… 2 results" as the last re-wake.
+            await _complete_child(child_a, "A_DONE")
+            await asyncio.wait_for(server_client.wake_seen.wait(), timeout=5.0)
+            server_client.wake_seen.clear()
+            await _start_blocking_parent_turn()
+            await _complete_child(child_b, "B_DONE")
+            await asyncio.wait_for(server_client.wake_seen.wait(), timeout=5.0)
+            server_client.wake_seen.clear()
+            gate.set()
+            await asyncio.wait_for(server_client.wake_seen.wait(), timeout=5.0)
+            server_client.wake_seen.clear()
+            await _wait_turn_idle()
+            assert len(server_client.wake_posts) == 3, (
+                f"Expected A + B + recovery wakes to end episode 1, got "
+                f"{len(server_client.wake_posts)}."
+            )
+            assert (
+                "2 results waiting in inbox"
+                in (server_client.wake_posts[2]["data"]["content"][0]["text"])
+            )
+
+            # Step 4: the parent fully drains during T2, ending the episode.
+            gate.clear()
+            await _start_blocking_parent_turn()
+            while not session_inbox.empty():
+                session_inbox.get_nowait()
+            gate.set()
+            await _wait_turn_idle()
+            assert len(server_client.wake_posts) == 3, (
+                f"A drained inbox owes no wake, got {len(server_client.wake_posts)}."
+            )
+
+            # Episode 2, steps 5-6: two new children bring the count back to 2,
+            # so the pending recovery notice matches episode 1's verbatim.
+            gate.clear()
+            await _complete_child(child_c, "C_DONE")
+            await asyncio.wait_for(server_client.wake_seen.wait(), timeout=5.0)
+            server_client.wake_seen.clear()
+            await _start_blocking_parent_turn()
+            await _complete_child(child_d, "D_DONE")
+            await asyncio.wait_for(server_client.wake_seen.wait(), timeout=5.0)
+            server_client.wake_seen.clear()
+            assert len(server_client.wake_posts) == 5, (
+                f"Expected C + D completion wakes in episode 2, got "
+                f"{len(server_client.wake_posts)}."
+            )
+
+            # Step 7: T3 ends → the new episode's recovery wake must fire even
+            # though its text matches episode 1's. Swallow the wait timeout so a
+            # missing wake surfaces as the count assertion below, not a
+            # TimeoutError.
+            gate.set()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(server_client.wake_seen.wait(), timeout=5.0)
+            await _wait_turn_idle()
+    finally:
+        gate.set()
+        for child in children:
+            runner_app.unregister_subagent_work(child)
+        runner_app._session_inboxes_ref.pop(parent_id, None)
+
+    assert len(server_client.wake_posts) == 6, (
+        f"Expected episode 2's recovery wake to fire after the drain (6 wakes "
+        f"total), got {len(server_client.wake_posts)}."
+    )
+    assert not session_inbox.empty(), "The stranded results should still be waiting."
 
 
 @pytest.mark.asyncio
