@@ -755,8 +755,9 @@ def build_policy_engine(
     period_requirements = _get_period_cost_requirements(all_policy_specs)
     if len(period_requirements) > 1:
         raise ValueError(
-            f"Multiple period cost policies are not yet supported. Found {len(period_requirements)} "
-            f"policies with periods: {[p for p, _ in period_requirements]}. "
+            f"Multiple period cost policies are not yet supported. "
+            f"Found {len(period_requirements)} policies with periods: "
+            f"{[p for p, _ in period_requirements]}. "
             "Configure at most one period cost policy (day, week, month, quarter, or year)."
         )
     initial_user_period_cost = None
