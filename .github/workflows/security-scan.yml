@@ -156,13 +156,16 @@ jobs:
           # protobuf>=7 conflicts with cwsandbox/modal/databricks and the lint
           # group), so --all-extras alone exits 2 before pip-audit ever runs,
           # blocking every gated downstream job for untrusted uv.lock PRs.
-          # Audit each compatible resolution set instead: everything except
-          # antigravity, then antigravity alone (#4942).
+          # Audit the full compatible resolution sets instead: everything
+          # except antigravity (with every dependency group, since
+          # default-groups is empty), then antigravity plus the `all` extra
+          # (which selects the locked databricks-sdk fork). Together they
+          # cover every registry package/version tuple in uv.lock.
           uv export --frozen --format requirements-txt \
-            --all-extras --no-extra antigravity > /tmp/uv-req-full.txt
+            --all-extras --no-extra antigravity --all-groups > /tmp/uv-req-full.txt
           grep -v '^-e ' /tmp/uv-req-full.txt > /tmp/uv-req.txt
           uv export --frozen --format requirements-txt \
-            --extra antigravity --no-default-groups > /tmp/uv-req-antigravity.txt
+            --extra antigravity --extra all --no-default-groups > /tmp/uv-req-antigravity.txt
           grep -v '^-e ' /tmp/uv-req-antigravity.txt > /tmp/uv-req-ag.txt
           uvx pip-audit --requirement /tmp/uv-req.txt --no-deps
           uvx pip-audit --requirement /tmp/uv-req-ag.txt --no-deps
