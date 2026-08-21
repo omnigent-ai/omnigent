@@ -11,7 +11,7 @@ import importlib
 import importlib.metadata
 import logging
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import TypeVar, cast
 
 from omnigent._wrapper_labels import (
@@ -35,13 +35,11 @@ from omnigent.harness_capabilities import (
     AuthModel,
     EffortFamily,
     Elicitation,
-    FeatureSupport,
     ForkHistory,
     HarnessCapabilities,
     IntegrationMode,
     ModelFamily,
     Resume,
-    Support,
 )
 from omnigent.harness_install_spec import HarnessInstallSpec
 
@@ -650,36 +648,19 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
 for _acp_cli_name in ACP_CLI_HARNESSES:
     _BUILTIN_CAPABILITIES[_acp_cli_name] = _BUILTIN_CAPABILITIES["acp"]
 
-# The skills axis follows from the tool surface rather than from anything a row
-# chooses, so it is derived here instead of repeated on eleven rows. A native
-# harness ignores ``request.tools`` and sees only the relay in
-# ``runner/tool_dispatch.py``, whose builtin set omits ``load_skill`` /
-# ``read_skill_file`` — so an agent on one cannot reach an Omnigent skill at
-# all. Every other integration mode gets the ordinary tool surface, where the
-# skill tools are Omnigent's own rather than the vendor's, hence ``shimmed``.
-# tests/test_harness_capabilities.py asserts this against the relay's actual
-# tool set so the declaration cannot drift away from the code behind it.
-_SKILLS_UNAVAILABLE = FeatureSupport(
-    support=Support.UNAVAILABLE,
-    limitations=(
-        "Native harnesses see only the Omnigent tool relay, which does not carry "
-        "load_skill / read_skill_file, so a SKILL.md directory is unreachable from "
-        "this harness."
-    ),
-)
-_SKILLS_SHIMMED = FeatureSupport(
-    support=Support.SHIMMED,
-    mode="load_skill / read_skill_file over a SKILL.md directory",
-)
-for _harness_name, _declared in _BUILTIN_CAPABILITIES.items():
-    _relay_only = _declared.integration_mode in (
-        IntegrationMode.NATIVE_TUI,
-        IntegrationMode.NATIVE_SERVER,
-    )
-    _BUILTIN_CAPABILITIES[_harness_name] = replace(
-        _declared,
-        skills=_SKILLS_UNAVAILABLE if _relay_only else _SKILLS_SHIMMED,
-    )
+# The four parity axes are left undeclared on every builtin harness, and that
+# is deliberate. An earlier cut derived ``skills`` from the native tool relay —
+# which does not carry ``load_skill`` / ``read_skill_file`` — and concluded that
+# no native harness can load a skill. That is wrong: the relay is one mechanism
+# of several, and the native launch paths wire skills through the vendor's own
+# discovery instead. ``claude_native_skill_args`` passes the bundle to the real
+# ``claude`` binary via ``--plugin-dir``; ``populate_codex_skills_from_bundle``
+# links them into the per-bridge ``CODEX_HOME``. Both load ``SKILL.md`` files
+# the relay never carries.
+#
+# So the honest value is ``unknown`` until the harness bench observes each one.
+# Deriving a published claim from a single mechanism is how a parity matrix
+# stops being true, which is the failure this axis exists to prevent.
 
 
 _BUILTIN_CONTRIBUTION = HarnessContribution(

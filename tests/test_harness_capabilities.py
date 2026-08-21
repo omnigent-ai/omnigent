@@ -364,34 +364,30 @@ def test_every_harness_declares_the_four_parity_axes() -> None:
             assert isinstance(support, Support), f"{harness}.{axis} is not a Support"
 
 
-def test_skills_declaration_matches_the_relay_that_enforces_it() -> None:
-    """The skills axis must not drift from the tool surface behind it.
+def test_no_parity_axis_is_declared_without_a_bench_observation() -> None:
+    """An unverified cell must read ``unknown``, not a guess.
 
-    A native harness ignores ``request.tools`` and sees only the relay set in
-    ``runner/tool_dispatch.py``. If someone adds the skill tools to that relay,
-    this test fails and the declaration has to move with it — which is the
-    point, because the alternative is a published parity matrix that quietly
-    stops being true.
+    An earlier cut derived ``skills`` from the native tool relay and published
+    ``unavailable`` for every native harness. That was wrong — the relay is one
+    mechanism among several, and the native launch paths wire skills through
+    the vendor's own discovery (``claude_native_skill_args`` passes the bundle
+    to the real ``claude`` binary; ``populate_codex_skills_from_bundle`` links
+    them into ``CODEX_HOME``). A published matrix that infers from one
+    mechanism is how the matrix stops being true.
+
+    Filling these in is the harness bench's job, and a bench result carries
+    ``last_verified``. So: no declared support without one.
     """
-    from omnigent.harness_capabilities import IntegrationMode, Support
-    from omnigent.runner.tool_dispatch import (
-        _NATIVE_RELAY_BUILTIN_TOOLS,
-        _SKILL_TOOLS,
-    )
-
-    relay_carries_skills = bool(_SKILL_TOOLS & _NATIVE_RELAY_BUILTIN_TOOLS)
-    expected_for_native = Support.SHIMMED if relay_carries_skills else Support.UNAVAILABLE
+    from omnigent.harness_capabilities import Support
 
     for harness, capability in harness_capabilities().items():
-        relay_only = capability.integration_mode in (
-            IntegrationMode.NATIVE_TUI,
-            IntegrationMode.NATIVE_SERVER,
-        )
-        expected = expected_for_native if relay_only else Support.SHIMMED
-        assert capability.skills.support is expected, (
-            f"{harness} declares skills={capability.skills.support.value} "
-            f"but its tool surface says {expected.value}"
-        )
+        for axis in ("skills", "hooks", "mcp", "plan_mode"):
+            feature = getattr(capability, axis)
+            if feature.support is not Support.UNKNOWN:
+                assert feature.last_verified, (
+                    f"{harness}.{axis} claims {feature.support.value} with no bench run "
+                    "behind it — declare it unknown until the bench observes it"
+                )
 
 
 def test_an_unavailable_axis_says_why() -> None:

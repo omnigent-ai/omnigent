@@ -70,12 +70,16 @@ Declaring a new harness:
 - **`unavailable` must carry a `limitations` reason.** "It does not work" is a
   bug report; "the relay does not carry these tools" is something the next
   contributor can act on. A test enforces this.
-- **`skills` is derived, not declared.** A native harness ignores
-  `request.tools` and sees only `_NATIVE_RELAY_BUILTIN_TOOLS`, which omits
-  `load_skill` / `read_skill_file` — so the answer follows from the integration
-  mode. `tests/test_harness_capabilities.py` asserts the derivation against the
-  relay's own tool set, so adding the skill tools to the relay fails the test
-  until the declaration moves with it.
+- **Do not infer an axis from one mechanism.** `skills` is the cautionary
+  example: the native tool relay does not carry `load_skill` /
+  `read_skill_file`, which looks like "native harnesses cannot load skills" and
+  is not true. The native launch paths wire skills through the vendor's own
+  discovery instead — `claude_native_skill_args` hands the bundle to the real
+  `claude` binary via `--plugin-dir`, and `populate_codex_skills_from_bundle`
+  links them into the per-bridge `CODEX_HOME`. Both load `SKILL.md` files the
+  relay never sees. A cell is only as good as the mechanism you did not check.
+- **A declared cell carries `last_verified`.** A test enforces it: anything
+  other than `unknown` needs a bench run behind it.
 - **`plan_mode` means one specific thing:** a read-only planning phase where
   the harness proposes without editing. Not the vendor's UI mode of the same
   name, and not a policy that denies writes.
