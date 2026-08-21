@@ -1967,6 +1967,53 @@ def _record_daily_cost(
     conversation_store.add_daily_cost(owner, _utc_day(now_epoch()), delta_usd)
 
 
+def _record_period_costs(
+    conv: Conversation | None,
+    delta_usd: float,
+    conversation_store: ConversationStore,
+) -> None:
+    """
+    Add a turn's LLM cost to the session owner's period rollups.
+
+    Records cost for standard time periods (week, month, quarter, year) to
+    back period-based cost-budget policies. Follows the same ownership
+    resolution as :func:`_record_daily_cost`: the session creator, or the
+    root session's owner for sub-agents. Cross-harness budgets use the
+    sentinel value internally; per-harness budgets would require harness
+    detection (not yet implemented).
+
+    Recorded unconditionally (like daily cost) so the rollups are available
+    when a period cost policy is later configured.
+
+    :param conv: The conversation row for the session, or ``None``
+        (a no-op — no owner to attribute to).
+    :param delta_usd: The turn's cost in USD; ``<= 0`` is a no-op.
+    :param conversation_store: Store for the owner lookup and the
+        period-cost UPSERTs.
+    """
+    if conv is None or delta_usd <= 0:
+        return
+    owner = conversation_store.get_session_owner(conv.id)
+    if owner is None and conv.root_conversation_id != conv.id:
+        owner = conversation_store.get_session_owner(conv.root_conversation_id)
+    if owner is None:
+        return
+    from omnigent.db.utils import now_epoch
+    from omnigent.runtime.policies.builder import (
+        _utc_month,
+        _utc_quarter,
+        _utc_week,
+        _utc_year,
+    )
+
+    epoch = now_epoch()
+    # Record for all standard periods (cross-harness mode: harness=None → "__all__" sentinel)
+    conversation_store.add_period_cost(owner, _utc_week(epoch), delta_usd, harness=None)
+    conversation_store.add_period_cost(owner, _utc_month(epoch), delta_usd, harness=None)
+    conversation_store.add_period_cost(owner, _utc_quarter(epoch), delta_usd, harness=None)
+    conversation_store.add_period_cost(owner, _utc_year(epoch), delta_usd, harness=None)
+
+
 def _priced_cost_for_display(usage: dict[str, Any]) -> float | None:
     """
     Extract ``total_cost_usd`` for client display, or ``None`` when unpriced.
@@ -9647,6 +9694,7 @@ __all__ = [
     "_read_state_entry",
     "_read_upload_capped",
     "_record_daily_cost",
+    "_record_period_costs",
     "_registered_runner_id",
     "_reject_reserved_cost_control_label_seed",
     "_reject_server_reserved_label_seed",

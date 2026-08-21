@@ -270,6 +270,7 @@ from omnigent.server.routes._sessions.helpers import (
     _query_host_runner_status,
     _read_state_entry,
     _record_daily_cost,
+    _record_period_costs,
     _reject_reserved_cost_control_label_seed,
     _reject_server_reserved_label_seed,
     _relay_persist,
@@ -1272,6 +1273,8 @@ def _accumulate_session_usage(
     new_current = conversation_store.increment_session_usage(session_id, delta)
     # Per-user daily rollup (policy-gated; this is the per-turn delta).
     _record_daily_cost(conv, cost_delta, conversation_store)
+    # Per-user period rollups (week, month, quarter, year).
+    _record_period_costs(conv, cost_delta, conversation_store)
     return _priced_cost_for_display(new_current)
 
 
@@ -1462,7 +1465,10 @@ def _persist_native_cumulative_usage(
     new_cost = float(current.get("total_cost_usd", 0.0) or 0.0)
     # Non-negative by the monotonic clamp above; ``max(0.0, ...)`` keeps the
     # daily rollup from ever being clawed back even if that invariant changes.
-    _record_daily_cost(conv, max(0.0, new_cost - old_cost), conversation_store)
+    cost_delta = max(0.0, new_cost - old_cost)
+    _record_daily_cost(conv, cost_delta, conversation_store)
+    # Per-user period rollups (week, month, quarter, year).
+    _record_period_costs(conv, cost_delta, conversation_store)
     return _priced_cost_for_display(current)
 
 

@@ -163,12 +163,14 @@ def _get_period_cost_requirements(specs: list[PolicySpec]) -> list[tuple[str, st
 
     Scans the specs for any user_period_cost_budget policies and returns a
     list of (period, harness) tuples for which the engine needs to load cost
-    data. Multiple policies with different periods/harnesses can coexist.
+    data. NOTE: Currently only ONE period cost policy is supported per engine;
+    callers must validate ``len(result) <= 1`` or raise an error.
 
     :param specs: The merged policy specs for the engine.
     :returns: List of ``(period, harness)`` tuples, e.g.
-        ``[("month", None), ("week", "codex-native")]``. Empty when no
-        period cost policies are configured.
+        ``[("month", None)]`` or ``[("week", "codex-native")]``. Empty when no
+        period cost policies are configured. Contains at most one element in
+        current implementation.
     """
     requirements: list[tuple[str, str | None]] = []
     for s in specs:
@@ -746,11 +748,20 @@ def build_policy_engine(
     )
     # Conditional injection (#2): only pay the owner + period-cost lookups
     # when a per-user period cost-budget policy is actually present.
-    # If multiple period policies are configured, load the first non-day one.
+    # NOTE: Only ONE period policy is currently supported per engine. Multiple
+    # period policies would require seeding multiple context keys (e.g.,
+    # user_weekly_cost, user_monthly_cost) and updating each policy to read
+    # its specific context. For now, we validate this constraint.
     period_requirements = _get_period_cost_requirements(all_policy_specs)
+    if len(period_requirements) > 1:
+        raise ValueError(
+            f"Multiple period cost policies are not yet supported. Found {len(period_requirements)} "
+            f"policies with periods: {[p for p, _ in period_requirements]}. "
+            "Configure at most one period cost policy (day, week, month, quarter, or year)."
+        )
     initial_user_period_cost = None
     if period_requirements:
-        # Load the first period requirement (period, harness)
+        # Load the single period requirement (period, harness)
         period, harness = period_requirements[0]
         initial_user_period_cost = _load_user_period_cost(
             conversation_id, conversation_store, period=period, harness=harness
