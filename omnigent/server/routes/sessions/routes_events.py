@@ -915,6 +915,31 @@ def register_events_routes(
                 {"type": _COMPACT_TYPE},
                 timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
             )
+            if runner_result is None:
+                runner_client, conv = await ensure_runner_connected(
+                    session_id=session_id,
+                    conv=conv,
+                    app_state=request.app.state,
+                    conversation_store=conversation_store,
+                    runner_router=runner_router or get_server_runner_router(),
+                )
+                if runner_client is not None:
+                    await _ensure_runner_session_initialized(
+                        session_id,
+                        conv,
+                        runner_client,
+                        conversation_store,
+                        initializer=getattr(
+                            request.app.state,
+                            "runner_session_initializer",
+                            None,
+                        ),
+                    )
+                    runner_result = await _forward_session_change_to_runner(
+                        session_id,
+                        runner_router,
+                        {"type": _COMPACT_TYPE},
+                    )
             if runner_result is not None and runner_result.status_code == 200:
                 return {"queued": False}
             if runner_result is not None and runner_result.status_code != 204:

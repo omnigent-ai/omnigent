@@ -146,6 +146,56 @@ async def test_compact_skips_omnigent_compaction_when_runner_handles_it(
     )
 
 
+async def test_compact_wakes_sleeping_native_runner(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.routes import sessions as sessions_routes
+
+    calls: list[str] = []
+    online = False
+
+    async def _forward(*_: Any, **__: Any) -> httpx.Response | None:
+        calls.append("forward")
+        return httpx.Response(200) if online else None
+
+    async def _wake(**kwargs: Any) -> tuple[object, Any]:
+        nonlocal online
+        calls.append("wake")
+        online = True
+        return object(), kwargs["conv"]
+
+    async def _initialize(*_: Any, **__: Any) -> bool:
+        calls.append("initialize")
+        return True
+
+    monkeypatch.setattr(sessions_routes, "_forward_session_change_to_runner", _forward)
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.routes_events.ensure_runner_connected",
+        _wake,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.routes_events._ensure_runner_session_initialized",
+        _initialize,
+    )
+
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+        include_llm=False,
+    )
+    sid = await _create_session(client, agent["id"])
+    resp = await client.post(
+        f"/v1/sessions/{sid}/events",
+        json={"type": "compact", "data": {}},
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert resp.json() == {"queued": False}
+    assert calls == ["forward", "wake", "initialize", "forward"]
+
+
 async def test_compact_runs_omnigent_compaction_when_runner_noops(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
