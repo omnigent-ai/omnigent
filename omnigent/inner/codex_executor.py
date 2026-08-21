@@ -2033,8 +2033,22 @@ def _result_text(result: CodexToolResult) -> str:
         return str(result)
 
 
-def _codex_builtin_tool_request(item: CodexParams) -> ToolCallRequest | None:
-    """Translate a structured Codex built-in tool item into an observed request."""
+def _codex_builtin_tool_request(
+    item: CodexParams,
+    *,
+    completed: bool = False,
+) -> ToolCallRequest | None:
+    """Translate a structured Codex built-in item into an observed tool request.
+
+    Codex executes these tools itself, so the request is observational: the
+    adapter must display and persist it without dispatching it back to Codex.
+    ``completed`` distinguishes the live start from the durable lifecycle
+    update emitted alongside the result. Malformed items return ``None``.
+
+    :param item: Codex ``commandExecution`` or ``fileChange`` item.
+    :param completed: Whether Codex has completed the item.
+    :returns: A correlated observed request, or ``None`` for an invalid item.
+    """
 
     call_id = item.get("id")
     item_type = item.get("type")
@@ -2051,7 +2065,11 @@ def _codex_builtin_tool_request(item: CodexParams) -> ToolCallRequest | None:
         return ToolCallRequest(
             name="shell",
             args=args,
-            metadata={"call_id": call_id, "internally_completed": True},
+            metadata={
+                "call_id": call_id,
+                "internally_executed": True,
+                "observed_call_completed": completed,
+            },
         )
     if item_type == "fileChange":
         changes = item.get("changes")
@@ -2066,16 +2084,26 @@ def _codex_builtin_tool_request(item: CodexParams) -> ToolCallRequest | None:
             return None
         return ToolCallRequest(
             name="apply_patch",
-            args={"path": paths[0]},
-            metadata={"call_id": call_id, "internally_completed": True},
+            # Match codex-native: retain every structured change, including
+            # diffs, so consumers can render more than the first changed path.
+            args={"changes": changes},
+            metadata={
+                "call_id": call_id,
+                "internally_executed": True,
+                "observed_call_completed": completed,
+            },
         )
     return None
 
 
 def _codex_builtin_tool_completion(item: CodexParams) -> ToolCallComplete | None:
-    """Translate a completed Codex built-in tool item into a correlated result."""
+    """Translate a completed Codex built-in item into a correlated result.
 
-    request = _codex_builtin_tool_request(item)
+    :param item: Completed Codex ``commandExecution`` or ``fileChange`` item.
+    :returns: The observed result, or ``None`` for an invalid item.
+    """
+
+    request = _codex_builtin_tool_request(item, completed=True)
     if request is None:
         return None
     status = ToolCallStatus.SUCCESS
@@ -2088,6 +2116,8 @@ def _codex_builtin_tool_completion(item: CodexParams) -> ToolCallComplete | None
         if isinstance(exit_code, int) and exit_code != 0:
             status = ToolCallStatus.ERROR
             error = f"Command exited with status {exit_code}."
+            suffix = f"[exit code: {exit_code}]"
+            result = f"{result}\n{suffix}" if result else suffix
     else:
         changes = item.get("changes")
         assert isinstance(changes, list)
@@ -2099,7 +2129,8 @@ def _codex_builtin_tool_completion(item: CodexParams) -> ToolCallComplete | None
             kind = change.get("kind")
             kind_type = kind.get("type") if isinstance(kind, dict) else None
             if isinstance(path, str):
-                summaries.append(f"{kind_type if isinstance(kind_type, str) else 'change'} {path}")
+                label = kind_type if isinstance(kind_type, str) and kind_type else "change"
+                summaries.append(f"{label} {path}")
         result = "\n".join(summaries)
         if item.get("status") in {"failed", "declined"}:
             status = ToolCallStatus.ERROR
@@ -2614,6 +2645,7 @@ class _CodexAppServerSession:
         message_buffers: dict[str, str] = {}
         pending_tool_results: dict[str, _PendingToolResult] = {}
         observed_builtin_tool_ids: set[str] = set()
+        completed_builtin_tool_ids: set[str] = set()
         final_response = ""
         observed_turn_id: str | None = None
 
@@ -2836,11 +2868,16 @@ class _CodexAppServerSession:
                     builtin_completion = _codex_builtin_tool_completion(item)
                     if builtin_completion is not None:
                         call_id = builtin_completion.metadata["call_id"]
-                        if isinstance(call_id, str) and call_id not in observed_builtin_tool_ids:
-                            request = _codex_builtin_tool_request(item)
-                            if request is not None:
-                                observed_builtin_tool_ids.add(call_id)
-                                yield request
+                        if not isinstance(call_id, str) or call_id in completed_builtin_tool_ids:
+                            continue
+                        completed_builtin_tool_ids.add(call_id)
+                        # The start remains a live in-progress observation. Re-emit
+                        # its completed form here because the relay deliberately
+                        # persists only completed function calls.
+                        request = _codex_builtin_tool_request(item, completed=True)
+                        if request is not None:
+                            observed_builtin_tool_ids.add(call_id)
+                            yield request
                         yield builtin_completion
                         continue
                     if item_type == "agentMessage":

@@ -1154,9 +1154,8 @@ def test_translate_event_non_mcp_request_queues_tool_use_id() -> None:
     result panel for the orphan call (the 2026-04-29
     user-reported regression on ``sys_timer_set``).
 
-    Executors that complete a tool internally remove this queued
-    identity when their ``ToolCallComplete`` arrives. This prevents a
-    later bridged-tool call from draining the wrong identity.
+    Executors that observe a tool already run by the native harness mark
+    it ``internally_executed`` and bypass this queue entirely.
     """
     from omnigent.inner.executor import ToolCallRequest
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
@@ -1185,7 +1184,7 @@ def test_translate_event_non_mcp_request_queues_tool_use_id() -> None:
     )
 
 
-def test_internal_tool_completion_removes_undispatched_correlation_id() -> None:
+def test_internally_executed_tool_bypasses_dispatch_correlation_queue() -> None:
     """Keep an observed native tool from corrupting a later dispatch identity."""
 
     from omnigent.inner.executor import ToolCallComplete, ToolCallRequest, ToolCallStatus
@@ -1197,7 +1196,7 @@ def test_internal_tool_completion_removes_undispatched_correlation_id() -> None:
         ToolCallRequest(
             name="shell",
             args={"command": "pwd"},
-            metadata={"call_id": "native-command-1"},
+            metadata={"call_id": "native-command-1", "internally_executed": True},
         ),
         ctx,  # type: ignore[arg-type]
     )
@@ -1893,8 +1892,8 @@ def test_internal_errored_tool_complete_emits_output_with_real_call_id() -> None
     )
 
 
-def test_internally_completed_tool_request_is_durable() -> None:
-    """Mark an internally completed tool call durable for session persistence."""
+def test_completed_observed_tool_request_is_durable() -> None:
+    """Mark the completed observation durable while retaining the live start."""
 
     from omnigent.inner.executor import ToolCallRequest
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
@@ -1902,17 +1901,27 @@ def test_internally_completed_tool_request_is_durable() -> None:
     adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
     ctx = _RecordingTurnContext()
 
+    request = ToolCallRequest(
+        name="shell",
+        args={"command": "pwd"},
+        metadata={"call_id": "command-1", "internally_executed": True},
+    )
+    adapter._translate_event(request, ctx)  # type: ignore[arg-type]
     adapter._translate_event(
         ToolCallRequest(
             name="shell",
             args={"command": "pwd"},
-            metadata={"call_id": "command-1", "internally_completed": True},
+            metadata={
+                "call_id": "command-1",
+                "internally_executed": True,
+                "observed_call_completed": True,
+            },
         ),
         ctx,  # type: ignore[arg-type]
     )
 
-    assert len(ctx.emitted) == 1
-    assert ctx.emitted[0].item["status"] == "completed"
+    assert [event.item["status"] for event in ctx.emitted] == ["in_progress", "completed"]
+    assert list(adapter._pending_mcp_call_ids) == []
 
 
 # ── ToolCallComplete suppression scoped to dispatched call ids ──────────────

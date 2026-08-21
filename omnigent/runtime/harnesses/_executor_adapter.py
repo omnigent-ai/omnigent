@@ -715,13 +715,15 @@ class ExecutorAdapter(HarnessApp):
             # so the post-stream dispatch reuses the same call_id for deduplication.
             # Emit bare names (strip MCP prefix) to match the Omnigent wire shape.
             tool_use_id = _call_id_from_metadata(event.metadata)
-            if tool_use_id is not None:
+            # Observed native tools already ran inside their harness. They must
+            # never enter the queue consumed by Omnigent's dispatch bridge.
+            if tool_use_id is not None and event.metadata.get("internally_executed") is not True:
                 self._pending_mcp_call_ids.append(tool_use_id)
             call_id = tool_use_id or f"call_{uuid.uuid4().hex[:12]}"
             bare_name = _strip_mcp_tool_prefix(event.name)
             status = (
                 _COMPLETED_TOOL_CALL_STATUS
-                if event.metadata.get("internally_completed") is True
+                if event.metadata.get("observed_call_completed") is True
                 else _OBSERVED_TOOL_CALL_STATUS
             )
             ctx.emit(
@@ -743,11 +745,6 @@ class ExecutorAdapter(HarnessApp):
             # (unpaiable — they'd render a ghost card). Internally-run tools (e.g. antigravity)
             # stamp real ids and are the sole output source; they must not be suppressed.
             call_id = _call_id_from_metadata(getattr(event, "metadata", None)) or ""
-            # Internally executed tools have no later dispatch callback to drain
-            # their observed request identity. Remove it when their correlated
-            # completion arrives so a later dynamic tool cannot reuse it.
-            with contextlib.suppress(ValueError):
-                self._pending_mcp_call_ids.remove(call_id)
             if not call_id or call_id in self._dispatched_call_ids:
                 return
             item: dict[str, Any] = {

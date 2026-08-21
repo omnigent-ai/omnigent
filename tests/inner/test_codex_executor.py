@@ -20,6 +20,7 @@ from omnigent.inner.codex_executor import (
     _TURN_EVENT_WARN_SECONDS,
     CodexExecutor,
     _build_initial_prompt,
+    _codex_builtin_tool_completion,
     _codex_cli_version,
     _CodexAppServerSession,
     _databricks_codex_config_overrides,
@@ -1926,7 +1927,15 @@ async def test_run_turn_emits_correlated_codex_builtin_tool_events() -> None:
     session.start = AsyncMock()
     session._proc = _FakeProcess()
     session.thread_id = "thread-1"
-    session._request = AsyncMock(return_value={"result": {"turn": {"id": "turn-1"}}})
+    turn_started = asyncio.Event()
+
+    async def _start_turn(*_args: object, **_kwargs: object) -> dict[str, object]:
+        """Return the turn id and release the live event producer."""
+
+        turn_started.set()
+        return {"result": {"turn": {"id": "turn-1"}}}
+
+    session._request = AsyncMock(side_effect=_start_turn)
 
     command_item = {
         "id": "command-1",
@@ -1934,54 +1943,59 @@ async def test_run_turn_emits_correlated_codex_builtin_tool_events() -> None:
         "command": "pwd",
         "cwd": "/tmp/workspace",
     }
-    await session._events.put(
-        {
-            "method": "item/started",
-            "params": {"turnId": "turn-1", "item": command_item},
-        }
-    )
-    await session._events.put(
-        {
-            "method": "item/completed",
-            "params": {
-                "turnId": "turn-1",
-                "item": {
-                    **command_item,
-                    "aggregatedOutput": "/tmp/workspace\n",
-                    "exitCode": 0,
-                    "durationMs": 12,
+
+    async def _produce_live_events() -> None:
+        """Publish lifecycle notifications after ``turn/start`` returns."""
+
+        await turn_started.wait()
+        events = [
+            {
+                "method": "item/started",
+                "params": {"turnId": "turn-1", "item": command_item},
+            },
+            {
+                "method": "item/completed",
+                "params": {
+                    "turnId": "turn-1",
+                    "item": {
+                        **command_item,
+                        "aggregatedOutput": "/tmp/workspace\n",
+                        "exitCode": 0,
+                        "durationMs": 12,
+                    },
                 },
             },
-        }
-    )
-    await session._events.put(
-        {
-            "method": "item/completed",
-            "params": {
-                "turnId": "turn-1",
-                "item": {
-                    "id": "file-1",
-                    "type": "fileChange",
-                    "status": "completed",
-                    "changes": [{"path": "/tmp/workspace/result.txt", "kind": {"type": "add"}}],
+            {
+                "method": "item/completed",
+                "params": {
+                    "turnId": "turn-1",
+                    "item": {
+                        "id": "file-1",
+                        "type": "fileChange",
+                        "status": "completed",
+                        "changes": [
+                            {"path": "/tmp/workspace/result.txt", "kind": {"type": "add"}}
+                        ],
+                    },
                 },
             },
-        }
-    )
-    await session._events.put(
-        {
-            "method": "item/completed",
-            "params": {
-                "turnId": "turn-1",
-                "item": {
-                    "id": "message-1",
-                    "type": "agentMessage",
-                    "phase": "final_answer",
-                    "text": "done",
+            {
+                "method": "item/completed",
+                "params": {
+                    "turnId": "turn-1",
+                    "item": {
+                        "id": "message-1",
+                        "type": "agentMessage",
+                        "phase": "final_answer",
+                        "text": "done",
+                    },
                 },
             },
-        }
-    )
+        ]
+        for event in events:
+            await session._events.put(event)
+
+    producer = asyncio.create_task(_produce_live_events())
 
     events = [
         event
@@ -1994,11 +2008,13 @@ async def test_run_turn_emits_correlated_codex_builtin_tool_events() -> None:
             sandbox="workspace-write",
         )
     ]
+    await producer
 
     tool_events = [
         event for event in events if isinstance(event, (ToolCallRequest, ToolCallComplete))
     ]
     assert [event.name for event in tool_events] == [
+        "shell",
         "shell",
         "shell",
         "apply_patch",
@@ -2007,18 +2023,44 @@ async def test_run_turn_emits_correlated_codex_builtin_tool_events() -> None:
     assert [event.metadata["call_id"] for event in tool_events] == [
         "command-1",
         "command-1",
+        "command-1",
         "file-1",
         "file-1",
     ]
     assert isinstance(tool_events[0], ToolCallRequest)
     assert tool_events[0].args == {"command": "pwd", "cwd": "/tmp/workspace"}
-    assert isinstance(tool_events[1], ToolCallComplete)
-    assert tool_events[1].result == "/tmp/workspace\n"
-    assert tool_events[1].status is ToolCallStatus.SUCCESS
-    assert isinstance(tool_events[2], ToolCallRequest)
-    assert tool_events[2].args == {"path": "/tmp/workspace/result.txt"}
+    assert tool_events[0].metadata["observed_call_completed"] is False
+    assert isinstance(tool_events[1], ToolCallRequest)
+    assert tool_events[1].metadata["observed_call_completed"] is True
+    assert isinstance(tool_events[2], ToolCallComplete)
+    assert tool_events[2].result == "/tmp/workspace\n"
+    assert tool_events[2].status is ToolCallStatus.SUCCESS
+    assert isinstance(tool_events[3], ToolCallRequest)
+    assert tool_events[3].args == {
+        "changes": [{"path": "/tmp/workspace/result.txt", "kind": {"type": "add"}}]
+    }
+    assert tool_events[3].metadata["observed_call_completed"] is True
     assert isinstance(events[-1], TurnComplete)
     assert events[-1].response == "done"
+
+
+def test_codex_builtin_command_completion_surfaces_nonzero_exit() -> None:
+    """Keep failed command output visibly distinguishable from success."""
+
+    completion = _codex_builtin_tool_completion(
+        {
+            "id": "command-failed",
+            "type": "commandExecution",
+            "command": "false",
+            "aggregatedOutput": "boom",
+            "exitCode": 3,
+        }
+    )
+
+    assert completion is not None
+    assert completion.status is ToolCallStatus.ERROR
+    assert completion.result == "boom\n[exit code: 3]"
+    assert completion.error == "Command exited with status 3."
 
 
 async def test_run_turn_refuses_to_adopt_stale_final_answer_event() -> None:
