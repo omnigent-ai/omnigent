@@ -7942,7 +7942,12 @@ def _stdin_is_tty() -> bool:
     return sys.stdin.isatty()
 
 
-def _maybe_open_host_web_ui(server_url: str, *, non_interactive: bool) -> None:
+def _maybe_open_host_web_ui(
+    server_url: str,
+    *,
+    non_interactive: bool,
+    cfg: dict[str, Any] | None = None,  # type: ignore[explicit-any]
+) -> None:
     """Open the Omnigent web UI in the browser when a host comes up.
 
     Honors the shared ``auto_open_conversation`` setting — the same switch
@@ -7955,12 +7960,17 @@ def _maybe_open_host_web_ui(server_url: str, *, non_interactive: bool) -> None:
     :param server_url: Resolved server URL the host serves/connects to, e.g.
         ``"http://127.0.0.1:6767"`` or ``"https://ws/api/2.0/omnigent"``.
     :param non_interactive: When ``True``, never open a browser.
+    :param cfg: Effective config the caller already loaded, reused to resolve
+        ``auto_open_conversation``; loaded lazily when ``None`` (only after
+        the interactive gate passes, so a skipped open reads no config).
     """
     # Mirror the adjacent sign-in flow: a pipe/CI/systemd context has no one
     # watching a browser, so treat "no TTY" like --non-interactive.
     if non_interactive or not _stdin_is_tty():
         return
-    if _resolve_auto_open_conversation_setting(_load_effective_config()) is False:
+    if cfg is None:
+        cfg = _load_effective_config()
+    if _resolve_auto_open_conversation_setting(cfg) is False:
         return
     from omnigent.conversation_browser import display_server_url, open_conversation_url
 
@@ -8208,7 +8218,7 @@ def host(
             _ensure_databricks_server_auth(server, non_interactive=non_interactive)
         # Open the web UI before the daemon blocks in the foreground, so the
         # user lands in Omnigent web without a second command.
-        _maybe_open_host_web_ui(server, non_interactive=non_interactive)
+        _maybe_open_host_web_ui(server, non_interactive=non_interactive, cfg=cfg)
         run_host_process(server_url=server)
         stopped_cleanly = True
     except KeyboardInterrupt:

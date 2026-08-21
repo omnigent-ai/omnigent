@@ -949,21 +949,46 @@ def test_start_hosts_on_explicit_server(
 # ── auto-open web UI ──────────────────────────────────────────────
 
 
-def test_host_opens_web_ui_when_interactive(
+@pytest.mark.parametrize(
+    ("is_tty", "extra_args", "config_content", "expected_opened"),
+    [
+        # Interactive TTY, default (unconfigured) auto_open: the local
+        # server's URL is opened once, before the blocking loop starts —
+        # the daemon otherwise occupies the terminal.
+        pytest.param(True, [], None, ["http://127.0.0.1:8123"], id="interactive-opens"),
+        # ``--non-interactive`` never opens a browser, even on a TTY (scripts/CI).
+        pytest.param(True, ["--non-interactive"], None, [], id="non-interactive-skips"),
+        # A non-terminal context (pipe / nohup / systemd) never opens: else
+        # ``webbrowser.open`` shells out to ``xdg-open`` with no display, so
+        # "no TTY" is treated like ``--non-interactive``.
+        pytest.param(False, [], None, [], id="no-tty-skips"),
+        # An explicit ``auto_open_conversation: false`` suppresses it on a TTY.
+        pytest.param(
+            True, [], "auto_open_conversation: false\n", [], id="auto-open-disabled-skips"
+        ),
+    ],
+)
+def test_host_web_ui_open_gates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    is_tty: bool,
+    extra_args: list[str],
+    config_content: str | None,
+    expected_opened: list[str],
 ) -> None:
     """
-    Foreground ``omnigent host`` opens the web UI before it blocks.
+    Foreground ``omnigent host`` opens the web UI only when appropriate.
 
-    The daemon otherwise occupies the terminal, so a user had to open a
-    second tab to reach the web app. On an interactive terminal, with the
-    default (unconfigured) ``auto_open_conversation``, the local server's
-    URL is opened once, before the blocking loop starts.
+    It opens the local server's URL before the daemon blocks so the user
+    lands in the web app without a second command — but stays quiet on
+    ``--non-interactive``, without a TTY, or when ``auto_open_conversation``
+    is explicitly ``false``. Each parametrization exercises one gate.
     """
+    if config_content is not None:
+        (tmp_path / "config.yaml").write_text(config_content)
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
-    monkeypatch.setattr("omnigent.cli._stdin_is_tty", lambda: True)
+    monkeypatch.setattr("omnigent.cli._stdin_is_tty", lambda: is_tty)
     opened: list[str] = []
 
     with (
@@ -977,98 +1002,10 @@ def test_host_opens_web_ui_when_interactive(
             lambda url: opened.append(url) or True,
         ),
     ):
-        result = CliRunner().invoke(cli, ["host"])
+        result = CliRunner().invoke(cli, ["host", *extra_args])
 
     assert result.exit_code == 0, result.output
-    # The local server's own URL is the web UI's URL.
-    assert opened == ["http://127.0.0.1:8123"]
-
-
-def test_host_skips_web_ui_when_non_interactive(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``--non-interactive`` never opens a browser, even on a TTY (scripts/CI)."""
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
-    monkeypatch.setattr("omnigent.cli._stdin_is_tty", lambda: True)
-    opened: list[str] = []
-
-    with (
-        patch(
-            "omnigent.cli.ensure_local_omnigent_server",
-            lambda: LocalServerStartup(url="http://127.0.0.1:8123", spawned=False),
-        ),
-        patch("omnigent.host.connect.run_host_process", lambda server_url, **kwargs: None),
-        patch(
-            "omnigent.conversation_browser.open_conversation_url",
-            lambda url: opened.append(url) or True,
-        ),
-    ):
-        result = CliRunner().invoke(cli, ["host", "--non-interactive"])
-
-    assert result.exit_code == 0, result.output
-    assert opened == []
-
-
-def test_host_skips_web_ui_without_tty(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    A non-terminal context (pipe / nohup / systemd) never opens a browser.
-
-    ``webbrowser.open`` would otherwise shell out to ``xdg-open`` with no
-    display, so "no TTY" is treated like ``--non-interactive``.
-    """
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
-    monkeypatch.setattr("omnigent.cli._stdin_is_tty", lambda: False)
-    opened: list[str] = []
-
-    with (
-        patch(
-            "omnigent.cli.ensure_local_omnigent_server",
-            lambda: LocalServerStartup(url="http://127.0.0.1:8123", spawned=False),
-        ),
-        patch("omnigent.host.connect.run_host_process", lambda server_url, **kwargs: None),
-        patch(
-            "omnigent.conversation_browser.open_conversation_url",
-            lambda url: opened.append(url) or True,
-        ),
-    ):
-        result = CliRunner().invoke(cli, ["host"])
-
-    assert result.exit_code == 0, result.output
-    assert opened == []
-
-
-def test_host_respects_auto_open_conversation_disabled(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An explicit ``auto_open_conversation: false`` suppresses the open on a TTY."""
-    (tmp_path / "config.yaml").write_text("auto_open_conversation: false\n")
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
-    monkeypatch.setattr("omnigent.cli._stdin_is_tty", lambda: True)
-    opened: list[str] = []
-
-    with (
-        patch(
-            "omnigent.cli.ensure_local_omnigent_server",
-            lambda: LocalServerStartup(url="http://127.0.0.1:8123", spawned=False),
-        ),
-        patch("omnigent.host.connect.run_host_process", lambda server_url, **kwargs: None),
-        patch(
-            "omnigent.conversation_browser.open_conversation_url",
-            lambda url: opened.append(url) or True,
-        ),
-    ):
-        result = CliRunner().invoke(cli, ["host"])
-
-    assert result.exit_code == 0, result.output
-    assert opened == []
+    assert opened == expected_opened
 
 
 def test_start_opens_web_ui_when_interactive(
