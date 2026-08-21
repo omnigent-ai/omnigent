@@ -317,7 +317,11 @@ export function ProjectSettingsDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
         onClick={(e) => e.stopPropagation()}
-        className="sm:max-w-lg"
+        // Height is the CALLER's job: DialogContent caps width only, and is
+        // centered with `-translate-y-1/2`, so an uncapped dialog taller than
+        // the viewport is clipped at BOTH ends with nothing to scroll. Mirrors
+        // the other long dialogs in this shell (fork / add-agent / reconnect).
+        className="flex max-h-[85vh] flex-col gap-4 sm:max-w-lg"
         // Keep a nested dropdown's dismiss (pick an option, or click the modal
         // body while it's open) from closing the whole Dialog. See
         // `guardDialogDismiss`; real backdrop clicks and Escape still close.
@@ -331,300 +335,305 @@ export function ProjectSettingsDialog({
             a starting point you can change per session; leave a field blank for no default.
           </DialogDescription>
         </DialogHeader>
-        <form onSubmit={onSubmit} className="flex flex-col gap-4">
-          <Field label="Host" hint="Where new sessions run by default">
-            <Select
-              value={hostId}
-              onValueChange={setHostId}
-              onOpenChange={onDropdownOpenChange}
-              disabled={isLoading}
-            >
-              <SelectTrigger className="w-full" data-testid="project-settings-host">
-                <SelectValue placeholder="No default" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value={NONE}>No default</SelectItem>
-                {managedSandboxesEnabled && (
-                  <SelectItem value={SANDBOX_HOST_CHOICE}>
-                    {sandboxOptionLabel(sandboxProvider)}
-                  </SelectItem>
-                )}
-                {onlineHosts.map((h) => (
-                  <SelectItem key={h.host_id} value={h.host_id}>
-                    {h.name}
-                  </SelectItem>
-                ))}
-                {storedHostMissing && (
-                  <SelectItem value={hostId}>
-                    {stored?.host_id === hostId ? `${hostId} (unavailable)` : hostId}
-                  </SelectItem>
-                )}
-              </SelectContent>
-            </Select>
-          </Field>
-
-          <Field
-            label="Working directory"
-            hint={
-              hostId === NONE
-                ? "Pick a host first"
-                : browsableHostId
-                  ? "Browse the host or type a path"
-                  : "Absolute path on the host"
-            }
-            htmlFor="project-settings-workspace"
-          >
-            {hostId === NONE ? (
-              // Mirror the new-session composer: the working directory can only
-              // be chosen once a host is selected (the file browser lists
-              // against a concrete host, and a path is host-relative anyway).
-              <p
-                className="rounded-md border border-dashed px-3 py-2 text-muted-foreground text-ui"
-                data-testid="project-settings-workspace"
+        <form onSubmit={onSubmit} className="flex min-h-0 flex-1 flex-col gap-4">
+          <div className="-mr-4 flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto pr-4">
+            <Field label="Host" hint="Where new sessions run by default">
+              <Select
+                value={hostId}
+                onValueChange={setHostId}
+                onOpenChange={onDropdownOpenChange}
+                disabled={isLoading}
               >
-                Pick a host first
-              </p>
-            ) : browsableHostId ? (
-              // A compact trigger showing the current path; clicking expands
-              // the filesystem browser as an overlay anchored to the trigger.
-              // The browser is rendered inside DialogContent (not a portaled
-              // popover) so it scrolls — a modal Dialog's scroll-lock blocks
-              // wheel events on portaled content — but positioned `absolute`
-              // so it floats over the fields below instead of stretching the
-              // modal. onNavigate updates the field live as you browse.
-              <div
-                className="relative flex flex-col gap-1.5"
-                data-testid="project-settings-workspace"
-              >
-                <button
-                  type="button"
-                  onClick={() => setWorkspaceOpen((v) => !v)}
-                  aria-expanded={workspaceOpen}
-                  disabled={isLoading}
-                  className="flex h-8 w-full items-center justify-between gap-2 rounded-md border border-input bg-transparent px-3 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  <span className={workspace ? "truncate" : "truncate text-muted-foreground"}>
-                    {workspace || "Browse…"}
-                  </span>
-                  <ChevronDownIcon
-                    className={`size-4 shrink-0 opacity-50 transition-transform ${
-                      workspaceOpen ? "rotate-180" : ""
-                    }`}
-                  />
-                </button>
-                {workspaceOpen && (
-                  <>
-                    {/* Click-away: a transparent full-modal backdrop that
-                          closes the browser (keeping the current path) on any
-                          click outside it. */}
-                    <button
-                      type="button"
-                      aria-label="Close directory browser"
-                      className="fixed inset-0 z-10 cursor-default"
-                      onClick={() => setWorkspaceOpen(false)}
-                    />
-                    <div className="absolute top-full right-0 left-0 z-20 mt-1 rounded-[12px] border border-border bg-popover p-2 shadow-menu [&>[data-testid=workspace-picker]]:border-0">
-                      <WorkspacePicker
-                        hostId={browsableHostId}
-                        initialPath={isNavigablePath(workspace) ? workspace : undefined}
-                        onNavigate={setWorkspace}
-                      />
-                    </div>
-                  </>
-                )}
-              </div>
-            ) : (
-              // A host is picked but not browsable (sandbox / offline stored
-              // host) — fall back to typing an absolute path.
-              <input
-                id="project-settings-workspace"
-                data-testid="project-settings-workspace"
-                className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
-                placeholder="/path/to/repo"
-                value={workspace}
-                onChange={(e) => setWorkspace(e.target.value)}
-                disabled={isLoading}
-              />
-            )}
-          </Field>
-
-          <Field
-            label="Random worktree"
-            hint="Start each new session in a fresh randomly-named git worktree (vs. directly in the workspace)"
-          >
-            <div className="flex sm:justify-end">
-              <Switch
-                data-testid="project-settings-worktree"
-                checked={useWorktree}
-                onCheckedChange={setUseWorktree}
-                disabled={isLoading}
-              />
-            </div>
-          </Field>
-
-          {useWorktree && (
-            <Field
-              label="Base branch"
-              hint="Branch new worktrees fork from; blank uses the current branch"
-              htmlFor="project-settings-base-branch"
-            >
-              <input
-                id="project-settings-base-branch"
-                data-testid="project-settings-base-branch"
-                className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
-                placeholder="e.g. main"
-                value={baseBranch}
-                onChange={(e) => setBaseBranch(e.target.value)}
-                disabled={isLoading}
-              />
+                <SelectTrigger className="w-full" data-testid="project-settings-host">
+                  <SelectValue placeholder="No default" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={NONE}>No default</SelectItem>
+                  {managedSandboxesEnabled && (
+                    <SelectItem value={SANDBOX_HOST_CHOICE}>
+                      {sandboxOptionLabel(sandboxProvider)}
+                    </SelectItem>
+                  )}
+                  {onlineHosts.map((h) => (
+                    <SelectItem key={h.host_id} value={h.host_id}>
+                      {h.name}
+                    </SelectItem>
+                  ))}
+                  {storedHostMissing && (
+                    <SelectItem value={hostId}>
+                      {stored?.host_id === hostId ? `${hostId} (unavailable)` : hostId}
+                    </SelectItem>
+                  )}
+                </SelectContent>
+              </Select>
             </Field>
-          )}
 
-          <Field
-            label="Worktree location"
-            hint="Directory new worktrees are created in. Relative to the repo root; {repo} is its name. Blank uses <repo>-worktrees next to it."
-            htmlFor="project-settings-worktree-root"
-          >
-            <input
-              id="project-settings-worktree-root"
-              data-testid="project-settings-worktree-root"
-              className="w-full rounded-md border bg-transparent px-3 py-2 font-mono text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
-              placeholder="e.g. .worktrees or ../worktrees"
-              value={worktreeRoot}
-              onChange={(e) => setWorktreeRoot(e.target.value)}
-              disabled={isLoading}
-            />
-          </Field>
+            <Field
+              label="Working directory"
+              hint={
+                hostId === NONE
+                  ? "Pick a host first"
+                  : browsableHostId
+                    ? "Browse the host or type a path"
+                    : "Absolute path on the host"
+              }
+              htmlFor="project-settings-workspace"
+            >
+              {hostId === NONE ? (
+                // Mirror the new-session composer: the working directory can only
+                // be chosen once a host is selected (the file browser lists
+                // against a concrete host, and a path is host-relative anyway).
+                <p
+                  className="rounded-md border border-dashed px-3 py-2 text-muted-foreground text-ui"
+                  data-testid="project-settings-workspace"
+                >
+                  Pick a host first
+                </p>
+              ) : browsableHostId ? (
+                // A compact trigger showing the current path; clicking expands
+                // the filesystem browser as an overlay anchored to the trigger.
+                // The browser is rendered inside DialogContent (not a portaled
+                // popover) so it scrolls — a modal Dialog's scroll-lock blocks
+                // wheel events on portaled content — but positioned `absolute`
+                // so it floats over the fields below instead of stretching the
+                // modal. onNavigate updates the field live as you browse.
+                <div
+                  className="relative flex flex-col gap-1.5"
+                  data-testid="project-settings-workspace"
+                >
+                  <button
+                    type="button"
+                    onClick={() => setWorkspaceOpen((v) => !v)}
+                    aria-expanded={workspaceOpen}
+                    disabled={isLoading}
+                    className="flex h-8 w-full items-center justify-between gap-2 rounded-md border border-input bg-transparent px-3 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <span className={workspace ? "truncate" : "truncate text-muted-foreground"}>
+                      {workspace || "Browse…"}
+                    </span>
+                    <ChevronDownIcon
+                      className={`size-4 shrink-0 opacity-50 transition-transform ${
+                        workspaceOpen ? "rotate-180" : ""
+                      }`}
+                    />
+                  </button>
+                  {workspaceOpen && (
+                    <>
+                      {/* Click-away: a transparent full-modal backdrop that
+                            closes the browser (keeping the current path) on any
+                            click outside it. */}
+                      <button
+                        type="button"
+                        aria-label="Close directory browser"
+                        className="fixed inset-0 z-10 cursor-default"
+                        onClick={() => setWorkspaceOpen(false)}
+                      />
+                      <div className="absolute top-full right-0 left-0 z-20 mt-1 rounded-[12px] border border-border bg-popover p-2 shadow-menu [&>[data-testid=workspace-picker]]:border-0">
+                        <WorkspacePicker
+                          hostId={browsableHostId}
+                          initialPath={isNavigablePath(workspace) ? workspace : undefined}
+                          onNavigate={setWorkspace}
+                        />
+                      </div>
+                    </>
+                  )}
+                </div>
+              ) : (
+                // A host is picked but not browsable (sandbox / offline stored
+                // host) — fall back to typing an absolute path.
+                <input
+                  id="project-settings-workspace"
+                  data-testid="project-settings-workspace"
+                  className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
+                  placeholder="/path/to/repo"
+                  value={workspace}
+                  onChange={(e) => setWorkspace(e.target.value)}
+                  disabled={isLoading}
+                />
+              )}
+            </Field>
 
-          <ScriptField
-            label="Worktree setup script"
-            hint="Runs on the host in each new worktree before the first turn. One command or a full script; leave blank for none."
-            htmlFor="project-settings-post-create"
-          >
-            <textarea
-              id="project-settings-post-create"
-              data-testid="project-settings-post-create"
-              className={SCRIPT_TEXTAREA_CLASS}
-              rows={5}
-              spellCheck={false}
-              placeholder={POST_CREATE_PLACEHOLDER}
-              value={postCreateCommand}
-              onChange={(e) => setPostCreateCommand(e.target.value)}
-              disabled={isLoading}
-            />
-          </ScriptField>
+            <Field
+              label="Random worktree"
+              hint="Start each new session in a fresh randomly-named git worktree (vs. directly in the workspace)"
+            >
+              <div className="flex sm:justify-end">
+                <Switch
+                  data-testid="project-settings-worktree"
+                  checked={useWorktree}
+                  onCheckedChange={setUseWorktree}
+                  disabled={isLoading}
+                />
+              </div>
+            </Field>
 
-          <ScriptField
-            label="Worktree teardown script"
-            hint="Runs on the host in the worktree just before it's deleted (stop a dev server, drop a database)."
-            htmlFor="project-settings-pre-delete"
-          >
-            <textarea
-              id="project-settings-pre-delete"
-              data-testid="project-settings-pre-delete"
-              className={SCRIPT_TEXTAREA_CLASS}
-              rows={4}
-              spellCheck={false}
-              placeholder={PRE_DELETE_PLACEHOLDER}
-              value={preDeleteCommand}
-              onChange={(e) => setPreDeleteCommand(e.target.value)}
-              disabled={isLoading}
-            />
-          </ScriptField>
-
-          {(postCreateCommand.trim() !== "" || preDeleteCommand.trim() !== "") && (
-            <>
+            {useWorktree && (
               <Field
-                label="Script timeout"
-                hint="Seconds before either script is killed; blank uses 300."
-                htmlFor="project-settings-hook-timeout"
+                label="Base branch"
+                hint="Branch new worktrees fork from; blank uses the current branch"
+                htmlFor="project-settings-base-branch"
               >
                 <input
-                  id="project-settings-hook-timeout"
-                  data-testid="project-settings-hook-timeout"
-                  type="number"
-                  min={1}
-                  max={3600}
+                  id="project-settings-base-branch"
+                  data-testid="project-settings-base-branch"
                   className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
-                  placeholder="300"
-                  value={hookTimeout}
-                  onChange={(e) => setHookTimeout(e.target.value)}
+                  placeholder="e.g. main"
+                  value={baseBranch}
+                  onChange={(e) => setBaseBranch(e.target.value)}
                   disabled={isLoading}
                 />
               </Field>
-              {/* The accepted trust model, stated where it's chosen: these
-                  scripts run as the host daemon's OS user with no sandbox. */}
-              <p className="text-muted-foreground text-sm" data-testid="project-settings-hook-note">
-                These scripts run unsandboxed as the user running the host, with the same access as
-                the agent itself.
-              </p>
-            </>
-          )}
+            )}
 
-          <Field label="Agent" hint="Default agent / harness for new sessions">
-            <div className="flex flex-col items-end gap-1" data-testid="project-settings-agent">
-              <AgentHarnessPicker
-                agentEntries={agentEntries}
-                harnessEntries={harnessEntries}
-                effectiveAgentId={agentId}
-                agentLabel={agentLabel}
-                hasAgents={agentList.length > 0}
-                host={warningHost}
-                onSelectAgent={(a) => setAgentId(a.id)}
-                pendingAgent={null}
-                pendingAgentId="__unused_pending_agent__"
-                onSelectPending={() => {}}
-                // No interactive create flow here, so hide the "Create custom
-                // agent" action and leave the handler inert.
-                onCreateCustomAgent={() => {}}
-                allowCreateCustomAgent={false}
-                sandboxSelected={hostId === SANDBOX_HOST_CHOICE}
-                // Modal so the menu establishes its own scroll context and can
-                // scroll inside the Dialog's scroll-lock (a non-modal dropdown
-                // portals outside that lock and can't scroll). The dismiss
-                // guard on DialogContent keeps this modal dropdown's own close
-                // from bubbling up and closing the settings dialog.
-                dropdownModal
-                onOpenChange={onDropdownOpenChange}
-                // Bound the menu height so it scrolls inside the modal instead
-                // of running off the bottom; fixed width matches the composer.
-                contentClassName="max-h-80 w-80"
-                contentAlign="end"
-                // Fill the field column and match the sibling <Select> triggers
-                // (full width, bordered, h-8) so the control right-aligns with
-                // the host / effort dropdowns instead of floating mid-row.
-                triggerClassName="h-8 w-full justify-between rounded-md border border-input bg-transparent px-3 text-foreground hover:bg-transparent hover:text-foreground"
-                triggerLabelClassName="max-w-none text-ui"
-              />
-              {agentId && (
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  className="h-auto p-0 text-muted-foreground text-sm hover:bg-transparent"
-                  onClick={() => setAgentId(null)}
-                >
-                  Clear
-                </Button>
-              )}
-            </div>
-          </Field>
-
-          {loadFailed && (
-            <p
-              className="text-destructive text-ui"
-              role="alert"
-              data-testid="project-settings-load-error"
+            <Field
+              label="Worktree location"
+              hint="Directory new worktrees are created in. Relative to the repo root; {repo} is its name. Blank uses <repo>-worktrees next to it."
+              htmlFor="project-settings-worktree-root"
             >
-              Couldn't load this project's settings. Close and reopen to try again — saving is
-              disabled so your existing defaults aren't overwritten.
-            </p>
-          )}
-          {updateConfig.isError && (
-            <p className="text-destructive text-ui" role="alert">
-              {(updateConfig.error as Error).message}
-            </p>
-          )}
+              <input
+                id="project-settings-worktree-root"
+                data-testid="project-settings-worktree-root"
+                className="w-full rounded-md border bg-transparent px-3 py-2 font-mono text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
+                placeholder="e.g. .worktrees or ../worktrees"
+                value={worktreeRoot}
+                onChange={(e) => setWorktreeRoot(e.target.value)}
+                disabled={isLoading}
+              />
+            </Field>
+
+            <ScriptField
+              label="Worktree setup script"
+              hint="Runs on the host in each new worktree before the first turn. One command or a full script; leave blank for none."
+              htmlFor="project-settings-post-create"
+            >
+              <textarea
+                id="project-settings-post-create"
+                data-testid="project-settings-post-create"
+                className={SCRIPT_TEXTAREA_CLASS}
+                rows={5}
+                spellCheck={false}
+                placeholder={POST_CREATE_PLACEHOLDER}
+                value={postCreateCommand}
+                onChange={(e) => setPostCreateCommand(e.target.value)}
+                disabled={isLoading}
+              />
+            </ScriptField>
+
+            <ScriptField
+              label="Worktree teardown script"
+              hint="Runs on the host in the worktree just before it's deleted (stop a dev server, drop a database)."
+              htmlFor="project-settings-pre-delete"
+            >
+              <textarea
+                id="project-settings-pre-delete"
+                data-testid="project-settings-pre-delete"
+                className={SCRIPT_TEXTAREA_CLASS}
+                rows={4}
+                spellCheck={false}
+                placeholder={PRE_DELETE_PLACEHOLDER}
+                value={preDeleteCommand}
+                onChange={(e) => setPreDeleteCommand(e.target.value)}
+                disabled={isLoading}
+              />
+            </ScriptField>
+
+            {(postCreateCommand.trim() !== "" || preDeleteCommand.trim() !== "") && (
+              <>
+                <Field
+                  label="Script timeout"
+                  hint="Seconds before either script is killed; blank uses 300."
+                  htmlFor="project-settings-hook-timeout"
+                >
+                  <input
+                    id="project-settings-hook-timeout"
+                    data-testid="project-settings-hook-timeout"
+                    type="number"
+                    min={1}
+                    max={3600}
+                    className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
+                    placeholder="300"
+                    value={hookTimeout}
+                    onChange={(e) => setHookTimeout(e.target.value)}
+                    disabled={isLoading}
+                  />
+                </Field>
+                {/* The accepted trust model, stated where it's chosen: these
+                    scripts run as the host daemon's OS user with no sandbox. */}
+                <p
+                  className="text-muted-foreground text-sm"
+                  data-testid="project-settings-hook-note"
+                >
+                  These scripts run unsandboxed as the user running the host, with the same access
+                  as the agent itself.
+                </p>
+              </>
+            )}
+
+            <Field label="Agent" hint="Default agent / harness for new sessions">
+              <div className="flex flex-col items-end gap-1" data-testid="project-settings-agent">
+                <AgentHarnessPicker
+                  agentEntries={agentEntries}
+                  harnessEntries={harnessEntries}
+                  effectiveAgentId={agentId}
+                  agentLabel={agentLabel}
+                  hasAgents={agentList.length > 0}
+                  host={warningHost}
+                  onSelectAgent={(a) => setAgentId(a.id)}
+                  pendingAgent={null}
+                  pendingAgentId="__unused_pending_agent__"
+                  onSelectPending={() => {}}
+                  // No interactive create flow here, so hide the "Create custom
+                  // agent" action and leave the handler inert.
+                  onCreateCustomAgent={() => {}}
+                  allowCreateCustomAgent={false}
+                  sandboxSelected={hostId === SANDBOX_HOST_CHOICE}
+                  // Modal so the menu establishes its own scroll context and can
+                  // scroll inside the Dialog's scroll-lock (a non-modal dropdown
+                  // portals outside that lock and can't scroll). The dismiss
+                  // guard on DialogContent keeps this modal dropdown's own close
+                  // from bubbling up and closing the settings dialog.
+                  dropdownModal
+                  onOpenChange={onDropdownOpenChange}
+                  // Bound the menu height so it scrolls inside the modal instead
+                  // of running off the bottom; fixed width matches the composer.
+                  contentClassName="max-h-80 w-80"
+                  contentAlign="end"
+                  // Fill the field column and match the sibling <Select> triggers
+                  // (full width, bordered, h-8) so the control right-aligns with
+                  // the host / effort dropdowns instead of floating mid-row.
+                  triggerClassName="h-8 w-full justify-between rounded-md border border-input bg-transparent px-3 text-foreground hover:bg-transparent hover:text-foreground"
+                  triggerLabelClassName="max-w-none text-ui"
+                />
+                {agentId && (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="h-auto p-0 text-muted-foreground text-sm hover:bg-transparent"
+                    onClick={() => setAgentId(null)}
+                  >
+                    Clear
+                  </Button>
+                )}
+              </div>
+            </Field>
+
+            {loadFailed && (
+              <p
+                className="text-destructive text-ui"
+                role="alert"
+                data-testid="project-settings-load-error"
+              >
+                Couldn't load this project's settings. Close and reopen to try again — saving is
+                disabled so your existing defaults aren't overwritten.
+              </p>
+            )}
+            {updateConfig.isError && (
+              <p className="text-destructive text-ui" role="alert">
+                {(updateConfig.error as Error).message}
+              </p>
+            )}
+          </div>
 
           <DialogFooter className="border-t-0 bg-transparent">
             <Button

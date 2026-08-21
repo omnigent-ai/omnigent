@@ -387,6 +387,32 @@ describe("ProjectSettingsDialog", () => {
     );
   });
 
+  it("caps its height and scrolls the fields, keeping Save reachable", async () => {
+    // DialogContent caps WIDTH only and is centered with `-translate-y-1/2`, so
+    // an uncapped dialog taller than the viewport is clipped at both ends with
+    // nothing to scroll — which is what happened as settings were added. jsdom
+    // does no layout, so assert the contract that prevents it: a height cap on
+    // the dialog, a scrollable fields region, and Save OUTSIDE that region.
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+    renderDialog();
+    await waitFor(() =>
+      expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(
+        false,
+      ),
+    );
+
+    const content = document.querySelector('[data-slot="dialog-content"]');
+    expect(content).not.toBeNull();
+    expect(content!.className).toMatch(/max-h-\[85vh\]/);
+
+    const scroller = content!.querySelector(".overflow-y-auto");
+    expect(scroller).not.toBeNull();
+    // The worktree location field scrolls...
+    expect(scroller!.contains(screen.getByTestId("project-settings-worktree-root"))).toBe(true);
+    // ...while Save stays pinned outside the scroll region.
+    expect(scroller!.contains(screen.getByTestId("project-settings-save"))).toBe(false);
+  });
+
   it("blocks Save (does not clear defaults) when the config load fails", async () => {
     // A transient GET failure must NOT be read as "no config" — otherwise
     // saving the blank draft would send `{}` and wipe the stored defaults.
