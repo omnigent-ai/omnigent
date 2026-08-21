@@ -4645,6 +4645,60 @@ async def _launch_runner_on_host(*args: Any, **kwargs: Any) -> _HostLaunchAttemp
     return await _facade._launch_runner_on_host(*args, **kwargs)
 
 
+# Per-conversation relaunch locks (single-flight; weak values so a lock is
+# collected once no flight holds or awaits it), the most recent attempt per
+# conversation (so a rider that short-circuits onto another flight's binding
+# surfaces THAT flight's structured refusal instead of a generic connect
+# timeout; entries are a few strings each and only conversations that ever
+# relaunched appear), and strong refs to the detached superseded-runner
+# stops.
+_relaunch_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+_relaunch_last_attempt: dict[str, _HostLaunchAttempt] = {}
+_detached_supersede_stops: set[asyncio.Task[None]] = set()
+
+
+def _spawn_superseded_runner_stop(
+    session_id: str,
+    host_id: str,
+    runner_id: str,
+    host_registry: HostRegistry,
+) -> None:
+    """
+    Stop a relaunch's superseded runner as a retained background task.
+
+    The relaunch has already rotated the session's binding, so the old
+    runner serves nothing — but left alive it idles forever (tunnel still
+    authenticating, transcript forwarder still tailing the session): one
+    leaked generation per relaunch, each holding a native pane. Detached so
+    the relaunch's latency never waits out the stop's ack timeout; the host
+    connection is live by construction here (the launch frame just went
+    over it), so delivery is the overwhelmingly common case, and the
+    host-side supersession check covers a lost frame. Any failure is
+    logged rather than left as an unretrieved task exception.
+
+    :param session_id: Session/conversation identifier.
+    :param host_id: The session's owning host.
+    :param runner_id: The superseded runner's id.
+    :param host_registry: Registry holding the live host tunnel.
+    """
+
+    async def _stop_and_log() -> None:
+        try:
+            await _stop_session_host_runner(session_id, host_id, runner_id, host_registry)
+        except Exception:  # noqa: BLE001 — must never die unobserved
+            _logger.warning(
+                "Superseded-runner stop failed for session %s runner %s; "
+                "the host-side supersession check reaps it on the next relaunch",
+                session_id,
+                runner_id,
+                exc_info=True,
+            )
+
+    task = asyncio.create_task(_stop_and_log())
+    _detached_supersede_stops.add(task)
+    task.add_done_callback(_detached_supersede_stops.discard)
+
+
 async def _launch_runner_on_host_impl(
     conv: Conversation,
     conversation_store: ConversationStore,
@@ -4663,6 +4717,14 @@ async def _launch_runner_on_host_impl(
     structured refusal (harness not configured) can be surfaced instead
     of silently timing out as ``RUNNER_UNAVAILABLE``.
 
+    Single-flight per conversation: concurrent callers (a turn POST racing a
+    terminal ensure, both seeing the runner offline) serialize on a
+    per-conversation lock, and a caller that waited re-reads the row — a
+    binding another flight just rotated is ridden instead of spawning a
+    second runner. The superseded runner is stopped best-effort in the
+    background (see :func:`_spawn_superseded_runner_stop`); before this,
+    every relaunch leaked the previous runner process on the host.
+
     :param conv: The conversation that needs a runner.
     :param conversation_store: Store for updating ``runner_id``.
     :param host_registry: In-memory ``HostRegistry``.
@@ -4670,9 +4732,46 @@ async def _launch_runner_on_host_impl(
     :returns: The :class:`_HostLaunchAttempt` — the new runner id plus any
         structured refusal from the host.
     """
+    lock = _relaunch_locks.setdefault(conv.id, asyncio.Lock())
+    async with lock:
+        # Re-read under the lock: a binding that moved past the caller's
+        # snapshot means another flight just relaunched (concurrently, or
+        # a moment ago) — ride its runner rather than rotating it away
+        # and double-spawning. Return that flight's own attempt when it is
+        # on record, so a structured refusal (harness not configured,
+        # workspace missing) still reaches this caller's error surface.
+        fresh = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+        if fresh is None:
+            # Deleted mid-relaunch: don't rotate a vanished row or spawn a
+            # runner for a session nothing can route to.
+            return _HostLaunchAttempt(
+                runner_id=conv.runner_id or "",
+                error_code="session_not_found",
+                error="session was deleted while its relaunch was in flight",
+            )
+        if fresh.runner_id and fresh.runner_id != conv.runner_id:
+            last = _relaunch_last_attempt.get(conv.id)
+            if last is not None and last.runner_id == fresh.runner_id:
+                return last
+            return _HostLaunchAttempt(runner_id=fresh.runner_id)
+        attempt = await _launch_runner_on_host_locked(
+            fresh, conversation_store, host_registry, host_conn
+        )
+        _relaunch_last_attempt[conv.id] = attempt
+        return attempt
+
+
+async def _launch_runner_on_host_locked(
+    conv: Conversation,
+    conversation_store: ConversationStore,
+    host_registry: HostRegistry,
+    host_conn: HostConnection,
+) -> _HostLaunchAttempt:
+    """The launch round-trip proper; runs under the conversation's lock."""
     from omnigent.host.frames import HostLaunchRunnerFrame, encode_host_frame
     from omnigent.runner.identity import token_bound_runner_id
 
+    superseded_runner_id = conv.runner_id
     binding_token = secrets.token_urlsafe(32)
     new_runner_id = token_bound_runner_id(binding_token)
 
@@ -4681,6 +4780,11 @@ async def _launch_runner_on_host_impl(
         conv.id,
         new_runner_id,
     )
+    if superseded_runner_id and conv.host_id is not None:
+        # The old runner is unbound as of the replace above; reap it so it
+        # doesn't idle on the host forever (tunnel still authenticating,
+        # forwarder still tailing this session).
+        _spawn_superseded_runner_stop(conv.id, conv.host_id, superseded_runner_id, host_registry)
 
     # Pull workspace from the session row — populated and validated
     # at session create per designs/SESSION_WORKSPACE_SELECTION.md.
