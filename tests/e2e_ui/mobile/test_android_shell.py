@@ -27,6 +27,8 @@ from __future__ import annotations
 
 from playwright.sync_api import Page, ViewportSize, expect
 
+from tests.e2e_ui.conftest import open_right_rail
+
 # A phone-sized viewport: the Android shell is a mobile surface, and the narrow
 # width is where the sidebar behaves as an overlay drawer (the
 # ``[data-android-native]`` drawer rules this change adds). The
@@ -132,6 +134,184 @@ def test_no_android_tag_or_fold_in_plain_browser(
     # The web app never injects --omnigent-android-safe-area-*, so with
     # env(safe-area-inset-top) also 0 here the shared inset stays 0.
     assert page.evaluate(_READ_SAFE_TOP_PX) == "0px"
+
+
+# Inject all four OS insets the way the shell does (distinct per edge, so an
+# edge-for-edge mapping error can't cancel out): status bar top, gesture-nav
+# bottom, display-cutout left/right.
+_INJECT_FOUR_EDGE_INSETS = """
+() => {
+  const s = document.documentElement.style;
+  s.setProperty('--omnigent-android-safe-area-top', '17px');
+  s.setProperty('--omnigent-android-safe-area-bottom', '23px');
+  s.setProperty('--omnigent-android-safe-area-left', '11px');
+  s.setProperty('--omnigent-android-safe-area-right', '13px');
+}
+"""
+
+_READ_RAIL_LAYOUT = """
+() => {
+  const rail = document.querySelector('aside[aria-label="Workspace"]');
+  if (!rail) return null;
+  const cs = getComputedStyle(rail);
+  const rect = rail.getBoundingClientRect();
+  const tabs = rail.querySelector('[role="tablist"]');
+  const tabsRect = tabs ? tabs.getBoundingClientRect() : null;
+  return {
+    padding: {
+      top: cs.paddingTop,
+      bottom: cs.paddingBottom,
+      left: cs.paddingLeft,
+      right: cs.paddingRight,
+    },
+    margin: {
+      top: cs.marginTop,
+      bottom: cs.marginBottom,
+      left: cs.marginLeft,
+      right: cs.marginRight,
+    },
+    rect: { top: rect.top, right: rect.right, bottom: rect.bottom, left: rect.left },
+    tabs: tabsRect
+      ? { top: tabsRect.top, left: tabsRect.left, right: tabsRect.right }
+      : null,
+    innerWidth: window.innerWidth,
+    innerHeight: window.innerHeight,
+  };
+}
+"""
+
+# The four injected insets, edge for edge: status bar top, gesture-nav bottom,
+# display-cutout left/right.
+_EXPECTED_FOUR_EDGE_PADDING = {
+    "top": "17px",
+    "bottom": "23px",
+    "left": "11px",
+    "right": "13px",
+}
+
+
+def test_workspace_rail_folds_inset_on_all_four_edges(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The md+ Workspace rail pads itself by the injected OS inset, edge for edge.
+
+    The rail only exists at desktop width (hidden below 48rem), outside the
+    mobile drawer rules, so it needs its own safe-area rule: on a landscape
+    phone / tablet with a display cutout its content would otherwise start
+    under the cutout and the gesture-nav bar. Asserts the full chain: injected
+    bridge -> ``data-android-native`` -> the ``--omnigent-android-safe-area-*``
+    fold -> computed four-edge padding on the real rail — and that the inset
+    arrives as PADDING only: zero margin, the rail box flush with the window
+    edges (a second displacement via margin, position, or the app-owned
+    ``--omnigent-inset-*``/``--omnigent-native-*`` vars would double-count),
+    with the tab strip landing inside the padded content box.
+
+    :param page: Playwright page fixture (fresh context per test).
+    :param seeded_session: ``(base_url, session_id)`` of a runner-bound session.
+    """
+    base_url, session_id = seeded_session
+
+    page.set_viewport_size({"width": 1280, "height": 800})
+    page.add_init_script(_ANDROID_SHELL_INIT_SCRIPT)
+    page.goto(f"{base_url}/c/{session_id}")
+    open_right_rail(page)
+
+    page.evaluate(_INJECT_FOUR_EDGE_INSETS)
+    layout = page.evaluate(_READ_RAIL_LAYOUT)
+    assert layout["padding"] == _EXPECTED_FOUR_EDGE_PADDING
+
+    # The fold displaces nothing: no margin, and the box stays flush with the
+    # window's top/right/bottom edges whatever channel a future rule might use.
+    assert layout["margin"] == {
+        "top": "0px",
+        "bottom": "0px",
+        "left": "0px",
+        "right": "0px",
+    }
+    assert abs(layout["rect"]["top"]) <= 0.5
+    assert layout["rect"]["right"] >= layout["innerWidth"] - 1
+    assert layout["rect"]["bottom"] >= layout["innerHeight"] - 1
+
+    # The padding genuinely insets content: the rail's tab strip sits inside
+    # the padded content box on every folded edge.
+    tabs = layout["tabs"]
+    assert tabs is not None
+    assert tabs["top"] >= 17
+    assert tabs["left"] >= layout["rect"]["left"] + 11
+    assert tabs["right"] <= layout["rect"]["right"] - 13
+
+
+_READ_EXEC_PANEL_LAYOUT = """
+() => {
+  const panel = document.querySelector('[data-testid="execution-logs-panel"]');
+  if (!panel) return null;
+  const cs = getComputedStyle(panel);
+  const rect = panel.getBoundingClientRect();
+  return {
+    padding: {
+      top: cs.paddingTop,
+      bottom: cs.paddingBottom,
+      left: cs.paddingLeft,
+      right: cs.paddingRight,
+    },
+    width: rect.width,
+    right: rect.right,
+    innerWidth: window.innerWidth,
+  };
+}
+"""
+
+
+def test_execution_logs_panel_folds_inset_below_and_above_md(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The execution-logs panel folds the OS inset as an overlay AND docked.
+
+    Below 48rem the panel is a full-screen overlay drawer; above it a docked
+    right-edge push panel. Both incarnations touch screen edges, so both must
+    fold the injected OS inset into their padding — a phone-width-gated rule
+    covers only the overlay. Between the two, asserts the CLOSED panel stays
+    zero-width at md+ with insets injected: it remains mounted (``w-0``), and
+    with border-box sizing any padding on it would render as a cutout-sized
+    gap in the layout.
+
+    :param page: Playwright page fixture (fresh context per test).
+    :param seeded_session: ``(base_url, session_id)`` of a runner-bound session.
+    """
+    base_url, session_id = seeded_session
+
+    page.set_viewport_size({"width": 390, "height": 844})
+    page.add_init_script(_ANDROID_SHELL_INIT_SCRIPT)
+    page.goto(f"{base_url}/c/{session_id}?debug=1")
+
+    # Below 48rem: open the full-screen overlay from the session-menu FAB
+    # (its Logs entry is debug-mode only).
+    page.get_by_role("button", name="Open session menu").click()
+    page.get_by_role("menuitem", name="Logs").click()
+    panel = page.locator('[data-testid="execution-logs-panel"]')
+    expect(panel).to_be_visible()
+
+    page.evaluate(_INJECT_FOUR_EDGE_INSETS)
+    layout = page.evaluate(_READ_EXEC_PANEL_LAYOUT)
+    assert layout["padding"] == _EXPECTED_FOUR_EDGE_PADDING
+
+    # Above 48rem the closed panel stays mounted at w-0 — with insets
+    # injected its layout width must remain zero.
+    panel.get_by_role("button", name="Close").click()
+    page.set_viewport_size({"width": 1280, "height": 800})
+    expect(panel).to_have_attribute("data-collapsed", "true")
+    assert page.evaluate(_READ_EXEC_PANEL_LAYOUT)["width"] == 0
+
+    # Open it docked from the debug SessionRail and re-assert the same fold.
+    page.get_by_test_id("execution-log-row-main").click()
+    expect(panel).not_to_have_attribute("data-collapsed", "true")
+    layout = page.evaluate(_READ_EXEC_PANEL_LAYOUT)
+    assert layout["padding"] == _EXPECTED_FOUR_EDGE_PADDING
+    # Docked flush against the right screen edge: the inset is padding, not
+    # displacement.
+    assert layout["right"] >= layout["innerWidth"] - 1
 
 
 # Bridge stub that also CAPTURES the notification-activation callback the SPA

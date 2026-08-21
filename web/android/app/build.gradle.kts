@@ -6,6 +6,7 @@ import java.net.Socket
 import java.net.URI
 import java.nio.file.Files
 import java.nio.file.Path
+import java.security.MessageDigest
 import java.util.Properties
 import java.util.concurrent.TimeUnit
 
@@ -97,6 +98,89 @@ android {
     }
 }
 
+// The JVM unit tests run on a Java 21 toolchain (Robolectric's SDK 35 image
+// needs a 21 runtime) even though the module compiles to JDK 17 bytecode.
+// Gradle satisfies the toolchain with the running JVM when it is already 21,
+// otherwise with a JDK 21 discovered via JAVA_HOME_21_* (see gradle.properties).
+tasks.withType<Test>().configureEach {
+    javaLauncher.set(
+        javaToolchains.launcherFor {
+            languageVersion.set(JavaLanguageVersion.of(21))
+        },
+    )
+}
+
+val releaseVerificationInputs =
+    files(
+        fileTree("src"),
+        file("build.gradle.kts"),
+        rootProject.file("build.gradle.kts"),
+        rootProject.file("settings.gradle.kts"),
+        rootProject.file("gradle.properties"),
+        rootProject.file("gradle/libs.versions.toml"),
+        rootProject.file("gradle/wrapper/gradle-wrapper.properties"),
+    )
+val releaseVerificationReceipt =
+    layout.buildDirectory.file(
+        "verification/release-unit-tests.sha256",
+    )
+
+fun releaseVerificationFingerprint(): String {
+    val digest = MessageDigest.getInstance("SHA-256")
+    releaseVerificationInputs.files.sortedBy { it.absolutePath }.forEach { input ->
+        digest.update(input.relativeTo(rootProject.projectDir).path.toByteArray())
+        digest.update(input.readBytes())
+    }
+    digest.update("$appVersionCode\u0000$appVersionName".toByteArray())
+    return digest.digest().joinToString("") { "%02x".format(it) }
+}
+
+val verifyReleaseUnitTests =
+    tasks.register<Exec>("verifyReleaseUnitTests") {
+        group = "verification"
+        description =
+            "Runs release unit tests without Play credentials and records the verified tree."
+        inputs.files(releaseVerificationInputs)
+        inputs.property("versionCode", appVersionCode)
+        inputs.property("versionName", appVersionName)
+        outputs.file(releaseVerificationReceipt)
+        outputs.upToDateWhen { false }
+        workingDir(rootProject.projectDir)
+        commandLine(
+            rootProject.file("gradlew").absolutePath,
+            "--no-build-cache",
+            "--rerun-tasks",
+            "testDebugUnitTest",
+        )
+        environment.remove("PLAY_SERVICE_ACCOUNT_JSON")
+        doFirst {
+            check(System.getenv("PLAY_SERVICE_ACCOUNT_JSON") == null) {
+                "Run verifyReleaseUnitTests before exporting PLAY_SERVICE_ACCOUNT_JSON."
+            }
+            check(!rootProject.file("play-credentials.json").exists()) {
+                "Temporarily remove play-credentials.json before release verification."
+            }
+        }
+        doLast {
+            releaseVerificationReceipt.get().asFile.apply {
+                parentFile.mkdirs()
+                writeText(releaseVerificationFingerprint())
+            }
+        }
+    }
+
+val requireReleaseUnitTests =
+    tasks.register("requireReleaseUnitTests") {
+        group = "verification"
+        description = "Requires a credential-free unit-test receipt for the current release tree."
+        doLast {
+            val receipt = releaseVerificationReceipt.get().asFile
+            check(receipt.isFile && receipt.readText() == releaseVerificationFingerprint()) {
+                "Run ./gradlew verifyReleaseUnitTests with no Play credentials, then publish separately."
+            }
+        }
+    }
+
 // Gradle Play Publisher: `./gradlew publishReleaseBundle` builds the signed AAB
 // and uploads it to the internal track. The service-account JSON is a secret —
 // point PLAY_SERVICE_ACCOUNT_JSON at it, or drop it at web/android/
@@ -105,6 +189,18 @@ android {
 val playCredentialsFile =
     (System.getenv("PLAY_SERVICE_ACCOUNT_JSON")?.let { file(it) })
         ?: rootProject.file("play-credentials.json")
+
+// A local unsigned bundle is the credential-free verification gate. Signed
+// artifact and publisher paths consume the source/version-bound receipt.
+tasks.matching { it.name == "bundleRelease" }.configureEach {
+    dependsOn(if (playCredentialsFile.exists()) requireReleaseUnitTests else verifyReleaseUnitTests)
+}
+tasks.matching { it.name == "packageReleaseBundle" }.configureEach {
+    if (playCredentialsFile.exists()) dependsOn(requireReleaseUnitTests)
+}
+tasks.matching { it.name == "publishReleaseBundle" }.configureEach {
+    dependsOn(requireReleaseUnitTests)
+}
 
 play {
     enabled.set(playCredentialsFile.exists())

@@ -53,6 +53,7 @@ class ConnectActivity : ComponentActivity() {
         startActivity(
             Intent(this, MainActivity::class.java).apply {
                 flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                putExtra(EXTRA_SERVER_CHANGED, true)
             },
         )
         finish()
@@ -71,5 +72,9 @@ class ConnectActivity : ComponentActivity() {
             row.setOnClickListener { connect(url) }
             container.addView(row)
         }
+    }
+
+    companion object {
+        const val EXTRA_SERVER_CHANGED = "ai.omnigent.android.SERVER_CHANGED"
     }
 }

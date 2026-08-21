@@ -1,6 +1,8 @@
 package ai.omnigent.android
 
+import android.icu.text.IDNA
 import android.net.Uri
+import java.util.Locale
 
 /**
  * Normalizes a URL to its origin (`scheme://host[:port]`), the unit of trust
@@ -10,19 +12,54 @@ import android.net.Uri
 fun originOf(url: String?): String? {
     val uri = url?.let(Uri::parse) ?: return null
     val scheme = uri.scheme?.lowercase() ?: return null
-    val host = uri.host?.lowercase() ?: return null
-    // Canonicalize like a browser origin (WHATWG): lowercase scheme + host and
-    // omit the default port — so an explicit `https://host:443` (or odd casing)
-    // the user typed compares equal to the WebView's normalized `https://host`.
-    // The pinned origin and every page URL both flow through here, so they
-    // canonicalize identically.
-    val port = uri.port
-    val hasExplicitPort =
-        port != -1 &&
-            !(scheme == "https" && port == 443) &&
-            !(scheme == "http" && port == 80)
-    return if (hasExplicitPort) "$scheme://$host:$port" else "$scheme://$host"
+    val host = canonicalHost(uri.host ?: return null) ?: return null
+    return canonicalOrigin(scheme, host, uri.port)
 }
+
+/** IDNA-normalize a host to the lowercase ASCII form used for origin comparisons. */
+fun canonicalHost(host: String): String? {
+    val normalized = host.lowercase(Locale.ROOT).removeSurrounding("[", "]")
+    if (":" in normalized) return normalized
+    val info = IDNA.Info()
+    val ascii = StringBuilder()
+    UTS46.nameToASCII(normalized, ascii, info)
+    return ascii.toString().takeIf { it.isNotEmpty() && !info.hasErrors() }
+}
+
+private val UTS46 = IDNA.getUTS46Instance(IDNA.NONTRANSITIONAL_TO_ASCII)
+
+/** Build the canonical browser-style origin for already-validated components. */
+fun canonicalOrigin(
+    scheme: String,
+    host: String,
+    port: Int = -1,
+): String {
+    val normalizedScheme = scheme.lowercase()
+    val hostPart =
+        bracketIfIpv6(canonicalHost(host) ?: host.lowercase().removeSurrounding("[", "]"))
+    return if (port != -1 && !isDefaultPort(normalizedScheme, port)) {
+        "$normalizedScheme://$hostPart:$port"
+    } else {
+        "$normalizedScheme://$hostPart"
+    }
+}
+
+/** Whether [port] is implicit for an HTTP(S) [scheme]. */
+fun isDefaultPort(
+    scheme: String?,
+    port: Int,
+): Boolean =
+    (scheme.equals("https", ignoreCase = true) && port == 443) ||
+        (scheme.equals("http", ignoreCase = true) && port == 80)
+
+/**
+ * Re-wrap a bare IPv6 literal in the brackets a URL authority requires —
+ * without them a rebuilt origin is unparseable ("https://::1:8000"). Callers
+ * strip any existing brackets first: `Uri.getHost` usually strips them but has
+ * been observed returning them intact (Robolectric SDK 35), so neither shape
+ * can be assumed.
+ */
+fun bracketIfIpv6(host: String): String = if (":" in host) "[$host]" else host
 
 /**
  * True for the only two schemes the WebView loads inline (http/https). This

@@ -7,13 +7,44 @@ shipping a duplicate copy of the SPA. It is a native _shell_, not a rewrite.
 ## Development
 
 Open `web/android` in Android Studio Meerkat (AGP 9.1+) and run the `app`
-configuration on an API 36 emulator. Requires JDK 17 and the Android SDK
-(`compileSdk 36`, `targetSdk 36`, `minSdk 28`).
+configuration on an API 36 emulator. You need the Android SDK
+(`compileSdk 36`, `targetSdk 36`, `minSdk 28`) and **JDK 21**: the Robolectric
+unit tests — and `bundleRelease`, which runs them — resolve a Java 21 toolchain,
+so Gradle must run under, or be able to discover, a JDK 21. `just ensure` does
+not install one; set it up yourself, e.g.:
+
+```sh
+brew install openjdk@21                         # or any JDK 21 distribution
+export JAVA_HOME="$(brew --prefix openjdk@21)/libexec/openjdk.jdk/Contents/Home"
+./gradlew --version                             # confirm "JVM: 21.x"
+```
 
 Debug builds permit cleartext (`http://`) to localhost and private-range hosts
 via `res/xml/network_security_config.xml` for local development; release builds
-keep the platform default (HTTPS only), mirroring the iOS
-`NSAllowsArbitraryLoadsInWebContent` debug-only posture.
+are HTTPS-only except device-local loopback (for omnigent:// deep links — see
+_Deep links_ below), mirroring the iOS `NSAllowsArbitraryLoadsInWebContent`
+debug-only posture. Release IPv6 loopback remains HTTPS-only until WebView's
+cleartext enforcement is verified on a physical release device.
+
+## Deep links
+
+The app handles `omnigent://<host>[:port]/c/<id>` links. The manifest's intent
+filter lives on `DeepLinkActivity`, a trampoline that forwards to
+`MainActivity`; `DeepLink.kt` parses and `MainActivity` routes. Same-origin
+links navigate in place, and a previously-connected server switches directly.
+Links carrying a query, fragment, or userinfo are rejected.
+
+**Consent invariant:** a deep link never triggers a network request to a server
+the user has not already connected to. A never-connected host requires an
+explicit consent dialog first, and is remembered only after its first
+successful page load.
+
+Limitation: unlike iOS/desktop there is no workspace-mount discovery, so a
+consented **unknown** Databricks workspace host connects to the bare origin
+without probing `/ml/omnigents`. Links to already-connected workspaces keep the
+stored URL's mount.
+
+Manual test: `adb shell am start -a android.intent.action.VIEW -d "omnigent://<host>/c/<id>"`.
 
 ## How it relates to the web bundle
 
@@ -145,6 +176,9 @@ verbatim via Managed App Configuration.
 
 ### Known parity gaps
 
+- A failed deep-link load is dropped so later queued links continue processing;
+  retrying the failed destination is an explicit user action.
+
 - **App badge count.** Android has no universal numeric badge API. We set
   `NotificationCompat.setNumber()` (shown by some launchers; AOSP/Pixel shows
   only a dot) and treat the notification dot as the guaranteed surface.
@@ -212,12 +246,16 @@ service-account key:
    `web/android/play-credentials.json` (both gitignored).
 
 ```sh
+unset PLAY_SERVICE_ACCOUNT_JSON
+./gradlew verifyReleaseUnitTests -PversionCode=10 -PversionName=0.2.0
 export PLAY_SERVICE_ACCOUNT_JSON=/path/to/play-credentials.json
-./gradlew publishReleaseBundle   # signs + uploads to the internal track
+./gradlew publishReleaseBundle -PversionCode=10 -PversionName=0.2.0
 ```
 
-The publish tasks are inert when no credentials file is present, so ordinary
-builds are unaffected. Change the target track via `track.set(...)` in
+The first invocation records a source/version fingerprint under `build/`; the
+separate publish invocation refuses stale or missing verification. The publish
+tasks are inert when no credentials file is present, so ordinary builds are
+unaffected. Change the target track via `track.set(...)` in
 `app/build.gradle.kts` (`internal` → `alpha` → `beta` → `production`).
 
 > Status: builds clean — `gradlew :app:assembleDebug :app:lintDebug` produces a

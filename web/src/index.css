@@ -194,6 +194,14 @@
     env(safe-area-inset-bottom, 0px),
     var(--omnigent-android-safe-area-bottom, 0px)
   );
+  --omnigent-safe-left: max(
+    env(safe-area-inset-left, 0px),
+    var(--omnigent-android-safe-area-left, 0px)
+  );
+  --omnigent-safe-right: max(
+    env(safe-area-inset-right, 0px),
+    var(--omnigent-android-safe-area-right, 0px)
+  );
   --omnigent-native-top-bar: 0px; /* set by native bridge (px) */
   --omnigent-native-bottom-bar: 0px; /* set by native bridge (px) */
   --omnigent-top-bar-visible: 0; /* web-owned 0|1 */
@@ -923,19 +931,27 @@ aside[aria-label="Workspace"][data-maximized] {
     height: var(--omnigent-inset-bottom);
     flex: none;
   }
+}
 
-  :is([data-ios-native], [data-android-native])
-    :is(
-      .conversations-sidebar,
-      [data-testid="file-viewer"],
-      [data-testid="files-panel-drawer"],
-      [data-testid="terminals-panel"],
-      [data-testid="subagents-panel-drawer"],
-      [data-testid="todos-panel-drawer"]
-    ) {
-    padding-top: var(--omnigent-safe-top);
-    padding-bottom: var(--omnigent-safe-bottom);
-  }
+/* Full-height native surfaces touch screen edges at every width. Collapsed
+ * panels must remain zero-width, peeking sidebars are already inset, and
+ * panels inside the padded Workspace rail must not receive the inset twice. */
+:is([data-ios-native], [data-android-native])
+  :is(
+    aside[aria-label="Workspace"],
+    .conversations-sidebar,
+    [data-testid="execution-logs-panel"],
+    [data-testid="file-viewer"],
+    [data-testid="files-panel-drawer"],
+    [data-testid="terminals-panel"],
+    [data-testid="subagents-panel-drawer"],
+    [data-testid="todos-panel-drawer"],
+    [data-testid="shells-panel-drawer"]
+  ):not(aside[aria-label="Workspace"] *):not([data-collapsed]):not(.is-peek) {
+  padding-top: var(--omnigent-safe-top);
+  padding-bottom: var(--omnigent-safe-bottom);
+  padding-left: var(--omnigent-safe-left);
+  padding-right: var(--omnigent-safe-right);
 }
 
 @media (width < 48rem) and (prefers-reduced-motion: reduce) {

@@ -17,6 +17,9 @@
     <string name="connect_invalid">Enter a valid http(s) server URL</string>
     <string name="menu_reload">Reload</string>
     <string name="menu_connect_new">Connect to New Server</string>
+    <string name="deep_link_consent_title">Open conversation?</string>
+    <string name="deep_link_consent_body">This link will connect Omnigent to %1$s and open a conversation.</string>
+    <string name="deep_link_consent_open">Open</string>
     <!-- Shown to IT admins in their EMM console, not to app users. -->
     <string name="restriction_server_urls_title">Omnigent server URLs</string>
     <string name="restriction_server_urls_description">Server URLs to offer users, separated by commas or new lines, most preferred first. They are listed in the app for the user to pick from; the app does not connect to one automatically, and users can still enter a different server.</string>

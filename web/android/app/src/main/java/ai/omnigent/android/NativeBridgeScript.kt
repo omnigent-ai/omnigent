@@ -15,6 +15,19 @@ package ai.omnigent.android
  * `evaluateJavascript` into the `window.__omnigentNativeEmit*` functions here.
  */
 object NativeBridgeScript {
+    // Interpolated into a JS template literal in [source], so this CSS must stay
+    // free of backticks and of the `${` sequence.
+    internal val insetStyles: String =
+        """
+        .chat-header{top:max(0px, calc(var(--omnigent-safe-top, 0px) - 0.5rem)) !important}
+        .chat-conversation-content{padding-top:calc(var(--omnigent-header-height, 3.5rem) + 1.5rem + var(--omnigent-safe-top, 0px)) !important}
+        .main-terminal-view{padding-top:calc(3.25rem + var(--omnigent-safe-top, 0px)) !important}
+        .chat-composer-form{padding-bottom:calc(0.75rem + var(--omnigent-safe-bottom, 0px)) !important}
+        .chat-composer-form.terminal-first-composer-form{padding-bottom:0.25rem !important}
+        .terminal-first-switcher-container{padding-bottom:calc(0.35rem + var(--omnigent-safe-bottom, 0px)) !important}
+        :is(aside[aria-label="Workspace"],.conversations-sidebar,[data-testid="execution-logs-panel"],[data-testid="file-viewer"],[data-testid="files-panel-drawer"],[data-testid="terminals-panel"],[data-testid="subagents-panel-drawer"],[data-testid="todos-panel-drawer"],[data-testid="shells-panel-drawer"]):not(aside[aria-label="Workspace"] *):not([data-collapsed]):not(.is-peek){padding-top:var(--omnigent-safe-top, 0px) !important;padding-bottom:var(--omnigent-safe-bottom, 0px) !important;padding-left:var(--omnigent-safe-left, 0px) !important;padding-right:var(--omnigent-safe-right, 0px) !important}
+        """.trimIndent()
+
     val source: String =
         """
         (() => {
@@ -48,7 +61,7 @@ object NativeBridgeScript {
           else document.addEventListener("DOMContentLoaded", ensureViewportFit, { once: true });
 
           // Apply the OS safe area to the layout from the native side. emitInsets
-          // feeds --omnigent-safe-top/bottom (the app's own inset vars), but on a
+          // feeds the app's own --omnigent-safe-* vars, but on a
           // server whose web build predates the Android shell the inset-aware rules
           // lose the cascade: their semantic selectors (.chat-conversation-content
           // etc., specificity 0,1,0) tie with the Tailwind utility classes on the
@@ -60,23 +73,9 @@ object NativeBridgeScript {
           // Android WebView reports as 0, so it needs the override even pre-Tailwind.
           const ensureInsetStyles = () => {
             if (document.getElementById("omnigent-android-insets")) return;
-            const T = "var(--omnigent-safe-top, 0px)";
-            const B = "var(--omnigent-safe-bottom, 0px)";
             const style = document.createElement("style");
             style.id = "omnigent-android-insets";
-            style.textContent = [
-              ".chat-header{top:max(0px, calc(" + T + " - 0.5rem)) !important}",
-              ".chat-conversation-content{padding-top:calc(var(--omnigent-header-height, 3.5rem) + 1.5rem + " + T + ") !important}",
-              ".main-terminal-view{padding-top:calc(3.25rem + " + T + ") !important}",
-              // Bottom inset belongs on whichever element is bottom-most per mode:
-              // the composer in regular chat, the switcher pill in terminal-first
-              // (its composer sits above the pill, so it must NOT also add it).
-              ".chat-composer-form{padding-bottom:calc(0.75rem + " + B + ") !important}",
-              ".chat-composer-form.terminal-first-composer-form{padding-bottom:0.25rem !important}",
-              ".terminal-first-switcher-container{padding-bottom:calc(0.35rem + " + B + ") !important}",
-              // Drawers/panels span full height — clear both bars.
-              ":is(.conversations-sidebar,[data-testid=\"file-viewer\"],[data-testid=\"files-panel-drawer\"],[data-testid=\"terminals-panel\"],[data-testid=\"subagents-panel-drawer\"],[data-testid=\"todos-panel-drawer\"]){padding-top:" + T + " !important;padding-bottom:" + B + " !important}",
-            ].join("");
+            style.textContent = `$insetStyles`;
             (document.head || document.documentElement).appendChild(style);
           };
           if (document.head) ensureInsetStyles();

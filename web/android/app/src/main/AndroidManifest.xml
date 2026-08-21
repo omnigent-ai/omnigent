@@ -46,6 +46,34 @@
             android:name=".ConnectActivity"
             android:exported="false"
             android:windowSoftInputMode="adjustResize" />
+
+        <!-- omnigent://<host>/c/<id> deep links. Custom schemes are unverified —
+             any co-installed app can also claim
+             this one — so DeepLink.parse (in MainActivity) treats the URI as
+             untrusted. This trampoline only forwards: task-fronting can swallow
+             a VIEW intent aimed straight at a non-top MainActivity (verified
+             on-device), so the filter lives here instead.
+             taskAffinity="": a task whose base intent/root activity matches an
+             incoming VIEW+NEW_TASK launch gets fronted WITHOUT delivery (the
+             same drop, one level up — hit this even with the filter moved here,
+             once this activity had rooted a task shared with MainActivity's
+             default affinity). An empty affinity gives every launch its own
+             disposable task, torn down the instant this activity finishes, so
+             no later launch can ever match it and get silently fronted. -->
+        <activity
+            android:name=".DeepLinkActivity"
+            android:exported="true"
+            android:noHistory="true"
+            android:excludeFromRecents="true"
+            android:taskAffinity=""
+            android:theme="@style/Theme.Omnigent.Translucent">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="omnigent" />
+            </intent-filter>
+        </activity>
     </application>
 
 </manifest>

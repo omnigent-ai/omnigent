@@ -5,7 +5,9 @@ import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 
@@ -26,8 +28,14 @@ import android.webkit.WebViewClient
 class OmnigentWebViewClient(
     private val pinnedOrigin: () -> String?,
     private val shouldInjectBridgeAtPageReady: () -> Boolean,
-    private val onPageReady: (url: String?) -> Unit,
+    private val onPageReady: (
+        url: String?,
+        mainFrameLoadFailed: Boolean,
+        mainFramePersistenceFailed: Boolean,
+        loadGeneration: Long?,
+    ) -> Unit,
     private val onLoginRequired: () -> Unit,
+    private val loadUrl: (WebView, String) -> Unit = WebView::loadUrl,
 ) : WebViewClient() {
     // Bare-root -> /omnigent bounces since the last app page loaded; see
     // workspaceRootTarget for why they're capped.
@@ -35,12 +43,51 @@ class OmnigentWebViewClient(
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
+    private var expectedLoadGeneration: Long? = null
+    private var activeLoad: ActiveLoad? = null
+    private var preStartLoadFailed = false
+    private var preStartPersistenceFailed = false
+    private var ignoreUnmatchedFinish = false
+    private var tracksDocuments = false
+
+    fun expectLoad(generation: Long) {
+        expectedLoadGeneration = generation
+    }
+
+    fun supersedePendingLoads() {
+        ignoreUnmatchedFinish = activeLoad != null
+        expectedLoadGeneration = null
+        activeLoad = null
+        preStartLoadFailed = false
+        preStartPersistenceFailed = false
+    }
+
     override fun onPageStarted(
         view: WebView,
         url: String?,
         favicon: Bitmap?,
     ) {
         super.onPageStarted(view, url, favicon)
+        tracksDocuments = true
+        val generation = expectedLoadGeneration
+        if (generation != null || activeLoad == null) {
+            activeLoad =
+                ActiveLoad(
+                    generation = generation,
+                    url = url,
+                    loadFailed = preStartLoadFailed,
+                    persistenceFailed = preStartPersistenceFailed,
+                )
+            expectedLoadGeneration = null
+            preStartLoadFailed = false
+            preStartPersistenceFailed = false
+        } else {
+            // Redirect starts belong to the navigation already in flight.
+            activeLoad?.apply {
+                this.url = url
+            }
+        }
+        ignoreUnmatchedFinish = false
 
         val origin = originOf(url)
         val scheme = url?.let { Uri.parse(it).scheme?.lowercase() }
@@ -95,11 +142,95 @@ class OmnigentWebViewClient(
         bounce(view, target)
     }
 
+    // request.isForMainFrame is only meaningful on this (API 23+, our floor
+    // is 28) overload — the deprecated int/String one can't distinguish a
+    // subframe (an embedded image, an iframe) failure from the page's own.
+    override fun onReceivedError(
+        view: WebView,
+        request: WebResourceRequest,
+        error: WebResourceError,
+    ) {
+        super.onReceivedError(view, request, error)
+        if (
+            request.isForMainFrame &&
+            isPinnedLoadError(request.url) &&
+            isBlockingLoadError(error.errorCode, error.description)
+        ) {
+            when {
+                activeLoad != null -> activeLoad?.loadFailed = true
+                expectedLoadGeneration != null || !tracksDocuments -> preStartLoadFailed = true
+            }
+        }
+    }
+
+    override fun onReceivedHttpError(
+        view: WebView,
+        request: WebResourceRequest,
+        errorResponse: WebResourceResponse,
+    ) {
+        super.onReceivedHttpError(view, request, errorResponse)
+        if (request.isForMainFrame && isPinnedLoadError(request.url)) {
+            when {
+                activeLoad != null -> {
+                    activeLoad?.persistenceFailed = true
+                }
+
+                expectedLoadGeneration != null || !tracksDocuments -> {
+                    preStartPersistenceFailed = true
+                }
+            }
+        }
+    }
+
+    private fun isPinnedLoadError(url: Uri): Boolean {
+        if (originOf(url.toString()) != pinnedOrigin()) return false
+        val load = activeLoad ?: return expectedLoadGeneration != null || !tracksDocuments
+        return load.url == url.toString()
+    }
+
+    override fun onPageCommitVisible(
+        view: WebView,
+        url: String?,
+    ) {
+        super.onPageCommitVisible(view, url)
+        // Inline-auth documents belong to the navigation in flight, but only
+        // the returning app document may complete its load generation.
+        if (originOf(url) != pinnedOrigin()) return
+        val load = activeLoad?.takeIf { it.url == url } ?: return
+        if (load.loadFailed || load.persistenceFailed) return
+        completeLoad(view, url, load)
+    }
+
     override fun onPageFinished(
         view: WebView,
         url: String?,
     ) {
         super.onPageFinished(view, url)
+        val load = activeLoad
+        val onPinnedOrigin = originOf(url) == pinnedOrigin()
+        // Inline authentication can finish foreign documents before returning
+        // to the app. They remain part of the current app navigation.
+        if (load != null && !onPinnedOrigin) return
+        if (load == null && (ignoreUnmatchedFinish || tracksDocuments)) {
+            ignoreUnmatchedFinish = false
+            return
+        }
+        if (load != null && !load.loadFailed && !load.persistenceFailed) return
+        completeLoad(view, url, load)
+    }
+
+    private fun completeLoad(
+        view: WebView,
+        url: String?,
+        load: ActiveLoad?,
+    ) {
+        val loadFailed = load?.loadFailed ?: preStartLoadFailed
+        val persistenceFailed = load?.persistenceFailed ?: preStartPersistenceFailed
+        val loadGeneration = load?.generation
+        activeLoad = null
+        preStartLoadFailed = false
+        preStartPersistenceFailed = false
+        ignoreUnmatchedFinish = tracksDocuments
         val onPinnedOrigin = originOf(url) == pinnedOrigin()
         // An app page loaded, so the mount works: re-arm the bounce budget for
         // the next time the user lands back on the workspace root.
@@ -115,10 +246,12 @@ class OmnigentWebViewClient(
             view.evaluateJavascript(WorkspaceChromeScript.source, null)
         }
         if (onPinnedOrigin && shouldInjectBridgeAtPageReady()) {
-            view.evaluateJavascript(NativeBridgeScript.source) { onPageReady(url) }
+            view.evaluateJavascript(
+                NativeBridgeScript.source,
+            ) { onPageReady(url, loadFailed, persistenceFailed, loadGeneration) }
             return
         }
-        onPageReady(url)
+        onPageReady(url, loadFailed, persistenceFailed, loadGeneration)
     }
 
     override fun shouldOverrideUrlLoading(
@@ -201,10 +334,23 @@ class OmnigentWebViewClient(
         view: WebView,
         target: String,
     ) {
-        mainHandler.post { view.loadUrl(target) }
+        // MainActivity injects a generation-stamped loader for this app navigation.
+        mainHandler.post { loadUrl(view, target) }
     }
+
+    private data class ActiveLoad(
+        val generation: Long?,
+        var url: String?,
+        var loadFailed: Boolean = false,
+        var persistenceFailed: Boolean = false,
+    )
 
     private companion object {
         const val MAX_ROOT_BOUNCES = 1
     }
 }
+
+internal fun isBlockingLoadError(
+    errorCode: Int,
+    description: CharSequence,
+): Boolean = errorCode != WebViewClient.ERROR_UNKNOWN || !description.contains("ERR_ABORTED")

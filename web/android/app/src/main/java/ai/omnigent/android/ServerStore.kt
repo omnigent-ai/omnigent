@@ -44,6 +44,10 @@ class ServerStore(
     fun offeredServers(): List<String> =
         managed.serverUrls + recentServers().filterNot(managed::includes)
 
+    /** Every server the user has connected to: the current one (when set) plus recents. */
+    fun knownServers(): List<String> =
+        (listOfNotNull(currentServerUrl().takeIf { hasServer() }) + recentServers()).distinct()
+
     /** Recently-connected servers, most recent first. */
     fun recentServers(): List<String> =
         prefs

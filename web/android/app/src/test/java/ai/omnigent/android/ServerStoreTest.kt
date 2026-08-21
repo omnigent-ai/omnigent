@@ -115,6 +115,18 @@ class ServerStoreTest {
         assertEquals(listOf("https://policy.example.com"), ServerStore(context).managed.serverUrls)
     }
 
+    @Test
+    fun `known servers contains the current recent only once`() {
+        val store = storeWithPresets()
+        store.connect("https://first.example")
+        store.connect("https://current.example")
+
+        assertEquals(
+            listOf("https://current.example", "https://first.example"),
+            store.knownServers(),
+        )
+    }
+
     private fun setApplicationRestrictions(restrictions: Bundle) {
         val manager = context.getSystemService(RestrictionsManager::class.java)
         Shadow.extract<ShadowRestrictionsManager>(manager).setApplicationRestrictions(restrictions)

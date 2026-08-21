@@ -5,6 +5,7 @@ import android.net.Uri
 import android.os.Looper
 import android.webkit.ValueCallback
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
@@ -33,7 +34,7 @@ class OmnigentWebViewClientTest {
         val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
         var readyUrl: String? = null
         val client =
-            client(shouldInjectBridgeAtPageReady = true) { url ->
+            client(shouldInjectBridgeAtPageReady = true) { url, _, _, _ ->
                 readyUrl = url
             }
 
@@ -49,6 +50,94 @@ class OmnigentWebViewClientTest {
 
         webView.completeEvaluation()
         assertEquals(PINNED_URL, readyUrl)
+    }
+
+    @Test
+    fun `stale same-url finish and error after commit cannot alter the replacement`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val generations = mutableListOf<Long?>()
+        val client = client(onPageReady = { _, _, _, generation -> generations += generation })
+        client.expectLoad(1)
+        client.onPageStarted(webView, PINNED_URL, null)
+        client.supersedePendingLoads()
+        client.expectLoad(2)
+        client.onPageStarted(webView, PINNED_URL, null)
+
+        client.onPageCommitVisible(webView, PINNED_URL)
+        client.onReceivedHttpError(
+            webView,
+            request(PINNED_URL),
+            WebResourceResponse("text/html", "UTF-8", null),
+        )
+        // Both the superseded and current documents report the same URL.
+        client.onPageFinished(webView, PINNED_URL)
+        client.onPageFinished(webView, PINNED_URL)
+
+        assertEquals(listOf(2L), generations)
+    }
+
+    @Test
+    fun `superseding an unfinished load attributes the next finish to the new generation`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val generations = mutableListOf<Long?>()
+        val client = client(onPageReady = { _, _, _, generation -> generations += generation })
+        client.expectLoad(1)
+        client.onPageStarted(webView, PINNED_URL, null)
+
+        client.supersedePendingLoads()
+        client.expectLoad(2)
+        client.onPageStarted(webView, PINNED_URL, null)
+        client.onPageCommitVisible(webView, PINNED_URL)
+        client.onPageFinished(webView, PINNED_URL)
+
+        assertEquals(listOf(2L), generations)
+    }
+
+    @Test
+    fun `superseded finish is inert before the current load starts`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val generations = mutableListOf<Long?>()
+        val client = client(onPageReady = { _, _, _, generation -> generations += generation })
+        client.expectLoad(1)
+        client.onPageStarted(webView, PINNED_URL, null)
+
+        client.supersedePendingLoads()
+        client.onPageFinished(webView, PINNED_URL)
+        client.expectLoad(2)
+        client.onPageStarted(webView, PINNED_URL, null)
+        client.onPageCommitVisible(webView, PINNED_URL)
+        client.onPageFinished(webView, PINNED_URL)
+
+        assertEquals(listOf(2L), generations)
+    }
+
+    @Test
+    fun `redirect starts retain the current generation until the app document commits`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val ready = mutableListOf<Pair<String?, Long?>>()
+        val client =
+            client(
+                pinnedOrigin = DATABRICKS_ORIGIN,
+                onPageReady = { url, _, _, generation -> ready += url to generation },
+            )
+        val appUrl = "$DATABRICKS_ORIGIN/omnigent/c/abc"
+
+        client.expectLoad(7)
+        client.onPageStarted(webView, appUrl, null)
+        client.onPageStarted(webView, IDP_URL, null)
+        client.onPageCommitVisible(webView, IDP_URL)
+        client.onPageFinished(webView, IDP_URL)
+        client.onPageStarted(webView, appUrl, null)
+        client.onPageCommitVisible(webView, appUrl)
+        client.onReceivedHttpError(
+            webView,
+            request(appUrl),
+            WebResourceResponse("text/html", "UTF-8", null),
+        )
+        client.onPageFinished(webView, appUrl)
+        client.onPageFinished(webView, appUrl)
+
+        assertEquals(listOf(appUrl to 7L), ready)
     }
 
     @Test
@@ -295,7 +384,7 @@ class OmnigentWebViewClientTest {
         shouldInjectBridgeAtPageReady: Boolean = false,
         pinnedOrigin: String = PINNED_ORIGIN,
         onLoginRequired: () -> Unit = {},
-        onPageReady: (String?) -> Unit = {},
+        onPageReady: (String?, Boolean, Boolean, Long?) -> Unit = { _, _, _, _ -> },
     ) = OmnigentWebViewClient(
         pinnedOrigin = { pinnedOrigin },
         shouldInjectBridgeAtPageReady = { shouldInjectBridgeAtPageReady },
