@@ -7008,7 +7008,7 @@ async def _execute_task_lifecycle_tool(
 
 
 # Native sub-agent cancellation capabilities, resolved from the harness set
-# rather than a single wrapper label (#5086). Mirrors the child runner's
+# rather than a single wrapper label. Mirrors the child runner's
 # ``stop_session`` dispatch (``NativeInterruptRunner.stop`` +
 # ``_UNIFORM_STOP`` in ``runner/native/interrupt.py``): the runner-side
 # hard-stop exists for claude plus the six uniform-stop harnesses; codex and
@@ -7052,6 +7052,46 @@ def _native_cancel_capability(wrapper_label: str | None) -> str:
     if wrapper_label in _BEST_EFFORT_NATIVE_WRAPPERS:
         return "best_effort"
     return "inprocess"
+
+
+# Terminal-registry short names for the stop-capable natives — the pane a
+# failed child would still be resident in, keyed by its wrapper label.
+_STOP_CAPABLE_TERMINAL_NAMES = {
+    CLAUDE_NATIVE_WRAPPER_VALUE: "claude",
+    CURSOR_NATIVE_WRAPPER_VALUE: "cursor",
+    GOOSE_NATIVE_WRAPPER_VALUE: "goose",
+    KIRO_NATIVE_WRAPPER_VALUE: "kiro",
+    KIMI_NATIVE_WRAPPER_VALUE: "kimi",
+    HERMES_NATIVE_WRAPPER_VALUE: "hermes",
+    QWEN_NATIVE_WRAPPER_VALUE: "qwen",
+}
+
+
+async def _native_child_pane_alive(task_id: str, wrapper_label: str | None) -> bool:
+    """Probe whether a failed native child's pane still answers.
+
+    ``failed`` does not say whether the harness process is still resident:
+    a required-terminal exit fails the entry after the process died, while
+    a harness-side failure can leave the pane alive. The uniform bridge
+    stop cannot kill a dead tmux session — it answers 503 — so a failed
+    entry earns its hard-stop only when its registered pane is verifiably
+    alive; otherwise the cached terminal failure is the truthful answer.
+    """
+    from omnigent.runtime import get_terminal_registry
+
+    terminal_name = _STOP_CAPABLE_TERMINAL_NAMES.get(wrapper_label or "")
+    if terminal_name is None:
+        return False
+    try:
+        instance = get_terminal_registry().get(task_id, terminal_name, "main")
+    except Exception:
+        return False
+    if instance is None:
+        return False
+    try:
+        return await instance.is_alive()
+    except Exception:
+        return False
 
 
 async def _post_session_stop(server_client: httpx.AsyncClient, task_id: str) -> str | None:
@@ -7128,12 +7168,14 @@ async def _cancel_subagent_task(
       delivers a terminal payload to the parent inbox and auto-wakes
       it. A bare interrupt only cancelled the current turn and left the
       worker process alive; a stop frees it. A ``failed`` stop-capable
-      entry still routes — failed does not mean exited.
+      entry still routes when its pane answers the liveness probe —
+      failed does not mean exited; a dead pane returns the cached
+      failure instead of a bridge 503.
     * best-effort natives (``codex``, ``pi``, ``antigravity``,
       ``opencode``) and in-process harnesses — POST ``interrupt``, the
       path those harnesses actually honor. No runner-side hard-stop is
       wired for them, so the result is reported best-effort rather
-      than implying process termination (#5086).
+      than implying process termination.
 
     :param args: Tool arguments containing ``task_id`` or
         ``handle_id``, e.g. ``{"task_id": "conv_child456"}``.
@@ -7164,11 +7206,16 @@ async def _cancel_subagent_task(
     # start sub-agent would silently no-op and leave it running. A failed
     # claude-native entry still falls through because its pane may be alive.
     capability = _native_cancel_capability(entry.wrapper_label)
-    # A failed native entry with a hard-stop still routes: its process may be
-    # alive (failed ≠ exited), and the stop frees it. Failed entries without
-    # a hard-stop return their cached terminal status — there is nothing this
-    # path could forward that would change it (#5086).
-    can_stop_failed = capability == "stop" and entry.status == "failed"
+    # A failed native entry with a hard-stop still routes when its pane is
+    # verifiably alive (failed ≠ exited), and the stop frees it. A failed
+    # entry whose pane already died returns its cached terminal status — the
+    # uniform bridge stop cannot kill a dead tmux session, so routing it
+    # would answer 503 instead of the task's terminal failure.
+    can_stop_failed = (
+        capability == "stop"
+        and entry.status == "failed"
+        and await _native_child_pane_alive(str(task_id), entry.wrapper_label)
+    )
     if entry.status not in ("launching", "running", "waiting") and not can_stop_failed:
         return json.dumps(
             {
@@ -7182,7 +7229,7 @@ async def _cancel_subagent_task(
 
     # Route from the harness capability: stop-capable natives get the
     # runner-side hard-stop; the rest (best-effort natives + in-process
-    # harnesses) get the interrupt the child actually honors (#5086).
+    # harnesses) get the interrupt the child actually honors.
     event_type = "stop_session" if capability == "stop" else "interrupt"
 
     try:

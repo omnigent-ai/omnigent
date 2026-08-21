@@ -5030,8 +5030,15 @@ async def test_sys_cancel_task_interrupts_non_native_subagent() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sys_cancel_task_stops_terminal_claude_native_entry() -> None:
+async def test_sys_cancel_task_stops_terminal_claude_native_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A failed work status does not block cleanup of a live Claude pane."""
+
+    async def _alive(_task_id: str, _wrapper: str | None) -> bool:
+        return True
+
+    _patch_pane_probe(monkeypatch, _alive)
     from omnigent.runner import app as runner_app
     from omnigent.runner.tool_dispatch import _cancel_subagent_task
 
@@ -5078,7 +5085,7 @@ async def test_sys_cancel_task_stops_uniform_native_subagent() -> None:
     Six native harnesses expose runner-side hard-stops through
     ``_UNIFORM_STOP`` (cursor, goose, kiro, kimi, hermes, qwen); the cancel
     used to route by the Claude wrapper label alone, so those children got a
-    bare interrupt and the resident process could stay alive (#5086).
+    bare interrupt and the resident process could stay alive.
     """
     from omnigent.runner import app as runner_app
     from omnigent.runner.tool_dispatch import _cancel_subagent_task
@@ -5115,8 +5122,55 @@ async def test_sys_cancel_task_stops_uniform_native_subagent() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sys_cancel_task_stops_terminal_uniform_native_entry() -> None:
-    """A failed uniform-native entry still routes its (possibly live) stop."""
+async def test_sys_cancel_task_stops_terminal_uniform_native_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed uniform-native entry still routes its stop while its pane lives."""
+
+    async def _alive(_task_id: str, _wrapper: str | None) -> bool:
+        return True
+
+    _patch_pane_probe(monkeypatch, _alive)
+    posts, _ = await _cancel_failed_qwen_native()
+
+    assert posts == [{"type": "stop_session", "data": {}}], (
+        "a failed stop-capable native entry with a live pane must still "
+        "hard-stop its resident process"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sys_cancel_task_preserves_cached_failure_for_dead_pane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed entry whose pane already died returns the cached failure.
+
+    A required-terminal exit fails the work entry after the process died,
+    and the uniform bridge stop cannot kill a dead tmux session — routing
+    it would answer 503 instead of the task's terminal failure.
+    """
+
+    async def _dead(_task_id: str, _wrapper: str | None) -> bool:
+        return False
+
+    _patch_pane_probe(monkeypatch, _dead)
+    posts, output = await _cancel_failed_qwen_native()
+
+    assert posts == [], "a dead pane must not be routed to the bridge stop"
+    assert output == {"cancelled": False, "task_id": "conv_child_uniform_failed", "status": "failed"}
+
+
+def _patch_pane_probe(
+    monkeypatch: pytest.MonkeyPatch,
+    probe: object,
+) -> None:
+    from omnigent.runner import tool_dispatch
+
+    monkeypatch.setattr(tool_dispatch, "_native_child_pane_alive", probe)
+
+
+async def _cancel_failed_qwen_native():
+    """Drive sys_cancel_task against one failed qwen-native work entry."""
     from omnigent.runner import app as runner_app
     from omnigent.runner.tool_dispatch import _cancel_subagent_task
 
@@ -5131,6 +5185,7 @@ async def test_sys_cancel_task_stops_terminal_uniform_native_entry() -> None:
     )
     entry.status = "failed"
     posts: list[dict[str, Any]] = []
+    output: dict[str, Any] = {}
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         posts.append(json.loads(request.content))
@@ -5141,18 +5196,17 @@ async def test_sys_cancel_task_stops_terminal_uniform_native_entry() -> None:
             transport=httpx.MockTransport(_server_handler),
             base_url="http://server",
         ) as server_client:
-            await _cancel_subagent_task(
-                {"task_id": child_id},
-                conversation_id=parent_id,
-                server_client=server_client,
+            output = json.loads(
+                await _cancel_subagent_task(
+                    {"task_id": child_id},
+                    conversation_id=parent_id,
+                    server_client=server_client,
+                )
             )
     finally:
         runner_app.unregister_subagent_work(child_id)
 
-    assert posts == [{"type": "stop_session", "data": {}}], (
-        "a failed stop-capable native entry must still hard-stop its "
-        "potentially live process"
-    )
+    return posts, output
 
 
 @pytest.mark.asyncio
@@ -5161,7 +5215,7 @@ async def test_sys_cancel_task_returns_cached_status_for_failed_best_effort_nati
 
     There is no event this path could forward that would change a terminal
     best-effort entry, so unlike stop-capable natives its ``failed`` status
-    is final for the cancel path (#5086).
+    is final for the cancel path.
     """
     from omnigent.runner import app as runner_app
     from omnigent.runner.tool_dispatch import _cancel_subagent_task
@@ -5198,7 +5252,7 @@ async def test_cancel_evicted_native_subagent_checks_ownership_and_capability() 
     The recovery path trusts the caller's task id after the local work entry
     is gone, so it must verify the snapshot's parent AND that the wrapper
     names a harness with a runner-side hard-stop — for every stop-capable
-    native, not just Claude (#5086).
+    native, not just Claude.
     """
     from omnigent.runner.tool_dispatch import _cancel_evicted_native_subagent
 
