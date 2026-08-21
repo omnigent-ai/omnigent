@@ -364,10 +364,13 @@ async def _prepare_kiro_terminal_via_daemon(
             if session_bundle is None:
                 raise click.ClickException("Creating a Kiro session requires a session bundle.")
             _update_startup_progress(startup_progress, "Creating Kiro session...")
-            session_id = await _create_kiro_session(
-                client,
-                session_bundle,
-                terminal_launch_args=persist_args or None,
+            session_id, _ = await asyncio.gather(
+                _create_kiro_session(
+                    client,
+                    session_bundle,
+                    terminal_launch_args=persist_args or None,
+                ),
+                wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S),
             )
         else:
             _update_startup_progress(startup_progress, "Loading Kiro session...")
@@ -409,7 +412,8 @@ async def _prepare_kiro_terminal_via_daemon(
                         f"({resp.status_code}): {error_text(resp)}"
                     )
 
-        await wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S)
+        if not fresh_session:
+            await wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S)
         _update_startup_progress(startup_progress, "Starting runner...")
         runner_id = await launch_or_reuse_daemon_runner(
             client,

@@ -48,6 +48,7 @@ import type {
   SessionTerminalActivityEvent,
   SessionStatusEvent,
   SessionModelEvent,
+  SessionTitleEvent,
   SessionCollaborationModeEvent,
   SessionReasoningEffortEvent,
   SessionAgentChangedEvent,
@@ -608,6 +609,13 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     const model = data.model;
     if (typeof model !== "string" || !model) return null;
     return { type: "session_model", conversationId, model } satisfies SessionModelEvent;
+  }
+  if (eventType === "session.title") {
+    const conversationId = data.conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    const title = data.title;
+    if (typeof title !== "string" || !title) return null;
+    return { type: "session_title", conversationId, title } satisfies SessionTitleEvent;
   }
   if (eventType === "session.reasoning_effort") {
     const conversationId = data.conversation_id;

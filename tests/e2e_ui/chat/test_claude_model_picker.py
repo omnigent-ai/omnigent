@@ -167,7 +167,13 @@ def test_claude_native_picker_updates_after_delayed_catalog(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """A live catalog event fills the modal and applies a compatible sticky alias."""
+    """A live catalog event fills the modal; the sticky stays a preference.
+
+    The catalog's arrival populates the picker rows and lets the label
+    resolve the reported model to its display name. The cross-session
+    sticky pick is never silently PATCHed onto the session — a request
+    exists only when the user explicitly picks.
+    """
     base_url, session_id = seeded_session
     catalog_state = {"ready": False}
     patch_bodies = _patch_session_as_claude_native(
@@ -221,8 +227,10 @@ def test_claude_native_picker_updates_after_delayed_catalog(
         {"sessionId": session_id},
     )
 
-    expect(label).to_contain_text("Opus 4.10", timeout=10_000)
-    assert {"model_override": "opus", "silent": True} in patch_bodies
+    # The catalog labels the reported model; the sticky ("opus") is never
+    # silently written as a request.
+    expect(label).to_contain_text("Sonnet 5", timeout=10_000)
+    assert not any("model_override" in body for body in patch_bodies)
     page.get_by_test_id("composer-config-gear").click()
     page.get_by_test_id("composer-config-model").click()
     expect(page.locator('[role="option"][data-model-id]')).to_have_count(len(_EXPECTED_ROWS))
@@ -232,7 +240,11 @@ def test_claude_native_alias_selection_persists(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Picking Opus PATCHes its alias and the label shows the live name.
+    """Picking Opus PATCHes its row id; the label keeps the reported model.
+
+    The pick is a REQUEST — it persists verbatim as ``model_override`` —
+    while the composer label keeps rendering the harness's reported model
+    until a confirmation report arrives.
 
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` for a real server-backed
@@ -261,8 +273,9 @@ def test_claude_native_alias_selection_persists(
         page.get_by_test_id("composer-config-save").click()
 
     assert patch_bodies[-1] == {"model_override": "opus"}
-    # The read-only composer label reflects the new pick.
-    expect(page.get_by_test_id("composer-model-effort-label")).to_contain_text("Opus 4.10")
+    # The read-only composer label keeps the reported model — a request is
+    # not truth until the harness confirms it.
+    expect(page.get_by_test_id("composer-model-effort-label")).to_contain_text("Sonnet 5")
 
 
 def _force_asleep_liveness(page: Page, session_id: str) -> None:
@@ -608,11 +621,183 @@ def test_composer_model_label_never_shows_the_previous_sessions_model(
     )
 
 
-def test_claude_native_picker_prefers_session_override_over_sticky_model(
+def test_claude_model_label_never_claims_a_version_the_catalog_didnt_give(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """The active row follows the session override, not another session's pick."""
+    """The label renders the reported model — raw before the catalog labels it.
+
+    The chip renders only the harness's reported model: the raw wire id
+    until the catalog can name it, the catalog's display name after — and
+    at no point a version the catalog didn't give (the old fallback said
+    "Sonnet 4.6" while the catalog resolves to Sonnet 5). Every label the
+    page ever paints is recorded, so a transient wrong label can't hide
+    from a retrying ``expect()``.
+    """
+    base_url, session_id = seeded_session
+    catalog_state = {"ready": False}
+    one_m_catalog = [
+        *_MODEL_OPTIONS,
+        {
+            "id": "sonnet[1m]",
+            "model": "system.ai.claude-sonnet-5[1m]",
+            "displayName": "Sonnet 5 (1M context)",
+            "isDefault": False,
+        },
+    ]
+    _patch_session_as_claude_native(
+        page,
+        session_id,
+        model_override="sonnet[1m]",
+        catalog_state=catalog_state,
+        model_options=one_m_catalog,
+        llm_model="system.ai.claude-sonnet-5[1m]",
+    )
+    stream_script = """
+        (() => {
+          const sessionId = __SESSION_ID__;
+          const originalFetch = window.fetch.bind(window);
+          window.fetch = (input, init) => {
+            const url = typeof input === "string" ? input : input.url;
+            const streamPath = `/v1/sessions/${sessionId}/stream`;
+            if (new URL(url, window.location.origin).pathname === streamPath) {
+              const body = new ReadableStream({
+                start(controller) {
+                  window.__claudeModelStreamController = controller;
+                },
+              });
+              return Promise.resolve(new Response(body, {
+                status: 200,
+                headers: { "content-type": "text/event-stream" },
+              }));
+            }
+            return originalFetch(input, init);
+          };
+        })()
+        """.replace("__SESSION_ID__", json.dumps(session_id))
+    page.add_init_script(stream_script)
+    page.add_init_script(_LABEL_RECORDER)
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    # Pre-catalog: the reported wire id renders raw — honest over pretty.
+    label = page.get_by_test_id("composer-model-effort-label")
+    expect(label).to_contain_text("system.ai.claude-sonnet-5[1m]", timeout=15_000)
+    page.wait_for_function("window.__claudeModelStreamController !== undefined")
+
+    # The catalog lands: its display name supersedes the fallback.
+    catalog_state["ready"] = True
+    page.evaluate(
+        """
+        ({ sessionId }) => {
+          const frame = `event: session.model_options\ndata: ${JSON.stringify({
+            conversation_id: sessionId,
+          })}\n\n`;
+          window.__claudeModelStreamController.enqueue(new TextEncoder().encode(frame));
+        }
+        """,
+        {"sessionId": session_id},
+    )
+    expect(label).to_contain_text("Sonnet 5 (1M context)", timeout=10_000)
+
+    log = page.evaluate("window.__modelLabelLog")
+    labels = [entry["text"] for entry in log if entry["text"]]
+    assert labels, "the recorder never saw a composer label"
+    offending = [text for text in labels if "4.6" in text]
+    assert not offending, (
+        f"the composer painted a version the catalog didn't give: {offending} "
+        f"(full label sequence: {labels}). Labels render the reported model — "
+        "raw before the catalog names it, the catalog's name after — never an "
+        "invented version."
+    )
+    _screenshot(page, "one-m-label-settled")
+
+
+def test_union_catalog_pick_patches_the_row_id_verbatim(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Picking a probe-contributed row saves exactly that row's id.
+
+    A gateway session's catalog is the configured∪probe union: pinned
+    family rows carrying gateway model ids next to probe rows like
+    ``sonnet[1m]``. Picking the probe row must PATCH its id verbatim —
+    the id is the launch contract the runner types into the pane, so any
+    client-side rewrite here switches the session to a model the user
+    did not choose (the bug this guards showed a Fable pick landing on
+    Opus; the web layer was innocent, and must stay that way).
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` for a real
+        server-backed session; the browser snapshot is patched to a
+        claude-native shape with the union catalog.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    union_catalog = [
+        {
+            "id": "opus",
+            "model": "databricks-claude-opus-5",
+            "displayName": "Opus 5",
+            "isDefault": True,
+        },
+        {
+            "id": "sonnet",
+            "model": "databricks-claude-sonnet-5",
+            "displayName": "Sonnet 5",
+            "isDefault": False,
+        },
+        {
+            "id": "sonnet[1m]",
+            "model": "databricks-claude-sonnet-5[1m]",
+            "displayName": "Sonnet 5 (1M context)",
+        },
+    ]
+    # No fixture-pinned model_override: the route fake would force it back
+    # onto every response, including the PATCH echo the store adopts. The
+    # bound ``llm_model`` already implicitly selects the sonnet row.
+    patch_bodies = _patch_session_as_claude_native(
+        page,
+        session_id,
+        model_options=union_catalog,
+        llm_model="databricks-claude-sonnet-5",
+    )
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    gear = page.get_by_test_id("composer-config-gear")
+    expect(gear).to_be_visible(timeout=15_000)
+    gear.click()
+    page.get_by_test_id("composer-config-model").click()
+    bracket_row = page.locator('[role="option"][data-model-id="sonnet[1m]"]')
+    expect(bracket_row).to_contain_text("Sonnet 5 (1M context)")
+    bracket_row.click()
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PATCH"
+            and urlparse(response.url).path == f"/v1/sessions/{session_id}"
+            and response.status == 200
+        )
+    ):
+        page.get_by_test_id("composer-config-save").click()
+
+    assert patch_bodies[-1] == {"model_override": "sonnet[1m]"}
+    # The label keeps the reported model ("Sonnet 5" — the bound
+    # databricks-claude-sonnet-5); the request flips nothing until the
+    # harness confirms.
+    expect(page.get_by_test_id("composer-model-effort-label")).to_contain_text("Sonnet 5")
+
+
+def test_claude_native_picker_highlights_the_reported_model(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The active row follows the reported model — not the request or sticky.
+
+    The session carries a pending request ("opus") and another session's
+    sticky pick ("haiku"), but the pane reports Sonnet 5: only its row may
+    read as active.
+    """
     page.add_init_script("window.localStorage.setItem('omnigent.picker.model', 'haiku')")
     base_url, session_id = seeded_session
     _patch_session_as_claude_native(page, session_id, model_override="opus")
@@ -624,7 +809,10 @@ def test_claude_native_picker_prefers_session_override_over_sticky_model(
     gear.click()
     page.get_by_test_id("composer-config-model").click()
 
-    expect(page.locator('[role="option"][data-model-id="opus"]')).to_have_attribute(
+    expect(page.locator('[role="option"][data-model-id="sonnet"]')).to_have_attribute(
+        "data-active", "true"
+    )
+    expect(page.locator('[role="option"][data-model-id="opus"]')).not_to_have_attribute(
         "data-active", "true"
     )
     expect(page.locator('[role="option"][data-model-id="haiku"]')).not_to_have_attribute(

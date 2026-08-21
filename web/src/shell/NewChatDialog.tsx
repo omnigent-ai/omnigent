@@ -62,7 +62,10 @@ import {
   MODEL_SELECT_DEFAULT,
   MODEL_SELECT_SMART,
   RoutingModelSelect,
+  defaultModelLabel,
+  nativeModelLabel,
 } from "@/components/HarnessConfigControls";
+import { ProjectLandingIcon } from "@/components/ProjectIconPicker";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -122,7 +125,7 @@ import {
 import { readLastHarness, writeLastHarness } from "@/lib/harnessPreferences";
 import { readHideUnconfiguredHarnesses } from "@/lib/harnessVisibilityPreferences";
 import { readDefaultBaseBranch } from "@/lib/baseBranchPreferences";
-import { readHarnessOptions, writeHarnessOption } from "@/lib/modePreferences";
+import { readHarnessOptions, writeHarnessOption, type HarnessOptions } from "@/lib/modePreferences";
 import {
   AUTO_HARNESS_DESCRIPTION,
   AUTO_HARNESS_ID,
@@ -389,20 +392,58 @@ const CODEX_NATIVE_BYPASS_APPROVAL_OPTION = {
   args: [] as string[],
 };
 
-function displayModelId(option: Pick<NativeModelOption, "id">): string {
-  return option.id;
-}
+function createdHarnessOptions({
+  harness,
+  supportsPermissionMode,
+  supportsApprovalMode,
+  supportsCursorMode,
+  supportsAgySkipPermissions,
+  supportsModelPicker,
+  permissionMode,
+  approvalMode,
+  bypassSandbox,
+  cursorExecMode,
+  agySkipMode,
+  pickedModel,
+  pickedEffort,
+  smartRoutingEligible,
+  costControlMode,
+}: {
+  harness: string | null;
+  supportsPermissionMode: boolean;
+  supportsApprovalMode: boolean;
+  supportsCursorMode: boolean;
+  supportsAgySkipPermissions: boolean;
+  supportsModelPicker: boolean;
+  permissionMode: string;
+  approvalMode: string;
+  bypassSandbox: boolean;
+  cursorExecMode: string;
+  agySkipMode: string;
+  pickedModel: string;
+  pickedEffort: string;
+  smartRoutingEligible: boolean;
+  costControlMode: CostControlMode;
+}): HarnessOptions | null {
+  if (harness === null) return null;
 
-function displayModelName(option: Pick<NativeModelOption, "id" | "displayName">): string {
-  return option.displayName ?? option.id;
-}
+  const options: HarnessOptions = {};
+  if (supportsModelPicker) options.model = pickedModel;
+  if (supportsPermissionMode) {
+    options.mode = permissionMode;
+    options.effort = pickedEffort;
+  } else if (supportsApprovalMode) {
+    options.mode = bypassSandbox ? CODEX_NATIVE_BYPASS_APPROVAL_VALUE : approvalMode;
+  } else if (supportsCursorMode) {
+    options.mode = cursorExecMode;
+  } else if (supportsAgySkipPermissions) {
+    options.mode = agySkipMode;
+  }
 
-function defaultModelLabel(
-  options: readonly Pick<NativeModelOption, "id" | "displayName" | "isDefault">[],
-  display: (option: Pick<NativeModelOption, "id" | "displayName">) => string,
-): string {
-  const dflt = options.find((option) => option.isDefault);
-  return dflt ? `Default (${display(dflt)})` : "Default";
+  if (smartRoutingEligible) {
+    options.routing = costControlMode === "on" ? "on" : "off";
+  }
+  return Object.keys(options).length > 0 ? options : null;
 }
 
 /** Use a local-friendly label only when the desktop shell proves the host id is this machine. */
@@ -1491,8 +1532,10 @@ function HarnessConfigModal({
   pickedModel,
   claudeModelOptions,
   claudeModelsLoading,
+  claudeModelsError,
   codexModelOptions,
   codexModelsLoading,
+  codexModelsError,
   piModelOptions,
   piModelsLoading,
   pickedEffort,
@@ -1523,8 +1566,10 @@ function HarnessConfigModal({
   pickedModel: string;
   claudeModelOptions: readonly Pick<NativeModelOption, "id" | "displayName" | "isDefault">[];
   claudeModelsLoading: boolean;
+  claudeModelsError: string | null;
   codexModelOptions: readonly Pick<NativeModelOption, "id" | "displayName" | "isDefault">[];
   codexModelsLoading: boolean;
+  codexModelsError: string | null;
   piModelOptions: readonly { id: string; displayName: string }[];
   piModelsLoading: boolean;
   pickedEffort: string;
@@ -1599,11 +1644,11 @@ function HarnessConfigModal({
   const configTitleName = autoNative ? SMART_ROUTING_LABEL : agent.display_name;
   const modelValue = smartRoutingOn ? MODEL_SELECT_SMART : draftModel || MODEL_SELECT_DEFAULT;
   const claudeModelSelectOptions = useMemo(
-    () => claudeModelOptions.map((m) => ({ id: m.id, label: displayModelName(m) })),
+    () => claudeModelOptions.map((m) => ({ id: m.id, label: nativeModelLabel(m) })),
     [claudeModelOptions],
   );
   const codexModelSelectOptions = useMemo(
-    () => codexModelOptions.map((m) => ({ id: m.id, label: displayModelId(m) })),
+    () => codexModelOptions.map((m) => ({ id: m.id, label: nativeModelLabel(m) })),
     [codexModelOptions],
   );
   const onModelChange = (value: string) => {
@@ -1641,12 +1686,13 @@ function HarnessConfigModal({
       setPickedModel(draftModel);
       setPickedEffort(draftEffort);
       setPermissionMode(draftPermission);
-      if (entryHarness)
+      if (entryHarness) {
         writeHarnessOption(entryHarness, {
           model: draftModel,
           effort: draftEffort,
           mode: draftPermission,
         });
+      }
     } else if (hasModelPicker) {
       setPickedModel(draftModel);
       if (entryHarness) writeHarnessOption(entryHarness, { model: draftModel });
@@ -1654,11 +1700,12 @@ function HarnessConfigModal({
       if (isCodex) setPickedModel(draftModel);
       setApprovalMode(draftApproval);
       setBypassSandbox(draftBypass);
-      if (entryHarness)
+      if (entryHarness) {
         writeHarnessOption(entryHarness, {
-          mode: draftApproval,
+          mode: isCodex && draftBypass ? CODEX_NATIVE_BYPASS_APPROVAL_VALUE : draftApproval,
           ...(isCodex ? { model: draftModel } : {}),
         });
+      }
     } else if (hasCursor) {
       setCursorExecMode(draftCursor);
       if (entryHarness) writeHarnessOption(entryHarness, { mode: draftCursor });
@@ -1684,11 +1731,12 @@ function HarnessConfigModal({
         setPickedModel("");
         setPickedEffort("");
       }
-      if (entryHarness)
+      if (entryHarness) {
         writeHarnessOption(entryHarness, {
           routing: draftRouting === "on" ? "on" : "off",
           ...(draftRouting === "on" ? { model: "", effort: "" } : {}),
         });
+      }
     }
     onOpenChange(false);
   };
@@ -1736,6 +1784,7 @@ function HarnessConfigModal({
                   offerSmartRouting={smartRoutingEligible}
                   testId="new-chat-landing-config-model"
                   models={claudeModelSelectOptions}
+                  defaultLabel={defaultModelLabel(claudeModelOptions)}
                   contentClassName="[&_[data-slot=select-item]]:pl-2.5"
                 >
                   {claudeModelsLoading && (
@@ -1743,7 +1792,7 @@ function HarnessConfigModal({
                   )}
                   {!claudeModelsLoading && claudeModelOptions.length === 0 && (
                     <div className="px-2.5 py-1 text-sm text-muted-foreground">
-                      Models unavailable
+                      {claudeModelsError ?? "Models unavailable"}
                     </div>
                   )}
                 </RoutingModelSelect>
@@ -1806,7 +1855,7 @@ function HarnessConfigModal({
                   offerSmartRouting={smartRoutingEligible}
                   testId="new-chat-landing-config-model"
                   models={codexModelSelectOptions}
-                  defaultLabel={defaultModelLabel(codexModelOptions, displayModelId)}
+                  defaultLabel={defaultModelLabel(codexModelOptions)}
                   contentClassName="[&_[data-slot=select-item]]:pl-2.5"
                 >
                   {codexModelsLoading && (
@@ -1814,7 +1863,7 @@ function HarnessConfigModal({
                   )}
                   {!codexModelsLoading && codexModelOptions.length === 0 && (
                     <div className="px-2.5 py-1 text-sm text-muted-foreground">
-                      Models unavailable
+                      {codexModelsError ?? "Models unavailable"}
                     </div>
                   )}
                 </RoutingModelSelect>
@@ -2208,16 +2257,16 @@ export function NewChatLandingScreen() {
   const [sandboxProvider, setSandboxProvider] = useState<string | null>(
     () => landingDraft?.sandboxProvider ?? null,
   );
-  const { data: hostClaudeModelOptions, isLoading: hostClaudeModelsLoading } = useHostModelOptions(
-    selectedHostId,
-    "claude-native",
-    !sandboxSelected,
-  );
-  const { data: hostCodexModelOptions, isLoading: hostCodexModelsLoading } = useHostModelOptions(
-    selectedHostId,
-    "codex-native",
-    !sandboxSelected,
-  );
+  const {
+    data: hostClaudeModelOptions,
+    isLoading: hostClaudeModelsLoading,
+    error: hostClaudeModelsError,
+  } = useHostModelOptions(selectedHostId, "claude-native", !sandboxSelected);
+  const {
+    data: hostCodexModelOptions,
+    isLoading: hostCodexModelsLoading,
+    error: hostCodexModelsError,
+  } = useHostModelOptions(selectedHostId, "codex-native", !sandboxSelected);
   const { data: hostPiModelOptions, isLoading: hostPiModelsLoading } = useHostModelOptions(
     selectedHostId,
     "pi-native",
@@ -2233,6 +2282,9 @@ export function NewChatLandingScreen() {
         : (hostClaudeModelOptions ?? []).map((option) => ({
             id: option.id,
             displayName: option.displayName ?? option.id,
+            // Keep the catalog's default marker: the Default row names the
+            // model a bare launch truly runs, for claude exactly as codex.
+            isDefault: option.isDefault,
           })),
     [hostClaudeModelOptions, sandboxSelected],
   );
@@ -2867,7 +2919,8 @@ export function NewChatLandingScreen() {
     if (supportsPermissionMode) {
       const modelValue = routingOn
         ? SMART_ROUTING_LABEL
-        : (claudeModelOptions.find((m) => m.id === pickedModel)?.displayName ?? "Default");
+        : (claudeModelOptions.find((m) => m.id === pickedModel)?.displayName ??
+          defaultModelLabel(claudeModelOptions));
       // Routing picks the model + effort per turn, so mirror the modal's frozen
       // Effort row: an em-dash when routing is on, else the picked level.
       const effortValue = routingOn
@@ -2900,15 +2953,16 @@ export function NewChatLandingScreen() {
           ? CODEX_NATIVE_BYPASS_APPROVAL_OPTION.label
           : (CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.label ??
             approvalMode);
+      const pickedCodexRow = codexModelOptions.find((m) => m.id === pickedModel);
       const modelRows =
         routingOn || !isCodex
           ? routingRow
           : [
               {
                 label: "Model",
-                value:
-                  codexModelOptions.find((m) => m.id === pickedModel)?.id ??
-                  defaultModelLabel(codexModelOptions, displayModelId),
+                value: pickedCodexRow
+                  ? nativeModelLabel(pickedCodexRow)
+                  : defaultModelLabel(codexModelOptions),
               },
             ];
       return [...modelRows, { label: "Approval", value: approvalValue }];
@@ -2964,10 +3018,13 @@ export function NewChatLandingScreen() {
   // first id, or a persisted/draft pick resolving on mount), which would wipe a
   // costControlMode/bypass restored from the landing draft.
   const prevAgentIdRef = useRef<string | null | undefined>(undefined);
+  const suppressBypassSeedRef = useRef(false);
   useEffect(() => {
     const prev = prevAgentIdRef.current;
     prevAgentIdRef.current = effectiveAgentId;
-    if (prev === undefined || prev === effectiveAgentId) return;
+    suppressBypassSeedRef.current =
+      prev !== undefined && prev !== null && prev !== effectiveAgentId;
+    if (!suppressBypassSeedRef.current) return;
     setBypassSandbox(false);
     setCostControlMode(null);
   }, [effectiveAgentId, setCostControlMode]);
@@ -3024,6 +3081,11 @@ export function NewChatLandingScreen() {
           : "",
       );
     } else if (supportsApprovalMode) {
+      setBypassSandbox(
+        !suppressBypassSeedRef.current &&
+          selectedNativeHarness === "codex-native" &&
+          stored.mode === CODEX_NATIVE_BYPASS_APPROVAL_VALUE,
+      );
       setApprovalMode(resolve(CODEX_NATIVE_APPROVAL_MODES, CODEX_NATIVE_DEFAULT_APPROVAL_MODE));
       // A remembered routing "on" outranks a remembered concrete model, and
       // also drops any model/effort left in the shared state (e.g. seeded for
@@ -3995,6 +4057,32 @@ export function NewChatLandingScreen() {
         }
         data = { id: created.id };
       }
+      // Persist the configuration that actually launched. Modal Save updates
+      // storage eagerly so an immediate Send cannot observe stale state; this
+      // successful-create snapshot also covers restored drafts and every
+      // harness-specific creation path.
+      if (!smartRoutingHarnessSelected) {
+        const launchedOptions = createdHarnessOptions({
+          harness: selectedNativeHarness,
+          supportsPermissionMode: agentSupportsPermissionMode,
+          supportsApprovalMode: agentSupportsApprovalMode,
+          supportsCursorMode: agentSupportsCursorMode,
+          supportsAgySkipPermissions: agentSupportsAgySkip,
+          supportsModelPicker: agentSupportsModelPicker || nativeAgent?.harness === "codex-native",
+          permissionMode,
+          approvalMode,
+          bypassSandbox,
+          cursorExecMode,
+          agySkipMode,
+          pickedModel,
+          pickedEffort,
+          smartRoutingEligible: effectiveAgentId !== PENDING_AGENT_ID && smartRoutingEligible,
+          costControlMode,
+        });
+        if (launchedOptions !== null) {
+          writeHarnessOption(selectedNativeHarness, launchedOptions);
+        }
+      }
       // Promote the born-filed session to first-class project membership. The
       // create above already stamped the `omni_project` label (so the row
       // groups under its project immediately); this move sets the first-class
@@ -4101,15 +4189,23 @@ export function NewChatLandingScreen() {
       <div className="flex w-full max-w-[840px] flex-col items-center gap-6 px-4 pt-8 pb-16 md:select-none md:px-10">
         <div className="flex w-full flex-col items-center justify-center gap-3.5">
           {selectedProject ? (
-            // Landing inside a project: swap Otto's eyes for the same folder
-            // icon the sidebar uses for a project, and name the project. Sized
-            // to Otto's h-16 box so the centered composer doesn't shift when
-            // toggling between the two landings.
-            <span className="flex h-16 shrink-0 items-center">
-              <div className="w-14 h-14 flex rounded-xl bg-tag-pink items-center justify-center">
-                <FolderIcon className="size-6 text-brand-accent" />
-              </div>
-            </span>
+            // Landing inside a project: swap Otto's eyes for the project's
+            // icon — the default pink folder, or a chosen emoji — and name the
+            // project. Sized to Otto's h-16 box so the centered composer doesn't
+            // shift when toggling between the two landings.
+            <ProjectLandingIcon
+              projectId={configProjectId}
+              projectName={selectedProject}
+              config={storedProjectConfig}
+              // Gate editing until the config resolves: the PATCH replaces the
+              // whole blob, so a write before the name→id and config have loaded
+              // would wipe the project's other defaults. A label-only folder
+              // (`configProjectId === null`) has no first-class config to lose.
+              configReady={
+                !projectListLoading &&
+                (configProjectId === null || storedProjectConfig !== undefined)
+              }
+            />
           ) : (
             <BrandLogo variant="eyes" className="h-14 w-auto shrink-0" />
           )}
@@ -4502,9 +4598,15 @@ export function NewChatLandingScreen() {
                     claudeModelsLoading={
                       !sandboxSelected && selectedHostId !== null && hostClaudeModelsLoading
                     }
+                    claudeModelsError={
+                      !sandboxSelected ? (hostClaudeModelsError?.message ?? null) : null
+                    }
                     codexModelOptions={codexModelOptions}
                     codexModelsLoading={
                       !sandboxSelected && selectedHostId !== null && hostCodexModelsLoading
+                    }
+                    codexModelsError={
+                      !sandboxSelected ? (hostCodexModelsError?.message ?? null) : null
                     }
                     piModelOptions={piModelOptions}
                     piModelsLoading={

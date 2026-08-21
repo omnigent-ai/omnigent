@@ -443,7 +443,7 @@
     <script>
       // Shared URL helpers (electron/src/url.js), exposed as window.omnigentUrl
       // — the same module the main process uses, so the two never drift.
-      const { isPlainHttpRemote } = window.omnigentUrl;
+      const { isPlainHttpRemote, serverDisplayLabel } = window.omnigentUrl;
       // Uses the Electron preload bridge (electron/src/preload.js).
       const setup = window.omnigentSetup;
       const input = document.getElementById("url");
@@ -486,8 +486,8 @@
           });
       }
 
-      // Recently-connected servers (persisted by the main process on every
-      // successful non-ephemeral Connect). The URL keeps its one-click Connect
+      // Recently-connected servers (persisted by the main process after each
+      // successful non-ephemeral connection). The URL keeps its one-click Connect
       // behavior; the adjacent clipboard action copies without navigating.
       // An empty/unavailable list keeps the section hidden.
       const recentsSection = document.getElementById("recents");
@@ -497,15 +497,16 @@
         .then((recents) => {
           if (!Array.isArray(recents) || recents.length === 0) return;
           for (const url of recents) {
+            const label = serverDisplayLabel(url);
             const row = document.createElement("div");
             row.className = "recent-row";
 
             const serverButton = document.createElement("button");
             serverButton.type = "button";
             serverButton.className = "recent-btn";
-            serverButton.textContent = url;
-            serverButton.title = url;
-            serverButton.setAttribute("aria-label", `Connect to recent server ${url}`);
+            serverButton.textContent = label;
+            serverButton.title = label;
+            serverButton.setAttribute("aria-label", `Connect to recent server ${label}`);
             serverButton.addEventListener("click", () => {
               input.value = url;
               void connect();
@@ -515,7 +516,7 @@
             copyButton.type = "button";
             copyButton.className = "recent-copy";
             copyButton.title = "Copy URL";
-            copyButton.setAttribute("aria-label", `Copy recent server URL ${url}`);
+            copyButton.setAttribute("aria-label", `Copy recent server URL ${label}`);
             copyButton.innerHTML = `
               <svg class="copy-icon" viewBox="0 0 24 24" aria-hidden="true">
                 <rect width="8" height="4" x="8" y="2" rx="1"></rect>
@@ -531,11 +532,11 @@
                 await setup.copyText(url);
                 copyButton.dataset.copied = "true";
                 copyButton.title = "Copied";
-                copyButton.setAttribute("aria-label", `Copied recent server URL ${url}`);
+                copyButton.setAttribute("aria-label", `Copied recent server URL ${label}`);
                 setTimeout(() => {
                   delete copyButton.dataset.copied;
                   copyButton.title = "Copy URL";
-                  copyButton.setAttribute("aria-label", `Copy recent server URL ${url}`);
+                  copyButton.setAttribute("aria-label", `Copy recent server URL ${label}`);
                 }, 1500);
               } catch {
                 err.textContent = "Could not copy recent server URL.";

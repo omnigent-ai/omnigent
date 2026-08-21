@@ -39,15 +39,18 @@ const { execFile } = require("node:child_process");
 const { registerLocalhostCors } = require("./localhost_cors");
 const {
   normalizeUrl,
+  normalizeRecentServers,
   expandDatabricksWorkspaceUrl,
   fetchServerManifest,
   PRE_MANIFEST_BASELINE,
 } = require("./url");
 const { parseOmnigentDeepLink, chooseDeepLinkStrategy } = require("./deepLink");
 const { registerWorkspaceChromeHide } = require("./workspace-chrome");
+const { registerWorkspaceRootBounce } = require("./workspace-root-bounce");
 const { createBrowserViewRegistry } = require("./browserViewRegistry");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { registerBrowserIpc } = require("./browserIpc");
+const { isDeveloperModeEnabled } = require("./developer_mode");
 const { registerSessionExpiryReload } = require("./session-expiry");
 const { decideWindowOpen, stripCrossOriginOpenerHeaders, WEB_SCHEMES } = require("./popupPolicy");
 const omnigentCli = require("./omnigent_cli");
@@ -89,6 +92,21 @@ const POPUP_PRELOAD = path.join(__dirname, "popup_preload.js");
 
 /** Absolute path to the app icon (PNG works for the macOS dock at runtime). */
 const ICON_PNG = path.join(__dirname, "..", "icons", "icon.png");
+
+/**
+ * Development builds always expose debugging. Packaged macOS builds require
+ * `defaults write ai.omnigent.desktop DeveloperMode -bool true` before launch.
+ */
+function developerModeEnabled() {
+  return isDeveloperModeEnabled({
+    isPackaged: app.isPackaged,
+    platform: process.platform,
+    getUserDefault:
+      typeof systemPreferences.getUserDefault === "function"
+        ? systemPreferences.getUserDefault.bind(systemPreferences)
+        : undefined,
+  });
+}
 
 /**
  * Quit-safety timeouts (see the before-quit handler near the end of this
@@ -581,7 +599,7 @@ function pinWindow(win, origin) {
 /**
  * Record (or clear) the full server URL a window is connected to. The pinned
  * `origin` drops any path, but the host/server CLI commands need the exact URL
- * the user connected with (e.g. a Databricks ``…/ml/omnigents`` mount), so the
+ * the user connected with (e.g. a Databricks ``…/omnigent`` mount), so the
  * window keeps both.
  *
  * @param {BrowserWindow} win
@@ -976,10 +994,10 @@ function hardenOauthPopup(child) {
 
 /**
  * Join a basename-less SPA path (e.g. ``/c/conv_abc``) onto a server URL that
- * may carry a workspace mount (e.g. ``https://host/ml/omnigents/``). The path
- * is an ABSOLUTE in-app route, but it lives UNDER the server's mount —
+ * may carry a workspace mount (e.g. ``https://host/omnigent/``). The path is
+ * an ABSOLUTE in-app route, but it lives UNDER the server's mount —
  * ``new URL("/c/x", serverUrl)`` would resolve against the ORIGIN and drop
- * ``/ml/omnigents`` — so we string-concatenate: strip the server URL's trailing
+ * ``/omnigent`` — so we string-concatenate: strip the server URL's trailing
  * slash, append the path. The SPA's react-router basename then matches
  * ``${mount}/c/:id``. Shared by createWindow (cold open) and loadServerUrl
  * (re-pointing an existing window) so the mount-aware join is in one place.
@@ -1074,6 +1092,9 @@ function createWindow(targetUrl, opts = {}) {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
+      // Packaged builds expose DevTools only after the macOS user explicitly
+      // opts in through the DeveloperMode user default.
+      devTools: developerModeEnabled(),
       // Electron passes HTML5 drag-drop through to the page by default (no
       // native handler intercepts it), so images drop onto the composer
       // textbox with no extra work.
@@ -1119,6 +1140,7 @@ function createWindow(targetUrl, opts = {}) {
     // Per-conversation embedded-browser view registry for this window.
     browserRegistry: createBrowserRegistryForWindow(win),
   });
+  registerWorkspaceRootBounce(win.webContents, () => pinnedOrigin(win));
   if (destination) {
     // Learn the server's version alongside the load. Every window that opens
     // straight onto a server (normal app launch with a saved URL, a deep link,
@@ -1130,7 +1152,20 @@ function createWindow(targetUrl, opts = {}) {
         if (!win.isDestroyed()) setWindowServerManifest(win, manifest);
       });
     }
-    void win.loadURL(destination);
+    void win
+      .loadURL(destination)
+      .then(() => {
+        // A saved server can predate the recents list. Backfill it only after
+        // a successful cold load; explicit targets may be conversation URLs.
+        if (!ephemeral && !explicit && serverUrl) {
+          const settings = loadSettings();
+          rememberRecentServer(settings, serverUrl);
+          saveSettings(settings);
+        }
+      })
+      .catch(() => {
+        // Load failure falls back via did-fail-load → setup page w/ error.
+      });
   } else {
     // ?ephemeral=1 only changes the setup page's copy (the window's
     // WindowState is the source of truth for persistence behavior).
@@ -1792,11 +1827,14 @@ function buildMenu() {
   /** @type {Electron.MenuItemConstructorOptions[]} */
   const serverSubmenu = [
     {
+      id: "new_session",
+      label: "New Session",
+      accelerator: "CmdOrCtrl+N",
+      click: () => sendOpenPath(activeWindow(), "/"),
+    },
+    {
       id: "new_window",
       label: "New Window",
-      // Own the standard new-window accelerator here — there is no
-      // role-based File menu in this app.
-      accelerator: "CmdOrCtrl+N",
       click: () => newWindow(),
     },
     {
@@ -1911,7 +1949,7 @@ function buildMenu() {
     ],
   });
   // Standard View roles (Reload/zoom/fullscreen). Developer Tools lives in
-  // the Debug menu (dev only), so this menu is identical in dev and release.
+  // the opt-in Debug menu, so this menu is identical in normal releases.
   template.push({
     label: "View",
     submenu: [
@@ -1927,14 +1965,11 @@ function buildMenu() {
   });
   template.push({ role: "windowMenu" });
 
-  // Debug menu (dev only, !app.isPackaged): consolidates every debug-only /
-  // non-production affordance behind a single top-level menu — the macOS
-  // notification-sound settings (sound playback uses `afplay`, so macOS-only)
-  // and the developer tools. Restart-to-update now lives in the production
-  // Server menu (it's a needed install path, not a debug affordance, once the
-  // UpdateBanner toast is dismissible). Hidden in the shipped .app. Placed
-  // last so it never displaces the standard menus users expect.
-  if (!app.isPackaged) {
+  // Consolidate non-production affordances behind one top-level menu. It is
+  // always present in development and can be explicitly enabled in a packaged
+  // macOS app through the DeveloperMode user default. Restart-to-update stays
+  // in the production Server menu because it is a normal install path.
+  if (developerModeEnabled()) {
     /** @type {Electron.MenuItemConstructorOptions[]} */
     const debugSubmenu = [];
 
@@ -2170,9 +2205,7 @@ function registerIpc() {
     if (!isSetupPageSender(event)) {
       throw new Error("get-recent-servers is only available to the setup page");
     }
-    const recents = loadSettings().recent_servers;
-    // Same hand-edited-settings tolerance as rememberRecentServer.
-    return Array.isArray(recents) ? recents.filter((u) => typeof u === "string") : [];
+    return normalizeRecentServers(loadSettings().recent_servers);
   });
 
   ipcMain.handle("omnigent:copy-setup-text", (event, text) => {
@@ -2771,7 +2804,7 @@ function drainPendingDeepLinks() {
  * (expandDatabricksWorkspaceUrl) runs ONLY after the user consents to an
  * UNKNOWN server — so clicking (or the OS dispatching) a link to an
  * attacker-chosen host makes no HTTP request until the user has agreed. The
- * probe is safe post-consent because it can only append a path (`/ml/omnigents`)
+ * probe is safe post-consent because it can only append a path (`/omnigent`)
  * under the SAME origin — it never changes the origin the user approved.
  *
  * @param {string} raw The raw `omnigent://...` URL.
@@ -2786,7 +2819,7 @@ async function handleDeepLink(raw) {
   // same origin, so approving the origin is approving the server.
   const targetOrigin = parsed.origin;
   // A KNOWN server: reuse its recorded URL (already mount-bearing, e.g.
-  // `https://host/ml/omnigents`) so we SKIP the probe entirely. null for an
+  // `https://host/omnigent`) so we SKIP the probe entirely. null for an
   // unknown server — the mount is discovered AFTER consent (see consent-unknown).
   const known = findKnownServerUrl(targetOrigin);
 

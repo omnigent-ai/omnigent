@@ -10,6 +10,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -553,6 +554,54 @@ def clear_engine_cache() -> None:
 # ── Managed session ────────────────────────────────────
 
 
+# Ambient per-engine sessions for a read-only "share one checkout" scope. When
+# active (see :func:`shared_read_scope`), ``managed_session()`` reuses the
+# scope's session for its engine instead of opening a fresh pool checkout,
+# collapsing several back-to-back reads (e.g. the access-control check's
+# permission + conversation lookups) into a single connection round-trip.
+# Keyed by ``id(engine)`` so distinct engines (split-DB) still get independent
+# checkouts. Unset outside a scope, so it is a strict no-op for every ordinary
+# caller.
+_shared_read_sessions: ContextVar[dict[int, Session] | None] = ContextVar(
+    "omnigent_shared_read_sessions", default=None
+)
+
+
+@contextmanager
+def shared_read_scope() -> Iterator[None]:
+    """Collapse back-to-back reads into one pool checkout per engine.
+
+    Within this scope, ``managed_session()`` reuses a single session per
+    engine rather than checking out a fresh pooled connection (plus a
+    ``pool_pre_ping`` round-trip) on every store call. Intended for a short,
+    strictly READ-ONLY burst — an access-control check, a snapshot assembly —
+    where the per-call checkout dominates the actual query time.
+
+    Nesting reuses the outer scope. Write makers (``immediate=True``) never
+    participate, so they keep their own ``BEGIN IMMEDIATE`` isolation even
+    when nested here. Never hold this open across network I/O: it pins a
+    pooled connection for the scope's whole duration.
+    """
+    if _shared_read_sessions.get() is not None:
+        # Already inside a scope — the outer one owns the sessions.
+        yield
+        return
+    sessions: dict[int, Session] = {}
+    token = _shared_read_sessions.set(sessions)
+    try:
+        yield
+        for session in sessions.values():
+            session.commit()
+    except BaseException:
+        for session in sessions.values():
+            session.rollback()
+        raise
+    finally:
+        for session in sessions.values():
+            session.close()
+        _shared_read_sessions.reset(token)
+
+
 def make_managed_session_maker(
     engine: Engine,
     *,
@@ -592,7 +641,27 @@ def make_managed_session_maker(
         Commits on clean exit, rolls back on exception. For SQLite
         backends, enables foreign key enforcement and sets a
         busy timeout before yielding.
+
+        Inside a :func:`shared_read_scope` (and only for read makers), the
+        scope's per-engine session is reused instead of a fresh checkout;
+        the scope — not this block — owns its commit/close.
         """
+        if not immediate:
+            shared = _shared_read_sessions.get()
+            if shared is not None:
+                key = id(engine)
+                session = shared.get(key)
+                if session is None:
+                    session = factory()
+                    # Register before the PRAGMAs: those executes force the pool
+                    # checkout, so if one raises the scope must already track the
+                    # session to close it (otherwise the connection would leak).
+                    shared[key] = session
+                    if is_sqlite:
+                        session.execute(text("PRAGMA foreign_keys = ON"))
+                        session.execute(text("PRAGMA busy_timeout = 20000"))  # 20s
+                yield session
+                return
         with factory() as session:
             try:
                 if is_sqlite:

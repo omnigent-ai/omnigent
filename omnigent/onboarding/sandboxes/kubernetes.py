@@ -16,7 +16,7 @@ creates the Job — an init container prepares the workspace (``mkdir`` + option
 which dials back over the existing managed launch-token tunnel. Because the host
 is never started by ``exec``-ing into an already-running container, this launcher
 needs no ``pods/exec`` rights and no exec transport — it implements only
-``prepare`` / ``provision`` / ``start_host`` / ``terminate``.
+``prepare`` / ``provision`` / ``start_host`` / ``resume`` / ``terminate``.
 
 Platform notes that shape this launcher:
 
@@ -982,7 +982,9 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
     Server-managed only and entrypoint-as-host: :meth:`provision` reserves a Job
     name, :meth:`start_host` creates a per-Job token Secret and a Job whose Pod
     template's init container prepares the workspace and whose main container runs
-    ``omnigent host``, and :meth:`terminate` deletes both.  The Job uses
+    ``omnigent host``. :meth:`resume` removes a dormant Job and its stale token
+    Secret so the managed-host wake path can recreate both under the same sandbox
+    id, while :meth:`terminate` permanently deletes them. The Job uses
     ``restartPolicy: OnFailure`` so the kubelet automatically restarts a crashed
     host container, providing automatic failover within the Job's
     ``backoffLimit``.  All transport rides the official ``kubernetes`` client's
@@ -992,6 +994,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
     """
 
     provider: ClassVar[str] = "kubernetes"
+    can_resume: ClassVar[bool] = True
 
     @property
     def capabilities(self) -> SandboxCapabilities:
@@ -999,7 +1002,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
             cli_bootstrap=False,
             managed_launch=True,
             local_port_forward=False,
-            resume_stopped=False,
+            resume_stopped=True,
             programmatic_terminate=True,
             classifies_runner_by_agent=True,
         )
@@ -1738,6 +1741,23 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
             self._close_clients()
         if first_error is not None:
             raise first_error
+
+    def resume(self, sandbox_id: str) -> None:
+        """
+        Prepare a dormant Kubernetes sandbox for recreation in place.
+
+        Kubernetes Jobs cannot be restarted after their host process exits.
+        Remove the old Job and launch-token Secret so the shared managed-host
+        wake path can call :meth:`start_host` with the same sandbox id and a
+        freshly armed token. Operator-managed PVCs are external resources and
+        are not touched.
+
+        :param sandbox_id: The dormant Job name to recreate.
+        :raises click.ClickException: On an API delete failure other than
+            not-found.
+        """
+        click.echo(f"▸ Resuming Kubernetes sandbox '{sandbox_id}'")
+        self.terminate(sandbox_id)
 
     def _delete_with_retry(self, kind: str, name: str, delete: Callable[[], object]) -> None:
         """

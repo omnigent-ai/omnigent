@@ -93,7 +93,7 @@ import { clearSseLog, pushSseEvent } from "@/lib/sseEventLog";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { sessionItemsQueryKey } from "@/hooks/useSessionItems";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
-import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
+import { overlayTitleIntoCaches, type ConversationsInfiniteData } from "@/lib/sessionListCache";
 import { useTerminalActivityStore } from "./terminalActivity";
 import { terminalInfoFromResource, terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
 import type {
@@ -109,8 +109,6 @@ import type {
 import { uploadFile } from "@/lib/filesApi";
 import type { ActiveResponse } from "./types";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
-import { isClaudeNativeModel } from "@/lib/claudeNativeModels";
-import { isCodexNativeModel } from "@/lib/codexNativeModels";
 import { codexPlanModeFromSession } from "@/lib/codexPlanMode";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { getOmnigentHostConfig } from "@/lib/host";
@@ -411,6 +409,14 @@ export interface ConversationState {
    */
   llmModel: string | null;
   /**
+   * A model switch the harness has not confirmed yet: the requested model
+   * from the moment the PATCH lands until the harness's own report
+   * (``session.model``) or a ``model_change_not_applied`` error settles it.
+   * Drives the composer's pending indicator; never display state for the
+   * chip itself (the chip keeps showing ``llmModel`` — the truth).
+   */
+  pendingModelChange: string | null;
+  /**
    * Effective brain harness for the active session (override-aware),
    * e.g. ``"claude-sdk"`` or ``"pi"``. Populated from the session
    * snapshot on bind; drives the composer pill's harness suffix.
@@ -694,8 +700,12 @@ export interface ChatActions {
    * Set the sticky model and PATCH it onto the current session. For
    * claude-native, the server also injects ``/model`` into the tmux
    * pane so the in-binary picker tracks the change.
+   *
+   * ``expectConfirmation`` marks the pick pending until the harness's own
+   * report (or a not-applied error) settles it — pass it for sessions
+   * whose chip renders the reported model (claude-/codex-native).
    */
-  setModel: (model: string | null) => Promise<void>;
+  setModel: (model: string | null, opts?: { expectConfirmation?: boolean }) => Promise<void>;
   /**
    * Set the active session's cost-control switch — optimistic local
    * flip, then PATCH; the server's canonical value (or a rollback on
@@ -1282,6 +1292,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   failedSendDraft: null,
   sendLatchedAt: null,
   llmModel: null,
+  pendingModelChange: null,
   sessionHarness: null,
   subAgentName: null,
   contextWindow: null,
@@ -2086,7 +2097,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
-  setModel: async (model) => {
+  setModel: async (model, opts) => {
     // `selectedModel` is the sticky pick; `sessionModelOverride` is this
     // session's applied override. An explicit `/model` sets both.
     modelPickRevision += 1;
@@ -2095,7 +2106,37 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     savePickerPref(PICKER_PREF_MODEL_KEY, model);
     const { conversationId } = get();
     if (conversationId) {
-      const session = await updateSession(conversationId, { modelOverride: model });
+      const expectConfirmation = opts?.expectConfirmation === true && model !== null;
+      if (expectConfirmation) {
+        // Reported-model sessions: the chip keeps the harness's model until
+        // its own report confirms the switch. Mark the ask pending BEFORE
+        // the PATCH: the PATCH is held open while the runner drives and
+        // CONFIRMS the switch, so the harness's `session.model` report
+        // usually arrives before the PATCH resolves — pending set after the
+        // response would miss that clear and strand the spinner. The
+        // `session.model` event or a `model_change_not_applied` error
+        // settles it; the timer is spinner hygiene for the case where
+        // neither ever arrives (e.g. the session fell asleep mid-ask) — it
+        // outlasts the server's 20 s runner-forward budget.
+        setterFor(conversationId)({ pendingModelChange: model });
+        setTimeout(() => {
+          setterFor(conversationId)((s) =>
+            s.pendingModelChange === model ? { pendingModelChange: null } : {},
+          );
+        }, 30_000);
+      }
+      let session;
+      try {
+        session = await updateSession(conversationId, { modelOverride: model });
+      } catch (err) {
+        // The ask never reached the server — nothing will confirm it.
+        if (expectConfirmation) {
+          setterFor(conversationId)((s) =>
+            s.pendingModelChange === model ? { pendingModelChange: null } : {},
+          );
+        }
+        throw err;
+      }
       // Server-canonical may differ from the optimistic write (e.g.
       // when a clear alias was sent) — refresh local state to match.
       const canonical = session.modelOverride ?? null;
@@ -2608,56 +2649,6 @@ function nativeModelFamilyForSession(session: Pick<Session, "labels">): NativeMo
 }
 
 /**
- * Whether a sticky model id can be applied to a native session family.
- *
- * :param family: Native model family from :func:`nativeModelFamilyForSession`.
- * :param model: Sticky model id / alias.
- * :returns: True only when the model is compatible with that native family.
- */
-function isNativeModelCompatible(
-  family: NativeModelFamily,
-  model: string,
-  session: Session,
-): boolean {
-  switch (family) {
-    case "claude": {
-      const options = session.codexModelOptions ?? [];
-      return (
-        isClaudeNativeModel(model) &&
-        options.some((option) => option.id === model || option.model === model)
-      );
-    }
-    case "codex":
-      return isCodexNativeModel(session.codexModelOptions ?? [], model);
-  }
-}
-
-/**
- * Recover a persisted native-model preference once its live catalog arrives.
- *
- * Bind snapshots deliberately invalidate runner-backed catalogs, so an empty
- * option list at bind time means "loading," not "removed." The in-memory
- * selection is cleared until compatibility can be checked; local storage keeps
- * the preference available for this delayed handoff.
- */
-function deferredNativeStickyModel(session: Session): string | null {
-  const family = nativeModelFamilyForSession(session);
-  if (
-    family === null ||
-    session.parentSessionId != null ||
-    session.costControlModeOverride === "on" ||
-    session.modelOverride != null
-  ) {
-    return null;
-  }
-  const stickyModel =
-    useChatStore.getState().selectedModel ?? loadPickerPref(PICKER_PREF_MODEL_KEY);
-  return stickyModel != null && isNativeModelCompatible(family, stickyModel, session)
-    ? stickyModel
-    : null;
-}
-
-/**
  * Ensure the store has a bound session with a live SSE stream, creating
  * one if there is no conversation yet. Returns the session id. Shared by
  * `send` and `sendSlashCommand` so the two POST entry points can't drift
@@ -2868,6 +2859,7 @@ function sessionBindingPatch(
   | "boundAgentId"
   | "boundAgentName"
   | "llmModel"
+  | "pendingModelChange"
   | "sessionModelOverride"
   | "sessionHarness"
   | "subAgentName"
@@ -2893,6 +2885,7 @@ function sessionBindingPatch(
     boundAgentId: session.agentId,
     boundAgentName: session.agentName,
     llmModel: session.llmModel ?? null,
+    pendingModelChange: null,
     sessionModelOverride: session.modelOverride ?? null,
     sessionHarness: session.harness ?? null,
     subAgentName: session.subAgentName ?? null,
@@ -3055,7 +3048,6 @@ async function bindStream(
     const items = page.items;
 
     // Sticky-pref handoff for CLI-created sessions with no override.
-    const nativeModelFamily = nativeModelFamilyForSession(session);
     // Binding-derived fields (isNativeTerminalSession, bound agent,
     // model/skills metadata) — shared with the session.agent_changed
     // refresh path; see sessionBindingPatch.
@@ -3069,41 +3061,12 @@ async function bindStream(
     const effectiveEffort = canApplyEffort
       ? (session.reasoningEffort ?? stickyEffort ?? null)
       : stickyEffort;
-    // Non-native: don't auto-apply the model, but keep the sticky pick so
-    // navigating back to a native session restores it.
-    const compatibleStickyModel =
-      nativeModelFamily !== null && stickyModel != null
-        ? isNativeModelCompatible(nativeModelFamily, stickyModel, session)
-          ? stickyModel
-          : null
-        : stickyModel;
-    const effectiveModel =
-      nativeModelFamily !== null ? (session.modelOverride ?? compatibleStickyModel) : stickyModel;
-    // The session's REAL effective override: the server's stored value,
-    // plus the sticky model the native handoff is about to apply. Unlike
-    // `effectiveModel`/`selectedModel` (which hold the unapplied sticky
-    // pick for non-native sessions), this is the session truth the `/model`
-    // readout shows, so a non-applied sticky pick is never mislabeled as
-    // an active "(override)".
-    // Intelligent routing owns model selection: never carry a sticky model
-    // onto a routing-enabled session. Leaving model_override null is what lets
-    // the server-side judge pick on the first turn; a silent sticky PATCH here
-    // would re-pin the session (e.g. to the last-used Opus) and trip the
-    // server's ``model_override is None`` routing guard. effectiveSessionOverride
-    // then resolves to null too, so the /model readout doesn't mislabel it.
-    const routingOn = session.costControlModeOverride === "on";
-    const willApplyStickyModel =
-      !isSubAgentSession &&
-      !routingOn &&
-      nativeModelFamily !== null &&
-      session.modelOverride == null &&
-      compatibleStickyModel != null &&
-      // While cooling down we skip the PATCH, so don't let the /model readout
-      // claim an override the server won't have — effectiveSessionOverride stays
-      // null, matching the un-persisted server truth.
-      !stickyApplyBlocked();
-    const effectiveSessionOverride =
-      session.modelOverride ?? (willApplyStickyModel ? compatibleStickyModel : null);
+    // The sticky model is a UI PREFERENCE only: it pre-fills pickers but is
+    // never silently PATCHed onto a session and never rendered as the
+    // session's model. Display comes from the harness's reported model
+    // (`llmModel`); a request exists only when the user explicitly picks.
+    // (The old bind-time auto-apply wrote requests the pane was never asked
+    // to honor — removed with the reported-model semantics.)
     if (
       !isSubAgentSession &&
       canApplyEffort &&
@@ -3115,17 +3078,6 @@ async function bindStream(
         armStickyApplyBackoff();
         console.warn(`Failed to apply sticky effort=${stickyEffort} to session ${id}:`, err);
       });
-    }
-    if (willApplyStickyModel) {
-      updateSession(id, { modelOverride: compatibleStickyModel, silent: true }).catch(
-        (err: unknown) => {
-          armStickyApplyBackoff();
-          console.warn(
-            `Failed to apply sticky model=${compatibleStickyModel} to session ${id}:`,
-            err,
-          );
-        },
-      );
     }
 
     const snapshotBlocks = itemsToBlocks(items);
@@ -3145,18 +3097,6 @@ async function bindStream(
       const effectiveBindingPatch = catalogWonBindRace
         ? { ...bindingPatch, codexModelOptions: racedOptions! }
         : bindingPatch;
-      // The raced branch preserves the selection the deferred handoff
-      // applied — but only when that selection exists in the raced catalog.
-      // A sticky pick the handoff REJECTED (e.g. a removed alias) must not
-      // linger visually selected with no server override behind it.
-      const preservedModelValid =
-        !catalogWonBindRace ||
-        state.selectedModel == null ||
-        nativeModelFamily === null ||
-        isNativeModelCompatible(nativeModelFamily, state.selectedModel, {
-          ...session,
-          codexModelOptions: racedOptions!,
-        });
       const seenItemIds = new Set(
         state.blocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
       );
@@ -3274,8 +3214,7 @@ async function bindStream(
               ...structuredErrorFields(session.lastTaskError),
             }
           : null;
-      resolvedStickyModel =
-        catalogWonBindRace && preservedModelValid ? state.selectedModel : effectiveModel;
+      resolvedStickyModel = stickyModel;
       return {
         ...effectiveBindingPatch,
         blocks: syntheticError !== null ? [...allBlocks, syntheticError] : allBlocks,
@@ -3323,10 +3262,7 @@ async function bindStream(
         // Session truth for the `/model` readout — overrides the snapshot
         // value spread via `...bindingPatch` so the claude-native sticky
         // handoff (fired above, silent) shows immediately.
-        sessionModelOverride:
-          catalogWonBindRace && preservedModelValid
-            ? state.sessionModelOverride
-            : effectiveSessionOverride,
+        sessionModelOverride: session.modelOverride ?? null,
         tokensUsed: session.lastTotalTokens ?? null,
         sessionCostUsd: session.totalCostUsd ?? null,
         sessionUsageByModel: session.usageByModel ?? null,
@@ -4934,8 +4870,8 @@ async function refetchRunnerBackedSessionState(
   if (options.modelOptionsResolved === true && (session.codexModelOptions ?? []).length > 0) {
     racedNativeModelOptions.set(conversationId, session.codexModelOptions ?? []);
   }
-  const stickyModel = deferredNativeStickyModel(session);
-  const alreadyApplied = stickyModel != null && currentState.sessionModelOverride === stickyModel;
+  // No sticky-model graft here: the sticky pick is a pure preference under
+  // the reported-model semantics, so a delayed catalog only hydrates state.
   const statePatch: Partial<ConversationState> =
     options.applyBindingPatch === true
       ? sessionBindingPatch(session)
@@ -4943,27 +4879,7 @@ async function refetchRunnerBackedSessionState(
           skills: session.skills ?? [],
           codexModelOptions: session.codexModelOptions ?? [],
         };
-  if (stickyModel != null) {
-    statePatch.sessionModelOverride = stickyModel;
-    // `selectedModel` is the cross-session sticky pick, so recover it only for
-    // the conversation on screen: a backgrounded session's delayed handoff must
-    // not overwrite a model the user has since picked elsewhere.
-    if (useChatStore.getState().conversationId === conversationId) {
-      rootSetState({ selectedModel: stickyModel });
-    }
-  }
   setterFor(conversationId)(statePatch);
-  if (stickyModel != null && !alreadyApplied && !stickyApplyBlocked()) {
-    updateSession(conversationId, { modelOverride: stickyModel, silent: true }).catch(
-      (err: unknown) => {
-        armStickyApplyBackoff();
-        console.warn(
-          `Failed to apply delayed sticky model=${stickyModel} to session ${conversationId}:`,
-          err,
-        );
-      },
-    );
-  }
 }
 
 /**
@@ -5156,19 +5072,42 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       return;
     }
     case "session_model":
-      // A `/model` switch made inside a native terminal (Claude Code,
-      // codex, or cursor-agent). Reflect it in the picker for the open
-      // session. The server already
-      // persisted `model_override`, so a reload restores it; the
-      // cross-session sticky pref is intentionally left untouched (a
-      // terminal switch is a per-session choice, not a new default).
-      // Guard by conversation id so a late frame from a switched-away
-      // stream cannot overwrite the model for the currently-open session.
-      if (event.conversationId === useChatStore.getState().conversationId) {
-        // `selectedModel` is a sticky app-level pref, so it is set directly.
-        useChatStore.setState({ selectedModel: event.model });
+      // The harness's model report — the launch's own model, or a switch
+      // made inside the pane. The value is VERBATIM (the harness's own
+      // spelling); it lands on `llmModel`, the reported-model slot every
+      // display surface renders from. The request (`sessionModelOverride`)
+      // and the cross-session sticky are deliberately untouched: reports
+      // and requests are separate roles. The report also settles any
+      // pending switch: whatever the harness says it runs now IS the
+      // outcome of the ask.
+      applyToNamedConversation(event.conversationId, {
+        llmModel: event.model,
+        pendingModelChange: null,
+      });
+      return;
+    case "error":
+      // A `model_change_not_applied` error is the loud outcome of a model
+      // ask the pane never took: settle the pending indicator (the chip
+      // already shows the true model). The error block itself renders
+      // through the BlockStream reducer as usual.
+      if (event.error.code === "model_change_not_applied") {
+        applyToConversation((s) =>
+          s.pendingModelChange !== null ? { pendingModelChange: null } : {},
+        );
       }
-      applyToNamedConversation(event.conversationId, { sessionModelOverride: event.model });
+      return;
+    case "session_title":
+      // A `/rename` typed inside a native terminal. The server already
+      // persisted `title`, so a reload restores it; patch the caches the
+      // sidebar and session snapshot render from so the new name shows
+      // without waiting for the next list reconcile. Writes are keyed by
+      // the event's own conversation id, so no open-session guard is
+      // needed (this stream only carries the open session anyway).
+      // Sessions renamed while NOT open converge via the
+      // `WS /v1/sessions/updates` diff instead.
+      if (queryClient !== null) {
+        overlayTitleIntoCaches(queryClient, event.conversationId, event.title);
+      }
       return;
     case "session_reasoning_effort":
       // A thinking-level switch made inside a native terminal. The session's own
@@ -5400,26 +5339,36 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
             patch.pendingUserMessages = [];
           }
         }
-        // Surface the error inline when the harness reports a terminal failure
-        // with a structured error payload (e.g. token expiration on startup).
-        // `response.failed` / `response.error` handle mid-turn failures, but
-        // startup failures only emit `session.status: failed` — nothing
-        // converts that into a visible ErrorBlock. Synthesize one here so the
-        // user sees the message without having to reload.
-        if (
-          event.status === "failed" &&
-          event.error != null &&
-          !s.blocks.some((b) => b.type === "error")
-        ) {
+        // Surface terminal-native failures carried only by session status.
+        // Deduplicate repeated status edges for one response, but preserve the
+        // same failure on later turns so each rejected prompt has a visible error.
+        const statusError = event.error;
+        const hasMatchingStatusError =
+          statusError != null &&
+          s.blocks.some(
+            (block) =>
+              block.type === "error" &&
+              block.ctx.responseId === (event.responseId ?? "") &&
+              block.code === statusError.code &&
+              block.message === statusError.message,
+          );
+        if (event.status === "failed" && statusError != null && !hasMatchingStatusError) {
           patch.blocks = [
             ...s.blocks,
             {
               type: "error",
-              ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId: null },
-              message: event.error.message,
+              ctx: {
+                agent: null,
+                depth: 0,
+                turn: 0,
+                timestamp: 0,
+                responseId: event.responseId ?? "",
+                itemId: null,
+              },
+              message: statusError.message,
               source: "",
-              code: event.error.code,
-              ...structuredErrorFields(event.error),
+              code: statusError.code,
+              ...structuredErrorFields(statusError),
             } satisfies ErrorBlock,
           ];
         }

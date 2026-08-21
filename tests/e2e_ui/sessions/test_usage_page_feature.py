@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime, timedelta, timezone
 
 from playwright.sync_api import Page, Route, expect
 
@@ -118,3 +119,59 @@ def test_session_table_shows_other_harnesses_badge(
     badge = row.get_by_text("+2")
     expect(badge).to_be_visible()
     expect(badge).to_have_attribute("title", "antigravity, openai-agents")
+
+
+def _setup_usage_page(page: Page, live_server: str) -> None:
+    """Stub endpoints and navigate to the usage page."""
+    _stub_server_info(page, usage_page=True)
+    report = json.dumps(
+        {
+            "cost_today": 0.0,
+            "cost_last_7d": 0.0,
+            "cost_last_30d": 0.0,
+            "total_cost_usd": 0.0,
+            "daily_costs": [],
+            "sessions": [],
+        }
+    )
+
+    def handle_usage(route: Route) -> None:
+        route.fulfill(status=200, content_type="application/json", body=report)
+
+    page.route("**/v1/usage", handle_usage)
+    page.goto(f"{live_server}/usage")
+    expect(page.get_by_role("heading", name="Usage", exact=True)).to_be_visible(timeout=30_000)
+
+
+def test_custom_date_inputs_have_max_today(page: Page, live_server: str) -> None:
+    """Both custom date inputs are capped at today so future dates are blocked."""
+    _setup_usage_page(page, live_server)
+
+    page.get_by_role("button", name="Custom").click()
+
+    today_str = datetime.now(tz=timezone.utc).date().isoformat()
+    start_input = page.locator('input[type="date"]').first
+    end_input = page.locator('input[type="date"]').last
+
+    expect(end_input).to_have_attribute("max", today_str)
+    start_max = start_input.get_attribute("max")
+    assert start_max is not None and start_max <= today_str
+
+
+def test_custom_date_end_auto_adjusts_when_start_exceeds_end(page: Page, live_server: str) -> None:
+    """Setting start after end auto-corrects the end date forward."""
+    _setup_usage_page(page, live_server)
+
+    page.get_by_role("button", name="Custom").click()
+
+    start_input = page.locator('input[type="date"]').first
+    end_input = page.locator('input[type="date"]').last
+
+    today = datetime.now(tz=timezone.utc).date()
+    new_start = today.isoformat()
+    yesterday = (today - timedelta(days=1)).isoformat()
+
+    end_input.fill(yesterday)
+    start_input.fill(new_start)
+
+    expect(end_input).to_have_value(new_start)

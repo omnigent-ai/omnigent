@@ -93,6 +93,7 @@ RawToolItem: TypeAlias = Any  # type: ignore[explicit-any]
 # an optional import at type-check time — the executor only constructs
 # one when instantiated.
 AsyncOpenAIClient: TypeAlias = Any  # type: ignore[explicit-any]
+ReasoningItemIdPolicy: TypeAlias = Literal["preserve", "omit"]
 
 # Tool executor callable wired in by ``omnigent.Session``. The result
 # is JSON-ish (dict[str, Any]) but the static type leaks ``Any`` through
@@ -1026,6 +1027,7 @@ class OpenAIAgentsSDKExecutor(Executor):
         base_url_override: str | None = None,
         gateway_host: str | None = None,
         gateway_auth_command: str | None = None,
+        reasoning_item_id_policy: ReasoningItemIdPolicy | None = None,
     ) -> None:
         """Create an OpenAIAgentsSDKExecutor.
 
@@ -1071,7 +1073,15 @@ class OpenAIAgentsSDKExecutor(Executor):
             ``"databricks auth token --host https://example.databricks.com ..."``
             or ``"printf %s sk-..."``. Set from
             ``HARNESS_OPENAI_AGENTS_GATEWAY_AUTH_COMMAND``.
+        :param reasoning_item_id_policy: Optional Responses API replay policy.
+            ``"preserve"`` retains reasoning item IDs; ``"omit"`` is available
+            for legacy providers that reject orphaned reasoning items. ``None``
+            leaves the setting unspecified and uses the SDK default.
+        :raises ValueError: If *reasoning_item_id_policy* is not ``"preserve"``
+            or ``"omit"``.
         """
+        if reasoning_item_id_policy not in (None, "preserve", "omit"):
+            raise ValueError("reasoning_item_id_policy must be 'preserve', 'omit', or unset")
         self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
         raw_client = (
             client
@@ -1100,6 +1110,7 @@ class OpenAIAgentsSDKExecutor(Executor):
         self._profile = profile
         self._use_responses = use_responses
         self._model_override = model
+        self._reasoning_item_id_policy = reasoning_item_id_policy
         self._databricks = _is_databricks_openai_client(self._client)
         self._tool_executor: ToolExecutor | None = None
         self._session_states: dict[str, _AgentsSessionState] = {}
@@ -1525,13 +1536,15 @@ class OpenAIAgentsSDKExecutor(Executor):
             max_tokens=max_tokens,
         )
         current_item_count = len(await state.sdk_session.get_items())
-        run_config = agents_sdk.RunConfig(
-            model=model,
-            model_provider=provider,
-            tracing_disabled=True,
-            reasoning_item_id_policy="omit",
-            call_model_input_filter=self._filter_model_input,
-        )
+        run_config_kwargs: dict[str, object] = {
+            "model": model,
+            "model_provider": provider,
+            "tracing_disabled": True,
+            "call_model_input_filter": self._filter_model_input,
+        }
+        if self._reasoning_item_id_policy is not None:
+            run_config_kwargs["reasoning_item_id_policy"] = self._reasoning_item_id_policy
+        run_config = agents_sdk.RunConfig(**run_config_kwargs)
         max_turns = 1 if stepwise_internal_turns else int(cfg.extra.get("max_turns", 1000))
 
         # ── LLM_REQUEST policy evaluation ────────────────────────

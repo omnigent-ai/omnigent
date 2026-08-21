@@ -519,6 +519,19 @@ export interface SessionModelEvent {
 }
 
 /**
+ * `session.title` — session rename from a claude-native session.
+ *
+ * Emitted by the Omnigent server when the claude-native forwarder observes a
+ * `/rename` typed inside the Claude Code terminal. Carries the operator's
+ * new title so the session list stops showing the auto-generated one.
+ */
+export interface SessionTitleEvent {
+  type: "session_title";
+  conversationId: string;
+  title: string;
+}
+
+/**
  * `session.reasoning_effort` — active thinking-level switch from a native
  * session.
  *
@@ -903,6 +916,7 @@ export type StreamEvent =
   | SessionStatusEvent
   | SessionUsageEvent
   | SessionModelEvent
+  | SessionTitleEvent
   | SessionReasoningEffortEvent
   | SessionCollaborationModeEvent
   | SessionAgentChangedEvent

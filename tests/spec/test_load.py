@@ -357,6 +357,21 @@ def test_load_omnigent_yaml_preserves_use_responses_bool(tmp_path: Path) -> None
     assert spec.executor.config.get("use_responses") is False
 
 
+def test_load_omnigent_yaml_preserves_reasoning_item_id_policy(tmp_path: Path) -> None:
+    yaml_text = textwrap.dedent("""\
+        name: reasoning-replay-test
+        prompt: You are a helpful assistant.
+
+        executor:
+          harness: openai-agents
+          model: databricks-gpt-5-4-mini
+          reasoning_item_id_policy: preserve
+    """)
+    (tmp_path / "reasoning-replay-test.yaml").write_text(yaml_text)
+    spec = load_omnigent_yaml(tmp_path / "reasoning-replay-test.yaml")
+    assert spec.executor.config["reasoning_item_id_policy"] == "preserve"
+
+
 def test_load_omnigent_yaml_threads_executor_extra_max_tokens_to_llm_extra(
     tmp_path: Path,
 ) -> None:

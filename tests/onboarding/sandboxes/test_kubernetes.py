@@ -932,6 +932,24 @@ def test_terminate_deletes_job_and_secret(
     assert core.deleted_secrets == ["omnigent-job-6-token"]
 
 
+def test_resume_recycles_job_and_token_secret(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+) -> None:
+    """Resume clears stale launch resources so start_host can recreate the same id."""
+    core, batch = fake_clients
+    launcher = _launcher()
+
+    assert launcher.can_resume is True
+    assert launcher.capabilities.resume_stopped is True
+
+    launcher.resume("omnigent-job-resume")
+
+    assert batch.deleted_jobs == ["omnigent-job-resume"]
+    assert batch.last_delete_body.propagation_policy == "Foreground"
+    assert core.deleted_pods == ["omnigent-job-resume"]
+    assert core.deleted_secrets == ["omnigent-job-resume-token"]
+
+
 def test_terminate_is_idempotent_on_404(
     fake_clients: tuple[_FakeCore, _FakeBatch],
 ) -> None:

@@ -43,6 +43,8 @@ import {
   SearchIcon,
   Settings2Icon,
   ShareIcon,
+  SmileIcon,
+  SmilePlusIcon,
   SquareIcon,
   SquareCheckIcon,
   SquarePenIcon,
@@ -115,6 +117,8 @@ import {
   useMoveToProject,
   useDeleteProject,
   useRenameProject,
+  useProjectConfig,
+  useUpdateProjectConfig,
   PROJECT_LABEL_KEY,
   PINNED_CONVERSATIONS_KEY,
   usePinnedConversations,
@@ -133,6 +137,7 @@ import { relativeTime } from "@/lib/relativeTime";
 import { showToast } from "@/components/ui/toast";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
+import { EmojiPicker } from "@/components/ProjectIconPicker";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useActiveRootSessionId } from "@/hooks/useSession";
@@ -1071,6 +1076,7 @@ function InfiniteScrollSentinel({
 function ProjectFolder({
   name,
   projectId,
+  icon,
   windowConversations,
   expanded,
   active,
@@ -1091,6 +1097,9 @@ function ProjectFolder({
   name: string;
   /** First-class project id, or null for a label-only folder. */
   projectId: string | null;
+  /** Chosen emoji icon (unicode grapheme), or null/absent for the default
+      folder glyph. */
+  icon?: string | null;
   /** This folder's members from the globally-loaded window (may lag or lead
       the folder's own pages — e.g. a just-moved row carries its optimistic
       membership here before the folder query returns it). */
@@ -1169,7 +1178,9 @@ function ProjectFolder({
       <ConversationSection
         title={name}
         icon={
-          expanded ? (
+          icon ? (
+            <span className="text-[14px] leading-none">{icon}</span>
+          ) : expanded ? (
             <FolderOpenIcon
               className={cn(
                 "ui-icon",
@@ -1218,7 +1229,12 @@ function ProjectFolder({
         }
         indentRows
         headerAction={
-          <ProjectFolderActions projectName={name} projectId={projectId} onNavigate={onRowClick} />
+          <ProjectFolderActions
+            projectName={name}
+            projectId={projectId}
+            icon={icon}
+            onNavigate={onRowClick}
+          />
         }
         footer={
           loadingFirstPage ? (
@@ -1442,24 +1458,29 @@ function ConversationList({
     // (and out of the flat Shared list via filedIds). Each folder holds its
     // non-pinned sessions — pinning a project's last one leaves it empty.
     const filedIds = new Set<string>();
-    const projectGroups: { id: string | null; name: string; conversations: Conversation[] }[] =
-      projects.map(({ id, name }) => {
-        // Dual-read membership: a session belongs to this folder if it has
-        // the first-class id OR the legacy omni_project label of this name,
-        // and (filing being owner-only) the viewer owns it.
-        const inProject = notArchived.filter(
-          (c) =>
-            isOwnedByViewer(c, viewerId) &&
-            ((id !== null && c.project_id === id) || c.labels?.[PROJECT_LABEL_KEY] === name) &&
-            !pinnedIdSet.has(c.id),
-        );
-        inProject.forEach((c) => filedIds.add(c.id));
-        return {
-          id,
-          name,
-          conversations: sortByUpdatedAtDesc(inProject, activeOverride, frozenKeys),
-        };
-      });
+    const projectGroups: {
+      id: string | null;
+      name: string;
+      icon?: string | null;
+      conversations: Conversation[];
+    }[] = projects.map(({ id, name, icon }) => {
+      // Dual-read membership: a session belongs to this folder if it has
+      // the first-class id OR the legacy omni_project label of this name,
+      // and (filing being owner-only) the viewer owns it.
+      const inProject = notArchived.filter(
+        (c) =>
+          isOwnedByViewer(c, viewerId) &&
+          ((id !== null && c.project_id === id) || c.labels?.[PROJECT_LABEL_KEY] === name) &&
+          !pinnedIdSet.has(c.id),
+      );
+      inProject.forEach((c) => filedIds.add(c.id));
+      return {
+        id,
+        name,
+        icon,
+        conversations: sortByUpdatedAtDesc(inProject, activeOverride, frozenKeys),
+      };
+    });
     // NOTE: empty projects are intentionally NOT filtered out. A project comes
     // from the server project list (useProjects), so it can have zero *loaded*
     // conversations — either genuinely empty or because its chats live on an
@@ -1942,6 +1963,7 @@ function ConversationList({
                       key={group.name}
                       name={group.name}
                       projectId={group.id}
+                      icon={group.icon}
                       windowConversations={group.conversations}
                       expanded={expandedProjects.includes(group.name)}
                       active={newSessionProjectName === group.name}
@@ -3886,11 +3908,14 @@ function ArchivingRow({ label }: { label: string }) {
 function ProjectFolderActions({
   projectName,
   projectId,
+  icon,
   onNavigate,
 }: {
   projectName: string;
   /** First-class project id, or null for a label-only folder. */
   projectId: string | null;
+  /** Current emoji icon, or null/absent when unset. */
+  icon?: string | null;
   /** Plain-left-click nav handler — closes the mobile overlay so the
       pre-filed new-session page isn't left hidden behind the sidebar. */
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
@@ -3927,7 +3952,12 @@ function ProjectFolderActions({
         </TooltipTrigger>
         <TooltipContent side="bottom">New session in project</TooltipContent>
       </Tooltip>
-      <ProjectFolderMenu projectName={projectName} projectId={projectId} onNavigate={onNavigate} />
+      <ProjectFolderMenu
+        projectName={projectName}
+        projectId={projectId}
+        icon={icon}
+        onNavigate={onNavigate}
+      />
     </div>
   );
 }
@@ -3943,10 +3973,13 @@ function ProjectFolderActions({
 function ProjectFolderMenu({
   projectName,
   projectId,
+  icon,
   onNavigate,
 }: {
   projectName: string;
   projectId: string | null;
+  /** Current emoji icon, or null/absent when unset (gates "Remove icon"). */
+  icon?: string | null;
   /** Nav handler for the mobile-only "New session" item (desktop uses the
       hover-revealed pencil). Closes the sidebar overlay on mobile. */
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
@@ -3955,9 +3988,43 @@ function ProjectFolderMenu({
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [renameOpen, setRenameOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [iconOpen, setIconOpen] = useState(false);
   const [renameValue, setRenameValue] = useState(projectName);
   const deleteProject = useDeleteProject();
   const renameProject = useRenameProject();
+  const updateConfig = useUpdateProjectConfig();
+  // Fetch the full config only while the menu or picker is open, so we can
+  // merge the icon onto the other stored defaults (host / workspace / agent)
+  // without a per-folder request on every sidebar render — and without wiping
+  // those defaults on set/remove.
+  const { data: iconConfig, isLoading: iconConfigLoading } = useProjectConfig(
+    menuOpen || iconOpen ? projectId : null,
+  );
+  // The config PATCH replaces the whole blob, so a set/remove must merge onto a
+  // fully-loaded config or it silently wipes the other defaults. "Ready" means
+  // the config actually resolved (`!== undefined` — `isLoading` alone is false
+  // on a query *error* too, leaving no data to merge onto) — except a
+  // label-only folder (`projectId === null`), whose base is legitimately `{}`.
+  const configReady = projectId === null || iconConfig !== undefined;
+  const setIcon = (native: string) => {
+    if (!configReady) return;
+    updateConfig.mutate(
+      { id: projectId, name: projectName, config: { ...(iconConfig ?? {}), icon: native } },
+      {
+        onSuccess: () => {
+          setIconOpen(false);
+          setMenuOpen(false);
+        },
+      },
+    );
+  };
+  const removeIcon = () => {
+    if (!configReady) return;
+    const next = { ...(iconConfig ?? {}) };
+    delete next.icon;
+    updateConfig.mutate({ id: projectId, name: projectName, config: next });
+    setMenuOpen(false);
+  };
 
   return (
     <>
@@ -4005,6 +4072,20 @@ function ProjectFolderMenu({
             <Settings2Icon className="size-3.5" />
             Project settings
           </DropdownMenuItem>
+          <DropdownMenuItem data-testid="change-project-icon" onSelect={() => setIconOpen(true)}>
+            <SmilePlusIcon className="size-3.5" />
+            Change icon…
+          </DropdownMenuItem>
+          {icon ? (
+            <DropdownMenuItem
+              data-testid="remove-project-icon"
+              disabled={!configReady}
+              onSelect={removeIcon}
+            >
+              <SmileIcon className="size-3.5" />
+              Remove icon
+            </DropdownMenuItem>
+          ) : null}
           <DropdownMenuItem
             data-testid="delete-project"
             variant="destructive"
@@ -4084,6 +4165,33 @@ function ProjectFolderMenu({
         projectId={projectId}
         projectName={projectName}
       />
+      <Dialog
+        open={iconOpen}
+        onOpenChange={(o) => {
+          setIconOpen(o);
+          if (!o) setMenuOpen(false);
+        }}
+      >
+        <DialogContent
+          onClick={(e) => e.stopPropagation()}
+          className="w-auto items-center gap-3 p-4"
+        >
+          <DialogHeader>
+            <DialogTitle>Choose an icon</DialogTitle>
+          </DialogHeader>
+          {configReady ? (
+            <EmojiPicker onSelect={setIcon} />
+          ) : iconConfigLoading ? (
+            <div className="flex h-[420px] w-[352px] items-center justify-center">
+              <Loader2Icon className="size-5 animate-spin text-muted-foreground" />
+            </div>
+          ) : (
+            <div className="flex h-[420px] w-[352px] items-center justify-center px-6 text-center text-ui text-muted-foreground">
+              Couldn&apos;t load this project&apos;s settings. Close and try again.
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
       <Dialog open={deleteOpen} onOpenChange={setDeleteOpen}>
         <DialogContent onClick={(e) => e.stopPropagation()}>
           <DialogHeader>

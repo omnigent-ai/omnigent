@@ -109,7 +109,6 @@ import {
 } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { retrySession } from "@/lib/sessionsApi";
-import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
 import {
   composerAttachmentKey,
@@ -121,6 +120,7 @@ import {
 } from "@/store/chatStore";
 import {
   isNativeTerminalSession,
+  nativeCodingAgentForSession,
   nativeCodingAgentForHarness,
   nativeCodingAgentForSubagentWrapper,
   WRAPPER_LABEL_KEY,
@@ -169,6 +169,12 @@ import {
 } from "@/hooks/useWorkspaceChangedFiles";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import { isCostRoutingSession, isSubagentRoutingSession } from "@/components/CostRoutingControl";
+import {
+  SMART_ROUTING_ARMS,
+  hostBacksHarnessWithGateway,
+  smartRoutingSourceFor,
+} from "@/lib/smartRoutingAvailability";
+import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import { isSessionScopedDecision, showsRoutingDecisionChip } from "@/lib/routingDecision";
 import {
   Dialog,
@@ -192,6 +198,8 @@ import {
   MODEL_SELECT_DEFAULT,
   MODEL_SELECT_SMART,
   RoutingModelSelect,
+  defaultModelLabel,
+  nativeModelLabel,
 } from "@/components/HarnessConfigControls";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
@@ -232,18 +240,35 @@ function smartRoutingEnabled(serverInfo: ServerInfoValue): boolean {
 }
 
 /**
- * Whether the session's own model can be routed per turn: the deployment flag,
- * plus a top-level agent session that is not a native terminal (their CLI bakes
- * the model at launch and can't per-turn route).
+ * Whether the session's own model can be routed per turn.
+ *
+ * SDK/bundle agent sessions need only the deployment flag. Native Claude
+ * Code / Codex panes ARE routable per turn — the server injects the routed
+ * pick via ``/model`` when ``cost_control_mode_override`` is on, the same
+ * apparatus the create-time gear arms — but only when a router can answer
+ * for their family (the server rejects a routing-on create otherwise): the
+ * external AI-Gateway router needs the family's inference gateway-backed on
+ * the session's host, and the built-in judge covers the rest. An absent
+ * host row reads as backed, mirroring {@link hostBacksHarnessWithGateway}.
  */
 export function isCostRoutingEligible(
   serverInfo: ServerInfoValue,
   session: Session | null | undefined,
+  host?: { gateway_inference?: Record<string, boolean> | null } | null,
 ): boolean {
+  if (serverInfo === "loading" || !serverInfo.smart_routing_enabled) return false;
+  if (!isCostRoutingSession(session)) return false;
+  if (!isNativeTerminalSession(session)) return true;
+  const native = nativeCodingAgentForSession(session);
+  if (native === undefined || !SMART_ROUTING_ARMS.some((arm) => arm === native.harness)) {
+    return false;
+  }
   return (
-    smartRoutingEnabled(serverInfo) &&
-    isCostRoutingSession(session) &&
-    !isNativeTerminalSession(session)
+    smartRoutingSourceFor({
+      externalConfigured: serverInfo.smart_routing_sources.external,
+      ossConfigured: serverInfo.smart_routing_sources.oss,
+      gatewayBacked: hostBacksHarnessWithGateway(host, native.harness),
+    }) !== null
   );
 }
 
@@ -1005,13 +1030,16 @@ export function ChatPage() {
 
   // Orchestrator-only: polly's children inherit its agentName, so the gate
   // needs the session predicate (parent linkage), not a bare name check. An
-  // eligible session's Smart Routing toggle lives in the gear modal — Claude
-  // folds it into the Model dropdown; other routable agents get a standalone
-  // Switch row. Native terminal sessions (Claude Code / Codex / Pi / …) are
-  // excluded: their CLI bakes the model at launch and can't per-turn route, so
-  // Smart Routing is meaningless there.
+  // eligible session's Smart Routing option lives in the gear modal — Claude
+  // Code / Codex fold it into the Model dropdown (the server routes native
+  // panes per turn via /model injection); other routable agents get a
+  // standalone Switch row. The session's host row feeds the per-family
+  // gateway check the external router requires.
   const serverInfo = useServerInfo();
-  const costRoutingEligible = isCostRoutingEligible(serverInfo, activeSession);
+  const { data: hostRows } = useHosts();
+  const sessionHost =
+    hostRows?.find((row) => row.host_id === (activeSession?.hostId ?? null)) ?? null;
+  const costRoutingEligible = isCostRoutingEligible(serverInfo, activeSession, sessionHost);
   // Sub-agent routing is a separate knob with a different gate: a native CLI
   // can't per-turn route itself, but the sub-agents it spawns are routed per
   // spawn — where the launch actually installed that apparatus. See
@@ -1172,9 +1200,39 @@ export function ChatPage() {
     document.title = showsWorking ? `● ${base}` : base;
   }, [activeConv?.title, subAgentTabTitle, showsWorking, urlConvId, appName]);
 
-  const codexModelOptions = useChatStore((s) => s.codexModelOptions);
+  const sessionModelOptions = useChatStore((s) => s.codexModelOptions);
   const selectedModel = useChatStore((s) => s.selectedModel);
   const llmModel = useChatStore((s) => s.llmModel);
+  // Pre-catalog fallback: a fresh native session's own catalog only arrives
+  // once its CLI is up (codex answers model/list after app-server boot,
+  // ~15s cold), which left the gear's Model list sparse and its Effort row
+  // hidden until then. The session's host already probed the same harness
+  // for the new-chat picker — ride those cached rows (same ids the launch
+  // accepts, ~90ms warm) until the runner's per-session catalog lands;
+  // the runner truth replaces them the moment it arrives. Must stay above
+  // the hydration early-returns below (hook order).
+  const fallbackPickerKind = modelPickerKindForConv({
+    labels: activeSession ? (activeSession.labels ?? {}) : (activeConv?.labels ?? {}),
+  });
+  const hostProbeHarness =
+    fallbackPickerKind === "codex"
+      ? "codex-native"
+      : fallbackPickerKind === "claude"
+        ? "claude-native"
+        : null;
+  const { data: hostProbeOptions } = useHostModelOptions(
+    activeSession?.hostId ?? null,
+    hostProbeHarness ?? "",
+    hostProbeHarness !== null && sessionModelOptions.length === 0,
+  );
+  // Identity-stable on purpose: substitute only when the host rows actually
+  // exist, else keep the store's own array reference — a fresh [] here would
+  // re-render every options consumer (composer, gear, agent-info popover) on
+  // each streaming/liveness tick.
+  const codexModelOptions =
+    sessionModelOptions.length === 0 && hostProbeOptions != null && hostProbeOptions.length > 0
+      ? hostProbeOptions
+      : sessionModelOptions;
 
   // Loading + error gates for `/c/:id` hydration.
   if (urlConvId) {
@@ -1275,10 +1333,13 @@ export function ChatPage() {
     labels: activeSession ? (activeSession.labels ?? {}) : (activeConv?.labels ?? {}),
   };
   const modelPickerKind = modelPickerKindForConv(capabilitySource);
+  // Effort ladders key on the model the session is actually on — the
+  // reported `llmModel` — falling back to the sticky preference only
+  // before the first report lands.
   const effortLevels = effortLevelsForConv(
     capabilitySource,
     codexModelOptions,
-    selectedModel ?? llmModel,
+    llmModel ?? selectedModel,
   );
   const showEffort = shouldShowEffortPicker(capabilitySource) && effortLevels.length > 0;
 
@@ -3862,6 +3923,14 @@ function AssistantBubble({
   const hasElicitation = bubble.items.some((it) => it.kind === "elicitation");
   const isWide =
     hasElicitation || containsMarkdownTable(bubble.items) || containsDisplayMath(bubble.items);
+  // An error banner's dashed rule spans the full chat column: MessageContent
+  // is w-fit, so without w-full an error-only bubble shrink-wraps the 560px
+  // pill and the rule clips to it instead of reaching the column edges.
+  const hasError = bubble.items.some((it) => it.kind === "error");
+  // A bubble carrying an error but no prose stands alone as a thread-level
+  // element — the hover footer's timestamp/actions belong to assistant text,
+  // not to the error.
+  const errorOnly = hasError && !markdownText;
 
   return (
     <>
@@ -3876,7 +3945,7 @@ function AssistantBubble({
             collapsed the row's trailing hairline (a flex-1 span) to zero
             and stopped its click target short of the column. Keeping the
             cap lands the hairline where an answered turn's does. */}
-        <MessageContent className={isWide || foldOnly ? "w-full" : undefined}>
+        <MessageContent className={isWide || foldOnly || hasError ? "w-full" : undefined}>
           <BlockRenderer
             items={bubble.items}
             sessionStatus={sessionStatus}
@@ -3903,9 +3972,11 @@ function AssistantBubble({
             the user can see, and hanging them off a collapsed row spaced
             consecutive rows unevenly depending on hidden narration. Also
             skipped when there is neither a timestamp nor actions to show.
+            Also skipped on an error-only bubble: the banner stands alone as
+            a thread-level element, so no timestamp/actions hang off it.
             40%-visible on touch (no hover), hover/focus-reveal on desktop.
             Order matches the design target: actions, then timestamp. */}
-        {!foldOnly && (ts || markdownText) && (
+        {!foldOnly && !errorOnly && (ts || markdownText) && (
           <div className="flex items-center gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
             {markdownText && (
               <MessageActions>
@@ -4186,9 +4257,10 @@ function ContextRing({ contextWindow, tokensUsed }: { contextWindow: number; tok
  *
  * @param model - Model override or bound agent model id.
  * @param codexModelOptions - Native model metadata, when available.
- * @returns The advertised display label for known native models, a local Claude alias
- *   label for Claude native tiers, the raw model id otherwise, or ``null``
- *   when no model is known.
+ * @returns The advertised display label for known native models, a
+ *   version-agnostic friendly form for an alias-shaped id the catalog
+ *   doesn't list, the raw model id otherwise, or ``null`` when no model
+ *   is known.
  */
 export function formatStatusModelLabel(
   model: string | null,
@@ -4199,8 +4271,19 @@ export function formatStatusModelLabel(
   const lower = raw.toLowerCase();
   const codexOption = findNativeModelOption(codexModelOptions, raw);
   if (codexOption) return codexOption.displayName ?? codexOption.id;
-  const known = CLAUDE_NATIVE_MODELS.find((m) => m.id === lower);
-  if (known) return known.label;
+  // An alias-shaped id the session's catalog doesn't list (e.g. during
+  // the pre-catalog window): render it friendly mechanically — "sonnet"
+  // → "Sonnet", "sonnet_5" → "Sonnet 5", "sonnet[1m]" → "Sonnet
+  // (1M context)" — without claiming a version the client can't know.
+  // Which model an alias lands on is the harness's answer; the catalog's
+  // display name supersedes this wherever one has arrived.
+  const alias = /^([a-z]+)(?:_(\d+))?(\[1m\])?$/.exec(lower);
+  if (alias) {
+    let label = `${alias[1]!.charAt(0).toUpperCase()}${alias[1]!.slice(1)}`;
+    if (alias[2]) label += ` ${alias[2]}`;
+    if (alias[3]) label += " (1M context)";
+    return label;
+  }
   return raw;
 }
 
@@ -4959,9 +5042,14 @@ export function Composer({
         // Confirmation is a durable `[System: model changed to X]` note the
         // server appends to the transcript (see _persist_model_change_note) —
         // not a transient composer hint. Surface only failures inline here.
+        // Native reported-model sessions additionally show the pending
+        // indicator until the harness's own report settles the ask.
+        const harness = useChatStore.getState().sessionHarness;
         void useChatStore
           .getState()
-          .setModel(clear ? null : target)
+          .setModel(clear ? null : target, {
+            expectConfirmation: harness === "claude-native" || harness === "codex-native",
+          })
           .catch((err: unknown) => {
             setCommandError(err instanceof Error ? err.message : "Failed to set model");
           });
@@ -5341,6 +5429,11 @@ export function Composer({
           }
         }}
       />
+      {/* Background tasks that outlive the turn show as a pill, not the
+          "Working…" shimmer. Sits above the queued/sub-agent trays: those dock
+          onto the composer card with a negative margin, so nothing may come
+          between them and the card. Self-gates to null otherwise. */}
+      <BackgroundTaskPill />
       {/* Queued messages — peeks above the card like the sub-agent tray.
           Lists follow-ups held while the agent is busy; drains FIFO on idle.
           Scope to this conversation so a queue held elsewhere never leaks in. */}
@@ -5368,9 +5461,6 @@ export function Composer({
           Truthy (not just non-null) so an empty label never peeks a
           nameless tray. */}
       {subAgentLabel ? <SubagentComposerTray label={subAgentLabel} /> : null}
-      {/* Background tasks that outlive the turn show as a pill here, not the
-          "Working…" shimmer. Self-gates to null otherwise. */}
-      <BackgroundTaskPill />
       {/* Single rounded container — textarea + action row. No focus-within
           ring; drag-over still lifts an inset ring. dark:bg-card-solid so
           upper trays (queued / sub-agent) don't ghost through glass --card. */}
@@ -6152,25 +6242,6 @@ export function shouldShowPollyCodexGoalControl(
   );
 }
 
-/**
- * Highlight a model row when ``selectedModel`` is null by matching the
- * bound spec ``llmModel`` to its tier alias (e.g.
- * ``"anthropic/claude-opus-4-8"`` matches ``"opus"``).
- *
- * Sonnet 5 is special-cased both ways: its concrete id ("...-sonnet-5")
- * would otherwise substring-match the generic "sonnet" row (since "sonnet"
- * is itself a substring), and its own opt-in row id ("sonnet_5") never
- * literally appears in a hyphenated concrete id. The default "sonnet" row
- * stays bound to the older Sonnet (4.6), which collapses to it normally.
- */
-export function isModelImplicitlySelected(modelId: string, llmModel: string | null): boolean {
-  if (!llmModel) return false;
-  const isSonnet5 = llmModel.includes("sonnet-5") || llmModel.includes("sonnet_5");
-  if (modelId === "sonnet_5") return isSonnet5;
-  if (modelId === "sonnet" && isSonnet5) return false;
-  return llmModel === modelId || llmModel.endsWith(`/${modelId}`) || llmModel.includes(modelId);
-}
-
 /** Title-case an effort level for the status label (``"high"`` → ``"High"``). */
 function formatEffortLabel(effort: string): string {
   return effort.charAt(0).toUpperCase() + effort.slice(1);
@@ -6233,11 +6304,10 @@ function SessionConfigModal({
   // model shows without an explicit pick), else the catalog default. Falls back
   // to the "Default" sentinel when nothing resolves.
   const implicitModelId =
-    pickerSelectedModel === null
-      ? ((usesServerModelOptions
-          ? (findNativeModelOption(codexModelOptions, llmModel)?.id ??
-            codexModelOptions.find((option) => option.isDefault)?.id)
-          : modelOptions.find((m) => isModelImplicitlySelected(m.id, llmModel))?.id) ?? null)
+    pickerSelectedModel === null && usesServerModelOptions
+      ? (findNativeModelOption(codexModelOptions, llmModel)?.id ??
+        codexModelOptions.find((option) => option.isDefault)?.id ??
+        null)
       : null;
   const resolvedModelId = pickerSelectedModel ?? implicitModelId;
 
@@ -6326,7 +6396,13 @@ function SessionConfigModal({
           // routing off just clears via setModel(null) below.
           const modelChanged = draftModelId !== resolvedModelId;
           const rePinAfterRouting = liveRoutingOn && showModels;
-          if (rePinAfterRouting || modelChanged) await store.setModel(draftModelId);
+          if (rePinAfterRouting || modelChanged)
+            await store.setModel(draftModelId, {
+              // Reported-model sessions confirm through the harness's own
+              // report — mark the ask pending until it (or the not-applied
+              // error) settles.
+              expectConfirmation: modelPickerKind === "claude" || modelPickerKind === "codex",
+            });
           if (costRoutingEligible && liveRoutingOn) await store.setCostControlMode("off");
         }
         // Skip effort while routing is on: the router picks it per turn, and a
@@ -6355,7 +6431,7 @@ function SessionConfigModal({
 
   const modelSelectOptions = useMemo(() => {
     const catalog = usesServerModelOptions
-      ? modelOptions.map((m) => ({ id: m.id, label: m.displayName ?? m.id }))
+      ? modelOptions.map((m) => ({ id: m.id, label: nativeModelLabel(m) }))
       : modelOptions.map((m) => ({ id: m.id, label: m.label ?? m.id }));
     // Smart Routing pins the router's fully-qualified pick
     // (``databricks-claude-opus-4-8``), which the harness catalog carries only
@@ -6390,6 +6466,14 @@ function SessionConfigModal({
                 offerSmartRouting={costRoutingEligible}
                 testId="composer-config-model"
                 models={modelSelectOptions}
+                // Claude's and Codex's Default resolves to a model the
+                // spellings don't make obvious, so name it here exactly as
+                // the landing dialog does — one shared labeling.
+                defaultLabel={
+                  modelPickerKind === "codex" || modelPickerKind === "claude"
+                    ? defaultModelLabel(modelOptions)
+                    : undefined
+                }
                 activeModelId={draftModelId}
               />
             </ConfigRow>
@@ -6674,7 +6758,6 @@ function useResolvedComposerModel(
   modelPickerKind: NativeModelPickerKind | null,
   codexModelOptions: readonly NativeModelOption[],
 ) {
-  const selectedModel = useChatStore((s) => s.selectedModel);
   const sessionModelOverride = useChatStore((s) => s.sessionModelOverride);
   const llmModel = useChatStore((s) => s.llmModel);
   const nativeVendorOwnsModel = useChatStore((s) => s.nativeVendorOwnsModel);
@@ -6689,74 +6772,58 @@ function useResolvedComposerModel(
     modelPickerKind === "kiro" ||
     modelPickerKind === "pi" ||
     modelPickerKind === "opencode";
-  const modelOptions: readonly { id: string; label?: string; displayName?: string }[] =
-    usesServerModelOptions ? codexModelOptions : [];
+  const modelOptions: readonly {
+    id: string;
+    label?: string;
+    displayName?: string;
+    isDefault?: boolean;
+  }[] = usesServerModelOptions ? codexModelOptions : [];
   const isNativeModelPicker = modelPickerKind !== null;
 
-  // qwen/goose/cursor/pi/opencode native wrappers pick their model inside
-  // the vendor TUI, so the bound `llmModel` is an unused default — don't
-  // surface it as if it were live; claude-/codex-native and SDK agents
-  // resolve to a real model.
-  // cursor-native is a vendor-owns-model wrapper, but unlike qwen/goose/pi/
-  // opencode it mirrors its live TUI model into the session override
-  // (`sessionModelOverride` / `model_override`), kept current both by the
-  // forwarder's terminal→web mirror and by web-side picks. Surface *that* as
-  // the live model — never the cross-session sticky `selectedModel` (a pick
-  // carried over from some other session) nor the meaningless `llmModel`
-  // default. The other vendor-owns wrappers have no Omnigent-visible model and
-  // stay null.
-  // kiro persists the pick as ``model_override`` (applied via ``--model`` at
-  // launch) and, mid-session, the runner types ``/model <id>`` into the live TUI.
-  // There is no terminal→web mirror, so the picker reflects the web-side
-  // ``sessionModelOverride`` (which stays correct since a web pick sets it), like
-  // cursor/opencode surface theirs.
-  // pi mirrors both ways into ``model_override`` (a web pick persists it before
-  // the live ``setModel``; a TUI ``/model`` pick posts external_model_change),
-  // so like cursor/kiro/opencode the live model is the session override, never
-  // the cross-session sticky ``selectedModel``.
-  // The sticky is this session's model only when the session itself advertises
-  // it. `switchTo` clears the session-scoped fields but deliberately keeps
-  // `selectedModel`, so until the incoming snapshot lands the catalog is empty
-  // and the sticky still holds the OUTGOING session's pick — surfacing it paints
-  // e.g. a Codex gpt-5.5 on a Claude session for the whole bind round trip.
-  // Gating on the session's own catalog mirrors the compatibility rule bindStream
-  // applies a moment later, so the label never advertises a model this session
-  // would reject. Post-bind this is a no-op: the store only ever leaves a
-  // catalog-compatible sticky (or the override) in `selectedModel`.
-  const sessionStickyModel =
-    findNativeModelOption(codexModelOptions, selectedModel) !== null ? selectedModel : null;
-  const pickerSelectedModel =
-    modelPickerKind === "cursor" ||
-    modelPickerKind === "kiro" ||
-    modelPickerKind === "opencode" ||
-    modelPickerKind === "pi"
-      ? sessionModelOverride
-      : (sessionModelOverride ?? sessionStickyModel);
-  // SDK/bundle agents (no native picker) never have the cross-session sticky
-  // applied to them, so their live model is the session's own — the applied
-  // override or the bound default — never `selectedModel` (a pick carried over
-  // from an unrelated session, e.g. a gpt-5.5 left from a Codex session showing
-  // on a Claude-SDK agent like Polly). claude-/codex-native keep the sticky —
-  // there it IS the applied model — but only once this session's catalog vouches
-  // for it (see `sessionStickyModel`).
-  const nonNativeModel =
-    modelPickerKind === null
-      ? (sessionModelOverride ?? llmModel)
-      : (sessionModelOverride ?? sessionStickyModel ?? llmModel);
+  // The harness's own report is the display authority for claude-/codex-
+  // native sessions: `llmModel` carries the verbatim reported model (the
+  // launch's own report, or an in-pane switch), and the chip, the gear
+  // highlight, and the hover summary all resolve from it alone. The user's
+  // request (`sessionModelOverride`) and the cross-session sticky
+  // (`selectedModel`) are inputs, never display state — rendering a request
+  // as if it were truth is exactly how a record/pane divergence hides.
+  const isReportedModelPicker = modelPickerKind === "claude" || modelPickerKind === "codex";
+  // The row the reported model maps to: its catalog row when one matches
+  // exactly (by id or wire model), else the raw reported value itself — the
+  // modal appends that as its own honest row rather than relabeling it onto
+  // a same-family row of a different generation.
+  const reportedRowId =
+    isReportedModelPicker && llmModel
+      ? (findNativeModelOption(codexModelOptions, llmModel)?.id ?? llmModel)
+      : null;
+  // Before the harness has reported anything (a routed session whose pane
+  // has not started, a reload of one), the gear seeds from the session's
+  // own REQUEST so the pick the user (or the router) made is what the row
+  // offers to edit — a request is never display truth, but it is the draft.
+  // The moment a report exists it wins, so a request the pane never took
+  // can't masquerade as the active model.
+  const requestedRowId =
+    isReportedModelPicker && sessionModelOverride
+      ? (findNativeModelOption(codexModelOptions, sessionModelOverride)?.id ?? sessionModelOverride)
+      : null;
+  // cursor mirrors its live TUI model into ``model_override``; kiro sets it
+  // on a web pick (which also drives a live ``/model`` switch); opencode/pi
+  // mirror both ways into ``model_override``. Those wrappers keep their
+  // override-derived surface until they adopt reported-model semantics.
+  // SDK/bundle agents (no native picker) resolve the session override or the
+  // bound default — never the cross-session sticky.
+  const pickerSelectedModel = isReportedModelPicker
+    ? (reportedRowId ?? requestedRowId)
+    : sessionModelOverride;
   const effectiveModel = nativeVendorOwnsModel
     ? modelPickerKind === "cursor" || modelPickerKind === "kiro"
-      ? // cursor mirrors its live TUI model into ``model_override``; kiro sets it
-        // on a web pick (which also drives a live ``/model`` switch). Either way
-        // the Omnigent-visible model is ``model_override``.
-        sessionModelOverride
+      ? sessionModelOverride
       : modelPickerKind === "opencode" || modelPickerKind === "pi"
-        ? // opencode/pi mirror their live TUI model into ``model_override``
-          // (set on a web pick, updated by the extension's model_select
-          // handler on a TUI switch); show that, falling back to the
-          // launch-resolved model before any switch.
-          (sessionModelOverride ?? llmModel)
+        ? (sessionModelOverride ?? llmModel)
         : null
-    : nonNativeModel;
+    : isReportedModelPicker
+      ? llmModel
+      : (sessionModelOverride ?? llmModel);
   const modelLabel = formatStatusModelLabel(effectiveModel, codexModelOptions);
   return {
     llmModel,
@@ -6801,8 +6868,20 @@ function ComposerModelEffortLabel({
 }) {
   const selectedEffort = useSessionEffort();
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
+  const pendingModelChange = useChatStore((s) => s.pendingModelChange);
   const { modelLabel } = useResolvedComposerModel(modelPickerKind, codexModelOptions);
   const routingOn = costRoutingEligible && costControlModeOverride === "on";
+  // An asked-but-unconfirmed switch on a reported-model session: the chip
+  // keeps the harness's model; this spinner is the honest "asked, not yet
+  // true" marker until the report (or the not-applied error) settles it.
+  const modelPending =
+    pendingModelChange !== null && (modelPickerKind === "claude" || modelPickerKind === "codex") ? (
+      <Loader2Icon
+        data-testid="composer-model-pending"
+        aria-label="Model change pending"
+        className="ml-1 inline size-3 shrink-0 animate-spin text-muted-foreground"
+      />
+    ) : null;
   // Routing picks the model + effort per turn, so the label reads
   // "Smart Routing" with no pinned model/effort — matching the tooltip.
   if (routingOn) {
@@ -6848,6 +6927,7 @@ function ComposerModelEffortLabel({
       {model && <span className="text-foreground">{model}</span>}
       {model && effortLabel && " "}
       {effortLabel && <span className="text-muted-foreground">{effortLabel}</span>}
+      {modelPending}
     </span>
   );
 }

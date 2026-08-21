@@ -1936,6 +1936,264 @@ async def test_events_model_change_on_native_session_types_slash_command(
     )
 
 
+async def _post_model_change_with_status_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+    status_values: list[str | None],
+    pane_status: str | None = None,
+) -> Any:
+    """Run one claude-native ``model_change`` with a scripted status file.
+
+    ``status_values`` are successive ``read_claude_status_model`` answers
+    (the first is the pre-injection baseline); the last value repeats once
+    the script is exhausted. Injection is stubbed; the confirm pacing is
+    tightened so the unconfirmed path stays fast.
+
+    :returns: The ``/events`` HTTP response.
+    """
+    from omnigent.runner import app as runner_app_module
+    from omnigent.spec.types import ExecutorSpec
+
+    def _fake_inject(
+        bridge_dir: Any,
+        *,
+        command: str,
+        timeout_s: float,
+        auto_confirm: bool = False,
+        confirm_hint: str | None = None,
+    ) -> None:
+        del bridge_dir, command, timeout_s, auto_confirm, confirm_hint
+
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "read_model_env",
+        lambda _bridge_dir: {"ANTHROPIC_CUSTOM_MODEL_OPTION": "claude-opus-4-7"},
+    )
+    script = list(status_values)
+
+    def _scripted_status(_bridge_dir: Any) -> str | None:
+        return script.pop(0) if len(script) > 1 else script[0]
+
+    monkeypatch.setattr(claude_native_bridge, "read_claude_status_model", _scripted_status)
+    # No tmux behind these tests: the in-loop dialog check must not spend a
+    # real 1 s tmux-info wait per poll.
+    monkeypatch.setattr(claude_native_bridge, "confirm_dialog_if_open", lambda _b, *, hint: False)
+    monkeypatch.setattr(runner_app_module, "_CLAUDE_MODEL_CONFIRM_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(runner_app_module, "_CLAUDE_MODEL_CONFIRM_POLL_S", 0.01)
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": "68c7c1acc5eeec3978c5e62043da51a5",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        if pane_status is not None:
+            app.state.native_pane_status["68c7c1acc5eeec3978c5e62043da51a5"] = pane_status
+        return await client.post(
+            "/v1/sessions/68c7c1acc5eeec3978c5e62043da51a5/events",
+            json={"type": "model_change", "model": "claude-opus-4-7"},
+        )
+
+
+@pytest.mark.asyncio
+async def test_events_model_change_confirms_against_the_status_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The switch replies success only after the pane's status shows it.
+
+    The statusLine snapshot starts on the old model and flips to the picked
+    one after the injection — the design's confirmed-switch contract: the
+    reply follows the pane, not the keystroke.
+    """
+    resp = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        ["claude-opus-4-6", "claude-opus-4-6", "claude-opus-4-7"],
+    )
+    assert resp.status_code == 204, resp.text
+
+
+@pytest.mark.asyncio
+async def test_events_model_change_unconfirmed_switch_answers_503(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pane that never switches makes the ask fail loud, not pass silent.
+
+    The statusLine snapshot keeps reporting the old model for the whole
+    confirmation budget on an IDLE pane (the swallowed-dialog case): the
+    runner must answer non-2xx so the server surfaces the divergence
+    instead of the row claiming the pick.
+    """
+    resp = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        ["claude-opus-4-6"],
+    )
+    assert resp.status_code == 503, resp.text
+    body = resp.json()
+    assert body["error"] == "claude_native_model_unconfirmed"
+    assert "did not confirm" in body["detail"]
+
+
+@pytest.mark.asyncio
+async def test_events_model_change_mid_turn_defers_instead_of_failing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A switch during an active turn is deferred, never a visible failure.
+
+    Claude queues a mid-turn ``/model`` and applies it when the turn
+    settles — possibly well past the confirmation budget. With the pane
+    reporting ``running``, the timeout answers success (a detached watcher
+    keeps answering the late confirm dialog) so the user does not get a
+    "was not switched" error for a switch that is still on its way; the
+    harness's report settles the picker when it lands.
+    """
+    resp = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        ["claude-opus-4-6"],
+        pane_status="running",
+    )
+    assert resp.status_code == 204, resp.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pins", "picked", "expected_command"),
+    [
+        # The reported bug: a gateway config pins the three families but not
+        # fable; picking the probed ``fable`` row injected ``/model opus`` —
+        # the resolver swapped the alias for the provider default and the
+        # vocabulary re-spelled that as its pinned alias.
+        pytest.param(
+            {
+                "ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic",
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-5",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-5",
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": "databricks-claude-haiku-4-5",
+            },
+            "fable",
+            "/model fable",
+            id="gateway-unpinned-family-is-never-swapped-for-the-default",
+        ),
+        # Bracket aliases are the harness's own /model vocabulary. On a
+        # pinned env the old vocabulary had no spelling for them (503);
+        pytest.param(
+            {
+                "ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-5",
+            },
+            "sonnet[1m]",
+            "/model sonnet[1m]",
+            id="pinned-bracket-alias-passes-through",
+        ),
+        # on a bare login it stepped down to the family alias, silently
+        # dropping the 1M-context marker.
+        pytest.param(
+            {},
+            "sonnet[1m]",
+            "/model sonnet[1m]",
+            id="bare-login-bracket-alias-keeps-its-context-marker",
+        ),
+    ],
+)
+async def test_events_model_change_applies_the_picked_alias_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+    pins: dict[str, str],
+    picked: str,
+    expected_command: str,
+) -> None:
+    """
+    A picker alias reaches the pane as itself, never as another model.
+
+    The harness enumerated these aliases itself (they are its ``/model``
+    vocabulary), so the injected command must carry the pick verbatim and
+    leave resolution to Claude — anything else switches the pane to a
+    model the user did not choose.
+    """
+    from omnigent.claude_native import ClaudeNativeUcodeConfig
+
+    captured: list[str] = []
+
+    def _fake_inject(
+        bridge_dir: Any,
+        *,
+        command: str,
+        timeout_s: float,
+        auto_confirm: bool = False,
+        confirm_hint: str | None = None,
+    ) -> None:
+        """Record the injected command without touching tmux."""
+        del bridge_dir, timeout_s, auto_confirm, confirm_hint
+        captured.append(command)
+
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
+    monkeypatch.setattr(claude_native_bridge, "read_model_env", lambda _bridge_dir: dict(pins))
+    monkeypatch.setattr("omnigent.claude_native._CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
+    config = (
+        ClaudeNativeUcodeConfig(env=dict(pins), model=pins.get("ANTHROPIC_DEFAULT_OPUS_MODEL"))
+        if pins
+        else None
+    )
+    monkeypatch.setattr(
+        "omnigent.claude_native.resolve_native_claude_config", lambda *, spec: config
+    )
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the native spec for any agent_id."""
+        del agent_id, session_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    conv_id = uuid.uuid4().hex
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "model_change", "model": picked},
+        )
+
+    assert resp.status_code == 204, (
+        f"model_change for {picked!r} must apply; got {resp.status_code}: {resp.text}"
+    )
+    assert captured == [expected_command], (
+        f"picking {picked!r} must inject {expected_command!r}; injecting anything else "
+        f"switches the pane to a model the user did not choose (got {captured!r})"
+    )
+
+
 @pytest.mark.asyncio
 async def test_events_model_change_rejects_a_model_the_picker_cannot_spell(
     monkeypatch: pytest.MonkeyPatch,
