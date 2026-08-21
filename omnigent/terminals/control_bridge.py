@@ -182,9 +182,18 @@ async def _read_tmux_buffer(
     except (OSError, ValueError):
         return None
     assert proc.stdout is not None
+
+    async def _kill_and_reap() -> None:
+        """Kill the buffer reader and bound the wait for its process record."""
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(proc.wait(), timeout=_CLIPBOARD_READ_TIMEOUT_S)
+
+    data = b""
     try:
         try:
-            data = await asyncio.wait_for(
+            await asyncio.wait_for(
                 proc.stdout.readexactly(_CLIPBOARD_MAX_BYTES + 1),
                 timeout=_CLIPBOARD_READ_TIMEOUT_S,
             )
@@ -197,16 +206,10 @@ async def _read_tmux_buffer(
                 proc.kill()
         await asyncio.wait_for(proc.wait(), timeout=_CLIPBOARD_READ_TIMEOUT_S)
     except asyncio.CancelledError:
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
-        with contextlib.suppress(Exception):
-            await asyncio.shield(proc.wait())
+        await _kill_and_reap()
         raise
     except (asyncio.TimeoutError, OSError):
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
-        with contextlib.suppress(Exception):
-            await proc.wait()
+        await _kill_and_reap()
         return None
     if oversized or proc.returncode != 0:
         return None
@@ -567,9 +570,9 @@ async def bridge_tmux_control_to_websocket(
     # one bounded ``send_bytes``, so when the browser send lags tmux's firehose
     # a backlog of tiny per-line payloads collapses into a few large frames.
     output_chunks: asyncio.Queue[bytes | None] = asyncio.Queue()
-    # Clipboard notifications are handled outside the raw output hot path: each
-    # item names the immutable tmux buffer created by copy-mode; None is EOF.
-    clipboard_buffers: asyncio.Queue[str | None] = asyncio.Queue()
+    # Keep at most the newest pending clipboard buffer plus the EOF sentinel.
+    # A noisy pane cannot build an unbounded queue of names/subprocess reads.
+    clipboard_buffers: asyncio.Queue[str | None] = asyncio.Queue(maxsize=2)
     # Terminal bytes and clipboard JSON have separate producer tasks but one
     # websocket. Serialize sends so ASGI never sees concurrent send calls.
     ws_send_lock = asyncio.Lock()
@@ -582,6 +585,21 @@ async def bridge_tmux_control_to_websocket(
     def _current_ws_coalesce_limit() -> int:
         """Per-frame cap: small right after input, larger for output floods."""
         return _coalesce_limit_after_input(last_client_input_at)
+
+    def _queue_clipboard_buffer(buffer_name: str) -> None:
+        """Replace pending clipboard names with the newest notification."""
+        eof_seen = False
+        while True:
+            try:
+                queued = clipboard_buffers.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if queued is None:
+                eof_seen = True
+        if eof_seen:
+            clipboard_buffers.put_nowait(None)
+        else:
+            clipboard_buffers.put_nowait(buffer_name)
 
     async def _send_command(line: bytes) -> None:
         """Write one newline-terminated control command, ignoring a dead pipe."""
@@ -617,7 +635,7 @@ async def bridge_tmux_control_to_websocket(
                 and last_client_input_at is not None
                 and _monotonic() - last_client_input_at <= _CLIPBOARD_RECENT_INPUT_WINDOW_S
             ):
-                clipboard_buffers.put_nowait(buffer_name)
+                _queue_clipboard_buffer(buffer_name)
             return True
         if line.startswith(b"%exit"):
             return False
@@ -809,6 +827,16 @@ async def bridge_tmux_control_to_websocket(
                 if exc is not None:
                     _logger.warning("control-attach: bridge task crashed: %r", exc)
     finally:
+        # Outer route cancellation can bypass the normal post-wait cleanup.
+        # Always stop and join every child task before detaching the tmux client.
+        bridge_tasks = {read_task, forward_task, clipboard_task, ws_task}
+        for task in bridge_tasks:
+            if not task.done():
+                task.cancel()
+        task_results = await asyncio.gather(*bridge_tasks, return_exceptions=True)
+        for result in task_results:
+            if isinstance(result, Exception):
+                _logger.warning("control-attach: bridge task failed during teardown: %r", result)
         # Detach reflows the pane back to remaining clients — stamp it.
         if on_client_interaction is not None:
             on_client_interaction()
@@ -822,7 +850,7 @@ async def bridge_tmux_control_to_websocket(
             with contextlib.suppress(ProcessLookupError):
                 proc.kill()
             with contextlib.suppress(Exception):
-                await proc.wait()
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
         with contextlib.suppress(RuntimeError):
             if control_ended_first:
                 # The control client ended: distinguish a genuine session-gone

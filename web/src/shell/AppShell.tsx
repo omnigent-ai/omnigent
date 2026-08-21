@@ -104,7 +104,7 @@ import { TerminalsPanel } from "./TerminalsPanel";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { KeyboardShortcutsDialog } from "@/components/KeyboardShortcutsDialog";
 import { CommandPalette } from "./CommandPalette";
-import { Toaster } from "@/components/ui/toast";
+import { Toaster } from "@/components/ui/sonner";
 import { CloseShellDialog } from "./CloseShellDialog";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { ForkDialogContextProvider, type ForkDialogContextValue } from "./ForkDialogContext";
@@ -1992,7 +1992,20 @@ export function AppShell() {
           />
           {/* Transient toasts (e.g. "session archived"). Mounted once here so
               any surface can fire one via showToast(). */}
-          <Toaster />
+          {/* Match the previous toast system's effectively unbounded stack so
+              security prompts cannot be hidden behind ordinary notifications. */}
+          <Toaster
+            position="bottom-right"
+            visibleToasts={100}
+            offset={{
+              right: "1rem",
+              bottom: "calc(1rem + var(--omnigent-inset-bottom))",
+            }}
+            mobileOffset={{
+              right: "1rem",
+              bottom: "calc(1rem + var(--omnigent-inset-bottom))",
+            }}
+          />
         </ForkDialogContextProvider>
       </TerminalFirstContextProvider>
     </FileViewerContext.Provider>
