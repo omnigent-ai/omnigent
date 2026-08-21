@@ -19,6 +19,7 @@ from omnigent.llms.context_window import (
     _encoded_context_window,
     compute_llm_cost,
     fetch_model_pricing,
+    find_model_context_window,
     get_model_context_window,
     resolve_effective_context_window,
 )
@@ -347,6 +348,40 @@ def test_get_model_context_window_prefers_catalog_metadata(
     )
 
     assert get_model_context_window("catalog-model") == 997_952
+
+
+def test_find_model_context_window_resolves_and_returns_none_when_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The no-default lookup resolves known models and returns ``None`` for
+    unknown ones — callers that must omit a guessed window (e.g. the
+    kimi-native forwarder's context ring) depend on the ``None``."""
+    monkeypatch.setattr(
+        context_window,
+        "find_catalog_models",
+        lambda _model: [
+            ModelInfo(name="catalog-model", provider="provider", max_input_tokens=262_144)
+        ],
+    )
+    assert find_model_context_window("catalog-model") == 262_144
+
+    monkeypatch.setattr(context_window, "find_catalog_models", lambda _model: [])
+    assert find_model_context_window("uncatalogued-model") is None
+
+
+def test_find_model_context_window_honors_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``AP_CONTEXT_WINDOW_OVERRIDE`` overrides everything, so users can fix
+    the context ring for uncatalogued models."""
+
+    def _boom(_model: str) -> list[ModelInfo]:
+        raise AssertionError("catalog lookup must not run when the override is set")
+
+    monkeypatch.setattr(context_window, "find_catalog_models", _boom)
+    monkeypatch.setenv("AP_CONTEXT_WINDOW_OVERRIDE", "555000")
+    assert find_model_context_window("uncatalogued-model") == 555_000
+    assert get_model_context_window("uncatalogued-model") == 555_000
 
 
 def test_get_model_context_window_encoded_and_offline_fallback(
