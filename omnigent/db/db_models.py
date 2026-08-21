@@ -1383,9 +1383,9 @@ class SqlUserPeriodCost(OmnigentBase):
 
     One row per ``(user_id, period, harness)``. Incremented (UPSERT
     ``cost_usd = cost_usd + delta``) at each turn boundary from the cost
-    write sites — but only when the session runs under at least one
-    policy, so the table is never touched in deployments that have no
-    policies configured.
+    write sites **unconditionally** on every priced turn (not gated on
+    whether policies are configured). Deployments must run the migration
+    before this code ships.
 
     The ``harness`` column enables two budget modes:
     - Per-harness budgets: read cost for a specific harness (e.g.

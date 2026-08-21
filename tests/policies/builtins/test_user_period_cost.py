@@ -46,10 +46,15 @@ class TestPeriodValidation:
         with pytest.raises(ValueError, match="period must be"):
             user_period_cost_budget(period="invalid", max_cost_usd=10.0)
 
-    def test_harness_not_supported_for_day(self):
-        """Per-harness budgets are not supported for day periods."""
-        with pytest.raises(ValueError, match="per-harness budgets are not yet supported"):
-            user_period_cost_budget(period="day", max_cost_usd=10.0, harness="codex-native")
+    def test_harness_not_supported(self):
+        """Per-harness budgets are not yet supported for any period."""
+        for period in ["day", "week", "month", "quarter", "year"]:
+            with pytest.raises(
+                ValueError, match="per-harness budgets are not yet supported"
+            ):
+                user_period_cost_budget(
+                    period=period, max_cost_usd=10.0, harness="codex-native"
+                )
 
 
 class TestMonthlyBudget:
@@ -229,50 +234,28 @@ class TestYearlyBudget:
 
 
 class TestPerHarnessBudget:
-    """Test per-harness budget mode."""
+    """Test per-harness budget rejection (not yet implemented)."""
 
-    def test_per_harness_budget(self):
-        """Per-harness budgets should scope to specific harness."""
-        policy = user_period_cost_budget(
-            period="month", max_cost_usd=100.0, harness="codex-native"
-        )
-        # Cost is for codex-native harness
-        event = _event(
-            period_cost={
-                "cost_usd": 150.0,
-                "ask_approved_usd": 0.0,
-                "user_id": "alice@example.com",
-                "period": "2026-08",
-                "harness": "codex-native",
-            },
-            model="opus",
-            harness="codex-native",
-        )
-        result = policy(event)
-        assert result["result"] == "DENY"
-        assert "monthly cost budget" in result["reason"]
+    def test_per_harness_budget_raises(self):
+        """Per-harness budgets should raise ValueError (not yet supported)."""
+        with pytest.raises(
+            ValueError, match="per-harness budgets are not yet supported"
+        ):
+            user_period_cost_budget(
+                period="month", max_cost_usd=100.0, harness="codex-native"
+            )
 
-    def test_per_harness_threshold_message(self):
-        """Per-harness threshold should mention harness in message."""
-        policy = user_period_cost_budget(
-            period="month",
-            max_cost_usd=100.0,
-            ask_thresholds_usd=[25.0],
-            harness="codex-native",
-        )
-        event = _event(
-            period_cost={
-                "cost_usd": 30.0,
-                "ask_approved_usd": 0.0,
-                "user_id": "alice@example.com",
-                "period": "2026-08",
-                "harness": "codex-native",
-            },
-            harness="codex-native",
-        )
-        result = policy(event)
-        assert result["result"] == "ASK"
-        assert "on codex-native" in result["reason"]
+    def test_per_harness_with_thresholds_raises(self):
+        """Per-harness budgets with thresholds should raise ValueError."""
+        with pytest.raises(
+            ValueError, match="per-harness budgets are not yet supported"
+        ):
+            user_period_cost_budget(
+                period="month",
+                max_cost_usd=100.0,
+                ask_thresholds_usd=[25.0],
+                harness="codex-native",
+            )
 
 
 class TestCrossHarnessBudget:

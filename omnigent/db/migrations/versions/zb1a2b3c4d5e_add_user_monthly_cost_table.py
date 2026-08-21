@@ -24,10 +24,11 @@ The ``harness`` column enables two budget modes:
   NULL because ``harness`` is part of the PRIMARY KEY (PostgreSQL does not
   allow NULL in PK columns).
 
-This is a brand-new table (not a column on existing tables), so it does
-not affect deployments whose database lacks it: the server only ever
-reads or writes it from policy-gated code paths, which are inert when no
-policy is configured.
+This is a brand-new table (not a column on existing tables). The write
+path is **unconditional** (every priced turn issues four UPSERTs regardless
+of policies configured), so deployments running this code *before*
+``alembic upgrade head`` will fail every priced turn with a missing-table
+error until the migration lands.
 """
 
 from __future__ import annotations
