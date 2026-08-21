@@ -719,15 +719,17 @@ def test_ucode_config_refreshes_live_models_and_builds_picker_options(
     ]
 
 
-def test_claude_native_static_model_options_keep_alias_as_model(
+def test_claude_native_static_model_options_list_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Direct Claude auth rows preserve the alias/model/label contract."""
-    monkeypatch.setattr(claude_native, "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
-    options = claude_native.claude_native_model_options(None)
+    """Direct Claude auth has no configured rows — the probe is the catalog.
 
-    assert options
-    assert all(option["model"] == option["id"] for option in options)
+    The static alias table is gone: a subscription launch's rows come from
+    the harness's own enumeration, so inventing configured rows here would
+    let the picker drift from what the harness can actually run.
+    """
+    monkeypatch.setattr(claude_native, "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
+    assert claude_native.claude_native_model_options(None) == []
 
 
 def test_claude_native_model_options_follow_managed_claude_catalog(
@@ -776,19 +778,24 @@ def test_claude_native_model_options_follow_managed_claude_catalog(
     ]
 
 
-def test_unpinned_family_alias_resolves_to_the_provider_default_model(
+def test_unpinned_family_alias_is_never_swapped_for_the_provider_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A tier alias with no env pin cannot reach the gateway as a canonical id."""
+    """Picking an alias never silently runs a different model.
+
+    The old degrade swapped an unpinned family alias for the provider's
+    default model on a gateway endpoint — a Fable pick landed on Opus with
+    no error. Picker rows are pin-backed or probe-vouched now, so the alias
+    passes through; an out-of-band unpinned pick fails visibly at inference
+    instead of silently running the default.
+    """
     monkeypatch.setattr(claude_native, "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
     config = claude_native.ClaudeNativeUcodeConfig(
         env={"ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic"},
         model="databricks-claude-sonnet-4-5",
     )
-    assert (
-        claude_native.resolve_claude_native_model_selection("opus", config)
-        == "databricks-claude-sonnet-4-5"
-    )
+    assert claude_native.resolve_claude_native_model_selection("fable", config) == "fable"
+    assert claude_native.resolve_claude_native_model_selection("opus", config) == "opus"
 
 
 def test_unpinned_family_alias_passes_through_on_the_anthropic_api() -> None:
@@ -895,15 +902,18 @@ def test_provider_config_without_pins_offers_only_the_default_model_row() -> Non
     )
 
 
-def test_anthropic_endpoint_config_without_pins_keeps_the_alias_rows() -> None:
-    """API-key providers on the Anthropic API keep the alias catalog Claude resolves."""
+def test_anthropic_endpoint_config_without_pins_lists_nothing_configured() -> None:
+    """API-key providers on the Anthropic API have no configured rows either.
+
+    The static alias fallback is gone: the harness's own enumeration
+    supplies the rows for canonical endpoints, so the configured listing
+    stays empty rather than inventing aliases.
+    """
     config = claude_native.ClaudeNativeUcodeConfig(
         env={"ANTHROPIC_BASE_URL": "https://api.anthropic.com"},
         model="claude-sonnet-5",
     )
-    options = claude_native.claude_native_model_options(config)
-    assert options
-    assert all(option["model"] == option["id"] for option in options)
+    assert claude_native.claude_native_model_options(config) == []
 
 
 def test_sonnet_5_selection_resolves_to_the_configured_custom_model() -> None:
@@ -919,45 +929,14 @@ def test_sonnet_5_selection_resolves_to_the_configured_custom_model() -> None:
     )
 
 
-def test_sonnet_5_subscription_selection_uses_owned_fallback(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The direct-login custom row resolves from the central fallback record."""
-    fallback = SimpleNamespace(model_ids=("future-claude-sonnet-5",))
-    monkeypatch.setattr(claude_native, "static_model_fallback", lambda *_args: fallback)
+def test_sonnet_5_subscription_selection_degrades_to_the_sonnet_alias() -> None:
+    """The direct-login custom row degrades to Claude's own family alias.
 
-    assert (
-        claude_native.resolve_claude_native_model_selection("sonnet_5", None)
-        == "future-claude-sonnet-5"
-    )
-
-
-def test_sonnet_5_subscription_selection_uses_first_sonnet_family_fallback(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A renamed Sonnet release stays routable when its display label drifts."""
-    fallback = SimpleNamespace(model_ids=("future-claude-opus-5", "future-claude-sonnet-5-1"))
-    monkeypatch.setattr(claude_native, "static_model_fallback", lambda *_args: fallback)
-
-    assert (
-        claude_native.resolve_claude_native_model_selection("sonnet_5", None)
-        == "future-claude-sonnet-5-1"
-    )
-
-
-@pytest.mark.parametrize(
-    "fallback",
-    [None, SimpleNamespace(model_ids=("future-claude-opus-5",))],
-)
-def test_sonnet_5_subscription_selection_fails_without_sonnet_fallback(
-    fallback: object,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The private picker id never reaches Claude when its fallback disappears."""
-    monkeypatch.setattr(claude_native, "static_model_fallback", lambda *_args: fallback)
-
-    with pytest.raises(ValueError, match="no routable Sonnet model"):
-        claude_native.resolve_claude_native_model_selection("sonnet_5", None)
+    With no provider config to pin the custom slot there is no static list
+    to hunt — the harness resolves ``sonnet`` to its current Sonnet itself,
+    so the private picker id never reaches Claude.
+    """
+    assert claude_native.resolve_claude_native_model_selection("sonnet_5", None) == "sonnet"
 
 
 def test_removed_sonnet_5_selection_falls_back_to_routable_databricks_sonnet() -> None:
@@ -7358,14 +7337,102 @@ def test_provider_config_for_native_claude_key_injects_base_url_and_helper(
     cfg = claude_native._provider_config_for_native_claude(entry)
     assert cfg is not None
     # ANTHROPIC_BASE_URL plus the gateway-safety beta-disable flag (gateways
-    # 400 on beta flags they don't implement; see _provider_config_for_native_claude).
+    # 400 on beta flags they don't implement; see _provider_config_for_native_claude)
+    # plus the declared default pinning its own family alias, so /model and
+    # the harness probe resolve ``sonnet`` to the entry's model.
     assert cfg.env == {
         "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-6",
         "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
     }
     # Static key delivered via the apiKeyHelper, never the env (allowlist).
     assert cfg.api_key_helper == "printf %s sk-ant-test"
     assert cfg.model == "claude-sonnet-4-6"
+    assert cfg.routable_models == ("claude-sonnet-4-6",)
+
+
+def test_provider_config_for_native_claude_pins_declared_tier_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A gateway entry's ``models:`` tier keys pin the alias vocabulary.
+
+    The flat tier keys (``opus``/``sonnet``/…) pin their aliases directly and
+    ``models.default`` pins its own family's alias when that family has no
+    explicit key — so every declared model becomes a servable ``/model``
+    spelling (and a probed catalog row) instead of the alias falling back to
+    a canonical Anthropic id the gateway rejects.
+    """
+    from omnigent.onboarding.provider_config import load_providers
+
+    monkeypatch.delenv("CLAUDE_CODE_USE_GATEWAY", raising=False)
+
+    entry = load_providers(
+        {
+            "providers": {
+                "gw": {
+                    "kind": "gateway",
+                    "anthropic": {
+                        "base_url": "https://gw.example/anthropic",
+                        "auth_command": "my-cli print-token",
+                        "models": {
+                            "default": "system.ai.claude-opus-4-8[1m]",
+                            "sonnet": "system.ai.claude-sonnet-5",
+                            "haiku": "system.ai.claude-haiku-4-5",
+                        },
+                    },
+                }
+            }
+        }
+    )["gw"]
+
+    cfg = claude_native._provider_config_for_native_claude(entry)
+    assert cfg is not None
+    assert cfg.env == {
+        "ANTHROPIC_BASE_URL": "https://gw.example/anthropic",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": "system.ai.claude-sonnet-5",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": "system.ai.claude-haiku-4-5",
+        # The default's own family (opus) had no explicit key, so the
+        # default pins it — bracket markers ride along verbatim.
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-4-8[1m]",
+        "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+    }
+    assert cfg.model == "system.ai.claude-opus-4-8[1m]"
+    assert set(cfg.routable_models) == {
+        "system.ai.claude-opus-4-8[1m]",
+        "system.ai.claude-sonnet-5",
+        "system.ai.claude-haiku-4-5",
+    }
+
+
+def test_provider_config_for_native_claude_explicit_tier_key_beats_the_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``models.default`` never overwrites an explicitly keyed family pin."""
+    from omnigent.onboarding.provider_config import load_providers
+
+    monkeypatch.delenv("CLAUDE_CODE_USE_GATEWAY", raising=False)
+
+    entry = load_providers(
+        {
+            "providers": {
+                "gw": {
+                    "kind": "gateway",
+                    "anthropic": {
+                        "base_url": "https://gw.example/anthropic",
+                        "auth_command": "my-cli print-token",
+                        "models": {
+                            "default": "system.ai.claude-opus-4-8",
+                            "opus": "system.ai.claude-opus-5",
+                        },
+                    },
+                }
+            }
+        }
+    )["gw"]
+
+    cfg = claude_native._provider_config_for_native_claude(entry)
+    assert cfg is not None
+    assert cfg.env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "system.ai.claude-opus-5"
 
 
 def test_provider_config_for_native_claude_uses_auth_command_verbatim(
@@ -7706,10 +7773,11 @@ def test_resolve_native_claude_config_ambient_prefixed_key(
     cfg = claude_native.resolve_native_claude_config(spec=None)
 
     assert cfg is not None
-    assert cfg.env == {
-        "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
-        "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
-    }
+    assert cfg.env["ANTHROPIC_BASE_URL"] == "https://api.anthropic.com"
+    assert cfg.env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] == "1"
+    # The ambient entry's declared default pins its own family alias too —
+    # one behavior for every provider-entry shape.
+    assert cfg.env.get("ANTHROPIC_DEFAULT_OPUS_MODEL") == cfg.model
     assert cfg.api_key_helper == "printf %s sk-ant-prefixed"
 
 
@@ -9088,3 +9156,417 @@ def test_routed_arms_keep_the_existing_pin_when_no_spelling_is_servable() -> Non
     )
     assert claude_native.claude_config_with_routed_arms_pinned(None, ("claude-opus-4-8",)) is None
     assert claude_native.claude_config_with_routed_arms_pinned(config, ()) is config
+
+
+# ── Harness model probe (harness-truth listing) ───────────────────────────
+
+
+def _gateway_probe_config(**env_extra: str) -> Any:
+    """A ucode-shaped config routed through a gateway endpoint."""
+    return claude_native.ClaudeNativeUcodeConfig(
+        env={
+            "ANTHROPIC_BASE_URL": "https://gw.example/anthropic",
+            **env_extra,
+        },
+        api_key_helper="printf token",
+    )
+
+
+def test_parse_claude_model_aliases_reads_the_usage_line() -> None:
+    """The harness's printed alias enumeration parses verbatim.
+
+    Only the trailing prose fragment is dropped — no alias names are known
+    to the parser, so a new alias in a future Claude release flows through.
+    """
+    stdout = (
+        "Current model: Opus 4.8 (1M context) (effort: high)\n"
+        "Usage: /model <name>. Available: sonnet, opus, haiku, fable, best, "
+        "sonnet[1m], opus[1m], fable[1m], opusplan, default, or a full model ID.\n"
+    )
+    assert claude_native._parse_claude_model_aliases(stdout) == [
+        "sonnet",
+        "opus",
+        "haiku",
+        "fable",
+        "best",
+        "sonnet[1m]",
+        "opus[1m]",
+        "fable[1m]",
+        "opusplan",
+        "default",
+    ]
+    assert claude_native._parse_claude_model_aliases("no usage line here") == []
+
+
+@pytest.mark.parametrize(
+    ("stdout", "expected"),
+    [
+        pytest.param(
+            json.dumps({"type": "system", "subtype": "init", "model": "claude-opus-5"})
+            + "\n"
+            + json.dumps({"type": "result", "result": "Current model: Opus 5 (effort: high)"}),
+            {"model": "claude-opus-5", "label": "Opus 5"},
+            id="id-and-label",
+        ),
+        pytest.param(
+            json.dumps(
+                {
+                    "type": "result",
+                    "result": "Current model: Opus 4.8 (1M context) (effort: high)",
+                }
+            ),
+            {"label": "Opus 4.8 (1M context)"},
+            id="only-the-effort-suffix-is-stripped",
+        ),
+        pytest.param(
+            json.dumps(
+                {
+                    "type": "result",
+                    "result": "Current model: Opus in plan mode, else Sonnet (effort: high)",
+                }
+            ),
+            {"label": "Opus in plan mode, else Sonnet"},
+            id="prose-label-kept-verbatim",
+        ),
+        pytest.param("Current model: Opus 5\nnot json", {}, id="non-stream-json-yields-nothing"),
+    ],
+)
+def test_parse_claude_current_model(stdout: str, expected: dict[str, str]) -> None:
+    """The stream-json run's exact id and printed label parse verbatim.
+
+    Only the trailing ``(effort: …)`` suffix is stripped from the label —
+    context markers and prose like opusplan's description survive, because
+    the parser knows no model names.
+    """
+    assert claude_native._parse_claude_current_model(stdout) == expected
+
+
+async def test_probe_claude_model_options_runs_bare(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bare subscription launch (no config) asks the harness itself.
+
+    No ``--settings`` rides along without an apiKeyHelper to deliver, and
+    the plain-text usage line still parses when the harness answers
+    without stream-json events (failed per-alias resolutions leave the
+    bare alias rows).
+    """
+
+    class _FakeProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return (
+                b"Usage: /model <name>. Available: sonnet, opus, or a full model ID.\n",
+                b"",
+            )
+
+    async def _fake_exec(command: str, *args: str, **kwargs: Any) -> _FakeProcess:
+        # No --settings without an apiKeyHelper to deliver.
+        assert "--settings" not in args
+        return _FakeProcess()
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
+
+    probe = await claude_native.probe_claude_model_options(None)
+
+    assert probe is not None
+    assert probe.alias_rows == [
+        {"id": "sonnet", "model": "sonnet", "displayName": "sonnet"},
+        {"id": "opus", "model": "opus", "displayName": "opus"},
+    ]
+    assert probe.default_model is None
+
+
+async def test_probe_claude_model_options_resolves_each_alias_via_the_harness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every kept alias gets its own ``--model`` resolution run.
+
+    The harness resolves each alias itself (exact id from the init event,
+    label from the printed line); rows show only the resolved label with
+    1M-context resolutions marked, aliases resolving to a model an
+    earlier row already covers are dropped (``best``, ``fable[1m]``, and
+    ``opusplan`` here), ``default`` never becomes a row (the picker has
+    its own Default choice), and a failing resolution leaves that alias's
+    bare row, never the whole probe.
+    """
+    resolutions = {
+        "sonnet": ("claude-sonnet-5", "Sonnet 5"),
+        "opus": ("claude-opus-5", "Opus 5"),
+        "fable": ("claude-fable-5", "Fable 5"),
+        "best": ("claude-fable-5", "Fable 5"),
+        "sonnet[1m]": ("claude-sonnet-5[1m]", "Sonnet 5"),
+        "opus[1m]": ("claude-opus-5[1m]", "Opus 5 (1M context)"),
+        "fable[1m]": ("claude-fable-5", "Fable 5"),
+        "opusplan": ("claude-sonnet-5", "Opus in plan mode, else Sonnet"),
+    }
+
+    class _Run:
+        def __init__(self, stdout: bytes, returncode: int = 0) -> None:
+            self.returncode = returncode
+            self._stdout = stdout
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return self._stdout, b""
+
+    async def _fake_exec(command: str, *args: str, **kwargs: Any) -> _Run:
+        if "--model" not in args:
+            return _Run(
+                b"Usage: /model <name>. Available: sonnet, opus, haiku, fable, best, "
+                b"sonnet[1m], opus[1m], fable[1m], opusplan, default, or a full model ID.\n"
+            )
+        assert "--output-format" in args and "stream-json" in args and "--verbose" in args
+        alias = args[args.index("--model") + 1]
+        assert alias != "default", "the skipped alias must not spawn a resolution run"
+        if alias == "haiku":
+            return _Run(b"", returncode=1)
+        model, label = resolutions[alias]
+        events = [
+            {"type": "system", "subtype": "init", "model": model},
+            {"type": "result", "result": f"Current model: {label} (effort: high)"},
+        ]
+        return _Run("\n".join(json.dumps(event) for event in events).encode())
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
+
+    probe = await claude_native.probe_claude_model_options(None)
+
+    assert probe is not None
+    alias_rows = probe.alias_rows
+    assert alias_rows == [
+        {"id": "sonnet", "model": "claude-sonnet-5", "displayName": "Sonnet 5"},
+        {"id": "opus", "model": "claude-opus-5", "displayName": "Opus 5"},
+        {"id": "haiku", "model": "haiku", "displayName": "haiku"},
+        {"id": "fable", "model": "claude-fable-5", "displayName": "Fable 5"},
+        {
+            "id": "sonnet[1m]",
+            "model": "claude-sonnet-5[1m]",
+            "displayName": "Sonnet 5 (1M context)",
+        },
+        {"id": "opus[1m]", "model": "claude-opus-5[1m]", "displayName": "Opus 5 (1M context)"},
+    ]
+
+
+async def test_probe_claude_model_options_runs_the_harness_under_the_launch_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The probe launches Claude Code with the exact launch env.
+
+    Speed env vars ride along, the nonessential-traffic kill-switch is
+    stripped (Claude treats it as covering the probe's own runs), and the
+    apiKeyHelper is delivered via ``--settings`` — so the enumeration
+    answers for the session the user would actually get.
+    """
+    monkeypatch.setenv("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+    monkeypatch.setenv("CLAUDECODE", "1")
+    captured: dict[str, Any] = {}
+
+    class _FakeProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return (
+                b"Current model: Opus\n"
+                b"Usage: /model <name>. Available: opus, or a full model ID.\n",
+                b"",
+            )
+
+    async def _fake_exec(command: str, *args: str, **kwargs: Any) -> _FakeProcess:
+        if "command" not in captured:
+            # The first spawn is the enumeration run; per-alias resolution
+            # runs reuse the same launch env.
+            captured["command"] = command
+            captured["args"] = list(args)
+            captured["env"] = dict(kwargs["env"])
+        return _FakeProcess()
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
+
+    probe = await claude_native.probe_claude_model_options(_gateway_probe_config())
+
+    assert probe is not None
+    assert probe.alias_rows == [{"id": "opus", "model": "opus", "displayName": "opus"}]
+    args = captured["args"]
+    assert args[:2] == ["-p", "/model"]
+    assert "--strict-mcp-config" in args and "--no-session-persistence" in args
+    settings_payload = json.loads(args[args.index("--settings") + 1])
+    assert settings_payload == {"apiKeyHelper": "printf token"}
+    env = captured["env"]
+    assert env["ANTHROPIC_BASE_URL"] == "https://gw.example/anthropic"
+    assert env["DISABLE_TELEMETRY"] == "1"
+    assert env["DISABLE_AUTOUPDATER"] == "1"
+    assert "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC" not in env
+    assert "CLAUDECODE" not in env
+
+
+async def test_claude_model_catalog_marks_the_enumerated_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The enumeration run's own model marks its row as the default."""
+
+    async def _fake_probe(config: object) -> claude_native.ClaudeModelProbe:
+        del config
+        return claude_native.ClaudeModelProbe(
+            alias_rows=[
+                {"id": "sonnet", "model": "claude-sonnet-5", "displayName": "Sonnet 5"},
+                {"id": "opus", "model": "claude-opus-5", "displayName": "Opus 5"},
+            ],
+            default_model="claude-opus-5",
+            default_label="Opus 5",
+        )
+
+    monkeypatch.setattr(claude_native, "probe_claude_model_options", _fake_probe)
+    rows = await claude_native.claude_model_catalog(None)
+    assert rows is not None
+    assert [row["id"] for row in rows] == ["sonnet", "opus"]
+    assert "isDefault" not in rows[0]
+    assert rows[1]["isDefault"] is True
+
+
+async def test_claude_model_catalog_appends_an_off_list_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A settings-pinned default absent from the aliases becomes its own row.
+
+    On this shape a bare launch runs a model no alias resolves to (e.g. a
+    ``settings.json`` ``ANTHROPIC_MODEL`` pin); the catalog appends it as a
+    row so every visible row is launchable and the Default label is honest.
+    """
+
+    async def _fake_probe(config: object) -> claude_native.ClaudeModelProbe:
+        del config
+        return claude_native.ClaudeModelProbe(
+            alias_rows=[
+                {"id": "sonnet", "model": "claude-sonnet-5", "displayName": "Sonnet 5"},
+            ],
+            default_model="claude-opus-4-8[1m]",
+            default_label="Opus 4.8 (1M context)",
+        )
+
+    monkeypatch.setattr(claude_native, "probe_claude_model_options", _fake_probe)
+    rows = await claude_native.claude_model_catalog(None)
+    assert rows is not None
+    assert rows[-1] == {
+        "id": "claude-opus-4-8[1m]",
+        "model": "claude-opus-4-8[1m]",
+        "displayName": "Opus 4.8 (1M context)",
+        "isDefault": True,
+    }
+
+
+async def test_claude_model_catalog_never_appends_an_unservable_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bare-Anthropic default is not appended on a gateway endpoint.
+
+    The gateway rejects canonical Anthropic spellings, so claiming claude's
+    own default is launchable there would offer a row that cannot work.
+    """
+
+    async def _fake_probe(config: object) -> claude_native.ClaudeModelProbe:
+        del config
+        return claude_native.ClaudeModelProbe(
+            alias_rows=[
+                {
+                    "id": "sonnet",
+                    "model": "databricks-claude-sonnet-5",
+                    "displayName": "Sonnet 5",
+                },
+                {"id": "fable", "model": "claude-fable-5", "displayName": "Fable 5"},
+            ],
+            default_model="claude-opus-5[1m]",
+            default_label="Opus 5 (1M context)",
+        )
+
+    monkeypatch.setattr(claude_native, "probe_claude_model_options", _fake_probe)
+    rows = await claude_native.claude_model_catalog(_gateway_probe_config())
+    assert rows is not None
+    # The unservable alias row is filtered AND the unservable default is not
+    # appended; no row claims the default.
+    assert [row["id"] for row in rows] == ["sonnet"]
+    assert all(row.get("isDefault") is not True for row in rows)
+
+
+async def test_claude_model_catalog_marks_the_launch_pin_as_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A provider-configured shape's default is its LAUNCH PIN, not claude's.
+
+    Default launches on these shapes pass ``--model <config.model>``
+    explicitly, so that pin — not the enumeration run's own model — is what
+    a Default launch actually runs. The gateway-entry shape (one pinned
+    alias) must mark its row, or the picker reads a bare "Default".
+    """
+
+    async def _fake_probe(config: object) -> claude_native.ClaudeModelProbe:
+        del config
+        return claude_native.ClaudeModelProbe(
+            alias_rows=[
+                {
+                    "id": "opus",
+                    "model": "system.ai.claude-opus-4-8[1m]",
+                    "displayName": "Opus 4.8 (1M context)",
+                }
+            ],
+            default_model=None,
+            default_label=None,
+        )
+
+    monkeypatch.setattr(claude_native, "probe_claude_model_options", _fake_probe)
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={
+            "ANTHROPIC_BASE_URL": "https://gw.example/anthropic",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-4-8[1m]",
+        },
+        api_key_helper="printf token",
+        model="system.ai.claude-opus-4-8[1m]",
+    )
+    rows = await claude_native.claude_model_catalog(config)
+    assert rows == [
+        {
+            "id": "opus",
+            "model": "system.ai.claude-opus-4-8[1m]",
+            "displayName": "Opus 4.8 (1M context)",
+            "isDefault": True,
+        }
+    ]
+
+
+async def test_claude_launch_catalog_reads_the_store_then_probes_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The launch catalog is store-first; a miss probes once and persists."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    calls: list[int] = []
+
+    async def _fake_catalog(config: object) -> list[dict[str, object]]:
+        del config
+        calls.append(1)
+        return [{"id": "sonnet", "model": "claude-sonnet-5", "isDefault": True}]
+
+    monkeypatch.setattr(claude_native, "claude_model_catalog", _fake_catalog)
+    first = await claude_native.claude_launch_catalog(None)
+    second = await claude_native.claude_launch_catalog(None)
+    assert first == second == [{"id": "sonnet", "model": "claude-sonnet-5", "isDefault": True}]
+    assert len(calls) == 1, "the second read must come from the store, not a re-probe"
+
+
+async def test_probe_claude_model_options_returns_none_on_probe_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A failing harness run yields None so callers keep configured rows."""
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+
+    class _FailedProcess:
+        returncode = 1
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"", b"boom"
+
+    async def _fake_exec(command: str, *args: str, **kwargs: Any) -> _FailedProcess:
+        return _FailedProcess()
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
+
+    assert await claude_native.probe_claude_model_options(_gateway_probe_config()) is None

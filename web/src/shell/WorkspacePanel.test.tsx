@@ -25,14 +25,8 @@ vi.mock("./FilesPanel", () => ({
     <div data-testid="files-panel-stub" data-flat-view={String(flatView)} />
   ),
 }));
-vi.mock("./InlineTerminalsSection", () => ({
-  InlineTerminalsSection: () => <div data-testid="terminals-stub" />,
-}));
 vi.mock("./SubagentsPanel", () => ({
   SubagentsPanel: () => <div data-testid="subagents-stub" />,
-}));
-vi.mock("./TodoPanel", () => ({
-  TodoPanel: () => <div data-testid="todos-stub" />,
 }));
 vi.mock("@/components/BrowserPane/BrowserPane", () => ({
   BrowserPane: ({ conversationId }: { conversationId: string }) => (
@@ -87,7 +81,6 @@ function renderWorkspace(
     openFiles?: string[];
     changedCount?: number;
     showBrowserTab?: boolean;
-    showShellsTab?: boolean;
     openTerminals?: string[];
     selectedTerminalKey?: string | null;
     maximized?: boolean;
@@ -111,13 +104,8 @@ function renderWorkspace(
         showFilesPanel
         showBrowserTab={overrides.showBrowserTab ?? false}
         changedCount={overrides.changedCount ?? 0}
-        showShellsTab={overrides.showShellsTab ?? false}
-        terminalsLength={0}
         subagentsWorking={0}
         agentCount={1}
-        todosSupported={false}
-        todosCompleted={0}
-        todosTotal={0}
         rootSessionId={null}
         selectedFilePath={overrides.selectedFilePath ?? null}
         openFiles={overrides.openFiles ?? []}
@@ -171,6 +159,11 @@ describe("WorkspacePanel surface presentation", () => {
     expect(filesTab).not.toHaveAttribute("title");
     expect(changesTab).not.toHaveAttribute("title");
     expect(agentsTab).not.toHaveAttribute("title");
+  });
+
+  it("has no static Shells nav tab — shells open only as closable soft tabs", () => {
+    renderWorkspace({ openTerminals: [] });
+    expect(screen.queryByRole("tab", { name: /shells/i })).toBeNull();
   });
 
   it("badges the Changes tab (not Files) with the changed-file count", () => {
@@ -314,7 +307,7 @@ describe("WorkspacePanel shell tabs", () => {
 
   it("renders a tab per open shell labeled by name · session", () => {
     useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
-    renderWorkspace({ showShellsTab: true, openTerminals: [termKey] });
+    renderWorkspace({ openTerminals: [termKey] });
 
     // The label resolves through the terminals cache (name · session), not the
     // raw tab key. A failure means the strip didn't render or didn't resolve
@@ -325,7 +318,6 @@ describe("WorkspacePanel shell tabs", () => {
   it("sizes shell tab pills to the same 24px height as file tabs", () => {
     useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
     renderWorkspace({
-      showShellsTab: true,
       openFiles: ["src/App.tsx"],
       openTerminals: [termKey],
     });
@@ -340,7 +332,6 @@ describe("WorkspacePanel shell tabs", () => {
   it("surfaces the active shell's xterm in the content slot", () => {
     useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
     renderWorkspace({
-      showShellsTab: true,
       openTerminals: [termKey],
       selectedTerminalKey: termKey,
     });
@@ -355,7 +346,6 @@ describe("WorkspacePanel shell tabs", () => {
   it("activates a shell via openTerminalTab when its tab body is clicked", () => {
     useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
     const { openTerminalTab } = renderWorkspace({
-      showShellsTab: true,
       openTerminals: [termKey],
     });
 
@@ -367,7 +357,6 @@ describe("WorkspacePanel shell tabs", () => {
   it("closes a shell via onCloseTerminal (and does not also open it) when the x is clicked", () => {
     useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
     const { openTerminalTab, onCloseTerminal } = renderWorkspace({
-      showShellsTab: true,
       openTerminals: [termKey],
     });
 
@@ -380,7 +369,6 @@ describe("WorkspacePanel shell tabs", () => {
   it("keeps the static nav tabs inactive while a shell tab is active", () => {
     useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
     renderWorkspace({
-      showShellsTab: true,
       openTerminals: [termKey],
       selectedTerminalKey: termKey,
     });

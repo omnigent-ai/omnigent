@@ -253,6 +253,14 @@ _INVOCATION_SETTINGS_FILE = "claude-settings.json"
 ToolExecutor = Callable[[str, _JsonObject], Awaitable[object]]
 
 
+class ClaudePromptTimeout(RuntimeError):
+    """Claude Code's input box did not render before delivery timed out."""
+
+
+class TmuxSessionNotAdvertised(RuntimeError):
+    """The bridge's tmux target was not advertised before the deadline."""
+
+
 def _absolute_syntactic_path(path: Path) -> Path:
     """
     Return an absolute path without following symlinks.
@@ -446,6 +454,11 @@ class TranscriptReadResult:
         entry was scanned.
     :param latest_model: ``message.model`` from the most recent
         assistant entry, or ``None``.
+    :param latest_custom_title: ``customTitle`` from the most recent
+        ``custom-title`` record — the explicit title a ``/rename`` typed
+        in the Claude Code pane writes. ``None`` when no such record was
+        scanned. Claude's own auto-generated ``aiTitle`` is deliberately
+        not surfaced here; Omnigent titles unnamed sessions itself.
     """
 
     line_cursor: int
@@ -454,6 +467,7 @@ class TranscriptReadResult:
     items: list[ClaudeTranscriptItem]
     latest_usage: dict[str, int] | None = None
     latest_model: str | None = None
+    latest_custom_title: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1211,6 +1225,48 @@ def read_model_env(bridge_dir: Path) -> dict[str, str]:
         for key, value in model_env.items()
         if isinstance(key, str) and isinstance(value, str) and value
     }
+
+
+def record_model_vocabulary(
+    bridge_dir: Path,
+    *,
+    launch_env: Mapping[str, str] | None,
+    launch_model: str | None,
+) -> None:
+    """
+    Persist the launch's model vocabulary after the bridge dir exists.
+
+    The runner prepares the bridge before it resolves the provider config,
+    so the vocabulary (alias pins + custom slot) and the launch model land
+    here in a second write once known — the same keys
+    :func:`prepare_bridge_dir` records on the CLI path, so
+    :func:`read_model_env` / :func:`read_launch_model` serve both paths
+    identically.
+
+    :param bridge_dir: Bridge directory path.
+    :param launch_env: The resolved launch env (pins + custom slot), or
+        ``None`` for a bare subscription launch.
+    :param launch_model: The model the launch pins via ``--model``, or
+        ``None``.
+    :returns: None.
+    """
+    config = _read_json_file(bridge_dir / _CONFIG_FILE)
+    if not isinstance(config, dict):
+        return
+    model_env = {
+        key: launch_env[key]
+        for key in MODEL_VOCABULARY_ENV_VARS
+        if launch_env is not None and launch_env.get(key)
+    }
+    changed = False
+    if model_env and config.get("model_env") != model_env:
+        config["model_env"] = model_env
+        changed = True
+    if launch_model and config.get("launch_model") != launch_model:
+        config["launch_model"] = launch_model
+        changed = True
+    if changed:
+        _write_json_file(bridge_dir / _CONFIG_FILE, config)
 
 
 def read_bridge_id(bridge_dir: Path) -> str | None:
@@ -2194,11 +2250,14 @@ def read_transcript_items_since(
 
     Claude Code writes append-only JSONL records whose ``message``
     payloads include user prompts, assistant text, native tool calls,
-    and native tool results. This parser intentionally ignores
-    metadata records (title, file-history, permission mode, system
-    bookkeeping) and raw ``thinking`` blocks, while translating the
-    user-visible semantic records into Omnigent item types the web UI
-    already understands.
+    and native tool results. This parser intentionally renders no
+    conversation item for metadata records (title, file-history,
+    permission mode, system bookkeeping) or raw ``thinking`` blocks,
+    while translating the user-visible semantic records into Omnigent
+    item types the web UI already understands. Some metadata is still
+    read for out-of-band mirroring rather than dropped outright — a
+    ``custom-title`` record surfaces on
+    :attr:`TranscriptReadResult.latest_custom_title`.
 
     :param transcript_path: Claude transcript path, e.g.
         ``"/home/user/.claude/projects/x/session.jsonl"``.
@@ -2259,6 +2318,7 @@ def read_transcript_items_since_with_position(
     active_settled_id = settled_response_id
     latest_usage: dict[str, int] | None = None
     latest_model: str | None = None
+    latest_custom_title: str | None = None
     for record in read_result.records:
         if record.text is None:
             continue
@@ -2288,6 +2348,9 @@ def read_transcript_items_since_with_position(
         model = _model_from_transcript_entry(entry)
         if model is not None:
             latest_model = model
+        custom_title = _custom_title_from_transcript_entry(entry)
+        if custom_title is not None:
+            latest_custom_title = custom_title
     return TranscriptReadResult(
         line_cursor=read_result.line_cursor,
         byte_offset=read_result.byte_offset,
@@ -2295,6 +2358,7 @@ def read_transcript_items_since_with_position(
         items=items,
         latest_usage=latest_usage,
         latest_model=latest_model,
+        latest_custom_title=latest_custom_title,
     )
 
 
@@ -2347,6 +2411,7 @@ def read_transcript_items_from_offset(
     active_settled_id = settled_response_id
     latest_usage: dict[str, int] | None = None
     latest_model: str | None = None
+    latest_custom_title: str | None = None
     for record in read_result.records:
         if record.text is None:
             continue
@@ -2377,6 +2442,9 @@ def read_transcript_items_from_offset(
         model = _model_from_transcript_entry(entry)
         if model is not None:
             latest_model = model
+        custom_title = _custom_title_from_transcript_entry(entry)
+        if custom_title is not None:
+            latest_custom_title = custom_title
     return TranscriptReadResult(
         line_cursor=read_result.line_cursor,
         byte_offset=read_result.byte_offset,
@@ -2384,6 +2452,7 @@ def read_transcript_items_from_offset(
         items=items,
         latest_usage=latest_usage,
         latest_model=latest_model,
+        latest_custom_title=latest_custom_title,
     )
 
 
@@ -3168,10 +3237,16 @@ def kill_session(
         there is no live session to kill.
     :returns: None.
     :raises RuntimeError: If the tmux target is not advertised in
-        time, or if the ``tmux kill-session`` invocation fails.
+        time, or if ``tmux kill-session`` fails for an unexpected reason.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    _run_tmux(info["socket_path"], "kill-session", "-t", info["tmux_target"])
+    try:
+        _run_tmux(info["socket_path"], "kill-session", "-t", info["tmux_target"])
+    except RuntimeError as exc:
+        detail = str(exc).lower()
+        if "can't find session" in detail or "no server running on" in detail:
+            return
+        raise
 
 
 def inject_slash_command(
@@ -3335,6 +3410,38 @@ def _confirm_tui_dialog(
         return False
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     return False
+
+
+def confirm_dialog_if_open(bridge_dir: Path, *, hint: str) -> bool:
+    """
+    Accept the *hint* dialog iff it is on screen RIGHT NOW; never blind-Enter.
+
+    Loop-safe building block for watchers that outlive a single injection
+    (a mid-turn ``/model`` queues in Claude's composer and pops its confirm
+    dialog only when the turn settles — minutes later). Unlike
+    :func:`_confirm_tui_dialog` there is no timeout fallback Enter, so
+    calling this every few seconds can never type into a surface that is
+    not the named dialog.
+
+    :param bridge_dir: Bridge directory path.
+    :param hint: Text the dialog renders, e.g.
+        :data:`SWITCH_MODEL_DIALOG_HINT`.
+    :returns: ``True`` when the dialog was on screen and confirmed.
+    """
+    try:
+        info = _wait_for_tmux_info(bridge_dir, timeout_s=1.0)
+    except (RuntimeError, OSError):
+        return False
+    socket_path = info["socket_path"]
+    tmux_target = info["tmux_target"]
+    try:
+        pane = _capture_pane(socket_path, tmux_target)
+        if hint not in pane:
+            return False
+        _confirm_and_verify_dialog_closed(socket_path, tmux_target, hint=hint)
+    except (RuntimeError, OSError):
+        return False
+    return True
 
 
 def _confirm_and_verify_dialog_closed(
@@ -3827,7 +3934,7 @@ def _wait_for_claude_prompt_ready(
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param timeout_s: Seconds to wait for the prompt, e.g. ``30.0``.
     :returns: None.
-    :raises RuntimeError: If the prompt never renders within
+    :raises ClaudePromptTimeout: If the prompt never renders within
         *timeout_s* (Claude failed to boot). The message carries a poll
         count, how many of those polls saw an empty capture, and the tail
         of the last non-empty capture the loop actually observed (see
@@ -3864,7 +3971,7 @@ def _wait_for_claude_prompt_ready(
     # session is alive but capture-pane came back blank); non-empty captures
     # with no box point at Claude never rendering the prompt (a boot crash,
     # e.g. a ``JSON Parse error``, whose text the tail then surfaces).
-    raise RuntimeError(
+    raise ClaudePromptTimeout(
         f"Claude Code terminal did not become ready within {timeout_s}s "
         f"(input prompt never rendered in {polls} polls, "
         f"{empty_polls} empty captures). The message was not delivered."
@@ -3920,7 +4027,7 @@ def _wait_for_tmux_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, str]
     :param bridge_dir: Bridge directory path.
     :param timeout_s: Seconds to wait, e.g. ``30.0``.
     :returns: ``{"socket_path": ..., "tmux_target": ...}``.
-    :raises RuntimeError: If the file never appears with valid
+    :raises TmuxSessionNotAdvertised: If the file never appears with valid
         ``socket_path`` and ``tmux_target`` fields.
     """
     deadline = time.monotonic() + timeout_s
@@ -3932,7 +4039,7 @@ def _wait_for_tmux_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, str]
         if isinstance(socket_path, str) and isinstance(tmux_target, str):
             return {"socket_path": socket_path, "tmux_target": tmux_target}
         time.sleep(0.05)
-    raise RuntimeError(
+    raise TmuxSessionNotAdvertised(
         "Claude terminal tmux target is not advertised yet. Wait for the "
         "terminal to launch before sending messages from the web UI."
     )
@@ -4990,6 +5097,32 @@ def _model_from_transcript_entry(entry: _JsonObject) -> str | None:
     model = message.get("model")
     if isinstance(model, str) and model:
         return model
+    return None
+
+
+def _custom_title_from_transcript_entry(entry: _JsonObject) -> str | None:
+    """
+    Return ``customTitle`` from a ``custom-title`` transcript record.
+
+    Claude Code appends this metadata record when the operator renames
+    the session from the pane (``/rename``). It carries no ``message``,
+    so it renders no conversation item; the forwarder mirrors it onto the
+    Omnigent session title instead.
+
+    Only the explicit user title is read. Claude also writes an
+    ``aiTitle`` record holding its own generated summary, which is
+    ignored here because Omnigent runs its own background titler and two
+    auto-titlers would fight over one field.
+
+    :param entry: One decoded transcript JSONL record.
+    :returns: The operator-chosen title, e.g. ``"auth-refactor"``, or
+        ``None`` for other record types and blank values.
+    """
+    if entry.get("type") != "custom-title":
+        return None
+    title = entry.get("customTitle")
+    if isinstance(title, str) and title.strip():
+        return title
     return None
 
 

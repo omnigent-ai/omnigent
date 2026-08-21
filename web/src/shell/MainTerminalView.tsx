@@ -1,6 +1,6 @@
 // Inline terminal renderer for terminal-first sessions. Replaces the
 // chat conversation + composer when the user picks "Terminal" in the
-// connection pill, or opens a shell from the rail's Shells tab. Shares
+// connection pill, or opens a shell as a rail soft tab. Shares
 // the lower-level primitives (`useTerminals` + `TerminalView`) with
 // `InlineTerminalsSection` and `TerminalsPanel`, but renders as plain
 // flex content — no drawer chrome, no resize handle, no collapse — so
@@ -10,8 +10,8 @@
 // Two render states, for every session shape (SDK and native alike):
 // the AGENT's terminal (the SDK REPL or the native vendor pane)
 // renders chrome-free, and a rail-opened user shell renders with a
-// single header row (identity + close X). There is no tab strip —
-// shells are enumerated and created in the rail's Shells tab.
+// single header row (identity + close X). There is no tab strip here —
+// shells are opened and created from the rail's tab strip ("+" menu).
 
 import { TerminalIcon, XIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
@@ -25,8 +25,8 @@ interface MainTerminalViewProps {
   conversationId: string;
   /**
    * Terminal tab key to focus when the view opens, e.g.
-   * `"terminal:terminal_zsh_main"` from clicking a shell row in the
-   * rail's Shells tab. Falsy values (null / the PANEL_NO_TERMINAL_KEY
+   * `"terminal:terminal_zsh_main"` from opening a shell in the rail.
+   * Falsy values (null / the PANEL_NO_TERMINAL_KEY
    * sentinel) leave the agent-terminal auto-selection in place; an
    * unknown or closed key falls back the same way once terminals load.
    */

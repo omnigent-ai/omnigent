@@ -173,6 +173,7 @@ def test_web_started_codex_turn_returns_without_waiting_for_terminal_event(
             thread_id="thread_123",
             codex_home=str(tmp_path / "codex-home"),
             active_turn_id=None,
+            cwd=str(tmp_path),
         ),
     )
     executor = CodexNativeExecutor(bridge_dir=tmp_path)
@@ -189,6 +190,7 @@ def test_web_started_codex_turn_returns_without_waiting_for_terminal_event(
             {
                 "threadId": "thread_123",
                 "input": [{"type": "text", "text": "first"}],
+                "environments": [{"environmentId": "local", "cwd": str(tmp_path)}],
             },
         )
     ]
@@ -214,6 +216,7 @@ def test_goal_command_sets_goal_before_starting_objective_turn(
             thread_id="thread_123",
             codex_home=str(tmp_path / "codex-home"),
             active_turn_id=None,
+            cwd=str(tmp_path),
         ),
     )
     executor = CodexNativeExecutor(bridge_dir=tmp_path)
@@ -234,6 +237,7 @@ def test_goal_command_sets_goal_before_starting_objective_turn(
             {
                 "threadId": "thread_123",
                 "input": [{"type": "text", "text": "Finish the implementation and tests"}],
+                "environments": [{"environmentId": "local", "cwd": str(tmp_path)}],
             },
         ),
     ]
@@ -261,6 +265,7 @@ def test_system_prompt_does_not_override_collaboration_mode(
             thread_id="thread_123",
             codex_home=str(tmp_path / "codex-home"),
             active_turn_id=None,
+            cwd=str(tmp_path),
         ),
     )
     executor = CodexNativeExecutor(bridge_dir=tmp_path)
@@ -282,6 +287,7 @@ def test_system_prompt_does_not_override_collaboration_mode(
             {
                 "threadId": "thread_123",
                 "input": [{"type": "text", "text": "hello"}],
+                "environments": [{"environmentId": "local", "cwd": str(tmp_path)}],
             },
         ),
     ]
@@ -760,6 +766,7 @@ def _start_state(tmp_path: Path) -> None:
             thread_id="thread_123",
             codex_home=str(tmp_path / "codex-home"),
             active_turn_id=None,
+            cwd=str(tmp_path),
         ),
     )
 
@@ -834,6 +841,7 @@ def test_web_model_pick_applied_via_thread_settings_update(
             {
                 "threadId": "thread_123",
                 "input": [{"type": "text", "text": "hello"}],
+                "environments": [{"environmentId": "local", "cwd": str(tmp_path)}],
             },
         ),
     ]
@@ -903,8 +911,8 @@ def test_no_settings_update_when_overrides_unset(
 
     A native thread that never touches the web picker must keep its
     launch-pinned model — a stray ``thread/settings/update`` could
-    clobber it. An empty/None config issues only the bare
-    ``{threadId, input}`` ``turn/start``.
+    clobber it. An empty/None config still selects the native local
+    environment on ``turn/start``.
     """
     _FakeCodexNativeClient.requests = []
     _FakeCodexNativeClient.created = []
@@ -916,11 +924,18 @@ def test_no_settings_update_when_overrides_unset(
     _start_state(tmp_path)
     executor = CodexNativeExecutor(bridge_dir=tmp_path)
 
-    # A config with neither field set produces the bare turn/start params.
+    # A config with neither field set still selects the native local environment.
     _run_turn_with_config(executor, "a", ExecutorConfig())
 
     assert _FakeCodexNativeClient.requests == [
-        ("turn/start", {"threadId": "thread_123", "input": [{"type": "text", "text": "a"}]}),
+        (
+            "turn/start",
+            {
+                "threadId": "thread_123",
+                "input": [{"type": "text", "text": "a"}],
+                "environments": [{"environmentId": "local", "cwd": str(tmp_path)}],
+            },
+        ),
     ]
 
 

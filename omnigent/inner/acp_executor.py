@@ -93,6 +93,11 @@ class _PolicyVerdict(Protocol):
 
 _PolicyEvaluator: TypeAlias = Callable[[str, _AcpJsonObject], Awaitable[_PolicyVerdict]]
 _ElicitationHandler: TypeAlias = Callable[[str, _AcpJsonObject], Awaitable[bool]]
+# Choice-aware elicitation: offers the agent's own permission options and returns
+# the chosen label (``None`` = declined). Optional; falls back to the yes/no form.
+_ElicitationChoiceHandler: TypeAlias = Callable[
+    [str, _AcpJsonObject, Sequence[str]], Awaitable[str | None]
+]
 _ToolExecutor: TypeAlias = Callable[[str, _AcpJsonObject], Awaitable[_AcpJsonObject]]
 
 # ACP error code an agent maps to a filesystem "not found" (ENOENT) when a
@@ -185,6 +190,11 @@ class AcpAgentConfig:
         the agent authenticates with — an agent that reads a variable must name
         it here (or in ``os_env.sandbox.env_passthrough``) or it starts
         unauthenticated. Names only; values come from the host environment.
+    :param permission_mode: Omnigent permission stance, e.g. ``"auto"``
+        (default) or ``"bypassPermissions"``. Only the latter changes anything:
+        it skips the human approval card for a request no policy had an opinion
+        on, matching claude-sdk's ``can_use_tool`` gate. Policy still runs in
+        every mode, so a DENY still blocks and an explicit ASK still prompts.
     """
 
     command: str
@@ -194,6 +204,7 @@ class AcpAgentConfig:
     send_model_in_session_new: bool = False
     omnigent_mcp: bool = True
     env_passthrough: tuple[str, ...] = ()
+    permission_mode: str = "auto"
 
 
 class _AcpRequestError(Exception):
@@ -332,9 +343,11 @@ class AcpExecutor(Executor):
         self._image_supported: bool = False
         self._system_prompt_sent: bool = False
 
-        # ACP toolCallId → tool name, so a later tool_call_update can close the
-        # right tool card with the name from the originating tool_call.
+        # ACP toolCallId → tool name / rawInput from the originating tool_call, so
+        # a later tool_call_update can close the right tool card, and a permission
+        # request that names only the id can still say what is about to run.
         self._tool_names: dict[str, str] = {}
+        self._tool_inputs: dict[str, _AcpJsonObject] = {}
 
         # Context-window size (tokens) reported via ``usage_update``; surfaced by
         # :meth:`max_context_tokens` so the UI context meter fills.
@@ -346,6 +359,7 @@ class AcpExecutor(Executor):
         # wired (standalone / unit tests) → permission falls back to allow.
         self._policy_evaluator: _PolicyEvaluator | None = None
         self._elicitation_handler: _ElicitationHandler | None = None
+        self._elicitation_choice_handler: _ElicitationChoiceHandler | None = None
         # Adapter-injected tool-execution bridge (the same ``_tool_executor``
         # attribute the SDK harnesses use); backs the Omnigent MCP relay.
         self._tool_executor: _ToolExecutor | None = None
@@ -714,8 +728,8 @@ class AcpExecutor(Executor):
         error: _AcpJsonObject | None = None
         try:
             if method == _AGENT_REQUEST_REQUEST_PERMISSION:
-                allow = await self._decide_permission(params)
-                result = self._permission_outcome(params, allow=allow)
+                allow, option_id = await self._decide_permission(params)
+                result = self._permission_outcome(params, allow=allow, option_id=option_id)
             elif method == "fs/read_text_file" and self._fs_delegation:
                 result = await self._handle_fs_read(params)
             elif method == "fs/write_text_file" and self._fs_delegation:
@@ -798,40 +812,137 @@ class AcpExecutor(Executor):
     # Permission (session/request_permission) → policy + elicitation
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _extract_tool_call(params: _AcpJsonObject) -> tuple[str, _AcpJsonObject]:
+    def _extract_tool_call(self, params: _AcpJsonObject) -> tuple[str, _AcpJsonObject]:
         """Pull ``(tool_name, tool_input)`` from a ``session/request_permission``.
 
         ACP's ``toolCall`` carries a human ``title`` (e.g. ``"shell"``), a
-        ``kind`` (e.g. ``"execute"``), and a ``rawInput`` dict. We prefer the
-        title, else the kind. (Vendor-specific ``_meta`` tool names — e.g.
-        Goose's ``_meta.goose.toolCall.toolName`` — are not read here; ``title``
-        is the portable name every ACP agent supplies.)
+        ``kind`` (e.g. ``"execute"``), and a ``rawInput`` dict; prefer the title,
+        else the kind. An agent may instead send the request bare, carrying only
+        ``toolCallId``, so fall back to what the originating ``tool_call`` update
+        reported for that id — it always arrives first. Without that fallback a
+        bare request degrades to ``"tool"`` with no arguments, so the approval
+        card cannot say what is about to run and no TOOL_CALL policy rule can
+        match it (rules gate on the tool name, then read its arguments).
+
+        (Vendor-specific ``_meta`` tool names — e.g. Goose's
+        ``_meta.goose.toolCall.toolName`` — are not read here; ``title`` is the
+        portable name and ``toolCallId`` the portable correlation.)
         """
         tool_call = params.get("toolCall") or {}
-        name = tool_call.get("title") or tool_call.get("kind") or "tool"
+        call_id = tool_call.get("toolCallId")
+        call_id = call_id if isinstance(call_id, str) else None
+        name = (
+            tool_call.get("title")
+            or tool_call.get("kind")
+            or (self._tool_names.get(call_id) if call_id else None)
+            or "tool"
+        )
         args = tool_call.get("rawInput")
         if not isinstance(args, dict):
-            args = {}
+            cached = self._tool_inputs.get(call_id) if call_id else None
+            args = cached if isinstance(cached, dict) else {}
         return str(name), args
 
-    async def _decide_permission(self, params: _AcpJsonObject) -> bool:
-        """Decide allow/deny for a permission request — policy then elicitation.
+    @property
+    def _bypass_permissions(self) -> bool:
+        """Whether the user opted out of approval cards for this agent.
+
+        Mirrors :class:`~omnigent.inner.claude_sdk_executor.ClaudeSDKExecutor`'s
+        ``can_use_tool`` stance: ``"bypassPermissions"`` and nothing else, so the ``"auto"``
+        default keeps prompting. (Cursor also treats ``"auto"`` as no-prompt;
+        ACP agents ask only about actions they consider permission-worthy, so
+        silencing the default would drop meaningful prompts.)
+        """
+        return self._config.permission_mode == "bypassPermissions"
+
+    @staticmethod
+    def _permission_options(params: _AcpJsonObject) -> list[_AcpJsonObject]:
+        """The agent's offered options, each an ``{optionId, name, kind}`` dict."""
+        return [o for o in (params.get("options") or []) if isinstance(o, dict)]
+
+    def _scoped_options(self, params: _AcpJsonObject) -> list[tuple[str, _AcpJsonObject]] | None:
+        """Label the agent's options for a choice card, or ``None`` if unusable.
+
+        Unusable means: fewer than two options, a blank or duplicated label (the
+        reply names the label, so duplicates are ambiguous), or no ``reject_*``
+        option — a choice card replaces the Approve/Reject buttons, so without one
+        the user would have no way to say no.
+        """
+        labeled = [(str(o.get("name") or "").strip(), o) for o in self._permission_options(params)]
+        if len(labeled) < 2 or any(not name for name, _ in labeled):
+            return None
+        labels = [name for name, _ in labeled]
+        if len(set(labels)) != len(labels):
+            return None
+        if not any("reject" in str(o.get("kind", "")) for _, o in labeled):
+            return None
+        return labeled
+
+    async def _ask_user(
+        self, tool_name: str, tool_input: _AcpJsonObject, params: _AcpJsonObject
+    ) -> tuple[bool, str | None]:
+        """Route a permission request to the user; return ``(allowed, option_id)``.
+
+        Prefers the choice bridge, which puts the agent's *own* options on the
+        card: picking "allow this command for the session" is one click the agent
+        then honors itself, so the same command class stops re-prompting. Falls
+        back to the yes/no bridge, whose grant stays once-scoped.
+        """
+        choice_handler = self._elicitation_choice_handler
+        labeled = self._scoped_options(params) if choice_handler is not None else None
+        if choice_handler is not None and labeled is not None:
+            chosen = await choice_handler(tool_name, tool_input, [name for name, _ in labeled])
+            if chosen is None:
+                return False, None
+            picked = next((o for name, o in labeled if name == chosen), None)
+            if picked is None:
+                logger.warning(
+                    "acp permission choice %r was not offered; denying tool=%s", chosen, tool_name
+                )
+                return False, None
+            option_id = picked.get("optionId")
+            allowed = "allow" in str(picked.get("kind", ""))
+            logger.info(
+                "acp permission %s by user (scope=%s): tool=%s",
+                "allowed" if allowed else "denied",
+                option_id,
+                tool_name,
+            )
+            return allowed, (option_id if isinstance(option_id, str) else None)
+
+        handler = self._elicitation_handler
+        if handler is None:
+            return False, None
+        return bool(await handler(tool_name, tool_input)), None
+
+    async def _decide_permission(self, params: _AcpJsonObject) -> tuple[bool, str | None]:
+        """Decide a permission request — policy then elicitation.
 
         1. **TOOL_CALL policy** (:attr:`_policy_evaluator`): a hard
            ``POLICY_ACTION_DENY`` denies; ``POLICY_ACTION_ASK`` defers to
            elicitation (and **fails closed** when no handler is wired);
            ``ALLOW`` / unspecified falls through.
-        2. **Human-consent elicitation** (:attr:`_elicitation_handler`): routes
-           to the user via a web approval card and returns their accept/deny.
+        2. **Human-consent elicitation**: the agent's own options via
+           :attr:`_elicitation_choice_handler`, else a yes/no card via
+           :attr:`_elicitation_handler`. Skipped under
+           ``permission_mode="bypassPermissions"`` — but only for a request no
+           policy had an opinion on, so a DENY still blocks and a policy that
+           says ASK still prompts.
 
         When neither bridge is wired (standalone / unit tests), falls back to
         allow so direct use of the executor isn't blocked. In normal runner
         operation the adapter installs both, so destructive actions are gated.
+
+        :returns: ``(allowed, option_id)`` — *option_id* is the scope the user
+            picked from the agent's options, or ``None`` to let
+            :meth:`_permission_outcome` choose the narrowest grant.
         """
         tool_name, tool_input = self._extract_tool_call(params)
-        handler = getattr(self, "_elicitation_handler", None)
         policy_eval = getattr(self, "_policy_evaluator", None)
+        # Either bridge can carry the question to the user.
+        can_ask = (
+            self._elicitation_handler is not None or self._elicitation_choice_handler is not None
+        )
 
         if policy_eval is not None:
             action: str | None
@@ -845,45 +956,47 @@ class AcpExecutor(Executor):
                 action = None
             if action == "POLICY_ACTION_DENY":
                 logger.info("acp permission denied by policy: tool=%s", tool_name)
-                return False
+                return False, None
             if action == "POLICY_ACTION_ASK":
-                if handler is None:
+                if not can_ask:
                     logger.warning(
                         "acp TOOL_CALL policy ASK with no elicitation handler; denying tool=%s",
                         tool_name,
                     )
-                    return False
-                allowed = bool(await handler(tool_name, tool_input))
-                logger.info(
-                    "acp permission %s by user (policy ASK): tool=%s",
-                    "allowed" if allowed else "denied",
-                    tool_name,
-                )
-                return allowed
+                    return False, None
+                return await self._ask_user(tool_name, tool_input, params)
             # ALLOW / UNSPECIFIED / unknown → fall through to elicitation.
 
-        if handler is not None:
-            allowed = bool(await handler(tool_name, tool_input))
-            logger.info(
-                "acp permission %s by user: tool=%s",
-                "allowed" if allowed else "denied",
-                tool_name,
-            )
-            return allowed
+        if can_ask and not self._bypass_permissions:
+            return await self._ask_user(tool_name, tool_input, params)
+        if can_ask:
+            # bypassPermissions: no policy had an opinion and the user asked not
+            # to be prompted. Logged at info so the audit trail still names what
+            # ran unreviewed. Answered per-request (never the agent's own bypass
+            # option) so every later call stays visible to policy.
+            logger.info("acp permission allowed (bypassPermissions): tool=%s", tool_name)
+            return True, None
 
         logger.debug("acp permission allowed (no policy/elicitation wired): tool=%s", tool_name)
-        return True
+        return True, None
 
     @staticmethod
-    def _permission_outcome(params: _AcpJsonObject, *, allow: bool) -> _AcpJsonObject:
-        """Map an allow/deny decision to an ACP permission ``outcome``.
+    def _permission_outcome(
+        params: _AcpJsonObject, *, allow: bool, option_id: str | None = None
+    ) -> _AcpJsonObject:
+        """Map a decision to an ACP permission ``outcome``.
 
-        On allow, prefer a once-scoped grant (``allow_once``) over
-        ``allow_always`` so we never persist a blanket "always allow". On deny,
-        pick a ``reject_*`` option, or ``cancelled`` when none is offered. The
-        agent's options carry both ``optionId`` and ``kind`` (e.g. ``allow_once``).
+        *option_id* is a scope the user picked from the agent's own options; it is
+        echoed only after confirming the agent offered it, so we never send an id
+        it doesn't know. Without one: on allow prefer a once-scoped grant
+        (``allow_once``) over ``allow_always``, so a blanket "always allow" is
+        only ever sent because the user chose it; on deny pick a ``reject_*``
+        option, or ``cancelled`` when none is offered. The agent's options carry
+        both ``optionId`` and ``kind`` (e.g. ``allow_once``).
         """
-        options = [o for o in (params.get("options") or []) if isinstance(o, dict)]
+        options = AcpExecutor._permission_options(params)
+        if option_id is not None and any(o.get("optionId") == option_id for o in options):
+            return {"outcome": {"outcome": "selected", "optionId": option_id}}
 
         def _pick(*kinds: str) -> _AcpJsonObject | None:
             for kind in kinds:
@@ -1069,6 +1182,7 @@ class AcpExecutor(Executor):
             args = raw_input if isinstance(raw_input, dict) else {}
             if isinstance(call_id, str) and call_id:
                 self._tool_names[call_id] = str(name)
+                self._tool_inputs[call_id] = args
                 events.append(
                     ToolCallRequest(name=str(name), args=args, metadata={"call_id": call_id})
                 )
@@ -1080,6 +1194,7 @@ class AcpExecutor(Executor):
                 _TOOL_STATUS_FAILED,
             ):
                 name = self._tool_names.pop(call_id, "tool")
+                self._tool_inputs.pop(call_id, None)
                 events.append(
                     ToolCallComplete(
                         name=name,

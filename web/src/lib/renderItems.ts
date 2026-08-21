@@ -189,8 +189,9 @@ export type Bubble =
        * trailing answer of its own.
        */
       continued?: boolean;
-      /** Epoch seconds of the first block in the group — server-stamped
-       *  from history, client-stamped while live. Display-only. */
+      /** Freshest epoch stamp in the group (latest activity) —
+       *  server-stamped from history, client-stamped while live.
+       *  Display-only. */
       createdAtS?: number;
     }
   | { kind: "compaction_loading"; itemId: string }
@@ -960,10 +961,31 @@ function walkBubbles(
     lastBubbleCount = 1;
     const workedForS = turnWorkedForS(groupBlocks);
     const lastActivityAtS = turnLastActivityAtS(groupBlocks);
-    // Server stamp on cold load, client stamp while live — display only.
+    // Freshest stamp in the group — server stamp on cold load, client
+    // stamp while live, either clock display-only. The max tracks latest
+    // activity and never jumps back for a backdated tail block.
+    // A delayed result backdated to an earlier turn is absorbed into this
+    // group but renders into its own turn's card (crossBubbleResults), so
+    // only results whose call lives here count as this bubble's activity.
+    const localResultKeys = new Set<string>();
+    for (const bk of groupBlocks) {
+      if (bk.type === "tool_group") {
+        for (const ex of bk.executions) {
+          localResultKeys.add(`${bk.ctx.responseId}:${ex.callId}`);
+        }
+      }
+    }
     const groupCreatedAtS = groupBlocks
+      .filter(
+        (bk) =>
+          bk.type !== "tool_result" || localResultKeys.has(`${bk.ctx.responseId}:${bk.callId}`),
+      )
       .map((bk) => bk.ctx.createdAtS ?? bk.ctx.clientCreatedAtS)
-      .find((v) => v !== undefined);
+      .reduce<number | undefined>(
+        (freshest, v) =>
+          v !== undefined && (freshest === undefined || v > freshest) ? v : freshest,
+        undefined,
+      );
     bubbles.push({
       kind: "assistant",
       responseId: groupResponseId,

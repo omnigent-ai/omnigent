@@ -661,14 +661,14 @@ def test_agent_read_tools_registered_for_every_agent() -> None:
     assert "sys_agent_download" in names
     assert "sys_agent_list" in names
     # get/download require a session_id (an agent is only inspectable
-    # while running in some session); list takes no parameters.
+    # while running in some session); list exposes optional pagination.
     for tool_name in ("sys_agent_get", "sys_agent_download"):
         schema = next(s for s in mgr.get_tool_schemas() if s["function"]["name"] == tool_name)
         assert "session_id" in schema["function"]["parameters"]["required"]
     list_schema = next(
         s for s in mgr.get_tool_schemas() if s["function"]["name"] == "sys_agent_list"
     )
-    assert list_schema["function"]["parameters"]["properties"] == {}
+    assert set(list_schema["function"]["parameters"]["properties"]) == {"limit", "cursor"}
 
 
 # ── MCP integration ──────────────────────────────────────

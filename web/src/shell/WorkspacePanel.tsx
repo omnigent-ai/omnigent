@@ -5,18 +5,16 @@ import {
   FolderTreeIcon,
   FileDiffIcon,
   GlobeIcon,
-  ListTodoIcon,
   Loader2Icon,
   MaximizeIcon,
   MinimizeIcon,
   PlusIcon,
-  SquareTerminalIcon,
   TerminalIcon,
   XIcon,
 } from "lucide-react";
 import { type ReactElement, useCallback, useEffect, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
-import { isOwnerLevel } from "@/lib/permissionsApi";
+import { isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -38,9 +36,7 @@ import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import { FilesPanel } from "./FilesPanel";
 import { FileViewer } from "./FileViewer";
 import type { ChangedSort } from "./FlatFileList";
-import { InlineTerminalsSection } from "./InlineTerminalsSection";
 import { SubagentsPanel } from "./SubagentsPanel";
-import { TodoPanel } from "./TodoPanel";
 import { useTerminalStatuses } from "./useTerminalStatuses";
 import { type RightRailTab, TAB_BADGE_BASE } from "./railTabs";
 import { Button } from "../components/ui/button";
@@ -120,12 +116,20 @@ function shellConnectState(liveness: SessionLiveness | undefined): ShellConnectS
 function NewTabMenu({
   conversationId,
   onOpenTerminal,
+  onCreateStart,
+  onCreateError,
   triggerClassName,
   liveness,
 }: {
   conversationId: string;
   /** Open a freshly-created terminal as a rail tab by its tab key. */
   onOpenTerminal: (key: string) => void;
+  /** Called when a shell create is initiated (before the POST resolves), so
+   *  the shell can be focused as soon as its tab appears in the list. */
+  onCreateStart?: () => void;
+  /** Called when the shell create POST fails, so the caller can disarm the
+   *  focus snapshot armed by ``onCreateStart``. */
+  onCreateError?: () => void;
   /** Extra classes on the trigger wrapper — used to cancel the open-tabs
    *  region's gap so the "+" hugs the last tab. */
   triggerClassName?: string;
@@ -153,8 +157,14 @@ function NewTabMenu({
     preferred !== null && declaredTerminals.includes(preferred) ? preferred : declaredTerminals[0];
 
   const launchShell = (name: string) => {
+    // Signal the create is starting so the shell gets focused the moment its
+    // tab lands in the list — not only when this POST resolves. On a waking
+    // (runner-asleep) session the POST can lag the tab's arrival by seconds;
+    // ``onOpenTerminal`` on success is a backstop for when it's already open.
+    onCreateStart?.();
     create.mutate(name, {
       onSuccess: (info) => onOpenTerminal(terminalTabKey(info)),
+      onError: () => onCreateError?.(),
     });
   };
 
@@ -262,7 +272,7 @@ function NewTabMenu({
 
 // ---------------------------------------------------------------------------
 // FileTabsStrip — open file tabs rendered in the top rail tab strip, as peers
-// of the fixed Files/Terminals/Agents/Tasks tabs. Each tab is a cell with the
+// of the fixed Files/Terminals/Agents tabs. Each tab is a cell with the
 // file's basename and an "x" close button. Clicking the cell activates the
 // tab (opening its viewer); clicking the x closes it. No own scroll container
 // or flex-1: the parent strip's overflow-x-auto scrolls the whole row.
@@ -377,6 +387,8 @@ function FileTabsStrip({
 function TerminalTabsStrip({
   openTerminals,
   activeTerminalKey,
+  closingKey,
+  canClose,
   labelFor,
   onSelect,
   onClose,
@@ -385,6 +397,11 @@ function TerminalTabsStrip({
   openTerminals: string[];
   /** Currently active terminal key, or null when another tab is active. */
   activeTerminalKey: string | null;
+  /** Tab key whose close (kill) is in flight — greyed + non-interactive. */
+  closingKey: string | null;
+  /** Whether the viewer may close (kill) a shell. Closing is server-gated on
+   *  edit access, so a read-only viewer gets no close affordance. */
+  canClose: boolean;
   /** Resolve a tab key to its display label (shell name / session). */
   labelFor: (key: string) => string;
   /** Activate a terminal tab by key. */
@@ -405,23 +422,25 @@ function TerminalTabsStrip({
       {openTerminals.map((key) => {
         const name = labelFor(key);
         const active = key === activeTerminalKey;
+        const closing = key === closingKey;
         return (
           <div
             key={key}
             ref={active ? activeTabRef : undefined}
             role="button"
-            tabIndex={0}
+            tabIndex={closing ? -1 : 0}
             aria-current={active}
+            aria-busy={closing}
             title={name}
-            onClick={() => onSelect(key)}
+            onClick={() => !closing && onSelect(key)}
             onAuxClick={(e) => {
-              if (e.button === 1) {
+              if (e.button === 1 && !closing && canClose) {
                 e.preventDefault();
                 onClose(key);
               }
             }}
             onKeyDown={(e) => {
-              if (e.key === "Enter" || e.key === " ") {
+              if (!closing && (e.key === "Enter" || e.key === " ")) {
                 e.preventDefault();
                 onSelect(key);
               }
@@ -433,23 +452,27 @@ function TerminalTabsStrip({
               active
                 ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
                 : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
+              // Closing: kill is in flight — dim and freeze the tab until it goes.
+              closing && "pointer-events-none opacity-50",
             )}
           >
             <TerminalIcon className="size-4 shrink-0" />
             <span className="min-w-0 truncate text-sm">{name}</span>
-            <span className="absolute inset-y-0 right-0 flex items-center pl-[12px] pr-[4px] opacity-0 transition-opacity group-hover/tab:opacity-100 [background:linear-gradient(to_right,transparent,color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))_40%)]">
-              <button
-                type="button"
-                aria-label={`Close ${name}`}
-                className="flex size-6 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onClose(key);
-                }}
-              >
-                <XIcon className="size-4" />
-              </button>
-            </span>
+            {canClose && (
+              <span className="absolute inset-y-0 right-0 flex items-center pl-[12px] pr-[4px] opacity-0 transition-opacity group-hover/tab:opacity-100 [background:linear-gradient(to_right,transparent,color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))_40%)]">
+                <button
+                  type="button"
+                  aria-label={`Close ${name}`}
+                  className="flex size-6 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onClose(key);
+                  }}
+                >
+                  <XIcon className="size-4" />
+                </button>
+              </span>
+            )}
           </div>
         );
       })}
@@ -483,7 +506,7 @@ function RailTerminalView({
     );
   }
   return (
-    <div key={terminal.id} className="flex h-full min-h-0 flex-col p-2">
+    <div key={terminal.id} className="flex h-full min-h-0 flex-col">
       <TerminalView
         sessionId={conversationId}
         terminalId={terminal.id}
@@ -528,15 +551,6 @@ interface WorkspacePanelProps {
   showBrowserTab: boolean;
   /** Count of changed files, shown as the Changes tab badge. */
   changedCount: number;
-  /**
-   * Whether the Shells tab is available — AppShell's combined gate
-   * (not a native wrapper, AND either a shell exists or the agent's
-   * spec declares shell access, which makes the tab show by default
-   * with its "+ New shell" empty state).
-   */
-  showShellsTab: boolean;
-  /** Number of open shells, shown as the Shells tab badge when > 0. */
-  terminalsLength: number;
   /** How many child agents are actively working (Agents tab badge). */
   subagentsWorking: number;
   /**
@@ -544,12 +558,6 @@ interface WorkspacePanelProps {
    * badge denominator) — starts at 1 for a lone agent.
    */
   agentCount: number;
-  /** Whether the session publishes a todo list (gates the Tasks tab). */
-  todosSupported: boolean;
-  /** Number of completed todos (Tasks tab badge numerator). */
-  todosCompleted: number;
-  /** Total todo count (Tasks tab badge denominator + visibility gate). */
-  todosTotal: number;
   /**
    * The "root" session id for the Agents tab — the active session's
    * parent when inside a child, else the active id. May be null while
@@ -577,6 +585,9 @@ interface WorkspacePanelProps {
   openTerminals: string[];
   /** Active shell tab key, or null when no shell tab is selected. */
   selectedTerminalKey: string | null;
+  /** Tab key whose close (terminal kill) is in flight — rendered greyed and
+   *  non-interactive until it disappears. Null when no close is pending. */
+  closingTerminalKey?: string | null;
   /** Close a single open shell tab by key. */
   onCloseTerminal: (key: string) => void;
   /** Whether the rail is maximized (occupies the full content area). */
@@ -597,13 +608,19 @@ interface WorkspacePanelProps {
    *  connect affordance (Reconnecting… / Offline). Absent is treated as
    *  ready. */
   liveness?: SessionLiveness;
+  /** Called when a shell create is initiated from the "+" menu, so the new
+   *  shell is focused as soon as its tab lands (not only on the create POST). */
+  onShellCreateStart?: () => void;
+  /** Called when the shell create POST fails, so the focus snapshot armed by
+   *  ``onShellCreateStart`` is disarmed and can't grab an unrelated shell. */
+  onShellCreateFailed?: () => void;
 }
 
 /**
  * WorkspacePanel — the desktop right "Workspace" rail, rendered as a
  * floating card (bg-card, rounded, bordered, shadowed) sitting below the
  * full-width chat header band. Internally tabbed between Files, Changes,
- * Terminals, Agents and Tasks so each can claim the full rail height
+ * Terminals and Agents so each can claim the full rail height
  * instead of competing for a vertically-split slot.
  *
  * Desktop-only (``hidden md:flex``): on mobile the rail's contents are
@@ -624,13 +641,8 @@ export function WorkspacePanel({
   showFilesPanel,
   showBrowserTab,
   changedCount,
-  showShellsTab,
-  terminalsLength,
   subagentsWorking,
   agentCount,
-  todosSupported,
-  todosCompleted,
-  todosTotal,
   rootSessionId,
   selectedFilePath,
   openFiles,
@@ -641,6 +653,7 @@ export function WorkspacePanel({
   openTerminalTab,
   openTerminals,
   selectedTerminalKey,
+  closingTerminalKey,
   onCloseTerminal,
   maximized,
   onToggleMaximized,
@@ -650,6 +663,8 @@ export function WorkspacePanel({
   filesPanelShowHidden,
   onShowHiddenChange,
   liveness,
+  onShellCreateStart,
+  onShellCreateFailed,
 }: WorkspacePanelProps) {
   // Memoized so FileViewer's Escape-to-close effect doesn't re-subscribe its
   // window keydown listener on every render — an inline arrow would change
@@ -657,8 +672,8 @@ export function WorkspacePanel({
   const handleCloseTab = useCallback(() => {
     if (selectedFilePath !== null) onCloseFile(selectedFilePath);
   }, [onCloseFile, selectedFilePath]);
-  // Resolve shell tab keys to display labels. The list is already fetched for
-  // the Shells tab / count badge, so this shares the same query cache.
+  // Resolve shell tab keys to display labels. The terminals list is already
+  // fetched elsewhere for the session, so this shares the same query cache.
   const { terminals } = useTerminals(conversationId);
   const terminalLabelFor = useCallback(
     (key: string) => {
@@ -702,14 +717,12 @@ export function WorkspacePanel({
           className="absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors"
         />
       )}
-      {/* Tab strip, in display order Files · Changes · Agents · Shells · Tasks.
+      {/* Tab strip, in display order Files · Changes · Agents.
           Files (full folder tree) and Changes (changed-files-only list) are
           two peer tabs — same gate (an on-disk workspace), same FilesPanel,
           each pinned to one scope. Agents is always present (the Agents panel
-          lists at least the main agent). Shells shows whenever AppShell's gate
-          allows it (the agent declares shell access, or a shell already
-          exists) — the empty state carries the "+ New shell"
-          affordance, so an empty tab is an entry point, not a dead end.
+          lists at least the main agent). Shells have no nav tab — they open as
+          closable soft tabs (see the "+" NewTabMenu / TerminalTabsStrip below).
           The Agents tab keys off ``rootSessionId``, so inside a child
           it lists the siblings + a "main" link back to the parent. */}
       {/* Tab strip: the static nav tabs + divider stay pinned on the left at
@@ -726,9 +739,15 @@ export function WorkspacePanel({
           className="shrink-0"
           // When a file or shell tab is active no fixed trigger should
           // highlight, so feed the radix group a sentinel that matches none of
-          // them. The active file/shell tab carries its own highlight.
+          // them. The active file/shell tab carries its own highlight. Gate the
+          // shell case on the terminal actually being present (same gate as the
+          // content slot below): a sticky selection whose terminal is gone shows
+          // the fallback nav view, so its nav tab must highlight, not "__tab__".
           value={
-            selectedFilePath !== null || selectedTerminalKey !== null ? "__tab__" : rightRailTab
+            selectedFilePath !== null ||
+            (selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey))
+              ? "__tab__"
+              : rightRailTab
           }
           onValueChange={(v) => onRightRailTabChange(v as RightRailTab)}
         >
@@ -781,36 +800,6 @@ export function WorkspacePanel({
                 </span>
               </TabsTrigger>
             </WorkspaceTabTooltip>
-            {showShellsTab && (
-              <WorkspaceTabTooltip label="Shells">
-                <TabsTrigger
-                  value="terminals"
-                  aria-label={terminalsLength > 0 ? `Shells ${terminalsLength}` : "Shells"}
-                  className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
-                >
-                  <SquareTerminalIcon />
-                  <span className="sr-only">Shells</span>
-                  {terminalsLength > 0 && (
-                    <span className="sr-only text-muted-foreground">{terminalsLength}</span>
-                  )}
-                </TabsTrigger>
-              </WorkspaceTabTooltip>
-            )}
-            {todosSupported && todosTotal > 0 && (
-              <WorkspaceTabTooltip label="Tasks">
-                <TabsTrigger
-                  value="todos"
-                  aria-label={`Tasks ${todosCompleted} of ${todosTotal} completed`}
-                  className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
-                >
-                  <ListTodoIcon />
-                  <span className="sr-only">Tasks</span>
-                  <span className="sr-only">
-                    {todosCompleted}/{todosTotal}
-                  </span>
-                </TabsTrigger>
-              </WorkspaceTabTooltip>
-            )}
             {showBrowserTab && (
               <WorkspaceTabTooltip label="Browser">
                 <TabsTrigger
@@ -847,6 +836,8 @@ export function WorkspacePanel({
               <TerminalTabsStrip
                 openTerminals={openTerminals}
                 activeTerminalKey={selectedTerminalKey}
+                closingKey={closingTerminalKey ?? null}
+                canClose={isEditorLevel(permissionLevel)}
                 labelFor={terminalLabelFor}
                 onSelect={openTerminalTab}
                 onClose={onCloseTerminal}
@@ -858,7 +849,9 @@ export function WorkspacePanel({
                 same gap the scroller's gap-0.5 gives between tabs. */}
             <NewTabMenu
               conversationId={conversationId}
+              onCreateError={onShellCreateFailed}
               onOpenTerminal={openTerminalTab}
+              onCreateStart={onShellCreateStart}
               triggerClassName="ml-[2px]"
               liveness={liveness}
             />
@@ -872,6 +865,8 @@ export function WorkspacePanel({
           <NewTabMenu
             conversationId={conversationId}
             onOpenTerminal={openTerminalTab}
+            onCreateStart={onShellCreateStart}
+            onCreateError={onShellCreateFailed}
             liveness={liveness}
           />
         )}
@@ -898,14 +893,14 @@ export function WorkspacePanel({
       </div>
       {/* Tab content — single slot. An open shell tab holds its xterm; a
           file tab holds FileViewer; the Files/Changes tabs show FilesPanel
-          (tree vs changed-only list); the
-          Shells tab holds the list-only inline section (clicking a row
-          opens the shell as a tab above, surfacing its xterm here);
-          Subagents lists the root's children + a "main" link back to the
-          parent. The Shells branch is unreachable when its tab is hidden —
-          native wrappers, claude-native sub-agents, or no shell attached. */}
+          (tree vs changed-only list); Subagents lists the root's children +
+          a "main" link back to the parent. */}
       <div data-workspace-panel-content className="flex min-h-0 flex-1 flex-col overflow-hidden">
-        {selectedTerminalKey !== null ? (
+        {selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey) ? (
+          // Show the selected shell's xterm only while its terminal is actually
+          // present. The selection is sticky (AppShell never prunes it off the
+          // list), so during a transient terminals-list churn this falls back to
+          // the default view and the xterm reappears when the terminal returns.
           <RailTerminalView
             conversationId={conversationId}
             terminalKey={selectedTerminalKey}
@@ -930,10 +925,6 @@ export function WorkspacePanel({
           <BrowserPane conversationId={conversationId} className="min-h-0 flex-1" />
         ) : rightRailTab === "subagents" && rootSessionId ? (
           <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
-        ) : rightRailTab === "todos" && todosSupported ? (
-          <TodoPanel frameless />
-        ) : rightRailTab === "terminals" && showShellsTab ? (
-          <InlineTerminalsSection conversationId={conversationId} onExpand={openTerminalTab} />
         ) : (
           showFilesPanel && (
             <FilesPanel

@@ -213,6 +213,56 @@ describe("BubbleView dispatch", () => {
     expect(bubble.firstElementChild).toHaveClass("w-full");
   });
 
+  const errorItem = (): AssistantBubble["items"][number] => ({
+    kind: "error",
+    itemId: "err_1",
+    message: "Required terminal exited unexpectedly; the runtime is no longer available.",
+    source: "execution",
+    code: "required_terminal_exited",
+  });
+
+  const errorBubble = (items: AssistantBubble["items"]): AssistantBubble => ({
+    kind: "assistant",
+    responseId: "resp_err",
+    stableId: "resp_err",
+    lifecycle: "completed",
+    error: null,
+    items,
+    createdAtS: 1_750_000_000,
+  });
+
+  it("spans the chat column for an error-only bubble, with no hover footer", () => {
+    // WHY: an error banner is a thread-level element — its dashed rule must
+    // span the width a long-text turn takes (not shrink-wrap the 560px pill
+    // via MessageContent's w-fit), and the timestamp/actions chrome belongs
+    // to assistant prose, never to the error.
+    render(<BubbleView bubble={errorBubble([errorItem()])} />);
+
+    const bubble = screen.getByTestId("message-bubble");
+    expect(screen.getByTestId("error-pill")).toBeInTheDocument();
+    expect(bubble.firstElementChild).toHaveClass("w-full");
+    expect(screen.queryByTestId("message-timestamp")).not.toBeInTheDocument();
+  });
+
+  it("spans the chat column for a text+error turn and keeps the footer", () => {
+    // WHY: a mid-turn error shares the bubble with prose — the rule still
+    // spans the full column even when the prose is short, and the footer
+    // stays because the timestamp/actions describe the text.
+    render(
+      <BubbleView
+        bubble={errorBubble([
+          { kind: "text", itemId: "t1", text: "short answer", final: true },
+          errorItem(),
+        ])}
+      />,
+    );
+
+    const bubble = screen.getByTestId("message-bubble");
+    expect(screen.getByTestId("error-pill")).toBeInTheDocument();
+    expect(bubble.firstElementChild).toHaveClass("w-full");
+    expect(screen.getByTestId("message-timestamp")).toBeInTheDocument();
+  });
+
   it("marks a cancelled assistant turn as Interrupted", () => {
     // WHY: the cancelled lifecycle branch surfaces an explicit Interrupted
     // note so a truncated turn doesn't read as a complete answer.

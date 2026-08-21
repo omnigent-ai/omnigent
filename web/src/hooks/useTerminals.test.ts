@@ -12,6 +12,7 @@ import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createTerminal,
+  deleteTerminal,
   fetchTerminals,
   inventoryTerminals,
   isAgentTerminalKey,
@@ -417,6 +418,36 @@ describe("createTerminal", () => {
       ),
     );
     await expect(createTerminal("conv_abc", "zsh")).rejects.toThrow(/not declared/);
+  });
+});
+
+describe("deleteTerminal", () => {
+  beforeEach(() => {
+    fetchMock.mockReset();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("DELETEs the terminal resource by id", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse(null, { ok: true, status: 204 }));
+
+    await deleteTerminal("conv_abc", "terminal_bash_s1");
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1");
+    expect(init.method).toBe("DELETE");
+  });
+
+  it("treats a 404 (already gone) as success", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse(null, { ok: false, status: 404 }));
+    await expect(deleteTerminal("conv_abc", "terminal_gone")).resolves.toBeUndefined();
+  });
+
+  it("throws on a non-404 failure", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse(null, { ok: false, status: 500 }));
+    await expect(deleteTerminal("conv_abc", "terminal_bash_s1")).rejects.toThrow(/delete failed/);
   });
 });
 

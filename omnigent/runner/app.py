@@ -170,6 +170,25 @@ from omnigent.tools.builtins.load_skill import (
 
 _logger = logging.getLogger(__name__)
 
+# Claude-native session model listing: how long one request waits inline for
+# the probe before answering 503-pending, and how long the probe may stay
+# pending before the configured rows are served instead. Module-level so
+# tests can patch the pacing.
+_CLAUDE_MODEL_OPTIONS_INLINE_WAIT_S = 2.5
+
+# Claude-native model switch confirmation: how long to watch the pane's
+# statusLine snapshot for the switched model after typing ``/model``, and how
+# often to re-read it. Module-level so tests can patch the pacing.
+_CLAUDE_MODEL_CONFIRM_TIMEOUT_S = 10.0
+_CLAUDE_MODEL_CONFIRM_POLL_S = 0.25
+
+# How long the detached watcher keeps answering a /model confirm dialog that
+# pops after the active turn settles (a mid-turn switch queues in the
+# composer), and how often it looks. Long turns are common; the watch is
+# cheap (one tmux capture per poll) and never types blind.
+_CLAUDE_MODEL_LATE_DIALOG_BUDGET_S = 1200.0
+_CLAUDE_MODEL_LATE_DIALOG_POLL_S = 2.0
+
 
 def _warn_unresolved_sub_agent(session_id: str | None, sub_agent_name: str) -> None:
     """
@@ -2070,6 +2089,10 @@ def create_runner_app(
     _active_turns: dict[str, asyncio.Task[None] | None] = {}
     app.state.active_turns = _active_turns
     _native_pane_status: dict[str, str] = {}
+    app.state.native_pane_status = _native_pane_status
+    # Detached watchers answering a /model confirm dialog that pops after
+    # the active turn settles (a mid-turn switch queues in the composer).
+    _model_dialog_watchers: set[asyncio.Task[None]] = set()
     _session_message_buffers: dict[str, list[dict[str, Any]]] = {}
     app.state.session_message_buffers = _session_message_buffers
     _author_attribution_sessions: set[str] = set()
@@ -4075,7 +4098,16 @@ def create_runner_app(
             return Response(status_code=204)
         state = await _codex_native_bridge_state_for_session(conv_id, action="settings update")
         if state is None:
-            return Response(status_code=204)
+            # No loaded Codex bridge means nothing applied the settings; a
+            # silent 204 here would let the caller claim a switch the
+            # app-server never saw.
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "codex_native_settings_update_failed",
+                    "detail": "Codex-native settings update requires a loaded Codex bridge.",
+                },
+            )
 
         codex_client = client_for_transport(
             state.socket_path,
@@ -4126,7 +4158,13 @@ def create_runner_app(
                 if resp.status_code == 200:
                     snapshot = resp.json()
                     if isinstance(snapshot, dict):
-                        raw_model = snapshot.get("model_override") or snapshot.get("llm_model")
+                        # ``llm_model`` is the harness's own report — the model
+                        # the pane is actually on. ``model_override`` is only a
+                        # request and may predate a relaunch or an unconfirmed
+                        # switch, so it is the fallback, not the lead: a
+                        # plan-mode toggle must re-assert the pane's real
+                        # model, never resurrect a stale ask.
+                        raw_model = snapshot.get("llm_model") or snapshot.get("model_override")
                         if isinstance(raw_model, str) and raw_model.strip():
                             model = raw_model.strip()
                         raw_effort = snapshot.get("reasoning_effort")
@@ -4188,7 +4226,9 @@ def create_runner_app(
         from omnigent.codex_native_app_server import (
             client_for_transport,
             list_codex_model_options,
+            mark_launch_default,
         )
+        from omnigent.codex_native_bridge import read_codex_home_config_model
 
         state = await _codex_native_bridge_state_for_session(
             conv_id,
@@ -4204,10 +4244,48 @@ def create_runner_app(
         )
         try:
             await codex_client.connect()
-            return await list_codex_model_options(codex_client)
+            rows = await list_codex_model_options(codex_client)
         finally:
             with contextlib.suppress(Exception):
                 await codex_client.close()
+        active_model = await asyncio.to_thread(
+            read_codex_home_config_model,
+            Path(state.codex_home),
+        )
+        marked = mark_launch_default(rows, active_model)
+        # Write the live account rows back to the shared catalog store so the
+        # pre-launch picker converges to account truth after the first
+        # session — keeping the SHAPE's stored default (a session's own pin
+        # must not become the host-wide default).
+        asyncio.get_running_loop().create_task(
+            _write_back_codex_catalog([dict(row) for row in rows])
+        )
+        return marked
+
+    async def _write_back_codex_catalog(rows: list[_JsonObject]) -> None:
+        try:
+            from omnigent import model_catalog_store
+            from omnigent.codex_native_app_server import (
+                codex_catalog_fingerprint,
+                mark_launch_default,
+                resolve_native_codex_launch,
+            )
+
+            launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
+            fingerprint = codex_catalog_fingerprint(launch)
+            stored = model_catalog_store.read_catalog("codex-native", fingerprint)
+            stored_default = next(
+                (row.get("id") for row in stored or [] if row.get("isDefault") is True),
+                None,
+            )
+            shaped = mark_launch_default(
+                rows, stored_default if isinstance(stored_default, str) else None
+            )
+            await asyncio.to_thread(
+                model_catalog_store.write_catalog, "codex-native", fingerprint, shaped
+            )
+        except Exception:  # noqa: BLE001 — write-back is best-effort
+            _logger.debug("codex model-catalog write-back skipped", exc_info=True)
 
     async def _handle_pi_native_model_change(
         conv_id: str,
@@ -4310,6 +4388,48 @@ def create_runner_app(
             )
         return Response(status_code=204)
 
+    async def _watch_late_model_dialog(
+        conv_id: str,
+        bridge_dir: Path,
+        expected: set[str],
+    ) -> None:
+        """Answer a ``/model`` confirm dialog that pops after the active turn.
+
+        A mid-turn switch queues in Claude's composer; the confirm dialog
+        renders only when the turn settles — potentially minutes after the
+        injection's own watch and the request's confirm window. This watcher
+        presses Enter ONLY when the model dialog is verifiably on screen
+        (never blind), stops as soon as the statusLine reports one of the
+        expected spellings, and gives up quietly after its budget — the
+        persisted request and the forwarder's verbatim report remain the
+        authoritative record either way.
+        """
+        from omnigent.claude_native_bridge import (
+            SWITCH_MODEL_DIALOG_HINT,
+            confirm_dialog_if_open,
+            read_claude_status_model,
+        )
+
+        deadline = time.monotonic() + _CLAUDE_MODEL_LATE_DIALOG_BUDGET_S
+        while time.monotonic() < deadline:
+            try:
+                current = await asyncio.to_thread(read_claude_status_model, bridge_dir)
+                if current and current in expected:
+                    return
+                await asyncio.to_thread(
+                    confirm_dialog_if_open, bridge_dir, hint=SWITCH_MODEL_DIALOG_HINT
+                )
+            except Exception:  # noqa: BLE001 — best-effort; the report reconciles
+                _logger.debug(
+                    "late model-dialog watch errored for session=%s", conv_id, exc_info=True
+                )
+                return
+            await asyncio.sleep(_CLAUDE_MODEL_LATE_DIALOG_POLL_S)
+        _logger.info(
+            "late model-dialog watch for session=%s ended without a confirmed switch",
+            conv_id,
+        )
+
     async def _handle_claude_native_model_change(
         conv_id: str,
         model: str | None,
@@ -4321,7 +4441,9 @@ def create_runner_app(
         from omnigent.claude_native_bridge import (
             SWITCH_MODEL_DIALOG_HINT,
             bridge_dir_for_bridge_id,
+            confirm_dialog_if_open,
             inject_slash_command,
+            read_claude_status_model,
             read_model_env,
         )
 
@@ -4362,6 +4484,7 @@ def create_runner_app(
                 },
             )
         command = f"/model {model_arg}"
+        baseline = await asyncio.to_thread(read_claude_status_model, bridge_dir)
         try:
             # Accepted trade-off: ``/model <id>`` also saves the pick as the
             # person's global default in ``~/.claude/settings.json``. Driving
@@ -4383,7 +4506,80 @@ def create_runner_app(
                     "detail": _client_safe_error_detail(exc, context="claude-native model change"),
                 },
             )
-        return Response(status_code=204)
+        # Verify against the statusLine snapshot the forwarder already polls:
+        # Claude rewrites it on every render, including right after ``/model``.
+        # Expected spellings come from this session's own catalog rows (every
+        # row's ``model`` is the harness's own resolution), plus the typed arg
+        # and its selection mapping. Success replies only after the pane
+        # actually switched; the swallowed-dialog case answers non-2xx so the
+        # server surfaces it instead of the row silently claiming the pick.
+        expected = {value for value in (resolved_model, model_arg) if value}
+        for row in _claude_model_options_rows.get(conv_id) or []:
+            if row.get("id") in (selected_model, resolved_model) or row.get("model") in (
+                selected_model,
+                resolved_model,
+            ):
+                row_model = row.get("model")
+                if isinstance(row_model, str) and row_model:
+                    expected.add(row_model)
+        deadline = time.monotonic() + _CLAUDE_MODEL_CONFIRM_TIMEOUT_S
+        while True:
+            current = await asyncio.to_thread(read_claude_status_model, bridge_dir)
+            if current and (current in expected or (baseline and current != baseline)):
+                # The pane switched. When it landed somewhere other than the
+                # expected spelling, the forwarder's verbatim report is the
+                # truth the UI will settle on — the command still took effect.
+                return Response(status_code=204)
+            if baseline is None and current is None:
+                # No statusLine snapshot on either side of the injection: a
+                # live wrapper-managed pane writes one on every render, so
+                # this is a shape without the wrapper — the switch is
+                # unverifiable, not failed. Report success and leave the
+                # forwarder to reconcile the row.
+                _logger.warning(
+                    "claude-native model change for session=%s could not be verified: "
+                    "no statusLine snapshot in %s",
+                    conv_id,
+                    bridge_dir,
+                )
+                return Response(status_code=204)
+            # The confirm dialog can render well after the injection's own
+            # short watch (a warm repaint, or a queued command surfacing) —
+            # answer it whenever it shows inside the window.
+            await asyncio.to_thread(
+                confirm_dialog_if_open, bridge_dir, hint=SWITCH_MODEL_DIALOG_HINT
+            )
+            if time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(_CLAUDE_MODEL_CONFIRM_POLL_S)
+        if _native_pane_status.get(conv_id) in ("running", "waiting"):
+            # Mid-turn switch: Claude queues the typed command and applies it
+            # when the turn settles — its confirm dialog can pop minutes from
+            # now. Not a failure: answer success, keep a detached watcher on
+            # the late dialog, and let the forwarder's report settle the
+            # picker when the switch actually lands.
+            watcher = asyncio.create_task(
+                _watch_late_model_dialog(conv_id, bridge_dir, expected),
+                name=f"claude-model-dialog-{conv_id}",
+            )
+            _model_dialog_watchers.add(watcher)
+            watcher.add_done_callback(_model_dialog_watchers.discard)
+            _logger.info(
+                "claude-native model change for session=%s is queued behind an active "
+                "turn; watching for the late confirm dialog",
+                conv_id,
+            )
+            return Response(status_code=204)
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "claude_native_model_unconfirmed",
+                "detail": (
+                    f"the terminal did not confirm the switch to {model_arg} within "
+                    f"{_CLAUDE_MODEL_CONFIRM_TIMEOUT_S:.0f}s — a dialog may be open in the pane"
+                ),
+            },
+        )
 
     async def _apply_claude_native_plan_verdict(
         conv_id: str,
@@ -7824,18 +8020,23 @@ def create_runner_app(
             override=transport,
             spec_transport=entry.instance.terminal_transport,
         )
-        bridge = (
-            bridge_tmux_control_to_websocket
-            if resolved_transport == TERMINAL_TRANSPORT_CONTROL
-            else bridge_tmux_pty_to_websocket
-        )
-        await bridge(
-            websocket,
-            socket_path=str(entry.instance.socket_path),
-            tmux_target=entry.instance.tmux_target,
-            read_only=read_only,
-            on_client_interaction=entry.instance.note_client_interaction,
-        )
+        if resolved_transport == TERMINAL_TRANSPORT_CONTROL:
+            await bridge_tmux_control_to_websocket(
+                websocket,
+                socket_path=str(entry.instance.socket_path),
+                tmux_target=entry.instance.tmux_target,
+                read_only=read_only,
+                on_client_interaction=entry.instance.note_client_interaction,
+            )
+        else:
+            await bridge_tmux_pty_to_websocket(
+                websocket,
+                socket_path=str(entry.instance.socket_path),
+                tmux_target=entry.instance.tmux_target,
+                read_only=read_only,
+                on_client_interaction=entry.instance.note_client_interaction,
+                allow_osc52_clipboard=not entry.instance.tmux_allow_passthrough,
+            )
 
     # Reused by the loopback direct-attach listener (see
     # ``omnigent.runner.direct_attach``): same attach handler served on a
@@ -8538,10 +8739,23 @@ def create_runner_app(
         }
         return JSONResponse(status_code=200, content={"models": models})
 
+    # Claude's session listing IS the shared launch catalog: the same
+    # fingerprint-keyed store file the launch resolved against and the
+    # host's pre-launch picker serves — identical by construction, no
+    # separate composition. Cached per session for its lifetime (the launch
+    # config cannot change under it). A cold store pays one probe: a short
+    # inline wait answers a warm one, past that the endpoint answers 503
+    # (the server's fetch retries those) while the store's single-flight
+    # probe completes in the background.
+    _claude_model_options_rows: dict[str, list[dict[str, object]]] = {}
+
     @app.get("/v1/sessions/{session_id}/claude-model-options")
     async def get_session_claude_model_options(session_id: str) -> JSONResponse:
         if _session_harness_name(session_id) != "claude-native":
             return JSONResponse(status_code=200, content={"models": []})
+        cached = _claude_model_options_rows.get(session_id)
+        if cached is not None:
+            return JSONResponse(status_code=200, content={"models": cached})
         try:
             claude_config = await _resolve_session_claude_launch_config(session_id)
         except click.ClickException as exc:
@@ -8573,12 +8787,52 @@ def create_runner_app(
                     ),
                 },
             )
-        from omnigent.claude_native import claude_native_model_options
+        from omnigent.claude_native import claude_launch_catalog
 
-        return JSONResponse(
-            status_code=200,
-            content={"models": claude_native_model_options(claude_config)},
-        )
+        rows: list[dict[str, object]] | None
+        try:
+            # The store's single-flight probe survives this wait expiring
+            # (ensure_catalog shields it), so a 503 here is genuinely
+            # "pending", not "restarted".
+            async with asyncio.timeout(_CLAUDE_MODEL_OPTIONS_INLINE_WAIT_S):
+                rows = await claude_launch_catalog(claude_config)
+        except TimeoutError:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "claude_native_model_options_pending",
+                    "detail": "the harness model probe is still resolving",
+                },
+            )
+        if not rows:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "claude_native_model_options_failed",
+                    "detail": "the harness model probe failed; retrying",
+                },
+            )
+        _claude_model_options_rows[session_id] = rows
+        return JSONResponse(status_code=200, content={"models": rows})
+
+    @app.get("/v1/sessions/{session_id}/model-options")
+    async def get_session_model_options(session_id: str) -> JSONResponse:
+        """One route for every harness family's session model listing.
+
+        The runner derives the harness from the session — the four
+        harness-named routes above/below remain as compatibility aliases
+        for older servers (deprecated; remove in 0.11.0).
+        """
+        harness = _session_harness_name(session_id)
+        if harness == "claude-native":
+            return await get_session_claude_model_options(session_id)
+        if harness in ("codex-native", "opencode-native"):
+            return await get_session_codex_model_options(session_id)
+        if harness == "cursor-native":
+            return await get_session_cursor_model_options(session_id)
+        if harness == "kiro-native":
+            return await get_session_kiro_model_options(session_id)
+        return JSONResponse(status_code=200, content={"models": []})
 
     @app.post("/v1/sessions/{session_id}/skills/resolve")
     async def resolve_session_skill(session_id: str, request: Request) -> JSONResponse:

@@ -28,7 +28,9 @@ import { authenticatedFetch } from "@/lib/identity";
 import {
   filtersFromConversationQueryKey,
   mergeItemsIntoPages,
+  overlayTitleIntoCaches,
   PINNED_LABEL_KEY,
+  PROJECT_FOLDER_FILTERS,
   PROJECT_LABEL_KEY,
   removeIdsFromPages,
   type ConversationsInfiniteData,
@@ -519,59 +521,14 @@ export async function deleteConversation(id: string, deleteBranch = false): Prom
  * polls. Callers (the sidebar row) trigger this on blur / Enter in
  * the inline-edit input.
  */
-// Project folders (["project-sessions", name]) are non-archived, unsearched
-// lists — the same filters the push-delta merge uses to overlay them.
-const PROJECT_FOLDER_FILTERS = { searchQuery: "", includeArchived: false } as const;
-
 export function useRenameConversation() {
   const queryClient = useQueryClient();
 
-  // Overlay a title into every cache that holds a row for this session.
-  // Only the fields the rename changes are written — the full PATCH
-  // snapshot carries nulls for absent fields that would clobber
-  // list-shaped rows (see `nullsToUndefined` in sessionListCache).
-  const overlayTitle = (id: string, title: string | null, updatedAt?: number) => {
-    const wire: SessionListWireItem = {
-      id,
-      title,
-      ...(updatedAt !== undefined ? { updated_at: updatedAt } : {}),
-    };
-    const itemsById = new Map([[id, wire]]);
-    for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
-      queryKey: ["conversations"],
-    })) {
-      const { data: next } = mergeItemsIntoPages(
-        data,
-        itemsById,
-        filtersFromConversationQueryKey(key),
-        // activeId only gates `needsRefetch`, which is unused here —
-        // we deliberately skip the refetch (see hook docstring).
-        undefined,
-      );
-      if (next !== data) queryClient.setQueryData(key, next);
-    }
-    // A filed session renders from its own ["project-sessions", name] list,
-    // not the flat ["conversations"] cache, so patch those (non-archived,
-    // unsearched — PROJECT_FOLDER_FILTERS) too or the folder row stays stale.
-    for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
-      queryKey: ["project-sessions"],
-    })) {
-      const { data: next } = mergeItemsIntoPages(
-        data,
-        itemsById,
-        PROJECT_FOLDER_FILTERS,
-        undefined,
-      );
-      if (next !== data) queryClient.setQueryData(key, next);
-    }
-    // The pinned-row backfill cache (staleTime 60s) and the per-session
-    // snapshot (staleTime Infinity) are not covered by the list patch and
-    // would serve the old title long after.
-    queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
-      old ? { ...old, title, ...(updatedAt !== undefined ? { updated_at: updatedAt } : {}) } : old,
-    );
-    queryClient.setQueryData<Session>(["session", id], (old) => (old ? { ...old, title } : old));
-  };
+  // Overlay a title into every cache holding a row for this session. Shared
+  // with the `session.title` SSE handler so a terminal-side `/rename` and a
+  // Web UI rename patch exactly the same caches.
+  const overlayTitle = (id: string, title: string | null, updatedAt?: number) =>
+    overlayTitleIntoCaches(queryClient, id, title, updatedAt);
 
   return useMutation({
     mutationFn: ({ id, title }: { id: string; title: string }) => renameConversation(id, title),
@@ -1379,6 +1336,9 @@ export { PROJECT_LABEL_KEY };
 export interface ProjectSummary {
   id: string | null;
   name: string;
+  /** Chosen emoji icon (a unicode grapheme), or null/absent for the default
+      folder glyph. Sourced from the project's `config.icon`. */
+  icon?: string | null;
 }
 
 /**
@@ -1962,7 +1922,7 @@ export function useUpdateProjectConfig() {
       // config to `{}` and drop the saved defaults on that first visit.
       queryClient.setQueryData<ProjectSummary[]>(["projects"], (prev) => {
         if (!prev) return prev;
-        const summary = { id: project.id, name: project.name };
+        const summary = { id: project.id, name: project.name, icon: project.config?.icon };
         return prev.some((p) => p.name === project.name)
           ? prev.map((p) => (p.name === project.name ? summary : p))
           : [...prev, summary];

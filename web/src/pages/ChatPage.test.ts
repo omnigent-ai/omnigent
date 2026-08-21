@@ -39,6 +39,7 @@ import {
   stripGatedSubagentRoutingChips,
   stripPendingElicitations,
   subAgentComposerLabel,
+  unboundSessionResumableInApp,
   WORKING_MESSAGES,
   workingIndicatorLabel,
 } from "./ChatPage";
@@ -1634,12 +1635,46 @@ describe("isUnboundCodingFork", () => {
   });
 });
 
+describe("unboundSessionResumableInApp", () => {
+  const owner = { unbound: true, isOwner: true, importSource: null };
+
+  it("is false unless the session is unbound", () => {
+    expect(unboundSessionResumableInApp({ ...owner, unbound: false })).toBe(false);
+  });
+
+  it("is false for a non-owner (launch_runner would 404)", () => {
+    // Regression: a shared viewer must not get a picker that always fails.
+    expect(unboundSessionResumableInApp({ ...owner, isOwner: false })).toBe(false);
+    expect(unboundSessionResumableInApp({ ...owner, isOwner: false, importSource: "claude" })).toBe(
+      false,
+    );
+  });
+
+  it("allows a non-import unbound session (e.g. an unbound fork)", () => {
+    expect(unboundSessionResumableInApp(owner)).toBe(true);
+  });
+
+  it("allows host-portable import sources", () => {
+    for (const src of ["claude", "codex", "pi", "opencode"]) {
+      expect(unboundSessionResumableInApp({ ...owner, importSource: src })).toBe(true);
+    }
+  });
+
+  it("blocks imports whose context does not carry to a chosen host", () => {
+    // kimi has no resume path; kiro/qwen resume only from a local file on the
+    // original machine — a chosen host would launch with no context.
+    for (const src of ["kimi", "kiro", "qwen"]) {
+      expect(unboundSessionResumableInApp({ ...owner, importSource: src })).toBe(false);
+    }
+  });
+});
+
 // The routing gates the ChatPage call site uses. The deployment flag is half of
 // each gate: a session-shape-eligible session on a server WITHOUT a routing
 // client must show no routing control at all, and neither must one while the
 // `/v1/info` probe is still in flight.
 describe("routing eligibility gates", () => {
-  function info(smartRouting: boolean): ServerInfo {
+  function info(smartRouting: boolean, sources?: { external: boolean; oss: boolean }): ServerInfo {
     return {
       accounts_enabled: false,
       single_user: false,
@@ -1652,7 +1687,7 @@ describe("routing eligibility gates", () => {
       public_sharing_enabled: true,
       server_version: null,
       smart_routing_enabled: smartRouting,
-      smart_routing_sources: { external: smartRouting, oss: smartRouting },
+      smart_routing_sources: sources ?? { external: smartRouting, oss: smartRouting },
       features: {},
       harness_install_enabled: false,
       installable_harnesses: [],
@@ -1690,8 +1725,30 @@ describe("routing eligibility gates", () => {
     expect(isSubagentRoutingEligible("loading", nativeSession)).toBe(false);
   });
 
-  it("a native terminal session is excluded from cost routing but not subagent routing", () => {
-    expect(isCostRoutingEligible(info(true), nativeSession)).toBe(false);
+  it("a native pane follows the per-family router sources for cost routing", () => {
+    // The judge answers for any family, gateway-backed or not.
+    expect(isCostRoutingEligible(info(true, { external: false, oss: true }), nativeSession)).toBe(
+      true,
+    );
+    // External-only: the family must be gateway-backed on the session's host.
+    const externalOnly = info(true, { external: true, oss: false });
+    expect(
+      isCostRoutingEligible(externalOnly, nativeSession, {
+        gateway_inference: { "claude-native": false },
+      }),
+    ).toBe(false);
+    expect(
+      isCostRoutingEligible(externalOnly, nativeSession, {
+        gateway_inference: { "claude-native": true },
+      }),
+    ).toBe(true);
+    // An absent host row reads as backed (older host / no row), like the
+    // landing's gate.
+    expect(isCostRoutingEligible(externalOnly, nativeSession)).toBe(true);
+    // No router at all: the option is withheld.
+    expect(isCostRoutingEligible(info(true, { external: false, oss: false }), nativeSession)).toBe(
+      false,
+    );
     expect(isSubagentRoutingEligible(info(true), nativeSession)).toBe(true);
   });
 

@@ -12,6 +12,8 @@ import { Loader2Icon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTheme } from "next-themes";
 import { Button } from "@/components/ui/button";
+import { showToast } from "@/components/ui/toast";
+import { copyText } from "@/lib/clipboard";
 import { isDatabricksWorkspace, resolveWebSocketUrl } from "@/lib/host";
 import { subscribeCodeFont } from "@/lib/codeFontPreferences";
 import { resolveInitialAttachUrl, watchDirectUpgrade, withAttachParams } from "@/lib/terminals";
@@ -157,6 +159,8 @@ export function TerminalView({
   onActivityRef.current = onActivity;
   const onInputRef = useRef(onInput);
   onInputRef.current = onInput;
+  const activeRef = useRef(active);
+  activeRef.current = active;
   // Track whether this terminal has already tried a keyless re-dial after a
   // 4400 wrong-replica close. If keyless still fails with 4400, the host is
   // genuinely unreachable — stop retrying.
@@ -181,6 +185,29 @@ export function TerminalView({
 
   const notifyInput = useCallback(() => {
     onInputRef.current?.();
+  }, []);
+
+  const notifyClipboardRequest = useCallback((text: string) => {
+    const copyAndRefocus = () => copyText(text).finally(() => sessionRef.current?.focus());
+    const copied = () => showToast("Copied from terminal.", { duration: 1500 });
+    const failed = () =>
+      showToast("Couldn't copy terminal selection to the clipboard.", { duration: 0 });
+    void copyAndRefocus().then(copied, () => {
+      showToast(
+        <span className="flex items-center gap-2">
+          <span>Terminal copy is ready.</span>
+          <Button
+            type="button"
+            size="xs"
+            variant="secondary"
+            onClick={() => void copyAndRefocus().then(copied, failed)}
+          >
+            Copy
+          </Button>
+        </span>,
+        { duration: 0 },
+      );
+    });
   }, []);
 
   // Dispose the outgoing session before a remount re-dials. React 18
@@ -276,6 +303,8 @@ export function TerminalView({
           notifyActivity,
           notifyInput,
           controlMode,
+          !readOnly && activeRef.current,
+          notifyClipboardRequest,
         );
         sessionRef.current = terminalSession;
         // Relay-connected with a direct URL on offer: negotiate the
@@ -309,6 +338,7 @@ export function TerminalView({
       notifyState,
       notifyActivity,
       notifyInput,
+      notifyClipboardRequest,
       disposeActiveSession,
     ],
   );
@@ -317,6 +347,10 @@ export function TerminalView({
   useEffect(() => {
     sessionRef.current?.setTheme(isDark);
   }, [isDark]);
+
+  useEffect(() => {
+    sessionRef.current?.setClipboardEnabled(!readOnly && active);
+  }, [readOnly, active]);
 
   // On the hidden→visible edge of a pre-warmed surface: focus the
   // terminal (the session's WS-open focus is a no-op while the element is

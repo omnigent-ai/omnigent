@@ -232,7 +232,7 @@ def test_run_background_uses_exec_background(monkeypatch: pytest.MonkeyPatch) ->
     assert name == "sb-1"
     assert command[:2] == ["bash", "-lc"]
     assert "omnigent host --server https://s" in command[2]
-    assert "> /tmp/host.log 2>&1 < /dev/null" in command[2]
+    assert ">> /tmp/host.log 2>&1 < /dev/null" in command[2]
     assert fake.exec_calls == []
 
 

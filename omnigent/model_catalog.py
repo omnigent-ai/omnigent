@@ -46,7 +46,6 @@ from cachetools import TTLCache
 from omnigent._platform import default_shell_argv
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.llms.anthropic_model_metadata import parse_anthropic_model_metadata
-from omnigent.model_fallbacks import StaticModelFallback, static_model_fallback
 from omnigent.model_metadata import (
     ModelCapability,
     ModelCostTier,
@@ -206,15 +205,12 @@ class ModelListing:
     :param models: The enumerated models, e.g.
         ``(ModelEntry(id="databricks-gpt-5-4", family="openai"),)``.
     :param note: Human-readable provenance / failure explanation.
-    :param static_fallback: Ownership metadata for a release-curated fallback;
-        ``None`` for live or empty listings.
     """
 
     source: str
     verified: bool
     models: tuple[ModelEntry, ...]
     note: str
-    static_fallback: StaticModelFallback | None = None
 
 
 @dataclass(frozen=True)
@@ -897,8 +893,7 @@ def _listing_payload(listing: ModelListing) -> _JsonObject:
     """Serialize a :class:`ModelListing` into the tool's JSON row shape.
 
     :param listing: The listing to serialize.
-    :returns: Row dict; ``context_window`` and ``static_fallback`` appear only
-        when known.
+    :returns: Row dict; ``context_window`` appears only when known.
     """
     models: list[_JsonObject] = []
     for entry in listing.models:
@@ -934,12 +929,6 @@ def _listing_payload(listing: ModelListing) -> _JsonObject:
         "models": models,
         "note": listing.note,
     }
-    if listing.static_fallback is not None:
-        payload["static_fallback"] = {
-            "owner": listing.static_fallback.owner,
-            "provenance": listing.static_fallback.provenance,
-            "discovery_gap": listing.static_fallback.discovery_gap,
-        }
     return payload
 
 
@@ -1061,23 +1050,24 @@ def _fetch_cursor_cli_listing(provider: ResolvedModelProvider) -> ModelListing:
 
 
 def _static_subscription_listing(provider: ResolvedModelProvider) -> ModelListing:
-    """Build the curated static listing for a subscription CLI login.
+    """Build the (empty) pre-launch listing for a subscription CLI login.
+
+    Subscription logins expose no model-listing API, and the curated
+    stand-ins this used to serve are gone — the live harness probes are the
+    source of truth, so a path that cannot probe reports nothing rather
+    than a plausible-but-stale list.
 
     :param provider: A ``kind="subscription"`` provider descriptor.
-    :returns: A ``source="static"`` listing with ``verified=False``.
+    :returns: A ``source="static"`` listing with no models.
     """
-    fallback = static_model_fallback(SUBSCRIPTION_KIND, provider.cli or "")
-    ids = fallback.model_ids if fallback is not None else ()
     return ModelListing(
         source="static",
         verified=False,
-        models=tuple(ModelEntry(id=i, family=model_family_token(i)) for i in ids),
+        models=(),
         note=(
-            f"curated aliases for the {provider.cli or 'unknown'} CLI login "
-            "(subscription logins expose no model-listing API; availability "
-            "depends on the logged-in plan)"
+            f"the {provider.cli or 'unknown'} CLI login exposes no model-listing "
+            "API before launch; the live listing comes from probing the harness"
         ),
-        static_fallback=fallback,
     )
 
 
@@ -1091,20 +1081,16 @@ def _static_cli_config_listing(provider: ResolvedModelProvider) -> ModelListing:
     resolve — not a "no credentials" preflight failure.
 
     :param provider: A ``kind="cli-config"`` provider descriptor.
-    :returns: A ``source="static"`` listing with ``verified=False``.
+    :returns: A ``source="static"`` listing with no models.
     """
-    fallback = static_model_fallback(CLI_CONFIG_KIND, provider.cli or "")
-    ids = fallback.model_ids if fallback is not None else ()
     return ModelListing(
         source="static",
         verified=False,
-        models=tuple(ModelEntry(id=i, family=model_family_token(i)) for i in ids),
+        models=(),
         note=(
-            f"curated ids for {provider.detail}; its credential lives in the "
-            "CLI's own config file and is resolved by the CLI at launch, so "
-            "it cannot be verified from here"
+            f"{provider.detail} enumerates its models only from the CLI's own "
+            "config at launch; the live listing comes from probing the harness"
         ),
-        static_fallback=fallback,
     )
 
 

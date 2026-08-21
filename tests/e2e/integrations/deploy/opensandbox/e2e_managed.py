@@ -111,6 +111,8 @@ def wait_for_result(client: httpx.Client, session_id: str, timeout_s: float) -> 
         text = assistant_text(last.get("items") or [])
         if text and last.get("status") == "idle":
             return text
+        if last.get("status") == "failed":
+            raise RuntimeError(f"session ended in failed status: {json.dumps(last)[:1200]}")
         time.sleep(4)
     raise TimeoutError(
         f"session did not finish within {timeout_s:.0f}s: {json.dumps(last)[:1200]}"

@@ -596,6 +596,65 @@ def test_host_stop_treats_zombie_daemon_as_dead(
     )
 
 
+def test_host_stop_drops_stale_foreign_daemon_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Verify ``host stop`` drops a daemon record whose pid it cannot signal.
+
+    A registry record can outlive its daemon: the pid may be reused by
+    another user's process, or the daemon was started under a different
+    account. ``_pid_alive`` reports such a pid as alive (psutil maps the
+    EPERM to ``AccessDenied``), so stop falls through to ``os.kill``, which
+    raises ``PermissionError``. Stop must treat the record as stale — warn
+    and delete it — instead of crashing on the EPERM, even with ``--force``.
+    """
+    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+
+    daemons_dir = tmp_path / "daemons"
+    daemons_dir.mkdir()
+    # The file name must match _daemon_record_path's derivation (sha256 of
+    # the target, truncated) or stop's record cleanup would unlink a
+    # different path than the one written here.
+    record_path = daemons_dir / (hashlib.sha256(b"local").hexdigest()[:16] + ".json")
+    record_path.write_text(
+        json.dumps(
+            {
+                "pid": 4242,
+                "target": "local",
+                "mode": "local",
+                "server_url": None,
+                "log_path": None,
+                "started_at": 1781200000,
+                "host_id": "host_foreign_test",
+                "resolved_server_url": None,
+                "config_sig": None,
+            }
+        )
+    )
+
+    def _eperm_kill(pid: int, sig: int) -> None:
+        """Simulate signalling a pid owned by another user (EPERM)."""
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr("omnigent.cli._pid_alive", lambda pid: True)
+    monkeypatch.setattr("omnigent.cli.os.kill", _eperm_kill)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["host", "stop", "--all", "--daemon-only", "--force"])
+
+    # Exit code 0 proves the EPERM was treated as a stale record. A nonzero
+    # exit means the PermissionError propagated out of os.kill and crashed
+    # the CLI before the SIGKILL path --force is supposed to reach.
+    assert result.exit_code == 0, f"host stop crashed on a foreign daemon pid: {result.output}"
+    assert "owned by another user" in result.output
+    assert not record_path.exists(), (
+        "stale foreign daemon record survived stop — a subsequent host start "
+        "would be blocked by an 'already running' conflict"
+    )
+
+
 def test_add_daemon_host_status_skips_http_for_dead_process() -> None:
     """Dead processes must not trigger a network round-trip.
 

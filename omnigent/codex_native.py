@@ -853,11 +853,14 @@ async def _prepare_codex_terminal_via_daemon(
             if session_bundle is None:
                 raise click.ClickException("Creating a Codex session requires a session bundle.")
             _update_startup_progress(startup_progress, "Creating Codex session...")
-            session_id = await _create_codex_session(
-                client,
-                session_bundle,
-                bridge_id=None,
-                terminal_launch_args=persist_args or None,
+            session_id, _ = await asyncio.gather(
+                _create_codex_session(
+                    client,
+                    session_bundle,
+                    bridge_id=None,
+                    terminal_launch_args=persist_args or None,
+                ),
+                wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S),
             )
         else:
             _update_startup_progress(startup_progress, "Loading Codex session...")
@@ -910,7 +913,8 @@ async def _prepare_codex_terminal_via_daemon(
                         f"({resp.status_code}): {error_text(resp)}"
                     )
 
-        await wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S)
+        if not fresh_session:
+            await wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S)
         _update_startup_progress(startup_progress, "Starting runner...")
         runner_id = await launch_or_reuse_daemon_runner(
             client,
@@ -1196,6 +1200,7 @@ async def _prepare_codex_terminal(
                         socket_path=codex_ws_url,
                         thread_id=thread_id,
                         codex_home=str(codex_home),
+                        cwd=str(Path.cwd()),
                     ),
                 )
             if runner_id is not None:
@@ -1417,6 +1422,7 @@ async def _initialize_fresh_terminal_thread(
             socket_path=app_server_url,
             thread_id=thread_id,
             codex_home=str(codex_home_for_bridge_dir(prepared.bridge_dir)),
+            cwd=str(Path.cwd()),
         ),
     )
     return thread_id

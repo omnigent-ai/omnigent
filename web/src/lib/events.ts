@@ -519,6 +519,19 @@ export interface SessionModelEvent {
 }
 
 /**
+ * `session.title` — session rename from a claude-native session.
+ *
+ * Emitted by the Omnigent server when the claude-native forwarder observes a
+ * `/rename` typed inside the Claude Code terminal. Carries the operator's
+ * new title so the session list stops showing the auto-generated one.
+ */
+export interface SessionTitleEvent {
+  type: "session_title";
+  conversationId: string;
+  title: string;
+}
+
+/**
  * `session.reasoning_effort` — active thinking-level switch from a native
  * session.
  *
@@ -573,8 +586,8 @@ export interface SessionAgentChangedEvent {
  * Each todo item has:
  * - `content`: the task description string
  * - `status`: `"pending"` | `"in_progress"` | `"completed"`
- * - `activeForm`: present-continuous form of the task (e.g. `"Running tests"`).
- *   Shown by the TodoPanel under in-progress items when distinct from `content`.
+ * - `activeForm`: present-continuous form of the task (e.g. `"Running tests"`),
+ *   the present-continuous label for an in-progress item when distinct from `content`.
  */
 export interface SessionTodosEvent {
   type: "session_todos";
@@ -903,6 +916,7 @@ export type StreamEvent =
   | SessionStatusEvent
   | SessionUsageEvent
   | SessionModelEvent
+  | SessionTitleEvent
   | SessionReasoningEffortEvent
   | SessionCollaborationModeEvent
   | SessionAgentChangedEvent
