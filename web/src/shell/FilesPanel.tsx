@@ -303,14 +303,16 @@ export function FilesPanel({
 
   /**
    * Open a file the TREE named. Tree paths are relative to the browsed
-   * location while the viewer resolves against the workspace root, so an
-   * in-workspace location has to be re-attached — otherwise a file opened
-   * after navigating into a folder is looked for in the wrong place. An
-   * absolute location has no workspace-relative form to hand over, so it is
-   * passed through as before.
+   * location, so the location is re-attached before handing the file to the
+   * viewer. For an in-workspace location that yields a workspace-relative
+   * path; for a location OUTSIDE the workspace it yields the file's absolute
+   * path, which the viewer fetches host-absolutely (see `fetchFileContent`).
+   * Without this a file opened while browsing an absolute location like
+   * `/tmp` would be looked up by its bare name under the workspace root and
+   * 404.
    */
   function openTreeFile(path: string) {
-    onFileSelect(locationParam.startsWith("/") ? path : joinBrowseLocation(locationParam, path));
+    onFileSelect(joinBrowseLocation(locationParam, path));
   }
 
   const allFilesQuery = useWorkspaceAllFiles(conversationId, { enabled: !flatView }, locationParam);

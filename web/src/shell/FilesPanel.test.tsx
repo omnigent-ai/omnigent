@@ -1393,6 +1393,32 @@ describe("FilesPanel browse location", () => {
     expect(trigger).toHaveTextContent("/home/user/proj");
   });
 
+  it("opens a file at an absolute browse location by its absolute path", () => {
+    // Regression: after navigating OUTSIDE the workspace (e.g. /etc), the tree
+    // lists files by bare name relative to that location. Opening one must
+    // hand the viewer the file's ABSOLUTE path (/etc/hosts) -- otherwise the
+    // viewer looks the bare name up under the workspace root and 404s.
+    const onFileSelect = vi.fn();
+    renderPanel({
+      conversationId: "conv_open_abs",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: UNCONFINED,
+      onFileSelect,
+    });
+
+    // Re-rooting to /etc swaps the listing for one whose file is bare-named.
+    useAllFilesMock.mockImplementation((_id: unknown, _opts: unknown, location?: string) =>
+      location === "/etc" ? allFilesResult([file("hosts")]) : allFilesResult([]),
+    );
+    fireEvent.click(screen.getByTestId("browse-location-path"));
+    fireEvent.click(screen.getByTestId("stub-picker-navigate"));
+
+    fireEvent.click(screen.getByText("hosts"));
+
+    expect(onFileSelect).toHaveBeenCalledWith("/etc/hosts");
+  });
+
   it("re-roots both the tree and search when a directory is picked", () => {
     // The bug this feature fixes is a tree showing one directory while search
     // reports on another, so both queries must move together.
