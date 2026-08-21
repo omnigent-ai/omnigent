@@ -172,6 +172,11 @@ def _builtin_contribution() -> SandboxProviderContribution:
                 launcher_class="omnigent.onboarding.sandboxes.kubernetes:KubernetesSandboxLauncher",
                 managed_token_ttl_s=7 * 24 * 3600,
             ),
+            "coda": SandboxProviderMetadata(
+                name="coda",
+                launcher_class="omnigent.onboarding.sandboxes.coda:CodaProvider",
+                managed_token_ttl_s=13 * 3600,
+            ),
         },
     )
 
@@ -313,6 +318,16 @@ def instantiate(
             f"which is not a SandboxHostLauncher subclass"
         )
     if name == "lakebox" and workspace_host is not None:
-        launcher_factory = cast(_WorkspaceHostLauncherFactory, launcher_cls)
-        return launcher_factory(workspace_host=workspace_host)
-    return launcher_cls()
+        try:
+            launcher_factory = cast(_WorkspaceHostLauncherFactory, launcher_cls)
+            return launcher_factory(workspace_host=workspace_host)
+        except Exception as exc:
+            raise SandboxRegistryError(
+                f"could not instantiate sandbox provider '{name}': {exc}"
+            ) from exc
+    try:
+        return launcher_cls()
+    except Exception as exc:
+        raise SandboxRegistryError(
+            f"could not instantiate sandbox provider '{name}': {exc}"
+        ) from exc

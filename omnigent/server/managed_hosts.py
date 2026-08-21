@@ -180,6 +180,7 @@ SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
         "e2b",
         "openshell",
         "kubernetes",
+        "coda",
     }
 )
 PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
@@ -193,6 +194,7 @@ PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
         "e2b",
         "openshell",
         "kubernetes",
+        "coda",
     }
 )
 
@@ -253,6 +255,11 @@ OPENSHELL_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 # reconnects while still expiring tokens of Pods nobody deleted. A relaunch
 # mints a fresh token (and the per-Pod token Secret is replaced).
 KUBERNETES_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
+
+# CoDA leases are held by an already-running App. The token lifetime is
+# slightly longer than the App's bounded lease lifetime so a live host can
+# reconnect while stale credentials still expire.
+CODA_MANAGED_TOKEN_TTL_S = 13 * 3600
 
 # The cwsandbox launch-token TTL is NOT a constant: CW Sandbox's lifetime is
 # operator-overridable (OMNIGENT_CWSANDBOX_MAX_LIFETIME_S), so the TTL is
@@ -1184,6 +1191,30 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
             secret_mounts=secret_mounts,
         )
         token_ttl_s = KUBERNETES_MANAGED_TOKEN_TTL_S
+    elif provider == "coda":
+        from omnigent.onboarding.sandboxes.coda import validate_coda_app_url
+
+        coda_section = _parse_provider_section(raw, "coda") or {}
+        _reject_unknown_keys(
+            coda_section, {"app_name", "app_url", "workspace_path"}, "sandbox.coda"
+        )
+        app_name = _parse_provider_string(raw, "coda", "app_name")
+        app_url = _parse_provider_string(raw, "coda", "app_url")
+        if app_name is None or app_url is None:
+            raise ValueError("server config 'sandbox.coda' requires app_name and app_url")
+        try:
+            validate_coda_app_url(app_url)
+        except ValueError as exc:
+            raise ValueError(f"server config 'sandbox.coda.app_url' is invalid: {exc}") from exc
+        workspace_path = _parse_provider_string(raw, "coda", "workspace_path")
+        if workspace_path is not None and not workspace_path.startswith("/"):
+            raise ValueError("server config 'sandbox.coda.workspace_path' must be absolute")
+        launcher_factory = _coda_launcher_factory(
+            app_name=app_name,
+            app_url=app_url,
+            workspace_path=workspace_path,
+        )
+        token_ttl_s = CODA_MANAGED_TOKEN_TTL_S
     else:
         launcher_factory = _unsupported_launcher_factory(provider)
         # Never consulted (the factory rejects before any token is
@@ -2416,6 +2447,26 @@ def _reject_overlapping_kubernetes_mounts(
                     "server config 'sandbox.kubernetes' has nested pvc_mounts / "
                     f"secret_mounts paths: {low!r} contains {high!r}"
                 )
+
+
+def _coda_launcher_factory(
+    *, app_name: str, app_url: str, workspace_path: str | None
+) -> Callable[[], SandboxHostLauncher]:
+    """Build the launcher factory for the YAML ``provider: coda`` path."""
+
+    def _build() -> SandboxHostLauncher:
+        """Construct the CoDA provider lazily so the SDK stays optional."""
+        from omnigent.onboarding.sandboxes.coda import CodaProvider
+
+        if workspace_path is None:
+            return CodaProvider(app_name=app_name, app_url=app_url)
+        return CodaProvider(
+            app_name=app_name,
+            app_url=app_url,
+            workspace_path=workspace_path,
+        )
+
+    return _build
 
 
 def _kubernetes_launcher_factory(

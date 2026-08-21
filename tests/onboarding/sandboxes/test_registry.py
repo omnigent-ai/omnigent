@@ -69,6 +69,7 @@ def test_plugin_state_loads_builtins() -> None:
     assert "modal" in state
     assert "blaxel" in state
     assert "kubernetes" in state
+    assert "coda" in state
 
 
 def test_plugin_state_is_cached() -> None:
@@ -104,6 +105,17 @@ def test_get_provider_metadata_known_provider() -> None:
     assert meta is not None
     assert meta.name == "modal"
     assert "omnigent.onboarding.sandboxes.modal:ModalSandboxLauncher" in meta.launcher_class
+
+
+def test_get_coda_provider_metadata() -> None:
+    """CoDA is registered through the same built-in contribution seam."""
+    reset_plugin_state_for_tests()
+
+    meta = get_provider_metadata("coda")
+
+    assert meta is not None
+    assert meta.launcher_class == "omnigent.onboarding.sandboxes.coda:CodaProvider"
+    assert meta.managed_token_ttl_s == 13 * 3600
 
 
 def test_get_provider_metadata_unknown_returns_none() -> None:
@@ -287,6 +299,16 @@ def test_get_launcher_unknown_raises_click_exception() -> None:
         match="Unknown or unavailable sandbox provider",
     ):
         get_launcher("definitely-not-real")
+
+
+def test_get_launcher_coda_reports_configuration_error() -> None:
+    """Provider-specific constructor failures stay controlled at the registry seam."""
+    reset_plugin_state_for_tests()
+
+    with pytest.raises(
+        click.ClickException, match="could not instantiate sandbox provider 'coda'"
+    ):
+        get_launcher("coda")
 
 
 def test_instantiate_rejects_non_launcher_class(
