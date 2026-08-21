@@ -1106,10 +1106,10 @@ def test_help_hides_update_alias_but_keeps_it_runnable() -> None:
 def test_help_hides_extras_gated_harness_when_sdk_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """cursor/antigravity drop out of the harness list; a notice replaces them."""
+    """cursor/agy drop out of the harness list; a notice replaces them."""
     monkeypatch.setattr(
         "omnigent.cli._harness_extra_checks",
-        lambda: {"cursor": lambda: False, "antigravity": lambda: False},
+        lambda: {"cursor": lambda: False, "agy": lambda: False},
     )
 
     result = CliRunner().invoke(cli, ["--help"])
@@ -1127,17 +1127,17 @@ def test_help_hides_extras_gated_harness_when_sdk_missing(
 def test_help_shows_extras_gated_harness_when_sdk_installed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """cursor/antigravity appear in --help once their extra is importable."""
+    """cursor/agy appear in --help once their extra is importable."""
     monkeypatch.setattr(
         "omnigent.cli._harness_extra_checks",
-        lambda: {"cursor": lambda: True, "antigravity": lambda: True},
+        lambda: {"cursor": lambda: True, "agy": lambda: True},
     )
 
     result = CliRunner().invoke(cli, ["--help"])
 
     assert result.exit_code == 0, result.output
     assert "cursor" in result.output
-    assert "antigravity" in result.output
+    assert "agy" in result.output
     assert "Some harnesses need an optional extra" not in result.output
 
 
@@ -5794,6 +5794,19 @@ def test_click_subcommands_allowlist_covers_registered_commands() -> None:
         "commands registered on the cli group but missing from "
         f"_CLICK_SUBCOMMANDS (unreachable from main()): {sorted(missing)}"
     )
+
+
+def test_agy_cli_alias_registered_and_in_subcommands() -> None:
+    """``omni agy`` is registered on the cli group, prioritized in harnesses list."""
+    from omnigent.cli import _ALIAS_COMMANDS, _CLICK_SUBCOMMANDS, _HARNESS_COMMANDS, cli
+
+    assert "agy" in cli.commands
+    assert "antigravity" in cli.commands
+    assert cli.commands["agy"].callback is cli.commands["antigravity"].callback
+    assert "agy" in _CLICK_SUBCOMMANDS
+    assert "agy" in _HARNESS_COMMANDS
+    assert "antigravity" in _ALIAS_COMMANDS
+    assert "agy" not in _ALIAS_COMMANDS
 
 
 # ── first-run smart defaults (omnigent run) ──────────
