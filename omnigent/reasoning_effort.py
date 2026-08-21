@@ -92,6 +92,49 @@ def nearest_pi_thinking_level(level: str, available: Iterable[str]) -> str | Non
     return min(offered, key=lambda value: abs(PI_THINKING_LADDER.index(value) - target))
 
 
+def efforts_for_harness(harness: str | None) -> frozenset[str] | None:
+    """
+    Return the effort vocabulary *harness* accepts.
+
+    Three outcomes, and the difference between the last two matters:
+
+    - a non-empty set — the harness takes an effort from that vocabulary;
+    - an empty set — the harness is known and has no effort plumbing
+      (``EffortFamily.NONE``), so any effort is meaningless to it;
+    - ``None`` — the harness is not in the capability registry, so it
+      cannot be classified. Callers that filter should pass the value
+      through rather than drop it, since a plugin-registered harness may
+      handle an effort this process knows nothing about.
+
+    :param harness: Harness name or alias, e.g. ``"claude-native"``.
+    :returns: Accepted values, an empty set, or ``None`` when unknown.
+    """
+    # Imported inside the function: harness_plugins pulls in a large slice
+    # of the package, and a module-level edge from here has produced an
+    # import cycle before.
+    from omnigent.harness_aliases import canonicalize_harness
+    from omnigent.harness_capabilities import EffortFamily
+    from omnigent.harness_plugins import harness_capabilities
+
+    if harness is None:
+        return None
+    canonical = canonicalize_harness(harness) or harness
+    capabilities = harness_capabilities().get(canonical)
+    if capabilities is None:
+        return None
+    # Every family that has a vocabulary must be listed: an unmapped family
+    # falls through to the empty set, which callers read as "known harness with
+    # no effort plumbing" and silently drop the effort. A new EffortFamily
+    # therefore has to be added here in the same change that declares it.
+    return {
+        EffortFamily.ANTHROPIC: ANTHROPIC_EFFORTS,
+        EffortFamily.OPENAI: OPENAI_EFFORTS,
+        EffortFamily.GEMINI: GEMINI_EFFORTS,
+        EffortFamily.COPILOT: COPILOT_EFFORTS,
+        EffortFamily.PI: PI_EFFORTS,
+    }.get(capabilities.effort, frozenset())
+
+
 def format_supported(values: Iterable[str]) -> str:
     """Return a stable comma-separated supported-values string."""
     order = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]

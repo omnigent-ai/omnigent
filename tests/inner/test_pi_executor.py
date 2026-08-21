@@ -319,13 +319,14 @@ def test_sanitize_real_sys_session_send_args_collapses_to_object() -> None:
 
     sanitized_args = _sanitize_schema(params)["properties"]["args"]
 
-    # Structured fields the purpose guard and the per-dispatch model
-    # override read must survive the collapse.
+    # Structured fields the purpose guard and the per-dispatch model /
+    # reasoning-effort overrides read must survive the collapse.
     assert sanitized_args["type"] == "object"
     assert set(sanitized_args["properties"]) == {
         "input",
         "purpose",
         "model",
+        "reasoning_effort",
         "file_ids",
         "cost_budget",
     }
