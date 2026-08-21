@@ -924,6 +924,13 @@ def user_period_cost_budget(
     Abstains (ALLOW) on every other phase, and whenever the period cost
     is ``0.0`` (no spend recorded, no owner, or pricing unavailable).
 
+    **Current limitation**: Only ONE non-day period cost policy is supported
+    per agent spec. Configuring multiple period policies (e.g., weekly +
+    monthly) will raise a ``ValueError`` at engine build time. Daily cost
+    policies can coexist with one period policy (they use separate context
+    keys). This limitation prevents silent correctness bugs where multiple
+    policies would read the wrong period's data.
+
     :param period: Time period granularity: ``"day"``, ``"week"``,
         ``"month"``, ``"quarter"``, or ``"year"``. ``"day"`` reads from
         ``user_daily_cost`` context; all others read from
