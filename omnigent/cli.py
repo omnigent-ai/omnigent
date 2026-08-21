@@ -595,6 +595,12 @@ _LOCAL_CONFIG_RELPATH: Path = Path(".omnigent") / "config.yaml"
 # Keys that ``omnigent config`` accepts.  Mirrors the option names in
 # the ``run`` command so the mapping is explicit and auditable.
 _AUTO_OPEN_CONVERSATION_CONFIG_KEY = "auto_open_conversation"
+# Operator policy: refuse naked ``omni``/``omnigent`` calls so use goes through
+# a wrapper (e.g. ``isaac omni``). ``wrapper_command`` names the command to
+# suggest. The wrapper passes through per launch via OMNIGENT_WRAPPER_BYPASS on
+# the child it spawns, so bypass stays an env var (see the guard below).
+_REQUIRE_WRAPPER_CONFIG_KEY = "require_wrapper"
+_WRAPPER_COMMAND_CONFIG_KEY = "wrapper_command"
 _GLOBAL_CONFIG_KEYS: frozenset[str] = frozenset(
     {
         "default_agent",
@@ -605,9 +611,13 @@ _GLOBAL_CONFIG_KEYS: frozenset[str] = frozenset(
         "opencode_model",
         "server",
         _AUTO_OPEN_CONVERSATION_CONFIG_KEY,
+        _REQUIRE_WRAPPER_CONFIG_KEY,
+        _WRAPPER_COMMAND_CONFIG_KEY,
     }
 )
-_BOOLEAN_CONFIG_KEYS: frozenset[str] = frozenset({_AUTO_OPEN_CONVERSATION_CONFIG_KEY})
+_BOOLEAN_CONFIG_KEYS: frozenset[str] = frozenset(
+    {_AUTO_OPEN_CONVERSATION_CONFIG_KEY, _REQUIRE_WRAPPER_CONFIG_KEY}
+)
 _CONFIG_TRUE_VALUES: frozenset[str] = frozenset({"1", "true", "yes", "on"})
 _CONFIG_FALSE_VALUES: frozenset[str] = frozenset({"0", "false", "no", "off"})
 _ConfigValue: TypeAlias = (
@@ -2033,24 +2043,29 @@ def _warn_deprecated_harness_path_env_vars() -> None:
         )
 
 
-REQUIRE_WRAPPER_ENV = "OMNIGENT_REQUIRE_WRAPPER"
-WRAPPER_COMMAND_ENV = "OMNIGENT_WRAPPER_COMMAND"
 WRAPPER_BYPASS_ENV = "OMNIGENT_WRAPPER_BYPASS"
 
 
-def _wrapper_guard_error(env: Mapping[str, str], prog: str) -> str | None:
+def _wrapper_guard_error(
+    *,
+    require_wrapper: bool,
+    wrapper_command: str,
+    bypass: bool,
+    prog: str,
+) -> str | None:
     """Return the block message when a naked ``omni`` call is refused, else ``None``.
 
-    A deployment that wraps the CLI (e.g. ``isaac omni``) sets
-    ``OMNIGENT_REQUIRE_WRAPPER`` so direct calls are refused; the wrapper sets
-    ``OMNIGENT_WRAPPER_BYPASS`` around its own invocation to pass through, and
-    ``OMNIGENT_WRAPPER_COMMAND`` names the command to suggest instead.
+    An operator opts a deployment into the guard with the ``require_wrapper``
+    config so direct calls are refused in favour of a wrapper (e.g.
+    ``isaac omni``); ``wrapper_command`` names the command to suggest. The
+    wrapper sets ``OMNIGENT_WRAPPER_BYPASS`` on the child it launches to pass
+    through, which is why bypass stays a per-launch env signal, not config.
     """
-    if not env_truthy(env.get(REQUIRE_WRAPPER_ENV)):
+    if not require_wrapper:
         return None
-    if env_truthy(env.get(WRAPPER_BYPASS_ENV)):
+    if bypass:
         return None
-    redirect = (env.get(WRAPPER_COMMAND_ENV) or "").strip()
+    redirect = wrapper_command.strip()
     if redirect:
         detail = f"Use `{redirect}` instead, or set {WRAPPER_BYPASS_ENV}=1 to run it directly."
     else:
@@ -2058,14 +2073,40 @@ def _wrapper_guard_error(env: Mapping[str, str], prog: str) -> str | None:
     return f"Error: running `{prog}` directly is disabled in this environment.\n{detail}"
 
 
+def _resolve_wrapper_guard_config() -> tuple[bool, str]:
+    """Read the wrapper-guard policy from effective (user + project) config.
+
+    Fails open: a missing, unreadable, or malformed config yields "guard off"
+    so the opt-in guard never blocks an unrelated command (``version``,
+    ``--help``) when config can't be parsed.
+
+    :returns: ``(require_wrapper, wrapper_command)``.
+    """
+    try:
+        cfg = _load_effective_config()
+        require = _parse_config_bool(
+            _REQUIRE_WRAPPER_CONFIG_KEY, cfg.get(_REQUIRE_WRAPPER_CONFIG_KEY, False)
+        )
+    except (OSError, yaml.YAMLError, click.ClickException):
+        return False, ""
+    command = cfg.get(_WRAPPER_COMMAND_CONFIG_KEY)
+    return require, command.strip() if isinstance(command, str) else ""
+
+
 def _enforce_wrapper_guard() -> None:
     """Exit early when a naked ``omni``/``omnigent`` call is blocked by an operator."""
+    require_wrapper, wrapper_command = _resolve_wrapper_guard_config()
     # argv[0] is the console-script name (``omni``/``omnigent``); ``python -m
     # omnigent`` reports ``__main__.py``, so fall back to the canonical name.
     prog = os.path.basename(sys.argv[0])
     if not prog or prog == "__main__.py":
         prog = "omnigent"
-    message = _wrapper_guard_error(os.environ, prog)
+    message = _wrapper_guard_error(
+        require_wrapper=require_wrapper,
+        wrapper_command=wrapper_command,
+        bypass=env_truthy(os.environ.get(WRAPPER_BYPASS_ENV)),
+        prog=prog,
+    )
     if message is not None:
         click.echo(message, err=True)
         raise SystemExit(2)
@@ -2103,8 +2144,9 @@ def main() -> None:
     install_crash_handler(app_name="omnigent", repo="omnigent-ai/omnigent")
 
     # Operators can force all use through a wrapper (e.g. `isaac omni`) by
-    # setting OMNIGENT_REQUIRE_WRAPPER; the wrapper sets OMNIGENT_WRAPPER_BYPASS
-    # to pass through. Refuse naked calls before any work happens.
+    # setting the `require_wrapper` config; the wrapper sets
+    # OMNIGENT_WRAPPER_BYPASS to pass through. Refuse naked calls before any
+    # work happens.
     _enforce_wrapper_guard()
 
     cwd = os.getcwd()
@@ -9977,17 +10019,18 @@ def config_set(is_global: bool, settings: tuple[str, ...]) -> None:
     ``~/.gitconfig``). Project values take precedence.
 
     Supported keys: auto_open_conversation, default_agent, harness,
-    model, server.
-
-    :param is_global: When ``True``, write to ``~/.omnigent/config.yaml``;
-        when ``False``, to ``.omnigent/config.yaml`` in cwd.
-    :param settings: ``KEY=VALUE`` pairs to set, e.g.
-        ``("default_agent=examples/hello.yaml", "model=gpt-5.4-mini")``.
+    model, opencode_model, require_wrapper, server, wrapper_command.
 
     \b
     Examples:
       omnigent config set default_agent=examples/hello_world.yaml
       omnigent config set --global server=https://<app>.databricksapps.com
+
+    \f
+    :param is_global: When ``True``, write to ``~/.omnigent/config.yaml``;
+        when ``False``, to ``.omnigent/config.yaml`` in cwd.
+    :param settings: ``KEY=VALUE`` pairs to set, e.g.
+        ``("default_agent=examples/hello.yaml", "model=gpt-5.4-mini")``.
     """
     if is_global:
         parsed = _parse_config_settings(settings, resolve_paths=True)
@@ -10014,6 +10057,7 @@ def config_set(is_global: bool, settings: tuple[str, ...]) -> None:
 def config_unset(is_global: bool, keys: tuple[str, ...]) -> None:
     """Remove one or more Omnigent defaults.
 
+    \f
     :param is_global: When ``True``, remove from ``~/.omnigent/config.yaml``;
         when ``False``, from ``.omnigent/config.yaml`` in cwd.
     :param keys: Keys to remove, e.g. ``("server", "model")``.

@@ -476,6 +476,26 @@ checked first. Spend caps and access limits ship as builtins.
 
 See the [policy guide](https://github.com/omnigent-ai/omnigent/blob/main/docs/POLICIES.md) for the full catalog and trust model.
 
+<details>
+<summary>Requiring a CLI wrapper (operator control)</summary>
+
+Fronting Omnigent with your own launcher (e.g. `isaac omni`)? Refuse direct
+`omni` / `omnigent` calls so everyone goes through it:
+
+```bash
+omnigent config set --global require_wrapper=true             # refuse naked calls
+omnigent config set --global wrapper_command="isaac omni"     # command to suggest
+omnigent config unset --global require_wrapper                # turn it back off
+```
+
+Your wrapper passes through by setting `OMNIGENT_WRAPPER_BYPASS=1` on the child
+it launches; that stays an env var since it's a per-launch signal, not a stored
+preference. A refused call prints the suggested command and that same escape
+hatch, so `OMNIGENT_WRAPPER_BYPASS=1 omnigent config unset --global require_wrapper`
+always gets you back in. Drop `--global` to scope it to one project.
+
+</details>
+
 ---
 
 ## Write your own agent

@@ -24,9 +24,9 @@ from omnigent.cli import (
     _CLICK_SUBCOMMANDS,
     _GLOBAL_CONFIG_KEYS,
     _NATIVE_TERMINAL_DISPATCH_SPECS,
-    REQUIRE_WRAPPER_ENV,
+    _REQUIRE_WRAPPER_CONFIG_KEY,
+    _WRAPPER_COMMAND_CONFIG_KEY,
     WRAPPER_BYPASS_ENV,
-    WRAPPER_COMMAND_ENV,
     _bundle,
     _bundled_example_path,
     _dispatch_native_terminal_harness,
@@ -48,6 +48,7 @@ from omnigent.cli import (
     _resolve_default_agent_target,
     _resolve_first_run_plan,
     _resolve_server_url,
+    _resolve_wrapper_guard_config,
     _save_global_config,
     _save_local_config,
     _server_uvicorn_log_config,
@@ -178,7 +179,9 @@ def test_python_module_entrypoint_uses_unified_click_cli() -> None:
     assert "Omnigent quick chat" not in result.stdout
 
 
-def _run_entrypoint(*args: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+def _run_entrypoint(
+    *args: str, env: dict[str, str], cwd: str | None = None
+) -> subprocess.CompletedProcess[str]:
     """Invoke the real CLI entry point in a subprocess with an augmented env."""
     return subprocess.run(
         [sys.executable, "-m", "omnigent", *args],
@@ -186,15 +189,26 @@ def _run_entrypoint(*args: str, env: dict[str, str]) -> subprocess.CompletedProc
         text=True,
         timeout=30,
         env={**os.environ, **env},
+        cwd=cwd,
     )
 
 
-def test_wrapper_guard_blocks_naked_call_end_to_end() -> None:
-    """With the toggle set, a naked call is refused before any CLI dispatch."""
-    result = _run_entrypoint(
-        "--help",
-        env={REQUIRE_WRAPPER_ENV: "1", WRAPPER_COMMAND_ENV: "isaac omni"},
-    )
+def _write_guard_config(tmp_path: Path, **values: object) -> dict[str, str]:
+    """Write a config.yaml with *values* and return the env pointing the CLI at it.
+
+    Used to exercise the wrapper guard end-to-end: the CLI reads
+    ``$OMNIGENT_CONFIG_HOME/config.yaml`` as its user-level config.
+    """
+    config_home = tmp_path / "config-home"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text(yaml.safe_dump(values))
+    return {"OMNIGENT_CONFIG_HOME": str(config_home)}
+
+
+def test_wrapper_guard_blocks_naked_call_end_to_end(tmp_path: Path) -> None:
+    """With require_wrapper config set, a naked call is refused before dispatch."""
+    env = _write_guard_config(tmp_path, require_wrapper=True, wrapper_command="isaac omni")
+    result = _run_entrypoint("--help", env=env, cwd=str(tmp_path))
 
     assert result.returncode == 2
     assert "running `omnigent` directly is disabled" in result.stderr
@@ -203,16 +217,11 @@ def test_wrapper_guard_blocks_naked_call_end_to_end() -> None:
     assert "Usage: python -m omnigent" not in result.stdout
 
 
-def test_wrapper_guard_bypass_reaches_cli_end_to_end() -> None:
-    """The bypass token lets the wrapped call dispatch normally."""
-    result = _run_entrypoint(
-        "--help",
-        env={
-            REQUIRE_WRAPPER_ENV: "1",
-            WRAPPER_COMMAND_ENV: "isaac omni",
-            WRAPPER_BYPASS_ENV: "1",
-        },
-    )
+def test_wrapper_guard_bypass_reaches_cli_end_to_end(tmp_path: Path) -> None:
+    """The bypass env token lets the wrapped call dispatch normally."""
+    env = _write_guard_config(tmp_path, require_wrapper=True, wrapper_command="isaac omni")
+    env[WRAPPER_BYPASS_ENV] = "1"
+    result = _run_entrypoint("--help", env=env, cwd=str(tmp_path))
 
     assert result.returncode == 0
     assert "Usage: python -m omnigent [OPTIONS] COMMAND [ARGS]..." in result.stdout
@@ -245,15 +254,20 @@ def test_removed_ad_hoc_detection(argv: list[str], expected: bool) -> None:
 
 
 def test_wrapper_guard_inactive_when_toggle_unset() -> None:
-    """No block without the opt-in toggle, whatever else is set."""
-    assert _wrapper_guard_error({WRAPPER_COMMAND_ENV: "isaac omni"}, "omni") is None
+    """No block without the opt-in config, whatever else is set."""
+    assert (
+        _wrapper_guard_error(
+            require_wrapper=False, wrapper_command="isaac omni", bypass=False, prog="omni"
+        )
+        is None
+    )
 
 
 def test_wrapper_guard_blocks_naked_call_and_suggests_redirect() -> None:
     """A naked call is refused with the configured redirect command."""
-    env = {REQUIRE_WRAPPER_ENV: "1", WRAPPER_COMMAND_ENV: "isaac omni"}
-
-    message = _wrapper_guard_error(env, "omni")
+    message = _wrapper_guard_error(
+        require_wrapper=True, wrapper_command="isaac omni", bypass=False, prog="omni"
+    )
 
     assert message is not None
     assert "running `omni` directly is disabled" in message
@@ -263,7 +277,9 @@ def test_wrapper_guard_blocks_naked_call_and_suggests_redirect() -> None:
 
 def test_wrapper_guard_message_without_redirect() -> None:
     """With no redirect command the block only offers the bypass escape hatch."""
-    message = _wrapper_guard_error({REQUIRE_WRAPPER_ENV: "1"}, "omnigent")
+    message = _wrapper_guard_error(
+        require_wrapper=True, wrapper_command="", bypass=False, prog="omnigent"
+    )
 
     assert message is not None
     assert "instead" not in message
@@ -272,19 +288,71 @@ def test_wrapper_guard_message_without_redirect() -> None:
 
 def test_wrapper_guard_bypass_passes_through() -> None:
     """The wrapper's bypass token lets the wrapped call proceed."""
-    env = {
-        REQUIRE_WRAPPER_ENV: "1",
-        WRAPPER_COMMAND_ENV: "isaac omni",
-        WRAPPER_BYPASS_ENV: "1",
-    }
+    assert (
+        _wrapper_guard_error(
+            require_wrapper=True, wrapper_command="isaac omni", bypass=True, prog="omni"
+        )
+        is None
+    )
 
-    assert _wrapper_guard_error(env, "omni") is None
+
+def test_resolve_wrapper_guard_config_reads_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """require_wrapper / wrapper_command come from the effective config."""
+    monkeypatch.setattr(
+        "omnigent.cli._load_effective_config",
+        lambda: {
+            _REQUIRE_WRAPPER_CONFIG_KEY: True,
+            _WRAPPER_COMMAND_CONFIG_KEY: "  isaac omni  ",
+        },
+    )
+
+    assert _resolve_wrapper_guard_config() == (True, "isaac omni")
 
 
-@pytest.mark.parametrize("falsey", ["", "0", "false", "no", "off"])
-def test_wrapper_guard_toggle_falsey_values_do_not_block(falsey: str) -> None:
-    """Falsey toggle values are treated as unset."""
-    assert _wrapper_guard_error({REQUIRE_WRAPPER_ENV: falsey}, "omni") is None
+def test_resolve_wrapper_guard_config_defaults_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An empty config leaves the guard off with no redirect."""
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+
+    assert _resolve_wrapper_guard_config() == (False, "")
+
+
+def test_resolve_wrapper_guard_config_fails_open_on_bad_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed config never blocks an unrelated command — the guard reads off."""
+
+    def _raise() -> dict[str, object]:
+        raise yaml.YAMLError("broken config")
+
+    monkeypatch.setattr("omnigent.cli._load_effective_config", _raise)
+
+    assert _resolve_wrapper_guard_config() == (False, "")
+
+
+@pytest.mark.parametrize("truthy", [True, "1", "true", "yes", "on"])
+def test_resolve_wrapper_guard_config_truthy_values(
+    monkeypatch: pytest.MonkeyPatch, truthy: object
+) -> None:
+    """require_wrapper accepts the same truthy spellings as other bool config."""
+    monkeypatch.setattr(
+        "omnigent.cli._load_effective_config",
+        lambda: {_REQUIRE_WRAPPER_CONFIG_KEY: truthy},
+    )
+
+    assert _resolve_wrapper_guard_config()[0] is True
+
+
+@pytest.mark.parametrize("falsey", [False, "0", "false", "no", "off"])
+def test_resolve_wrapper_guard_config_falsey_values(
+    monkeypatch: pytest.MonkeyPatch, falsey: object
+) -> None:
+    """Falsey require_wrapper values leave the guard off."""
+    monkeypatch.setattr(
+        "omnigent.cli._load_effective_config",
+        lambda: {_REQUIRE_WRAPPER_CONFIG_KEY: falsey},
+    )
+
+    assert _resolve_wrapper_guard_config()[0] is False
 
 
 def test_extract_global_logging_flags_preserves_run_shorthand() -> None:
@@ -4699,6 +4767,49 @@ def test_config_set_global_writes_auto_open_conversation_bool(
     cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     assert cfg["auto_open_conversation"] is True
     assert _resolve_auto_open_conversation_from_config(cfg) is True
+
+
+def test_config_set_global_writes_wrapper_guard_keys(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """``require_wrapper`` / ``wrapper_command`` round-trip through config.
+
+    ``require_wrapper`` persists as a real YAML boolean and
+    :func:`_resolve_wrapper_guard_config` reads both back.
+    """
+    config_path = tmp_path / "config.yaml"
+    monkeypatch.setattr("omnigent.cli._GLOBAL_CONFIG_PATH", config_path)
+    # Keep the effective read hermetic: no project-local config bleeds in.
+    monkeypatch.setattr("omnigent.cli._load_local_config", dict)
+
+    result = CliRunner().invoke(
+        cli,
+        ["config", "set", "--global", "require_wrapper=true", "wrapper_command=isaac omni"],
+    )
+
+    assert result.exit_code == 0, result.output
+    cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert cfg["require_wrapper"] is True
+    assert cfg["wrapper_command"] == "isaac omni"
+    assert _resolve_wrapper_guard_config() == (True, "isaac omni")
+
+
+def test_config_set_rejects_invalid_require_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """``require_wrapper`` accepts only explicit boolean values."""
+    monkeypatch.setattr("omnigent.cli._GLOBAL_CONFIG_PATH", tmp_path / "config.yaml")
+
+    result = CliRunner().invoke(
+        cli,
+        ["config", "set", "--global", "require_wrapper=maybe"],
+    )
+
+    assert result.exit_code != 0
+    assert "require_wrapper" in result.output
+    assert "must be a boolean" in result.output
 
 
 def test_config_set_global_reports_effective_config_home(
