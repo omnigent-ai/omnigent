@@ -1365,6 +1365,28 @@ class SqlUserDailyCost(OmnigentBase):
     updated_at: Mapped[int] = mapped_column(Integer)
 
 
+class SqlCostAlert(OmnigentBase):
+    """Per-user cost alert thresholds for the Usage feature."""
+
+    __tablename__ = "cost_alerts"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16, primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    threshold_usd: Mapped[float] = mapped_column(Float, nullable=False)
+    period: Mapped[str] = mapped_column(String(16), nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="1")
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (Index("ix_cost_alerts_user", "workspace_id", "user_id", "created_at"),)
+
+
 class SqlScheduledTask(OmnigentBase):
     """
     SQLAlchemy model for the ``scheduled_tasks`` table.

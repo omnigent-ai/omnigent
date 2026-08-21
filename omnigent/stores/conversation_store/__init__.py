@@ -1102,7 +1102,12 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
-    def sum_daily_cost(self, user_id: str, since_day_utc: str) -> float:
+    def sum_daily_cost(
+        self,
+        user_id: str,
+        since_day_utc: str,
+        until_day_utc: str | None = None,
+    ) -> float:
         """
         Sum a user's LLM spend over all UTC days ``>= since_day_utc``.
 
@@ -1117,18 +1122,27 @@ class ConversationStore(ABC):
         :param user_id: The user to read, e.g. ``"alice@example.com"``.
         :param since_day_utc: Inclusive lower-bound UTC day as an ISO date
             string ``"YYYY-MM-DD"``, e.g. ``"2026-06-05"``.
+        :param until_day_utc: Optional inclusive upper-bound UTC day as an
+            ISO date string ``"YYYY-MM-DD"``. When ``None``, no upper bound.
         :returns: The summed ``cost_usd`` across matching days, or ``0.0``
             when no rows fall in the range.
         """
         ...
 
     @abstractmethod
-    def list_daily_costs(self, user_id: str, since_day_utc: str) -> list[tuple[str, float]]:
+    def list_daily_costs(
+        self,
+        user_id: str,
+        since_day_utc: str,
+        until_day_utc: str | None = None,
+    ) -> list[tuple[str, float]]:
         """
         Return per-day cost rows for a user from ``since_day_utc`` onward.
 
         :param user_id: The user to read, e.g. ``"alice@example.com"``.
         :param since_day_utc: Inclusive lower-bound UTC day as ``"YYYY-MM-DD"``.
+        :param until_day_utc: Optional inclusive upper-bound UTC day as
+            ``"YYYY-MM-DD"``. When ``None``, no upper bound.
         :returns: List of ``(day_utc, cost_usd)`` tuples, ascending by day.
             Days with no spend are omitted.
         """
@@ -1169,6 +1183,41 @@ class ConversationStore(ABC):
         :param ask_approved_usd: The crossed checkpoint value (USD) the
             user approved continuing past, e.g. ``0.05``.
         """
+        ...
+
+    # ── Cost alerts ──────────────────────────────────────────────────
+
+    @abstractmethod
+    def create_cost_alert(
+        self,
+        alert_id: str,
+        user_id: str,
+        threshold_usd: float,
+        period: str,
+    ) -> dict[str, Any]:
+        """Create a cost alert threshold for a user."""
+        ...
+
+    @abstractmethod
+    def list_cost_alerts(self, user_id: str) -> list[dict[str, Any]]:
+        """Return all cost alerts for a user, ordered by created_at."""
+        ...
+
+    @abstractmethod
+    def delete_cost_alert(self, alert_id: str, user_id: str) -> bool:
+        """Delete a cost alert. Returns True if deleted, False if not found."""
+        ...
+
+    @abstractmethod
+    def update_cost_alert(
+        self,
+        alert_id: str,
+        user_id: str,
+        *,
+        enabled: bool | None = None,
+        threshold_usd: float | None = None,
+    ) -> dict[str, Any] | None:
+        """Update a cost alert. Returns updated alert or None if not found."""
         ...
 
     @abstractmethod

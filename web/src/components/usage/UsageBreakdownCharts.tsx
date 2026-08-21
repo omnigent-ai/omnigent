@@ -1,9 +1,10 @@
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 import type { Payload } from "recharts/types/component/DefaultTooltipContent";
-import type { SessionUsage } from "@/lib/usageApi";
+import type { ProjectCost, SessionUsage } from "@/lib/usageApi";
 
 interface Props {
   sessions: SessionUsage[];
+  projects?: ProjectCost[];
 }
 
 function aggregateByKey(
@@ -91,12 +92,16 @@ function HorizontalBarChart({ data }: { data: { name: string; cost: number }[] }
   );
 }
 
-export function UsageBreakdownCharts({ sessions }: Props) {
+export function UsageBreakdownCharts({ sessions, projects }: Props) {
   const byHarness = aggregateByKey(sessions, (s) => s.harness);
   const byModel = aggregateByModel(sessions);
+  const byProject = (projects ?? []).map((p) => ({
+    name: p.projectName ?? "Unfiled",
+    cost: p.costUsd,
+  }));
 
   return (
-    <div className="grid gap-6 md:grid-cols-2">
+    <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
       <div>
         <h3 className="mb-2 text-sm font-medium text-muted-foreground">Cost by harness</h3>
         <HorizontalBarChart data={byHarness} />
@@ -104,6 +109,10 @@ export function UsageBreakdownCharts({ sessions }: Props) {
       <div>
         <h3 className="mb-2 text-sm font-medium text-muted-foreground">Cost by model</h3>
         <HorizontalBarChart data={byModel} />
+      </div>
+      <div>
+        <h3 className="mb-2 text-sm font-medium text-muted-foreground">Cost by project</h3>
+        <HorizontalBarChart data={byProject} />
       </div>
     </div>
   );
