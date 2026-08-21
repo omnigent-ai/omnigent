@@ -686,3 +686,187 @@ def test_snapshot_for_returns_independent_copies() -> None:
     # the index; if "tampered-top-level", the top-level copy is
     # there but nested values are still shared.
     assert snap2[0]["params"]["message"] == "original"
+
+
+class _FakeStore:
+    """In-memory stand-in for the elicitation store.
+
+    Records call order so tests can pin that the durable write leads the index
+    mutation — the ordering the mirror depends on to be recoverable.
+    """
+
+    def __init__(self) -> None:
+        self.rows: dict[str, Any] = {}
+        self.calls: list[str] = []
+        self.fail_on_put = False
+
+    def put(self, elicitation: Any) -> None:
+        self.calls.append(f"put:{elicitation.id}")
+        if self.fail_on_put:
+            raise RuntimeError("store is down")
+        self.rows[elicitation.id] = elicitation
+
+    def delete(self, conversation_id: str, elicitation_id: str) -> bool:
+        self.calls.append(f"delete:{elicitation_id}")
+        return self.rows.pop(elicitation_id, None) is not None
+
+    def list_for_conversation(
+        self,
+        conversation_id: str,
+        *,
+        not_before: int | None = None,
+    ) -> list[Any]:
+        self.calls.append(f"list:{conversation_id}")
+        return [
+            row
+            for row in self.rows.values()
+            if row.conversation_id == conversation_id
+            and (not_before is None or row.created_at >= not_before)
+        ]
+
+
+def _request_event(elicitation_id: str, message: str = "Approve?") -> dict[str, Any]:
+    """Build a ``response.elicitation_request`` event."""
+    return {
+        "type": "response.elicitation_request",
+        "elicitation_id": elicitation_id,
+        "params": {"message": message},
+    }
+
+
+def test_no_store_leaves_the_index_in_memory_only() -> None:
+    """The runner and unit tests never wire a store; nothing may break there."""
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1"))
+    pending_elicitations.resolve("conv_a", "elicit_1")
+
+    assert pending_elicitations.count_for("conv_a") == 0
+    assert pending_elicitations.restore_for("conv_a") == []
+
+
+def test_publish_writes_the_row_before_indexing_it() -> None:
+    """Write-ahead: a crash between the two must not lose the prompt.
+
+    A row for a prompt the index never learned about is recoverable; an indexed
+    prompt with no row is the loss this mirror exists to prevent.
+    """
+    store = _FakeStore()
+    pending_elicitations.set_store(store)
+
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1"))
+
+    assert store.calls == ["put:elicit_1"]
+    assert store.rows["elicit_1"].event == _request_event("elicit_1")
+    assert store.rows["elicit_1"].conversation_id == "conv_a"
+    assert pending_elicitations.count_for("conv_a") == 1
+
+
+def test_resolve_deletes_the_row() -> None:
+    """An answered prompt must not come back after a restart."""
+    store = _FakeStore()
+    pending_elicitations.set_store(store)
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1"))
+
+    pending_elicitations.resolve("conv_a", "elicit_1")
+
+    assert store.rows == {}
+    assert store.calls == ["put:elicit_1", "delete:elicit_1"]
+
+
+def test_resolve_deletes_the_row_even_when_the_index_already_forgot() -> None:
+    """The runner publishes a resolved event on every exit path.
+
+    A second resolve for the same id finds nothing in the index, but the row
+    must still go — otherwise a timed-out prompt is restored as answerable.
+    """
+    store = _FakeStore()
+    pending_elicitations.set_store(store)
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1"))
+    pending_elicitations.resolve("conv_a", "elicit_1")
+    store.rows["elicit_1"] = object()  # a row the index no longer knows about
+
+    pending_elicitations.resolve("conv_a", "elicit_1")
+
+    assert store.rows == {}
+
+
+def test_a_failed_write_still_raises_the_prompt() -> None:
+    """Losing durability is not a reason to refuse to ask the human."""
+    store = _FakeStore()
+    store.fail_on_put = True
+    pending_elicitations.set_store(store)
+
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1"))
+
+    assert pending_elicitations.count_for("conv_a") == 1
+    assert pending_elicitations.snapshot_for("conv_a")[0]["elicitation_id"] == "elicit_1"
+
+
+def test_restore_repopulates_the_index_after_a_restart() -> None:
+    """The whole point: a prompt outstanding across a restart is answerable."""
+    store = _FakeStore()
+    pending_elicitations.set_store(store)
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1", "gate me"))
+
+    # A restart wipes the index but not the store.
+    rows = dict(store.rows)
+    pending_elicitations.reset_for_tests()
+    store.rows = rows
+    pending_elicitations.set_store(store)
+    assert pending_elicitations.snapshot_for("conv_a") == []
+
+    restored = pending_elicitations.restore_for("conv_a")
+
+    assert [event["elicitation_id"] for event in restored] == ["elicit_1"]
+    assert restored[0]["params"]["message"] == "gate me"
+    assert pending_elicitations.count_for("conv_a") == 1
+    # And it is now resolvable through the ordinary path.
+    pending_elicitations.resolve("conv_a", "elicit_1")
+    assert pending_elicitations.count_for("conv_a") == 0
+    assert store.rows == {}
+
+
+def test_restore_skips_prompts_too_old_to_have_an_awaiter() -> None:
+    """A day-old prompt has no parked awaiter, so offering it is a lie."""
+    import time as _time
+
+    store = _FakeStore()
+    pending_elicitations.set_store(store)
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_stale"))
+    # The entity is frozen, so age it by rebuilding rather than mutating.
+    stale = store.rows["elicit_stale"]
+    store.rows["elicit_stale"] = type(stale)(
+        id=stale.id,
+        workspace_id=stale.workspace_id,
+        conversation_id=stale.conversation_id,
+        created_at=int(_time.time()) - 90_000,
+        event=stale.event,
+    )
+    pending_elicitations.reset_for_tests()
+    pending_elicitations.set_store(store)
+
+    assert pending_elicitations.restore_for("conv_a") == []
+    assert pending_elicitations.count_for("conv_a") == 0
+
+
+def test_restore_does_not_clobber_a_live_index_entry() -> None:
+    """A prompt raised since the restart must not be replaced by its old row."""
+    store = _FakeStore()
+    pending_elicitations.set_store(store)
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1", "old"))
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1", "new"))
+
+    restored = pending_elicitations.restore_for("conv_a")
+
+    assert [event["params"]["message"] for event in restored] == ["new"]
+
+
+def test_a_failed_restore_degrades_to_an_empty_snapshot() -> None:
+    """A store outage must not 500 a session snapshot."""
+
+    class _BrokenStore(_FakeStore):
+        def list_for_conversation(self, conversation_id: str, **kwargs: Any) -> list[Any]:
+            raise RuntimeError("store is down")
+
+    pending_elicitations.set_store(_BrokenStore())
+
+    assert pending_elicitations.restore_for("conv_a") == []

@@ -26,12 +26,22 @@ UI's chat blocks on cold load — the SSE stream itself has no replay,
 so an elicitation emitted before the user opened the chat would
 otherwise render as nothing.
 
+Outstanding entries are also mirrored to the ``elicitations`` table when a
+store is wired (:func:`set_store` — the server does this at startup; the runner
+and unit tests leave it unset and are unaffected). The index stays the read
+path; the rows exist so a server restart does not take the parked set with it.
+:func:`restore_for` reads them back. Unlike the count mirror on the
+conversation row, which is best-effort because a stale count self-corrects on
+the next transition, these writes are synchronous and lead the index — losing
+one is the very failure the mirror exists to prevent.
+
 Limitations:
 
-* In-memory only; multi-replica Omnigent deploys would each see their own
-  slice. This matches the existing ``_harness_elicitation_registry``
-  constraint — when a shared backplane is added for the registry,
-  this index should be wired through the same backplane.
+* Without a store the index is in-memory only; multi-replica Omnigent deploys
+  would each see their own slice. This matches the existing
+  ``_harness_elicitation_registry`` constraint — when a shared backplane is
+  added for the registry, this index should be wired through the same
+  backplane.
 * Events emitted before the Omnigent server starts (e.g. between turns,
   with the session_stream having dropped them) are not tracked,
   same as every other AP-server-side in-memory state.
@@ -40,9 +50,22 @@ Limitations:
 from __future__ import annotations
 
 import copy
+import logging
 import threading
+import time
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from omnigent.stores.elicitation_store import ElicitationStore
+
+_logger = logging.getLogger(__name__)
+
+# Longest a prompt can still have something waiting on it. The runner parks an
+# ASK for at most ``pending_approvals._DEFAULT_WAIT_SECONDS`` (one day), so a
+# restored row older than this has no awaiter left to release and is dropped on
+# read rather than shown as answerable.
+_MAX_PARK_SECONDS = 86400
 
 # Per-conversation mapping of outstanding elicitation_id → original
 # event payload. Storing the full event (not just the id) lets
@@ -104,6 +127,132 @@ def _notify_count_hook(conversation_id: str, count: int) -> None:
         hook(conversation_id, count)
 
 
+# Durable mirror of the index. ``None`` (runner, unit tests) keeps the index
+# purely in-memory and every store call below a no-op.
+_store: ElicitationStore | None = None
+
+
+def set_store(store: ElicitationStore | None) -> None:
+    """
+    Wire (or clear) the store outstanding prompts are mirrored to.
+
+    :param store: The server's elicitation store, or ``None`` to keep the
+        index in-memory only (the runner process and unit tests).
+    """
+    global _store
+    _store = store
+
+
+def _persist_add(conversation_id: str, elicitation_id: str, event: dict[str, Any]) -> None:
+    """
+    Write an outstanding prompt to the store, ahead of indexing it.
+
+    Write-ahead so a crash between the two leaves a row for a prompt the index
+    never learned about — recoverable — rather than an indexed prompt with no
+    row, which is the loss this mirror exists to prevent.
+
+    Failures log and are dropped: a prompt that cannot be persisted should
+    still be raised. The session keeps working; only its restart-survival is
+    lost, which is the behaviour before this mirror existed.
+
+    :param conversation_id: Session the prompt was raised on.
+    :param elicitation_id: The prompt's correlation id.
+    :param event: The ``response.elicitation_request`` payload.
+    """
+    store = _store
+    if store is None:
+        return
+    from omnigent.db.db_models import current_workspace_id
+    from omnigent.entities import Elicitation
+
+    try:
+        store.put(
+            Elicitation(
+                id=elicitation_id,
+                workspace_id=current_workspace_id(),
+                conversation_id=conversation_id,
+                created_at=int(time.time()),
+                event=event,
+            )
+        )
+    except Exception:  # never block raising the prompt
+        _logger.warning(
+            "Could not persist elicitation %r; it will not survive a restart",
+            elicitation_id,
+            exc_info=True,
+        )
+
+
+def _persist_remove(conversation_id: str, elicitation_id: str) -> None:
+    """
+    Drop a resolved prompt from the store, ahead of dropping it from the index.
+
+    Store-first for the same reason :func:`_persist_add` is: a crash between
+    the two leaves the index holding a prompt whose row is already gone, so the
+    next restart forgets it — correct, since it was answered. The reverse order
+    would resurrect an answered prompt and ask the user twice.
+
+    :param conversation_id: Session the prompt was raised on.
+    :param elicitation_id: The prompt's correlation id.
+    """
+    store = _store
+    if store is None:
+        return
+    try:
+        store.delete(conversation_id, elicitation_id)
+    except Exception:  # never block resolving the prompt
+        _logger.warning(
+            "Could not delete resolved elicitation %r",
+            elicitation_id,
+            exc_info=True,
+        )
+
+
+def restore_for(conversation_id: str) -> list[dict[str, Any]]:
+    """
+    Reload one session's outstanding prompts from the store into the index.
+
+    Called when a session snapshot finds its index empty but the conversation
+    row still reports outstanding prompts — the signature of a server restart,
+    since the count is mirrored to the row and the payloads were not.
+
+    Prompts older than :data:`_MAX_PARK_SECONDS` are skipped: nothing can still
+    be parked on them, so surfacing one would offer the user a button that
+    resolves nothing. They are left in the store for a reaper to collect rather
+    than deleted from a read path.
+
+    Restoring does not fire the count hook. The count is what sent us here, so
+    rewriting it would be a no-op at best, and at worst would race the mirror
+    that is already correct.
+
+    :param conversation_id: Session to restore, e.g. ``"conv_abc123"``.
+    :returns: The restored event payloads, oldest first. Empty when no store
+        is wired, the store fails, or nothing survives the age check.
+    """
+    store = _store
+    if store is None:
+        return []
+    try:
+        rows = store.list_for_conversation(
+            conversation_id,
+            not_before=int(time.time()) - _MAX_PARK_SECONDS,
+        )
+    except Exception:  # a failed restore degrades to the pre-mirror behaviour
+        _logger.warning(
+            "Could not restore outstanding elicitations for %s",
+            conversation_id,
+            exc_info=True,
+        )
+        return []
+    if not rows:
+        return []
+    with _lock:
+        ids = _pending.setdefault(conversation_id, {})
+        for row in rows:
+            ids.setdefault(row.id, row.event)
+        return [copy.deepcopy(event) for event in ids.values()]
+
+
 def record_publish(conversation_id: str, event: dict[str, Any]) -> None:
     """
     Update the index when an SSE event is published.
@@ -145,6 +294,7 @@ def record_publish(conversation_id: str, event: dict[str, Any]) -> None:
         elicitation_id = event.get("elicitation_id")
         if not isinstance(elicitation_id, str) or not elicitation_id:
             return
+        _persist_add(conversation_id, elicitation_id, event)
         with _lock:
             ids = _pending.setdefault(conversation_id, {})
             ids[elicitation_id] = event
@@ -202,6 +352,10 @@ def resolve(conversation_id: str, elicitation_id: str) -> None:
     :param elicitation_id: The elicitation correlation id from the
         approval payload, e.g. ``"elicit_abc123"``.
     """
+    # Unconditional, and before the index drop: this call may be the second
+    # resolve for an id the index already forgot (the runner publishes a
+    # resolved event on every exit path), and the row must go either way.
+    _persist_remove(conversation_id, elicitation_id)
     with _lock:
         ids = _pending.get(conversation_id)
         if ids is None:
@@ -377,7 +531,8 @@ def reset_for_tests() -> None:
     production callers — there is no legitimate use case for
     wiping the index at runtime.
     """
-    global _observer
+    global _observer, _store
     with _lock:
         _pending.clear()
     _observer = None
+    _store = None

@@ -1497,12 +1497,21 @@ def _pending_elicitation_snapshot_for_session(
     other than ``conv`` has an outstanding prompt in the in-memory
     index (the common case is none anywhere).
 
+    An index with nothing for a session whose row still counts prompts is the
+    signature of a server restart: the count is mirrored to the conversation
+    row, the payloads were not. That case reloads the payloads from the
+    ``elicitations`` table so the prompt renders and stays answerable. The row
+    count is read from the conversation already loaded here, so a session with
+    nothing parked costs no extra query.
+
     :param conv_store: Store used to list descendant sub-agents.
     :param conv: Session conversation being snapshotted.
     :returns: Pending elicitation event dicts suitable for
         :class:`SessionResponse.pending_elicitations`.
     """
     events = pending_elicitations.snapshot_for(conv.id)
+    if not events and (conv.pending_elicitation_count or 0) > 0:
+        events = pending_elicitations.restore_for(conv.id)
     if not (set(pending_elicitations.pending_session_ids()) - {conv.id}):
         return events
     seen = {
