@@ -58,6 +58,70 @@ export interface UsageReport {
   sessions: SessionUsage[];
 }
 
+// ── Cost Breakdown types ────────────────────────────────────────
+
+interface UsageEntryWire {
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  cache_read_input_tokens: number;
+  cache_creation_input_tokens: number;
+  total_cost_usd?: number;
+}
+
+interface CategoryBreakdownItemWire {
+  name: string;
+  usage: UsageEntryWire;
+}
+
+interface CategoryBreakdownWire {
+  total: UsageEntryWire;
+  items: CategoryBreakdownItemWire[];
+}
+
+interface SessionCostBreakdownWire {
+  session_id: string;
+  total_cost_usd: number;
+  total_tokens: number;
+  tools: CategoryBreakdownWire;
+  shell: CategoryBreakdownWire;
+  model: CategoryBreakdownWire;
+  system: CategoryBreakdownWire;
+  user: CategoryBreakdownWire;
+  images: CategoryBreakdownWire;
+}
+
+export interface UsageEntry {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  cacheReadInputTokens: number;
+  cacheCreationInputTokens: number;
+  totalCostUsd?: number;
+}
+
+export interface CategoryBreakdownItem {
+  name: string;
+  usage: UsageEntry;
+}
+
+export interface CategoryBreakdown {
+  total: UsageEntry;
+  items: CategoryBreakdownItem[];
+}
+
+export interface SessionCostBreakdown {
+  sessionId: string;
+  totalCostUsd: number;
+  totalTokens: number;
+  tools: CategoryBreakdown;
+  shell: CategoryBreakdown;
+  model: CategoryBreakdown;
+  system: CategoryBreakdown;
+  user: CategoryBreakdown;
+  images: CategoryBreakdown;
+}
+
 // ── Fetch ───────────────────────────────────────────────────────
 
 export async function fetchUsageReport(): Promise<UsageReport> {
@@ -82,5 +146,45 @@ export async function fetchUsageReport(): Promise<UsageReport> {
       llmModel: s.llm_model ?? null,
       agentName: s.agent_name ?? null,
     })),
+  };
+}
+
+function convertUsageEntry(wire: UsageEntryWire): UsageEntry {
+  return {
+    inputTokens: wire.input_tokens,
+    outputTokens: wire.output_tokens,
+    totalTokens: wire.total_tokens,
+    cacheReadInputTokens: wire.cache_read_input_tokens,
+    cacheCreationInputTokens: wire.cache_creation_input_tokens,
+    totalCostUsd: wire.total_cost_usd,
+  };
+}
+
+function convertCategoryBreakdown(wire: CategoryBreakdownWire): CategoryBreakdown {
+  return {
+    total: convertUsageEntry(wire.total),
+    items: (wire.items ?? []).map((item) => ({
+      name: item.name,
+      usage: convertUsageEntry(item.usage),
+    })),
+  };
+}
+
+export async function fetchSessionCostBreakdown(
+  sessionId: string
+): Promise<SessionCostBreakdown> {
+  const res = await authenticatedFetch(`/v1/sessions/${sessionId}/cost-breakdown`);
+  if (!res.ok) throw new Error(`Cost breakdown fetch failed: ${res.status}`);
+  const wire: SessionCostBreakdownWire = await res.json();
+  return {
+    sessionId: wire.session_id,
+    totalCostUsd: wire.total_cost_usd,
+    totalTokens: wire.total_tokens,
+    tools: convertCategoryBreakdown(wire.tools),
+    shell: convertCategoryBreakdown(wire.shell),
+    model: convertCategoryBreakdown(wire.model),
+    system: convertCategoryBreakdown(wire.system),
+    user: convertCategoryBreakdown(wire.user),
+    images: convertCategoryBreakdown(wire.images),
   };
 }
