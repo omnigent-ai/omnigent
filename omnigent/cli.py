@@ -5819,6 +5819,22 @@ def resume(
     help="Import the N most recently modified parent sessions (maximum 50).",
 )
 @click.option(
+    "--worktree",
+    type=click.Path(
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        resolve_path=True,
+        path_type=Path,
+    ),
+    default=None,
+    metavar="PATH",
+    help=(
+        "Existing worktree to associate with one Claude Code session. "
+        "Requires --harness claude and --session."
+    ),
+)
+@click.option(
     "--server",
     default=None,
     help=(
@@ -5835,6 +5851,7 @@ def import_session_command(
     harness: str,
     source_session_id: str | None,
     recent_session_count: int | None,
+    worktree: Path | None,
     server: str | None,
     force: bool,
 ) -> None:
@@ -5849,7 +5866,7 @@ def import_session_command(
 
     \b
     Examples:
-      omnigent import --harness claude --session <session-id>
+      omnigent import --harness claude --session <session-id> --worktree /path/to/worktree
       omnigent import --harness codex --session <session-id>
       omnigent import --harness opencode --session <session-id>
       omnigent import --harness qwen --session <session-id>
@@ -5874,6 +5891,12 @@ def import_session_command(
 
     source = cast(ImportSource, harness.lower())
     is_batch = recent_session_count is not None
+    if worktree is not None and source != "claude":
+        raise click.UsageError("--worktree is currently supported only with --harness claude.")
+    if worktree is not None and is_batch:
+        raise click.UsageError(
+            "--worktree requires --session; import each Claude Code session with its worktree."
+        )
     if recent_session_count is not None:
         try:
             recent_ids = list_recent_local_session_ids(source, limit=recent_session_count)
@@ -5910,10 +5933,11 @@ def import_session_command(
             click.echo(f"Failed {current_source_session_id}: {exc}", err=True)
             continue
 
+        workspace = str(worktree) if worktree is not None else imported.workspace
         payload = {
             "source": imported.source,
             "external_session_id": imported.external_session_id,
-            "workspace": imported.workspace,
+            "workspace": workspace,
             "force": force,
             "items": [
                 {
@@ -5964,6 +5988,10 @@ def import_session_command(
                 err=True,
             )
             continue
+        if source == "claude" and workspace is not None:
+            from omnigent.claude_native_state import write_launch_state
+
+            write_launch_state(session_id, str(Path(workspace).resolve()))
         imported_count += 1
         # Surface the browser URL, not the bare id, so the user can open the
         # imported session straight into the web (where it offers the resume

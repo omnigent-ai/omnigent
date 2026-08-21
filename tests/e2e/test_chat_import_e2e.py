@@ -242,7 +242,7 @@ def _write_force_import_fixture(home: Path, harness: str, text: str) -> str:
 
 
 def test_cli_imports_claude_chat_into_live_server(live_server: str, tmp_path: Path) -> None:
-    """The real CLI and server create a readable session from Claude JSONL."""
+    """The real CLI and server map a Claude session to a selected worktree."""
     source_session_id = "a1b2c3d4-1234-5678-9abc-def012345678"
     transcript = tmp_path / ".claude" / "projects" / "-repo" / f"{source_session_id}.jsonl"
     transcript.parent.mkdir(parents=True)
@@ -273,12 +273,15 @@ def test_cli_imports_claude_chat_into_live_server(live_server: str, tmp_path: Pa
         ),
         encoding="utf-8",
     )
+    worktree = tmp_path / "repo-worktrees" / "feature-import"
+    worktree.mkdir(parents=True)
     env = os.environ.copy()
     env.update(
         {
             "HOME": str(tmp_path),
             "OMNIGENT_CONFIG_HOME": str(tmp_path / "config"),
             "OMNIGENT_DATA_DIR": str(tmp_path / "omnigent-data"),
+            "OMNIGENT_CLAUDE_NATIVE_STATE_DIR": str(tmp_path / "claude-native-state"),
         }
     )
 
@@ -292,6 +295,8 @@ def test_cli_imports_claude_chat_into_live_server(live_server: str, tmp_path: Pa
             "claude",
             "--session",
             source_session_id,
+            "--worktree",
+            str(worktree),
             "--server",
             live_server,
         ],
@@ -314,7 +319,7 @@ def test_cli_imports_claude_chat_into_live_server(live_server: str, tmp_path: Pa
     session.raise_for_status()
     session_data = session.json()
     assert session_data["external_session_id"] == source_session_id
-    assert session_data["workspace"] == "/repo"
+    assert session_data["workspace"] == str(worktree.resolve())
     assert session_data["title"] == "inspect TODO.md"
     items = httpx.get(f"{live_server}/v1/sessions/{session_id}/items", timeout=10)
     items.raise_for_status()

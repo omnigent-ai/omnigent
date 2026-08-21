@@ -11,6 +11,7 @@ import httpx
 import respx
 from click.testing import CliRunner
 
+from omnigent.claude_native_state import read_launch_state
 from omnigent.cli import _CLICK_SUBCOMMANDS, cli
 from omnigent.session_import.models import SessionImportNotFoundError
 
@@ -111,6 +112,90 @@ def test_import_command_sends_force_override(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     assert json.loads(route.calls.last.request.content)["force"] is True
     assert "conv_replaced" in result.output
+
+
+@respx.mock
+def test_import_command_maps_claude_session_to_selected_worktree(tmp_path: Path) -> None:
+    """A Claude import persists its worktree for server and local resume paths."""
+    session_id = "a1b2c3d4-1234-5678-9abc-def012345679"
+    _write_claude_transcript(tmp_path, session_id, text="continue in my worktree")
+    worktree = tmp_path / "repo-worktrees" / "feature-import"
+    worktree.mkdir(parents=True)
+    state_root = tmp_path / "claude-native-state"
+    route = respx.post(f"{_BASE}/v1/imports").mock(
+        return_value=httpx.Response(
+            201,
+            json={"session_id": "conv_worktree", "status": "imported", "item_count": 1},
+        )
+    )
+
+    with patch("omnigent.cli._resolve_attach_server", return_value=_BASE):
+        result = CliRunner().invoke(
+            cli,
+            [
+                "import",
+                "--harness",
+                "claude",
+                "--session",
+                session_id,
+                "--worktree",
+                str(worktree),
+            ],
+            env={
+                "HOME": str(tmp_path),
+                "OMNIGENT_CLAUDE_NATIVE_STATE_DIR": str(state_root),
+            },
+        )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(route.calls.last.request.content)
+    assert payload["workspace"] == str(worktree.resolve())
+    with patch.dict(
+        os.environ,
+        {"OMNIGENT_CLAUDE_NATIVE_STATE_DIR": str(state_root)},
+    ):
+        state = read_launch_state("conv_worktree")
+    assert state is not None
+    assert state.working_directory == str(worktree.resolve())
+
+
+def test_import_command_scopes_worktree_override_to_single_claude_session(
+    tmp_path: Path,
+) -> None:
+    """Codex and batch imports remain out of scope for worktree overrides."""
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    runner = CliRunner()
+
+    codex = runner.invoke(
+        cli,
+        [
+            "import",
+            "--harness",
+            "codex",
+            "--session",
+            "019f7777-0001-7000-8000-000000000001",
+            "--worktree",
+            str(worktree),
+        ],
+    )
+    batch = runner.invoke(
+        cli,
+        [
+            "import",
+            "--harness",
+            "claude",
+            "--last",
+            "2",
+            "--worktree",
+            str(worktree),
+        ],
+    )
+
+    assert codex.exit_code == 2
+    assert "supported only with --harness claude" in codex.output
+    assert batch.exit_code == 2
+    assert "import each Claude Code session with its worktree" in batch.output
 
 
 def test_import_command_rejects_cursor() -> None:
