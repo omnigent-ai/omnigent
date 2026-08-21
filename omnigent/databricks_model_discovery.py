@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import re
 import warnings
@@ -234,7 +235,10 @@ def discover_databricks_claude_catalog(
     named Claude models — short-circuiting on the UC hit would cost one HTTP
     round trip less per launch, but UC only ever spells ids ``system.ai.``, so
     the spelling a consumer sees would depend on whether the (transiently
-    failing) UC call answered.
+    failing) UC call answered. Since both are always issued and neither feeds
+    the other, they are issued concurrently: this runs on the
+    ``omnigent claude`` startup path, where the two listings' latencies would
+    otherwise add up.
 
     :param workspace_url: Workspace origin, e.g. ``"https://example.com"``.
     :param token: Workspace bearer token.
@@ -251,13 +255,24 @@ def discover_databricks_claude_catalog(
     gateway_error: Exception | None = None
     model_service_ids: list[str] = []
     gateway_ids: list[str] = []
-    with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
+    # Both listings are always issued (see above) and neither feeds the other,
+    # so they run concurrently on one connection pool: the stage costs
+    # max(uc, gateway) instead of their sum. Pagination stays sequential inside
+    # each listing, which its page tokens require.
+    with (
+        httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client,
+        concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool,
+    ):
+        model_services_future = pool.submit(
+            _list_model_service_ids, client, workspace_url, headers
+        )
+        gateway_future = pool.submit(_list_anthropic_gateway_ids, client, workspace_url, headers)
         try:
-            model_service_ids = _list_model_service_ids(client, workspace_url, headers)
+            model_service_ids = model_services_future.result()
         except (httpx.HTTPError, ValueError) as exc:
             primary_error = exc
         try:
-            gateway_ids = _list_anthropic_gateway_ids(client, workspace_url, headers)
+            gateway_ids = gateway_future.result()
         except (httpx.HTTPError, ValueError) as exc:
             gateway_error = exc
 
