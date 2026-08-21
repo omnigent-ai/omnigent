@@ -8029,6 +8029,7 @@ async def _create_session_from_existing_agent(
             workspace=canonical_workspace,
             git_branch=git_branch,
             terminal_launch_args=validated_launch_args,
+            project_id=body.project_id,
         )
     except Exception:
         # Broad catch is intentional: ANY create_conversation failure
