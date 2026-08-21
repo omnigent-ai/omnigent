@@ -70,6 +70,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import cast
 
 from omnigent.policies.schema import (
     SESSION_COST_ASK_APPROVED_STATE_KEY,
@@ -993,7 +994,7 @@ def user_period_cost_budget(
     def _read_period_cost(event: PolicyEvent) -> float:
         """Read the owner's period cost from the event context."""
         context = event.get("context") or {}
-        period_data: dict[str, object] = context.get(context_key) or {}
+        period_data = cast(dict[str, object], context.get(context_key) or {})
         raw = period_data.get("cost_usd", 0.0)
         try:
             return float(raw)
@@ -1003,7 +1004,7 @@ def user_period_cost_budget(
     def _read_period_approved(event: PolicyEvent) -> float:
         """Read the highest approved checkpoint for this period."""
         context = event.get("context") or {}
-        period_data: dict[str, object] = context.get(context_key) or {}
+        period_data = cast(dict[str, object], context.get(context_key) or {})
         raw = period_data.get("ask_approved_usd", 0.0)
         try:
             return float(raw)
@@ -1013,7 +1014,7 @@ def user_period_cost_budget(
     def _read_period_owner(event: PolicyEvent) -> str | None:
         """Read the session owner from the period context."""
         context = event.get("context") or {}
-        period_data: dict[str, object] = context.get(context_key) or {}
+        period_data = cast(dict[str, object], context.get(context_key) or {})
         owner = period_data.get("user_id")
         return owner if isinstance(owner, str) and owner else None
 
@@ -1217,9 +1218,9 @@ POLICY_REGISTRY: list[dict[str, object]] = [
         "description": "Gates the session OWNER's cumulative LLM spend across all their "
         "sessions for a configurable time period (day, week, month, quarter, or year). Supports "
         "optional per-harness budgets (non-day periods only). Once a hard period limit is reached "
-        "DENY (the whole turn at the request phase, or each tool call) while still on an expensive "
-        "model (prompting a /model downgrade), and ASK for approval at each soft warning checkpoint "
-        "(request + tool-call phases, remembered per user+period+harness). "
+        "DENY (the whole turn at the request phase, or each tool call) while still on an "
+        "expensive model (prompting a /model downgrade), and ASK for approval at each soft "
+        "warning checkpoint (request + tool-call phases, remembered per user+period+harness). "
         "Reads event.context.user_daily_cost for day periods or "
         "event.context.user_period_cost for others.",
         "params_schema": {
