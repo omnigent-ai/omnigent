@@ -8,17 +8,26 @@ items, not token-by-token deltas — so the work is visible while it happens
 rather than only at the end:
 
 - Genie's planning arrives as **reasoning** while the turn is still running.
-- Each **SQL query it runs** appears as a tool call *during* the turn, with the
-  query's output attached when it finishes.
+- Each **SQL query it runs** surfaces *during* the turn as a tool card, with the
+  query's output attached when it finishes. Genie runs that SQL itself and
+  Omnigent only observes it — it is not a tool call Omnigent serves.
 - The **report text** lands when Genie finishes writing it, with result rows
   re-rendered as Markdown tables (capped at 50 rows) from Genie's
   machine-readable `columns` / `preview_rows` metadata — Databricks documents
   Genie's own Markdown as unstable.
 
 Genie executes its SQL itself, so those calls are observations: this harness
-dispatches no Omnigent tools. The Genie space also carries its own instructions,
-so the `prompt` in [`config.yaml`](config.yaml) documents the agent rather than
-being sent to Genie.
+dispatches no Omnigent tools. Because Omnigent never serves them, they are not
+subject to `TOOL_CALL` policy gating and emit no usage toward cost budgets. The
+Genie space also carries its own instructions, so the `prompt` in
+[`config.yaml`](config.yaml) documents the agent rather than being sent to Genie.
+
+For the same reason, **tools attached to a `databricks-genie` agent are inert**.
+A `tools:` block — or an MCP server wired to the agent — parses and connects
+without complaint, but the harness reports no tool-calling support and forwards
+only the latest user message to Genie, so the tools are silently discarded. If
+you need tool composition, point a tool-calling harness (`claude-sdk`, `codex`,
+…) at the Genie MCP server instead of using this harness.
 
 ## Prerequisites
 
@@ -81,9 +90,12 @@ omnigent run examples/genie
 ```
 
 Follow-up questions in the same session continue the same Genie conversation, so
-you can refine ("now break that down by month") without repeating context. The
-conversation id is held by the running harness process, so a new process starts
-a fresh Genie conversation.
+you can refine ("now break that down by month") without repeating context. That
+context lives server-side in Databricks, keyed by a `conversation_id` the
+running harness process holds in memory — it is never persisted, and the harness
+declares resume `NONE`. Restarting Omnigent (or resuming a saved session) starts
+a fresh, contextless Genie conversation: only the latest user message is
+forwarded, so earlier turns are not replayed.
 
 If a turn fails with `RESOURCE_CONFLICT` (HTTP 409), the conversation still has
 a turn in progress — wait for it to finish before sending the next message.

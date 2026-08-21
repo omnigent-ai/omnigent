@@ -225,6 +225,19 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     ``omnigent run --harness hermes-native``, AND it wraps the ``hermes`` CLI
     binary. Its coverage is the dedicated hermes-native bridge/executor/forwarder/
     approval-mirror unit tests.
+
+    ``databricks-genie`` is excluded for the same reason as ``cursor`` /
+    ``copilot``: it is an SDK harness that drives a live Databricks workspace
+    rather than the shared gateway/profile probe wiring this matrix drives. A
+    round-trip needs a real Genie space id in ``executor.model``, workspace
+    credentials the Databricks SDK can resolve, and the workspace-admin Beta
+    preview toggle for Genie Agent mode — without that toggle every turn fails
+    with a 404 ``FEATURE_DISABLED``. Its live round-trip is covered by the
+    skip-gated ``tests/e2e/omnigent/test_per_harness_databricks_genie.py``.
+
+    (The ``genie`` alias needs no exclusion: it is registered in
+    ``_HARNESS_MODULES`` but not in ``OMNIGENT_HARNESSES``, so the intersection
+    above never yields it.)
     """
     expected_live_harnesses = set(OMNIGENT_HARNESSES).intersection(_HARNESS_MODULES) - {
         "acp",
@@ -246,5 +259,6 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "kimi-native",
         "hermes",
         "hermes-native",
+        "databricks-genie",
     }
     assert {probe.harness for probe in HARNESS_PROBES} == expected_live_harnesses
