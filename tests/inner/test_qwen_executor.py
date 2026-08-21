@@ -91,6 +91,9 @@ async def test_close_terminates_process() -> None:
     mock_proc = MagicMock()
     mock_proc.stdin = MagicMock()
     mock_proc.returncode = None
+    # pid=None routes the tree-aware teardown helpers down their no-pid
+    # branch, which signals this handle directly and makes no OS calls.
+    mock_proc.pid = None
 
     # wait() must be a coroutine.
     async def fake_wait() -> int:
