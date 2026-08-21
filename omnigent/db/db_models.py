@@ -1587,3 +1587,57 @@ class SqlScheduledTaskRun(OmnigentBase):
             "conversation_id",
         ),
     )
+
+
+class SqlElicitation(OmnigentBase):
+    """
+    SQLAlchemy model for the ``elicitations`` table.
+
+    One row per approval prompt still waiting on a human. A resolved prompt is
+    deleted, so the table holds the parked set and never grows with history —
+    the durable mirror of
+    :mod:`omnigent.runtime.pending_elicitations`, which is otherwise
+    process-local and dies with the server.
+
+    :param id: The prompt's correlation id, e.g. ``"elicit_abc123"``. A plain
+        String, not :class:`Uuid16`: several native harnesses mint deterministic
+        ids from the session plus the gated tool call (see
+        ``cursor_tool_call_elicitation_id``), so the value is opaque text.
+    :param workspace_id: Tenant partition key owning this row (0 = default).
+    :param conversation_id: Session the prompt was raised on (relates to
+        ``conversations.id``; no DB foreign key, Rule R032 — the application
+        deletes these alongside the conversation).
+    :param created_at: Unix epoch seconds the prompt was raised, used to age
+        out prompts whose session or runner never came back.
+    :param event: The ``response.elicitation_request`` payload as JSON, stored
+        verbatim so a restored prompt replays byte-identically into the UI.
+        Opaque, never SQL-queried — stored compressed like other blobs.
+    """
+
+    __tablename__ = "elicitations"
+
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    # Relates to conversations.id. No DB foreign key (Rule R032); the
+    # application deletes these with the conversation.
+    conversation_id: Mapped[str] = mapped_column(Uuid16, nullable=False)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Opaque JSON blob, never SQL-queried — stored compressed.
+    event: Mapped[str] = mapped_column(CompressedText, nullable=False)
+
+    __table_args__ = (
+        # The only read path: "what is still parked on this session?", served
+        # when a session snapshot finds its in-memory index empty.
+        Index(
+            "ix_elicitations_conversation_id",
+            "workspace_id",
+            "conversation_id",
+        ),
+    )

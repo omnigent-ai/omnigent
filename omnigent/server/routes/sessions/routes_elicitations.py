@@ -147,9 +147,13 @@ def register_elicitations_routes(
         Used by the frontend's standalone approval page
         (``/approve/:sessionId/:elicitationId``) to fetch the
         elicitation prompt and render approve/reject controls.
-        The payload is read from the in-memory
-        :mod:`omnigent.runtime.pending_elicitations` index — no
-        database persistence required.
+        Served from the in-memory
+        :mod:`omnigent.runtime.pending_elicitations` index, falling
+        back to the durable rows when the index has nothing for the
+        session. That fallback matters here more than anywhere: this
+        is the link someone opens on a phone, and after a server
+        restart the index is empty, so an index-only read would tell
+        them a still-pending approval had been resolved.
 
         :param request: The inbound request, used for identity
             extraction.
@@ -172,6 +176,12 @@ def register_elicitations_routes(
                 raise _session_not_found()
 
         found = pending_elicitations.lookup(elicitation_id)
+        if found is None:
+            # Nothing indexed for this id. Before calling it resolved, give the
+            # durable rows a chance — on a restarted server the index is empty
+            # and every genuinely-pending prompt would otherwise read as done.
+            await asyncio.to_thread(pending_elicitations.restore_for, session_id)
+            found = pending_elicitations.lookup(elicitation_id)
         if found is None or found[0] != session_id:
             return {"status": "resolved"}
 

@@ -33,6 +33,7 @@ from omnigent.db.db_models import (
     SqlConversationItem,
     SqlConversationLabel,
     SqlConversationMetadata,
+    SqlElicitation,
     SqlPolicy,
     SqlProject,
     SqlSessionPermission,
@@ -4029,6 +4030,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                 delete(SqlConversationMetadata).where(
                     SqlConversationMetadata.workspace_id == current_workspace_id(),
                     SqlConversationMetadata.id.in_(subtree_ids),
+                )
+            )
+            session.execute(
+                delete(SqlElicitation).where(
+                    SqlElicitation.workspace_id == current_workspace_id(),
+                    SqlElicitation.conversation_id.in_(subtree_ids),
                 )
             )
             if bound_agent_ids:

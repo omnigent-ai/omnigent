@@ -94,6 +94,7 @@ from omnigent.stores import (
 )
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import SessionConnectivity, runner_seen_is_fresh
+from omnigent.stores.elicitation_store import ElicitationStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
@@ -911,6 +912,7 @@ def create_app(
     policy_store: PolicyStore | None = None,
     permission_store: PermissionStore | None = None,
     scheduled_task_store: ScheduledTaskStore | None = None,
+    elicitation_store: ElicitationStore | None = None,
     project_store: ProjectStore | None = None,
     auth_provider: AuthProvider | None = None,
     host_store: HostStore | None = None,
@@ -958,6 +960,10 @@ def create_app(
         starts an :class:`ScheduledTaskScheduler` that arms a timer per
         active task and fires the injected ``on_fire`` callback on
         schedule. ``None`` disables the scheduler entirely.
+    :param elicitation_store: Store backing outstanding approval prompts, so a
+        prompt parked when the server goes down is still there and still
+        answerable when it comes back. ``None`` keeps the pending-elicitation
+        index in memory only, i.e. the behaviour before the table existed.
     :param project_store: Store for first-class projects (owner-private
         containers that group sessions). ``None`` disables the
         ``/v1/projects`` CRUD endpoints.
@@ -1458,6 +1464,11 @@ def create_app(
     # _publish_status when a fired conversation's turn reaches terminal.
     session_live_state.configure(conversation_store, scheduled_task_store)
     pending_elicitations.set_count_persist_hook(session_live_state.persist_pending_count)
+    # The count above is a best-effort mirror — a stale one self-corrects on the
+    # next transition. The prompt itself gets a durable home instead, so a
+    # restart cannot leave the count asserting an approval the session can no
+    # longer render.
+    pending_elicitations.set_store(elicitation_store)
 
     @app.middleware("http")
     async def _record_server_metrics(
