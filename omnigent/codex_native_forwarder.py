@@ -2088,6 +2088,7 @@ async def _create_thread_replacement_session(
                 if state is not None
                 else str(codex_home_for_bridge_dir(bridge_dir))
             ),
+            cwd=state.cwd if state is not None else None,
         ),
     )
 

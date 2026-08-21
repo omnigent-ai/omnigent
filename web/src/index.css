@@ -1482,6 +1482,13 @@ aside[aria-label="Workspace"][data-maximized] {
   background-color: color-mix(in oklch, var(--warning) 70%, transparent);
 }
 
+::highlight(rendered-preview-comment) {
+  background-color: color-mix(in oklch, var(--warning) 30%, transparent);
+}
+::highlight(rendered-preview-comment-active) {
+  background-color: color-mix(in oklch, var(--warning) 60%, transparent);
+}
+
 /* TipTap editor prose styling */
 .tiptap-md-content .ProseMirror {
   outline: none;

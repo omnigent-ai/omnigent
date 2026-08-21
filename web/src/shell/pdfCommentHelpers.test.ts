@@ -9,6 +9,7 @@ import {
   isPdfAnchor,
 } from "./pdfCommentHelpers";
 import type { Comment } from "@/hooks/useComments";
+import { encodeRenderedPreviewAnchor } from "./RenderedPreviewCommentSurface";
 
 function makeComment(overrides: Partial<Comment> = {}): Comment {
   return {
@@ -54,6 +55,17 @@ describe("displayAnchorContent", () => {
 
   it("passes through plain-text anchors unchanged", () => {
     expect(displayAnchorContent("plain anchor")).toBe("plain anchor");
+  });
+
+  it("returns the selected text for rendered-preview anchors", () => {
+    const selection = encodeRenderedPreviewAnchor({
+      surface: "notebook",
+      region: "cell:0:source",
+      start: 0,
+      end: 5,
+      text: "Sales",
+    });
+    expect(displayAnchorContent(selection.anchor_content)).toBe("Sales");
   });
 });
 

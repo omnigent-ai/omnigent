@@ -7,6 +7,7 @@ Comments can be sent to the agent as a formatted message via the
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import asdict
 from typing import Any
 
@@ -26,6 +27,8 @@ from omnigent.server.routes._errors import session_not_found
 from omnigent.stores import ConversationStore
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.permission_store import PermissionStore
+
+_RENDERED_PREVIEW_ANCHOR_PREFIX = "__OMNIGENT_RENDERED_PREVIEW_ANCHOR__:"
 
 
 def _format_message(comments: list[Comment]) -> str:
@@ -49,8 +52,41 @@ def _format_message(comments: list[Comment]) -> str:
         lines.append("")
         lines.append(f"File: {path}")
         for c in sorted(by_path[path], key=lambda c: c.start_index):
-            anchor = f'"{c.anchor_content.strip()}" ' if c.anchor_content else ""
-            lines.append(f"• {anchor}(offset {c.start_index}–{c.end_index}): {c.body}")
+            anchor_content = c.anchor_content.strip() if c.anchor_content else ""
+            location = f"offset {c.start_index}–{c.end_index}"
+            if anchor_content.startswith(_RENDERED_PREVIEW_ANCHOR_PREFIX):
+                try:
+                    rendered_anchor = json.loads(
+                        anchor_content.removeprefix(_RENDERED_PREVIEW_ANCHOR_PREFIX)
+                    )
+                except json.JSONDecodeError:
+                    pass
+                else:
+                    if isinstance(rendered_anchor, dict):
+                        text = rendered_anchor.get("text")
+                        surface = rendered_anchor.get("surface")
+                        region = rendered_anchor.get("region")
+                        start = rendered_anchor.get("start")
+                        end = rendered_anchor.get("end")
+                        if (
+                            isinstance(text, str)
+                            and text.strip()
+                            and isinstance(surface, str)
+                            and surface.strip()
+                            and isinstance(region, str)
+                            and region.strip()
+                            and isinstance(start, int)
+                            and not isinstance(start, bool)
+                            and isinstance(end, int)
+                            and not isinstance(end, bool)
+                            and 0 <= start < end
+                        ):
+                            anchor_content = text.strip()
+                            surface = " ".join(surface.split())
+                            region = " ".join(region.split())
+                            location = f"{surface} preview, {region}"
+            anchor = f'"{anchor_content}" ' if anchor_content else ""
+            lines.append(f"• {anchor}({location}): {c.body}")
 
     return "\n".join(lines)
 

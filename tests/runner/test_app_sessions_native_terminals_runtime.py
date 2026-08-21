@@ -631,6 +631,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert bridge_state is not None
     assert bridge_state.thread_id == thread_id
     assert bridge_state.socket_path == app_server.listen_url
+    assert bridge_state.cwd == str((tmp_path / "workspace").resolve())
 
 
 @pytest.mark.asyncio
@@ -1311,6 +1312,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
         :returns: None.
         """
         assert kwargs["bridge_dir"] == bridge_dir
+        assert kwargs["workspace"] == str(worktree.resolve())
         assert codex_native_bridge.read_bridge_state(bridge_dir) is None, (
             "fresh Codex launch must clear stale bridge state before the "
             "discovery forwarder publishes the new thread"
@@ -3021,6 +3023,58 @@ async def test_codex_session_needs_runner_terminal_false_without_client() -> Non
 
 
 @pytest.mark.asyncio
+async def test_codex_discover_thread_records_session_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Fresh runner-owned Codex turns inherit the session workspace."""
+    from omnigent import codex_native_bridge, codex_native_forwarder
+    from omnigent.runner import app as runner_app_mod
+    from omnigent.runner.native import orchestration as orchestration_mod
+
+    closed = {"client": False, "app_server": False}
+
+    class _Client:
+        async def close(self) -> None:
+            closed["client"] = True
+
+    class _AppServer:
+        async def close(self) -> None:
+            closed["app_server"] = True
+
+    async def _thread_started(*_args: object, **_kwargs: object) -> str:
+        return "019e96aa-1111-7222-8333-444455556666"
+
+    def _stop_after_state_write(name: str) -> str:
+        assert name == "RUNNER_SERVER_URL"
+        raise RuntimeError("stop after bridge state write")
+
+    monkeypatch.setattr(codex_native_forwarder, "wait_for_thread_started", _thread_started)
+    monkeypatch.setattr(orchestration_mod, "_required_runner_env", _stop_after_state_write)
+
+    session_id = "3053b47e49239a8c24e3cd30cdb21c8f"
+    workspace = tmp_path / "session-workspace"
+    runner_app_mod._AUTO_CODEX_APP_SERVERS[session_id] = _AppServer()
+    try:
+        with pytest.raises(RuntimeError, match="stop after bridge state write"):
+            await runner_app_mod._codex_discover_thread_and_forward(
+                session_id=session_id,
+                bridge_dir=tmp_path,
+                codex_ws_url="ws://127.0.0.1:1",
+                codex_home=tmp_path / "codex-home",
+                workspace=str(workspace),
+                event_client=_Client(),  # type: ignore[arg-type]
+                routing_summary="provider 'test' (model=gpt-test)",
+            )
+    finally:
+        runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+
+    state = codex_native_bridge.read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.cwd == str(workspace)
+    assert closed == {"client": True, "app_server": True}
+
+
+@pytest.mark.asyncio
 async def test_codex_discover_thread_and_forward_cleans_up_on_discovery_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -3061,6 +3115,7 @@ async def test_codex_discover_thread_and_forward_cleans_up_on_discovery_failure(
             bridge_dir=tmp_path,
             codex_ws_url="ws://127.0.0.1:1",
             codex_home=tmp_path / "codex-home",
+            workspace=str(tmp_path / "workspace"),
             event_client=_Client(),  # type: ignore[arg-type]
             routing_summary="provider 'test' (model=gpt-test)",
         )
@@ -3124,6 +3179,7 @@ async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
             bridge_dir=tmp_path,
             codex_ws_url="ws://127.0.0.1:1",
             codex_home=tmp_path / "codex-home",
+            workspace=str(tmp_path / "workspace"),
             event_client=_Client(),  # type: ignore[arg-type]
             routing_summary="provider 'test' (model=gpt-test)",
         )
