@@ -996,20 +996,24 @@ def user_period_cost_budget(
         context = event.get("context") or {}
         period_data = cast(dict[str, object], context.get(context_key) or {})
         raw = period_data.get("cost_usd", 0.0)
-        try:
-            return float(raw)
-        except (TypeError, ValueError):
-            return 0.0
+        if isinstance(raw, (int, float, str)):
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                return 0.0
+        return 0.0
 
     def _read_period_approved(event: PolicyEvent) -> float:
         """Read the highest approved checkpoint for this period."""
         context = event.get("context") or {}
         period_data = cast(dict[str, object], context.get(context_key) or {})
         raw = period_data.get("ask_approved_usd", 0.0)
-        try:
-            return float(raw)
-        except (TypeError, ValueError):
-            return 0.0
+        if isinstance(raw, (int, float, str)):
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                return 0.0
+        return 0.0
 
     def _read_period_owner(event: PolicyEvent) -> str | None:
         """Read the session owner from the period context."""
@@ -1255,9 +1259,9 @@ POLICY_REGISTRY: list[dict[str, object]] = [
                 "harness": {
                     "type": "string",
                     "description": "Optional harness filter for per-harness budgets (e.g. "
-                    "'codex-native'). When set, only that harness's cost counts. Only supported "
-                    "for non-day periods (week/month/quarter/year); omit for cross-harness budgets "
-                    "or when using period='day'.",
+                    "'codex-native'). When set, only that harness's cost counts. Only "
+                    "supported for non-day periods (week/month/quarter/year); omit for "
+                    "cross-harness budgets or when using period='day'.",
                 },
             },
             "required": ["period", "max_cost_usd"],
