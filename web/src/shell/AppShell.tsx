@@ -1682,6 +1682,9 @@ export function AppShell() {
                   }}
                   isChildSession={isChildSession}
                   conversationId={conversationId}
+                  actionConversation={
+                    isKnownTopLevel && isOwnerLevel(permissionLevel) ? activeConv : null
+                  }
                   conversationTitle={headerConversationTitle}
                   projectName={headerProjectName}
                   titleLinkTo={headerTitleLinkTo}

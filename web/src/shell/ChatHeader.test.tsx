@@ -4,6 +4,7 @@ import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Agent } from "@/hooks/useAgents";
+import type { Conversation } from "@/hooks/useConversations";
 import type * as NativeBridgeModule from "@/lib/nativeBridge";
 import { ChatHeader } from "./ChatHeader";
 import {
@@ -54,6 +55,7 @@ function renderHeader(props: {
   sidebarOpen: boolean;
   isChildSession?: boolean;
   conversationId?: string;
+  actionConversation?: Conversation | null;
   conversationTitle?: string | null;
   projectName?: string | null;
   titleLinkTo?: string;
@@ -76,6 +78,7 @@ function renderHeader(props: {
             // right-panel toggle / mobile FAB all gate on conversationId and
             // stay unmounted, isolating the left-slot affordances under test.
             conversationId={props.conversationId}
+            actionConversation={props.actionConversation}
             conversationTitle={props.conversationTitle ?? null}
             projectName={props.projectName ?? null}
             titleLinkTo={props.titleLinkTo}
@@ -388,5 +391,47 @@ describe("ChatHeader — Chat/Terminal switcher wiring", () => {
   it("omits the toggle when there is no TerminalFirst context", () => {
     renderHeaderWithSession(null);
     expect(screen.queryByRole("group", { name: /switch between chat and terminal/i })).toBeNull();
+  });
+});
+
+describe("ChatHeader — title-adjacent conversation actions", () => {
+  const conversation: Conversation = {
+    id: "conv-1",
+    object: "conversation",
+    title: "A very long session title that must truncate before the overflow trigger",
+    created_at: 1_700_000_000,
+    updated_at: 1_700_000_100,
+    labels: {},
+    permission_level: 3,
+  };
+
+  it("keeps the overflow trigger immediately after a truncating title", () => {
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      conversationTitle: conversation.title,
+      actionConversation: conversation,
+    });
+
+    const title = screen.getByText(conversation.title as string);
+    const trigger = screen.getByRole("button", { name: "Conversation actions" });
+    expect(title).toHaveClass("min-w-0", "truncate");
+    expect(title.parentElement).toBe(trigger.parentElement);
+    expect(title.compareDocumentPosition(trigger) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("does not add a management menu to a sub-agent breadcrumb", () => {
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "child-9",
+      isChildSession: true,
+      conversationTitle: "Parent session",
+      titleLinkTo: "/c/parent-123",
+      boundAgent: { id: "a1", name: "reviewer" },
+    });
+
+    expect(screen.queryByRole("button", { name: "Conversation actions" })).toBeNull();
+    expect(screen.getByRole("link", { name: "Back to parent session" })).toBeInTheDocument();
+    expect(screen.getByText("reviewer")).toBeInTheDocument();
   });
 });
