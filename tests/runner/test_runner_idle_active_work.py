@@ -9,6 +9,7 @@ the pin so a short idle timeout can shut down.
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 
 import pytest
@@ -17,6 +18,8 @@ from fastapi import FastAPI
 from omnigent.runner import create_runner_app, pending_approvals
 from omnigent.runner._entry import _run_inactivity_monitor
 from omnigent.runner.app import (
+    _NATIVE_PANE_RUNNING_STALE_S,
+    _has_fresh_native_pane_running,
     _has_live_async_tasks,
     _session_timers,
     register_timer,
@@ -278,6 +281,72 @@ async def test_parked_approval_blocks_idle_shutdown() -> None:
         release=_release,
     )
     assert app.state.has_active_work() is False
+
+
+@pytest.mark.asyncio
+async def test_native_pane_running_blocks_idle_shutdown() -> None:
+    """A native terminal turn keeps the runner alive until it becomes idle."""
+    app = _scaffold_app()
+    registry = app.state.session_resource_registry
+    publish_status = registry._session_status_publisher
+    assert callable(publish_status)
+
+    app.state.native_pane_status["conv_native"] = "idle"
+    app.state.native_pane_activity_at["conv_native"] = 0.0
+    publish_status("conv_native", "running")
+    assert app.state.has_active_work() is True
+
+    async def _release() -> None:
+        publish_status("conv_native", "idle")
+
+    await _assert_monitor_blocked_then_shuts_down(
+        has_active_work=app.state.has_active_work,
+        release=_release,
+    )
+    assert app.state.has_active_work() is False
+
+
+def test_native_pane_running_pin_expires_without_activity() -> None:
+    """A stale native status cannot keep an abandoned runner alive forever."""
+    statuses = {"conv_native": "running"}
+    activity_at = {"conv_native": 100.0}
+
+    assert _has_fresh_native_pane_running(statuses, activity_at, now=100.0) is True
+    assert (
+        _has_fresh_native_pane_running(
+            statuses,
+            activity_at,
+            now=100.0 + _NATIVE_PANE_RUNNING_STALE_S + 1.0,
+        )
+        is False
+    )
+
+
+def test_native_terminal_activity_refreshes_running_pin_and_idle_timer() -> None:
+    """Terminal activity refreshes both native liveness and runner activity."""
+    app = _scaffold_app()
+    registry = app.state.session_resource_registry
+    publish_status = registry._session_status_publisher
+    publish_activity = registry._terminal_activity_publisher
+    assert callable(publish_status)
+    assert callable(publish_activity)
+    activity_marks: list[str] = []
+    app.state.mark_activity = lambda: activity_marks.append("activity")
+
+    app.state.native_pane_status["conv_native"] = "idle"
+    app.state.native_pane_activity_at["conv_native"] = 0.0
+    publish_status("conv_native", "running")
+    app.state.native_pane_activity_at["conv_native"] = (
+        time.monotonic() - _NATIVE_PANE_RUNNING_STALE_S - 1.0
+    )
+    assert app.state.has_active_work() is False
+
+    publish_activity("conv_native", "terminal_codex_main")
+    assert app.state.has_active_work() is True
+
+    publish_status("conv_native", "idle")
+    assert app.state.has_active_work() is False
+    assert activity_marks == ["activity", "activity", "activity"]
 
 
 @pytest.mark.asyncio
