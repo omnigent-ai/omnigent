@@ -870,3 +870,97 @@ def test_a_failed_restore_degrades_to_an_empty_snapshot() -> None:
     pending_elicitations.set_store(_BrokenStore())
 
     assert pending_elicitations.restore_for("conv_a") == []
+
+
+def test_restore_does_not_depend_on_the_conversation_count() -> None:
+    """The durable row is the truth; the mirrored count is best-effort.
+
+    The count is written on a background executor and dropped on failure, so a
+    crash between the row commit and the count write leaves a real row behind.
+    Gating the read on that count would hide it — in exactly the crash the rows
+    exist to survive.
+    """
+    store = _FakeStore()
+    pending_elicitations.set_store(store)
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1"))
+
+    rows = dict(store.rows)
+    pending_elicitations.reset_for_tests()
+    store.rows = rows
+    pending_elicitations.set_store(store)
+
+    # No count was ever persisted for this conversation; the row must still
+    # come back.
+    restored = pending_elicitations.restore_for("conv_a")
+
+    assert [event["elicitation_id"] for event in restored] == ["elicit_1"]
+
+
+def test_restore_asks_the_store_once_per_conversation() -> None:
+    """Dropping the count gate must not become a query on every session read."""
+    store = _FakeStore()
+    pending_elicitations.set_store(store)
+
+    for _ in range(5):
+        pending_elicitations.restore_for("conv_quiet")
+
+    assert store.calls.count("list:conv_quiet") == 1
+
+
+def test_a_failed_restore_can_be_retried() -> None:
+    """A briefly-unavailable store must not cost the only restore attempt.
+
+    ``restore_for`` remembers which conversations it has asked about so it
+    queries once per process. A failure has to un-remember, or one blip
+    permanently hides that session's parked prompts.
+    """
+
+    class _FlakyStore(_FakeStore):
+        fail_next = True
+
+        def list_for_conversation(self, conversation_id: str, **kwargs: Any) -> list[Any]:
+            if self.fail_next:
+                self.fail_next = False
+                raise RuntimeError("store is down")
+            return super().list_for_conversation(conversation_id, **kwargs)
+
+    store = _FlakyStore()
+    pending_elicitations.set_store(store)
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1"))
+    rows = dict(store.rows)
+
+    # Restart: index gone, rows kept, and the first read hits the outage.
+    pending_elicitations.reset_for_tests()
+    store.rows = rows
+    pending_elicitations.set_store(store)
+    assert pending_elicitations.restore_for("conv_a") == []
+
+    # The store recovers; the next read must try again rather than stay silent.
+    restored = pending_elicitations.restore_for("conv_a")
+
+    assert [event["elicitation_id"] for event in restored] == ["elicit_1"]
+
+
+def test_an_ancestor_mirror_does_not_steal_the_child_row() -> None:
+    """A child's prompt is mirrored into every ancestor's stream.
+
+    The durable row is keyed by elicitation id alone, so if a mirror persisted
+    too, the last ancestor to publish would move the child's only row onto
+    itself and the child would restore nothing.
+    """
+    store = _FakeStore()
+    pending_elicitations.set_store(store)
+
+    child_event = _request_event("elicit_1")
+    pending_elicitations.record_publish("conv_child", child_event)
+
+    mirrored = {
+        **child_event,
+        "params": {**child_event["params"], "target_session_id": "conv_child"},
+    }
+    pending_elicitations.record_publish("conv_parent", mirrored)
+
+    assert store.rows["elicit_1"].conversation_id == "conv_child"
+    # The ancestor still renders it — the index tracks mirrors, only the
+    # durable row is owner-only.
+    assert pending_elicitations.count_for("conv_parent") == 1

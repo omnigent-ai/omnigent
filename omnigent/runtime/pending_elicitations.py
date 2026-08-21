@@ -131,6 +131,12 @@ def _notify_count_hook(conversation_id: str, count: int) -> None:
 # purely in-memory and every store call below a no-op.
 _store: ElicitationStore | None = None
 
+# Conversations this process has already asked the store about. Bounds
+# :func:`restore_for` to one query per conversation per process, which is what
+# lets it run without a precondition — a restore is only ever needed once,
+# after which the index is authoritative for the rest of the process's life.
+_restored: set[str] = set()
+
 
 def set_store(store: ElicitationStore | None) -> None:
     """
@@ -141,6 +147,35 @@ def set_store(store: ElicitationStore | None) -> None:
     """
     global _store
     _store = store
+    with _lock:
+        _restored.clear()
+
+
+def _owns_elicitation(conversation_id: str, event: dict[str, Any]) -> bool:
+    """
+    Whether this conversation owns the prompt, rather than mirroring it.
+
+    A child's prompt is republished into every ancestor's stream so an
+    ancestor chat can render and resolve it, carrying ``target_session_id`` to
+    say which session actually owns the parked awaiter. Only the owner may
+    persist: the durable row is keyed by elicitation id alone, so letting a
+    mirror write would move the child's only row onto whichever ancestor
+    published last, and the child would restore nothing.
+
+    The index still tracks mirrors — that is what makes the ancestor's card
+    render — but the index is per-conversation and cannot collide this way.
+
+    :param conversation_id: Conversation the event was published on.
+    :param event: The ``response.elicitation_request`` payload.
+    :returns: ``True`` when *conversation_id* owns the prompt.
+    """
+    params = event.get("params")
+    if not isinstance(params, dict):
+        return True
+    target = params.get("target_session_id")
+    if not isinstance(target, str) or not target:
+        return True
+    return target == conversation_id
 
 
 def _persist_add(conversation_id: str, elicitation_id: str, event: dict[str, Any]) -> None:
@@ -212,18 +247,25 @@ def restore_for(conversation_id: str) -> list[dict[str, Any]]:
     """
     Reload one session's outstanding prompts from the store into the index.
 
-    Called when a session snapshot finds its index empty but the conversation
-    row still reports outstanding prompts — the signature of a server restart,
-    since the count is mirrored to the row and the payloads were not.
+    Called whenever a session's index is empty. It deliberately does **not**
+    take the conversation's mirrored count as a precondition: that count is
+    written best-effort on a background executor, so a crash between the row
+    commit and the count write leaves a durable row that a count-gated read
+    would never ask for — which is precisely the crash this whole mechanism
+    exists to survive.
+
+    The cost of dropping that gate is bounded by remembering which
+    conversations have already been looked up, so a process pays at most one
+    indexed query per conversation however many times the session is loaded.
+    Once the index holds an entry there is nothing to restore anyway.
 
     Prompts older than :data:`_MAX_PARK_SECONDS` are skipped: nothing can still
     be parked on them, so surfacing one would offer the user a button that
     resolves nothing. They are left in the store for a reaper to collect rather
     than deleted from a read path.
 
-    Restoring does not fire the count hook. The count is what sent us here, so
-    rewriting it would be a no-op at best, and at worst would race the mirror
-    that is already correct.
+    Restoring does not fire the count hook. Whether the count is right or
+    stale, the rows are the truth, and rewriting it here would race the mirror.
 
     :param conversation_id: Session to restore, e.g. ``"conv_abc123"``.
     :returns: The restored event payloads, oldest first. Empty when no store
@@ -232,12 +274,21 @@ def restore_for(conversation_id: str) -> list[dict[str, Any]]:
     store = _store
     if store is None:
         return []
+    with _lock:
+        if conversation_id in _restored:
+            return []
+        _restored.add(conversation_id)
     try:
         rows = store.list_for_conversation(
             conversation_id,
             not_before=int(time.time()) - _MAX_PARK_SECONDS,
         )
     except Exception:  # a failed restore degrades to the pre-mirror behaviour
+        # Let the next read try again: a store that was briefly unavailable
+        # must not cost this conversation its only restore for the lifetime of
+        # the process.
+        with _lock:
+            _restored.discard(conversation_id)
         _logger.warning(
             "Could not restore outstanding elicitations for %s",
             conversation_id,
@@ -294,7 +345,8 @@ def record_publish(conversation_id: str, event: dict[str, Any]) -> None:
         elicitation_id = event.get("elicitation_id")
         if not isinstance(elicitation_id, str) or not elicitation_id:
             return
-        _persist_add(conversation_id, elicitation_id, event)
+        if _owns_elicitation(conversation_id, event):
+            _persist_add(conversation_id, elicitation_id, event)
         with _lock:
             ids = _pending.setdefault(conversation_id, {})
             ids[elicitation_id] = event
@@ -534,5 +586,6 @@ def reset_for_tests() -> None:
     global _observer, _store
     with _lock:
         _pending.clear()
+        _restored.clear()
     _observer = None
     _store = None

@@ -89,3 +89,73 @@ async def test_resolved_prompt_does_not_come_back(
     pending_elicitations.set_store(SqlAlchemyElicitationStore(db_uri))
 
     assert await _pending_ids(client, session_id) == []
+
+
+async def test_snapshot_restores_when_the_mirrored_count_was_lost(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """The durable row must not be gated behind the best-effort count.
+
+    ``pending_elicitation_count`` is mirrored onto the conversation row by a
+    background executor that logs and drops failures. So a crash between the
+    row commit and the count write leaves a real, still-parked prompt whose
+    count says zero — and a count-gated read would never ask for it. That is
+    the same crash the durable rows exist to survive, so it must not be the
+    thing that hides them.
+    """
+    from omnigent.runtime import pending_elicitations
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+    from omnigent.stores.elicitation_store.sqlalchemy_store import (
+        SqlAlchemyElicitationStore,
+    )
+
+    agent = await create_test_agent(client, "test-elicitation-count-lost")
+    session_id = await _create_session(client, agent["id"])
+    hook_task, elicitation_id = await _park_permission_hook(client, session_id)
+
+    try:
+        # The row is durable; now make the mirror say nothing is parked, which
+        # is what a dropped count write leaves behind.
+        SqlAlchemyConversationStore(db_uri).set_pending_elicitation_count(session_id, 0)
+        pending_elicitations.reset_for_tests()
+        pending_elicitations.set_store(SqlAlchemyElicitationStore(db_uri))
+
+        assert await _pending_ids(client, session_id) == [elicitation_id]
+    finally:
+        hook_task.cancel()
+
+
+async def test_the_standalone_approval_page_survives_a_restart(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """The approval link is the phone path; a restart must not blank it.
+
+    ``GET /v1/sessions/{id}/elicitations/{eid}`` backs
+    ``/approve/:sessionId/:elicitationId``. Reading only the in-memory index
+    means that after a restart it reports every genuinely-pending prompt as
+    ``resolved`` — telling someone their approval was already handled when the
+    work is still parked on it.
+    """
+    from omnigent.runtime import pending_elicitations
+    from omnigent.stores.elicitation_store.sqlalchemy_store import (
+        SqlAlchemyElicitationStore,
+    )
+
+    agent = await create_test_agent(client, "test-elicitation-approve-page")
+    session_id = await _create_session(client, agent["id"])
+    hook_task, elicitation_id = await _park_permission_hook(client, session_id)
+
+    try:
+        pending_elicitations.reset_for_tests()
+        pending_elicitations.set_store(SqlAlchemyElicitationStore(db_uri))
+
+        resp = await client.get(f"/v1/sessions/{session_id}/elicitations/{elicitation_id}")
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "pending"
+    finally:
+        hook_task.cancel()

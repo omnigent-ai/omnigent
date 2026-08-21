@@ -1497,12 +1497,14 @@ def _pending_elicitation_snapshot_for_session(
     other than ``conv`` has an outstanding prompt in the in-memory
     index (the common case is none anywhere).
 
-    An index with nothing for a session whose row still counts prompts is the
-    signature of a server restart: the count is mirrored to the conversation
-    row, the payloads were not. That case reloads the payloads from the
-    ``elicitations`` table so the prompt renders and stays answerable. The row
-    count is read from the conversation already loaded here, so a session with
-    nothing parked costs no extra query.
+    An index with nothing for a session is the signature of a server restart,
+    so the payloads are reloaded from the ``elicitations`` table and the prompt
+    renders and stays answerable. This deliberately does not first consult the
+    conversation's mirrored count: that count is written best-effort on a
+    background executor, so a crash between the row commit and the count write
+    would hide a real row from a count-gated read — the exact crash the durable
+    rows exist to survive. ``restore_for`` bounds itself to one query per
+    conversation per process instead.
 
     :param conv_store: Store used to list descendant sub-agents.
     :param conv: Session conversation being snapshotted.
@@ -1510,7 +1512,7 @@ def _pending_elicitation_snapshot_for_session(
         :class:`SessionResponse.pending_elicitations`.
     """
     events = pending_elicitations.snapshot_for(conv.id)
-    if not events and (conv.pending_elicitation_count or 0) > 0:
+    if not events:
         events = pending_elicitations.restore_for(conv.id)
     if not (set(pending_elicitations.pending_session_ids()) - {conv.id}):
         return events
