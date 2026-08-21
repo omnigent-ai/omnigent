@@ -1774,6 +1774,9 @@ def register_resources_routes(
         # ``base=host`` distinguishes it from a workspace-root listing. Hand it
         # to the path handler so it gets the same owner gate and reach check as
         # any other absolute location instead of listing the workspace root.
+        # ``read_or_list_environment_path`` runs its own ``_validate_session``
+        # at the owner level for an absolute path, so this delegation is gated
+        # there, not here.
         if request.query_params.get("base") == "host":
             return await read_or_list_environment_path(
                 request,

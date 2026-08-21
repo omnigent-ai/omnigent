@@ -1,5 +1,6 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
+import { browseLocationBase, browseLocationSegment } from "@/hooks/useWorkspaceChangedFiles";
 import type { FileContentResponse } from "./useFileContent";
 
 const DEFAULT_ENVIRONMENT_ID = "default";
@@ -9,17 +10,15 @@ async function writeFileContent(
   path: string,
   content: string,
 ): Promise<void> {
-  // An absolute path (saving a file edited outside the workspace) is sent
-  // WITHOUT its leading slash and named `?base=host`, matching the read path:
-  // a leading "%2F" would decode to a "//" that reverse proxies (the
-  // Databricks Apps front door) merge to a single "/", writing to the wrong
-  // (workspace-relative) location. See `browseLocationSegment`.
-  const absolute = path.startsWith("/");
-  const encodedPath = path.replace(/^\//, "").split("/").map(encodeURIComponent).join("/");
+  // Same slash-merge-safe wire form as the read path, via the shared helpers:
+  // a bare per-segment-encoded path, and `?base=host` for an absolute location
+  // (saving a file edited outside the workspace). See `browseLocationSegment`.
+  const encodedPath = browseLocationSegment(path);
+  const base = browseLocationBase(path);
   const url =
     `/v1/sessions/${encodeURIComponent(conversationId)}` +
     `/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem/${encodedPath}` +
-    (absolute ? "?base=host" : "");
+    (base ? `?base=${base}` : "");
   const res = await authenticatedFetch(url, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
