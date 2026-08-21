@@ -111,6 +111,57 @@ def test_unknown_read_provider_fails_loudly(tool_ctx: ToolContext) -> None:
     assert "jina" in result.lower()
 
 
+# ── config-key validation (no silent-ignore footgun) ─
+
+
+def test_other_backends_option_on_jina_is_rejected(tool_ctx: ToolContext) -> None:
+    """
+    A key that belongs to a different backend (e.g. Nimble's ``output_format``)
+    set under ``jina`` fails loudly and names the backend it applies to —
+    rather than being silently ignored.
+    """
+    tool = WebReadTool(config={"read_provider": "jina", "output_format": "html"})
+    result = tool.invoke(json.dumps({"url": "https://example.com"}), tool_ctx)
+    assert result.startswith("web_read error:")
+    assert "output_format" in result
+    assert "nimble" in result
+
+
+def test_firecrawl_proxy_on_nimble_is_rejected(tool_ctx: ToolContext) -> None:
+    """Firecrawl's ``proxy`` set under ``nimble`` is rejected and names firecrawl."""
+    tool = WebReadTool(config={"read_provider": "nimble", "api_key": "k", "proxy": "auto"})
+    result = tool.invoke(json.dumps({"url": "https://example.com"}), tool_ctx)
+    assert result.startswith("web_read error:")
+    assert "proxy" in result
+    assert "firecrawl" in result
+
+
+def test_unknown_config_key_is_rejected(tool_ctx: ToolContext) -> None:
+    """A key no backend recognizes (e.g. a typo) fails loudly with the allowed set."""
+    tool = WebReadTool(config={"read_provider": "nimble", "api_key": "k", "drier": "vx10"})
+    result = tool.invoke(json.dumps({"url": "https://example.com"}), tool_ctx)
+    assert result.startswith("web_read error: unknown config key 'drier'")
+
+
+def test_backend_own_options_are_accepted(tool_ctx: ToolContext) -> None:
+    """A backend's own options (nimble driver/output_format) pass validation."""
+    fake_response = MagicMock()
+    fake_response.json.return_value = {"data": {"markdown": "body"}}
+    tool = WebReadTool(
+        config={
+            "read_provider": "nimble",
+            "api_key": "k",
+            "driver": "vx10",
+            "output_format": "markdown",
+        }
+    )
+    with patch("omnigent.tools.builtins.web_read_nimble.httpx.post") as mock_post:
+        mock_post.return_value = fake_response
+        result = tool.invoke(json.dumps({"url": "https://example.com"}), tool_ctx)
+    assert not result.startswith("web_read error:")
+    assert "body" in result
+
+
 # ── read_provider: jina (keyless) ──────────────────
 
 

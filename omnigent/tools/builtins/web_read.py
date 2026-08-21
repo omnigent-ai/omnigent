@@ -53,10 +53,15 @@ class _Backend:
 
     :param run: Callable ``(url, config) -> content_or_error`` for the engine.
     :param keyless: True if the engine needs no ``api_key`` (drives hint text).
+    :param options: Optional config keys this engine reads *beyond* the shared
+        ``read_provider`` / ``api_key`` (e.g. ``{"driver", "output_format"}`` for
+        Nimble). Used to reject a key that belongs to a different backend so a
+        silently-ignored option surfaces as a clear error.
     """
 
     run: Callable[[str, dict[str, str]], str]
     keyless: bool
+    options: frozenset[str] = frozenset()
 
 
 class WebReadTool(Tool):
@@ -183,15 +188,50 @@ def _read(url: str, config: dict[str, str]) -> str:
         ``read_provider`` is configured).
     """
     backend = config.get("read_provider")
-
-    engine = _BACKENDS.get(backend) if backend else None
-    if engine is None:
-        if backend:
-            return f"web_read error: unknown read_provider {backend!r}. {_backend_hint()}"
+    if not backend:
         return f"web_read error: no read_provider configured. {_backend_hint()}"
+
+    engine = _BACKENDS.get(backend)
+    if engine is None:
+        return f"web_read error: unknown read_provider {backend!r}. {_backend_hint()}"
+
+    key_error = _check_config_keys(backend, engine, config)
+    if key_error is not None:
+        return key_error
 
     result = engine.run(url, config)
     return _finalize(result, url)
+
+
+def _check_config_keys(backend: str, engine: _Backend, config: dict[str, str]) -> str | None:
+    """
+    Reject a config key the chosen backend ignores, so it can't fail silently.
+
+    A key that is valid for a *different* backend (e.g. ``output_format`` is
+    Nimble-only) is the common trap — someone sets it under ``jina`` and gets no
+    error while it does nothing. The message names the backend that key belongs
+    to when there is one.
+
+    :param backend: The resolved ``read_provider`` name.
+    :param engine: Its registry entry (its ``options`` are the extra keys it reads).
+    :param config: The spec-level config dict.
+    :returns: An error string, or ``None`` if every key is meaningful here.
+    """
+    allowed = _SHARED_CONFIG_KEYS | engine.options
+    for key in config:
+        if key in allowed:
+            continue
+        owners = sorted(name for name, b in _BACKENDS.items() if key in b.options)
+        if owners:
+            return (
+                f"web_read error: {key!r} is not a {backend} option — it applies to "
+                f"read_provider {' / '.join(owners)}. Remove it or switch read_provider."
+            )
+        return (
+            f"web_read error: unknown config key {key!r} for read_provider {backend!r}. "
+            f"Allowed: {', '.join(sorted(allowed))}."
+        )
+    return None
 
 
 def _finalize(result: str, url: str) -> str:
@@ -272,9 +312,12 @@ def _run_jina(url: str, config: dict[str, str]) -> str:
 # ``keyless`` drives only the hint wording (which engines need no ``api_key``).
 _BACKENDS: dict[str, _Backend] = {
     "jina": _Backend(_run_jina, keyless=True),
-    "nimble": _Backend(_run_nimble, keyless=False),
-    "firecrawl": _Backend(_run_firecrawl, keyless=False),
+    "nimble": _Backend(_run_nimble, keyless=False, options=frozenset({"driver", "output_format"})),
+    "firecrawl": _Backend(_run_firecrawl, keyless=False, options=frozenset({"proxy"})),
 }
+
+# Config keys accepted by every backend (the rest are engine-specific ``options``).
+_SHARED_CONFIG_KEYS = frozenset({"read_provider", "api_key"})
 
 
 def _backend_hint() -> str:
