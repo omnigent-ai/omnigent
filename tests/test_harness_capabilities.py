@@ -118,6 +118,14 @@ def test_optional_bench_capabilities_default_to_unknown() -> None:
     assert capability.fork_history is ForkHistory.NONE
     assert capability.shell_tool_name is None
     assert capability.shell_tool_prompt is None
+    # The parity axes default to "unknown" rather than to a guess, so an
+    # undeclared feature is distinguishable from one checked and found absent.
+    unknown_feature = {
+        "support": "unknown",
+        "mode": None,
+        "limitations": None,
+        "last_verified": None,
+    }
     assert capability.as_dict() == {
         "integration_mode": "sdk-in-process",
         "elicitation": "none",
@@ -135,6 +143,10 @@ def test_optional_bench_capabilities_default_to_unknown() -> None:
         "fork_history": "none",
         "shell_tool_name": None,
         "shell_tool_prompt": None,
+        "skills": unknown_feature,
+        "hooks": unknown_feature,
+        "mcp": unknown_feature,
+        "plan_mode": unknown_feature,
     }
 
 
@@ -171,8 +183,13 @@ def test_catalog_rows_include_capabilities() -> None:
     for row in rows:
         if row["id"] in caps:
             assert "capabilities" in row, row["id"]
-            # JSON-serializable: values are primitives, not enums.
+            # JSON-serializable: primitives, or a flat dict of primitives for a
+            # structured axis. Nothing may still be an enum by this point.
             for value in row["capabilities"].values():
+                if isinstance(value, dict):
+                    for nested in value.values():
+                        assert nested is None or isinstance(nested, str)
+                    continue
                 assert value is None or isinstance(value, (str, bool))
 
 
@@ -328,3 +345,76 @@ def test_native_tui_harnesses_declare_shell_tool_provocation() -> None:
         assert capability.shell_tool_name, harness
         assert capability.shell_tool_prompt, harness
         assert "omnigent-bench-ok" in capability.shell_tool_prompt, harness
+
+
+# ── skills / hooks / MCP / plan-mode axes ──────────────────
+
+
+def test_every_harness_declares_the_four_parity_axes() -> None:
+    """The axes exist on every harness, even when the answer is "unknown".
+
+    An undeclared axis has to read as ``unknown`` rather than as absent, so a
+    consumer can tell "nobody has checked" apart from "checked, and no".
+    """
+    from omnigent.harness_capabilities import Support
+
+    for harness, capability in harness_capabilities().items():
+        for axis in ("skills", "hooks", "mcp", "plan_mode"):
+            support = getattr(capability, axis).support
+            assert isinstance(support, Support), f"{harness}.{axis} is not a Support"
+
+
+def test_skills_declaration_matches_the_relay_that_enforces_it() -> None:
+    """The skills axis must not drift from the tool surface behind it.
+
+    A native harness ignores ``request.tools`` and sees only the relay set in
+    ``runner/tool_dispatch.py``. If someone adds the skill tools to that relay,
+    this test fails and the declaration has to move with it — which is the
+    point, because the alternative is a published parity matrix that quietly
+    stops being true.
+    """
+    from omnigent.harness_capabilities import IntegrationMode, Support
+    from omnigent.runner.tool_dispatch import (
+        _NATIVE_RELAY_BUILTIN_TOOLS,
+        _SKILL_TOOLS,
+    )
+
+    relay_carries_skills = bool(_SKILL_TOOLS & _NATIVE_RELAY_BUILTIN_TOOLS)
+    expected_for_native = Support.SHIMMED if relay_carries_skills else Support.UNAVAILABLE
+
+    for harness, capability in harness_capabilities().items():
+        relay_only = capability.integration_mode in (
+            IntegrationMode.NATIVE_TUI,
+            IntegrationMode.NATIVE_SERVER,
+        )
+        expected = expected_for_native if relay_only else Support.SHIMMED
+        assert capability.skills.support is expected, (
+            f"{harness} declares skills={capability.skills.support.value} "
+            f"but its tool surface says {expected.value}"
+        )
+
+
+def test_an_unavailable_axis_says_why() -> None:
+    """An `unavailable` cell without a reason is not an honest grading.
+
+    "It does not work" is a bug report. "It does not work because the relay
+    does not carry these tools" is something a contributor can act on.
+    """
+    from omnigent.harness_capabilities import Support
+
+    for harness, capability in harness_capabilities().items():
+        for axis in ("skills", "hooks", "mcp", "plan_mode"):
+            feature = getattr(capability, axis)
+            if feature.support is Support.UNAVAILABLE:
+                assert feature.limitations, f"{harness}.{axis} is unavailable with no reason"
+
+
+def test_the_axes_reach_the_catalog() -> None:
+    """``GET /v1/harnesses`` has to carry them, or nothing can consume them."""
+    catalog = harness_catalog()
+    row = next(entry for entry in catalog if entry.get("capabilities"))
+    capabilities = row["capabilities"]
+
+    for axis in ("skills", "hooks", "mcp", "plan_mode"):
+        assert axis in capabilities, f"{axis} missing from the catalog"
+        assert set(capabilities[axis]) == {"support", "mode", "limitations", "last_verified"}

@@ -42,6 +42,44 @@ the vendor's tool-calling interface.
 | **Images** | Image content (screenshots, diagrams) is forwarded — full binary, path reference, or text-flattened |
 | **Cost tracking** | Harness reports token usage and cost data back to Omnigent for each turn |
 
+### Declaring skills, hooks, MCP and plan mode
+
+Four axes on `HarnessCapabilities` are structured rather than boolean, because
+a bool cannot say the thing that matters about them — whether a feature works
+because the vendor implements it, or because Omnigent emulates it over a vendor
+that does not:
+
+```python
+skills: FeatureSupport   # can an agent here load an Omnigent SKILL.md?
+hooks: FeatureSupport    # can Omnigent interpose on this harness's tool calls?
+mcp: FeatureSupport      # is an MCP server from the agent YAML callable here?
+plan_mode: FeatureSupport  # can the harness propose a change without making it?
+```
+
+Each carries `support` (`native` / `shimmed` / `unavailable` / `unknown`),
+`mode` for the mechanism or the hook events covered, `limitations` for what
+does not work, and `last_verified` for a bench run id when the value was
+observed rather than read off the code.
+
+Declaring a new harness:
+
+- **Leave an axis `unknown` until you have checked it.** `unknown` and
+  `unavailable` are different claims, and guessing at one costs more than
+  leaving it blank — a published matrix is only worth having if its cells are
+  true.
+- **`unavailable` must carry a `limitations` reason.** "It does not work" is a
+  bug report; "the relay does not carry these tools" is something the next
+  contributor can act on. A test enforces this.
+- **`skills` is derived, not declared.** A native harness ignores
+  `request.tools` and sees only `_NATIVE_RELAY_BUILTIN_TOOLS`, which omits
+  `load_skill` / `read_skill_file` — so the answer follows from the integration
+  mode. `tests/test_harness_capabilities.py` asserts the derivation against the
+  relay's own tool set, so adding the skill tools to the relay fails the test
+  until the declaration moves with it.
+- **`plan_mode` means one specific thing:** a read-only planning phase where
+  the harness proposes without editing. Not the vendor's UI mode of the same
+  name, and not a policy that denies writes.
+
 ### MCP connectivity
 
 The harness must bridge Omnigent's builtin MCP tools so the model can call
