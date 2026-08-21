@@ -4884,6 +4884,37 @@ def test_append_reads_counter_not_max_scan(
     assert _stored_next_position(conversation_store, conv.id) == 101
 
 
+def test_append_persists_batch_in_single_insert(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A multi-item append writes every item in one bulk INSERT, not one
+    statement per row — a per-row round-trip dominates import latency against a
+    remote managed Postgres, so guard against a regression to it."""
+    import re
+
+    conv = conversation_store.create_conversation()
+
+    statements: list[str] = []
+
+    def _record(conn, cursor, statement, parameters, context, executemany):  # type: ignore[no-untyped-def]
+        statements.append(statement)
+
+    # Attach after create_conversation so only the append's SQL is captured.
+    event.listen(conversation_store._conv_engine, "before_cursor_execute", _record)
+    try:
+        conversation_store.append(conv.id, [_user_message(f"m{i}") for i in range(10)])
+    finally:
+        event.remove(conversation_store._conv_engine, "before_cursor_execute", _record)
+
+    # The FTS mirror is a separate table (conversation_items_fts); the regex
+    # keeps it out by requiring the base table name to be followed by "(".
+    item_inserts = [
+        s for s in statements if re.search(r"insert into conversation_items\s*\(", s, re.I)
+    ]
+    assert len(item_inserts) == 1, item_inserts
+    assert _stored_positions(conversation_store, conv.id) == list(range(10))
+
+
 @pytest.mark.parametrize("preexisting", [0, 1, 3])
 def test_append_falls_back_to_scan_when_counter_null(
     conversation_store: SqlAlchemyConversationStore,
