@@ -1,5 +1,5 @@
 import { type CSSProperties, useState } from "react";
-import { FolderIcon, PlusIcon } from "lucide-react";
+import { PlusIcon, SmilePlusIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -108,7 +108,7 @@ export function NewProjectButton({ onCreated }: { onCreated: (name: string) => v
                   {icon ? (
                     <span className="text-xl leading-none">{icon}</span>
                   ) : (
-                    <FolderIcon className="size-4 text-brand-accent" />
+                    <SmilePlusIcon className="size-4 text-brand-accent" />
                   )}
                 </button>
               </PopoverTrigger>
