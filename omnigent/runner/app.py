@@ -7824,18 +7824,23 @@ def create_runner_app(
             override=transport,
             spec_transport=entry.instance.terminal_transport,
         )
-        bridge = (
-            bridge_tmux_control_to_websocket
-            if resolved_transport == TERMINAL_TRANSPORT_CONTROL
-            else bridge_tmux_pty_to_websocket
-        )
-        await bridge(
-            websocket,
-            socket_path=str(entry.instance.socket_path),
-            tmux_target=entry.instance.tmux_target,
-            read_only=read_only,
-            on_client_interaction=entry.instance.note_client_interaction,
-        )
+        if resolved_transport == TERMINAL_TRANSPORT_CONTROL:
+            await bridge_tmux_control_to_websocket(
+                websocket,
+                socket_path=str(entry.instance.socket_path),
+                tmux_target=entry.instance.tmux_target,
+                read_only=read_only,
+                on_client_interaction=entry.instance.note_client_interaction,
+            )
+        else:
+            await bridge_tmux_pty_to_websocket(
+                websocket,
+                socket_path=str(entry.instance.socket_path),
+                tmux_target=entry.instance.tmux_target,
+                read_only=read_only,
+                on_client_interaction=entry.instance.note_client_interaction,
+                allow_osc52_clipboard=not entry.instance.tmux_allow_passthrough,
+            )
 
     # Reused by the loopback direct-attach listener (see
     # ``omnigent.runner.direct_attach``): same attach handler served on a
