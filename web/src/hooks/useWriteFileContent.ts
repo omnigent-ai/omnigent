@@ -9,10 +9,17 @@ async function writeFileContent(
   path: string,
   content: string,
 ): Promise<void> {
-  const encodedPath = path.split("/").map(encodeURIComponent).join("/");
+  // An absolute path (saving a file edited outside the workspace) is sent
+  // WITHOUT its leading slash and named `?base=host`, matching the read path:
+  // a leading "%2F" would decode to a "//" that reverse proxies (the
+  // Databricks Apps front door) merge to a single "/", writing to the wrong
+  // (workspace-relative) location. See `browseLocationSegment`.
+  const absolute = path.startsWith("/");
+  const encodedPath = path.replace(/^\//, "").split("/").map(encodeURIComponent).join("/");
   const url =
     `/v1/sessions/${encodeURIComponent(conversationId)}` +
-    `/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem/${encodedPath}`;
+    `/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem/${encodedPath}` +
+    (absolute ? "?base=host" : "");
   const res = await authenticatedFetch(url, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },

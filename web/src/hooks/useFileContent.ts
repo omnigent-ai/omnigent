@@ -29,11 +29,18 @@ export async function fetchFileContent(
   conversationId: string,
   path: string,
 ): Promise<FileContentResponse> {
-  // Encode each path segment individually so slashes remain structural.
-  const encodedPath = path.split("/").map(encodeURIComponent).join("/");
+  // Encode each path segment individually so slashes stay structural. An
+  // absolute path (a file opened while browsing outside the workspace) is sent
+  // WITHOUT its leading slash and named `?base=host`, exactly as the directory
+  // listing does — a leading "%2F" would decode to a "//" that reverse proxies
+  // (the Databricks Apps front door) merge to a single "/", turning it into a
+  // workspace-relative path and opening the wrong file (or none).
+  const absolute = path.startsWith("/");
+  const encodedPath = path.replace(/^\//, "").split("/").map(encodeURIComponent).join("/");
   const url =
     `/v1/sessions/${encodeURIComponent(conversationId)}` +
-    `/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem/${encodedPath}`;
+    `/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem/${encodedPath}` +
+    (absolute ? "?base=host" : "");
   const res = await authenticatedFetch(url);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return (await res.json()) as FileContentResponse;
