@@ -2158,17 +2158,16 @@ async def _auto_create_pi_terminal(
             resolve_pi_native_provider,
         )
 
-        # Thread the agent spec's pinned model (``executor.model``) into the
-        # resolved provider so the generated ``models.json`` — and the
-        # appended ``--model`` arg (see ``pi_native_provider_launch``) — select
-        # it, reaching parity with claude-native / cursor-native. ``None``
-        # (no model declared) keeps the provider's default model.
-        # model_override (set by /model or sys_session_create's model arg)
-        # takes precedence over the spec's pinned executor.model.
+        # Provider-qualified picker values select one of the models rendered
+        # from the provider configured through ``omni setup``.
         spec_model = launch_config.model_override or _pi_native_model_from_spec(agent_spec)
         provider = resolve_pi_native_provider(model=spec_model)
         if provider is not None:
-            cred_env, cred_args = pi_native_provider_launch(bridge_dir / "pi-agent", provider)
+            cred_env, cred_args = pi_native_provider_launch(
+                bridge_dir / "pi-agent",
+                provider,
+                selection=spec_model,
+            )
             pi_env.update(cred_env)
             pi_args.extend(cred_args)
             # An unroutable model leaves Pi unable to select it, which looks
@@ -3769,6 +3768,37 @@ async def _auto_create_codex_terminal(
     from omnigent.inner.codex_executor import _find_codex_cli
 
     _codex_cli_path = _find_codex_cli()
+    # Explicit launches (model-flows design §4): validate an explicit request
+    # against the shared catalog, and give a Default launch on codex's own
+    # login the ACCOUNT's real default — so the ``model =`` line copied from
+    # the user's shared config can never govern a session (the stale-gpt-5.4
+    # 400 class). Profile-backed shapes already resolve their default at
+    # materialization time and are left alone.
+    if launch_config.model_override or (
+        _codex_launch.model is None and _codex_launch.profile is None
+    ):
+        from dataclasses import replace as _dataclass_replace
+
+        from omnigent.codex_native_app_server import codex_launch_catalog
+        from omnigent.model_catalog_store import catalog_contains, default_row
+
+        _codex_catalog = await codex_launch_catalog(codex_path=_codex_cli_path)
+        if launch_config.model_override and _codex_catalog:
+            if not catalog_contains(_codex_catalog, launch_config.model_override):
+                raise click.ClickException(
+                    f"the requested model {launch_config.model_override!r} is not in "
+                    "this host's current model list — it may have changed since the "
+                    "pick. Pick again from the model menu."
+                )
+        if _codex_launch.model is None and _codex_launch.profile is None and _codex_catalog:
+            _catalog_default = default_row(_codex_catalog)
+            _default_id = (
+                str(_catalog_default.get("id") or _catalog_default.get("model") or "") or None
+                if _catalog_default is not None
+                else None
+            )
+            if _default_id:
+                _codex_launch = _dataclass_replace(_codex_launch, model=_default_id)
     # Cancel any surviving forwarder first so its teardown closes the OLD app-server,
     # not the one registered below — and so it can't mirror alongside the new one.
     await _cancel_auto_forwarder_task(session_id)
@@ -4003,9 +4033,9 @@ async def _auto_create_codex_terminal(
         ap_server_url=launch_config.policy_server_url,
         ap_auth_headers=policy_headers,
         bypass_sandbox=launch_config.bypass_sandbox,
-        # Codex 0.146 prompts for project trust before creating a thread.
-        # This TUI runs detached for the web UI, so trust the runner-selected
-        # workspace in the session-private config instead of blocking forever.
+        # Codex can show project-trust and legacy-model migration prompts before
+        # creating a thread. This TUI runs detached for the web UI, so persist
+        # the runner-owned acknowledgements in the private session config.
         trust_project=True,
         **routed_spawn_extras,
     )
@@ -4130,18 +4160,14 @@ async def _auto_create_codex_terminal(
                     # hook sources itself; skip the interactive trust prompt
                     # that headless sub-agents can never answer.
                     #
-                    # Requires a *positively parsed* version, unlike the
-                    # hooks-file gate in ``codex_native_app_server``, which
-                    # treats an unknown version as supported. The two differ
-                    # because their failure modes do: an unsupported hooks
-                    # file is ignored by codex and caught downstream at the
-                    # trust check, whereas an unknown CLI flag aborts argv
-                    # parsing — so a transient ``codex --version`` hiccup on a
-                    # pre-0.131 codex would turn a recoverable trust prompt
-                    # into a dead terminal.
+                    # A failed version probe must not restore the interactive
+                    # gate: Omnigent's supported Codex floor is newer than the
+                    # release that added this flag. Otherwise a transient
+                    # ``codex --version`` failure strands the queued web
+                    # message behind the terminal-only review screen.
                     bypass_hook_trust=(
-                        app_server.codex_cli_version is not None
-                        and app_server.codex_cli_version >= _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION
+                        app_server.codex_cli_version is None
+                        or app_server.codex_cli_version >= _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION
                     ),
                 ),
                 env=codex_terminal_env(app_server),
@@ -6455,6 +6481,43 @@ async def _auto_create_claude_terminal(
         or (claude_config.model if claude_config is not None else None),
         claude_config,
     )
+    # Explicit launches (model-flows design §4): consult the shared catalog
+    # only when it can change the outcome — to validate an explicit request,
+    # or to resolve a Default launch that would otherwise pass no ``--model``
+    # and leave the model to invisible CLI-private state.
+    if session_model_override or launch_model is None:
+        from omnigent.claude_native import claude_catalog_serves_model, claude_launch_catalog
+        from omnigent.model_catalog_store import default_row
+
+        launch_catalog: list[dict[str, object]] | None = None
+        try:
+            launch_catalog = await claude_launch_catalog(claude_config)
+        except Exception:  # noqa: BLE001 — no catalog means no validation/default
+            _logger.warning(
+                "claude launch catalog unavailable for session=%s", session_id, exc_info=True
+            )
+        if session_model_override and launch_catalog:
+            resolved_request = (
+                resolve_claude_native_model_selection(session_model_override, claude_config)
+                or session_model_override
+            )
+            # A pane's ``/model`` persists the exact id it runs; the catalog
+            # may spell that model only by its family alias.
+            if not (
+                claude_catalog_serves_model(launch_catalog, session_model_override, claude_config)
+                or claude_catalog_serves_model(launch_catalog, resolved_request, claude_config)
+            ):
+                raise click.ClickException(
+                    f"the requested model {session_model_override!r} is not in this "
+                    "host's current model list — it may have changed since the pick. "
+                    "Pick again from the model menu."
+                )
+        if launch_model is None and launch_catalog:
+            catalog_default = default_row(launch_catalog)
+            if catalog_default is not None:
+                launch_model = (
+                    str(catalog_default.get("model") or catalog_default.get("id") or "") or None
+                )
     # Give an exact launch model (a Smart Routing pick is resolved before the
     # terminal exists) a spelling of its own in the picker, so a later
     # ``/model`` can return to it instead of stepping onto whatever the family
@@ -6466,6 +6529,18 @@ async def _auto_create_claude_terminal(
         claude_config = claude_config_with_launch_model_pinned(claude_config, launch_model)
     if record_launch_config is not None:
         record_launch_config(session_id, claude_config)
+    # Persist the vocabulary + launch model onto the bridge so mid-session
+    # ``/model`` conversion reads THIS session's pins, not the runner's
+    # ambient env (the CLI path records these at prepare time; the runner
+    # resolves its config only after the bridge exists).
+    from omnigent.claude_native_bridge import record_model_vocabulary
+
+    await asyncio.to_thread(
+        record_model_vocabulary,
+        bridge_dir,
+        launch_env=claude_config.env if claude_config is not None else None,
+        launch_model=launch_model,
+    )
     _logger.info(
         "Claude terminal provider config resolved: session=%s configured=%s "
         "env_keys=%s api_key_helper_set=%s model_set=%s launch_model=%s",

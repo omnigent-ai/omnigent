@@ -37,13 +37,14 @@ import sys
 import tempfile
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, Protocol, TypeAlias, cast
 
 from omnigent import model_catalog
 from omnigent._platform import resolve_cli_binary, stable_user_id
+from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
 from omnigent.inner import _proc
 from omnigent.inner.bundle_skills import ensure_bundle_plugin_manifest
 from omnigent.inner.hook_scripts import subagent_router
@@ -946,6 +947,39 @@ def _find_system_claude() -> str | None:
     return resolve_cli_binary("claude", env_var=_CLAUDE_PATH_ENV)
 
 
+# DATABRICKS-PATCH(claude-sdk-live-model-discovery)
+def _resolve_databricks_claude_model(profile: str | None) -> str:
+    """Resolve the launch model from what the workspace serves.
+
+    The bundled MLflow catalog is a third-party listing whose Databricks ids use
+    the legacy ``databricks-`` spelling the gateway now answers with ``501 … Use
+    Unity Catalog model services (v3)``. Resolve from the live Unity Catalog
+    listing as claude-native does, keeping the catalog as the last resort.
+
+    :param profile: Databricks CLI profile backing the gateway.
+    :returns: The model id to launch on.
+    """
+    try:
+        from omnigent.databricks_model_discovery import discover_databricks_claude_catalog
+        from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
+
+        creds = resolve_databricks_workspace(profile)
+        families = discover_databricks_claude_catalog(creds.host, creds.token).families
+        # The precedence claude-native itself falls back to.
+        for tier in ("opus", "sonnet", "haiku", "fable"):
+            servable = families.get(tier)
+            if servable:
+                return servable
+    except Exception:  # noqa: BLE001 — the bundled catalog is the last resort
+        logger.warning(
+            "claude-sdk: live Databricks model discovery failed for profile %r; "
+            "falling back to the bundled catalog",
+            profile,
+            exc_info=True,
+        )
+    return model_catalog.resolve_catalog_model("databricks", family="claude").model_id
+
+
 def _resolve_gateway_env(
     profile: str | None = None,
     *,
@@ -1036,15 +1070,28 @@ def _resolve_gateway_env(
         base_url = base_url_override
         auth_command = auth_command_override
 
-    return {
+    gateway_env = {
         "ANTHROPIC_BASE_URL": base_url,
         "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": str(
             auth_refresh_interval_ms or _GATEWAY_AUTH_REFRESH_MS
         ),
-        "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
         _ANTHROPIC_CUSTOM_HEADERS_ENV: _DATABRICKS_CODING_AGENT_HEADER,
         _CLAUDE_API_KEY_HELPER_ENV_KEY: auth_command,
     }
+    # DATABRICKS-PATCH(claude-sdk-gateway-betas)
+    # Blanket-disabling betas makes Claude Code strip `interleaved-thinking`,
+    # after which the Databricks gateway rejects the malformed thinking blocks
+    # with `400 messages.N.content.0.type: Expected 'thinking'`. claude-native
+    # already fixed this by negotiating betas with the gateway instead
+    # (`claude_native.py` CLAUDE_CODE_USE_GATEWAY=1); claude-sdk — the harness
+    # behind Polly and Debby — never got that change. Scope it to a real
+    # Databricks AI Gateway base URL so a generic gateway (or a mock server)
+    # that cannot negotiate betas keeps the original workaround.
+    if is_databricks_ai_gateway_url(base_url):
+        gateway_env["CLAUDE_CODE_USE_GATEWAY"] = "1"
+    else:
+        gateway_env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] = "1"
+    return gateway_env
 
 
 def _databricks_claude_auth_command(host: str, profile: str | None = None) -> str:
@@ -1659,7 +1706,27 @@ class ClaudeSDKExecutor(Executor):
                 # ``options.settings`` explicitly sets apiKeyHelper and
                 # ``options.env`` sets the Databricks base URL, so the
                 # Claude CLI does not need an inherited Anthropic key.
-                with _unset_env_var("CLAUDECODE"), _unset_env_var("ANTHROPIC_API_KEY"):
+                #
+                # DATABRICKS-PATCH(claude-sdk-gateway-betas): on the Databricks
+                # gateway we negotiate betas rather than disabling them, but
+                # *omitting* CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS from
+                # ``options.env`` does not beat an INHERITED one — Databricks
+                # runners export it (devtools/ai/databricks_auth/gateway_env.py
+                # and the arca/isaac runners), and the merge puts os.environ
+                # under options.env. Without this the child still strips
+                # interleaved-thinking and the gateway still answers 400. Scoped
+                # to launches that negotiate (CLAUDE_CODE_USE_GATEWAY): the
+                # non-gateway branch re-adds the key through ``options.env``,
+                # which wins over os.environ, and a non-gateway session keeps
+                # whatever it inherited.
+                sdk_env = getattr(options, "env", None)
+                with ExitStack() as env_stack:
+                    env_stack.enter_context(_unset_env_var("CLAUDECODE"))
+                    env_stack.enter_context(_unset_env_var("ANTHROPIC_API_KEY"))
+                    if isinstance(sdk_env, dict) and "CLAUDE_CODE_USE_GATEWAY" in sdk_env:
+                        env_stack.enter_context(
+                            _unset_env_var("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS")
+                        )
                     await asyncio.wait_for(client.connect(), timeout=_CONNECT_TIMEOUT_SECONDS)
             except asyncio.TimeoutError as exc:
                 await self._force_close_client(client)
@@ -2256,12 +2323,9 @@ class ClaudeSDKExecutor(Executor):
         # spawning, so no ``databricks-*`` default is injected there.
         model = cfg.model or self._model_override
         if model is None and self._gateway_uses_databricks_profile:
-            resolution = await run_sync_on_thread(
-                model_catalog.resolve_catalog_model,
-                "databricks",
-                family="claude",
+            model = await run_sync_on_thread(
+                _resolve_databricks_claude_model, self._databricks_profile
             )
-            model = resolution.model_id
 
         # Build env: Databricks gateway settings derived from profile-backed
         # creds. CLAUDECODE removal happens around the subprocess spawn in

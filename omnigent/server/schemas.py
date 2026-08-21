@@ -808,6 +808,7 @@ class ChildSessionSummary(BaseModel):
     object: str = "child_session"
     parent_session_id: str
     title: str | None = None
+    task_summary: str | None = None
     tool: str | None = None
     session_name: str | None = None
     kind: str = "sub_agent"
@@ -1719,10 +1720,13 @@ class SessionResponse(BaseModel):
         permission level on this session: ``1`` = read, ``2`` =
         edit, ``3`` = manage. ``None`` when permissions are
         disabled (single-user mode without a permission store).
-    :param llm_model: The LLM model identifier from the bound
-        agent's spec, e.g. ``"anthropic/claude-sonnet-4-6"``.
-        ``None`` when the agent has no explicit ``llm:`` block or
-        the agent cannot be looked up.
+    :param llm_model: The model this session is actually on. When the
+        harness has reported one (``reported_model``, written by
+        ``external_model_change``), that verbatim value serves here
+        and is the only model value clients display; otherwise the
+        bound agent spec's model, e.g.
+        ``"anthropic/claude-sonnet-4-6"``. ``None`` when neither
+        exists.
     :param harness: The bound agent's canonical harness, e.g.
         ``"claude-sdk"`` or ``"openai-agents"``. Lets the client
         render the active credential for the correct provider
@@ -1976,6 +1980,15 @@ class UpdateSessionRequest(BaseModel):
         ``"plan"`` enters Plan mode and ``"default"`` returns to Default
         mode for subsequent Codex turns. Only valid for sessions stamped
         with the codex-native wrapper label. Omitted leaves unchanged.
+    :param permission_mode: Claude-native permission mode to switch a
+        running session to, e.g. ``"auto"``. Only the modes Claude Code's
+        shift+tab cycle can reach are accepted (``default``,
+        ``acceptEdits``, ``plan``, ``auto``) — ``dontAsk`` and
+        ``bypassPermissions`` are launch-only. Only valid for sessions
+        stamped with the claude-native wrapper label. Unlike the other
+        fields here the switch is applied by the live TUI, so a failure
+        to reach the mode is surfaced as an error rather than persisted.
+        Omitted leaves unchanged.
     :param cost_control_mode_override: Per-session cost-control
         switch: ``"on"`` activates the spec's configured cost-control
         mode, ``"off"`` disables cost control for this session.
@@ -2033,6 +2046,7 @@ class UpdateSessionRequest(BaseModel):
     reasoning_effort: str | None = None
     model_override: str | None = None
     collaboration_mode: str | None = None
+    permission_mode: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
     external_session_id: str | None = None
@@ -2439,6 +2453,7 @@ class SessionUsage(BaseModel):
     cost_usd: float = 0.0
     models: dict[str, float] = Field(default_factory=dict)
     harness: str | None = None
+    other_harnesses: list[str] | None = None
     llm_model: str | None = None
     agent_name: str | None = None
 
@@ -2723,29 +2738,52 @@ class SessionUsageEvent(_SSEEventBase):
 
 class SessionModelEvent(_SSEEventBase):
     """
-    Active-model update from a terminal-backed integration.
+    Active-model report from a terminal-backed integration.
 
-    Emitted after an ``external_model_change`` POST from the
-    ``omnigent claude`` transcript forwarder when the model is
-    switched inside the Claude Code terminal (a ``/model`` command or
-    the in-TUI picker). Lets the web model picker reflect a TUI-side
-    switch without a reload.
+    Emitted after an ``external_model_change`` POST from a native
+    forwarder — the launch's own model report, or a switch made inside
+    the pane (a ``/model`` command or the in-TUI picker). Every surface
+    re-renders its model display from this.
 
     :param type: Always ``"session.model"``.
     :param conversation_id: Session identifier, e.g. ``"conv_abc123"``.
-    :param model: Tier alias the session is now on, e.g. ``"opus"`` —
-        Claude Code's version-agnostic alias, matching the picker's
-        vocabulary (not a pinned ``"claude-opus-4-8"`` id).
+    :param model: The model the harness reports the session is on,
+        VERBATIM in the harness's own spelling, e.g.
+        ``"claude-opus-4-8[1m]"`` or ``"gpt-5.6-luna"`` — never
+        collapsed to a picker alias.
 
     Category: **transient** (SSE-only). The server also writes
-    ``model_override`` on the conversation, so on reconnect clients
-    restore the selection from the snapshot's ``model_override`` rather
-    than from a replayed event.
+    ``reported_model`` on the conversation (served on the snapshot's
+    ``llm_model``), so on reconnect clients restore the display from
+    the snapshot rather than from a replayed event.
     """
 
     type: Literal["session.model"]
     conversation_id: str
     model: str
+
+
+class SessionTitleEvent(_SSEEventBase):
+    """
+    Session-title update from a terminal-backed integration.
+
+    Emitted after an ``external_session_title`` POST from the
+    ``omnigent claude`` transcript forwarder when the operator renames
+    the session inside the Claude Code pane (``/rename``). Lets the web
+    session list show the new name without a reload.
+
+    :param type: Always ``"session.title"``.
+    :param conversation_id: Session identifier, e.g. ``"conv_abc123"``.
+    :param title: Title the session is now on, e.g. ``"auth-refactor"``.
+
+    Category: **transient** (SSE-only). The server also writes ``title``
+    on the conversation, so on reconnect clients restore the name from
+    the session snapshot rather than from a replayed event.
+    """
+
+    type: Literal["session.title"]
+    conversation_id: str
+    title: str
 
 
 class SessionReasoningEffortEvent(_SSEEventBase):
@@ -2794,6 +2832,29 @@ class SessionCollaborationModeEvent(_SSEEventBase):
     type: Literal["session.collaboration_mode"]
     conversation_id: str
     mode: str
+
+
+class SessionPermissionModeEvent(_SSEEventBase):
+    """
+    Active permission-mode update from a claude-native session.
+
+    Emitted after the web UI switches the mode, and after the Claude forwarder
+    observes a different mode in the pane footer — a shift+tab pressed inside
+    the TUI, which Omnigent has no other way to see. Lets the composer's mode
+    picker track the pane without a reload.
+
+    :param type: Always ``"session.permission_mode"``.
+    :param conversation_id: Session identifier, e.g. ``"conv_abc123"``.
+    :param permission_mode: The active mode, e.g. ``"auto"`` or ``"plan"``.
+
+    Category: **transient** (SSE-only). The server also writes
+    ``omnigent.claude_native.permission_mode`` on the conversation labels, so
+    reconnecting clients restore the same state from the session snapshot.
+    """
+
+    type: Literal["session.permission_mode"]
+    conversation_id: str
+    permission_mode: str
 
 
 class SessionAgentChangedEvent(_SSEEventBase):
@@ -4185,8 +4246,10 @@ ServerStreamEvent = Annotated[
     SessionStatusEvent
     | SessionUsageEvent
     | SessionModelEvent
+    | SessionTitleEvent
     | SessionReasoningEffortEvent
     | SessionCollaborationModeEvent
+    | SessionPermissionModeEvent
     | SessionAgentChangedEvent
     | SessionTodosEvent
     | SessionTerminalPendingEvent
@@ -4373,10 +4436,14 @@ class SessionProjectSummary(BaseModel):
     :param id: First-class project id when one exists, or ``None`` for a
         label-only project not yet promoted to the ``projects`` table.
     :param name: Project name (the folder's display name and union key).
+    :param icon: The project's chosen emoji icon (a unicode grapheme), read
+        from its ``config``; ``None`` when unset or for a label-only folder,
+        so the sidebar falls back to the default folder glyph.
     """
 
     id: str | None = None
     name: str
+    icon: str | None = None
 
 
 class CreateProjectRequest(BaseModel):

@@ -36,6 +36,7 @@ from omnigent.claude_native_bridge import (
     read_hook_events_from_offset,
     read_hook_events_since_with_position,
     read_message_deltas_from_offset,
+    read_permission_mode,
     read_transcript_items_from_offset,
     read_transcript_items_since_with_position,
     read_transcript_path,
@@ -82,6 +83,11 @@ _SUBAGENT_IDLE_QUIESCENCE_S = 5.0
 # ``agent-<id>.jsonl`` transcript.
 _SUBAGENT_META_GLOB = "agent-*.meta.json"
 _DEFAULT_POLL_INTERVAL_S = 0.25
+# Minimum spacing between permission-mode pane reads. Unlike the model mirror
+# (which reads a JSON file), this spawns a ``tmux capture-pane`` subprocess, so
+# it runs well below the poll interval; a mode switch is a human action and 2s
+# of lag is imperceptible.
+_PERMISSION_MODE_POLL_INTERVAL_S = 2.0
 # Hard ceiling on one poll iteration of the forward loop. A silently stalled
 # await anywhere in the pipeline used to stop mirroring, status and the busy
 # signal forever; the deadline cancels the stall (the traceback names it) and
@@ -490,16 +496,15 @@ class _ForwardDedupeState:
     :param usage: Last ``message.usage`` snapshot POSTed via
         ``external_session_usage``, or ``None`` if none yet.
     :param context_window: Last context-window POSTed, or ``None``.
-    :param observed_model: Last tier alias seen in the transcript,
-        sticky across polls (the incremental window often carries no
-        fresh ``message.model``), e.g. ``"opus"``. ``None`` until first
-        seen.
-    :param posted_model: Last tier alias POSTed via
-        ``external_model_change``. Seeded from the first observation
-        WITHOUT a POST so a passive spawn default never overwrites a
-        pending silent model handoff; only a later in-TUI switch is
-        mirrored. Left behind ``observed_model`` on a failed POST so the
-        next poll retries. ``None`` until the first observation.
+    :param observed_model: Last VERBATIM model seen (statusLine or
+        transcript), sticky across polls (the incremental window often
+        carries no fresh ``message.model``), e.g.
+        ``"claude-opus-4-8[1m]"``. ``None`` until first seen.
+    :param posted_model: Last verbatim model POSTed via
+        ``external_model_change``. Every observation posts — the first
+        one is the launch report that seeds the session's
+        ``reported_model``. Left behind ``observed_model`` on a failed
+        POST so the next poll retries. ``None`` until the first post.
     :param posted_cost: Last DISPLAY cost (USD) POSTed as
         ``cumulative_cost_usd`` — the statusLine total ``S`` verbatim.
         ``None`` until the first cost post. Used to dedupe so a steady
@@ -510,6 +515,15 @@ class _ForwardDedupeState:
         from ``posted_cost`` because it advances mid-turn (with in-flight
         sub-agent spend) while ``S`` stays frozen. ``None`` until first
         post.
+    :param observed_title: Last ``custom-title`` seen in the transcript,
+        sticky across polls, e.g. ``"auth-refactor"``. ``None`` until the
+        operator runs ``/rename``.
+    :param posted_title: Last title POSTed via
+        ``external_session_title``. Unlike ``posted_model`` this is NOT
+        seeded without a POST — a ``custom-title`` record only exists
+        because the operator renamed the session, so the first
+        observation is a real change worth mirroring. Left behind
+        ``observed_title`` on a failed POST so the next poll retries.
     :param recorded_token_usage: Last token counters recorded on a
         ``claude_native.usage`` span as ``gen_ai.usage.*``. Deduped
         separately from ``usage`` because that snapshot also moves on
@@ -523,6 +537,8 @@ class _ForwardDedupeState:
     recorded_token_usage: dict[str, int] | None = None
     observed_model: str | None = None
     posted_model: str | None = None
+    observed_title: str | None = None
+    posted_title: str | None = None
     # Last DISPLAY cost (USD) POSTed as ``cumulative_cost_usd`` — the
     # statusLine total ``S`` verbatim (matches /cost in the Claude TUI).
     # Kept to suppress duplicate posts when S hasn't advanced.
@@ -532,6 +548,13 @@ class _ForwardDedupeState:
     # sub-agent spend so the gate can block mid-turn. Separate baseline
     # because it can advance while ``posted_cost`` (S) is frozen.
     posted_policy_cost: float | None = None
+    # Last permission mode POSTed as ``external_permission_mode_change`` —
+    # mirrors the launch mode and any in-pane shift+tab switch, neither of
+    # which the web UI can observe on its own.
+    posted_permission_mode: str | None = None
+    # Monotonic deadline before which the next pane read is skipped, so the
+    # subprocess spawn runs at _PERMISSION_MODE_POLL_INTERVAL_S, not every poll.
+    permission_mode_next_read: float = 0.0
     # Turn-settle latch driving the scheduled-wake boundary. The Stop edge
     # records the ended turn's id as PENDING; it activates (moves to
     # ``settled_response_id``) only once a fully-consumed transcript batch
@@ -996,6 +1019,14 @@ async def forward_claude_transcript_to_session(
                         # before the user's next message, so model-gated policies
                         # (cost-budget hard cap) no longer lag a switch by one turn.
                         await _forward_model_from_status(
+                            client=client,
+                            session_id=current_session_id,
+                            bridge_dir=bridge_dir,
+                            dedupe=dedupe,
+                        )
+                        # Same rationale for the permission mode: a shift+tab in
+                        # the pane emits no event, so poll the footer.
+                        await _forward_permission_mode_from_pane(
                             client=client,
                             session_id=current_session_id,
                             bridge_dir=bridge_dir,
@@ -3561,19 +3592,27 @@ async def _forward_available_items(
                 _http_status_for_log(exc),
                 exc_info=True,
             )
-    # Mirror a TUI-side `/model` switch to the web picker. The transcript
-    # records the resolved concrete id (e.g. "claude-opus-4-8"); collapse
-    # it to the picker's tier alias. This transcript-derived observation
-    # only fires when a turn produces a fresh ``message.model``, so it lags
-    # an in-pane switch by one turn — the per-poll statusLine sync
-    # (:func:`_forward_model_from_status`) is the primary, low-latency
-    # source; this stays as a fallback for cold-resume before the first
-    # statusLine render. Both share ``dedupe`` so neither double-posts.
+    # Report the transcript's model verbatim. This transcript-derived
+    # observation only fires when a turn produces a fresh
+    # ``message.model``, so it lags an in-pane switch by one turn — the
+    # per-poll statusLine sync (:func:`_forward_model_from_status`) is the
+    # primary, low-latency source; this stays as a fallback for cold-resume
+    # before the first statusLine render. Both share ``dedupe`` so neither
+    # double-posts.
     await _post_model_change_if_new(
         client,
         session_id=session_id,
         dedupe=dedupe,
-        alias=_model_alias_for(result.latest_model),
+        model=result.latest_model,
+    )
+    # Mirror a TUI-side `/rename` to the web session list. Claude writes the
+    # operator's title as a `custom-title` metadata record, which renders no
+    # conversation item, so this is the only path that surfaces it.
+    await _post_title_change_if_new(
+        client,
+        session_id=session_id,
+        dedupe=dedupe,
+        title=result.latest_custom_title,
     )
     return updated
 
@@ -4157,38 +4196,81 @@ def _gen_ai_usage_tokens(usage: Mapping[str, float | str] | None) -> dict[str, i
     return tokens
 
 
-def _model_alias_for(model: str | None) -> str | None:
+async def _post_external_permission_mode_change(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    mode: str,
+) -> None:
     """
-    Collapse a concrete Claude model id to the picker's tier alias.
+    Post one ``external_permission_mode_change`` event to the Sessions API.
 
-    The web model picker speaks Claude Code's version-agnostic aliases
-    (``"fable"`` / ``"opus"`` / ``"sonnet"`` / ``"haiku"``), plus the one
-    extra concrete-id slot ``"sonnet_5"`` (see
-    :data:`omnigent.claude_native._UCODE_CLAUDE_CUSTOM_TIER`) for the newer
-    Sonnet generation offered alongside the default ``"sonnet"`` tier; the
-    transcript records the resolved concrete id (e.g.
-    ``"claude-opus-4-8"`` or ``"databricks-claude-sonnet-5"``).
-    Mapping to the tier keeps the mirrored value in the picker's
-    vocabulary and makes a web→TUI round-trip a no-op. The older Sonnet
-    (``sonnet-4-6``) collapses to the generic ``"sonnet"`` alias — it is the
-    default that row is bound to.
+    Lets the web mode picker reflect a shift+tab switch made inside the Claude
+    Code terminal, which Omnigent has no other way to observe.
 
-    :param model: Concrete model id from the transcript, e.g.
-        ``"claude-opus-4-8"``; ``None`` when none observed yet.
-    :returns: ``"fable"`` / ``"opus"`` / ``"sonnet"`` / ``"sonnet_5"`` /
-        ``"haiku"`` when the id carries a known tier token, else ``None``
-        (the caller skips the post rather than surface an id the picker
-        can't render).
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent session/conversation id, e.g. ``"conv_abc123"``.
+    :param mode: Permission mode the pane now shows, e.g. ``"auto"``.
+    :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
-    if not model:
-        return None
-    lowered = model.lower()
-    if "sonnet-5" in lowered or "sonnet_5" in lowered:
-        return "sonnet_5"
-    for tier in ("fable", "opus", "sonnet", "haiku"):
-        if tier in lowered:
-            return tier
-    return None
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "external_permission_mode_change", "data": {"permission_mode": mode}},
+    )
+    resp.raise_for_status()
+
+
+async def _forward_permission_mode_from_pane(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    dedupe: _ForwardDedupeState,
+) -> None:
+    """
+    Mirror the pane's permission-mode footer to the session label each poll.
+
+    A shift+tab pressed inside the TUI produces no event Omnigent can see, so
+    without this the web picker shows a stale mode until the next UI-driven
+    switch. Polling the footer is the only signal available: Claude Code emits
+    nothing on a mode change, and hook payloads only arrive on tool use.
+
+    The launch mode is posted too, not just later switches: a session started
+    in manual mode carries no ``--permission-mode`` arg and no mode label, so
+    with nothing posted the web picker has no mode to render and hides itself.
+    Best-effort and idempotent — the server ignores a mode equal to the stored
+    label, an unchanged mode or unreadable pane is a no-op, and a failed POST
+    is retried next poll.
+
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent session/conversation id.
+    :param bridge_dir: Native Claude bridge directory.
+    :param dedupe: Shared per-session dedupe state; mutated in place.
+    """
+    # Throttled: this spawns a tmux subprocess, unlike the file-backed model
+    # mirror that shares this poll loop.
+    now = time.monotonic()
+    if now < dedupe.permission_mode_next_read:
+        return
+    dedupe.permission_mode_next_read = now + _PERMISSION_MODE_POLL_INTERVAL_S
+    mode = await asyncio.to_thread(read_permission_mode, bridge_dir)
+    if mode is None or mode == dedupe.posted_permission_mode:
+        return
+    try:
+        await _post_external_permission_mode_change(
+            client,
+            session_id=session_id,
+            mode=mode,
+        )
+    except httpx.HTTPError:
+        _logger.debug(
+            "external_permission_mode_change post failed; session=%s mode=%s",
+            session_id,
+            mode,
+            exc_info=True,
+        )
+        return
+    dedupe.posted_permission_mode = mode
 
 
 async def _post_external_model_change(
@@ -4200,13 +4282,15 @@ async def _post_external_model_change(
     """
     Post one ``external_model_change`` event to the Sessions API.
 
-    Lets the web model picker reflect a model switch made inside the
-    Claude Code terminal (a ``/model`` command or the in-TUI picker).
+    Reports the model the pane is actually on — the launch's own model
+    included — so every surface renders the harness's truth.
 
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id, e.g.
         ``"conv_abc123"``.
-    :param model: Tier alias the session is now on, e.g. ``"opus"``.
+    :param model: The harness's VERBATIM model, e.g.
+        ``"claude-opus-4-8[1m]"`` — never collapsed to a picker alias
+        (a family word claims a generation the pane may not be on).
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
     resp = await client.post(
@@ -4216,44 +4300,120 @@ async def _post_external_model_change(
     resp.raise_for_status()
 
 
+async def _post_external_session_title(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    title: str,
+) -> None:
+    """
+    Post one ``external_session_title`` event to the Sessions API.
+
+    Mirrors a ``/rename`` typed in the Claude Code pane onto the Omnigent
+    session title so the web session list stops showing the stale
+    auto-generated one.
+
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent session/conversation id, e.g.
+        ``"conv_abc123"``.
+    :param title: Operator-chosen title, e.g. ``"auth-refactor"``.
+    :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
+    """
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "external_session_title", "data": {"title": title}},
+    )
+    resp.raise_for_status()
+
+
+async def _post_title_change_if_new(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    dedupe: _ForwardDedupeState,
+    title: str | None,
+) -> None:
+    """
+    Mirror an observed ``/rename`` title to the session, deduped.
+
+    Unlike :func:`_post_model_change_if_new`, the FIRST observation is
+    posted rather than used to seed the baseline silently: a
+    ``custom-title`` record exists only because the operator ran
+    ``/rename``, so there is no passive spawn default to protect.
+
+    A steady-state poll reads only records past its byte cursor, so the
+    dedupe is not for the ordinary case — it covers the cursor rewind /
+    restart path that re-reads an already-posted record, and it is what
+    makes the retry below safe to attempt on every poll.
+
+    Best-effort: a failed POST leaves ``posted_title`` behind
+    ``observed_title`` so the next poll retries. ``observed_title`` is
+    sticky for exactly this reason — the retry must survive polls whose
+    own window carries no rename.
+
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent session/conversation id.
+    :param dedupe: Shared per-session dedupe state; mutated in place.
+    :param title: Title just observed, or ``None`` when this poll's
+        window carried no ``custom-title`` record. ``observed_title`` is
+        sticky, so ``None`` does not clear it — a previously-observed but
+        unposted title is still retried here.
+    """
+    if title is not None:
+        dedupe.observed_title = title
+    if dedupe.observed_title is None or dedupe.observed_title == dedupe.posted_title:
+        return
+    try:
+        await _post_external_session_title(
+            client,
+            session_id=session_id,
+            title=dedupe.observed_title,
+        )
+        dedupe.posted_title = dedupe.observed_title
+    except httpx.HTTPError:
+        # Leave posted_title behind observed_title so the next poll retries.
+        _logger.warning(
+            "Failed to mirror /rename to Omnigent session=%s; the web session "
+            "list may show a stale title until the next poll",
+            session_id,
+            exc_info=True,
+        )
+
+
 async def _post_model_change_if_new(
     client: httpx.AsyncClient,
     *,
     session_id: str,
     dedupe: _ForwardDedupeState,
-    alias: str | None,
+    model: str | None,
 ) -> None:
     """
-    Mirror an observed model tier alias to ``model_override``, deduped.
+    Report the observed model to ``reported_model``, verbatim and deduped.
 
     Shared by the transcript-driven path (:func:`_forward_available_items`)
     and the statusLine-driven per-poll path
-    (:func:`_forward_model_from_status`). The FIRST observation is the
-    session's spawn default, not a switch, so it seeds the dedupe baseline
-    WITHOUT posting (posting it could clobber a pending silent model
-    handoff). Every later change posts ``external_model_change``. Both
-    callers pass the same ``dedupe`` so whichever observes a switch first
-    posts it and the other no-ops. Best-effort: a failed POST leaves
-    ``posted_model`` behind ``observed_model`` so the next poll retries.
+    (:func:`_forward_model_from_status`). EVERY observation posts — the
+    first one is the launch report that seeds the session's
+    ``reported_model``, so surfaces show the pane's truth within seconds
+    of spawn; the server dedupes by equality, so a steady model costs one
+    POST total. Both callers pass the same ``dedupe`` so whichever
+    observes a change first posts it and the other no-ops. Best-effort: a
+    failed POST leaves ``posted_model`` behind ``observed_model`` so the
+    next poll retries.
 
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
     :param dedupe: Shared per-session dedupe state; mutated in place.
-    :param alias: Tier alias just observed (``"opus"`` / ``"sonnet"`` /
-        …), or ``None`` when this source carried no recognizable model on
-        this poll. ``observed_model`` is sticky across polls, so passing
-        ``None`` does NOT clear it — it just means "no fresh observation,"
-        and a previously-observed-but-unposted model is still reconciled
-        (retried) here.
+    :param model: The harness's verbatim model just observed (e.g.
+        ``"claude-opus-4-8[1m]"``), or ``None`` when this source carried
+        no model on this poll. ``observed_model`` is sticky across
+        polls, so passing ``None`` does NOT clear it — it just means "no
+        fresh observation," and a previously-observed-but-unposted model
+        is still reconciled (retried) here.
     """
-    if alias is not None:
-        dedupe.observed_model = alias
+    if model is not None:
+        dedupe.observed_model = model
     if dedupe.observed_model is None or dedupe.observed_model == dedupe.posted_model:
-        return
-    if dedupe.posted_model is None:
-        # First observation = the spawn default; seed the baseline without
-        # posting so it can't clobber a pending silent model handoff.
-        dedupe.posted_model = dedupe.observed_model
         return
     try:
         await _post_external_model_change(
@@ -4280,7 +4440,7 @@ async def _forward_model_from_status(
     dedupe: _ForwardDedupeState,
 ) -> None:
     """
-    Mirror the statusLine-reported active model to ``model_override`` each poll.
+    Report the statusLine's active model to ``reported_model`` each poll.
 
     Claude Code rewrites the statusLine stdin on every TUI render — including
     right after an in-pane ``/model`` switch, BEFORE the next turn runs. The
@@ -4292,8 +4452,9 @@ async def _forward_model_from_status(
     turn later, which is what happened when the model was derived solely
     from the next turn's transcript ``message.model``.
 
-    Best-effort and idempotent: shares ``dedupe`` with the transcript path,
-    so a no-op when the model is unchanged.
+    The value posts VERBATIM — the harness's own spelling, never collapsed
+    to a picker alias. Best-effort and idempotent: shares ``dedupe`` with
+    the transcript path, so a no-op when the model is unchanged.
 
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
@@ -4304,12 +4465,11 @@ async def _forward_model_from_status(
     if status_state is None:
         return
     model = status_state.get("model")
-    alias = _model_alias_for(model if isinstance(model, str) else None)
     await _post_model_change_if_new(
         client,
         session_id=session_id,
         dedupe=dedupe,
-        alias=alias,
+        model=model.strip() if isinstance(model, str) and model.strip() else None,
     )
 
 

@@ -46,7 +46,7 @@ function getSnapshot(): number {
 
 /**
  * Monotonic wall-clock bucket that advances once every `ROTATE_MS`. Feed it
- * into `workingIndicatorLabel(bgCount, tick)` to rotate the label. SSR-safe
+ * into `workingIndicatorLabel(tick)` to rotate the label. SSR-safe
  * (returns 0 on the server, matching `useIsMobileViewport`).
  */
 export function useWorkingLabelTick(): number {

@@ -35,6 +35,7 @@ describe("KeyboardShortcutsDialog", () => {
 
     expect(screen.getByText("Keyboard shortcuts")).toBeTruthy();
     // General / In chats / Navigation / View / Slash commands — one each.
+    expect(screen.getByText("Start a new session")).toBeTruthy();
     expect(screen.getByText("Open command palette")).toBeTruthy();
     expect(screen.getByText("Show keyboard shortcuts")).toBeTruthy();
     expect(screen.getByText("Send message")).toBeTruthy();

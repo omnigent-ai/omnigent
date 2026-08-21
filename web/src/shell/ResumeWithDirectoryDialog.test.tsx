@@ -249,3 +249,100 @@ describe("ResumeWithDirectoryDialog", () => {
     expect(screen.queryByTestId("resume-dir-bind-button")).toBeNull();
   });
 });
+
+function renderHostless(prefill?: {
+  hostId?: string | null;
+  workspace?: string | null;
+  gitBranch?: string | null;
+}) {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return render(
+    <QueryClientProvider client={client}>
+      <ResumeWithDirectoryDialog
+        open
+        onOpenChange={() => {}}
+        sessionId="conv_imported"
+        // Host-less: no fork source.
+        sourceSessionId={null}
+        prefill={prefill}
+        serverUrl="http://localhost:5173"
+      />
+    </QueryClientProvider>,
+  );
+}
+
+describe("ResumeWithDirectoryDialog (host-less session)", () => {
+  it("prefills from the session's own fields and binds without fetching a source", async () => {
+    useHostsMock.mockReturnValue({
+      data: [
+        { host_id: "host_a", name: "laptop", owner: "me", status: "online" },
+        { host_id: "host_b", name: "desktop", owner: "me", status: "online" },
+      ],
+    } as unknown as ReturnType<typeof useHosts>);
+
+    // Prefer the session's recorded host when it's online; prefill the dir.
+    renderHostless({ hostId: "host_b", workspace: "/Users/alice/imported" });
+
+    const bindBtn = await screen.findByTestId("resume-dir-bind-button");
+    await waitFor(() => expect((bindBtn as HTMLButtonElement).disabled).toBe(false));
+    await waitFor(() =>
+      expect((screen.getByTestId("mock-workspace-input") as HTMLInputElement).value).toBe(
+        "/Users/alice/imported",
+      ),
+    );
+    fireEvent.click(bindBtn);
+
+    await waitFor(() =>
+      expect(launchRunnerMock).toHaveBeenCalledWith(
+        "host_b",
+        "conv_imported",
+        "/Users/alice/imported",
+        undefined,
+      ),
+    );
+    // No fork source → the source session is never fetched.
+    expect(getSessionMock).not.toHaveBeenCalled();
+    // No source means no mismatch/CLI-fallback machinery.
+    expect(screen.queryByTestId("resume-dir-mismatch-warning")).toBeNull();
+    expect(screen.queryByTestId("resume-dir-cli-fallback")).toBeNull();
+  });
+
+  it("defaults the host to the caller's current online machine when the recorded host is gone", async () => {
+    // Recorded host offline (or absent from the list) → fall back to the
+    // most-recent online machine (first in the list).
+    useHostsMock.mockReturnValue({
+      data: [
+        { host_id: "host_current", name: "laptop", owner: "me", status: "online" },
+        { host_id: "host_old", name: "old", owner: "me", status: "offline" },
+      ],
+    } as unknown as ReturnType<typeof useHosts>);
+
+    renderHostless({ hostId: "host_old", workspace: "/repo" });
+
+    const bindBtn = await screen.findByTestId("resume-dir-bind-button");
+    await waitFor(() => expect((bindBtn as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(bindBtn);
+
+    await waitFor(() =>
+      expect(launchRunnerMock).toHaveBeenCalledWith(
+        "host_current",
+        "conv_imported",
+        "/repo",
+        undefined,
+      ),
+    );
+  });
+
+  it("shows the no-online-hosts message (no CLI fallback) when none are online", async () => {
+    useHostsMock.mockReturnValue({
+      data: [{ host_id: "host_old", name: "old", owner: "me", status: "offline" }],
+    } as unknown as ReturnType<typeof useHosts>);
+
+    renderHostless({ workspace: "/repo" });
+
+    expect(await screen.findByTestId("resume-dir-no-hosts")).toBeTruthy();
+    expect(screen.queryByTestId("resume-dir-cli-fallback")).toBeNull();
+    expect(screen.queryByTestId("resume-dir-host-select")).toBeNull();
+    expect(launchRunnerMock).not.toHaveBeenCalled();
+  });
+});

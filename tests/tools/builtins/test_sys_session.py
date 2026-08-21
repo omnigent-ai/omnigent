@@ -803,6 +803,16 @@ def test_session_list_skips_label_closed_child_with_original_title(
     assert payload["sub_agents"] == []
 
 
+def test_session_list_schema_exposes_bounded_pagination() -> None:
+    """The harness can discover the same pagination inputs the runner accepts."""
+
+    properties = SysSessionListTool().get_schema()["function"]["parameters"]["properties"]
+
+    assert "default" not in properties["limit"]
+    assert properties["limit"]["maximum"] == 100
+    assert properties["cursor"]["type"] == "string"
+
+
 def test_close_unknown_conversation_id_returns_not_found(
     session_fixture: _Fixture,
 ) -> None:
