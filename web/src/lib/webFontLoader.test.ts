@@ -16,7 +16,10 @@ function deferred<T>() {
 // Records each `document.fonts.load(spec)` call and hands back a deferred whose
 // resolution the test controls, so readiness ordering is observable rather than
 // resolving instantly.
-type FontsLoadCall = { spec: string; deferred: ReturnType<typeof deferred<unknown[]>> };
+interface FontsLoadCall {
+  spec: string;
+  deferred: ReturnType<typeof deferred<unknown[]>>;
+}
 let fontsLoadCalls: FontsLoadCall[] = [];
 
 beforeEach(() => {
@@ -52,7 +55,10 @@ function fireLinkLoads(): void {
   for (const link of links()) link.dispatchEvent(new Event("load"));
 }
 /** Let queued microtasks/promise callbacks run. */
-const flush = () => new Promise<void>((r) => setTimeout(r, 0));
+const flush = () =>
+  new Promise<void>((r) => {
+    setTimeout(r, 0);
+  });
 
 const inter = () => getFontById("inter") as FontCatalogEntry;
 const roboto = () => getFontById("roboto") as FontCatalogEntry;
