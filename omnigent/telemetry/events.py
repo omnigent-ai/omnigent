@@ -86,6 +86,38 @@ class SessionDeletedEvent:
 
 
 @dataclass
+class TurnTokenUsageEvent:
+    """Fired after each LLM turn that carries token usage data.
+
+    Emitted once per ``response.completed`` event on the relay path and once per
+    ``external_session_usage`` broadcast on the native path.  Captures the
+    per-turn delta (relay) or cumulative totals (native) so token spend can be
+    aggregated without waiting for session deletion.
+
+    :param installation_id: Server-side installation ID.
+    :param session_id: Omnigent conversation/session identifier.
+    :param input_tokens: Input tokens consumed this turn (relay: delta;
+        native: cumulative session total at time of report).
+    :param output_tokens: Output tokens consumed this turn (relay: delta;
+        native: cumulative session total at time of report).
+    :param cost_usd: Cost for this turn in USD (relay: delta; native:
+        cumulative).  ``None`` when the model is unpriced.
+    :param model: LLM model name, e.g. ``"claude-3-7-sonnet-20250219"``.
+        ``None`` when not reported by the harness.
+    :param is_cumulative: ``True`` for native-path events that carry a
+        cumulative total rather than a per-turn delta.
+    """
+
+    installation_id: str | None
+    session_id: str
+    input_tokens: int | None
+    output_tokens: int | None
+    cost_usd: float | None
+    model: str | None
+    is_cumulative: bool
+
+
+@dataclass
 class PolicyRegisteredEvent:
     """Fired when a policy is created via the API.
 
