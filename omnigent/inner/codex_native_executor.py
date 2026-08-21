@@ -8,6 +8,7 @@ import binascii
 import json
 import logging
 import os
+import re
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import cast
@@ -17,6 +18,7 @@ from omnigent.codex_native_bridge import (
     CODEX_NATIVE_BRIDGE_DIR_ENV_VAR,
     CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
     cancel_pending_mcp_startup,
+    codex_home_for_bridge_dir,
     mcp_startup_waiting_detail,
     read_bridge_startup_error,
     read_bridge_state,
@@ -210,11 +212,13 @@ class CodexNativeExecutor(Executor):
         settings_overrides = _model_effort_overrides(config)
         latest_user_content = _latest_user_content(messages)
         goal_objective = goal_objective_from_content(latest_user_content)
-        input_items: list[dict[str, object]] = (
-            [{"type": "text", "text": goal_objective}]
-            if goal_objective is not None
-            else _content_to_input_items(latest_user_content, self._bridge_dir)
-        )
+        if goal_objective is not None:
+            input_items = [{"type": "text", "text": goal_objective}]
+        else:
+            input_items = (
+                _slash_skill_input_items(latest_user_content, self._bridge_dir)
+                or _content_to_input_items(latest_user_content, self._bridge_dir)
+            )
         if not input_items:
             yield ExecutorError(message="Codex native turn had no user input to send")
             return
@@ -441,6 +445,65 @@ def _latest_user_content(messages: list[Message]) -> object:
         if message.get("role") == "user":
             return message.get("content")
     return None
+
+
+# Leading "/<skill-name>" interception for the chat path. Codex's TUI sends a
+# structured skill input item for slash invocations; the app-server's text
+# path leaves the literal "/name" in the prompt, so a skill command typed in
+# the web chat silently does nothing (#4935).
+_SLASH_SKILL_RE = re.compile(r"^/([^\s/]+)(?:\s+(.*))?$", re.DOTALL)
+
+
+def _slash_skill_input_items(
+    content: object, bridge_dir: Path
+) -> list[dict[str, object]] | None:
+    """Translate a standalone ``/<skill> [args]`` text into skill input items.
+
+    Resolution is against the per-session ``$CODEX_HOME/skills`` — exactly
+    the symlinks the launch path populated and Codex registered as slash
+    commands — so a chat-view invocation matches what the TUI's slash menu
+    sends: a ``{"type": "skill", "name", "path"}`` item naming the
+    SKILL.md, followed by the remaining text as a text item when present.
+
+    Chat text reaches the executor as ``input_text`` blocks; a slash
+    command is intercepted only when the content is text-only (the same
+    normalization ``/goal`` applies) — a multimodal turn's leading text is
+    left to Codex verbatim.
+
+    :param content: Latest user content (string or content blocks).
+    :param bridge_dir: Native Codex bridge directory (locates CODEX_HOME).
+    :returns: Input items, or ``None`` when the text is not a slash command
+        naming a registered skill — unknown commands, path-like text such as
+        ``/etc/hosts``, and everything else fall through to the text path
+        exactly as before.
+    """
+    if isinstance(content, list):
+        text_parts: list[str] = []
+        for block in content:
+            if not isinstance(block, dict):
+                return None
+            if block.get("type") not in {"input_text", "text"}:
+                return None
+            text = block.get("text")
+            if not isinstance(text, str):
+                return None
+            text_parts.append(text)
+        content = "".join(text_parts)
+    if not isinstance(content, str) or not content.lstrip().startswith("/"):
+        return None
+    match = _SLASH_SKILL_RE.match(content.strip())
+    if match is None:
+        return None
+    name, rest = match.group(1), match.group(2)
+    skill_md = codex_home_for_bridge_dir(bridge_dir) / "skills" / name / "SKILL.md"
+    if not skill_md.is_file():
+        return None
+    items: list[dict[str, object]] = [
+        {"type": "skill", "name": name, "path": str(skill_md)}
+    ]
+    if rest and rest.strip():
+        items.append({"type": "text", "text": rest})
+    return items
 
 
 def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str, object]]:

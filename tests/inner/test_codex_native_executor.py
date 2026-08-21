@@ -243,6 +243,193 @@ def test_goal_command_sets_goal_before_starting_objective_turn(
     ]
 
 
+def test_slash_skill_command_sends_structured_skill_input(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A registered skill's slash command reaches Codex as a skill input.
+
+    The TUI sends ``{"type": "skill", name, path}`` for slash invocations;
+    the chat path used to send the literal ``/name`` as text, so an explicit
+    skill command silently did nothing (#4935). Resolution is against the
+    per-session ``$CODEX_HOME/skills`` — what the launch path symlinked and
+    Codex registered — and the remainder rides along as a text item.
+    """
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id=None,
+        ),
+    )
+    skill_md = tmp_path / "codex-home" / "skills" / "ask-matt" / "SKILL.md"
+    skill_md.parent.mkdir(parents=True)
+    skill_md.write_text("---\nname: ask-matt\n---\nDo the thing.", encoding="utf-8")
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    events = _collect_turn_events(executor, "  /ask-matt verify this service  ")
+
+    assert [type(event) for event in events] == [TurnComplete]
+    assert _FakeCodexNativeClient.requests == [
+        (
+            "turn/start",
+            {
+                "threadId": "thread_123",
+                "input": [
+                    {
+                        "type": "skill",
+                        "name": "ask-matt",
+                        "path": str(skill_md),
+                    },
+                    {"type": "text", "text": "verify this service"},
+                ],
+            },
+        ),
+    ]
+
+
+def test_slash_skill_command_without_args_sends_skill_item_only(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A bare ``/<skill>`` sends just the skill item, no empty text item."""
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id=None,
+        ),
+    )
+    skill_md = tmp_path / "codex-home" / "skills" / "ask-matt" / "SKILL.md"
+    skill_md.parent.mkdir(parents=True)
+    skill_md.write_text("---\nname: ask-matt\n---\nDo the thing.", encoding="utf-8")
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    events = _collect_turn_events(executor, "/ask-matt")
+
+    assert [type(event) for event in events] == [TurnComplete]
+    assert _FakeCodexNativeClient.requests == [
+        (
+            "turn/start",
+            {
+                "threadId": "thread_123",
+                "input": [{"type": "skill", "name": "ask-matt", "path": str(skill_md)}],
+            },
+        ),
+    ]
+
+
+def test_unknown_slash_command_falls_through_to_text(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A slash command that names no registered skill stays literal text.
+
+    Codex's own unknown-command handling (and any model-side meaning the
+    text has) must be preserved — interception is opt-in per registered
+    skill, never a blanket rewrite of leading-slash text.
+    """
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id=None,
+        ),
+    )
+    # A different skill IS registered — proves the miss is by name, not
+    # because no skills exist at all.
+    other = tmp_path / "codex-home" / "skills" / "other-skill" / "SKILL.md"
+    other.parent.mkdir(parents=True)
+    other.write_text("---\nname: other-skill\n---\nOther.", encoding="utf-8")
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    events = _collect_turn_events(executor, "/not-a-skill do something")
+
+    assert [type(event) for event in events] == [TurnComplete]
+    assert _FakeCodexNativeClient.requests == [
+        (
+            "turn/start",
+            {
+                "threadId": "thread_123",
+                "input": [{"type": "text", "text": "/not-a-skill do something"}],
+            },
+        ),
+    ]
+
+
+def test_path_like_slash_text_is_not_intercepted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Path-shaped text (``/etc/hosts``) never becomes a skill invocation.
+
+    The command grammar requires a single token after the slash with no
+    interior ``/``; anything else — paths, fractions, markdown — passes
+    through to the text path untouched.
+    """
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id=None,
+        ),
+    )
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    events = _collect_turn_events(executor, "/etc/hosts is where it points")
+
+    assert [type(event) for event in events] == [TurnComplete]
+    assert _FakeCodexNativeClient.requests == [
+        (
+            "turn/start",
+            {
+                "threadId": "thread_123",
+                "input": [{"type": "text", "text": "/etc/hosts is where it points"}],
+            },
+        ),
+    ]
+
+
 def test_system_prompt_does_not_override_collaboration_mode(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
