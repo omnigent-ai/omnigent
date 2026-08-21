@@ -915,11 +915,11 @@ def user_period_cost_budget(
       ``expensive_models`` model (a ``/model`` downgrade gate, not a
       stop); ALLOW once on a cheaper model.
 
-    When ``harness`` is ``None`` (the default), the budget is
-    **cross-harness**: cost is summed across all harnesses. When
-    ``harness`` is set (e.g. ``"codex-native"``), the budget is
-    **per-harness**: only that harness's cost counts, and approvals are
-    scoped to that harness.
+    Currently only **cross-harness** budgets are supported (``harness=None``,
+    the default): cost is summed across all harnesses. Per-harness budgets
+    (``harness="codex-native"``) are not yet implemented because the cost
+    write path does not detect harness identity. Setting ``harness``
+    raises ``ValueError``.
 
     Abstains (ALLOW) on every other phase, and whenever the period cost
     is ``0.0`` (no spend recorded, no owner, or pricing unavailable).
@@ -945,26 +945,27 @@ def user_period_cost_budget(
         all models are blocked once the limit is reached. Pass an
         explicit non-empty list for a downgrade gate that only blocks the
         named tiers.
-    :param harness: Optional harness filter for per-harness budgets.
-        ``None`` (the default) sums cost across all harnesses.
-        A specific value (e.g. ``"codex-native"``) gates only that
-        harness's cost. **Only supported for non-day periods**; daily
-        budgets are currently cross-harness only.
+    :param harness: **Not yet supported.** Reserved for future per-harness
+        budgets. Must be ``None`` (the default). Setting this parameter
+        raises ``ValueError`` because the cost write path does not yet
+        detect harness identity — all period costs are recorded as
+        cross-harness (``"__all__"`` sentinel).
     :returns: A policy callable implementing the per-user period budget.
     :raises ValueError: If ``period`` is not valid, if ``max_cost_usd`` is
         not positive, if any ``ask_thresholds_usd`` value is not in
         ``(0, max_cost_usd)``, if any ``expensive_models`` entry is not a
-        non-empty string, or if ``harness`` is set for ``period="day"``
-        (not yet supported).
+        non-empty string, or if ``harness`` is set (per-harness budgets
+        not yet implemented).
     """
     if period not in ("day", "week", "month", "quarter", "year"):
         raise ValueError(
             f"period must be 'day', 'week', 'month', 'quarter', or 'year', got {period!r}"
         )
-    if period == "day" and harness is not None:
+    if harness is not None:
         raise ValueError(
-            "per-harness budgets are not yet supported for period='day'; "
-            "only period='month' supports the harness parameter"
+            "per-harness budgets are not yet supported; "
+            "cost write path (_record_period_costs) does not detect harness. "
+            "Omit the harness parameter for cross-harness budgets (default)."
         )
     if max_cost_usd <= 0:
         raise ValueError(f"max_cost_usd must be > 0, got {max_cost_usd!r}")

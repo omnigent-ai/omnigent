@@ -10,11 +10,22 @@ from __future__ import annotations
 import pytest
 
 from omnigent.runtime.policies.builder import build_policy_engine
-from omnigent.spec.types import FunctionPolicySpec, FunctionRef, Phase, PhaseSelector
-from omnigent.stores.conversation_store.memory_store import MemoryConversationStore
+from omnigent.spec.types import (
+    AgentSpec,
+    FunctionPolicySpec,
+    FunctionRef,
+    GuardrailsSpec,
+    Phase,
+    PhaseSelector,
+)
+from omnigent.stores.conversation_store.sqlalchemy_store import (
+    SqlAlchemyConversationStore,
+)
 
 
-def test_multiple_period_policies_rejected() -> None:
+def test_multiple_period_policies_rejected(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
     """
     Multiple period cost policies should raise ValueError.
 
@@ -23,10 +34,8 @@ def test_multiple_period_policies_rejected() -> None:
     cost is seeded into context, so the second policy silently reads the
     wrong period's data. The fix is to validate and reject this configuration.
     """
-    store = MemoryConversationStore()
-
     # Two period policies with different periods
-    specs = [
+    policy_specs = [
         FunctionPolicySpec(
             name="weekly_budget",
             on=[PhaseSelector(phase=Phase.REQUEST)],
@@ -45,25 +54,32 @@ def test_multiple_period_policies_rejected() -> None:
         ),
     ]
 
+    spec = AgentSpec(
+        spec_version=1,
+        name="test-agent",
+        guardrails=GuardrailsSpec(policies=policy_specs),
+    )
+    conv = conversation_store.create_conversation()
+
     # Should raise ValueError about multiple period policies
     with pytest.raises(
         ValueError,
         match=r"Multiple period cost policies are not yet supported.*Found 2 policies",
     ):
         build_policy_engine(
-            conversation_id="test-conv",
-            policy_specs=specs,
-            conversation_store=store,
+            spec=spec,
+            conversation_id=conv.id,
+            conversation_store=conversation_store,
         )
 
 
-def test_single_period_policy_allowed() -> None:
+def test_single_period_policy_allowed(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
     """
     Single period policy should work fine.
     """
-    store = MemoryConversationStore()
-
-    specs = [
+    policy_specs = [
         FunctionPolicySpec(
             name="monthly_budget",
             on=[PhaseSelector(phase=Phase.REQUEST)],
@@ -74,22 +90,29 @@ def test_single_period_policy_allowed() -> None:
         ),
     ]
 
+    spec = AgentSpec(
+        spec_version=1,
+        name="test-agent",
+        guardrails=GuardrailsSpec(policies=policy_specs),
+    )
+    conv = conversation_store.create_conversation()
+
     # Should not raise
     engine = build_policy_engine(
-        conversation_id="test-conv",
-        policy_specs=specs,
-        conversation_store=store,
+        spec=spec,
+        conversation_id=conv.id,
+        conversation_store=conversation_store,
     )
     assert engine is not None
 
 
-def test_daily_plus_period_policy_allowed() -> None:
+def test_daily_plus_period_policy_allowed(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
     """
     Daily cost policy + one period policy should work (daily uses different context).
     """
-    store = MemoryConversationStore()
-
-    specs = [
+    policy_specs = [
         FunctionPolicySpec(
             name="daily_budget",
             on=[PhaseSelector(phase=Phase.REQUEST)],
@@ -108,10 +131,17 @@ def test_daily_plus_period_policy_allowed() -> None:
         ),
     ]
 
+    spec = AgentSpec(
+        spec_version=1,
+        name="test-agent",
+        guardrails=GuardrailsSpec(policies=policy_specs),
+    )
+    conv = conversation_store.create_conversation()
+
     # Should not raise (daily uses user_daily_cost context, monthly uses user_period_cost)
     engine = build_policy_engine(
-        conversation_id="test-conv",
-        policy_specs=specs,
-        conversation_store=store,
+        spec=spec,
+        conversation_id=conv.id,
+        conversation_store=conversation_store,
     )
     assert engine is not None

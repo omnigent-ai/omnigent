@@ -61,8 +61,6 @@ _USER_DAILY_COST_POLICY_PATH = "omnigent.policies.builtins.cost.user_daily_cost_
 # Dotted path of the per-user monthly cost-budget factory. The engine is
 # seeded with the session owner's monthly-cost rollup ONLY when a policy
 # set includes this handler.
-_USER_MONTHLY_COST_POLICY_PATH = "omnigent.policies.builtins.cost.user_monthly_cost_budget"
-
 # Dotted path of the generic per-user period cost-budget factory.
 _USER_PERIOD_COST_POLICY_PATH = "omnigent.policies.builtins.cost.user_period_cost_budget"
 
@@ -176,11 +174,8 @@ def _get_period_cost_requirements(specs: list[PolicySpec]) -> list[tuple[str, st
     for s in specs:
         if not isinstance(s, FunctionPolicySpec) or s.function is None:
             continue
-        # Legacy monthly cost budget policy (if implemented)
-        if s.function.path == _USER_MONTHLY_COST_POLICY_PATH:
-            requirements.append(("month", None))
         # Generic period policy
-        elif s.function.path == _USER_PERIOD_COST_POLICY_PATH:
+        if s.function.path == _USER_PERIOD_COST_POLICY_PATH:
             args = s.function.arguments or {}
             period = args.get("period")
             harness = args.get("harness")
