@@ -49,12 +49,8 @@ class TestPeriodValidation:
     def test_harness_not_supported(self):
         """Per-harness budgets are not yet supported for any period."""
         for period in ["day", "week", "month", "quarter", "year"]:
-            with pytest.raises(
-                ValueError, match="per-harness budgets are not yet supported"
-            ):
-                user_period_cost_budget(
-                    period=period, max_cost_usd=10.0, harness="codex-native"
-                )
+            with pytest.raises(ValueError, match="per-harness budgets are not yet supported"):
+                user_period_cost_budget(period=period, max_cost_usd=10.0, harness="codex-native")
 
 
 class TestMonthlyBudget:
@@ -238,18 +234,12 @@ class TestPerHarnessBudget:
 
     def test_per_harness_budget_raises(self):
         """Per-harness budgets should raise ValueError (not yet supported)."""
-        with pytest.raises(
-            ValueError, match="per-harness budgets are not yet supported"
-        ):
-            user_period_cost_budget(
-                period="month", max_cost_usd=100.0, harness="codex-native"
-            )
+        with pytest.raises(ValueError, match="per-harness budgets are not yet supported"):
+            user_period_cost_budget(period="month", max_cost_usd=100.0, harness="codex-native")
 
     def test_per_harness_with_thresholds_raises(self):
         """Per-harness budgets with thresholds should raise ValueError."""
-        with pytest.raises(
-            ValueError, match="per-harness budgets are not yet supported"
-        ):
+        with pytest.raises(ValueError, match="per-harness budgets are not yet supported"):
             user_period_cost_budget(
                 period="month",
                 max_cost_usd=100.0,
