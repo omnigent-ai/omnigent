@@ -615,6 +615,11 @@ _native_ask_gate_locks: weakref.WeakValueDictionary[tuple[str, str], asyncio.Loc
 )
 
 
+_policy_evaluation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+
+
 @dataclass
 class _RelayHandle:
     """

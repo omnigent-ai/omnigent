@@ -613,15 +613,10 @@ def scenario_guardrail_blast_radius(ctx: Ctx) -> Result:
 
 
 def scenario_fanout_dispatch(ctx: Ctx) -> Result:
-    """Six-wide fan-out: many dispatch handles are created in one turn.
+    """Seven-wide fan-out: six dispatches pass and the seventh is denied.
 
-    Hard check: the fan-out *substrate* works — emitting N ``sys_session_send``
-    calls in one response creates N sub-agent dispatch handles. The
-    ``spawn_bounds`` per-turn cap (max 5) is reported as a non-failing
-    *finding*: it is a stateful counter, but the server rebuilds the policy
-    engine per ``tools/call`` (``_build_policy_engine_from_spec``), so the
-    counter resets each call and the cap does not trip in this local
-    server-side path. See SKILL.md "Known sharp edges". Verify the cap live.
+    Hard checks: fan-out creates dispatch handles and ``spawn_bounds`` enforces
+    Polly's six-dispatch cap through the deployed server-side path.
     """
     res = Result("fanout_dispatch")
     s = ctx.servers
@@ -634,7 +629,7 @@ def scenario_fanout_dispatch(ctx: Ctx) -> Result:
             {"input": "noop", "purpose": "explore"},
             call_id=f"call_{i}",
         )
-        for i in range(1, 7)
+        for i in range(1, 8)
     ]
     _mock_configure(
         s.mock_url,
@@ -652,11 +647,12 @@ def scenario_fanout_dispatch(ctx: Ctx) -> Result:
     outs = _tool_outputs(_session_items(s.server_url, sid))
     combined = "\n".join(outs)
     handles = sum(1 for o in outs if '"kind": "sub_agent"' in o or '"status": "launching"' in o)
-    res.add("fanout_dispatched", handles >= 2, f"{handles} handles / {len(outs)} outputs")
+    res.add("fanout_dispatched", handles == 6, f"{handles} handles / {len(outs)} outputs")
     cap_fired = "worker dispatches this turn" in combined
+    res.add("spawn_bounds_capped", cap_fired, "seventh dispatch denied")
     res.notes.append(
         f"finding: spawn_bounds per-turn cap fired={cap_fired} "
-        "(expected False in this server-side path; verify the cap live)"
+        "(expected True in the deployed server-side path)"
     )
     res.notes.append(f"session={sid}")
     return res
