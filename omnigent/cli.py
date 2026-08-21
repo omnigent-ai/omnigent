@@ -1894,7 +1894,7 @@ def _extract_global_logging_flags(argv: list[str]) -> tuple[list[str], bool, boo
 
 @click.group(cls=_OmnigentCLI)
 @click.option(
-    "--profile",
+    "--profiling",
     is_flag=True,
     is_eager=True,
     expose_value=False,
@@ -2142,7 +2142,7 @@ def main() -> None:
             "--help",
             "-h",
             "--version",
-            "--profile",
+            "--profiling",
         }
     ):
         argv = ["run", *argv]
@@ -2316,7 +2316,7 @@ def _is_removed_ad_hoc_invocation(argv: list[str]) -> bool:
         return False
     # A root profiling flag may precede an eager help/version flag or stand
     # alone. These are valid Click invocations, not removed ad-hoc chat.
-    if all(token in {"--profile", "--help", "-h", "--version"} for token in argv):
+    if all(token in {"--profiling", "--help", "-h", "--version"} for token in argv):
         return False
     # Skip leading flags to find the first positional. If all
     # tokens are flags (e.g. ``omnigent --system-prompt "..."``),

@@ -120,14 +120,14 @@ def _restore_logging_state() -> Iterator[None]:
         logger.propagate = propagate
 
 
-def test_global_profile_writes_summary_and_timestamped_stats(tmp_path: Path) -> None:
+def test_global_profiling_writes_summary_and_timestamped_stats(tmp_path: Path) -> None:
     """The real entry point profiles any command selected after the root flag."""
     repo_root = Path(__file__).resolve().parents[2]
     pythonpath = os.pathsep.join(
         part for part in (str(repo_root), os.environ.get("PYTHONPATH")) if part
     )
     result = subprocess.run(
-        [sys.executable, "-m", "omnigent", "--profile", "version"],
+        [sys.executable, "-m", "omnigent", "--profiling", "version"],
         capture_output=True,
         text=True,
         timeout=30,
@@ -224,7 +224,7 @@ def test_wrapper_guard_bypass_reaches_cli_end_to_end() -> None:
         (["run", "tests/resources/examples/hello_world.yaml"], False),
         (["attach", "tests/resources/examples/hello_world.yaml"], False),
         (["--help"], False),
-        (["--profile", "--help"], False),
+        (["--profiling", "--help"], False),
         (["what does this repo do?"], True),
         (["--system-prompt", "You are terse"], True),
         # A single command-shaped word is an unknown subcommand, not
@@ -1080,7 +1080,7 @@ def test_help_groups_harnesses_and_other_commands() -> None:
     result = CliRunner().invoke(cli, ["--help"])
 
     assert result.exit_code == 0, result.output
-    assert "--profile" in result.output
+    assert "--profiling" in result.output
     assert "Harnesses:" in result.output
     assert "Commands:" in result.output
     # A harness launcher lands under Harnesses; a management command
@@ -3493,7 +3493,34 @@ def test_run_profile_sets_databricks_config_profile_env(
     assert seen["value"] == "my-sp"
 
 
-def test_global_cpu_profile_coexists_with_run_databricks_profile(
+def test_bare_run_profile_shorthand_still_selects_databricks_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The new root flag must not consume the historical bare-run spelling."""
+    from omnigent.cli import main
+
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    seen = _capture_profile_env_at_dispatch(monkeypatch)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "omnigent",
+            "--profile",
+            "my-sp",
+            "--server",
+            "https://example.com",
+            "-p",
+            "hi",
+        ],
+    )
+
+    main()
+
+    assert seen["value"] == "my-sp"
+
+
+def test_global_profiling_coexists_with_run_databricks_profile(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -3505,7 +3532,7 @@ def test_global_cpu_profile_coexists_with_run_databricks_profile(
     result = CliRunner().invoke(
         cli,
         [
-            "--profile",
+            "--profiling",
             "run",
             "--server",
             "https://example.com",
