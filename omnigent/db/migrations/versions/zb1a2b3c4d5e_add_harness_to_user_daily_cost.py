@@ -56,7 +56,7 @@ def upgrade() -> None:
         sa.Column("workspace_id", sa.BigInteger(), nullable=False, server_default="0"),
         sa.Column("user_id", sa.String(128), nullable=False),
         sa.Column("day_utc", sa.String(10), nullable=False),
-        sa.Column("harness", sa.String(64), nullable=False, server_default="'__all__'"),
+        sa.Column("harness", sa.String(64), nullable=False, server_default="__all__"),
         sa.Column("cost_usd", sa.Float(), nullable=False),
         sa.Column("ask_approved_usd", sa.Float(), nullable=False, server_default="0"),
         sa.Column("updated_at", sa.Integer(), nullable=False),
