@@ -1,8 +1,9 @@
 """Live model-flow CUJs (model-flows-design.md §10.1, the "UI-live" tier).
 
 Every test drives the product the way a person uses it — the browser drives the
-rig server's real SPA, and harness truth is read from the tmux pane — with REST
-snapshots as secondary probes only. Assertions encode the DESIGN's target
+rig server's real SPA (or, for the rows whose actor is a REPL, a routing pin,
+or an API client, the same REST calls), and harness truth is read from the
+tmux pane — with REST snapshots as secondary probes only. Assertions encode the DESIGN's target
 behavior, so this suite is red on unmodified main (and partially red on the PR
 branch) in exactly the ways `model-flows-report.md` cites, and goes green as
 the landing-order steps land. Run one row's red twin with::
@@ -18,20 +19,30 @@ from __future__ import annotations
 import re
 import time
 from collections.abc import Callable, Iterator
+from pathlib import Path
+from typing import Any
 
+import httpx
 import pytest
 
+from omnigent.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME, CODEX_NATIVE_AGENT_NAME
 from tests.e2e.omnigent._model_flows_rig import (
     ModelFlowsRig,
     PaneWatcher,
     Ui,
+    assistant_message_count,
     booted_rig,
     browser_ui,
+    bypass_args,
     codex_config_copy_model,
     dismiss_blocking_dialogs,
     host_model_options,
+    kill_pane,
     require_clis,
     require_opt_in,
+    rest_create_session,
+    rest_patch_session,
+    rest_post_user_message,
     session_snapshot,
     shape_providers,
 )
@@ -551,3 +562,164 @@ def test_row9_codex_subscription_default_first_turn_succeeds(
         f"stale-config-line class (finding B). Pane:\n{settled[-600:]}\n"
         f"(config-copy pin: {codex_config_copy_model(session_id)!r})"
     )
+
+
+# ---------------------------------------------------------------------------
+# Cold resume: the persisted pick survives the pane (claude + codex)
+# ---------------------------------------------------------------------------
+
+#: Host shape, wrapper agent, and pane-ready marker per harness.
+_COLD_RESUME_HARNESSES: dict[str, tuple[str, str, str]] = {
+    "claude-native": ("claude-subscription", CLAUDE_NATIVE_AGENT_NAME, r"│"),
+    "codex-native": ("codex-subscription", CODEX_NATIVE_AGENT_NAME, r"›"),
+}
+
+
+def _resume_override(harness: str, rows: list[dict[str, Any]]) -> str | None:
+    """
+    The model to persist, spelled the way the harness itself reports it.
+
+    claude: a canonical Anthropic id no row spells exactly — the plain twin of
+    a listed ``[1m]`` model. The endpoint serves it (the 1M marker is a request
+    flag on the same model) and the pane reports exactly that id after a
+    ``/model`` to it; only the catalog's alias rows know its family.
+
+    codex: a non-default row id — codex has no alias layer, so the harness's
+    own report IS a catalog id.
+
+    :param harness: ``"claude-native"`` or ``"codex-native"``.
+    :param rows: The host's pre-launch catalog rows.
+    :returns: The override to persist, or ``None`` when the catalog offers
+        no such spelling.
+    """
+    listed = {str(v) for row in rows for v in (row.get("id"), row.get("model")) if v}
+    if harness == "claude-native":
+        for row in rows:
+            model = str(row.get("model") or "")
+            if model.startswith("claude-") and model.endswith("[1m]") and model[:-4] not in listed:
+                return model[:-4]
+        return None
+    for row in rows:
+        if row.get("isDefault") is True or row.get("hidden") is True:
+            continue
+        row_id = row.get("id")
+        if isinstance(row_id, str) and row_id:
+            return row_id
+    return None
+
+
+def _same_model(reported: object, wanted: str) -> bool:
+    """
+    Whether a harness report names *wanted* (a dated suffix allowed)."""
+    if not isinstance(reported, str) or not reported:
+        return False
+    lhs, rhs = reported.lower(), wanted.lower()
+    return lhs == rhs or lhs.startswith(f"{rhs}-")
+
+
+@pytest.mark.timeout(900)
+@pytest.mark.parametrize("harness", sorted(_COLD_RESUME_HARNESSES))
+def test_row18_cold_resume_honors_the_persisted_model_override(
+    rig: ModelFlowsRig,
+    shaped_host: Callable[[str], str],
+    harness: str,
+    tmp_path: Path,
+) -> None:
+    """
+    A session resumes on the persisted model the harness was already running.
+
+    The pane exits (idle reap, host restart) and the next message re-creates
+    the terminal. The relaunch must pass the persisted model straight through
+    — the host demonstrably served it moments earlier — instead of refusing
+    it as "not in this host's current model list" because the catalog spells
+    the same model differently (an alias row carries the family, the override
+    the canonical id).
+    """
+    shape, agent_name, ready = _COLD_RESUME_HARNESSES[harness]
+    require_clis(harness.split("-")[0])
+    host_id = shaped_host(shape)
+
+    def _rows() -> list[dict[str, Any]] | None:
+        try:
+            payload = host_model_options(rig.base_url, host_id, harness)
+        except httpx.HTTPError:
+            return None
+        return payload.get("models") or None
+
+    rows = wait_for(_rows, timeout=180.0, what=f"the boot-warmed {harness} catalog")
+    override = _resume_override(harness, rows)
+    if override is None:
+        pytest.skip(f"this {harness} catalog offers no spelling to exercise: {rows}")
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "README.md").write_text("# cold resume workspace\n")
+    pane = PaneWatcher()
+    pane.arm()
+    session_id = rest_create_session(
+        rig.base_url,
+        agent_name=agent_name,
+        host_id=host_id,
+        workspace=workspace,
+        terminal_launch_args=bypass_args(harness),
+    )
+    rest_post_user_message(rig.base_url, session_id, "Reply with exactly: ok. Nothing else.")
+    pane.wait_for_pane()
+    pane.wait_for_text(ready)
+    dismiss_blocking_dialogs(pane)
+
+    def _replies(at_least: int) -> Callable[[], int | None]:
+        def _count() -> int | None:
+            snapshot = session_snapshot(rig.base_url, session_id)
+            assert snapshot.get("status") != "failed", (
+                f"session {session_id} failed: "
+                f"{snapshot.get('last_task_error') or snapshot.get('error')}"
+            )
+            count = assistant_message_count(snapshot)
+            return count if count >= at_least else None
+
+        return _count
+
+    def _reported_override() -> str | None:
+        reported = session_snapshot(rig.base_url, session_id).get("llm_model")
+        return str(reported) if _same_model(reported, override) else None
+
+    wait_for(_replies(1), timeout=150.0, what="the first reply")
+
+    # The actor is a REPL ``/model``, a routing pin, or an API client: they
+    # persist the harness's own spelling. The pane switches live — this host
+    # serves the model — and reports it back verbatim.
+    rest_patch_session(rig.base_url, session_id, model_override=override)
+    rest_post_user_message(rig.base_url, session_id, "Reply with exactly: switched. Nothing else.")
+    wait_for(_replies(2), timeout=150.0, what="the reply on the switched model")
+    wait_for(_reported_override, timeout=60.0, what=f"the harness to report {override!r}")
+
+    # The pane exits; the next message is the resume.
+    kill_pane(pane)
+    resumed = PaneWatcher()
+    resumed.arm()
+    rest_post_user_message(rig.base_url, session_id, "Reply with exactly: back. Nothing else.")
+    wait_for(_replies(3), timeout=240.0, what="the reply after the cold resume")
+
+    snapshot = session_snapshot(rig.base_url, session_id)
+    assert snapshot.get("model_override") == override, (
+        f"the resume rewrote the persisted pick: {snapshot.get('model_override')!r}"
+    )
+    assert _same_model(snapshot.get("llm_model"), override), (
+        f"the resumed pane runs {snapshot.get('llm_model')!r}, not the persisted "
+        f"{override!r} (session {session_id})"
+    )
+    resumed.wait_for_pane()
+    pane_text = resumed.wait_for_text(ready)
+    if harness == "codex-native":
+        pinned = codex_config_copy_model(session_id)
+        assert pinned == override, (
+            f"the relaunch pinned {pinned!r} in the config copy, not {override!r}"
+        )
+    else:
+        family = override.removeprefix("claude-").split("-")[0]
+        footer = next((line for line in pane_text.splitlines() if "│" in line), "")
+        assert family in footer.lower(), (
+            f"the resumed pane footer {footer!r} does not name the {family} family "
+            f"of {override!r} (session {session_id})"
+        )

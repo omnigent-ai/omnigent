@@ -9570,3 +9570,78 @@ async def test_probe_claude_model_options_returns_none_on_probe_failure(
     monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
 
     assert await claude_native.probe_claude_model_options(_gateway_probe_config()) is None
+
+
+def _subscription_catalog() -> list[dict[str, object]]:
+    """
+    A direct-login catalog: alias rows plus the appended settings default."""
+    return [
+        {"id": "sonnet", "model": "claude-sonnet-5", "displayName": "Sonnet 5"},
+        {"id": "opus", "model": "claude-opus-5", "displayName": "Opus 5"},
+        {"id": "fable", "model": "fable", "displayName": "fable"},
+        {"id": "opus[1m]", "model": "claude-opus-5[1m]", "displayName": "Opus 5 (1M context)"},
+        {
+            "id": "claude-opus-4-8[1m]",
+            "model": "claude-opus-4-8[1m]",
+            "displayName": "Opus 4.8 (1M context)",
+            "isDefault": True,
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    ("model", "config", "served"),
+    [
+        # Exact rows always serve: a picker id, a wire model, the appended default.
+        ("opus", None, True),
+        ("claude-sonnet-5", None, True),
+        ("claude-opus-4-8[1m]", None, True),
+        # A canonical id the endpoint serves but no row spells: the default's
+        # plain twin, an older generation, the bare id behind a bare alias row,
+        # a 1M request on a listed family.
+        ("claude-opus-4-8", None, True),
+        ("claude-sonnet-4-5-20250929", None, True),
+        ("claude-fable-5", None, True),
+        ("claude-sonnet-5[1m]", None, True),
+        # Anthropic's own endpoint behind a key serves canonical ids too.
+        (
+            "claude-opus-4-8",
+            claude_native.ClaudeNativeUcodeConfig(
+                env={"ANTHROPIC_BASE_URL": "https://api.anthropic.com"},
+                api_key_helper="printf sk-key",
+            ),
+            True,
+        ),
+        # A family the catalog does not list is a genuinely stale pick.
+        ("claude-haiku-4-5", None, False),
+        ("claude-mythos-5", None, False),
+        # Not a canonical Anthropic id: only an exact row could serve it.
+        ("gpt-5.4", None, False),
+        ("", None, False),
+        # Gateways and Bedrock route their own spellings only.
+        (
+            "claude-opus-4-8",
+            claude_native.ClaudeNativeUcodeConfig(
+                env={"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"},
+                api_key_helper="printf sk-key",
+            ),
+            False,
+        ),
+        (
+            "claude-opus-4-8",
+            claude_native.ClaudeNativeUcodeConfig(
+                env={"ANTHROPIC_BEDROCK_BASE_URL": "https://bedrock.example"},
+                api_key_helper=None,
+            ),
+            False,
+        ),
+    ],
+)
+def test_claude_catalog_serves_model(
+    model: str, config: claude_native.ClaudeNativeUcodeConfig | None, served: bool
+) -> None:
+    """
+    Exact rows serve; a canonical id serves on a canonical endpoint when its family is listed."""
+    assert (
+        claude_native.claude_catalog_serves_model(_subscription_catalog(), model, config) is served
+    )
