@@ -1317,6 +1317,53 @@ def test_run_preflights_local_tmux(monkeypatch: pytest.MonkeyPatch) -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("server", "expected_calls"),
+    [(None, 1), ("https://example.com/", 0)],
+    ids=["local-resolves", "remote-skips"],
+)
+def test_run_resolves_claude_config_only_for_the_local_path(
+    monkeypatch: pytest.MonkeyPatch,
+    server: str | None,
+    expected_calls: int,
+) -> None:
+    """
+    Only the local path resolves the native Claude launch config.
+
+    Resolving mints a Databricks workspace token and lists the
+    workspace's Claude model services — two HTTP round trips. The
+    daemon-spawned runner on the remote path derives its own config from
+    the provider config and never receives this one, so paying for it
+    there is pure startup latency.
+    """
+    calls = 0
+
+    def fake_resolve(**kwargs: object) -> None:
+        """Count resolutions without touching Databricks.
+
+        :param kwargs: Ignored ``spec`` / ``refresh_models`` arguments.
+        :returns: ``None``, i.e. "use Claude's own login".
+        """
+        del kwargs
+        nonlocal calls
+        calls += 1
+        return None
+
+    monkeypatch.setattr(claude_native.shutil, "which", lambda command: f"/usr/bin/{command}")
+    monkeypatch.setattr(claude_native, "resolve_native_claude_config", fake_resolve)
+    monkeypatch.setattr(claude_native, "_run_with_local_server", lambda *a, **k: None)
+    monkeypatch.setattr(claude_native, "_run_with_remote_server", lambda *a, **k: None)
+
+    claude_native.run_claude_native(
+        server=server,
+        session_id=None,
+        extra_args=(),
+        command="claude",
+    )
+
+    assert calls == expected_calls
+
+
 def test_local_run_persists_launch_state_on_fresh_session(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

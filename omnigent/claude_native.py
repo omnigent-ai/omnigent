@@ -1341,22 +1341,24 @@ def run_claude_native(
     if prompt and prompt.strip():
         sanitized_args = (*sanitized_args, prompt)
     startup_profiler.mark("claude args normalized")
-    # Resolve the launch config across all offerings: a configured provider
-    # (configure harnesses), the Databricks ucode profile, or Claude's own
-    # login — so `omnigent claude` honors the provider selection just like
-    # the in-process claude-sdk harness. ``use_claude_config`` forces the
-    # CLI's own ~/.claude config (skips all of it).
-    startup_profiler.mark("resolving claude config")
-    claude_config = None if use_claude_config else resolve_native_claude_config(spec=None)
-    startup_profiler.mark(
-        "claude config resolved",
-        detail="native config" if claude_config is not None else "claude cli config",
-    )
-
     with TemporaryDirectory(prefix="omnigent-claude-native-") as tmpdir:
         spec_path = _materialize_claude_agent_spec(Path(tmpdir))
         startup_profiler.mark("agent spec materialized")
         if server is None:
+            # Resolve the launch config across all offerings: a configured
+            # provider (configure harnesses), the Databricks ucode profile, or
+            # Claude's own login — so `omnigent claude` honors the provider
+            # selection just like the in-process claude-sdk harness.
+            # ``use_claude_config`` forces the CLI's own ~/.claude config
+            # (skips all of it). Local-only: resolving mints a workspace token
+            # and lists the workspace's Claude model services, so the remote
+            # path — which never consumes the result — must not pay for it.
+            startup_profiler.mark("resolving claude config")
+            claude_config = None if use_claude_config else resolve_native_claude_config(spec=None)
+            startup_profiler.mark(
+                "claude config resolved",
+                detail="native config" if claude_config is not None else "claude cli config",
+            )
             _run_with_local_server(
                 spec_path,
                 session_id=session_id,
