@@ -47,28 +47,38 @@ def upgrade() -> None:
     """
     Add harness column to user_daily_cost and rebuild primary key.
 
-    Uses batch mode with recreate for SQLite compatibility. This will:
-    1. Create a temporary table with the new schema
-    2. Copy existing data (harness="__all__" for all existing rows)
-    3. Drop the old table
-    4. Rename the temporary table
-
-    For PostgreSQL/MySQL, this generates optimized ALTER TABLE statements.
+    Manually recreates the table with the new schema for cross-database
+    compatibility. This ensures the primary key is correctly updated.
     """
-    with op.batch_alter_table(
-        "user_daily_cost",
-        schema=None,
-        recreate="auto",  # Recreate table for SQLite, use ALTER for PostgreSQL
-    ) as batch_op:
-        # Add harness column with default value for existing rows
-        batch_op.add_column(
-            sa.Column(
-                "harness",
-                sa.String(64),
-                nullable=False,
-                server_default="'__all__'",
-            )
-        )
+    # Create new table with harness in PK
+    op.create_table(
+        "user_daily_cost_new",
+        sa.Column("workspace_id", sa.BigInteger(), nullable=False, server_default="0"),
+        sa.Column("user_id", sa.String(128), nullable=False),
+        sa.Column("day_utc", sa.String(10), nullable=False),
+        sa.Column("harness", sa.String(64), nullable=False, server_default="'__all__'"),
+        sa.Column("cost_usd", sa.Float(), nullable=False),
+        sa.Column("ask_approved_usd", sa.Float(), nullable=False, server_default="0"),
+        sa.Column("updated_at", sa.Integer(), nullable=False),
+        sa.PrimaryKeyConstraint("workspace_id", "user_id", "day_utc", "harness"),
+    )
+
+    # Copy existing data, adding harness='__all__' to all rows
+    op.execute(
+        """
+        INSERT INTO user_daily_cost_new
+            (workspace_id, user_id, day_utc, harness, cost_usd, ask_approved_usd, updated_at)
+        SELECT
+            workspace_id, user_id, day_utc, '__all__', cost_usd, ask_approved_usd, updated_at
+        FROM user_daily_cost
+        """
+    )
+
+    # Drop old table
+    op.drop_table("user_daily_cost")
+
+    # Rename new table to original name
+    op.rename_table("user_daily_cost_new", "user_daily_cost")
 
 
 def downgrade() -> None:
@@ -78,10 +88,32 @@ def downgrade() -> None:
     WARNING: This will DELETE all per-harness rows (harness != "__all__").
     Only cross-harness data will be preserved.
     """
-    with op.batch_alter_table(
-        "user_daily_cost",
-        schema=None,
-        recreate="auto",  # Recreate table for SQLite, use ALTER for PostgreSQL
-    ) as batch_op:
-        # Drop harness column - batch mode will automatically adjust PK
-        batch_op.drop_column("harness")
+    # Create table without harness column
+    op.create_table(
+        "user_daily_cost_old",
+        sa.Column("workspace_id", sa.BigInteger(), nullable=False, server_default="0"),
+        sa.Column("user_id", sa.String(128), nullable=False),
+        sa.Column("day_utc", sa.String(10), nullable=False),
+        sa.Column("cost_usd", sa.Float(), nullable=False),
+        sa.Column("ask_approved_usd", sa.Float(), nullable=False, server_default="0"),
+        sa.Column("updated_at", sa.Integer(), nullable=False),
+        sa.PrimaryKeyConstraint("workspace_id", "user_id", "day_utc"),
+    )
+
+    # Copy only cross-harness data
+    op.execute(
+        """
+        INSERT INTO user_daily_cost_old
+            (workspace_id, user_id, day_utc, cost_usd, ask_approved_usd, updated_at)
+        SELECT
+            workspace_id, user_id, day_utc, cost_usd, ask_approved_usd, updated_at
+        FROM user_daily_cost
+        WHERE harness = '__all__'
+        """
+    )
+
+    # Drop current table
+    op.drop_table("user_daily_cost")
+
+    # Rename old table back
+    op.rename_table("user_daily_cost_old", "user_daily_cost")
