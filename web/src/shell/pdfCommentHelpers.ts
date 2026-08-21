@@ -5,6 +5,7 @@
 
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
+import { decodeRenderedPreviewAnchor } from "./RenderedPreviewCommentSurface";
 
 /** Prefix that marks anchor_content as a PDF geometry payload, not raw text. */
 export const PDF_ANCHOR_PREFIX = "__pdf__";
@@ -40,6 +41,8 @@ export function decodePdfAnchor(anchorContent: string | null | undefined): PdfAn
 export function displayAnchorContent(anchorContent: string | null | undefined): string {
   const decoded = decodePdfAnchor(anchorContent);
   if (decoded) return decoded.text;
+  const preview = decodeRenderedPreviewAnchor(anchorContent);
+  if (preview) return preview.text;
   return anchorContent?.trim() ?? "";
 }
 

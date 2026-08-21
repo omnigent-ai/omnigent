@@ -4,7 +4,10 @@ import AnsiDefault from "ansi-to-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { CodeBlockContent } from "@/components/ai-elements/code-block";
+import type { Comment } from "@/hooks/useComments";
 import { cn } from "@/lib/utils";
+import type { ActiveSelection } from "./codeViewerHelpers";
+import { RenderedPreviewCommentSurface } from "./RenderedPreviewCommentSurface";
 
 // ansi-to-react is CJS with a TS-compiled `exports.default`; depending on the
 // bundler interop (Vite dev prebundle vs vitest vs production build) the
@@ -117,13 +120,22 @@ function parseNotebook(content: string): { notebook?: Notebook; error?: string }
   return { notebook: nb };
 }
 
-function AnsiText({ text, className }: { text: string; className?: string }) {
+function AnsiText({
+  text,
+  className,
+  region,
+}: {
+  text: string;
+  className?: string;
+  region?: string;
+}) {
   // Outputs (tracebacks especially) contain long unbroken runs — separator
   // rules, file paths — that word-wrapping can't split. Wrap where possible
   // (overflow-wrap) but let anything unbreakable scroll horizontally within the
   // cell rather than pushing the whole preview wide.
   return (
     <pre
+      data-rendered-preview-comment-region={region}
       className={cn(
         "overflow-x-auto whitespace-pre-wrap [overflow-wrap:anywhere] font-mono text-sm p-2",
         className,
@@ -134,18 +146,25 @@ function AnsiText({ text, className }: { text: string; className?: string }) {
   );
 }
 
-function OutputView({ output }: { output: NotebookOutput }) {
+function OutputView({ output, region }: { output: NotebookOutput; region: string }) {
   if (output.output_type === "stream") {
     return (
       <AnsiText
         text={joinSource(output.text)}
+        region={region}
         className={output.name === "stderr" ? "bg-destructive/10" : undefined}
       />
     );
   }
 
   if (output.output_type === "error") {
-    return <AnsiText text={(output.traceback ?? []).join("\n")} className="bg-destructive/10" />;
+    return (
+      <AnsiText
+        text={(output.traceback ?? []).join("\n")}
+        region={region}
+        className="bg-destructive/10"
+      />
+    );
   }
 
   // execute_result / display_data carry a mime bundle; pick the richest safe
@@ -185,12 +204,20 @@ function OutputView({ output }: { output: NotebookOutput }) {
           Rich HTML output hidden — showing plain text.
         </div>
       )}
-      {plain !== undefined && <AnsiText text={plain} />}
+      {plain !== undefined && <AnsiText text={plain} region={region} />}
     </div>
   );
 }
 
-function CodeCell({ cell, language }: { cell: NotebookCell; language: BundledLanguage }) {
+function CodeCell({
+  cell,
+  cellIndex,
+  language,
+}: {
+  cell: NotebookCell;
+  cellIndex: number;
+  language: BundledLanguage;
+}) {
   const count = cell.execution_count;
   return (
     <div className="flex gap-2">
@@ -198,27 +225,40 @@ function CodeCell({ cell, language }: { cell: NotebookCell; language: BundledLan
         In [{count ?? " "}]:
       </div>
       <div className="min-w-0 flex-1 space-y-1">
-        <div className="rounded border bg-muted/30 text-sm">
+        <div
+          data-rendered-preview-comment-region={`cell:${cellIndex}:source`}
+          className="rounded border bg-muted/30 text-sm"
+        >
           <CodeBlockContent code={joinSource(cell.source)} language={language} />
         </div>
         {(cell.outputs ?? []).map((output, i) => (
           // eslint-disable-next-line react/no-array-index-key
-          <OutputView key={i} output={output} />
+          <OutputView key={i} output={output} region={`cell:${cellIndex}:output:${i}`} />
         ))}
       </div>
     </div>
   );
 }
 
+interface NotebookPreviewProps {
+  content: string;
+  rootRef?: RefObject<HTMLDivElement | null>;
+  onScroll?: (event: UIEvent<HTMLElement>) => void;
+  comments?: Comment[];
+  activeSelection?: ActiveSelection | null;
+  onSetActiveSelection?: (selection: ActiveSelection | null) => void;
+  canComment?: boolean;
+}
+
 export function NotebookPreview({
   content,
   rootRef,
   onScroll,
-}: {
-  content: string;
-  rootRef?: RefObject<HTMLDivElement | null>;
-  onScroll?: (event: UIEvent<HTMLElement>) => void;
-}) {
+  comments,
+  activeSelection = null,
+  onSetActiveSelection,
+  canComment = false,
+}: NotebookPreviewProps) {
   const { notebook, error } = parseNotebook(content);
 
   if (error || !notebook) {
@@ -236,29 +276,43 @@ export function NotebookPreview({
   const language = langName as BundledLanguage;
 
   return (
-    <div
-      ref={rootRef}
-      data-preview-scroll
+    <RenderedPreviewCommentSurface
+      surface="notebook"
+      rootRef={rootRef}
+      comments={comments}
+      activeSelection={activeSelection}
+      onSetActiveSelection={onSetActiveSelection}
+      canComment={canComment}
       onScroll={onScroll}
       className="h-full space-y-4 overflow-auto px-6 py-4"
     >
       {(notebook.cells ?? []).map((cell, i) => {
         if (cell.cell_type === "markdown") {
           return (
-            // eslint-disable-next-line react/no-array-index-key
-            <div key={i} className="prose dark:prose-invert prose-sm max-w-none pl-16">
+            <div
+              // eslint-disable-next-line react/no-array-index-key
+              key={i}
+              data-rendered-preview-comment-region={`cell:${i}:source`}
+              className="prose dark:prose-invert prose-sm max-w-none pl-16"
+            >
               <ReactMarkdown remarkPlugins={[remarkGfm]}>{joinSource(cell.source)}</ReactMarkdown>
             </div>
           );
         }
         if (cell.cell_type === "code") {
           // eslint-disable-next-line react/no-array-index-key
-          return <CodeCell key={i} cell={cell} language={language} />;
+          return <CodeCell key={i} cell={cell} cellIndex={i} language={language} />;
         }
-        // raw (and any unknown cell type): show the source verbatim.
-        // eslint-disable-next-line react/no-array-index-key
-        return <AnsiText key={i} text={joinSource(cell.source)} className="pl-16 opacity-70" />;
+        return (
+          <AnsiText
+            // eslint-disable-next-line react/no-array-index-key
+            key={i}
+            text={joinSource(cell.source)}
+            region={`cell:${i}:source`}
+            className="pl-16 opacity-70"
+          />
+        );
       })}
-    </div>
+    </RenderedPreviewCommentSurface>
   );
 }

@@ -1,6 +1,10 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { NotebookPreview } from "./NotebookPreview";
+import {
+  decodeRenderedPreviewAnchor,
+  resolveRenderedPreviewOffsets,
+} from "./RenderedPreviewCommentSurface";
 
 // Stub Shiki (same rationale as CodeViewer.test.tsx) — render code verbatim so
 // assertions can target cell source without async highlighting.
@@ -15,6 +19,89 @@ import brokenRaw from "./__fixtures__/03_broken.ipynb?raw";
 afterEach(cleanup);
 
 describe("NotebookPreview — typical notebook", () => {
+  it("re-anchors rendered selections after nearby text changes", () => {
+    expect(
+      resolveRenderedPreviewOffsets("Updated Sales Analysis", {
+        start: 0,
+        end: 5,
+        text: "Sales",
+      }),
+    ).toEqual({ start: 8, end: 13 });
+  });
+
+  it("does not treat a distant duplicate as a nearby re-anchor", () => {
+    const content = `Sales${"x".repeat(1_195)}Sales`;
+    expect(
+      resolveRenderedPreviewOffsets(content, {
+        start: 600,
+        end: 605,
+        text: "Sales",
+      }),
+    ).toEqual({ start: 0, end: 5 });
+  });
+
+  it("creates a comment anchor from rendered notebook text", () => {
+    const onSetActiveSelection = vi.fn();
+    render(
+      <NotebookPreview
+        content={typicalRaw}
+        canComment
+        onSetActiveSelection={onSetActiveSelection}
+      />,
+    );
+    const heading = screen.getByRole("heading", { name: "Sales Analysis" });
+    const text = heading.firstChild!;
+    const range = document.createRange();
+    range.setStart(text, 0);
+    range.setEnd(text, 5);
+    const selection = window.getSelection()!;
+    selection.removeAllRanges();
+    selection.addRange(range);
+
+    fireEvent.mouseUp(heading);
+    fireEvent.click(screen.getByRole("button", { name: "Add comment" }));
+
+    const active = onSetActiveSelection.mock.calls[0]![0];
+    expect(decodeRenderedPreviewAnchor(active.anchor_content)).toEqual({
+      surface: "notebook",
+      region: "cell:0:source",
+      start: 0,
+      end: 5,
+      text: "Sales",
+    });
+  });
+
+  it("clears the add-comment button for whitespace-only selections", () => {
+    const onSetActiveSelection = vi.fn();
+    render(
+      <NotebookPreview
+        content={typicalRaw}
+        canComment
+        onSetActiveSelection={onSetActiveSelection}
+      />,
+    );
+    const heading = screen.getByRole("heading", { name: "Sales Analysis" });
+    const headingText = heading.firstChild!;
+    const range = document.createRange();
+    range.setStart(headingText, 0);
+    range.setEnd(headingText, 5);
+    const selection = window.getSelection()!;
+    selection.removeAllRanges();
+    selection.addRange(range);
+    fireEvent.mouseUp(heading);
+    expect(screen.getByRole("button", { name: "Add comment" })).toBeInTheDocument();
+
+    const code = screen.getAllByTestId("code-cell")[0];
+    const whitespace = code.firstChild!;
+    range.setStart(whitespace, 6);
+    range.setEnd(whitespace, 7);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    fireEvent.mouseUp(code);
+
+    expect(screen.queryByRole("button", { name: "Add comment" })).toBeNull();
+  });
+
   it("renders markdown cells as formatted markdown", () => {
     render(<NotebookPreview content={typicalRaw} />);
     expect(screen.getByRole("heading", { name: "Sales Analysis" })).toBeInTheDocument();

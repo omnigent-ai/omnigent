@@ -67,6 +67,7 @@ import {
   lineOverlapsSelection,
 } from "./codeViewerHelpers";
 import { NotebookPreview } from "./NotebookPreview";
+import { isRenderedPreviewAnchor } from "./RenderedPreviewCommentSurface";
 import { useScrollRestore } from "./useScrollRestore";
 import { PreviewSearchBar } from "./PreviewSearchBar";
 import { renderLineTokens } from "./codeViewerRendering";
@@ -219,6 +220,10 @@ function PreviewWithSearch({
   searchInputRef,
   scrollKey,
   scrollReady,
+  comments,
+  activeSelection,
+  onSetActiveSelection,
+  canComment,
 }: {
   content: string;
   isNotebook: boolean;
@@ -230,6 +235,10 @@ function PreviewWithSearch({
   scrollKey: string | null;
   /** True once the file content backing the preview is present. */
   scrollReady: boolean;
+  comments: Comment[];
+  activeSelection: ActiveSelection | null;
+  onSetActiveSelection: (selection: ActiveSelection | null) => void;
+  canComment: boolean;
 }) {
   const previewRef = useRef<HTMLDivElement>(null);
   // The preview div (not the FileViewer content area) is the real scroller
@@ -245,7 +254,15 @@ function PreviewWithSearch({
     />
   );
   const preview = isNotebook ? (
-    <NotebookPreview content={content} rootRef={previewRef} onScroll={handleScroll} />
+    <NotebookPreview
+      content={content}
+      rootRef={previewRef}
+      onScroll={handleScroll}
+      comments={comments}
+      activeSelection={activeSelection}
+      onSetActiveSelection={onSetActiveSelection}
+      canComment={canComment}
+    />
   ) : (
     <MarkdownPreview content={content} rootRef={previewRef} onScroll={handleScroll} />
   );
@@ -761,6 +778,10 @@ export function CodeViewer({
         searchInputRef={searchInputRef}
         scrollKey={conversationId && path ? `viewer-preview:${conversationId}:${path}` : null}
         scrollReady={fileQuery.data !== undefined}
+        comments={comments}
+        activeSelection={activeSelection}
+        onSetActiveSelection={onSetActiveSelection}
+        canComment={canEdit && !truncated}
       />
     );
   }
@@ -784,8 +805,10 @@ export function CodeViewer({
           onSaveStatusChange={onSaveStatusChange}
           searchOpen={searchOpen}
           onSearchHandled={handleSearchHandled}
-          comments={comments}
-          activeSelection={activeSelection}
+          comments={comments.filter((comment) => !isRenderedPreviewAnchor(comment.anchor_content))}
+          activeSelection={
+            isRenderedPreviewAnchor(activeSelection?.anchor_content) ? null : activeSelection
+          }
           onSetActiveSelection={onSetActiveSelection}
           pendingBodyRef={pendingBodyRef}
         />
