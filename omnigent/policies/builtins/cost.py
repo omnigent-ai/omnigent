@@ -1075,7 +1075,9 @@ def user_period_cost_budget(
                 approved_up_to = _read_period_approved(event)
                 if crossed > approved_up_to:
                     spend_subject = (
-                        f"{owner}'s spend this {period_noun}" if owner else f"This {period_noun}'s spend"
+                        f"{owner}'s spend this {period_noun}"
+                        if owner
+                        else f"This {period_noun}'s spend"
                     )
                     harness_note = f" on {harness}" if harness else ""
                     return {
