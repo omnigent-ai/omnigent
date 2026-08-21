@@ -6379,6 +6379,33 @@ function SessionConfigModal({
   // drafted model, else the "Default" sentinel (no override).
   const modelValue = draftRoutingOn ? MODEL_SELECT_SMART : (draftModelId ?? MODEL_SELECT_DEFAULT);
 
+  // Codex advertises a per-model effort ladder, so the dropdown must follow the
+  // DRAFTED model, not the committed one the parent computed — else picking
+  // Luna still lists Sol's "ultra". "Default" (null) resolves to the catalog
+  // default; non-codex harnesses use a model-independent ladder, so keep the
+  // parent's list.
+  const draftEffortLevels = useMemo(() => {
+    if (modelPickerKind !== "codex") return effortLevels;
+    const modelForEffort =
+      draftModelId ?? codexModelOptions.find((o) => o.isDefault)?.id ?? llmModel;
+    const levels = codexEffortLevelsForModel(codexModelOptions, modelForEffort);
+    return levels.length > 0 ? levels : effortLevels;
+  }, [modelPickerKind, codexModelOptions, draftModelId, llmModel, effortLevels]);
+
+  // Drop a picked level the newly-drafted model doesn't offer (Sol's "ultra"
+  // when switching to Luna) so no stale rung shows and Save never submits a
+  // level the model rejects.
+  const clampDraftEffortToModel = (modelId: string | null) => {
+    if (modelPickerKind !== "codex") return;
+    setDraftEffort((prev) => {
+      if (prev === null) return null;
+      const modelForEffort = modelId ?? codexModelOptions.find((o) => o.isDefault)?.id ?? llmModel;
+      return codexEffortLevelsForModel(codexModelOptions, modelForEffort).includes(prev)
+        ? prev
+        : null;
+    });
+  };
+
   const onModelChange = (value: string) => {
     if (value === MODEL_SELECT_SMART) {
       setDraftRoutingOn(true);
@@ -6389,10 +6416,12 @@ function SessionConfigModal({
     } else if (value === MODEL_SELECT_DEFAULT) {
       setDraftModelId(null);
       setDraftRoutingOn(false);
+      clampDraftEffortToModel(null);
     } else {
       // Pinning a model turns routing off (mutually exclusive).
       setDraftModelId(value);
       setDraftRoutingOn(false);
+      clampDraftEffortToModel(value);
     }
   };
 
@@ -6538,7 +6567,7 @@ function SessionConfigModal({
                   className="w-(--radix-select-trigger-width)"
                 >
                   <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
-                  {effortLevels.map((level) => (
+                  {draftEffortLevels.map((level) => (
                     <SelectItem
                       key={level}
                       value={level}
