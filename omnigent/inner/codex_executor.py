@@ -2048,7 +2048,11 @@ def _codex_builtin_tool_request(item: CodexParams) -> ToolCallRequest | None:
         cwd = item.get("cwd")
         if isinstance(cwd, str) and cwd:
             args["cwd"] = cwd
-        return ToolCallRequest(name="shell", args=args, metadata={"call_id": call_id})
+        return ToolCallRequest(
+            name="shell",
+            args=args,
+            metadata={"call_id": call_id, "internally_completed": True},
+        )
     if item_type == "fileChange":
         changes = item.get("changes")
         if not isinstance(changes, list) or not changes:
@@ -2063,7 +2067,7 @@ def _codex_builtin_tool_request(item: CodexParams) -> ToolCallRequest | None:
         return ToolCallRequest(
             name="apply_patch",
             args={"path": paths[0]},
-            metadata={"call_id": call_id},
+            metadata={"call_id": call_id, "internally_completed": True},
         )
     return None
 

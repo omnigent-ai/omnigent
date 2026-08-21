@@ -56,6 +56,7 @@ _logger = logging.getLogger(__name__)
 
 # Observed tool calls use "in_progress" (distinct from "action_required" for server-dispatched).
 _OBSERVED_TOOL_CALL_STATUS = "in_progress"
+_COMPLETED_TOOL_CALL_STATUS = "completed"
 
 
 # Prefix for Claude SDK MCP-registered tool names (e.g. ``mcp__omnigent__sys_terminal_launch``).
@@ -718,13 +719,18 @@ class ExecutorAdapter(HarnessApp):
                 self._pending_mcp_call_ids.append(tool_use_id)
             call_id = tool_use_id or f"call_{uuid.uuid4().hex[:12]}"
             bare_name = _strip_mcp_tool_prefix(event.name)
+            status = (
+                _COMPLETED_TOOL_CALL_STATUS
+                if event.metadata.get("internally_completed") is True
+                else _OBSERVED_TOOL_CALL_STATUS
+            )
             ctx.emit(
                 OutputItemDoneEvent(
                     type="response.output_item.done",
                     item={
                         "id": f"fc_{uuid.uuid4().hex[:12]}",
                         "type": "function_call",
-                        "status": _OBSERVED_TOOL_CALL_STATUS,
+                        "status": status,
                         "name": bare_name,
                         "arguments": _serialize_args(event.args),
                         "call_id": call_id,

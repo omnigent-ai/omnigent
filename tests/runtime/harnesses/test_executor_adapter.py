@@ -1893,6 +1893,28 @@ def test_internal_errored_tool_complete_emits_output_with_real_call_id() -> None
     )
 
 
+def test_internally_completed_tool_request_is_durable() -> None:
+    """Mark an internally completed tool call durable for session persistence."""
+
+    from omnigent.inner.executor import ToolCallRequest
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext()
+
+    adapter._translate_event(
+        ToolCallRequest(
+            name="shell",
+            args={"command": "pwd"},
+            metadata={"call_id": "command-1", "internally_completed": True},
+        ),
+        ctx,  # type: ignore[arg-type]
+    )
+
+    assert len(ctx.emitted) == 1
+    assert ctx.emitted[0].item["status"] == "completed"
+
+
 # ── ToolCallComplete suppression scoped to dispatched call ids ──────────────
 #
 # A tool routed through ``_stable_tool_executor`` → ``ctx.dispatch_tool`` already
