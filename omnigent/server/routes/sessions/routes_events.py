@@ -1060,6 +1060,21 @@ def register_events_routes(
             if effective_status != status:
                 status = effective_status
                 body.data["status"] = status
+            if status == "quiesced":
+                # The claude-native sub-agent transcript-quiescence badge: a
+                # UI signal only. Publish it for the badge, but never forward
+                # it to the runner — the runner's terminal-delivery branch
+                # consumes "idle"/"failed" as authoritative completions, and a
+                # >5s transcript gap is not one (#4988).
+                _publish_status(
+                    session_id,
+                    "idle",
+                    status_error,
+                    response_id=response_id,
+                    background_task_count=bg_count,
+                    blocked_on=blocked_on,
+                )
+                return {"queued": False}
             _publish_status(
                 session_id,
                 status,

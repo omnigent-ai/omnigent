@@ -99,8 +99,11 @@ _EXTERNAL_ELICITATION_RESOLVED_TYPE: str = "external_elicitation_resolved"
 _EXTERNAL_SESSION_STATUS_TYPE: str = "external_session_status"
 
 
+# "quiesced": the claude-native sub-agent transcript-quiescence badge — a
+# UI signal only, never a terminal edge (the runner must not deliver a
+# parent-inbox completion from it; #4988).
 _EXTERNAL_SESSION_STATUS_VALUES: frozenset[str] = frozenset(
-    {"idle", "running", "waiting", "failed"}
+    {"idle", "running", "waiting", "failed", "quiesced"}
 )
 
 
