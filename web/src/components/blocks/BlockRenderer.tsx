@@ -514,9 +514,9 @@ function isProvisionalTrace(items: RenderItem[]): boolean {
 /**
  * Codex-style demarcation for a completed turn: the whole process
  * trace (narration, tool folds, reasoning) collapses behind one muted
- * "Worked for Xs" row with a hairline rule, so the final answer below
- * is unambiguously where reading starts. Expanding replays the trace
- * inline.
+ * "Worked for Xs" disclosure, so the final answer below is
+ * unambiguously where reading starts. Expanding replays the trace
+ * beside a compact vertical guide.
  *
  * `animateCollapse` marks the render where the fold appeared while the
  * user was watching. The fold then MOUNTS OPEN — showing exactly the
@@ -616,10 +616,9 @@ function TurnWorkedFold({
       {/* Height animation lives in index.css (it needs Radix's measured
           --radix-collapsible-content-height) and is disabled under
           prefers-reduced-motion. */}
-      {/* No padding/border on the animated element: any chrome here is
-          height that appears before the collapse starts, i.e. the jolt
-          this animation exists to remove. Expanded spacing comes from
-          the row's hairline above and the message column's gap below. */}
+      {/* Keep pt-2/pl-4 and the vertical pin inside the collapsible
+          content so the spacing and guide shrink with its existing
+          height animation. */}
       <CollapsibleContent
         className={cn("turn-fold-content", userOpened && "turn-fold-content-instant")}
       >
