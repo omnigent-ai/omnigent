@@ -761,6 +761,8 @@ def create_app(
     sandbox_config: ManagedSandboxConfig | None = None,
     github_config: Any | None = None,  # GitHubAppConfig — GitHub App integration
     github_store: Any | None = None,  # GithubConnectionStore — GitHub App integration
+    databricks_config: Any | None = None,  # DatabricksConfig — Databricks Connect
+    databricks_store: Any | None = None,  # DatabricksConnectionStore — Databricks Connect
     sharing_mode: SharingMode | Callable[[], SharingMode] | None = None,
     public_sharing: bool | Callable[[], bool] | None = None,
     server_config: dict[str, Any] | None = None,
@@ -1190,6 +1192,17 @@ def create_app(
         app.state.github_client = GitHubAppClient(github_config)
     else:
         app.state.github_client = None
+    # Databricks Connect: enabled only when both the config and the connection
+    # store are wired. The client is stateless (holds config), built once.
+    databricks_enabled = databricks_config is not None and databricks_store is not None
+    app.state.databricks_config = databricks_config if databricks_enabled else None
+    app.state.databricks_store = databricks_store if databricks_enabled else None
+    if databricks_enabled:
+        from omnigent.server.databricks_app_client import DatabricksAppClient
+
+        app.state.databricks_client = DatabricksAppClient(databricks_config)
+    else:
+        app.state.databricks_client = None
     # Admin roster: the config ``admins:`` list (canonical) union'd with the
     # runtime-editable ``<data_dir>/admins`` file. Built once here so BOTH the
     # admin-gated auth routes AND ``/v1/me``'s is_admin computation consult the
@@ -1863,6 +1876,10 @@ def create_app(
             getattr(app.state, "github_config", None) is not None
             and getattr(app.state, "github_store", None) is not None
         )
+        databricks_app_enabled = (
+            getattr(app.state, "databricks_config", None) is not None
+            and getattr(app.state, "databricks_store", None) is not None
+        )
         # sharing_mode is the server's session-sharing policy
         # (on/read_only/off), surfaced so the web app can hide the Share
         # control (off) or restrict it to read-only (read_only) in lockstep
@@ -1932,6 +1949,7 @@ def create_app(
             "managed_sandboxes_enabled": managed_sandboxes_enabled,
             "sandbox_provider": sandbox_provider,
             "github_app_enabled": github_app_enabled,
+            "databricks_app_enabled": databricks_app_enabled,
             "sharing_mode": sharing_mode.value,
             "public_sharing_enabled": public_sharing_enabled,
             "server_version": _server_version(),
@@ -2510,6 +2528,20 @@ def create_app(
                 prefix="/v1",
                 tags=["hosts"],
             )
+        # Host-facing Databricks credential vending (AI Gateway token), same
+        # launch-token-authenticated channel. Only when Databricks is connected.
+        if databricks_enabled and app.state.databricks_client is not None:
+            from omnigent.server.routes.host_databricks import (
+                create_host_databricks_router,
+            )
+
+            app.include_router(
+                create_host_databricks_router(
+                    host_store, databricks_store, app.state.databricks_client
+                ),
+                prefix="/v1",
+                tags=["hosts"],
+            )
         app.include_router(
             create_hosts_router(
                 host_registry,
@@ -2539,6 +2571,24 @@ def create_app(
                 github_store,
                 auth_provider=auth_provider,
                 client=app.state.github_client,
+            ),
+            prefix="/v1",
+            tags=["integrations"],
+        )
+
+    # Databricks Connect routes (connect / callback / status / disconnect),
+    # mounted only when configured.
+    if databricks_enabled:
+        from omnigent.server.routes.integrations_databricks import (
+            create_integrations_databricks_router,
+        )
+
+        app.include_router(
+            create_integrations_databricks_router(
+                databricks_config,
+                databricks_store,
+                auth_provider=auth_provider,
+                client=app.state.databricks_client,
             ),
             prefix="/v1",
             tags=["integrations"],
