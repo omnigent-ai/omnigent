@@ -26,6 +26,7 @@ import {
   isMacElectronShell,
   onNativeSidebarDrag,
   supportsBrowser,
+  updateBridge,
 } from "@/lib/nativeBridge";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
 import {
@@ -38,6 +39,7 @@ import {
   readDefaultWorkspacePanelOpen,
   writeDefaultWorkspacePanelOpen,
 } from "@/lib/workspacePanelPreferences";
+import { updateOverlayToastOffset } from "@/lib/updateOverlayInset";
 import {
   Dialog,
   DialogContent,
@@ -159,6 +161,32 @@ export function AppShell() {
   // the whole document (which would hide the header and break the layout).
   // No-op off the iOS shell. Scoped here so auth pages keep normal scrolling.
   useIOSViewportLock();
+
+  const desktopUpdates = useMemo(() => updateBridge(), []);
+  const [updateOverlayHeight, setUpdateOverlayHeight] = useState(0);
+  useEffect(() => {
+    if (!desktopUpdates?.getOverlayHeight || !desktopUpdates.onOverlayHeight) return;
+    let alive = true;
+    let receivedPush = false;
+    const unsubscribe = desktopUpdates.onOverlayHeight((height) => {
+      receivedPush = true;
+      setUpdateOverlayHeight(Math.max(0, Math.round(Number(height) || 0)));
+    });
+    void desktopUpdates
+      .getOverlayHeight()
+      .then((height) => {
+        if (alive && !receivedPush) {
+          setUpdateOverlayHeight(Math.max(0, Math.round(Number(height) || 0)));
+        }
+      })
+      .catch(() => {
+        // Older/mismatched shells may expose the method before registering IPC.
+      });
+    return () => {
+      alive = false;
+      unsubscribe();
+    };
+  }, [desktopUpdates]);
 
   // Read early: the conversationId scopes the per-session workspace state
   // (rail open/width/tab/open files) used throughout this component.
@@ -1999,11 +2027,11 @@ export function AppShell() {
             visibleToasts={100}
             offset={{
               right: "1rem",
-              bottom: "calc(1rem + var(--omnigent-inset-bottom))",
+              bottom: updateOverlayToastOffset(updateOverlayHeight),
             }}
             mobileOffset={{
               right: "1rem",
-              bottom: "calc(1rem + var(--omnigent-inset-bottom))",
+              bottom: updateOverlayToastOffset(updateOverlayHeight),
             }}
           />
         </ForkDialogContextProvider>
