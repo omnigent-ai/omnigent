@@ -237,6 +237,11 @@ dictation = [
     # rather than riding whichever extra happens to pull it in.
     "numpy>=1.24,<3",
 ]
+# Apple Silicon dictation via MLX. Keep this separate from the portable
+# sherpa extra so non-Mac servers do not resolve the native MLX stack.
+dictation-mlx = [
+    "parakeet-mlx>=0.5.1,<0.6; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
 # Cursor SDK harness (`harness: cursor`). Optional like antigravity: the
 # harness imports the cursor-sdk lazily on first turn, so only `--harness
 # cursor` users need this extra (`omnigent[cursor]`). Was a baseline dependency;
@@ -317,6 +322,9 @@ lint = [
 ]
 test = [
     "pytest>=7.0",
+    # Dictation engine tests mock optional native runtimes but exercise the
+    # shared PCM normalization path directly.
+    "numpy>=1.24,<3",
     # These clients are optional product capabilities, but their tests import
     # and execute the real packages against mocks.
     "hindsight-client>=0.4.0",

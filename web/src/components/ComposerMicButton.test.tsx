@@ -20,27 +20,32 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import { CapabilitiesContext } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
-import type { DictationSessionEvents } from "@/lib/dictation";
+import type { DictationSessionEvents, DictationSessionOptions } from "@/lib/dictation";
 import { ComposerMicButton } from "./ComposerMicButton";
 
 // Controllable DictationSession stand-in for the server-mode tests. The
 // factory reads the mutable spies at call time, so each test installs its
 // own behavior in beforeEach.
 interface SessionStub {
+  captureStream: MediaStream;
   stop: () => Promise<string>;
   cancel: () => void;
 }
-let sessionStartMock: Mock<(events: DictationSessionEvents) => Promise<SessionStub>>;
+let sessionStartMock: Mock<
+  (events: DictationSessionEvents, options?: DictationSessionOptions) => Promise<SessionStub>
+>;
 let sessionStopMock: Mock<() => Promise<string>>;
 let sessionCancelMock: Mock<() => void>;
 let sessionEvents: DictationSessionEvents | null;
+let sessionStream: MediaStream;
 
 vi.mock("@/lib/dictation", () => {
   class DictationBusyError extends Error {}
   return {
     DictationBusyError,
     DictationSession: {
-      start: (events: DictationSessionEvents) => sessionStartMock(events),
+      start: (events: DictationSessionEvents, options?: DictationSessionOptions) =>
+        sessionStartMock(events, options),
     },
   };
 });
@@ -49,9 +54,10 @@ function installDictationSession() {
   sessionEvents = null;
   sessionStopMock = vi.fn(async () => "");
   sessionCancelMock = vi.fn();
+  sessionStream = { getTracks: () => [] } as unknown as MediaStream;
   sessionStartMock = vi.fn(async (events: DictationSessionEvents) => {
     sessionEvents = events;
-    return { stop: sessionStopMock, cancel: sessionCancelMock };
+    return { captureStream: sessionStream, stop: sessionStopMock, cancel: sessionCancelMock };
   });
 }
 
@@ -59,8 +65,51 @@ function installDictationSession() {
 let handlers: Record<string, (event: unknown) => void>;
 let startSpy: ReturnType<typeof vi.fn>;
 let stopSpy: ReturnType<typeof vi.fn>;
+let recognitionLanguage: string;
+let getUserMediaMock: Mock;
 /** Original navigator.mediaDevices descriptor, restored after each test. */
 let originalMediaDevices: PropertyDescriptor | undefined;
+
+interface MeterMocks {
+  close: Mock;
+  createMediaStreamSource: Mock;
+  cancelAnimationFrame: Mock;
+}
+
+function installMeterAudio(): MeterMocks {
+  const close = vi.fn(function (this: { state: AudioContextState }) {
+    this.state = "closed";
+    return Promise.resolve();
+  });
+  const createMediaStreamSource = vi.fn(() => ({ connect: vi.fn() }));
+  const createAnalyser = vi.fn(() => ({
+    fftSize: 0,
+    smoothingTimeConstant: 0,
+    frequencyBinCount: 32,
+    getByteFrequencyData: vi.fn(),
+  }));
+  class FakeAudioContext {
+    state: AudioContextState = "running";
+    close = close;
+    createMediaStreamSource = createMediaStreamSource;
+    createAnalyser = createAnalyser;
+  }
+  const cancelAnimationFrame = vi.fn();
+  vi.stubGlobal("AudioContext", FakeAudioContext);
+  vi.stubGlobal(
+    "requestAnimationFrame",
+    vi.fn(() => 1),
+  );
+  vi.stubGlobal("cancelAnimationFrame", cancelAnimationFrame);
+  return { close, createMediaStreamSource, cancelAnimationFrame };
+}
+
+function mediaStream(stop = vi.fn()): { stream: MediaStream; stop: Mock } {
+  return {
+    stream: { getTracks: () => [{ stop }] } as unknown as MediaStream,
+    stop,
+  };
+}
 
 function installSpeechRecognition() {
   handlers = {};
@@ -71,7 +120,14 @@ function installSpeechRecognition() {
   class FakeRecognition {
     continuous = false;
     interimResults = false;
-    lang = "en-US";
+    private recognitionLang = "en-US";
+    get lang() {
+      return this.recognitionLang;
+    }
+    set lang(value: string) {
+      this.recognitionLang = value;
+      recognitionLanguage = value;
+    }
     start = startSpy;
     stop = stopSpy;
     addEventListener(type: string, handler: (event: unknown) => void) {
@@ -97,9 +153,10 @@ beforeEach(() => {
   // (unavailable in jsdom) is ever constructed. Capture the original descriptor
   // first so afterEach can restore it — otherwise this navigator stub leaks.
   originalMediaDevices = Object.getOwnPropertyDescriptor(navigator, "mediaDevices");
+  getUserMediaMock = vi.fn().mockRejectedValue(new Error("no mic"));
   Object.defineProperty(navigator, "mediaDevices", {
     configurable: true,
-    value: { getUserMedia: vi.fn().mockRejectedValue(new Error("no mic")) },
+    value: { getUserMedia: getUserMediaMock },
   });
 });
 
@@ -107,6 +164,7 @@ afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
   vi.clearAllMocks();
+  localStorage.clear();
   // Restore navigator.mediaDevices so the stub never leaks to other test files.
   if (originalMediaDevices) {
     Object.defineProperty(navigator, "mediaDevices", originalMediaDevices);
@@ -116,11 +174,12 @@ afterEach(() => {
 });
 
 describe("ComposerMicButton", () => {
-  it("renders nothing when the browser has no SpeechRecognition support", () => {
+  it("keeps the button disabled while fallback availability is loading", () => {
     vi.stubGlobal("SpeechRecognition", undefined);
     vi.stubGlobal("webkitSpeechRecognition", undefined);
-    const { container } = render(<ComposerMicButton onTranscript={vi.fn()} />);
-    expect(container).toBeEmptyDOMElement();
+    render(<ComposerMicButton onTranscript={vi.fn()} />);
+    expect(screen.getByRole("button", { name: "Voice dictation" })).toBeDisabled();
+    expect(screen.getByRole("status")).toBeEmptyDOMElement();
   });
 
   it("renders an idle, un-pressed dictation button when supported", () => {
@@ -135,10 +194,140 @@ describe("ComposerMicButton", () => {
 
     fireEvent.click(button);
     expect(startSpy).toHaveBeenCalledTimes(1);
+    expect(button).toHaveAttribute("aria-busy", "true");
+    expect(button).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByRole("status")).toHaveTextContent("Starting dictation...");
 
     // The recognizer's "start" event flips the pressed state.
     act(() => handlers.start?.({}));
     expect(button).toHaveAttribute("aria-pressed", "true");
+    expect(button).toHaveAttribute("aria-busy", "false");
+    expect(screen.getByRole("status")).toHaveTextContent("Listening...");
+  });
+
+  it("times out a Web Speech start that never reports listening", () => {
+    vi.useFakeTimers();
+    try {
+      render(<ComposerMicButton onTranscript={vi.fn()} />);
+      const button = screen.getByRole("button", { name: "Voice dictation" });
+      fireEvent.click(button);
+
+      act(() => vi.advanceTimersByTime(45_000));
+
+      expect(stopSpy).toHaveBeenCalledOnce();
+      expect(button).toHaveAttribute("aria-busy", "false");
+      expect(screen.getByRole("status")).toHaveTextContent("Could not start dictation. Try again.");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels Web Speech when clicked again during startup", () => {
+    render(<ComposerMicButton onTranscript={vi.fn()} />);
+    const button = screen.getByRole("button", { name: "Voice dictation" });
+    fireEvent.click(button);
+
+    fireEvent.click(button);
+
+    expect(stopSpy).toHaveBeenCalledOnce();
+    expect(button).toHaveAttribute("aria-busy", "false");
+    expect(screen.getByRole("status")).toHaveTextContent("Dictation cancelled");
+
+    act(() => handlers.start?.({}));
+    expect(button).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("captures a separate owned stream for the Web Speech meter", async () => {
+    const meter = installMeterAudio();
+    const owned = mediaStream();
+    getUserMediaMock.mockResolvedValue(owned.stream);
+    render(<ComposerMicButton onTranscript={vi.fn()} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    await act(async () => handlers.start?.({}));
+
+    expect(getUserMediaMock).toHaveBeenCalledOnce();
+    expect(meter.createMediaStreamSource).toHaveBeenCalledWith(owned.stream);
+    expect(owned.stop).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["stop", () => handlers.end?.({})],
+    ["error", () => handlers.error?.({ error: "network" })],
+    [
+      "Escape",
+      () => window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })),
+    ],
+  ])("cleans up the owned Web Speech meter on %s", async (_name, finish) => {
+    const meter = installMeterAudio();
+    const owned = mediaStream();
+    getUserMediaMock.mockResolvedValue(owned.stream);
+    render(<ComposerMicButton onTranscript={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    await act(async () => handlers.start?.({}));
+
+    act(finish);
+
+    expect(owned.stop).toHaveBeenCalledOnce();
+    expect(meter.close).toHaveBeenCalledOnce();
+    expect(meter.cancelAnimationFrame).toHaveBeenCalledWith(1);
+  });
+
+  it("cleans up the owned Web Speech meter when disabled", async () => {
+    const meter = installMeterAudio();
+    const owned = mediaStream();
+    getUserMediaMock.mockResolvedValue(owned.stream);
+    const { rerender } = render(<ComposerMicButton onTranscript={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    await act(async () => handlers.start?.({}));
+
+    rerender(<ComposerMicButton onTranscript={vi.fn()} disabled />);
+
+    expect(owned.stop).toHaveBeenCalledOnce();
+    expect(meter.close).toHaveBeenCalledOnce();
+  });
+
+  it("stops a late Web Speech meter capture after unmount", async () => {
+    installMeterAudio();
+    const owned = mediaStream();
+    let resolveCapture: ((stream: MediaStream) => void) | undefined;
+    getUserMediaMock.mockReturnValue(
+      new Promise<MediaStream>((resolve) => {
+        resolveCapture = resolve;
+      }),
+    );
+    const { unmount } = render(<ComposerMicButton onTranscript={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    act(() => handlers.start?.({}));
+
+    unmount();
+    await act(async () => resolveCapture?.(owned.stream));
+
+    expect(owned.stop).toHaveBeenCalledOnce();
+  });
+
+  it("stops its owned stream when meter setup fails", async () => {
+    const owned = mediaStream();
+    getUserMediaMock.mockResolvedValue(owned.stream);
+    function BrokenAudioContext() {
+      throw new Error("audio context failed");
+    }
+    vi.stubGlobal("AudioContext", BrokenAudioContext);
+    render(<ComposerMicButton onTranscript={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+
+    await act(async () => handlers.start?.({}));
+
+    expect(owned.stop).toHaveBeenCalledOnce();
+  });
+
+  it("uses the saved browser recognition language", () => {
+    localStorage.setItem(
+      "omnigent:dictation-preferences",
+      JSON.stringify({ path: "browser", browserLanguage: "de-DE", microphoneDeviceId: null }),
+    );
+    render(<ComposerMicButton onTranscript={vi.fn()} />);
+    expect(recognitionLanguage).toBe("de-DE");
   });
 
   it("stops recognition on a second click once recording", () => {
@@ -170,20 +359,45 @@ describe("ComposerMicButton", () => {
     expect(onTranscript).not.toHaveBeenCalled();
   });
 
-  it("surfaces a permission-denied error in the button tooltip", () => {
+  it("shows and announces actionable permission feedback", () => {
     render(<ComposerMicButton onTranscript={vi.fn()} />);
     const button = screen.getByRole("button", { name: "Voice dictation" });
 
+    fireEvent.click(button);
     act(() => handlers.error?.({ error: "not-allowed" }));
-    expect(button).toHaveAttribute("title", "Microphone permission denied");
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Microphone access denied. Allow access, then try again.",
+    );
+    expect(button).toHaveAttribute("aria-pressed", "false");
+    expect(button).toHaveAccessibleDescription(
+      "Microphone access denied. Allow access, then try again.",
+    );
   });
 
-  it("ignores routine no-speech/aborted errors (no tooltip change)", () => {
+  it("announces a routine recognizer stop without showing an error", () => {
     render(<ComposerMicButton onTranscript={vi.fn()} />);
     const button = screen.getByRole("button", { name: "Voice dictation" });
 
+    fireEvent.click(button);
     act(() => handlers.error?.({ error: "no-speech" }));
     expect(button).toHaveAttribute("title", "Voice dictation");
+    expect(screen.getByRole("status")).toHaveTextContent("Dictation stopped");
+  });
+
+  it("announces normal stop and discard outcomes", () => {
+    render(<ComposerMicButton onTranscript={vi.fn()} onVoiceDiscard={vi.fn()} />);
+    const button = screen.getByRole("button", { name: "Voice dictation" });
+    fireEvent.click(button);
+    act(() => handlers.start?.({}));
+    fireEvent.click(button);
+    expect(screen.getByRole("status")).toHaveTextContent("Stopping dictation...");
+    act(() => handlers.end?.({}));
+    expect(screen.getByRole("status")).toHaveTextContent("Dictation stopped");
+
+    fireEvent.click(button);
+    act(() => handlers.start?.({}));
+    act(() => window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" })));
+    expect(screen.getByRole("status")).toHaveTextContent("Dictation cancelled");
   });
 
   it("snapshots via onVoiceStart when dictation begins", () => {
@@ -307,24 +521,325 @@ async function clickMic() {
 }
 
 describe("ComposerMicButton (server dictation)", () => {
+  it("borrows the direct server capture for metering without another capture", async () => {
+    const meter = installMeterAudio();
+    const borrowed = mediaStream();
+    getUserMediaMock.mockResolvedValue(borrowed.stream);
+    sessionStartMock = vi.fn(async (events: DictationSessionEvents) => {
+      sessionEvents = events;
+      const captureStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      return { captureStream, stop: sessionStopMock, cancel: sessionCancelMock };
+    });
+    renderServerMode();
+
+    await clickMic();
+
+    expect(sessionStartMock).toHaveBeenCalledOnce();
+    expect(getUserMediaMock).toHaveBeenCalledOnce();
+    expect(meter.createMediaStreamSource).toHaveBeenCalledWith(borrowed.stream);
+    expect(borrowed.stop).not.toHaveBeenCalled();
+  });
+
+  it.each(["stop", "error", "disable", "Escape", "unmount"])(
+    "cleans up but never stops the borrowed server stream on %s",
+    async (finish) => {
+      const meter = installMeterAudio();
+      const borrowed = mediaStream();
+      sessionStream = borrowed.stream;
+      const view = renderServerMode();
+      await clickMic();
+
+      if (finish === "stop") await clickMic();
+      else if (finish === "error") act(() => sessionEvents?.onError("failed"));
+      else if (finish === "disable") {
+        view.rerender(
+          <CapabilitiesContext.Provider value={DICTATION_INFO}>
+            <ComposerMicButton onTranscript={vi.fn()} disabled />
+          </CapabilitiesContext.Provider>,
+        );
+      } else if (finish === "Escape") {
+        act(() =>
+          window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })),
+        );
+      } else view.unmount();
+
+      expect(borrowed.stop).not.toHaveBeenCalled();
+      expect(meter.close).toHaveBeenCalledOnce();
+      expect(meter.cancelAnimationFrame).toHaveBeenCalledWith(1);
+    },
+  );
+
+  it("cancels a session that resolves after unmount", async () => {
+    let resolveStart: ((session: SessionStub) => void) | undefined;
+    sessionStartMock = vi.fn(
+      () =>
+        new Promise<SessionStub>((resolve) => {
+          resolveStart = resolve;
+        }),
+    );
+    const { unmount } = renderServerMode();
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    unmount();
+
+    await act(async () =>
+      resolveStart?.({
+        captureStream: sessionStream,
+        stop: sessionStopMock,
+        cancel: sessionCancelMock,
+      }),
+    );
+    expect(sessionCancelMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["unmount", "disable", "toggle", "Escape"])(
+    "aborts a pending server start on %s without showing an error",
+    async (cancel) => {
+      let rejectStart: ((error: unknown) => void) | undefined;
+      sessionStartMock = vi.fn(
+        (_events, options) =>
+          new Promise<SessionStub>((_resolve, reject) => {
+            rejectStart = reject;
+            options?.signal?.addEventListener("abort", () =>
+              reject(new DOMException("aborted", "AbortError")),
+            );
+          }),
+      );
+      const view = renderServerMode();
+      const button = screen.getByRole("button", { name: "Voice dictation" });
+      fireEvent.click(button);
+      const signal = sessionStartMock.mock.calls[0]?.[1]?.signal;
+
+      if (cancel === "unmount") view.unmount();
+      else if (cancel === "disable") {
+        view.rerender(
+          <CapabilitiesContext.Provider value={DICTATION_INFO}>
+            <ComposerMicButton onTranscript={vi.fn()} disabled />
+          </CapabilitiesContext.Provider>,
+        );
+      } else if (cancel === "toggle") fireEvent.click(button);
+      else {
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      }
+      await act(async () => {
+        if (!signal?.aborted) rejectStart?.(new Error("start was not aborted"));
+      });
+
+      expect(signal?.aborted).toBe(true);
+      if (cancel !== "unmount") {
+        expect(screen.getByRole("button", { name: "Voice dictation" })).toHaveAttribute(
+          "title",
+          "Voice dictation",
+        );
+      }
+    },
+  );
+
+  it("cancels a session that resolves after the composer becomes disabled", async () => {
+    let resolveStart: ((session: SessionStub) => void) | undefined;
+    sessionStartMock = vi.fn(
+      () =>
+        new Promise<SessionStub>((resolve) => {
+          resolveStart = resolve;
+        }),
+    );
+    const { rerender } = renderServerMode();
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    rerender(
+      <CapabilitiesContext.Provider value={DICTATION_INFO}>
+        <ComposerMicButton onTranscript={vi.fn()} disabled />
+      </CapabilitiesContext.Provider>,
+    );
+
+    await act(async () =>
+      resolveStart?.({
+        captureStream: sessionStream,
+        stop: sessionStopMock,
+        cancel: sessionCancelMock,
+      }),
+    );
+    expect(sessionCancelMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores transport events from a cancelled take after a new take starts", async () => {
+    const firstEvents: { current: DictationSessionEvents | null } = { current: null };
+    const onTranscript = vi.fn();
+    sessionStartMock = vi
+      .fn()
+      .mockImplementationOnce(async (events: DictationSessionEvents) => {
+        firstEvents.current = events;
+        return { captureStream: sessionStream, stop: sessionStopMock, cancel: sessionCancelMock };
+      })
+      .mockImplementationOnce(async (events: DictationSessionEvents) => {
+        sessionEvents = events;
+        return { captureStream: sessionStream, stop: sessionStopMock, cancel: sessionCancelMock };
+      });
+    renderServerMode({ onTranscript });
+    await clickMic();
+    act(() => window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" })));
+    await clickMic();
+
+    act(() => {
+      firstEvents.current?.onFinal("late final");
+      firstEvents.current?.onError("late failure");
+      sessionEvents?.onFinal("current final");
+    });
+
+    expect(onTranscript).toHaveBeenCalledOnce();
+    expect(onTranscript).toHaveBeenCalledWith("current final");
+    expect(screen.getByRole("status")).toHaveTextContent("Listening...");
+  });
+
+  it("shows cancelled and ignores late startup resolution when disabled", async () => {
+    let resolveStart: ((session: SessionStub) => void) | undefined;
+    sessionStartMock = vi.fn(
+      () =>
+        new Promise<SessionStub>((resolve) => {
+          resolveStart = resolve;
+        }),
+    );
+    const view = renderServerMode();
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    view.rerender(
+      <CapabilitiesContext.Provider value={DICTATION_INFO}>
+        <ComposerMicButton onTranscript={vi.fn()} disabled />
+      </CapabilitiesContext.Provider>,
+    );
+    expect(screen.getByRole("status")).toHaveTextContent("Dictation cancelled");
+
+    await act(async () =>
+      resolveStart?.({
+        captureStream: sessionStream,
+        stop: sessionStopMock,
+        cancel: sessionCancelMock,
+      }),
+    );
+    expect(sessionCancelMock).toHaveBeenCalledOnce();
+    expect(screen.getByRole("button", { name: "Voice dictation" })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+  });
+
+  it("times out a cold server start and cancels a late session", async () => {
+    vi.useFakeTimers();
+    try {
+      let resolveStart: ((session: SessionStub) => void) | undefined;
+      sessionStartMock = vi.fn(
+        () =>
+          new Promise<SessionStub>((resolve) => {
+            resolveStart = resolve;
+          }),
+      );
+      renderServerMode();
+      fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+
+      act(() => vi.advanceTimersByTime(45_000));
+
+      expect(sessionStartMock.mock.calls[0]?.[1]?.signal?.aborted).toBe(true);
+      expect(screen.getByRole("status")).toHaveTextContent("Could not start dictation. Try again.");
+      await act(async () =>
+        resolveStart?.({
+          captureStream: sessionStream,
+          stop: sessionStopMock,
+          cancel: sessionCancelMock,
+        }),
+      );
+      expect(sessionCancelMock).toHaveBeenCalledOnce();
+      expect(screen.getByRole("button", { name: "Voice dictation" })).toHaveAttribute(
+        "aria-pressed",
+        "false",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("server mode bypasses Web Speech and passes the selected microphone", async () => {
+    localStorage.setItem(
+      "omnigent:dictation-preferences",
+      JSON.stringify({ path: "server", browserLanguage: "en-US", microphoneDeviceId: "mic-2" }),
+    );
+    render(
+      <CapabilitiesContext.Provider value={DICTATION_INFO}>
+        <ComposerMicButton onTranscript={vi.fn()} />
+      </CapabilitiesContext.Provider>,
+    );
+    await clickMic();
+
+    expect(startSpy).not.toHaveBeenCalled();
+    expect(sessionStartMock).toHaveBeenCalledWith(expect.any(Object), {
+      microphoneDeviceId: "mic-2",
+      signal: expect.any(AbortSignal),
+    });
+  });
+
+  it("browser mode never falls back to the server after a network error", async () => {
+    localStorage.setItem(
+      "omnigent:dictation-preferences",
+      JSON.stringify({ path: "browser", browserLanguage: "en-US", microphoneDeviceId: null }),
+    );
+    render(
+      <CapabilitiesContext.Provider value={DICTATION_INFO}>
+        <ComposerMicButton onTranscript={vi.fn()} />
+      </CapabilitiesContext.Provider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    await act(async () => handlers.error?.({ error: "network" }));
+
+    expect(startSpy).toHaveBeenCalledTimes(1);
+    expect(sessionStartMock).not.toHaveBeenCalled();
+  });
+
+  it("shows the selected strict path as unavailable", () => {
+    localStorage.setItem(
+      "omnigent:dictation-preferences",
+      JSON.stringify({ path: "server", browserLanguage: "en-US", microphoneDeviceId: null }),
+    );
+    render(
+      <CapabilitiesContext.Provider value={NO_DICTATION_INFO}>
+        <ComposerMicButton onTranscript={vi.fn()} />
+      </CapabilitiesContext.Provider>,
+    );
+    expect(screen.getByRole("button", { name: "Voice dictation" })).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent("Server dictation is unavailable.");
+  });
+
   it("renders the button when the server advertises dictation", () => {
     renderServerMode();
     expect(screen.getByRole("button", { name: "Voice dictation" })).toBeInTheDocument();
   });
 
-  it("renders nothing when neither Web Speech nor the server can help", () => {
-    const { container } = renderServerMode({}, NO_DICTATION_INFO);
-    expect(container).toBeEmptyDOMElement();
+  it("shows unavailable when neither Web Speech nor the server can help", () => {
+    renderServerMode({}, NO_DICTATION_INFO);
+    expect(screen.getByRole("button", { name: "Voice dictation" })).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent("Voice dictation is unavailable.");
   });
 
   it("starts a session on click and reflects the recording state", async () => {
-    renderServerMode();
-    await clickMic();
-    expect(sessionStartMock).toHaveBeenCalledTimes(1);
-    expect(screen.getByRole("button", { name: "Voice dictation" })).toHaveAttribute(
-      "aria-pressed",
-      "true",
+    let resolveStart: ((session: SessionStub) => void) | undefined;
+    sessionStartMock = vi.fn(
+      () =>
+        new Promise<SessionStub>((resolve) => {
+          resolveStart = resolve;
+        }),
     );
+    renderServerMode();
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    const button = screen.getByRole("button", { name: "Voice dictation" });
+    expect(button).toHaveAttribute("aria-busy", "true");
+    expect(screen.getByRole("status")).toHaveTextContent("Starting dictation...");
+
+    await act(async () =>
+      resolveStart?.({
+        captureStream: sessionStream,
+        stop: sessionStopMock,
+        cancel: sessionCancelMock,
+      }),
+    );
+    expect(sessionStartMock).toHaveBeenCalledTimes(1);
+    expect(button).toHaveAttribute("aria-pressed", "true");
+    expect(button).toHaveAttribute("aria-busy", "false");
+    expect(screen.getByRole("status")).toHaveTextContent("Listening...");
   });
 
   it("routes partials to onInterim and finals to onTranscript", async () => {
@@ -367,15 +882,56 @@ describe("ComposerMicButton (server dictation)", () => {
     expect(onInterim).toHaveBeenCalledWith("");
   });
 
-  it("surfaces mic permission denial in the tooltip", async () => {
+  it("does not publish a late stop tail after disable or unmount", async () => {
+    let resolveStop: ((tail: string) => void) | undefined;
+    sessionStopMock = vi.fn(
+      () =>
+        new Promise<string>((resolve) => {
+          resolveStop = resolve;
+        }),
+    );
+    const onTranscript = vi.fn();
+    const view = renderServerMode({ onTranscript });
+    await clickMic();
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+
+    view.unmount();
+    await act(async () => resolveStop?.("late tail"));
+
+    expect(onTranscript).not.toHaveBeenCalled();
+  });
+
+  it("keeps Escape cancellation authoritative during an asynchronous stop", async () => {
+    let resolveStop: ((tail: string) => void) | undefined;
+    sessionStopMock = vi.fn(
+      () =>
+        new Promise<string>((resolve) => {
+          resolveStop = resolve;
+        }),
+    );
+    const onTranscript = vi.fn();
+    const onVoiceDiscard = vi.fn();
+    renderServerMode({ onTranscript, onVoiceDiscard });
+    await clickMic();
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    act(() => window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" })));
+    expect(screen.getByRole("status")).toHaveTextContent("Dictation cancelled");
+    expect(onVoiceDiscard).toHaveBeenCalledOnce();
+
+    await act(async () => resolveStop?.("late tail"));
+
+    expect(onTranscript).not.toHaveBeenCalled();
+    expect(screen.getByRole("status")).toHaveTextContent("Dictation cancelled");
+  });
+
+  it("shows mic permission denial with recovery guidance", async () => {
     sessionStartMock = vi.fn(async () => {
       throw new DOMException("denied", "NotAllowedError");
     });
     renderServerMode();
     await clickMic();
-    expect(screen.getByRole("button", { name: "Voice dictation" })).toHaveAttribute(
-      "title",
-      "Microphone permission denied",
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Microphone access denied. Allow access, then try again.",
     );
   });
 
@@ -387,7 +943,7 @@ describe("ComposerMicButton (server dictation)", () => {
     act(() => sessionEvents?.onError("dictation failed"));
     const button = screen.getByRole("button", { name: "Voice dictation" });
     expect(button).toHaveAttribute("aria-pressed", "false");
-    expect(button).toHaveAttribute("title", "Dictation unavailable");
+    expect(screen.getByRole("status")).toHaveTextContent("Dictation connection lost. Try again.");
     expect(onInterim).toHaveBeenCalledWith("");
   });
 
@@ -397,20 +953,28 @@ describe("ComposerMicButton (server dictation)", () => {
     // build at runtime with "network". The take must fall back to server
     // dictation so the user's click still lands.
     const onInterim = vi.fn();
+    const onVoiceStart = vi.fn();
     render(
       <CapabilitiesContext.Provider value={DICTATION_INFO}>
-        <ComposerMicButton onTranscript={vi.fn()} onInterim={onInterim} />
+        <ComposerMicButton
+          onTranscript={vi.fn()}
+          onInterim={onInterim}
+          onVoiceStart={onVoiceStart}
+        />
       </CapabilitiesContext.Provider>,
     );
     const button = screen.getByRole("button", { name: "Voice dictation" });
 
     fireEvent.click(button);
     expect(startSpy).toHaveBeenCalledTimes(1);
+    act(() => handlers.start?.({}));
+    expect(onVoiceStart).toHaveBeenCalledOnce();
     await act(async () => handlers.error?.({ error: "network" }));
 
     // The take restarted on the server path, with no error tooltip for
     // the silent switch, and partials flow.
     expect(sessionStartMock).toHaveBeenCalledTimes(1);
+    expect(onVoiceStart).toHaveBeenCalledOnce();
     expect(button).toHaveAttribute("aria-pressed", "true");
     expect(button).toHaveAttribute("title", "Voice dictation");
     act(() => sessionEvents?.onPartial("via server"));
@@ -430,6 +994,44 @@ describe("ComposerMicButton (server dictation)", () => {
     expect(sessionStartMock).toHaveBeenCalledTimes(1);
   });
 
+  it("snapshots once when Web Speech falls back before its start event", async () => {
+    const onVoiceStart = vi.fn();
+    render(
+      <CapabilitiesContext.Provider value={DICTATION_INFO}>
+        <ComposerMicButton onTranscript={vi.fn()} onVoiceStart={onVoiceStart} />
+      </CapabilitiesContext.Provider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+
+    await act(async () => handlers.error?.({ error: "network" }));
+
+    expect(sessionStartMock).toHaveBeenCalledOnce();
+    expect(onVoiceStart).toHaveBeenCalledOnce();
+  });
+
+  it("switches from an owned Web Speech meter to the borrowed fallback stream", async () => {
+    const meter = installMeterAudio();
+    const owned = mediaStream();
+    const borrowed = mediaStream();
+    getUserMediaMock.mockResolvedValue(owned.stream);
+    sessionStream = borrowed.stream;
+    render(
+      <CapabilitiesContext.Provider value={DICTATION_INFO}>
+        <ComposerMicButton onTranscript={vi.fn()} />
+      </CapabilitiesContext.Provider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    await act(async () => handlers.start?.({}));
+
+    await act(async () => handlers.error?.({ error: "network" }));
+
+    expect(getUserMediaMock).toHaveBeenCalledOnce();
+    expect(owned.stop).toHaveBeenCalledOnce();
+    expect(borrowed.stop).not.toHaveBeenCalled();
+    expect(meter.createMediaStreamSource).toHaveBeenNthCalledWith(1, owned.stream);
+    expect(meter.createMediaStreamSource).toHaveBeenNthCalledWith(2, borrowed.stream);
+  });
+
   it("reports a busy server distinctly from a broken one", async () => {
     const { DictationBusyError } = await import("@/lib/dictation");
     sessionStartMock = vi.fn(async () => {
@@ -437,10 +1039,7 @@ describe("ComposerMicButton (server dictation)", () => {
     });
     renderServerMode();
     await clickMic();
-    expect(screen.getByRole("button", { name: "Voice dictation" })).toHaveAttribute(
-      "title",
-      "Dictation is busy — try again shortly",
-    );
+    expect(screen.getByRole("status")).toHaveTextContent("Dictation is busy. Try again shortly.");
   });
 
   it("keeps the plain error path when the server offers no dictation", async () => {
@@ -453,7 +1052,7 @@ describe("ComposerMicButton (server dictation)", () => {
     fireEvent.click(button);
     await act(async () => handlers.error?.({ error: "network" }));
     expect(sessionStartMock).not.toHaveBeenCalled();
-    expect(button).toHaveAttribute("title", "Dictation unavailable");
+    expect(screen.getByRole("status")).toHaveTextContent("Could not start dictation. Try again.");
   });
 
   it("cancels the session when the composer goes disabled mid-take", async () => {

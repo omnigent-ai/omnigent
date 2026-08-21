@@ -104,6 +104,37 @@ def test_dictation_streams_transcript_into_composer(
         context.close()
 
 
+def test_dictation_replaces_selected_composer_text(
+    browser: Browser,
+    browser_context_args: dict[str, Any],
+    seeded_session: tuple[str, str],
+) -> None:
+    """A server transcript replaces the selected range instead of appending."""
+    base_url, session_id = seeded_session
+    context, page = _open_server_dictation_page(
+        browser, browser_context_args, base_url, session_id
+    )
+    try:
+        composer = page.get_by_placeholder("Ask the agent anything…")
+        expect(composer).to_be_visible()
+        composer.fill("before replace-me after")
+        composer.evaluate("el => el.setSelectionRange(7, 17)")
+
+        mic = page.get_by_role("button", name="Voice dictation")
+        mic.click()
+        expect(mic).to_have_attribute("aria-pressed", "true")
+        expect(composer).to_have_value(
+            f"before {_FAKE_SCRIPT} after",
+            timeout=_TRANSCRIPT_TIMEOUT_MS,
+        )
+
+        mic.click()
+        expect(mic).to_have_attribute("aria-pressed", "false")
+        expect(composer).to_have_value(f"before {_FAKE_SCRIPT} after")
+    finally:
+        context.close()
+
+
 def test_hotkey_toggles_dictation(
     browser: Browser,
     browser_context_args: dict[str, Any],

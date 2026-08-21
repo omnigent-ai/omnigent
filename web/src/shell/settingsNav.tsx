@@ -13,6 +13,7 @@ import {
   DownloadIcon,
   GitBranchIcon,
   KeyboardIcon,
+  MicIcon,
   PaletteIcon,
   Share2Icon,
   ShieldCheckIcon,
@@ -31,6 +32,7 @@ import { SIDEBAR_ROW } from "./sidebarStyles";
 
 export type SettingsSectionId =
   | "appearance"
+  | "dictation"
   | "git"
   | "shortcuts"
   | "account"
@@ -43,6 +45,7 @@ export type SettingsSectionId =
 
 const SECTION_IDS: readonly SettingsSectionId[] = [
   "appearance",
+  "dictation",
   "git",
   "shortcuts",
   "account",
@@ -84,6 +87,7 @@ export function settingsNavGroups(
 ): SettingsNavGroup[] {
   const general: SettingsNavItem[] = [
     { id: "appearance", label: "Appearance", icon: PaletteIcon },
+    { id: "dictation", label: "Dictation", icon: MicIcon },
     { id: "git", label: "Git", icon: GitBranchIcon },
     { id: "shortcuts", label: "Keyboard shortcuts", icon: KeyboardIcon, hideOnMobile: true },
   ];
