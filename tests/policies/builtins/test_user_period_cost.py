@@ -9,10 +9,7 @@ from __future__ import annotations
 import pytest
 
 from omnigent.policies.builtins.cost import user_period_cost_budget
-from omnigent.policies.schema import (
-    USER_DAILY_ASK_APPROVED_STATE_KEY,
-    USER_PERIOD_ASK_APPROVED_STATE_KEY,
-)
+from omnigent.policies.schema import USER_PERIOD_ASK_APPROVED_STATE_KEY
 
 
 def _event(
