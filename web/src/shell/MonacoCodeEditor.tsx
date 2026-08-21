@@ -37,10 +37,10 @@ import { useEditorAutoSave } from "./useEditorAutoSave";
 import {
   ensureLanguage,
   ensureMonacoReady,
+  monaco,
   monacoLanguageId,
   resolvedThemeToMonaco,
 } from "./monacoSetup";
-import type { monaco } from "./monacoSetup";
 import { useMonacoCommentLayer, type CodeEditorInstance } from "./useMonacoCommentLayer";
 import { attachEditorScrollRestore } from "./useScrollRestore";
 import "./monacoCodeEditor.css";
@@ -295,7 +295,7 @@ function MonacoCodeEditorInner({
   scrollKeyRef.current = `viewer:${conversationId}:${path}`;
 
   const handleMount: OnMount = useCallback(
-    (editor, monaco) => {
+    (editor, monacoApi) => {
       editorInstanceRef.current = editor;
       baselineRef.current = editor.getValue();
       latestContentRef.current = editor.getValue();
@@ -306,14 +306,14 @@ function MonacoCodeEditorInner({
         .getModel()
         ?.setEOL(
           content.includes("\r\n")
-            ? monaco.editor.EndOfLineSequence.CRLF
-            : monaco.editor.EndOfLineSequence.LF,
+            ? monacoApi.editor.EndOfLineSequence.CRLF
+            : monacoApi.editor.EndOfLineSequence.LF,
         );
       // Route ⌘S through the same single-flight + trailing-save engine as
       // auto-save, so a manual save during an in-flight/debounced auto-save can't
       // start an overlapping PUT.
       // Monaco keybindings are bitwise OR'd flags.
-      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
+      editor.addCommand(monacoApi.KeyMod.CtrlCmd | monacoApi.KeyCode.KeyS, () => {
         flushRef.current();
       });
       // Flush a pending debounce when focus leaves the editor (snappier than
@@ -479,6 +479,11 @@ function MonacoCodeEditorInner({
         fontSize: font.sizePx,
         fontFamily: codeFontFamilyForEditor(font.family),
       });
+      // A newly-loaded webfont changes the glyph cell metrics after the family
+      // was set. Monaco caches font measurements, so tell it to re-measure or
+      // the editor keeps laying out against the fallback's cell size until the
+      // next reflow. Cheap and safe when nothing changed.
+      monaco.editor.remeasureFonts();
     });
   }, []);
 

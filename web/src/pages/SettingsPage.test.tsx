@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import type { ElectronUpdateBridge, UpdateConfig, UpdateStatus } from "@/lib/nativeBridge";
+import { UI_FONT_FAMILY_FALLBACK } from "@/lib/uiFontPreferences";
 
 const mocks = vi.hoisted(() => ({
   setTheme: vi.fn(),
@@ -428,7 +429,7 @@ describe("SettingsPage", () => {
     // ...and applied live to the document root, with the system stack appended
     // so an uninstalled/partial name degrades to the default sans, not serif.
     expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe(
-      "Inter, var(--font-sans)",
+      `Inter, ${UI_FONT_FAMILY_FALLBACK}`,
     );
     expect(screen.getByTestId("ui-font-family-reset")).not.toBeDisabled();
   });

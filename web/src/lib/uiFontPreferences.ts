@@ -13,6 +13,8 @@
 // `var(--ui-font-family, var(--font-sans))`, so an unset family falls back to
 // the system stack and any value we set on documentElement wins.
 
+import { createCssFontFamilyPreference } from "./cssFontFamilyPreference";
+
 const STORAGE_KEY = "omnigent:ui-font-size";
 
 export const UI_FONT_SIZE_DEFAULT = 13;
@@ -84,25 +86,25 @@ const FONT_FAMILY_STORAGE_KEY = "omnigent:ui-font-family";
 /** Empty string = "System default": no override, falls back to `--font-sans`. */
 export const UI_FONT_FAMILY_DEFAULT = "";
 
-/** Longest family name we'll accept — a guard against a corrupt/oversized entry. */
-const UI_FONT_FAMILY_MAX_LENGTH = 100;
-
 /**
- * Normalize a raw family name into a value safe to persist and to set as a CSS
- * custom property: trimmed, with characters that could terminate the
- * declaration or open a new one (`;{}` and control chars) stripped. Over-long
- * input collapses to the default. Returns "" for anything that isn't a usable
- * family, so callers treat empty as "System default".
+ * The sans stack the UI font falls back to when no custom family is set (or an
+ * uninstalled name is chosen). It's the `--font-sans` variable rather than a
+ * literal so the CSS var and the appended fallback stay in lockstep, and so
+ * SettingsPage can name the fallback semantically instead of repeating the
+ * literal (mirrors {@link CODE_FONT_FAMILY_FALLBACK}).
  */
-function normalizeUiFontFamily(value: unknown): string {
-  if (typeof value !== "string") return UI_FONT_FAMILY_DEFAULT;
-  // eslint-disable-next-line no-control-regex -- intentionally stripping control chars
-  const cleaned = value.replace(/[;{}\x00-\x1f\x7f]/g, "").trim();
-  if (!cleaned || cleaned.length > UI_FONT_FAMILY_MAX_LENGTH) {
-    return UI_FONT_FAMILY_DEFAULT;
-  }
-  return cleaned;
-}
+export const UI_FONT_FAMILY_FALLBACK = "var(--font-sans)";
+
+// The whole UI font-family preference — read/normalize/persist/apply — is the
+// shared CSS-variable-backed shape. Setting `--ui-font-family` on the document
+// root drives the `html` rule in index.css; the `sans` category loads the right
+// catalog entry for a shared family.
+const uiFontFamilyPreference = createCssFontFamilyPreference({
+  key: FONT_FAMILY_STORAGE_KEY,
+  cssVar: "--ui-font-family",
+  fallback: UI_FONT_FAMILY_FALLBACK,
+  category: "sans",
+});
 
 /**
  * Read the persisted UI font family.
@@ -112,15 +114,7 @@ function normalizeUiFontFamily(value: unknown): string {
  * corrupt entry can't break app boot.
  */
 export function readUiFontFamily(): string {
-  if (typeof window === "undefined") return UI_FONT_FAMILY_DEFAULT;
-  try {
-    const raw = window.localStorage.getItem(FONT_FAMILY_STORAGE_KEY);
-    if (!raw) return UI_FONT_FAMILY_DEFAULT;
-    const parsed: unknown = JSON.parse(raw);
-    return normalizeUiFontFamily(parsed);
-  } catch {
-    return UI_FONT_FAMILY_DEFAULT;
-  }
+  return uiFontFamilyPreference.read();
 }
 
 /**
@@ -129,17 +123,7 @@ export function readUiFontFamily(): string {
  * quota/access errors so a failed write can't break the app.
  */
 export function writeUiFontFamily(name: string): void {
-  if (typeof window === "undefined") return;
-  try {
-    const normalized = normalizeUiFontFamily(name);
-    if (!normalized) {
-      window.localStorage.removeItem(FONT_FAMILY_STORAGE_KEY);
-      return;
-    }
-    window.localStorage.setItem(FONT_FAMILY_STORAGE_KEY, JSON.stringify(normalized));
-  } catch {
-    // localStorage quota or access errors shouldn't break the app.
-  }
+  uiFontFamilyPreference.write(name);
 }
 
 /**
@@ -150,17 +134,9 @@ export function writeUiFontFamily(name: string): void {
  * The chosen family is applied WITH the system stack appended
  * (`<name>, var(--font-sans)`) so a name that isn't installed — or a partial one
  * typed so far — degrades to the app's default sans rather than the browser's
- * default serif. (The `var(--ui-font-family, …)` fallback in the CSS only fires
- * when the property is unset, not when it holds an unusable name, so the
- * fallback has to live inside the value too.) This is the single source of the
- * DOM side-effect.
+ * default serif. Also kicks a fire-and-forget webfont load for a catalog family.
+ * This is the single source of the DOM side-effect.
  */
 export function applyUiFontFamily(name: string): void {
-  if (typeof document === "undefined") return;
-  const normalized = normalizeUiFontFamily(name);
-  if (!normalized) {
-    document.documentElement.style.removeProperty("--ui-font-family");
-    return;
-  }
-  document.documentElement.style.setProperty("--ui-font-family", `${normalized}, var(--font-sans)`);
+  uiFontFamilyPreference.apply(name);
 }
