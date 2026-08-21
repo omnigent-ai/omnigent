@@ -655,9 +655,11 @@ class PolicyEngine:
         if self._user_period_cost is None:
             return
         period_str = self._user_period_cost.get("period")
-        if not period_str:
+        if not isinstance(period_str, str):
             return
         harness = self._user_period_cost.get("harness")
+        if harness is not None and not isinstance(harness, str):
+            return
 
         self._store.set_period_ask_approved(owner, period_str, approved, harness=harness)
         # Keep the in-memory snapshot current so any later evaluate() on
