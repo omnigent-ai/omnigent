@@ -335,7 +335,7 @@ platform :ios do
     xcargs = ["-allowProvisioningUpdates"]
     xcargs << "CURRENT_PROJECT_VERSION=#{options[:build_number]}" if options[:build_number]
     if flavor
-      xcargs << "PRODUCT_BUNDLE_IDENTIFIER=#{flavor[:bundle_id].shellescape}"
+      xcargs << "OMNIGENT_APP_BUNDLE_ID=#{flavor[:bundle_id].shellescape}"
       xcargs << "APP_DISPLAY_NAME=#{flavor[:display_name].shellescape}"
     end
     build_app(

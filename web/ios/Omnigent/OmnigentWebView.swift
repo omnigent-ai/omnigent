@@ -497,6 +497,12 @@ struct OmnigentWebView: UIViewRepresentable {
       // stylesheet persists across in-app navigation.
       if pinnedOrigin != nil, webView.url?.omnigentOrigin == pinnedOrigin {
         webView.evaluateJavaScript(WorkspaceChromeScript.source)
+        if let pinnedURL {
+          WatchBridge.shared.sync(
+            serverURL: pinnedURL,
+            cookieStore: webView.configuration.websiteDataStore.httpCookieStore
+          )
+        }
         parent.loadSucceeded()
       }
     }
