@@ -152,10 +152,28 @@ jobs:
           # third-party pinned packages anyway — OSV has no advisories for
           # local source. Filtering all `-e` lines (rather than naming each
           # workspace member) keeps this correct if members are added later.
-          uv export --frozen --format requirements-txt --all-extras \
-            > /tmp/uv-req-full.txt
-          grep -v '^-e ' /tmp/uv-req-full.txt > /tmp/uv-req.txt
-          uvx pip-audit --requirement /tmp/uv-req.txt --no-deps
+          #
+          # The extras are NOT mutually installable: `antigravity` declares
+          # conflicts with `cwsandbox`/`modal`/`databricks` (and the lint
+          # group), so a single `--all-extras` export dies during resolution
+          # and thereby blocks every gated CI job on any PR that changes
+          # uv.lock (#4942). Audit the maximal compatible resolution sets
+          # separately instead: everything except the conflicting extra, then
+          # the conflicting extra alone with no default groups. The two files
+          # are deliberately NOT merged into one pip-audit run: a package can
+          # legitimately pin different versions per set (e.g. protobuf 6.x for
+          # cwsandbox/modal vs 7.x for antigravity), which a single
+          # requirements file would present as conflicting pins. Overlapping
+          # base pins are simply audited twice — harmless.
+          uv export --frozen --format requirements-txt \
+            --all-extras --no-extra antigravity > /tmp/uv-req-set-a.txt
+          uv export --frozen --format requirements-txt \
+            --extra antigravity --no-default-groups > /tmp/uv-req-set-b.txt
+          for reqs in /tmp/uv-req-set-a.txt /tmp/uv-req-set-b.txt; do
+            grep -v '^-e ' "$reqs" > /tmp/uv-req.txt
+            echo "pip-audit: $(grep -c '==' /tmp/uv-req.txt) pinned packages from $reqs"
+            uvx pip-audit --requirement /tmp/uv-req.txt --no-deps
+          done
 
       - name: Semgrep (changed files, local rules)
         if: ${{ steps.gate.outputs.scan == 'true' }}
