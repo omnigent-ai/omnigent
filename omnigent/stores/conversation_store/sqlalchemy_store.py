@@ -1470,12 +1470,16 @@ class SqlAlchemyConversationStore(ConversationStore):
             # Generic dialect fallback — SELECT-then-INSERT/UPDATE in one
             # transaction (race-safe under SERIALIZABLE / SQLite's
             # single-writer semantics).
-            existing = session.get(SqlUserDailyCost, (current_workspace_id(), user_id, day_utc))
+            existing = session.get(
+                SqlUserDailyCost,
+                (current_workspace_id(), user_id, day_utc, CROSS_HARNESS_SENTINEL),
+            )
             if existing is None:
                 session.add(
                     SqlUserDailyCost(
                         user_id=user_id,
                         day_utc=day_utc,
+                        harness=CROSS_HARNESS_SENTINEL,
                         cost_usd=delta_usd,
                         updated_at=now,
                     )
@@ -1525,9 +1529,15 @@ class SqlAlchemyConversationStore(ConversationStore):
             from sqlalchemy.dialects.postgresql import insert as pg_insert
 
             stmt = pg_insert(SqlUserDailyCost)
-        stmt = stmt.values(user_id=user_id, day_utc=day_utc, cost_usd=delta_usd, updated_at=now)
+        stmt = stmt.values(
+            user_id=user_id,
+            day_utc=day_utc,
+            harness=CROSS_HARNESS_SENTINEL,
+            cost_usd=delta_usd,
+            updated_at=now,
+        )
         stmt = stmt.on_conflict_do_update(
-            index_elements=["workspace_id", "user_id", "day_utc"],
+            index_elements=["workspace_id", "user_id", "day_utc", "harness"],
             set_={
                 "cost_usd": SqlUserDailyCost.cost_usd + stmt.excluded.cost_usd,
                 "updated_at": stmt.excluded.updated_at,
@@ -1546,7 +1556,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             exists for ``(user_id, day_utc)``.
         """
         with self._session("get_daily_cost") as session:
-            row = session.get(SqlUserDailyCost, (current_workspace_id(), user_id, day_utc))
+            row = session.get(
+                SqlUserDailyCost,
+                (current_workspace_id(), user_id, day_utc, CROSS_HARNESS_SENTINEL),
+            )
             return float(row.cost_usd) if row is not None else 0.0
 
     def sum_daily_cost(self, user_id: str, since_day_utc: str) -> float:
@@ -1593,7 +1606,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             both ``0.0`` when no row exists for ``(user_id, day_utc)``.
         """
         with self._session("get_daily_cost_state") as session:
-            row = session.get(SqlUserDailyCost, (current_workspace_id(), user_id, day_utc))
+            row = session.get(
+                SqlUserDailyCost,
+                (current_workspace_id(), user_id, day_utc, CROSS_HARNESS_SENTINEL),
+            )
             if row is None:
                 return {"cost_usd": 0.0, "ask_approved_usd": 0.0}
             return {
@@ -1637,6 +1653,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 stmt = stmt.values(
                     user_id=user_id,
                     day_utc=day_utc,
+                    harness=CROSS_HARNESS_SENTINEL,
                     cost_usd=0.0,
                     ask_approved_usd=ask_approved_usd,
                     updated_at=now,
@@ -1644,7 +1661,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # On conflict touch only the approval (+ stamp) — never
                 # the accumulated cost.
                 stmt = stmt.on_conflict_do_update(
-                    index_elements=["workspace_id", "user_id", "day_utc"],
+                    index_elements=["workspace_id", "user_id", "day_utc", "harness"],
                     set_={
                         "ask_approved_usd": stmt.excluded.ask_approved_usd,
                         "updated_at": stmt.excluded.updated_at,
@@ -1653,11 +1670,15 @@ class SqlAlchemyConversationStore(ConversationStore):
                 session.execute(stmt)
                 return
             # Generic dialect fallback — SELECT-then-INSERT/UPDATE.
-            existing = session.get(SqlUserDailyCost, (current_workspace_id(), user_id, day_utc))
+            existing = session.get(
+                SqlUserDailyCost,
+                (current_workspace_id(), user_id, day_utc, CROSS_HARNESS_SENTINEL),
+            )
             if existing is None:
                 session.add(
                     SqlUserDailyCost(
                         user_id=user_id,
+                        harness=CROSS_HARNESS_SENTINEL,
                         day_utc=day_utc,
                         cost_usd=0.0,
                         ask_approved_usd=ask_approved_usd,
