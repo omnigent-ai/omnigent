@@ -26,7 +26,7 @@ import re
 import uuid
 
 import httpx
-from playwright.sync_api import Locator, Page, expect
+from playwright.sync_api import Browser, Locator, Page, expect
 
 from tests.e2e_ui.conftest import seed_committed_turn
 
@@ -231,6 +231,42 @@ def test_remove_session_from_project(
 # mobile overlay and the folder header's new-session pencil (`max-md:hidden`)
 # collapses into the kebab.
 _MOBILE_VIEWPORT = {"width": 390, "height": 780}
+_TABLET_VIEWPORT = {"width": 834, "height": 1112}
+
+
+def test_project_header_action_is_clickable_on_mobile(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The Projects header keeps its new-project action visible on mobile."""
+    base_url, session_id = seeded_session
+    page.set_viewport_size(_MOBILE_VIEWPORT)
+    page.goto(f"{base_url}/c/{session_id}?sidebar=open")
+
+    new_project = page.get_by_test_id("new-project")
+    expect(new_project).to_be_visible()
+    new_project.click()
+    expect(page.get_by_placeholder("Project name…")).to_be_visible()
+
+
+def test_project_header_action_is_clickable_on_touch_tablet(
+    browser: Browser,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The Projects header action stays visible above ``md`` without hover."""
+    base_url, session_id = seeded_session
+    context = browser.new_context(viewport=_TABLET_VIEWPORT, has_touch=True)
+    page = context.new_page()
+    try:
+        page.goto(f"{base_url}/c/{session_id}")
+        assert page.evaluate("matchMedia('(hover: none)').matches")
+        new_project = page.get_by_test_id("new-project")
+        expect(new_project).to_be_visible()
+        expect(new_project.locator("xpath=../..")).to_have_css("opacity", "1")
+        new_project.click()
+        expect(page.get_by_placeholder("Project name…")).to_be_visible()
+    finally:
+        context.close()
 
 
 def test_project_new_session_folds_into_kebab_on_mobile(
