@@ -2042,8 +2042,7 @@ def _record_period_costs(
         # Log and continue; a period rollup failure should not break turn accounting.
         # The turn's daily cost was already recorded (via _record_daily_cost) so the
         # per-day rollup is safe even if period rollups fail.
-        import logging
-        logging.exception(
+        _logger.exception(
             "Period cost rollup failed for user=%s, delta=$%.4f; continuing turn accounting",
             owner,
             delta_usd,
