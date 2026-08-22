@@ -289,9 +289,9 @@ class ApprovalEvent(BaseModel):
     elicitation.
 
     Resolves the parked Future on whichever in-flight turn
-    registered the elicitation. Single-shot — an unknown
-    ``elicitation_id`` is a hard 404 because the URL path's
-    correlation token must match an outstanding elicitation.
+    registered the elicitation. Unknown never-seen
+    ``elicitation_id`` values are a hard 404. Already-completed
+    ids are idempotent (204) so duplicate delivery never 404s.
 
     Wire shape mirrors MCP's ``elicitation/create`` response per
     Principle 8 — same ``action`` + ``content`` fields as
@@ -415,6 +415,10 @@ class TurnContext:
         # Future[ElicitationResult]. Populated by ``elicit``;
         # resolved by the ``approval`` /events handler.
         self._pending_elicitations: dict[str, asyncio.Future[ElicitationResult]] = {}
+        # Tombstones for elicitation ids that already completed so
+        # duplicate ``approval`` deliveries stay idempotent after
+        # ``elicit``'s finally pops the Future (never-seen → 404).
+        self._completed_elicitations: set[str] = set()
         # Layer 3 per-policy-evaluation state:
         # ``evaluation_id`` → Future[PolicyVerdictPayload].
         # Populated by ``evaluate_policy``; resolved by the
@@ -611,16 +615,40 @@ class TurnContext:
         """
         Internal: resolve a pending elicitation Future.
 
+        Tombstones only after a real approval verdict is delivered
+        via ``set_result``. Cancelled / abandoned Futures (interrupt)
+        are done without a verdict and must not become idempotent
+        204s — a later stale approval for that id stays unknown (404).
+        Duplicate delivery after a real complete still returns True.
+
         :param elicitation_id: The id from the URL path.
         :param result: The MCP-shaped reply body.
-        :returns: ``True`` if a pending elicitation was resolved,
-            ``False`` if the id didn't match anything outstanding
-            (the route returns 404 in that case).
+        :returns: ``True`` if this id was newly resolved or was
+            already completed with a real verdict (idempotent),
+            ``False`` if the id was never registered, or only
+            cancelled without delivery.
         """
+        if elicitation_id in self._completed_elicitations:
+            return True
         future = self._pending_elicitations.get(elicitation_id)
-        if future is None or future.done():
+        if future is None:
             return False
+        if future.done():
+            # Interrupt/cancel abandons are done() without a verdict.
+            # Only a successful set_result delivery is idempotent.
+            if future.cancelled():
+                return False
+            try:
+                exc = future.exception()
+            except asyncio.CancelledError:
+                return False
+            if exc is not None:
+                return False
+            # Race: real result already set, tombstone not yet recorded.
+            self._completed_elicitations.add(elicitation_id)
+            return True
         future.set_result(result)
+        self._completed_elicitations.add(elicitation_id)
         return True
 
     async def evaluate_policy(
@@ -778,6 +806,10 @@ class HarnessApp:
         # at its REST boundary), but stored as a dict so the route
         # handlers can look up by id without assuming uniqueness.
         self._in_flight: dict[str, TurnContext] = {}
+        # Process-lifetime tombstones for elicitation ids that already
+        # completed. Survives turn teardown so a duplicate ``approval``
+        # after ``_in_flight`` drop still returns 204 (never-seen 404).
+        self._completed_elicitations: set[str] = set()
         # The currently active turn context, or ``None`` when idle.
         # Set under ``_lock`` when a turn starts, cleared
         # synchronously when the streaming generator finishes
@@ -1702,19 +1734,25 @@ class HarnessApp:
         :class:`ApprovalEvent`.
 
         Invoked by :meth:`_post_session_event` for ``approval``
-        events. The id MUST belong to an outstanding elicitation
-        on one of the in-flight turns; otherwise raises 404.
+        events. First delivery completes the parked Future.
+        Duplicate delivery of a completed id is idempotent (204).
+        Never-seen ids raise 404.
 
         :param elicitation_id: Correlation id from the event body.
         :param body: MCP-shape :class:`ElicitationResult` adapted
             from the :class:`ApprovalEvent`.
-        :returns: 204 on success.
-        :raises OmnigentError: 404 if no pending elicitation
-            matches the id (across all in-flight turns).
+        :returns: 204 on success (including idempotent redelivery).
+        :raises OmnigentError: 404 if no in-flight turn knows this
+            elicitation id (never outstanding, never completed).
         """
         for ctx in self._in_flight.values():
             if ctx._complete_elicitation(elicitation_id, body):
+                self._completed_elicitations.add(elicitation_id)
                 return Response(status_code=status.HTTP_204_NO_CONTENT)
+        # Turn may have already torn down after the first resolve;
+        # completed ids stay idempotent (204). Never-seen still 404.
+        if elicitation_id in self._completed_elicitations:
+            return Response(status_code=status.HTTP_204_NO_CONTENT)
         raise OmnigentError(
             f"no outstanding elicitation {elicitation_id!r}",
             code=ErrorCode.NOT_FOUND,
