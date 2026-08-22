@@ -207,6 +207,29 @@ def test_ensure_local_omnigent_server_respawns_on_config_drift(
     )
 
 
+def test_server_config_signature_changes_with_features(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Changing the startup feature set forces a managed-server respawn."""
+    monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
+    sig_off = local_server.server_config_signature()
+
+    monkeypatch.setenv("OMNIGENT_FEATURES", "usage_page")
+    sig_on = local_server.server_config_signature()
+
+    assert sig_off != sig_on
+    assert sig_on == local_server.server_config_signature()
+
+
+def test_remote_daemon_signature_ignores_local_server_features(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Remote host daemons do not parse config for a server they do not own."""
+    monkeypatch.setenv("OMNIGENT_FEATURES", "not-a-feature")
+
+    assert local_server.server_config_signature(include_features=False)
+
+
 def test_server_config_signature_changes_with_version(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -627,7 +650,7 @@ def test_ensure_local_omnigent_server_spawn_records_and_returns_log_path(
     monkeypatch.setattr(local_server, "_LOCAL_SERVER_SIG_PATH", sig_file)
     monkeypatch.setattr(local_server, "_LOCAL_SERVER_LOG_REF_PATH", log_ref)
     # Point the persistent data dir at tmp so logs/server lands under tmp.
-    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / ".omnigent"))
 
     class _Proc:
         pid = 9001

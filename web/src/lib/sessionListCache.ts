@@ -2,13 +2,16 @@
 // `WS /v1/sessions/updates` stream) into the TanStack Query cache that
 // backs the sidebar's `["conversations", ...]` infinite queries.
 //
-// Kept side-effect-free and React-free so the merge / remove logic can be
-// unit-tested directly. Production callers wire these to the real
-// QueryClient: SessionUpdatesProvider (push deltas) and
-// useRenameConversation (overlaying the PATCH response after a rename).
+// The merge / remove logic is pure so it can be unit-tested directly;
+// `overlayTitleIntoCaches` takes the QueryClient as a parameter rather than
+// reaching for a hook, keeping this module free of React runtime imports.
+// Production callers: SessionUpdatesProvider (push deltas),
+// useRenameConversation (overlaying the PATCH response after a rename), and
+// the chat store's `session.title` handler (a terminal-side `/rename`).
 
-import type { InfiniteData } from "@tanstack/react-query";
+import type { InfiniteData, QueryClient } from "@tanstack/react-query";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
+import type { Session } from "@/lib/types";
 
 /** Cache value shape for a `useConversations` infinite query. */
 export type ConversationsInfiniteData = InfiniteData<ConversationsPage, string | undefined>;
@@ -322,4 +325,69 @@ export function collectConversationIds(datas: (ConversationsInfiniteData | undef
     }
   }
   return [...ids];
+}
+
+/**
+ * Filters for a project-folder list (`["project-sessions", name]`) — those
+ * lists are non-archived and unsearched, the same dimensions the push-delta
+ * merge uses when overlaying rows into them.
+ */
+export const PROJECT_FOLDER_FILTERS = { searchQuery: "", includeArchived: false } as const;
+
+/**
+ * Overlay a title into every cache that holds a row for one session.
+ *
+ * Only the fields a rename changes are written — a full session snapshot
+ * carries nulls for absent fields that would clobber list-shaped rows (see
+ * {@link nullsToUndefined}). Covers the flat `["conversations"]` lists, the
+ * per-project `["project-sessions"]` lists (a filed session renders from its
+ * own list, so skipping it leaves the folder row stale), the pinned-row
+ * `["conversation-backfill"]` cache, and the per-session `["session"]`
+ * snapshot — the last two have long stale times and would otherwise serve
+ * the old title long after.
+ *
+ * Shared by the two paths that learn a title changed outside a list fetch:
+ * `useRenameConversation` (optimistic paint for a Web UI rename) and the
+ * `session.title` SSE handler (a `/rename` typed in a native terminal).
+ *
+ * @param queryClient - The app QueryClient.
+ * @param id - Conversation id whose title changed.
+ * @param title - The new title, or `null` to clear it.
+ * @param updatedAt - Optional `updated_at` to write alongside the title.
+ */
+export function overlayTitleIntoCaches(
+  queryClient: QueryClient,
+  id: string,
+  title: string | null,
+  updatedAt?: number,
+): void {
+  const wire: SessionListWireItem = {
+    id,
+    title,
+    ...(updatedAt !== undefined ? { updated_at: updatedAt } : {}),
+  };
+  const itemsById = new Map([[id, wire]]);
+  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+    queryKey: ["conversations"],
+  })) {
+    // activeId only gates `needsRefetch`, which both callers ignore —
+    // they patch in place rather than refetching.
+    const { data: next } = mergeItemsIntoPages(
+      data,
+      itemsById,
+      filtersFromConversationQueryKey(key),
+      undefined,
+    );
+    if (next !== data) queryClient.setQueryData(key, next);
+  }
+  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+    queryKey: ["project-sessions"],
+  })) {
+    const { data: next } = mergeItemsIntoPages(data, itemsById, PROJECT_FOLDER_FILTERS, undefined);
+    if (next !== data) queryClient.setQueryData(key, next);
+  }
+  queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
+    old ? { ...old, title, ...(updatedAt !== undefined ? { updated_at: updatedAt } : {}) } : old,
+  );
+  queryClient.setQueryData<Session>(["session", id], (old) => (old ? { ...old, title } : old));
 }

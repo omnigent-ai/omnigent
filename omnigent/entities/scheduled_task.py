@@ -45,6 +45,11 @@ class ScheduledTask:
         ``"claude-opus-4-7"``. ``None`` means use the agent default.
     :param reasoning_effort: Per-task reasoning-effort hint, e.g. ``"high"``.
         ``None`` means use the agent default.
+    :param max_cost_usd: Optional per-firing cost budget in USD. When set, the
+        fire path attaches a ``cost_budget`` policy to each spawned session that
+        blocks all models once cumulative spend reaches this limit. ``None``
+        means no per-firing cost cap (the session runs unconstrained unless the
+        agent spec or server-wide defaults impose one).
     :param workspace: Absolute existing path where a fired session's connected
         host runner should start. ``None`` only for legacy or invalid rows.
     :param base_branch: Reserved legacy column; scheduled tasks currently do
@@ -74,6 +79,7 @@ class ScheduledTask:
     workspace_id: int = 0
     model_override: str | None = None
     reasoning_effort: str | None = None
+    max_cost_usd: float | None = None
     workspace: str | None = None
     base_branch: str | None = None
     execution_target: str = "connected_host"

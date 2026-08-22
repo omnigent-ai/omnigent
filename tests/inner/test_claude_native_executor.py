@@ -10,7 +10,11 @@ from typing import Any
 
 import pytest
 
-from omnigent.claude_native_bridge import REQUEST_SESSION_ID_ENV_VAR
+from omnigent.claude_native_bridge import (
+    REQUEST_SESSION_ID_ENV_VAR,
+    ClaudePromptTimeout,
+    TmuxSessionNotAdvertised,
+)
 from omnigent.inner import claude_native_executor
 from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
 from omnigent.inner.executor import ExecutorConfig, ExecutorError, TurnComplete
@@ -1224,3 +1228,136 @@ async def test_a_routed_first_message_switches_the_model_exactly_once(
     )
     assert msg_calls == ["hello"]
     assert events == [TurnComplete(response=None)]
+
+
+@pytest.mark.asyncio
+async def test_run_turn_reaps_tmux_before_reporting_prompt_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A readiness timeout cannot leave a failed turn's pane alive."""
+    bridge_dir = tmp_path / "bridge"
+    killed: list[Path] = []
+
+    def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
+        del bridge_dir_arg, content, timeout_s
+        raise ClaudePromptTimeout("terminal did not become ready")
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "kill_session",
+        lambda bridge_dir_arg, *, timeout_s: killed.append(bridge_dir_arg),
+    )
+
+    executor = ClaudeNativeExecutor(bridge_dir)
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            system_prompt="",
+        )
+    ]
+
+    assert killed == [bridge_dir]
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+
+
+@pytest.mark.asyncio
+async def test_run_turn_does_not_reap_unrelated_runtime_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Only the readiness failure that terminalizes the turn triggers cleanup."""
+    killed: list[Path] = []
+
+    def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
+        del bridge_dir_arg, content, timeout_s
+        raise RuntimeError("tmux send-keys failed")
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "kill_session",
+        lambda *args, **kwargs: killed.append(args[0]),
+    )
+
+    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            system_prompt="",
+        )
+    ]
+
+    assert killed == []
+    assert isinstance(events[0], ExecutorError)
+
+
+@pytest.mark.asyncio
+async def test_run_turn_reports_reap_failure_with_prompt_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A failed hard-stop remains visible beside the delivery error."""
+
+    def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
+        del bridge_dir_arg, content, timeout_s
+        raise ClaudePromptTimeout("terminal did not become ready")
+
+    def fail_kill(bridge_dir_arg: Path, *, timeout_s: float) -> None:
+        del bridge_dir_arg, timeout_s
+        raise RuntimeError("tmux kill failed")
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
+    monkeypatch.setattr(claude_native_executor, "kill_session", fail_kill)
+
+    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            system_prompt="",
+        )
+    ]
+
+    assert isinstance(events[0], ExecutorError)
+    assert "terminal did not become ready" in events[0].message
+    assert "Cleanup also failed: tmux kill failed" in events[0].message
+
+
+@pytest.mark.asyncio
+async def test_run_turn_ignores_missing_tmux_during_timeout_reap(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A pane that exited during readiness polling needs no cleanup error."""
+
+    def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
+        del bridge_dir_arg, content, timeout_s
+        raise ClaudePromptTimeout("terminal did not become ready")
+
+    def absent_kill(bridge_dir_arg: Path, *, timeout_s: float) -> None:
+        del bridge_dir_arg, timeout_s
+        raise TmuxSessionNotAdvertised("not advertised")
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
+    monkeypatch.setattr(claude_native_executor, "kill_session", absent_kill)
+
+    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            system_prompt="",
+        )
+    ]
+
+    assert isinstance(events[0], ExecutorError)
+    assert events[0].message == "terminal did not become ready"

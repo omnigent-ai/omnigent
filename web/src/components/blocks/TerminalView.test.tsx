@@ -20,13 +20,25 @@ import {
   selectionHintText,
 } from "./TerminalView";
 
+const clipboardMock = vi.hoisted(() => ({
+  copyText: vi.fn<(text: string) => Promise<void>>(),
+  showToast: vi.fn(),
+}));
+
+vi.mock("@/lib/clipboard", () => ({ copyText: clipboardMock.copyText }));
+vi.mock("@/components/ui/toast", () => ({ showToast: clipboardMock.showToast }));
+
 const terminalSessionMock = vi.hoisted(() => ({
   instances: [] as {
     url: string;
+    container: HTMLDivElement;
     nativeSelection: boolean;
+    clipboardEnabled: boolean;
+    onClipboardRequest?: (text: string) => void;
     onState: (state: ConnectionState) => void;
     dispose: ReturnType<typeof vi.fn>;
     setTheme: ReturnType<typeof vi.fn>;
+    setClipboardEnabled: ReturnType<typeof vi.fn>;
     focus: ReturnType<typeof vi.fn>;
   }[],
 }));
@@ -38,23 +50,30 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
   TerminalSession: class {
     dispose = vi.fn();
     setTheme = vi.fn();
+    setClipboardEnabled = vi.fn();
     focus = vi.fn();
 
     constructor(
-      _container: HTMLDivElement,
+      container: HTMLDivElement,
       url: string,
       onState: (state: ConnectionState) => void,
       _isDark?: boolean,
       _onActivity?: () => void,
       _onInput?: () => void,
       nativeSelection = false,
+      clipboardEnabled = true,
+      onClipboardRequest?: (text: string) => void,
     ) {
       terminalSessionMock.instances.push({
         url,
+        container,
         nativeSelection,
+        clipboardEnabled,
+        onClipboardRequest,
         onState,
         dispose: this.dispose,
         setTheme: this.setTheme,
+        setClipboardEnabled: this.setClipboardEnabled,
         focus: this.focus,
       });
     }
@@ -63,6 +82,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
 
 beforeEach(() => {
   terminalSessionMock.instances = [];
+  clipboardMock.copyText.mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -87,16 +107,28 @@ describe("buildAttachPath", () => {
     );
   });
 
+  it("appends ?omnigent_slice_key=host_id for host-sharded routing", () => {
+    expect(buildAttachPath("conv_abc", "terminal_bash_s1", false, "host_123")).toBe(
+      "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach?omnigent_slice_key=host_123",
+    );
+  });
+
   it("appends ?transport= when a transport override is given", () => {
-    expect(buildAttachPath("conv_abc", "terminal_bash_s1", false, "control")).toBe(
+    expect(buildAttachPath("conv_abc", "terminal_bash_s1", false, undefined, "control")).toBe(
       "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach?transport=control",
     );
   });
 
-  it("combines read_only and transport params", () => {
-    const path = buildAttachPath("conv_abc", "terminal_bash_s1", true, "control");
+  it("combines read_only, slice_key, and transport params", () => {
+    const path = buildAttachPath("conv_abc", "terminal_bash_s1", true, "host_789", "control");
     expect(path).toContain("read_only=true");
+    expect(path).toContain("omnigent_slice_key=host_789");
     expect(path).toContain("transport=control");
+  });
+
+  it("omits ?omnigent_slice_key when no hostId is provided", () => {
+    const path = buildAttachPath("conv_abc", "terminal_bash_s1", false);
+    expect(path.includes("omnigent_slice_key")).toBe(false);
   });
 
   it("omits ?transport when no override is given", () => {
@@ -137,6 +169,19 @@ describe("control-mode transport", () => {
     expect(inst.nativeSelection).toBe(true);
   });
 
+  it("disables clipboard bridging for read-only attaches", async () => {
+    render(
+      <TerminalView
+        sessionId="conv_abc"
+        terminalId="terminal_bash_s1"
+        transport="control"
+        readOnly
+      />,
+    );
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    expect(terminalSessionMock.instances[0].clipboardEnabled).toBe(false);
+  });
+
   it("hides the selection hint bar in control mode", async () => {
     render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" transport="control" />);
     await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
@@ -150,6 +195,38 @@ describe("control-mode transport", () => {
     expect(inst.url).not.toContain("transport");
     expect(inst.nativeSelection).toBe(false);
     expect(screen.getByTestId("terminal-selection-hint")).toBeInTheDocument();
+  });
+});
+
+describe("tmux clipboard", () => {
+  it("writes validated terminal copies through the shared clipboard helper", async () => {
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+
+    terminalSessionMock.instances[0].onClipboardRequest?.("copied text");
+
+    await waitFor(() => expect(clipboardMock.copyText).toHaveBeenCalledWith("copied text"));
+    expect(clipboardMock.showToast).toHaveBeenCalledWith("Copied from terminal.", {
+      duration: 1500,
+    });
+    expect(terminalSessionMock.instances[0].focus).toHaveBeenCalled();
+  });
+
+  it("offers a gesture-backed retry when automatic clipboard access fails", async () => {
+    clipboardMock.copyText
+      .mockRejectedValueOnce(new Error("permission denied"))
+      .mockResolvedValueOnce(undefined);
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+
+    terminalSessionMock.instances[0].onClipboardRequest?.("retry text");
+    await waitFor(() => expect(clipboardMock.showToast).toHaveBeenCalled());
+    const retryContent = clipboardMock.showToast.mock.calls[0][0];
+    render(retryContent);
+    fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+
+    await waitFor(() => expect(clipboardMock.copyText).toHaveBeenCalledTimes(2));
+    expect(clipboardMock.copyText).toHaveBeenLastCalledWith("retry text");
   });
 });
 
@@ -179,12 +256,62 @@ describe("hidden pre-warmed surface", () => {
     expect(inst.focus).toHaveBeenCalledTimes(1);
   });
 
+  it("toggles clipboard bridging when a warm surface is revealed", async () => {
+    const { rerender } = render(
+      <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active={false} />,
+    );
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    const inst = terminalSessionMock.instances[0];
+    expect(inst.clipboardEnabled).toBe(false);
+
+    rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active />);
+    await waitFor(() => expect(inst.setClipboardEnabled).toHaveBeenCalledWith(true));
+    expect(terminalSessionMock.instances).toHaveLength(1);
+  });
+
   it("does not focus on a plain active mount (WS-open handles it)", async () => {
     render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
     await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
     // No reveal edge — the session's own WS-open focus owns this case;
     // an extra explicit call would steal focus on every reconnect.
     expect(terminalSessionMock.instances[0].focus).not.toHaveBeenCalled();
+  });
+});
+
+describe("late direct-attach advert", () => {
+  it("retires the outgoing session when the advert lands on a live terminal", async () => {
+    // The runner's loopback advert reaches the client on a terminals
+    // refetch — after the terminal has already dialed. That prop change
+    // re-runs the attach ref for the SAME mount node (React 18 hands the
+    // node back rather than remounting, and skips the ref's cleanup), so
+    // the attach itself has to retire its predecessor. Without that,
+    // xterm stacks a second instance inside one node — two helper
+    // textareas, two renderers, two live bridges.
+    const { rerender } = render(
+      <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />,
+    );
+    await act(async () => {});
+    expect(terminalSessionMock.instances).toHaveLength(1);
+    const relayed = terminalSessionMock.instances[0];
+
+    rerender(
+      <TerminalView
+        sessionId="conv_abc"
+        terminalId="terminal_bash_s1"
+        directAttachUrl={
+          "ws://127.0.0.1:54321/v1/sessions/conv_abc" +
+          "/resources/terminals/terminal_bash_s1/attach?token=t"
+        }
+      />,
+    );
+    await act(async () => {});
+
+    // Same node, so this is a re-attach rather than a remount — which is
+    // exactly why the predecessor cannot be left running.
+    const readvertised = terminalSessionMock.instances.at(-1)!;
+    expect(readvertised).not.toBe(relayed);
+    expect(readvertised.container).toBe(relayed.container);
+    expect(relayed.dispose).toHaveBeenCalled();
   });
 });
 

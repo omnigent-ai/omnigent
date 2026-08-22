@@ -15,7 +15,14 @@ from fastapi.responses import JSONResponse
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID, Conversation, ConversationItem, PagedList
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.runtime import _globals, session_stream, set_runner_client, set_runner_router
+from omnigent.runtime import (
+    _globals,
+    session_stream,
+    set_runner_client,
+    set_runner_direct_attach_resolver,
+    set_runner_router,
+)
+from omnigent.server._runner_ws_tunnel import DirectAttachEndpoint
 from omnigent.server.routes.sessions import _ancestor_session_ids, create_sessions_router
 from omnigent.server.schemas import SessionEventInput
 
@@ -411,9 +418,16 @@ class _FakeRunnerRouter:
     def __init__(self, client: _FakeRunnerClient) -> None:
         self.client = client
         self.resource_calls: list[str] = []
+        self.resource_conversations: list[Conversation | None] = []
 
-    def client_for_session_resources(self, session_id: str) -> _RoutedRunner:
+    def client_for_session_resources(
+        self,
+        session_id: str,
+        *,
+        conversation: Conversation | None = None,
+    ) -> _RoutedRunner:
         self.resource_calls.append(session_id)
+        self.resource_conversations.append(conversation)
         return _RoutedRunner(self.client)
 
 
@@ -421,11 +435,14 @@ class _FakeRunnerRouter:
 def runner_globals_reset() -> Iterator[None]:
     prior_client = _globals._runner_client
     prior_router = _globals._runner_router
+    prior_direct = _globals._runner_direct_attach_resolver
     set_runner_client(None)
     set_runner_router(None)
+    set_runner_direct_attach_resolver(None)
     yield
     set_runner_client(prior_client)
     set_runner_router(prior_router)
+    set_runner_direct_attach_resolver(prior_direct)
 
 
 @pytest.fixture
@@ -551,6 +568,9 @@ async def test_list_session_resources_proxies_to_bound_runner(
 
     assert resp.status_code == 200
     assert fake_router.resource_calls == ["79b22ebd2309e48fdeb450c65611d51b"]
+    assert [conv.id for conv in fake_router.resource_conversations if conv is not None] == [
+        "79b22ebd2309e48fdeb450c65611d51b"
+    ]
     assert fake_runner.calls == [
         ("GET", "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources")
     ]
@@ -658,6 +678,7 @@ async def test_claude_native_message_forwards_to_runner_without_persisting(
                 "terminal": "claude",
                 "session_key": "main",
                 "ensure_native_terminal": True,
+                "persist_resource_event": True,
             },
         ),
         (
@@ -1040,6 +1061,85 @@ async def test_list_terminals_forwards_pagination_params_to_runner(
     # here means the proxy dropped the whole query string — the
     # refresh-flips-tab-order regression.
     assert fake_runner.get_params == [{"order": "asc", "limit": "1000"}]
+
+
+def _terminals_only_payload() -> dict[str, object]:
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": "terminal_runner_s1",
+                "object": "session.resource",
+                "type": "terminal",
+                "session_id": "79b22ebd2309e48fdeb450c65611d51b",
+                "name": "runner:s1",
+                "metadata": {
+                    "terminal_name": "runner",
+                    "session_key": "s1",
+                    "running": True,
+                },
+            },
+        ],
+        "first_id": "terminal_runner_s1",
+        "last_id": "terminal_runner_s1",
+        "has_more": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_terminals_adds_direct_attach_url_when_advertised(
+    client: httpx.AsyncClient,
+) -> None:
+    """A runner-advertised loopback listener surfaces per-terminal URLs.
+
+    Permissions are disabled in this harness (single-user mode), which
+    the disclosure gate treats as owner — mirroring the relay's
+    write-attach behavior.
+    """
+    fake_runner = _FakeRunnerClient(payload=_terminals_only_payload())
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    set_runner_direct_attach_resolver(
+        lambda conversation_id: DirectAttachEndpoint(port=54321, token="tok_abc")
+    )
+
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals")
+
+    assert resp.status_code == 200
+    (item,) = resp.json()["data"]
+    assert item["metadata"]["direct_attach_url"] == (
+        "ws://127.0.0.1:54321/v1/sessions/79b22ebd2309e48fdeb450c65611d51b"
+        "/resources/terminals/terminal_runner_s1/attach?token=tok_abc"
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_terminals_without_resolver_leaves_payload_untouched(
+    client: httpx.AsyncClient,
+) -> None:
+    fake_runner = _FakeRunnerClient(payload=_terminals_only_payload())
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals")
+
+    assert resp.status_code == 200
+    (item,) = resp.json()["data"]
+    assert "direct_attach_url" not in item["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_list_terminals_without_runner_advert_leaves_payload_untouched(
+    client: httpx.AsyncClient,
+) -> None:
+    """A resolver miss (runner offline / no listener) adds nothing."""
+    fake_runner = _FakeRunnerClient(payload=_terminals_only_payload())
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    set_runner_direct_attach_resolver(lambda conversation_id: None)
+
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals")
+
+    assert resp.status_code == 200
+    (item,) = resp.json()["data"]
+    assert "direct_attach_url" not in item["metadata"]
 
 
 @pytest.mark.asyncio
@@ -2725,6 +2825,80 @@ async def test_filesystem_path_omits_absent_cursors(
 
 
 @pytest.mark.asyncio
+async def test_filesystem_base_host_forwards_an_absolute_path(
+    client: httpx.AsyncClient,
+) -> None:
+    """``?base=host`` reads a bare ``{path}`` as an absolute host path and
+    forwards it to the runner ``%2F``-encoded.
+
+    This is the wire form that survives a reverse proxy which merges the ``//``
+    the old leading-``%2F`` marker decoded to (the Databricks Apps front door
+    does exactly that). The path arrives here with literal slashes and no
+    leading marker; ``base=host`` is what restores its absoluteness, so a
+    directory above the workspace lists instead of showing an empty tree.
+    """
+    fake_runner = _FakeRunnerClient(payload=_fs_list_payload())
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
+        "/filesystem/Users/me/reports?limit=1000&order=asc&base=host",
+    )
+
+    assert resp.status_code == 200
+    forwarded_url = fake_runner.calls[0][1]
+    # The runner receives an absolute path: the leading slash re-added and
+    # sent as %2F, interior slashes literal.
+    assert "/filesystem/%2FUsers/me/reports?" in forwarded_url
+
+
+@pytest.mark.asyncio
+async def test_filesystem_bare_path_without_base_is_workspace_relative(
+    client: httpx.AsyncClient,
+) -> None:
+    """Without ``base=host`` a bare ``{path}`` stays workspace-relative.
+
+    This is the exact shape a slash-merging proxy produced from the old
+    absolute wire form — the regression. Pinned as the contrast that documents
+    why ``base=host`` is load-bearing: the runner must NOT receive a ``%2F``
+    absolute path here.
+    """
+    fake_runner = _FakeRunnerClient(payload=_fs_list_payload())
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
+        "/filesystem/Users/me/reports?limit=1000&order=asc",
+    )
+
+    assert resp.status_code == 200
+    forwarded_url = fake_runner.calls[0][1]
+    assert "/filesystem/Users/me/reports?" in forwarded_url
+    assert "%2F" not in forwarded_url
+
+
+@pytest.mark.asyncio
+async def test_filesystem_root_base_host_forwards_filesystem_root(
+    client: httpx.AsyncClient,
+) -> None:
+    """``?base=host`` on the no-path route browses the filesystem root, not the
+    workspace root: navigating up to ``/`` must not silently show the workspace.
+    """
+    fake_runner = _FakeRunnerClient(payload=_fs_list_payload())
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
+        "/filesystem?limit=1000&order=asc&base=host",
+    )
+
+    assert resp.status_code == 200
+    forwarded_url = fake_runner.calls[0][1]
+    # Root reconstructs to "/" -> %2F with an empty remainder.
+    assert "/filesystem/%2F?" in forwarded_url
+
+
+@pytest.mark.asyncio
 async def test_filesystem_read_proxies_to_runner(
     client: httpx.AsyncClient,
 ) -> None:
@@ -3122,6 +3296,36 @@ async def test_relay_persists_terminal_resource_created_from_runner() -> None:
     assert events[0].data.resource["id"] == "terminal_zsh_s1"
     # Resource events thread on the session id (matches the REST path).
     assert events[0].response_id == "79b22ebd2309e48fdeb450c65611d51b"
+
+
+@pytest.mark.asyncio
+async def test_relay_does_not_persist_transient_terminal_resource_created() -> None:
+    """Retry recovery publishes terminal readiness without changing history."""
+    from omnigent.server.routes.sessions import _relay_runner_stream
+
+    store = _ConversationStore()
+    client = _FakeStreamingRunnerClient(
+        [
+            _sse_frame(
+                {
+                    "type": "session.resource.created",
+                    "persist_resource_event": False,
+                    "resource": {
+                        "id": "terminal_claude_main",
+                        "type": "terminal",
+                        "name": "claude:main",
+                        "metadata": {"terminal_name": "claude", "session_key": "main"},
+                    },
+                }
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+
+    await _relay_runner_stream("79b22ebd2309e48fdeb450c65611d51b", client, store)  # type: ignore[arg-type]
+
+    events = [item for item in store.appended_items if item.type == "resource_event"]
+    assert events == []
 
 
 @pytest.mark.asyncio

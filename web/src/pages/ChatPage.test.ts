@@ -34,10 +34,12 @@ import {
   shouldShowTerminalSurface,
   updateWarmTerminalSurfaces,
   type WarmTerminalEntry,
+  isBackgroundTasksOnly,
   splitSlashCommand,
   stripGatedSubagentRoutingChips,
   stripPendingElicitations,
   subAgentComposerLabel,
+  unboundSessionResumableInApp,
   WORKING_MESSAGES,
   workingIndicatorLabel,
 } from "./ChatPage";
@@ -436,6 +438,30 @@ describe("buildPendingBubbles", () => {
     // p.author ("bob") wins over the viewer's selfAuthor ("alice").
     expect(bubble.createdBy).toBe("bob@example.com");
   });
+
+  it("carries the send-time stamp; replayed entries show no re-stamped time", () => {
+    // A fresh send was stamped once in the store at send time — the
+    // optimistic bubble shows THAT time, not a drifting render-time
+    // Date.now(). Snapshot-replayed entries carry no stamp (the server
+    // has none for pending inputs), so the bubble renders no timestamp
+    // rather than pretending the reload time was the send time.
+    const [stamped] = buildPendingBubbles(
+      [
+        {
+          tempId: "tmp_2",
+          content: [{ type: "input_text" as const, text: "hi" }],
+          createdAtS: 1_753_900_000,
+        },
+      ],
+      null,
+    ) as [Extract<Bubble, { kind: "user" }>];
+    expect(stamped.createdAtS).toBe(1_753_900_000);
+    const [replayed] = buildPendingBubbles(
+      [{ tempId: "tmp_3", content: [{ type: "input_text" as const, text: "hi" }] }],
+      null,
+    ) as [Extract<Bubble, { kind: "user" }>];
+    expect(replayed.createdAtS).toBeUndefined();
+  });
 });
 
 // ── mergePendingBubbles ────────────────────────────────────────────────────
@@ -454,9 +480,13 @@ const assistantText = (id: string): Bubble => ({
   error: null,
   items: [{ kind: "text", itemId: id, text: "hi", final: true }],
 });
-const elicitationBubble = (id: string, phase: string): Bubble => ({
+// A card with no turn to anchor to carries the `elicit_*` response id
+// blockStream stamps for exactly that case; pass `responseId` to model a
+// card that DOES belong to a turn (an inline approval, or a question card
+// the walker split into its own bubble).
+const elicitationBubble = (id: string, phase: string, responseId = `elicit_${id}`): Bubble => ({
   kind: "assistant",
-  responseId: id,
+  responseId,
   stableId: id,
   lifecycle: "completed",
   error: null,
@@ -621,6 +651,16 @@ describe("reorderCommittedRequestElicitations", () => {
 
   it("does NOT reorder a tool_call-phase card followed by a user message", () => {
     const committed = [elicitationBubble("e1", "tool_call"), userBubble("u1")];
+    const result = reorderCommittedRequestElicitations(committed);
+    expect(result).toBe(committed);
+    expect(bubbleIds(result)).toEqual(["e1", "u1"]);
+  });
+
+  it("does NOT reorder a card anchored to a turn", () => {
+    // A question/plan card the walker split out of its turn keeps that
+    // turn's response id. It gated nothing — the message after it is a NEW
+    // prompt — so lifting the prompt above it would reorder history.
+    const committed = [elicitationBubble("e1", "pre_tool_use", "resp_1"), userBubble("u1")];
     const result = reorderCommittedRequestElicitations(committed);
     expect(result).toBe(committed);
     expect(bubbleIds(result)).toEqual(["e1", "u1"]);
@@ -809,7 +849,7 @@ describe("computeShowsWorking", () => {
 
   it("parent idle stays idle in the main chat", () => {
     // Busy children are surfaced by the sidebar/Agents rail, not by the
-    // main chat's shimmer or pinned "Working…" pill.
+    // main chat's "Working…" shimmer.
     expect(computeShowsWorking("idle", opts())).toBe(false);
   });
 
@@ -981,61 +1021,69 @@ describe("shouldShowWorkingIndicator", () => {
 
 describe("workingIndicatorLabel — parked on a dialog", () => {
   it("names what the agent is waiting on", () => {
-    expect(workingIndicatorLabel(0, 0, "permission prompt")).toBe("Blocked on: permission prompt");
+    expect(workingIndicatorLabel(0, "permission prompt")).toBe("Blocked on: permission prompt");
   });
 
-  it("outranks the background tally and the rotation", () => {
+  it("outranks the rotation", () => {
     // Being blocked on the user is the one state that needs an action, and the
     // dialog may exist only in the terminal tab — so it must not be buried
-    // under a rotating "Cooking…" or a background-shell count.
-    expect(workingIndicatorLabel(3, 2, "dialog open")).toBe("Blocked on: dialog open");
+    // under a rotating "Cooking…".
+    expect(workingIndicatorLabel(2, "dialog open")).toBe("Blocked on: dialog open");
   });
 
   it("falls back to the normal label when not parked", () => {
-    expect(workingIndicatorLabel(0, 0, null)).toBe("Working…");
-    expect(workingIndicatorLabel(1, 0, null)).toBe("1 background task still running");
+    expect(workingIndicatorLabel(0, null)).toBe("Working…");
   });
 });
 
 describe("workingIndicatorLabel", () => {
-  it("shows the plain Working label when no background tasks remain", () => {
+  it("shows the plain Working label at the first tick", () => {
     expect(workingIndicatorLabel(0)).toBe("Working…");
   });
 
-  it("treats a negative count as no background tasks", () => {
-    // Defensive: the store seeds 0, but a stale/negative tally must never
-    // produce a nonsensical "-1 background tasks" label.
-    expect(workingIndicatorLabel(-1)).toBe("Working…");
-  });
-
-  it("uses the singular noun for exactly one background task", () => {
-    expect(workingIndicatorLabel(1)).toBe("1 background task still running");
-  });
-
-  it("pluralizes the noun for more than one background task", () => {
-    expect(workingIndicatorLabel(3)).toBe("3 background tasks still running");
+  it("does not report background tasks — the pill owns that count", () => {
+    // The shimmer is the working indicator; the background-task tally lives in
+    // BackgroundTaskPill, so the label never mentions it regardless of tick.
+    expect(workingIndicatorLabel(0)).toBe("Working…");
+    expect(workingIndicatorLabel(5)).toBe(WORKING_MESSAGES[5 % WORKING_MESSAGES.length]);
   });
 
   it("pins the first rotation message to 'Working…'", () => {
     // A fresh tick and the default arg both land on index 0, so this label
-    // must stay "Working…" — the invariant the (0) / (-1) cases rely on.
+    // must stay "Working…".
     expect(WORKING_MESSAGES[0]).toBe("Working…");
-    expect(workingIndicatorLabel(0, 0)).toBe("Working…");
+    expect(workingIndicatorLabel(0)).toBe("Working…");
   });
 
   it("rotates through the message pool by tick", () => {
-    expect(workingIndicatorLabel(0, 1)).toBe(WORKING_MESSAGES[1]);
-    expect(workingIndicatorLabel(0, 2)).toBe(WORKING_MESSAGES[2]);
+    expect(workingIndicatorLabel(1)).toBe(WORKING_MESSAGES[1]);
+    expect(workingIndicatorLabel(2)).toBe(WORKING_MESSAGES[2]);
   });
 
   it("wraps the rotation modulo the pool length", () => {
-    expect(workingIndicatorLabel(0, WORKING_MESSAGES.length)).toBe("Working…");
-    expect(workingIndicatorLabel(0, WORKING_MESSAGES.length + 1)).toBe(WORKING_MESSAGES[1]);
+    expect(workingIndicatorLabel(WORKING_MESSAGES.length)).toBe("Working…");
+    expect(workingIndicatorLabel(WORKING_MESSAGES.length + 1)).toBe(WORKING_MESSAGES[1]);
+  });
+});
+
+// ── isBackgroundTasksOnly ───────────────────────────────────────────────────
+
+describe("isBackgroundTasksOnly", () => {
+  it("is true only once the turn ends with background tasks and nothing blocked", () => {
+    // Turn over (not working) + shells linger → the pill owns the state.
+    expect(isBackgroundTasksOnly(2, null, false)).toBe(true);
+    expect(isBackgroundTasksOnly(0, null, false)).toBe(false);
   });
 
-  it("ignores the tick while background tasks remain", () => {
-    // The count is information, not decoration — it must not rotate away.
-    expect(workingIndicatorLabel(2, 5)).toBe("2 background tasks still running");
+  it("yields while the turn is still active so the shimmer shows too", () => {
+    // running/waiting or a local send in flight: the agent's turn is live, so
+    // the "Working…" shimmer wins and the pill sits alongside it.
+    expect(isBackgroundTasksOnly(2, null, true)).toBe(false);
+  });
+
+  it("yields to a parked dialog so the shimmer still shouts", () => {
+    // blockedOn needs an action; it must never sit as a quiet pill.
+    expect(isBackgroundTasksOnly(2, "permission prompt", false)).toBe(false);
   });
 });
 
@@ -1587,12 +1635,46 @@ describe("isUnboundCodingFork", () => {
   });
 });
 
+describe("unboundSessionResumableInApp", () => {
+  const owner = { unbound: true, isOwner: true, importSource: null };
+
+  it("is false unless the session is unbound", () => {
+    expect(unboundSessionResumableInApp({ ...owner, unbound: false })).toBe(false);
+  });
+
+  it("is false for a non-owner (launch_runner would 404)", () => {
+    // Regression: a shared viewer must not get a picker that always fails.
+    expect(unboundSessionResumableInApp({ ...owner, isOwner: false })).toBe(false);
+    expect(unboundSessionResumableInApp({ ...owner, isOwner: false, importSource: "claude" })).toBe(
+      false,
+    );
+  });
+
+  it("allows a non-import unbound session (e.g. an unbound fork)", () => {
+    expect(unboundSessionResumableInApp(owner)).toBe(true);
+  });
+
+  it("allows host-portable import sources", () => {
+    for (const src of ["claude", "codex", "pi", "opencode"]) {
+      expect(unboundSessionResumableInApp({ ...owner, importSource: src })).toBe(true);
+    }
+  });
+
+  it("blocks imports whose context does not carry to a chosen host", () => {
+    // kimi has no resume path; kiro/qwen resume only from a local file on the
+    // original machine — a chosen host would launch with no context.
+    for (const src of ["kimi", "kiro", "qwen"]) {
+      expect(unboundSessionResumableInApp({ ...owner, importSource: src })).toBe(false);
+    }
+  });
+});
+
 // The routing gates the ChatPage call site uses. The deployment flag is half of
 // each gate: a session-shape-eligible session on a server WITHOUT a routing
 // client must show no routing control at all, and neither must one while the
 // `/v1/info` probe is still in flight.
 describe("routing eligibility gates", () => {
-  function info(smartRouting: boolean): ServerInfo {
+  function info(smartRouting: boolean, sources?: { external: boolean; oss: boolean }): ServerInfo {
     return {
       accounts_enabled: false,
       single_user: false,
@@ -1605,7 +1687,8 @@ describe("routing eligibility gates", () => {
       public_sharing_enabled: true,
       server_version: null,
       smart_routing_enabled: smartRouting,
-      smart_routing_sources: { external: smartRouting, oss: smartRouting },
+      smart_routing_sources: sources ?? { external: smartRouting, oss: smartRouting },
+      features: {},
       harness_install_enabled: false,
       installable_harnesses: [],
       dictation_available: false,
@@ -1642,8 +1725,30 @@ describe("routing eligibility gates", () => {
     expect(isSubagentRoutingEligible("loading", nativeSession)).toBe(false);
   });
 
-  it("a native terminal session is excluded from cost routing but not subagent routing", () => {
-    expect(isCostRoutingEligible(info(true), nativeSession)).toBe(false);
+  it("a native pane follows the per-family router sources for cost routing", () => {
+    // The judge answers for any family, gateway-backed or not.
+    expect(isCostRoutingEligible(info(true, { external: false, oss: true }), nativeSession)).toBe(
+      true,
+    );
+    // External-only: the family must be gateway-backed on the session's host.
+    const externalOnly = info(true, { external: true, oss: false });
+    expect(
+      isCostRoutingEligible(externalOnly, nativeSession, {
+        gateway_inference: { "claude-native": false },
+      }),
+    ).toBe(false);
+    expect(
+      isCostRoutingEligible(externalOnly, nativeSession, {
+        gateway_inference: { "claude-native": true },
+      }),
+    ).toBe(true);
+    // An absent host row reads as backed (older host / no row), like the
+    // landing's gate.
+    expect(isCostRoutingEligible(externalOnly, nativeSession)).toBe(true);
+    // No router at all: the option is withheld.
+    expect(isCostRoutingEligible(info(true, { external: false, oss: false }), nativeSession)).toBe(
+      false,
+    );
     expect(isSubagentRoutingEligible(info(true), nativeSession)).toBe(true);
   });
 

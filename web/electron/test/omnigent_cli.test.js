@@ -20,6 +20,8 @@ const {
   parseDaemonRecord,
   daemonServerUrl,
   getHostConnectionFast,
+  probeServerAuth,
+  localHostId,
 } = require("../src/omnigent_cli");
 
 describe("normalizeServerUrl", () => {
@@ -310,5 +312,111 @@ describe("getHostConnectionFast — probe destination & token handling (S1)", ()
 
     assert.equal(calls.length, 1);
     assert.equal(calls[0].headers.Authorization, undefined);
+  });
+});
+
+describe("probeServerAuth — /v1/me auth gate", () => {
+  afterEach(() => {
+    mock.restoreAll();
+  });
+
+  it("returns authed for a 200 and targets {server}/v1/me with redirect:manual", async () => {
+    mock.method(fs, "readFileSync", () => "{}"); // no stored token
+    const calls = [];
+    mock.method(globalThis, "fetch", async (target, init) => {
+      calls.push({ target, init });
+      return { status: 200 };
+    });
+
+    const res = await probeServerAuth("https://app.example.com");
+
+    assert.deepEqual(res, { authed: true, reachable: true });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].target, "https://app.example.com/v1/me");
+    assert.equal(calls[0].init.redirect, "manual");
+  });
+
+  it("returns not-authed for non-200 statuses (Databricks 302, opaque-redirect 0, 401)", async () => {
+    mock.method(fs, "readFileSync", () => "{}");
+    const url = "https://app.example.com";
+
+    // Databricks-edge 302 to the workspace OAuth page.
+    mock.method(globalThis, "fetch", async () => ({ status: 302 }));
+    assert.deepEqual(await probeServerAuth(url), { authed: false, reachable: true });
+
+    // undici opaque-redirect (redirect:"manual") surfaces as status 0.
+    mock.method(globalThis, "fetch", async () => ({ status: 0 }));
+    assert.deepEqual(await probeServerAuth(url), { authed: false, reachable: true });
+
+    // Plain unauthenticated.
+    mock.method(globalThis, "fetch", async () => ({ status: 401 }));
+    assert.deepEqual(await probeServerAuth(url), { authed: false, reachable: true });
+  });
+
+  it("returns unreachable (never authed) when fetch throws", async () => {
+    mock.method(fs, "readFileSync", () => "{}");
+    mock.method(globalThis, "fetch", async () => {
+      throw new Error("ECONNREFUSED");
+    });
+
+    const res = await probeServerAuth("https://app.example.com");
+
+    assert.deepEqual(res, { authed: false, reachable: false });
+  });
+
+  it("attaches a stored session token, but none for a Databricks pointer", async () => {
+    const url = "https://app.example.com";
+
+    // Session-token record → Authorization attached, so an authed OIDC/accounts
+    // server can answer 200 and skip a needless login.
+    mock.method(fs, "readFileSync", () =>
+      JSON.stringify({ [url]: { token: "sess-123", expires_at: Date.now() / 1000 + 3600 } }),
+    );
+    let seen;
+    mock.method(globalThis, "fetch", async (_target, init) => {
+      seen = init.headers;
+      return { status: 200 };
+    });
+    await probeServerAuth(url);
+    assert.equal(seen.Authorization, "Bearer sess-123");
+
+    // Databricks pointer → no in-process token → no Authorization header (the
+    // unauthenticated probe correctly yields not-authed and defers to login).
+    mock.method(fs, "readFileSync", () =>
+      JSON.stringify({ [url]: { auth_type: "databricks", workspace_host: "https://ws" } }),
+    );
+    seen = undefined;
+    mock.method(globalThis, "fetch", async (_target, init) => {
+      seen = init.headers;
+      return { status: 302 };
+    });
+    await probeServerAuth(url);
+    assert.equal(seen.Authorization, undefined);
+  });
+
+  it("returns unreachable without fetching for an empty server URL", async () => {
+    const calls = [];
+    mock.method(globalThis, "fetch", async (target) => {
+      calls.push(target);
+      return { status: 200 };
+    });
+
+    const res = await probeServerAuth("");
+
+    assert.deepEqual(res, { authed: false, reachable: false });
+    assert.equal(calls.length, 0);
+  });
+});
+
+describe("localHostId", () => {
+  // The id is memoized process-wide, so this is the ONLY case that may call
+  // localHostId — a second one would read the cache, not the mocked file.
+  it("strips the legacy host_ prefix so the id matches a /v1/hosts row", () => {
+    mock.method(fs, "readFileSync", () => "host:\n  host_id: host_abc123\n  name: laptop\n");
+
+    // The renderer compares this against host_id as a plain string, so the
+    // prefixed form would make "this machine" unmatchable in the host list.
+    assert.equal(localHostId(), "abc123");
+    assert.equal(localHostId(), "abc123");
   });
 });

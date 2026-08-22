@@ -50,7 +50,7 @@ Run it from anywhere inside the checkout — it walks up to the repo root
 |---|---|---|
 | server | `uv run omnigent --log-to-stderr server --host 127.0.0.1 --port <p> --database-uri … --artifact-location …` | Waited on via `GET /health`. |
 | host   | `uv run omnigent --log-to-stderr host --server http://127.0.0.1:<p>` | Started once the server is healthy. |
-| vite   | `pnpm run dev -- --host <host> --port <p> --strictPort` (cwd `web/`) | `OMNIGENT_URL` points its proxy at the pod's server. |
+| vite   | `pnpm run dev --host <host> --port <p> --strictPort` (cwd `web/`) | `OMNIGENT_URL` points its proxy at the pod's server. |
 
 Before Vite starts (and on a manual Vite restart), omnidev runs `pnpm install`
 in `web/` when needed — `node_modules/` is missing, or `package.json` /

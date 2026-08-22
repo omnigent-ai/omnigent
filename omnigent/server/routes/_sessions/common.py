@@ -69,6 +69,9 @@ _SLASH_COMMAND_TYPE: str = "slash_command"
 _STOP_SESSION_TYPE: str = "stop_session"
 
 
+_RETRY_SESSION_TYPE: str = "retry_session"
+
+
 _EXTERNAL_ASSISTANT_MESSAGE_TYPE: str = "external_assistant_message"
 
 
@@ -126,6 +129,12 @@ _EXTERNAL_SESSION_USAGE_TYPE: str = "external_session_usage"
 _EXTERNAL_MODEL_CHANGE_TYPE: str = "external_model_change"
 
 
+_EXTERNAL_PERMISSION_MODE_CHANGE_TYPE: str = "external_permission_mode_change"
+
+
+_EXTERNAL_SESSION_TITLE_TYPE: str = "external_session_title"
+
+
 _EXTERNAL_MODEL_OPTIONS_TYPE: str = "external_model_options"
 
 
@@ -181,6 +190,21 @@ _EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE: str = "external_codex_approval_mode_c
 
 
 _CODEX_NATIVE_COLLABORATION_MODES: frozenset[str] = frozenset({"default", "plan"})
+
+
+# Current permission mode of a live claude-native session.
+# ``terminal_launch_args`` records only the launch mode, so this label is what
+# the web UI reads back after a reload.
+_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY = "omnigent.claude_native.permission_mode"
+
+
+# Permission modes switchable on a running session — the ones Claude
+# Code's shift+tab cycle can reach. Mirrors
+# ``claude_native_bridge.CYCLEABLE_PERMISSION_MODES``; ``dontAsk`` and
+# ``bypassPermissions`` are launch-only and rejected on PATCH.
+_CLAUDE_NATIVE_PERMISSION_MODES: frozenset[str] = frozenset(
+    {"default", "acceptEdits", "plan", "auto"}
+)
 
 
 _CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK = "Codex"
@@ -398,6 +422,7 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _MCP_ELICITATION_TYPE,
     _COMPACT_TYPE,
     _STOP_SESSION_TYPE,
+    _RETRY_SESSION_TYPE,
     _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
     _EXTERNAL_CONVERSATION_ITEM_TYPE,
     _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
@@ -412,7 +437,9 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_MCP_STARTUP_TYPE,
     _EXTERNAL_MODEL_CHANGE_TYPE,
     _EXTERNAL_MODEL_OPTIONS_TYPE,
+    _EXTERNAL_PERMISSION_MODE_CHANGE_TYPE,
     _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
+    _EXTERNAL_SESSION_TITLE_TYPE,
     _EXTERNAL_SESSION_TODOS_TYPE,
     _EXTERNAL_SUBAGENT_START_TYPE,
     _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
@@ -789,6 +816,8 @@ __all__ = [
     "_CLAUDE_NATIVE_MESSAGE_TIMEOUT_S",
     "_CLAUDE_NATIVE_MODEL",
     "_CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S",
+    "_CLAUDE_NATIVE_PERMISSION_MODES",
+    "_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY",
     "_CLAUDE_NATIVE_REMEMBER_INELIGIBLE_TOOLS",
     "_CLAUDE_NATIVE_SUBAGENT_ID_LABEL_KEY",
     "_CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE",
@@ -834,11 +863,13 @@ __all__ = [
     "_EXTERNAL_MODEL_OPTIONS_TYPE",
     "_EXTERNAL_OUTPUT_REASONING_DELTA_TYPE",
     "_EXTERNAL_OUTPUT_TEXT_DELTA_TYPE",
+    "_EXTERNAL_PERMISSION_MODE_CHANGE_TYPE",
     "_EXTERNAL_REASONING_EFFORT_CHANGE_TYPE",
     "_EXTERNAL_SESSION_INTERRUPTED_TYPE",
     "_EXTERNAL_SESSION_STATUS_TYPE",
     "_EXTERNAL_SESSION_STATUS_VALUES",
     "_EXTERNAL_SESSION_SUPERSEDED_TYPE",
+    "_EXTERNAL_SESSION_TITLE_TYPE",
     "_EXTERNAL_SESSION_TODOS_TYPE",
     "_EXTERNAL_SESSION_USAGE_TYPE",
     "_EXTERNAL_STATUS_ASSISTANT_SCAN_LIMIT",
@@ -879,6 +910,7 @@ __all__ = [
     "_OPENCODE_NATIVE_WRAPPER_LABEL_VALUE",
     "_PI_NATIVE_WRAPPER_LABEL_VALUE",
     "_RACE_TASK_REAP_TIMEOUT_S",
+    "_RETRY_SESSION_TYPE",
     "_RUNNER_CONVICTION_POLL_S",
     "_RUNNER_FORWARD_TIMEOUT",
     "_RUNNER_RELAY_READY_TIMEOUT_S",

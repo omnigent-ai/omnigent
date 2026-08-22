@@ -747,3 +747,53 @@ def test_vertex_claude_not_detected_when_incomplete(
     for var, val in env.items():
         monkeypatch.setenv(var, val)
     assert detect_providers() == []
+
+
+def test_prewarm_detect_providers_is_consumed_once(
+    clean_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A prewarmed sweep serves exactly the next detection, then expires.
+
+    One-shot semantics keep staleness bounded: only the runner-boot consumer
+    (seconds after the prewarm) sees the snapshot; every later call runs a
+    fresh sweep, exactly as before the prewarm existed.
+    """
+    sweeps: list[str] = []
+    sentinel = [
+        DetectedProvider(name="claude", kind="subscription", family="anthropic", source="test")
+    ]
+
+    def _fake_sweep() -> list[DetectedProvider]:
+        sweeps.append("sweep")
+        return sentinel
+
+    monkeypatch.setattr(ambient, "_detect_providers_now", _fake_sweep)
+    monkeypatch.setattr(ambient, "_prewarmed_detection", None)
+
+    ambient.prewarm_detect_providers()
+    # Consumes the prewarmed future — no second sweep.
+    assert detect_providers() == sentinel
+    assert sweeps == ["sweep"]
+    # The next call is fresh, not the stale snapshot.
+    assert detect_providers() == sentinel
+    assert sweeps == ["sweep", "sweep"]
+
+
+def test_prewarm_detect_providers_failure_falls_back_to_fresh_sweep(
+    clean_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crashed speculative sweep must not poison the real detection."""
+    sweeps: list[str] = []
+
+    def _flaky_sweep() -> list[DetectedProvider]:
+        sweeps.append("sweep")
+        if len(sweeps) == 1:
+            raise RuntimeError("scripted prewarm failure")
+        return []
+
+    monkeypatch.setattr(ambient, "_detect_providers_now", _flaky_sweep)
+    monkeypatch.setattr(ambient, "_prewarmed_detection", None)
+
+    ambient.prewarm_detect_providers()
+    assert detect_providers() == []
+    assert sweeps == ["sweep", "sweep"]

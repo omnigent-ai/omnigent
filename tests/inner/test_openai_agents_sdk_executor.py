@@ -445,6 +445,65 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
 
         _run(_t())
 
+    def test_reasoning_item_id_policy_defaults_to_sdk_behavior(self):
+        async def _t():
+            _FakeRunner.last_calls = []
+            _FakeRunner.next_result = _FakeResult(events=[], final_output="done")
+            executor = OpenAIAgentsSDKExecutor(client=object(), model="gpt-test")
+            with patch(
+                "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                return_value=_fake_agents_sdk(),
+            ):
+                _ = [
+                    event
+                    async for event in executor.run_turn(
+                        [{"role": "user", "content": "hi"}],
+                        [],
+                        "Be helpful.",
+                    )
+                ]
+
+            run_config = _FakeRunner.last_calls[0]["run_config"]
+            self.assertNotIn("reasoning_item_id_policy", run_config.kwargs)
+
+        _run(_t())
+
+    def test_reasoning_item_id_policy_is_configurable(self):
+        async def _t():
+            for policy in ("preserve", "omit"):
+                with self.subTest(policy=policy):
+                    _FakeRunner.last_calls = []
+                    _FakeRunner.next_result = _FakeResult(events=[], final_output="done")
+                    executor = OpenAIAgentsSDKExecutor(
+                        client=object(),
+                        model="gpt-test",
+                        reasoning_item_id_policy=policy,
+                    )
+                    with patch(
+                        "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                        return_value=_fake_agents_sdk(),
+                    ):
+                        _ = [
+                            event
+                            async for event in executor.run_turn(
+                                [{"role": "user", "content": "hi"}],
+                                [],
+                                "Be helpful.",
+                            )
+                        ]
+
+                    run_config = _FakeRunner.last_calls[0]["run_config"]
+                    self.assertEqual(run_config.kwargs["reasoning_item_id_policy"], policy)
+
+        _run(_t())
+
+    def test_reasoning_item_id_policy_rejects_invalid_value(self):
+        with self.assertRaisesRegex(ValueError, "reasoning_item_id_policy"):
+            OpenAIAgentsSDKExecutor(
+                client=object(),
+                reasoning_item_id_policy="invalid",  # type: ignore[arg-type]
+            )
+
     def test_sanitize_replay_item_drops_long_ids(self):
         item = {
             "type": "message",
@@ -2072,6 +2131,43 @@ def test_normalize_content_blocks_strips_filename_from_input_image() -> None:
     assert result == [{"type": "input_image", "image_url": "data:image/png;base64,abcd"}]
     assert "filename" not in result[0]
     assert result is not blocks
+
+
+def test_normalize_responses_items_wraps_string_assistant_content() -> None:
+    """String content must become blocks before the chat converter sees it.
+
+    A plain string is legal Responses-API content, but ``items_to_messages``
+    iterates content expecting blocks — so it walks the string character by
+    character and indexes each one, raising ``string indices must be integers,
+    not 'str'``. Since history is replayed, one such item breaks every later
+    turn in the conversation.
+    """
+    items = [
+        {"type": "message", "role": "assistant", "content": "I'll explore the repo."},
+        {"type": "message", "role": "user", "content": "go ahead"},
+    ]
+
+    result = _normalize_responses_items_for_chat(items)
+
+    assert result[0]["content"] == [{"type": "output_text", "text": "I'll explore the repo."}]
+    # User strings reach a different converter branch that accepts them, and
+    # callers rely on them staying strings.
+    assert result[1]["content"] == "go ahead"
+
+
+def test_normalize_responses_items_leaves_block_content_alone() -> None:
+    """Content that is already a block list is untouched."""
+    items = [
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "hi"}],
+        }
+    ]
+
+    result = _normalize_responses_items_for_chat(items)
+
+    assert result[0]["content"] == [{"type": "output_text", "text": "hi"}]
 
 
 def test_normalize_content_blocks_preserves_input_image_detail_for_http_url() -> None:

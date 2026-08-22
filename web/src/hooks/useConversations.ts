@@ -28,15 +28,19 @@ import { authenticatedFetch } from "@/lib/identity";
 import {
   filtersFromConversationQueryKey,
   mergeItemsIntoPages,
+  overlayTitleIntoCaches,
   PINNED_LABEL_KEY,
+  PROJECT_FOLDER_FILTERS,
   PROJECT_LABEL_KEY,
   removeIdsFromPages,
   type ConversationsInfiniteData,
   type SessionListWireItem,
 } from "@/lib/sessionListCache";
 import { showToast } from "@/components/ui/toast";
+import { revokePermission } from "@/lib/permissionsApi";
 import { conversationDisplayLabel, setLegacyPinnedConversationId } from "@/shell/sidebarNav";
 import { stopSession } from "@/lib/sessionsApi";
+import { setSessionHost } from "@/lib/sessionHost";
 import {
   createProject as apiCreateProject,
   deleteProject as apiDeleteProject,
@@ -46,7 +50,7 @@ import {
   renameProject as apiRenameProject,
   updateProjectConfig as apiUpdateProjectConfig,
 } from "@/lib/projectsApi";
-import { useChatStore } from "@/store/chatStore";
+import { releaseConversation, useChatStore } from "@/store/chatStore";
 import type { Session } from "@/lib/types";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import { markConversationSeen } from "./useUnseenConversations";
@@ -303,6 +307,12 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const wire = await res.json();
+  // Seed the session→host map on this pin-backfill path too, not just the list
+  // seed / `sessionFromWire`: a pinned session outside the paginated window can
+  // enter client state only through here, and terminal-attach / session-scoped
+  // requests key their slice off this map — so record the host before returning
+  // the row, or those requests fall back to the modal and can miss the replica.
+  setSessionHost(wire.id, wire.host_id);
   return {
     id: wire.id,
     object: "conversation",
@@ -363,7 +373,18 @@ async function fetchConversationsPage({
   const signal = searchQuery ? AbortSignal.timeout(SEARCH_FETCH_TIMEOUT_MS) : undefined;
   const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`, { signal });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  return withoutDeletingSessions((await res.json()) as ConversationsPage);
+  const page = (await res.json()) as ConversationsPage;
+  // Seed the session→host map from every list row, not just sessions the user
+  // has opened (which is all `sessionFromWire` covers). Two payoffs: (1) the
+  // modal-host pick (`resolveModalHost`, latched on this query's first settle)
+  // sees ALL the user's sessions, so it picks the true most-common host rather
+  // than whichever single session happened to be fetched individually first;
+  // (2) a session-scoped request (`/v1/sessions/{id}/*`) issued before that
+  // session's own snapshot loads still keys to the right replica instead of
+  // falling back to the modal. host_id is fixed for a session's life, so this
+  // can't seed a stale value; a hostless row clears any prior mapping.
+  for (const row of page.data) setSessionHost(row.id, row.host_id);
+  return withoutDeletingSessions(page);
 }
 
 /**
@@ -476,6 +497,8 @@ export async function deleteConversation(id: string, deleteBranch = false): Prom
   // Drop any client-side queued messages for the now-deleted session; bound to
   // a dead conversation, they could never flush.
   useChatStore.getState().clearQueuedMessages(id);
+  // A deleted conversation must stop pumping and let go of its stream.
+  releaseConversation(id);
 }
 
 /**
@@ -498,59 +521,14 @@ export async function deleteConversation(id: string, deleteBranch = false): Prom
  * polls. Callers (the sidebar row) trigger this on blur / Enter in
  * the inline-edit input.
  */
-// Project folders (["project-sessions", name]) are non-archived, unsearched
-// lists — the same filters the push-delta merge uses to overlay them.
-const PROJECT_FOLDER_FILTERS = { searchQuery: "", includeArchived: false } as const;
-
 export function useRenameConversation() {
   const queryClient = useQueryClient();
 
-  // Overlay a title into every cache that holds a row for this session.
-  // Only the fields the rename changes are written — the full PATCH
-  // snapshot carries nulls for absent fields that would clobber
-  // list-shaped rows (see `nullsToUndefined` in sessionListCache).
-  const overlayTitle = (id: string, title: string | null, updatedAt?: number) => {
-    const wire: SessionListWireItem = {
-      id,
-      title,
-      ...(updatedAt !== undefined ? { updated_at: updatedAt } : {}),
-    };
-    const itemsById = new Map([[id, wire]]);
-    for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
-      queryKey: ["conversations"],
-    })) {
-      const { data: next } = mergeItemsIntoPages(
-        data,
-        itemsById,
-        filtersFromConversationQueryKey(key),
-        // activeId only gates `needsRefetch`, which is unused here —
-        // we deliberately skip the refetch (see hook docstring).
-        undefined,
-      );
-      if (next !== data) queryClient.setQueryData(key, next);
-    }
-    // A filed session renders from its own ["project-sessions", name] list,
-    // not the flat ["conversations"] cache, so patch those (non-archived,
-    // unsearched — PROJECT_FOLDER_FILTERS) too or the folder row stays stale.
-    for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
-      queryKey: ["project-sessions"],
-    })) {
-      const { data: next } = mergeItemsIntoPages(
-        data,
-        itemsById,
-        PROJECT_FOLDER_FILTERS,
-        undefined,
-      );
-      if (next !== data) queryClient.setQueryData(key, next);
-    }
-    // The pinned-row backfill cache (staleTime 60s) and the per-session
-    // snapshot (staleTime Infinity) are not covered by the list patch and
-    // would serve the old title long after.
-    queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
-      old ? { ...old, title, ...(updatedAt !== undefined ? { updated_at: updatedAt } : {}) } : old,
-    );
-    queryClient.setQueryData<Session>(["session", id], (old) => (old ? { ...old, title } : old));
-  };
+  // Overlay a title into every cache holding a row for this session. Shared
+  // with the `session.title` SSE handler so a terminal-side `/rename` and a
+  // Web UI rename patch exactly the same caches.
+  const overlayTitle = (id: string, title: string | null, updatedAt?: number) =>
+    overlayTitleIntoCaches(queryClient, id, title, updatedAt);
 
   return useMutation({
     mutationFn: ({ id, title }: { id: string; title: string }) => renameConversation(id, title),
@@ -827,6 +805,49 @@ export function useStopAndDeleteConversation() {
 }
 
 /**
+ * Leave a session shared with you — revoking your OWN grant via
+ * `DELETE /v1/sessions/{id}/permissions/{viewerId}` — so it drops out of the
+ * sidebar. The server allows a self-revoke with only read access; `viewerId`
+ * must be the caller's own id (the sidebar reads it from the resolved identity
+ * it already uses to decide the row isn't owned).
+ *
+ * The row is spliced out of the cached list pages in place rather than
+ * invalidated, for the same reason delete does it (see
+ * `useStopAndDeleteConversation`): `GET /v1/sessions` may be served from a
+ * search index that catches up asynchronously, so an immediate refetch can
+ * resurrect the row the user just dismissed. Nothing is deleted server-side —
+ * only the caller's grant — so the owner re-sharing brings it back.
+ *
+ * Callers are responsible for navigating away from `/c/{id}` when leaving the
+ * session currently being viewed; it 404s for them afterwards.
+ */
+export function useLeaveSession() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, viewerId }: { id: string; viewerId: string }) =>
+      revokePermission(id, viewerId),
+    onSuccess: (_data, { id }) => {
+      const ids = new Set([id]);
+      for (const queryKey of [["conversations"], ["project-sessions"]]) {
+        for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+          queryKey,
+        })) {
+          const { data: next, removed } = removeIdsFromPages(data, ids);
+          if (removed) queryClient.setQueryData(key, next);
+        }
+      }
+      // Drop the per-session caches too, so the row can't re-enter the sidebar
+      // from a still-fresh backfill entry once it leaves the paginated pages.
+      queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
+      queryClient.removeQueries({ queryKey: ["session", id] });
+      queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (old) =>
+        old ? { ...old, conversations: old.conversations.filter((c) => !ids.has(c.id)) } : old,
+      );
+    },
+  });
+}
+
+/**
  * Stop a live session via `POST /v1/sessions/{id}/events` with a
  * `stop_session` event. Unlike delete, the conversation row and its
  * transcript are kept — only the running process is terminated (for
@@ -897,11 +918,22 @@ export function useBulkArchiveConversations() {
  * the cached lists in `onMutate` so the sidebar repaints immediately,
  * and only the ones whose delete failed are restored. Returns the
  * succeeded / failed session IDs.
+ *
+ * `deleteBranchIds` opts individual worktree sessions into git cleanup:
+ * a session whose id is in the set is deleted with `?delete_branch=true`
+ * (the server removes its worktree and branch). Ids absent from the set
+ * — or all ids when it's omitted — delete without touching any branch.
  */
 export function useBulkDeleteConversations() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async (ids: string[]) => {
+    mutationFn: async ({
+      ids,
+      deleteBranchIds,
+    }: {
+      ids: string[];
+      deleteBranchIds?: ReadonlySet<string>;
+    }) => {
       const results = await Promise.allSettled(
         ids.map(async (id) => {
           try {
@@ -909,7 +941,7 @@ export function useBulkDeleteConversations() {
           } catch {
             // Best-effort stop
           }
-          await deleteConversation(id);
+          await deleteConversation(id, deleteBranchIds?.has(id) ?? false);
         }),
       );
       const succeeded: string[] = [];
@@ -927,11 +959,11 @@ export function useBulkDeleteConversations() {
       }
       return { succeeded, failed };
     },
-    onMutate: (ids) => paintConversationsDeleted(queryClient, ids),
-    onSuccess: (_data, ids) => {
+    onMutate: ({ ids }) => paintConversationsDeleted(queryClient, ids),
+    onSuccess: (_data, { ids }) => {
       finalizeDeletedConversations(queryClient, ids);
     },
-    onError: (error, ids, snapshot) => {
+    onError: (error, { ids }, snapshot) => {
       // Partial failure: the sessions that did delete stay gone; the rest
       // come back. A non-bulk error (nothing reported) restores everything.
       const bulk = error instanceof BulkConversationMutationError ? error : null;
@@ -976,6 +1008,38 @@ export function useBulkStopSessions() {
     },
     onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+    },
+  });
+}
+
+/**
+ * Move multiple sessions to a project (or remove from all projects when
+ * `project=""`). Each session is moved independently; partial failures don't
+ * block the rest.
+ */
+export function useBulkMoveToProject() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ ids, project }: { ids: string[]; project: string }) => {
+      const results = await Promise.allSettled(
+        ids.map((id) => moveConversationToProject(id, project)),
+      );
+      const failed: string[] = [];
+      for (let i = 0; i < results.length; i++) {
+        if (results[i].status === "rejected") failed.push(ids[i]);
+      }
+      if (failed.length > 0) {
+        throw new BulkConversationMutationError("move", { failed, total: ids.length });
+      }
+      return results
+        .filter((r): r is PromiseFulfilledResult<Conversation> => r.status === "fulfilled")
+        .map((r) => r.value);
+    },
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      void queryClient.invalidateQueries({ queryKey: ["projects"] });
+      void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
     },
   });
 }
@@ -1272,6 +1336,9 @@ export { PROJECT_LABEL_KEY };
 export interface ProjectSummary {
   id: string | null;
   name: string;
+  /** Chosen emoji icon (a unicode grapheme), or null/absent for the default
+      folder glyph. Sourced from the project's `config.icon`. */
+  icon?: string | null;
 }
 
 /**
@@ -1735,7 +1802,8 @@ export function useDeleteProject() {
 export function useCreateProject() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (name: string) => apiCreateProject(name),
+    mutationFn: ({ name, icon }: { name: string; icon?: string }) =>
+      apiCreateProject(name, icon ? { icon } : undefined),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
     },
@@ -1796,6 +1864,10 @@ export function useRenameProject() {
           if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
         }),
       );
+      // Return the resolved id so a caller promoting a label-only folder can
+      // target the just-created row for a follow-up write instead of passing
+      // the stale `null` and re-creating it (which 409s on the duplicate name).
+      return projectId;
     },
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
@@ -1855,7 +1927,7 @@ export function useUpdateProjectConfig() {
       // config to `{}` and drop the saved defaults on that first visit.
       queryClient.setQueryData<ProjectSummary[]>(["projects"], (prev) => {
         if (!prev) return prev;
-        const summary = { id: project.id, name: project.name };
+        const summary = { id: project.id, name: project.name, icon: project.config?.icon };
         return prev.some((p) => p.name === project.name)
           ? prev.map((p) => (p.name === project.name ? summary : p))
           : [...prev, summary];

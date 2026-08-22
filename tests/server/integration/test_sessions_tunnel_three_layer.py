@@ -1520,10 +1520,17 @@ async def test_on_runner_disconnect_spares_idle_sessions_and_labels_interrupted_
         await communicator.send_input({"type": "websocket.disconnect", "code": 1006})
 
         async def _hook_ran() -> None:
-            while sessions_module._session_status_cache.get(running_id) != "failed":
+            # The hook publishes the status first and persists the labels on
+            # a later await, so wait for the labels — the end state asserted
+            # below — instead of the status flip that precedes them.
+            while True:
+                conv = store.get_conversation(running_id)
+                if conv is not None and sessions_module._last_task_error_from_labels(conv.labels):
+                    return
                 await asyncio.sleep(0.01)
 
         await asyncio.wait_for(_hook_ran(), timeout=5.0)
+        assert sessions_module._session_status_cache.get(running_id) == "failed"
 
         # The interrupted turn is failed AND carries the cause, so the client
         # renders a recoverable "Disconnected" and recovery can clear it.
