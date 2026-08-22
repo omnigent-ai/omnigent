@@ -2,7 +2,6 @@ import * as React from "react";
 import * as DialogPrimitive from "radix-ui/dialog";
 
 import { getEmbedRoot } from "@/lib/host";
-import { isIOSShell } from "@/lib/nativeBridge";
 import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -46,50 +45,112 @@ function DialogOverlay({
   );
 }
 
+/**
+ * The scrollable middle of a dialog. `DialogContent` wraps whatever sits
+ * between the header and the footer in one of these, so overflow scrolls
+ * *inside* the panel and the footer stays visible without the caller doing
+ * anything. It is a flex column as well as a scroller, so a caller that hands
+ * its own `flex-1 min-h-0` child (a form, a Tabs) keeps that child's scroller
+ * as the only one that ever moves.
+ */
+function DialogBody({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div
+      data-slot="dialog-body"
+      className={cn("flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto", className)}
+      {...props}
+    />
+  );
+}
+
+function isSlot(node: React.ReactNode, slot: React.ElementType): boolean {
+  return React.isValidElement(node) && node.type === slot;
+}
+
+/**
+ * Flatten keyless `<>…</>` wrappers: a bare fragment is not a layout box, so a
+ * caller that groups a conditional branch's fields *and* its footer in one is
+ * still handing the dialog those as siblings. Keyed fragments (a `.map`) are
+ * left alone — flattening would drop the key.
+ */
+function flattenFragments(children: React.ReactNode): React.ReactNode[] {
+  const items: React.ReactNode[] = [];
+  React.Children.forEach(children, (child) => {
+    if (React.isValidElement(child) && child.type === React.Fragment && child.key === null) {
+      items.push(...flattenFragments((child.props as { children?: React.ReactNode }).children));
+    } else {
+      items.push(child);
+    }
+  });
+  return items;
+}
+
+/**
+ * Split a dialog's children into the leading header, the middle, and the
+ * trailing footer. Nulls are kept in place so a conditional child toggling
+ * cannot shift its siblings' positional keys and remount them.
+ */
+function splitDialogChildren(children: React.ReactNode): {
+  header: React.ReactNode[];
+  body: React.ReactNode[];
+  footer: React.ReactNode[];
+} {
+  const items = flattenFragments(children);
+  let start = 0;
+  while (start < items.length && isSlot(items[start], DialogHeader)) start += 1;
+  let end = items.length;
+  while (end > start && isSlot(items[end - 1], DialogFooter)) end -= 1;
+  return { header: items.slice(0, start), body: items.slice(start, end), footer: items.slice(end) };
+}
+
+// Key by the child's original position so the identity survives the split
+// boundary moving between renders.
+function keyed(nodes: React.ReactNode[], offset: number): React.ReactNode[] {
+  return nodes.map((node, index) => <React.Fragment key={offset + index}>{node}</React.Fragment>);
+}
+
 function DialogContent({
   className,
   children,
   showCloseButton = true,
-  style,
   ...props
 }: React.ComponentProps<typeof DialogPrimitive.Content> & {
   showCloseButton?: boolean;
 }) {
-  // On the iOS shell the layout viewport stays full-height when the soft
-  // keyboard opens (the native shell keeps the WKWebView full via
-  // `.ignoresSafeArea(.keyboard)`), so a modal centered on `50%` and capped at
-  // `85vh` sizes and positions against the whole screen — its lower half (and a
-  // focused field) sit behind the keyboard. `useIOSViewportLock` publishes the
-  // keyboard-aware visible height as `--omnigent-viewport-height` on :root, so
-  // pin both the centering origin and the height cap to it (less the safe-area
-  // insets) via inline style — inline beats callers' `max-h-[85vh]`/`top`
-  // Tailwind classes (which `cn`'s twMerge would otherwise keep). No-op off iOS.
-  const iosViewportStyle: React.CSSProperties = isIOSShell()
-    ? {
-        // Center within the visible viewport (not the full layout height).
-        top: "calc(var(--omnigent-viewport-height, 100lvh) / 2)",
-        // Cap to the visible area less both safe insets and a small margin, so
-        // the modal can never extend behind the keyboard, notch, or home bar.
-        maxHeight:
-          "calc(var(--omnigent-viewport-height, 100lvh) - var(--omnigent-safe-top, 0px) - var(--omnigent-safe-bottom, 0px) - 1rem)",
-      }
-    : {};
+  const { header, body, footer } = splitDialogChildren(children);
+  // A body that is already a single `DialogBody` is left alone rather than
+  // nested inside a second scroller.
+  const wrappedBody =
+    body.length === 1 && isSlot(body[0], DialogBody) ? (
+      body[0]
+    ) : (
+      <DialogBody>{keyed(body, header.length)}</DialogBody>
+    );
   return (
     <DialogPortal>
       <DialogOverlay />
       <DialogPrimitive.Content
         data-slot="dialog-content"
+        // Height safety is the SHARED component's job, on every platform.
+        // `top`/`max-h` come from `--omnigent-dialog-*` (index.css), which
+        // resolve against the live visual viewport less the safe-area insets —
+        // so the panel is centered in, and fits inside, the area the user can
+        // actually see rather than the taller layout viewport that `vh` and
+        // `top-1/2` measure. They stay Tailwind utilities (not inline style) so
+        // a caller that deliberately positions its own panel — the command
+        // palette's `top-1/4` — still wins through twMerge.
         className={cn(
-          "fixed top-1/2 left-1/2 z-50 grid w-full max-w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2 gap-4 rounded-[30px] bg-popover p-6 text-ui text-popover-foreground duration-150 ease-[cubic-bezier(0.16,1,0.3,1)] outline-none sm:max-w-sm data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95 shadow-dialog",
+          "fixed top-[var(--omnigent-dialog-center)] left-1/2 z-50 flex max-h-[var(--omnigent-dialog-max-height)] w-full max-w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2 flex-col gap-4 rounded-[30px] bg-popover p-6 text-ui text-popover-foreground duration-150 ease-[cubic-bezier(0.16,1,0.3,1)] outline-none sm:max-w-sm data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95 shadow-dialog",
           className,
         )}
-        style={{ ...iosViewportStyle, ...style }}
         {...props}
       >
         {/* Hide the native browser view while this dialog is open (#3980).
             Inside Content so it mounts only while the dialog is open. */}
         <SuppressBrowserView />
-        {children}
+        {keyed(header, 0)}
+        {body.length > 0 ? wrappedBody : null}
+        {keyed(footer, header.length + body.length)}
         {showCloseButton && (
           <DialogPrimitive.Close data-slot="dialog-close" asChild>
             <Button variant="ghost" className="absolute top-5 right-6" size="icon-lg">
@@ -105,7 +166,11 @@ function DialogContent({
 
 function DialogHeader({ className, ...props }: React.ComponentProps<"div">) {
   return (
-    <div data-slot="dialog-header" className={cn("flex flex-col gap-2", className)} {...props} />
+    <div
+      data-slot="dialog-header"
+      className={cn("flex shrink-0 flex-col gap-2", className)}
+      {...props}
+    />
   );
 }
 
@@ -120,8 +185,12 @@ function DialogFooter({
   return (
     <div
       data-slot="dialog-footer"
+      // `pb` reserves the home indicator / Android gesture bar / native bottom
+      // bar (`--omnigent-inset-bottom`) on top of the normal 1.5rem, so the
+      // buttons are never under system chrome. 0px off mobile, so desktop is
+      // unchanged. Listed after `p-6` so twMerge keeps both.
       className={cn(
-        "-mx-6 -mb-6 flex flex-col-reverse gap-2 rounded-b-xl border-t bg-muted/50 p-6 sm:flex-row sm:justify-end",
+        "-mx-6 -mb-6 flex shrink-0 flex-col-reverse gap-2 rounded-b-xl border-t bg-muted/50 p-6 pb-[max(1.5rem,var(--omnigent-inset-bottom))] sm:flex-row sm:justify-end",
         className,
       )}
       {...props}
@@ -167,6 +236,7 @@ function DialogDescription({
 
 export {
   Dialog,
+  DialogBody,
   DialogClose,
   DialogContent,
   DialogDescription,

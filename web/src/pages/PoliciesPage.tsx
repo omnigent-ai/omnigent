@@ -148,7 +148,7 @@ function AddDefaultPolicyDialog({
         onOpenChange(next);
       }}
     >
-      <DialogContent className="max-h-[80vh] overflow-y-auto sm:max-w-lg">
+      <DialogContent className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>Add Global Policy</DialogTitle>
           <DialogDescription>Choose a policy to apply globally to all sessions.</DialogDescription>

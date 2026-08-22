@@ -160,10 +160,7 @@ export function ReconnectSessionDialog({
   return (
     <>
       <Dialog open={open} onOpenChange={onOpenChange}>
-        <DialogContent
-          data-testid="reconnect-session-dialog"
-          className="flex max-h-[85vh] flex-col gap-4 sm:max-w-lg"
-        >
+        <DialogContent data-testid="reconnect-session-dialog" className="sm:max-w-lg">
           <DialogHeader>
             <DialogTitle>{title}</DialogTitle>
             {/* The visible per-tab text lives inside the tab panels; this

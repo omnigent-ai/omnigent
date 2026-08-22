@@ -209,6 +209,30 @@
       var(--omnigent-bottom-bar-visible)
   );
 
+  /* ---- Visible viewport ---------------------------------------------------
+   * `position: fixed` anchors to the LAYOUT viewport, which stays tall while
+   * mobile browser chrome or the soft keyboard cover its bottom. These describe
+   * the band the user can actually SEE, in layout-viewport coordinates.
+   * `--omnigent-viewport-height` / `--omnigent-viewport-offset` are the live
+   * `visualViewport` metrics published by `useVisibleViewportHeight`; the
+   * `100svh` / `0px` fallbacks hold before JS runs and where the API is
+   * missing. `svh` (not `lvh`/`vh`) is the small viewport — browser chrome
+   * shown — so the static fallback errs toward the smaller, safer box. */
+  --omnigent-visible-top: var(--omnigent-viewport-offset, 0px);
+  --omnigent-visible-height: var(--omnigent-viewport-height, 100svh);
+
+  /* Dialog geometry, consumed by `DialogContent`. `center` is where a fixed,
+     `-translate-y-1/2` panel must sit to be centered in the visible band clear
+     of both safe insets; `max-height` keeps it inside that band with a 1rem
+     margin top and bottom. Callers can still override either via Tailwind. */
+  --omnigent-dialog-center: calc(
+    var(--omnigent-visible-top) +
+      (var(--omnigent-visible-height) + var(--omnigent-safe-top) - var(--omnigent-safe-bottom)) / 2
+  );
+  --omnigent-dialog-max-height: calc(
+    var(--omnigent-visible-height) - var(--omnigent-safe-top) - var(--omnigent-safe-bottom) - 2rem
+  );
+
   /* Brand palette (light). Hex values are the brand spec, kept verbatim
      * for fidelity. --background is white: the lavender brand canvas is
      * expressed by the .app-shell gradient (see index.css .app-shell), so
@@ -761,7 +785,7 @@ aside[aria-label="Workspace"][data-maximized] {
   [data-ios-native].app-shell {
     /* Lock the shell to the live visual viewport so the soft keyboard can never
        pan the whole document (which hides the header). --omnigent-viewport-
-       height is published by useIOSViewportLock from visualViewport.height; it
+       height is published by useVisibleViewportHeight from visualViewport; it
        shrinks when the keyboard opens so inputs stay above it and only inner
        panes scroll. Falls back to the large viewport before JS runs / on older
        WebKit. The two-line pattern keeps the lvh fallback for browsers without

@@ -160,6 +160,22 @@ describe("optimistic delete session flow", () => {
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
+  it("caps and scrolls the confirm dialog without any per-caller class", () => {
+    // The sidebar's confirm dialogs pass no height class; before DialogContent
+    // owned the cap they rendered at 92.5% of the LARGE viewport, putting
+    // Delete below the visible area on a phone with the URL bar showing.
+    renderSidebar();
+    openDeleteDialog();
+
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.className).toContain("max-h-[var(--omnigent-dialog-max-height)]");
+    expect(dialog.className).toContain("top-[var(--omnigent-dialog-center)]");
+    const body = dialog.querySelector('[data-slot="dialog-body"]');
+    expect(body?.className).toContain("overflow-y-auto");
+    // Delete sits in the footer, outside that scroller, so it stays visible.
+    expect(body?.contains(within(dialog).getByRole("button", { name: "Delete" }))).toBe(false);
+  });
+
   it("shows no in-flight status row — the row is removed optimistically instead", () => {
     // The real hook drops the row from the cached list in onMutate, so by
     // the time a delete is pending the row is already gone from the sidebar.

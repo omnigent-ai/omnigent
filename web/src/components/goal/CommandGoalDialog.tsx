@@ -63,7 +63,10 @@ export function CommandGoalDialog({
             </DialogDescription>
           </DialogHeader>
 
-          <div className="space-y-1.5">
+          {/* The form is `display: contents`, so this is a flex child of the
+              dialog's scroll region: it takes the slack and scrolls, keeping
+              the footer's button pinned below it. */}
+          <div className="flex min-h-0 flex-1 flex-col gap-1.5 overflow-y-auto">
             <label className="text-sm font-medium text-muted-foreground" htmlFor="goal-condition">
               Completion condition
             </label>

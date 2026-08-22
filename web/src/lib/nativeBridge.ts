@@ -410,7 +410,7 @@ export function isIOSShell(): boolean {
 /**
  * True when running inside the native Android WebView shell. A sibling to
  * {@link isIOSShell} — deliberately NOT folded into it, since the iOS-only
- * chrome (viewport lock, native keyboard inset, server switcher) keys off
+ * chrome (keyboard pan lock, native keyboard inset, server switcher) keys off
  * `isIOSShell()` and must stay off on Android, which uses its own WebView
  * keyboard/inset behavior and the web in-page fallbacks.
  */

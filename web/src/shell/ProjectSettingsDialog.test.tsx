@@ -388,11 +388,13 @@ describe("ProjectSettingsDialog", () => {
   });
 
   it("caps its height and scrolls the fields, keeping Save reachable", async () => {
-    // DialogContent caps WIDTH only and is centered with `-translate-y-1/2`, so
-    // an uncapped dialog taller than the viewport is clipped at both ends with
-    // nothing to scroll — which is what happened as settings were added. jsdom
-    // does no layout, so assert the contract that prevents it: a height cap on
-    // the dialog, a scrollable fields region, and Save OUTSIDE that region.
+    // An uncapped dialog taller than the viewport is clipped at both ends with
+    // nothing to scroll — which is what happened as settings were added. The
+    // cap now comes from DialogContent itself, against the VISIBLE viewport
+    // rather than a static `85vh` that overhangs the mobile URL bar; this
+    // caller only supplies its width. jsdom does no layout, so assert the
+    // contract that prevents it: a height cap on the dialog, a scrollable
+    // fields region, and Save OUTSIDE that region.
     getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
     renderDialog();
     await waitFor(() =>
@@ -403,14 +405,23 @@ describe("ProjectSettingsDialog", () => {
 
     const content = document.querySelector('[data-slot="dialog-content"]');
     expect(content).not.toBeNull();
-    expect(content!.className).toMatch(/max-h-\[85vh\]/);
+    expect(content!.className).toMatch(/max-h-\[var\(--omnigent-dialog-max-height\)\]/);
+    expect(content!.className).toMatch(/top-\[var\(--omnigent-dialog-center\)\]/);
+    // No stale `vh` cap: `vh` is the LARGE viewport, so it overhangs the
+    // visible area whenever mobile browser chrome is showing.
+    expect(content!.className).not.toMatch(/max-h-\[\d+vh\]/);
 
-    const scroller = content!.querySelector(".overflow-y-auto");
-    expect(scroller).not.toBeNull();
-    // The worktree location field scrolls...
-    expect(scroller!.contains(screen.getByTestId("project-settings-worktree-root"))).toBe(true);
-    // ...while Save stays pinned outside the scroll region.
-    expect(scroller!.contains(screen.getByTestId("project-settings-save"))).toBe(false);
+    // The fields region is the scroller that holds the fields but not Save.
+    const scrollers = Array.from(content!.querySelectorAll(".overflow-y-auto"));
+    const field = screen.getByTestId("project-settings-worktree-root");
+    const save = screen.getByTestId("project-settings-save");
+    const scroller = scrollers.find((el) => el.contains(field) && !el.contains(save));
+    expect(scroller).toBeDefined();
+    // The form between DialogContent's shared scroller and the fields is
+    // flex-constrained, so only the fields ever move and Save stays put.
+    const form = content!.querySelector("form")!;
+    expect(form.className).toContain("min-h-0");
+    expect(form.className).toContain("flex-1");
   });
 
   it("blocks Save (does not clear defaults) when the config load fails", async () => {

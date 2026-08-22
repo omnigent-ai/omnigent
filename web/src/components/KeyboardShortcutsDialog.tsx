@@ -204,7 +204,7 @@ export function KeyboardShortcutsDialog() {
             The keyboard shortcuts available in the chat.
           </DialogDescription>
         </DialogHeader>
-        <div className="max-h-[70vh] overflow-y-auto pr-1">
+        <div className="pr-1">
           <KeyboardShortcutsList />
         </div>
       </DialogContent>

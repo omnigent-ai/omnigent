@@ -828,6 +828,26 @@ describe("SettingsPage", () => {
     expect(mocks.deleteMutate).toHaveBeenCalledWith({ id: "conv_archived" });
   });
 
+  it("caps the archived-delete confirm without any per-caller class", () => {
+    // This dialog passes no className at all — one of the 20+ that carried no
+    // height cap and whose footer therefore sat off-screen on a phone with the
+    // URL bar showing. Safety now comes from DialogContent, so the contract is
+    // asserted here rather than re-declared at the call site.
+    mocks.conversations = [conv("conv_archived", { archived: true, title: "Old chat" })];
+    renderPage("/settings/archived");
+    fireEvent.click(screen.getByTestId("delete-archived"));
+
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.className).toContain("max-h-[var(--omnigent-dialog-max-height)]");
+    expect(dialog.className).toContain("top-[var(--omnigent-dialog-center)]");
+    // Header + footer only, so there is nothing to scroll and no body slot is
+    // rendered; Delete sits in the footer, a direct child of the panel.
+    expect(dialog.querySelector('[data-slot="dialog-body"]')).toBeNull();
+    const footer = dialog.querySelector('[data-slot="dialog-footer"]')!;
+    expect(footer.parentElement).toBe(dialog);
+    expect(footer.contains(screen.getByRole("button", { name: "Delete" }))).toBe(true);
+  });
+
   it("scopes the archived list to the project picked in the filter", () => {
     mocks.projectNames = ["Alpha", "Beta"];
     mocks.conversations = [

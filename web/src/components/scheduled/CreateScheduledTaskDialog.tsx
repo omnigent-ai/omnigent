@@ -314,7 +314,7 @@ export function CreateScheduledTaskDialog({
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent
-        className="flex max-h-[90vh] flex-col overflow-hidden p-0 sm:max-w-[560px]"
+        className="overflow-hidden p-0 sm:max-w-[560px]"
         data-testid="create-scheduled-task-dialog"
         // Keep a nested Select's dismiss (pick an option, OR click empty modal
         // body / trigger while it's open) from closing the whole Dialog. See

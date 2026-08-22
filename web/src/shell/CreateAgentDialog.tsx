@@ -186,10 +186,7 @@ export function CreateAgentDialog({
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogContent
-        data-testid="create-agent-dialog"
-        className="flex max-h-[85vh] flex-col gap-4 sm:max-w-lg"
-      >
+      <DialogContent data-testid="create-agent-dialog" className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>Create custom agent</DialogTitle>
         </DialogHeader>
