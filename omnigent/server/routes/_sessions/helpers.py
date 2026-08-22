@@ -205,6 +205,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _read_last_seen,
     _runner_skills_cache,
     _runner_skills_inflight,
+    _runner_skills_stale,
     _session_active_response_cache,
     _session_background_task_count_cache,
     _session_mcp_startup_cache,
@@ -4229,12 +4230,19 @@ def _invalidate_runner_backed_snapshot_state(
     *,
     cancel_inflight: bool,
     drop_model_options: bool,
+    drop_skills: bool = True,
 ) -> None:
     """
     Drop runner-derived session snapshot overlays for one session.
 
-    Skills are discovered from the bound runner, so they are dropped and
-    re-fetched at the next snapshot. The native model catalog is instead
+    Skills are discovered from the bound runner. They can be dropped outright
+    or, with ``drop_skills=False``, marked stale so the cached list keeps
+    SERVING while a re-fetch runs — the same contract the native model catalog
+    gets. Serving stale matters because skills resolve off the snapshot hot
+    path: dropping them makes the very snapshot that triggered the
+    invalidation answer ``skills: []``, and a client applying that response
+    blanks its slash-command menu until the session is re-opened.
+    The native model catalog is likewise
     marked stale by default: it must outlive runner death so the model
     picker stays populated (and offline model/effort changes stay possible)
     while the session is asleep — a stale catalog keeps serving until a
@@ -4251,10 +4259,19 @@ def _invalidate_runner_backed_snapshot_state(
         right away (refresh with a live runner) or no longer belongs to
         the session (agent switch); ``False`` keeps it serving while the
         session has no runner.
+    :param drop_skills: Drop the cached skills outright instead of marking
+        them stale. Defaults to ``True`` so callers opt IN to serving stale.
+        Pass ``False`` whenever the session keeps the same agent (a refresh,
+        a runner rebind) so the menu never blanks; ``True`` belongs to an
+        agent switch, where the cached skills are another agent's.
     """
     from omnigent.server.smart_routing import invalidate_runner_catalog
 
-    _runner_skills_cache.pop(session_id, None)
+    if drop_skills:
+        _runner_skills_cache.pop(session_id, None)
+        _runner_skills_stale.discard(session_id)
+    else:
+        _runner_skills_stale.add(session_id)
     # Routing's candidate catalog is runner-derived too: a rebind or a relaunch
     # can change which models the session can be switched onto, so it must not
     # keep routing off the previous runner's list.
@@ -9342,6 +9359,7 @@ async def _load_runner_skills(
         _logger.debug("Runner skills payload malformed for %s", session_id)
         return
     _runner_skills_cache[session_id] = skills
+    _runner_skills_stale.discard(session_id)
     # Nudge any subscribed client to re-read the (now-warm) snapshot so
     # its slash-command menu fills without waiting for the next bind.
     _publish_runner_skills(session_id)

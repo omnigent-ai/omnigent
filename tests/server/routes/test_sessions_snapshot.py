@@ -2464,3 +2464,119 @@ async def test_persist_error_labels_clears_stale_structured_fields() -> None:
         "code": "runner_error",
         "message": "turn setup failed",
     }
+
+
+# ---------------------------------------------------------------------------
+# Runner-skill cache survives a refresh (the "skills vanish mid-session" bug)
+# ---------------------------------------------------------------------------
+#
+# ``refresh_state=true`` invalidates runner-backed overlays, and skills are
+# fetched OFF the snapshot hot path — so dropping them outright makes that
+# very snapshot answer ``skills: []`` even though the session has them. A
+# client that applies the response wipes its slash-command menu. Skills
+# therefore get the same contract the model catalog already has: a stale
+# entry keeps SERVING while a re-fetch runs. Only an agent switch (whose
+# skills genuinely belong to another agent) drops them.
+
+
+class _SkillsRunnerClient:
+    """Runner stub serving one skill, counting /skills round-trips."""
+
+    def __init__(self) -> None:
+        self.skill_calls = 0
+
+    async def get(self, url: str, timeout: float = 5.0):
+        self.skill_calls += 1
+
+        class _Resp:
+            status_code = 200
+
+            @staticmethod
+            def json() -> dict[str, object]:
+                return {"skills": [{"name": "brainstorming", "description": "d"}]}
+
+        return _Resp()
+
+
+@pytest.mark.asyncio
+async def test_refresh_keeps_serving_cached_skills_while_refetching() -> None:
+    """A refresh-driven invalidation must not blank the menu.
+
+    The cached list keeps serving (so the snapshot never answers a spurious
+    ``[]``) and a background re-fetch is scheduled to replace it.
+    """
+    from omnigent.server.schemas import SkillSummary
+
+    session_id = "conv_refresh_keeps_skills"
+    _sessions_mod._runner_skills_cache.clear()
+    _sessions_mod._runner_skills_inflight.clear()
+    _sessions_mod._runner_skills_cache[session_id] = [
+        SkillSummary(name="brainstorming", description="d")
+    ]
+
+    _sessions_mod._invalidate_runner_backed_snapshot_state(
+        session_id, cancel_inflight=False, drop_model_options=False, drop_skills=False
+    )
+
+    client = _SkillsRunnerClient()
+    served = await _sessions_mod._fetch_runner_skills(client, session_id)  # type: ignore[arg-type]
+    assert [s.name for s in served] == ["brainstorming"], "stale entry must keep serving"
+
+    inflight = _sessions_mod._runner_skills_inflight.get(session_id)
+    assert inflight is not None, "a stale entry must schedule a re-fetch"
+    await inflight
+    assert client.skill_calls == 1
+    # Re-fetch landed: no longer stale, so a later poll schedules nothing new.
+    _sessions_mod._runner_skills_inflight.clear()
+    await _sessions_mod._fetch_runner_skills(client, session_id)  # type: ignore[arg-type]
+    assert session_id not in _sessions_mod._runner_skills_inflight
+    assert client.skill_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_agent_switch_drops_cached_skills() -> None:
+    """An agent switch DOES drop them — the old agent's skills aren't the new one's."""
+    from omnigent.server.schemas import SkillSummary
+
+    session_id = "conv_agent_switch_skills"
+    _sessions_mod._runner_skills_cache.clear()
+    _sessions_mod._runner_skills_inflight.clear()
+    _sessions_mod._runner_skills_cache[session_id] = [
+        SkillSummary(name="old-agent-skill", description="d")
+    ]
+
+    _sessions_mod._invalidate_runner_backed_snapshot_state(
+        session_id, cancel_inflight=True, drop_model_options=True, drop_skills=True
+    )
+
+    client = _SkillsRunnerClient()
+    served = await _sessions_mod._fetch_runner_skills(client, session_id)  # type: ignore[arg-type]
+    assert served == [], "dropped skills must not serve the old agent's list"
+
+
+@pytest.mark.asyncio
+async def test_refresh_snapshot_path_serves_stale_skills() -> None:
+    """The refresh-path invalidation itself must keep skills serving.
+
+    Guards the call-site contract: the ``refresh_state=true`` snapshot path
+    marks skills stale rather than dropping them, so the invalidating request
+    still answers the cached list.
+    """
+    from omnigent.server.schemas import SkillSummary
+
+    session_id = "conv_refresh_call_site"
+    _sessions_mod._runner_skills_cache.clear()
+    _sessions_mod._runner_skills_inflight.clear()
+    _sessions_mod._runner_skills_cache[session_id] = [
+        SkillSummary(name="brainstorming", description="d")
+    ]
+
+    # Exactly what the refresh_state=true snapshot path invokes for a
+    # non-cursor native session with a live runner.
+    _sessions_mod._invalidate_runner_backed_snapshot_state(
+        session_id, cancel_inflight=False, drop_model_options=True, drop_skills=False
+    )
+
+    client = _SkillsRunnerClient()
+    served = await _sessions_mod._fetch_runner_skills(client, session_id)  # type: ignore[arg-type]
+    assert [s.name for s in served] == ["brainstorming"]

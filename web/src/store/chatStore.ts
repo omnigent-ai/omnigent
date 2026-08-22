@@ -4919,6 +4919,19 @@ async function refetchRunnerBackedSessionState(
           skills: session.skills ?? [],
           codexModelOptions: session.codexModelOptions ?? [],
         };
+  // A `refreshState` request invalidates the server's runner-skill cache, and
+  // skills resolve off the snapshot hot path — so that response can answer an
+  // empty list for a session that has skills. The same empty answer can also
+  // reach a plain nudge refetch by deduping onto an in-flight refresh-state
+  // query (shared `["session", id]` key), so the guard must not key off this
+  // call's own options. Treat "no skills" as "not yet known" on every refetch
+  // path and keep whatever the menu already holds — the `session_skills`
+  // event refills it when the server's re-fetch lands. This function only
+  // pulls cache-warmed runner state; genuine skill-set changes (agent switch,
+  // rebind) flow through `refreshSessionBinding` / `bindStream` instead.
+  if ((session.skills ?? []).length === 0) {
+    delete statePatch.skills;
+  }
   setterFor(conversationId)(statePatch);
 }
 

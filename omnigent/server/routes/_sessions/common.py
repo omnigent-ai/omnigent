@@ -524,6 +524,14 @@ _runner_skills_cache: dict[str, list[SkillSummary]] = {}
 _runner_skills_inflight: dict[str, asyncio.Task[None]] = {}
 
 
+# Sessions whose cached skills should be re-fetched at the next snapshot with a
+# live runner. A stale entry still SERVES in the meantime, mirroring
+# ``_model_options_stale``: skills resolve off the snapshot hot path, so
+# dropping them would make the invalidating snapshot answer a spurious ``[]``
+# and blank the client's slash-command menu.
+_runner_skills_stale: set[str] = set()
+
+
 _model_options_cache: dict[str, list[dict[str, Any]]] = {}
 
 
@@ -956,6 +964,7 @@ __all__ = [
     "_runner_relay_tasks",
     "_runner_skills_cache",
     "_runner_skills_inflight",
+    "_runner_skills_stale",
     "_server_host_registry",
     "_server_runner_router",
     "_session_active_response_cache",
