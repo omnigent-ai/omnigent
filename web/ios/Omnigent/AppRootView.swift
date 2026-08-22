@@ -27,6 +27,7 @@ struct AppRootView: View {
         }
       case .web(let serverURL, let path):
         WebShellView(
+          serverURL: serverURL,
           initialURL: path.map { conversationURL(for: serverURL, path: $0) } ?? serverURL,
           connectToNewServer: {
             mode = .setup(prefill: settings.serverURL, error: nil)

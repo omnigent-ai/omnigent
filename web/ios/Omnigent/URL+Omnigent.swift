@@ -7,8 +7,20 @@ extension URL {
     var components = URLComponents()
     components.scheme = scheme.lowercased()
     components.host = host.lowercased()
-    components.port = port
+    if let port, !Self.isDefaultPort(port, for: scheme) {
+      components.port = port
+    }
     return components.url?.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+  }
+
+  var omnigentServerKey: String? {
+    guard let origin = omnigentOrigin else { return nil }
+    let components = URLComponents(url: self, resolvingAgainstBaseURL: false)
+    let path =
+      components?.percentEncodedPath.trimmingCharacters(
+        in: CharacterSet(charactersIn: "/")) ?? ""
+    let query = components?.percentEncodedQuery.map { "?\($0)" } ?? ""
+    return origin + (path.isEmpty ? "" : "/\(path)") + query
   }
 
   var omnigentHostLabel: String {
@@ -17,6 +29,11 @@ extension URL {
       return "\(host):\(port)"
     }
     return host
+  }
+
+  private static func isDefaultPort(_ port: Int, for scheme: String) -> Bool {
+    (scheme.lowercased() == "https" && port == 443)
+      || (scheme.lowercased() == "http" && port == 80)
   }
 }
 

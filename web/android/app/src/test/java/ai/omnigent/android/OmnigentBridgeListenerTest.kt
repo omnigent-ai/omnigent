@@ -25,6 +25,11 @@ class OmnigentBridgeListenerTest {
     private lateinit var context: Application
     private lateinit var listener: OmnigentBridgeListener
     private lateinit var shadow: ShadowNotificationManager
+    private val switchedServers = mutableListOf<String>()
+    private var serverSetupOpenCount = 0
+    private val readyVersions = mutableListOf<Int>()
+    private val heartbeatVersions = mutableListOf<Int>()
+    private val pickerRequests = mutableListOf<Int>()
 
     private val badgeId = 1
 
@@ -36,6 +41,11 @@ class OmnigentBridgeListenerTest {
             OmnigentBridgeListener(
                 notifications = NativeNotificationManager(context),
                 blobSaver = BlobSaver(context),
+                onNativeWebReady = readyVersions::add,
+                onNativeHeartbeat = heartbeatVersions::add,
+                onGetServerPicker = pickerRequests::add,
+                onSwitchServer = switchedServers::add,
+                onOpenServerSetup = { serverSetupOpenCount++ },
             )
         shadow =
             shadowOf(
@@ -131,5 +141,28 @@ class OmnigentBridgeListenerTest {
         listener.handle("""{"method":"unknownThing","count":5}""")
         listener.handle("""{"count":5}""")
         assertEquals(0, shadow.allNotifications.size)
+    }
+
+    @Test
+    fun `server picker messages dispatch valid native actions`() {
+        listener.handle("""{"method":"switchServer","url":"https://known.example.com"}""")
+        listener.handle("""{"method":"switchServer","url":123}""")
+        listener.handle("""{"method":"switchServer"}""")
+        listener.handle("""{"method":"openServerSetup"}""")
+
+        assertEquals(listOf("https://known.example.com"), switchedServers)
+        assertEquals(1, serverSetupOpenCount)
+    }
+
+    @Test
+    fun `compatibility and live picker messages dispatch typed values`() {
+        listener.handle("""{"method":"nativeWebReady","version":1}""")
+        listener.handle("""{"method":"nativeHeartbeat","version":1}""")
+        listener.handle("""{"method":"getServerPicker","requestId":42}""")
+        listener.handle("""{"method":"getServerPicker","requestId":"bad"}""")
+
+        assertEquals(listOf(1), readyVersions)
+        assertEquals(listOf(1), heartbeatVersions)
+        assertEquals(listOf(42), pickerRequests)
     }
 }

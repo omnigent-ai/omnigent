@@ -15,7 +15,10 @@ package ai.omnigent.android
  * `evaluateJavascript` into the `window.__omnigentNativeEmit*` functions here.
  */
 object NativeBridgeScript {
-    val source: String =
+    const val PROTOCOL_VERSION = 1
+    val source: String = source()
+
+    fun source(): String =
         """
         (() => {
           if (window.omnigentNative && window.omnigentNative.kind === "android") return;
@@ -88,6 +91,8 @@ object NativeBridgeScript {
               if (bridge) bridge.postMessage(JSON.stringify(payload));
             } catch (_) {}
           };
+          const pickerRequests = new Map();
+          let nextPickerRequest = 1;
 
           const notificationCallbacks = new Set();
           // An activation is a fire-once event, but the native side may emit it
@@ -111,13 +116,22 @@ object NativeBridgeScript {
           let lastInsets = null;
           Object.defineProperty(window, "__omnigentNativeEmitInsets", {
             configurable: false, enumerable: false, writable: false,
-            value(topBar, bottomBar) {
+            value(bottomBar) {
               const insets = {
-                topBar: typeof topBar === "number" && Number.isFinite(topBar) ? topBar : 0,
                 bottomBar: typeof bottomBar === "number" && Number.isFinite(bottomBar) ? bottomBar : 0,
               };
               lastInsets = insets;
               for (const cb of insetCallbacks) { try { cb(insets); } catch (_) {} }
+            },
+          });
+          Object.defineProperty(window, "__omnigentNativeEmitServerPicker", {
+            configurable: false, enumerable: false, writable: false,
+            value(requestId, info) {
+              const pending = pickerRequests.get(requestId);
+              if (!pending) return;
+              pickerRequests.delete(requestId);
+              clearTimeout(pending.timer);
+              pending.resolve(info && typeof info === "object" ? info : null);
             },
           });
 
@@ -203,6 +217,13 @@ object NativeBridgeScript {
 
           window.omnigentNative = Object.freeze({
             kind: "android",
+            nativeBridgeVersion: $PROTOCOL_VERSION,
+            nativeWebReady(version) {
+              post({ method: "nativeWebReady", version });
+            },
+            nativeHeartbeat(version) {
+              post({ method: "nativeHeartbeat", version });
+            },
             setColorScheme(scheme) {
               if (scheme !== "light" && scheme !== "dark" && scheme !== "system") return;
               post({ method: "setColorScheme", scheme });
@@ -250,7 +271,27 @@ object NativeBridgeScript {
               if (lastInsets) { try { callback(lastInsets); } catch (_) {} }
               return () => insetCallbacks.delete(callback);
             },
+          getServerPicker() {
+              const requestId = nextPickerRequest++;
+              return new Promise((resolve) => {
+                const timer = setTimeout(() => {
+                  pickerRequests.delete(requestId);
+                  resolve(null);
+                }, 3000);
+                pickerRequests.set(requestId, { resolve, timer });
+                post({ method: "getServerPicker", requestId });
+              });
+            },
+            switchServer(url) {
+              if (typeof url !== "string") return Promise.reject(new Error("invalid server"));
+              post({ method: "switchServer", url });
+              return Promise.resolve();
+            },
+            openServerSetup() {
+              post({ method: "openServerSetup" });
+            },
           });
+          window.dispatchEvent(new Event("omnigent-native-bridge-ready"));
         })();
         """.trimIndent()
 }

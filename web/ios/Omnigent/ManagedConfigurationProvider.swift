@@ -55,7 +55,7 @@ final class ManagedConfigurationProvider: ObservableObject {
 
   /// Runs for the lifetime of the app: the sequence re-yields whenever the
   /// administrator updates the configuration, so the connect screen and the
-  /// server switcher stay current without a relaunch.
+  /// sidebar server picker stay current without a relaunch.
   private func subscribeToDeclarativeConfiguration() {
     subscription = Task { [weak self] in
       let provider = ManagedAppConfigurationProvider()

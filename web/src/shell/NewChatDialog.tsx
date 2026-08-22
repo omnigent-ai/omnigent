@@ -183,7 +183,6 @@ import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
-import { useNativeServerSwitcherForMainSurface } from "@/hooks/useNativeServerSwitcher";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation } from "@/hooks/useConversations";
 import type { NativeModelOption } from "@/lib/types";
@@ -2083,12 +2082,6 @@ export function NewChatLandingScreen() {
   const [pendingAgent, setPendingAgent] = useState<AgentBundleInput | null>(null);
   // Sentinel id for the pending custom agent in the picker dropdown.
   const PENDING_AGENT_ID = "__pending_custom_agent__";
-
-  // Surface element backing the iOS native server switcher overlay, which
-  // the in-session view shows too — the picker stays reachable while starting
-  // a new session. The hook hides it whenever the sidebar covers the surface.
-  const [landingSurface, setLandingSurface] = useState<HTMLElement | null>(null);
-  useNativeServerSwitcherForMainSurface(landingSurface, true);
 
   const [message, setMessage] = useState<string>(() => landingDraft?.message ?? "");
   // Composer text captured when voice dictation starts, so Esc can revert to it.
@@ -4156,7 +4149,6 @@ export function NewChatLandingScreen() {
     // pb-12 lifts the content slightly above the geometric center, where
     // the hero reads better optically.
     <div
-      ref={setLandingSurface}
       className="relative flex flex-1 items-center justify-center"
       data-testid="new-chat-landing"
     >

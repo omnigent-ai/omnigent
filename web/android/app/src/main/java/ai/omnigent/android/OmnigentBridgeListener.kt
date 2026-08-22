@@ -23,6 +23,11 @@ import org.json.JSONObject
 class OmnigentBridgeListener(
     private val notifications: NativeNotificationManager,
     private val blobSaver: BlobSaver,
+    private val onNativeWebReady: (Int) -> Unit = {},
+    private val onNativeHeartbeat: (Int) -> Unit = {},
+    private val onGetServerPicker: (Int) -> Unit = {},
+    private val onSwitchServer: (String) -> Unit = {},
+    private val onOpenServerSetup: () -> Unit = {},
 ) : WebViewCompat.WebMessageListener {
     override fun onPostMessage(
         view: WebView,
@@ -46,6 +51,19 @@ class OmnigentBridgeListener(
             }
 
         when (json.optString("method")) {
+            "nativeWebReady" -> {
+                onNativeWebReady(json.optInt("version", -1))
+            }
+
+            "nativeHeartbeat" -> {
+                onNativeHeartbeat(json.optInt("version", -1))
+            }
+
+            "getServerPicker" -> {
+                val requestId = json.optInt("requestId", -1)
+                if (requestId >= 0) onGetServerPicker(requestId)
+            }
+
             "setColorScheme" -> {
                 when (json.optString("scheme")) {
                     "light" -> {
@@ -85,6 +103,15 @@ class OmnigentBridgeListener(
                     body = params.optString("body").ifEmpty { null },
                     navigatePath = params.optString("navigatePath").ifEmpty { null },
                 )
+            }
+
+            "switchServer" -> {
+                val url = (json.opt("url") as? String)?.ifEmpty { return } ?: return
+                onSwitchServer(url)
+            }
+
+            "openServerSetup" -> {
+                onOpenServerSetup()
             }
 
             "blobBase64" -> {

@@ -38,11 +38,22 @@ class ServerStore(
 
     /**
      * The servers to offer in the UI: organization presets first, then recents
-     * they don't already cover. Presets join the one list rather than getting a
-     * section of their own.
+     * they don't already cover. Only canonical duplicates collapse; two apps on
+     * the same origin with different mount paths remain separate choices.
      */
-    fun offeredServers(): List<String> =
-        managed.serverUrls + recentServers().filterNot(managed::includes)
+    fun offeredServers(): List<String> {
+        val seen = mutableSetOf<String>()
+        return (managed.serverUrls + recentServers()).filter { url ->
+            serverKey(url)?.let(seen::add) ?: false
+        }
+    }
+
+    fun managedServers(): List<String> = dedupeServers(managed.serverUrls)
+
+    fun recentServersForPicker(): List<String> {
+        val managedKeys = managedServers().mapNotNull(::serverKey).toSet()
+        return dedupeServers(recentServers()).filter { serverKey(it) !in managedKeys }
+    }
 
     /** Recently-connected servers, most recent first. */
     fun recentServers(): List<String> =
@@ -54,7 +65,7 @@ class ServerStore(
 
     /** Set the current server and push it to the front of the recents list. */
     fun connect(url: String) {
-        val recents = (listOf(url) + recentServers()).distinct().take(MAX_RECENTS)
+        val recents = dedupeServers(listOf(url) + recentServers()).take(MAX_RECENTS)
         prefs
             .edit()
             .putString(KEY_CURRENT, url)
@@ -63,6 +74,11 @@ class ServerStore(
     }
 
     private fun storedServerUrl(): String? = prefs.getString(KEY_CURRENT, null)
+
+    private fun dedupeServers(servers: List<String>): List<String> {
+        val seen = mutableSetOf<String>()
+        return servers.filter { serverKey(it)?.let(seen::add) ?: false }
+    }
 
     private companion object {
         const val PREFS = "ai.omnigent.android.servers"

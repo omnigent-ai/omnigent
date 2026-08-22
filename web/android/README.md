@@ -52,8 +52,7 @@ when the bridge methods are absent, so the Android shell omits them for now:
   system back gesture owns both screen edges, and
   `View.setSystemGestureExclusionRects()` does not apply to it. The sidebar
   opens from the in-page hamburger, exactly as in a browser tab.
-- **Native floating server switcher** and **Chat/Terminal bar.** Rendered
-  in-page by the SPA.
+- **Chat/Terminal bar.** Rendered in-page by the SPA.
 
 ## Databricks workspaces
 
@@ -109,7 +108,7 @@ to enrolled devices:
 Behaviour (`ManagedConfig` + `ServerStore`):
 
 - The URLs are **offered**, listed ahead of the user's recent servers on the
-  connect screen and in the server switcher. The user still taps one to connect —
+  connect screen and in the sidebar server picker. The user still taps one to connect —
   this is true for a single URL as much as for several.
 - The app never auto-connects to a preset and never skips the connect screen, so
   a policy can't silently move someone onto a different server.

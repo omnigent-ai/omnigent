@@ -24,6 +24,19 @@ fun originOf(url: String?): String? {
     return if (hasExplicitPort) "$scheme://$host:$port" else "$scheme://$host"
 }
 
+/** Canonical server identity that preserves path-based deployments. */
+fun serverKey(url: String?): String? {
+    val uri = url?.let(Uri::parse) ?: return null
+    val origin = originOf(url) ?: return null
+    val path =
+        uri.encodedPath
+            .orEmpty()
+            .trimEnd('/')
+            .ifEmpty { "" }
+    val query = uri.encodedQuery?.let { "?$it" }.orEmpty()
+    return origin + path + query
+}
+
 /**
  * True for the only two schemes the WebView loads inline (http/https). This
  * gates a security boundary (which navigations load in the bridged WebView vs.

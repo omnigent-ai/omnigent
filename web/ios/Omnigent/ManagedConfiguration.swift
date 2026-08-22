@@ -56,15 +56,12 @@ struct OmnigentManagedConfiguration: Decodable, Equatable {
           "'serverUrls' has \(raw.count) entries; at most \(Self.maxServerURLs) are allowed.")
     }
 
-    var origins: Set<String> = []
+    var serverKeys: Set<String> = []
     var urls: [URL] = []
     for entry in raw {
       let url = try Self.normalize(entry)
-      // Same origin comparison the rest of the shell uses, so a duplicate is
-      // dropped rather than offered twice. Note this does not canonicalize a
-      // redundant `:443`, matching `URL.omnigentOrigin` everywhere else.
-      guard let origin = url.omnigentOrigin else { throw Self.invalidURL(entry) }
-      if origins.insert(origin).inserted {
+      guard let key = url.omnigentServerKey else { throw Self.invalidURL(entry) }
+      if serverKeys.insert(key).inserted {
         urls.append(url)
       }
     }
@@ -138,20 +135,24 @@ struct OmnigentManagedConfiguration: Decodable, Equatable {
 /// `SettingsStore`, so withdrawing a configuration removes them cleanly and
 /// they never consume the recents cap and evict a server the user chose.
 enum ManagedServers {
-  /// `recents` minus any origin the administrator already presets, so a preset
+  /// `recents` minus any exact server the administrator already presets, so a preset
   /// server is offered once rather than twice.
   static func recents(_ recents: [String], excludingManaged managed: [URL]) -> [String] {
     guard !managed.isEmpty else { return recents }
-    let managedOrigins = Set(managed.compactMap(\.omnigentOrigin))
+    let managedKeys = Set(managed.compactMap(\.omnigentServerKey))
     return recents.filter { value in
-      guard let origin = URL(string: value)?.omnigentOrigin else { return true }
-      return !managedOrigins.contains(origin)
+      guard let key = URL(string: value)?.omnigentServerKey else { return true }
+      return !managedKeys.contains(key)
     }
   }
 
   /// Every server to offer, administrator-preset ones first.
   static func merged(managed: [URL], recents: [String]) -> [String] {
-    managed.map(\.absoluteString) + Self.recents(recents, excludingManaged: managed)
+    var seen = Set<String>()
+    return (managed.map(\.absoluteString) + recents).filter { value in
+      guard let key = URL(string: value)?.omnigentServerKey else { return false }
+      return seen.insert(key).inserted
+    }
   }
 
   /// Picks between the two configuration channels. A declarative configuration
@@ -159,5 +160,32 @@ enum ManagedServers {
   /// classic key is the fallback for services that don't send declarations.
   static func resolve(declarative: [URL], legacy: [URL]) -> [URL] {
     declarative.isEmpty ? legacy : declarative
+  }
+}
+
+/// Backs the web sidebar server picker's bridge requests (`getServerPicker` /
+/// `switchServer` in `OmnigentWebView`). Pure so the offer/switch rules are
+/// unit-testable without a WKWebView.
+enum ServerPickerBridge {
+  /// The `getServerPicker` reply: the pinned origin plus every server on offer
+  /// (managed presets first, then recents — `ManagedServers.merged`), matching
+  /// the web's `ServerPickerInfo` shape.
+  static func payload(currentOrigin: String, offered: [String]) -> [String: Any] {
+    ["currentOrigin": currentOrigin, "recentServers": offered]
+  }
+
+  /// Resolve a web-requested switch to a server the shell already offers, or
+  /// nil. The page can only nominate an origin it learned from the picker
+  /// payload; the returned URL is the shell's own offered entry (which may
+  /// carry a workspace mount), never the raw string the page sent — so a
+  /// compromised page cannot steer the shell to a server it doesn't know.
+  static func switchTarget(requested: String, offered: [String]) -> URL? {
+    guard let requestedOrigin = URL(string: requested)?.omnigentOrigin else { return nil }
+    for entry in offered {
+      if let url = URL(string: entry), url.omnigentOrigin == requestedOrigin {
+        return url
+      }
+    }
+    return nil
   }
 }

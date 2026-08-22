@@ -83,7 +83,7 @@ class MainActivityTest {
     }
 
     @Test
-    fun `a managed preset never overrides the server the user picked`() {
+    fun `unsupported secure bridge opens full-screen recovery with user server`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         ServerStore(context).connect("https://example.com")
         val manager = context.getSystemService(RestrictionsManager::class.java)
@@ -97,7 +97,10 @@ class MainActivityTest {
 
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
 
-        assertEquals("https://example.com", shadowOf(activity.webView()).lastLoadedUrl)
+        assertEquals("https://example.com", ServerStore(context).currentServerUrl())
+        val recovery = shadowOf(activity).nextStartedActivity
+        assertEquals(ConnectActivity::class.java.name, recovery.component?.className)
+        assertEquals("https://example.com", recovery.getStringExtra(ConnectActivity.EXTRA_PREFILL))
     }
 
     private fun MainActivity.webView(): WebView =

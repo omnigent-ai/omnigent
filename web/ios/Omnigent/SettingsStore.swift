@@ -36,7 +36,12 @@ final class SettingsStore: ObservableObject {
 
   func rememberRecentServer(_ url: URL) {
     let value = url.absoluteString
-    let deduped: [String] = [value] + recentServers.filter { $0 != value }
+    let key = url.omnigentServerKey
+    let deduped: [String] =
+      [value]
+      + recentServers.filter {
+        URL(string: $0)?.omnigentServerKey != key
+      }
     recentServers = Array(deduped.prefix(maxRecentServers))
   }
 

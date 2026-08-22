@@ -46,7 +46,7 @@ Notes:
 
 Preset servers appear on the connect screen under **"Provided by your
 organization"**, above the person's own recent servers, and in the in-app server
-switcher.
+picker at the bottom of the conversations sidebar.
 
 They are **offered, not enforced**:
 

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { isSurfaceFrontmost } from "./useNativeServerSwitcher";
+import { isSurfaceFrontmost } from "./useSurfaceFrontmost";
 
 // The native Liquid Glass Chat/Terminal bar floats over the web view, so DOM
 // stacking can't hide it — its visibility rides on `isSurfaceFrontmost`. A

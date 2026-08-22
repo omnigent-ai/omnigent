@@ -50,8 +50,8 @@ interface MainTerminalViewProps {
    */
   readOnly?: boolean;
   /**
-   * Exposes the outer terminal surface so the iOS native shell can show its
-   * server switcher only while this surface is actually frontmost.
+   * Exposes the outer terminal surface so native bottom chrome is shown only
+   * while this surface is actually frontmost.
    */
   onSurfaceElement?: (element: HTMLElement | null) => void;
 }

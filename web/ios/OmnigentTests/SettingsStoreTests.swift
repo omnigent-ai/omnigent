@@ -32,6 +32,17 @@ final class SettingsStoreTests: XCTestCase {
     XCTAssertFalse(store.recentServers.contains("https://a.example.com"))
   }
 
+  func testRecentServersCanonicalizeDefaultPortsAndPreservePaths() {
+    let store = SettingsStore(defaults: defaults)
+    store.rememberRecentServer(URL(string: "https://apps.example.com/first")!)
+    store.rememberRecentServer(URL(string: "https://apps.example.com:443/first/")!)
+    store.rememberRecentServer(URL(string: "https://apps.example.com/second")!)
+
+    XCTAssertEqual(
+      store.recentServers,
+      ["https://apps.example.com/second", "https://apps.example.com:443/first/"])
+  }
+
   func testProtocolGrantsAreScopedByOrigin() {
     let store = SettingsStore(defaults: defaults)
     store.allowProtocol("vscode", from: "https://one.example.com")

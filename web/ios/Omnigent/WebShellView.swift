@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct WebShellView: View {
+  let serverURL: URL
   let initialURL: URL
   let connectToNewServer: () -> Void
   let switchToServer: (URL) -> Void
@@ -19,34 +20,21 @@ struct WebShellView: View {
   @State private var deferredOpenPath: String?
 
   var body: some View {
-    GeometryReader { geometry in
-      ZStack(alignment: .top) {
-        OmnigentWebView(
-          initialURL: initialURL,
-          model: model,
-          settings: settings,
-          loadFailed: loadFailed,
-          loadSucceeded: loadSucceeded
-        )
-        .ignoresSafeArea()
-
-        ServerSwitcher(
-          currentURL: model.currentURL ?? initialURL,
-          recents: ManagedServers.merged(
-            managed: managedConfiguration.serverURLs, recents: settings.recentServers),
-          isLoading: model.isLoading,
-          maxWidth: ServerSwitcherMetrics.maxWidth(for: geometry.size.width),
-          switchServer: switchServer,
-          connectToNewServer: connectToNewServer,
-          reload: model.reload
-        )
-        .padding(.top, InsetMetrics.serverSwitcherTopPadding)
-        .opacity(model.serverSwitcherHidden ? 0 : 1)
-        .scaleEffect(model.serverSwitcherHidden ? 0.96 : 1, anchor: .top)
-        .allowsHitTesting(!model.serverSwitcherHidden)
-        .accessibilityHidden(model.serverSwitcherHidden)
-      }
-      .animation(.easeInOut(duration: 0.16), value: model.serverSwitcherHidden)
+    ZStack {
+      OmnigentWebView(
+        serverURL: serverURL,
+        initialURL: initialURL,
+        managedServers: managedConfiguration.serverURLs.map(\.absoluteString),
+        recentServers: ManagedServers.recents(
+          settings.recentServers, excludingManaged: managedConfiguration.serverURLs),
+        model: model,
+        settings: settings,
+        switchToServer: switchToServer,
+        connectToNewServer: connectToNewServer,
+        loadFailed: loadFailed,
+        loadSucceeded: loadSucceeded
+      )
+      .ignoresSafeArea()
       .ignoresSafeArea(.keyboard)
       .background(DesignTokens.background(colorScheme).ignoresSafeArea())
       .overlay(alignment: .bottom) {
@@ -98,122 +86,19 @@ struct WebShellView: View {
       // Re-push the native bar footprints once each load completes; the JS
       // bridge caches the value so a later-mounting subscriber still gets it.
       if !loading {
-        model.emitInsets(
-          topBar: InsetMetrics.topBarFootprint,
-          bottomBar: InsetMetrics.bottomBarFootprint
-        )
+        model.emitInsets(bottomBar: InsetMetrics.bottomBarFootprint)
       }
     }
   }
-
-  private func switchServer(_ urlString: String) {
-    guard let url = URL(string: urlString) else { return }
-    switchToServer(url)
-  }
 }
 
-private struct ServerSwitcher: View {
-  let currentURL: URL
-  let recents: [String]
-  let isLoading: Bool
-  let maxWidth: CGFloat
-  let switchServer: (String) -> Void
-  let connectToNewServer: () -> Void
-  let reload: () -> Void
-
-  @Environment(\.colorScheme) private var colorScheme
-
-  var body: some View {
-    Menu {
-      Button {
-      } label: {
-        Label(currentURL.omnigentHostLabel, systemImage: "checkmark")
-      }
-      .disabled(true)
-
-      let otherServers = recents.filter {
-        URL(string: $0)?.omnigentOrigin != currentURL.omnigentOrigin
-      }
-      if !otherServers.isEmpty {
-        Divider()
-        ForEach(otherServers, id: \.self) { recent in
-          Button {
-            switchServer(recent)
-          } label: {
-            Text(URL(string: recent)?.omnigentHostLabel ?? recent)
-          }
-        }
-      }
-
-      Divider()
-
-      Button(action: reload) {
-        Label("Reload", systemImage: "arrow.clockwise")
-      }
-
-      Divider()
-
-      Button(action: connectToNewServer) {
-        Label("Connect to New Server", systemImage: "plus")
-      }
-    } label: {
-      HStack(spacing: 6) {
-        Text(currentURL.omnigentHostLabel)
-          .fontWeight(.medium)
-          .lineLimit(1)
-          .truncationMode(.middle)
-
-        if isLoading {
-          ProgressView()
-            .controlSize(.mini)
-            .padding(.leading, 2)
-        } else {
-          Image(systemName: "chevron.down")
-            .font(.system(size: 11, weight: .semibold))
-            .foregroundStyle(DesignTokens.mutedForeground(colorScheme))
-        }
-      }
-      .font(.system(size: 12))
-      .foregroundStyle(DesignTokens.foreground(colorScheme))
-      .padding(.horizontal, 10)
-      .frame(height: InsetMetrics.serverSwitcherHeight)
-      .frame(maxWidth: maxWidth)
-      .contentShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
-    }
-    .buttonStyle(.plain)
-    // The material/border/shadow live OUTSIDE the `label:` closure, on the
-    // Menu's persistent host view. Applied inside the closure, UIKit's menu
-    // presentation snapshots the styled label for its open/dismiss morph and
-    // drops the shadow layer — leaving the pill flat (no shadow) for a beat
-    // after dismissal. Keeping the chrome on the Menu sidesteps that snapshot.
-    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-    .overlay {
-      RoundedRectangle(cornerRadius: 9, style: .continuous)
-        .stroke(Color.primary.opacity(colorScheme == .dark ? 0.16 : 0.10), lineWidth: 0.5)
-    }
-    .shadow(color: .black.opacity(colorScheme == .dark ? 0.22 : 0.08), radius: 10, y: 4)
-    .accessibilityLabel("Switch server")
-  }
-}
-
-private enum ServerSwitcherMetrics {
-  static func maxWidth(for containerWidth: CGFloat) -> CGFloat {
-    min(172, max(120, containerWidth * 0.38))
-  }
-}
-
-/// Single source of truth for the floating native bars' dimensions. These drive
+/// Single source of truth for the floating native bar's dimensions. These drive
 /// both the SwiftUI layout (the `.frame`/`.padding` calls above and in
 /// `ChatTerminalBar`) and the footprint pushed to the web layer via
 /// `WebViewModel.emitInsets`, so the web's content insets can never drift from
 /// the bars' real size. Values are CSS points, excluding the OS safe area (the
 /// web layer adds that with `env(safe-area-inset-*)`).
 enum InsetMetrics {
-  // Server switcher — the top floating pill.
-  static let serverSwitcherHeight: CGFloat = 28
-  static let serverSwitcherTopPadding: CGFloat = 8
-  static var topBarFootprint: CGFloat { serverSwitcherHeight + serverSwitcherTopPadding }
-
   // Chat/Terminal bar — the bottom floating capsule. The capsule wraps the
   // segment row (`barSegmentHeight`) in `barCapsulePadding` on every side.
   static let barSegmentHeight: CGFloat = 34

@@ -1,14 +1,14 @@
 import { useEffect, useState } from "react";
 
-import { isIOSShell, setNativeServerSwitcherHidden } from "@/lib/nativeBridge";
+import { isIOSShell } from "@/lib/nativeBridge";
 
 /**
  * Tracks whether `surface` is the frontmost element at its own centre — i.e.
  * not covered by a drawer / sidebar / sheet. Returns false when inactive,
  * outside the iOS shell, or while obscured. Re-checks on the layout signals a
- * drawer transition emits (mutations, transitions, viewport changes). Both the
- * native server switcher and the native Chat/Terminal bar hide off this signal
- * so neither floats over an opened panel.
+ * drawer transition emits (mutations, transitions, viewport changes). The
+ * native Chat/Terminal bar hides off this signal so it never floats over an
+ * opened panel.
  */
 export function useSurfaceFrontmost(surface: HTMLElement | null, active: boolean): boolean {
   const [frontmost, setFrontmost] = useState(false);
@@ -65,31 +65,6 @@ export function useSurfaceFrontmost(surface: HTMLElement | null, active: boolean
     };
   }, [active, surface]);
   return frontmost;
-}
-
-/**
- * Drive the iOS shell's native server switcher overlay so it shows only while
- * `surface` is the frontmost element on screen and `active` is true. The
- * switcher is a native chrome element the web app toggles via the bridge; it
- * must hide whenever the sidebar (or any other overlay) covers the main
- * surface, and whenever the surface is unmounted.
- *
- * No-ops outside the iOS shell. Used by both the in-session main surface
- * (ChatPage) and the new-session landing screen (NewChatDialog).
- */
-export function useNativeServerSwitcherForMainSurface(
-  surface: HTMLElement | null,
-  active: boolean,
-) {
-  const frontmost = useSurfaceFrontmost(surface, active);
-  useEffect(() => {
-    if (!isIOSShell()) return;
-    setNativeServerSwitcherHidden(!frontmost);
-  }, [frontmost]);
-  useEffect(() => {
-    if (!isIOSShell()) return;
-    return () => setNativeServerSwitcherHidden(true);
-  }, []);
 }
 
 export function isSurfaceFrontmost(surface: HTMLElement | null): boolean {

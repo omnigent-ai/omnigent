@@ -3,7 +3,7 @@ import SwiftUI
 /// The native Chat/Terminal switcher rendered over the bottom of the web view.
 ///
 /// On iOS 26+ the capsule uses the system Liquid Glass material; on iOS 18–25 it
-/// falls back to `.ultraThinMaterial`, matching the look of `ServerSwitcher`.
+/// falls back to `.ultraThinMaterial`.
 struct ChatTerminalBar: View {
   @Binding var mode: WebViewMode
   let terminalEnabled: Bool
@@ -68,7 +68,7 @@ struct ChatTerminalBar: View {
 }
 
 /// Wraps the bar in the system glass material where available, otherwise a
-/// hand-rolled material capsule that mirrors `ServerSwitcher`'s styling.
+/// hand-rolled material capsule used on earlier iOS versions.
 private struct GlassCapsule: ViewModifier {
   let colorScheme: ColorScheme
 
