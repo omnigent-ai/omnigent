@@ -1228,7 +1228,8 @@ describe("Sidebar collapsible sections", () => {
     fireEvent.click(screen.getByRole("button", { name: "Sessions" }));
     expect(screen.queryByText("conv_mine")).toBeNull();
     expect(screen.queryByText("conv_mine_two")).toBeNull();
-    expect(screen.getByRole("button", { name: "Sessions" })).toBeInTheDocument();
+    // Collapsed headers append the hidden-row count to their accessible name.
+    expect(screen.getByRole("button", { name: /^Sessions/ })).toBeInTheDocument();
 
     // Fresh mount re-reads localStorage: still collapsed. If this fails,
     // the toggle wrote state only to memory and reloads lose it.
@@ -1236,9 +1237,51 @@ describe("Sidebar collapsible sections", () => {
     renderSidebar();
     expect(screen.queryByText("conv_mine")).toBeNull();
 
-    // Expanding brings the rows back.
-    fireEvent.click(screen.getByRole("button", { name: "Sessions" }));
+    // Expanding brings the rows back. (Collapsed headers append the hidden-row
+    // count to their accessible name, so match on the title prefix.)
+    fireEvent.click(screen.getByRole("button", { name: /^Sessions/ }));
     expect(screen.getByText("conv_mine")).toBeInTheDocument();
+  });
+});
+
+// A collapsed section surfaces a count pill of the rows it hides — without
+// it, a collapsed section is indistinguishable from an empty one and the
+// sidebar can read as having no sessions at all.
+describe("Sidebar collapsed section count pill", () => {
+  it("shows the hidden-row count on a collapsed Sessions header and removes it on expand", () => {
+    mockConversations([conv("conv_mine", "Claude Code"), conv("conv_mine_two", "Claude Code")]);
+    renderSidebar();
+
+    // Expanded: no pill — the rows themselves are visible.
+    expect(screen.queryByTestId("section-collapsed-count")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Sessions" }));
+    const pill = screen.getByTestId("section-collapsed-count");
+    expect(pill).toHaveTextContent("2");
+    expect(pill).toHaveAttribute("aria-label", "2 hidden items");
+
+    fireEvent.click(screen.getByRole("button", { name: /^Sessions/ }));
+    expect(screen.queryByTestId("section-collapsed-count")).toBeNull();
+  });
+
+  it("shows the project count on the collapsed Projects group header", () => {
+    projectsMock.push("Customer X", "Customer Y");
+    mockConversations([
+      conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
+    ]);
+    renderSidebar();
+
+    fireEvent.click(screen.getByRole("button", { name: "Projects" }));
+    const projectsSection = screen.getByText("Projects").closest("section")!;
+    expect(within(projectsSection).getByTestId("section-collapsed-count")).toHaveTextContent("2");
+  });
+
+  it("shows no pill when the collapsed section is genuinely empty", () => {
+    mockConversations([]);
+    renderSidebar();
+
+    fireEvent.click(screen.getByRole("button", { name: "Sessions" }));
+    expect(screen.queryByTestId("section-collapsed-count")).toBeNull();
   });
 });
 
@@ -1269,7 +1312,7 @@ describe("Sidebar load-more vs collapsed Sessions", () => {
     // Collapsed Sessions hides its rows AND the pagination affordance.
     expect(screen.queryByText("conv_mine")).toBeNull();
     expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Sessions" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Sessions/ }));
     expect(screen.getByRole("button", { name: "Load more" })).toBeInTheDocument();
   });
 
@@ -1620,8 +1663,9 @@ describe("Sidebar project sections", () => {
     expect(screen.queryByTestId("collapse-all-projects")).toBeNull();
     closeProjectsMenu();
 
-    // Re-expanding the group brings it back.
-    fireEvent.click(screen.getByRole("button", { name: "Projects" }));
+    // Re-expanding the group brings it back. (Collapsed headers append the
+    // hidden-row count to their accessible name.)
+    fireEvent.click(screen.getByRole("button", { name: /^Projects/ }));
     openProjectsMenu();
     expect(screen.getByTestId("expand-all-projects")).toBeInTheDocument();
   });

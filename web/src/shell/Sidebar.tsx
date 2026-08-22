@@ -1907,6 +1907,7 @@ function ConversationList({
                     <ConversationSection
                       title="Pinned"
                       conversations={sections.pinned}
+                      count={sections.pinned.length}
                       pinnedConversationIds={pinnedConversationIds}
                       collapsed={effectiveCollapsedSections.includes("Pinned")}
                       onToggleCollapsed={() => effectiveToggleSectionCollapsed("Pinned")}
@@ -1928,6 +1929,7 @@ function ConversationList({
               vanish when switching to Shared or Archived. */}
                 <SectionGroup
                   title="Projects"
+                  count={sections.projectGroups.length}
                   collapsed={effectiveCollapsedSections.includes("Projects")}
                   onToggleCollapsed={() => effectiveToggleSectionCollapsed("Projects")}
                   afterHeader={
@@ -2005,6 +2007,7 @@ function ConversationList({
                     <ConversationSection
                       title="Sessions"
                       conversations={sections.sessions}
+                      count={sections.sessions.length}
                       emptyMessage={SIDEBAR_FILTER_EMPTY[activeTab]}
                       pinnedConversationIds={pinnedConversationIds}
                       collapsed={effectiveCollapsedSections.includes("Chats")}
@@ -2204,30 +2207,50 @@ function SectionHeader({
   title,
   icon,
   marker,
+  count,
   active = false,
   hasAction,
+  mobileAction = true,
+  hasPersistentAction,
   collapsed,
   onToggleCollapsed,
 }: {
   title: string;
   icon?: ReactNode;
   marker?: SessionState | null;
+  /** When collapsed, how many rows the section hides — shown as a count pill
+      so a collapsed section can't read as an empty one. */
+  count?: number;
   /** Whether this header represents the current page context. */
   active?: boolean;
   /** Whether the section also renders a hover-revealed header action (the
       project-folder kebab), which shares the header's right edge with the
       collapsed marker. */
   hasAction?: boolean;
+  /** Whether that hover-revealed action is also always shown on mobile,
+      reserving right-edge space there. False for desktop-only overlays
+      (the Projects group's controls). */
+  mobileAction?: boolean;
+  /** Whether an always-visible control sits at the header's right edge (the
+      Sessions filter), which the count pill must clear at rest. */
+  hasPersistentAction?: boolean;
   collapsed: boolean;
   onToggleCollapsed: () => void;
 }) {
+  const showCount = collapsed && count != null && count > 0;
   return (
     <h2>
       <button
         type="button"
         aria-expanded={!collapsed}
         aria-current={active ? "page" : undefined}
-        onClick={onToggleCollapsed}
+        onClick={(event) => {
+          // A pointer click would otherwise leave the header focus-within,
+          // keeping the hover-revealed controls up and the count pill faded
+          // at rest. Keyboard toggles (detail 0) keep focus for the ring.
+          if (event.detail > 0) event.currentTarget.blur();
+          onToggleCollapsed();
+        }}
         className={
           icon
             ? cn(
@@ -2270,6 +2293,25 @@ function SectionHeader({
               : "md:opacity-0 md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
           )}
         />
+        {/* Collapsed sections surface how many rows they hide as a count pill
+            at the right edge (same column as the Inbox badge) — without it a
+            collapsed section is indistinguishable from an empty one. It clears
+            a persistent right-edge control at rest and fades while the
+            hover-revealed controls take that edge. */}
+        {showCount && (
+          <span
+            aria-label={count === 1 ? "1 hidden item" : `${count} hidden items`}
+            data-testid="section-collapsed-count"
+            className={cn(
+              "ml-auto inline-flex h-4 min-w-4 shrink-0 items-center justify-center rounded-full bg-[var(--sidebar-active)] px-1 font-medium text-10 text-[var(--sidebar-active-foreground)] tabular-nums transition-opacity",
+              hasAction && mobileAction ? "mr-14" : "mr-2",
+              hasPersistentAction ? "md:mr-7" : "md:mr-2",
+              hasAction && "md:group-hover/header:opacity-0 md:group-focus-within/header:opacity-0",
+            )}
+          >
+            {count}
+          </span>
+        )}
         {/* A hidden row inside this collapsed section carries a marker — surface
             the exact same badge a row would show, pinned to the right edge. */}
         {collapsed && marker && (
@@ -2434,6 +2476,7 @@ function SectionGroup({
   title,
   collapsed,
   onToggleCollapsed,
+  count,
   headerAction,
   afterHeader,
   children,
@@ -2441,6 +2484,8 @@ function SectionGroup({
   title: string;
   collapsed: boolean;
   onToggleCollapsed: () => void;
+  /** When collapsed, how many child sections the group hides (count pill). */
+  count?: number;
   /** Optional control overlaid at the group header's right edge (e.g. the
       "collapse all projects" toggle). Hover/focus-revealed on desktop. */
   headerAction?: ReactNode;
@@ -2454,7 +2499,9 @@ function SectionGroup({
       <div className="group/header relative">
         <SectionHeader
           title={title}
+          count={count}
           hasAction={headerAction != null}
+          mobileAction={false}
           collapsed={collapsed}
           onToggleCollapsed={onToggleCollapsed}
         />
@@ -2481,6 +2528,7 @@ function ConversationSection({
   title,
   icon,
   marker,
+  count,
   active,
   conversations,
   pinnedConversationIds,
@@ -2504,6 +2552,10 @@ function ConversationSection({
   icon?: ReactNode;
   /** When collapsed, the aggregate marker of hidden rows (same badge as a row). */
   marker?: SessionState | null;
+  /** When collapsed, how many rows the section hides (count pill). Omitted on
+      project folders — a collapsed folder hasn't fetched its own sessions, so
+      its window count would under-report. */
+  count?: number;
   /** Whether this section header represents the current page context. */
   active?: boolean;
   conversations: Conversation[];
@@ -2548,8 +2600,10 @@ function ConversationSection({
             title={title}
             icon={icon}
             marker={marker}
+            count={count}
             active={active}
             hasAction={headerAction != null || persistentHeaderAction != null}
+            hasPersistentAction={persistentHeaderAction != null}
             collapsed={isCollapsed}
             onToggleCollapsed={onToggleCollapsed}
           />
