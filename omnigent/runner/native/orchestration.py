@@ -7187,6 +7187,10 @@ class NativeLaunchContext:
     auth_token_factory: Callable[[], str | None] | None = None
     resolve_launch_config: Callable[[], Awaitable[ClaudeNativeUcodeConfig | None]] | None = None
     record_launch_config: Callable[[str, ClaudeNativeUcodeConfig | None], None] | None = None
+    # Returns whether the session's terminal generation is still the one this
+    # launch started under. A reset bumps it, so a terminal that finished
+    # starting afterwards was built from a spec the reset retired.
+    registration_is_current: Callable[[], bool] | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -7431,6 +7435,17 @@ async def _launch_native_terminal(
             elif resolve_agent_spec is not None:
                 ctx = dataclasses.replace(ctx, agent_spec=await resolve_agent_spec())
             await adapter(ctx)
+            if ctx.registration_is_current is not None and not ctx.registration_is_current():
+                # A reset landed while the terminal was starting, so it carries
+                # the superseded spec. Drop it rather than leave it registered.
+                _logger.info(
+                    "Discarding %s terminal for %s: session was reset mid-launch",
+                    agent.terminal_name,
+                    ctx.session_id,
+                )
+                if registry is not None:
+                    await registry.cleanup_conversation(ctx.session_id)
+                return False
             return True
         except Exception as exc:
             _logger.exception(
@@ -7560,6 +7575,26 @@ async def _ensure_native_terminal(
                 ctx.session_id,
             )
             return _native_terminal_start_error_response(exc, agent.display_name)
+        if ctx.registration_is_current is not None and not ctx.registration_is_current():
+            # Same fence as the launch path: a reset mid-start retires this
+            # terminal's spec, so the caller must ask again rather than attach.
+            _logger.info(
+                "Discarding %s terminal for %s: session was reset mid-ensure",
+                terminal_name,
+                ctx.session_id,
+            )
+            registry = ctx.resource_registry.terminal_registry
+            if registry is not None:
+                await registry.cleanup_conversation(ctx.session_id)
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": {
+                        "code": "session_reset_during_launch",
+                        "message": "The session was reset while this terminal was starting.",
+                    }
+                },
+            )
         return respond(view)
 
 
