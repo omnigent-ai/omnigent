@@ -323,6 +323,46 @@ def test_create_agent_with_mcp_server(
     _run_in_fresh_loop(_drive_mcp_server(base_url, session_id))
 
 
+def test_create_agent_adds_searched_mcp_preset(
+    seeded_session: tuple[str, str],
+) -> None:
+    """Searching the integration catalog adds an editable preset row."""
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_mcp_preset(base_url, session_id))
+
+
+async def _drive_mcp_preset(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            await _register_routes(page, created_session_id=session_id, create_requests=[])
+            await _seed_workspace(page)
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+            await _open_create_agent(page)
+
+            await page.get_by_test_id("create-agent-add-mcp").click()
+            search = page.get_by_test_id("mcp-integration-search")
+            await search.fill("Microsoft")
+            await expect(page.get_by_text("AWS Knowledge")).to_be_hidden()
+            await page.get_by_test_id("create-agent-add-preset-microsoft-learn").click()
+
+            entry = page.get_by_test_id("create-agent-mcp-entry")
+            await expect(entry).to_be_visible()
+            await expect(page.get_by_test_id("create-agent-mcp-name")).to_have_value(
+                "microsoft-learn"
+            )
+            await expect(page.get_by_test_id("create-agent-mcp-url")).to_have_value(
+                "https://learn.microsoft.com/api/mcp"
+            )
+        finally:
+            await browser.close()
+
+
 async def _drive_mcp_server(base_url: str, session_id: str) -> None:
     async with async_playwright() as pw:
         browser = await pw.chromium.launch()
@@ -351,6 +391,7 @@ async def _drive_mcp_server(base_url: str, session_id: str) -> None:
 
             # Add an MCP server.
             await page.get_by_test_id("create-agent-add-mcp").click()
+            await page.get_by_test_id("create-agent-add-custom-mcp").click()
 
             # An MCP entry card should appear.
             mcp_entry = page.get_by_test_id("create-agent-mcp-entry")
