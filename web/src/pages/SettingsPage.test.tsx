@@ -269,14 +269,14 @@ describe("SettingsPage", () => {
     expect(mocks.setTheme).toHaveBeenCalledWith("dark");
   });
 
-  it("keeps automatic bottom locking off by default", () => {
+  it("keeps automatic bottom locking on by default", () => {
     renderPage("/settings/appearance");
     const toggle = screen.getByTestId("bottom-lock-toggle");
 
-    expect(toggle).toHaveAttribute("aria-checked", "false");
-    fireEvent.click(toggle);
     expect(toggle).toHaveAttribute("aria-checked", "true");
-    expect(localStorage.getItem("omnigent:bottom-lock")).toBe("true");
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+    expect(localStorage.getItem("omnigent:bottom-lock")).toBe("false");
   });
   it("renders the Terminal theme radiogroup with auto selected by default", () => {
     renderPage("/settings/appearance");
@@ -518,7 +518,7 @@ describe("SettingsPage", () => {
       "aria-checked",
       "false",
     );
-    expect(screen.getByTestId("bottom-lock-toggle")).toHaveAttribute("aria-checked", "false");
+    expect(screen.getByTestId("bottom-lock-toggle")).toHaveAttribute("aria-checked", "true");
   });
 
   it("lets you clear and retype the font size without clamping mid-edit", () => {

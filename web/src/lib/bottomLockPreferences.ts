@@ -1,4 +1,4 @@
-export const DEFAULT_BOTTOM_LOCK_ENABLED = false;
+export const DEFAULT_BOTTOM_LOCK_ENABLED = true;
 export const BOTTOM_LOCK_STORAGE_KEY = "omnigent:bottom-lock";
 
 const CHANGE_EVENT = "omnigent:bottom-lock-change";

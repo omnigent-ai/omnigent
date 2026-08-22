@@ -10,14 +10,14 @@ afterEach(() => {
 });
 
 describe("bottom lock preferences", () => {
-  it("defaults to disabled and stores only the enabled override", () => {
-    expect(readBottomLockEnabled()).toBe(false);
-
-    writeBottomLockEnabled(true);
+  it("defaults to enabled and stores only the disabled override", () => {
     expect(readBottomLockEnabled()).toBe(true);
-    expect(localStorage.getItem("omnigent:bottom-lock")).toBe("true");
 
     writeBottomLockEnabled(false);
+    expect(readBottomLockEnabled()).toBe(false);
+    expect(localStorage.getItem("omnigent:bottom-lock")).toBe("false");
+
+    writeBottomLockEnabled(true);
     expect(localStorage.getItem("omnigent:bottom-lock")).toBeNull();
   });
 
@@ -25,11 +25,11 @@ describe("bottom lock preferences", () => {
     const onChange = vi.fn();
     const unsubscribe = subscribeBottomLockEnabled(onChange);
 
-    writeBottomLockEnabled(true);
+    writeBottomLockEnabled(false);
     expect(onChange).toHaveBeenCalledOnce();
 
     unsubscribe();
-    writeBottomLockEnabled(false);
+    writeBottomLockEnabled(true);
     expect(onChange).toHaveBeenCalledOnce();
   });
 });
