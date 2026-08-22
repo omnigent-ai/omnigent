@@ -544,6 +544,62 @@ describe("AppShell header", () => {
     expect(screen.getByRole("button", { name: /sidebar/i })).toBeInTheDocument();
   });
 
+  it("shows owner actions for a top-level session omitted from conversation pages", () => {
+    mockConversations([]);
+    useSessionMock.mockReturnValue({
+      session: {
+        id: "conv_off_window",
+        agentId: "ag_owner",
+        agentName: "developer",
+        runnerId: null,
+        status: "idle",
+        createdAt: 1_700_000_000,
+        title: "Off-window owner session",
+        labels: {},
+        items: [],
+        pendingElicitations: [],
+        permissionLevel: 4,
+        parentSessionId: null,
+        subAgentName: null,
+        kind: "default",
+      },
+      isLoading: false,
+      error: null,
+    });
+
+    renderShell("/c/conv_off_window");
+
+    expect(screen.getByRole("button", { name: "Conversation actions" })).toBeInTheDocument();
+  });
+
+  it("keeps owner actions hidden for an off-window sub-agent", () => {
+    mockConversations([]);
+    useSessionMock.mockReturnValue({
+      session: {
+        id: "conv_child",
+        agentId: "ag_owner",
+        agentName: "developer",
+        runnerId: null,
+        status: "idle",
+        createdAt: 1_700_000_000,
+        title: "Child session",
+        labels: {},
+        items: [],
+        pendingElicitations: [],
+        permissionLevel: 4,
+        parentSessionId: "conv_parent",
+        subAgentName: "researcher",
+        kind: "sub_agent",
+      },
+      isLoading: false,
+      error: null,
+    });
+
+    renderShell("/c/conv_child");
+
+    expect(screen.queryByRole("button", { name: "Conversation actions" })).toBeNull();
+  });
+
   it("defaults to chat view on a native Claude session", () => {
     // The shell used to auto-open the terminals panel for terminal-first
     // sessions. The new behavior is: default to Chat, let the user opt

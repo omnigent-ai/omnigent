@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent, type KeyboardEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 import {
   ArchiveIcon,
   CheckIcon,
@@ -94,6 +94,7 @@ function ProjectPicker({
       <div className="flex items-center gap-2 border-b px-2 py-1.5">
         <SearchIcon className="size-3.5 shrink-0 text-muted-foreground" />
         <input
+          aria-label="Search projects"
           className="w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
           placeholder="Search projects"
           value={search}
@@ -155,6 +156,7 @@ export function HeaderConversationMenu({
   const [renameTitle, setRenameTitle] = useState(conversation.title ?? "");
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteBranch, setDeleteBranch] = useState(false);
+  const previousConversationId = useRef(conversation.id);
   const isPinned = conversation.labels?.[PINNED_LABEL_KEY] != null;
   const label = conversationDisplayLabel(conversation);
   const gitBranch = conversation.git_branch ?? null;
@@ -162,6 +164,17 @@ export function HeaderConversationMenu({
   useEffect(() => {
     if (!renameOpen) setRenameTitle(conversation.title ?? "");
   }, [conversation.title, renameOpen]);
+
+  useEffect(() => {
+    if (previousConversationId.current === conversation.id) return;
+    previousConversationId.current = conversation.id;
+    setMenuOpen(false);
+    setProjectPickerOpen(false);
+    setRenameOpen(false);
+    setRenameTitle(conversation.title ?? "");
+    setDeleteOpen(false);
+    setDeleteBranch(false);
+  }, [conversation.id, conversation.title]);
 
   const closeMenu = () => {
     setMenuOpen(false);
@@ -339,6 +352,7 @@ export function HeaderConversationMenu({
             </DialogHeader>
             <input
               autoFocus
+              aria-label="Session name"
               data-testid="header-rename-conversation-input"
               value={renameTitle}
               onChange={(event) => setRenameTitle(event.target.value)}
