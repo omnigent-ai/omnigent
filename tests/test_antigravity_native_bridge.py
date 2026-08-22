@@ -1705,6 +1705,50 @@ def test_seed_isolated_agy_home_skips_gcp_when_host_has_none(
     assert not (agy_gemini_dir(bridge_dir) / "antigravity-cli" / "settings.json").exists()
 
 
+@pytest.mark.parametrize("host_body", ["{not json", '["a", "list"]'])
+def test_seed_isolated_agy_home_skips_gcp_when_host_settings_unparseable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, host_body: str
+) -> None:
+    """A corrupt or non-object HOST settings.json seeds nothing — never a failure."""
+    fake_home = tmp_path / "real-home"
+    real_settings = fake_home / ".gemini" / "antigravity-cli" / "settings.json"
+    real_settings.parent.mkdir(parents=True)
+    real_settings.write_text(host_body, encoding="utf-8")
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+
+    assert not (agy_gemini_dir(bridge_dir) / "antigravity-cli" / "settings.json").exists()
+
+
+@pytest.mark.parametrize("iso_body", ["{not json", '["a", "list"]'])
+def test_seed_isolated_agy_home_gcp_never_clobbers_unparseable_isolated_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, iso_body: str
+) -> None:
+    """An isolated settings file that isn't a JSON object is left byte-identical."""
+    fake_home = tmp_path / "real-home"
+    real_settings = fake_home / ".gemini" / "antigravity-cli" / "settings.json"
+    real_settings.parent.mkdir(parents=True)
+    real_settings.write_text(
+        json.dumps({"gcp": {"project": "acme-prod", "location": "global"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    iso_settings = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "settings.json"
+    iso_settings.parent.mkdir(parents=True)
+    iso_settings.write_text(iso_body, encoding="utf-8")
+
+    seed_isolated_agy_home(bridge_dir)
+
+    # Fail safe: skipping the gcp seed beats reducing the file to {"gcp": ...}.
+    assert iso_settings.read_text(encoding="utf-8") == iso_body
+
+
 def test_seed_isolated_agy_home_exposes_user_plugins(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

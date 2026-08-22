@@ -773,7 +773,9 @@ def _seed_isolated_agy_gcp(real_home: Path, iso_gemini: Path) -> None:
 
     Merge-only + best-effort, like the workspace-trust seed: a host without the
     file or without a ``gcp`` object seeds nothing, and every other key already
-    in the isolated ``settings.json`` is preserved.
+    in the isolated ``settings.json`` is preserved. An existing isolated file
+    that cannot be parsed into a JSON object is left UNTOUCHED rather than
+    clobbered (mirrors :func:`ensure_agy_feedback_survey_disabled`).
 
     :param real_home: The user's real home directory.
     :param iso_gemini: The bridge-owned ``--gemini_dir`` being seeded.
@@ -794,16 +796,27 @@ def _seed_isolated_agy_gcp(real_home: Path, iso_gemini: Path) -> None:
         try:
             loaded = json.loads(settings_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            loaded = None
-        if isinstance(loaded, dict):
-            data = loaded
+            return
+        if not isinstance(loaded, dict):
+            return
+        data = loaded
     if data.get("gcp") == gcp:
         return
     data["gcp"] = gcp
     settings_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    tmp = settings_path.with_suffix(settings_path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(tmp, settings_path)
+    # mkstemp gives a unique, O_EXCL-created temp file so concurrent seeds never
+    # collide and a planted symlink is never followed; the gcp block may carry
+    # account/project metadata, so pin 0o600 explicitly rather than trusting umask.
+    fd, tmp_name = tempfile.mkstemp(prefix="settings.json.", dir=str(settings_path.parent))
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.replace(tmp_name, settings_path)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
 
 
 def _seed_isolated_agy_workspace_trust(iso_gemini: Path, workspace: Path) -> None:
