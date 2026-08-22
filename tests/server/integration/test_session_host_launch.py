@@ -1275,9 +1275,10 @@ async def test_host_session_message_waits_for_bound_runner_before_relaunch(
         f"recorded runner POSTs were {runner_paths!r}"
     )
     event_paths = [path for path in runner_paths if path.endswith("/events")]
-    assert event_paths, (
-        f"the user message should be forwarded after session init; "
-        f"recorded runner POSTs were {runner_paths!r}"
+    assert len(event_paths) == 1, (
+        f"the user message should be forwarded exactly once after session "
+        f"init; a second forward would mean the message was replayed onto a "
+        f"replacement runner. Recorded runner POSTs were {runner_paths!r}"
     )
     assert init_bodies and init_bodies[0]["session_id"] == session_id, (
         f"session-init body should target {session_id!r}; got {init_bodies!r}"

@@ -329,6 +329,19 @@ _NATIVE_POLICY_NOT_ENFORCED_CODE = "native_policy_not_enforced"
 _HOST_BOUND_RUNNER_CONNECT_GRACE_S = 10.0
 
 
+# How long to keep waiting for a host-bound runner once the host has
+# confirmed the process is ``alive``. The short grace above is tuned for the
+# common case where the tunnel is milliseconds behind the launch; a cold boot
+# (image pull, interpreter start, harness init) can outlast it while the host
+# still holds the runner's ``Popen``. Abandoning that runner rotates the
+# binding and races a replacement, so an ``alive`` verdict waits this long
+# instead of expiring at the grace. 60s matches the budget the CLI already
+# allows a runner to come online in (``DAEMON_RUNNER_ONLINE_TIMEOUT_S``),
+# restated here rather than imported so this leaf module stays free of the
+# CLI-side module tree.
+_HOST_BOUND_RUNNER_ALIVE_CONNECT_TIMEOUT_S = 60.0
+
+
 _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S = 30.0
 
 
@@ -881,6 +894,7 @@ __all__ = [
     "_HARNESS_PRE_RESOLVED_ELICITATION_MAX_ENTRIES",
     "_HARNESS_PRE_RESOLVED_ELICITATION_TTL_S",
     "_HOOK_ELICITATION_ID_RE",
+    "_HOST_BOUND_RUNNER_ALIVE_CONNECT_TIMEOUT_S",
     "_HOST_BOUND_RUNNER_CONNECT_GRACE_S",
     "_HOST_LAUNCH_RESULT_TIMEOUT_S",
     "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S",

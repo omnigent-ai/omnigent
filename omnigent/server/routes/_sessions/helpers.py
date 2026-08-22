@@ -4434,10 +4434,12 @@ async def _query_host_runner_status(
     Ask a host whether a runner's process is alive, dead, or unknown.
 
     The host owns runner-process liveness (it holds the ``Popen``), so it
-    can answer the one question the server's tunnel registry cannot: is an
-    absent-from-the-tunnel runner still coming (booting) or gone for good
-    (stopped, crashed, or lost to a host restart)? Used before the connect
-    grace so the dispatch path waits only for a runner that is coming.
+    can answer the one question the server's tunnel registry cannot: is the
+    process behind an absent-from-the-tunnel runner still held (``alive``)
+    or gone for good (stopped, crashed, or lost to a host restart)? Raced
+    against the connect grace so the verdict can shorten the wait for a
+    runner that is gone, or extend it to the caller's bounded budget for one
+    the host still holds.
 
     :param host_conn: Live host connection to query.
     :param host_registry: Registry used to enqueue the outbound frame.
@@ -4467,9 +4469,9 @@ async def _query_host_runner_status(
     except asyncio.TimeoutError:
         return None
     except Exception:  # noqa: BLE001
-        # Defensive: this query only ever *speeds up* the connect grace, so
-        # any unexpected failure (e.g. the future resolved with an error)
-        # must degrade to "no verdict" and fall back to the wait rather than
+        # Defensive: this query only ever *adjusts* the connect wait, so any
+        # unexpected failure (e.g. the future resolved with an error) must
+        # degrade to "no verdict" and fall back to the plain grace rather than
         # break the message POST. CancelledError is a BaseException and still
         # propagates, so the race helper's cancel/drain is unaffected.
         _logger.warning(
