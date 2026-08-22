@@ -6,9 +6,14 @@ executor:
   type: omnigent
   config:
     harness: claude-native
-    # Headless workers can't answer ApprovalCards, and managed Claude
-    # settings disable ``bypassPermissions``. ``auto`` auto-approves without
-    # prompting and is allowed under managed settings (-> ``--permission-mode auto``).
+    # ``permission_mode: auto`` becomes Claude Code's ``--permission-mode auto``:
+    # Claude auto-approves tool calls instead of prompting, which this worker
+    # needs because polly runs it headless and nobody is watching to answer an
+    # ApprovalCard. ``bypassPermissions`` also skips prompting, but its
+    # ``PermissionRequest`` hook never fires for ``AskUserQuestion``; Omnigent
+    # needs a separate interception shim to deliver those questions to the web UI.
+    # Omnigent's independent ``blast_radius`` gate below still denies the
+    # catastrophic set.
     permission_mode: auto
 
 prompt: |
