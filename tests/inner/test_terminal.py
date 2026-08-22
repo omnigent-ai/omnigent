@@ -605,6 +605,12 @@ async def test_launch_enables_csi_u_extended_keys_quietly(
         cmd,
         ["set-option", "-sq", "extended-keys-format", "csi-u"],
     )
+    # tmux copy-mode may export selections to an attached terminal, but pane
+    # applications must not be allowed to create paste buffers through OSC 52.
+    assert contains_subsequence(
+        cmd,
+        ["set-option", "-sq", "set-clipboard", "external"],
+    )
 
 
 @pytest.mark.asyncio

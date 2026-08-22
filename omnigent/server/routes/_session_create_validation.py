@@ -115,7 +115,9 @@ async def validate_existing_host_workspace(
             "workspace required when host_id is set",
             code=ErrorCode.INVALID_INPUT,
         )
-    if not workspace.startswith("/"):
+    from omnigent.server.routes._workspace_validation import _is_windows_absolute_path
+
+    if not workspace.startswith("/") and not _is_windows_absolute_path(workspace):
         raise OmnigentError(
             "workspace must be an absolute path starting with /",
             code=ErrorCode.INVALID_INPUT,

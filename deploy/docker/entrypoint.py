@@ -304,6 +304,11 @@ def _build_routing(
     return _build_local_llm_routing_client(server_llm), settings
 
 
+def _resolve_execution_timeout(cfg: dict[str, Any]) -> int:
+    """Return the configured execution limit or the RuntimeCaps default."""
+    return int(cfg.get("execution_timeout") or 7200)
+
+
 def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     """Resolve config if needed, wire the stores, and build the app.
 
@@ -374,6 +379,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     routing_client, routing_settings = _build_routing(cfg, server_llm)
 
     caps = RuntimeCaps(
+        execution_timeout=_resolve_execution_timeout(cfg),
         default_policies=parse_default_policies(cfg.get("policies")),
         llm=server_llm,
         routing_client=routing_client,

@@ -2,8 +2,7 @@ import Foundation
 
 enum WorkspaceURLExpander {
   /// Path the Omnigent SPA is mounted at inside a Databricks workspace. Matches
-  /// Android's `WORKSPACE_UI_PATH` (`Origins.kt`). The Electron shell still uses
-  /// `/ml/omnigents`; see the note in `web/electron/src/url.js`.
+  /// Android and Electron's `WORKSPACE_UI_PATH`.
   static let workspaceUIPath = "/omnigent"
 
   /// Databricks domains that serve a workspace, and therefore mount the SPA at

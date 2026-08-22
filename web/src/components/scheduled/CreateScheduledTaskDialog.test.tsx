@@ -717,7 +717,7 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
       />,
     );
     // Prefilled selections surface as the trigger's shown value.
-    expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Sonnet 4.6");
+    expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Sonnet");
     expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("Medium");
   });
 

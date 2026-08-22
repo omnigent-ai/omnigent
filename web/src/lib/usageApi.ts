@@ -15,6 +15,7 @@ interface SessionUsageWire {
   cost_usd: number;
   models: Record<string, number>;
   harness: string | null;
+  other_harnesses: string[] | null;
   llm_model: string | null;
   agent_name: string | null;
 }
@@ -43,6 +44,7 @@ export interface SessionUsage {
   costUsd: number;
   models: Record<string, number>;
   harness: string | null;
+  otherHarnesses: string[] | null;
   llmModel: string | null;
   agentName: string | null;
 }
@@ -76,6 +78,7 @@ export async function fetchUsageReport(): Promise<UsageReport> {
       costUsd: s.cost_usd,
       models: s.models ?? {},
       harness: s.harness ?? null,
+      otherHarnesses: s.other_harnesses ?? null,
       llmModel: s.llm_model ?? null,
       agentName: s.agent_name ?? null,
     })),

@@ -8,23 +8,29 @@ from types import MappingProxyType
 
 from omnigent.llms.errors import PermanentLLMError
 
-EFFORT_VALUES = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
+EFFORT_VALUES = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"})
 EFFORT_CLEAR_VALUES = frozenset({"default", "off", "reset"})
 
-# Deprecated / vendor-written effort values mapped to the canonical value to
-# use instead. The ChatGPT desktop app writes ``model_reasoning_effort =
-# "ultra"`` into ``~/.codex/config.toml``, and the codex CLI forwards it as
-# the retired ``max`` wire value — the OpenAI Responses API accepts neither
-# (its ladder tops out at ``xhigh``). ``validate_effort`` coerces an alias
-# only when the raw value is unsupported but the canonical value IS
-# supported, so providers that genuinely support ``max`` (Anthropic) keep it
-# unchanged.
+# Fold a value to a canonical one, but only where the target ladder lacks it:
+# ``validate_effort`` applies an alias only when the raw value is unsupported
+# but the canonical one is. On the SDK/Responses codex ladder (``CODEX_EFFORTS``,
+# capped at ``xhigh``) the ChatGPT app's ``ultra`` / retired ``max`` fold to
+# ``xhigh``; ladders that carry them (codex-native ``CODEX_NATIVE_EFFORTS``,
+# Anthropic's ``max``) keep them unchanged.
 EFFORT_ALIASES: dict[str, str] = {"ultra": "xhigh", "max": "xhigh"}
 
 OPENAI_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh"})
 ANTHROPIC_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 CLAUDE_EFFORTS = ANTHROPIC_EFFORTS
 CODEX_EFFORTS = OPENAI_EFFORTS
+# Codex-native drives the real codex process, which is the per-model authority
+# on reasoning levels — it advertises them via ``model/list`` and validates the
+# pairing itself. Sol reaches ``ultra``; the picker already gates which levels a
+# model offers, so accept codex's full ladder here rather than re-clamping a
+# valid pick down to ``xhigh``.
+CODEX_NATIVE_EFFORTS = frozenset(
+    {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
+)
 OPENAI_AGENTS_EFFORTS = OPENAI_EFFORTS
 GEMINI_EFFORTS = frozenset({"low", "medium", "high"})
 ANTIGRAVITY_EFFORTS = GEMINI_EFFORTS
@@ -36,7 +42,7 @@ COPILOT_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
 
 def format_supported(values: Iterable[str]) -> str:
     """Return a stable comma-separated supported-values string."""
-    order = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+    order = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
     values_set = set(values)
     return ", ".join(value for value in order if value in values_set)
 
@@ -61,8 +67,10 @@ def unsupported_effort_message(effort: str, provider: str, supported: Iterable[s
 # above stay frozen: they are the wire APIs' own vocabularies.
 _MODEL_EFFORT_FALLBACK: Mapping[str, str] = MappingProxyType({"glm-5-2": "medium"})
 # Efforts a fallback model cannot accept, so a pinned high value coerces down.
+# GLM tops out at ``high``, so every rung above it (``xhigh``/``max``/``ultra``)
+# is unsupported.
 _MODEL_EFFORT_UNSUPPORTED: Mapping[str, frozenset[str]] = MappingProxyType(
-    {"glm-5-2": frozenset({"xhigh", "max"})}
+    {"glm-5-2": frozenset({"xhigh", "max", "ultra"})}
 )
 
 

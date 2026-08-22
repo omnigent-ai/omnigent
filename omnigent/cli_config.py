@@ -3794,8 +3794,19 @@ def _run_configure_harnesses_interactive() -> None:
         # discoverable than a user's own `acp:` entry.
         from omnigent._platform import resolve_cli_binary
         from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+        from omnigent.onboarding.acp_auth import acp_agents, shadowed_builtin_acp_rows
+
+        # Skip a row a configured `acp:` agent already claims, so the list shows
+        # one "Devin" (the user's, with its command) rather than two identically
+        # labeled rows. A config error is reported by the custom-ACP block below.
+        try:
+            _shadowed_acp_rows: frozenset[str] = shadowed_builtin_acp_rows(acp_agents(config))
+        except ValueError:
+            _shadowed_acp_rows = frozenset()
 
         for _acp_cli_name, _acp_cli_row in sorted(ACP_CLI_HARNESSES.items()):
+            if _acp_cli_name in _shadowed_acp_rows:
+                continue
             _acp_cli_key = _ACP_CLI_PREFIX + _acp_cli_name
             if resolve_cli_binary(_acp_cli_row.binary) is None:
                 rows.append(

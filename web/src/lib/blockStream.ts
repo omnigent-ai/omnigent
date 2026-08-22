@@ -34,6 +34,7 @@ import {
   type ToolGroup,
   type ToolResultBlock,
   type UserMessageBlock,
+  ELICITATION_RESPONSE_PREFIX,
   slashCommandEchoItemId,
   slashCommandEchoText,
   structuredErrorFields,
@@ -853,7 +854,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         // inline with the turn that triggered it.
         ctx:
           event.phase === "request" || state.responseId === ""
-            ? ctx(state, null, `elicit_${event.elicitationId}`)
+            ? ctx(state, null, `${ELICITATION_RESPONSE_PREFIX}${event.elicitationId}`)
             : ctx(state),
         elicitationId: event.elicitationId,
         targetSessionId: event.targetSessionId,

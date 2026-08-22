@@ -21,7 +21,13 @@ type StreamdownHardenPlugin = StreamdownPluginTuple & {
 export const STREAMDOWN_PLUGINS = {
   cjk,
   code: lazyCodePlugin,
-  math: createMathPlugin({ singleDollarTextMath: true }),
+  // Only `$$…$$` opens math. A single `$` is prose far more often than it is a
+  // math delimiter — currency ($5), rates ($/PR, $/session), shell variables
+  // ($LLM_API_KEY) — and single-dollar math pairs any two of them up, rendering
+  // the whole span between them as letter-by-letter math soup. Explicit TeX
+  // delimiters (`\(…\)`, `\[…\]`), which is what LLMs emit for real math, are
+  // rewritten to `$$…$$` by `normalizeExplicitMathDelimiters`.
+  math: createMathPlugin({ singleDollarTextMath: false }),
   mermaid,
 };
 export const SECURE_STREAMDOWN_REHYPE_PLUGINS = createStreamdownRehypePlugins(false);

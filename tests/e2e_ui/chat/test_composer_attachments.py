@@ -240,9 +240,13 @@ def test_failed_upload_restores_the_message(
     composer.fill("look at this file")
     composer.press("Enter")
 
-    # The server's reason reaches the user instead of a bare status line.
-    expect(page.get_by_text("Unsupported attachment type", exact=False)).to_be_visible(
-        timeout=30_000
-    )
+    # The compact pill keeps the reason one expansion away instead of
+    # dropping it or replacing it with a bare status line.
+    pill = page.get_by_test_id("error-pill")
+    expect(pill).to_be_visible(timeout=30_000)
+    headline = pill.get_by_role("button", name="Something went wrong", exact=False)
+    expect(headline).to_have_attribute("aria-expanded", "false")
+    headline.click()
+    expect(page.get_by_text("Unsupported attachment type", exact=False)).to_be_visible()
     # And the message is back in the composer, ready to retry.
     expect(composer).to_have_value("look at this file", timeout=10_000)

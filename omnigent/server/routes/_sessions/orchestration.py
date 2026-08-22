@@ -338,7 +338,7 @@ from omnigent.stores.conversation_store import (
     pinned_label_key,
 )
 from omnigent.stores.file_store import FileStore
-from omnigent.stores.host_store import Host, HostStore
+from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.telemetry import emit as _tel_emit
 from omnigent.telemetry.events import SessionCreatedEvent as _TelSessionCreatedEvent
@@ -1221,7 +1221,13 @@ def _accumulate_session_usage(
     llm_model = (
         usage_model
         if isinstance(usage_model, str) and usage_model
-        else (conv.model_override if conv and conv.model_override else _resolve_llm_model(conv))
+        else (
+            conv.reported_model
+            if conv and conv.reported_model
+            else (
+                conv.model_override if conv and conv.model_override else _resolve_llm_model(conv)
+            )
+        )
     )
     if llm_model:
         if isinstance(provider_cost, (int, float)):
@@ -2538,7 +2544,7 @@ async def _mark_runner_sessions_offline_impl(
         # turn edges), falling back to the row for a session whose live state
         # was published before a restart.
         live = _session_status_cache.get(conv.id, conv.live_status)
-        interrupted = live in ("running", "waiting")
+        interrupted = live in _MID_TURN_STATUSES
         dead_on_arrival = fail_idle_top_level and conv.kind != "sub_agent"
         if not interrupted and not dead_on_arrival:
             continue
@@ -2889,7 +2895,7 @@ async def _maybe_relaunch_managed_sandbox(
     host = await asyncio.to_thread(host_store.get_host, conv.host_id)
     if host is None or host.sandbox_provider is None:
         return False
-    if await asyncio.to_thread(host_store.is_online, conv.host_id):
+    if host_is_live(host):
         host_registry = getattr(app_state, "host_registry", None)
         host_conn = host_registry.get(conv.host_id) if host_registry is not None else None
         if not (host_resume_supported(host, sandbox_config) and host_conn is None):
@@ -3012,7 +3018,7 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
             runner_idle_s is not None and runner_idle_s >= _MANAGED_RESUMABLE_TUNNEL_STALE_S
         )
 
-    host_row_online = await asyncio.to_thread(host_store.is_online, conv.host_id)
+    host_row_online = host_is_live(host)
     sandbox_running = await asyncio.to_thread(host_sandbox_is_running, host, sandbox_config)
     if (
         sandbox_running is not False
@@ -3054,6 +3060,7 @@ async def ensure_runner_connected(
     app_state: Any,
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
+    raise_host_refusal: bool = False,
 ) -> tuple[httpx.AsyncClient | None, Conversation]:
     """
     Bring a wakeable session's runner online for out-of-band resource access.
@@ -3088,6 +3095,10 @@ async def ensure_runner_connected(
         managed-launch tracker, host store, and sandbox config.
     :param conversation_store: Store holding the session row.
     :param runner_router: The ``RunnerRouter``, or ``None`` for in-process.
+    :param raise_host_refusal: Raise typed, non-persisting errors when the
+        host rejects launch because the harness is unavailable or the
+        workspace is gone. Resource callers keep the legacy ``False``
+        behavior; retry recovery opts in because it has no message to persist.
     :returns: ``(runner_client, conv)`` — the client is ``None`` when no
         runner is reachable and none is wakeable; ``conv`` is re-read after
         any wake/relaunch so the caller sees the rebound row.
@@ -3177,6 +3188,21 @@ async def ensure_runner_connected(
                 _HARNESS_NOT_CONFIGURED_ERROR_CODE,
                 _WORKSPACE_MISSING_ERROR_CODE,
             )
+            if _fatal_refusal and raise_host_refusal:
+                error_code = (
+                    ErrorCode.HARNESS_NOT_CONFIGURED
+                    if launch_attempt.error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE
+                    else ErrorCode.WORKSPACE_MISSING
+                )
+                raise OmnigentError(
+                    launch_attempt.error
+                    or (
+                        "The session harness is not configured on this host."
+                        if error_code == ErrorCode.HARNESS_NOT_CONFIGURED
+                        else "The session workspace no longer exists on the host."
+                    ),
+                    code=error_code,
+                )
             if _fatal_refusal and launch_attempt.error is not None:
                 _rer = getattr(app_state, "runner_exit_reports", None)
                 if _rer is not None:
@@ -3549,6 +3575,7 @@ async def _ensure_runner_session_initialized(
     initializer: RunnerSessionInitializer | None = None,
     *,
     suppress_recovery_turn: bool = False,
+    require_success: bool = False,
 ) -> bool:
     """
     Drive — and wait for — the runner's session-init handshake.
@@ -3597,6 +3624,8 @@ async def _ensure_runner_session_initialized(
         forward then arrives to an active turn, is buffered, and is
         processed a second time once the (redundant) recovery turn
         finishes.
+    :param require_success: Raise ``runner_unavailable`` when the handshake
+        fails instead of using the message path's best-effort fallback.
     :returns: ``True`` when a current runner explicitly confirmed its native
         terminal is ready; ``False`` for legacy or non-native responses.
     """
@@ -3635,13 +3664,18 @@ async def _ensure_runner_session_initialized(
             and payload.get("session_init_protocol_version") == 2
             and payload.get("terminal_ready") is True
         )
-    except (httpx.HTTPError, ConnectionError):
+    except (httpx.HTTPError, ConnectionError) as exc:
         _logger.warning(
             "Session-init handshake to runner failed for session %s; "
             "forwarding the message anyway",
             session_id,
             exc_info=True,
         )
+        if require_success:
+            raise OmnigentError(
+                "The recovered runner did not finish session initialization.",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            ) from exc
         return False
 
 
@@ -3687,6 +3721,8 @@ async def _ensure_native_terminal_ready(
     runner_client: httpx.AsyncClient,
     session_id: str,
     conv: Conversation,
+    *,
+    persist_resource_event: bool = True,
 ) -> _NativeTerminalEnsureOutcome:
     """
     Ask the runner to create or return the native terminal for a message.
@@ -3701,6 +3737,9 @@ async def _ensure_native_terminal_ready(
     :param session_id: Session/conversation identifier, e.g.
         ``"conv_abc123"``.
     :param conv: Conversation row used to identify the native harness.
+    :param persist_resource_event: Whether a newly created terminal should be
+        appended to conversation history. Retry recovery disables persistence
+        while retaining the live resource event for connected clients.
     :returns: The probe outcome — a definitive ``error`` when the terminal
         could not start, else ``error=None``.
     """
@@ -3713,6 +3752,7 @@ async def _ensure_native_terminal_ready(
                 "terminal": terminal_name,
                 "session_key": "main",
                 "ensure_native_terminal": True,
+                "persist_resource_event": persist_resource_event,
             },
             timeout=10.0,
         )
@@ -4219,7 +4259,12 @@ async def _refresh_stale_native_model_options(
     if inflight is None:
         endpoint = _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER[_CLAUDE_NATIVE_WRAPPER_LABEL_VALUE]
         inflight = asyncio.create_task(
-            _load_model_options(runner_client, session_id, f"/v1/sessions/{session_id}/{endpoint}")
+            _load_model_options(
+                runner_client,
+                session_id,
+                f"/v1/sessions/{session_id}/model-options",
+                fallback_path=f"/v1/sessions/{session_id}/{endpoint}",
+            )
         )
         _model_options_inflight[session_id] = inflight
         inflight.add_done_callback(
@@ -5218,7 +5263,8 @@ async def _record_create_route_prompt(
             exc_info=True,
         )
         return conv
-    return await asyncio.to_thread(conversation_store.get_conversation, conv.id) or conv
+    conv.labels[CREATE_ROUTE_PROMPT_LABEL_KEY] = fingerprint
+    return conv
 
 
 async def _dispatch_session_event_to_runner(*args: Any, **kwargs: Any) -> Any:
@@ -5554,6 +5600,12 @@ async def _dispatch_session_event_to_runner_impl(
 RUNNER_DISCONNECT_GRACE_S: float = 10.0
 # Delay between relay stream reconnect attempts inside the grace window.
 _RELAY_RETRY_INTERVAL_S: float = 0.5
+# Session statuses that mean a turn was in flight. A runner going away
+# only interrupts work in one of these states; from any other state the
+# departure is a benign disconnect, carried by liveness rather than a
+# failure. ``waiting`` counts because the turn's background work (shells,
+# sub-agents) outlives the turn and dies with the runner.
+_MID_TURN_STATUSES = ("running", "waiting")
 
 
 class _RelayTransportLost(Exception):
@@ -5569,6 +5621,48 @@ class _RelayTransportLost(Exception):
         self.intentional = intentional
 
 
+async def _runner_drop_interrupted_turn(
+    session_id: str,
+    conversation_store: ConversationStore,
+) -> bool:
+    """
+    Report whether a departing runner caught this session mid-turn.
+
+    Prefers the relay-fed cache — the replica holding the runner's tunnel
+    saw the turn edges — and falls back to the row for a session whose live
+    state was published before a restart, so a deploy mid-turn does not
+    downgrade a real interruption to a benign one.
+
+    An unreadable or missing row leaves the question open, and this runs
+    inside the disconnect handler: answering "not mid-turn" there would
+    both swallow the failure and let the error escape the handler, killing
+    the relay without publishing anything — the silent truncation the
+    failed status exists to prevent. So an indeterminate answer reports the
+    drop, as the ungated relay always did.
+
+    :param session_id: Session/conversation identifier,
+        e.g. ``"conv_abc123"``.
+    :param conversation_store: Store used to read the durable live status.
+    :returns: ``True`` when a turn was in flight
+        (:data:`_MID_TURN_STATUSES`) or the state is indeterminate.
+    """
+    cached = _session_status_cache.get(session_id)
+    if cached is not None:
+        return cached in _MID_TURN_STATUSES
+    try:
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    except Exception:  # noqa: BLE001 — an unreadable row must not kill the relay
+        _logger.warning(
+            "Relay: live-status read failed for session=%s; reporting the drop",
+            session_id,
+            exc_info=True,
+        )
+        return True
+    if conv is None:
+        return True
+    return conv.live_status in _MID_TURN_STATUSES
+
+
 async def _relay_runner_stream(
     session_id: str,
     runner_client: httpx.AsyncClient,
@@ -5581,9 +5675,14 @@ async def _relay_runner_stream(
     Transport drops from ingress recycles and sleep-wake reconnects
     re-register the runner within :data:`RUNNER_DISCONNECT_GRACE_S`, so a
     lost stream retries inside that window instead of failing the
-    session. The ``failed`` status (with durable ``runner_disconnected``
-    labels) publishes only when the runner stays gone past the grace; an
-    intentional Stop still exits quietly at once.
+    session. An intentional Stop exits quietly at once.
+
+    Past the grace the runner is genuinely gone, and only a session it
+    caught mid-turn (:func:`_runner_drop_interrupted_turn`) gets the
+    ``failed`` status and durable ``runner_disconnected`` labels — the same
+    rule :func:`_mark_runner_sessions_offline_impl` applies to the runner's
+    other sessions. An idle session had no work to interrupt, so it stays
+    idle and the disconnect surfaces through liveness instead.
 
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
@@ -5638,6 +5737,20 @@ async def _relay_runner_stream(
                     session_id,
                     None,
                     conversation_store,
+                )
+            elif not await _runner_drop_interrupted_turn(session_id, conversation_store):
+                # The runner went away while this session sat idle (host
+                # asleep, host restart, `omnigent host` stopped). Nothing was
+                # interrupted, so there is no error to report: publishing one
+                # lit a red "connection to the host dropped" banner over a
+                # session that had simply finished its last turn. The absence
+                # is already carried by liveness (``clear_runner_liveness``),
+                # which drives the reconnect affordance. Stay silent — no
+                # status edge, and no clearing of labels either, so a genuine
+                # earlier failure keeps its error.
+                _logger.info(
+                    "Relay: runner gone for idle session=%s; no failure to report",
+                    session_id,
                 )
             else:
                 # Publish a failed status so the client's SSE stream sees a
@@ -5968,7 +6081,10 @@ async def _relay_runner_stream_once(
                     # The live publish below already updates connected
                     # clients.
                     resource_item = _resource_event_item_from_sse(session_id, event)
-                    if resource_item is not None:
+                    if (
+                        resource_item is not None
+                        and event.get("persist_resource_event") is not False
+                    ):
                         resource_data = resource_item.data
                         await _relay_persist(
                             conversation_store,
@@ -7980,13 +8096,7 @@ async def _create_session_from_existing_agent(
         _native_labels = dict(body.labels) if body.labels else {}
         _native_labels.update(native_agent.presentation_labels)
         await asyncio.to_thread(conversation_store.set_labels, conv.id, _native_labels)
-        updated_conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
-        if updated_conv is None:
-            raise OmnigentError(
-                f"Session {conv.id!r} disappeared while setting native labels",
-                code=ErrorCode.INTERNAL_ERROR,
-            )
-        conv = updated_conv
+        conv.labels.update(_native_labels)
     elif (
         body.sub_agent_name
         and sub_spec is not None
@@ -8002,13 +8112,7 @@ async def _create_session_from_existing_agent(
         _merged = dict(body.labels) if body.labels else {}
         _merged.update(_sa_labels)
         await asyncio.to_thread(conversation_store.set_labels, conv.id, _merged)
-        updated_conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
-        if updated_conv is None:
-            raise OmnigentError(
-                f"Session {conv.id!r} disappeared while setting sub-agent labels",
-                code=ErrorCode.INTERNAL_ERROR,
-            )
-        conv = updated_conv
+        conv.labels.update(_merged)
     elif (
         body.sub_agent_name is None
         and body.host_id is not None
@@ -8027,13 +8131,7 @@ async def _create_session_from_existing_agent(
         _merged = dict(body.labels) if body.labels else {}
         _merged.update(_repl_labels)
         await asyncio.to_thread(conversation_store.set_labels, conv.id, _merged)
-        updated_conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
-        if updated_conv is None:
-            raise OmnigentError(
-                f"Session {conv.id!r} disappeared while setting terminal-view labels",
-                code=ErrorCode.INTERNAL_ERROR,
-            )
-        conv = updated_conv
+        conv.labels.update(_merged)
     elif body.labels:
         await asyncio.to_thread(conversation_store.set_labels, conv.id, body.labels)
 
@@ -8049,13 +8147,7 @@ async def _create_session_from_existing_agent(
             conv.id,
             {AUTO_HARNESS_LABEL_KEY: "1"},
         )
-        updated_conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
-        if updated_conv is None:
-            raise OmnigentError(
-                f"Session {conv.id!r} disappeared while setting the auto-harness label",
-                code=ErrorCode.INTERNAL_ERROR,
-            )
-        conv = updated_conv
+        conv.labels[AUTO_HARNESS_LABEL_KEY] = "1"
 
     if _native_smart_routing:
         # Surface the create-time pick as a transcript card, so the user sees
@@ -8099,7 +8191,8 @@ async def _create_session_from_existing_agent(
                 harness=_fixed_native_harness,
             )
             await _stamp_routing_decision_label(conv.id, conversation_store, _fixed_decision_id)
-            conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id) or conv
+            if _fixed_decision_id is not None:
+                conv.labels[ROUTING_DECISION_LABEL_KEY] = _fixed_decision_id
         elif _fixed_routing_error is not None:
             await _emit_server_routing_decision(
                 conv.id,
@@ -8895,8 +8988,16 @@ async def _fetch_model_options(
     if cached is not None and session_id not in _model_options_stale:
         return cached
     if session_id not in _model_options_inflight:
-        path = f"/v1/sessions/{session_id}/{endpoint}"
-        task = asyncio.create_task(_load_model_options(runner_client, session_id, path))
+        # Unified route first; the harness-named route is the fallback for
+        # an older runner (deprecated aliases, removed in 0.11.0).
+        task = asyncio.create_task(
+            _load_model_options(
+                runner_client,
+                session_id,
+                f"/v1/sessions/{session_id}/model-options",
+                fallback_path=f"/v1/sessions/{session_id}/{endpoint}",
+            )
+        )
         _model_options_inflight[session_id] = task
 
         def _clear_runner_options_inflight(_task: asyncio.Task[None]) -> None:
@@ -9127,6 +9228,12 @@ async def _get_session_snapshot(
                     )
         except Exception:  # noqa: BLE001
             pass
+    # The harness's own report is the display authority: when a session has
+    # a verbatim ``reported_model``, it supersedes the spec-derived value on
+    # the wire's ``llm_model`` field (the web renders and highlights only
+    # from this).
+    if conv.reported_model:
+        llm_model = conv.reported_model
     # Skills are runner-owned: the bound runner discovers them against its
     # own filesystem (bundled skills + host skills under the session's
     # workspace and ``~/.claude/skills/``) — the host where the harness

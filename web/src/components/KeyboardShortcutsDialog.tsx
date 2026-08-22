@@ -66,6 +66,7 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
   {
     title: "General",
     items: [
+      { label: "Start a new session", keys: [MOD_KEY, "N"] },
       { label: "Open command palette", keys: [MOD_KEY, "K"] },
       { label: "Show keyboard shortcuts", keys: [MOD_KEY, "/"] },
     ],

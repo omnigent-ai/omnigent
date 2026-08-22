@@ -800,10 +800,13 @@ async def _prepare_antigravity_terminal_via_daemon(
             _update_progress(startup_progress, "Creating Antigravity session...")
             bridge_id = _mint_agy_conversation_id()
             conversation_id = bridge_id
-            session_id = await _create_antigravity_session(
-                client,
-                session_bundle,
-                bridge_id=bridge_id,
+            session_id, _ = await asyncio.gather(
+                _create_antigravity_session(
+                    client,
+                    session_bundle,
+                    bridge_id=bridge_id,
+                ),
+                wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S),
             )
         else:
             _update_progress(startup_progress, "Loading Antigravity session...")
@@ -847,7 +850,8 @@ async def _prepare_antigravity_terminal_via_daemon(
             conversation_id = external if isinstance(external, str) and external else bridge_id
             resume = isinstance(external, str) and bool(external)
 
-        await wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S)
+        if not fresh_session:
+            await wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S)
         _update_progress(startup_progress, "Starting runner...")
         runner_id = await launch_or_reuse_daemon_runner(
             client,

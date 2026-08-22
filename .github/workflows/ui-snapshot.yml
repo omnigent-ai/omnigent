@@ -157,8 +157,8 @@ jobs:
           # must not share a key or a cross-restore would mismatch.
           key: venv-uisnapshot-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
 
-      - name: Install project + dev extras
-        run: uv sync --extra all --extra dev
+      - name: Install project + test dependencies
+        run: uv sync --extra all --group test
 
       # No "playwright install": the pinned image already ships matching Chromium
       # + system deps under $PLAYWRIGHT_BROWSERS_PATH (/ms-playwright), so the

@@ -32,10 +32,12 @@ to resolving the terminal in the local registry.
 Wire protocol on the WebSocket
 ------------------------------
 
-- **Server → client**: every PTY read is forwarded as a *binary*
-  WebSocket frame. xterm.js's ``term.write()`` accepts ``Uint8Array``
-  directly and runs it through its ANSI parser, so colors, cursor
-  motion, alternate screen, mouse modes all work transparently.
+- **Server → client**: terminal output is forwarded as *binary* WebSocket
+  frames. xterm.js's ``term.write()`` accepts ``Uint8Array`` directly and runs
+  it through its ANSI parser, so colors, cursor motion, alternate screen, and
+  mouse modes work transparently. Control-mode attaches may also send a text
+  ``clipboard-write`` JSON frame after tmux reports a copy-mode selection; PTY
+  attaches advertise whether OSC 52 is safe before terminal output begins.
 - **Client → server**:
     - **Text frames** are JSON control messages:
       ``{"type": "resize", "cols": N, "rows": M}``. Parsed and applied
@@ -274,17 +276,21 @@ def create_terminal_attach_router(
                 "terminal.transport": resolved_transport,
             },
         ):
-            bridge = (
-                bridge_tmux_control_to_websocket
-                if resolved_transport == TERMINAL_TRANSPORT_CONTROL
-                else bridge_tmux_pty_to_websocket
-            )
-            await bridge(
-                websocket,
-                socket_path=str(entry.instance.socket_path),
-                tmux_target=entry.instance.tmux_target,
-                read_only=read_only,
-            )
+            if resolved_transport == TERMINAL_TRANSPORT_CONTROL:
+                await bridge_tmux_control_to_websocket(
+                    websocket,
+                    socket_path=str(entry.instance.socket_path),
+                    tmux_target=entry.instance.tmux_target,
+                    read_only=read_only,
+                )
+            else:
+                await bridge_tmux_pty_to_websocket(
+                    websocket,
+                    socket_path=str(entry.instance.socket_path),
+                    tmux_target=entry.instance.tmux_target,
+                    read_only=read_only,
+                    allow_osc52_clipboard=not entry.instance.tmux_allow_passthrough,
+                )
 
     return router
 

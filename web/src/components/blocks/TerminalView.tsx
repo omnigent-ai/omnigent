@@ -12,8 +12,11 @@ import { Loader2Icon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTheme } from "next-themes";
 import { Button } from "@/components/ui/button";
+import { showToast } from "@/components/ui/toast";
+import { copyText } from "@/lib/clipboard";
 import { isDatabricksWorkspace, resolveWebSocketUrl } from "@/lib/host";
 import { subscribeCodeFont } from "@/lib/codeFontPreferences";
+import { resolveInitialAttachUrl, watchDirectUpgrade, withAttachParams } from "@/lib/terminals";
 import {
   readTerminalThemeMode,
   resolveTerminalIsDark,
@@ -92,6 +95,15 @@ interface TerminalViewProps {
    * Default true.
    */
   active?: boolean;
+  /**
+   * Loopback attach URL advertised by the session's runner (from the
+   * terminal resource's ``metadata.direct_attach_url``). When set, each
+   * connection attempt probes it first and uses it if the listener
+   * answers — a browser on the runner's machine then attaches with zero
+   * relay legs. Unreachable or absent falls back to the relay URL; the
+   * page URL and all HTTP traffic are unaffected either way.
+   */
+  directAttachUrl?: string;
 }
 
 export function TerminalView({
@@ -105,6 +117,7 @@ export function TerminalView({
   resumePending = false,
   transport,
   active = true,
+  directAttachUrl,
 }: TerminalViewProps) {
   // Control mode: xterm owns the buffer + mouse, so plain drag selects and
   // the normal copy gesture works — no forced-selection modifier, no hint bar.
@@ -146,10 +159,19 @@ export function TerminalView({
   onActivityRef.current = onActivity;
   const onInputRef = useRef(onInput);
   onInputRef.current = onInput;
+  const activeRef = useRef(active);
+  activeRef.current = active;
   // Track whether this terminal has already tried a keyless re-dial after a
   // 4400 wrong-replica close. If keyless still fails with 4400, the host is
   // genuinely unreachable — stop retrying.
   const keylessRef = useRef(false);
+  // Bumped by every attach so an in-flight attach can tell it has been
+  // superseded — a ref callback can re-run for the *same* node, which
+  // leaves no other way to retire the previous attempt's async work.
+  const attachGenerationRef = useRef(0);
+  // Abort handle for the outgoing attach's direct-upgrade probe, which
+  // otherwise holds a loopback socket open for its full timeout.
+  const upgradeCtlRef = useRef<AbortController | null>(null);
 
   // Stable dispatcher: updates local state and notifies the parent.
   const notifyState = useCallback((next: ConnectionState) => {
@@ -163,6 +185,29 @@ export function TerminalView({
 
   const notifyInput = useCallback(() => {
     onInputRef.current?.();
+  }, []);
+
+  const notifyClipboardRequest = useCallback((text: string) => {
+    const copyAndRefocus = () => copyText(text).finally(() => sessionRef.current?.focus());
+    const copied = () => showToast("Copied from terminal.", { duration: 1500 });
+    const failed = () =>
+      showToast("Couldn't copy terminal selection to the clipboard.", { duration: 0 });
+    void copyAndRefocus().then(copied, () => {
+      showToast(
+        <span className="flex items-center gap-2">
+          <span>Terminal copy is ready.</span>
+          <Button
+            type="button"
+            size="xs"
+            variant="secondary"
+            onClick={() => void copyAndRefocus().then(copied, failed)}
+          >
+            Copy
+          </Button>
+        </span>,
+        { duration: 0 },
+      );
+    });
   }, []);
 
   // Dispose the outgoing session before a remount re-dials. React 18
@@ -189,6 +234,17 @@ export function TerminalView({
   const attachSession = useCallback(
     (node: HTMLDivElement | null) => {
       if (node === null) return;
+      // React re-runs a ref callback for the *same* node whenever the
+      // callback's identity changes — here, when the runner's
+      // direct-attach advert lands after mount. Retire the previous
+      // attach before touching the node: otherwise xterm stacks a
+      // second instance inside it (two helper textareas, two
+      // renderers) and the superseded upgrade watcher later re-dials
+      // on top of the session that replaced it.
+      const generation = (attachGenerationRef.current += 1);
+      upgradeCtlRef.current?.abort();
+      disposeActiveSession();
+      node.replaceChildren();
       // Reset to ``connecting`` for every fresh attach so a stale
       // overlay from a previous mount doesn't flash during the
       // handshake. The session's WS ``open`` handler transitions us
@@ -207,31 +263,66 @@ export function TerminalView({
       // is the one that actually opens the WS.
       let terminalSession: TerminalSession | null = null;
       let cancelled = false;
-      queueMicrotask(() => {
-        if (cancelled) return;
+      const upgradeCtl = new AbortController();
+      upgradeCtlRef.current = upgradeCtl;
+      // Superseded by a later attach on this node? React 18 never calls
+      // the ref cleanup, so `cancelled` alone can't catch that case.
+      const superseded = () => cancelled || attachGenerationRef.current !== generation;
+      void (async () => {
+        // The awaited microtask preserves the StrictMode-collapse
+        // behavior queueMicrotask provided; the URL resolution (when a
+        // direct URL exists) adds real async time, so re-check after
+        // every await.
+        await Promise.resolve();
+        if (superseded()) return;
         // Route this WS to the replica holding the session's runner tunnel
         // (key = the session's host_id). A browser WS can't set request
         // headers, so the key rides the query string. Only against a
         // Databricks workspace-hosted server — an unsharded server needs no key,
-        // and a hostless session yields none.
+        // and a hostless session yields none. The direct URL needs no key: it
+        // bypasses the server entirely.
         const computedHostId = (() => {
           if (keylessRef.current || !isDatabricksWorkspace()) return undefined;
           const h = getSessionHost(sessionId);
           return h && !isHostKeyless(h) ? h : undefined;
         })();
+        const relayUrl = buildAttachUrl(sessionId, terminalId, readOnly, computedHostId, transport);
+        const directUrl = directAttachUrl
+          ? withAttachParams(directAttachUrl, readOnly, transport)
+          : undefined;
+        // Never keep the user waiting on the direct path: this resolves
+        // direct only when the loopback listener is already known
+        // reachable; otherwise it returns the relay URL immediately.
+        const url = await resolveInitialAttachUrl(directUrl, relayUrl);
+        if (superseded()) return;
         terminalSession = new TerminalSession(
           node,
-          buildAttachUrl(sessionId, terminalId, readOnly, computedHostId, transport),
+          url,
           notifyState,
           isDarkRef.current,
           notifyActivity,
           notifyInput,
           controlMode,
+          !readOnly && activeRef.current,
+          notifyClipboardRequest,
         );
         sessionRef.current = terminalSession;
-      });
+        // Relay-connected with a direct URL on offer: negotiate the
+        // loopback upgrade in the background. In Chrome this is what
+        // raises the Local Network Access prompt; the probe socket
+        // waits out the user's decision behind the live relay session.
+        // On success, re-dial — the known-good cache makes the remount
+        // pick the direct URL.
+        if (directUrl !== undefined && url === relayUrl) {
+          const upgraded = await watchDirectUpgrade(directUrl, upgradeCtl.signal);
+          if (superseded() || !upgraded) return;
+          disposeActiveSession();
+          setConnectAttempt((attempt) => attempt + 1);
+        }
+      })();
       return () => {
         cancelled = true;
+        upgradeCtl.abort();
         terminalSession?.dispose();
         sessionRef.current = null;
         onStateChangeRef.current?.(null);
@@ -242,10 +333,13 @@ export function TerminalView({
       terminalId,
       readOnly,
       transport,
+      directAttachUrl,
       controlMode,
       notifyState,
       notifyActivity,
       notifyInput,
+      notifyClipboardRequest,
+      disposeActiveSession,
     ],
   );
 
@@ -253,6 +347,10 @@ export function TerminalView({
   useEffect(() => {
     sessionRef.current?.setTheme(isDark);
   }, [isDark]);
+
+  useEffect(() => {
+    sessionRef.current?.setClipboardEnabled(!readOnly && active);
+  }, [readOnly, active]);
 
   // On the hidden→visible edge of a pre-warmed surface: focus the
   // terminal (the session's WS-open focus is a no-op while the element is

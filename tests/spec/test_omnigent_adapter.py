@@ -2181,6 +2181,27 @@ def test_use_responses_absent_omits_key_from_executor_config() -> None:
     assert "use_responses" not in spec.executor.config
 
 
+def test_reasoning_item_id_policy_propagates_to_executor_config() -> None:
+    agent_def, raw_yaml = _build_agent_def_with_raw_yaml()
+    raw_yaml["executor"] = {
+        "model": "databricks-gpt-5-4-mini",
+        "harness": "openai-agents",
+        "reasoning_item_id_policy": "preserve",
+    }
+    spec = agent_def_to_agent_spec(agent_def, raw_yaml=raw_yaml)
+    assert spec.executor.config["reasoning_item_id_policy"] == "preserve"
+
+
+def test_reasoning_item_id_policy_absent_omits_key_from_executor_config() -> None:
+    agent_def, raw_yaml = _build_agent_def_with_raw_yaml()
+    raw_yaml["executor"] = {
+        "model": "databricks-gpt-5-4-mini",
+        "harness": "openai-agents",
+    }
+    spec = agent_def_to_agent_spec(agent_def, raw_yaml=raw_yaml)
+    assert "reasoning_item_id_policy" not in spec.executor.config
+
+
 def test_malformed_acp_agent_propagates_for_runtime_validation() -> None:
     agent_def, raw_yaml = _build_agent_def_with_raw_yaml()
     raw_yaml["executor"] = {

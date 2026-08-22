@@ -613,11 +613,34 @@ def _make_auth_token_factory(
         """
         # Check stored OIDC token first.
         if resolved_server_url:
-            from omnigent.cli_auth import load_token
+            from omnigent.cli_auth import (
+                REFRESH_MIN_REMAINING_SECONDS,
+                load_token,
+                refresh_stored_token,
+            )
 
-            oidc_token = load_token(resolved_server_url)
+            # Require enough remaining life that the token cannot lapse
+            # mid-handshake; a token inside that window falls through to
+            # the renewal path below rather than being used and rejected.
+            oidc_token = load_token(
+                resolved_server_url,
+                min_remaining_seconds=REFRESH_MIN_REMAINING_SECONDS,
+            )
             if oidc_token:
                 return oidc_token
+            # Expired or near-lapse: renew from the login-issued refresh
+            # grant when one exists. This is what keeps an unattended host
+            # alive past session-JWT expiry — the tunnel rebuilds headers
+            # through this factory on every reconnect.
+            refreshed = refresh_stored_token(resolved_server_url)
+            if refreshed:
+                return refreshed
+            # Nothing to renew with: a near-expiry token that has NOT
+            # actually lapsed still authenticates, so prefer it over
+            # falling through to no credential at all.
+            still_valid = load_token(resolved_server_url)
+            if still_valid:
+                return still_valid
         return _sdk_token()
 
     # Probe once to check if a user credential is available.
@@ -1508,6 +1531,35 @@ async def _run_tunnel_from_env() -> None:
     # drains its session streams and closes cleanly — the server then sees an
     # end-of-stream, not an abrupt drop that renders a scary error banner.
     tunnel_shutdown_event = asyncio.Event()
+    # Loopback direct-attach listener: lets a browser on this machine attach
+    # to terminals with zero relay legs. Best-effort — any failure keeps the
+    # runner relay-only. Windows never runs the web terminal bridges, so the
+    # listener is POSIX-only like the bridges themselves.
+    direct_attach_listener = None
+    direct_attach_token: str | None = None
+    if sys.platform != "win32":
+        try:
+            from omnigent.runner.direct_attach import (
+                allowed_origin_for_server,
+                create_direct_attach_app,
+                new_direct_attach_token,
+                start_direct_attach_listener,
+            )
+
+            attach_handler = getattr(app.state, "terminal_attach_handler", None)
+            allowed_origin = allowed_origin_for_server(server_url)
+            if attach_handler is not None and allowed_origin is not None:
+                direct_attach_token = new_direct_attach_token()
+                direct_attach_listener = await start_direct_attach_listener(
+                    create_direct_attach_app(
+                        attach_handler,
+                        token=direct_attach_token,
+                        allowed_origins=frozenset({allowed_origin}),
+                    )
+                )
+        except Exception:  # noqa: BLE001 — optimization only; never block the tunnel
+            _logger.warning("direct-attach listener setup failed", exc_info=True)
+            direct_attach_listener = None
     tunnel_task = asyncio.create_task(
         serve_tunnel(
             cast("_ASGIApp", app),  # FastAPI is ASGI-compatible; cast narrows for mypy
@@ -1521,6 +1573,12 @@ async def _run_tunnel_from_env() -> None:
             on_activity=_mark_activity,
             shutdown_event=tunnel_shutdown_event,
             on_graceful_shutdown=getattr(app.state, "drain_session_streams", None),
+            direct_attach_port=(
+                direct_attach_listener.port if direct_attach_listener is not None else None
+            ),
+            direct_attach_token=(
+                direct_attach_token if direct_attach_listener is not None else None
+            ),
         ),
         name=f"runner-ws-tunnel:{runner_id}",
     )
@@ -1613,6 +1671,9 @@ async def _run_tunnel_from_env() -> None:
         if idle_task is not None:
             with contextlib.suppress(asyncio.CancelledError):
                 await idle_task
+        if direct_attach_listener is not None:
+            with contextlib.suppress(Exception):
+                await direct_attach_listener.stop()
         await _lifespan_cm.__aexit__(None, None, None)
 
 
@@ -1731,6 +1792,29 @@ def _install_crash_logging() -> None:
     sys.excepthook = _log_uncaught
 
 
+def _maybe_prewarm_ambient_detection() -> None:
+    """Prewarm ambient provider detection for claude-native launches.
+
+    Terminal auto-create resolves the session's provider config, and on a
+    machine with no explicit provider that runs ambient detection — on macOS
+    a ``claude auth status`` subprocess (~0.6-0.9s) — inside the
+    user-visible "Starting up…" window. Starting the sweep at boot overlaps
+    it with tunnel connect and session init instead.
+
+    Gated on the launch-harness stamp the host injects (absent for CLI-local
+    runners and hosts that predate it), so other harnesses don't pay a
+    speculative subprocess on every launch.
+    """
+    from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
+    from omnigent.runner.identity import RUNNER_LAUNCH_HARNESS_ENV_VAR
+
+    if os.environ.get(RUNNER_LAUNCH_HARNESS_ENV_VAR) != CLAUDE_NATIVE_CODING_AGENT.harness:
+        return
+    from omnigent.onboarding.ambient import prewarm_detect_providers
+
+    prewarm_detect_providers()
+
+
 def main() -> None:
     """Console entry point for the runner tunnel process.
 
@@ -1747,6 +1831,7 @@ def main() -> None:
 
     configure_process_logging("runner", force=True)
     _install_crash_logging()
+    _maybe_prewarm_ambient_detection()
     try:
         asyncio.run(_run_tunnel_from_env())
     except RuntimeError as exc:
