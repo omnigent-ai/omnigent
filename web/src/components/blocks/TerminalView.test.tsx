@@ -456,6 +456,23 @@ describe("automatic reconnect", () => {
     expect(terminalSessionMock.instances[0].dispose).toHaveBeenCalled();
   });
 
+  it("re-dials after a code-less close (1005) — the redeploy-behind-ingress case", async () => {
+    // A server redeploy behind a fronting proxy tears the attach socket
+    // down without a clean app code reaching the browser, which reports
+    // 1005 ("no status"). It must recover exactly like 1006, not dead-end
+    // on "Bridge closed: code 1005".
+    await renderAndAttach();
+
+    closeNewest(1005);
+
+    expect(screen.getByTestId("terminal-reconnecting")).toBeInTheDocument();
+    expect(screen.queryByText(/Bridge closed/)).toBeNull();
+
+    await elapse(RECONNECT_BACKOFF_MS[0]);
+    expect(terminalSessionMock.instances).toHaveLength(2);
+    expect(terminalSessionMock.instances[0].dispose).toHaveBeenCalled();
+  });
+
   it("does not re-dial after a deliberate server close (4405 terminal-detached)", async () => {
     await renderAndAttach();
 

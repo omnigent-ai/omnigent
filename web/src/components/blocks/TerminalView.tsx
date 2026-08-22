@@ -39,9 +39,16 @@ import {
  * when the schedule is exhausted the closed overlay stays up and the
  * user falls back to a manual refresh / resume.
  *
+ * The cumulative budget must outlast a server redeploy so a terminal
+ * watched through one recovers on its own instead of dead-ending a few
+ * seconds before the backend returns. A Databricks Apps redeploy takes
+ * the ingress ~20-25s to route to the new instance, so the tail reaches
+ * 15s for a ~30.5s total — comfortably past that window. (A backgrounded
+ * tab also re-dials with a fresh budget on the visibilitychange reveal.)
+ *
  * Exported for direct unit testing (fake timers advance through it).
  */
-export const RECONNECT_BACKOFF_MS = [500, 1000, 2000, 4000, 8000] as const;
+export const RECONNECT_BACKOFF_MS = [500, 1000, 2000, 4000, 8000, 15000] as const;
 
 /**
  * A connection that stayed open at least this long before dropping is
