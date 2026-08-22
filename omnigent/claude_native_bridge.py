@@ -2489,6 +2489,10 @@ def _transcript_model_pricing(model: str) -> ModelPricing | None:
     """
     Look up per-token pricing for *model*, memoizing successful results.
 
+    Checks provider config for custom pricing first (self-hosted models),
+    then falls back to catalog. This enables cost tracking for native
+    claude-native sessions using self-hosted endpoints.
+
     :param model: API model id from a transcript ``message.model``,
         e.g. ``"claude-opus-4-8"`` or ``"databricks-claude-sonnet-4-6"``.
     :returns: The model's :class:`ModelPricing`, or ``None`` when pricing
@@ -2498,9 +2502,15 @@ def _transcript_model_pricing(model: str) -> ModelPricing | None:
     cached = _TRANSCRIPT_PRICING_CACHE.get(model)
     if cached is not None:
         return cached
-    from omnigent.llms.context_window import fetch_model_pricing
+    from omnigent.llms.context_window import fetch_model_pricing_with_provider
+    from omnigent.onboarding.provider_config import load_config
 
-    pricing = fetch_model_pricing(model)
+    # Load provider config to check for custom pricing
+    provider_config = load_config()
+    # For claude-native transcript pricing, assume claude-native harness
+    pricing = fetch_model_pricing_with_provider(
+        model, provider_config=provider_config, harness="claude-native"
+    )
     if pricing is not None:
         _TRANSCRIPT_PRICING_CACHE[model] = pricing
     return pricing
