@@ -3275,6 +3275,189 @@ async def _handle_compact_summary_item(
     return True
 
 
+# Transcript items per batch. A batch's items share one fate only in the rare
+# case where its response is lost: they may or may not have been committed, so
+# none can be safely re-posted and all are dead-lettered together — which is
+# what a single ambiguous post does today, just for one item. A small cap keeps
+# that blast radius near today's while still collapsing a burst's round trips,
+# which is what matters: a poll that dumps thirty items used to spend thirty
+# round trips inside one iteration, starving the delta stream behind it.
+_ITEM_BATCH_MAX = 8
+
+
+def _item_event(item: ClaudeTranscriptItem) -> dict[str, object]:
+    """
+    Build the ``external_conversation_item`` event body for one item.
+
+    :param item: Transcript-derived conversation item.
+    :returns: The event body a single or batched post carries.
+    """
+    return {
+        "type": "external_conversation_item",
+        "data": {
+            "item_type": item.item_type,
+            "item_data": item.data,
+            "response_id": item.response_id,
+        },
+    }
+
+
+@dataclass(frozen=True)
+class _AttemptedItem:
+    """
+    Outcome of an item a batch already attempted.
+
+    :param error: ``None`` when the server accepted it. Otherwise the
+        exception the equivalent single post would have raised, so the
+        caller's existing failure handling classifies it identically —
+        a synthesized status error for a rejection, or the batch's real
+        transport error when the response was lost.
+    """
+
+    error: httpx.HTTPError | None
+
+
+def _synthesized_status_error(
+    status: int,
+    *,
+    session_id: str,
+    message: str | None,
+    code: str | None,
+) -> httpx.HTTPStatusError:
+    """
+    Rebuild the exception a single post would have raised for one status.
+
+    Lets a batched rejection flow through exactly the same permanent /
+    transient / ambiguous classification as a per-item post, instead of a
+    parallel set of rules that could drift.
+
+    :param status: HTTP status the server reported for the event.
+    :param session_id: Session the post was for (URL reconstruction only).
+    :param message: Server-reported failure message, if any.
+    :param code: Server-reported Omnigent error code, if any.
+    :returns: An ``httpx.HTTPStatusError`` carrying that status.
+    """
+    request = httpx.Request("POST", f"/v1/sessions/{session_id}/events")
+    response = httpx.Response(
+        status,
+        request=request,
+        json={"error": {"code": code or "", "message": message or ""}},
+    )
+    return httpx.HTTPStatusError(
+        f"batched session event rejected with {status}",
+        request=request,
+        response=response,
+    )
+
+
+def _batchable_item_run(
+    items: list[ClaudeTranscriptItem],
+    *,
+    seen: set[str],
+    skip_user_messages: bool,
+    retry_tracker: _PostRetryTracker,
+    limit: int = _ITEM_BATCH_MAX,
+) -> list[ClaudeTranscriptItem]:
+    """
+    Take the leading run of items that can go out together.
+
+    Ordering is load-bearing, so the run stops at the first item the caller
+    handles specially: a compaction boundary (its own persist path, which
+    must land before later items) or an item still inside its retry
+    backoff. Items already forwarded, and user messages this session skips,
+    post nothing at all — they neither join the run nor end it.
+
+    :param items: Items read from the transcript this poll, in order.
+    :param seen: Source ids already forwarded.
+    :param skip_user_messages: Whether user messages are mirrored.
+    :param retry_tracker: Per-item retry/backoff state.
+    :param limit: Most items to take.
+    :returns: The leading batchable items, in order (possibly empty).
+    """
+    run: list[ClaudeTranscriptItem] = []
+    for item in items:
+        if item.source_id in seen:
+            continue
+        if item.is_compact_summary:
+            break
+        if skip_user_messages and item.item_type == "message" and item.data.get("role") == "user":
+            continue
+        if retry_tracker.retry_delay_s(f"item:{item.source_id}") is not None:
+            break
+        run.append(item)
+        if len(run) >= limit:
+            break
+    return run
+
+
+async def _attempt_item_batch(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    items: list[ClaudeTranscriptItem],
+    seen: set[str],
+    skip_user_messages: bool,
+    retry_tracker: _PostRetryTracker,
+) -> dict[str, _AttemptedItem] | None:
+    """
+    Forward the leading run of items in one request, if that helps.
+
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent session/conversation id.
+    :param items: Items read from the transcript this poll, in order.
+    :param seen: Source ids already forwarded.
+    :param skip_user_messages: Whether user messages are mirrored.
+    :param retry_tracker: Per-item retry/backoff state.
+    :returns: Outcomes by source id for the items the batch attempted, or
+        ``None`` when nothing was attempted — a run too short to be worth a
+        batch, a server without the batch route, or a request that provably
+        never left, all of which leave the caller to post item by item.
+    """
+    run = _batchable_item_run(
+        items,
+        seen=seen,
+        skip_user_messages=skip_user_messages,
+        retry_tracker=retry_tracker,
+    )
+    if len(run) < 2:
+        return None
+    try:
+        outcomes = await post_session_events_batch(
+            client,
+            session_id=session_id,
+            events=[_item_event(item) for item in run],
+            on_error="stop",
+        )
+    except httpx.HTTPError as exc:
+        if not post_may_have_been_delivered(exc):
+            # Proven undelivered (the request never left): nothing landed, so
+            # the caller may post these normally and retry as it always has.
+            return None
+        # The response was lost. Any prefix of the run may be committed and
+        # external items are not deduped, so re-posting would duplicate
+        # bubbles; hand every item back as ambiguous and let the caller's
+        # existing ambiguous path dead-letter them.
+        return {item.source_id: _AttemptedItem(error=exc) for item in run}
+    if outcomes is None:
+        return None
+    attempted: dict[str, _AttemptedItem] = {}
+    for item, outcome in zip(run, outcomes, strict=False):
+        if outcome.delivered:
+            attempted[item.source_id] = _AttemptedItem(error=None)
+        elif outcome.status is not None:
+            attempted[item.source_id] = _AttemptedItem(
+                error=_synthesized_status_error(
+                    outcome.status,
+                    session_id=session_id,
+                    message=outcome.error,
+                    code=None,
+                )
+            )
+        # An item the batch stopped short of is absent, so the caller posts it
+        # itself — the same order, one request later.
+    return attempted
+
+
 async def _forward_available_items(
     *,
     client: httpx.AsyncClient,
@@ -3339,6 +3522,18 @@ async def _forward_available_items(
     # their own ``response_id`` (see :func:`_post_external_conversation_item`),
     # so the transcript's job here is items, not status.
     updated = state
+    # Forward the leading run of plain items in one request. Everything below is
+    # unchanged: the loop consumes the outcome for an item the batch attempted
+    # and posts the rest itself, so ordering, cursor advancement, retries and
+    # dead-lettering all behave as they did per item.
+    batch = await _attempt_item_batch(
+        client,
+        session_id=session_id,
+        items=items,
+        seen=seen,
+        skip_user_messages=skip_user_messages,
+        retry_tracker=retry_tracker,
+    )
     for item in items:
         if item.source_id in seen:
             continue
@@ -3391,13 +3586,23 @@ async def _forward_available_items(
         retry_key = f"item:{item.source_id}"
         if retry_tracker.retry_delay_s(retry_key) is not None:
             return updated
-        try:
-            await _post_external_conversation_item(
-                client,
-                session_id=session_id,
-                item=item,
-            )
-        except httpx.HTTPError as exc:
+        # The batch above may already have attempted this item. Consume its
+        # outcome instead of re-posting; anything it did not cover (an older
+        # server, or an item past the batch's cap) falls back to a single post.
+        attempted = batch.pop(item.source_id, None) if batch is not None else None
+        exc: httpx.HTTPError | None = None
+        if attempted is not None:
+            exc = attempted.error
+        else:
+            try:
+                await _post_external_conversation_item(
+                    client,
+                    session_id=session_id,
+                    item=item,
+                )
+            except httpx.HTTPError as post_exc:
+                exc = post_exc
+        if exc is not None:
             decision = retry_tracker.record_failure(retry_key, exc)
             if decision.exhausted:
                 _logger.error(
@@ -3463,7 +3668,27 @@ async def _forward_available_items(
                     item.source_id,
                     item.item_type,
                     _http_status_for_log(exc),
-                    exc_info=True,
+                    # The failure may have come from the batch above rather than
+                    # a call in this frame, so name it explicitly.
+                    exc_info=exc,
+                )
+                # Record the drop so it is recoverable. The replay classifier
+                # never auto-replays an ambiguous record (re-posting could
+                # duplicate a bubble), but without a record the item is simply
+                # gone — and a batch resolves this ambiguity for its whole run
+                # at once, so the gap would be a poll's worth of transcript.
+                append_dead_letter(
+                    bridge_dir,
+                    session_id=session_id,
+                    event_type="external_conversation_item",
+                    payload={
+                        "item_type": item.item_type,
+                        "item_data": item.data,
+                        "response_id": item.response_id,
+                    },
+                    reason="ambiguous POST failure (may already be committed)",
+                    delivered_ambiguous=True,
+                    http_status=_http_status_for_log(exc),
                 )
                 retry_tracker.clear(retry_key)
                 seen.add(item.source_id)
@@ -3492,7 +3717,7 @@ async def _forward_available_items(
                 decision.permanent,
                 decision.delay_s,
                 _http_status_for_log(exc),
-                exc_info=True,
+                exc_info=exc,
             )
             return updated
         retry_tracker.clear(retry_key)

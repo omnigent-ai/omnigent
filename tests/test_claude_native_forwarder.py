@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import json
 import logging
 import os
@@ -13,6 +14,7 @@ from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -85,6 +87,11 @@ def _handler_factory(
     :returns: A concrete :class:`BaseHTTPRequestHandler` subclass.
     """
 
+    # Monotonic per-HTTP-request counter stamped on every recorded entry. A
+    # batch envelope expands into several entries that share one index, which is
+    # how a test can still distinguish "two events" from "two requests".
+    request_counter = itertools.count()
+
     class _Handler(BaseHTTPRequestHandler):
         """Request handler for the test Omnigent endpoint."""
 
@@ -102,16 +109,50 @@ def _handler_factory(
             """
             Record a JSON POST body and return HTTP 202.
 
+            A batch envelope is recorded as its individual events, one queue
+            entry each, so tests that read the mirrored event sequence do not
+            have to know how many requests it arrived in.
+
             :returns: None.
             """
             length = int(self.headers.get("Content-Length", "0"))
             raw = self.rfile.read(length)
+            body = json.loads(raw.decode("utf-8"))
+            request_index = next(request_counter)
+            if self.path.endswith("/events/batch"):
+                events = body["events"]
+                single_path = self.path[: -len("/batch")]
+                for event in events:
+                    requests.put(
+                        {
+                            "method": "POST",
+                            "path": single_path,
+                            "body": event,
+                            "authorization": self.headers.get("Authorization"),
+                            "request_index": request_index,
+                        }
+                    )
+                payload = json.dumps(
+                    {
+                        "results": [
+                            {"index": index, "status": 202} for index in range(len(events))
+                        ],
+                        "stopped_at": None,
+                    }
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
             requests.put(
                 {
                     "method": "POST",
                     "path": self.path,
-                    "body": json.loads(raw.decode("utf-8")),
+                    "body": body,
                     "authorization": self.headers.get("Authorization"),
+                    "request_index": request_index,
                 }
             )
             self.send_response(202)
@@ -132,6 +173,7 @@ def _handler_factory(
                     "path": self.path,
                     "body": json.loads(raw.decode("utf-8")),
                     "authorization": self.headers.get("Authorization"),
+                    "request_index": next(request_counter),
                 }
             )
             self.send_response(200)
@@ -1946,11 +1988,17 @@ async def test_forwarder_uses_auth_to_refresh_token_per_request(tmp_path: Path) 
         )
     )
     try:
-        # Two external_conversation_item POSTs (one per assistant item).
-        # The PATCH that mirrors the Claude session id is filtered out
-        # by ``_get_recorded_request``'s default ``method="POST"``.
-        first = await _get_recorded_request(server)
-        second = await _get_recorded_request(server)
+        # Two *requests*, not two events: the forwarder mirrors Claude's session
+        # id with a one-shot PATCH and ships the run of transcript items in one
+        # batched POST. Both go through the same client, so they are what proves
+        # the header is minted per request rather than snapshotted once. (Reading
+        # two events out of one batch could not: one request carries one header.)
+        collected: dict[str, dict[str, Any]] = {}
+        while len(collected) < 2:
+            recorded = await asyncio.to_thread(server.requests.get, True, 5.0)
+            collected.setdefault(str(recorded["method"]), recorded)
+        first = collected["PATCH"]
+        second = collected["POST"]
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -1966,22 +2014,22 @@ async def test_forwarder_uses_auth_to_refresh_token_per_request(tmp_path: Path) 
     assert first["authorization"] is not None and first["authorization"].startswith(
         "Bearer token-"
     ), (
-        f"First POST must carry a bearer minted by the counting auth, "
+        f"First request must carry a bearer minted by the counting auth, "
         f"got {first['authorization']!r}. ``None`` means auth was not "
         f"threaded into httpx.AsyncClient."
     )
     assert second["authorization"] is not None and second["authorization"].startswith(
         "Bearer token-"
     ), (
-        f"Second POST must carry a bearer minted by the counting auth, "
+        f"Second request must carry a bearer minted by the counting auth, "
         f"got {second['authorization']!r}."
     )
-    # The load-bearing assertion: the two POSTs carry DIFFERENT
+    # The load-bearing assertion: the two requests carry DIFFERENT
     # bearers. If they were equal, httpx would be reusing a
     # construction-time header snapshot instead of consulting the
     # auth flow per request — that is exactly the production bug.
     assert first["authorization"] != second["authorization"], (
-        f"Two consecutive POSTs share the same Authorization "
+        f"Two consecutive requests share the same Authorization "
         f"({first['authorization']!r}). The AsyncClient is reusing a "
         f"snapshot of the original header instead of consulting auth "
         f"on each request — this is the production token-refresh bug."
@@ -2942,6 +2990,320 @@ async def test_forwarder_survives_unhandled_loop_exceptions(
     }
 
 
+def _write_assistant_transcript(path: Path, count: int) -> None:
+    """
+    Write *count* assistant items to a transcript file.
+
+    :param path: Transcript path to create.
+    :param count: How many assistant items to write.
+    :returns: None.
+    """
+    path.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "uuid": f"item-{index}",
+                    "message": {"role": "assistant", "content": f"line {index}"},
+                }
+            )
+            + "\n"
+            for index in range(count)
+        ),
+        encoding="utf-8",
+    )
+
+
+def _item_forward_state(transcript_path: Path) -> forwarder.TranscriptForwardState:
+    """
+    Build a fresh transcript cursor for *transcript_path*.
+
+    :param transcript_path: Transcript the cursor points at.
+    :returns: A state positioned at the start of the file.
+    """
+    return forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+
+
+async def _forward_items_once(
+    client: httpx.AsyncClient,
+    *,
+    bridge_dir: Path,
+    state: forwarder.TranscriptForwardState,
+    retry_tracker: forwarder._PostRetryTracker | None = None,
+) -> forwarder.TranscriptForwardState:
+    """
+    Run one item-forward pass with the usual test arguments.
+
+    :param client: Omnigent HTTP client.
+    :param bridge_dir: Bridge directory.
+    :param state: Transcript cursor to start from.
+    :param retry_tracker: Retry tracker, defaulting to a no-delay one.
+    :returns: The updated cursor.
+    """
+    return await forwarder._forward_available_items(
+        client=client,
+        session_id="conv_abc",
+        bridge_dir=bridge_dir,
+        agent_name="claude-native-ui",
+        state=state,
+        retry_tracker=retry_tracker
+        or forwarder._PostRetryTracker(base_delay_s=0.0, max_delay_s=0.0),
+        dedupe=forwarder._ForwardDedupeState(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_run_of_items_is_mirrored_in_one_request(tmp_path: Path) -> None:
+    """
+    Items available in one poll go out together, capped, in order.
+
+    A burst used to cost a round trip per item *inside a single poll
+    iteration*, which from another region both delayed the cards and starved
+    the streamed-text tail queued behind it. Fails if the run fans back out
+    into per-item requests, if the cap stops bounding one request's blast
+    radius, or if the remainder past the cap is dropped instead of following.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    total = forwarder._ITEM_BATCH_MAX + 2
+    _write_assistant_transcript(transcript_path, total)
+    paths: list[str] = []
+    events: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """Accept everything, recording the request path and each event."""
+        paths.append(request.url.path)
+        batched = _record_forwarder_post(events, request)
+        return batched if batched is not None else httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        await _forward_items_once(
+            client, bridge_dir=bridge_dir, state=_item_forward_state(transcript_path)
+        )
+
+    # One batch for the capped run, then a single post for each leftover.
+    assert paths == [
+        "/v1/sessions/conv_abc/events/batch",
+        *["/v1/sessions/conv_abc/events"] * 2,
+    ]
+    # Every item still mirrored, exactly once, in transcript order.
+    assert [event["data"]["item_data"]["content"][0]["text"] for event in events] == [
+        f"line {index}" for index in range(total)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_an_item_rejected_inside_a_batch_retries_like_a_single_post(
+    tmp_path: Path,
+) -> None:
+    """
+    A batched rejection is classified exactly as a per-item one.
+
+    The retry, dead-letter, and cursor rules for a rejected item are
+    load-bearing and must not acquire a second, divergent implementation for
+    the batched path. Fails if a batched 4xx escapes the permanent-failure
+    budget (the item would be retried forever, or dropped without a
+    dead-letter record).
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    _write_assistant_transcript(transcript_path, 3)
+    retry_tracker = forwarder._PostRetryTracker(
+        max_permanent_attempts=2, base_delay_s=0.0, max_delay_s=0.0
+    )
+    events: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """Reject the first item of every batch; accept everything else."""
+        payload = json.loads(request.content.decode("utf-8"))
+        if not request.url.path.endswith("/events/batch"):
+            events.append(payload)
+            return httpx.Response(202, json={})
+        events.extend(payload["events"])
+        results: list[dict[str, Any]] = [
+            {"index": 0, "status": 422, "error": "bad item", "code": "invalid_input"}
+        ]
+        return httpx.Response(200, json={"results": results, "stopped_at": 0})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        state = _item_forward_state(transcript_path)
+        for _ in range(2):
+            state = await _forward_items_once(
+                client, bridge_dir=bridge_dir, state=state, retry_tracker=retry_tracker
+            )
+
+    # Two attempts (the permanent budget), then the forwarder-failed status —
+    # the same shape the per-item path produces for a poison item.
+    assert [event["type"] for event in events].count("external_conversation_item") >= 2
+    assert "external_session_status" in [event["type"] for event in events]
+    dead_letters = (bridge_dir / "dead_letter.jsonl").read_text(encoding="utf-8").splitlines()
+    assert [json.loads(line)["event_type"] for line in dead_letters] == [
+        "external_conversation_item"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_lost_batch_response_is_dead_lettered_not_reposted(tmp_path: Path) -> None:
+    """
+    When a batch's response is lost, its items are never posted again.
+
+    External items are not deduped server-side, so any prefix of that batch
+    may already be committed and a re-post would render duplicate bubbles.
+    The per-item path already resolves this ambiguity by dropping the item
+    and dead-lettering it for recovery; a batch must resolve it the same way
+    for its whole run. Fails if the items are re-sent (duplicates) or
+    dropped without a dead-letter record (unrecoverable).
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    _write_assistant_transcript(transcript_path, 3)
+    attempts: list[str] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """Lose the batch response; accept the failure status that follows."""
+        attempts.append(request.url.path)
+        if request.url.path.endswith("/events/batch"):
+            # A response the client never sees: request sent, reply lost.
+            raise httpx.ReadTimeout("response lost", request=request)
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        state = _item_forward_state(transcript_path)
+        state = await _forward_items_once(client, bridge_dir=bridge_dir, state=state)
+        # A second pass must not re-attempt the ambiguous items.
+        await _forward_items_once(client, bridge_dir=bridge_dir, state=state)
+
+    assert attempts.count("/v1/sessions/conv_abc/events/batch") == 1
+    assert "/v1/sessions/conv_abc/events" not in attempts[1:2]
+    dead_letters = (bridge_dir / "dead_letter.jsonl").read_text(encoding="utf-8").splitlines()
+    records = [json.loads(line) for line in dead_letters]
+    assert len(records) == 3
+    assert all(record["delivered_ambiguous"] is True for record in records)
+
+
+@pytest.mark.asyncio
+async def test_a_batch_that_never_left_falls_back_to_single_posts(tmp_path: Path) -> None:
+    """
+    A connect failure loses nothing: the run is retried item by item.
+
+    A request that provably never reached the server committed nothing, so
+    unlike the lost-response case there is no ambiguity to resolve and the
+    items must still be delivered. Fails if a refused connection
+    dead-letters a poll's transcript that the server never saw.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    _write_assistant_transcript(transcript_path, 3)
+    events: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """Refuse the batch outright; accept single posts."""
+        if request.url.path.endswith("/events/batch"):
+            raise httpx.ConnectError("refused", request=request)
+        events.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        await _forward_items_once(
+            client, bridge_dir=bridge_dir, state=_item_forward_state(transcript_path)
+        )
+
+    assert [event["data"]["item_data"]["content"][0]["text"] for event in events] == [
+        "line 0",
+        "line 1",
+        "line 2",
+    ]
+    assert not (bridge_dir / "dead_letter.jsonl").exists()
+
+
+@pytest.mark.asyncio
+async def test_items_post_one_by_one_when_the_server_lacks_the_batch_route(
+    tmp_path: Path,
+) -> None:
+    """
+    An older deployment still receives every item, one request each.
+
+    A user's CLI can be newer than the server it talks to; the mirror must
+    keep working there, just without the round-trip saving. Fails if a
+    missing batch route drops the run.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    _write_assistant_transcript(transcript_path, 3)
+    events: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """Answer the batch route with Starlette's route-miss shape."""
+        if request.url.path.endswith("/events/batch"):
+            return httpx.Response(404, json={"detail": "Not Found"})
+        events.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        reset_events_batch_support(client)
+        await _forward_items_once(
+            client, bridge_dir=bridge_dir, state=_item_forward_state(transcript_path)
+        )
+
+    assert [event["data"]["item_data"]["content"][0]["text"] for event in events] == [
+        "line 0",
+        "line 1",
+        "line 2",
+    ]
+
+
+def test_a_compaction_boundary_ends_a_batchable_run() -> None:
+    """
+    The run stops before a compaction boundary, never spanning it.
+
+    The boundary has its own durable persist path and must land in order —
+    batching past it would reorder the transcript, and a resume would reload
+    history the compaction was supposed to drop. Fails if a summary record
+    is swept into the batch or merely skipped over.
+    """
+
+    def _item(source_id: str, *, compact: bool = False) -> Any:
+        """Build a minimal transcript item stand-in."""
+        return SimpleNamespace(
+            source_id=source_id,
+            item_type="message",
+            data={"role": "assistant"},
+            is_compact_summary=compact,
+        )
+
+    items = [_item("a"), _item("b"), _item("summary", compact=True), _item("c")]
+    run = forwarder._batchable_item_run(
+        items,
+        seen=set(),
+        skip_user_messages=False,
+        retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0, max_delay_s=0.0),
+    )
+    assert [item.source_id for item in run] == ["a", "b"]
+
+    # Already-forwarded items and skipped user messages neither join the run
+    # nor end it — they post nothing at all.
+    already = [_item("a"), _item("b")]
+    assert [
+        item.source_id
+        for item in forwarder._batchable_item_run(
+            already,
+            seen={"a"},
+            skip_user_messages=False,
+            retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0, max_delay_s=0.0),
+        )
+    ] == ["b"]
+
+
 @pytest.mark.asyncio
 async def test_forwarder_drops_poison_item_after_bounded_permanent_retries(
     tmp_path: Path,
@@ -3524,8 +3886,14 @@ async def test_forward_model_from_status_posts_the_status_model_verbatim(
     requests: list[dict[str, Any]] = []
 
     def _handle_request(request: httpx.Request) -> httpx.Response:
-        requests.append(json.loads(request.content.decode("utf-8")))
-        return httpx.Response(202, json={})
+        """
+        Accept every forwarder POST, recording each event it carries.
+
+        :param request: Outbound HTTP request from the forwarder.
+        :returns: HTTP 202 for the mock Omnigent endpoint.
+        """
+        batched = _record_forwarder_post(requests, request)
+        return batched if batched is not None else httpx.Response(202, json={})
 
     dedupe = forwarder._ForwardDedupeState()
     transport = httpx.MockTransport(_handle_request)
@@ -3557,8 +3925,14 @@ async def test_model_reports_keep_generation_and_context_marker(tmp_path: Path) 
     requests: list[dict[str, Any]] = []
 
     def _handle_request(request: httpx.Request) -> httpx.Response:
-        requests.append(json.loads(request.content.decode("utf-8")))
-        return httpx.Response(202, json={})
+        """
+        Accept every forwarder POST, recording each event it carries.
+
+        :param request: Outbound HTTP request from the forwarder.
+        :returns: HTTP 202 for the mock Omnigent endpoint.
+        """
+        batched = _record_forwarder_post(requests, request)
+        return batched if batched is not None else httpx.Response(202, json={})
 
     dedupe = forwarder._ForwardDedupeState()
     transport = httpx.MockTransport(_handle_request)
@@ -3627,13 +4001,13 @@ async def test_forwarder_reports_the_launch_model_then_a_switch(tmp_path: Path) 
 
     def _handle_request(request: httpx.Request) -> httpx.Response:
         """
-        Accept every forwarder POST and record its payload.
+        Accept every forwarder POST, recording each event it carries.
 
         :param request: Outbound HTTP request from the forwarder.
-        :returns: 202 for every event.
+        :returns: HTTP 202 for the mock Omnigent endpoint.
         """
-        requests.append(json.loads(request.content.decode("utf-8")))
-        return httpx.Response(202, json={})
+        batched = _record_forwarder_post(requests, request)
+        return batched if batched is not None else httpx.Response(202, json={})
 
     transport = httpx.MockTransport(_handle_request)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -3706,13 +4080,13 @@ async def test_forwarder_mirrors_tui_rename_on_first_observation(tmp_path: Path)
 
     def _handle_request(request: httpx.Request) -> httpx.Response:
         """
-        Accept every forwarder POST and record its payload.
+        Accept every forwarder POST, recording each event it carries.
 
         :param request: Outbound HTTP request from the forwarder.
-        :returns: 202 for every event.
+        :returns: HTTP 202 for the mock Omnigent endpoint.
         """
-        requests.append(json.loads(request.content.decode("utf-8")))
-        return httpx.Response(202, json={})
+        batched = _record_forwarder_post(requests, request)
+        return batched if batched is not None else httpx.Response(202, json={})
 
     transport = httpx.MockTransport(_handle_request)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -3959,9 +4333,14 @@ async def test_forwarder_mirrors_in_pane_permission_mode_switch(
     posts: list[dict[str, Any]] = []
 
     def _handle_request(request: httpx.Request) -> httpx.Response:
-        """Accept every POST and record its payload."""
-        posts.append(json.loads(request.content.decode("utf-8")))
-        return httpx.Response(202, json={})
+        """
+        Accept every forwarder POST, recording each event it carries.
+
+        :param request: Outbound HTTP request from the forwarder.
+        :returns: HTTP 202 for the mock Omnigent endpoint.
+        """
+        batched = _record_forwarder_post(posts, request)
+        return batched if batched is not None else httpx.Response(202, json={})
 
     transport = httpx.MockTransport(_handle_request)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -4024,9 +4403,14 @@ async def test_forwarder_posts_manual_launch_mode_so_picker_renders(
     posts: list[dict[str, Any]] = []
 
     def _handle_request(request: httpx.Request) -> httpx.Response:
-        """Accept the POST and record its payload."""
-        posts.append(json.loads(request.content.decode("utf-8")))
-        return httpx.Response(202, json={})
+        """
+        Accept every forwarder POST, recording each event it carries.
+
+        :param request: Outbound HTTP request from the forwarder.
+        :returns: HTTP 202 for the mock Omnigent endpoint.
+        """
+        batched = _record_forwarder_post(posts, request)
+        return batched if batched is not None else httpx.Response(202, json={})
 
     transport = httpx.MockTransport(_handle_request)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -5881,6 +6265,38 @@ class _CapturedDeltaPost:
     body: dict[str, Any]
 
 
+def _record_forwarder_post(
+    sink: list[dict[str, Any]], request: httpx.Request
+) -> httpx.Response | None:
+    """
+    Record a forwarder POST as individual events, unwrapping a batch.
+
+    The forwarder ships runs of events through ``/events/batch``, so a stub
+    that wants to assert on the *event* sequence has to look inside the
+    envelope. Recording both framings the same way keeps these tests about
+    what the forwarder mirrors rather than how many requests it took.
+
+    :param sink: List appended to with each event body, in order.
+    :param request: The outbound request to record.
+    :returns: The response for a batch envelope (every event accepted), or
+        ``None`` for a single post so the caller can pick its own status.
+    """
+    payload = json.loads(request.content.decode("utf-8"))
+    assert isinstance(payload, dict)
+    if not request.url.path.endswith("/events/batch"):
+        sink.append(payload)
+        return None
+    events = payload["events"]
+    sink.extend(events)
+    return httpx.Response(
+        200,
+        json={
+            "results": [{"index": index, "status": 202} for index in range(len(events))],
+            "stopped_at": None,
+        },
+    )
+
+
 def _write_deltas_file(bridge_dir: Path, records: list[dict[str, Any]]) -> None:
     """
     Append delta records to ``message_deltas.jsonl`` as the hook would.
@@ -6311,15 +6727,13 @@ async def test_scheduled_wake_forwards_marker_under_a_new_turn_id(tmp_path: Path
 
     def _handle_request(request: httpx.Request) -> httpx.Response:
         """
-        Accept every forwarder POST, recording its payload.
+        Accept every forwarder POST, recording each event it carries.
 
         :param request: Outbound HTTP request from the forwarder.
         :returns: HTTP 202 for the mock Omnigent endpoint.
         """
-        payload = json.loads(request.content.decode("utf-8"))
-        assert isinstance(payload, dict)
-        requests.append(payload)
-        return httpx.Response(202, json={})
+        batched = _record_forwarder_post(requests, request)
+        return batched if batched is not None else httpx.Response(202, json={})
 
     transport = httpx.MockTransport(_handle_request)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -8314,13 +8728,13 @@ async def test_short_turn_poll_posts_items_without_a_status_edge(tmp_path: Path)
 
     def _handle_request(request: httpx.Request) -> httpx.Response:
         """
-        Record every forwarder POST body.
+        Accept every forwarder POST, recording each event it carries.
 
         :param request: Outbound HTTP request from the forwarder.
         :returns: HTTP 202 for the mock Omnigent endpoint.
         """
-        posted.append(json.loads(request.content.decode("utf-8")))
-        return httpx.Response(202, json={})
+        batched = _record_forwarder_post(posted, request)
+        return batched if batched is not None else httpx.Response(202, json={})
 
     transport = httpx.MockTransport(_handle_request)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -8407,10 +8821,14 @@ async def test_forwarder_does_not_leave_running_open_for_slash_command_only_turn
     requests: list[dict[str, Any]] = []
 
     def _handle_request(request: httpx.Request) -> httpx.Response:
-        payload = json.loads(request.content.decode("utf-8"))
-        assert isinstance(payload, dict)
-        requests.append(payload)
-        return httpx.Response(202, json={})
+        """
+        Accept every forwarder POST, recording each event it carries.
+
+        :param request: Outbound HTTP request from the forwarder.
+        :returns: HTTP 202 for the mock Omnigent endpoint.
+        """
+        batched = _record_forwarder_post(requests, request)
+        return batched if batched is not None else httpx.Response(202, json={})
 
     transport = httpx.MockTransport(_handle_request)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
