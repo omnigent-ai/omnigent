@@ -860,9 +860,9 @@ def test_host_background_reuses_running_daemon(
     """
     from omnigent.cli import (
         _LOCAL_DAEMON_MARKER,
+        _host_daemon_config_signature,
         _HostDaemonRecord,
         _write_daemon_record,
-        server_config_signature,
     )
 
     spawned_args, _ = _patch_background_host_spawn(monkeypatch, tmp_path)
@@ -879,7 +879,7 @@ def test_host_background_reuses_running_daemon(
             # No host_id: the tmp config home has no identity file, and a
             # mismatch would tear the "running" daemon down as stale.
             host_id=None,
-            config_sig=server_config_signature(),
+            config_sig=_host_daemon_config_signature(None),
         )
     )
 

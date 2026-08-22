@@ -72,7 +72,7 @@ from omnigent.onboarding.provider_config import (
 # / ``agents_sdk``) and the ``claude`` alias normalize onto these first.
 # ``antigravity`` is the in-process Gemini SDK harness (its key resolves at
 # runtime), distinct from the CLI-wrapping ``antigravity-native`` (``agy``)
-# harness gated below on its binary plus a file-based OAuth credential.
+# harness gated below on its binary plus an API key or OAuth credential.
 _logger = logging.getLogger(__name__)
 
 _SDK_HARNESSES: frozenset[str] = frozenset(
@@ -82,7 +82,7 @@ _SDK_HARNESSES: frozenset[str] = frozenset(
 # Families/harnesses whose CLIs authenticate via file-based credentials rather
 # than a CLI login-status command. For these, ``harness_is_configured`` checks
 # BOTH the binary (via ``harness_cli_installed``) AND the credential (via the
-# callable here). ``agy`` writes an OAuth token on its first interactive run;
+# callable here). ``agy`` accepts ``GEMINI_API_KEY`` or writes an OAuth token;
 # ``kimi login`` writes ``~/.kimi-code/credentials/kimi-code.json`` (kimi has no
 # login-status probe). The ``anthropic`` / ``openai`` families authenticate via
 # subscription provider config and do not appear here. Each lambda resolves

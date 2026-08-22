@@ -696,6 +696,9 @@ _LOCAL_DAEMON_ENV_PREFIXES: tuple[str, ...] = (
     "OMNIGENT_",
     "OPENAI_",
 )
+# Credentials required by native harnesses that authenticate from the host
+# environment even when the daemon connects to a remote Omnigent server.
+_REMOTE_DAEMON_ENV_ALLOWLIST: frozenset[str] = frozenset({"GEMINI_API_KEY"})
 _HOST_DAEMON_PROXY_ENV_ALLOWLIST: frozenset[str] = frozenset(
     {
         "HTTP_PROXY",
@@ -2870,6 +2873,14 @@ class _DaemonReuseDecision:
     config_changed: bool
 
 
+def _host_daemon_config_signature(server_url: str | None) -> str:
+    """Fingerprint daemon startup inputs that cannot change in-process."""
+    base = server_config_signature(include_features=not server_url)
+    gemini_key = os.environ.get("GEMINI_API_KEY", "")
+    payload = f"{base}\0GEMINI_API_KEY={gemini_key}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
 def _reuse_existing_daemon_record(target: str) -> _DaemonReuseDecision:
     """
     Decide whether an existing daemon for *target* can be reused.
@@ -2912,7 +2923,13 @@ def _reuse_existing_daemon_record(target: str) -> _DaemonReuseDecision:
         # "re-run" semantics below don't apply (auth posture is the remote's
         # concern; its own reconnect loop covers transient tunnel drops). Keep
         # the original PID-liveness reuse so a live daemon for the URL is
-        # reused as-is.
+        # reused as-is, unless a background daemon carries stale native-agy
+        # credentials. Foreground/legacy daemons remain user-owned and are
+        # never silently terminated.
+        desired_sig = _host_daemon_config_signature(target)
+        if background and existing.config_sig is not None and existing.config_sig != desired_sig:
+            _terminate_host_unit(existing, reason="Gemini API key changed")
+            return _DaemonReuseDecision(reuse=False, config_changed=False)
         return _DaemonReuseDecision(reuse=True, config_changed=False)
 
     if not background:
@@ -2922,7 +2939,7 @@ def _reuse_existing_daemon_record(target: str) -> _DaemonReuseDecision:
         return _DaemonReuseDecision(reuse=True, config_changed=False)
 
     # Config drift → the running server has the wrong auth source.
-    desired_sig = server_config_signature()
+    desired_sig = _host_daemon_config_signature(None)
     if existing.config_sig is not None and existing.config_sig != desired_sig:
         _terminate_host_unit(existing, reason="config changed (auth)")
         return _DaemonReuseDecision(reuse=False, config_changed=True)
@@ -3049,7 +3066,7 @@ def _foreground_daemon_record(
         started_at=int(time.time()),
         host_id=host_id,
         resolved_server_url=server_url.rstrip("/") if mode == "local" else None,
-        config_sig=server_config_signature(include_features=mode == "local"),
+        config_sig=_host_daemon_config_signature(None if mode == "local" else target),
     )
 
 
@@ -3179,7 +3196,7 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
     _persist_spawned_daemon(
         target=target,
         spawned=spawned,
-        config_sig=server_config_signature(include_features=not server_url),
+        config_sig=_host_daemon_config_signature(server_url),
     )
     return decision.config_changed
 
@@ -3225,13 +3242,16 @@ def _build_host_daemon_env(
     else:
         # Allowlist the remote daemon's environment (W8): pass process
         # essentials + TLS trust + standard proxy selectors + the user's
-        # Databricks auth (the daemon authenticates to the server with it), but
-        # not unrelated provider secrets like ANTHROPIC_API_KEY / OPENAI_API_KEY.
+        # Databricks auth (the daemon authenticates to the server with it).
+        # Native agy also authenticates directly from GEMINI_API_KEY, so that
+        # credential must survive this hop before the runner's credential
+        # allowlist can forward it to the harness.
         daemon_env_prefixes = (*_RUNNER_ENV_ALLOWLIST_PREFIXES, "DATABRICKS_")
         env = {
             key: value
             for key, value in os.environ.items()
             if key in _RUNNER_ENV_ALLOWLIST
+            or key in _REMOTE_DAEMON_ENV_ALLOWLIST
             or key in _HOST_DAEMON_PROXY_ENV_ALLOWLIST
             or key.startswith(daemon_env_prefixes)
         }
