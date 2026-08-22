@@ -1117,6 +1117,7 @@ function savePickerPref(key: string, value: string | null): void {
 // have A's slower PATCH land last — and two reordered picks WITHIN one
 // conversation share an id. Only the newest pick may settle the sticky pref.
 let modelPickRevision = 0;
+let effortPickRevision = 0;
 
 /**
  * Make `id` the live, active conversation and return setters bound to its entry.
@@ -2092,6 +2093,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   setEffort: async (effort) => {
     // `selectedEffort` is the cross-session sticky pick; `sessionReasoningEffort`
     // is this conversation's effective value. An explicit pick sets both.
+    effortPickRevision += 1;
     setActive({ selectedEffort: effort, sessionReasoningEffort: effort });
     savePickerPref(PICKER_PREF_EFFORT_KEY, effort);
     const { conversationId } = get();
@@ -2186,6 +2188,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // model-less (e.g. SDK) session doesn't emit a spurious model-cleared change.
     const previousModel = get().sessionModelOverride;
     const clearModel = mode === "on" && previousModel != null;
+    const clearEffort = mode === "on";
+    const previousEffort = get().sessionReasoningEffort;
+    const previousStickyEffort = get().selectedEffort;
+    let effortClearRevision: number | null = null;
     // Pin the target: these are this conversation's switches, and the PATCH can
     // outlive a switch away. Resolving the target afterwards would leave a
     // backgrounded conversation showing an optimistic value the server rejected,
@@ -2196,15 +2202,26 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     patchSet({
       costControlModeOverride: mode,
       ...(clearModel ? { sessionModelOverride: null } : {}),
+      ...(clearEffort ? { sessionReasoningEffort: null } : {}),
     });
+    if (clearEffort) {
+      effortPickRevision += 1;
+      effortClearRevision = effortPickRevision;
+      rootSetState({ selectedEffort: null });
+      savePickerPref(PICKER_PREF_EFFORT_KEY, null);
+    }
     try {
       const session = await updateSession(conversationId, {
         costControlModeOverride: mode,
         ...(clearModel ? { modelOverride: null } : {}),
+        ...(clearEffort ? { reasoningEffort: null } : {}),
       });
       patchSet({
         costControlModeOverride: session.costControlModeOverride ?? null,
         ...(clearModel ? { sessionModelOverride: session.modelOverride ?? null } : {}),
+        ...(clearEffort && effortClearRevision === effortPickRevision
+          ? { sessionReasoningEffort: session.reasoningEffort ?? null }
+          : {}),
       });
     } catch (err) {
       // Roll back so neither control claims a state the server never persisted.
@@ -2213,7 +2230,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       patchSet({
         costControlModeOverride: previous,
         ...(clearModel ? { sessionModelOverride: previousModel } : {}),
+        ...(clearEffort && effortClearRevision === effortPickRevision
+          ? { sessionReasoningEffort: previousEffort }
+          : {}),
       });
+      if (clearEffort && effortClearRevision === effortPickRevision) {
+        savePickerPref(PICKER_PREF_EFFORT_KEY, previousStickyEffort);
+        if (useChatStore.getState().conversationId === conversationId) {
+          rootSetState({ selectedEffort: previousStickyEffort });
+        }
+      }
       throw err;
     }
   },
@@ -3097,9 +3123,15 @@ async function bindStream(
     const canApplyEffort = supportsEffortControl(session);
     const stickyEffort = get().selectedEffort;
     const stickyModel = get().selectedModel;
+    const routingOn = session.costControlModeOverride === "on";
     // Apply sticky effort only where the Web UI control is meaningful.
-    const effectiveEffort = canApplyEffort
-      ? (session.reasoningEffort ?? stickyEffort ?? null)
+    const sessionEffort = canApplyEffort
+      ? (session.reasoningEffort ?? (routingOn ? null : stickyEffort) ?? null)
+      : null;
+    const effectiveStickyEffort = canApplyEffort
+      ? routingOn
+        ? null
+        : sessionEffort
       : stickyEffort;
     // The sticky model is a UI PREFERENCE only: it pre-fills pickers but is
     // never silently PATCHed onto a session and never rendered as the
@@ -3109,6 +3141,7 @@ async function bindStream(
     // to honor — removed with the reported-model semantics.)
     if (
       !isSubAgentSession &&
+      !routingOn &&
       canApplyEffort &&
       session.reasoningEffort == null &&
       stickyEffort != null &&
@@ -3298,7 +3331,7 @@ async function bindStream(
         //
         // This conversation's own effective effort, which is what a warm switch
         // back re-projects (it does not re-bind, so it cannot recompute it).
-        sessionReasoningEffort: effectiveEffort,
+        sessionReasoningEffort: sessionEffort,
         // Session truth for the `/model` readout — overrides the snapshot
         // value spread via `...bindingPatch` so the claude-native sticky
         // handoff (fired above, silent) shows immediately.
@@ -3318,7 +3351,10 @@ async function bindStream(
     // mid-fetch, or two cold binds racing) must hydrate its own conversation
     // without touching the visible conversation's picker.
     if (useChatStore.getState().conversationId === id) {
-      rootSetState({ selectedEffort: effectiveEffort, selectedModel: resolvedStickyModel });
+      rootSetState({
+        selectedEffort: effectiveStickyEffort,
+        selectedModel: resolvedStickyModel,
+      });
     }
     racedNativeModelOptions.delete(id);
   } catch (err) {
@@ -5163,7 +5199,13 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         event.conversationId === sourceConversationId &&
         useChatStore.getState().conversationId === event.conversationId
       ) {
-        useChatStore.setState({ selectedEffort: event.reasoningEffort });
+        effortPickRevision += 1;
+        if (
+          conversationRegistry.peek(event.conversationId)?.getState().costControlModeOverride !==
+          "on"
+        ) {
+          useChatStore.setState({ selectedEffort: event.reasoningEffort });
+        }
       }
       return;
     case "session_permission_mode":

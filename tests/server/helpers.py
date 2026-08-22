@@ -1018,14 +1018,19 @@ class FakeRoutingClient:
         self.last_error = last_error
         self.calls: list[tuple[str, dict[str, list[str]]]] = []
         self.offered: list[dict[str, list[str]]] = []
+        self.model_efforts: list[dict[str, list[str]] | None] = []
 
     async def route(
-        self, message: str, available_models: dict[str, list[str]]
+        self,
+        message: str,
+        available_models: dict[str, list[str]],
+        model_efforts: dict[str, list[str]] | None = None,
     ) -> RoutingResult | None:
         """Record the offer and return the canned verdict (or raise)."""
         offer = dict(available_models)
         self.calls.append((message, offer))
         self.offered.append(offer)
+        self.model_efforts.append(model_efforts)
         if self._error is not None:
             raise self._error
         return self._result

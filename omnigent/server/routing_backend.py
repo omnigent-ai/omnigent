@@ -132,6 +132,7 @@ async def route_with_fallback(
     available_models: dict[str, list[str]],
     *,
     gateway_backed: bool,
+    model_efforts: dict[str, list[str]] | None = None,
 ) -> RoutedCall | None:
     """Call the deployment's router, falling back to the judge when it fails.
 
@@ -144,6 +145,7 @@ async def route_with_fallback(
     :param backends: The deployment's configured clients.
     :param message: The task text to route on.
     :param available_models: Harness id → candidate model ids.
+    :param model_efforts: Optional model id → supported effort values.
     :param gateway_backed: Whether every harness family involved resolves
         AI-Gateway-backed inference (see :func:`select_router`).
     :returns: The answer, or ``None`` when no backend is configured at all.
@@ -154,14 +156,20 @@ async def route_with_fallback(
     choice = select_router(backends, gateway_backed=gateway_backed)
     if choice is None:
         return None
+
+    async def _route(client: RoutingClient) -> RoutingResult | None:
+        if model_efforts is None:
+            return await client.route(message, available_models)
+        return await client.route(message, available_models, model_efforts)
+
     if choice.source != "databricks-aigw" or backends.local is None:
         return RoutedCall(
-            result=await choice.client.route(message, available_models),
+            result=await _route(choice.client),
             source=choice.source,
             client=choice.client,
         )
     try:
-        result = await choice.client.route(message, available_models)
+        result = await _route(choice.client)
     except Exception:  # noqa: BLE001 — the judge is the fallback for any failure
         _logger.warning(
             "routing: the external router raised; falling back to the built-in judge",
@@ -176,7 +184,7 @@ async def route_with_fallback(
             getattr(choice.client, "last_error", None),
         )
     return RoutedCall(
-        result=await backends.local.route(message, available_models),
+        result=await _route(backends.local),
         source="oss-llm",
         client=backends.local,
     )

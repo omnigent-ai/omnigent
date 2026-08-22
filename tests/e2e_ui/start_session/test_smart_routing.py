@@ -254,12 +254,18 @@ async def _drive_smart_routing_model_option(base_url: str, session_id: str) -> N
             # Pin Claude Code, then open its run-config modal.
             await _open_entry_config(page, "ag_claude_e2e")
             model = page.get_by_test_id("new-chat-landing-config-model")
+            effort = page.get_by_test_id("new-chat-landing-config-effort")
             await expect(model).to_be_visible()
+            await effort.click()
+            await page.get_by_role("option", name="High", exact=True).click()
+            await expect(effort).to_contain_text("High")
             await model.click()
             await page.get_by_role("option", name="Smart Routing", exact=True).click()
             await expect(model).to_contain_text("Smart Routing")
             # The router picks the effort with the model, so the row is frozen.
-            await expect(page.get_by_test_id("new-chat-landing-config-effort")).to_be_disabled()
+            await expect(effort).to_be_disabled()
+            await expect(effort).to_contain_text("—")
+            await expect(effort).not_to_contain_text("High")
             await _save_config(page)
 
             await page.get_by_test_id("new-chat-landing-input").fill("fix the flaky test")
@@ -272,6 +278,7 @@ async def _drive_smart_routing_model_option(base_url: str, session_id: str) -> N
             # Per-turn routing owns the model, so nothing is pinned; the
             # harness itself stays the one the user picked.
             assert body.get("model_override") is None, body
+            assert body.get("reasoning_effort") is None, body
             assert body.get("harness_override") != "auto", body
         finally:
             await browser.close()
