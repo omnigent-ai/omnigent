@@ -58,6 +58,25 @@ def _response_json_object(response: httpx.Response) -> _JsonObject:
     return result
 
 
+def _input_response(verdict: pending_approvals.Verdict) -> _JsonObject:
+    """
+    Build the MRTR ``inputResponses`` entry for one resolved elicitation.
+
+    Carries the person's ``content`` when the prompt collected fields, so a
+    server that asked "which environment?" is told which one rather than
+    only that someone said yes.
+
+    :param verdict: The resolved verdict for this elicitation.
+    :returns: The wire object for this elicitation id.
+    """
+    if not verdict.approved:
+        return {"action": "decline"}
+    response: _JsonObject = {"action": "accept"}
+    if verdict.content is not None:
+        response["content"] = cast(object, verdict.content)
+    return response
+
+
 def _json_object_list(value: object) -> list[_JsonObject]:
     """Return only object entries from a JSON array."""
     if not isinstance(value, list):
@@ -330,7 +349,7 @@ class ProxyMcpManager:
                     if self._publish_event is not None
                     else (lambda _s, _e: None)
                 )
-                approved = await pending_approvals.wait_for_user_approval(
+                verdict = await pending_approvals.wait_for_user_verdict(
                     elicitation_id=elicitation_id,
                     conversation_id=self._session_id,
                     publish_event=publisher,
@@ -345,7 +364,7 @@ class ProxyMcpManager:
                         "arguments": arguments,
                         "requestState": request_state,
                         "inputResponses": {
-                            elicitation_id: {"action": "accept" if approved else "decline"}
+                            elicitation_id: _input_response(verdict),
                         },
                     },
                 }

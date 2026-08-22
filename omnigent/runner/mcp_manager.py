@@ -23,6 +23,63 @@ from omnigent.tools.mcp import McpServerConnection
 _logger = logging.getLogger(__name__)
 
 
+def _schema_asks_for_fields(params: ElicitRequestParams) -> bool:
+    """
+    Whether the server's ``requestedSchema`` declares any property.
+
+    A schema with no properties is a bare consent prompt, where an accept
+    carrying no content is exactly right.
+
+    :param params: The elicitation params from the MCP server.
+    :returns: ``True`` when at least one property was requested.
+    """
+    schema = getattr(params, "requestedSchema", None)
+    if not isinstance(schema, dict):
+        return False
+    properties = schema.get("properties")
+    return isinstance(properties, dict) and bool(properties)
+
+
+def _validated_content(
+    content: dict[str, str | int | float | bool | list[str] | None] | None,
+    params: ElicitRequestParams,
+) -> dict[str, str | int | float | bool | list[str] | None] | None:
+    """
+    Keep answered content only when it fits what the server asked for.
+
+    The resolve payload reaches here from a browser, so it is checked rather
+    than trusted: values must be the primitives MCP allows, keys must be ones
+    the schema named, and an enum must be answered with one of its own
+    members. Anything else is discarded so the caller falls back instead of
+    forwarding a body the server's own schema rejects — or one that would
+    fail ``ElicitResult`` validation inside this callback.
+
+    :param content: The content the person's verdict carried, or ``None``.
+    :param params: The elicitation params from the MCP server.
+    :returns: The content when it conforms, otherwise ``None``.
+    """
+    if not content:
+        return None
+    schema = getattr(params, "requestedSchema", None)
+    properties = schema.get("properties") if isinstance(schema, dict) else None
+    if not isinstance(properties, dict):
+        return None
+    for key, value in content.items():
+        prop = properties.get(key)
+        if not isinstance(prop, dict):
+            return None
+        if isinstance(value, list) and not all(isinstance(v, str) for v in value):
+            return None
+        if not isinstance(value, str | int | float | bool | list) and value is not None:
+            return None
+        allowed = prop.get("enum")
+        if isinstance(allowed, list) and allowed:
+            chosen = value if isinstance(value, list) else [value]
+            if any(v not in allowed for v in chosen):
+                return None
+    return content
+
+
 def _build_accept_content(
     params: ElicitRequestParams,
 ) -> dict[str, str | int | float | bool | list[str] | None] | None:
@@ -308,24 +365,39 @@ class RunnerMcpManager:
                 return ElicitResult(action="decline")
 
             # Park until the user approves or declines (or timeout).
-            # ``pending_approvals`` resolves a bool (accept/decline)
-            # — it does not carry the user's form data. Content is
-            # auto-filled from the requestedSchema below.
             # No-op publish_event: ``response.elicitation_resolved``
             # won't fire on timeout/cancellation, so the Omnigent server's
             # sidebar badge may stay stale. Same pattern as
             # proxy_mcp_manager. A future enhancement could POST
             # the resolved event back to the Omnigent server here.
-            approved = await pending_approvals.wait_for_user_approval(
+            verdict = await pending_approvals.wait_for_user_verdict(
                 elicitation_id=elicitation_id,
                 conversation_id=session_id,
                 publish_event=lambda _s, _e: None,
             )
 
-            if not approved:
+            if not verdict.approved:
                 return ElicitResult(action="decline")
 
-            content = _build_accept_content(params)
+            # The person's own answer wins. The schema auto-fill is the
+            # fallback for a surface that collected no fields — a bare
+            # approve/reject card, or the REPL — where a consent-shaped
+            # schema (a boolean, a lone enum, an explicit default) has only
+            # one sensible value anyway.
+            content = _validated_content(verdict.content, params)
+            if content is None:
+                content = _build_accept_content(params)
+            if content is None and _schema_asks_for_fields(params):
+                # The server asked for something nobody supplied, and the
+                # schema gives nothing to fall back on. An accept without the
+                # fields it declared is a malformed answer; declining is the
+                # outcome the server already knows how to handle.
+                _logger.info(
+                    "MCP elicitation %s accepted with no content for a schema "
+                    "that requires fields — declining instead",
+                    elicitation_id,
+                )
+                return ElicitResult(action="decline")
             return ElicitResult(action="accept", content=content)
 
         return _elicit

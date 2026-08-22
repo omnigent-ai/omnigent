@@ -67,7 +67,7 @@ async def test_resolve_sets_result_and_returns_true() -> None:
     # between register and resolve.
     assert delivered is True
     assert fut.done()
-    assert fut.result() is True
+    assert fut.result() == pending_approvals.Verdict(approved=True, content=None)
 
 
 @pytest.mark.asyncio
@@ -94,7 +94,7 @@ async def test_resolve_already_done_returns_false() -> None:
     stays idempotent.
     """
     fut = pending_approvals.register("elicit_dup")
-    fut.set_result(True)
+    fut.set_result(pending_approvals.Verdict(approved=True))
     second = pending_approvals.resolve("elicit_dup", False)
     assert second is False
 
