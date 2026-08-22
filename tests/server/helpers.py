@@ -217,6 +217,11 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.resources: dict[str, object] | None = None
         self.pvc_mounts: list[dict[str, object]] | None = None
         self.secret_mounts: list[dict[str, object]] | None = None
+        # mesos-compose ctor wiring.
+        self.compose_url: str | None = None
+        self.username: str | None = None
+        self.verify_ssl: bool | None = None
+        self.target_hostname: str | None = None
         self.prepared = False
         self.provisioned_names: list[str] = []
         self.commands: list[str] = []
@@ -591,6 +596,33 @@ def install_fake_kubernetes_launcher(
         return fake
 
     monkeypatch.setattr(kubernetes_mod, "KubernetesSandboxLauncher", _ctor)
+
+
+def install_fake_mesos_launcher(
+    monkeypatch: Any,
+    fake: FakeSandboxLauncher,
+) -> None:
+    """Substitute a constructor-recording fake for the Mesos launcher."""
+    import omnigent.onboarding.sandboxes.mesos as mesos_mod
+
+    def _ctor(
+        *,
+        image: str | None = None,
+        env: list[str] | None = None,
+        compose_url: str | None = None,
+        username: str | None = None,
+        verify_ssl: bool | None = None,
+        target_hostname: str | None = None,
+    ) -> FakeSandboxLauncher:
+        fake.image = image
+        fake.env = env
+        fake.compose_url = compose_url
+        fake.username = username
+        fake.verify_ssl = verify_ssl
+        fake.target_hostname = target_hostname
+        return fake
+
+    monkeypatch.setattr(mesos_mod, "MesosSandboxLauncher", _ctor)
 
 
 async def wait_for_completion(

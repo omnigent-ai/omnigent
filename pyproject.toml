@@ -89,7 +89,7 @@ dependencies = [
     # PostgreSQL, and MySQL rather than depending on each backend's storage engine.
     "zstandard>=0.22,<1",
     "tiktoken>=0.7,<1",
-    # Server performance metrics use the no-op API even when tracing is off.
+    # Server performance metrics use the no-op API even when tracing is off.    
     "opentelemetry-api>=1.20,<2",
     # The Claude Code and OpenAI Agents harnesses are part of the
     # baseline install — every CUJ command in the README depends on at
@@ -269,7 +269,7 @@ databricks = [
     # Floor matches what core code was tested against when the SDK was a
     # default dependency (it moved here from `dependencies` above).
     "databricks-sdk>=0.56.0,<1",
-    "opentelemetry-distro>=0,<1",
+    "opentelemetry-distro>=0.41b0,<1",
     "psycopg[binary]>=3.1,<4",
     "pymysql>=1.1,<2",
     # Databricks-specific MCP servers. Not imported by core Omnigent
