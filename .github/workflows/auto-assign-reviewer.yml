@@ -29,7 +29,11 @@ name: Auto-assign Reviewer
 
 on:
   pull_request_target:
-    types: [opened, reopened, ready_for_review]
+    # `edited` catches a `closes #N` link added after open (stub body, then
+    # filled in): on that event the script is promote-only (adopt a linked-issue
+    # assignee if one now exists, else leave the current pick untouched). Still
+    # checks out only the trusted default branch, never PR head -- no PR code runs.
+    types: [opened, reopened, ready_for_review, edited]
 
 permissions:
   contents: read
@@ -76,6 +80,9 @@ jobs:
       # issue-triage.yml; the returned ranking is treated as untrusted and can
       # only reorder an area's own owners (the assigner enforces the allowlist).
       - name: Rank area owners by fit (LLM, advisory)
+        # Skipped on `edited`: that path only adopts a linked-issue assignee,
+        # which does not use area-fit ranking, so a gateway call per edit is waste.
+        if: github.event.action != 'edited'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}

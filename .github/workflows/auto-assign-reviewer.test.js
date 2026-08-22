@@ -32,6 +32,7 @@ async function run({
   files, load = {}, current = [], currentAssignees = [],
   author = "someexternaldev", fork = true, linkedIssues = [],
   rank = null, // LLM area-fit ranking (array of logins) or null for none
+  action = "opened", // PR event action; `edited` is promote-only
 }) {
   // Point the script at a per-run rank file so real /tmp state can't leak in.
   // `rank: null` writes no file -> the script's fallback (pure load) is tested,
@@ -83,7 +84,7 @@ async function run({
   };
   const context = {
     repo: { owner: "omnigent-ai", repo: "omnigent" },
-    payload: { pull_request: {
+    payload: { action, pull_request: {
       number: PR_NUMBER, draft: false,
       user: { login: author },
       // precise fork detection compares head vs base full_name
@@ -330,4 +331,49 @@ function assert(name, cond, detail) {
   });
   assert("linked-issue adoption overrides the LLM rank",
     JSON.stringify(r.added) === JSON.stringify(["TomeHirata"]), JSON.stringify(r));
+
+  // 21. `edited` event: a `closes #N` link added after open now points at an
+  //     issue assigned to a pool maintainer. The PR currently carries the
+  //     load-balanced pick (dbczumar); the "more matched" issue owner is
+  //     promoted -- swapping BOTH the reviewer and the assignee.
+  r = await run({
+    action: "edited",
+    files: ["omnigent/inner/foo.py"],
+    load: { SabhyaC26: 5, TomeHirata: 4, dhruv0811: 0, dbczumar: 1 },
+    current: ["dbczumar"], currentAssignees: ["dbczumar"],
+    linkedIssues: [{ number: 42, assignees: ["TomeHirata"] }],
+  });
+  assert("edited: linked-issue owner is promoted over the current reviewer",
+    JSON.stringify(r.added) === JSON.stringify(["TomeHirata"]) &&
+    JSON.stringify(r.removed) === JSON.stringify(["dbczumar"]), JSON.stringify(r));
+  assert("edited: the PR assignee is swapped to the linked-issue owner too",
+    JSON.stringify(r.assigned) === JSON.stringify(["TomeHirata"]) &&
+    JSON.stringify(r.unassigned) === JSON.stringify(["dbczumar"]), JSON.stringify(r));
+
+  // 22. `edited` event with NO linked-issue assignee to adopt: promote-only, so
+  //     the existing reviewer/assignee is left untouched (no load-balanced
+  //     fallback) -- a routine title/body edit must not thrash a chosen pick.
+  r = await run({
+    action: "edited",
+    files: ["omnigent/inner/foo.py"],
+    load: { SabhyaC26: 5, TomeHirata: 4, dhruv0811: 0, dbczumar: 1 },
+    current: ["dbczumar"], currentAssignees: ["dbczumar"],
+    linkedIssues: [],
+  });
+  assert("edited with nothing to adopt leaves reviewer/assignee unchanged",
+    r.added.length === 0 && r.removed.length === 0 &&
+    r.assigned.length === 0 && r.unassigned.length === 0, JSON.stringify(r));
+
+  // 23. `edited` event where the linked-issue owner already IS the current pick:
+  //     no-op (nothing added or removed).
+  r = await run({
+    action: "edited",
+    files: ["omnigent/inner/foo.py"],
+    load: { SabhyaC26: 5, TomeHirata: 4, dhruv0811: 0, dbczumar: 1 },
+    current: ["TomeHirata"], currentAssignees: ["TomeHirata"],
+    linkedIssues: [{ number: 42, assignees: ["TomeHirata"] }],
+  });
+  assert("edited: already-correct reviewer is a no-op",
+    r.added.length === 0 && r.removed.length === 0 &&
+    r.assigned.length === 0 && r.unassigned.length === 0, JSON.stringify(r));
 })();
