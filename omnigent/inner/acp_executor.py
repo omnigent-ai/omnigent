@@ -53,6 +53,7 @@ import math
 import os
 import secrets
 import shlex
+from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -74,8 +75,10 @@ from omnigent.inner.executor import (
     ToolCallStatus,
     ToolSpec,
     TurnComplete,
+    describe_exception,
 )
 from omnigent.inner.os_env import OSEnvironment, create_os_environment
+from omnigent.process_logging import current_process_log_path, display_log_path
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +93,11 @@ class _PolicyVerdict(Protocol):
 
 _PolicyEvaluator: TypeAlias = Callable[[str, _AcpJsonObject], Awaitable[_PolicyVerdict]]
 _ElicitationHandler: TypeAlias = Callable[[str, _AcpJsonObject], Awaitable[bool]]
+# Choice-aware elicitation: offers the agent's own permission options and returns
+# the chosen label (``None`` = declined). Optional; falls back to the yes/no form.
+_ElicitationChoiceHandler: TypeAlias = Callable[
+    [str, _AcpJsonObject, Sequence[str]], Awaitable[str | None]
+]
 _ToolExecutor: TypeAlias = Callable[[str, _AcpJsonObject], Awaitable[_AcpJsonObject]]
 
 # ACP error code an agent maps to a filesystem "not found" (ENOENT) when a
@@ -116,6 +124,13 @@ _UPDATE_AGENT_THOUGHT_CHUNK = "agent_thought_chunk"
 _UPDATE_TOOL_CALL = "tool_call"
 _UPDATE_TOOL_CALL_UPDATE = "tool_call_update"
 _UPDATE_USAGE = "usage_update"
+_UPDATE_CONFIG_OPTION = "config_option_update"
+
+# ACP ``session/set_config_option`` — the standard warm-switch method. The
+# option id for the model, and the param name the agent expects (``configId``,
+# not ``optionId``).
+_AGENT_METHOD_SET_CONFIG_OPTION = "session/set_config_option"
+_CONFIG_OPTION_MODEL = "model"
 
 # ACP tool-call lifecycle statuses (the terminal ones close a tool card).
 _TOOL_STATUS_COMPLETED = "completed"
@@ -136,6 +151,14 @@ if not math.isfinite(_PROMPT_TIMEOUT_SECONDS) or _PROMPT_TIMEOUT_SECONDS <= 0:
 
 # Idle timeout for the initial ACP handshake (initialize / session setup).
 _INIT_TIMEOUT_SECONDS = 30.0
+
+# Agent stderr kept for diagnostics: how many trailing lines to retain, how many
+# to quote in a turn error, and the per-line cap (a chatty CLI can emit one
+# enormous line, and the error goes in a UI toast).
+_STDERR_RING_LINES = 20
+_STDERR_QUOTED_LINES = 5
+_STDERR_LINE_LIMIT = 500
+_STDERR_QUOTED_LIMIT = 1000
 
 # ACP protocol version this executor targets (matches Goose 1.38 / Qwen).
 _PROTOCOL_VERSION = 1
@@ -167,6 +190,11 @@ class AcpAgentConfig:
         the agent authenticates with — an agent that reads a variable must name
         it here (or in ``os_env.sandbox.env_passthrough``) or it starts
         unauthenticated. Names only; values come from the host environment.
+    :param permission_mode: Omnigent permission stance, e.g. ``"auto"``
+        (default) or ``"bypassPermissions"``. Only the latter changes anything:
+        it skips the human approval card for a request no policy had an opinion
+        on, matching claude-sdk's ``can_use_tool`` gate. Policy still runs in
+        every mode, so a DENY still blocks and an explicit ASK still prompts.
     """
 
     command: str
@@ -176,6 +204,7 @@ class AcpAgentConfig:
     send_model_in_session_new: bool = False
     omnigent_mcp: bool = True
     env_passthrough: tuple[str, ...] = ()
+    permission_mode: str = "auto"
 
 
 class _AcpRequestError(Exception):
@@ -280,6 +309,14 @@ class AcpExecutor(Executor):
         self._fs_delegation: bool = os_env is not None and not bool(getattr(os_env, "fork", False))
         self._os_environment: OSEnvironment | None = None
 
+        # Session config options the agent advertises (``mode``, ``model``, …)
+        # and the live model value, both learned from ``config_option_update``.
+        self._config_option_ids: set[str] = set()
+        self._active_model: str | None = None
+        # Latches off once an agent proves it can't warm-switch, so we don't
+        # retry a failing request on every turn.
+        self._model_switch_supported: bool = True
+
         # Parsed argv; the first token is the binary we resolve / sandbox.
         self._argv: list[str] = shlex.split(config.command)
         if not self._argv:
@@ -289,6 +326,11 @@ class AcpExecutor(Executor):
         self._queue: asyncio.Queue[_AcpJsonObject] = asyncio.Queue()
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
+        # Last few agent stderr lines, attached to a startup failure. An agent
+        # that dies or stalls during the handshake usually explains why on
+        # stderr ("no API key", "unknown flag"), and that text is the whole
+        # diagnosis; without it the turn error names only the stalled RPC.
+        self._recent_stderr: deque[str] = deque(maxlen=_STDERR_RING_LINES)
         # Serializes stdin writes: run_turn (prompt / request replies) and the
         # adapter's interrupt_session() write from different tasks.
         self._write_lock = asyncio.Lock()
@@ -301,9 +343,11 @@ class AcpExecutor(Executor):
         self._image_supported: bool = False
         self._system_prompt_sent: bool = False
 
-        # ACP toolCallId → tool name, so a later tool_call_update can close the
-        # right tool card with the name from the originating tool_call.
+        # ACP toolCallId → tool name / rawInput from the originating tool_call, so
+        # a later tool_call_update can close the right tool card, and a permission
+        # request that names only the id can still say what is about to run.
         self._tool_names: dict[str, str] = {}
+        self._tool_inputs: dict[str, _AcpJsonObject] = {}
 
         # Context-window size (tokens) reported via ``usage_update``; surfaced by
         # :meth:`max_context_tokens` so the UI context meter fills.
@@ -315,6 +359,7 @@ class AcpExecutor(Executor):
         # wired (standalone / unit tests) → permission falls back to allow.
         self._policy_evaluator: _PolicyEvaluator | None = None
         self._elicitation_handler: _ElicitationHandler | None = None
+        self._elicitation_choice_handler: _ElicitationChoiceHandler | None = None
         # Adapter-injected tool-execution bridge (the same ``_tool_executor``
         # attribute the SDK harnesses use); backs the Omnigent MCP relay.
         self._tool_executor: _ToolExecutor | None = None
@@ -404,11 +449,33 @@ class AcpExecutor(Executor):
             )
             return binary, rest
 
+    def _startup_error_message(self, exc: BaseException) -> str:
+        """Describe a handshake failure, quoting the agent's own stderr.
+
+        Builds on :func:`describe_exception` (which keeps a bare
+        ``TimeoutError`` from rendering blank), then appends what the agent
+        printed — that text ("no API key", "unknown flag") is usually the actual
+        diagnosis — and the log file so the full traceback is findable.
+        """
+        detail = describe_exception(exc)
+        if self._recent_stderr:
+            tail = " | ".join(list(self._recent_stderr)[-_STDERR_QUOTED_LINES:])
+            # Cap here too, not just per line in the reader: this string ends up
+            # in a UI toast, and the ring can hold several long lines.
+            if len(tail) > _STDERR_QUOTED_LIMIT:
+                tail = tail[:_STDERR_QUOTED_LIMIT] + "...[truncated]"
+            detail = f"{detail}; {self._config.name} stderr: {tail}"
+        log_path = current_process_log_path()
+        if log_path is not None:
+            detail = f"{detail} (harness log: {display_log_path(log_path)})"
+        return detail
+
     async def _read_stderr(self) -> None:
         """Continuously drain the agent's stderr, logging each line at debug.
 
         Prevents a chatty CLI from filling the OS pipe buffer (~64 KiB) and
-        stalling the turn.
+        stalling the turn. Also retains the trailing lines so a startup failure
+        can quote what the agent said before it gave up.
         """
         assert self._proc and self._proc.stderr
         try:
@@ -418,6 +485,9 @@ class AcpExecutor(Executor):
                     break
                 line = raw_line.decode("utf-8", errors="replace").rstrip()
                 if line:
+                    if len(line) > _STDERR_LINE_LIMIT:
+                        line = line[:_STDERR_LINE_LIMIT] + "...[truncated]"
+                    self._recent_stderr.append(line)
                     logger.debug("acp[%s] stderr: %s", self._config.name, line)
         except asyncio.CancelledError:
             # Expected: close() cancels this reader task on teardown.
@@ -472,7 +542,7 @@ class AcpExecutor(Executor):
             for fut in self._pending.values():
                 if not fut.done():
                     fut.set_exception(exc)
-            await self._queue.put({"type": "error", "message": str(exc)})
+            await self._queue.put({"type": "error", "message": describe_exception(exc)})
 
     async def _send(self, msg: _AcpJsonObject) -> None:
         """Write one newline-terminated JSON message to the agent's stdin."""
@@ -658,8 +728,8 @@ class AcpExecutor(Executor):
         error: _AcpJsonObject | None = None
         try:
             if method == _AGENT_REQUEST_REQUEST_PERMISSION:
-                allow = await self._decide_permission(params)
-                result = self._permission_outcome(params, allow=allow)
+                allow, option_id = await self._decide_permission(params)
+                result = self._permission_outcome(params, allow=allow, option_id=option_id)
             elif method == "fs/read_text_file" and self._fs_delegation:
                 result = await self._handle_fs_read(params)
             elif method == "fs/write_text_file" and self._fs_delegation:
@@ -742,40 +812,137 @@ class AcpExecutor(Executor):
     # Permission (session/request_permission) → policy + elicitation
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _extract_tool_call(params: _AcpJsonObject) -> tuple[str, _AcpJsonObject]:
+    def _extract_tool_call(self, params: _AcpJsonObject) -> tuple[str, _AcpJsonObject]:
         """Pull ``(tool_name, tool_input)`` from a ``session/request_permission``.
 
         ACP's ``toolCall`` carries a human ``title`` (e.g. ``"shell"``), a
-        ``kind`` (e.g. ``"execute"``), and a ``rawInput`` dict. We prefer the
-        title, else the kind. (Vendor-specific ``_meta`` tool names — e.g.
-        Goose's ``_meta.goose.toolCall.toolName`` — are not read here; ``title``
-        is the portable name every ACP agent supplies.)
+        ``kind`` (e.g. ``"execute"``), and a ``rawInput`` dict; prefer the title,
+        else the kind. An agent may instead send the request bare, carrying only
+        ``toolCallId``, so fall back to what the originating ``tool_call`` update
+        reported for that id — it always arrives first. Without that fallback a
+        bare request degrades to ``"tool"`` with no arguments, so the approval
+        card cannot say what is about to run and no TOOL_CALL policy rule can
+        match it (rules gate on the tool name, then read its arguments).
+
+        (Vendor-specific ``_meta`` tool names — e.g. Goose's
+        ``_meta.goose.toolCall.toolName`` — are not read here; ``title`` is the
+        portable name and ``toolCallId`` the portable correlation.)
         """
         tool_call = params.get("toolCall") or {}
-        name = tool_call.get("title") or tool_call.get("kind") or "tool"
+        call_id = tool_call.get("toolCallId")
+        call_id = call_id if isinstance(call_id, str) else None
+        name = (
+            tool_call.get("title")
+            or tool_call.get("kind")
+            or (self._tool_names.get(call_id) if call_id else None)
+            or "tool"
+        )
         args = tool_call.get("rawInput")
         if not isinstance(args, dict):
-            args = {}
+            cached = self._tool_inputs.get(call_id) if call_id else None
+            args = cached if isinstance(cached, dict) else {}
         return str(name), args
 
-    async def _decide_permission(self, params: _AcpJsonObject) -> bool:
-        """Decide allow/deny for a permission request — policy then elicitation.
+    @property
+    def _bypass_permissions(self) -> bool:
+        """Whether the user opted out of approval cards for this agent.
+
+        Mirrors :class:`~omnigent.inner.claude_sdk_executor.ClaudeSDKExecutor`'s
+        ``can_use_tool`` stance: ``"bypassPermissions"`` and nothing else, so the ``"auto"``
+        default keeps prompting. (Cursor also treats ``"auto"`` as no-prompt;
+        ACP agents ask only about actions they consider permission-worthy, so
+        silencing the default would drop meaningful prompts.)
+        """
+        return self._config.permission_mode == "bypassPermissions"
+
+    @staticmethod
+    def _permission_options(params: _AcpJsonObject) -> list[_AcpJsonObject]:
+        """The agent's offered options, each an ``{optionId, name, kind}`` dict."""
+        return [o for o in (params.get("options") or []) if isinstance(o, dict)]
+
+    def _scoped_options(self, params: _AcpJsonObject) -> list[tuple[str, _AcpJsonObject]] | None:
+        """Label the agent's options for a choice card, or ``None`` if unusable.
+
+        Unusable means: fewer than two options, a blank or duplicated label (the
+        reply names the label, so duplicates are ambiguous), or no ``reject_*``
+        option — a choice card replaces the Approve/Reject buttons, so without one
+        the user would have no way to say no.
+        """
+        labeled = [(str(o.get("name") or "").strip(), o) for o in self._permission_options(params)]
+        if len(labeled) < 2 or any(not name for name, _ in labeled):
+            return None
+        labels = [name for name, _ in labeled]
+        if len(set(labels)) != len(labels):
+            return None
+        if not any("reject" in str(o.get("kind", "")) for _, o in labeled):
+            return None
+        return labeled
+
+    async def _ask_user(
+        self, tool_name: str, tool_input: _AcpJsonObject, params: _AcpJsonObject
+    ) -> tuple[bool, str | None]:
+        """Route a permission request to the user; return ``(allowed, option_id)``.
+
+        Prefers the choice bridge, which puts the agent's *own* options on the
+        card: picking "allow this command for the session" is one click the agent
+        then honors itself, so the same command class stops re-prompting. Falls
+        back to the yes/no bridge, whose grant stays once-scoped.
+        """
+        choice_handler = self._elicitation_choice_handler
+        labeled = self._scoped_options(params) if choice_handler is not None else None
+        if choice_handler is not None and labeled is not None:
+            chosen = await choice_handler(tool_name, tool_input, [name for name, _ in labeled])
+            if chosen is None:
+                return False, None
+            picked = next((o for name, o in labeled if name == chosen), None)
+            if picked is None:
+                logger.warning(
+                    "acp permission choice %r was not offered; denying tool=%s", chosen, tool_name
+                )
+                return False, None
+            option_id = picked.get("optionId")
+            allowed = "allow" in str(picked.get("kind", ""))
+            logger.info(
+                "acp permission %s by user (scope=%s): tool=%s",
+                "allowed" if allowed else "denied",
+                option_id,
+                tool_name,
+            )
+            return allowed, (option_id if isinstance(option_id, str) else None)
+
+        handler = self._elicitation_handler
+        if handler is None:
+            return False, None
+        return bool(await handler(tool_name, tool_input)), None
+
+    async def _decide_permission(self, params: _AcpJsonObject) -> tuple[bool, str | None]:
+        """Decide a permission request — policy then elicitation.
 
         1. **TOOL_CALL policy** (:attr:`_policy_evaluator`): a hard
            ``POLICY_ACTION_DENY`` denies; ``POLICY_ACTION_ASK`` defers to
            elicitation (and **fails closed** when no handler is wired);
            ``ALLOW`` / unspecified falls through.
-        2. **Human-consent elicitation** (:attr:`_elicitation_handler`): routes
-           to the user via a web approval card and returns their accept/deny.
+        2. **Human-consent elicitation**: the agent's own options via
+           :attr:`_elicitation_choice_handler`, else a yes/no card via
+           :attr:`_elicitation_handler`. Skipped under
+           ``permission_mode="bypassPermissions"`` — but only for a request no
+           policy had an opinion on, so a DENY still blocks and a policy that
+           says ASK still prompts.
 
         When neither bridge is wired (standalone / unit tests), falls back to
         allow so direct use of the executor isn't blocked. In normal runner
         operation the adapter installs both, so destructive actions are gated.
+
+        :returns: ``(allowed, option_id)`` — *option_id* is the scope the user
+            picked from the agent's options, or ``None`` to let
+            :meth:`_permission_outcome` choose the narrowest grant.
         """
         tool_name, tool_input = self._extract_tool_call(params)
-        handler = getattr(self, "_elicitation_handler", None)
         policy_eval = getattr(self, "_policy_evaluator", None)
+        # Either bridge can carry the question to the user.
+        can_ask = (
+            self._elicitation_handler is not None or self._elicitation_choice_handler is not None
+        )
 
         if policy_eval is not None:
             action: str | None
@@ -789,45 +956,47 @@ class AcpExecutor(Executor):
                 action = None
             if action == "POLICY_ACTION_DENY":
                 logger.info("acp permission denied by policy: tool=%s", tool_name)
-                return False
+                return False, None
             if action == "POLICY_ACTION_ASK":
-                if handler is None:
+                if not can_ask:
                     logger.warning(
                         "acp TOOL_CALL policy ASK with no elicitation handler; denying tool=%s",
                         tool_name,
                     )
-                    return False
-                allowed = bool(await handler(tool_name, tool_input))
-                logger.info(
-                    "acp permission %s by user (policy ASK): tool=%s",
-                    "allowed" if allowed else "denied",
-                    tool_name,
-                )
-                return allowed
+                    return False, None
+                return await self._ask_user(tool_name, tool_input, params)
             # ALLOW / UNSPECIFIED / unknown → fall through to elicitation.
 
-        if handler is not None:
-            allowed = bool(await handler(tool_name, tool_input))
-            logger.info(
-                "acp permission %s by user: tool=%s",
-                "allowed" if allowed else "denied",
-                tool_name,
-            )
-            return allowed
+        if can_ask and not self._bypass_permissions:
+            return await self._ask_user(tool_name, tool_input, params)
+        if can_ask:
+            # bypassPermissions: no policy had an opinion and the user asked not
+            # to be prompted. Logged at info so the audit trail still names what
+            # ran unreviewed. Answered per-request (never the agent's own bypass
+            # option) so every later call stays visible to policy.
+            logger.info("acp permission allowed (bypassPermissions): tool=%s", tool_name)
+            return True, None
 
         logger.debug("acp permission allowed (no policy/elicitation wired): tool=%s", tool_name)
-        return True
+        return True, None
 
     @staticmethod
-    def _permission_outcome(params: _AcpJsonObject, *, allow: bool) -> _AcpJsonObject:
-        """Map an allow/deny decision to an ACP permission ``outcome``.
+    def _permission_outcome(
+        params: _AcpJsonObject, *, allow: bool, option_id: str | None = None
+    ) -> _AcpJsonObject:
+        """Map a decision to an ACP permission ``outcome``.
 
-        On allow, prefer a once-scoped grant (``allow_once``) over
-        ``allow_always`` so we never persist a blanket "always allow". On deny,
-        pick a ``reject_*`` option, or ``cancelled`` when none is offered. The
-        agent's options carry both ``optionId`` and ``kind`` (e.g. ``allow_once``).
+        *option_id* is a scope the user picked from the agent's own options; it is
+        echoed only after confirming the agent offered it, so we never send an id
+        it doesn't know. Without one: on allow prefer a once-scoped grant
+        (``allow_once``) over ``allow_always``, so a blanket "always allow" is
+        only ever sent because the user chose it; on deny pick a ``reject_*``
+        option, or ``cancelled`` when none is offered. The agent's options carry
+        both ``optionId`` and ``kind`` (e.g. ``allow_once``).
         """
-        options = [o for o in (params.get("options") or []) if isinstance(o, dict)]
+        options = AcpExecutor._permission_options(params)
+        if option_id is not None and any(o.get("optionId") == option_id for o in options):
+            return {"outcome": {"outcome": "selected", "optionId": option_id}}
 
         def _pick(*kinds: str) -> _AcpJsonObject | None:
             for kind in kinds:
@@ -958,21 +1127,32 @@ class AcpExecutor(Executor):
     def _usage_from_result(result: _AcpJsonObject) -> dict[str, int] | None:
         """Map an agent's final ``result.usage`` to Omnigent's usage keys.
 
-        ACP does not standardize usage, but agents that report it (Goose) use
-        ``{totalTokens, inputTokens, outputTokens}``; Omnigent's
-        ``TurnComplete.usage`` uses ``{input_tokens, output_tokens, total_tokens}``.
+        ACP does not standardize usage, but agents that report it (Goose, Devin)
+        use ``{totalTokens, inputTokens, outputTokens}`` plus an optional
+        ``cachedReadTokens``; Omnigent's ``TurnComplete.usage`` uses
+        ``{input_tokens, output_tokens, total_tokens, cache_read_input_tokens}``.
         Absent → ``None`` (usage simply isn't shown for agents that don't report).
+
+        ``cachedReadTokens`` is kept as its own key rather than folded into
+        ``input_tokens``: cache reads are real consumption but billed at a
+        fraction of the rate, so collapsing them would overstate cost — in one
+        measured turn 10,944 of 15,637 input tokens were cache reads.
+        ``cache_read_input_tokens`` is the key the rest of the stack already
+        speaks, so it renders without any UI change.
         """
         usage = result.get("usage")
         if not isinstance(usage, dict):
             return None
         out: dict[str, int] = {}
-        if isinstance(usage.get("inputTokens"), int):
-            out["input_tokens"] = usage["inputTokens"]
-        if isinstance(usage.get("outputTokens"), int):
-            out["output_tokens"] = usage["outputTokens"]
-        if isinstance(usage.get("totalTokens"), int):
-            out["total_tokens"] = usage["totalTokens"]
+        for acp_key, omni_key in (
+            ("inputTokens", "input_tokens"),
+            ("outputTokens", "output_tokens"),
+            ("totalTokens", "total_tokens"),
+            ("cachedReadTokens", "cache_read_input_tokens"),
+        ):
+            value = usage.get(acp_key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                out[omni_key] = value
         return out or None
 
     def _handle_session_update(self, update: _AcpJsonObject) -> list[ExecutorEvent]:
@@ -1002,6 +1182,7 @@ class AcpExecutor(Executor):
             args = raw_input if isinstance(raw_input, dict) else {}
             if isinstance(call_id, str) and call_id:
                 self._tool_names[call_id] = str(name)
+                self._tool_inputs[call_id] = args
                 events.append(
                     ToolCallRequest(name=str(name), args=args, metadata={"call_id": call_id})
                 )
@@ -1013,6 +1194,7 @@ class AcpExecutor(Executor):
                 _TOOL_STATUS_FAILED,
             ):
                 name = self._tool_names.pop(call_id, "tool")
+                self._tool_inputs.pop(call_id, None)
                 events.append(
                     ToolCallComplete(
                         name=name,
@@ -1030,14 +1212,108 @@ class AcpExecutor(Executor):
             if isinstance(size, int) and size > 0:
                 self._context_window = size
 
+        elif update_type == _UPDATE_CONFIG_OPTION:
+            self._note_config_options(update.get("configOptions"))
+
         return events
+
+    def _note_config_options(self, options: object) -> str | None:
+        """Record which session config options the agent exposes, and their values.
+
+        ACP agents advertise settable options (``mode``, ``model``, …) via
+        ``config_option_update``. Tracking the ids tells us whether a warm model
+        switch is possible at all; tracking ``model``'s ``currentValue`` is the
+        only trustworthy record of which model is live — an agent's own
+        self-report is unreliable.
+
+        :returns: The echoed ``model`` ``currentValue`` when the payload carried a
+            model option, else ``None`` — lets a caller distinguish "the agent
+            reported its model" from "no model option present".
+        """
+        if not isinstance(options, list):
+            return None
+        model_value: str | None = None
+        for opt in options:
+            if not isinstance(opt, dict):
+                continue
+            opt_id = opt.get("id")
+            if not isinstance(opt_id, str):
+                continue
+            self._config_option_ids.add(opt_id)
+            if opt_id == _CONFIG_OPTION_MODEL:
+                current = opt.get("currentValue")
+                if isinstance(current, str) and current:
+                    self._active_model = current
+                    model_value = current
+        return model_value
+
+    async def _apply_model_override(self, session_id: str, model: str | None) -> None:
+        """Warm-switch the agent's model via ACP ``session/set_config_option``.
+
+        Standard ACP (not a vendor extension), so this works for any agent that
+        exposes a ``model`` session config option. The transcript is preserved —
+        the session is not recreated — so a ``/model`` pick mid-conversation keeps
+        the history the agent has already built up.
+
+        No-ops when the model is unset, already active, or the agent never
+        advertised a ``model`` option. A failed attempt latches the feature off
+        for this process rather than re-requesting on every turn, and never fails
+        the turn: an agent that can't switch should still answer on the model it
+        has.
+
+        :param session_id: The live ACP session to reconfigure.
+        :param model: Requested model id, or ``None`` to leave it alone.
+        """
+        if not model or model == self._active_model or not self._model_switch_supported:
+            return
+        # Before the first ``config_option_update`` we don't know what's settable;
+        # attempting is harmless because a rejection just latches the feature off.
+        if self._config_option_ids and _CONFIG_OPTION_MODEL not in self._config_option_ids:
+            self._model_switch_supported = False
+            logger.info(
+                "acp[%s] agent exposes no %r config option; leaving model as-is",
+                self._config.name,
+                _CONFIG_OPTION_MODEL,
+            )
+            return
+
+        response = await self._rpc(
+            _AGENT_METHOD_SET_CONFIG_OPTION,
+            {"sessionId": session_id, "configId": _CONFIG_OPTION_MODEL, "value": model},
+        )
+        if "error" in response:
+            self._model_switch_supported = False
+            logger.warning(
+                "acp[%s] model switch to %s rejected (%s); continuing on the current model",
+                self._config.name,
+                model,
+                response["error"].get("message", response["error"]),
+            )
+            return
+        # The agent echoes its options back; trust the echoed ``currentValue``
+        # over our request, since an agent may normalize or silently reject the
+        # id. Fall back to the requested model only when the agent echoed no model
+        # option at all (some accept the switch without echoing options) — never
+        # overwrite an echoed value with the request, or a later turn would skip a
+        # switch it should retry.
+        result = response.get("result")
+        echoed_model = (
+            self._note_config_options(result.get("configOptions"))
+            if isinstance(result, dict)
+            else None
+        )
+        if echoed_model is None:
+            self._active_model = model
+        logger.info(
+            "acp[%s] model set to %s (transcript kept)", self._config.name, self._active_model
+        )
 
     async def run_turn(
         self,
         messages: list[Message],
         tools: list[ToolSpec],
         system_prompt: str,
-        config: ExecutorConfig | None = None,  # noqa: ARG002 — unused; required by the interface
+        config: ExecutorConfig | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
         """Run one turn of the agent loop via ACP.
 
@@ -1057,8 +1333,18 @@ class AcpExecutor(Executor):
             await self._ensure_initialized()
             session_id = await self._ensure_session()
         except Exception as exc:  # noqa: BLE001
-            yield ExecutorError(message=str(exc), retryable=False)
+            yield ExecutorError(message=self._startup_error_message(exc), retryable=False)
             return
+
+        # Apply a ``/model`` pick to the live session before prompting, so the
+        # switch takes effect on this turn with the transcript intact. Never fatal
+        # — an agent that can't switch answers on the model it already has.
+        requested_model = config.model if config is not None else None
+        try:
+            await self._apply_model_override(session_id, requested_model)
+        except Exception as exc:  # noqa: BLE001
+            self._model_switch_supported = False
+            logger.warning("acp[%s] model switch failed: %s", self._config.name, exc)
 
         # A fresh ACP session holds no prior context. Captured before the latch
         # flips so we know whether to replay history into this turn.
@@ -1083,8 +1369,10 @@ class AcpExecutor(Executor):
                     )
                 break
 
-        # On a fresh session, replay prior conversation so a model switch (which
-        # respawns the subprocess) or a session reset doesn't drop the thread.
+        # On a fresh session, replay prior conversation so a subprocess restart
+        # (after the agent process exits) or a session reset doesn't drop the
+        # thread. A ``/model`` switch no longer respawns — it reconfigures the
+        # live session (see ``_apply_model_override``) — so it never reaches here.
         if fresh_session and latest_user_idx is not None and latest_user_idx > 0:
             history_prefix = self._history_prefix(messages[:latest_user_idx])
             user_text = f"{history_prefix}\n\nuser: {user_text}" if user_text else history_prefix

@@ -493,7 +493,8 @@ def _render_startup_banner_ansi(
         ``None`` for the minimal banner.
     :returns: ANSI-styled string ready to be written to stdout.
     """
-    from omnigent.conversation_browser import display_server_url, is_workspace_hosted_url
+    from omnigent.cli_auth import is_workspace_hosted_url
+    from omnigent.conversation_browser import display_server_url
     from omnigent.inner.banner import BannerLine, startup_banner_strings
 
     remote = _is_remote_server_url(server_url)
@@ -4512,7 +4513,7 @@ async def run_repl(
         #   - the server is a Databricks workspace mount — a workspace build
         #     reports no meaningful version string (its /api/version returns a
         #     placeholder like "source"), so showing it is noise.
-        from omnigent.conversation_browser import is_workspace_hosted_url
+        from omnigent.cli_auth import is_workspace_hosted_url
 
         _show_version = _header is not None and not (
             server_url is not None and is_workspace_hosted_url(server_url)
@@ -4813,7 +4814,7 @@ async def _cmd_theme(
     host.output(_build_preview(selected.name))
 
 
-_EFFORT_VALUES = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+_EFFORT_VALUES = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 _EFFORT_CLEAR_ALIASES = {"default", "off", "reset"}
 
 
@@ -4879,7 +4880,8 @@ async def _cmd_effort(
         host.output(
             Text.from_markup(
                 "  [bold red]Invalid effort: "
-                f"{value} · expected none, minimal, low, medium, high, xhigh, max, or default[/]"
+                f"{value} · expected none, minimal, low, medium, high, "
+                "xhigh, max, ultra, or default[/]"
             )
         )
         return

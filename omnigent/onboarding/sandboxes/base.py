@@ -712,7 +712,7 @@ class SandboxExecTransport(SandboxLifecycle):
         return self.run(
             sandbox_id,
             f"setsid nohup sh -c {shlex.quote(supervise_host_command(command))} "
-            f"> {log_path} 2>&1 < /dev/null & echo launched",
+            f">> {log_path} 2>&1 < /dev/null & echo launched",
         )
 
     def put(self, sandbox_id: str, local_path: Path, remote_path: str) -> None:

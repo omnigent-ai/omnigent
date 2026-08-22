@@ -23,10 +23,17 @@ import sys
 import uuid
 
 from omnigent.json_types import JsonObject as _JsonObject
+from omnigent.llms.adapters._content import redact_binary_payloads
+from omnigent.runtime.tool_result_replay import (
+    blocks_from_parsed_list,
+    image_payloads_in_blocks,
+    strip_unparseable_image_output,
+    tool_result_content_blocks,
+)
 
 # termios/tty are POSIX-only and drive the native (tmux/PTY) Claude terminal,
-# which is disabled on Windows. Guard the import (special-cased by mypy, which
-# type-checks on Linux) so importing this module never crashes the CLI there.
+# which is disabled on Windows. Guard the import so static checking keeps the
+# POSIX path typed without making module import crash the CLI on Windows.
 if sys.platform != "win32":
     import termios
     import tty
@@ -52,6 +59,7 @@ if TYPE_CHECKING:
 import click
 import httpx
 import yaml
+from omnigent_client._http import is_loopback_url
 from websockets.exceptions import ConnectionClosed, ConnectionClosedError, WebSocketException
 from websockets.frames import Close
 
@@ -73,8 +81,11 @@ from omnigent._wrapper_labels import (
 )
 from omnigent.claude_launcher import resolve_claude_launch
 from omnigent.claude_model_vocabulary import (
+    ALIAS_MODEL_ENV_VARS,
     CUSTOM_MODEL_OPTION_ENV_VAR,
     CUSTOM_MODEL_OPTION_NAME_ENV_VAR,
+    LEGACY_CUSTOM_SLOT_ROW_ID,
+    claude_model_alias,
 )
 from omnigent.claude_native_bridge import (
     BRIDGE_ID_LABEL_KEY,
@@ -100,10 +111,10 @@ from omnigent.host.daemon_launch import (
     DAEMON_POLL_INTERVAL_S,
     error_text,
     launch_or_reuse_daemon_runner,
+    open_daemon_client,
     wait_for_host_online,
     wait_for_runner_online,
 )
-from omnigent.model_fallbacks import static_model_fallback
 from omnigent.native_coding_agents import native_shell_terminal_spec
 from omnigent.native_terminal import (
     DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
@@ -123,7 +134,6 @@ from omnigent.native_terminal import (
 from omnigent.native_terminal import (
     terminal_attach_url as _attach_url,
 )
-from omnigent.onboarding.provider_config import SUBSCRIPTION_KIND
 from omnigent.terminals.ws_bridge import (
     WS_CLOSE_TERMINAL_DETACHED,
     WS_CLOSE_TERMINAL_NOT_FOUND,
@@ -184,6 +194,18 @@ _CLAUDE_CODE_NESTED_SESSION_ENV = "CLAUDECODE"
 _CLAUDE_CODE_API_KEY_HELPER_TTL_ENV = "CLAUDE_CODE_API_KEY_HELPER_TTL_MS"
 _CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV = "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"
 _CLAUDE_CODE_USE_GATEWAY_ENV = "CLAUDE_CODE_USE_GATEWAY"
+#: Kill-switch Claude Code treats as covering nonessential startup traffic;
+#: the probe strips it so speed knobs never mask harness output.
+_CLAUDE_NONESSENTIAL_TRAFFIC_ENV = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
+_CLAUDE_MODEL_PROBE_TIMEOUT_S = 20.0
+#: Wall-clock cap for the per-alias resolution fan-out as a whole; aliases
+#: still unresolved when it expires keep their bare rows (the cache's
+#: revalidation retries them later). Startup dominates each run and
+#: stretches with box load (measured 0.7s–17s for the same command), so the
+#: concurrency covers a whole alias set in one wave and the budget fits one
+#: slow wave.
+_CLAUDE_ALIAS_RESOLUTION_BUDGET_S = 30.0
+_CLAUDE_ALIAS_RESOLUTION_CONCURRENCY = 12
 _CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
 _CLAUDE_CODE_CUSTOM_HEADERS_ENV = "ANTHROPIC_CUSTOM_HEADERS"
 # Claude Code forwards the ANTHROPIC_CUSTOM_HEADERS value verbatim as
@@ -196,6 +218,11 @@ _DATABRICKS_CODING_AGENT_HEADER = "x-databricks-use-coding-agent-mode: true"
 # UI, so a wrapped terminal must stay pinned to the one session the UI thinks
 # it is showing.
 _CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV = "CLAUDE_CODE_DISABLE_AGENT_VIEW"
+# Claude Code's in-TUI feedback surveys ("How is Claude doing this session?",
+# the memory-recollection rating, the transcript-sharing follow-up) render
+# only in the pane, so a web-driven session shows an unanswerable prompt —
+# often with nobody attached to the terminal at all.
+_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV = "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY"
 # Claude Code env vars that pin each model-tier alias to a provider-specific
 # model ID.  When set, the /model picker shows these IDs as options rather
 # than normalising to canonical Anthropic names (which the Databricks gateway
@@ -219,15 +246,8 @@ _UCODE_CLAUDE_TIER_TO_ENV: dict[str, str] = {
 # See https://code.claude.com/docs/en/model-config#custom-model-options
 _ANTHROPIC_CUSTOM_MODEL_OPTION_ENV = CUSTOM_MODEL_OPTION_ENV_VAR
 _ANTHROPIC_CUSTOM_MODEL_OPTION_NAME_ENV = CUSTOM_MODEL_OPTION_NAME_ENV_VAR
-_UCODE_CLAUDE_CUSTOM_TIER = "sonnet_5"
+_UCODE_CLAUDE_CUSTOM_TIER = LEGACY_CUSTOM_SLOT_ROW_ID
 _UCODE_CLAUDE_CUSTOM_TIER_LABEL = "Sonnet 5"
-_CLAUDE_NATIVE_STATIC_MODEL_OPTIONS: tuple[tuple[str, str], ...] = (
-    ("fable", "Fable"),
-    ("opus", "Opus"),
-    ("sonnet", "Sonnet 4.6"),
-    (_UCODE_CLAUDE_CUSTOM_TIER, _UCODE_CLAUDE_CUSTOM_TIER_LABEL),
-    ("haiku", "Haiku"),
-)
 _DEFAULT_UCODE_AUTH_REFRESH_INTERVAL_MS = 900_000
 _SESSION_LABELS = {
     "omnigent.ui": "terminal",
@@ -395,6 +415,57 @@ def _serves_canonical_anthropic_ids(claude_config: ClaudeNativeUcodeConfig) -> b
     return host == "anthropic.com" or host.endswith(".anthropic.com")
 
 
+def _claude_family(token: str) -> str | None:
+    """
+    The family alias a model id or alias folds onto, bracket markers dropped.
+
+    :param token: A picker id or model id, e.g. ``"opus[1m]"``,
+        ``"claude-opus-4-8"``.
+    :returns: The family alias, e.g. ``"opus"``, or ``None`` for none.
+    """
+    from omnigent.claude_model_vocabulary import claude_model_alias
+
+    alias = claude_model_alias(token, {})
+    return alias.partition("[")[0] if alias else None
+
+
+def claude_catalog_serves_model(
+    rows: list[dict[str, object]],
+    model: str,
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> bool:
+    """
+    Whether a launch of *model* is backed by this config's catalog.
+
+    An exact row — a picker id or its wire model — always serves. A canonical
+    Anthropic id no row spells exactly still launches when the endpoint takes
+    canonical spellings (``--model`` passes any string through, and a pane's
+    ``/model`` persists exactly this id) and the catalog lists the id's
+    family: the same family fold ``/model`` applies to an unpinned canonical
+    id. A gateway that routes only its own ids, and a family the catalog
+    does not list, refuse — a genuinely stale pick still fails fast.
+
+    :param rows: Catalog rows, e.g.
+        ``[{"id": "opus", "model": "claude-opus-5"}]``.
+    :param model: A picker id or model id, e.g. ``"claude-opus-4-8"``.
+    :param claude_config: The resolved launch config, or ``None`` (Claude's
+        own login).
+    :returns: ``True`` when the launch can run *model* against this catalog.
+    """
+    from omnigent.model_catalog_store import catalog_contains
+
+    if catalog_contains(rows, model):
+        return True
+    if claude_config is not None and not _serves_canonical_anthropic_ids(claude_config):
+        return False
+    if not model.lower().startswith("claude-"):
+        return False
+    family = _claude_family(model)
+    return family is not None and any(
+        _claude_family(str(row.get("id") or row.get("model") or "")) == family for row in rows
+    )
+
+
 def resolve_claude_native_model_selection(
     model: str | None,
     claude_config: ClaudeNativeUcodeConfig | None,
@@ -405,28 +476,21 @@ def resolve_claude_native_model_selection(
     extra Sonnet 5 row uses Omnigent's ``sonnet_5`` id because it occupies
     Claude Code's provider-configured custom model slot. Resolve that id to
     the exact custom option, preserving provider suffixes such as ``[1m]``.
-    Direct Claude logins have no provider config, so they use the canonical
-    Anthropic model id.
+    Direct Claude logins have no provider config, so the pick degrades to
+    the ``sonnet`` family alias, which Claude resolves itself.
 
-    On a gateway/Bedrock endpoint, a family alias with no tier pin (launch env
-    or managed settings) resolves to the provider's default model — Claude
-    Code would canonicalize it to an Anthropic id the endpoint rejects.
+    Every other pick passes through verbatim: picker rows are pin-backed or
+    vouched for by the harness's own probe, so rewriting one switches the
+    pane to a model nobody chose (an unpinned family alias used to degrade
+    to the provider's default model this way — a Fable pick landed on
+    Opus). An out-of-band unpinned alias on a gateway endpoint now fails
+    visibly at inference instead of silently running the default.
 
     :param model: Persisted picker id, built-in alias, or concrete model id.
     :param claude_config: Resolved provider config for the terminal.
     :returns: A model identifier suitable for ``--model`` or ``/model``.
     """
     if model != _UCODE_CLAUDE_CUSTOM_TIER:
-        tier_env = _UCODE_CLAUDE_TIER_TO_ENV.get(model or "")
-        if (
-            tier_env is not None
-            and claude_config is not None
-            and not claude_config.env.get(tier_env)
-            and not _serves_canonical_anthropic_ids(claude_config)
-        ):
-            managed = _managed_claude_model_config()
-            if managed is None or not managed.env.get(tier_env):
-                return claude_config.model or model
         return model
     if claude_config is not None:
         custom_model = claude_config.env.get(_ANTHROPIC_CUSTOM_MODEL_OPTION_ENV)
@@ -437,26 +501,9 @@ def resolve_claude_native_model_selection(
             return provider_fallback
         if claude_config.model:
             return claude_config.model
-    fallback = static_model_fallback(SUBSCRIPTION_KIND, "claude")
-    if fallback is None:
-        raise ValueError("Claude subscription fallback has no routable Sonnet model")
-    exact_match = next(
-        (
-            model_id
-            for model_id in fallback.model_ids
-            if _claude_model_display_name("sonnet", model_id) == _UCODE_CLAUDE_CUSTOM_TIER_LABEL
-        ),
-        None,
-    )
-    if exact_match is not None:
-        return exact_match
-    family_match = next(
-        (model_id for model_id in fallback.model_ids if "claude-sonnet-" in model_id.lower()),
-        None,
-    )
-    if family_match is None:
-        raise ValueError("Claude subscription fallback has no routable Sonnet model")
-    return family_match
+    # No provider config pins the custom slot: hand Claude Code its own
+    # ``sonnet`` alias and let it resolve the current Sonnet itself.
+    return "sonnet"
 
 
 def claude_config_with_routed_arms_pinned(
@@ -606,6 +653,40 @@ def _managed_claude_model_config() -> ClaudeNativeUcodeConfig | None:
     return None
 
 
+def managed_claude_gateway_signal() -> tuple[str | None, bool]:
+    """Read the AI-Gateway backing Claude Code applies from managed settings.
+
+    Managed settings win at Claude Code's actual launch, so an enterprise file
+    can pin all inference through an AI Gateway even when omnigent's own
+    provider config resolves nothing (a ``subscription`` login). This reports
+    that backing: the managed ``env.ANTHROPIC_BASE_URL`` and whether a
+    credential is delivered, either through a top-level ``apiKeyHelper`` or a
+    truthy ``env.CLAUDE_CODE_USE_GATEWAY``.
+
+    :returns: ``(base_url, has_credential)`` from the first readable managed
+        settings file, or ``(None, False)`` when none is present or parseable.
+    """
+    for path in _CLAUDE_CODE_MANAGED_SETTINGS_PATHS:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        raw_env = payload.get("env")
+        env = raw_env if isinstance(raw_env, dict) else {}
+        raw_base_url = env.get("ANTHROPIC_BASE_URL")
+        base_url = raw_base_url.strip() if isinstance(raw_base_url, str) else None
+        has_helper = bool(payload.get("apiKeyHelper"))
+        use_gateway = str(env.get("CLAUDE_CODE_USE_GATEWAY", "")).strip().lower() not in (
+            "",
+            "0",
+            "false",
+        )
+        return base_url or None, has_helper or use_gateway
+    return None, False
+
+
 def claude_native_model_options(
     claude_config: ClaudeNativeUcodeConfig | None,
 ) -> list[dict[str, object]]:
@@ -657,15 +738,472 @@ def claude_native_model_options(
         if not model_id:
             return []
         return [{"id": model_id, "model": model_id, "displayName": model_id, "isDefault": True}]
-    return [
-        {
-            "id": model_id,
-            "model": model_id,
-            "displayName": label,
-            "isDefault": False,
-        }
-        for model_id, label in _CLAUDE_NATIVE_STATIC_MODEL_OPTIONS
+    # No curated fallback: an unconfigured shape's rows come from the probe
+    # (the harness's own enumeration) or not at all — a hand-written list
+    # here is exactly how a frozen "Sonnet 4.6" once shipped.
+    return []
+
+
+def _parse_claude_model_aliases(stdout: str) -> list[str]:
+    """
+    Extract the alias list from ``claude -p "/model"``'s printed usage line.
+
+    The harness prints e.g. ``Usage: /model <name>. Available: sonnet, opus,
+    haiku, fable, best, sonnet[1m], opusplan, default, or a full model ID.``
+    — its own enumeration of every settable alias. Parsing keeps zero model
+    knowledge here: entries are taken verbatim, and only the trailing prose
+    fragment (anything with whitespace) is dropped.
+
+    :param stdout: The probe run's stdout.
+    :returns: Alias tokens in the harness's order; empty when no line parses.
+    """
+    for line in stdout.splitlines():
+        _, marker, tail = line.partition("Available:")
+        if not marker:
+            continue
+        aliases: list[str] = []
+        for entry in tail.split(","):
+            token = entry.strip().rstrip(".")
+            if token and " " not in token:
+                aliases.append(token)
+        return aliases
+    return []
+
+
+def _parse_claude_current_model(stdout: str) -> dict[str, str]:
+    """
+    Extract the resolved model from a stream-json ``/model`` probe run.
+
+    Two harness-owned facts, taken verbatim: the ``init`` event's exact
+    model id, and the printed ``Current model:`` label with only the
+    trailing ``(effort: …)`` suffix stripped — so labels like
+    ``Opus 4.8 (1M context)`` survive untouched.
+
+    :param stdout: The run's ``--output-format stream-json`` stdout.
+    :returns: Whichever of ``{"model": …, "label": …}`` parsed.
+    """
+    resolved: dict[str, str] = {}
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "system" and event.get("subtype") == "init":
+            model = event.get("model")
+            if isinstance(model, str) and model:
+                resolved["model"] = model
+        if event.get("type") == "result":
+            for text_line in str(event.get("result", "")).splitlines():
+                _, marker, tail = text_line.partition("Current model:")
+                if not marker:
+                    continue
+                label = re.sub(r"\s*\(effort:[^)]*\)\s*$", "", tail).strip()
+                if label:
+                    resolved["label"] = label
+                break
+    return resolved
+
+
+def _claude_model_probe_invocation(
+    claude_config: ClaudeNativeUcodeConfig | None,
+    extra_args: Sequence[str] = (),
+) -> tuple[str, list[str], dict[str, str]]:
+    """
+    Assemble one headless ``/model`` probe invocation.
+
+    Shared by the alias-enumeration run and the per-alias resolution runs
+    so the two cannot drift: same launch resolution, session env, speed
+    env, and env-unset list.
+
+    :param claude_config: The resolved native launch config, or ``None``.
+    :param extra_args: Appended CLI args (e.g. ``--model <alias>``).
+    :returns: ``(command, launch_args, env)`` ready to exec.
+    """
+    from omnigent.claude_launcher import resolve_claude_launch
+
+    args = [
+        "-p",
+        "/model",
+        # The probe asks one client-side question; the MCP fleet, session
+        # persistence, and background chatter are irrelevant startup weight.
+        "--strict-mcp-config",
+        "--mcp-config",
+        '{"mcpServers":{}}',
+        "--no-session-persistence",
+        *extra_args,
     ]
+    if claude_config is not None and claude_config.api_key_helper:
+        args.extend(("--settings", json.dumps({"apiKeyHelper": claude_config.api_key_helper})))
+    command, launch_args = resolve_claude_launch("claude", args)
+    env = dict(os.environ)
+    env.update(build_native_claude_terminal_env(claude_config))
+    env.update(
+        {
+            "DISABLE_TELEMETRY": "1",
+            "DISABLE_ERROR_REPORTING": "1",
+            "DISABLE_AUTOUPDATER": "1",
+        }
+    )
+    # Mirrors the native terminal's env-unset list, plus the nonessential-
+    # traffic kill-switch, so speed knobs never mask harness output.
+    env.pop("DATABRICKS_CONFIG_PROFILE", None)
+    env.pop(_CLAUDE_CODE_NESTED_SESSION_ENV, None)
+    env.pop(_CLAUDE_NONESSENTIAL_TRAFFIC_ENV, None)
+    if claude_config is not None and claude_config.api_key_helper:
+        env.pop(_ANTHROPIC_API_KEY_ENV, None)
+    return command, launch_args, env
+
+
+async def _resolve_claude_model_alias(
+    claude_config: ClaudeNativeUcodeConfig | None,
+    alias: str,
+) -> dict[str, str]:
+    """
+    Ask the harness what one printed alias resolves to.
+
+    A ``--model <alias>`` run in stream-json mode carries the exact model
+    id in its init event and the human label in its ``Current model:``
+    line; both are the harness's own resolution, never computed here.
+
+    :param claude_config: The resolved native launch config, or ``None``.
+    :param alias: The alias exactly as the harness printed it.
+    :returns: Whichever of ``{"model": …, "label": …}`` resolved; empty on
+        any failure (the alias keeps its bare row).
+    """
+    command, launch_args, env = _claude_model_probe_invocation(
+        claude_config,
+        ("--model", alias, "--output-format", "stream-json", "--verbose"),
+    )
+    try:
+        process = await asyncio.create_subprocess_exec(
+            command,
+            *launch_args,
+            cwd=str(Path.home()),
+            env=env,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError:
+        _logger.debug("Claude alias resolution could not launch for %r", alias, exc_info=True)
+        return {}
+    try:
+        async with asyncio.timeout(_CLAUDE_MODEL_PROBE_TIMEOUT_S):
+            stdout, _stderr = await process.communicate()
+    except (TimeoutError, asyncio.CancelledError) as exc:
+        if process.returncode is None:
+            process.kill()
+        with contextlib.suppress(Exception):
+            await process.wait()
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        _logger.debug("Claude alias resolution timed out for %r", alias)
+        return {}
+    if process.returncode != 0:
+        _logger.debug("Claude alias resolution exited %s for %r", process.returncode, alias)
+        return {}
+    return _parse_claude_current_model(stdout.decode(errors="replace"))
+
+
+async def _resolve_claude_model_aliases(
+    claude_config: ClaudeNativeUcodeConfig | None,
+    aliases: Sequence[str],
+) -> dict[str, dict[str, str]]:
+    """
+    Resolve every printed alias concurrently, best-effort.
+
+    Bounded fan-out under one overall budget: whatever resolved in time is
+    kept and the rest stay bare, so a hung harness cannot stretch the
+    probe indefinitely.
+
+    :param claude_config: The resolved native launch config, or ``None``.
+    :param aliases: The harness-printed aliases.
+    :returns: Non-empty resolutions keyed by alias.
+    """
+    if not aliases:
+        return {}
+    semaphore = asyncio.Semaphore(_CLAUDE_ALIAS_RESOLUTION_CONCURRENCY)
+
+    async def _bounded(alias: str) -> dict[str, str]:
+        async with semaphore:
+            return await _resolve_claude_model_alias(claude_config, alias)
+
+    tasks = {alias: asyncio.create_task(_bounded(alias)) for alias in aliases}
+    try:
+        async with asyncio.timeout(_CLAUDE_ALIAS_RESOLUTION_BUDGET_S):
+            await asyncio.gather(*tasks.values())
+    except TimeoutError:
+        for task in tasks.values():
+            task.cancel()
+        await asyncio.gather(*tasks.values(), return_exceptions=True)
+        done = sum(1 for task in tasks.values() if not task.cancelled())
+        _logger.warning(
+            "Claude alias resolution budget expired; keeping %d/%d resolutions",
+            done,
+            len(tasks),
+        )
+    return {
+        alias: task.result()
+        for alias, task in tasks.items()
+        if not task.cancelled() and task.exception() is None and task.result()
+    }
+
+
+def _claude_alias_row(alias: str, resolution: dict[str, str]) -> dict[str, object]:
+    """
+    One picker row for a printed alias, shown as its resolution.
+
+    ``id`` stays the alias — launches pass it through unchanged — while the
+    display shows only the resolved label. Labels are normalized so every
+    1M-context resolution (a ``[1m]``-suffixed model id) says so; the
+    harness omits the marker for some of them (e.g. ``sonnet[1m]`` prints
+    just "Sonnet 5").
+
+    :param alias: The harness-printed alias.
+    :param resolution: Its resolution, possibly empty.
+    :returns: The picker row.
+    """
+    label = resolution.get("label")
+    model = resolution.get("model") or alias
+    if label and model.endswith("[1m]") and "1M context" not in label:
+        label = f"{label} (1M context)"
+    return {"id": alias, "model": model, "displayName": label or alias}
+
+
+@dataclass(frozen=True)
+class ClaudeModelProbe:
+    """One harness enumeration: picker rows plus the bare-launch default.
+
+    :param alias_rows: The printed aliases as deduplicated picker rows.
+    :param default_model: The model the enumeration run itself launched on
+        (its init event's ``model``) — what a no-pick launch of this config
+        actually runs — or ``None`` when unreadable.
+    :param default_label: The harness's own label for *default_model*, or
+        ``None``.
+    """
+
+    alias_rows: list[dict[str, object]]
+    default_model: str | None = None
+    default_label: str | None = None
+
+
+def _parse_claude_enumeration_aliases(stdout: str) -> list[str]:
+    """Extract the alias list from a stream-json enumeration run.
+
+    The ``Available:`` line lives inside the ``result`` event's text on a
+    stream-json run; falls back to scanning the raw output so a plain-text
+    run still parses.
+
+    :param stdout: The enumeration run's decoded stdout.
+    :returns: Alias names, e.g. ``["sonnet", "opus", ...]``.
+    """
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "result":
+            result_text = event.get("result")
+            if isinstance(result_text, str):
+                aliases = _parse_claude_model_aliases(result_text)
+                if aliases:
+                    return aliases
+    return _parse_claude_model_aliases(stdout)
+
+
+async def probe_claude_model_options(
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> ClaudeModelProbe | None:
+    """
+    Ask Claude Code itself which models it would offer, and its default.
+
+    The harness is the source of truth: a short ``claude -p "/model"`` run
+    (stream-json, so its init event also names the model a bare launch of
+    this config actually runs — the truthful "Default") makes Claude Code
+    print its own alias list. Each printed alias is then resolved to its
+    concrete model by a per-alias harness run. All outputs are read
+    verbatim; no selection semantics are replicated here. Runs for every
+    config shape, including the bare subscription launch (``None`` config).
+
+    :param claude_config: The resolved native launch config
+        (:func:`resolve_native_claude_config`), or ``None``.
+    :returns: The probe result, or ``None`` when the probe failed (callers
+        fall back to the configured/static rows).
+    """
+    command, launch_args, env = _claude_model_probe_invocation(
+        claude_config, ("--output-format", "stream-json", "--verbose")
+    )
+    try:
+        process = await asyncio.create_subprocess_exec(
+            command,
+            *launch_args,
+            cwd=str(Path.home()),
+            env=env,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError:
+        _logger.warning("Claude model probe could not launch the claude CLI", exc_info=True)
+        return None
+    try:
+        async with asyncio.timeout(_CLAUDE_MODEL_PROBE_TIMEOUT_S):
+            stdout, stderr = await process.communicate()
+    except (TimeoutError, asyncio.CancelledError):
+        if process.returncode is None:
+            process.kill()
+        with contextlib.suppress(Exception):
+            await process.wait()
+        _logger.warning("Claude model probe timed out; keeping configured rows only")
+        return None
+    if process.returncode != 0:
+        _logger.warning(
+            "Claude model probe exited %s: %s",
+            process.returncode,
+            stderr.decode(errors="replace").strip()[-500:],
+        )
+        return None
+    text = stdout.decode(errors="replace")
+    aliases = _parse_claude_enumeration_aliases(text)
+    # The enumeration run's own init event names what a bare launch runs —
+    # the harness's truthful Default.
+    default_resolution = _parse_claude_current_model(text)
+    # The picker renders its own top-level Default choice (launch with no
+    # model), which is exactly what the harness's ``default`` alias does —
+    # listing it again would duplicate that row.
+    aliases = [alias for alias in aliases if alias != "default"]
+    resolutions = await _resolve_claude_model_aliases(claude_config, aliases)
+    alias_rows: list[dict[str, object]] = []
+    seen_models: set[object] = set()
+    for alias in aliases:
+        row = _claude_alias_row(alias, resolutions.get(alias, {}))
+        # Distinct aliases can resolve to a model an earlier row already
+        # covers (``best``, ``fable[1m]``, and ``opusplan`` all do today);
+        # repeating the model is picker noise.
+        if row["model"] in seen_models:
+            continue
+        seen_models.add(row["model"])
+        alias_rows.append(row)
+    return ClaudeModelProbe(
+        alias_rows=alias_rows,
+        default_model=default_resolution.get("model"),
+        default_label=default_resolution.get("label"),
+    )
+
+
+def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) -> str:
+    """The launch-config fingerprint keying claude's shared model catalog.
+
+    One formula for every consumer (host boot probe, runner launch, session
+    listing), so they read and write the same catalog file.
+
+    :param claude_config: The resolved launch config, or ``None``.
+    :returns: A stable fingerprint string.
+    """
+    from omnigent.model_catalog_store import fingerprint_of
+
+    return fingerprint_of(
+        "claude-native",
+        sorted(claude_config.env.items()) if claude_config is not None else None,
+        claude_config.api_key_helper if claude_config is not None else None,
+        claude_config.model if claude_config is not None else None,
+    )
+
+
+async def claude_model_catalog(
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> list[dict[str, object]] | None:
+    """
+    The harness-truth catalog: probe rows with one truthful ``isDefault``.
+
+    Rows come from the harness's own enumeration alone (no configured/static
+    merge). Servability filtering matches the listing composition: on a
+    non-canonical endpoint, aliases resolving to bare Anthropic ids are
+    dropped. The default marker is what a Default launch of this config
+    actually runs: the config's own launch pin when the provider resolves
+    one (those launches pass ``--model`` explicitly), else the enumeration
+    run's init-event model (a bare subscription launch). It is matched onto
+    its row, or appended as its own row when the catalog lacks it (a
+    ``settings.json`` pin, say) and the endpoint can serve it.
+
+    :param claude_config: The resolved launch config, or ``None``.
+    :returns: Catalog rows, or ``None`` when the probe failed.
+    """
+    probe = await probe_claude_model_options(claude_config)
+    if probe is None:
+        return None
+    rows = list(probe.alias_rows)
+    if claude_config is not None and not _serves_canonical_anthropic_ids(claude_config):
+        rows = [row for row in rows if not str(row.get("model", "")).startswith("claude-")]
+
+    configured_pin = claude_config.model if claude_config is not None else None
+    default_model = configured_pin or probe.default_model
+    marked = False
+    out: list[dict[str, object]] = []
+    for row in rows:
+        is_default = (
+            bool(default_model)
+            and not marked
+            and (row.get("model") == default_model or row.get("id") == default_model)
+        )
+        if is_default:
+            marked = True
+            out.append({**row, "isDefault": True})
+        else:
+            out.append({key: value for key, value in row.items() if key != "isDefault"})
+    if default_model and not marked:
+        # Append the observed default as its own honest row — but never
+        # claim a bare Anthropic id is launchable on an endpoint that
+        # rejects that spelling.
+        servable = (
+            claude_config is None
+            or _serves_canonical_anthropic_ids(claude_config)
+            or not default_model.startswith("claude-")
+        )
+        if servable:
+            # The probe's printed label describes the ENUMERATION run's
+            # model; it only names a config-pinned default when the two are
+            # the same model.
+            label = (
+                probe.default_label
+                if default_model == probe.default_model and probe.default_label
+                else default_model
+            )
+            out.append(
+                {
+                    "id": default_model,
+                    "model": default_model,
+                    "displayName": label,
+                    "isDefault": True,
+                }
+            )
+    return out
+
+
+async def claude_launch_catalog(
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> list[dict[str, object]] | None:
+    """
+    The shared catalog for this launch config: read the store, probe on miss.
+
+    The store read is what keeps launches fast once the host's boot probe
+    (or a previous launch) has run; a cold miss pays one probe and persists
+    the answer for every later consumer.
+
+    :param claude_config: The resolved launch config, or ``None``.
+    :returns: Catalog rows, or ``None`` when no catalog could be obtained.
+    """
+    from omnigent import model_catalog_store
+
+    fingerprint = claude_catalog_fingerprint(claude_config)
+    return await model_catalog_store.ensure_catalog(
+        "claude-native", fingerprint, lambda: claude_model_catalog(claude_config)
+    )
 
 
 def build_native_claude_terminal_env(
@@ -675,8 +1213,11 @@ def build_native_claude_terminal_env(
     Build env overrides for a native Claude Code terminal process.
 
     Forces MCP Tool Search on so Claude defers MCP tool schemas and
-    loads them on demand, and disables Claude Code's agent view so the
-    terminal stays pinned to the session the Omnigent UI is showing.
+    loads them on demand, disables Claude Code's agent view so the
+    terminal stays pinned to the session the Omnigent UI is showing, and
+    disables the in-TUI feedback surveys, which a web-driven session
+    cannot see or answer (see
+    :data:`_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV`).
 
     :param claude_config: Optional provider/ucode launch config, e.g.
         one carrying ``{"ANTHROPIC_BASE_URL": "https://example.com"}``.
@@ -687,11 +1228,13 @@ def build_native_claude_terminal_env(
     terminal_env = {
         _CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV: "true",
         _CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV: "1",
+        _CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV: "1",
     }
     if claude_config is not None:
         terminal_env.update(claude_config.env)
         terminal_env[_CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV] = "true"
         terminal_env[_CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV] = "1"
+        terminal_env[_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV] = "1"
     # On the apiKeyHelper path the credential reaches Claude Code via the
     # helper; a raw ANTHROPIC_API_KEY here re-triggers Claude Code's "Detected a
     # custom API key" menu, which hangs tmux delivery. Fail loud if one leaks.
@@ -1480,7 +2023,12 @@ def _fetch_external_session_id_for_redirect(
     if base_url is None:
         return None
     try:
-        with httpx.Client(base_url=base_url, headers=headers, timeout=10.0) as client:
+        with httpx.Client(
+            base_url=base_url,
+            headers=headers,
+            timeout=10.0,
+            trust_env=not is_loopback_url(base_url),
+        ) as client:
             resp = client.get(f"/v1/sessions/{url_component(session_id)}")
         if resp.status_code >= 400:
             return None
@@ -1596,7 +2144,127 @@ def _copy_transcript_with_cwd(
                     payload["cwd"] = current_text
                 if new_session_id is not None and isinstance(payload.get("sessionId"), str):
                     payload["sessionId"] = new_session_id
+                _sanitize_cloned_tool_result_record(payload)
             dst.write(json.dumps(payload, separators=(",", ":")) + "\n")
+
+
+def _sanitize_cloned_tool_result_record(payload: _JsonObject) -> None:
+    """
+    Repair image duplication in one copied transcript record, in place.
+
+    A fork clone byte-copies the source JSONL, so a record written before the
+    ``toolUseResult`` redaction fix would replay its base64 twice on the clone's
+    first ``--resume``. Two routes: content whose payload rehydrates into an
+    image block is normalized and its duplicated metadata repaired; a truncated
+    payload — which cannot rehydrate — is collapsed via
+    :func:`strip_unparseable_image_output` and its metadata rewritten from the
+    collapsed form. That second route is the only case where a record carrying
+    no recoverable payload is still touched.
+
+    :param payload: One decoded transcript record (mutated).
+    :returns: None.
+    """
+    message = payload.get("message")
+    if not isinstance(message, dict):
+        return
+    content = message.get("content")
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_result":
+            continue
+        inner = block.get("content")
+        if isinstance(inner, str):
+            collapsed = strip_unparseable_image_output(inner)
+            if collapsed != inner:
+                # Truncated (possibly error-prefixed) image payload: the
+                # placeholder replaces it in both content and metadata.
+                collapsed_blocks = tool_result_content_blocks(collapsed).blocks
+                if collapsed_blocks is not None:
+                    block["content"] = collapsed_blocks
+                    payload["toolUseResult"] = _json_safe_tool_use_result(collapsed)
+                    continue
+            rehydrated = tool_result_content_blocks(inner)
+        elif isinstance(inner, list):
+            rehydrated = blocks_from_parsed_list(inner)
+        else:
+            continue
+        blocks = rehydrated.blocks
+        if blocks is None:
+            continue
+        payloads = image_payloads_in_blocks(blocks)
+        if rehydrated.dropped_oversized_image and not payloads:
+            # Normalization dropped the payload for a placeholder, so there is
+            # nothing left to search the metadata for — rewrite both from it.
+            block["content"] = blocks
+            payload["toolUseResult"] = json.dumps(
+                _redact_binary_blocks(blocks), separators=(",", ":")
+            )
+            continue
+        if not payloads:
+            continue
+        block["content"] = blocks
+        _repair_cloned_tool_use_result(payload, blocks, payloads)
+
+
+#: A wrapped payload's line breaks, in every spelling they reach metadata as.
+#: Escape sequences must go as a unit — dropping the backslash alone would leave
+#: a literal ``n`` inside the payload — and the backslash run is variable because
+#: a string literal nested in another escapes each break twice.
+_WRAPPED_LINE_BREAK = re.compile(r"\\+[nrtf]")
+_LITERAL_NOISE = re.compile(r"[\\\s]+")
+
+
+def _carries_any_payload(text: str, payloads: list[str]) -> bool:
+    """
+    Whether *text* still holds one of *payloads*, in any base64 spelling.
+
+    :param text: Serialized metadata to search.
+    :param payloads: Canonical base64 payloads from the structured content.
+    :returns: True when a payload is present wrapped, unpadded, or verbatim.
+    """
+    compact = _LITERAL_NOISE.sub("", _WRAPPED_LINE_BREAK.sub("", text))
+    return any(item in compact or item.rstrip("=") in compact for item in payloads)
+
+
+def _repair_cloned_tool_use_result(
+    payload: _JsonObject,
+    blocks: list[_JsonObject],
+    payloads: list[str],
+) -> None:
+    """
+    Remove a duplicated image payload from a cloned record's metadata.
+
+    Rewritten only when the metadata still carries a payload present in the
+    structured content. Matching is spelling-insensitive: the content blocks hold
+    canonical base64 while the metadata may hold the producer's wrapped or
+    unpadded original, so an exact substring test would miss the duplicate it is
+    meant to find. A redacted passthrough is preferred; when the payload survives
+    that (a JSON string literal wrapping mixed text-plus-image, which structured
+    redaction cannot reach), the canonical redacted block list replaces it.
+
+    :param payload: The transcript record (mutated).
+    :param blocks: The normalized image-bearing content blocks.
+    :param payloads: Base64 payloads present in *blocks*.
+    :returns: None.
+    """
+    tool_use_result = payload.get("toolUseResult")
+    if isinstance(tool_use_result, str):
+        result_text = tool_use_result
+    elif isinstance(tool_use_result, (dict, list)):
+        result_text = json.dumps(tool_use_result)
+    else:
+        return
+    if not _carries_any_payload(result_text, payloads):
+        return
+    if isinstance(tool_use_result, str):
+        candidate: object = _json_safe_tool_use_result(tool_use_result)
+    else:
+        candidate = _redact_binary_blocks(tool_use_result)
+    candidate_text = candidate if isinstance(candidate, str) else json.dumps(candidate)
+    if _carries_any_payload(candidate_text, payloads):
+        candidate = json.dumps(_redact_binary_blocks(blocks), separators=(",", ":"))
+    payload["toolUseResult"] = candidate
 
 
 def _clone_claude_transcript(
@@ -1891,15 +2559,18 @@ def _ucode_config_for_profile(
     env: dict[str, str] = {
         _UCODE_CLAUDE_BASE_URL_ENV: base_url,
         _CLAUDE_CODE_API_KEY_HELPER_TTL_ENV: str(refresh_interval_ms),
+        # This path always launches in gateway mode (CLAUDE_CODE_USE_GATEWAY=1),
+        # in which Claude Code negotiates the anthropic-beta set with the gateway
+        # rather than sending every flag blindly — so we do NOT disable
+        # experimental betas here. Disabling them also turns off MCP tool search
+        # (it rides on ``advanced-tool-use``), which reloads every MCP tool
+        # schema eagerly and inflates the context window. The Databricks gateway
+        # now accepts the flags Claude Code sends under CLAUDE_CODE_USE_GATEWAY=1
+        # (advanced-tool-use / prompt-caching-scope / advisor-tool), so the
+        # earlier ``CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS`` workaround for
+        # 400 "invalid beta flag" is no longer needed on this path.
         _CLAUDE_CODE_USE_GATEWAY_ENV: "1",
         _CLAUDE_CODE_CUSTOM_HEADERS_ENV: _DATABRICKS_CODING_AGENT_HEADER,
-        # The gateway allowlists beta flags and 400s the whole request
-        # ("invalid beta flag") on one it does not know, failing the turn
-        # rather than the feature. This env var is the only client-side way to
-        # drop them: the CLI computes ``anthropic-beta`` itself and ignores
-        # ANTHROPIC_CUSTOM_HEADERS. Tool search rides on a rejected flag
-        # (``advanced-tool-use``), so it was never reachable here anyway.
-        _CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV: "1",
     }
     # Pin each Claude Code model-tier alias to the corresponding Databricks
     # gateway model ID so that the /model picker natively shows gateway model
@@ -2053,9 +2724,27 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
         family.base_url,
         family.default_model,
     )
+    # Pin the alias vocabulary to the entry's declared models, so ``/model``
+    # and the harness probe resolve aliases inside this gateway's routable
+    # set instead of falling back to canonical Anthropic ids the gateway
+    # rejects. The ``models:`` map's flat tier keys (``opus``/``sonnet``/…)
+    # pin their aliases directly; ``models.default`` pins its own family's
+    # alias when nothing else declared that family.
+    pin_env: dict[str, str] = {}
+    for alias, env_var in ALIAS_MODEL_ENV_VARS.items():
+        pinned = family.models.get(alias)
+        if isinstance(pinned, str) and pinned.strip():
+            pin_env[env_var] = pinned.strip()
+    if family.default_model:
+        default_alias = claude_model_alias(family.default_model, env={})
+        base_alias = (default_alias or "").partition("[")[0]
+        default_env_var = ALIAS_MODEL_ENV_VARS.get(base_alias)
+        if default_env_var:
+            pin_env.setdefault(default_env_var, family.default_model)
     return ClaudeNativeUcodeConfig(
         env={
             _UCODE_CLAUDE_BASE_URL_ENV: family.base_url,
+            **pin_env,
             # Disable beta flags gateways reject (400 "invalid beta flag");
             # skip when CLAUDE_CODE_USE_GATEWAY=1 to keep tool search enabled.
             **(
@@ -2066,6 +2755,15 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
         },
         api_key_helper=api_key_helper,
         model=family.default_model,
+        # The declared models are exactly what this entry can route.
+        routable_models=tuple(
+            dict.fromkeys(
+                [
+                    *pin_env.values(),
+                    *([family.default_model] if family.default_model else []),
+                ]
+            )
+        ),
     )
 
 
@@ -2160,7 +2858,13 @@ def _bedrock_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcode
             _ANTHROPIC_BEDROCK_BASE_URL_ENV: family.base_url,
             _AWS_BEARER_TOKEN_BEDROCK_ENV: token,
             _CLAUDE_CODE_USE_BEDROCK_ENV: "1",
-            _CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV: "1",
+            # Disable beta flags gateways reject (400 "invalid beta flag");
+            # skip when CLAUDE_CODE_USE_GATEWAY=1 to keep tool search enabled.
+            **(
+                {_CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV: "1"}
+                if os.environ.get("CLAUDE_CODE_USE_GATEWAY") != "1"
+                else {}
+            ),
         },
         # No apiKeyHelper: Bedrock mode authenticates from the env token above.
         model=family.default_model,
@@ -2975,9 +3679,11 @@ async def _is_terminal_resource_gone(
         f"/v1/sessions/{url_component(session_id)}"
         f"/resources/terminals/{url_component(terminal_id)}"
     )
+    from omnigent.cli_auth import open_server_client
+
     try:
-        async with httpx.AsyncClient(
-            base_url=base_url,
+        async with open_server_client(
+            base_url,
             headers=headers,
             timeout=httpx.Timeout(timeout_s),
         ) as client:
@@ -3077,9 +3783,11 @@ async def _close_claude_terminal(
         f"/v1/sessions/{url_component(session_id)}"
         f"/resources/terminals/{url_component(terminal_id)}"
     )
+    from omnigent.cli_auth import open_server_client
+
     with contextlib.suppress(Exception):
-        async with httpx.AsyncClient(
-            base_url=base_url, headers=headers, timeout=httpx.Timeout(10.0)
+        async with open_server_client(
+            base_url, headers=headers, timeout=httpx.Timeout(10.0)
         ) as client:
             await client.delete(path)
 
@@ -3217,29 +3925,37 @@ async def _prepare_claude_terminal_via_daemon(
     startup_profiler = startup_profiler or StartupProfiler(name="omnigent claude", enabled=False)
     persist_args = list(_strip_resume_from_claude_args(claude_args))
     timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout) as client:
+    async with open_daemon_client(base_url, headers, host_id, timeout=timeout) as client:
         startup_profiler.mark("daemon prepare http client ready")
         # Resuming an existing session must not re-close its terminal on
         # exit; a fresh launch owns teardown.
         reattached = session_id is not None
+        fresh_session = session_id is None
         if session_id is None:
             if session_bundle is None:
                 raise click.ClickException("Creating a Claude session requires a session bundle.")
+            # Session creation (POST /v1/sessions, ~2s), daemon tunnel
+            # start (~2s), and host-online polling (~0.2s) are mutually
+            # independent — run all three concurrently so they collapse to
+            # max(session_create, daemon_start) instead of their sum.
             _mark_startup_step(
                 startup_profiler,
-                "creating daemon claude session",
+                "creating daemon claude session and waiting for host online",
                 startup_progress=startup_progress,
                 progress_message="Creating Claude session...",
             )
-            session_id = await _create_claude_session(
-                client,
-                session_bundle,
-                bridge_id=None,
-                terminal_launch_args=persist_args or None,
+            session_id, _ = await asyncio.gather(
+                _create_claude_session(
+                    client,
+                    session_bundle,
+                    bridge_id=None,
+                    terminal_launch_args=persist_args or None,
+                ),
+                wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S),
             )
             _mark_startup_step(
                 startup_profiler,
-                "daemon claude session created",
+                "daemon claude session created and host online",
                 startup_progress=startup_progress,
             )
         elif persist_args:
@@ -3261,17 +3977,30 @@ async def _prepare_claude_terminal_via_daemon(
                 "resume launch args persisted",
                 startup_progress=startup_progress,
             )
-        _mark_startup_step(
-            startup_profiler,
-            "waiting for host online",
-            startup_progress=startup_progress,
-        )
-        await wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S)
-        _mark_startup_step(
-            startup_profiler,
-            "host online",
-            startup_progress=startup_progress,
-        )
+            _mark_startup_step(
+                startup_profiler,
+                "waiting for host online",
+                startup_progress=startup_progress,
+            )
+            await wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S)
+            _mark_startup_step(
+                startup_profiler,
+                "host online",
+                startup_progress=startup_progress,
+            )
+        else:
+            # Resume with no new flags: just wait for the host.
+            _mark_startup_step(
+                startup_profiler,
+                "waiting for host online",
+                startup_progress=startup_progress,
+            )
+            await wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S)
+            _mark_startup_step(
+                startup_profiler,
+                "host online",
+                startup_progress=startup_progress,
+            )
         _mark_startup_step(
             startup_profiler,
             "launching or reusing daemon runner",
@@ -3283,6 +4012,7 @@ async def _prepare_claude_terminal_via_daemon(
             host_id=host_id,
             session_id=session_id,
             workspace=workspace,
+            fresh=fresh_session,
         )
         _mark_startup_step(
             startup_profiler,
@@ -3290,27 +4020,30 @@ async def _prepare_claude_terminal_via_daemon(
             startup_progress=startup_progress,
             detail=f"runner={runner_id}",
         )
-        _mark_startup_step(
-            startup_profiler,
-            "waiting for runner online",
-            startup_progress=startup_progress,
-            progress_message="Waiting for runner...",
-        )
-        await wait_for_runner_online(client, runner_id, timeout_s=_DAEMON_RUNNER_ONLINE_TIMEOUT_S)
-        _mark_startup_step(
-            startup_profiler,
-            "daemon runner online",
-            startup_progress=startup_progress,
-        )
         if reattached:
+            # Resume: runner must be online before we ask it to ensure the
+            # terminal (the POST goes to the runner via the server relay).
+            _mark_startup_step(
+                startup_profiler,
+                "waiting for runner online",
+                startup_progress=startup_progress,
+                progress_message="Waiting for runner...",
+            )
+            await wait_for_runner_online(
+                client, runner_id, timeout_s=_DAEMON_RUNNER_ONLINE_TIMEOUT_S
+            )
+            _mark_startup_step(
+                startup_profiler,
+                "daemon runner online",
+                startup_progress=startup_progress,
+            )
             # Resume onto an already-online daemon runner reuses it without
             # re-running the session-start auto-create, so a runner whose
             # terminal was torn down (e.g. after a ``-p`` one-shot) comes
             # back terminal-less and the wait below would time out. Ask the
             # runner to ensure the claude terminal: idempotent (returns the
             # live one if present) and otherwise auto-creates it with cold
-            # resume so history is restored. A fresh launch already creates
-            # it on session-start, so this is only needed when reattaching.
+            # resume so history is restored.
             _mark_startup_step(
                 startup_profiler,
                 "ensuring resumed terminal on runner",
@@ -3323,15 +4056,37 @@ async def _prepare_claude_terminal_via_daemon(
                 "resumed terminal ensure requested",
                 startup_progress=startup_progress,
             )
-        _mark_startup_step(
-            startup_profiler,
-            "waiting for claude terminal ready",
-            startup_progress=startup_progress,
-            progress_message="Starting Claude terminal...",
-        )
-        terminal_id = await _wait_for_claude_terminal_ready(
-            client, session_id, timeout_s=_DAEMON_TERMINAL_READY_TIMEOUT_S
-        )
+            _mark_startup_step(
+                startup_profiler,
+                "waiting for claude terminal ready",
+                startup_progress=startup_progress,
+                progress_message="Starting Claude terminal...",
+            )
+            terminal_id = await _wait_for_claude_terminal_ready(
+                client, session_id, timeout_s=_DAEMON_TERMINAL_READY_TIMEOUT_S
+            )
+        else:
+            # Fresh launch: the runner auto-creates the terminal on session-start,
+            # so runner-online and terminal-ready are sequential from the runner's
+            # side but independent from the CLI's perspective — the terminal poll
+            # returns None (404) until the runner creates it. Run both concurrently:
+            # wait_for_runner_online provides the fail-fast dead-runner signal;
+            # _wait_for_claude_terminal_ready drives to completion. The gather
+            # propagates any runner failure immediately, cancelling the terminal wait.
+            _mark_startup_step(
+                startup_profiler,
+                "waiting for runner online and claude terminal ready",
+                startup_progress=startup_progress,
+                progress_message="Starting Claude terminal...",
+            )
+            _, terminal_id = await asyncio.gather(
+                wait_for_runner_online(
+                    client, runner_id, timeout_s=_DAEMON_RUNNER_ONLINE_TIMEOUT_S
+                ),
+                _wait_for_claude_terminal_ready(
+                    client, session_id, timeout_s=_DAEMON_TERMINAL_READY_TIMEOUT_S
+                ),
+            )
         _mark_startup_step(
             startup_profiler,
             "claude terminal ready",
@@ -3394,12 +4149,16 @@ def _run_with_remote_server(
     :returns: None.
     """
     from omnigent.chat import _bundle_agent, _remote_headers, _server_auth
-    from omnigent.cli import _ensure_host_daemon
     from omnigent.host.identity import load_or_create_host_identity
 
     startup_profiler = startup_profiler or StartupProfiler(name="omnigent claude", enabled=False)
+    # This machine's host id keys the WebSocket attach handshake (and its
+    # reconnects) to the replica holding the runner's tunnel. A browser WS can't
+    # set request headers, but the CLI can, so this rides the header — the
+    # builder emits it only on a host-sharded deployment.
+    host_id = load_or_create_host_identity().host_id
     startup_profiler.mark("remote headers resolving")
-    headers = _remote_headers(server_url=base_url)
+    headers = _remote_headers(server_url=base_url, host_id=host_id)
     startup_profiler.mark("remote headers resolved")
     # ``headers`` carries the bearer for the WebSocket attach handshake
     # (refreshed in place by ``_recover``). For HTTP requests we additionally
@@ -3407,7 +4166,7 @@ def _run_with_remote_server(
     # long-lived transcript-forwarder client survives the ~1h Databricks
     # OAuth token TTL.
     startup_profiler.mark("remote auth resolving")
-    forwarder_auth = _server_auth(server_url=base_url)
+    forwarder_auth = _server_auth(server_url=base_url, session_id=None)
     startup_profiler.mark("remote auth resolved")
     prepared: PreparedClaudeTerminal | None = None
     # Bound before the attach call so the ``finally`` can read it even
@@ -3446,22 +4205,6 @@ def _run_with_remote_server(
                     startup_progress=progress,
                 )
 
-            # Ensure the connect daemon is up for this server, then route the
-            # runner launch through it. The runner the daemon spawns brings
-            # up the Claude terminal itself, so the CLI just waits and
-            # attaches.
-            _mark_startup_step(
-                startup_profiler,
-                "ensuring host daemon",
-                startup_progress=progress,
-                progress_message="Connecting to local daemon...",
-            )
-            _ensure_host_daemon(base_url)
-            _mark_startup_step(
-                startup_profiler,
-                "host daemon ready",
-                startup_progress=progress,
-            )
             host_id = load_or_create_host_identity().host_id
             _mark_startup_step(
                 startup_profiler,
@@ -3539,7 +4282,7 @@ def _run_with_remote_server(
             daemon-spawned runner died, the server relaunches it on the
             next message (host-bound auto-relaunch).
             """
-            new_headers = _remote_headers(server_url=base_url)
+            new_headers = _remote_headers(server_url=base_url, host_id=host_id)
             headers.clear()
             headers.update(new_headers)
 
@@ -3621,7 +4364,9 @@ async def _prepare_claude_terminal(
     """
     startup_profiler = startup_profiler or StartupProfiler(name="omnigent claude", enabled=False)
     timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout) as client:
+    from omnigent.cli_auth import open_server_client
+
+    async with open_server_client(base_url, headers=headers, timeout=timeout) as client:
         startup_profiler.mark("prepare http client ready")
         cold_resume_args: tuple[str, ...] = ()
         # Cold resume = session existed but no live terminal. Even when
@@ -4201,6 +4946,13 @@ def _claude_transcript_record_from_session_item(
     """
     Convert one Omnigent item into one Claude transcript record.
 
+    No ``message.model`` is emitted. An item's wire ``model`` is the
+    Omnigent *agent* name (``MessageData.agent`` serializes under that
+    alias), e.g. ``"claude-native-ui"`` — not a Claude model id. Copying
+    it through made ``--resume`` report "Session model … could not be
+    restored" and silently fall back to another model; omitting it lets
+    Claude keep its configured one.
+
     :param item: Flat Omnigent item dict, e.g.
         ``{"type": "function_call", "name": "Read", ...}``.
     :param session_id: Claude-native session id for the transcript,
@@ -4234,9 +4986,6 @@ def _claude_transcript_record_from_session_item(
                 return None
             record_type = "assistant"
             message = {"role": "assistant", "content": assistant_content}
-            model = item.get("model")
-            if isinstance(model, str) and model:
-                message["model"] = model
         else:
             return None
     elif item_type == "function_call":
@@ -4258,9 +5007,6 @@ def _claude_transcript_record_from_session_item(
                 }
             ],
         }
-        model = item.get("model")
-        if isinstance(model, str) and model:
-            message["model"] = model
     elif item_type == "function_call_output":
         call_id = item.get("call_id")
         if not isinstance(call_id, str) or not call_id:
@@ -4276,13 +5022,14 @@ def _claude_transcript_record_from_session_item(
         # wedging compaction. Collapse only that truncated case to a
         # placeholder, so both the tool_result content and the toolUseResult
         # metadata stay small while intact images still resume as images.
-        output = _strip_unparseable_image_output(output)
+        output = strip_unparseable_image_output(output)
         record_type = "user"
         # Image (and other structured) tool results are persisted as a
         # stringified content-block array. Rehydrate them into real blocks
         # so ``claude --resume`` sends screenshots as images — not as ~250K
         # tokens of base64 text — and the model actually sees them again.
-        content_blocks = _claude_tool_result_content_blocks(output)
+        rehydrated = tool_result_content_blocks(output)
+        content_blocks = rehydrated.blocks
         tool_result_content: str | list[_JsonObject] = (
             content_blocks if content_blocks is not None else output
         )
@@ -4296,7 +5043,9 @@ def _claude_transcript_record_from_session_item(
                 }
             ],
         }
-        extra["toolUseResult"] = _json_safe_tool_use_result(output)
+        extra["toolUseResult"] = _tool_use_result_for_content(
+            output, content_blocks, rehydrated.dropped_oversized_image
+        )
     else:
         return None
     return {
@@ -4475,6 +5224,55 @@ def _json_object_from_string(value: object) -> _JsonObject:
     return _json_object(parsed) or {}
 
 
+def _redact_binary_blocks(value: object) -> object:
+    """
+    Replace inline binary payloads with the ``toolUseResult`` marker.
+
+    :returns: A copy with base64 payloads redacted.
+    """
+    return redact_binary_payloads(value, _tool_use_result_payload_omitted)
+
+
+def _tool_use_result_for_content(
+    output: str,
+    content_blocks: list[_JsonObject] | None,
+    dropped_oversized_image: bool = False,
+) -> str:
+    """
+    Build the ``toolUseResult`` metadata for one rebuilt tool result.
+
+    An image-bearing result uses the redacted block list, so the base64 exists
+    exactly once in the record — in the ``tool_result`` content the model
+    re-sees. A dropped oversized payload uses it too, since the raw passthrough
+    would still carry base64 that shape-keyed redaction cannot reach. Image-free
+    results keep the byte-for-byte passthrough.
+
+    :param output: The persisted tool-result string.
+    :param content_blocks: Rehydrated blocks, or ``None`` when the
+        output is not a recognized block shape.
+    :param dropped_oversized_image: True when normalization replaced an
+        oversized unconvertible image payload with a placeholder.
+    :returns: A JSON-parseable string for the record's
+        ``toolUseResult`` field.
+    """
+    if content_blocks is None:
+        return _json_safe_tool_use_result(output)
+    if image_payloads_in_blocks(content_blocks) or dropped_oversized_image:
+        return json.dumps(_redact_binary_blocks(content_blocks), separators=(",", ":"))
+    return _json_safe_tool_use_result(output)
+
+
+def _tool_use_result_payload_omitted(media_type: str, _payload_length: int) -> str:
+    """
+    Build the marker written over a redacted ``toolUseResult`` payload.
+
+    :param media_type: The block's declared media type, if any.
+    :returns: The replacement text.
+    """
+    label = media_type or "binary"
+    return f"[{label} payload omitted from toolUseResult; kept in the tool_result content]"
+
+
 def _json_safe_tool_use_result(output: str) -> str:
     """
     Return a ``toolUseResult`` value Claude Code can ``JSON.parse``.
@@ -4486,11 +5284,21 @@ def _json_safe_tool_use_result(output: str) -> str:
     before the input prompt renders — so the whole resume fails and the
     first web-UI message is never delivered.
 
-    Outputs that are already JSON (e.g. an image content-block array)
-    pass through verbatim; anything else is wrapped as a JSON string
-    literal so the parse always succeeds. The plain-text output still
-    lives verbatim in the ``tool_result`` content block, so this does
-    not change what the model or the web UI sees.
+    Outputs that are already JSON pass through verbatim; anything else
+    is wrapped as a JSON string literal so the parse always succeeds.
+    The plain-text output still lives verbatim in the ``tool_result``
+    content block, so this does not change what the model or the web UI
+    sees.
+
+    One exception to the verbatim passthrough: inline binary payloads
+    (base64 ``image``/``document``/``file`` blocks and ``data:`` URIs)
+    are replaced with a short marker. The ``tool_result`` content block
+    already carries that payload once — the image the model re-sees — so
+    the metadata copy is pure duplication: a single intact screenshot
+    would otherwise double its ~250K-token base64 in the resumed
+    transcript. Redaction keys on the payload *shape*, so any tool or
+    MCP server returning inline image data is covered; non-binary JSON
+    structure, text, and renderer metadata are preserved.
 
     :param output: The tool result string synthesized for the
         transcript, e.g. ``"<retrieval_status>timeout</...>"`` or
@@ -4499,74 +5307,13 @@ def _json_safe_tool_use_result(output: str) -> str:
         ``toolUseResult`` field.
     """
     try:
-        json.loads(output)
-    except (json.JSONDecodeError, ValueError):
-        return json.dumps(output)
-    return output
-
-
-def _strip_unparseable_image_output(output: str) -> str:
-    """Collapse a truncated/corrupt base64 image tool result to a placeholder.
-
-    Intact image outputs (valid JSON) are returned unchanged so the caller can
-    rehydrate them into real image blocks for ``--resume``. Only a payload that
-    *looks* like an image but no longer parses as JSON — the shape produced when
-    the conversation store clipped it at its byte cap — is replaced with a short
-    placeholder, so the corrupt ~250K-char base64 is never sent as prompt text.
-
-    :param output: The persisted tool-result string.
-    :returns: The original string, or a placeholder JSON array when the output
-        is an unparseable image payload.
-    """
-    stripped = output.lstrip()
-    if stripped[:1] not in ("[", "{") or '"image"' not in output or '"base64"' not in output:
-        return output
-    try:
-        json.loads(output)
-    except (json.JSONDecodeError, ValueError):
-        from omnigent.runtime.prompt import _image_omitted_placeholder
-
-        placeholder = {"type": "text", "text": _image_omitted_placeholder(None)}
-        return json.dumps([placeholder], separators=(",", ":"))
-    return output
-
-
-def _claude_tool_result_content_blocks(output: str) -> list[_JsonObject] | None:
-    """
-    Rehydrate a stringified content-block array into real blocks.
-
-    Tool results that return image content are persisted as a JSON *string*
-    like ``'[{"type":"image","source":{...}}]'``. Passing that string
-    straight into a ``tool_result`` content block makes ``claude --resume``
-    send the base64 to the API as plain text — a single screenshot balloons
-    to ~250K text tokens instead of the ~1.5K an image block costs, which is
-    what pushes a resumed conversation over the context limit.
-
-    Only ``text`` and ``image`` blocks are rehydrated: those are the block
-    types the API accepts inside a ``tool_result``. Anything else (plain
-    text, or a JSON array of some other shape) stays a raw string so the
-    resume request keeps sending exactly what it did before.
-
-    :param output: The persisted tool-result string, e.g.
-        ``'[{"type":"image","source":{"type":"base64","data":"..."}}]'``
-        or plain text like ``"file written"``.
-    :returns: A list of content blocks when *output* parses to a non-empty
-        list of ``text``/``image`` block dicts; ``None`` otherwise, so the
-        caller keeps the raw string as the block content.
-    """
-    try:
         parsed = json.loads(output)
     except (json.JSONDecodeError, ValueError):
-        return None
-    if not isinstance(parsed, list) or not parsed:
-        return None
-    blocks: list[_JsonObject] = []
-    for value in parsed:
-        block = _json_object(value)
-        if block is None or block.get("type") not in ("text", "image"):
-            return None
-        blocks.append(block)
-    return blocks
+        return json.dumps(output)
+    redacted = _redact_binary_blocks(parsed)
+    if redacted != parsed:
+        return json.dumps(redacted, separators=(",", ":"))
+    return output
 
 
 def _preflight_local_tools(command: str) -> None:

@@ -274,6 +274,7 @@ const DICTATION_INFO: ServerInfo = {
   server_version: "test",
   smart_routing_enabled: false,
   smart_routing_sources: { external: false, oss: false },
+  features: {},
   harness_install_enabled: false,
   installable_harnesses: [],
   dictation_available: true,

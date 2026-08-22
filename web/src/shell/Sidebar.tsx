@@ -15,7 +15,6 @@ import {
   useState,
 } from "react";
 import {
-  AlertTriangleIcon,
   ArchiveIcon,
   ArchiveRestoreIcon,
   CheckIcon,
@@ -38,18 +37,18 @@ import {
   Maximize2Icon,
   Minimize2Icon,
   MoreHorizontalIcon,
-  PanelRightOpenIcon,
   PencilIcon,
   PinIcon,
   PinOffIcon,
   SearchIcon,
   Settings2Icon,
-  SettingsIcon,
   ShareIcon,
+  SmilePlusIcon,
   SquareIcon,
   SquareCheckIcon,
   SquarePenIcon,
   Trash2Icon,
+  WalletIcon,
   XIcon,
 } from "lucide-react";
 import {
@@ -68,6 +67,7 @@ import {
 } from "@dnd-kit/core";
 import { useQueryClient } from "@tanstack/react-query";
 import { Link, useLocation, useNavigate, useParams } from "@/lib/routing";
+import { SidebarHeaderActions } from "./SidebarHeaderActions";
 import omnigentWordmark from "@/assets/omnigent-wordmark.svg";
 import { Button } from "@/components/ui/button";
 import {
@@ -102,19 +102,23 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
   type Conversation,
   type PinnedConversationsResult,
-  BulkConversationMutationError,
   useArchiveConversation,
   useBulkArchiveConversations,
   useBulkDeleteConversations,
+  useBulkMoveToProject,
   useProjects,
   useProjectSessions,
   useConversations,
+  useLeaveSession,
   useMoveToProject,
   useDeleteProject,
   useRenameProject,
+  useProjectConfig,
+  useUpdateProjectConfig,
   PROJECT_LABEL_KEY,
   PINNED_CONVERSATIONS_KEY,
   usePinnedConversations,
@@ -127,11 +131,13 @@ import {
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isSingleUserMode, sandboxOptionLabel } from "@/lib/capabilities";
+import { isFeatureEnabled, isSingleUserMode, sandboxOptionLabel } from "@/lib/capabilities";
+import { useBranding } from "@/lib/branding";
 import { relativeTime } from "@/lib/relativeTime";
 import { showToast } from "@/components/ui/toast";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
+import { EmojiPicker } from "@/components/ProjectIconPicker";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useActiveRootSessionId } from "@/hooks/useSession";
@@ -176,6 +182,7 @@ import {
   sortByUpdatedAtDesc,
   writeLegacyPinnedConversationIds,
 } from "./sidebarNav";
+import { SidebarServerPicker } from "./SidebarServerPicker";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 
 // Positioning for a row's trailing session-state badge. On desktop it shares
@@ -254,6 +261,12 @@ interface SidebarProps {
   open: boolean;
   onClose: () => void;
   /**
+   * Pin a peeking sidebar fully open (the in-sidebar toggle shown while
+   * peeking). Optional (defaults to a no-op) so the sidebar renders standalone
+   * in tests.
+   */
+  onOpen?: () => void;
+  /**
    * Live open fraction (0 = closed, 1 = open) while the iOS shell's left-edge
    * swipe is dragging the sidebar; `null` when not dragging. When set, the
    * mobile overlay tracks it directly (transition suppressed) so the drawer
@@ -268,6 +281,10 @@ interface SidebarProps {
    * Optional (defaults to a no-op) so the sidebar renders standalone in tests.
    */
   onOpenSearch?: () => void;
+  /**
+   * Whether the sidebar is peeking.
+   */
+  peek?: boolean;
 }
 
 /**
@@ -285,6 +302,7 @@ function useActiveNavItem(): {
   isNewChatPage: boolean;
   isInboxPage: boolean;
   isTasksPage: boolean;
+  isUsagePage: boolean;
   newSessionProjectName: string | null;
 } {
   const { conversationId: activeConversationId } = useParams<{ conversationId: string }>();
@@ -292,16 +310,18 @@ function useActiveNavItem(): {
   const leaf = location.pathname.split("/").filter(Boolean).at(-1);
   const isInboxPage = leaf === "inbox";
   const isTasksPage = leaf === "tasks";
-  const isNewSessionRoute = activeConversationId == null && !isInboxPage && !isTasksPage;
+  const isUsagePage = leaf === "usage";
+  const isNewSessionRoute =
+    activeConversationId == null && !isInboxPage && !isTasksPage && !isUsagePage;
   const requestedProject = isNewSessionRoute
     ? new URLSearchParams(location.search).get("project")
     : null;
   const newSessionProjectName = requestedProject || null;
-  // Exclude inbox/tasks: they also have no `:conversationId`, so they would
-  // otherwise light up the "New session" button. A project-prefilled new
-  // session belongs to that project row instead of the global nav item.
+  // Exclude inbox/tasks/usage: they also have no `:conversationId`, so they
+  // would otherwise light up the "New session" button. A project-prefilled
+  // new session belongs to that project row instead of the global nav item.
   const isNewChatPage = isNewSessionRoute && newSessionProjectName == null;
-  return { isNewChatPage, isInboxPage, isTasksPage, newSessionProjectName };
+  return { isNewChatPage, isInboxPage, isTasksPage, isUsagePage, newSessionProjectName };
 }
 
 /**
@@ -451,7 +471,17 @@ export function useMigrateLocalPinsToServer(
   }, [pinnedLoaded, filterHonored]);
 }
 
-export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: SidebarProps) {
+export function Sidebar({
+  open,
+  onClose,
+  onOpen,
+  dragProgress = null,
+  onOpenSearch,
+  peek,
+}: SidebarProps) {
+  const branding = useBranding();
+  const serverInfo = useServerInfo();
+  const usagePageEnabled = isFeatureEnabled(serverInfo, "usage_page");
   const [selectionMode, setSelectionMode] = useState(false);
   // Which rows the current selection targets: the flat "Sessions" list, or the
   // sessions nested inside project folders. Set when selection mode is entered
@@ -567,7 +597,8 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
   }
 
   // Which top-level nav button to highlight for the current route.
-  const { isNewChatPage, isInboxPage, isTasksPage, newSessionProjectName } = useActiveNavItem();
+  const { isNewChatPage, isInboxPage, isTasksPage, isUsagePage, newSessionProjectName } =
+    useActiveNavItem();
 
   // On /settings the card keeps its chrome but swaps the conversation list
   // for the settings section nav (see settingsNav.tsx) — entering settings
@@ -646,11 +677,37 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
   // interactive even though `open` hasn't flipped yet — treat a live drag as
   // visually open so it isn't `inert`/`aria-hidden` mid-gesture.
   const dragging = dragProgress != null;
-  const effectiveOpen = open || dragging;
+  const effectiveOpen = open || dragging || peek;
+
+  // While peeking, leaving the card closes it after a short grace period;
+  // re-entering before that fires cancels the close so a wobble doesn't
+  // dismiss it.
+  const peekCloseTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cancelPeekClose = useCallback(() => {
+    if (peekCloseTimer.current) {
+      clearTimeout(peekCloseTimer.current);
+      peekCloseTimer.current = null;
+    }
+  }, []);
+  useEffect(() => cancelPeekClose, [cancelPeekClose]);
 
   return (
     <aside
       aria-label="Conversations"
+      onPointerEnter={cancelPeekClose}
+      onPointerLeave={() => {
+        if (!peek) return;
+        cancelPeekClose();
+        // Defer closing if any context menu is open
+        const tryClose = () => {
+          if (document.querySelector('[role="menu"][data-state="open"]')) {
+            peekCloseTimer.current = setTimeout(tryClose, 200);
+            return;
+          }
+          onClose();
+        };
+        peekCloseTimer.current = setTimeout(tryClose, 200);
+      }}
       className={cn(
         // Base: bg + flex column. No transition — expand/collapse snaps
         // instantly (animating the width also lagged drag-to-resize).
@@ -681,8 +738,17 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
         // divider — no outer margin or rounding. Width (the user-resizable
         // variable) animates →0 to push main; when closed the border
         // collapses too so nothing lingers.
-        "md:relative md:inset-auto md:translate-x-0 md:overflow-hidden",
-        open ? "md:m-0 md:w-[var(--sidebar-width)] " : "md:m-0 md:w-0 md:border-0",
+        "md:translate-x-0 md:overflow-hidden",
+        // Normal desktop flow: relative panel that pushes main. Suppressed while
+        // peeking so its `md:inset-auto`/`md:relative` don't override the
+        // floating-card positioning below (same `md:` layer, source order wins).
+        !peek && "md:relative md:inset-auto",
+        open || peek ? "md:m-0 md:w-[var(--sidebar-width)] " : "md:m-0 md:w-0 md:border-0",
+        // Peek: float as a card 4px off the viewport edge (capped at 300px wide),
+        // ringed and shadowed, sliding+fading in from the left so it reads as an
+        // overlay rather than a push.
+        peek &&
+          "is-peek md:absolute md:inset-2 p-0 md:max-w-[400px] ring-1 ring-border rounded-xl md:shadow-xl animate-in fade-in slide-in-from-left-4 duration-200 ease-out",
       )}
       style={
         {
@@ -705,16 +771,25 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
       {/* Right-edge resize handle (desktop only), mirroring the right rail's
           left-edge handle. Hidden on mobile, where the sidebar is a
           full-screen overlay with no resize affordance; the parent's ``inert``
-          when closed also keeps it from being draggable while collapsed. */}
-      <div
-        {...resizeHandleProps}
-        className="absolute inset-y-0 right-0 z-10 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block"
-      />
+          when closed also keeps it from being draggable while collapsed.
+          Hidden while peeking too — the peek card is a fixed-width flyout, not
+          a resizable panel. */}
+      {!peek && (
+        <div
+          {...resizeHandleProps}
+          className="absolute inset-y-0 right-0 z-10 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block"
+        />
+      )}
       {inSettings ? (
         <SettingsSidebarBody onNavClick={onNavClick} />
       ) : (
         <>
-          <div className="flex h-12 shrink-0 items-center justify-between pr-3 pl-4">
+          {/* sidebar-header-row is the hook for the macOS Electron shell, where
+          this row shares the window's top strip with the traffic lights: the
+          brand mark is dropped and the actions slide left to sit beside the
+          window controls (see the [data-electron-mac] rules in index.css).
+          Inert in a browser and on other platforms, which keep the row below. */}
+          <div className="sidebar-header-row flex h-12 shrink-0 items-center justify-between pr-3 pl-4">
             {/* Brand mark doubles as the "home" affordance: clicking it
             returns to `/`, the new-session composer. Without this there
             is no way back to the landing composer once you're inside a
@@ -724,71 +799,33 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
             <Link
               to="/"
               onClick={onNavClick}
-              className="rounded-none transition-opacity duration-200 ease-[var(--ease-otto)] hover:opacity-70"
+              data-testid="sidebar-brand"
+              className="sidebar-brand rounded-none transition-opacity duration-200 ease-[var(--ease-otto)] hover:opacity-70"
             >
-              <img
-                src={omnigentWordmark}
-                alt="Omnigent"
-                data-testid="sidebar-wordmark"
-                className="h-[15px] w-auto shrink-0 translate-y-px dark:invert"
-              />
+              {branding.app_name ? (
+                <span className="text-[15px] font-semibold tracking-tight">
+                  {branding.app_name}
+                </span>
+              ) : (
+                <img
+                  src={omnigentWordmark}
+                  alt="Omnigent"
+                  data-testid="sidebar-wordmark"
+                  className="h-[15px] w-auto shrink-0 translate-y-px dark:invert"
+                />
+              )}
             </Link>
-            <div className="flex items-center gap-1" data-testid="sidebar-header-actions">
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon-xs"
-                    aria-label="Search"
-                    onClick={() => onOpenSearch?.()}
-                    className="size-6 text-muted-foreground hover:text-foreground"
-                    data-testid="sidebar-search-button"
-                  >
-                    <SearchIcon className="ui-icon" />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent side="bottom">Search</TooltipContent>
-              </Tooltip>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    asChild
-                    variant="ghost"
-                    size="icon-xs"
-                    aria-label="Settings"
-                    className="size-6 text-muted-foreground hover:text-foreground"
-                  >
-                    {/* No onNavClick: on mobile, entering Settings keeps the
-                    drawer open and swaps it to the section list. */}
-                    <Link to="/settings" data-testid="settings-button">
-                      <SettingsIcon className="ui-icon" />
-                    </Link>
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent side="bottom">Settings</TooltipContent>
-              </Tooltip>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon-xs"
-                    aria-label="Close sidebar"
-                    onClick={onClose}
-                    className="size-6 text-muted-foreground hover:text-foreground"
-                  >
-                    {/* panel-right-open while the sidebar IS open — this button
-                    only renders in the open state (ChatHeader's PanelLeftIcon
-                    covers the collapsed state). */}
-                    <PanelRightOpenIcon className="ui-icon" />
-                  </Button>
-                </TooltipTrigger>
-                {/* Bottom placement keeps the tooltip clear of the macOS
-                Electron shell's traffic lights at the window's top edge. */}
-                <TooltipContent side="bottom">Collapse sidebar</TooltipContent>
-              </Tooltip>
-            </div>
+            {/* On the macOS shell this copy is hidden and an identical cluster
+            renders in the title-bar strip instead (see AppShell), so the icons
+            keep their place when the sidebar collapses or peeks. Everywhere
+            else this is the only copy. */}
+            <SidebarHeaderActions
+              expanded={!peek}
+              // onOpen is optional (the sidebar renders standalone in tests), so
+              // fall back to a no-op rather than widening the child's contract.
+              onToggle={peek ? () => onOpen?.() : onClose}
+              onOpenSearch={onOpenSearch}
+            />
           </div>
 
           <div className="flex flex-col gap-0 px-2 pt-2 pb-0" data-testid="sidebar-primary-nav">
@@ -888,13 +925,44 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                         ? "1 inbox item waiting"
                         : `${inboxCount} inbox items waiting`
                     }
-                    className="ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-brand-accent/15 px-1 text-10 font-medium text-brand-accent tabular-nums"
+                    className={cn(
+                      "ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-10 font-medium text-[var(--sidebar-active-foreground)] tabular-nums",
+                      // The active Inbox row already paints the translucent
+                      // --sidebar-active wash; repainting it on the nested
+                      // badge would double-composite to a darker fill.
+                      isInboxPage ? "bg-transparent" : "bg-[var(--sidebar-active)]",
+                    )}
                   >
                     {inboxCount}
                   </span>
                 )}
               </Link>
             </Button>
+            {usagePageEnabled && (
+              <Button
+                asChild
+                variant="ghost"
+                className={cn(
+                  SIDEBAR_ROW,
+                  "w-full justify-start border-0 font-normal",
+                  SIDEBAR_HOVER_HIGHLIGHT,
+                  isUsagePage && SIDEBAR_ACTIVE_HIGHLIGHT,
+                )}
+                data-testid="usage-nav"
+              >
+                <Link to="/usage" onClick={onNavClick}>
+                  <WalletIcon
+                    className={cn(
+                      "ui-icon",
+                      isUsagePage
+                        ? "text-[var(--sidebar-active-foreground)]"
+                        : "text-muted-foreground",
+                    )}
+                  />
+                  Usage
+                </Link>
+              </Button>
+            )}
           </div>
 
           <nav
@@ -925,6 +993,12 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
               getVisibleIdsRef={getVisibleIdsRef}
             />
           </nav>
+
+          {/* Desktop server picker, pinned below the scrolling session list.
+          Self-hiding: renders nothing outside the Electron shell (see
+          SidebarServerPicker), so browsers keep an unchanged sidebar that ends
+          with the list. */}
+          <SidebarServerPicker />
         </>
       )}
     </aside>
@@ -1002,6 +1076,7 @@ function InfiniteScrollSentinel({
 function ProjectFolder({
   name,
   projectId,
+  icon,
   windowConversations,
   expanded,
   active,
@@ -1022,6 +1097,9 @@ function ProjectFolder({
   name: string;
   /** First-class project id, or null for a label-only folder. */
   projectId: string | null;
+  /** Chosen emoji icon (unicode grapheme), or null/absent for the default
+      folder glyph. */
+  icon?: string | null;
   /** This folder's members from the globally-loaded window (may lag or lead
       the folder's own pages — e.g. a just-moved row carries its optimistic
       membership here before the folder query returns it). */
@@ -1100,7 +1178,9 @@ function ProjectFolder({
       <ConversationSection
         title={name}
         icon={
-          expanded ? (
+          icon ? (
+            <span className="text-[14px] leading-none">{icon}</span>
+          ) : expanded ? (
             <FolderOpenIcon
               className={cn(
                 "ui-icon",
@@ -1149,7 +1229,12 @@ function ProjectFolder({
         }
         indentRows
         headerAction={
-          <ProjectFolderActions projectName={name} projectId={projectId} onNavigate={onRowClick} />
+          <ProjectFolderActions
+            projectName={name}
+            projectId={projectId}
+            icon={icon}
+            onNavigate={onRowClick}
+          />
         }
         footer={
           loadingFirstPage ? (
@@ -1373,24 +1458,29 @@ function ConversationList({
     // (and out of the flat Shared list via filedIds). Each folder holds its
     // non-pinned sessions — pinning a project's last one leaves it empty.
     const filedIds = new Set<string>();
-    const projectGroups: { id: string | null; name: string; conversations: Conversation[] }[] =
-      projects.map(({ id, name }) => {
-        // Dual-read membership: a session belongs to this folder if it has
-        // the first-class id OR the legacy omni_project label of this name,
-        // and (filing being owner-only) the viewer owns it.
-        const inProject = notArchived.filter(
-          (c) =>
-            isOwnedByViewer(c, viewerId) &&
-            ((id !== null && c.project_id === id) || c.labels?.[PROJECT_LABEL_KEY] === name) &&
-            !pinnedIdSet.has(c.id),
-        );
-        inProject.forEach((c) => filedIds.add(c.id));
-        return {
-          id,
-          name,
-          conversations: sortByUpdatedAtDesc(inProject, activeOverride, frozenKeys),
-        };
-      });
+    const projectGroups: {
+      id: string | null;
+      name: string;
+      icon?: string | null;
+      conversations: Conversation[];
+    }[] = projects.map(({ id, name, icon }) => {
+      // Dual-read membership: a session belongs to this folder if it has
+      // the first-class id OR the legacy omni_project label of this name,
+      // and (filing being owner-only) the viewer owns it.
+      const inProject = notArchived.filter(
+        (c) =>
+          isOwnedByViewer(c, viewerId) &&
+          ((id !== null && c.project_id === id) || c.labels?.[PROJECT_LABEL_KEY] === name) &&
+          !pinnedIdSet.has(c.id),
+      );
+      inProject.forEach((c) => filedIds.add(c.id));
+      return {
+        id,
+        name,
+        icon,
+        conversations: sortByUpdatedAtDesc(inProject, activeOverride, frozenKeys),
+      };
+    });
     // NOTE: empty projects are intentionally NOT filtered out. A project comes
     // from the server project list (useProjects), so it can have zero *loaded*
     // conversations — either genuinely empty or because its chats live on an
@@ -1847,6 +1937,7 @@ function ConversationList({
                         allConversations={projectSessionPool}
                         onDeselectAll={onDeselectAll}
                         onExit={onExitSelectionMode}
+                        onProjectAssigned={expandProject}
                       />
                     ) : undefined
                   }
@@ -1872,6 +1963,7 @@ function ConversationList({
                       key={group.name}
                       name={group.name}
                       projectId={group.id}
+                      icon={group.icon}
                       windowConversations={group.conversations}
                       expanded={expandedProjects.includes(group.name)}
                       active={newSessionProjectName === group.name}
@@ -1930,6 +2022,7 @@ function ConversationList({
                             allConversations={sections.sessions}
                             onDeselectAll={onDeselectAll}
                             onExit={onExitSelectionMode}
+                            onProjectAssigned={expandProject}
                           />
                         ) : undefined
                       }
@@ -1937,34 +2030,34 @@ function ConversationList({
                         // The filter stays reachable while bulk-selecting;
                         // switching scope just exits selection. Only the
                         // "select" entry point hides, being already active.
-                        <div className="flex items-center gap-0.5">
-                          {!selectionMode && (
-                            <Tooltip>
-                              <TooltipTrigger asChild>
-                                <Button
-                                  type="button"
-                                  variant="ghost"
-                                  size="icon-xs"
-                                  aria-label="Select sessions"
-                                  data-testid="toggle-selection-mode"
-                                  className="text-muted-foreground"
-                                  onClick={(event) => {
-                                    event.stopPropagation();
-                                    onEnterSelectionMode("sessions");
-                                  }}
-                                >
-                                  <ListChecksIcon className="size-3.5" />
-                                </Button>
-                              </TooltipTrigger>
-                              <TooltipContent side="bottom">Select sessions</TooltipContent>
-                            </Tooltip>
-                          )}
-                          <SessionFilterMenu
-                            value={activeTab}
-                            onChange={onActiveTabChange}
-                            multiUser={multiUser}
-                          />
-                        </div>
+                        !selectionMode ? (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="icon-xs"
+                                aria-label="Select sessions"
+                                data-testid="toggle-selection-mode"
+                                className="text-muted-foreground"
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  onEnterSelectionMode("sessions");
+                                }}
+                              >
+                                <ListChecksIcon className="size-3.5" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent side="bottom">Select sessions</TooltipContent>
+                          </Tooltip>
+                        ) : undefined
+                      }
+                      persistentHeaderAction={
+                        <SessionFilterMenu
+                          value={activeTab}
+                          onChange={onActiveTabChange}
+                          multiUser={multiUser}
+                        />
                       }
                     />
                   </ChatsDropZone>
@@ -2401,6 +2494,7 @@ function ConversationSection({
   emptyMessage,
   indentRows,
   headerAction,
+  persistentHeaderAction,
   afterHeader,
   footer,
   onProjectAssigned,
@@ -2429,6 +2523,8 @@ function ConversationSection({
   /** Optional control overlaid at the header's right edge (e.g. a project's
       kebab). Hover/focus-revealed on desktop, always shown on mobile. */
   headerAction?: ReactNode;
+  /** Optional control that remains visible at the header's right edge. */
+  persistentHeaderAction?: ReactNode;
   /** Optional content rendered directly under the header, above the rows (and
       shown even when collapsed) — e.g. the bulk-selection action bar. */
   afterHeader?: ReactNode;
@@ -2453,13 +2549,18 @@ function ConversationSection({
             icon={icon}
             marker={marker}
             active={active}
-            hasAction={headerAction != null}
+            hasAction={headerAction != null || persistentHeaderAction != null}
             collapsed={isCollapsed}
             onToggleCollapsed={onToggleCollapsed}
           />
-          {headerAction && (
-            <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center transition-opacity md:opacity-0 md:group-focus-within/header:opacity-100 md:group-hover/header:opacity-100 md:group-has-[[data-state=open]]/header:opacity-100 md:has-[[aria-expanded=true]]:opacity-100">
-              {headerAction}
+          {(headerAction || persistentHeaderAction) && (
+            <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5">
+              {headerAction && (
+                <div className="flex items-center transition-opacity md:opacity-0 md:group-focus-within/header:opacity-100 md:group-hover/header:opacity-100 md:group-has-[[data-state=open]]/header:opacity-100 md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100 md:has-[[aria-expanded=true]]:opacity-100">
+                  {headerAction}
+                </div>
+              )}
+              {persistentHeaderAction}
             </div>
           )}
         </div>
@@ -2581,6 +2682,7 @@ function ConversationMenuItems({
   setIsEditing,
   setStopOpen,
   setDeleteOpen,
+  setLeaveOpen,
   setMenuOpen,
   runArchive,
 }: {
@@ -2609,6 +2711,7 @@ function ConversationMenuItems({
   setIsEditing: (editing: boolean) => void;
   setStopOpen: (open: boolean) => void;
   setDeleteOpen: (open: boolean) => void;
+  setLeaveOpen: (open: boolean) => void;
   // Closes the controlled kebab after a project pick; a no-op for the
   // (uncontrolled) context menu, which Radix closes on select automatically.
   setMenuOpen: (open: boolean) => void;
@@ -2850,7 +2953,14 @@ function ConversationMenuItems({
           </TooltipContent>
         </Tooltip>
       )}
-      {isOwner ? (
+      {/* One destructive slot, resolved by ownership — NOT two items. The owner
+          deletes the session; a shared-with viewer leaves it (gives up their own
+          grant). Non-owners used to get Delete rendered disabled here, an
+          always-dead row; Leave is the action that row should have offered all
+          along, so it reuses the slot, the trash icon, and the destructive
+          styling rather than adding a button beneath it. Single-user mode has no
+          sharing, so it keeps the plain owner Delete. */}
+      {isOwner || isSingleUser ? (
         <C.Item
           data-testid="delete-conversation"
           variant="destructive"
@@ -2860,19 +2970,14 @@ function ConversationMenuItems({
           Delete
         </C.Item>
       ) : (
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <div>
-              <C.Item data-testid="delete-conversation" disabled>
-                <Trash2Icon className="size-3.5" />
-                Delete
-              </C.Item>
-            </div>
-          </TooltipTrigger>
-          <TooltipContent side="left">
-            Only the session owner can delete this session
-          </TooltipContent>
-        </Tooltip>
+        <C.Item
+          data-testid="leave-conversation"
+          variant="destructive"
+          onSelect={() => setLeaveOpen(true)}
+        >
+          <Trash2Icon className="size-3.5" />
+          Leave session
+        </C.Item>
       )}
     </>
   );
@@ -2972,14 +3077,6 @@ function ConversationRow({
   // project flyout's HoverCard and leave it lingering over the chat. Gate the
   // flyout off below the `md` breakpoint (see `projectFlyoutName`).
   const isMobile = useIsMobileViewport();
-  // Track the *live* active conversation id. Delete is fire-and-forget,
-  // so the user can navigate to another conversation before the mutation
-  // resolves — the onSuccess redirect must key off where they are now,
-  // not the `isActive` captured when delete was initiated.
-  const activeIdRef = useRef(activeId);
-  useEffect(() => {
-    activeIdRef.current = activeId;
-  }, [activeId]);
   // When this row becomes the active conversation (e.g. a freshly created
   // session navigated to via `/c/:id`), scroll it toward the center of the
   // sidebar so it's comfortably in view rather than pinned to an edge.
@@ -2991,6 +3088,7 @@ function ConversationRow({
   const rename = useRenameConversation();
   const del = useStopAndDeleteConversation();
   const archive = useArchiveConversation();
+  const leave = useLeaveSession();
   const moveToProject = useMoveToProject();
   // The kebab's user-facing "Stop session" action. Archiving does NOT go
   // through here — the server stops the session itself once the archived
@@ -3019,16 +3117,21 @@ function ConversationRow({
   // Opt-in "delete local branch" checkbox (worktree sessions only).
   const [deleteBranch, setDeleteBranch] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
+  const [leaveOpen, setLeaveOpen] = useState(false);
   // True while an archive is in flight. Drives the "Archiving…" status
-  // row, mirroring delete's "Deleting…" indicator — without it the row
-  // shows nothing while the archive completes.
+  // row — without it the row shows nothing while the archive completes.
+  // Delete needs no counterpart: it drops its row optimistically.
   const [isArchiving, setIsArchiving] = useState(false);
   const gitBranch = conversation.git_branch ?? null;
   // Every row action gates on ownership alone — the sidebar carries no
   // effective-permission level, so rename/share/move/drag are owner-only and
   // non-owners get a read-only row. (Finer-grained edit/manage affordances
   // live on the open-session view, which fetches the caller's real level.)
-  const isOwner = isOwnedByViewer(conversation, useViewerId());
+  // Also the id Leave revokes: leaving is a self-revoke, so it needs the
+  // viewer's own id — resolved by the time a non-owned row renders, since
+  // `isOwner` below is derived from it.
+  const viewerId = useViewerId();
+  const isOwner = isOwnedByViewer(conversation, viewerId);
   // Server-wide sharing kill switch (OMNIGENT_SHARING_MODE=off) reported by
   // /v1/info — disables the row's Share item even for managers. Fail open
   // (share enabled) while the capability probe is still loading.
@@ -3190,32 +3293,13 @@ function ConversationRow({
     );
   }
 
-  // While a delete is in flight (or after it failed), swap the
-  // interactive row for a status row so the user sees progress without
-  // the dialog blocking. On success the row is spliced out of the
-  // cached list and this row unmounts; on error we keep it with
-  // retry/dismiss affordances.
-  if (del.isPending || del.isError) {
-    return (
-      <li>
-        <DeletingRow
-          label={label}
-          isError={del.isError}
-          // `del.variables` holds the args from the last mutate call,
-          // so retry replays the exact same delete (incl. deleteBranch).
-          onRetry={() => del.variables && runDelete(del.variables)}
-          onDismiss={() => del.reset()}
-        />
-      </li>
-    );
-  }
-
-  // Archiving is a single PATCH (see runArchive); show a
-  // status row for the span instead of leaving the row looking idle. On
-  // success
-  // the list refetches and the row drops out of the default view (or
-  // flips to its archived state under "Show archived"); on failure the
-  // flag clears and the interactive row returns so the user can retry.
+  // Archiving is a single PATCH (see runArchive); show a status row for the
+  // span instead of leaving the row looking idle. The spinner stays up until
+  // the row itself leaves the sidebar: on success the list refetches and this
+  // row unmounts (dropped from the default view), which removes the spinner
+  // with it — it is deliberately NOT cleared on PATCH-settle, or it would
+  // vanish a round-trip before the row does. On failure the flag clears and
+  // the interactive row returns so the user can retry.
   if (isArchiving) {
     return (
       <li>
@@ -3224,27 +3308,19 @@ function ConversationRow({
     );
   }
 
-  function runDelete(args: { id: string; deleteBranch?: boolean }) {
-    del.mutate(args, {
-      onSuccess: () => {
-        // If the user is *still* viewing the conversation we just
-        // deleted, bounce back to `/` so the chat surface doesn't
-        // 404-loop on the now-missing id. Read the live activeId (ref)
-        // — they may have navigated away while the delete was in flight.
-        if (activeIdRef.current === conversation.id) navigate("/", { replace: true });
-      },
-    });
-  }
-
   function confirmDelete() {
-    // Fire-and-forget: close the dialog immediately so the user isn't
-    // blocked on the (potentially slow) DELETE — worktree cleanup can
-    // take seconds. The row renders its own "Deleting…" indicator while
-    // `del.isPending`, and a retryable error state if it fails.
-    const args = { id: conversation.id, deleteBranch: gitBranch !== null && deleteBranch };
+    // Fire-and-forget: close the dialog and drop the row immediately so the
+    // user isn't blocked on the (potentially slow) DELETE — server-side
+    // teardown can take seconds. The mutation removes the row from the
+    // cached lists optimistically, which unmounts this component, so
+    // anything that must happen on delete either runs here or lives in the
+    // hook (a mutate-level callback would never fire).
     setDeleteOpen(false);
     setDeleteBranch(false);
-    runDelete(args);
+    // Viewing the session being deleted? Leave now, so the chat surface
+    // doesn't sit on an id that's about to 404.
+    if (isActive) navigate("/", { replace: true });
+    del.mutate({ id: conversation.id, deleteBranch: gitBranch !== null && deleteBranch });
   }
 
   function runArchive() {
@@ -3258,16 +3334,53 @@ function ConversationRow({
     // tears down a host-spawned runner) in the background once the flag is
     // committed. Sending a client stop too would race that one against the
     // same runner, and the loser gets a 503 from the already-killed pane.
-    // "Archiving…" shows until the archive settles (success → row leaves
-    // the default list; failure → interactive row returns for a retry).
+    //
+    // "Archiving…" must stay up until the row actually LEAVES the sidebar,
+    // not merely until the PATCH resolves. The PATCH success only kicks off
+    // an async `["conversations"]` refetch (see useArchiveConversation); the
+    // row drops out a round-trip later, once that refetch lands and the
+    // archived row is filtered out of the rendered list. Clearing the
+    // spinner on settle (the old behavior) reopened that gap: the row flashed
+    // back to its plain, clickable form — spinner gone — while the session
+    // was still listed. So we DON'T clear it on success: this row unmounts
+    // when the refetch removes it, which tears the spinner down with it.
+    // Only an error clears the flag, restoring the interactive row for retry.
     setIsArchiving(true);
     archive.mutate(
       { id: conversation.id, archived: true },
       {
         // Point the user at where the session went — it's no longer in
         // the sidebar list, so surface its new home in Settings.
-        onSuccess: showArchivedToast,
-        onSettled: () => setIsArchiving(false),
+        onSuccess: () => {
+          if (isActive) navigate("/", { replace: true });
+          showArchivedToast();
+        },
+        onError: () => setIsArchiving(false),
+      },
+    );
+  }
+
+  function confirmLeave() {
+    // Leave is a self-revoke, so it needs the viewer's own id. The menu item is
+    // gated on the row NOT being owned by the viewer, which is only decidable
+    // once the id has resolved — so this is non-null wherever it's reachable.
+    if (viewerId === null) return;
+    // Close immediately — the row drops out of the list on success, so there's
+    // nothing left to show progress against. A failure surfaces as a toast
+    // (the row is still there to retry from).
+    setLeaveOpen(false);
+    leave.mutate(
+      { id: conversation.id, viewerId },
+      {
+        onSuccess: () => {
+          // The session 404s for this user now, so don't leave them staring at
+          // its chat surface. Mirrors delete/archive's post-mutation navigate.
+          if (isActive) navigate("/", { replace: true });
+        },
+        onError: (err) => {
+          const detail = err instanceof Error && err.message ? `: ${err.message}` : "";
+          showToast(`Couldn't leave the session${detail}`);
+        },
       },
     );
   }
@@ -3295,6 +3408,7 @@ function ConversationRow({
     setIsEditing,
     setStopOpen,
     setDeleteOpen,
+    setLeaveOpen,
     runArchive,
   };
 
@@ -3626,6 +3740,41 @@ function ConversationRow({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+      <Dialog open={leaveOpen} onOpenChange={setLeaveOpen}>
+        <DialogContent
+          // Keep dialog clicks off the surrounding Link (same defensive
+          // handling as the delete dialog above).
+          onClick={(e) => e.stopPropagation()}
+        >
+          <DialogHeader>
+            <DialogTitle>Leave session?</DialogTitle>
+            <DialogDescription>
+              <span className="font-medium break-all">{label}</span> will be removed from your
+              sidebar. Nothing is deleted — the session and its history stay with its owner, who can
+              share it with you again.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="border-t-0 bg-transparent">
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={() => setLeaveOpen(false)}
+              disabled={leave.isPending}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              data-testid="confirm-leave-conversation"
+              onClick={confirmLeave}
+              disabled={leave.isPending}
+            >
+              Leave
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       {/* The stale-error reset lives on the kebab item's onSelect (the only
           open path) — onOpenChange only fires for Radix-initiated closes. */}
       <Dialog open={stopOpen} onOpenChange={setStopOpen}>
@@ -3662,10 +3811,11 @@ function ConversationRow({
             <Button
               type="button"
               variant="destructive"
+              data-testid="stop-session-confirm"
               onClick={() =>
                 stopSession.mutate(conversation.id, { onSuccess: () => setStopOpen(false) })
               }
-              disabled={stopSession.isPending}
+              loading={stopSession.isPending}
             >
               Stop session
             </Button>
@@ -3724,76 +3874,12 @@ function PinnedProjectFlyoutContent({
 }
 
 /**
- * Status row shown in place of a conversation while its delete is in
- * flight (`isError === false`) or after it failed (`isError === true`).
- * Keeps the user un-blocked: the delete dialog closes immediately and
- * this surfaces progress / failure inline in the sidebar.
- */
-function DeletingRow({
-  label,
-  isError,
-  onRetry,
-  onDismiss,
-}: {
-  label: string;
-  isError: boolean;
-  onRetry: () => void;
-  onDismiss: () => void;
-}) {
-  if (isError) {
-    return (
-      <div
-        className="flex w-full items-center gap-1.5 rounded-md px-2 py-2 text-ui"
-        data-testid="conversation-delete-failed"
-        role="alert"
-      >
-        <AlertTriangleIcon className="size-3.5 shrink-0 text-destructive" />
-        {/* Name the session in the visible text — with multiple failed
-            deletes the user must be able to tell the rows apart. */}
-        <span
-          className="min-w-0 flex-1 truncate text-destructive"
-          title={`Couldn't delete ${label}`}
-        >
-          Couldn't delete <span className="font-medium">{label}</span>
-        </span>
-        <Button type="button" variant="ghost" size="sm" className="h-6 px-1.5" onClick={onRetry}>
-          Retry
-        </Button>
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon-sm"
-          aria-label="Dismiss delete error"
-          onClick={onDismiss}
-        >
-          <XIcon className="size-3.5" />
-        </Button>
-      </div>
-    );
-  }
-  return (
-    // Match the interactive row's responsive metrics so the swap only changes
-    // color/opacity rather than shifting the list.
-    <div
-      className={cn(SIDEBAR_ROW, "flex w-full items-center text-muted-foreground opacity-70")}
-      data-testid="conversation-deleting"
-      aria-live="polite"
-    >
-      <Loader2Icon className="size-3.5 shrink-0 animate-spin" aria-hidden />
-      <span className="min-w-0 flex-1 truncate" title={label}>
-        {label}
-      </span>
-      <span className="shrink-0 text-sm">Deleting…</span>
-    </div>
-  );
-}
-
-/**
  * In-flight status row shown while a session is being archived (the
- * archive PATCH in ConversationRow.runArchive). Mirrors the
- * non-error arm of {@link DeletingRow}; archive failures fall back to
- * the interactive row rather than a persistent error state, so there's
- * no retry/dismiss affordance here.
+ * archive PATCH in ConversationRow.runArchive). Delete has no
+ * counterpart: it removes its row optimistically, so there is nothing
+ * left to show progress on. Archive failures fall back to the
+ * interactive row rather than a persistent error state, so there's no
+ * retry/dismiss affordance here.
  */
 function ArchivingRow({ label }: { label: string }) {
   return (
@@ -3822,11 +3908,14 @@ function ArchivingRow({ label }: { label: string }) {
 function ProjectFolderActions({
   projectName,
   projectId,
+  icon,
   onNavigate,
 }: {
   projectName: string;
   /** First-class project id, or null for a label-only folder. */
   projectId: string | null;
+  /** Current emoji icon, or null/absent when unset. */
+  icon?: string | null;
   /** Plain-left-click nav handler — closes the mobile overlay so the
       pre-filed new-session page isn't left hidden behind the sidebar. */
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
@@ -3863,7 +3952,12 @@ function ProjectFolderActions({
         </TooltipTrigger>
         <TooltipContent side="bottom">New session in project</TooltipContent>
       </Tooltip>
-      <ProjectFolderMenu projectName={projectName} projectId={projectId} onNavigate={onNavigate} />
+      <ProjectFolderMenu
+        projectName={projectName}
+        projectId={projectId}
+        icon={icon}
+        onNavigate={onNavigate}
+      />
     </div>
   );
 }
@@ -3879,10 +3973,13 @@ function ProjectFolderActions({
 function ProjectFolderMenu({
   projectName,
   projectId,
+  icon,
   onNavigate,
 }: {
   projectName: string;
   projectId: string | null;
+  /** Current emoji icon, or null/absent when unset (gates "Remove icon"). */
+  icon?: string | null;
   /** Nav handler for the mobile-only "New session" item (desktop uses the
       hover-revealed pencil). Closes the sidebar overlay on mobile. */
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
@@ -3891,9 +3988,33 @@ function ProjectFolderMenu({
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [renameOpen, setRenameOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [emojiOpen, setEmojiOpen] = useState(false);
   const [renameValue, setRenameValue] = useState(projectName);
+  // The icon staged in the rename modal, committed only on Confirm:
+  //   undefined = untouched (show the saved icon), string = a picked emoji,
+  //   null = staged removal. Reset to `undefined` each time the modal opens.
+  const [pendingIcon, setPendingIcon] = useState<string | null | undefined>(undefined);
   const deleteProject = useDeleteProject();
   const renameProject = useRenameProject();
+  const updateConfig = useUpdateProjectConfig();
+  // Fetch the full config only while the menu or rename modal is open, so we can
+  // merge the icon onto the other stored defaults (host / workspace / agent)
+  // without a per-folder request on every sidebar render — and without wiping
+  // those defaults on save.
+  const { data: iconConfig, isError: iconConfigError } = useProjectConfig(
+    menuOpen || renameOpen ? projectId : null,
+  );
+  // The config PATCH replaces the whole blob, so an ICON save must merge onto a
+  // fully-loaded config or it silently wipes the other defaults. "Ready" means
+  // the config actually resolved (`!== undefined` — `isLoading` alone is false
+  // on a query *error* too, leaving no data to merge onto) — except a
+  // label-only folder (`projectId === null`), whose base is legitimately `{}`.
+  // This gates only the icon path; renaming the name never needs the config.
+  const configReady = projectId === null || iconConfig !== undefined;
+  const savedIcon = iconConfig !== undefined ? iconConfig?.icon : icon;
+  // What the modal's tile shows: the staged pick when touched, else the saved
+  // icon. `null` (staged removal) renders as the empty folder.
+  const displayIcon = pendingIcon !== undefined ? pendingIcon : savedIcon;
 
   return (
     <>
@@ -3931,6 +4052,7 @@ function ProjectFolderMenu({
             data-testid="rename-project"
             onSelect={() => {
               setRenameValue(projectName);
+              setPendingIcon(undefined);
               setRenameOpen(true);
             }}
           >
@@ -3952,7 +4074,23 @@ function ProjectFolderMenu({
         </DropdownMenuContent>
       </DropdownMenu>
       <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
-        <DialogContent onClick={(e) => e.stopPropagation()}>
+        <DialogContent
+          onClick={(e) => e.stopPropagation()}
+          // emoji-mart preventDefaults the pointer event, so Radix's own
+          // outside-dismissal never fires for clicks elsewhere in the modal.
+          // Catch them in the capture phase and close the picker ourselves,
+          // unless the pointer is inside the picker or on its trigger tile.
+          onPointerDownCapture={(e) => {
+            if (!emojiOpen) return;
+            const target = e.target as Element;
+            if (
+              target.closest('[data-slot="popover-content"]') ||
+              target.closest('[data-testid="rename-project-icon"]')
+            )
+              return;
+            setEmojiOpen(false);
+          }}
+        >
           <DialogHeader>
             <DialogTitle>Rename project</DialogTitle>
           </DialogHeader>
@@ -3960,34 +4098,137 @@ function ProjectFolderMenu({
               doesn't wrap children in one) instead of relying on a manual
               key handler + button lookup. */}
           <form
-            onSubmit={(e) => {
+            onSubmit={async (e) => {
               e.preventDefault();
               const newName = renameValue.trim();
-              if (newName === "" || newName === projectName) {
-                setRenameOpen(false);
-                setMenuOpen(false);
+              const nameChanged = newName !== "" && newName !== projectName;
+              const iconChanged = pendingIcon !== undefined && pendingIcon !== (savedIcon ?? null);
+              // Only the icon write needs a loaded config to merge onto; a
+              // name-only rename must proceed even if the config fetch failed.
+              if (iconChanged && !configReady) return;
+              try {
+                // Name first: it promotes a label-only folder (creating the
+                // first-class row) and reconciles members. Capture the resolved
+                // id so the icon write below targets that row — passing the
+                // stale render-time `null` would make the config write try to
+                // create the project a second time and 409 on the duplicate.
+                let targetId = projectId;
+                if (nameChanged) {
+                  targetId = await renameProject.mutateAsync({
+                    id: projectId,
+                    oldName: projectName,
+                    newName,
+                  });
+                }
+                if (iconChanged) {
+                  const next = { ...(iconConfig ?? {}) };
+                  if (pendingIcon === null) delete next.icon;
+                  else next.icon = pendingIcon;
+                  await updateConfig.mutateAsync({
+                    id: targetId,
+                    name: nameChanged ? newName : projectName,
+                    config: next,
+                  });
+                }
+              } catch {
+                // Errors surface via the mutation state below. A rename that
+                // lands before a failed icon write is already persisted; only
+                // the icon needs retrying.
                 return;
               }
-              renameProject.mutate(
-                { id: projectId, oldName: projectName, newName },
-                {
-                  onSuccess: () => {
-                    setRenameOpen(false);
-                    setMenuOpen(false);
-                  },
-                },
-              );
+              setRenameOpen(false);
+              setMenuOpen(false);
             }}
           >
-            <input
-              autoFocus
-              className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none"
-              value={renameValue}
-              onChange={(e) => setRenameValue(e.target.value)}
-            />
-            {renameProject.isError && (
+            {/* One combined control: emoji tile (left) + name (right) share a
+                single border, so it reads as a single input. The tile opens a
+                picker popover; the pick is staged and committed on Confirm. */}
+            <div className="flex items-stretch overflow-hidden rounded-lg border border-input">
+              <Popover open={emojiOpen} onOpenChange={setEmojiOpen}>
+                <PopoverTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label="Change project icon"
+                    data-testid="rename-project-icon"
+                    disabled={!configReady}
+                    className={cn(
+                      "flex size-[38px] shrink-0 cursor-pointer items-center justify-center outline-none transition-colors disabled:cursor-default disabled:opacity-50",
+                      displayIcon ? "bg-muted" : "bg-tag-pink",
+                    )}
+                  >
+                    {displayIcon ? (
+                      <span className="text-xl leading-none">{displayIcon}</span>
+                    ) : (
+                      <SmilePlusIcon className="size-4 text-brand-accent" />
+                    )}
+                  </button>
+                </PopoverTrigger>
+                <PopoverContent
+                  align="start"
+                  // Publish the collision-aware available viewport height (Radix
+                  // exposes it as a CSS var), less the optional "Remove icon"
+                  // header and capped at the picker's natural size, so the
+                  // .emoji-picker-popover rule in index.css shrinks emoji-mart to
+                  // fit — it then scrolls its grid internally (nav + search
+                  // pinned) instead of clipping on short screens.
+                  collisionPadding={8}
+                  style={
+                    {
+                      "--emoji-picker-height": `min(420px, calc(var(--radix-popover-content-available-height) - ${displayIcon ? "38px" : "0px"}))`,
+                    } as CSSProperties
+                  }
+                  className="emoji-picker-popover flex max-h-[var(--radix-popover-content-available-height)] w-auto flex-col overflow-hidden p-0"
+                  // The rename Dialog's scroll lock (react-remove-scroll)
+                  // preventDefaults wheel events over the picker — it can't see
+                  // emoji-mart's scroll region inside shadow DOM. Stop the wheel
+                  // from reaching the document-level lock so the grid scrolls.
+                  onWheel={(e) => e.stopPropagation()}
+                  // Nested in the rename Dialog, emoji-mart's own focus handling
+                  // swallows Radix's default outside-pointer dismissal, so a
+                  // click elsewhere in the modal wouldn't close the picker.
+                  // Close it explicitly on any outside interaction.
+                >
+                  {displayIcon ? (
+                    <div className="shrink-0 border-b p-1">
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="w-full justify-start"
+                        data-testid="rename-project-remove-icon"
+                        onClick={() => {
+                          setPendingIcon(null);
+                          setEmojiOpen(false);
+                        }}
+                      >
+                        <Trash2Icon className="size-3.5" />
+                        Remove icon
+                      </Button>
+                    </div>
+                  ) : null}
+                  <EmojiPicker
+                    onSelect={(native) => {
+                      setPendingIcon(native);
+                      setEmojiOpen(false);
+                    }}
+                  />
+                </PopoverContent>
+              </Popover>
+              <input
+                className="w-full bg-transparent px-3 py-2 text-ui outline-none"
+                value={renameValue}
+                onChange={(e) => setRenameValue(e.target.value)}
+              />
+            </div>
+            {iconConfigError && (
               <p className="text-ui text-destructive" role="alert">
-                {(renameProject.error as Error).message}
+                Couldn&apos;t load this project&apos;s icon settings. You can still rename it;
+                changing the icon is unavailable until this loads.
+              </p>
+            )}
+            {(renameProject.isError || updateConfig.isError) && (
+              <p className="text-ui text-destructive" role="alert">
+                {((renameProject.error ?? updateConfig.error) as Error).message}
               </p>
             )}
             <DialogFooter className="border-t-0 bg-transparent">
@@ -3995,16 +4236,17 @@ function ProjectFolderMenu({
                 type="button"
                 variant="ghost"
                 onClick={() => setRenameOpen(false)}
-                disabled={renameProject.isPending}
+                disabled={renameProject.isPending || updateConfig.isPending}
               >
                 Cancel
               </Button>
               <Button
                 type="submit"
                 data-testid="rename-project-confirm"
-                disabled={renameProject.isPending || renameValue.trim() === ""}
+                loading={renameProject.isPending || updateConfig.isPending}
+                disabled={renameValue.trim() === ""}
               >
-                {renameProject.isPending ? "Renaming…" : "Rename"}
+                Confirm
               </Button>
             </DialogFooter>
           </form>
@@ -4049,7 +4291,7 @@ function ProjectFolderMenu({
             <Button
               type="button"
               variant="destructive"
-              disabled={deleteProject.isPending}
+              loading={deleteProject.isPending}
               onClick={() => {
                 deleteProject.mutate(
                   { id: projectId, name: projectName },
@@ -4062,7 +4304,7 @@ function ProjectFolderMenu({
                 );
               }}
             >
-              {deleteProject.isPending ? "Deleting…" : "Delete project"}
+              Delete project
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -4250,16 +4492,20 @@ function BulkActionBar({
   allConversations,
   onDeselectAll,
   onExit,
+  onProjectAssigned,
 }: {
   selectedIds: Set<string>;
   allConversations: Conversation[];
   onDeselectAll: () => void;
   onExit: () => void;
+  onProjectAssigned?: (projectName: string) => void;
 }) {
   const navigate = useNavigate();
   const { conversationId: activeId } = useParams<{ conversationId: string }>();
   const bulkArchive = useBulkArchiveConversations();
   const bulkDelete = useBulkDeleteConversations();
+  const bulkMove = useBulkMoveToProject();
+  const { data: projects = [] } = useProjects();
   const viewerId = useViewerId();
 
   const selectedConversations = useMemo(
@@ -4286,7 +4532,7 @@ function BulkActionBar({
     ownedSelected.length > 0 && (archivedSelected.length === 0 || nonArchivedSelected.length === 0);
 
   const count = selectedIds.size;
-  const isBusy = bulkArchive.isPending || bulkDelete.isPending;
+  const isBusy = bulkArchive.isPending || bulkDelete.isPending || bulkMove.isPending;
 
   // Delete acts only on owned rows, so surface that count on the control when it
   // differs from "N selected" — otherwise a mixed-ownership selection (reachable
@@ -4301,6 +4547,53 @@ function BulkActionBar({
       : "Delete";
 
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
+  const [moveSearch, setMoveSearch] = useState("");
+  // Worktree sessions among the selection each carry one local git branch
+  // (git_branch); the delete modal lists them so each branch can be opted
+  // into cleanup individually. `branchesToDelete` holds the session ids whose
+  // branch the user ticked — default empty (opt-in, matching single-session
+  // delete, since branch deletion is irreversible).
+  const [branchesToDelete, setBranchesToDelete] = useState<Set<string>>(new Set());
+
+  const worktreeSelected = useMemo(
+    () => ownedSelected.filter((c) => c.git_branch),
+    [ownedSelected],
+  );
+  const allBranchesSelected =
+    worktreeSelected.length > 0 && worktreeSelected.every((c) => branchesToDelete.has(c.id));
+  // Drives the header checkbox's indeterminate ([-]) state: some but not all
+  // branches ticked.
+  const someBranchesSelected =
+    !allBranchesSelected && worktreeSelected.some((c) => branchesToDelete.has(c.id));
+
+  function toggleBranch(id: string, checked: boolean) {
+    setBranchesToDelete((prev) => {
+      const next = new Set(prev);
+      if (checked) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  }
+
+  function toggleAllBranches() {
+    setBranchesToDelete(
+      allBranchesSelected ? new Set() : new Set(worktreeSelected.map((c) => c.id)),
+    );
+  }
+
+  function handleMoveToProject(project: string) {
+    const ids = ownedSelected.map((c) => c.id);
+    if (ids.length === 0) return;
+    bulkMove.mutate(
+      { ids, project },
+      {
+        onSuccess: () => {
+          if (project) onProjectAssigned?.(project);
+          onExit();
+        },
+      },
+    );
+  }
 
   function handleArchive() {
     if (nonArchivedSelected.length === 0) return;
@@ -4308,6 +4601,8 @@ function BulkActionBar({
       { ids: nonArchivedSelected.map((c) => c.id), archived: true },
       {
         onSuccess: () => {
+          if (activeId && nonArchivedSelected.some((c) => c.id === activeId))
+            navigate("/", { replace: true });
           onDeselectAll();
         },
       },
@@ -4330,21 +4625,14 @@ function BulkActionBar({
     const ids = ownedSelected.map((c) => c.id);
     if (ids.length === 0) return;
     setConfirmDeleteOpen(false);
-    bulkDelete.mutate(ids, {
-      onSuccess: () => {
-        if (activeId && ids.includes(activeId)) navigate("/", { replace: true });
-        onDeselectAll();
-      },
-      onError: (error) => {
-        if (
-          activeId &&
-          error instanceof BulkConversationMutationError &&
-          error.succeeded.includes(activeId)
-        ) {
-          navigate("/", { replace: true });
-        }
-      },
-    });
+    // The rows leave the sidebar optimistically, so the selection is already
+    // meaningless and the chat surface would be sitting on an id that's about
+    // to 404. Both are settled here rather than in a mutate-level callback:
+    // this bar unmounts with the selection, and callbacks on an unmounted
+    // observer never fire.
+    if (activeId && ids.includes(activeId)) navigate("/", { replace: true });
+    onDeselectAll();
+    bulkDelete.mutate({ ids, deleteBranchIds: branchesToDelete });
   }
 
   return (
@@ -4418,6 +4706,65 @@ function BulkActionBar({
                 <TooltipContent side="bottom">Unarchive</TooltipContent>
               </Tooltip>
             )}
+            <DropdownMenu
+              onOpenChange={(open) => {
+                if (!open) setMoveSearch("");
+              }}
+            >
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-xs"
+                      className="shrink-0"
+                      disabled={isBusy || ownedSelected.length === 0}
+                      aria-label="Move to project"
+                      data-testid="bulk-move-to-project"
+                    >
+                      {bulkMove.isPending ? (
+                        <Loader2Icon className="size-3.5 animate-spin" />
+                      ) : (
+                        <FolderInputIcon className="size-3.5" />
+                      )}
+                    </Button>
+                  </DropdownMenuTrigger>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">Move to project</TooltipContent>
+              </Tooltip>
+              <DropdownMenuContent align="end" className="w-52">
+                <div className="flex items-center gap-2 border-b px-2 py-1.5">
+                  <SearchIcon className="size-3.5 shrink-0 text-muted-foreground" />
+                  <input
+                    className="w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
+                    placeholder="Search projects"
+                    value={moveSearch}
+                    onChange={(e) => setMoveSearch(e.target.value)}
+                    onKeyDown={(e) => e.stopPropagation()}
+                  />
+                </div>
+                <div className="max-h-48 overflow-y-auto">
+                  {(moveSearch
+                    ? projects.filter((p) =>
+                        p.name.toLowerCase().includes(moveSearch.toLowerCase()),
+                      )
+                    : projects
+                  ).map((p) => (
+                    <DropdownMenuItem
+                      key={p.name}
+                      className="px-2 py-1"
+                      onSelect={() => handleMoveToProject(p.name)}
+                    >
+                      <span className="flex-1 truncate text-left">{p.name}</span>
+                    </DropdownMenuItem>
+                  ))}
+                  {projects.length === 0 && (
+                    <p className="px-2 py-1.5 text-sm text-muted-foreground">No projects yet.</p>
+                  )}
+                </div>
+              </DropdownMenuContent>
+            </DropdownMenu>
             <Tooltip>
               <TooltipTrigger asChild>
                 <Button
@@ -4442,15 +4789,23 @@ function BulkActionBar({
           </div>
         </div>
 
-        {(bulkArchive.isError || bulkDelete.isError) && (
+        {(bulkArchive.isError || bulkDelete.isError || bulkMove.isError) && (
           <p className="text-sm text-destructive" role="alert">
             Some actions failed. Retry or dismiss.
           </p>
         )}
       </div>
 
-      <Dialog open={confirmDeleteOpen} onOpenChange={setConfirmDeleteOpen}>
-        <DialogContent>
+      <Dialog
+        open={confirmDeleteOpen}
+        onOpenChange={(open) => {
+          setConfirmDeleteOpen(open);
+          // Reset the branch selection on close so it doesn't carry over to
+          // the next delete.
+          if (!open) setBranchesToDelete(new Set());
+        }}
+      >
+        <DialogContent className="sm:max-w-lg">
           <DialogHeader>
             <DialogTitle>Delete {ownedSelected.length} session(s)?</DialogTitle>
             <DialogDescription>
@@ -4458,15 +4813,78 @@ function BulkActionBar({
               be undone.
             </DialogDescription>
           </DialogHeader>
-          <p className="flex items-start gap-2 rounded-md border border-warning/40 bg-warning/5 p-3 text-sm text-muted-foreground">
-            <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0 text-warning" />
-            Branches are not cleaned up. Use single-session delete for branch surgery.
-          </p>
+          {worktreeSelected.length > 0 && (
+            <div className="flex flex-col gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-3">
+              <p className="text-sm text-muted-foreground">
+                Optionally delete the local git branches for these worktree sessions. These actions
+                are <span className="font-semibold text-destructive">irreversible</span>.
+              </p>
+              <div className="max-h-56 overflow-y-auto">
+                <table className="w-full border-collapse text-left text-ui">
+                  <thead>
+                    <tr className="border-b border-destructive/20 text-sm text-muted-foreground">
+                      <th scope="col" className="w-8 py-1.5 pr-2 font-medium">
+                        <input
+                          type="checkbox"
+                          ref={(el) => {
+                            if (el) el.indeterminate = someBranchesSelected;
+                          }}
+                          checked={allBranchesSelected}
+                          onChange={toggleAllBranches}
+                          aria-label="Select all branches"
+                          data-testid="bulk-delete-branch-toggle-all"
+                          className="mt-1 size-4 shrink-0 accent-destructive"
+                        />
+                      </th>
+                      <th scope="col" className="py-1.5 pr-3 font-medium">
+                        Branch
+                      </th>
+                      <th scope="col" className="py-1.5 font-medium">
+                        Session
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {worktreeSelected.map((c) => (
+                      <tr key={c.id} className="align-top">
+                        <td className="py-2 pr-2">
+                          <input
+                            type="checkbox"
+                            data-testid="bulk-delete-branch-checkbox"
+                            checked={branchesToDelete.has(c.id)}
+                            onChange={(e) => toggleBranch(c.id, e.target.checked)}
+                            aria-label={`Delete branch ${c.git_branch}`}
+                            className="mt-0.5 size-4 shrink-0 cursor-pointer accent-destructive"
+                          />
+                        </td>
+                        <td className="py-2 pr-3">
+                          <span className="flex items-start gap-1.5">
+                            <GitBranchIcon className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
+                            <code className="break-all rounded bg-muted px-1 py-0.5 text-sm">
+                              {c.git_branch}
+                            </code>
+                          </span>
+                        </td>
+                        <td className="py-2 text-sm text-muted-foreground">
+                          <span className="line-clamp-2 break-all">
+                            {conversationDisplayLabel(c)}
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
           <DialogFooter className="border-t-0 bg-transparent">
             <Button
               type="button"
               variant="ghost"
-              onClick={() => setConfirmDeleteOpen(false)}
+              onClick={() => {
+                setConfirmDeleteOpen(false);
+                setBranchesToDelete(new Set());
+              }}
               disabled={bulkDelete.isPending}
             >
               Cancel

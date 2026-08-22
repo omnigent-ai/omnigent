@@ -45,14 +45,13 @@ def _stub_cli_fallback_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.parametrize(
     "key,binary,package",
     [
-        (ANTHROPIC_FAMILY, "claude", "@anthropic-ai/claude-code"),
         (OPENAI_FAMILY, "codex", "@openai/codex"),
         (hi.PI_KEY, "pi", "@earendil-works/pi-coding-agent"),
         (hi.QWEN_KEY, "qwen", "@qwen-code/qwen-code"),
     ],
 )
 def test_install_spec_and_command(key: str, binary: str, package: str) -> None:
-    """Each known harness maps to the ucode-matching binary + npm package.
+    """Each npm-installed harness maps to the ucode-matching binary + package.
 
     A drift in binary/package (e.g. a wrong npm name) would install the wrong
     thing or check the wrong PATH entry — caught here.
@@ -62,6 +61,45 @@ def test_install_spec_and_command(key: str, binary: str, package: str) -> None:
     assert spec.binary == binary
     assert spec.package == package
     assert hi.harness_install_command(key) == ["npm", "install", "-g", package]
+
+
+def test_claude_installs_via_anthropic_native_installer() -> None:
+    """Claude ships via Anthropic's installer, not ``npm install -g``.
+
+    ``package`` must stay ``None``: that is the flag :func:`harness_setup_hint`
+    and the runner's missing-CLI error branch on to name the vendor installer.
+    """
+    spec = hi.harness_install_spec(ANTHROPIC_FAMILY)
+    assert spec is not None
+    assert spec.binary == "claude"
+    assert spec.package is None
+    assert spec.install_hint == "curl -fsSL https://claude.ai/install.sh | bash"
+    assert hi.harness_install_command(ANTHROPIC_FAMILY) == [
+        "bash",
+        "-c",
+        spec.install_hint,
+    ]
+
+
+@pytest.mark.parametrize(
+    "key,expected",
+    [
+        (ANTHROPIC_FAMILY, "curl -fsSL https://claude.ai/install.sh | bash"),
+        (OPENAI_FAMILY, "npm install -g @openai/codex"),
+    ],
+)
+def test_install_display_hides_the_bash_c_wrapper(key: str, expected: str) -> None:
+    """The command shown to a user is runnable as-is, without the ``bash -c``
+    wrapper :func:`harness_install_command` adds for ``subprocess``."""
+    assert hi.harness_install_display(key) == expected
+
+
+def test_claude_setup_hint_names_the_native_installer() -> None:
+    """A machine missing the claude CLI is pointed at the working installer."""
+    hint = hi.harness_setup_hint("claude-native")
+    assert "claude.ai/install.sh" in hint
+    assert "npm" not in hint
+    assert "claude auth login --claudeai" in hint
 
 
 def test_kimi_install_spec_is_login_only_no_npm() -> None:
@@ -137,11 +175,133 @@ def test_cli_probe_timeout_defaults_lenient_but_readiness_passes_short(
     assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
     assert recorded[-1] == 30.0
 
+    # The positive verdict above is now TTL-cached; drop it so the second
+    # call actually probes (this test is about timeout plumbing, and the
+    # cache behavior has its own tests below).
+    hi._LOGIN_PROBE_CACHE.clear()
     assert (
         hi.harness_cli_logged_in(ANTHROPIC_FAMILY, timeout=hi.READINESS_CLI_PROBE_TIMEOUT_S)
         is True
     )
     assert recorded[-1] == hi.READINESS_CLI_PROBE_TIMEOUT_S == 10.0
+
+
+def test_login_probe_caches_positive_verdicts_with_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A logged-in verdict is served from cache until its TTL expires.
+
+    Readiness refreshes across every host daemon exec ``auth status``
+    per pass; without the cache that compounds into a constant ambient
+    subprocess storm on machines with many idle hosts.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/local/bin/{name}")
+    runs: list[list[str]] = []
+
+    def _positive_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        runs.append(argv)
+        return subprocess.CompletedProcess(
+            args=argv, returncode=0, stdout='{"loggedIn": true}', stderr=""
+        )
+
+    monkeypatch.setattr(hi.subprocess, "run", _positive_run)
+
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
+    assert len(runs) == 1, "second call within the TTL must be cache-served"
+
+    # Expire the entry: the next call must probe again.
+    for cache_key in hi._LOGIN_PROBE_CACHE:
+        hi._LOGIN_PROBE_CACHE[cache_key] = 0.0
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
+    assert len(runs) == 2
+
+
+def test_login_probe_never_caches_negative_verdicts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Not-logged-in must re-probe every call.
+
+    The setup wizard confirms a just-completed login via this function; a
+    cached negative would report the fresh login as failed for the TTL.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/local/bin/{name}")
+    runs: list[list[str]] = []
+
+    def _negative_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        runs.append(argv)
+        return subprocess.CompletedProcess(
+            args=argv, returncode=1, stdout='{"loggedIn": false}', stderr=""
+        )
+
+    monkeypatch.setattr(hi.subprocess, "run", _negative_run)
+
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is False
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is False
+    assert len(runs) == 2, "negative verdicts must never be cache-served"
+
+
+def test_logout_invalidates_login_probe_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful logout is confirmed live, not from the cached positive."""
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/local/bin/{name}")
+    logged_in = True
+
+    def _stateful_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal logged_in
+        if "logout" in argv:
+            logged_in = False
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+        body = '{"loggedIn": true}' if logged_in else '{"loggedIn": false}'
+        return subprocess.CompletedProcess(
+            args=argv, returncode=0 if logged_in else 1, stdout=body, stderr=""
+        )
+
+    monkeypatch.setattr(hi.subprocess, "run", _stateful_run)
+
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
+    assert hi.harness_logout(ANTHROPIC_FAMILY) is True, (
+        "logout must invalidate the cached positive and confirm live"
+    )
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is False
+
+
+def test_version_probe_caches_by_binary_signature(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``--version`` parses cache against (path, mtime, size); failures don't.
+
+    The output is a pure function of the binary bytes, so a swap (upgrade)
+    must re-probe and an unchanged binary must never be probed twice.
+    """
+    binary = tmp_path / "fake-cli"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    spec = hi.harness_install_spec(ANTHROPIC_FAMILY)
+    assert spec is not None
+    runs: list[list[str]] = []
+    fail_first = True
+
+    def _version_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        runs.append(argv)
+        if fail_first:
+            raise OSError("scripted probe failure")
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="1.2.3", stderr="")
+
+    monkeypatch.setattr(hi.subprocess, "run", _version_run)
+
+    # A failed probe is not cached — the next call tries again.
+    assert hi._harness_cli_version_string(spec, str(binary)) is None
+    fail_first = False
+    assert hi._harness_cli_version_string(spec, str(binary)) == "1.2.3"
+    assert hi._harness_cli_version_string(spec, str(binary)) == "1.2.3"
+    assert len(runs) == 2, "unchanged binary must be version-cached after one success"
+
+    # Swapping the binary (new mtime/size) must re-probe.
+    binary.write_text("#!/bin/sh\n# upgraded\n", encoding="utf-8")
+    os.utime(binary, ns=(1, 1))
+    assert hi._harness_cli_version_string(spec, str(binary)) == "1.2.3"
+    assert len(runs) == 3
 
 
 def test_cursor_install_spec_is_login_only_no_npm() -> None:
@@ -304,10 +464,13 @@ def test_setup_hint_for_native_kiro_points_at_vendor_installer(harness: str) -> 
     assert "omni setup" not in hint
 
 
-@pytest.mark.parametrize("harness", ["claude-native", "codex", "pi", "claude-sdk", None])
+@pytest.mark.parametrize("harness", ["codex", "pi", "claude-sdk", None])
 def test_setup_hint_defaults_to_omnigent_setup(harness: str | None) -> None:
     """Harnesses whose CLI ``omni setup`` installs (npm CLIs) — and the
-    SDK / unknown / ``None`` cases — route to the ``omni setup`` hint."""
+    SDK / unknown / ``None`` cases — route to the ``omni setup`` hint.
+
+    ``claude-native`` is absent: it names Anthropic's installer instead.
+    """
     hint = hi.harness_setup_hint(harness)
     assert "omni setup" in hint
 
@@ -412,7 +575,7 @@ def test_install_harness_cli_requires_npm(monkeypatch: pytest.MonkeyPatch) -> No
         raise AssertionError("subprocess.run reached despite missing npm")
 
     monkeypatch.setattr(hi.subprocess, "run", _explode)
-    assert hi.install_harness_cli(ANTHROPIC_FAMILY) is False
+    assert hi.install_harness_cli(OPENAI_FAMILY) is False
 
 
 def test_try_install_harness_cli_missing_npm(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -427,9 +590,13 @@ def test_try_install_harness_cli_missing_npm(monkeypatch: pytest.MonkeyPatch) ->
         "run",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not shell out")),
     )
-    installed, reason = hi.try_install_harness_cli(ANTHROPIC_FAMILY)
+    installed, reason = hi.try_install_harness_cli(OPENAI_FAMILY)
     assert installed is False
     assert reason is not None and "npm" in reason
+    # Claude's installer is bash-based, so its reason names bash, not npm.
+    installed, reason = hi.try_install_harness_cli(ANTHROPIC_FAMILY)
+    assert installed is False
+    assert reason is not None and "bash" in reason
 
 
 def test_try_install_harness_cli_manual_only() -> None:
@@ -1109,7 +1276,7 @@ def test_ui_setup_steps_generic_for_non_installable() -> None:
 @pytest.mark.parametrize(
     "key,min_version,max_version_exclusive",
     [
-        (hi.OPENCODE_KEY, "1.17.7", "1.18.0"),
+        (hi.OPENCODE_KEY, "1.17.7", "1.19.0"),
         (hi.CURSOR_KEY, "2026.06.02", None),
         (hi.KIMI_KEY, "0.7.0", None),
         (ANTHROPIC_FAMILY, "2.1.161", None),
@@ -1135,9 +1302,10 @@ def test_versioned_specs_declare_bounds(
     "version,expected",
     [
         ("1.17.6", False),  # below min
-        ("1.18.0", False),  # at max exclusive
+        ("1.19.0", False),  # at max exclusive
         ("2.0.0", False),  # above max
         ("1.17.8", True),  # inside range
+        ("1.18.16", True),  # inside range (1.18.x)
     ],
 )
 def test_harness_cli_installed_checks_version_for_versioned_specs(
@@ -1149,7 +1317,7 @@ def test_harness_cli_installed_checks_version_for_versioned_specs(
 
     def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
         if len(argv) >= 2 and argv[1] == "--version":
-            # OpenCode's supported range is [1.17.7, 1.18.0).
+            # OpenCode's supported range is [1.17.7, 1.19.0).
             return subprocess.CompletedProcess(
                 args=argv, returncode=0, stdout=f"{version}\n", stderr=""
             )

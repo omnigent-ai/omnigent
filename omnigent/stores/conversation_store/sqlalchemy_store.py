@@ -96,6 +96,18 @@ from omnigent.stores.conversation_store import (
 
 _logger = logging.getLogger(__name__)
 
+# Server-side deadline (ms) for the content-search query in
+# ``list_conversations``. Session search matches ``LOWER(search_text) LIKE
+# '%q%'`` across ``conversation_items``; that is index-backed by the pg_trgm
+# GIN index (migration ``d5e9f1a2b3c4``), but if the index is ever missing the
+# scan can run unbounded and — since the query runs in a worker thread — a
+# client disconnect does not stop it. ``SET LOCAL statement_timeout`` caps it so
+# a degraded deployment fails the search fast instead of pinning a DB
+# connection. Postgres-only; ``SET LOCAL`` reverts on commit so it never leaks
+# to the connection's next pooled use. Longer than the client's own
+# ``SEARCH_FETCH_TIMEOUT_MS`` so the browser gives up first on the happy path.
+_SEARCH_STATEMENT_TIMEOUT_MS = 15_000
+
 
 class _RowCountResult(Protocol):
     rowcount: int
@@ -106,6 +118,7 @@ class _RowCountResult(Protocol):
 _SESSION_OVERRIDE_KEYS = (
     "reasoning_effort",
     "model_override",
+    "reported_model",
     "cost_control_mode_override",
     "subagent_routing_override",
     "harness_override",
@@ -197,10 +210,12 @@ def _to_conversation(
         session_usage=session_usage,
         reasoning_effort=overrides["reasoning_effort"],
         model_override=overrides["model_override"],
+        reported_model=overrides["reported_model"],
         cost_control_mode_override=overrides["cost_control_mode_override"],
         subagent_routing_override=overrides["subagent_routing_override"],
         harness_override=overrides["harness_override"],
         sub_agent_name=meta.sub_agent_name if meta else None,
+        task_summary=meta.task_summary if meta else None,
         external_session_id=meta.external_session_id if meta else None,
         # NULL → None; a stored JSON array (e.g. ``"[]"`` or
         # ``'["--foo"]'``) decodes back to a list. ``"[]"`` is a
@@ -572,10 +587,14 @@ def _fetch_search_snippets(
     # workspace_id leads the (workspace_id, conversation_id, position) index.
     # Both the aggregate and the join-back below must include it or Postgres
     # can't use that index and falls back to a full table scan of every item.
+    # ILIKE on the raw column rather than ``lower(search_text) LIKE`` for the
+    # same reason as the content match in ``list_conversations``: the lower()
+    # form matches the pg_trgm index expression, and the planner then scans the
+    # whole workspace even though this is already scoped to one page of ids.
     match_pred = and_(
         SqlConversationItem.workspace_id == workspace_id,
         SqlConversationItem.conversation_id.in_(conversation_ids),
-        func.lower(SqlConversationItem.search_text).like(pattern),
+        SqlConversationItem.search_text.ilike(pattern),
     )
     # Earliest matching position per conversation — a small (conv_id, position)
     # aggregate, no bodies materialized.
@@ -1119,10 +1138,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversationMetadata.id.in_(unique_ids),
                 )
             ).all()
-        # Fork-source label is in the AP DB.
+        # Connectivity markers are in the AP DB. Both signal on presence:
+        # the fork-source label forces an unbound clone to pick a workspace;
+        # the import-source label marks a transcript with no live executor.
         with self._conv_session("get_session_connectivity") as ap_sess:
-            # One pass over the fork-source connectivity marker, which
-            # signals on presence (its value is the source id).
             label_rows = ap_sess.execute(
                 select(
                     SqlConversationLabel.conversation_id,
@@ -1131,17 +1150,21 @@ class SqlAlchemyConversationStore(ConversationStore):
                 ).where(
                     SqlConversationLabel.workspace_id == current_workspace_id(),
                     SqlConversationLabel.conversation_id.in_(unique_ids),
-                    SqlConversationLabel.key.in_([FORK_SOURCE_LABEL_KEY]),
+                    SqlConversationLabel.key.in_([FORK_SOURCE_LABEL_KEY, IMPORT_SOURCE_LABEL_KEY]),
                 )
             ).all()
         needs_workspace_ids = {
             row.conversation_id for row in label_rows if row.key == FORK_SOURCE_LABEL_KEY
+        }
+        imported_ids = {
+            row.conversation_id for row in label_rows if row.key == IMPORT_SOURCE_LABEL_KEY
         }
         return {
             row.id: SessionConnectivity(
                 runner_id=row.runner_id,
                 host_id=row.host_id,
                 needs_workspace=row.id in needs_workspace_ids,
+                imported=row.id in imported_ids,
                 runner_last_seen=row.runner_last_seen,
             )
             for row in meta_rows
@@ -1544,6 +1567,17 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .where(SqlUserDailyCost.day_utc >= since_day_utc)
             ).scalar_one()
             return float(total or 0.0)
+
+    def list_daily_costs(self, user_id: str, since_day_utc: str) -> list[tuple[str, float]]:
+        with self._session("list_daily_costs") as session:
+            rows = session.execute(
+                select(SqlUserDailyCost.day_utc, SqlUserDailyCost.cost_usd)
+                .where(SqlUserDailyCost.workspace_id == current_workspace_id())
+                .where(SqlUserDailyCost.user_id == user_id)
+                .where(SqlUserDailyCost.day_utc >= since_day_utc)
+                .order_by(SqlUserDailyCost.day_utc.asc())
+            ).all()
+            return [(row.day_utc, float(row.cost_usd)) for row in rows]
 
     def get_daily_cost_state(self, user_id: str, day_utc: str) -> dict[str, float]:
         """
@@ -2312,6 +2346,20 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
 
         with self._conv_session("list_conversations") as session:
+            # Bound the content-search scan server-side (Postgres only). SET
+            # LOCAL scopes to this transaction and reverts on commit, so it
+            # can't leak to the connection's next pooled use. See
+            # _SEARCH_STATEMENT_TIMEOUT_MS. A worker-thread query is not stopped
+            # by a client disconnect, so this is the only server-side bound.
+            is_postgres = session.bind is not None and session.bind.dialect.name == "postgresql"
+            if search_query and is_postgres:
+                # Postgres SET does not accept a bind parameter, so the value is
+                # inlined. Safe from injection: it is an int module constant, not
+                # caller input — coerced through int() to keep it that way.
+                session.execute(
+                    text(f"SET LOCAL statement_timeout = {int(_SEARCH_STATEMENT_TIMEOUT_MS)}")
+                )
+
             stmt = select(SqlConversation).where(
                 SqlConversation.workspace_id == current_workspace_id()
             )
@@ -2364,13 +2412,28 @@ class SqlAlchemyConversationStore(ConversationStore):
             if search_query:
                 pattern = f"%{search_query.lower()}%"
                 title_match = func.lower(SqlConversation.title).like(pattern)
-                content_match = SqlConversation.id.in_(
+                # Correlated EXISTS rather than ``id IN (SELECT ...)``: the IN
+                # form is uncorrelated, so the match set is built for the WHOLE
+                # workspace before the outer query discards every row the caller
+                # cannot see. Correlating on conversation_id keeps each probe on
+                # the (workspace_id, conversation_id) index and lets it stop at
+                # the first matching item per conversation.
+                # ``ILIKE`` on the raw column, NOT ``lower(search_text) LIKE``:
+                # the latter matches the ``lower(search_text)`` pg_trgm index
+                # expression, and the planner then prefers that index — scanning
+                # every item in the workspace out of a multi-GB index that does
+                # not fit in shared_buffers. ILIKE is the same case-insensitive
+                # match but cannot use that index, so the probe stays on the
+                # (workspace_id, conversation_id) btree above. Do not "simplify"
+                # this back to lower(...) LIKE; see the covering test.
+                content_match = (
                     select(SqlConversationItem.conversation_id)
                     .where(
                         SqlConversationItem.workspace_id == current_workspace_id(),
-                        func.lower(SqlConversationItem.search_text).like(pattern),
+                        SqlConversationItem.conversation_id == SqlConversation.id,
+                        SqlConversationItem.search_text.ilike(pattern),
                     )
-                    .distinct()
+                    .exists()
                 )
                 stmt = stmt.where(or_(title_match, content_match))
             if project is not None:
@@ -2636,6 +2699,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         _unset_harness_override: bool = False,
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
+        reported_model: str | None = None,
     ) -> Conversation | None:
         """
         Update mutable fields on a conversation.
@@ -2647,10 +2711,15 @@ class SqlAlchemyConversationStore(ConversationStore):
             e.g. ``"high"``. ``None`` leaves unchanged.
         :param _unset_reasoning_effort: When ``True``, clear
             ``reasoning_effort`` to ``None``.
-        :param model_override: Per-session LLM model override,
-            e.g. ``"claude-opus-4-7"``. ``None`` leaves unchanged.
+        :param model_override: Per-session LLM model override — the
+            user's request, e.g. ``"claude-opus-4-7"``. ``None``
+            leaves unchanged.
         :param _unset_model_override: When ``True``, clear
             ``model_override`` to ``None``.
+        :param reported_model: The model the harness last reported the
+            session is actually on, verbatim, e.g.
+            ``"claude-opus-4-8[1m]"``. ``None`` leaves unchanged.
+            No ``_unset`` variant — reports only ever move forward.
         :param cost_control_mode_override: Per-session cost-control
             switch, ``"on"`` or ``"off"``. ``None`` leaves unchanged.
         :param _unset_cost_control_mode_override: When ``True``, clear
@@ -2702,6 +2771,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                 overrides_changed = True
             elif model_override is not None:
                 overrides["model_override"] = model_override
+                overrides_changed = True
+            if reported_model is not None:
+                overrides["reported_model"] = reported_model
                 overrides_changed = True
             if _unset_cost_control_mode_override:
                 overrides["cost_control_mode_override"] = None
@@ -2782,6 +2854,24 @@ class SqlAlchemyConversationStore(ConversationStore):
             if result.rowcount != 1:
                 return None
         # Bulk UPDATE leaves no in-session ORM row to reuse; re-read.
+        return self.get_conversation(conversation_id)
+
+    def set_task_summary(self, conversation_id: str, task_summary: str) -> Conversation | None:
+        """Set a human-readable task summary on a sub-agent conversation."""
+        with self._session("set_task_summary") as session:
+            result = cast(
+                _RowCountResult,
+                session.execute(
+                    update(SqlConversationMetadata)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id == conversation_id,
+                    )
+                    .values(task_summary=task_summary)
+                ),
+            )
+            if result.rowcount != 1:
+                return None
         return self.get_conversation(conversation_id)
 
     def set_runner_id(self, conversation_id: str, runner_id: str) -> bool:

@@ -66,7 +66,9 @@ def test_import_command_loads_local_session_and_posts_normalized_items(tmp_path:
 
     assert result.exit_code == 0, result.output
     assert "import" in _CLICK_SUBCOMMANDS
-    assert "conv_imported" in result.output
+    # The output surfaces the session's browser URL, not the bare id, so the
+    # user can open the import straight into the web (resume picker).
+    assert f"{_BASE}/c/conv_imported" in result.output
     request = route.calls.last.request
     payload = json.loads(request.content)
     assert payload == {

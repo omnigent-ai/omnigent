@@ -132,26 +132,144 @@ describe("BlockRenderer dispatch", () => {
       },
     ];
 
-    const { container } = render(<BlockRenderer items={items} sessionStatus="idle" />);
+    render(<BlockRenderer items={items} sessionStatus="idle" />);
 
-    const alert = screen.getByRole("alert");
-    expect(alert).toHaveClass("min-w-0");
-    expect(alert).toHaveClass("overflow-hidden");
+    const toggle = screen.getByRole("button", { name: /terminal exited unexpectedly/i });
+    const pill = toggle.parentElement!.parentElement as HTMLElement;
+    expect(pill).toHaveClass("w-[560px]", "max-w-full");
 
-    const description = container.querySelector('[data-slot="alert-description"]');
-    expect(description).not.toBeNull();
-    expect(description).toHaveClass("min-w-0");
-    expect(description).toHaveClass("overflow-hidden");
+    fireEvent.click(toggle);
+    const expandedRegion = screen
+      .getByTestId("error-message-content")
+      .closest("section")?.parentElement;
+    expect(expandedRegion).not.toBeNull();
+    expect(expandedRegion).toHaveClass("min-w-0");
+    expect(expandedRegion).toHaveClass("overflow-hidden");
 
-    const messageNode = screen.getByText(/Required terminal exited unexpectedly/);
+    const messageNode = screen.getByTestId("error-message-content");
     expect(messageNode).toHaveClass("whitespace-pre-wrap");
     expect(messageNode).toHaveClass("break-words");
-    expect(messageNode.textContent).toContain(
-      "Lifecycle diagnostics:\nterminal: required-runtime:main",
+    expect(messageNode.textContent).toContain("Required terminal exited unexpectedly");
+    expect(messageNode.textContent).not.toContain("terminal: required-runtime:main");
+
+    fireEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+    expect(screen.getByTestId("error-diagnostics-content").textContent).toContain(
+      "terminal: required-runtime:main",
     );
-    expect(messageNode.textContent).toContain(
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Last captured output" }));
+    expect(screen.getAllByTestId("error-diagnostics-content").at(-1)?.textContent).toContain(
       "  - first diagnostic line\n  - second diagnostic line",
     );
+  });
+
+  it("suppresses the runner's unavailable last-output diagnostics tab", () => {
+    const items: RenderItem[] = [
+      {
+        kind: "error",
+        itemId: null,
+        source: "execution",
+        code: "required_terminal_exited",
+        message: [
+          "Required terminal exited unexpectedly; the session runtime is no longer available.",
+          "Terminal diagnostics:",
+          "terminal: required-runtime:main",
+          "Last captured terminal output: unavailable. The process exited before Omnigent captured a pane snapshot.",
+        ].join("\n"),
+      },
+    ];
+
+    render(<BlockRenderer items={items} sessionStatus="idle" />);
+    fireEvent.click(screen.getByRole("button", { name: /terminal exited unexpectedly/i }));
+    fireEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+    expect(screen.queryByRole("tab", { name: "Last captured output" })).toBeNull();
+    expect(screen.getByTestId("error-diagnostics-content")).toHaveTextContent(
+      "terminal: required-runtime:main",
+    );
+  });
+
+  it("renders a friendly failure card when the error is classified", () => {
+    const items: RenderItem[] = [
+      {
+        kind: "error",
+        itemId: null,
+        source: "",
+        code: "required_terminal_exited",
+        title: "Claude Code can't run as root",
+        cause:
+          "The agent terminal exited immediately because Claude Code refuses the flag as root.",
+        remediation: "Run the host as a non-root user (uid != 0).",
+        message: "Claude Code can't run as root\n\nTerminal diagnostics:\ncommand: claude",
+      },
+    ];
+
+    render(<BlockRenderer items={items} sessionStatus="idle" />);
+
+    // Headline is the friendly title, not the raw code.
+    expect(screen.getByText("Claude Code can't run as root")).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: /Claude Code can't run as root/i }));
+    // Cause is shown in plain English.
+    expect(screen.getByText(/refuses the flag as root/)).toBeDefined();
+    // Remediation is surfaced.
+    expect(screen.getByText(/Run the host as a non-root user/)).toBeDefined();
+    // Raw diagnostics are folded away behind a nested disclosure.
+    expect(screen.getByRole("button", { name: "View diagnostics" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    // The raw enum is NOT the visible headline.
+    expect(screen.queryByText(/Error · required_terminal_exited/)).toBeNull();
+  });
+
+  it("forwards retryable errors once without inventing input replay", async () => {
+    let resolveRetry: (() => void) | undefined;
+    const onRetryError = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveRetry = resolve;
+        }),
+    );
+    const item: Extract<RenderItem, { kind: "error" }> = {
+      kind: "error",
+      itemId: null,
+      source: "execution",
+      code: "required_terminal_exited",
+      message: "Terminal stopped",
+    };
+
+    render(<BlockRenderer items={[item]} sessionStatus="idle" onRetryError={onRetryError} />);
+    const retry = screen.getByRole("button", { name: "Retry" });
+    fireEvent.click(retry);
+    fireEvent.click(retry);
+
+    expect(onRetryError).toHaveBeenCalledTimes(1);
+    expect(onRetryError).toHaveBeenCalledWith(item);
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent(/^Reconnecting$/);
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    resolveRetry?.();
+    await waitFor(() => {
+      expect(screen.queryByRole("status")).toBeNull();
+      expect(screen.queryByRole("alert")).toBeNull();
+    });
+  });
+
+  it("falls back to a code→sentence description for an unclassified failure", () => {
+    const items: RenderItem[] = [
+      {
+        kind: "error",
+        itemId: null,
+        source: "",
+        code: "runner_error",
+        message: "",
+      },
+    ];
+
+    render(<BlockRenderer items={items} sessionStatus="idle" />);
+
+    // Even with an empty message, the known code reads as an English headline
+    // instead of the raw enum.
+    expect(screen.getByText("Something went wrong setting up the turn on the host.")).toBeDefined();
+    expect(screen.queryByText(/runner_error/)).toBeNull();
   });
 
   it("treats a trailing reasoning item as streaming when sessionStatus is running", () => {
@@ -1040,7 +1158,7 @@ describe("BlockRenderer dispatch", () => {
   describe("math rendering", () => {
     it("normalizes explicit TeX delimiters outside code", () => {
       expect(normalizeExplicitMathDelimiters(String.raw`中文 \(\sqrt{x}\) 文本`)).toBe(
-        String.raw`中文 $\sqrt{x}$ 文本`,
+        String.raw`中文 $$\sqrt{x}$$ 文本`,
       );
       expect(normalizeExplicitMathDelimiters(String.raw`\[\sqrt{x}\]`)).toBe(
         String.raw`$$\sqrt{x}$$`,
@@ -1061,8 +1179,8 @@ describe("BlockRenderer dispatch", () => {
     });
 
     it("does not convert delimiters already inside a dollar-math span", () => {
-      const inline = String.raw`$\[x\]$`;
-      expect(normalizeExplicitMathDelimiters(inline)).toBe(inline);
+      const span = String.raw`$$\[x\]$$`;
+      expect(normalizeExplicitMathDelimiters(span)).toBe(span);
     });
 
     it("skips normalization inside multi-backtick inline code", () => {
@@ -1070,16 +1188,12 @@ describe("BlockRenderer dispatch", () => {
       expect(normalizeExplicitMathDelimiters(doubleTick)).toBe(doubleTick);
     });
 
-    it("escapes currency dollar amounts so prose isn't parsed as inline math", () => {
-      // With single-dollar math enabled, "it costs $5 or $10" would otherwise
-      // parse "5 or " as inline math. Escaping the digit-led `$` renders literal
-      // dollar figures and stops the run from flipping the math toggle.
-      expect(normalizeExplicitMathDelimiters("it costs $5 or $10")).toBe(
-        String.raw`it costs \$5 or \$10`,
-      );
-      // Delimiters after the currency text still normalize — the toggle didn't flip.
+    it("leaves prose dollar amounts verbatim", () => {
+      expect(normalizeExplicitMathDelimiters("it costs $5 or $10")).toBe("it costs $5 or $10");
+      // Delimiters after the currency text still normalize — the lone `$` didn't
+      // flip the math-span toggle.
       expect(normalizeExplicitMathDelimiters(String.raw`$5 then \(x\)`)).toBe(
-        String.raw`\$5 then $x$`,
+        String.raw`$5 then $$x$$`,
       );
     });
 
@@ -1116,6 +1230,30 @@ describe("BlockRenderer dispatch", () => {
         expect(source).toContain('import "streamdown/styles.css"');
       }
       expect(indexCss).toContain('@source "../node_modules/streamdown/dist/*.js"');
+    });
+
+    it("renders prose dollars as literal text, not math", async () => {
+      // `$/PR` and `$/session` are the shape that broke: a `$` before a slash is
+      // neither currency-with-a-digit nor a SCREAMING_CASE variable, so the old
+      // escaping heuristics missed them and single-dollar math paired them up,
+      // rendering the words between as letter-by-letter math soup.
+      const prose = "Costs $/PR versus $/session, a 60% saving on $LLM_API_KEY calls.";
+      const { container } = renderMarkdownText(prose);
+
+      await waitFor(() => expect(container.textContent).toContain("60%"));
+      expect(container.querySelector(".katex")).toBeNull();
+      expect(container.textContent).toContain(prose);
+    });
+
+    it("renders an explicit inline TeX span inline, not as a display block", async () => {
+      // `\(…\)` normalizes to `$$…$$`, which is a display block only when it
+      // opens its own line; mid-paragraph it must stay inline math.
+      const { container } = renderMarkdownText(String.raw`the value \(\sqrt{x + 1}\) holds`);
+
+      await waitFor(() => expect(container.querySelector(".katex")).not.toBeNull());
+      expect(container.querySelector(".katex-display")).toBeNull();
+      expect(container.textContent).toContain("the value");
+      expect(container.textContent).toContain("holds");
     });
 
     it("renders radicals, fractions, and superscripts without dropping the radicand", async () => {

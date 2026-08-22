@@ -6,10 +6,13 @@ import {
   UI_MODE_TERMINAL_VALUE,
   WRAPPER_LABEL_KEY,
   isFullySupportedNativeCodingAgent,
+  isNativePolicyName,
   isNativeTerminalSession,
   isNativeWrapper,
   isRecentHarness,
+  nativeAgentHasCapability,
   nativeCodingAgentForHarness,
+  nativeCodingAgentForPolicyName,
   nativeCodingAgentForSubagentWrapper,
   nativeWrapperLabelsForAgent,
 } from "./nativeCodingAgents";
@@ -71,6 +74,20 @@ describe("nativeCodingAgentForHarness", () => {
     );
   });
 
+  // agy's only pre-emptive control is the all-or-nothing bypass, so it must
+  // declare `skipPermissions` and NOT Claude's graded `permissionMode` — the
+  // latter would emit `--permission-mode <mode>`, a flag agy does not accept.
+  it("gives antigravity-native the skipPermissions capability, not permissionMode", () => {
+    const agy = nativeCodingAgentForHarness("antigravity-native");
+    expect(agy?.capabilities).toEqual(["skipPermissions"]);
+    expect(
+      nativeAgentHasCapability({ name: "antigravity-native-ui", harness: null }, "skipPermissions"),
+    ).toBe(true);
+    expect(
+      nativeAgentHasCapability({ name: "antigravity-native-ui", harness: null }, "permissionMode"),
+    ).toBe(false);
+  });
+
   it("leaves unknown / non-native harnesses unresolved", () => {
     expect(nativeCodingAgentForHarness("claude-sdk")).toBeUndefined();
     // The in-process Antigravity SDK harness is not a native CLI wrapper.
@@ -115,6 +132,9 @@ describe("nativeCodingAgentForSubagentWrapper", () => {
     );
     expect(nativeCodingAgentForSubagentWrapper("opencode-native-ui-subagent")?.displayName).toBe(
       "OpenCode",
+    );
+    expect(nativeCodingAgentForSubagentWrapper("antigravity-native-ui-subagent")?.displayName).toBe(
+      "Antigravity",
     );
   });
 
@@ -219,5 +239,45 @@ describe("isRecentHarness", () => {
     expect(isRecentHarness({ name: "polly", harness: "claude-sdk" }, ["claude-sdk"])).toBe(false);
     expect(isRecentHarness(null, ["pi-native"])).toBe(false);
     expect(isRecentHarness(pi, ["not-a-harness"])).toBe(false);
+  });
+});
+
+describe("nativeCodingAgentForPolicyName", () => {
+  // Every synthetic stamp the server bridges currently emit, so a renamed
+  // prefix on either side fails here rather than leaking the id to the UI.
+  it.each([
+    ["claude_native_permission", "Claude Code"],
+    ["codex_native_command_approval", "Codex"],
+    ["codex_native_apply_patch_approval", "Codex"],
+    ["cursor_native_permission", "Cursor"],
+    ["agy_native_permission", "Antigravity"],
+    ["agy_native_ask_question", "Antigravity"],
+    ["kiro_native_permission", "Kiro"],
+    ["goose_native_permission", "Goose"],
+    ["qwen_native_permission", "Qwen Code"],
+    ["hermes_native_permission", "Hermes"],
+  ])("maps %s to %s", (policyName, displayName) => {
+    expect(nativeCodingAgentForPolicyName(policyName)?.displayName).toBe(displayName);
+  });
+
+  it("has no vendor for user-authored policy names", () => {
+    expect(nativeCodingAgentForPolicyName("approve_shell_commands")).toBeUndefined();
+    expect(nativeCodingAgentForPolicyName("native_permission")).toBeUndefined();
+  });
+});
+
+describe("isNativePolicyName", () => {
+  it("is true for vendor stamps and the vendor-less fallback", () => {
+    expect(isNativePolicyName("claude_native_permission")).toBe(true);
+    expect(isNativePolicyName("agy_native_permission")).toBe(true);
+    expect(isNativePolicyName("native_permission")).toBe(true);
+  });
+
+  it("is false for user-authored policy names", () => {
+    expect(isNativePolicyName("approve_shell_commands")).toBe(false);
+    // A policy of one's own may still mention a vendor; only the bridges'
+    // `<vendor>_native_` shape counts as provenance.
+    expect(isNativePolicyName("codex_review_gate")).toBe(false);
+    expect(isNativePolicyName("")).toBe(false);
   });
 });

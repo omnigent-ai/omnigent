@@ -15,6 +15,7 @@ import type { MessageContentBlock } from "./blocks";
 import type { McpServerStartup } from "./events";
 import { authenticatedFetch } from "./identity";
 import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
+import { setSessionHost } from "./sessionHost";
 import type {
   ModelUsage,
   NativeModelOption,
@@ -72,6 +73,10 @@ export interface PostEventResponse {
    * events.
    */
   pendingId?: string;
+  /** True only when retry performed a usable runner or terminal recovery. */
+  recovered?: boolean;
+  /** Machine-readable recovery outcome for retry_session control events. */
+  recovery?: "already_connected" | "native_terminal_ready" | "runner_relaunched";
 }
 
 /**
@@ -133,6 +138,12 @@ interface SessionResponseWire {
   labels?: Record<string, string>;
   /** Canonical working directory; ``null`` when unbound. */
   workspace?: string | null;
+  /**
+   * Native-terminal CLI args the session launched with, e.g.
+   * ``["--permission-mode", "plan"]``. Records only the LAUNCH flags —
+   * a later mode switch is reflected in `labels`, not here.
+   */
+  terminal_launch_args?: string[] | null;
   /** Worktree branch; ``null`` when the session uses no worktree. */
   git_branch?: string | null;
   items?: SessionItem[];
@@ -158,7 +169,13 @@ interface SessionResponseWire {
    * `total_cost_usd`). Absent/`null` when no per-model usage was recorded.
    */
   usage_by_model?: Record<string, ModelUsageWire> | null;
-  last_task_error?: { code: string; message: string } | null;
+  last_task_error?: {
+    code: string;
+    message: string;
+    title?: string;
+    cause?: string;
+    remediation?: string;
+  } | null;
   /**
    * Outstanding `response.elicitation_request` event dicts at the
    * moment the snapshot was built. The live SSE stream has no
@@ -278,6 +295,9 @@ function usageByModelFromWire(
 }
 
 function sessionFromWire(wire: SessionResponseWire): Session {
+  // Record the session's host so slice-key routing (turn dispatch, terminal
+  // attach) can pin to the replica holding that host's runner tunnel.
+  setSessionHost(wire.id, wire.host_id);
   return {
     id: wire.id,
     agentId: wire.agent_id,
@@ -291,6 +311,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     title: wire.title ?? null,
     labels: wire.labels,
     workspace: wire.workspace ?? null,
+    terminalLaunchArgs: wire.terminal_launch_args ?? null,
     gitBranch: wire.git_branch ?? null,
     items: wire.items ?? [],
     queuedItems: wire.queued_items,
@@ -357,13 +378,25 @@ export class ApiError extends Error {
  * server's `error.message` / `error.code` over the bare status line.
  * Falls back to ``"<status> <statusText>"`` when the body is missing or
  * not the AP error shape.
+ *
+ * Routes that raise FastAPI's `HTTPException` directly (the upload route's
+ * 415/413, the 501 "not configured" guards) serialize as `{"detail": "…"}`
+ * instead, so that shape is read too — otherwise those failures reach the
+ * user as a bare status line ("415 ", with statusText empty over HTTP/2)
+ * rather than the reason the server actually gave.
  */
-async function apiErrorFromResponse(res: Response): Promise<ApiError> {
-  let message = `${res.status} ${res.statusText}`;
+export async function apiErrorFromResponse(res: Response): Promise<ApiError> {
+  let message = `${res.status} ${res.statusText}`.trim();
   let code: string | null = null;
   try {
-    const body = (await res.json()) as { error?: { code?: string; message?: string } };
+    const body = (await res.json()) as {
+      error?: { code?: string; message?: string };
+      detail?: unknown;
+    };
+    // FastAPI's validation errors put a list in `detail`; only a plain
+    // string is a message meant for the user.
     if (body.error?.message) message = body.error.message;
+    else if (typeof body.detail === "string" && body.detail) message = body.detail;
     if (body.error?.code) code = body.error.code;
   } catch {
     // Non-JSON / empty body — keep the status-line fallback.
@@ -376,12 +409,16 @@ function postEventResponseFromWire(wire: {
   item_id?: string;
   denied?: boolean;
   pending_id?: string;
+  recovered?: boolean;
+  recovery?: PostEventResponse["recovery"];
 }): PostEventResponse {
   return {
     queued: wire.queued,
     itemId: wire.item_id,
     denied: wire.denied,
     pendingId: wire.pending_id,
+    recovered: wire.recovered,
+    recovery: wire.recovery,
   };
 }
 
@@ -653,6 +690,14 @@ export async function updateSession(
     reasoningEffort?: string | null;
     modelOverride?: string | null;
     codexPlanMode?: boolean;
+    /**
+     * Claude-native permission mode to switch a RUNNING session to, e.g.
+     * `"auto"`. Rejected by the server unless it's shift+tab-reachable
+     * (see `CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES`), and the PATCH
+     * fails if the live TUI didn't actually land on it — so a resolved
+     * promise means the mode really changed.
+     */
+    claudePermissionMode?: string;
     costControlModeOverride?: "on" | "off" | null;
     subagentRoutingOverride?: "on" | "off" | null;
     runnerId?: string;
@@ -669,6 +714,9 @@ export async function updateSession(
   }
   if (updates.codexPlanMode !== undefined) {
     body.collaboration_mode = updates.codexPlanMode ? "plan" : "default";
+  }
+  if (updates.claudePermissionMode !== undefined) {
+    body.permission_mode = updates.claudePermissionMode;
   }
   if ("costControlModeOverride" in updates) {
     body.cost_control_mode_override = updates.costControlModeOverride ?? null;
@@ -891,6 +939,8 @@ export async function postEvent(
       item_id?: string;
       denied?: boolean;
       pending_id?: string;
+      recovered?: boolean;
+      recovery?: PostEventResponse["recovery"];
     },
   );
 }
@@ -941,6 +991,11 @@ export function interrupt(sessionId: string): Promise<PostEventResponse> {
  */
 export function stopSession(sessionId: string): Promise<PostEventResponse> {
   return postEvent(sessionId, { type: "stop_session", data: {} });
+}
+
+/** Reconnect or relaunch the existing runner without replaying user input. */
+export function retrySession(sessionId: string): Promise<PostEventResponse> {
+  return postEvent(sessionId, { type: "retry_session", data: {} });
 }
 
 /**

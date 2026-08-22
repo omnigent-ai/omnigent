@@ -1,4 +1,4 @@
-"""Tests for Codex, Claude, and Antigravity terminal runtime behavior."""
+"""Tests for Codex, Claude, Antigravity, and Kimi terminal runtime behavior."""
 
 from __future__ import annotations
 
@@ -1421,14 +1421,11 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
     assert launched_sandbox is not None and launched_sandbox.type == "none"
     assert launch_captured["parent_os_env"] is codex_os_env
 
-    # This fake app-server reports no codex version (an unparseable / failed
-    # probe). The argv flag requires a positively parsed version: on a
-    # pre-0.131 codex an unknown flag aborts argv parsing outright, which is
-    # strictly worse than the recoverable trust prompt. (The app-server's
-    # hooks-file gate keeps the opposite "unknown = supported" policy, since
-    # an unsupported hooks file is only ignored.)
+    # A transient / unparseable version probe must not strand a runner-owned
+    # session behind Codex's terminal-only hook review screen. Omnigent's
+    # supported Codex floor is newer than the release that added this flag.
     assert app_server.codex_cli_version is None
-    assert "--dangerously-bypass-hook-trust" not in launch_captured["spec"].args
+    assert launch_captured["spec"].args[0] == "--dangerously-bypass-hook-trust"
 
 
 @pytest.mark.asyncio
@@ -1744,6 +1741,8 @@ async def _run_antigravity_auto_create(
     pane: tuple[Path, str] | None = None,
     pane_scoped_port: int | None = None,
     pane_agy_found: bool = True,
+    lsof_attributes_ports: bool = False,
+    build_agy_launch_calls: list[dict[str, Any]] | None = None,
 ) -> tuple[Any, list[tuple[int, str]], list[dict[str, Any]], list[tuple[str, dict[str, Any]]]]:
     """
     Drive ``_auto_create_antigravity_terminal`` with every live collaborator faked.
@@ -1773,6 +1772,10 @@ async def _run_antigravity_auto_create(
     :param pane_agy_found: Whether the pane-scoped resolver found our agy in the
         pane subtree. ``True`` + a port → scoped (state 1); ``True`` + no port →
         candidate fallback (state 2); ``False`` → keep polling (state 3).
+    :param build_agy_launch_calls: When provided, every kwargs dict passed to the
+        stubbed ``build_agy_launch`` is appended here so a test can assert what
+        the auto-create path forwards (e.g. snapshot ``terminal_launch_args`` →
+        ``extra_args``).
     :returns: ``(bridge_state_after, start_cascade_calls, reader_calls,
         external_session_id_patch_calls)``.
     """
@@ -1790,9 +1793,12 @@ async def _run_antigravity_auto_create(
     monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
 
     # No-op the launch builder + onboarding seed so nothing tries to find agy.
-    monkeypatch.setattr(
-        launch_mod, "build_agy_launch", lambda **_kwargs: (("agy",), {"AGY_ENV": "1"})
-    )
+    def _fake_build_agy_launch(**kwargs: Any) -> tuple[tuple[str, ...], dict[str, str]]:
+        if build_agy_launch_calls is not None:
+            build_agy_launch_calls.append(kwargs)
+        return (("agy",), {"AGY_ENV": "1"})
+
+    monkeypatch.setattr(launch_mod, "build_agy_launch", _fake_build_agy_launch)
     monkeypatch.setattr(bridge_mod, "ensure_agy_onboarding_complete", lambda: None)
     # Auto-create now spawns the RPC reader (NOT the transcript forwarder); stub
     # ``supervise_reader`` at its definition module (the helper imports it lazily)
@@ -1833,6 +1839,10 @@ async def _run_antigravity_auto_create(
 
     monkeypatch.setattr(runner_app_mod, "_agy_cold_start_poll_sleep", _no_sleep)
     monkeypatch.setattr(rpc_mod, "_candidate_agy_rpc_ports", lambda: list(candidate_ports))
+    # Pinned so the cold-start's state-2 branch never reads the HOST's process
+    # table: default False models restricted /proc (attribution impossible for
+    # anyone), where the lone candidate really is ours.
+    monkeypatch.setattr(rpc_mod, "_can_attribute_any_agy_port", lambda: lsof_attributes_ports)
     monkeypatch.setattr(
         rpc_mod,
         "get_available_models",
@@ -1842,6 +1852,16 @@ async def _run_antigravity_auto_create(
 
     def _fake_start_cascade(port: int, cascade_id: str, **_kwargs: Any) -> None:
         start_cascade_calls.append((port, cascade_id))
+        # Mirror real agy: the conversation db is written into the Gemini dir of
+        # whichever agy served the call. These fixtures model OUR agy answering,
+        # so it lands in our bridge — which is the cold-start's ownership proof.
+        convs = (
+            bridge_mod.agy_gemini_dir(bridge_mod.bridge_dir_for_bridge_id(session_id))
+            / "antigravity-cli"
+            / "conversations"
+        )
+        convs.mkdir(parents=True, exist_ok=True)
+        (convs / f"{cascade_id}.db").write_bytes(b"")
 
     monkeypatch.setattr(rpc_mod, "start_cascade", _fake_start_cascade)
 
@@ -1943,6 +1963,136 @@ async def test_auto_create_antigravity_cold_starts_real_conversation(
     assert patch_calls == []  # cold-start no longer records the phantom cascade (#2 data-loss)
     # The RPC reader spawns (it replaced the transcript forwarder).
     assert len(reader_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_auto_create_antigravity_forwards_launch_args_to_agy_argv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Snapshot ``terminal_launch_args`` reach ``build_agy_launch`` as ``extra_args``.
+
+    This is the seam the server-derived bypass flag rides: a named
+    antigravity-native sub-agent with ``permission_mode: bypassPermissions``
+    persists ``["--dangerously-skip-permissions"]`` on the session, and the
+    runner's auto-create must forward it verbatim into the agy argv (with the
+    web-attended stance kept: ``permission_mode=None`` / ``headless=False`` so
+    bypass comes ONLY from the pass-through args). A failure means the derived
+    flag is dropped and the worker parks on approval cards.
+    """
+    launch_calls: list[dict[str, Any]] = []
+    await _run_antigravity_auto_create(
+        tmp_path,
+        monkeypatch,
+        session_id="82b5f9222c7ac0f45ba2736b57b51f77",
+        snapshot={"terminal_launch_args": ["--dangerously-skip-permissions"]},
+        candidate_ports=[52549],
+        build_agy_launch_calls=launch_calls,
+    )
+    assert len(launch_calls) == 1
+    call = launch_calls[0]
+    assert call["extra_args"] == ("--dangerously-skip-permissions",)
+    # Bypass must come only from the pass-through args on this attended path.
+    assert call["permission_mode"] is None
+    assert call["headless"] is False
+
+
+@pytest.mark.asyncio
+async def test_auto_create_kimi_forwards_launch_args_to_kimi_argv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Snapshot ``terminal_launch_args`` reach the launched kimi argv.
+
+    This is the seam the server-derived ``--yolo`` rides: a named kimi-native
+    sub-agent with ``yolo: true`` persists ``["--yolo"]`` on the session, and
+    the runner's auto-create must append it verbatim to the bare ``kimi`` TUI
+    command. A failure means the derived flag is dropped, the worker launches
+    as plain ``kimi``, and every risky tool call parks on an approval prompt
+    no headless pane can answer.
+    """
+    import omnigent.kimi_native as kimi_mod
+    import omnigent.kimi_native_credentials as kimi_creds_mod
+    import omnigent.kimi_native_forwarder as kimi_fwd_mod
+    from omnigent import kimi_native_bridge as kimi_bridge_mod
+    from omnigent.runner import app as runner_app_mod
+    from omnigent.runner.app import _auto_create_kimi_terminal
+    from omnigent.runner.resource_registry import KIMI_NATIVE_TERMINAL_ROLE
+
+    session_id = "92c6f9222c7ac0f45ba2736b57b51f88"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(kimi_bridge_mod, "_BRIDGE_ROOT", tmp_path / "kimi-native")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(kimi_mod, "resolve_kimi_executable", lambda: "/fake/bin/kimi")
+    # Keep the session-home build off the user's real kimi config.
+    monkeypatch.setattr(
+        kimi_creds_mod,
+        "build_kimi_session_home",
+        lambda session_home, **_kwargs: {"KIMI_CODE_HOME": str(session_home)},
+    )
+
+    async def _sleeping_forwarder(**_kwargs: Any) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(kimi_fwd_mod, "supervise_kimi_forwarder", _sleeping_forwarder)
+
+    snapshot = {"workspace": str(workspace), "terminal_launch_args": ["--yolo"]}
+
+    class _SnapshotServerClient:
+        """Server client returning the persisted session snapshot."""
+
+        async def get(self, url: str, **_kwargs: Any) -> httpx.Response:
+            assert url == f"/v1/sessions/{session_id}"
+            return httpx.Response(200, json=snapshot, request=httpx.Request("GET", url))
+
+    launched_specs: list[Any] = []
+
+    class _FakeResourceRegistry:
+        """Resource registry that records the required-terminal launch spec."""
+
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            *,
+            resource_role: str | None = None,
+            **_kwargs: Any,
+        ) -> SessionResourceView:
+            assert terminal_name == "kimi"
+            assert session_key == "main"
+            assert resource_role == KIMI_NATIVE_TERMINAL_ROLE
+            launched_specs.append(spec)
+            return SessionResourceView(
+                id="terminal_kimi_main",
+                type="terminal",
+                session_id=session_id,
+                name="Kimi",
+            )
+
+    try:
+        await _auto_create_kimi_terminal(
+            session_id,
+            cast(SessionResourceRegistry, _FakeResourceRegistry()),
+            lambda _sid, _event: None,
+            server_client=cast(httpx.AsyncClient, _SnapshotServerClient()),
+        )
+        await asyncio.sleep(0)
+    finally:
+        await runner_app_mod._cancel_auto_forwarder_task(session_id)
+
+    assert len(launched_specs) == 1
+    spec = launched_specs[0]
+    # Bare ``kimi`` plus the persisted pass-through args, verbatim.
+    assert spec.command == "/fake/bin/kimi"
+    assert spec.args == ["--yolo"]
 
 
 @pytest.mark.asyncio
@@ -2074,6 +2224,44 @@ async def test_auto_create_antigravity_cold_start_falls_back_when_port_unattribu
 
 
 @pytest.mark.asyncio
+async def test_auto_create_antigravity_cold_start_waits_out_our_agy_boot_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pane agy present but not listening yet, on a host with ANOTHER live agy.
+
+    The real-world race: the cold-start fires ~250ms after tmux exec-s agy, so
+    agy IS in the pane subtree (``agy_found=True``) but has not bound its
+    connect-RPC listener. lsof works fine here — it attributes a port for an
+    OLDER agy (52548) — so the missing port means still-booting, not
+    unattributable.
+
+    Binding 52548 would StartCascade inside that other session's agy: the reader
+    then adopts ITS active cascade, so the user's new chat mirrors an existing
+    conversation while their own agy is orphaned. The cold-start must instead
+    time out and leave the placeholder for the reader to resolve.
+    """
+    session_id = "0c1e4c0f6a3b45a2b19d0e6d5c4b3a29"
+    state, start_cascade_calls, _reader_calls, patch_calls = await _run_antigravity_auto_create(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+        snapshot={},
+        candidate_ports=[52548],  # a FOREIGN agy, the only one listening
+        pane=(tmp_path / "agy.sock", "main"),
+        pane_agy_found=True,  # our agy is exec-ed...
+        pane_scoped_port=None,  # ...but has not bound its port yet
+        lsof_attributes_ports=True,  # lsof works here → still-booting, not restricted
+    )
+    assert start_cascade_calls == [], "must not StartCascade onto a foreign agy"
+    assert patch_calls == []
+    assert state is not None
+    assert bridge_mod_is_placeholder(state.conversation_id), (
+        "the placeholder must survive so the reader binds our own agy's conversation"
+    )
+
+
+@pytest.mark.asyncio
 async def test_auto_create_antigravity_resume_skips_cold_start(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2191,6 +2379,9 @@ async def test_cold_start_agy_conversation_waits_for_model_readiness(
         ),
     )
 
+    convs = bridge_mod.agy_gemini_dir(bridge_dir) / "antigravity-cli" / "conversations"
+    convs.mkdir(parents=True, exist_ok=True)
+
     events: list[tuple[str, object]] = []
     catalogs = iter(
         [
@@ -2213,6 +2404,9 @@ async def test_cold_start_agy_conversation_waits_for_model_readiness(
 
     def _start(port: int, cascade_id: str) -> None:
         events.append(("start", (port, cascade_id)))
+        # Mirror real agy: the conversation db lands in the Gemini dir of the agy
+        # that served the call, which is the cold-start's ownership proof.
+        (convs / f"{cascade_id}.db").write_bytes(b"")
 
     monkeypatch.setattr(rpc_mod, "start_cascade", _start)
 
@@ -2943,3 +3137,101 @@ async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
     # A RuntimeError must never be described as a timeout.
     if not isinstance(exc, TimeoutError):
         assert "timed out" not in recorded
+
+
+@pytest.mark.asyncio
+async def test_cold_start_agy_conversation_rejects_a_foreign_agy_cascade(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cascade that did not land in THIS bridge's Gemini dir is not persisted.
+
+    Defense-in-depth behind the port scoping. ``StartCascade`` on a foreign agy
+    succeeds and returns an id, but agy writes the conversation into ITS OWN
+    ``--gemini_dir``. Persisting that id cross-binds the session durably: the
+    reader mirrors another session's conversation (the user sees a duplicate of
+    an ongoing chat) while this session's own agy is orphaned and its replies
+    never arrive. Refusing leaves the placeholder, which the reader's own
+    discovery later resolves correctly.
+    """
+    import omnigent.antigravity_native_rpc as rpc_mod
+    from omnigent import antigravity_native_bridge as bridge_mod
+    from omnigent.runner import app as runner_app_mod
+
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    session_id = "aa44894f77886259ee71e892a9e2af00"
+    bridge_dir = bridge_mod.prepare_bridge_dir(session_id)
+    placeholder = "agy_conv_placeholder"
+    bridge_mod.write_bridge_state(
+        bridge_dir,
+        bridge_mod.AntigravityNativeBridgeState(
+            session_id=session_id,
+            conversation_id=placeholder,
+        ),
+    )
+
+    monkeypatch.setattr(rpc_mod, "resolve_cold_start_agy_rpc_port", lambda _s, _t: 34601)
+    monkeypatch.setattr(rpc_mod, "start_cascade", lambda _port, _cid, **_k: None)
+    # The conversations dir stays EMPTY: the foreign agy wrote the .db into its
+    # own Gemini dir, not ours.
+    (bridge_mod.agy_gemini_dir(bridge_dir) / "antigravity-cli" / "conversations").mkdir(
+        parents=True, exist_ok=True
+    )
+
+    result = await runner_app_mod._cold_start_agy_conversation(bridge_dir, session_id)
+
+    assert result is None, "a foreign cascade must not be adopted"
+    state = bridge_mod.read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.conversation_id == placeholder, "placeholder must survive for the reader"
+
+
+@pytest.mark.asyncio
+async def test_cold_start_agy_conversation_accepts_a_locally_owned_cascade(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The happy path still persists: our own agy wrote the conversation here."""
+    import omnigent.antigravity_native_rpc as rpc_mod
+    from omnigent import antigravity_native_bridge as bridge_mod
+    from omnigent.runner import app as runner_app_mod
+    from omnigent.runner.native import orchestration as orchestration_mod
+
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    session_id = "bb44894f77886259ee71e892a9e2af11"
+    bridge_dir = bridge_mod.prepare_bridge_dir(session_id)
+    bridge_mod.write_bridge_state(
+        bridge_dir,
+        bridge_mod.AntigravityNativeBridgeState(
+            session_id=session_id,
+            conversation_id="agy_conv_placeholder",
+        ),
+    )
+    convs = bridge_mod.agy_gemini_dir(bridge_dir) / "antigravity-cli" / "conversations"
+    convs.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(rpc_mod, "resolve_cold_start_agy_rpc_port", lambda _s, _t: 34601)
+    # StartCascade waits for a ready model catalog first; hand it one immediately
+    # and collapse the settling delay so this test exercises only ownership.
+    monkeypatch.setattr(
+        rpc_mod,
+        "get_available_models",
+        lambda _port: {"models": {"gemini": {"model": "MODEL_GEMINI"}}},
+    )
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(orchestration_mod, "_agy_cold_start_poll_sleep", _no_sleep)
+
+    def _start_cascade(_port: int, cascade_id: str, **_kwargs: Any) -> None:
+        # Our agy owns it: the conversation db lands in OUR Gemini dir.
+        (convs / f"{cascade_id}.db").write_bytes(b"")
+
+    monkeypatch.setattr(rpc_mod, "start_cascade", _start_cascade)
+
+    result = await runner_app_mod._cold_start_agy_conversation(bridge_dir, session_id)
+
+    assert result is not None
+    state = bridge_mod.read_bridge_state(bridge_dir)
+    assert state is not None and state.conversation_id == result

@@ -54,6 +54,46 @@ fun usesInWebViewAuth(origin: String?): Boolean {
     return IN_WEBVIEW_AUTH_DOMAINS.any { host == it || host.endsWith(".$it") }
 }
 
+/** Path the Omnigent SPA is mounted at inside a Databricks workspace. */
+const val WORKSPACE_UI_PATH = "/omnigent"
+
+/**
+ * Databricks domains that serve a workspace, and therefore mount the SPA at
+ * [WORKSPACE_UI_PATH]. `databricksapps.com` is deliberately absent: Apps share
+ * the workspace login story (see [IN_WEBVIEW_AUTH_DOMAINS]) but serve their own
+ * app at the root, with no workspace mount to redirect to.
+ */
+private val WORKSPACE_DOMAINS = listOf("databricks.com", "azuredatabricks.net")
+
+/** True when [host] is, or sits under, a Databricks workspace domain. */
+private fun isDatabricksWorkspaceHost(host: String?): Boolean {
+    val normalized = host?.lowercase() ?: return false
+    return WORKSPACE_DOMAINS.any { normalized == it || normalized.endsWith(".$it") }
+}
+
+/**
+ * The workspace-UI URL for a bare Databricks workspace root, or null when [url]
+ * is anything else — a non-workspace host, or a URL that already carries a path
+ * (a deliberate deep link we must not override).
+ *
+ * A bare workspace root shows the Databricks landing page, not Omnigent, so the
+ * shell rewrites it to [WORKSPACE_UI_PATH]. Query and fragment survive because
+ * `?o=<org>` selects which workspace the request lands in.
+ */
+fun databricksWorkspaceUiUrl(url: String?): String? {
+    val uri = url?.let(Uri::parse) ?: return null
+    if (!isHttpScheme(uri.scheme)) return null
+    if (!isDatabricksWorkspaceHost(uri.host)) return null
+    val path = uri.path.orEmpty()
+    if (path.isNotEmpty() && path != "/") return null
+    val origin = originOf(url) ?: return null
+    return buildString {
+        append(origin).append(WORKSPACE_UI_PATH)
+        uri.encodedQuery?.let { append('?').append(it) }
+        uri.encodedFragment?.let { append('#').append(it) }
+    }
+}
+
 /**
  * Normalize user-entered server text into a loadable URL, or null if it isn't a
  * usable http(s) address. Adds a default `https://` scheme when omitted and

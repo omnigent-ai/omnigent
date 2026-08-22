@@ -78,7 +78,7 @@ def test_run_background_wraps_command_in_sh_c() -> None:
     [cmd] = launcher.commands
     assert cmd == (
         f"setsid nohup sh -c {shlex.quote(supervise_host_command(_HOST_LAUNCH))} "
-        "> /tmp/omnigent-host.log 2>&1 < /dev/null & echo launched"
+        ">> /tmp/omnigent-host.log 2>&1 < /dev/null & echo launched"
     )
     # The env prefix stays attached to the launch inside the quoted script, so
     # the inner shell re-applies it on every supervised restart attempt.

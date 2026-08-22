@@ -13,6 +13,7 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
+import type * as IdentityModule from "@/lib/identity";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 
 // Controllable rename mutation so the double-click test can assert the
@@ -52,6 +53,10 @@ const mocks = vi.hoisted(() => {
     // mobile in-place project view test can assert both the list and the pick.
     projects: [] as string[],
     moveToProject: { mutate: vi.fn() },
+    leave: { mutate: vi.fn(), isPending: false },
+    // The signed-in viewer. Rows with no `owner` read as owned by them; a row
+    // owned by someone else is the shared case Leave applies to.
+    viewerId: "viewer@example.com" as string | null,
     conversations: [] as unknown[],
     pinnedStore,
   };
@@ -94,9 +99,11 @@ vi.mock("@/hooks/useConversations", () => ({
   setConversationPinned: vi.fn(() => Promise.resolve({})),
   PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
   useRenameConversation: () => mocks.rename,
+  useLeaveSession: () => mocks.leave,
   useArchiveConversation: () => ({ mutate: vi.fn() }),
   useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useBulkMoveToProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useStopSession: () => ({ mutate: vi.fn() }),
   useProjects: () => ({ data: mocks.projects.map((name: string) => ({ id: `p_${name}`, name })) }),
@@ -131,6 +138,15 @@ vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }
 // jsdom's default loopback origin would otherwise read as single-user and hide
 // the tabs the shared-session row actions rely on.
 vi.mock("@/lib/serverOrigin", () => ({ isCurrentServerLocal: () => false }));
+// Pin "who am I": ownership (and therefore Leave, which revokes the viewer's
+// own grant) is derived from this id. Unmocked it resolves to null in jsdom,
+// which reads as "not the owner" for shared rows but leaves Leave with no id
+// to revoke.
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof IdentityModule>()),
+  getCurrentUserId: () => mocks.viewerId,
+  resolveIdentity: () => Promise.resolve(mocks.viewerId),
+}));
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
 import { resetReadStateForTests, seedReadState } from "@/hooks/useUnseenConversations";
@@ -190,6 +206,7 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
     server_version: null,
     smart_routing_enabled: false,
     smart_routing_sources: { external: false, oss: false },
+    features: {},
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
@@ -238,6 +255,7 @@ beforeEach(() => {
   mocks.rename.isSuccess = false;
   mocks.rename.isError = false;
   mocks.moveToProject.mutate.mockReset();
+  mocks.leave.mutate.mockReset();
   mocks.projects = [];
   // Default every test to the desktop viewport; the mobile flyout test opts in.
   mocks.isMobile = false;
@@ -599,6 +617,82 @@ describe("double-click to rename", () => {
 
     expect(screen.queryByTestId("rename-conversation-input")).toBeNull();
     expect(mocks.rename.mutate).not.toHaveBeenCalled();
+  });
+});
+
+describe("leave a shared session", () => {
+  // Every other row action is owner-only, so "Leave session" is the one thing
+  // a shared-with viewer can actually do: drop the session from their own
+  // sidebar without touching the owner's copy.
+
+  /** Switch to the "Shared with me" tab, where non-owned rows live. */
+  function openSharedTab() {
+    // Radix Tabs triggers activate on mousedown (primary button), not click.
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByTestId("session-filter-shared"));
+  }
+
+  it("offers Leave on a shared row and calls the mutation after confirming", () => {
+    mockConversations([{ ...CONV, owner: "other@example.com" }]);
+    renderSidebar();
+    openSharedTab();
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    fireEvent.click(screen.getByTestId("leave-conversation"));
+
+    // Destructive, and the row vanishes on success — so it confirms first.
+    expect(mocks.leave.mutate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId("confirm-leave-conversation"));
+    // Leaving revokes the VIEWER's own grant, so the mutation carries their id
+    // — not the owner's. Sending the owner's id would be a revoke attempt the
+    // server rejects for lack of manage access.
+    expect(mocks.leave.mutate).toHaveBeenCalledWith(
+      { id: "conv_1", viewerId: "viewer@example.com" },
+      expect.anything(),
+    );
+  });
+
+  it("shows Delete instead of Leave on a row the viewer owns", () => {
+    // The owner grant is what keeps the session reachable — leaving would
+    // orphan it, so the owner deletes instead. One slot, not two items.
+    mockConversations([CONV]);
+    renderSidebar();
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+
+    expect(screen.getByTestId("delete-conversation")).toBeInTheDocument();
+    expect(screen.queryByTestId("leave-conversation")).toBeNull();
+  });
+
+  it("replaces the once-dead disabled Delete rather than adding an item", () => {
+    // The point of reusing the slot: a non-owner used to get Delete rendered
+    // disabled ("only the owner can delete"), a row that could never do
+    // anything. Leave takes that slot — so exactly ONE destructive item shows,
+    // and it is never a disabled Delete.
+    mockConversations([{ ...CONV, owner: "other@example.com" }]);
+    renderSidebar();
+    openSharedTab();
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+
+    expect(screen.getByTestId("leave-conversation")).toBeInTheDocument();
+    expect(screen.queryByTestId("delete-conversation")).toBeNull();
+  });
+
+  it("keeps the plain owner Delete in single-user mode, where nothing is shared", () => {
+    // Single-user mode has one identity and no sharing, so an unowned-looking
+    // row must not offer Leave — it falls back to Delete.
+    mockConversations([{ ...CONV, owner: "other@example.com" }]);
+    renderSidebar(undefined, serverInfo({ single_user: true }));
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+
+    expect(screen.queryByTestId("leave-conversation")).toBeNull();
+    expect(screen.getByTestId("delete-conversation")).toBeInTheDocument();
   });
 });
 
@@ -997,5 +1091,54 @@ describe("sharing kill switch", () => {
 
     expect(screen.getByTestId("share-conversation")).toBeInTheDocument();
     expect(screen.getByTestId("share-conversation")).not.toHaveAttribute("data-disabled");
+  });
+});
+
+describe("peek mode row menu", () => {
+  // Peek render variant: the menu content portals OUTSIDE the <aside>, so
+  // moving the pointer from the kebab into the open menu fires the aside's
+  // onPointerLeave. The grace-period close must hold while a menu is open.
+  function renderPeek() {
+    const onClose = vi.fn();
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter>
+            <Sidebar open={false} peek onClose={onClose} />
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
+    return { onClose };
+  }
+
+  beforeEach(() => vi.useFakeTimers({ shouldAdvanceTime: true }));
+  afterEach(() => vi.useRealTimers());
+
+  it("holds the peek open while a row's kebab menu is open", () => {
+    const { onClose } = renderPeek();
+
+    // Open the row's kebab (Radix opens on pointerdown) — its content portals
+    // outside the aside, so the pointer entering it leaves the aside.
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+
+    const aside = screen.getByRole("complementary", { name: "Conversations" });
+    fireEvent.pointerLeave(aside);
+
+    // Grace period elapses, but the open menu holds the peek — no close.
+    vi.advanceTimersByTime(1000);
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("closes once the menu is gone and the pointer is away", () => {
+    const { onClose } = renderPeek();
+
+    const aside = screen.getByRole("complementary", { name: "Conversations" });
+    // No menu open: a plain pointer-leave closes after the grace period.
+    fireEvent.pointerLeave(aside);
+    vi.advanceTimersByTime(1000);
+    expect(onClose).toHaveBeenCalledTimes(1);
   });
 });

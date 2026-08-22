@@ -14,6 +14,7 @@ import hashlib
 import io
 import json
 import re
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -617,6 +618,101 @@ def test_daemon_host_online_false_when_no_host_id(
         resolved_server_url="http://127.0.0.1:8123",
     )
     assert cli._daemon_host_online(record) is False
+
+
+# Every proxy variable httpx consults, so the cases below see exactly the
+# ambient proxy configuration they set up (a developer's own ``NO_PROXY``
+# would otherwise exempt loopback and skip the proxy transport entirely).
+_PROXY_ENV_VARS = (
+    "ALL_PROXY",
+    "all_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "NO_PROXY",
+    "no_proxy",
+)
+
+
+def _socks_proxy_without_extra(monkeypatch: pytest.MonkeyPatch, base_url: str) -> None:
+    """Point the ambient environment at a SOCKS proxy httpx cannot build.
+
+    Reproduces a shell exporting ``ALL_PROXY=socks5://…`` on an install
+    without the ``httpx[socks]`` extra: httpx raises ``ImportError`` while
+    constructing the client. Blanking ``socksio`` in :data:`sys.modules`
+    makes the extra look absent whether or not it is really installed.
+
+    :param monkeypatch: Fixture used to scope the environment changes.
+    :param base_url: Server URL to pre-seed headers for, so the probe does
+        not resolve real credentials.
+    """
+    for name in _PROXY_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("ALL_PROXY", "socks5://127.0.0.1:1080")
+    monkeypatch.setitem(sys.modules, "socksio", None)
+    monkeypatch.setitem(cli._host_http_headers_cache, base_url, {})
+
+
+def test_host_http_json_reports_failure_when_socks_extra_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A proxy httpx cannot build is a transport failure, not a crash.
+
+    Uses a remote server because that is where a proxy still applies:
+    loopback targets bypass proxies outright (see the companion test), so
+    there is no proxy transport left to fail to build.
+    """
+    base_url = "https://server.example.com"
+    _socks_proxy_without_extra(monkeypatch, base_url)
+
+    result = cli._host_http_json(
+        base_url=base_url,
+        method="GET",
+        path="/v1/hosts/host_abc",
+        timeout_s=2.0,
+    )
+
+    assert result.status_code == 0
+    assert "socksio" in str(result.body)
+
+
+def test_host_http_json_ignores_proxy_for_loopback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The local server is reached directly, never through a proxy.
+
+    A proxy resolves ``127.0.0.1`` against itself, so honoring one here
+    means a developer who exports ``ALL_PROXY`` cannot reach their own
+    server at all — every call fails before it leaves the machine.
+    """
+    base_url = "http://127.0.0.1:8123"
+    _socks_proxy_without_extra(monkeypatch, base_url)
+
+    result = cli._host_http_json(
+        base_url=base_url,
+        method="GET",
+        path="/v1/hosts/host_abc",
+        timeout_s=2.0,
+    )
+
+    assert result.status_code == 0
+    # The SOCKS transport was never built, so this is an ordinary refused
+    # connection rather than the missing-extra ImportError.
+    assert "socksio" not in str(result.body)
+
+
+def test_daemon_host_online_false_when_socks_extra_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reuse probe degrades to "offline" instead of failing the command.
+
+    ``_daemon_host_online`` runs on the way into every command that ensures
+    the backend, so an unbuildable proxy must not escape as an exception.
+    """
+    _socks_proxy_without_extra(monkeypatch, "http://127.0.0.1:8123")
+
+    assert cli._daemon_host_online(_online_record()) is False
 
 
 def test_daemon_tunnel_recovers_returns_true_on_immediate_online(
@@ -1251,6 +1347,10 @@ def test_host_stop_stops_sessions_before_daemon(
                     ]
                 },
             )
+        # Stop resolves the session's host (any-replica metadata read) before
+        # keying the stop event by it.
+        if method == "GET" and path == "/v1/sessions/conv_owned":
+            return cli._HostHttpResult(status_code=200, body={"host_id": "host_abc"})
         if method == "POST" and path == "/v1/sessions/conv_owned/events":
             return cli._HostHttpResult(status_code=200, body={"queued": False})
         raise AssertionError(f"unexpected request: {method} {path}")
@@ -1272,6 +1372,7 @@ def test_host_stop_stops_sessions_before_daemon(
     assert result.exit_code == 0, result.output
     assert events == [
         ("GET", "/v1/sessions"),
+        ("GET", "/v1/sessions/conv_owned"),
         ("POST", "/v1/sessions/conv_owned/events"),
         ("TERM", "https://server.example.com"),
     ]
@@ -1418,6 +1519,37 @@ def test_host_stop_session_stops_only_named_sessions(
 
     assert result.exit_code == 0, result.output
     assert stopped == ["conv_a", "conv_b"]
+
+
+def test_stop_session_keys_event_by_resolved_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``stop-session`` resolves the session's host and keys the stop event by it.
+
+    A standalone ``omni host stop-session`` process has an empty session→host
+    map, so it reads the host from the session record first; the stop_session
+    event is a server→runner forward that must reach the replica holding the
+    runner's tunnel. A metadata GET (any replica) precedes it, and the POST
+    carries ``host_id`` from that record.
+    """
+    calls: list[dict[str, object]] = []
+
+    def _fake_http_json(**kwargs: object) -> cli._HostHttpResult:
+        calls.append(kwargs)
+        if kwargs["method"] == "GET":
+            return cli._HostHttpResult(status_code=200, body={"host_id": "host_bea4"})
+        return cli._HostHttpResult(status_code=202, body={})
+
+    monkeypatch.setattr(cli, "_host_http_json", _fake_http_json)
+
+    cli._stop_session_on_server(base_url="https://ws/api/2.0/omnigent", session_id="conv_1")
+
+    get_call = next(c for c in calls if c["method"] == "GET")
+    post_call = next(c for c in calls if c["method"] == "POST")
+    # Host resolved from the session record, then the stop event is keyed by it.
+    assert get_call["path"] == "/v1/sessions/conv_1"
+    assert post_call["path"] == "/v1/sessions/conv_1/events"
+    assert post_call["host_id"] == "host_bea4"
 
 
 def test_ensure_backend_remote_passthrough(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1631,7 +1763,7 @@ def _patch_auth_preflight(
 
     monkeypatch.setattr(
         "omnigent.chat._remote_headers",
-        lambda server_url=None: {},
+        lambda server_url=None, *, host_id=None: {},
     )
     monkeypatch.setattr(httpx, "get", lambda url, **kw: _databricks_probe_response(probe_status))
     monkeypatch.setattr(cli, "_workspace_api_server_url", lambda server: server.rstrip("/"))
@@ -1692,6 +1824,46 @@ def test_ensure_backend_databricks_preflight_skips_when_authenticated(
 
     assert login_calls == []
     assert result == "https://myapp-1234.aws.databricksapps.com"
+
+
+def test_databricks_preflight_silent_sdk_refresh_skips_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fresh SDK token recovers an expired Databricks Apps session silently."""
+    import httpx
+
+    responses = iter([_databricks_probe_response(302), _databricks_probe_response(200)])
+    requests: list[dict[str, object]] = []
+    stored: list[tuple[str, str, str | None]] = []
+    monkeypatch.setattr(
+        "omnigent.chat._remote_headers",
+        lambda server_url=None, *, host_id=None: {"Authorization": "Bearer expired"},
+    )
+
+    def _get(url: str, **kwargs: object) -> object:
+        requests.append(kwargs)
+        return next(responses)
+
+    monkeypatch.setattr(httpx, "get", _get)
+    monkeypatch.setattr(cli, "_databricks_workspace_token", lambda workspace: "fresh-token")
+    monkeypatch.setattr(cli, "_databricks_login", lambda *args, **kwargs: pytest.fail("login"))
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda server: "123")
+
+    def _store(
+        server: str,
+        workspace: str,
+        user_id: str | None = None,
+        org_id: str | None = None,
+    ) -> None:
+        stored.append((server, workspace, org_id))
+
+    monkeypatch.setattr("omnigent.cli_auth.store_databricks_auth", _store)
+
+    cli._ensure_databricks_server_auth(_HOST_DATABRICKS_SERVER, non_interactive=True)
+
+    assert requests[1]["headers"] == {"Authorization": "Bearer fresh-token"}
+    assert requests[1]["params"] == {"o": "123"}
+    assert stored == [(_HOST_DATABRICKS_SERVER, "https://example.databricks.com", "123")]
 
 
 # ── Foreground ``host`` auth pre-flight ─────────────────────────────

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import event, text
 
 from omnigent.db.utils import get_or_create_engine
 from omnigent.entities import (
@@ -332,6 +332,39 @@ def test_update_title(conversation_store: SqlAlchemyConversationStore) -> None:
         conversation_store.update_conversation("c55a64c3f6f954fe0fc8738ba3f45f26", title="x")
         is None
     )
+
+
+def test_reported_model_round_trips_beside_the_request(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    ``reported_model`` (the harness's verbatim report) persists in the
+    override blob independently of ``model_override`` (the user's
+    request): writing one never disturbs the other, and both read back
+    byte-for-byte.
+    """
+    conv = conversation_store.create_conversation()
+    reported = conversation_store.update_conversation(
+        conv.id, reported_model="claude-opus-4-8[1m]"
+    )
+    assert reported is not None
+    assert reported.reported_model == "claude-opus-4-8[1m]"
+    assert reported.model_override is None
+
+    requested = conversation_store.update_conversation(conv.id, model_override="sonnet")
+    assert requested is not None
+    assert requested.model_override == "sonnet"
+    assert requested.reported_model == "claude-opus-4-8[1m]"
+
+    # Clearing the request leaves the report untouched.
+    cleared = conversation_store.update_conversation(conv.id, _unset_model_override=True)
+    assert cleared is not None
+    assert cleared.model_override is None
+    assert cleared.reported_model == "claude-opus-4-8[1m]"
+
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.reported_model == "claude-opus-4-8[1m]"
 
 
 def test_update_archived_round_trip(
@@ -1346,6 +1379,165 @@ def test_list_conversations_search_snippet_absent_without_query(
     )
     page = conversation_store.list_conversations()
     assert all(c.search_snippet is None for c in page.data)
+
+
+def _captured_sql(store: SqlAlchemyConversationStore, run) -> list[str]:
+    """
+    Capture every SQL statement the conversation engine executes during ``run``.
+
+    Attaches a ``before_cursor_execute`` listener to the store's conversation
+    engine, invokes ``run()``, then detaches. Used to assert which session-level
+    SET statements the search path emits.
+    """
+    statements: list[str] = []
+
+    def _before(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(store._conv_engine, "before_cursor_execute", _before)
+    try:
+        run()
+    finally:
+        event.remove(store._conv_engine, "before_cursor_execute", _before)
+    return statements
+
+
+@pytest.mark.databricks
+def test_list_conversations_search_sets_statement_timeout(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    A content search bounds itself with ``SET LOCAL statement_timeout`` on
+    Postgres, so an unindexed scan can't run unbounded (the query runs in a
+    worker thread a client disconnect wouldn't stop).
+
+    Postgres-only: SQLite has no ``statement_timeout``; the search path skips
+    the SET there, which the companion assertion below guards.
+    """
+    if conversation_store._conv_engine.dialect.name != "postgresql":
+        pytest.skip("statement_timeout is a Postgres feature")
+
+    conv = conversation_store.create_conversation()
+    conversation_store.update_conversation(conv.id, title="deployment runbook")
+
+    statements = _captured_sql(
+        conversation_store,
+        lambda: conversation_store.list_conversations(search_query="deployment"),
+    )
+    assert any("statement_timeout" in s.lower() for s in statements), statements
+
+
+def test_list_conversations_no_search_skips_statement_timeout(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    A plain (non-search) listing never sets ``statement_timeout``.
+
+    Ordinary pagination is indexed and fast; bounding it could abort a
+    legitimately larger page. Holds on every dialect — the SET is gated on
+    ``search_query`` being set, not just on Postgres.
+    """
+    conv = conversation_store.create_conversation()
+    conversation_store.update_conversation(conv.id, title="deployment runbook")
+
+    statements = _captured_sql(
+        conversation_store,
+        lambda: conversation_store.list_conversations(),
+    )
+    assert not any("statement_timeout" in s.lower() for s in statements), statements
+
+
+def test_list_conversations_search_content_match_is_correlated(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    The content-search predicate is a correlated ``EXISTS``, not an
+    uncorrelated ``id IN (SELECT DISTINCT ...)``.
+
+    The IN form materializes the match set for the entire workspace before the
+    outer query discards the rows the caller cannot see, so on a large
+    ``conversation_items`` table it scans everything regardless of how few
+    conversations the caller can actually access. Correlating on
+    ``conversation_id`` keeps each probe on the
+    ``(workspace_id, conversation_id)`` index. Asserted on the emitted SQL
+    because the difference is a query-plan property, not an observable result
+    difference — the two forms return identical rows.
+    """
+    conv = conversation_store.create_conversation()
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_corr1",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "fix the deployment pipeline"}],
+                ),
+            ),
+        ],
+    )
+
+    statements = _captured_sql(
+        conversation_store,
+        lambda: conversation_store.list_conversations(search_query="deployment"),
+    )
+    select_sql = " ".join(s for s in statements if "conversation_items" in s).lower()
+    assert "exists" in select_sql, select_sql
+    assert "conversation_items.conversation_id = conversations.id" in select_sql, select_sql
+    # The uncorrelated form is what this guards against.
+    assert "distinct conversation_items.conversation_id" not in select_sql, select_sql
+
+
+def test_search_predicate_avoids_the_trigram_index_expression(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Content search matches with ``ILIKE`` on the raw column, never
+    ``lower(search_text) LIKE``.
+
+    ``lower(search_text)`` is exactly the expression the pg_trgm index
+    (migration ``d5e9f1a2b3c4``) is built on. Writing the predicate that way
+    makes the planner prefer that index, which scans every item in the
+    workspace out of a multi-GB index rather than probing the handful of
+    conversations the query is scoped to. ILIKE is the same case-insensitive
+    substring match but cannot match the index expression, so the scoped btree
+    probe wins. Covers both the list predicate and the snippet lookup, since
+    both run on a search request.
+    """
+    conv = conversation_store.create_conversation()
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_ilike1",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "fix the DEPLOYMENT pipeline"}],
+                ),
+            ),
+        ],
+    )
+
+    # Case-insensitivity is the behavioural contract and holds on every dialect
+    # (row stored as "DEPLOYMENT", queried as "deployment").
+    page = conversation_store.list_conversations(search_query="deployment")
+    assert conv.id in {c.id for c in page.data}
+
+    # The SQL-shape guarantee is Postgres-specific: SQLAlchemy emits native
+    # ILIKE there, while SQLite (which has no trigram index to avoid) compiles
+    # ILIKE down to lower(...) LIKE lower(...).
+    if conversation_store._conv_engine.dialect.name != "postgresql":
+        return
+
+    statements = _captured_sql(
+        conversation_store,
+        lambda: conversation_store.list_conversations(search_query="deployment"),
+    )
+    item_sql = " ".join(s for s in statements if "conversation_items" in s).lower()
+    assert "ilike" in item_sql, item_sql
+    assert "lower(conversation_items.search_text)" not in item_sql, item_sql
 
 
 def test_list_conversations_search_snippet_uses_earliest_match(
@@ -3279,6 +3471,62 @@ def test_fork_conversation_copies_items(
         assert fork_item.data == src_item.data
 
 
+def test_fork_of_sub_agent_is_top_level(
+    conversation_store: SqlAlchemyConversationStore,
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """Forking a sub-agent yields a top-level session, not another child.
+
+    This is what promotes a sub-agent to a session of its own: ``kind``
+    is derived from parent-nullness, so the fork only reaches the
+    sidebar (and only survives its parent's deletion) if the copy has no
+    parent and roots its own spawn tree. A fork that inherited the
+    source's parent or root would stay buried in the parent's tree.
+    """
+    agent_store.create(
+        agent_id="6b1cb0ab1a1c4b8f9ad4f0f6d5b0e3aa",
+        name="promote-test",
+        bundle_location="6b1cb0ab1a1c4b8f9ad4f0f6d5b0e3aa/fakehash",
+    )
+    parent = conversation_store.create_conversation(
+        agent_id="6b1cb0ab1a1c4b8f9ad4f0f6d5b0e3aa",
+        title="Parent",
+    )
+    child = conversation_store.create_conversation(
+        agent_id="6b1cb0ab1a1c4b8f9ad4f0f6d5b0e3aa",
+        kind="sub_agent",
+        title="researcher:sub_001",
+        parent_conversation_id=parent.id,
+        sub_agent_name="researcher",
+    )
+
+    fork = conversation_store.fork_conversation(child.id, title="Promoted")
+
+    assert fork.parent_conversation_id is None, (
+        f"Promoted fork must have no parent, got {fork.parent_conversation_id!r}"
+    )
+    assert fork.root_conversation_id == fork.id, (
+        f"Promoted fork must root its own tree, got {fork.root_conversation_id!r}"
+    )
+    assert fork.kind == "default", f"Promoted fork must not read as a sub-agent, got {fork.kind!r}"
+    assert fork.sub_agent_name is None, (
+        f"Promoted fork must shed the sub-agent name, got {fork.sub_agent_name!r}"
+    )
+    # The source stays where it was — promotion copies, it does not move.
+    still_child = conversation_store.get_conversation(child.id)
+    assert still_child is not None and still_child.parent_conversation_id == parent.id, (
+        "Forking a sub-agent must leave the source in its parent's tree"
+    )
+    # The fork must not surface as a child of the old parent.
+    child_ids = {
+        conv.id
+        for conv in conversation_store.list_conversations(
+            kind="sub_agent", parent_conversation_id=parent.id
+        ).data
+    }
+    assert fork.id not in child_ids, "Promoted fork must not appear in the parent's children"
+
+
 def test_fork_conversation_files_into_project(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -4258,6 +4506,28 @@ def test_get_session_connectivity_reports_needs_workspace_for_fork(
     # No label → in-process resumable, needs_workspace off. This is the
     # CUJ-2 chat-only fork path that must stay reachable.
     assert result[plain.id].needs_workspace is False
+
+
+def test_get_session_connectivity_reports_imported(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    The import-source label surfaces as ``imported=True``.
+
+    An imported transcript carries the ``omnigent.import.source`` label and
+    has no live executor, so ``get_session_connectivity`` must report
+    ``imported=True`` — the flag that makes ``_bulk_session_liveness`` mark
+    the unbound import offline so the open view offers the resume picker
+    instead of treating it as a reachable in-process session.
+    """
+    imported = conversation_store.create_conversation()
+    conversation_store.set_labels(imported.id, {"omnigent.import.source": "claude"})
+    plain = conversation_store.create_conversation()
+
+    result = conversation_store.get_session_connectivity([imported.id, plain.id])
+
+    assert result[imported.id].imported is True
+    assert result[plain.id].imported is False
 
 
 def test_get_session_connectivity_empty_input_skips_query(

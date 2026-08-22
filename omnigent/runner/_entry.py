@@ -401,6 +401,7 @@ class _InitialAuthTokenFactory:
         self._server_url = server_url
         self._fallback_factory: Callable[[], str | None] | None = None
         self._fallback_resolved = False
+        self._no_credential_logged = False
         self._lock = threading.Lock()
 
     def __call__(self) -> str | None:
@@ -415,22 +416,27 @@ class _InitialAuthTokenFactory:
                     _proxy_bearer=self._last_initial_token,
                 )
                 self._fallback_resolved = True
-            # Managed mint failed because the proxy bearer is expired — the
-            # initial bearer was injected once and cannot self-renew. Skip
-            # managed mint entirely and go straight to SDK/OIDC.
-            if getattr(self._fallback_factory, "proxy_auth_failed", False):
+            token = self._fallback_factory() if self._fallback_factory is not None else None
+            # Managed mint cannot renew itself when its proxy bearer expires —
+            # the injected host bearer before a first mint, or the minted JWT
+            # once a session outlives it. Re-resolve SDK/OIDC in the same call
+            # so the request that hit the failure still gets a credential.
+            if token is None and getattr(self._fallback_factory, "proxy_auth_failed", False):
                 self._fallback_factory = _make_auth_token_factory(
                     self._server_url,
                     _allow_initial_token=False,
                     _allow_delegated_mint=False,
                 )
-            if self._fallback_factory is None:
+                token = self._fallback_factory() if self._fallback_factory is not None else None
+            if self._fallback_factory is None and not self._no_credential_logged:
+                # This state is terminal for the process, so say it once
+                # rather than on every subsequent callback.
+                self._no_credential_logged = True
                 _logger.error(
                     "host bootstrap bearer expired and no SDK/OIDC credential is available "
                     "to renew it; run `databricks auth login` to re-authenticate"
                 )
-                return None
-            return self._fallback_factory()
+            return token
 
     @property
     def declined(self) -> bool:
@@ -607,11 +613,34 @@ def _make_auth_token_factory(
         """
         # Check stored OIDC token first.
         if resolved_server_url:
-            from omnigent.cli_auth import load_token
+            from omnigent.cli_auth import (
+                REFRESH_MIN_REMAINING_SECONDS,
+                load_token,
+                refresh_stored_token,
+            )
 
-            oidc_token = load_token(resolved_server_url)
+            # Require enough remaining life that the token cannot lapse
+            # mid-handshake; a token inside that window falls through to
+            # the renewal path below rather than being used and rejected.
+            oidc_token = load_token(
+                resolved_server_url,
+                min_remaining_seconds=REFRESH_MIN_REMAINING_SECONDS,
+            )
             if oidc_token:
                 return oidc_token
+            # Expired or near-lapse: renew from the login-issued refresh
+            # grant when one exists. This is what keeps an unattended host
+            # alive past session-JWT expiry — the tunnel rebuilds headers
+            # through this factory on every reconnect.
+            refreshed = refresh_stored_token(resolved_server_url)
+            if refreshed:
+                return refreshed
+            # Nothing to renew with: a near-expiry token that has NOT
+            # actually lapsed still authenticates, so prefer it over
+            # falling through to no credential at all.
+            still_valid = load_token(resolved_server_url)
+            if still_valid:
+                return still_valid
         return _sdk_token()
 
     # Probe once to check if a user credential is available.
@@ -675,7 +704,9 @@ def _make_managed_mint_factory(
         until process restart). If such a post-install mint then gets a
         definitive refusal, the factory latches ``declined`` and returns
         ``None`` thereafter, and :class:`_RunnerDatabricksAuth` falls back to
-        bare requests.
+        bare requests. A post-install 401/403 with no still-valid cache
+        latches ``proxy_auth_failed`` instead, which
+        :class:`_InitialAuthTokenFactory` answers by re-resolving SDK/OIDC.
     """
     from omnigent.runner.identity import token_bound_runner_id
 
@@ -712,6 +743,11 @@ class _ManagedMintTokenFactory:
     requests instead of failing closed. The latch matters when the
     construction probe loses a boot race (a connection error installs the
     factory, then the first real mint learns the server never mints).
+
+    A mint 401/403 with no still-valid cached token latches
+    :attr:`proxy_auth_failed` instead: the credential presented to the proxy
+    died (the seeded host bearer, or the minted JWT once a session outlives
+    it), so callers should re-resolve SDK/OIDC rather than send bare requests.
     """
 
     def __init__(
@@ -747,8 +783,10 @@ class _ManagedMintTokenFactory:
         """Return a fresh owner JWT, or ``None``.
 
         :returns: The cached or freshly-minted JWT; ``None`` after a
-            definitive server decline (sets :attr:`declined`) or on a
-            transient mint failure with no still-valid cached token.
+            definitive server decline (sets :attr:`declined`), after a mint
+            401/403 with no still-valid cached token (sets
+            :attr:`proxy_auth_failed`), or on a transient mint failure with
+            no still-valid cached token.
         """
         if self.declined:
             return None
@@ -779,13 +817,15 @@ class _ManagedMintTokenFactory:
                     return None
                 return self._still_valid_cached_token(now)
             if response.status_code in (401, 403):
-                # The proxy bearer is expired or invalid. If we have never
-                # successfully minted, there is no self-sustaining refresh
-                # loop to fall back to — signal proxy_auth_failed so the
-                # caller can try SDK/OIDC instead of looping on a dead bearer.
-                if self._cached_token is None:
+                # The proxy bearer is expired or invalid — the seeded host
+                # bearer, or the minted JWT once a session outlives it. With
+                # no still-valid cache left the mint loop cannot renew itself:
+                # latch proxy_auth_failed so the caller re-resolves SDK/OIDC
+                # instead of failing closed on every callback.
+                cached = self._still_valid_cached_token(now)
+                if cached is None:
                     self.proxy_auth_failed = True
-                    return None
+                return cached
             return self._still_valid_cached_token(now)
         except (httpx.HTTPError, ValueError, KeyError, OSError):
             # Transient mint failure: keep serving the cached token while
@@ -832,6 +872,8 @@ def _mint_managed_owner_token(
     :raises httpx.HTTPError: On network failure or a non-2xx response.
     :raises KeyError: If the response is missing the expected fields.
     """
+    from omnigent_client._http import is_loopback_url
+
     from omnigent.cli_auth import databricks_request_headers
     from omnigent.runner.identity import (
         OMNIGENT_INTERNAL_WS_ORIGIN,
@@ -843,7 +885,7 @@ def _mint_managed_owner_token(
         RUNNER_TUNNEL_TOKEN_HEADER: binding_token,
         **databricks_request_headers(server_url, bearer_token=proxy_bearer),
     }
-    with httpx.Client(timeout=10.0) as client:
+    with httpx.Client(timeout=10.0, trust_env=not is_loopback_url(server_url)) as client:
         response = client.post(mint_url, headers=headers)
         response.raise_for_status()
         payload = response.json()
@@ -1139,7 +1181,7 @@ def create_app(
         the app builds its own.
     :returns: A runner FastAPI app exposing the harness-contract subset.
     """
-    from omnigent.cli_auth import databricks_request_headers
+    from omnigent.cli_auth import open_server_client
     from omnigent.runner.app import create_runner_app
     from omnigent.runner.identity import (
         OMNIGENT_INTERNAL_WS_ORIGIN,
@@ -1179,6 +1221,7 @@ def create_app(
     # tunnel the runner opened to the Omnigent server at startup).
     # stdio_cwd=runner_workspace ensures relative command paths like
     # ".venv/bin/python" resolve against the user's project root.
+
     from omnigent.runner.mcp_manager import RunnerMcpManager
 
     # Reuse the caller's factory when given (shares one resolved SDK auth +
@@ -1186,22 +1229,20 @@ def create_app(
     if auth_token_factory is None:
         auth_token_factory = _make_auth_token_factory()
     binding_token = _runner_tunnel_binding_token_from_env()
-    server_client = httpx.AsyncClient(
-        base_url=server_url,
+    server_client = open_server_client(
+        server_url,
         auth=_RunnerDatabricksAuth(auth_token_factory),
         # Announce the runner as a first-party non-browser client via the
         # sentinel Origin. The server's require_trusted_origin CSRF guard on
         # the multipart routes (POST /v1/sessions bundle create, file upload
         # — both reached from tool_dispatch over this client) requires a
         # trusted Origin; the runner sends none otherwise, so the sentinel is
-        # what lets sys_session_create / sys_upload_file through.
-        #
-        # The workspace-routing header (empty unless a ?o= selector was
-        # recorded for this server) routes these callbacks to the workspace.
+        # what lets sys_session_create / sys_upload_file through. The factory
+        # folds the routing/slice-key headers in on top; we pass only the
+        # runner's tunnel-binding token (when present) alongside the Origin.
         headers={
             "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
             **({RUNNER_TUNNEL_TOKEN_HEADER: binding_token} if binding_token is not None else {}),
-            **databricks_request_headers(server_url),
         },
         timeout=httpx.Timeout(5.0, read=None),
         # NOTE: ``follow_redirects`` deliberately stays False.
@@ -1212,6 +1253,7 @@ def create_app(
         # httpx walks the redirect chain inside the auth loop and
         # hands the auth flow only the terminal HTML login page,
         # defeating the retry. See ``_is_login_redirect_or_unauthorized``.
+        follow_redirects=False,
     )
 
     mcp_manager = RunnerMcpManager(
@@ -1489,6 +1531,35 @@ async def _run_tunnel_from_env() -> None:
     # drains its session streams and closes cleanly — the server then sees an
     # end-of-stream, not an abrupt drop that renders a scary error banner.
     tunnel_shutdown_event = asyncio.Event()
+    # Loopback direct-attach listener: lets a browser on this machine attach
+    # to terminals with zero relay legs. Best-effort — any failure keeps the
+    # runner relay-only. Windows never runs the web terminal bridges, so the
+    # listener is POSIX-only like the bridges themselves.
+    direct_attach_listener = None
+    direct_attach_token: str | None = None
+    if sys.platform != "win32":
+        try:
+            from omnigent.runner.direct_attach import (
+                allowed_origin_for_server,
+                create_direct_attach_app,
+                new_direct_attach_token,
+                start_direct_attach_listener,
+            )
+
+            attach_handler = getattr(app.state, "terminal_attach_handler", None)
+            allowed_origin = allowed_origin_for_server(server_url)
+            if attach_handler is not None and allowed_origin is not None:
+                direct_attach_token = new_direct_attach_token()
+                direct_attach_listener = await start_direct_attach_listener(
+                    create_direct_attach_app(
+                        attach_handler,
+                        token=direct_attach_token,
+                        allowed_origins=frozenset({allowed_origin}),
+                    )
+                )
+        except Exception:  # noqa: BLE001 — optimization only; never block the tunnel
+            _logger.warning("direct-attach listener setup failed", exc_info=True)
+            direct_attach_listener = None
     tunnel_task = asyncio.create_task(
         serve_tunnel(
             cast("_ASGIApp", app),  # FastAPI is ASGI-compatible; cast narrows for mypy
@@ -1502,6 +1573,12 @@ async def _run_tunnel_from_env() -> None:
             on_activity=_mark_activity,
             shutdown_event=tunnel_shutdown_event,
             on_graceful_shutdown=getattr(app.state, "drain_session_streams", None),
+            direct_attach_port=(
+                direct_attach_listener.port if direct_attach_listener is not None else None
+            ),
+            direct_attach_token=(
+                direct_attach_token if direct_attach_listener is not None else None
+            ),
         ),
         name=f"runner-ws-tunnel:{runner_id}",
     )
@@ -1594,6 +1671,9 @@ async def _run_tunnel_from_env() -> None:
         if idle_task is not None:
             with contextlib.suppress(asyncio.CancelledError):
                 await idle_task
+        if direct_attach_listener is not None:
+            with contextlib.suppress(Exception):
+                await direct_attach_listener.stop()
         await _lifespan_cm.__aexit__(None, None, None)
 
 
@@ -1626,16 +1706,46 @@ def _install_signal_handlers(
             record_reason(f"received {signal.Signals(sig).name}")
         stop_event.set()
 
+    degraded = False
+
+    def _try_add_handler(sig: int, callback: Callable[..., None], *args: object) -> None:
+        """Register one handler; degrade instead of crashing the runner.
+
+        ``add_signal_handler`` raises RuntimeError when the loop's signal
+        wakeup fd is unusable — observed in zygote-forked runners whose
+        wakeup fd ended up in blocking mode ("the fd N must be in
+        non-blocking mode"), crash-looping every fork of the session.
+        Graceful-shutdown handlers are a nicety: a runner without them
+        still serves sessions and still exits via the parent-death
+        backstop, so warn once and continue instead of dying.
+
+        :param sig: Signal number to register.
+        :param callback: Handler invoked when the signal arrives.
+        :param args: Positional arguments passed to ``callback``.
+        :returns: None.
+        """
+        nonlocal degraded
+        if degraded:
+            return
+        try:
+            with contextlib.suppress(NotImplementedError):
+                loop.add_signal_handler(sig, callback, *args)
+        except RuntimeError:
+            degraded = True
+            _logger.warning(
+                "Signal handler registration failed; continuing without "
+                "graceful-shutdown signal handling",
+                exc_info=True,
+            )
+
     for sig in (signal.SIGINT, signal.SIGTERM):
-        with contextlib.suppress(NotImplementedError):
-            loop.add_signal_handler(sig, _handle_shutdown_signal, sig)
+        _try_add_handler(sig, _handle_shutdown_signal, sig)
     if adopted_event is not None:
         from omnigent.runner.identity import RUNNER_ADOPT_SIGNAL
 
         if RUNNER_ADOPT_SIGNAL is None:
             return
-        with contextlib.suppress(NotImplementedError):
-            loop.add_signal_handler(RUNNER_ADOPT_SIGNAL, adopted_event.set)
+        _try_add_handler(RUNNER_ADOPT_SIGNAL, adopted_event.set)
 
 
 def _install_crash_logging() -> None:
@@ -1682,6 +1792,29 @@ def _install_crash_logging() -> None:
     sys.excepthook = _log_uncaught
 
 
+def _maybe_prewarm_ambient_detection() -> None:
+    """Prewarm ambient provider detection for claude-native launches.
+
+    Terminal auto-create resolves the session's provider config, and on a
+    machine with no explicit provider that runs ambient detection — on macOS
+    a ``claude auth status`` subprocess (~0.6-0.9s) — inside the
+    user-visible "Starting up…" window. Starting the sweep at boot overlaps
+    it with tunnel connect and session init instead.
+
+    Gated on the launch-harness stamp the host injects (absent for CLI-local
+    runners and hosts that predate it), so other harnesses don't pay a
+    speculative subprocess on every launch.
+    """
+    from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
+    from omnigent.runner.identity import RUNNER_LAUNCH_HARNESS_ENV_VAR
+
+    if os.environ.get(RUNNER_LAUNCH_HARNESS_ENV_VAR) != CLAUDE_NATIVE_CODING_AGENT.harness:
+        return
+    from omnigent.onboarding.ambient import prewarm_detect_providers
+
+    prewarm_detect_providers()
+
+
 def main() -> None:
     """Console entry point for the runner tunnel process.
 
@@ -1689,8 +1822,16 @@ def main() -> None:
     """
     from omnigent.process_logging import configure_process_logging
 
+    # Spawned with -P, so the workspace is not on sys.path. Re-add it now that
+    # the real omnigent is imported (it can no longer be shadowed) so
+    # spec-declared local tools living in the workspace still import.
+    cwd = os.getcwd()
+    if cwd not in sys.path:
+        sys.path.insert(0, cwd)
+
     configure_process_logging("runner", force=True)
     _install_crash_logging()
+    _maybe_prewarm_ambient_detection()
     try:
         asyncio.run(_run_tunnel_from_env())
     except RuntimeError as exc:

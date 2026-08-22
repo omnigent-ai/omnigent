@@ -334,9 +334,14 @@ class TestConstructor(unittest.TestCase):
         self.assertEqual(executor._clients, {})
         self.assertEqual(executor._crashed_sessions, {})
         self.assertFalse(executor._gateway)
-        # _extra_env carries the default RetryPolicy's CLI env vars
-        # (ANTHROPIC_MAX_RETRIES + ANTHROPIC_REQUEST_TIMEOUT_SECONDS).
-        self.assertEqual(executor._extra_env, RetryPolicy().claude_cli.env())
+        # _extra_env carries Tool Search plus the default RetryPolicy's CLI env.
+        self.assertEqual(
+            executor._extra_env,
+            {
+                "ENABLE_TOOL_SEARCH": "true",
+                **RetryPolicy().claude_cli.env(),
+            },
+        )
 
     def test_os_env_spec_with_no_sandbox_keeps_native_tools_enabled(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
@@ -595,6 +600,7 @@ class TestConstructor(unittest.TestCase):
             executor._extra_env["OMNIGENT_CLAUDE_API_KEY_HELPER"],
             "printf token",
         )
+        self.assertEqual(executor._extra_env["ENABLE_TOOL_SEARCH"], "true")
 
     def test_databricks_flag_with_host_override_requires_base_url(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
@@ -627,9 +633,15 @@ class TestConstructor(unittest.TestCase):
         from omnigent.spec.types import RetryPolicy
 
         executor = ClaudeSDKExecutor(gateway=False)
-        # gateway=False → no Databricks env, but RetryPolicy CLI env
-        # is always merged in. Verify the only entries are the retry env.
-        self.assertEqual(executor._extra_env, RetryPolicy().claude_cli.env())
+        # gateway=False → no Databricks env, but Tool Search and RetryPolicy
+        # CLI env are always merged in.
+        self.assertEqual(
+            executor._extra_env,
+            {
+                "ENABLE_TOOL_SEARCH": "true",
+                **RetryPolicy().claude_cli.env(),
+            },
+        )
 
     def test_databricks_profile_default_model_used_when_unset(self):
         """gateway=True (profile-derived) + no model → Databricks default.
@@ -639,6 +651,10 @@ class TestConstructor(unittest.TestCase):
         model falls back to the Databricks default. The neutral
         generic-provider gateway path never does this (see
         ``test_neutral_gateway_no_model_does_not_inject_databricks_default``).
+
+        Live model discovery is stubbed unavailable here so the resolver drops
+        to the bundled catalog — its documented last resort; the discovery-first
+        path is covered by ``test_databricks_profile_uses_discovered_model``.
         """
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
         from omnigent.inner.databricks_executor import DatabricksCredentials
@@ -667,6 +683,10 @@ class TestConstructor(unittest.TestCase):
 
             with (
                 patch(
+                    "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
+                    side_effect=RuntimeError("live listing unavailable"),
+                ),
+                patch(
                     "omnigent.model_catalog.resolve_catalog_model",
                     side_effect=_resolve_model,
                 ),
@@ -681,6 +701,64 @@ class TestConstructor(unittest.TestCase):
                         pass
 
             self.assertEqual(captured["model"], "catalog-databricks-claude-default")
+
+        _run(_t())
+
+    def test_databricks_profile_uses_discovered_model(self):
+        """gateway=True (profile-derived) + no model → the workspace's live model.
+
+        The resolver prefers the live Unity Catalog listing over the bundled
+        catalog, walking the ``opus > sonnet > haiku > fable`` precedence
+        claude-native falls back to; the bundled ``databricks-*`` catalog is
+        only the last resort (see ``..._default_model_used_when_unset``).
+        """
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+        from omnigent.inner.databricks_executor import DatabricksCredentials
+
+        async def _t():
+            with patch(
+                "omnigent.inner.databricks_executor._read_databrickscfg",
+                return_value=DatabricksCredentials(
+                    host="https://example.cloud.databricks.com",
+                    token="dapi_test_token",
+                ),
+            ):
+                executor = ClaudeSDKExecutor(gateway=True)
+
+            captured: dict[str, str | None] = {}
+
+            async def fake_get_or_create_client(sdk, *, session_key, options, model):
+                captured["model"] = model
+                raise RuntimeError("stop after model resolution")
+
+            with (
+                patch(
+                    "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+                    return_value=SimpleNamespace(
+                        host="https://example.cloud.databricks.com", token="dapi_test_token"
+                    ),
+                ),
+                patch(
+                    "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
+                    return_value=SimpleNamespace(
+                        families={
+                            "sonnet": "system.ai.claude-sonnet-5",
+                            "opus": "system.ai.claude-opus-5",
+                        }
+                    ),
+                ),
+                patch.object(
+                    executor,
+                    "_get_or_create_client",
+                    side_effect=fake_get_or_create_client,
+                ),
+            ):
+                with self.assertRaises(RuntimeError):
+                    async for _ in executor.run_turn([{"role": "user", "content": "hi"}], [], ""):
+                        pass
+
+            # opus outranks sonnet in the family precedence.
+            self.assertEqual(captured["model"], "system.ai.claude-opus-5")
 
         _run(_t())
 
@@ -1171,6 +1249,54 @@ class TestResolveGatewayEnv(unittest.TestCase):
             )
             self.assertNotIn("ANTHROPIC_AUTH_TOKEN", env)
 
+    def test_databricks_gateway_negotiates_betas(self):
+        """A real Databricks AI Gateway base URL negotiates betas, not disables them.
+
+        Blanket-disabling betas makes Claude Code strip ``interleaved-thinking``,
+        which the Databricks gateway then rejects with a thinking-block 400. On a
+        genuine gateway we set ``CLAUDE_CODE_USE_GATEWAY`` and leave the disable
+        flag off (matching claude-native).
+        """
+        from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
+        from omnigent.inner.databricks_executor import DatabricksCredentials
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch(
+                "omnigent.inner.databricks_executor._read_databrickscfg",
+                return_value=DatabricksCredentials(
+                    host="https://wkspc.cloud.databricks.com",
+                    token="dapi_abc123",
+                ),
+            ),
+        ):
+            env = _resolve_gateway_env()
+        self.assertEqual(env["CLAUDE_CODE_USE_GATEWAY"], "1")
+        self.assertNotIn("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", env)
+
+    def test_non_databricks_gateway_keeps_beta_disable(self):
+        """A gateway host outside the trusted Databricks domains keeps the workaround.
+
+        A generic gateway (or a mock server) can't negotiate betas, so the
+        original ``CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS`` behavior is preserved.
+        """
+        from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
+        from omnigent.inner.databricks_executor import DatabricksCredentials
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch(
+                "omnigent.inner.databricks_executor._read_databrickscfg",
+                # Not under a trusted Databricks parent domain.
+                return_value=DatabricksCredentials(
+                    host="https://example.databricks.com", token="t"
+                ),
+            ),
+        ):
+            env = _resolve_gateway_env()
+        self.assertEqual(env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"], "1")
+        self.assertNotIn("CLAUDE_CODE_USE_GATEWAY", env)
+
     def test_strips_trailing_slash(self):
         from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
         from omnigent.inner.databricks_executor import DatabricksCredentials
@@ -1325,14 +1451,6 @@ class TestSystemMessages(unittest.TestCase):
         shim_upstream: dict[str, str] = {}
 
         async def _t():
-            executor = ClaudeSDKExecutor()
-            executor._gateway = True
-            executor._databricks_profile = "oss"
-            executor._base_url_override = "https://host/ai-gateway/anthropic"
-            executor._extra_env = _resolve_gateway_env(
-                profile="oss",
-                base_url_override="https://host/ai-gateway/anthropic",
-            )
             with (
                 patch(
                     "omnigent.inner.claude_sdk_executor._resolve_gateway_env",
@@ -1340,6 +1458,12 @@ class TestSystemMessages(unittest.TestCase):
                 ),
                 patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK),
             ):
+                executor = ClaudeSDKExecutor(
+                    gateway=True,
+                    gateway_host="https://host",
+                    base_url_override="https://host/ai-gateway/anthropic",
+                    gateway_auth_command="printf token",
+                )
                 events = [
                     e
                     async for e in executor.run_turn(
@@ -1375,6 +1499,7 @@ class TestSystemMessages(unittest.TestCase):
         self.assertTrue(shim_upstream["base_url"].startswith("http://127.0.0.1:"))
         self.assertEqual(shim_upstream["upstream"], "https://host/ai-gateway/anthropic")
         self.assertEqual(captured_options[0].env["CLAUDE_CODE_API_KEY_HELPER_TTL_MS"], "900000")
+        self.assertEqual(captured_options[0].env["ENABLE_TOOL_SEARCH"], "true")
         self.assertNotIn("OMNIGENT_CLAUDE_API_KEY_HELPER", captured_options[0].env)
         self.assertNotIn("ANTHROPIC_AUTH_TOKEN", captured_options[0].env)
 
@@ -1666,6 +1791,7 @@ class TestStreamEventStreaming(unittest.TestCase):
                             "extra_args": getattr(self.options, "extra_args", {}),
                             "tools": getattr(self.options, "tools", None),
                             "allowed_tools": getattr(self.options, "allowed_tools", None),
+                            "env": getattr(self.options, "env", None),
                         }
                     )
                     result_session_id = (
@@ -1701,12 +1827,10 @@ class TestStreamEventStreaming(unittest.TestCase):
                 query_calls[0]["extra_args"],
                 {"no-session-persistence": None},
             )
-            # Skill is always in the base tool set so the Skill tool is
-            # actually exposed to the model when ``skills="all"`` (the
-            # SDK only adds Skill to ``allowedTools`` — without listing
-            # it in ``tools`` the CLI passes ``--tools ""`` and zeros
-            # the base set).
-            self.assertEqual(query_calls[0]["tools"], ["Skill"])
+            # Skill remains available for configured skills; ToolSearch
+            # keeps large MCP definitions deferred until they are needed.
+            self.assertEqual(query_calls[0]["tools"], ["Skill", "ToolSearch"])
+            self.assertEqual(query_calls[0]["env"]["ENABLE_TOOL_SEARCH"], "true")
             self.assertEqual(query_calls[0]["allowed_tools"], [])
             self.assertEqual(query_calls[1]["session_id"], "session-b")
             self.assertEqual(query_calls[2]["session_id"], "session-a")
@@ -1809,15 +1933,15 @@ class TestStreamEventStreaming(unittest.TestCase):
                     )
                 ]
             # OS operations route through sys_os_* MCP tools, not SDK
-            # built-ins. Only Skill remains in the native base set.
-            self.assertEqual(captured_options["tools"], ["Skill"])
+            # built-ins. Skill and ToolSearch do not widen OS access.
+            self.assertEqual(captured_options["tools"], ["Skill", "ToolSearch"])
             self.assertIn("mcp__omnigent__sleep", captured_options["allowed_tools"])
             self.assertNotIn("Bash", captured_options["allowed_tools"])
             self.assertIsInstance(events[-1], TurnComplete)
 
         _run(_t())
 
-    def test_mcp_only_session_disables_native_tool_base_set(self):
+    def test_mcp_only_session_keeps_discovery_tools_without_native_os_tools(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 
         captured_options = {}
@@ -1895,14 +2019,13 @@ class TestStreamEventStreaming(unittest.TestCase):
                         "",
                     )
                 ]
-            # Default ``skills_filter="all"`` exposes the ``Skill``
-            # tool so the model can invoke discovered skills via
-            # the Claude SDK plugin mechanism. The OS tools
+            # Default ``skills_filter="all"`` exposes the ``Skill`` tool
+            # through the Claude SDK plugin mechanism. ToolSearch defers
+            # MCP definitions until needed. The OS tools
             # (Bash/Read/Edit/Write/Glob/Grep) stay absent — that's
-            # what this test pins. ``Skill`` itself doesn't widen
-            # the FS attack surface; it only loads pre-approved
-            # SKILL.md content.
-            self.assertEqual(captured_options["tools"], ["Skill"])
+            # what this test pins. Neither base tool widens the FS attack
+            # surface.
+            self.assertEqual(captured_options["tools"], ["Skill", "ToolSearch"])
             self.assertEqual(captured_options["allowed_tools"], ["mcp__omnigent__sleep"])
             self.assertIsInstance(events[-1], TurnComplete)
 
@@ -4397,10 +4520,112 @@ def test_precompact_hook_emits_compaction_complete_with_session_messages() -> No
         assert ce.compacted_messages[0]["role"] == "user"
         assert ce.compacted_messages[1]["role"] == "assistant"
         mock_get_msgs.assert_called_once_with("claude-uuid-123", directory=None)
-        # CompactionComplete before TurnComplete
+        # CompactionStarted before CompactionComplete before TurnComplete
+        from omnigent.inner.executor import CompactionStarted
+
+        started_events = [e for e in events if isinstance(e, CompactionStarted)]
+        assert len(started_events) == 1
         turn_completes = [e for e in events if isinstance(e, TurnComplete)]
         assert len(turn_completes) == 1
+        assert events.index(started_events[0]) < events.index(compaction_events[0])
         assert events.index(compaction_events[0]) < events.index(turn_completes[0])
+
+    _run(_t())
+
+
+def test_precompact_hook_emits_compaction_started_before_complete() -> None:
+    """CompactionStarted is yielded when PreCompact fires, before CompactionComplete.
+
+    This ensures clients see the in-progress signal while compaction is
+    still happening, rather than both events arriving back-to-back after
+    the turn ends.
+    """
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import CompactionComplete, CompactionStarted
+
+    class _ResultMessage:
+        def __init__(self, session_id, result):
+            self.session_id = session_id
+            self.result = result
+            self.content = []
+            self.model = "claude-test"
+            self.usage = type(
+                "U",
+                (),
+                {"input_tokens": 500, "output_tokens": 100},
+            )()
+
+    class _SystemMessage:
+        def __init__(self, subtype, data, hook_event_name=None):
+            self.subtype = subtype
+            self.data = data
+            self.hook_event_name = hook_event_name
+
+    class _FakeSDK:
+        AssistantMessage = type("AssistantMessage", (), {})
+        UserMessage = type("UserMessage", (), {})
+        SystemMessage = _SystemMessage
+        ResultMessage = _ResultMessage
+        StreamEvent = type("StreamEvent", (), {})
+        ClaudeAgentOptions = type(
+            "ClaudeAgentOptions",
+            (),
+            {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+        )
+        messages: list = []
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                self.options = options
+
+            async def connect(self):
+                return
+
+            async def query(self, prompt, session_id="default"):
+                _FakeSDK.messages = [
+                    _SystemMessage(
+                        subtype="hook_started",
+                        data={"hook_event": "PreCompact"},
+                        hook_event_name="PreCompact",
+                    ),
+                    _ResultMessage("claude-uuid-456", "compacted result"),
+                ]
+
+            async def receive_response(self):
+                for message in _FakeSDK.messages:
+                    yield message
+
+            async def disconnect(self):
+                return None
+
+    async def _t():
+        executor = ClaudeSDKExecutor()
+        with (
+            patch(
+                "omnigent.inner.claude_sdk_executor._ensure_sdk",
+                return_value=_FakeSDK,
+            ),
+            patch(
+                "claude_agent_sdk.get_session_messages",
+                return_value=[],
+            ),
+        ):
+            events = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hi", "session_id": "s1"}],
+                    [],
+                    "",
+                )
+            ]
+
+        started = [e for e in events if isinstance(e, CompactionStarted)]
+        completed = [e for e in events if isinstance(e, CompactionComplete)]
+        assert len(started) == 1, "expected exactly one CompactionStarted"
+        assert len(completed) == 1, "expected exactly one CompactionComplete"
+        assert events.index(started[0]) < events.index(completed[0]), (
+            "CompactionStarted must precede CompactionComplete"
+        )
 
     _run(_t())
 

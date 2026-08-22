@@ -1,11 +1,10 @@
 import {
   BotIcon,
-  ChevronLeftIcon,
   EllipsisVerticalIcon,
   FileIcon,
+  GitCompareIcon,
   InfoIcon,
   ListIcon,
-  ListTodoIcon,
   PanelLeftIcon,
   PanelRightCloseIcon,
   PanelRightIcon,
@@ -13,7 +12,6 @@ import {
   TerminalIcon,
   UserPlusIcon,
 } from "lucide-react";
-import { Link } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
@@ -23,12 +21,15 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { AgentInfoButton } from "@/components/AgentInfo";
-import { nativeCodingAgentForSubagentWrapper } from "@/lib/nativeCodingAgents";
+import { ConversationBreadcrumb } from "./ConversationBreadcrumb";
+import { UNTITLED_CONVERSATION_LABEL } from "./sidebarNav";
 import { PresenceAvatars } from "@/components/PresenceAvatars";
 import type { Agent } from "@/hooks/useAgents";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { cn } from "@/lib/utils";
 import { TAB_BADGE_BASE } from "./railTabs";
 import { ViewModeToggle } from "./ViewModeToggle";
+import { useCallback, useEffect, useRef } from "react";
 
 /**
  * Gating flags + handlers for the mobile-only session-menu FAB (the
@@ -51,20 +52,12 @@ interface MobileSessionMenuProps {
   subagentsPanelOpen: boolean;
   /** True while the mobile shells drawer is open. */
   shellsPanelOpen: boolean;
-  /** True while the mobile tasks drawer is open. */
-  todosPanelOpen: boolean;
   /** Hide the Shells entry (claude-native sub-agents only). */
   hideTerminalsTab: boolean;
   /** Whether the Shells entry is available. */
   showShellsTab: boolean;
   /** Number of open terminals (entry badge). */
   terminalsLength: number;
-  /** Whether the session publishes a todo list (gates the Tasks entry). */
-  todosSupported: boolean;
-  /** Completed todo count (Tasks entry badge numerator). */
-  todosCompleted: number;
-  /** Total todo count (Tasks entry badge denominator + visibility). */
-  todosTotal: number;
   /** Debug mode — surfaces the Logs entry. */
   debugMode: boolean;
   /** Changed-file count (Files entry badge). */
@@ -76,14 +69,14 @@ interface MobileSessionMenuProps {
    * entry badge) — starts at 1 for a lone agent.
    */
   agentCount: number;
-  /** Open the mobile files drawer. */
+  /** Open the mobile files drawer (full folder tree). */
   onOpenFiles: () => void;
+  /** Open the mobile files drawer pinned to the changed-files list. */
+  onOpenChanges: () => void;
   /** Open the mobile shells drawer. */
   onOpenShells: () => void;
   /** Open the mobile agents drawer. */
   onOpenSubagents: () => void;
-  /** Open the mobile tasks drawer. */
-  onOpenTodos: () => void;
   /** Open the main execution-log push panel. */
   onOpenMainExecutionLog: () => void;
 }
@@ -97,13 +90,29 @@ interface ChatHeaderProps {
   /** Whether the left sidebar is open (hides the open-sidebar button). */
   sidebarOpen: boolean;
   /** Open the left sidebar. */
-  onOpenSidebar: () => void;
-  /** Whether the active session is a sub-agent (shows the back link). */
+  onOpenSidebar: (peek?: boolean) => void;
+  /** Whether the active session is a sub-agent (appends its identity). */
   isChildSession: boolean;
-  /** Parent session id for the back link's destination (when a child). */
-  parentSessionId: string | null | undefined;
   /** Active session id, or undefined on the landing composer. */
   conversationId: string | undefined;
+  /**
+   * Breadcrumb title: the active conversation's display name, or its
+   * immediate parent's when viewing a sub-agent. ``null`` while unresolved.
+   * A child still renders the breadcrumb (and the parent link) when
+   * ``titleLinkTo`` is set — the title falls back to "New session".
+   */
+  conversationTitle: string | null;
+  /**
+   * Name of the project the breadcrumb conversation is filed under, shown as
+   * a leading folder icon (project name in its tooltip). ``null`` when
+   * unfiled — no folder renders.
+   */
+  projectName: string | null;
+  /**
+   * Route the title links to (the parent session, when inside a sub-agent),
+   * making the title a way back out. ``undefined`` renders it as plain text.
+   */
+  titleLinkTo?: string;
   /** The bound agent (mcp_servers + policies) for the info popover. */
   boundAgent: Agent | undefined;
   /**
@@ -131,7 +140,7 @@ interface ChatHeaderProps {
   showFilesPanel: boolean;
   /**
    * Whether the right workspace rail has at least one available tab
-   * (files, terminals, sub-agents, or todos). Gates the desktop
+   * (files, terminals, or sub-agents). Gates the desktop
    * collapse toggle — with no rail content the panel doesn't mount
    * (see AppShell), so a toggle would flip an invisible card.
    */
@@ -152,8 +161,9 @@ interface ChatHeaderProps {
  * canvas shows through, and chat content dissolves before it slides
  * under the controls (the conversation viewport's ``chat-scroll-fade``
  * mask, index.css; chat reserves clearance via ``pt-20``,
- * terminal-first via ``pt-14``). Left slot: open-sidebar +
- * back-to-parent. Right slot: desktop action buttons (Agent info ·
+ * terminal-first via ``pt-14``). Left slot: open-sidebar + a conversation
+ * breadcrumb (``[folder] / <title> [/ <sub-agent>]``). Right slot: desktop
+ * action buttons (Agent info ·
  * Share · right-panel toggle), a mobile three-dot menu mirroring the
  * same actions, and a mobile FAB that opens the rail tabs as
  * full-screen drawers. Stop session lives in the sidebar row's kebab
@@ -166,8 +176,10 @@ export function ChatHeader({
   sidebarOpen,
   onOpenSidebar,
   isChildSession,
-  parentSessionId,
   conversationId,
+  conversationTitle,
+  projectName,
+  titleLinkTo,
   boundAgent,
   wrapperLabel,
   canShare,
@@ -183,15 +195,26 @@ export function ChatHeader({
   onToggleRightPanel,
   mobileMenu,
 }: ChatHeaderProps) {
-  // A native sub-agent (a Claude Code Task, a Codex collab thread) is bound to
-  // its parent's `<vendor>-native-ui` row, so its agent name is an internal
-  // the server itself hides (`public_agent_name`). Name the product instead,
-  // matching the Agents rail and the composer. Every other sub-agent keeps its
-  // own agent name, which is already human-readable. Only the child branch
-  // below reads this, so it stays behind `isChildSession`.
-  const subAgentName = isChildSession
-    ? (nativeCodingAgentForSubagentWrapper(wrapperLabel)?.displayName ?? boundAgent?.name ?? null)
-    : null;
+  // Dwell on the toggle for 1s to peek the sidebar; leaving before then cancels
+  // the pending peek so a quick pass-over never opens it. Peek is a desktop
+  // hover affordance — on mobile the toggle just opens the full-screen overlay,
+  // so a tap's synthetic pointerenter must not trigger it.
+  const isMobile = useIsMobileViewport();
+  const peekTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cancelPeek = useCallback(() => {
+    if (peekTimer.current) {
+      clearTimeout(peekTimer.current);
+      peekTimer.current = null;
+    }
+  }, []);
+  const onPeekSidebar = useCallback(() => {
+    if (isMobile) return;
+    cancelPeek();
+    peekTimer.current = setTimeout(() => {
+      onOpenSidebar(true);
+    }, 400);
+  }, [isMobile, onOpenSidebar, cancelPeek]);
+  useEffect(() => cancelPeek, [cancelPeek]);
   return (
     <header
       className={cn(
@@ -201,7 +224,7 @@ export function ChatHeader({
         // Scrolled chat text can't render through the controls because the
         // conversation viewport fades its top edge instead (chat-scroll-fade
         // in index.css, applied in ChatPage).
-        "chat-header absolute inset-x-0 top-0 z-30 flex h-14 items-center justify-between px-2 py-3 md:right-[var(--workspace-panel-offset,0px)]",
+        "chat-header absolute inset-x-0 top-0 z-30 flex h-14 md:h-12 items-center justify-between px-2 md:px-4 py-3 md:right-[var(--workspace-panel-offset,0px)]",
       )}
     >
       {/* Left slot: sidebar toggle (when sidebar is closed) and a
@@ -214,17 +237,35 @@ export function ChatHeader({
           where the macOS Electron shell's traffic lights float — drop
           just this slot below them (the right action cluster stays up
           in the title-bar strip). Inert outside the shell (index.css). */}
-      <div className={cn("flex items-center gap-1", !sidebarOpen && "traffic-light-clearance")}>
+      <div
+        className={cn(
+          "flex min-w-0 items-center gap-1 md:gap-6",
+          !sidebarOpen && "traffic-light-clearance",
+        )}
+      >
         {!sidebarOpen && (
           <Tooltip>
             <TooltipTrigger asChild>
               <Button
                 type="button"
                 variant="ghost"
+                // icon on <md (size-10, comfortable tap target), icon-xs on
+                // desktop (md:size-6). size="icon" gives the base size-10; the
+                // md:size-6 override replaces the variant's md:size-8.
                 size="icon"
                 aria-label="Open sidebar"
-                onClick={onOpenSidebar}
-                className="text-muted-foreground hover:text-foreground"
+                onClick={() => {
+                  cancelPeek();
+                  onOpenSidebar(false);
+                }}
+                // chat-header-sidebar-toggle is hidden on the macOS shell, where
+                // the title-bar cluster carries an always-present toggle (with
+                // the same dwell-to-peek) and this would be a second, offset
+                // copy of it. Kept everywhere else, where it is the ONLY way to
+                // reopen a collapsed sidebar.
+                className="chat-header-sidebar-toggle text-muted-foreground hover:text-foreground md:size-6"
+                onPointerEnter={onPeekSidebar}
+                onPointerLeave={cancelPeek}
               >
                 <PanelLeftIcon className="size-4" />
               </Button>
@@ -234,47 +275,23 @@ export function ChatHeader({
             <TooltipContent side="bottom">Open sidebar</TooltipContent>
           </Tooltip>
         )}
-        {isChildSession && parentSessionId && (
-          <>
-            {/* Back affordance. Ghost (not a filled pill) so it sits on the
-                header's transparent overlay like the sidebar/panel toggles —
-                an opaque fill would read as a hard tile over the glass canvas
-                (the bar paints no background; see the header comment above).
-                The chevron + label still make it read as a way out, paired
-                with the sub-agent identity block beside it. */}
-            <Button
-              asChild
-              type="button"
-              variant="ghost"
-              size="sm"
-              className="gap-0.5 pl-1.5 pr-2 text-muted-foreground hover:text-foreground"
-            >
-              <Link to={`/c/${parentSessionId}`} aria-label="Back to parent session">
-                <ChevronLeftIcon className="size-4" />
-                <span>Back</span>
-              </Link>
-            </Button>
-            {/* Divider + sub-agent identity. The name (see ``subAgentName``)
-                plus the "Sub-agent" caption make the nesting obvious
-                on a phone, where the sidebar — and the tree it shows — is
-                collapsed. Falls back to a plain "Sub-agent" label until the
-                agent snapshot resolves, so the two lines never both read
-                "Sub-agent". */}
-            <span aria-hidden className="mx-1 h-5 w-px bg-border" />
-            <div className="flex min-w-0 items-center gap-2">
-              <BotIcon className="size-4 shrink-0 text-muted-foreground" />
-              {subAgentName ? (
-                <div className="flex min-w-0 flex-col leading-tight">
-                  <span className="truncate text-ui font-semibold text-foreground">
-                    {subAgentName}
-                  </span>
-                  <span className="text-sm text-muted-foreground">Sub-agent</span>
-                </div>
-              ) : (
-                <span className="text-ui font-semibold text-foreground">Sub-agent</span>
-              )}
-            </div>
-          </>
+        {/* Conversation breadcrumb (see ConversationBreadcrumb). Empty on the
+            landing composer. A resolved title is enough; so is titleLinkTo —
+            a child must keep its climb-out while the parent title loads.
+            min-w-0 on this slot lets it truncate rather than push the
+            right-hand action cluster. On the macOS shell with the sidebar
+            collapsed, the slot's traffic-light-clearance pads it past the
+            window controls + title-bar cluster (index.css). */}
+        {conversationId && (conversationTitle || titleLinkTo) && (
+          <ConversationBreadcrumb
+            conversationTitle={conversationTitle ?? UNTITLED_CONVERSATION_LABEL}
+            projectName={projectName}
+            titleLinkTo={titleLinkTo}
+            isChildSession={isChildSession}
+            boundAgent={boundAgent}
+            wrapperLabel={wrapperLabel}
+            className="pr-1"
+          />
         )}
       </div>
 
@@ -421,7 +438,6 @@ export function ChatHeader({
           !mobileMenu.filesPanelOpen &&
           !mobileMenu.subagentsPanelOpen &&
           !mobileMenu.shellsPanelOpen &&
-          !mobileMenu.todosPanelOpen &&
           (hasRailContent || mobileMenu.debugMode) && (
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
@@ -443,6 +459,15 @@ export function ChatHeader({
                   >
                     <FileIcon className="size-4" />
                     Files
+                  </DropdownMenuItem>
+                )}
+                {showFilesPanel && (
+                  <DropdownMenuItem
+                    onSelect={mobileMenu.onOpenChanges}
+                    className="gap-2.5 px-2.5 py-2 text-ui"
+                  >
+                    <GitCompareIcon className="size-4" />
+                    Changes
                     {mobileMenu.changedCount > 0 && (
                       <span
                         className={cn(TAB_BADGE_BASE, "ml-auto bg-muted text-muted-foreground")}
@@ -475,10 +500,11 @@ export function ChatHeader({
                       : mobileMenu.agentCount}
                   </span>
                 </DropdownMenuItem>
-                {/* Shells — mirrors the desktop rail's Shells tab: visible
-                    when a real shell exists, or when the agent spec declares
-                    shell access so the empty-state "+ New shell" affordance
-                    is reachable on mobile too. */}
+                {/* Shells — the mobile entry into the session's shells
+                    (desktop has no Shells tab; it opens shells as soft tabs):
+                    visible when a real shell exists, or when the agent spec
+                    declares shell access so the empty-state "+ New shell"
+                    affordance is reachable on mobile too. */}
                 {!mobileMenu.hideTerminalsTab && mobileMenu.showShellsTab && (
                   <DropdownMenuItem
                     onSelect={mobileMenu.onOpenShells}
@@ -493,18 +519,6 @@ export function ChatHeader({
                         {mobileMenu.terminalsLength}
                       </span>
                     )}
-                  </DropdownMenuItem>
-                )}
-                {mobileMenu.todosSupported && mobileMenu.todosTotal > 0 && (
-                  <DropdownMenuItem
-                    onSelect={mobileMenu.onOpenTodos}
-                    className="gap-2.5 px-2.5 py-2 text-ui"
-                  >
-                    <ListTodoIcon className="size-4" />
-                    Tasks
-                    <span className={cn(TAB_BADGE_BASE, "ml-auto bg-muted text-muted-foreground")}>
-                      {mobileMenu.todosCompleted}/{mobileMenu.todosTotal}
-                    </span>
                   </DropdownMenuItem>
                 )}
                 {mobileMenu.debugMode && (

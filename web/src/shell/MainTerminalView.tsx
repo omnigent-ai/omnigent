@@ -1,6 +1,6 @@
 // Inline terminal renderer for terminal-first sessions. Replaces the
 // chat conversation + composer when the user picks "Terminal" in the
-// connection pill, or opens a shell from the rail's Shells tab. Shares
+// connection pill, or opens a shell as a rail soft tab. Shares
 // the lower-level primitives (`useTerminals` + `TerminalView`) with
 // `InlineTerminalsSection` and `TerminalsPanel`, but renders as plain
 // flex content — no drawer chrome, no resize handle, no collapse — so
@@ -10,8 +10,8 @@
 // Two render states, for every session shape (SDK and native alike):
 // the AGENT's terminal (the SDK REPL or the native vendor pane)
 // renders chrome-free, and a rail-opened user shell renders with a
-// single header row (identity + close X). There is no tab strip —
-// shells are enumerated and created in the rail's Shells tab.
+// single header row (identity + close X). There is no tab strip here —
+// shells are opened and created from the rail's tab strip ("+" menu).
 
 import { TerminalIcon, XIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
@@ -25,12 +25,21 @@ interface MainTerminalViewProps {
   conversationId: string;
   /**
    * Terminal tab key to focus when the view opens, e.g.
-   * `"terminal:terminal_zsh_main"` from clicking a shell row in the
-   * rail's Shells tab. Falsy values (null / the PANEL_NO_TERMINAL_KEY
+   * `"terminal:terminal_zsh_main"` from opening a shell in the rail.
+   * Falsy values (null / the PANEL_NO_TERMINAL_KEY
    * sentinel) leave the agent-terminal auto-selection in place; an
    * unknown or closed key falls back the same way once terminals load.
    */
   initialTerminalKey?: string | null;
+  /**
+   * False while the surface is mounted but hidden behind the chat view
+   * (the pre-warmed overlay in MainAgentSurface). The WS attach and
+   * xterm buffer stay alive so flipping to Terminal is instant; on the
+   * visible→hidden edge a user-shell selection resets to the agent
+   * terminal so the next open targets the agent pane, matching the old
+   * unmount-on-close behavior. Default true.
+   */
+  visible?: boolean;
   /**
    * When true, attach every terminal (agent TUI and user shells)
    * read-only — the viewer can watch but not type. Set for non-owners:
@@ -50,6 +59,7 @@ interface MainTerminalViewProps {
 export function MainTerminalView({
   conversationId,
   initialTerminalKey,
+  visible = true,
   readOnly = false,
   onSurfaceElement,
 }: MainTerminalViewProps) {
@@ -94,6 +104,17 @@ export function MainTerminalView({
     if (!stillValid) setActiveKey(terminalTabKey(agentTerminals[0] ?? terminals[0]));
   }, [terminals, agentTerminals, activeKey]);
 
+  // While hidden, drop a user-shell selection back to the agent terminal.
+  // The surface used to unmount on close (forgetting the selection), so
+  // reopening always showed the agent pane; the persistent pre-warmed
+  // mount must reproduce that, and it points the background attach at
+  // the pane the next open will actually show.
+  useEffect(() => {
+    if (visible || terminals.length === 0) return;
+    const fallback = agentTerminals[0] ?? terminals[0];
+    setActiveKey(terminalTabKey(fallback));
+  }, [visible, terminals, agentTerminals]);
+
   const activeTerminal = terminals.find((t) => terminalTabKey(t) === activeKey) ?? null;
   // A user shell opened from the rail takes over the pane chrome-free:
   // a single header row naming the shell plus a close X — no agent tab
@@ -127,6 +148,9 @@ export function MainTerminalView({
       // Exposed for e2e assertions that an expand targeted the right
       // terminal (not just that the view opened).
       data-active-terminal={activeKey}
+      // Distinguishes the revealed surface from the hidden pre-warmed
+      // mount for tests — both are in the DOM.
+      data-visible={visible}
       className="main-terminal-view flex min-h-0 flex-1 flex-col px-3 pt-14 pb-1.5"
     >
       <div className="flex min-h-0 w-full flex-1 flex-col overflow-hidden rounded-lg border border-border bg-card p-3 shadow-sm">
@@ -172,6 +196,8 @@ export function MainTerminalView({
                     terminalId={activeTerminal.id}
                     readOnly={readOnly}
                     transport={activeTerminal.transport}
+                    active={visible}
+                    directAttachUrl={activeTerminal.directAttachUrl}
                     onStateChange={(state) => {
                       setTerminalConnectionState(activeTerminal.id, state);
                     }}

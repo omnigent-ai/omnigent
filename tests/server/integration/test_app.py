@@ -382,19 +382,18 @@ async def test_me_is_admin_honors_admin_list_before_db_promotion(
     assert resp.json() == {"user_id": "alice@example.com", "is_admin": True}
 
 
-async def test_web_ui_serves_pwa_service_worker_and_manifest(
+async def test_web_ui_serves_service_worker_uncached(
     runtime_init: None,
     db_uri: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    PWA assets are served correctly from the SPA static mount.
+    ``sw.js`` is served from the SPA static mount with ``no-cache``.
 
-    ``sw.js`` must be ``no-cache`` so a deploy is picked up promptly — a
-    stale service worker would defeat prompt-to-reload — and
-    ``manifest.webmanifest`` must carry ``application/manifest+json`` or the
-    browser silently refuses to install the app.
+    The PWA is retired and ``sw.js`` is now a tombstone that unregisters the old
+    worker, but the header exemption must outlive it: a cached ``sw.js`` would
+    otherwise shadow any service worker served at this path later.
 
     :param runtime_init: Fixture that initializes the runtime with a mock LLM.
     :param db_uri: Test database URI.
@@ -405,9 +404,7 @@ async def test_web_ui_serves_pwa_service_worker_and_manifest(
     web_ui_dist = tmp_path / "web-ui"
     web_ui_dist.mkdir(parents=True)
     (web_ui_dist / "index.html").write_text("<!doctype html><div id='root'></div>")
-    (web_ui_dist / "sw.js").write_text("self.addEventListener('install', () => {});")
-    (web_ui_dist / "manifest.webmanifest").write_text('{"name":"Omnigent"}')
-    (web_ui_dist / "version.json").write_text('{"build":"testbuild"}')
+    (web_ui_dist / "sw.js").write_text("self.addEventListener('activate', () => {});")
 
     monkeypatch.setattr(app_module, "_WEB_UI_DIST", web_ui_dist)
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
@@ -424,18 +421,9 @@ async def test_web_ui_serves_pwa_service_worker_and_manifest(
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         sw = await client.get("/sw.js")
-        manifest = await client.get("/manifest.webmanifest")
-        version = await client.get("/version.json")
 
     assert sw.status_code == 200
     assert sw.headers["cache-control"] == app_module._WEB_UI_HTML_CACHE_CONTROL
-    assert manifest.status_code == 200
-    assert manifest.headers["content-type"].startswith("application/manifest+json")
-    # version.json is the SW's cache sentinel: if the static mount ever stopped
-    # serving it, the SW install would fail and the update prompt never fire. It
-    # is no-cache for the same reason as sw.js — a stale sentinel must not linger.
-    assert version.status_code == 200
-    assert version.headers["cache-control"] == app_module._WEB_UI_HTML_CACHE_CONTROL
 
 
 async def test_unmatched_api_path_404s_for_every_method(

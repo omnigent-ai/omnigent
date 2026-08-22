@@ -17,6 +17,7 @@ import base64
 import binascii
 import contextlib
 import logging
+import os
 import random
 from collections.abc import Awaitable, Callable
 from typing import TypeAlias
@@ -27,6 +28,7 @@ from websockets.exceptions import ConnectionClosedOK, InvalidURI, WebSocketExcep
 
 from omnigent.runner.identity import (
     OMNIGENT_INTERNAL_WS_ORIGIN,
+    RUNNER_SLICE_KEY_ENV_VAR,
     RUNNER_TUNNEL_TOKEN_HEADER,
 )
 from omnigent.runner.transports.ws_tunnel.frames import (
@@ -51,6 +53,7 @@ from omnigent.runner.transports.ws_tunnel.limits import (
     TUNNEL_KEEPALIVE_PING_INTERVAL_S,
     TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
 )
+from omnigent.suspend_watch import watch_for_resume
 from omnigent.tls import client_ssl_context
 
 _logger = logging.getLogger(__name__)
@@ -77,12 +80,16 @@ _FATAL_SERVER_CLOSE_CODES = {4001, 4002, 4004, 4500}
 # (not 401) when a previously-valid token expires while the machine is
 # offline or sleeping. A fresh token from the factory is obtained and the
 # connection is retried with normal backoff. After
-# _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS consecutive rejections the runner
-# gives up — a genuinely-forbidden runner must not busy-reconnect forever.
+# _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS consecutive rejections a runner that
+# never upgraded gives up — a genuinely-forbidden runner must not
+# busy-reconnect forever.
 _REFRESHABLE_HTTP_STATUSES = {401, 403}
-# Maximum consecutive HTTP 401/403 rejections before the runner exits.
-# A single rejection is almost certainly an expired token; a persistent
-# streak means the credentials can't be fixed and we should fail loud.
+# Maximum consecutive HTTP 401/403 rejections before a runner that has NEVER
+# completed an upgrade exits. A runner that HAS served this tunnel is exempt:
+# it already proved its credentials, so a later 401/403 is almost always a
+# network-path artifact (a dropped VPN whose proxy answers the upgrade before
+# it reaches the server) and exiting would kill every conversation on the
+# runner. Mirrors the host tunnel's status classification.
 _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS = 3
 # Routine server-initiated recycles, NOT errors: 1012 "service restart" and
 # 1001 "going away" (and a 502 upgrade rejection) are how the Databricks Apps
@@ -275,6 +282,8 @@ async def serve_tunnel(
     on_activity: Callable[[], None] | None = None,
     shutdown_event: asyncio.Event | None = None,
     on_graceful_shutdown: Callable[[], None] | None = None,
+    direct_attach_port: int | None = None,
+    direct_attach_token: str | None = None,
 ) -> None:
     """Keep a runner WebSocket tunnel connected to a server.
 
@@ -346,6 +355,15 @@ async def serve_tunnel(
         login_redirect_streak = 0
         http_auth_rejection_streak = 0
 
+    # Set by the per-connection suspend watcher (in _serve_tunnel_once) when it
+    # aborts the live tunnel after a wake from system suspend. Read at the
+    # bottom of the loop to force a prompt reconnect (skip the backoff).
+    woke_from_suspend = False
+
+    def _note_resume_from_suspend() -> None:
+        nonlocal woke_from_suspend
+        woke_from_suspend = True
+
     while True:
         if shutdown_event is not None and shutdown_event.is_set():
             # A shutdown requested between reconnect attempts (no live
@@ -372,6 +390,9 @@ async def serve_tunnel(
                 shutdown_event=shutdown_event,
                 on_graceful_shutdown=on_graceful_shutdown,
                 on_connected=_mark_connected,
+                on_resume_note=_note_resume_from_suspend,
+                direct_attach_port=direct_attach_port,
+                direct_attach_token=direct_attach_token,
                 **activity_kwargs,
             )
             # A graceful shutdown drains and closes the connection cleanly,
@@ -420,7 +441,10 @@ async def serve_tunnel(
                 http_status = _websocket_http_status(exc)
                 if http_status is not None and http_status in _REFRESHABLE_HTTP_STATUSES:
                     http_auth_rejection_streak += 1
-                    if http_auth_rejection_streak >= _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS:
+                    if (
+                        not ever_connected
+                        and http_auth_rejection_streak >= _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
+                    ):
                         login_hint = (
                             f"run `databricks auth login --host {server_url}` to re-authenticate"
                             if server_url
@@ -437,9 +461,20 @@ async def serve_tunnel(
                     # already guarded against transient factory errors (OSError etc.),
                     # so we don't call the factory directly here.
                     _invalidate_auth_token_factory(auth_token_factory)
-                    _logger.info("HTTP %d; invalidated auth token, retrying", http_status)
                     retry_reason = f"HTTP {http_status}; retrying with refreshed token"
-                    delay_s = _INITIAL_RECONNECT_DELAY_S
+                    if ever_connected:
+                        # Escalate the backoff rather than resetting it: a rejection
+                        # that outlives the token refresh is a network path answering
+                        # the upgrade, and the base delay would retry every ~0.5s for
+                        # the whole outage.
+                        _logger.warning(
+                            "HTTP %d after a successful upgrade; retrying — "
+                            "check VPN/network connectivity",
+                            http_status,
+                        )
+                    else:
+                        _logger.info("HTTP %d; invalidated auth token, retrying", http_status)
+                        delay_s = _INITIAL_RECONNECT_DELAY_S
                 else:
                     close_code = _websocket_close_code(exc)
                     if close_code in _FATAL_SERVER_CLOSE_CODES:
@@ -467,6 +502,15 @@ async def serve_tunnel(
                         retry_reason = str(exc)
         except (ConnectionError, OSError, ValueError) as exc:
             retry_reason = str(exc)
+        if woke_from_suspend:
+            # A wake from system suspend already aborted the live tunnel (see
+            # _serve_tunnel_once's watcher). The abrupt close would otherwise
+            # ride the escalating backoff; force a prompt reconnect at the base
+            # delay, like a server recycle, so the session reattaches at once.
+            woke_from_suspend = False
+            delay_s = _INITIAL_RECONNECT_DELAY_S
+            recycle = True
+            retry_reason = "resumed from system suspend; reconnecting promptly"
         jittered = delay_s * (
             1.0 + random.uniform(-_RECONNECT_JITTER_FRACTION, _RECONNECT_JITTER_FRACTION)
         )
@@ -628,6 +672,9 @@ async def _serve_tunnel_once(
     shutdown_event: asyncio.Event | None = None,
     on_graceful_shutdown: Callable[[], None] | None = None,
     on_connected: Callable[[], None] | None = None,
+    on_resume_note: Callable[[], None] | None = None,
+    direct_attach_port: int | None = None,
+    direct_attach_token: str | None = None,
 ) -> None:
     """Serve one WebSocket connection until it closes.
 
@@ -655,6 +702,10 @@ async def _serve_tunnel_once(
     :param on_connected: Optional sync callback fired once the WS
         upgrade is accepted. ``serve_tunnel`` uses it to distinguish a
         runner that has authenticated from one that never has.
+    :param on_resume_note: Optional sync callback fired when a wake from
+        system suspend is detected on this connection (just before the dead
+        socket is aborted). ``serve_tunnel`` uses it to force a prompt
+        reconnect instead of the escalating backoff.
     :returns: None.
     """
     import websockets
@@ -671,7 +722,13 @@ async def _serve_tunnel_once(
     from omnigent.cli_auth import databricks_request_headers
 
     headers: dict[str, str] = {"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
-    headers.update(databricks_request_headers(server_url, bearer_token=auth_token))
+    # Co-locate this runner's tunnel with its host's on one server replica: the
+    # host injects its id at launch. Absent for CLI-local runners (no host), and
+    # the builder only emits the routing header on a host-sharded deployment.
+    host_id = os.environ.get(RUNNER_SLICE_KEY_ENV_VAR)
+    headers.update(
+        databricks_request_headers(server_url, bearer_token=auth_token, host_id=host_id)
+    )
     if tunnel_token:
         headers[RUNNER_TUNNEL_TOKEN_HEADER] = tunnel_token
     # Verifying SSL context from a real CA bundle for wss:// — a bare default
@@ -703,8 +760,39 @@ async def _serve_tunnel_once(
     ) as ws:
         if on_connected is not None:
             on_connected()
-        await _send_hello(ws.send, runner_version)
+        await _send_hello(
+            ws.send,
+            runner_version,
+            direct_attach_port=direct_attach_port,
+            direct_attach_token=direct_attach_token,
+        )
         _logger.info("runner %s connected to %s", runner_id, tunnel_url)
+
+        def _on_resume_from_suspend(gap_s: float) -> None:
+            # Wake from system suspend: this socket is now half-open (the server
+            # already dropped it), so abort it to make the read below raise at
+            # once instead of waiting out the ~90s keepalive timeout;
+            # serve_tunnel then reconnects promptly. Skip during a graceful
+            # idle-reaper drain — aborting mid-drain would turn the clean
+            # end-of-stream close into an abrupt runner_disconnected.
+            if shutdown_event is not None and shutdown_event.is_set():
+                return
+            _logger.info(
+                "runner %s resumed from suspend (~%.0fs); dropping tunnel to reconnect",
+                runner_id,
+                gap_s,
+            )
+            if on_resume_note is not None:
+                on_resume_note()
+            transport = getattr(ws, "transport", None)
+            if transport is not None:
+                with contextlib.suppress(Exception):
+                    transport.abort()
+
+        suspend_task = asyncio.create_task(
+            watch_for_resume(_on_resume_from_suspend),
+            name=f"runner-suspend-watch:{runner_id}",
+        )
         try:
             if shutdown_event is None:
                 async for raw in ws:
@@ -783,6 +871,9 @@ async def _serve_tunnel_once(
                     with contextlib.suppress(asyncio.CancelledError):
                         await shutdown_wait
         finally:
+            suspend_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await suspend_task
             await _cancel_dispatch_tasks(dispatch_tasks)
             await _cancel_ws_channels(ws_channels)
 
@@ -841,12 +932,21 @@ async def _graceful_drain(
 async def _send_hello(
     send_text: Callable[[str], Awaitable[None]],
     runner_version: str,
+    *,
+    direct_attach_port: int | None = None,
+    direct_attach_token: str | None = None,
 ) -> None:
     """Send the runner's opening hello frame.
 
     :param send_text: Async WebSocket text sender.
     :param runner_version: Runner version string for the hello
         frame, e.g. ``"0.1.0"``.
+    :param direct_attach_port: Loopback port of the runner's direct
+        terminal-attach listener, advertised to the server so it can
+        hand browsers a same-machine attach URL. ``None`` when the
+        listener is not running.
+    :param direct_attach_token: Bearer token guarding that listener;
+        travels only alongside *direct_attach_port*.
     :returns: None.
     """
     # Signal host-side telemetry opt-out to the server so it can honour
@@ -865,6 +965,8 @@ async def _send_hello(
                 runner_version=runner_version,
                 frame_protocol_version=1,
                 telemetry_opt_out=_tel_opt_out,
+                direct_attach_port=direct_attach_port,
+                direct_attach_token=direct_attach_token,
                 harnesses=[
                     "claude-native",
                     "claude-sdk",

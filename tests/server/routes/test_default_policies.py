@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -301,3 +302,38 @@ async def test_list_no_config_policies_when_caps_empty(
     data = resp.json()["data"]
     config_entries = [p for p in data if p.get("source") == "config"]
     assert config_entries == []
+
+
+# ── Telemetry ─────────────────────────────────────────────────────────
+
+
+async def test_create_default_policy_emits_telemetry(
+    policy_client: httpx.AsyncClient,
+) -> None:
+    """``POST /v1/policies`` emits a ``PolicyRegisteredEvent`` with scope='admin'."""
+    from omnigent.telemetry.events import PolicyRegisteredEvent
+
+    with patch("omnigent.server.routes.default_policies._tel_emit") as mock_emit:
+        resp = await policy_client.post("/v1/policies", json=_policy_payload())
+    assert resp.status_code == 200
+
+    mock_emit.assert_called_once()
+    event = mock_emit.call_args[0][0]
+    assert isinstance(event, PolicyRegisteredEvent)
+    assert event.scope == "admin"
+    assert event.session_id is None
+    assert event.handler == _REGISTERED_HANDLER
+    assert event.policy_type == "python"
+
+
+async def test_create_default_policy_no_telemetry_on_error(
+    policy_client: httpx.AsyncClient,
+) -> None:
+    """``POST /v1/policies`` does not emit telemetry when the request fails."""
+    with patch("omnigent.server.routes.default_policies._tel_emit") as mock_emit:
+        # Duplicate name → 409 before the emit block is reached.
+        await policy_client.post("/v1/policies", json=_policy_payload(name="dup"))
+        mock_emit.reset_mock()
+        resp = await policy_client.post("/v1/policies", json=_policy_payload(name="dup"))
+    assert resp.status_code == 409
+    mock_emit.assert_not_called()

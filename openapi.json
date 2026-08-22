@@ -123,7 +123,7 @@
             "type": "array"
           },
           "skills": {
-            "description": "Skills bundled in the agent spec (`skills/<name>/SKILL.md`). Lets the Web UI's new-session composer offer a slash-command menu before a session (and its runner) exists. Host-discovered skills are runner-owned, so they are NOT listed here \u2014 the session snapshot's `skills` field carries the merged set once a runner is bound. Empty list when the spec bundles no skills or when the bundle cannot be loaded.",
+            "description": "Skills bundled in the agent spec (`skills/<dir>/SKILL.md`). Lets the Web UI's new-session composer offer a slash-command menu before a session (and its runner) exists. Host-discovered skills are runner-owned, so they are NOT listed here \u2014 the session snapshot's `skills` field carries the merged set once a runner is bound. Empty list when the spec bundles no skills or when the bundle cannot be loaded.",
             "items": {
               "$ref": "#/components/schemas/SkillSummary"
             },
@@ -249,6 +249,91 @@
           "file"
         ],
         "title": "Body_upload_session_file_v1_sessions__session_id__resources_files_post",
+        "type": "object"
+      },
+      "BrandingInfo": {
+        "properties": {
+          "app_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "App Name"
+          },
+          "heading": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Heading"
+          },
+          "logos": {
+            "$ref": "#/components/schemas/BrandingLogosInfo"
+          },
+          "powered_by": {
+            "title": "Powered By",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "app_name",
+          "heading",
+          "logos",
+          "powered_by"
+        ],
+        "title": "BrandingInfo",
+        "type": "object"
+      },
+      "BrandingLogosInfo": {
+        "properties": {
+          "favicon": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Favicon"
+          },
+          "loading": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Loading"
+          },
+          "main": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Main"
+          }
+        },
+        "required": [
+          "main",
+          "loading",
+          "favicon"
+        ],
+        "title": "BrandingLogosInfo",
         "type": "object"
       },
       "BrowserActionRequestEvent": {
@@ -538,6 +623,17 @@
             ],
             "description": "Sub-agent instance name, the suffix of `title` after the first `\":\"`, e.g. `\"auth\"`. `None` if `title` is `None` or missing a colon.",
             "title": "Session Name"
+          },
+          "task_summary": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Summary"
           },
           "title": {
             "anyOf": [
@@ -1286,6 +1382,25 @@
         "title": "CreatedEvent",
         "type": "object"
       },
+      "DailyCost": {
+        "description": "One day's LLM spend for the daily timeline chart.",
+        "properties": {
+          "cost_usd": {
+            "default": 0.0,
+            "title": "Cost Usd",
+            "type": "number"
+          },
+          "day": {
+            "title": "Day",
+            "type": "string"
+          }
+        },
+        "required": [
+          "day"
+        ],
+        "title": "DailyCost",
+        "type": "object"
+      },
       "ElicitationRequestEvent": {
         "description": "Synchronous request for a decision from upstream.\n\nEmitted by Omnigent (or, under the new contract, by a harness)\nwhen the LLM / a tool / a policy needs a verdict before\nproceeding. The consumer replies via\n`POST /v1/sessions/{session_id}/events` with\n`type == \"approval\"` and\n`omnigent.server.schemas.ElicitationResult` fields in\n`data`. This preserves MCP request/reply correlation by id\nwithout threading elicitations through PATCH.\n\nWire shape matches the existing emit at\n`omnigent/runtime/policies/approval.py:175`.",
         "properties": {
@@ -1506,15 +1621,54 @@
       "ErrorDetail": {
         "description": "Machine-readable error information attached to a failed response.",
         "properties": {
+          "cause": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional one/two-sentence explanation of why it failed. Paired with `title`.",
+            "title": "Cause"
+          },
           "code": {
             "description": "Error code string, e.g. `\"server_error\"`, `\"invalid_input\"`.",
             "title": "Code",
             "type": "string"
           },
           "message": {
-            "description": "Human-readable error description.",
+            "description": "Human-readable error description. Always populated; older clients render this verbatim.",
             "title": "Message",
             "type": "string"
+          },
+          "remediation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional concrete next step to fix it, e.g. a command to run. `None` when there is no single clear fix.",
+            "title": "Remediation"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional short headline naming what went wrong, e.g. `\"Claude Code can't run as root\"`. Present when the runner recognized the failure (see `omnigent.runner.launch_failure`); lets the UI show a clear card title instead of the raw `code`.",
+            "title": "Title"
           }
         },
         "required": [
@@ -2437,7 +2591,7 @@
               }
             ],
             "default": null,
-            "description": "`True` on the last chunk of a terminal-observed message; `None` otherwise. Signals the web UI that no further chunks for `message_id` will arrive.",
+            "description": "Optional provider completion marker for the message.",
             "title": "Final"
           },
           "index": {
@@ -2450,7 +2604,7 @@
               }
             ],
             "default": null,
-            "description": "0-based chunk order within the message, e.g. `3`. `None` when not terminal-observed streaming.",
+            "description": "0-based chunk order within the message, e.g. `3`. Used to suppress repeated chunks; `None` for in-process streaming.",
             "title": "Index"
           },
           "message_id": {
@@ -2463,7 +2617,7 @@
               }
             ],
             "default": null,
-            "description": "For terminal-observed streaming (claude-native), the vendor's stable per-message id, e.g. `\"2ca51d97-2f0f-493a-aed7-85a5b56c5747\"`. Lets the web UI scope an in-flight buffer to one assistant message and reconcile it against the final item. `None` for ordinary in-process task streaming, where deltas already group by the active response.",
+            "description": "For native terminal streaming, the provider's stable per-message id, e.g. `\"2ca51d97-2f0f-493a-aed7-85a5b56c5747\"`. `None` for ordinary in-process task streaming, where deltas group by the active response.",
             "title": "Message Id"
           },
           "sequence_number": {
@@ -3377,6 +3531,131 @@
         "title": "SendCommentsRequest",
         "type": "object"
       },
+      "ServerInfoResponse": {
+        "properties": {
+          "accounts_enabled": {
+            "title": "Accounts Enabled",
+            "type": "boolean"
+          },
+          "branding": {
+            "$ref": "#/components/schemas/BrandingInfo"
+          },
+          "databricks_features": {
+            "title": "Databricks Features",
+            "type": "boolean"
+          },
+          "dictation_available": {
+            "title": "Dictation Available",
+            "type": "boolean"
+          },
+          "features": {
+            "additionalProperties": {
+              "type": "boolean"
+            },
+            "title": "Features",
+            "type": "object"
+          },
+          "harness_install_enabled": {
+            "title": "Harness Install Enabled",
+            "type": "boolean"
+          },
+          "installable_harnesses": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Installable Harnesses",
+            "type": "array"
+          },
+          "login_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Login Url"
+          },
+          "managed_sandboxes_enabled": {
+            "title": "Managed Sandboxes Enabled",
+            "type": "boolean"
+          },
+          "needs_setup": {
+            "title": "Needs Setup",
+            "type": "boolean"
+          },
+          "public_sharing_enabled": {
+            "title": "Public Sharing Enabled",
+            "type": "boolean"
+          },
+          "sandbox_provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sandbox Provider"
+          },
+          "sandbox_providers": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Sandbox Providers",
+            "type": "array"
+          },
+          "server_version": {
+            "title": "Server Version",
+            "type": "string"
+          },
+          "sharing_mode": {
+            "enum": [
+              "on",
+              "read_only",
+              "restricted_read_only",
+              "off"
+            ],
+            "title": "Sharing Mode",
+            "type": "string"
+          },
+          "single_user": {
+            "title": "Single User",
+            "type": "boolean"
+          },
+          "smart_routing_enabled": {
+            "title": "Smart Routing Enabled",
+            "type": "boolean"
+          },
+          "smart_routing_sources": {
+            "$ref": "#/components/schemas/SmartRoutingSourcesInfo"
+          }
+        },
+        "required": [
+          "accounts_enabled",
+          "single_user",
+          "login_url",
+          "needs_setup",
+          "databricks_features",
+          "managed_sandboxes_enabled",
+          "sandbox_provider",
+          "sandbox_providers",
+          "sharing_mode",
+          "public_sharing_enabled",
+          "server_version",
+          "smart_routing_enabled",
+          "smart_routing_sources",
+          "features",
+          "harness_install_enabled",
+          "installable_harnesses",
+          "dictation_available",
+          "branding"
+        ],
+        "title": "ServerInfoResponse",
+        "type": "object"
+      },
       "ServerStreamEvent": {
         "discriminator": {
           "mapping": {
@@ -3416,6 +3695,7 @@
             "session.mcp_startup": "#/components/schemas/SessionMcpStartupEvent",
             "session.model": "#/components/schemas/SessionModelEvent",
             "session.model_options": "#/components/schemas/SessionModelOptionsEvent",
+            "session.permission_mode": "#/components/schemas/SessionPermissionModeEvent",
             "session.presence": "#/components/schemas/SessionPresenceEvent",
             "session.reasoning_effort": "#/components/schemas/SessionReasoningEffortEvent",
             "session.resource.created": "#/components/schemas/SessionResourceCreatedEvent",
@@ -3426,6 +3706,7 @@
             "session.superseded": "#/components/schemas/SessionSupersededEvent",
             "session.terminal.activity": "#/components/schemas/SessionTerminalActivityEvent",
             "session.terminal_pending": "#/components/schemas/SessionTerminalPendingEvent",
+            "session.title": "#/components/schemas/SessionTitleEvent",
             "session.todos": "#/components/schemas/SessionTodosEvent",
             "session.usage": "#/components/schemas/SessionUsageEvent",
             "turn.cancelled": "#/components/schemas/TurnCancelledEvent",
@@ -3446,10 +3727,16 @@
             "$ref": "#/components/schemas/SessionModelEvent"
           },
           {
+            "$ref": "#/components/schemas/SessionTitleEvent"
+          },
+          {
             "$ref": "#/components/schemas/SessionReasoningEffortEvent"
           },
           {
             "$ref": "#/components/schemas/SessionCollaborationModeEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionPermissionModeEvent"
           },
           {
             "$ref": "#/components/schemas/SessionAgentChangedEvent"
@@ -4492,7 +4779,7 @@
         "type": "object"
       },
       "SessionModelEvent": {
-        "description": "Active-model update from a terminal-backed integration.\n\nEmitted after an `external_model_change` POST from the\n`omnigent claude` transcript forwarder when the model is\nswitched inside the Claude Code terminal (a `/model` command or\nthe in-TUI picker). Lets the web model picker reflect a TUI-side\nswitch without a reload.",
+        "description": "Active-model report from a terminal-backed integration.\n\nEmitted after an `external_model_change` POST from a native\nforwarder \u2014 the launch's own model report, or a switch made inside\nthe pane (a `/model` command or the in-TUI picker). Every surface\nre-renders its model display from this.",
         "properties": {
           "conversation_id": {
             "description": "Session identifier, e.g. `\"conv_abc123\"`.",
@@ -4500,7 +4787,7 @@
             "type": "string"
           },
           "model": {
-            "description": "Tier alias the session is now on, e.g. `\"opus\"` \u2014 Claude Code's version-agnostic alias, matching the picker's vocabulary (not a pinned `\"claude-opus-4-8\"` id). Category: **transient** (SSE-only). The server also writes `model_override` on the conversation, so on reconnect clients restore the selection from the snapshot's `model_override` rather than from a replayed event.",
+            "description": "The model the harness reports the session is on, VERBATIM in the harness's own spelling, e.g. `\"claude-opus-4-8[1m]\"` or `\"gpt-5.6-luna\"` \u2014 never collapsed to a picker alias. Category: **transient** (SSE-only). The server also writes `reported_model` on the conversation (served on the snapshot's `llm_model`), so on reconnect clients restore the display from the snapshot rather than from a replayed event.",
             "title": "Model",
             "type": "string"
           },
@@ -4565,6 +4852,46 @@
         "title": "SessionModelOptionsEvent",
         "type": "object"
       },
+      "SessionPermissionModeEvent": {
+        "description": "Active permission-mode update from a claude-native session.\n\nEmitted after the web UI switches the mode, and after the Claude forwarder\nobserves a different mode in the pane footer \u2014 a shift+tab pressed inside\nthe TUI, which Omnigent has no other way to see. Lets the composer's mode\npicker track the pane without a reload.",
+        "properties": {
+          "conversation_id": {
+            "description": "Session identifier, e.g. `\"conv_abc123\"`.",
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "permission_mode": {
+            "description": "The active mode, e.g. `\"auto\"` or `\"plan\"`. Category: **transient** (SSE-only). The server also writes `omnigent.claude_native.permission_mode` on the conversation labels, so reconnecting clients restore the same state from the session snapshot.",
+            "title": "Permission Mode",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.permission_mode",
+            "description": "Always `\"session.permission_mode\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id",
+          "permission_mode"
+        ],
+        "title": "SessionPermissionModeEvent",
+        "type": "object"
+      },
       "SessionPresenceEvent": {
         "description": "The session's viewer list changed \u2014 full state, not a delta.\n\nEmitted on `GET /v1/sessions/{id}/stream` whenever a user\njoins, leaves (after the server-side grace window absorbs\nreconnect churn), or flips their idle aggregate, and once to\neach newly-connected stream as a snapshot-on-connect. Every\nevent carries the COMPLETE viewer list so clients replace their\nstate wholesale \u2014 missed events self-heal on the next event or\nreconnect. Viewers are scoped to the session *tree* (the root\nconversation and every sub-agent conversation under it), so a\nuser on a sub-agent page and a user on the root page appear in\neach other's lists. See `omnigent/server/presence.py` and\n`designs/UI/PRESENCE.md`.",
         "properties": {
@@ -4611,6 +4938,18 @@
       "SessionProjectSummary": {
         "description": "One entry of `GET /v1/sessions/projects` \u2014 a sidebar project folder.\n\nDual-read union of first-class projects and legacy `omni_project`\nlabel-projects, keyed by name.",
         "properties": {
+          "icon": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The project's chosen emoji icon (a unicode grapheme), read from its `config`; `None` when unset or for a label-only folder, so the sidebar falls back to the default folder glyph.",
+            "title": "Icon"
+          },
           "id": {
             "anyOf": [
               {
@@ -5081,7 +5420,7 @@
                 "type": "null"
               }
             ],
-            "description": "The LLM model identifier from the bound agent's spec, e.g. `\"anthropic/claude-sonnet-4-6\"`. `None` when the agent has no explicit `llm:` block or the agent cannot be looked up.",
+            "description": "The model this session is actually on. When the harness has reported one (`reported_model`, written by `external_model_change`), that verbatim value serves here and is the only model value clients display; otherwise the bound agent spec's model, e.g. `\"anthropic/claude-sonnet-4-6\"`. `None` when neither exists.",
             "title": "Llm Model"
           },
           "mcp_startup": {
@@ -5711,6 +6050,46 @@
         "title": "SessionTerminalPendingEvent",
         "type": "object"
       },
+      "SessionTitleEvent": {
+        "description": "Session-title update from a terminal-backed integration.\n\nEmitted after an `external_session_title` POST from the\n`omnigent claude` transcript forwarder when the operator renames\nthe session inside the Claude Code pane (`/rename`). Lets the web\nsession list show the new name without a reload.",
+        "properties": {
+          "conversation_id": {
+            "description": "Session identifier, e.g. `\"conv_abc123\"`.",
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "title": {
+            "description": "Title the session is now on, e.g. `\"auth-refactor\"`. Category: **transient** (SSE-only). The server also writes `title` on the conversation, so on reconnect clients restore the name from the session snapshot rather than from a replayed event.",
+            "title": "Title",
+            "type": "string"
+          },
+          "type": {
+            "const": "session.title",
+            "description": "Always `\"session.title\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id",
+          "title"
+        ],
+        "title": "SessionTitleEvent",
+        "type": "object"
+      },
       "SessionTodosEvent": {
         "description": "Todo-list update from a Claude Code terminal-backed session.\n\nEmitted after an `external_session_todos` POST from the\n`omnigent claude` transcript forwarder, which captures todo\nupdates via `PostToolUse`/`TodoWrite` hook events from Claude\nCode and forwards them to the Omnigent server. Lets web render a\nlive todo panel in the right column without polling.",
         "properties": {
@@ -5758,6 +6137,17 @@
       "SessionUsage": {
         "description": "One session's rolled-up LLM spend for the `GET /v1/usage` report.\n\n`cost_usd` is the subtree total \u2014 the session plus every sub-agent it\nspawned \u2014 read from `session_usage` via\n`omnigent.runtime.policies.builder.load_session_usage`. It is the\nauthoritative session figure (the same value the web session sidebar\nshows as \"Session cost\" and the daily rollup records).\n\n`models` is the per-model cost breakdown, mirroring the web session\nsidebar's per-model list. Deliberately **not guaranteed to sum to\n`cost_usd`**: native harnesses report a single cumulative session\ntotal and the server attributes it to the currently-active model, so on\na session that switched models mid-run each model's bucket is a snapshot\nof the running total rather than that model's own spend. The header\n`cost_usd` stays authoritative; the per-model values are shown\nfaithfully as recorded (same convention as the web UI).",
         "properties": {
+          "agent_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Name"
+          },
           "cost_usd": {
             "default": 0.0,
             "description": "Authoritative cumulative USD spend for this session's subtree.",
@@ -5769,10 +6159,32 @@
             "title": "Created At",
             "type": "integer"
           },
+          "harness": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Harness"
+          },
           "id": {
             "description": "Session/conversation identifier, e.g. `\"conv_abc123\"`.",
             "title": "Id",
             "type": "string"
+          },
+          "llm_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Llm Model"
           },
           "models": {
             "additionalProperties": {
@@ -5781,6 +6193,20 @@
             "description": "Per-model recorded cost, keyed by the raw harness model id (e.g. `{\"claude-opus-4-8\": 14.03}`). Empty when no per-model cost was recorded. May not sum to `cost_usd` (see above).",
             "title": "Models",
             "type": "object"
+          },
+          "other_harnesses": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Other Harnesses"
           },
           "title": {
             "anyOf": [
@@ -6040,6 +6466,24 @@
           "arguments"
         ],
         "title": "SlashCommandData",
+        "type": "object"
+      },
+      "SmartRoutingSourcesInfo": {
+        "properties": {
+          "external": {
+            "title": "External",
+            "type": "boolean"
+          },
+          "oss": {
+            "title": "Oss",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "external",
+          "oss"
+        ],
+        "title": "SmartRoutingSourcesInfo",
         "type": "object"
       },
       "StoreHarnessCredentialRequest": {
@@ -6605,6 +7049,18 @@
             "description": "Per-session LLM model override, e.g. `\"claude-opus-4-7\"`. The value is forwarded as-is to the executor at turn start; the server does not enumerate valid models. Clear aliases such as `\"default\"`, `\"off\"`, or `\"reset\"` remove the override (matching the REPL's `/model` semantics). `None` leaves unchanged.",
             "title": "Model Override"
           },
+          "permission_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Claude-native permission mode to switch a running session to, e.g. `\"auto\"`. Only the modes Claude Code's shift+tab cycle can reach are accepted (`default`, `acceptEdits`, `plan`, `auto`) \u2014 `dontAsk` and `bypassPermissions` are launch-only. Only valid for sessions stamped with the claude-native wrapper label. Unlike the other fields here the switch is applied by the live TUI, so a failure to reach the mode is surfaced as an error rather than persisted. Omitted leaves unchanged.",
+            "title": "Permission Mode"
+          },
           "project_id": {
             "anyOf": [
               {
@@ -6886,6 +7342,13 @@
             "title": "Cost Today",
             "type": "number"
           },
+          "daily_costs": {
+            "items": {
+              "$ref": "#/components/schemas/DailyCost"
+            },
+            "title": "Daily Costs",
+            "type": "array"
+          },
           "object": {
             "const": "usage_report",
             "default": "usage_report",
@@ -6973,6 +7436,27 @@
   },
   "openapi": "3.2.0",
   "paths": {
+    "/.well-known/omnigent.json": {
+      "get": {
+        "description": "Version manifest for NON-BROWSER clients \u2014 chiefly the desktop shell.\n\nThe desktop shell ships and updates on its own cadence, so any\ninstalled build can meet any server version. The shell is the side\nthat must adapt (the user may not update it for months), and to adapt\nit first has to know what it is talking to. This endpoint is that\nanswer, fetched BEFORE the SPA loads \u2014 unlike `/v1/info`, which the\nSPA reads after boot and which is therefore useless to the shell when\ndeciding how to open a window in the first place.\n\nContract, in the order a client should apply it:\n\n1. `manifest_version` (int) versions this ENVELOPE. Clients gate on\n   `>=`, never `==`, so a newer server keeps working with an older\n   shell. See `WELL_KNOWN_MANIFEST_VERSION` for when it bumps \u2014\n   adding a field never does.\n2. `server_version` (str) is the installed omnigent package version,\n   the same value as `/api/version` and `/v1/info.server_version`.\n   Informational: for display and bug reports, NOT for gating. Gate on\n   the fields below, which state capability directly rather than making\n   every client hardcode \"which release added X\".\n3. `min_desktop_version` (str | null) is the oldest desktop build this\n   server still supports. Null means no floor \u2014 the overwhelmingly\n   common case, and what every shipped shell must treat as \"fine\".\n   A server sets it only to signal a genuinely breaking change.\n4. Everything else is additive detail an older client may ignore\n   wholesale. `ui` describes where server-driven chrome lives, so a\n   shell can place its own window furniture without guessing from the\n   version number: `server_picker` is `\"sidebar\"` on builds that\n   dock the picker at the sidebar's bottom (it was `\"titlebar\"`,\n   centered in the macOS title-bar strip, before this).\n\nUnknown fields MUST be ignored, and a missing manifest (404 \u2014 every\nserver older than this route) MUST be treated as the pre-manifest\nbaseline, not an error: the shell falls back to its current behavior.\nThat is what makes an old shell + new server and a new shell + old\nserver both work.\n\nAuthentication: intentionally UNAUTHED, like `/v1/info`. A client\nmust be able to read this before it holds a session cookie \u2014 the whole\npoint is to consult it before loading the app. It exposes only the\nversion already public via `/api/version` plus coarse UI-shape\nstrings, so there is nothing here to leak.\n\nServed under `/.well-known/` (RFC 8615) so it sits at a fixed,\nguessable path that never collides with an SPA client route.\n\n**Returns:** The manifest described above.",
+        "operationId": "well_known_manifest__well_known_omnigent_json_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Well Known Manifest  Well Known Omnigent Json Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Well Known Manifest"
+      }
+    },
     "/api/version": {
       "get": {
         "description": "Return the installed omnigent package version.\n\nUsed by the web UI to include version info in bug reports.\n\n**Returns:** `{\"version\": \"<semver string>\"}`, e.g. `{\"version\": \"0.1.0\"}`.",
@@ -7160,6 +7644,74 @@
         "tags": [
           "agents"
         ]
+      }
+    },
+    "/v1/branding/logo/{variant}": {
+      "get": {
+        "description": "Serve a validated public branding asset, or 404 when unset.",
+        "operationId": "branding_logo_v1_branding_logo__variant__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "variant",
+            "required": true,
+            "schema": {
+              "title": "Variant",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "image/gif": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              },
+              "image/jpeg": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              },
+              "image/png": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              },
+              "image/webp": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              },
+              "image/x-icon": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Validated raster branding image"
+          },
+          "404": {
+            "description": "Branding image not configured or invalid"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Branding Logo"
       }
     },
     "/v1/harnesses": {
@@ -7561,7 +8113,7 @@
     },
     "/v1/hosts/{host_id}/harnesses/{harness}/credential": {
       "post": {
-        "description": "Write a harness provider credential onto a connected host.\n\nBacks the Web UI setup dialog's \"Add a credential\" action so a user can\nconfigure a Claude / Codex / Pi credential on a connected host without a\nterminal. Owner-scoped, allowlisted, and gated behind\n`OMNIGENT_HARNESS_INSTALL_ENABLED` exactly like the install route\n(404 when disabled). The host daemon does the write with the same\nnon-interactive core the `omnigent setup` wizard uses.\n\nSecurity: the server is an authz'd pass-through \u2014 it validates\nownership + the allowlist and forwards the secret over the (TLS) tunnel;\nit never persists the secret or logs it. The secret rides in the request\nbody (not the URL), and the frame field is redaction-named so it never\nlands on a telemetry span.\n\n**Parameters**\n\n- `body` \u2014 The credential payload (kind + secret / gateway / adopt).\n\n**Returns:** `{\"object\": \"harness_credential\", \"harness\": ..., \"configured_harnesses\": {...}, \"gateway_inference\": {...} | None}` \u2014 refreshed readiness so the UI can flip the badge without a reconnect, plus the refreshed gateway-inference map (`None` when the host didn't report one).\n\n**Raises**\n\n- `HTTPException` \u2014 404 when disabled or host unknown, 400 when the harness isn't UI-configurable or the body is invalid, 403 when not the owner, 409 when offline, 502 on host-side failure, 504 on timeout.",
+        "description": "Write a harness provider credential onto a connected host.\n\nBacks the Web UI setup dialog's \"Add a credential\" action so a user can\nconfigure a Claude / Codex / Pi credential on a connected host without a\nterminal. Owner-scoped, allowlisted, and gated behind\n`harness_install` release feature exactly like the install route\n(404 when disabled). The host daemon does the write with the same\nnon-interactive core the `omnigent setup` wizard uses.\n\nSecurity: the server is an authz'd pass-through \u2014 it validates\nownership + the allowlist and forwards the secret over the (TLS) tunnel;\nit never persists the secret or logs it. The secret rides in the request\nbody (not the URL), and the frame field is redaction-named so it never\nlands on a telemetry span.\n\n**Parameters**\n\n- `body` \u2014 The credential payload (kind + secret / gateway / adopt).\n\n**Returns:** `{\"object\": \"harness_credential\", \"harness\": ..., \"configured_harnesses\": {...}, \"gateway_inference\": {...} | None}` \u2014 refreshed readiness so the UI can flip the badge without a reconnect, plus the refreshed gateway-inference map (`None` when the host didn't report one).\n\n**Raises**\n\n- `HTTPException` \u2014 404 when disabled or host unknown, 400 when the harness isn't UI-configurable or the body is invalid, 403 when not the owner, 409 when offline, 502 on host-side failure, 504 on timeout.",
         "operationId": "store_host_harness_credential_v1_hosts__host_id__harnesses__harness__credential_post",
         "parameters": [
           {
@@ -7627,7 +8179,7 @@
     },
     "/v1/hosts/{host_id}/harnesses/{harness}/install": {
       "post": {
-        "description": "Install a missing, npm-installable harness CLI onto a host.\n\nBacks the Web UI's New Chat dialog \"Install\" action so a user can\ninstall a harness the connected host is missing without dropping to a\nterminal. Owner-scoped like the other host actions: only the host owner\nmay install onto it. Scoped to the UI-installable allowlist (claude,\ncodex, pi, opencode, qwen) \u2014 curl/brew and interactive-auth harnesses\nare refused. The whole route is gated behind\n`OMNIGENT_HARNESS_INSTALL_ENABLED` (default off): when disabled it\nreturns 404 so the feature is invisible until opted in.\n\nConcurrent requests for the same (host, harness) coalesce onto one\nin-flight install so a double-click can't fire two global npm installs.\n\n**Returns:** `{\"object\": \"harness_install\", \"harness\": ..., \"configured_harnesses\": {...}, \"gateway_inference\": {...} | None}` \u2014 the host's refreshed readiness map so the UI can flip the badge without a reconnect, plus its refreshed gateway-inference map (`None` when the host didn't report one).\n\n**Raises**\n\n- `HTTPException` \u2014 404 when the feature is disabled or the host is unknown, 400 when the harness is not UI-installable, 403 when the caller is not the host owner, 409 when the host is offline, 502 on a host-side install failure, 504 on host timeout.",
+        "description": "Install a missing, npm-installable harness CLI onto a host.\n\nBacks the Web UI's New Chat dialog \"Install\" action so a user can\ninstall a harness the connected host is missing without dropping to a\nterminal. Owner-scoped like the other host actions: only the host owner\nmay install onto it. Scoped to the UI-installable allowlist (claude,\ncodex, pi, opencode, qwen) \u2014 curl/brew and interactive-auth harnesses\nare refused. The whole route is gated behind\n`harness_install` in `OMNIGENT_FEATURES` (default off): when\ndisabled it returns 404 so the feature is invisible until opted in.\n\nConcurrent requests for the same (host, harness) coalesce onto one\nin-flight install so a double-click can't fire two global npm installs.\n\n**Returns:** `{\"object\": \"harness_install\", \"harness\": ..., \"configured_harnesses\": {...}, \"gateway_inference\": {...} | None}` \u2014 the host's refreshed readiness map so the UI can flip the badge without a reconnect, plus its refreshed gateway-inference map (`None` when the host didn't report one).\n\n**Raises**\n\n- `HTTPException` \u2014 404 when the feature is disabled or the host is unknown, 400 when the harness is not UI-installable, 403 when the caller is not the host owner, 409 when the host is offline, 502 on a host-side install failure, 504 on host timeout.",
         "operationId": "install_host_harness_v1_hosts__host_id__harnesses__harness__install_post",
         "parameters": [
           {
@@ -7711,10 +8263,7 @@
               "application/json": {
                 "schema": {
                   "additionalProperties": {
-                    "items": {
-                      "additionalProperties": true,
-                      "type": "object"
-                    },
+                    "items": {},
                     "type": "array"
                   },
                   "title": "Response Get Host Model Options V1 Hosts  Host Id  Harnesses  Harness  Model Options Get",
@@ -7904,33 +8453,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": {
-                    "anyOf": [
-                      {
-                        "type": "boolean"
-                      },
-                      {
-                        "type": "string"
-                      },
-                      {
-                        "items": {
-                          "type": "string"
-                        },
-                        "type": "array"
-                      },
-                      {
-                        "additionalProperties": {
-                          "type": "boolean"
-                        },
-                        "type": "object"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ]
-                  },
-                  "title": "Response Info V1 Info Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/ServerInfoResponse"
                 }
               }
             },
@@ -10313,7 +10836,7 @@
     },
     "/v1/sessions/{session_id}/permissions/{target_user_id}": {
       "delete": {
-        "description": "Revoke a user's permission on a session.\n\nRequires manage-level access. Cannot revoke your own\nmanage grant (prevents orphaned sessions). Returns 204\nwhether or not the grant existed (idempotent).\n\n**Returns:** 204 No Content.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session or no access, 403 if attempting to revoke own manage grant.",
+        "description": "Revoke a permission on a session \u2014 someone else's, or your own.\n\nTwo shapes, one endpoint:\n\n* *Revoke* \u2014 removing **another** user's grant is a management\n  action and needs manage access.\n* *Leave* \u2014 removing **your own** grant (\"unshare myself\", so a\n  shared session stops cluttering your sidebar) needs only read\n  access, since giving up access requires no privilege.\n\nEither way the owner grant is protected: it is what keeps the\nsession reachable, so revoking it would orphan the session. That\nguard covers the self case too \u2014 an owner cannot leave, and\narchives or deletes instead. A manage-level *grantee* is still a\nguest and may leave. Leaving records no lasting refusal, so the\nowner re-granting brings the session back.\n\nIdempotent: 204 whether or not a grant existed.\n\n**Returns:** 204 No Content.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session or no access, 403 when the target holds the owner grant, 400 when leaving a sub-agent session, 401 if unauthenticated.",
         "operationId": "revoke_permission_v1_sessions__session_id__permissions__target_user_id__delete",
         "parameters": [
           {
@@ -10327,7 +10850,7 @@
             }
           },
           {
-            "description": "User whose grant to revoke, e.g. `\"alice@example.com\"`.",
+            "description": "User whose grant to revoke, or the caller's own id to leave, e.g. `\"alice@example.com\"`.",
             "in": "path",
             "name": "target_user_id",
             "required": true,
@@ -11451,6 +11974,127 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/resources/environments/{environment_id}/search/{path}": {
+      "get": {
+        "description": "Search under a directory rather than the whole workspace.\n\nTakes the same path shape as the filesystem routes: relative to the\nworkspace, or absolute with a leading slash. Keeps search covering\nexactly what the file tree is showing.\n\n**Returns:** JSON list response with matching filesystem entries.",
+        "operationId": "search_environment_files_under_v1_sessions__session_id__resources_environments__environment_id__search__path__get",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Environment resource id.",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "title": "Environment Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Directory to search under.",
+            "in": "path",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "title": "Path",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Case-insensitive search substring.",
+            "in": "query",
+            "name": "q",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "pattern": ".*\\S.*",
+              "title": "Q",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Comma-separated include globs.",
+            "in": "query",
+            "name": "include",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Include"
+            }
+          },
+          {
+            "description": "Comma-separated exclude globs.",
+            "in": "query",
+            "name": "exclude",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Exclude"
+            }
+          },
+          {
+            "description": "Maximum number of results (1-500, default 500).",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 500,
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Search Environment Files Under",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/resources/environments/{environment_id}/shell": {
       "post": {
         "description": "Execute a shell command in an environment.\n\n**Returns:** Shell result.",
@@ -12210,7 +12854,7 @@
     },
     "/v1/sessions/{source_id}/fork": {
       "post": {
-        "description": "Fork an existing session into a new session.\n\nDeep-copies the source session's conversation items and\nclones the agent into a new session. When `body.agent_id`\nis set, the fork binds that built-in agent instead of the\nsource's \u2014 switching harness (e.g. Claude-SDK \u2192 Claude Code,\nor Claude \u2192 Codex). The source's model settings carry over\nonly within the same provider family; a same-family native\ntarget also carries conversation history (the runner rebuilds\nits transcript). The REPL/CLI binds the fork to its runner via\n`PATCH /v1/sessions/{id}` after creation.\n\nWhen `body.up_to_response_id` is set, only history up to and\nincluding that response is copied into the fork (a \"fork from\nthis response\"); a native target then rebuilds its transcript\nfrom the truncated items instead of resuming the source's full\nnative transcript.\n\n**Parameters**\n\n- `body` \u2014 The validated `SessionForkRequest`.\n\n**Returns:** A `SessionResponse` describing the newly created fork (status `\"idle\"`).\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if *source_id* does not exist or `body.agent_id` is not a bindable built-in agent; 403 if the caller lacks read access; 400 if the source is a sub-agent session, has no agent binding, or `body.up_to_response_id` names no response in the source session.",
+        "description": "Fork an existing session into a new session.\n\nDeep-copies the source session's conversation items and\nclones the agent into a new session. When `body.agent_id`\nis set, the fork binds that built-in agent instead of the\nsource's \u2014 switching harness (e.g. Claude-SDK \u2192 Claude Code,\nor Claude \u2192 Codex). The source's model settings carry over\nonly within the same provider family; a same-family native\ntarget also carries conversation history (the runner rebuilds\nits transcript). The REPL/CLI binds the fork to its runner via\n`PATCH /v1/sessions/{id}` after creation.\n\nWhen `body.up_to_response_id` is set, only history up to and\nincluding that response is copied into the fork (a \"fork from\nthis response\"); a native target then rebuilds its transcript\nfrom the truncated items instead of resuming the source's full\nnative transcript.\n\nA sub-agent source is allowed, which is how a sub-agent is\npromoted to a session of its own: the fork is always a fresh\ntop-level conversation (no parent, its own spawn-tree root, its\nown owner grant), so it appears in the sidebar and outlives the\nparent. The source keeps running under its parent untouched,\nand the fork does not adopt the source's own children.\n\n**Parameters**\n\n- `body` \u2014 The validated `SessionForkRequest`.\n\n**Returns:** A `SessionResponse` describing the newly created fork (status `\"idle\"`).\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if *source_id* does not exist or `body.agent_id` is not a bindable built-in agent; 403 if the caller lacks read access; 400 if the source has no agent binding, or `body.up_to_response_id` names no response in the source session.",
         "operationId": "fork_session_v1_sessions__source_id__fork_post",
         "parameters": [
           {

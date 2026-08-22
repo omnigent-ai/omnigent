@@ -15,7 +15,14 @@ from fastapi.responses import JSONResponse
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID, Conversation, ConversationItem, PagedList
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.runtime import _globals, session_stream, set_runner_client, set_runner_router
+from omnigent.runtime import (
+    _globals,
+    session_stream,
+    set_runner_client,
+    set_runner_direct_attach_resolver,
+    set_runner_router,
+)
+from omnigent.server._runner_ws_tunnel import DirectAttachEndpoint
 from omnigent.server.routes.sessions import _ancestor_session_ids, create_sessions_router
 from omnigent.server.schemas import SessionEventInput
 
@@ -411,9 +418,16 @@ class _FakeRunnerRouter:
     def __init__(self, client: _FakeRunnerClient) -> None:
         self.client = client
         self.resource_calls: list[str] = []
+        self.resource_conversations: list[Conversation | None] = []
 
-    def client_for_session_resources(self, session_id: str) -> _RoutedRunner:
+    def client_for_session_resources(
+        self,
+        session_id: str,
+        *,
+        conversation: Conversation | None = None,
+    ) -> _RoutedRunner:
         self.resource_calls.append(session_id)
+        self.resource_conversations.append(conversation)
         return _RoutedRunner(self.client)
 
 
@@ -421,11 +435,14 @@ class _FakeRunnerRouter:
 def runner_globals_reset() -> Iterator[None]:
     prior_client = _globals._runner_client
     prior_router = _globals._runner_router
+    prior_direct = _globals._runner_direct_attach_resolver
     set_runner_client(None)
     set_runner_router(None)
+    set_runner_direct_attach_resolver(None)
     yield
     set_runner_client(prior_client)
     set_runner_router(prior_router)
+    set_runner_direct_attach_resolver(prior_direct)
 
 
 @pytest.fixture
@@ -551,6 +568,9 @@ async def test_list_session_resources_proxies_to_bound_runner(
 
     assert resp.status_code == 200
     assert fake_router.resource_calls == ["79b22ebd2309e48fdeb450c65611d51b"]
+    assert [conv.id for conv in fake_router.resource_conversations if conv is not None] == [
+        "79b22ebd2309e48fdeb450c65611d51b"
+    ]
     assert fake_runner.calls == [
         ("GET", "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources")
     ]
@@ -658,6 +678,7 @@ async def test_claude_native_message_forwards_to_runner_without_persisting(
                 "terminal": "claude",
                 "session_key": "main",
                 "ensure_native_terminal": True,
+                "persist_resource_event": True,
             },
         ),
         (
@@ -1040,6 +1061,85 @@ async def test_list_terminals_forwards_pagination_params_to_runner(
     # here means the proxy dropped the whole query string — the
     # refresh-flips-tab-order regression.
     assert fake_runner.get_params == [{"order": "asc", "limit": "1000"}]
+
+
+def _terminals_only_payload() -> dict[str, object]:
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": "terminal_runner_s1",
+                "object": "session.resource",
+                "type": "terminal",
+                "session_id": "79b22ebd2309e48fdeb450c65611d51b",
+                "name": "runner:s1",
+                "metadata": {
+                    "terminal_name": "runner",
+                    "session_key": "s1",
+                    "running": True,
+                },
+            },
+        ],
+        "first_id": "terminal_runner_s1",
+        "last_id": "terminal_runner_s1",
+        "has_more": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_terminals_adds_direct_attach_url_when_advertised(
+    client: httpx.AsyncClient,
+) -> None:
+    """A runner-advertised loopback listener surfaces per-terminal URLs.
+
+    Permissions are disabled in this harness (single-user mode), which
+    the disclosure gate treats as owner — mirroring the relay's
+    write-attach behavior.
+    """
+    fake_runner = _FakeRunnerClient(payload=_terminals_only_payload())
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    set_runner_direct_attach_resolver(
+        lambda conversation_id: DirectAttachEndpoint(port=54321, token="tok_abc")
+    )
+
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals")
+
+    assert resp.status_code == 200
+    (item,) = resp.json()["data"]
+    assert item["metadata"]["direct_attach_url"] == (
+        "ws://127.0.0.1:54321/v1/sessions/79b22ebd2309e48fdeb450c65611d51b"
+        "/resources/terminals/terminal_runner_s1/attach?token=tok_abc"
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_terminals_without_resolver_leaves_payload_untouched(
+    client: httpx.AsyncClient,
+) -> None:
+    fake_runner = _FakeRunnerClient(payload=_terminals_only_payload())
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals")
+
+    assert resp.status_code == 200
+    (item,) = resp.json()["data"]
+    assert "direct_attach_url" not in item["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_list_terminals_without_runner_advert_leaves_payload_untouched(
+    client: httpx.AsyncClient,
+) -> None:
+    """A resolver miss (runner offline / no listener) adds nothing."""
+    fake_runner = _FakeRunnerClient(payload=_terminals_only_payload())
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    set_runner_direct_attach_resolver(lambda conversation_id: None)
+
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals")
+
+    assert resp.status_code == 200
+    (item,) = resp.json()["data"]
+    assert "direct_attach_url" not in item["metadata"]
 
 
 @pytest.mark.asyncio
@@ -3125,6 +3225,36 @@ async def test_relay_persists_terminal_resource_created_from_runner() -> None:
 
 
 @pytest.mark.asyncio
+async def test_relay_does_not_persist_transient_terminal_resource_created() -> None:
+    """Retry recovery publishes terminal readiness without changing history."""
+    from omnigent.server.routes.sessions import _relay_runner_stream
+
+    store = _ConversationStore()
+    client = _FakeStreamingRunnerClient(
+        [
+            _sse_frame(
+                {
+                    "type": "session.resource.created",
+                    "persist_resource_event": False,
+                    "resource": {
+                        "id": "terminal_claude_main",
+                        "type": "terminal",
+                        "name": "claude:main",
+                        "metadata": {"terminal_name": "claude", "session_key": "main"},
+                    },
+                }
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+
+    await _relay_runner_stream("79b22ebd2309e48fdeb450c65611d51b", client, store)  # type: ignore[arg-type]
+
+    events = [item for item in store.appended_items if item.type == "resource_event"]
+    assert events == []
+
+
+@pytest.mark.asyncio
 async def test_relay_persists_terminal_resource_deleted_from_runner() -> None:
     """The relay persists a ``resource_event`` for a runner-emitted delete.
 
@@ -5073,6 +5203,112 @@ async def test_relay_never_delivers_terminal_on_pty_status(
     await _relay_runner_stream(child_id, client, store)  # type: ignore[arg-type]
 
     assert client.posts == []
+
+
+# ── Offline (agent asleep) environment synthesis ──────────────────────────────
+
+_OFFLINE_SESSION = "b17c0a4f9d2e4c6a8f1b3d5e7a9c0b2d"
+_OFFLINE_WORKSPACE = "/Users/dev/project"
+
+
+class _OfflineRunnerClient:
+    """Runner client whose tunnel is gone, as a sleeping agent's is."""
+
+    async def get(self, url: str, *, params: Any = None, timeout: float | None = None) -> Any:
+        del params, timeout
+        raise OmnigentError(f"runner is not connected ({url})", code=ErrorCode.RUNNER_UNAVAILABLE)
+
+
+@pytest.fixture
+def offline_env_app(
+    runner_globals_reset: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> FastAPI:
+    """App whose session is host-bound but whose runner is offline."""
+    del runner_globals_reset
+    from types import SimpleNamespace
+
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.server.routes.sessions import routes_resources as _routes
+
+    conv = Conversation(
+        id=_OFFLINE_SESSION,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=_OFFLINE_SESSION,
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        host_id="host_offline",
+        workspace=_OFFLINE_WORKSPACE,
+    )
+    # The seeded native-agent shape: no OS-level sandbox, so the reach the
+    # runner would report is "unconfined, anchored on the workspace".
+    monkeypatch.setattr(
+        _routes,
+        "_load_agent_spec_for_session",
+        lambda _conv, _agent_store: SimpleNamespace(
+            os_env=OSEnvSpec(
+                type="caller_process",
+                cwd=".",
+                sandbox=OSEnvSandboxSpec(type="none"),
+            )
+        ),
+    )
+    set_runner_router(_FakeRunnerRouter(_OfflineRunnerClient()))  # type: ignore[arg-type]
+
+    application = FastAPI()
+
+    @application.exception_handler(OmnigentError)
+    async def _handle(request: Request, exc: OmnigentError) -> JSONResponse:
+        del request
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={"error": {"code": exc.code, "message": exc.message}},
+        )
+
+    application.include_router(
+        create_sessions_router(
+            SimpleNamespace(get_conversation=lambda _sid: conv),  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]  — stub agent store
+            host_registry=SimpleNamespace(get=lambda _host_id: object()),  # type: ignore[arg-type]
+        ),
+        prefix="/v1",
+    )
+    return application
+
+
+@pytest.fixture
+async def offline_env_client(offline_env_app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
+    transport = httpx.ASGITransport(app=offline_env_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://server") as c:
+        yield c
+
+
+@pytest.mark.asyncio
+async def test_offline_environment_advertises_the_same_reach_as_the_runner(
+    offline_env_client: httpx.AsyncClient,
+) -> None:
+    """A sleeping agent's environment still reports what browsing can reach.
+
+    The file panel gates its navigation affordance on ``metadata.reachable``.
+    When the runner sleeps the server synthesizes this resource itself, and
+    omitting the field there made the panel silently decide "nowhere else to
+    go" and drop the control -- even though the host-served path authorizes
+    and serves absolute browsing exactly as the live runner does.
+
+    Asserted as the full payload, not just presence: a synthesis that
+    advertised a *different* reach from the runner's would be its own bug.
+    """
+    resp = await offline_env_client.get(
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/environments/default"
+    )
+
+    assert resp.status_code == 200, resp.text
+    metadata = resp.json()["metadata"]
+    assert metadata["root"] == _OFFLINE_WORKSPACE
+    assert metadata["reachable"] == {
+        "unconfined": True,
+        "roots": [{"path": _OFFLINE_WORKSPACE, "access": "write", "origin": "cwd"}],
+    }
 
 
 # ── Workspace-file gzip (GZipFileContentRoute) ───────────────────

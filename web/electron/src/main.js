@@ -37,12 +37,20 @@ const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const { execFile } = require("node:child_process");
 const { registerLocalhostCors } = require("./localhost_cors");
-const { normalizeUrl, expandDatabricksWorkspaceUrl } = require("./url");
+const {
+  normalizeUrl,
+  normalizeRecentServers,
+  expandDatabricksWorkspaceUrl,
+  fetchServerManifest,
+  PRE_MANIFEST_BASELINE,
+} = require("./url");
 const { parseOmnigentDeepLink, chooseDeepLinkStrategy } = require("./deepLink");
 const { registerWorkspaceChromeHide } = require("./workspace-chrome");
+const { registerWorkspaceRootBounce } = require("./workspace-root-bounce");
 const { createBrowserViewRegistry } = require("./browserViewRegistry");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { registerBrowserIpc } = require("./browserIpc");
+const { isDeveloperModeEnabled } = require("./developer_mode");
 const { registerSessionExpiryReload } = require("./session-expiry");
 const { decideWindowOpen, stripCrossOriginOpenerHeaders, WEB_SCHEMES } = require("./popupPolicy");
 const omnigentCli = require("./omnigent_cli");
@@ -84,6 +92,21 @@ const POPUP_PRELOAD = path.join(__dirname, "popup_preload.js");
 
 /** Absolute path to the app icon (PNG works for the macOS dock at runtime). */
 const ICON_PNG = path.join(__dirname, "..", "icons", "icon.png");
+
+/**
+ * Development builds always expose debugging. Packaged macOS builds require
+ * `defaults write ai.omnigent.desktop DeveloperMode -bool true` before launch.
+ */
+function developerModeEnabled() {
+  return isDeveloperModeEnabled({
+    isPackaged: app.isPackaged,
+    platform: process.platform,
+    getUserDefault:
+      typeof systemPreferences.getUserDefault === "function"
+        ? systemPreferences.getUserDefault.bind(systemPreferences)
+        : undefined,
+  });
+}
 
 /**
  * Quit-safety timeouts (see the before-quit handler near the end of this
@@ -557,6 +580,18 @@ function pinWindow(win, origin) {
     // Leaving a server: this window's unread contribution goes with it.
     state.badgeCount = 0;
     updateBadge();
+    // Destroy the window's embedded-browser views. They belong to sessions on
+    // the origin we're leaving, and the navigation tears down the renderer
+    // (setup page / new server) WITHOUT running BrowserPane's unmount detach —
+    // so without this the native WebContentsView keeps painting over the new
+    // page. Skip the initial pin (no prior origin: cold connect, nothing open).
+    if (state.origin != null) {
+      try {
+        state.browserRegistry?.closeAll("server-changed");
+      } catch {
+        /* registry already torn down */
+      }
+    }
   }
   state.origin = origin;
 }
@@ -564,7 +599,7 @@ function pinWindow(win, origin) {
 /**
  * Record (or clear) the full server URL a window is connected to. The pinned
  * `origin` drops any path, but the host/server CLI commands need the exact URL
- * the user connected with (e.g. a Databricks ``…/ml/omnigents`` mount), so the
+ * the user connected with (e.g. a Databricks ``…/omnigent`` mount), so the
  * window keeps both.
  *
  * @param {BrowserWindow} win
@@ -573,6 +608,34 @@ function pinWindow(win, origin) {
 function setWindowServerUrl(win, serverUrl) {
   const state = windows.get(win);
   if (state) state.serverUrl = serverUrl;
+}
+
+/**
+ * Record the version manifest of the server a window connected to (see
+ * `fetchServerManifest` in src/url.js). Stored per-window because different
+ * windows can be pinned to different servers — and therefore to servers of
+ * different versions — at the same time.
+ *
+ * @param {Electron.BrowserWindow} win
+ * @param {object} manifest A manifest from `fetchServerManifest`.
+ */
+function setWindowServerManifest(win, manifest) {
+  const state = windows.get(win);
+  if (state) state.serverManifest = manifest;
+}
+
+/**
+ * The server manifest for a window, or the pre-manifest baseline when the
+ * window has none yet (no connect has completed, or the server predates the
+ * manifest route). Never null, so callers can read `.manifestVersion`
+ * unconditionally and gate with `>=`.
+ *
+ * @param {Electron.BrowserWindow | null} win
+ * @returns {object} A manifest-shaped object.
+ */
+function windowServerManifest(win) {
+  const state = win ? windows.get(win) : undefined;
+  return state?.serverManifest ?? PRE_MANIFEST_BASELINE;
 }
 
 /**
@@ -619,6 +682,33 @@ function activeWindow() {
   return windows.keys().next().value ?? null;
 }
 
+/**
+ * Effective version for development update checks and UI. Packaged builds
+ * always use Electron's real app version.
+ */
+function configureDesktopVersion() {
+  const override = !app.isPackaged
+    ? process.env.OMNIGENT_DESKTOP_VERSION_OVERRIDE?.trim()
+    : undefined;
+  if (!override) return app.getVersion();
+
+  try {
+    // electron-updater stores a SemVer instance here and reads it when deciding
+    // eligibility. Reuse its constructor so comparisons keep the expected type.
+    const Version = autoUpdater.currentVersion.constructor;
+    const version = new Version(override);
+    autoUpdater.currentVersion = version;
+    return version.version;
+  } catch (err) {
+    throw new Error(
+      `OMNIGENT_DESKTOP_VERSION_OVERRIDE must be a valid semantic version (received ${JSON.stringify(override)})`,
+      { cause: err },
+    );
+  }
+}
+
+const currentDesktopVersion = configureDesktopVersion();
+
 // Desktop auto-update orchestration lives in its own module; the main process
 // only composes it with its main-process dependencies and wires the four thin
 // seams below (startup init, the Updates menu, the update IPC surface, and the
@@ -637,12 +727,11 @@ const updater = createDesktopUpdater({
   isPinnedOriginSender,
   pinnedOrigin,
   iconPath: ICON_PNG,
-  // Dev builds always use the local dev feed (dev-app-update.yml ->
-  // 127.0.0.1:8765); packaged builds always use the baked app-update.yml.
-  // Tying this to !app.isPackaged — not an env var — closes a redirect attack:
-  // an OMNIGENT_FORCE_DEV_UPDATE_CONFIG-style env var could otherwise point a
-  // packaged (production) app at an untrusted HTTP local feed and push a
-  // malicious update. A packaged build can never be redirected to the dev feed.
+  getCurrentVersion: () => currentDesktopVersion,
+  // Dev builds use dev-app-update.yml, which mirrors the production HTTPS
+  // endpoint; packaged builds always use their baked app-update.yml. Tying
+  // this to !app.isPackaged — not an env var — ensures a packaged app can
+  // never be redirected to a repository-local update configuration.
   forceDevUpdateConfig: !app.isPackaged,
 });
 
@@ -931,10 +1020,10 @@ function hardenOauthPopup(child) {
 
 /**
  * Join a basename-less SPA path (e.g. ``/c/conv_abc``) onto a server URL that
- * may carry a workspace mount (e.g. ``https://host/ml/omnigents/``). The path
- * is an ABSOLUTE in-app route, but it lives UNDER the server's mount —
+ * may carry a workspace mount (e.g. ``https://host/omnigent/``). The path is
+ * an ABSOLUTE in-app route, but it lives UNDER the server's mount —
  * ``new URL("/c/x", serverUrl)`` would resolve against the ORIGIN and drop
- * ``/ml/omnigents`` — so we string-concatenate: strip the server URL's trailing
+ * ``/omnigent`` — so we string-concatenate: strip the server URL's trailing
  * slash, append the path. The SPA's react-router basename then matches
  * ``${mount}/c/:id``. Shared by createWindow (cold open) and loadServerUrl
  * (re-pointing an existing window) so the mount-aware join is in one place.
@@ -1011,13 +1100,27 @@ function createWindow(targetUrl, opts = {}) {
     // .drag-strip). Other platforms keep their native frame — `hiddenInset`
     // is macOS-only and a frameless window without `titleBarOverlay` would
     // lose its window controls there.
-    ...(process.platform === "darwin" ? { titleBarStyle: "hiddenInset" } : {}),
+    ...(process.platform === "darwin"
+      ? {
+          titleBarStyle: "hiddenInset",
+          // Drop the native traffic lights ~4px from their hiddenInset default so
+          // they center in the 2.25rem (36px) title-bar strip, level with the
+          // Search/Settings/toggle cluster and the chat-header icons (both
+          // centered there — see the [data-electron-mac] rules in index.css).
+          // x:19 preserves hiddenInset's horizontal inset; y centers the ~14px
+          // controls ((36-14)/2 ≈ 11). Adjust y by ±1 if it reads off on device.
+          trafficLightPosition: { x: 16, y: 17 },
+        }
+      : {}),
     webPreferences: {
       // Security: the SPA is remote/untrusted relative to the shell, so we
       // keep Node out of the renderer and isolate the preload's context.
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
+      // Packaged builds expose DevTools only after the macOS user explicitly
+      // opts in through the DeveloperMode user default.
+      devTools: developerModeEnabled(),
       // Electron passes HTML5 drag-drop through to the page by default (no
       // native handler intercepts it), so images drop onto the composer
       // textbox with no extra work.
@@ -1063,8 +1166,32 @@ function createWindow(targetUrl, opts = {}) {
     // Per-conversation embedded-browser view registry for this window.
     browserRegistry: createBrowserRegistryForWindow(win),
   });
+  registerWorkspaceRootBounce(win.webContents, () => pinnedOrigin(win));
   if (destination) {
-    void win.loadURL(destination);
+    // Learn the server's version alongside the load. Every window that opens
+    // straight onto a server (normal app launch with a saved URL, a deep link,
+    // a new window) comes through here — without this the manifest would only
+    // exist after a fresh setup-page connect. Never awaited and never throws
+    // (see fetchServerManifest), so it cannot delay or fail the load.
+    if (serverUrl) {
+      void fetchServerManifest(serverUrl).then((manifest) => {
+        if (!win.isDestroyed()) setWindowServerManifest(win, manifest);
+      });
+    }
+    void win
+      .loadURL(destination)
+      .then(() => {
+        // A saved server can predate the recents list. Backfill it only after
+        // a successful cold load; explicit targets may be conversation URLs.
+        if (!ephemeral && !explicit && serverUrl) {
+          const settings = loadSettings();
+          rememberRecentServer(settings, serverUrl);
+          saveSettings(settings);
+        }
+      })
+      .catch(() => {
+        // Load failure falls back via did-fail-load → setup page w/ error.
+      });
   } else {
     // ?ephemeral=1 only changes the setup page's copy (the window's
     // WindowState is the source of truth for persistence behavior).
@@ -1726,11 +1853,14 @@ function buildMenu() {
   /** @type {Electron.MenuItemConstructorOptions[]} */
   const serverSubmenu = [
     {
+      id: "new_session",
+      label: "New Session",
+      accelerator: "CmdOrCtrl+N",
+      click: () => sendOpenPath(activeWindow(), "/"),
+    },
+    {
       id: "new_window",
       label: "New Window",
-      // Own the standard new-window accelerator here — there is no
-      // role-based File menu in this app.
-      accelerator: "CmdOrCtrl+N",
       click: () => newWindow(),
     },
     {
@@ -1766,9 +1896,9 @@ function buildMenu() {
           if (status.state === "none") {
             await dialog.showMessageBox(activeWindow(), {
               type: "info",
-              title: "Omnigent",
+              title: "Omnigent Desktop",
               message: "You're up to date!",
-              detail: `Omnigent ${app.getVersion()} is the latest version.`,
+              detail: `Omnigent Desktop ${currentDesktopVersion} is the latest version.`,
               buttons: ["OK"],
             });
           }
@@ -1845,7 +1975,7 @@ function buildMenu() {
     ],
   });
   // Standard View roles (Reload/zoom/fullscreen). Developer Tools lives in
-  // the Debug menu (dev only), so this menu is identical in dev and release.
+  // the opt-in Debug menu, so this menu is identical in normal releases.
   template.push({
     label: "View",
     submenu: [
@@ -1861,14 +1991,11 @@ function buildMenu() {
   });
   template.push({ role: "windowMenu" });
 
-  // Debug menu (dev only, !app.isPackaged): consolidates every debug-only /
-  // non-production affordance behind a single top-level menu — the macOS
-  // notification-sound settings (sound playback uses `afplay`, so macOS-only)
-  // and the developer tools. Restart-to-update now lives in the production
-  // Server menu (it's a needed install path, not a debug affordance, once the
-  // UpdateBanner toast is dismissible). Hidden in the shipped .app. Placed
-  // last so it never displaces the standard menus users expect.
-  if (!app.isPackaged) {
+  // Consolidate non-production affordances behind one top-level menu. It is
+  // always present in development and can be explicitly enabled in a packaged
+  // macOS app through the DeveloperMode user default. Restart-to-update stays
+  // in the production Server menu because it is a normal install path.
+  if (developerModeEnabled()) {
     /** @type {Electron.MenuItemConstructorOptions[]} */
     const debugSubmenu = [];
 
@@ -2061,6 +2188,14 @@ function registerIpc() {
       // trusted origin for privileged IPC and permission grants.
       pinWindow(win, new URL(target).origin);
       setWindowServerUrl(win, target);
+      // Learn what this server is before deciding anything version-dependent
+      // about the window. Deliberately NOT awaited ahead of loadURL: the
+      // manifest is advisory, and a slow/absent one must not delay (or block)
+      // connecting. fetchServerManifest never rejects — it resolves to the
+      // pre-manifest baseline — so no catch is needed here.
+      void fetchServerManifest(target).then((manifest) => {
+        if (!win.isDestroyed()) setWindowServerManifest(win, manifest);
+      });
       win
         .loadURL(target)
         .then(() => {
@@ -2096,9 +2231,7 @@ function registerIpc() {
     if (!isSetupPageSender(event)) {
       throw new Error("get-recent-servers is only available to the setup page");
     }
-    const recents = loadSettings().recent_servers;
-    // Same hand-edited-settings tolerance as rememberRecentServer.
-    return Array.isArray(recents) ? recents.filter((u) => typeof u === "string") : [];
+    return normalizeRecentServers(loadSettings().recent_servers);
   });
 
   ipcMain.handle("omnigent:copy-setup-text", (event, text) => {
@@ -2111,9 +2244,9 @@ function registerIpc() {
     clipboard.writeText(text);
   });
 
-  // SPA title-bar server picker → the sender window's pinned origin plus the
-  // persisted recent-servers list, so the picker can render "current server"
-  // and the switch targets. Foreign pages get null (nothing to fingerprint).
+  // SPA server picker → the sender window's pinned origin plus the persisted
+  // recent-servers list, so the picker can render "current server" and the
+  // switch targets. Foreign pages get null (nothing to fingerprint).
   ipcMain.handle("omnigent:get-server-picker", (event) => {
     if (!isPinnedOriginSender(event)) {
       console.warn("[omnigent] get-server-picker from untrusted sender dropped");
@@ -2125,6 +2258,11 @@ function registerIpc() {
       // isPinnedOriginSender guarantees the sender window is tracked.
       currentOrigin: windows.get(win).origin,
       recentServers: Array.isArray(recents) ? recents.filter((u) => typeof u === "string") : [],
+      // The connected server's manifest, forwarded so the SPA branches on the
+      // same document the shell did rather than re-fetching it (and so an
+      // older shell, which simply omits this field, is detectable as absent —
+      // see nativeBridge's `serverManifest` handling).
+      serverManifest: windowServerManifest(win),
     };
   });
 
@@ -2153,6 +2291,14 @@ function registerIpc() {
     if (win) {
       pinWindow(win, new URL(url).origin);
       setWindowServerUrl(win, url);
+      // Switching servers means a possibly DIFFERENT version: re-read the
+      // manifest so the window never keeps the previous server's answer. Reset
+      // to the baseline first — until the new fetch lands, "unknown" is the
+      // honest state, and stale-but-plausible would be worse than absent.
+      setWindowServerManifest(win, PRE_MANIFEST_BASELINE);
+      void fetchServerManifest(url).then((manifest) => {
+        if (!win.isDestroyed()) setWindowServerManifest(win, manifest);
+      });
       win
         .loadURL(url)
         .then(() => {
@@ -2445,7 +2591,7 @@ function registerIpc() {
       // Ensure the CLI is authenticated for a remote server first (local needs
       // none) — otherwise the host connect would just fail on a 401.
       const auth = await serverManager.ensureServerAuth(cliPath, serverUrl);
-      if (!auth.ok) result = { ok: false, error: auth.error };
+      if (!auth.ok) result = { ok: false, error: auth.error, authError: auth.authError };
       else if (action === "start")
         result = await serverManager.ensureHostConnected(cliPath, serverUrl);
       else result = await serverManager.restartHost(cliPath, serverUrl);
@@ -2684,7 +2830,7 @@ function drainPendingDeepLinks() {
  * (expandDatabricksWorkspaceUrl) runs ONLY after the user consents to an
  * UNKNOWN server — so clicking (or the OS dispatching) a link to an
  * attacker-chosen host makes no HTTP request until the user has agreed. The
- * probe is safe post-consent because it can only append a path (`/ml/omnigents`)
+ * probe is safe post-consent because it can only append a path (`/omnigent`)
  * under the SAME origin — it never changes the origin the user approved.
  *
  * @param {string} raw The raw `omnigent://...` URL.
@@ -2699,7 +2845,7 @@ async function handleDeepLink(raw) {
   // same origin, so approving the origin is approving the server.
   const targetOrigin = parsed.origin;
   // A KNOWN server: reuse its recorded URL (already mount-bearing, e.g.
-  // `https://host/ml/omnigents`) so we SKIP the probe entirely. null for an
+  // `https://host/omnigent`) so we SKIP the probe entirely. null for an
   // unknown server — the mount is discovered AFTER consent (see consent-unknown).
   const known = findKnownServerUrl(targetOrigin);
 

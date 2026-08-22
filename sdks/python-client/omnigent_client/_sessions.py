@@ -35,6 +35,7 @@ from omnigent.server.schemas import ServerStreamEvent
 
 from ._child_status import child_summary_busy
 from ._errors import raise_for_status, require_json_object, response_body
+from ._timeouts import _SSE_TIMEOUT
 
 # Default recursion cap for the sub-agent tree helpers. Mirrors web's
 # ``MAX_TREE_DEPTH`` and the REPL's ``_MAX_SUBAGENT_TREE_DEPTH`` so the SDK
@@ -1216,6 +1217,7 @@ async def _stream_session_events(
     async with http.stream(
         "GET",
         f"{base_url}/v1/sessions/{session_id}/stream",
+        timeout=_SSE_TIMEOUT,
     ) as resp:
         if resp.status_code >= 400:
             await resp.aread()

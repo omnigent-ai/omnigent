@@ -415,8 +415,9 @@ def _validate_sub_agents(
     Each sub-agent is validated independently as if it were a
     top-level spec — its own ``executor.type`` determines which
     fields are valid. The parent only checks structural references
-    (every name in ``tools.agents`` has a matching directory) and
-    tree-wide uniqueness.
+    (every name in ``tools.agents`` names a discovered sub-agent) and
+    tree-wide uniqueness. Names are matched against each sub-agent's
+    declared ``name``, which need not equal its directory name.
 
     :param spec: The agent spec to check.
     :param result: Accumulator for any validation errors found.
@@ -427,8 +428,8 @@ def _validate_sub_agents(
         if agent_ref not in sub_specs:
             result.add(
                 "tools.agents",
-                f"references sub-agent {agent_ref!r} but no "
-                f"matching directory found under agents/",
+                f"references sub-agent {agent_ref!r} but no sub-agent "
+                f"under agents/ declares that name",
             )
 
     # Validate each sub-agent independently — its own executor.type

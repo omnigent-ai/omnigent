@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias, cast
 
+from omnigent import _native_forwarder_health as native_forwarder_health
 from omnigent import model_catalog
 from omnigent._platform import resolve_cli_binary
 from omnigent.codex_model_vocabulary import (
@@ -44,7 +45,7 @@ from omnigent.codex_model_vocabulary import (
 )
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
-from omnigent.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG
+from omnigent.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, CODEX_DEFAULT_MODEL
 from omnigent.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
 from omnigent.spec.types import RetryPolicy
 
@@ -71,6 +72,7 @@ from .executor import (
     ToolSpec,
     TurnComplete,
     classify_tool_result,
+    describe_exception,
 )
 from .hook_scripts.subagent_router import HOOK_TIMEOUT_HEADROOM_S as _ROUTER_HOOK_HEADROOM_S
 from .hook_scripts.subagent_router import REQUEST_TIMEOUT_S as _ROUTER_REQUEST_TIMEOUT_S
@@ -114,6 +116,11 @@ CodexToolExecutor: TypeAlias = Callable[
 # but keep waiting — a long-running tool or model call can legitimately
 # block events far longer than any fixed deadline.
 _TURN_EVENT_WARN_SECONDS = 600.0
+# The idle wait polls on this shorter interval so a fatal gateway error the
+# stderr loop sets mid-wait is acted on promptly, rather than only when the
+# 600s warn window elapses. Chosen to divide the warn window evenly so the
+# warning cadence is unchanged.
+_TURN_EVENT_POLL_SECONDS = 5.0
 _TURN_COMPLETED_DRAIN_SECONDS = 1.0
 # Wall-clock budget for the ``codex --version`` probe. A broken codex
 # build that blocks (e.g. on stdin) must not stall session startup — on
@@ -151,6 +158,62 @@ _CODEX_PROVIDER_CONFIG_PREFIX = "model_providers."
 # the codex CLI uses its subscription auth (``auth.json``) rather than a
 # developer API key that would charge separately.
 _CODEX_ENV_DENY_EXACT: frozenset[str] = frozenset({"OPENAI_API_KEY"})
+
+# The codex CLI logs a rejected gateway request to stderr as
+# ``unexpected status <code> <reason>: {...}, url: <url>`` and precedes it with
+# ``Reconnecting... N/5`` retry lines. These parse that shape so the head can
+# attribute the real gateway error to a turn that otherwise emits no events.
+_CODEX_STDERR_STATUS_RE = re.compile(
+    r"unexpected status (?P<code>\d{3})(?:\s+(?P<reason>[A-Za-z][A-Za-z ]*?))?\s*[:,]"
+)
+_CODEX_STDERR_URL_RE = re.compile(r"url:\s*(?P<url>\S+)")
+_CODEX_STDERR_RETRY_EXHAUSTED_RE = re.compile(
+    r"Reconnecting\.{0,3}\s*(?P<n>\d+)\s*/\s*(?P<total>\d+)"
+)
+# HTTP statuses that are not transient — a retry can never fix them, so the
+# head fails the turn fast instead of riding the full idle watchdog.
+_CODEX_STDERR_FATAL_STATUSES: frozenset[int] = frozenset({401, 403})
+
+
+class _CodexGatewayError:
+    """A parsed gateway rejection read off the codex CLI's stderr.
+
+    ``code`` is the HTTP status; ``fatal`` marks an auth-class status that a
+    retry cannot fix (the turn should fail fast rather than stall).
+    """
+
+    __slots__ = ("code", "fatal", "reason", "url")
+
+    def __init__(self, code: int, reason: str | None, url: str | None) -> None:
+        self.code = code
+        self.reason = reason
+        self.url = url
+        self.fatal = code in _CODEX_STDERR_FATAL_STATUSES
+
+    def detail(self, *, model: str | None = None) -> str:
+        """A concise, actionable one-line cause for the turn-failure message."""
+        reason = f" {self.reason}" if self.reason else ""
+        target = f" for {model}" if model else ""
+        where = f" at {self.url}" if self.url else ""
+        hint = " (auth likely expired/misconfigured)" if self.fatal else ""
+        return f"gateway returned {self.code}{reason}{target}{where}{hint}"
+
+
+def _parse_codex_gateway_error(line: str) -> _CodexGatewayError | None:
+    """Return a parsed gateway rejection from a codex stderr *line*, else None.
+
+    Only lines carrying an ``unexpected status <code>`` shape are classified;
+    ordinary stderr (including the ``Reconnecting`` retry lines) returns None.
+    """
+    match = _CODEX_STDERR_STATUS_RE.search(line)
+    if match is None:
+        return None
+    code = int(match.group("code"))
+    raw_reason = match.group("reason")
+    reason = raw_reason.strip() if raw_reason else None
+    url_match = _CODEX_STDERR_URL_RE.search(line)
+    url = url_match.group("url").rstrip(",") if url_match else None
+    return _CodexGatewayError(code, reason, url)
 
 
 def _extract_codex_last_turn_usage(params: object, model: str | None) -> dict[str, object] | None:
@@ -2041,6 +2104,16 @@ class _CodexAppServerSession:
         # field (it is silently dropped), hence the separate settings update.
         self._applied_effort: str | None = None
         self._recent_stderr: list[str] = []
+        # Auth-class gateway rejection tracking, read off the CLI's stderr so a
+        # turn that emits no events fails fast with the real cause instead of
+        # stalling to the idle watchdog. ``_pending`` holds a parsed fatal
+        # (401/403) rejection; ``_saw_retries_exhausted`` records a final
+        # ``Reconnecting N/N``. Fast-fail arms (``_fatal_gateway_error``) only
+        # when BOTH are seen, so a blip the CLI recovers from can't kill a
+        # healthy turn. All three reset at turn start.
+        self._pending_fatal_gateway_error: _CodexGatewayError | None = None
+        self._saw_retries_exhausted = False
+        self._fatal_gateway_error: _CodexGatewayError | None = None
         self._recent_events: list[CodexMessage] = []
         self._process_cwd: Path | None = None
         # Private CODEX_HOME so the subprocess never writes to the user's ~/.codex/.
@@ -2334,6 +2407,14 @@ class _CodexAppServerSession:
         await self.start()
         assert self._proc is not None
 
+        # Fresh turn: forget any prior turn's gateway-error signals and clear
+        # the shared watchdog slot so a resolved earlier failure can't be
+        # misattributed to this turn.
+        self._pending_fatal_gateway_error = None
+        self._saw_retries_exhausted = False
+        self._fatal_gateway_error = None
+        native_forwarder_health.note_post_success()
+
         is_new_thread = self.thread_id is None
         if is_new_thread:
             params: CodexParams = {
@@ -2497,14 +2578,30 @@ class _CodexAppServerSession:
             while True:
                 event_task = asyncio.ensure_future(self._events.get())
                 idle_seconds = 0.0
+                seconds_since_warn = 0.0
+                fatal_gateway_error: _CodexGatewayError | None = None
+                # Poll on the shorter of the two intervals so a fatal gateway
+                # error set mid-wait is acted on promptly; when a test shrinks
+                # the warn window below the poll interval, poll at the warn
+                # window so the warning cadence is preserved.
+                poll_interval = min(_TURN_EVENT_POLL_SECONDS, _TURN_EVENT_WARN_SECONDS)
                 try:
                     while True:
-                        done, _ = await asyncio.wait(
-                            {event_task}, timeout=_TURN_EVENT_WARN_SECONDS
-                        )
+                        done, _ = await asyncio.wait({event_task}, timeout=poll_interval)
                         if event_task in done:
                             break
-                        idle_seconds += _TURN_EVENT_WARN_SECONDS
+                        # The stderr loop sets this once the CLI has exhausted
+                        # its retries on an auth-class gateway rejection. Fail
+                        # fast with the real cause rather than stalling to the
+                        # idle watchdog on a turn that will never emit events.
+                        if self._fatal_gateway_error is not None:
+                            fatal_gateway_error = self._fatal_gateway_error
+                            break
+                        idle_seconds += poll_interval
+                        seconds_since_warn += poll_interval
+                        if seconds_since_warn < _TURN_EVENT_WARN_SECONDS:
+                            continue
+                        seconds_since_warn = 0.0
                         pending_tool_summaries = [
                             {
                                 "call_id": call_id,
@@ -2530,6 +2627,18 @@ class _CodexAppServerSession:
                     with suppress(BaseException):
                         await event_task
                     raise
+                if fatal_gateway_error is not None:
+                    event_task.cancel()
+                    with suppress(BaseException):
+                        await event_task
+                    try:
+                        await asyncio.wait_for(self.interrupt_turn(), timeout=0.5)
+                    except Exception as exc:  # noqa: BLE001 — interrupt is best-effort
+                        logger.debug("Codex auth-failure turn interrupt failed: %s", exc)
+                    yield ExecutorError(
+                        message=fatal_gateway_error.detail(model=model), retryable=False
+                    )
+                    return
                 message = event_task.result()
 
                 self._record_event(message)
@@ -2900,8 +3009,30 @@ class _CodexAppServerSession:
                 if len(self._recent_stderr) > 20:
                     self._recent_stderr.pop(0)
                 logger.debug("codex app-server stderr: %s", text)
+                self._note_stderr_gateway_error(text)
         except asyncio.CancelledError:
             raise
+
+    def _note_stderr_gateway_error(self, text: str) -> None:
+        """Attribute (and, when fatal, arm fast-fail for) a gateway rejection.
+
+        The gateway cause is recorded into the shared watchdog slot the moment
+        it is seen, so a stalled turn surfaces the real error. An auth-class
+        (401/403) rejection arms fast-fail only once the CLI has also exhausted
+        its own retry budget (a final ``Reconnecting N/N``); the two signals can
+        arrive in either order, so both are tracked and fast-fail arms when both
+        hold — a single blip the CLI recovers from never kills a healthy turn.
+        """
+        retry = _CODEX_STDERR_RETRY_EXHAUSTED_RE.search(text)
+        if retry is not None and retry.group("n") == retry.group("total"):
+            self._saw_retries_exhausted = True
+        error = _parse_codex_gateway_error(text)
+        if error is not None:
+            native_forwarder_health.record_transport_failure(error.detail())
+            if error.fatal:
+                self._pending_fatal_gateway_error = error
+        if self._pending_fatal_gateway_error is not None and self._saw_retries_exhausted:
+            self._fatal_gateway_error = self._pending_fatal_gateway_error
 
 
 @dataclass
@@ -3034,7 +3165,7 @@ class CodexExecutor(Executor):
             ``RetryPolicy()`` defaults — see Phase 1f of
             ``designs/RETRY_ACROSS_HARNESSES.md``.
         :param bundle_dir: The agent bundle's extracted on-disk path.
-            When set, ``<bundle_dir>/skills/<name>/SKILL.md`` files are
+            When set, ``<bundle_dir>/skills/<dir>/SKILL.md`` files are
             symlinked into the per-conversation ``$CODEX_HOME/skills/``
             so Codex auto-discovers them. ``None`` skips bundle-skill
             wiring (host-installed ``~/.codex/skills/`` only, subject to
@@ -3298,13 +3429,18 @@ class CodexExecutor(Executor):
         if self._model_provider_override is not None:
             model = None
         elif model is None:
-            provider_name = "databricks" if self._gateway_uses_databricks_profile else "openai"
-            resolution = await run_sync_on_thread(
-                model_catalog.resolve_catalog_model,
-                provider_name,
-                family="openai",
-            )
-            model = resolution.model_id
+            if self._gateway_uses_databricks_profile:
+                resolution = await run_sync_on_thread(
+                    model_catalog.resolve_catalog_model,
+                    "databricks",
+                    family="openai",
+                )
+                model = resolution.model_id
+            else:
+                # Codex's own login (ChatGPT account / API key), where codex is
+                # the vocabulary authority: the bundled OpenAI catalog's newest
+                # row is a bare family alias its backend rejects.
+                model = CODEX_DEFAULT_MODEL
         effective_cwd = (
             self._cwd or (self._os_env_spec.cwd if self._os_env_spec else None) or os.getcwd()
         )
@@ -3319,7 +3455,7 @@ class CodexExecutor(Executor):
                 cfg.extra.get("reasoning_effort"), "codex", CODEX_EFFORTS
             )
         except ValueError as exc:
-            yield ExecutorError(message=str(exc), retryable=False)
+            yield ExecutorError(message=describe_exception(exc), retryable=False)
             return
 
         app_session = await self._ensure_app_session(

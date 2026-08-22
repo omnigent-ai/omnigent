@@ -185,6 +185,55 @@ describe("index.css table link wrapping rule", () => {
   });
 });
 
+/* Pins the table-cell `overflow-wrap: break-word` override so it applies to the cells and never leaks into prose outside a table. */
+describe("index.css table cell wrapping rule", () => {
+  const rule = (cssSource.match(/[^{}]+\{[^{}]*\}/g) ?? []).find(
+    (block) =>
+      /\[data-streamdown="table-cell"\],?\s*\n?\s*\[data-streamdown="table-header-cell"\]\s*\{/.test(
+        block,
+      ) && /overflow-wrap\s*:/.test(block),
+  );
+
+  const selector = (rule ?? "")
+    .slice(0, rule ? rule.indexOf("{") : 0)
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .trim();
+
+  it("has the rule this test exists to protect", () => {
+    expect(rule, "the table-cell wrapping rule is gone from index.css").toBeDefined();
+    expect(rule).toMatch(/overflow-wrap\s*:\s*break-word/);
+  });
+
+  function makeCell(cellAttr: string): HTMLElement {
+    const cell = document.createElement("div");
+    cell.setAttribute("data-streamdown", cellAttr);
+    document.body.appendChild(cell);
+    return cell;
+  }
+
+  it.each(["table-cell", "table-header-cell"])("targets the %s itself", (cellAttr) => {
+    const cell = makeCell(cellAttr);
+    expect(cell.matches(selector)).toBe(true);
+    cell.remove();
+  });
+
+  it("leaves ordinary prose (outside a table) on the inherited wrap-anywhere", () => {
+    const paragraph = document.createElement("p");
+    document.body.appendChild(paragraph);
+    expect(paragraph.matches(selector)).toBe(false);
+    paragraph.remove();
+  });
+
+  it("is declared after the link-in-cell rule, consistent with it rather than fighting it", () => {
+    const linkRuleIndex = cssSource.indexOf(
+      '[data-streamdown="table-cell"], [data-streamdown="table-header-cell"])\n  [data-streamdown="link"]',
+    );
+    const cellRuleIndex = cssSource.indexOf(rule ?? " ");
+    expect(linkRuleIndex).toBeGreaterThan(-1);
+    expect(cellRuleIndex).toBeGreaterThan(linkRuleIndex);
+  });
+});
+
 describe("index.css sidebar canvas", () => {
   const omniLightRule = cssSource.match(
     /:root:not\(\.dark\):not\(\[data-theme\]\) \.conversations-sidebar \{[^}]*\}/,
@@ -196,7 +245,7 @@ describe("index.css sidebar canvas", () => {
     /:root:not\(\.dark\)\[data-theme\] \.conversations-sidebar,[^{]*\.dark\[data-theme\] \.conversations-sidebar \{[^}]*\}/,
   )?.[0];
   const lightEdgeRule = cssSource.match(
-    /html:not\(\.dark\) \.conversations-sidebar \{[^}]*\}/,
+    /html:not\(\.dark\) \.conversations-sidebar(?::not\(\.is-peek\))? \{[^}]*\}/,
   )?.[0];
   const darkEdgeRule = cssSource.match(/\.dark \.conversations-sidebar \{[^}]*\}/)?.[0];
 
@@ -405,5 +454,162 @@ describe("index.css text selection colors", () => {
     expect(selectionRule).toContain("color: var(--sidebar-active-foreground)");
     expect(selectionRule).not.toContain("--brand-accent");
     expect(cssSource).not.toContain(".dark ::selection");
+  });
+});
+
+/* On the macOS desktop shell the window's top strip carries the OS traffic
+ * lights plus the Search/Settings/toggle cluster, and the cluster is owned by
+ * AppShell rather than the sidebar so it holds that spot whether the sidebar is
+ * open, collapsed, or peeking. Asserted at the CSS level because the whole
+ * change is CSS — and because the lights are painted by macOS OUTSIDE the page,
+ * so no DOM test (and no page screenshot) can see them. These values ARE the
+ * alignment.
+ */
+describe("index.css electron-mac sidebar header", () => {
+  const sidebarRule = cssSource.match(
+    /\[data-electron-mac\] \.conversations-sidebar \{[^}]*\}/,
+  )?.[0];
+  const headerRowRule = cssSource.match(
+    /\[data-electron-mac\] \.sidebar-header-row \{[^}]*\}/,
+  )?.[0];
+  const brandRule = cssSource.match(/\[data-electron-mac\] \.sidebar-brand \{[^}]*\}/)?.[0];
+  const inSidebarActionsRule = cssSource.match(
+    /\[data-electron-mac\] \.conversations-sidebar \[data-testid="sidebar-header-actions"\] \{[^}]*\}/,
+  )?.[0];
+  const stripActionsRule = cssSource.match(
+    /\[data-electron-mac\] \.electron-sidebar-header-actions \{(?:[^{}]|\{[^{}]*\})*\}/,
+  )?.[0];
+  const settingsHeaderRule = cssSource.match(
+    /\[data-electron-mac\] \.settings-sidebar-header \{[^}]*\}/,
+  )?.[0];
+  const chatHeaderToggleRule = cssSource.match(
+    /\[data-electron-mac\] \.chat-header-sidebar-toggle \{[^}]*\}/,
+  )?.[0];
+  const peekCardRule = cssSource.match(
+    /\[data-electron-mac\] \.conversations-sidebar\.is-peek \{[^}]*\}/,
+  )?.[0];
+  const peekHeaderRowRule = cssSource.match(
+    /\[data-electron-mac\] \.conversations-sidebar\.is-peek \.sidebar-header-row \{[^}]*\}/,
+  )?.[0];
+
+  it("starts the sidebar at the window's top edge (no empty strip above it)", () => {
+    // Was 2.25rem, which left the band of blank canvas this change removes.
+    expect(sidebarRule).toContain("margin-top: 0");
+  });
+
+  it("drops the brand mark, which has nowhere to sit beside the lights", () => {
+    expect(brandRule).toContain("display: none");
+  });
+
+  it("collapses the emptied header row instead of leaving a dead band", () => {
+    // Both the wordmark and the cluster are gone from this row on mac, so a
+    // 3rem row would reintroduce the empty strip this change set out to remove.
+    expect(headerRowRule).toContain("height: 2.25rem");
+  });
+
+  it("hides the sidebar's own cluster in favour of the title-bar copy", () => {
+    // The AppShell copy is the one that renders on mac; two visible clusters
+    // would be a duplicated control.
+    expect(inSidebarActionsRule).toContain("display: none");
+  });
+
+  it("scopes that hide to the sidebar so it cannot match the AppShell copy", () => {
+    // Without the .conversations-sidebar qualifier this selector would also hit
+    // the title-bar cluster and hide the icons entirely on mac.
+    expect(inSidebarActionsRule).toContain(".conversations-sidebar");
+  });
+
+  it("pins the title-bar cluster beside the lights, independent of the sidebar", () => {
+    // Positioned against the app shell, NOT inside the sidebar — that is what
+    // keeps the icons in place while the sidebar collapses (md:w-0 +
+    // overflow-hidden + inert) or peeks (floating card at inset-2).
+    expect(stripActionsRule).toContain("position: absolute");
+  });
+
+  it("stacks the cluster above the sidebar so it is actually painted", () => {
+    // Regression guard: the sidebar is a positioned sibling at z-index 50 with
+    // an OPAQUE gradient background, so any lower layer leaves the buttons
+    // measuring correctly in the DOM while being invisible on screen — a bug no
+    // geometry assertion catches. Must clear 50.
+    const z = stripActionsRule?.match(/z-index:\s*(\d+)/)?.[1];
+    expect(z, "cluster needs an explicit z-index").toBeDefined();
+    expect(Number(z)).toBeGreaterThan(50);
+  });
+
+  it("hides the chat header's duplicate open-sidebar button", () => {
+    // The title-bar toggle is present in every state and carries the same
+    // dwell-to-peek, so the chat header's copy would be a second, lower, offset
+    // instance of one control.
+    expect(chatHeaderToggleRule).toContain("display: none");
+  });
+
+  it("floats the peek card below the title-bar controls", () => {
+    // The card's own inset-2 would put its first row level with the lights and
+    // the icon cluster, so it slides up UNDER the window controls. Its top edge
+    // must clear the 2.25rem strip (2.75rem = strip + the same 0.5rem gap the
+    // card's other edges use).
+    expect(peekCardRule).toContain("top: 2.75rem");
+  });
+
+  it("drops the header row inside the peek card", () => {
+    // The row reserves the title-bar strip for the lights and cluster, which
+    // only applies to the docked sidebar starting at y=0. The peek card already
+    // floats clear of all of it, so the row is 2.25rem of empty canvas above the
+    // first entry — the content should line up against the card's own padding.
+    expect(peekHeaderRowRule).toContain("display: none");
+  });
+
+  it("orders the cluster Collapse, Search, Settings left-to-right", () => {
+    // The DOM order is Search → Settings → toggle (tab order follows
+    // importance), so the toggle is reordered visually rather than moved.
+    expect(stripActionsRule).toMatch(/&\s*>\s*\*\s*>\s*\*:last-child\s*\{[^}]*order:\s*-1/);
+  });
+
+  it("pushes the settings sidebar's Back row below the lights", () => {
+    // /settings swaps the header row out entirely; without this its Back row
+    // would sit underneath the window controls.
+    expect(settingsHeaderRule).toContain("padding-top: 2.75rem");
+  });
+
+  it("keeps every header rule scoped to the desktop shell", () => {
+    // A browser tab has no window controls to align to, so none of this may
+    // apply there. Every SELECTOR mentioning these classes must carry the
+    // [data-electron-mac] scope somewhere ahead of the class — not necessarily
+    // immediately before it, since some are qualified further (e.g.
+    // `[data-electron-mac] .conversations-sidebar.is-peek .sidebar-header-row`).
+    // Selectors are checked whole so a leaked unscoped rule still fails.
+    const selectorsInSource = [...cssSource.matchAll(/(^|\})\s*([^{}]+?)\s*\{/g)].map((m) => m[2]);
+    for (const cls of [
+      ".sidebar-header-row",
+      ".sidebar-brand",
+      ".settings-sidebar-header",
+      ".electron-sidebar-header-actions",
+      ".chat-header-sidebar-toggle",
+    ]) {
+      const mentioning = selectorsInSource.filter((sel) => sel.includes(cls));
+      expect(mentioning.length, `${cls} should appear in at least one rule`).toBeGreaterThan(0);
+      for (const sel of mentioning) {
+        expect(sel, `${cls} must always be [data-electron-mac]-scoped`).toContain(
+          "[data-electron-mac]",
+        );
+      }
+    }
+  });
+});
+
+describe("index.css native conversation breadcrumb", () => {
+  it("does not hide the parent-session link on iOS/Android native shells", () => {
+    // Native chrome is a server switcher, not session back. A blanket
+    // `.conversation-breadcrumb { display: none }` would also drop the only
+    // in-header climb-out of a sub-agent (native back is off; edge-pan opens
+    // the sidebar). Folder / title / sub-agent may hide; the parent link must
+    // stay.
+    const blanket = cssSource.match(
+      /\[data-ios-native\] \.conversation-breadcrumb\s*,\s*\[data-android-native\] \.conversation-breadcrumb\s*\{[^}]*display:\s*none/,
+    );
+    expect(blanket).toBeNull();
+    expect(cssSource).toMatch(
+      /\[data-ios-native\][\s\S]*breadcrumb-parent-link[\s\S]*\[data-android-native\][\s\S]*breadcrumb-parent-link/,
+    );
   });
 });

@@ -43,6 +43,7 @@ Omnigent lets you:
 
 - **☁️ Run agents in cloud sandboxes.** No laptop required: run sessions in
   disposable [Modal](https://modal.com), [Daytona](https://www.daytona.io),
+  [Blaxel](https://blaxel.ai),
   [Islo](https://islo.dev), [E2B](https://e2b.dev),
   [CoreWeave](https://docs.coreweave.com/products/sandboxes),
   [Kubernetes](https://kubernetes.io), [OpenShell](https://github.com/NVIDIA/OpenShell),
@@ -80,7 +81,7 @@ curl -fsSL https://raw.githubusercontent.com/omnigent-ai/omnigent/main/scripts/i
 Available user-facing extras include:
 
 - **Model providers:** `databricks`, `bedrock`, `vertex`
-- **Sandbox providers:** `modal`, `daytona`, `boxlite`, `cwsandbox`, `e2b`,
+- **Sandbox providers:** `modal`, `daytona`, `blaxel`, `boxlite`, `cwsandbox`, `e2b`,
   `openshell`, `kubernetes`
 - **SDK harnesses:** `antigravity`, `copilot`, `cursor`, `agents-sdk`
 - **Storage and memory:** `s3`, `hindsight`
@@ -364,8 +365,10 @@ Face Spaces**, **Modal**, **Cloudflare** (serverless, scale-to-zero), and
 covered too — and a **Cloudflare quick tunnel** (public) or **Tailscale**
 (private) reaches a server running on your own laptop without a deploy. The
 server can also provision a cloud sandbox per session (*managed hosts*), so no
-laptop has to stay online. The full menu of targets, the database options, and
-the sandbox setup live in
+laptop has to stay online. The full menu of targets, the database options, the
+sandbox setup, and
+[branding/white-labeling](https://github.com/omnigent-ai/omnigent/blob/main/deploy/README.md#branding-white-labeling)
+live in
 [`deploy/README.md`](https://github.com/omnigent-ai/omnigent/blob/main/deploy/README.md).
 
 Once the server is up, sign in and register your laptop as a host:
@@ -410,6 +413,9 @@ and they're in. Signup is invite-only.
 
 - **Share a live session.** Hit **Share** in the web UI and send the link;
   teammates watch your agent work and chat with it in real time.
+- **Leave a shared session.** Done with a session someone shared with you?
+  Pick **Leave session** from its sidebar row menu to drop it from your
+  sidebar. Nothing is deleted — the owner keeps it and can share it again.
 - **Co-drive.** A teammate co-attaches to your running session; their
   messages execute on **your** machine. Great for pairing or handing the
   keyboard to a domain expert mid-investigation.

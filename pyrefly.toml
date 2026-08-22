@@ -20,6 +20,8 @@ disable-search-path-heuristics = true
 ignore-missing-imports = [
     "boxlite",
     "boxlite.*",
+    "blaxel",
+    "blaxel.*",
     "copilot",
     "copilot.*",
     "cursor_sdk",

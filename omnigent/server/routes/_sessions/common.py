@@ -24,9 +24,11 @@ from omnigent.entities.conversation import (
 )
 from omnigent.harness_capabilities import ForkHistory
 from omnigent.harness_plugins import (
+    ANTIGRAVITY_NATIVE_CODING_AGENT,
     CLAUDE_NATIVE_CODING_AGENT,
     CODEX_NATIVE_CODING_AGENT,
     CURSOR_NATIVE_CODING_AGENT,
+    KIMI_NATIVE_CODING_AGENT,
     KIRO_NATIVE_CODING_AGENT,
     OPENCODE_NATIVE_CODING_AGENT,
     PI_NATIVE_CODING_AGENT,
@@ -65,6 +67,9 @@ _SLASH_COMMAND_TYPE: str = "slash_command"
 
 
 _STOP_SESSION_TYPE: str = "stop_session"
+
+
+_RETRY_SESSION_TYPE: str = "retry_session"
 
 
 _EXTERNAL_ASSISTANT_MESSAGE_TYPE: str = "external_assistant_message"
@@ -124,6 +129,12 @@ _EXTERNAL_SESSION_USAGE_TYPE: str = "external_session_usage"
 _EXTERNAL_MODEL_CHANGE_TYPE: str = "external_model_change"
 
 
+_EXTERNAL_PERMISSION_MODE_CHANGE_TYPE: str = "external_permission_mode_change"
+
+
+_EXTERNAL_SESSION_TITLE_TYPE: str = "external_session_title"
+
+
 _EXTERNAL_MODEL_OPTIONS_TYPE: str = "external_model_options"
 
 
@@ -181,7 +192,48 @@ _EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE: str = "external_codex_approval_mode_c
 _CODEX_NATIVE_COLLABORATION_MODES: frozenset[str] = frozenset({"default", "plan"})
 
 
+# Current permission mode of a live claude-native session.
+# ``terminal_launch_args`` records only the launch mode, so this label is what
+# the web UI reads back after a reload.
+_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY = "omnigent.claude_native.permission_mode"
+
+
+# Permission modes switchable on a running session — the ones Claude
+# Code's shift+tab cycle can reach. Mirrors
+# ``claude_native_bridge.CYCLEABLE_PERMISSION_MODES``; ``dontAsk`` and
+# ``bypassPermissions`` are launch-only and rejected on PATCH.
+_CLAUDE_NATIVE_PERMISSION_MODES: frozenset[str] = frozenset(
+    {"default", "acceptEdits", "plan", "auto"}
+)
+
+
 _CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK = "Codex"
+
+
+_EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE: str = "external_antigravity_subagent_start"
+
+
+_ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE = "antigravity-native-ui-subagent"
+
+
+_ANTIGRAVITY_NATIVE_SUBAGENT_CASCADE_ID_LABEL_KEY = (
+    "omnigent.antigravity_native.subagent_cascade_id"
+)
+
+
+_ANTIGRAVITY_NATIVE_SUBAGENT_TOOL_CALL_ID_LABEL_KEY = "omnigent.antigravity_native.tool_call_id"
+
+
+_ANTIGRAVITY_NATIVE_SUBAGENT_ROLE_LABEL_KEY = "omnigent.antigravity_native.agent_role"
+
+
+_ANTIGRAVITY_NATIVE_SUBAGENT_TYPE_LABEL_KEY = "omnigent.antigravity_native.agent_type"
+
+
+# Title head for a child whose ``subagentSpec`` named no role. agy always sends
+# one in practice; this only keeps the ``"<head>:<tail>"`` title parseable (the
+# Agents rail splits on the first colon) if it ever stops.
+_ANTIGRAVITY_NATIVE_SUBAGENT_DISPLAY_FALLBACK = "subagent"
 
 
 _LAST_CONTEXT_TOKENS_LABEL_KEY: str = "omnigent.last_context_tokens"
@@ -194,6 +246,18 @@ _LAST_TASK_ERROR_CODE_LABEL_KEY: str = "omnigent.last_task_error_code"
 
 
 _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: str = "omnigent.last_task_error_message"
+
+
+# Optional structured failure fields (present when the runner classified the
+# failure — see ``omnigent.runner.launch_failure``), persisted so a reload
+# renders the same clear failure card instead of only the raw code + message.
+_LAST_TASK_ERROR_TITLE_LABEL_KEY: str = "omnigent.last_task_error_title"
+
+
+_LAST_TASK_ERROR_CAUSE_LABEL_KEY: str = "omnigent.last_task_error_cause"
+
+
+_LAST_TASK_ERROR_REMEDIATION_LABEL_KEY: str = "omnigent.last_task_error_remediation"
 
 
 _LABEL_VALUE_MAX_LEN: int = LABEL_VALUE_MAX_LEN
@@ -236,6 +300,12 @@ _CURSOR_NATIVE_WRAPPER_LABEL_VALUE = CURSOR_NATIVE_CODING_AGENT.wrapper_label
 
 
 _CURSOR_NATIVE_HARNESS = CURSOR_NATIVE_CODING_AGENT.harness
+
+
+_KIMI_NATIVE_HARNESS = KIMI_NATIVE_CODING_AGENT.harness
+
+
+_ANTIGRAVITY_NATIVE_HARNESS = ANTIGRAVITY_NATIVE_CODING_AGENT.harness
 
 
 _KIRO_NATIVE_WRAPPER_LABEL_VALUE = KIRO_NATIVE_CODING_AGENT.wrapper_label
@@ -352,6 +422,7 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _MCP_ELICITATION_TYPE,
     _COMPACT_TYPE,
     _STOP_SESSION_TYPE,
+    _RETRY_SESSION_TYPE,
     _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
     _EXTERNAL_CONVERSATION_ITEM_TYPE,
     _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
@@ -366,10 +437,13 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_MCP_STARTUP_TYPE,
     _EXTERNAL_MODEL_CHANGE_TYPE,
     _EXTERNAL_MODEL_OPTIONS_TYPE,
+    _EXTERNAL_PERMISSION_MODE_CHANGE_TYPE,
     _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
+    _EXTERNAL_SESSION_TITLE_TYPE,
     _EXTERNAL_SESSION_TODOS_TYPE,
     _EXTERNAL_SUBAGENT_START_TYPE,
     _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
+    _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE,
     _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
     _EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE,
 }
@@ -725,6 +799,13 @@ __all__ = [
     "SUBAGENT_ROUTING_OVERRIDE_VALUES",
     "_ALLOWED_EVENT_TYPES",
     "_ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S",
+    "_ANTIGRAVITY_NATIVE_HARNESS",
+    "_ANTIGRAVITY_NATIVE_SUBAGENT_CASCADE_ID_LABEL_KEY",
+    "_ANTIGRAVITY_NATIVE_SUBAGENT_DISPLAY_FALLBACK",
+    "_ANTIGRAVITY_NATIVE_SUBAGENT_ROLE_LABEL_KEY",
+    "_ANTIGRAVITY_NATIVE_SUBAGENT_TOOL_CALL_ID_LABEL_KEY",
+    "_ANTIGRAVITY_NATIVE_SUBAGENT_TYPE_LABEL_KEY",
+    "_ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE",
     "_APPROVAL_TYPE",
     "_BROWSER_ACTION_AWAIT_S",
     "_BROWSER_ACTION_TIMEOUT_RESULT",
@@ -735,6 +816,8 @@ __all__ = [
     "_CLAUDE_NATIVE_MESSAGE_TIMEOUT_S",
     "_CLAUDE_NATIVE_MODEL",
     "_CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S",
+    "_CLAUDE_NATIVE_PERMISSION_MODES",
+    "_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY",
     "_CLAUDE_NATIVE_REMEMBER_INELIGIBLE_TOOLS",
     "_CLAUDE_NATIVE_SUBAGENT_ID_LABEL_KEY",
     "_CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE",
@@ -765,6 +848,7 @@ __all__ = [
     "_CURSOR_NATIVE_WRAPPER_LABEL_VALUE",
     "_DENY_SENTINEL_PREFIX",
     "_EVALUATE_HOOK_ELICITATION_ID_RE",
+    "_EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE",
     "_EXTERNAL_ASSISTANT_MESSAGE_TYPE",
     "_EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE",
     "_EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE",
@@ -779,11 +863,13 @@ __all__ = [
     "_EXTERNAL_MODEL_OPTIONS_TYPE",
     "_EXTERNAL_OUTPUT_REASONING_DELTA_TYPE",
     "_EXTERNAL_OUTPUT_TEXT_DELTA_TYPE",
+    "_EXTERNAL_PERMISSION_MODE_CHANGE_TYPE",
     "_EXTERNAL_REASONING_EFFORT_CHANGE_TYPE",
     "_EXTERNAL_SESSION_INTERRUPTED_TYPE",
     "_EXTERNAL_SESSION_STATUS_TYPE",
     "_EXTERNAL_SESSION_STATUS_VALUES",
     "_EXTERNAL_SESSION_SUPERSEDED_TYPE",
+    "_EXTERNAL_SESSION_TITLE_TYPE",
     "_EXTERNAL_SESSION_TODOS_TYPE",
     "_EXTERNAL_SESSION_USAGE_TYPE",
     "_EXTERNAL_STATUS_ASSISTANT_SCAN_LIMIT",
@@ -800,12 +886,16 @@ __all__ = [
     "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S",
     "_HOST_RUNNER_STATUS_TIMEOUT_S",
     "_INTERRUPT_TYPE",
+    "_KIMI_NATIVE_HARNESS",
     "_KIRO_NATIVE_WRAPPER_LABEL_VALUE",
     "_LABEL_VALUE_MAX_LEN",
     "_LAST_CONTEXT_TOKENS_LABEL_KEY",
     "_LAST_CONTEXT_WINDOW_LABEL_KEY",
+    "_LAST_TASK_ERROR_CAUSE_LABEL_KEY",
     "_LAST_TASK_ERROR_CODE_LABEL_KEY",
     "_LAST_TASK_ERROR_MESSAGE_LABEL_KEY",
+    "_LAST_TASK_ERROR_REMEDIATION_LABEL_KEY",
+    "_LAST_TASK_ERROR_TITLE_LABEL_KEY",
     "_MANAGED_RESUMABLE_TUNNEL_STALE_S",
     "_MAX_TERMINAL_LAUNCH_ARGS",
     "_MAX_TERMINAL_LAUNCH_ARG_LEN",
@@ -820,6 +910,7 @@ __all__ = [
     "_OPENCODE_NATIVE_WRAPPER_LABEL_VALUE",
     "_PI_NATIVE_WRAPPER_LABEL_VALUE",
     "_RACE_TASK_REAP_TIMEOUT_S",
+    "_RETRY_SESSION_TYPE",
     "_RUNNER_CONVICTION_POLL_S",
     "_RUNNER_FORWARD_TIMEOUT",
     "_RUNNER_RELAY_READY_TIMEOUT_S",
