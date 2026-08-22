@@ -45,6 +45,7 @@ _FAKE_ROW = AcpCliHarness(
     ),
     args=("agent", "stdio"),
     aliases=("fake-cli",),
+    env_passthrough=("FAKE_API_KEY", "FAKE_HOME"),
 )
 
 
@@ -104,6 +105,7 @@ def test_spawn_env_forwards_cwd_sandbox_and_quotes_command(
         "stdio",
     ]
     assert env["HARNESS_ACP_NAME"] == "Fake CLI"
+    assert env["HARNESS_ACP_ENV_PASSTHROUGH"] == "FAKE_API_KEY,FAKE_HOME"
     assert env["HARNESS_ACP_CWD"] == "/work/space"
     assert json.loads(env["HARNESS_ACP_OS_ENV"]) == dataclasses.asdict(os_env)
     # Rows own their model selection: no model var may ride along.
@@ -137,6 +139,33 @@ def test_fake_row_login_command() -> None:
     assert _FAKE_ROW.login_command == "fakecli login --device"
     assert _FAKE_ROW.label == "Fake CLI"
     assert _FAKE_ROW.binary == "fakecli"
+
+
+def test_deepseek_row_matches_published_acp_adapter() -> None:
+    """Pin the reviewed package boundary and its actual no-argument ACP command."""
+    row = ACP_CLI_HARNESSES["deepseek"]
+
+    assert row.install.package == "@openma/deepseek-harness-acp"
+    assert row.install.min_version == "0.4.6"
+    assert row.binary == "dsh-acp"
+    assert row.args == ()
+    assert row.login_command == "dsh-acp login"
+    assert row.aliases == ("deepseek-harness", "dsh")
+    assert row.env_passthrough == (
+        "DEEPSEEK_API_KEY",
+        "DEEPSEEK_BASE_URL",
+        "DSH_HOME",
+        "DSH_PATH",
+    )
+
+
+def test_grok_row_keeps_deny_by_default_environment() -> None:
+    """Rows without an allowlist must not emit the passthrough escape hatch."""
+    row = ACP_CLI_HARNESSES["grok"]
+
+    assert row.env_passthrough == ()
+    env = _build_acp_cli_spawn_env(_spec("grok"), harness="grok")
+    assert "HARNESS_ACP_ENV_PASSTHROUGH" not in env
 
 
 # ---------------------------------------------------------------------------

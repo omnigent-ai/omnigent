@@ -169,6 +169,28 @@ executor:
 CLI flags such as `--harness qwen` and `--model <id>` can override or supply
 missing executor values.
 
+## DeepSeek Harness
+
+`harness: deepseek` runs the official
+[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) runtime
+through the Apache-2.0
+[`@openma/deepseek-harness-acp`](https://github.com/openma-ai/deepseek-harness-acp)
+adapter. Install and authenticate it with:
+
+```bash
+npm install -g @openma/deepseek-harness-acp
+dsh-acp login
+```
+
+```yaml
+executor:
+  harness: deepseek             # aliases: deepseek-harness, dsh
+```
+
+The adapter and runtime boundary, authentication alternatives, supported ACP
+features, and current limitations are documented in the
+[DeepSeek Harness integration guide](deepseek-harness.md).
+
 ## Custom ACP agents
 
 `harness: acp:<slug>` runs any configured Agent Client Protocol server command.
