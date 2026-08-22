@@ -48,8 +48,17 @@ if TYPE_CHECKING:
 import httpx
 
 from omnigent._wrapper_labels import (
+    ANTIGRAVITY_NATIVE_WRAPPER_VALUE,
     CLAUDE_NATIVE_WRAPPER_VALUE,
     CODEX_NATIVE_WRAPPER_VALUE,
+    CURSOR_NATIVE_WRAPPER_VALUE,
+    GOOSE_NATIVE_WRAPPER_VALUE,
+    HERMES_NATIVE_WRAPPER_VALUE,
+    KIMI_NATIVE_WRAPPER_VALUE,
+    KIRO_NATIVE_WRAPPER_VALUE,
+    OPENCODE_NATIVE_WRAPPER_VALUE,
+    PI_NATIVE_WRAPPER_VALUE,
+    QWEN_NATIVE_WRAPPER_VALUE,
 )
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.model_override import (
@@ -7359,6 +7368,93 @@ async def _execute_task_lifecycle_tool(
     )
 
 
+# Native sub-agent cancellation capabilities, resolved from the harness set
+# rather than a single wrapper label. Mirrors the child runner's
+# ``stop_session`` dispatch (``NativeInterruptRunner.stop`` +
+# ``_UNIFORM_STOP`` in ``runner/native/interrupt.py``): the runner-side
+# hard-stop exists for claude plus the six uniform-stop harnesses; codex and
+# pi alias stop to interrupt; antigravity and opencode have no native stop
+# handler and fall through to the in-process turn cancel.
+_STOP_CAPABLE_NATIVE_WRAPPERS = frozenset(
+    {
+        CLAUDE_NATIVE_WRAPPER_VALUE,
+        CURSOR_NATIVE_WRAPPER_VALUE,
+        GOOSE_NATIVE_WRAPPER_VALUE,
+        KIRO_NATIVE_WRAPPER_VALUE,
+        KIMI_NATIVE_WRAPPER_VALUE,
+        HERMES_NATIVE_WRAPPER_VALUE,
+        QWEN_NATIVE_WRAPPER_VALUE,
+    }
+)
+# Native harnesses whose stop aliases to interrupt (codex, pi) or that have
+# no native stop handler at all (antigravity, opencode): cancelling them is
+# best-effort and the result says so instead of implying process termination.
+_BEST_EFFORT_NATIVE_WRAPPERS = frozenset(
+    {
+        CODEX_NATIVE_WRAPPER_VALUE,
+        PI_NATIVE_WRAPPER_VALUE,
+        ANTIGRAVITY_NATIVE_WRAPPER_VALUE,
+        OPENCODE_NATIVE_WRAPPER_VALUE,
+    }
+)
+
+
+def _native_cancel_capability(wrapper_label: str | None) -> str:
+    """Classify a child's wrapper label for cancellation routing.
+
+    :param wrapper_label: The work entry's wrapper label, e.g.
+        ``"cursor-native-ui"``; ``None``/non-native for in-process harnesses.
+    :returns: ``"stop"`` when the child's runner has a true hard-stop,
+        ``"best_effort"`` when the event is forwarded but no hard-stop is
+        wired, ``"inprocess"`` otherwise (turn cancel via interrupt).
+    """
+    if wrapper_label in _STOP_CAPABLE_NATIVE_WRAPPERS:
+        return "stop"
+    if wrapper_label in _BEST_EFFORT_NATIVE_WRAPPERS:
+        return "best_effort"
+    return "inprocess"
+
+
+# Terminal-registry short names for the stop-capable natives — the pane a
+# failed child would still be resident in, keyed by its wrapper label.
+_STOP_CAPABLE_TERMINAL_NAMES = {
+    CLAUDE_NATIVE_WRAPPER_VALUE: "claude",
+    CURSOR_NATIVE_WRAPPER_VALUE: "cursor",
+    GOOSE_NATIVE_WRAPPER_VALUE: "goose",
+    KIRO_NATIVE_WRAPPER_VALUE: "kiro",
+    KIMI_NATIVE_WRAPPER_VALUE: "kimi",
+    HERMES_NATIVE_WRAPPER_VALUE: "hermes",
+    QWEN_NATIVE_WRAPPER_VALUE: "qwen",
+}
+
+
+async def _native_child_pane_alive(task_id: str, wrapper_label: str | None) -> bool:
+    """Probe whether a failed native child's pane still answers.
+
+    ``failed`` does not say whether the harness process is still resident:
+    a required-terminal exit fails the entry after the process died, while
+    a harness-side failure can leave the pane alive. The uniform bridge
+    stop cannot kill a dead tmux session — it answers 503 — so a failed
+    entry earns its hard-stop only when its registered pane is verifiably
+    alive; otherwise the cached terminal failure is the truthful answer.
+    """
+    from omnigent.runtime import get_terminal_registry
+
+    terminal_name = _STOP_CAPABLE_TERMINAL_NAMES.get(wrapper_label or "")
+    if terminal_name is None:
+        return False
+    try:
+        instance = get_terminal_registry().get(task_id, terminal_name, "main")
+    except Exception:
+        return False
+    if instance is None:
+        return False
+    try:
+        return await instance.is_alive()
+    except Exception:
+        return False
+
+
 async def _post_session_stop(server_client: httpx.AsyncClient, task_id: str) -> str | None:
     """Hard-stop one claude-native child through the server."""
     try:
@@ -7376,13 +7472,19 @@ async def _post_session_stop(server_client: httpx.AsyncClient, task_id: str) -> 
     return None
 
 
-async def _cancel_evicted_claude_native_subagent(
+async def _cancel_evicted_native_subagent(
     task_id: str,
     *,
     conversation_id: str,
     server_client: httpx.AsyncClient | None,
 ) -> str:
-    """Stop an owned claude-native child after its work entry was evicted."""
+    """Stop an owned stop-capable native child after its work entry was evicted.
+
+    Ownership is still verified against the snapshot's ``parent_session_id``
+    and the wrapper label must name a harness with a runner-side hard-stop —
+    an evicted entry means the parent no longer knows the child's state, so
+    trusting the caller's task id alone could stop someone else's session.
+    """
     if server_client is None:
         return "Error: sys_cancel_task requires server access for sub-agent tasks"
     try:
@@ -7397,7 +7499,7 @@ async def _cancel_evicted_claude_native_subagent(
         not isinstance(snapshot, dict)
         or snapshot.get("parent_session_id") != conversation_id
         or not isinstance(labels, dict)
-        or labels.get(_SESSION_WRAPPER_LABEL_KEY) != CLAUDE_NATIVE_WRAPPER_VALUE
+        or labels.get(_SESSION_WRAPPER_LABEL_KEY) not in _STOP_CAPABLE_NATIVE_WRAPPERS
     ):
         return f"Error: no in-flight task with task_id {task_id}"
     stop_error = await _post_session_stop(server_client, task_id)
@@ -7415,23 +7517,26 @@ async def _cancel_subagent_task(
     """
     Cancel a running sub-agent worker, routing by the child's harness.
 
-    Only ``claude-native`` has a runner-side hard-stop, so the cancel
-    event is chosen per harness — the child runner's ``stop_session``
-    handler 204 no-ops for every other harness, so posting it there
-    would silently do nothing:
+    The cancel event is chosen from the child harness's capability
+    (``_native_cancel_capability``), mirroring the child runner's own
+    ``stop_session`` dispatch — the runner-side hard-stop exists for
+    claude plus the six uniform-stop natives (cursor, goose, kiro, kimi,
+    hermes, qwen):
 
-    * ``claude-native`` — POST ``stop_session``. The child runner
-      hard-kills the worker's tmux pane via ``_handle_claude_native_stop``
-      and marks the work entry cancelled, delivering a terminal payload to
-      the parent inbox and auto-waking it. A bare interrupt (Escape) only
-      cancelled the current turn and left the worker process alive; a stop
-      frees it.
-    * everything else (in-process harnesses, ``codex-native``) — POST
-      ``interrupt``, the path those harnesses actually honor. For an
-      in-process child the runner marks the turn cancelled (via
-      ``_interrupted_sessions`` → ``_on_proxy_stream_end``) and wakes the
-      parent. ``codex-native`` has no runner-side stop yet, so its cancel
-      stays best-effort (see message).
+    * stop-capable natives — POST ``stop_session``: the child runner
+      hard-stops the worker (claude kills its tmux pane; the uniform
+      six run their bridge stop), marks the work entry cancelled,
+      delivers a terminal payload to the parent inbox and auto-wakes
+      it. A bare interrupt only cancelled the current turn and left the
+      worker process alive; a stop frees it. A ``failed`` stop-capable
+      entry still routes when its pane answers the liveness probe —
+      failed does not mean exited; a dead pane returns the cached
+      failure instead of a bridge 503.
+    * best-effort natives (``codex``, ``pi``, ``antigravity``,
+      ``opencode``) and in-process harnesses — POST ``interrupt``, the
+      path those harnesses actually honor. No runner-side hard-stop is
+      wired for them, so the result is reported best-effort rather
+      than implying process termination.
 
     :param args: Tool arguments containing ``task_id`` or
         ``handle_id``, e.g. ``{"task_id": "conv_child456"}``.
@@ -7449,7 +7554,7 @@ async def _cancel_subagent_task(
         return "Error: sys_cancel_task requires conversation_id"
     entry = _runner_app.get_subagent_work(str(task_id))
     if entry is None:
-        return await _cancel_evicted_claude_native_subagent(
+        return await _cancel_evicted_native_subagent(
             str(task_id),
             conversation_id=conversation_id,
             server_client=server_client,
@@ -7461,9 +7566,18 @@ async def _cancel_subagent_task(
     # route to the child during that window — otherwise cancelling a slow-to-
     # start sub-agent would silently no-op and leave it running. A failed
     # claude-native entry still falls through because its pane may be alive.
-    is_claude_native = entry.wrapper_label == CLAUDE_NATIVE_WRAPPER_VALUE
-    can_stop_failed_claude = is_claude_native and entry.status == "failed"
-    if entry.status not in ("launching", "running", "waiting") and not can_stop_failed_claude:
+    capability = _native_cancel_capability(entry.wrapper_label)
+    # A failed native entry with a hard-stop still routes when its pane is
+    # verifiably alive (failed ≠ exited), and the stop frees it. A failed
+    # entry whose pane already died returns its cached terminal status — the
+    # uniform bridge stop cannot kill a dead tmux session, so routing it
+    # would answer 503 instead of the task's terminal failure.
+    can_stop_failed = (
+        capability == "stop"
+        and entry.status == "failed"
+        and await _native_child_pane_alive(str(task_id), entry.wrapper_label)
+    )
+    if entry.status not in ("launching", "running", "waiting") and not can_stop_failed:
         return json.dumps(
             {
                 "cancelled": entry.status == "cancelled",
@@ -7474,9 +7588,10 @@ async def _cancel_subagent_task(
     if server_client is None:
         return "Error: sys_cancel_task requires server access for sub-agent tasks"
 
-    # claude-native is the only harness with a runner-side hard-stop; every
-    # other harness 204 no-ops on stop_session, so route them to interrupt.
-    event_type = "stop_session" if is_claude_native else "interrupt"
+    # Route from the harness capability: stop-capable natives get the
+    # runner-side hard-stop; the rest (best-effort natives + in-process
+    # harnesses) get the interrupt the child actually honors.
+    event_type = "stop_session" if capability == "stop" else "interrupt"
 
     try:
         resp = await server_client.post(
@@ -7495,7 +7610,7 @@ async def _cancel_subagent_task(
     updated = _runner_app.get_subagent_work(str(task_id)) or entry
     if updated.status == "cancelled":
         return json.dumps({"cancelled": True, "task_id": task_id, "status": "cancelled"})
-    if updated.wrapper_label == CODEX_NATIVE_WRAPPER_VALUE:
+    if updated.wrapper_label in _BEST_EFFORT_NATIVE_WRAPPERS:
         return json.dumps(
             {
                 "cancel_requested": True,
@@ -7504,9 +7619,9 @@ async def _cancel_subagent_task(
                 "task_id": task_id,
                 "status": updated.status,
                 "message": (
-                    "Interrupt forwarded, but a runner-side hard-stop is not wired "
-                    "for codex-native workers yet; the child may keep running and no "
-                    "terminal inbox status is guaranteed."
+                    "Interrupt forwarded, but no runner-side hard-stop is wired for "
+                    "this harness; the child may keep running and no terminal inbox "
+                    "status is guaranteed."
                 ),
             }
         )
