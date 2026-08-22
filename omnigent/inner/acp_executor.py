@@ -195,6 +195,9 @@ class AcpAgentConfig:
         it skips the human approval card for a request no policy had an opinion
         on, matching claude-sdk's ``can_use_tool`` gate. Policy still runs in
         every mode, so a DENY still blocks and an explicit ASK still prompts.
+    :param policy_hook_authoritative: The agent has already evaluated the
+        Omnigent tool policy before it asks for native ACP consent. Answer that
+        secondary request without policy evaluation or another approval card.
     """
 
     command: str
@@ -205,6 +208,7 @@ class AcpAgentConfig:
     omnigent_mcp: bool = True
     env_passthrough: tuple[str, ...] = ()
     permission_mode: str = "auto"
+    policy_hook_authoritative: bool = False
 
 
 class _AcpRequestError(Exception):
@@ -938,6 +942,12 @@ class AcpExecutor(Executor):
             :meth:`_permission_outcome` choose the narrowest grant.
         """
         tool_name, tool_input = self._extract_tool_call(params)
+        if self._config.policy_hook_authoritative:
+            logger.info(
+                "acp permission allowed after authoritative agent policy hook: tool=%s",
+                tool_name,
+            )
+            return True, None
         policy_eval = getattr(self, "_policy_evaluator", None)
         # Either bridge can carry the question to the user.
         can_ask = (

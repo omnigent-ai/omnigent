@@ -10080,7 +10080,11 @@ def _build_spawn_env_from_spec(
             # Builtin ACP CLI harnesses (one catalog row each) share a single
             # builder; the row supplies the command, label, and install info.
             env = _build_acp_cli_spawn_env(
-                effective_spec, harness=harness, cwd=cwd, workdir=workdir
+                effective_spec,
+                harness=harness,
+                cwd=cwd,
+                workdir=workdir,
+                session_id=session_id,
             )
         else:
             builder_path = spawn_env_builders().get(harness)

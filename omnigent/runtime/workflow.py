@@ -1514,21 +1514,24 @@ def _build_acp_cli_spawn_env(
     harness: str,
     cwd: Path | None = None,
     workdir: Path | None = None,
+    session_id: str | None = None,
 ) -> dict[str, str]:
     """Build the generic-ACP env for one builtin ACP CLI harness (catalog row).
 
     Rows in :data:`omnigent.acp_cli_harnesses.ACP_CLI_HARNESSES` all run the
     shared ``omnigent/inner/acp_harness.py`` wrap; this maps a row + spec to
-    the ``HARNESS_ACP_*`` vars it reads. Like goose/acp, a vendor ACP CLI owns
-    its own auth and model, so no provider/gateway credential and no model var
-    is wired. The binary resolves via the ``OMNIGENT_<NAME>_PATH`` env
-    override, then the config ``harness.<name>.command`` path, then PATH plus
-    the common global install dirs.
+    the ``HARNESS_ACP_*`` vars it reads. A vendor ACP CLI owns its own auth and
+    model unless its row prepares a vendor-native per-session configuration.
+    No provider or gateway credential is wired here. The binary resolves via
+    the ``OMNIGENT_<NAME>_PATH`` env override, then the config
+    ``harness.<name>.command`` path, then PATH plus the common global install
+    dirs.
 
     :param spec: The agent spec.
     :param harness: The catalog row key, e.g. ``"grok"``.
     :param workdir: Accepted for signature parity with the other builders; the
         ACP wrap consumes no bundle dir.
+    :param session_id: Session identifier used by rows with per-session state.
     :returns: A dict of ``HARNESS_ACP_*`` env-var overrides for the spawn.
     """
     from omnigent._platform import resolve_cli_binary
@@ -1553,7 +1556,66 @@ def _build_acp_cli_spawn_env(
     # back to OMNIGENT_RUNNER_WORKSPACE — see HARNESS_ACP_CWD.
     if cwd is not None:
         env["HARNESS_ACP_CWD"] = str(cwd)
-    os_env_payload = _serialize_os_env(spec.os_env)
+    child_os_env = spec.os_env
+    if harness == "hermes-acp":
+        server_url = os.environ.get("RUNNER_SERVER_URL", "").strip()
+        if not session_id or not server_url:
+            raise RuntimeError("hermes-acp requires a session id and RUNNER_SERVER_URL")
+        if spec.skills_filter != "all":
+            raise RuntimeError(
+                "hermes-acp does not support restrictive skills_filter; "
+                "use the default 'all' skill selection"
+            )
+
+        from omnigent.hermes_native_bridge import (
+            bridge_dir_for_session_id,
+            write_policy_hook_config,
+        )
+        from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+        bridge_dir = bridge_dir_for_session_id(session_id)
+        model = _resolve_spec_model(spec)
+        if model is not None and model.startswith(("databricks-", "databricks/")):
+            model = None
+        hermes_home = write_policy_hook_config(
+            bridge_dir,
+            server_url,
+            session_id,
+            model=model,
+            include_omnigent_mcp=False,
+        )
+        env["HERMES_HOME"] = str(hermes_home)
+        env["HERMES_ACP_SKIP_CONFIGURED_MCP"] = "1"
+        passthrough_names = ["HERMES_HOME", "HERMES_ACP_SKIP_CONFIGURED_MCP"]
+        managed_dir = os.environ.get("OMNIGENT_HERMES_MANAGED_DIR", "").strip()
+        if managed_dir:
+            env["HERMES_MANAGED_DIR"] = managed_dir
+            env["_OMNIGENT_SERVER_URL"] = server_url
+            env["_OMNIGENT_SESSION_ID"] = session_id
+            passthrough_names.extend(
+                [
+                    "HERMES_MANAGED_DIR",
+                    "_OMNIGENT_SERVER_URL",
+                    "_OMNIGENT_SESSION_ID",
+                ]
+            )
+
+        if child_os_env is None:
+            child_os_env = OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none"))
+        sandbox = child_os_env.sandbox or OSEnvSandboxSpec()
+        passthrough = list(sandbox.env_passthrough or ())
+        for name in passthrough_names:
+            if name not in passthrough:
+                passthrough.append(name)
+        child_os_env = replace(
+            child_os_env,
+            sandbox=replace(sandbox, env_passthrough=passthrough),
+        )
+
+    if row.policy_hook_authoritative:
+        env["HARNESS_ACP_POLICY_HOOK_AUTHORITATIVE"] = "1"
+
+    os_env_payload = _serialize_os_env(child_os_env)
     if os_env_payload is not None:
         env["HARNESS_ACP_OS_ENV"] = os_env_payload
     # Permission stance for approval cards. Absent leaves the harness wrap on its
