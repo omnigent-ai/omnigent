@@ -45,6 +45,12 @@ describe("KeyboardShortcutsDialog", () => {
     expect(screen.getByText("Navigate suggestions")).toBeTruthy();
   });
 
+  it("describes voice dictation as a focused-window shortcut", () => {
+    render(<KeyboardShortcutsDialog />);
+    toggleViaHotkey();
+    expect(screen.getByText("Toggle voice dictation (focused Omnigent window)")).toBeTruthy();
+  });
+
   it("toggles closed on a second hotkey press", async () => {
     render(<KeyboardShortcutsDialog />);
     toggleViaHotkey();

@@ -76,12 +76,16 @@ import json
 import logging
 import os
 import re
+import ssl
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import urlsplit
+
+from omnigent.server.dictation_metrics import metrics
 
 _logger = logging.getLogger(__name__)
 
@@ -89,9 +93,14 @@ ENGINE_ENV = "OMNIGENT_DICTATION_ENGINE"
 MODEL_DIR_ENV = "OMNIGENT_DICTATION_MODEL_DIR"
 PUNCT_DIR_ENV = "OMNIGENT_DICTATION_PUNCT_DIR"
 MAX_STREAMS_ENV = "OMNIGENT_DICTATION_MAX_STREAMS"
+MAX_FRAME_BYTES_ENV = "OMNIGENT_DICTATION_MAX_FRAME_BYTES"
+MAX_TAKE_SECONDS_ENV = "OMNIGENT_DICTATION_MAX_TAKE_SECONDS"
 #: Worker stream URL for the ``remote`` engine, e.g.
 #: ``ws://venus:8100/v1/dictation/stream``.
 REMOTE_URL_ENV = "OMNIGENT_DICTATION_REMOTE_URL"
+WORKER_TOKEN_ENV = "OMNIGENT_DICTATION_WORKER_TOKEN"
+REMOTE_CA_FILE_ENV = "OMNIGENT_DICTATION_REMOTE_CA_FILE"
+ALLOW_INSECURE_REMOTE_ENV = "OMNIGENT_DICTATION_ALLOW_INSECURE_REMOTE"
 
 #: Built-in engine names. The default (empty ``OMNIGENT_DICTATION_ENGINE``)
 #: resolves to the sherpa engine.
@@ -113,8 +122,13 @@ REASON_EXTRA_NOT_INSTALLED = "extra_not_installed"
 REASON_MODELS_MISSING = "models_missing"
 REASON_UNKNOWN_ENGINE = "unknown_engine"
 REASON_REMOTE_URL_MISSING = "remote_url_missing"
+REASON_REMOTE_TOKEN_MISSING = "remote_token_missing"
+REASON_INSECURE_REMOTE = "insecure_remote"
+REASON_INVALID_REMOTE_URL = "invalid_remote_url"
 
 DEFAULT_MAX_STREAMS = 2
+DEFAULT_MAX_FRAME_BYTES = 256 * 1024
+DEFAULT_MAX_TAKE_SECONDS = 300.0
 
 # Endpoint rules mirror sherpa-onnx defaults tuned for dictation: a long
 # hard stop (rule1, silence with no text yet), a shorter pause once
@@ -239,6 +253,30 @@ def max_streams() -> int:
     return value if value > 0 else DEFAULT_MAX_STREAMS
 
 
+def max_frame_bytes() -> int:
+    """Maximum bytes accepted in one browser or relay audio frame."""
+    return _positive_int_env(MAX_FRAME_BYTES_ENV, DEFAULT_MAX_FRAME_BYTES)
+
+
+def max_take_seconds() -> float:
+    """Maximum wall-clock and audio duration accepted for one take."""
+    raw = os.environ.get(MAX_TAKE_SECONDS_ENV, "")
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_MAX_TAKE_SECONDS
+    return value if value > 0 else DEFAULT_MAX_TAKE_SECONDS
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name, "")
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 def _pick_model_file(model_dir: Path, stem: str) -> Path | None:
     """Find ``<stem>*.onnx`` in *model_dir*, preferring int8 variants.
 
@@ -303,8 +341,60 @@ def engine_availability() -> tuple[bool, str | None]:
     return entry.available()
 
 
+_STATUS_ACTIONS = {
+    REASON_EXTRA_NOT_INSTALLED: "Install the dictation extra.",
+    REASON_MODELS_MISSING: "Install or configure the dictation ASR model files.",
+    REASON_UNKNOWN_ENGINE: "Set a registered dictation engine name.",
+    REASON_REMOTE_URL_MISSING: "Set the remote worker WebSocket URL.",
+    REASON_REMOTE_TOKEN_MISSING: "Set the shared dictation worker token.",
+    REASON_INSECURE_REMOTE: "Use wss, loopback, or explicitly allow insecure remote transport.",
+    REASON_INVALID_REMOTE_URL: "Set a valid ws or wss remote worker URL.",
+}
+
+
+def engine_status() -> dict[str, object]:
+    """Return stable diagnostics without secrets, paths, or exception text."""
+    name = _selected_engine_name()
+    available, reason = engine_availability()
+    result: dict[str, object] = {
+        "available": available,
+        "engine": name,
+        "reason": reason,
+        "action": _STATUS_ACTIONS.get(reason) if reason is not None else None,
+        "capacity": {"max_streams": max_streams()},
+        "limits": {
+            "max_frame_bytes": max_frame_bytes(),
+            "max_take_seconds": max_take_seconds(),
+        },
+    }
+    if name == ENGINE_REMOTE:
+        url = _remote_url()
+        parsed = urlsplit(url)
+        result["remote"] = {
+            "configured": bool(url),
+            "secure": parsed.scheme == "wss",
+            "token_configured": bool(_worker_token()),
+            "fallback_available": _sherpa_available()[0],
+            "connection_state": _get_remote_connection_state(),
+        }
+    return result
+
+
 _engine_lock = threading.Lock()
 _engine: DictationEngine | None = None
+_remote_state_lock = threading.Lock()
+_remote_connection_state = "not_attempted"
+
+
+def _set_remote_connection_state(state: str) -> None:
+    global _remote_connection_state
+    with _remote_state_lock:
+        _remote_connection_state = state
+
+
+def _get_remote_connection_state() -> str:
+    with _remote_state_lock:
+        return _remote_connection_state
 
 
 def get_engine() -> DictationEngine:
@@ -424,7 +514,7 @@ class _SherpaStream:
 
     def feed_pcm16(self, data: bytes) -> DictationUpdate:
         """Decode one PCM chunk; fold an endpoint into ``finalized``."""
-        import numpy as np  # type: ignore[import-not-found]
+        import numpy as np
 
         # Drop a trailing odd byte rather than crash the take; the next
         # frame realigns (client frames are always whole samples).
@@ -491,6 +581,9 @@ class RemoteDictationEngine:
         self,
         url: str,
         *,
+        token: str | None = None,
+        ca_file: str | None = None,
+        allow_insecure: bool = False,
         fallback_factory: Callable[[], DictationEngine] | None = None,
     ) -> None:
         """
@@ -500,7 +593,12 @@ class RemoteDictationEngine:
             first use (lazy — its model weights cost ~real RAM), or
             ``None`` when no local model is installed.
         """
+        _validate_remote_url(url, allow_insecure=allow_insecure)
+        if not token:
+            raise ValueError("dictation worker token is required")
         self._url = url
+        self._token = token
+        self._ssl_context = _remote_ssl_context(url, ca_file)
         self._fallback_factory = fallback_factory
         self._fallback: DictationEngine | None = None
         self._fallback_lock = threading.Lock()
@@ -508,18 +606,24 @@ class RemoteDictationEngine:
     def create_stream(self) -> DictationStreamHandle:
         """Connect a take to the worker, or to the local fallback."""
         try:
-            return _RemoteStream(self._url)
+            stream = _RemoteStream(self._url, self._token, self._ssl_context)
+            _set_remote_connection_state("connected")
+            metrics.remote_connection("connected")
+            return stream
         except Exception:
+            _set_remote_connection_state("unavailable")
+            metrics.remote_connection("failed")
             if self._fallback_factory is None:
                 raise
             _logger.warning(
-                "dictation worker unreachable at %s; using local fallback engine",
-                self._url,
+                "dictation worker unreachable; using local fallback engine",
                 exc_info=True,
             )
             with self._fallback_lock:
                 if self._fallback is None:
                     self._fallback = self._fallback_factory()
+            _set_remote_connection_state("local_fallback")
+            metrics.fallback()
             return self._fallback.create_stream()
 
 
@@ -533,10 +637,16 @@ class _RemoteStream:
     relay just forwards it.
     """
 
-    def __init__(self, url: str) -> None:
+    def __init__(self, url: str, token: str, ssl_context: ssl.SSLContext | None) -> None:
         from websockets.sync.client import connect
 
-        self._ws = connect(url, open_timeout=5)
+        self._ws = connect(
+            url,
+            additional_headers={"Authorization": f"Bearer {token}"},
+            ssl=ssl_context,
+            open_timeout=5,
+            max_size=max_frame_bytes(),
+        )
         try:
             deadline = time.monotonic() + _REMOTE_READY_TIMEOUT_S
             while True:
@@ -599,13 +709,21 @@ class _RemoteStream:
             return DictationUpdate(partial=self._partial, finalized=finalized)
 
     def finish(self) -> str:
-        """Ask the worker to flush; return its tail utterance."""
-        with contextlib.suppress(Exception):
+        """Ask the worker to flush; return pending finals plus its tail."""
+        stopped = False
+        try:
             self._ws.send(json.dumps({"type": "stop"}))
-        self._stopped.wait(timeout=_REMOTE_STOP_TIMEOUT_S)
-        self.close()
+            stopped = self._stopped.wait(timeout=_REMOTE_STOP_TIMEOUT_S)
+        finally:
+            self.close()
+        if not stopped:
+            raise TimeoutError("dictation worker did not finish the take")
         with self._lock:
-            return self._tail
+            if self._dead:
+                raise RuntimeError("dictation worker connection lost while stopping")
+            parts = [*self._finals, self._tail]
+            self._finals.clear()
+            return " ".join(part for part in parts if part).strip()
 
     def close(self) -> None:
         """Close the worker socket, releasing its capacity slot.
@@ -622,6 +740,45 @@ def _remote_url() -> str:
     return os.environ.get(REMOTE_URL_ENV, "").strip()
 
 
+def _worker_token() -> str:
+    return os.environ.get(WORKER_TOKEN_ENV, "").strip()
+
+
+def _allow_insecure_remote() -> bool:
+    return os.environ.get(ALLOW_INSECURE_REMOTE_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
+def _is_loopback_host(host: str | None) -> bool:
+    if not host:
+        return False
+    if host.lower() == "localhost":
+        return True
+    import ipaddress
+
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _validate_remote_url(url: str, *, allow_insecure: bool) -> None:
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"ws", "wss"} or not parsed.hostname:
+        raise ValueError("dictation remote URL must use ws:// or wss://")
+    if parsed.scheme == "ws" and not _is_loopback_host(parsed.hostname) and not allow_insecure:
+        raise ValueError("plaintext remote dictation is denied for non-loopback hosts")
+
+
+def _remote_ssl_context(url: str, ca_file: str | None) -> ssl.SSLContext | None:
+    if urlsplit(url).scheme != "wss":
+        return None
+    return ssl.create_default_context(cafile=ca_file or None)
+
+
 def _remote_available() -> tuple[bool, str | None]:
     """Availability probe for the remote engine.
 
@@ -632,6 +789,14 @@ def _remote_available() -> tuple[bool, str | None]:
     """
     if not _remote_url():
         return False, REASON_REMOTE_URL_MISSING
+    if not _worker_token():
+        return False, REASON_REMOTE_TOKEN_MISSING
+    try:
+        _validate_remote_url(_remote_url(), allow_insecure=_allow_insecure_remote())
+    except ValueError as exc:
+        if "plaintext" in str(exc):
+            return False, REASON_INSECURE_REMOTE
+        return False, REASON_INVALID_REMOTE_URL
     return True, None
 
 
@@ -650,7 +815,13 @@ def _build_remote_engine() -> RemoteDictationEngine:
         if _sherpa_available()[0]
         else None
     )
-    return RemoteDictationEngine(url, fallback_factory=fallback)
+    return RemoteDictationEngine(
+        url,
+        token=_worker_token(),
+        ca_file=os.environ.get(REMOTE_CA_FILE_ENV, "").strip() or None,
+        allow_insecure=_allow_insecure_remote(),
+        fallback_factory=fallback,
+    )
 
 
 #: Scripted transcript the fake engine reveals; asserted verbatim by the
