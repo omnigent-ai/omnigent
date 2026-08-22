@@ -80,7 +80,7 @@ export function MainTerminalView({
   const { getStatus, setTerminalConnectionState, markTerminalActive } =
     useTerminalStatuses(terminals);
   // No manual keyboard padding here: this view is flow content inside the
-  // app-shell, which useIOSViewportLock sizes to the visual viewport, so the
+  // app-shell, which useVisibleViewportHeight sizes to the visual viewport, so the
   // terminal already sits above the keyboard. (Fixed overlays like the mobile
   // TerminalsPanel still pad themselves with useIOSNativeKeyboardInset.)
 

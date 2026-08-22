@@ -314,7 +314,7 @@ export function CreateScheduledTaskDialog({
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent
-        className="flex max-h-[90vh] flex-col overflow-hidden p-0 sm:max-w-[560px]"
+        className="overflow-hidden p-0 sm:max-w-[560px]"
         data-testid="create-scheduled-task-dialog"
         // Keep a nested Select's dismiss (pick an option, OR click empty modal
         // body / trigger while it's open) from closing the whole Dialog. See
@@ -539,7 +539,9 @@ export function CreateScheduledTaskDialog({
           )}
         </div>
 
-        <DialogFooter className="mx-0 mb-0 shrink-0 rounded-none border-t-0 bg-transparent px-6 py-4 sm:justify-end">
+        {/* `pb` keeps the shared safe-area reserve: a bare `py-4` would
+            twMerge-clobber the base `pb-[max(...)]` and drop it. */}
+        <DialogFooter className="mx-0 mb-0 shrink-0 rounded-none border-t-0 bg-transparent px-6 pt-4 pb-[max(1rem,var(--omnigent-inset-bottom))] sm:justify-end">
           <Button variant="outline" onClick={() => handleOpenChange(false)}>
             Cancel
           </Button>

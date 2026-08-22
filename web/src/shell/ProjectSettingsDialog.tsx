@@ -317,11 +317,7 @@ export function ProjectSettingsDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
         onClick={(e) => e.stopPropagation()}
-        // Height is the CALLER's job: DialogContent caps width only, and is
-        // centered with `-translate-y-1/2`, so an uncapped dialog taller than
-        // the viewport is clipped at BOTH ends with nothing to scroll. Mirrors
-        // the other long dialogs in this shell (fork / add-agent / reconnect).
-        className="flex max-h-[85vh] flex-col gap-4 sm:max-w-lg"
+        className="sm:max-w-lg"
         // Keep a nested dropdown's dismiss (pick an option, or click the modal
         // body while it's open) from closing the whole Dialog. See
         // `guardDialogDismiss`; real backdrop clicks and Escape still close.

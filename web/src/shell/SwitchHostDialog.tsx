@@ -210,7 +210,7 @@ export function SwitchHostDialog({
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogContent data-testid="switch-host-dialog" className="flex flex-col gap-4 sm:max-w-lg">
+      <DialogContent data-testid="switch-host-dialog" className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>Switch host</DialogTitle>
           <DialogDescription>Move this session to another connected machine.</DialogDescription>

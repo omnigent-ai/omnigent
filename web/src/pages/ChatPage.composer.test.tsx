@@ -2400,7 +2400,10 @@ describe("Composer config gear — subagent routing", () => {
     /** The modal's config rows (direct children of the rows container). */
     function configRows(): Element[] {
       const modal = screen.getByTestId("composer-config-modal");
-      return Array.from(modal.querySelectorAll(":scope > div.flex.flex-col.gap-5 > div"));
+      // Found by class, not by depth: DialogContent wraps a dialog's middle in
+      // its own scroll region, so the rows container is not a direct child.
+      const rows = modal.querySelector("div.flex.flex-col.gap-5");
+      return rows ? Array.from(rows.children) : [];
     }
 
     it("renders the gear when subagent routing is the only knob", () => {

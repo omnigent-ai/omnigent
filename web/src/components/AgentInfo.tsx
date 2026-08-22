@@ -363,7 +363,7 @@ function AddPolicyDialog({
         onOpenChange(next);
       }}
     >
-      <DialogContent className="max-h-[80vh] overflow-y-auto sm:max-w-lg">
+      <DialogContent className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>Add Policy</DialogTitle>
           <DialogDescription>Choose a policy to apply to this session.</DialogDescription>
@@ -808,7 +808,7 @@ function McpServerManagerDialog({
         if (!next) resetForm();
       }}
     >
-      <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-lg">
+      <DialogContent className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>Manage MCP Servers</DialogTitle>
           <DialogDescription>Add, edit, or remove MCP servers for this session.</DialogDescription>

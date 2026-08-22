@@ -140,7 +140,7 @@ export function SwitchAgentDialog({
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogContent data-testid="switch-agent-dialog" className="flex flex-col gap-4 sm:max-w-lg">
+      <DialogContent data-testid="switch-agent-dialog" className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>Switch agent</DialogTitle>
           <DialogDescription>

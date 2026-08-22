@@ -219,7 +219,7 @@ export function CommandPalette({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
         aria-describedby={undefined}
-        className="top-1/4 translate-y-0 overflow-hidden p-0 sm:max-w-2xl"
+        className="top-[calc(var(--omnigent-visible-top)_+_var(--omnigent-visible-height)_/_4)] max-h-[calc(var(--omnigent-visible-height)_*_0.75_-_var(--omnigent-safe-bottom)_-_1rem)] translate-y-0 overflow-hidden p-0 sm:max-w-2xl"
         showCloseButton={false}
       >
         <DialogTitle className="sr-only">Command palette</DialogTitle>

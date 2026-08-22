@@ -364,7 +364,7 @@ function FileViewerBody({
     frameless ? undefined : minWidthPx,
   );
   // The mobile viewer is a `fixed inset-0` overlay, so the iOS shell-lock
-  // (useIOSViewportLock) — which only resizes flow content inside .app-shell —
+  // (useVisibleViewportHeight) — which only resizes flow content inside .app-shell —
   // doesn't lift it above the soft keyboard. Pad the overlay's bottom by the
   // keyboard inset so the comments panel and its (auto-focused) textarea stay
   // visible. No-op off iOS / with the keyboard closed. Not needed frameless

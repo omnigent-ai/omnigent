@@ -230,7 +230,7 @@ export function ResumeWithDirectoryDialog({
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogContent data-testid="resume-dir-dialog" className="flex flex-col gap-4 sm:max-w-lg">
+      <DialogContent data-testid="resume-dir-dialog" className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>Resume this session</DialogTitle>
           <DialogDescription>

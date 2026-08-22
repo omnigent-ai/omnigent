@@ -108,7 +108,7 @@ export function AddAgentDialog({
         data-testid="add-agent-dialog"
         // max-w-lg matches NewChatDialog so the shared AgentCard renders at
         // the same width — and thus the same height once a description wraps.
-        className="flex max-h-[85vh] flex-col gap-4 sm:max-w-lg"
+        className="sm:max-w-lg"
       >
         <DialogHeader>
           <DialogTitle>Add agent</DialogTitle>

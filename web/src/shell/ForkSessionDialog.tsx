@@ -919,10 +919,7 @@ export function ForkSessionDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent
-        data-testid="fork-session-dialog"
-        className="flex max-h-[85vh] flex-col gap-4 sm:max-w-lg"
-      >
+      <DialogContent data-testid="fork-session-dialog" className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-1.5">
             {truncated ? "Fork from this response" : "Clone session"}

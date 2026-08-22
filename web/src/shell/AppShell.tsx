@@ -10,7 +10,7 @@ import { useIsEmbedded } from "@/lib/embedded";
 import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
 import { useSeedReadState } from "@/hooks/useUnseenConversations";
-import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
+import { useVisibleViewportHeight } from "@/hooks/useVisibleViewportHeight";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
 import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
@@ -144,10 +144,11 @@ export function AppShell() {
   // here so it works on every chat route, regardless of where focus sits.
   useApproveHotkey();
 
-  // Lock the iOS shell to the visual viewport so the soft keyboard can't pan
-  // the whole document (which would hide the header and break the layout).
-  // No-op off the iOS shell. Scoped here so auth pages keep normal scrolling.
-  useIOSViewportLock();
+  // Publish the live visual viewport to CSS so fixed overlays (dialogs) can
+  // size and center against the area the user can actually see, and lock the
+  // iOS shell against keyboard panning. Scoped here so auth pages keep normal
+  // scrolling.
+  useVisibleViewportHeight();
 
   // Read early: the conversationId scopes the per-session workspace state
   // (rail open/width/tab/open files) used throughout this component.
