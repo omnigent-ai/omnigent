@@ -225,6 +225,31 @@ class _ClassifiedWheels:
     oversize: list[Path]
 
 
+def _stage_web_ui_as_loose_files() -> bool:
+    """Stage the built SPA as loose files under src/web-ui for a full-UI deploy.
+
+    The ~25 MB of SPA assets take the main wheel to ~10.9 MB, over the
+    10 MB per-file cap; every individual asset is well under it. Ship the
+    SPA as loose files in the app source tree (each uploaded on its own) and
+    point the server at them via OMNIGENT_WEB_UI_DIST — the override
+    omnigent/server/app.py already documents for exactly this shape (#5003).
+
+    :returns: True when a built SPA was found and staged.
+    """
+    root = _repo_root()
+    spa = root / "omnigent" / "server" / "static" / "web-ui"
+    if not spa.is_dir() or not any(spa.iterdir()):
+        _log("no built web UI found (skip-web-ui build?); nothing to stage")
+        return False
+
+    dest = _deploy_dir() / "src" / "web-ui"
+    if dest.exists():
+        shutil.rmtree(dest)
+    shutil.copytree(spa, dest)
+    _log(f"staged web UI as loose files: src/web-ui ({sum(1 for _ in dest.rglob('*') if _.is_file())} files)")
+    return True
+
+
 def _classify_wheels(wheels: Iterable[Path]) -> _ClassifiedWheels:
     main_wheel = next(w for w in wheels if w.name.startswith("omnigent-"))
     small: list[Path] = []
@@ -743,7 +768,7 @@ def _ensure_compute_size(
 
 def _bundle_vars(args: argparse.Namespace) -> list[str]:
     """CLI args to pass to `databricks bundle` as --var pairs."""
-    return [
+    vars_: list[str] = [
         "--var",
         f"app_name={args.app_name}",
         "--var",
@@ -757,6 +782,9 @@ def _bundle_vars(args: argparse.Namespace) -> list[str]:
         "--var",
         f"features={args.features}",
     ]
+    if getattr(args, "web_ui_dist", None):
+        vars_ += ["--var", f"web_ui_dist={args.web_ui_dist}"]
+    return vars_
 
 
 def _profile_arg(args: argparse.Namespace) -> list[str]:
@@ -846,12 +874,34 @@ def main() -> int:
         size_mb = wheel.stat().st_size / 1024 / 1024
         _log(f"  {wheel.name}  {size_mb:.2f} MB")
     if classified.oversize:
-        raise SystemExit(
-            "uv-based Databricks Apps deploys require all Omnigent wheels "
-            "to fit in the app source snapshot. Rebuild with --skip-web-ui "
-            "or reduce wheel size; UC Volume wheel paths are not used "
-            "because uv lock validates path sources locally."
+        # A full-UI build puts the SPA in the main wheel and pushes it over
+        # the 10 MB cap. Rather than aborting to an API-only instruction,
+        # stage the SPA as loose files (server reads them via the
+        # OMNIGENT_WEB_UI_DIST override its app.py already documents) and
+        # rebuild without the SPA in package data (#5003).
+        spa = _repo_root() / "omnigent" / "server" / "static" / "web-ui"
+        oversize_is_main_with_spa = (
+            classified.oversize == [classified.main]
+            and spa.is_dir()
+            and any(spa.iterdir())
         )
+        if oversize_is_main_with_spa:
+            _log("main wheel over the 10 MB cap with a built web UI: "
+                 "staging the SPA as loose files and rebuilding without it")
+            if _stage_web_ui_as_loose_files():
+                args.web_ui_dist = "src/web-ui"
+                wheels = _build_wheels(skip_web_ui=True)
+                classified = _classify_wheels(wheels)
+                for wheel in wheels:
+                    size_mb = wheel.stat().st_size / 1024 / 1024
+                    _log(f"  {wheel.name}  {size_mb:.2f} MB (rebuilt)")
+        if classified.oversize:
+            raise SystemExit(
+                "uv-based Databricks Apps deploys require all Omnigent wheels "
+                "to fit in the app source snapshot. Rebuild with --skip-web-ui "
+                "or reduce wheel size; UC Volume wheel paths are not used "
+                "because uv lock validates path sources locally."
+            )
 
     # Late-import the SDK so `--help` works without it installed.
     from databricks.sdk import WorkspaceClient
