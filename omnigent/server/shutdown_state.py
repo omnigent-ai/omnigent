@@ -19,11 +19,14 @@ Two sources set the signal:
   code through :func:`note_tunnel_close_code`, which covers entrypoints that
   run a bare ``uvicorn.run(app)`` (the Databricks Apps wrapper).
 
-The signal is time-bounded rather than latched for the life of the process:
-a server that really is shutting down is gone within its platform's
+The mark is process-wide: while it is fresh, disconnect reconciliation is
+suppressed for every runner, so a genuine runner death inside that window
+surfaces through liveness (the offline dot) rather than a ``failed`` card.
+That is why it is time-bounded rather than latched for the life of the
+process: a server that really is shutting down is gone within its platform's
 termination grace (seconds), so the window never limits it, while a spurious
-mark (a client that closed with 1012) cannot permanently disable disconnect
-reconciliation.
+mark (a client that closed with 1012, which runners never send — they close
+with 1001) costs at most :data:`SHUTDOWN_WINDOW_S` of suppression.
 """
 
 from __future__ import annotations
