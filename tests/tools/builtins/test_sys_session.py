@@ -32,6 +32,7 @@ from omnigent.tools.builtins.spawn import (
     _HISTORY_DEFAULT_TAIL,
     _HISTORY_MAX_TAIL,
     SysSessionCloseTool,
+    SysSessionCreateTool,
     SysSessionGetHistoryTool,
     SysSessionListTool,
     SysSessionSendTool,
@@ -193,6 +194,7 @@ def test_send_schema_advertises_plain_string_and_purpose_object_args() -> None:
         "purpose",
         "model",
         "file_ids",
+        "directory_ids",
         "cost_budget",
     }
     assert "dispatch metadata" in object_schema["properties"]["purpose"]["description"]
@@ -234,6 +236,7 @@ def test_send_schema_gates_harness_field_behind_allowlist_opt_in() -> None:
         "purpose",
         "model",
         "file_ids",
+        "directory_ids",
         "cost_budget",
     }
 
@@ -258,6 +261,7 @@ def test_send_schema_gates_harness_field_behind_allowlist_opt_in() -> None:
         "purpose",
         "model",
         "file_ids",
+        "directory_ids",
         "harness",
         "cost_budget",
     }
@@ -284,9 +288,19 @@ def test_send_schema_gates_harness_field_behind_allowlist_opt_in() -> None:
         "purpose",
         "model",
         "file_ids",
+        "directory_ids",
         "harness",
         "cost_budget",
     }
+
+
+def test_session_create_schema_advertises_inherited_directory_scope() -> None:
+    """Durable child creation exposes omitted/all, empty, and subset scopes."""
+    properties = SysSessionCreateTool().get_schema()["function"]["parameters"]["properties"]
+
+    assert properties["directory_ids"]["type"] == "array"
+    assert properties["directory_ids"]["maxItems"] == 16
+    assert properties["directory_ids"]["uniqueItems"] is True
 
 
 def test_peek_schema_required_fields_and_no_extra_props() -> None:

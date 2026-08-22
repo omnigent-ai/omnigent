@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from omnigent.inner.native_attachments import UNRESOLVED_ATTACHMENT_MARKER_PATTERN
 from omnigent.llms.adapters._content import redact_binary_payloads
+from omnigent.session_directories import SessionDirectory
 
 # Attachment markers the native executors prepend to prompt text
 # ("[Attached: /tmp/.../x.png]" from claude-native's _content_to_text,
@@ -189,6 +190,10 @@ class Conversation:
         creation — see designs/SESSION_WORKSPACE_SELECTION.md. When
         a git worktree was created for the session, this is the
         worktree directory path rather than the picked source repo.
+    :param directories: Stable project roots visible to the session.
+        The primary ``workspace`` root has id ``"default"``; additional
+        roots have opaque ``dir_<uuid>`` ids. Child sessions inherit this
+        set or an explicit subset at creation time.
     :param git_branch: Git branch checked out in the session's
         worktree, e.g. ``"feature/login"``. Set only when the
         session was created with a server-created git worktree (the
@@ -236,6 +241,7 @@ class Conversation:
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
     workspace: str | None = None
+    directories: tuple[SessionDirectory, ...] = ()
     git_branch: str | None = None
     archived: bool = False
     # Live-state fields written by the replica holding the runner tunnel

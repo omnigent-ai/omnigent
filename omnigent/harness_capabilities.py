@@ -101,6 +101,8 @@ class HarnessCapabilities:
     :param streaming: Whether the harness forwards token-level deltas (vs a
         single complete blob). Declared claim; verified by the bench's
         streaming probe.
+    :param additional_directories: Whether the harness receives all attached
+        session directories in addition to its primary cwd.
     :param steering: Whether input can be added to an active turn.
     :param live_queue: Whether follow-up input can be queued during an active
         turn.
@@ -137,6 +139,7 @@ class HarnessCapabilities:
     fork_history: ForkHistory = ForkHistory.NONE
     shell_tool_name: str | None = None
     shell_tool_prompt: str | None = None
+    additional_directories: bool = False
 
     def as_dict(self) -> dict[str, str | bool | None]:
         """Return a JSON-serializable view for the ``/v1/harnesses`` catalog."""
@@ -150,6 +153,7 @@ class HarnessCapabilities:
             "subagents": self.subagents,
             "interrupt": self.interrupt,
             "streaming": self.streaming,
+            "additional_directories": self.additional_directories,
             "steering": self.steering,
             "live_queue": self.live_queue,
             "images": self.images,

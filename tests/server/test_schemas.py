@@ -769,6 +769,94 @@ def test_session_create_external_rejects_repo_url_workspace() -> None:
         )
 
 
+def test_session_create_directory_contract_distinguishes_top_level_and_child() -> None:
+    """Top-level paths and child ids are mutually exclusive request modes."""
+    from omnigent.server.schemas import SessionCreateRequest, SessionDirectoryInput
+
+    top_level = SessionCreateRequest(
+        agent_id="ag_x",
+        workspace="/repo/main",
+        directories=[SessionDirectoryInput(path="/repo/shared")],
+    )
+    assert [directory.path for directory in top_level.directories] == ["/repo/shared"]
+
+    child = SessionCreateRequest(
+        agent_id="ag_x",
+        parent_session_id="conv_parent",
+        directory_ids=[],
+    )
+    assert child.directory_ids == []
+
+    with pytest.raises(ValidationError, match="cannot add paths"):
+        SessionCreateRequest(
+            agent_id="ag_x",
+            parent_session_id="conv_parent",
+            directories=[SessionDirectoryInput(path="/repo/shared")],
+        )
+    with pytest.raises(ValidationError, match="only valid for child sessions"):
+        SessionCreateRequest(agent_id="ag_x", directory_ids=[])
+    with pytest.raises(ValidationError, match="managed hosts do not support"):
+        SessionCreateRequest(
+            agent_id="ag_x",
+            host_type="managed",
+            workspace="https://github.com/org/repo",
+            directories=[SessionDirectoryInput(path="/repo/shared")],
+        )
+
+
+def test_session_create_rejects_invalid_or_duplicate_directory_ids() -> None:
+    """Stable ids are bounded, canonical, and unique before route dispatch."""
+    from omnigent.server.schemas import SessionCreateRequest
+
+    with pytest.raises(ValidationError, match="invalid session directory id"):
+        SessionCreateRequest(
+            agent_id="ag_x",
+            parent_session_id="conv_parent",
+            directory_ids=["dir_not-a-uuid"],
+        )
+    with pytest.raises(ValidationError, match="must not contain duplicates"):
+        SessionCreateRequest(
+            agent_id="ag_x",
+            parent_session_id="conv_parent",
+            directory_ids=["default", "default"],
+        )
+
+
+def test_session_create_child_rejects_host_workspace_and_git_overrides() -> None:
+    """A child inherits placement; worktree creation remains top-level-only."""
+    from omnigent.server.schemas import SessionCreateRequest, SessionGitOptions
+
+    with pytest.raises(ValidationError, match="cannot be overridden"):
+        SessionCreateRequest(
+            agent_id="ag_x",
+            parent_session_id="conv_parent",
+            host_id="host_abc",
+            workspace="/repo/main",
+            git=SessionGitOptions(branch_name="child-branch"),
+        )
+
+
+def test_multipart_child_directory_metadata_rejects_malformed_ids_and_paths() -> None:
+    """Bundle-mode child scope errors become clean metadata validation errors."""
+    from omnigent.server.schemas import SessionCreateMetadata, SessionDirectoryInput
+
+    with pytest.raises(ValidationError, match="invalid session directory id"):
+        SessionCreateMetadata(
+            parent_session_id="conv_parent",
+            directory_ids=["not-a-directory-id"],
+        )
+    with pytest.raises(ValidationError, match="cannot be overridden"):
+        SessionCreateMetadata(
+            parent_session_id="conv_parent",
+            workspace="/repo/other",
+        )
+    with pytest.raises(ValidationError, match="cannot add paths"):
+        SessionCreateMetadata(
+            parent_session_id="conv_parent",
+            directories=[SessionDirectoryInput(path="/repo/other")],
+        )
+
+
 @pytest.mark.parametrize("status", ["idle", "running", "waiting", "failed"])
 def test_session_response_status_accepts_canonical_set(status: str) -> None:
     """

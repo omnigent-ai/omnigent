@@ -4120,6 +4120,30 @@
         "title": "SessionCreatedEvent",
         "type": "object"
       },
+      "SessionDirectoryObject": {
+        "description": "Stable public identity for one directory visible to a session.",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "path",
+          "name"
+        ],
+        "title": "SessionDirectoryObject",
+        "type": "object"
+      },
       "SessionForkRequest": {
         "additionalProperties": false,
         "description": "Request body for `POST /v1/sessions/{source_id}/fork`.\n\nCreates a deep copy of an existing session's items into a new\nsession. All fields are optional.",
@@ -4504,6 +4528,13 @@
             "description": "Unix epoch seconds of creation.",
             "title": "Created At",
             "type": "integer"
+          },
+          "directories": {
+            "items": {
+              "$ref": "#/components/schemas/SessionDirectoryObject"
+            },
+            "title": "Directories",
+            "type": "array"
           },
           "external_session_id": {
             "anyOf": [
@@ -5291,6 +5322,13 @@
             "description": "Unix epoch seconds of creation.",
             "title": "Created At",
             "type": "integer"
+          },
+          "directories": {
+            "items": {
+              "$ref": "#/components/schemas/SessionDirectoryObject"
+            },
+            "title": "Directories",
+            "type": "array"
           },
           "external_session_id": {
             "anyOf": [

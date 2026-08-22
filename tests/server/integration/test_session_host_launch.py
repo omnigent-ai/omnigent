@@ -196,6 +196,7 @@ async def _serve_one_launch(
     launch_status: str,
     launch_error: str | None = None,
     launch_error_code: str | None = None,
+    canonical_paths: dict[str, str] | None = None,
 ) -> HostLaunchRunnerFrame:
     """Answer the host round-trips for a single inline session launch.
 
@@ -214,6 +215,8 @@ async def _serve_one_launch(
     :param launch_error_code: Structured failure category to attach,
         e.g. ``"harness_not_configured"``; ``None`` reports an
         uncategorized failure (legacy host behavior).
+    :param canonical_paths: Optional requested-path to canonical-path mapping
+        for simulating symlinks. Unmapped paths echo unchanged.
     :returns: The ``host.launch_runner`` frame the server sent, so
         callers can assert on its fields (e.g. ``harness``).
     """
@@ -234,7 +237,7 @@ async def _serve_one_launch(
                             status="ok",
                             exists=True,
                             type="directory",
-                            canonical_path=frame.path,
+                            canonical_path=(canonical_paths or {}).get(frame.path, frame.path),
                         )
                     ),
                 }
@@ -801,6 +804,43 @@ async def _inline_launch_session(
     await launch_responder
     assert create_resp.status_code == 201, create_resp.text
     return {"id": create_resp.json()["id"], "runner_id": create_resp.json()["runner_id"]}
+
+
+async def test_inline_launch_keeps_symlink_name_as_additional_directory_title(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+) -> None:
+    """Canonical storage keeps the basename the user selected as the title."""
+    comm = await _connect_host(app)
+    requested = "/work/linked-repo"
+    canonical = "/mnt/repos/actual-repo"
+    agent = await create_test_agent(client)
+    launch_responder = asyncio.create_task(
+        _serve_one_launch(
+            comm,
+            launch_status="launched",
+            canonical_paths={requested: canonical},
+        )
+    )
+
+    response = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_id": _HOST_ID,
+            "workspace": _WORKSPACE,
+            "directories": [{"path": requested}],
+        },
+    )
+    launch_frame = await launch_responder
+
+    assert response.status_code == 201, response.text
+    assert launch_frame.workspace == _WORKSPACE
+    additional = next(
+        directory for directory in response.json()["directories"] if directory["id"] != "default"
+    )
+    assert additional["path"] == canonical
+    assert additional["name"] == "linked-repo"
 
 
 async def _stop_host_session(

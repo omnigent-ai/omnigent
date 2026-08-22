@@ -724,7 +724,7 @@ async def test_auto_create_claude_terminal_passes_session_effort(
     session_init = (
         RunnerSessionInitEnvelope.model_validate(
             {
-                "protocol_version": 2,
+                "protocol_version": 3,
                 "server_version": "0.6.0.dev0",
                 "session_id": session_id,
                 "agent_id": "agent",
@@ -767,7 +767,7 @@ async def test_claude_launch_metadata_envelope_never_calls_server() -> None:
 
     envelope = RunnerSessionInitEnvelope.model_validate(
         {
-            "protocol_version": 2,
+            "protocol_version": 3,
             "server_version": "0.6.0.dev0",
             "session_id": "conv_resume",
             "agent_id": "agent_resume",
@@ -2306,7 +2306,7 @@ async def test_create_session_auto_create_guard_skips_rotation_targets(
     }
     if use_envelope:
         payload["session_init"] = {
-            "protocol_version": 2,
+            "protocol_version": 3,
             "server_version": "0.6.0.dev0",
             "session_id": payload["session_id"],
             "agent_id": payload["agent_id"],

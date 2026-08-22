@@ -17,6 +17,7 @@ from typing import Annotated, Any, Literal, get_args
 from pydantic import BaseModel, ConfigDict, Field, Strict, field_validator, model_validator
 
 from omnigent.entities import ConversationItem
+from omnigent.session_directories import validate_directory_id
 
 # ── Shared ──────────────────────────────────────────────────────
 
@@ -1197,6 +1198,30 @@ class SessionEventInput(BaseModel):
     created_by: str | None = None
 
 
+class SessionDirectoryInput(BaseModel):
+    """An additional absolute directory requested at session creation."""
+
+    path: str = Field(min_length=1, max_length=2048)
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("path")
+    @classmethod
+    def _absolute_path(cls, value: str) -> str:
+        """Reject ambiguous relative and tilde-prefixed host paths."""
+        if not value.startswith("/"):
+            raise ValueError("directory path must be absolute and start with /")
+        return value
+
+
+class SessionDirectoryObject(BaseModel):
+    """Stable public identity for one directory visible to a session."""
+
+    id: str
+    path: str
+    name: str
+
+
 class SessionGitOptions(BaseModel):
     """
     Git worktree options for ``POST /v1/sessions``.
@@ -1390,6 +1415,8 @@ class SessionCreateRequest(BaseModel):
     host_id: str | None = None
     sandbox_provider: str | None = None
     workspace: str | None = None
+    directories: list[SessionDirectoryInput] = Field(default_factory=list, max_length=15)
+    directory_ids: list[str] | None = Field(default=None, max_length=16)
     git: SessionGitOptions | None = None
     terminal_launch_args: list[str] | None = None
     model_override: str | None = None
@@ -1398,6 +1425,35 @@ class SessionCreateRequest(BaseModel):
     subagent_routing_override: str | None = None
     harness_override: str | None = None
     smart_routing_message: str | None = None
+
+    @model_validator(mode="after")
+    def _check_directory_mode(self) -> SessionCreateRequest:
+        """Separate top-level path attachment from child scope selection."""
+        if self.parent_session_id is None and self.directory_ids is not None:
+            raise ValueError("directory_ids is only valid for child sessions")
+        if self.parent_session_id is not None and self.directories:
+            raise ValueError("child sessions select parent directory_ids; they cannot add paths")
+        if self.parent_session_id is not None and (
+            self.host_id is not None
+            or self.workspace is not None
+            or self.host_type != "external"
+            or self.git is not None
+        ):
+            raise ValueError(
+                "child sessions inherit their parent's host and directories; "
+                "host_type, host_id, workspace, and git cannot be overridden"
+            )
+        if self.host_type == "managed" and self.directories:
+            raise ValueError("managed hosts do not support additional directories")
+        paths = [directory.path for directory in self.directories]
+        if len(paths) != len(set(paths)):
+            raise ValueError("directory paths must not contain duplicates")
+        if self.directory_ids is not None:
+            if len(self.directory_ids) != len(set(self.directory_ids)):
+                raise ValueError("directory_ids must not contain duplicates")
+            for directory_id in self.directory_ids:
+                validate_directory_id(directory_id)
+        return self
 
     @model_validator(mode="after")
     def _check_git_requires_host(self) -> SessionCreateRequest:
@@ -1519,8 +1575,35 @@ class SessionCreateMetadata(BaseModel):
     reasoning_effort: str | None = None
     host_id: str | None = None
     workspace: str | None = None
+    directories: list[SessionDirectoryInput] = Field(default_factory=list, max_length=15)
+    directory_ids: list[str] | None = Field(default=None, max_length=16)
     terminal_launch_args: list[str] | None = None
     parent_session_id: str | None = None
+
+    @model_validator(mode="after")
+    def _check_directory_mode(self) -> SessionCreateMetadata:
+        """Apply the same top-level/child directory contract as JSON create."""
+        if self.parent_session_id is None and self.directory_ids is not None:
+            raise ValueError("directory_ids is only valid for child sessions")
+        if self.parent_session_id is not None and self.directories:
+            raise ValueError("child sessions select parent directory_ids; they cannot add paths")
+        if self.parent_session_id is not None and (
+            self.host_id is not None or self.workspace is not None
+        ):
+            raise ValueError(
+                "child sessions inherit their parent's host and directories; "
+                "host_id and workspace cannot be overridden"
+            )
+        paths = [directory.path for directory in self.directories]
+        if len(paths) != len(set(paths)):
+            raise ValueError("directory paths must not contain duplicates")
+        if self.directory_ids is not None and len(self.directory_ids) != len(
+            set(self.directory_ids)
+        ):
+            raise ValueError("directory_ids must not contain duplicates")
+        for directory_id in self.directory_ids or ():
+            validate_directory_id(directory_id)
+        return self
 
     model_config = ConfigDict(extra="forbid")
 
@@ -1925,6 +2008,7 @@ class SessionResponse(BaseModel):
     # Source: :mod:`omnigent.runtime.pending_inputs`.
     pending_inputs: list[dict[str, Any]] = Field(default_factory=list)
     workspace: str | None = None
+    directories: list[SessionDirectoryObject] = Field(default_factory=list)
     git_branch: str | None = None
     archived: bool = False
     todos: list[dict[str, Any]] = Field(default_factory=list)
@@ -2382,6 +2466,7 @@ class SessionListItem(BaseModel):
     external_session_id: str | None = None
     pending_elicitations_count: int = 0
     workspace: str | None = None
+    directories: list[SessionDirectoryObject] = Field(default_factory=list)
     git_branch: str | None = None
     archived: bool = False
     comments_count: int = 0

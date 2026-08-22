@@ -202,3 +202,49 @@ async def validate_existing_host_workspace(
             exc.message,
             code=ErrorCode.INVALID_INPUT,
         ) from exc
+
+
+async def validate_existing_host_directory(
+    *,
+    user_id: str | None,
+    host_id: str,
+    directory: str,
+    host_store: Any | None,
+    host_registry: Any | None,
+) -> str:
+    """Authorize, stat, and canonicalize an additional project root."""
+    from omnigent.server.routes._workspace_validation import (
+        WorkspaceValidationError,
+        validate_directory,
+    )
+
+    if host_registry is None:
+        raise OmnigentError(
+            "host registry is not configured on this server",
+            code=ErrorCode.INTERNAL_ERROR,
+        )
+
+    from omnigent.server.routes._host_launch import resolve_host_owner
+
+    host_name: str | None = None
+    if host_store is not None:
+        host = await asyncio.to_thread(
+            resolve_host_owner,
+            user_id=user_id,
+            host_id=host_id,
+            host_store=host_store,
+        )
+        host_name = host.name
+
+    try:
+        return await validate_directory(
+            host_registry=host_registry,
+            host_id=host_id,
+            directory=directory,
+            host_name_for_errors=host_name,
+        )
+    except WorkspaceValidationError as exc:
+        raise OmnigentError(
+            exc.message,
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc

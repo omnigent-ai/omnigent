@@ -315,3 +315,52 @@ async def validate_workspace(
             )
 
     return canonical_workspace
+
+
+async def validate_directory(
+    *,
+    host_registry: HostRegistry,
+    host_id: str,
+    directory: str,
+    host_name_for_errors: str | None = None,
+) -> str:
+    """Validate and canonicalize an additional session directory.
+
+    Additional roots are independent projects, so they must exist on the
+    selected host but are not constrained by the primary agent cwd boundary.
+
+    :param host_registry: Registry used for the ``host.stat`` round trip.
+    :param host_id: Target host's stable id.
+    :param directory: Absolute directory path supplied by the caller.
+    :param host_name_for_errors: Optional human-readable host name.
+    :returns: The canonical path returned by the host.
+    :raises WorkspaceValidationError: If the host is offline or the path is
+        invalid, missing, not a directory, or cannot be canonicalized.
+    """
+    if not directory.startswith("/"):
+        raise WorkspaceValidationError("directory path must be absolute and start with /")
+
+    display_host = host_name_for_errors or host_id
+    host_conn = host_registry.get(host_id)
+    if host_conn is None:
+        raise WorkspaceValidationError(
+            f"host '{display_host}' is offline; reconnect the host and try again"
+        )
+
+    directory_stat = await _ask_host_stat(
+        host_registry=host_registry,
+        host_conn=host_conn,
+        path=directory,
+    )
+    if not directory_stat.get("exists"):
+        raise WorkspaceValidationError(
+            f"directory path does not exist on host '{display_host}': {directory}"
+        )
+    if directory_stat.get("type") != "directory":
+        raise WorkspaceValidationError(
+            f"directory path is not a directory on host '{display_host}': {directory}"
+        )
+    canonical_directory = directory_stat.get("canonical_path")
+    if not isinstance(canonical_directory, str):
+        raise WorkspaceValidationError("host returned an empty canonical_path for the directory")
+    return canonical_directory

@@ -60,6 +60,10 @@ from omnigent.model_override import (
 )
 from omnigent.native_coding_agents import public_agent_name
 from omnigent.runtime import pending_elicitations
+from omnigent.session_directories import (
+    MAX_SESSION_DIRECTORIES,
+    validate_directory_id,
+)
 from omnigent.session_lifecycle import (
     CLOSED_LABEL_KEY,
     CLOSED_LABEL_VALUE,
@@ -1445,6 +1449,31 @@ def _subagent_file_ids_from_args(args: _JsonObject) -> list[str]:
     return list(raw_ids)
 
 
+def _validate_directory_ids(raw_ids: object) -> list[str] | None:
+    """Validate an optional child-session directory scope."""
+    if raw_ids is None:
+        return None
+    if not isinstance(raw_ids, list) or not all(
+        isinstance(directory_id, str) and directory_id for directory_id in raw_ids
+    ):
+        raise ValueError("'directory_ids' must be a list of non-empty strings")
+    if len(raw_ids) > MAX_SESSION_DIRECTORIES:
+        raise ValueError(f"'directory_ids' supports at most {MAX_SESSION_DIRECTORIES} entries")
+    if len(set(raw_ids)) != len(raw_ids):
+        raise ValueError("'directory_ids' must not contain duplicates")
+    for directory_id in raw_ids:
+        validate_directory_id(directory_id)
+    return list(raw_ids)
+
+
+def _subagent_directory_ids_from_args(args: _JsonObject) -> list[str] | None:
+    """Extract the create-time directory scope from object-form send args."""
+    raw_message = args.get("args")
+    if not isinstance(raw_message, dict):
+        return None
+    return _validate_directory_ids(raw_message.get("directory_ids"))
+
+
 async def _teardown_failed_child(
     server_client: httpx.AsyncClient,
     child_session_id: str,
@@ -1886,6 +1915,11 @@ async def _execute_subagent_tool(
         return f"Error: sys_session_send invalid 'file_ids': {exc}"
 
     try:
+        directory_ids = _subagent_directory_ids_from_args(args)
+    except ValueError as exc:
+        return f"Error: sys_session_send invalid 'directory_ids': {exc}"
+
+    try:
         harness_override = _subagent_harness_override_from_args(args)
     except ValueError as exc:
         return f"Error: sys_session_send invalid 'harness': {exc}"
@@ -1919,6 +1953,12 @@ async def _execute_subagent_tool(
                 "Error: sys_session_send 'file_ids' is supported only when "
                 "addressing a sub-agent by 'agent'/'title'; it cannot be "
                 f"forwarded to an existing session by id ({target_session_id!r})."
+            )
+        if directory_ids is not None:
+            return (
+                "Error: sys_session_send 'directory_ids' applies only when a "
+                "child session is first created; it cannot change an existing "
+                f"session ({target_session_id!r})."
             )
         if harness_override is not None:
             return (
@@ -2026,6 +2066,14 @@ async def _execute_subagent_tool(
                 f"{child_session_id}. Re-send without 'file_ids' to "
                 "continue it, or sys_session_close it first to spawn a "
                 "fresh session with the requested files."
+            )
+        if directory_ids is not None:
+            return (
+                f"Error: sys_session_send 'directory_ids' applies only when a "
+                f"sub-agent session is first created; {sub_agent_name!r} title "
+                f"{session_name!r} already exists as {child_session_id}. "
+                "Re-send without 'directory_ids' to continue it, or "
+                "sys_session_close it first to spawn a fresh scoped session."
             )
         if cost_budget is not None:
             return (
@@ -2157,6 +2205,8 @@ async def _execute_subagent_tool(
             "title": f"{sub_agent_name}:{session_name}",
             "sub_agent_name": sub_agent_name,
         }
+        if directory_ids is not None:
+            create_body["directory_ids"] = directory_ids
         if harness_override_canonical is not None:
             create_body["harness_override"] = harness_override_canonical
         if model is not None:
@@ -2509,6 +2559,7 @@ def _build_session_create_body(
     title: object,
     message: object,
     model: object = None,
+    directory_ids: list[str] | None = None,
 ) -> _JsonObject:
     """
     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
@@ -2527,6 +2578,8 @@ def _build_session_create_body(
         non-empty string.
     :param model: Optional model override, e.g. ``"databricks-glm-5-2"``;
         written as ``model_override`` on the session.
+    :param directory_ids: Optional inherited directory scope. ``None``
+        inherits all parent roots; an empty list selects private scratch.
     :returns: The JSON request body.
     """
     body: _JsonObject = {
@@ -2537,6 +2590,8 @@ def _build_session_create_body(
         body["title"] = title
     if isinstance(model, str) and model:
         body["model_override"] = model
+    if directory_ids is not None:
+        body["directory_ids"] = directory_ids
     if isinstance(message, str) and message:
         body["initial_items"] = [
             {
@@ -2675,6 +2730,10 @@ async def _execute_session_create(
                 )
             }
         )
+    try:
+        directory_ids = _validate_directory_ids(args.get("directory_ids"))
+    except ValueError as exc:
+        return json.dumps({"error": f"invalid directory_ids: {exc}"})
     if has_config_path:
         return await _session_create_from_config_path(
             str(config_path),
@@ -2691,6 +2750,7 @@ async def _execute_session_create(
         args.get("title"),
         args.get("message"),
         model=args.get("model"),
+        directory_ids=directory_ids,
     )
     try:
         resp = await server_client.post("/v1/sessions", json=body, timeout=30.0)
@@ -2854,6 +2914,9 @@ async def _upload_config_bundle(
         return json.dumps({"error": f"sys_session_create failed to bundle config: {exc}"})
 
     metadata: _JsonObject = {"parent_session_id": conversation_id}
+    directory_ids = _validate_directory_ids(args.get("directory_ids"))
+    if directory_ids is not None:
+        metadata["directory_ids"] = directory_ids
     title = args.get("title")
     if isinstance(title, str) and title:
         metadata["title"] = title

@@ -113,6 +113,7 @@ from omnigent.server.routes._auth_helpers import (
 )
 from omnigent.server.routes._host_worktree import CreatedWorktree
 from omnigent.server.routes._session_create_validation import (
+    validate_existing_host_directory,
     validate_existing_host_workspace,
 )
 
@@ -264,6 +265,11 @@ from omnigent.server.schemas import (
     SessionTodosEvent,
     SkillSummary,
     ToolOutputDeltaEvent,
+)
+from omnigent.session_directories import (
+    DEFAULT_DIRECTORY_ID,
+    build_session_directories,
+    select_session_directories,
 )
 from omnigent.session_lifecycle import (
     labels_with_closed_status,
@@ -4616,6 +4622,23 @@ async def _validate_session_workspace(
     )
 
 
+async def _validate_session_directory(
+    *,
+    user_id: str | None,
+    host_id: str,
+    directory: str,
+    request: Request,
+) -> str:
+    """Authorize and canonicalize one boundary-independent project root."""
+    return await validate_existing_host_directory(
+        user_id=user_id,
+        host_id=host_id,
+        directory=directory,
+        host_store=getattr(request.app.state, "host_store", None),
+        host_registry=getattr(request.app.state, "host_registry", None),
+    )
+
+
 @dataclass
 class _HostLaunchAttempt:
     """
@@ -8511,6 +8534,27 @@ def _persist_stored_session_bundle(
         any non-integrity reason.
     """
     try:
+        if metadata.parent_session_id is not None:
+            parent = conversation_store.get_conversation(metadata.parent_session_id)
+            if parent is None:
+                raise ConversationNotFoundError(
+                    f"parent conversation {metadata.parent_session_id!r} does not exist"
+                )
+            directories = select_session_directories(
+                parent.directories,
+                metadata.directory_ids,
+            )
+            default_directory = next(
+                (directory for directory in directories if directory.id == DEFAULT_DIRECTORY_ID),
+                None,
+            )
+            workspace = default_directory.path if default_directory is not None else None
+        else:
+            workspace = metadata.workspace
+            directories = build_session_directories(
+                workspace,
+                (directory.path for directory in metadata.directories),
+            )
         created = conversation_store.create_session_with_agent(
             agent_id=agent_id,
             agent_name=agent_name,
@@ -8519,7 +8563,8 @@ def _persist_stored_session_bundle(
             title=metadata.title,
             labels=metadata.labels,
             reasoning_effort=metadata.reasoning_effort,
-            workspace=metadata.workspace,
+            workspace=workspace,
+            directories=directories,
             terminal_launch_args=metadata.terminal_launch_args,
             parent_conversation_id=metadata.parent_session_id,
             runner_id=runner_id,
@@ -8535,6 +8580,12 @@ def _persist_stored_session_bundle(
             str(exc),
             code=ErrorCode.NOT_FOUND,
         ) from exc
+    except ValueError as exc:
+        _delete_stored_session_bundle_after_failure(
+            artifact_store,
+            agent_bundle_location,
+        )
+        raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
     except IntegrityError as exc:
         _delete_stored_session_bundle_after_failure(
             artifact_store,
@@ -9834,6 +9885,7 @@ __all__ = [
     "_usage_by_model_for_display",
     "_utc_day",
     "_validate_external_reasoning_effort",
+    "_validate_session_directory",
     "_validate_session_workspace",
     "_validate_terminal_launch_args",
     "_validated_cost_control_mode_override",

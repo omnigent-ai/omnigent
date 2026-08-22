@@ -369,6 +369,19 @@ def _build_sys_session_send_schema(
                                             "named session."
                                         ),
                                     },
+                                    "directory_ids": {
+                                        "type": "array",
+                                        "items": {"type": "string", "minLength": 1},
+                                        "maxItems": 16,
+                                        "uniqueItems": True,
+                                        "description": (
+                                            "Optional directory scope for a newly-created "
+                                            "child. Omit to inherit every parent directory, "
+                                            "pass [] for private scratch, or pass stable ids "
+                                            "from the parent session's directories list. "
+                                            "Accepted only on the first named send."
+                                        ),
+                                    },
                                     **harness_property,
                                     "cost_budget": {
                                         "type": "object",
@@ -953,6 +966,18 @@ class SysSessionCreateTool(Tool):
                                 "or 'provider-local-model-id'. Sets the harness "
                                 "model at session creation; omit to use the "
                                 "agent's default."
+                            ),
+                        },
+                        "directory_ids": {
+                            "type": "array",
+                            "items": {"type": "string", "minLength": 1},
+                            "maxItems": 16,
+                            "uniqueItems": True,
+                            "description": (
+                                "Optional directory scope inherited by the new child. "
+                                "Omit to inherit all parent directories, pass [] for "
+                                "private scratch, or pass stable directory ids exposed "
+                                "by the parent session."
                             ),
                         },
                     },

@@ -15,6 +15,7 @@ from omnigent.runner.session_init_protocol import (
     parse_runner_session_init_envelope,
 )
 from omnigent.server.runner_session_init import RunnerSessionInitializer
+from omnigent.session_directories import SessionDirectory
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store import (
     FORK_CARRY_HISTORY_LABEL_KEY,
@@ -55,6 +56,10 @@ def _conversation() -> Conversation:
         agent_id="agent_init",
         runner_id="runner_init",
         workspace="/tmp/workspace",
+        directories=(
+            SessionDirectory("default", "/tmp/workspace"),
+            SessionDirectory(f"dir_{1:032x}", "/tmp/shared", nickname="Shared services"),
+        ),
         labels={"example": "value"},
     )
 
@@ -79,6 +84,14 @@ async def test_initializer_shares_result_for_one_tunnel_generation() -> None:
     assert first_response is second_response
     assert len(client.calls) == 1
     assert client.calls[0]["session_init"]["snapshot"]["workspace"] == "/tmp/workspace"
+    assert client.calls[0]["session_init"]["snapshot"]["directories"] == [
+        {"id": "default", "path": "/tmp/workspace", "nickname": None},
+        {
+            "id": f"dir_{1:032x}",
+            "path": "/tmp/shared",
+            "nickname": "Shared services",
+        },
+    ]
 
     cached = await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
     assert cached is first_response
@@ -112,7 +125,7 @@ async def test_initializer_evicts_rejected_result_for_retry() -> None:
 @pytest.mark.parametrize(
     ("payload", "expected_ready"),
     [
-        ({"session_init_protocol_version": 2, "terminal_ready": True}, True),
+        ({"session_init_protocol_version": 3, "terminal_ready": True}, True),
         ({}, False),
     ],
     ids=["current-runner", "legacy-runner"],
