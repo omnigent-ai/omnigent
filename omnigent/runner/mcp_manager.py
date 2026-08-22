@@ -7,6 +7,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -197,6 +198,33 @@ def _mcp_tool_schema(
         "description": tool_def.description or "",
         "parameters": _normalize_input_schema(tool_def.inputSchema, namespaced_name),
     }
+
+
+# Matches a URL's query string and/or fragment, so it can be stripped from
+# connect-failure messages before they're logged or surfaced to the UI.
+_URL_QUERY_OR_FRAGMENT = re.compile(r"(https?://[^\s'\"]+?)[?#][^\s'\"]*")
+
+
+def _describe_connect_error(exc: Exception) -> str:
+    """Render *exc* for logging and UI surfacing, with URL query strings
+    and fragments stripped.
+
+    Some MCP servers require a credential in the URL itself (e.g.
+    ``?api_key=...``) rather than an ``Authorization`` header, and httpx
+    — the HTTP transport underneath :class:`McpServerConnection` —
+    commonly includes the full request URL verbatim in its exception
+    messages (e.g. ``HTTPStatusError: ... for url
+    'https://mcp.example.com/sse?api_key=sk-...'``). This message ends up
+    in `server.error`, which is both logged and forwarded to the browser
+    via the MCP startup band (:func:`_publish_runner_mcp_startup_failures`
+    on the server side), so it must not carry a live credential.
+
+    :param exc: The exception raised while connecting.
+    :returns: ``"{ExceptionType}: {message}"`` with any URL's query
+        string/fragment replaced by ``?<redacted>``.
+    """
+    message = f"{type(exc).__name__}: {exc}"
+    return _URL_QUERY_OR_FRAGMENT.sub(r"\1?<redacted>", message)
 
 
 class RunnerMcpManager:
@@ -739,7 +767,7 @@ class RunnerMcpManager:
                     raise
                 except Exception as exc:  # noqa: BLE001
                     async with self._lock:
-                        server.error = f"{type(exc).__name__}: {exc}"
+                        server.error = _describe_connect_error(exc)
                         server.connection = None
                         server.tools = []
                     _logger.warning(

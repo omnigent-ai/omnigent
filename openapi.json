@@ -4736,7 +4736,7 @@
         "type": "object"
       },
       "SessionMcpStartupEvent": {
-        "description": "Per-MCP-server startup progress for a native harness session.\n\nA codex-native session brings up its configured MCP servers when its\nCodex thread starts; slow or failing servers previously left the web\nsession looking hung with no signal. The native forwarder mirrors\nCodex's `mcpServer/startupStatus/updated` notifications as\n`external_mcp_startup` posts, republished here so the web UI can\nshow which servers are still starting and which failed or were\ncancelled.",
+        "description": "Per-MCP-server startup progress for a session.\n\nA codex-native session brings up its configured MCP servers when its\nCodex thread starts; slow or failing servers previously left the web\nsession looking hung with no signal. The native forwarder mirrors\nCodex's `mcpServer/startupStatus/updated` notifications as\n`external_mcp_startup` posts, republished here so the web UI can\nshow which servers are still starting and which failed or were\ncancelled.\n\nSDK-harness sessions (e.g. claude-sdk) have no such startup sequence \u2014\ninstead, the runner's per-turn `tools/list` call reports failing\nservers, which are folded into this same event so the web UI band\nworks for both harness families.",
         "properties": {
           "conversation_id": {
             "description": "Session identifier, e.g. `\"conv_abc123\"`.",

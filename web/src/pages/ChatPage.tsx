@@ -3431,7 +3431,9 @@ export function mcpSettledNames(names: string[]): string {
 }
 
 /**
- * Per-MCP-server startup band for native harness sessions (codex-native).
+ * Per-MCP-server startup band, fed by native harnesses (codex-native,
+ * via `external_mcp_startup`) and by the runner path used by SDK
+ * harnesses like claude-sdk (via per-turn `tools/list` failures).
  * Codex defers a mid-startup turn's execution until its MCP servers
  * settle, and the session previously showed nothing during that window.
  * Renders a spinner naming the still-starting servers; once startup

@@ -4155,9 +4155,11 @@ def _publish_mcp_startup(session_id: str, servers: dict[str, McpServerStartup]) 
     Publish a typed :class:`SessionMcpStartupEvent` to the live stream.
 
     Fired when a native forwarder reports harness MCP-server startup
-    progress via ``external_mcp_startup``, so the web UI can show
-    per-server startup state while the harness boots instead of an
-    apparently hung session. Also updates the snapshot cache so a client
+    progress via ``external_mcp_startup``, or when the runner path
+    (see :func:`_publish_runner_mcp_startup_failures`) reports a
+    ``tools/list`` failure, so the web UI can show per-server startup
+    state while the harness boots instead of an apparently hung
+    session. Also updates the snapshot cache so a client
     opening the session mid-startup seeds the band from the snapshot's
     ``mcp_startup`` field; a map with nothing left to show — empty, or
     every server ``ready`` — evicts the cache entry, mirroring the web
@@ -4179,6 +4181,54 @@ def _publish_mcp_startup(session_id: str, servers: dict[str, McpServerStartup]) 
         servers=servers,
     )
     session_stream.publish(session_id, event.model_dump())
+
+
+def _publish_runner_mcp_startup_failures(session_id: str, failures: dict[str, str]) -> None:
+    """
+    Publish runner-reported MCP ``tools/list`` failures as a
+    :class:`SessionMcpStartupEvent`.
+
+    Native harnesses report MCP startup via ``external_mcp_startup``
+    (see :func:`_publish_mcp_startup`); SDK-harness sessions instead
+    go through the runner's ``tools/list`` proxy path, which never
+    published anything and left failures as a log line only. This
+    routes that same data into the existing event/cache/UI band.
+
+    Shares ``_session_mcp_startup_cache`` with :func:`_publish_mcp_startup`.
+    That's safe only because a given session's harness routing never mixes
+    the two publishers: a native-forwarder session never also calls this
+    function, and vice versa. If that ever changed, a native ``"starting"``
+    snapshot cached for a session could be folded to ``"ready"`` by a
+    runner ``tools/list`` snapshot that simply doesn't mention that server
+    (see the fold loop below) — this function has no way to distinguish
+    "healthy and not in *failures*" from "not this publisher's server to
+    report on".
+
+    Unlike the native forwarder, the runner has no explicit startup
+    sequence to mirror — only a snapshot of which servers failed
+    this call. Previously-failed servers absent from the new
+    *failures* map are folded in as ``"ready"`` so a recovered
+    server (e.g. a refreshed token) clears the band instead of
+    leaving a stale error.
+
+    :param session_id: Session/conversation identifier, e.g.
+        ``"conv_abc123"``.
+    :param failures: Server name to error message for servers that
+        failed this call, e.g. ``{"pipeshub": "401 Unauthorized"}``.
+        Empty when every configured server responded.
+    """
+    previous = _session_mcp_startup_cache.get(session_id, {})
+    if not failures and not previous:
+        return
+    servers = {
+        name: McpServerStartup(status="failed", error=error) for name, error in failures.items()
+    }
+    for name in previous:
+        if name not in servers:
+            servers[name] = McpServerStartup(status="ready", error=None)
+    if servers == previous:
+        return
+    _publish_mcp_startup(session_id, servers)
 
 
 def _publish_runner_skills(session_id: str) -> None:
@@ -9268,6 +9318,7 @@ async def _handle_mcp_tools_list(
     failures: dict[str, str] = result.get("failures", {})
     for srv, msg in failures.items():
         _logger.warning("runner MCP server %r unavailable: %s", srv, msg)
+    _publish_runner_mcp_startup_failures(session_id, failures)
 
     _logger.debug(
         "MCP tools/list: session=%r returning %d tools, %d failures",
