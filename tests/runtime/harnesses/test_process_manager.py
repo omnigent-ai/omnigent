@@ -959,6 +959,147 @@ async def test_orphan_sweep_preserves_live_omnigent_dirs(
         await fresh.shutdown()
 
 
+@pytest.mark.posix_only
+async def test_orphan_sweep_survives_unreadable_tmp_parent(
+    short_tmp_parent: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unreadable tmp_parent must not abort manager startup.
+
+    A configured shared parent can be unreadable. ``iterdir()`` then
+    raises PermissionError; the documented best-effort contract is to
+    log and proceed with boot instead of crashing the runner.
+    """
+    if os.geteuid() == 0:
+        pytest.skip("permission checks do not apply to root")
+    locked_parent = short_tmp_parent / "fp"
+    locked_parent.mkdir(mode=0o700)
+    (locked_parent / "ap-unreachable").mkdir(mode=0o700)
+    # Write+search without read: our own instance dir can be created,
+    # but the sweep cannot enumerate the configured shared parent.
+    locked_parent.chmod(0o333)
+    manager = HarnessProcessManager(tmp_parent=locked_parent)
+    try:
+        # Before the fix this raised PermissionError out of start().
+        await manager.start()
+        assert any(
+            "cannot enumerate" in record.getMessage() and str(locked_parent) in record.getMessage()
+            for record in caplog.records
+        )
+    finally:
+        locked_parent.chmod(0o700)
+        with contextlib.suppress(Exception):
+            await manager.shutdown()
+
+
+async def test_orphan_sweep_survives_tmp_parent_stat_error(
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A tmp-parent stat race must not abort manager startup."""
+    real_exists = Path.exists
+    raised = False
+
+    def _racy_exists(self: Path) -> bool:
+        nonlocal raised
+        if self == short_tmp_parent and not raised:
+            raised = True
+            raise OSError("tmp parent changed during sweep")
+        return real_exists(self)
+
+    monkeypatch.setattr(Path, "exists", _racy_exists)
+    manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
+    try:
+        await manager.start()
+        assert manager.instance_dir.exists()
+        assert any(
+            "cannot access" in record.getMessage() and str(short_tmp_parent) in record.getMessage()
+            for record in caplog.records
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            await manager.shutdown()
+
+
+@pytest.mark.posix_only
+async def test_orphan_sweep_skips_unreadable_sibling_and_still_sweeps(
+    short_tmp_parent: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An inaccessible ``ap-*`` sibling is skipped, not fatal.
+
+    Plants one mode-0000 sibling (stat of its sentinel raises
+    PermissionError) and one readable dead-PID orphan. The sweep must
+    skip the former, still remove the latter, and leave a live
+    sibling untouched.
+    """
+    if os.geteuid() == 0:
+        pytest.skip("permission checks do not apply to root")
+    inaccessible = short_tmp_parent / "ap-inaccessible"
+    inaccessible.mkdir(mode=0o700)
+    (inaccessible / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    inaccessible.chmod(0o000)
+
+    dead = short_tmp_parent / "ap-deadsibling"
+    dead.mkdir(mode=0o700)
+    (dead / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+
+    live = short_tmp_parent / "ap-livesibling"
+    live.mkdir(mode=0o700)
+    (live / _AP_PID_FILE).write_text(str(os.getpid()), encoding="utf-8")
+
+    manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
+    try:
+        await manager.start()
+        assert inaccessible.exists(), "unreadable sibling must be skipped, not removed"
+        assert not dead.exists(), "readable dead orphan must still be swept"
+        assert live.exists(), "live sibling must remain untouched"
+        assert any(
+            "cannot inspect" in record.getMessage() and str(inaccessible) in record.getMessage()
+            for record in caplog.records
+        )
+    finally:
+        inaccessible.chmod(0o700)
+        with contextlib.suppress(Exception):
+            await manager.shutdown()
+
+
+async def test_orphan_sweep_treats_vanishing_child_as_benign_race(
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child that disappears mid-inspection does not abort the sweep.
+
+    Simulates the vanish race by making ``is_dir`` raise
+    FileNotFoundError for one planted child; the sweep must continue
+    and still remove a later dead orphan.
+    """
+    vanishing = short_tmp_parent / "ap-avanishing"
+    vanishing.mkdir(mode=0o700)
+    (vanishing / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    dead = short_tmp_parent / "ap-zzdead"
+    dead.mkdir(mode=0o700)
+    (dead / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+
+    real_is_dir = Path.is_dir
+
+    def _racy_is_dir(self: Path, **kwargs: object) -> bool:
+        if self.name == "ap-avanishing":
+            raise FileNotFoundError(2, "vanished mid-sweep", str(self))
+        return real_is_dir(self, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "is_dir", _racy_is_dir)
+    manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
+    try:
+        await manager.start()
+        assert not dead.exists(), "sweep must continue past the racy child"
+    finally:
+        monkeypatch.undo()
+        with contextlib.suppress(Exception):
+            await manager.shutdown()
+
+
 # ── Helper-level tests (small, fast) ───────────────────────────
 
 

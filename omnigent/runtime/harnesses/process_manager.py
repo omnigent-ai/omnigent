@@ -1477,15 +1477,44 @@ class HarnessProcessManager:
         Best-effort throughout — a permission error or unreadable
         sentinel logs and skips the dir rather than aborting boot.
         """
-        if not self._tmp_parent.exists():
+        try:
+            if not self._tmp_parent.exists():
+                return
+        except OSError as exc:
+            _logger.warning(
+                "cannot access %s for the orphan sweep: %s; skipping sweep",
+                self._tmp_parent,
+                exc,
+            )
             return
-        for child in self._tmp_parent.iterdir():
-            if not child.is_dir() or not child.name.startswith("ap-"):
-                continue
-            sentinel = child / _AP_PID_FILE
-            if not sentinel.exists():
-                # No sentinel — directory either pre-dates the
-                # convention or is mid-creation. Leave alone.
+        try:
+            children = list(self._tmp_parent.iterdir())
+        except OSError as exc:
+            # A configured shared parent can be unreadable. Boot proceeds
+            # without a sweep rather than crashing the runner.
+            _logger.warning(
+                "cannot enumerate %s for the orphan sweep: %s; skipping sweep",
+                self._tmp_parent,
+                exc,
+            )
+            return
+        for child in children:
+            try:
+                if not child.is_dir() or not child.name.startswith("ap-"):
+                    continue
+                sentinel = child / _AP_PID_FILE
+                if not sentinel.exists():
+                    # No sentinel: directory either pre-dates the
+                    # convention or is mid-creation. Leave alone.
+                    continue
+            except OSError as exc:
+                # An inaccessible sibling stats as EACCES; a dir vanishing
+                # mid-inspection as ENOENT. Skip it, keep sweeping.
+                _logger.warning(
+                    "cannot inspect %s during the orphan sweep: %s; skipping",
+                    child,
+                    exc,
+                )
                 continue
             try:
                 pid_str = sentinel.read_text(encoding="utf-8").strip()
