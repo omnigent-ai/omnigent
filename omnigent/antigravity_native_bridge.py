@@ -345,6 +345,14 @@ _AGY_SEED_FILES = (
     Path("antigravity-cli") / "antigravity-oauth-token",
     Path("installation_id"),
     Path("antigravity-cli") / "installation_id",
+    # First-run TUI state (theme picker, Terms of Service). Without it agy replays
+    # the interactive onboarding wizard in a fresh Gemini dir even when the
+    # onboarding.json marker below is seeded, so a headless turn never reaches the
+    # input box.
+    Path("antigravity-cli") / "jetski_state.pbtxt",
+    # The GCP project agy resolved for this account. Seeding it spares a fresh
+    # session the project re-discovery round-trip (and its failure modes).
+    Path("antigravity-cli") / "cache" / "default_project_id.txt",
 )
 
 
@@ -570,6 +578,7 @@ def seed_isolated_agy_home(
 
     _seed_isolated_agy_plugins(real_home, iso_gemini)
     _seed_isolated_agy_skills(real_home, iso_gemini)
+    _seed_isolated_agy_gcp(real_home, iso_gemini)
 
     if trusted_workspace is not None:
         _seed_isolated_agy_workspace_trust(iso_gemini, Path(trusted_workspace))
@@ -751,6 +760,50 @@ def ensure_agy_feedback_survey_disabled(home: Path) -> None:
             settings_path,
             exc_info=True,
         )
+
+
+def _seed_isolated_agy_gcp(real_home: Path, iso_gemini: Path) -> None:
+    """Copy the host's agy ``gcp`` settings object into the isolated settings.
+
+    agy's agent executor resolves its GCP project/location from the ``gcp``
+    object in ``settings.json``. A fresh ``--gemini_dir`` has none, so a
+    GCP-auth account crashes every turn with ``invalid location: ""`` before
+    the agent runs. The values are account-specific, so they are always read
+    from the host file at launch — never hardcoded.
+
+    Merge-only + best-effort, like the workspace-trust seed: a host without the
+    file or without a ``gcp`` object seeds nothing, and every other key already
+    in the isolated ``settings.json`` is preserved.
+
+    :param real_home: The user's real home directory.
+    :param iso_gemini: The bridge-owned ``--gemini_dir`` being seeded.
+    """
+    real_settings = real_home / ".gemini" / "antigravity-cli" / "settings.json"
+    try:
+        host = json.loads(real_settings.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(host, dict):
+        return
+    gcp = host.get("gcp")
+    if not isinstance(gcp, dict):
+        return
+    settings_path = iso_gemini / "antigravity-cli" / "settings.json"
+    data: dict[str, object] = {}
+    if settings_path.is_file():
+        try:
+            loaded = json.loads(settings_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            loaded = None
+        if isinstance(loaded, dict):
+            data = loaded
+    if data.get("gcp") == gcp:
+        return
+    data["gcp"] = gcp
+    settings_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = settings_path.with_suffix(settings_path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, settings_path)
 
 
 def _seed_isolated_agy_workspace_trust(iso_gemini: Path, workspace: Path) -> None:

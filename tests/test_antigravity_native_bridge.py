@@ -1583,6 +1583,128 @@ def test_seed_isolated_agy_home_tolerates_missing_credential(
     assert (iso_gemini / "antigravity-cli" / "cache" / "onboarding.json").is_file()
 
 
+def test_seed_isolated_agy_home_seeds_jetski_state_and_default_project_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """First-run TUI state + cached project id are copied so agy skips the wizard."""
+    fake_home = tmp_path / "real-home"
+    real_cli = fake_home / ".gemini" / "antigravity-cli"
+    (real_cli / "cache").mkdir(parents=True)
+    (real_cli / "jetski_state.pbtxt").write_text('theme: "dark"\n', encoding="utf-8")
+    (real_cli / "cache" / "default_project_id.txt").write_text("proj-123", encoding="utf-8")
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+
+    iso_gemini = agy_gemini_dir(bridge_dir)
+    jetski = iso_gemini / "antigravity-cli" / "jetski_state.pbtxt"
+    project_id = iso_gemini / "antigravity-cli" / "cache" / "default_project_id.txt"
+    assert jetski.read_text(encoding="utf-8") == 'theme: "dark"\n'
+    assert project_id.read_text(encoding="utf-8") == "proj-123"
+    # The real files are copied, never moved.
+    assert (real_cli / "jetski_state.pbtxt").is_file()
+    assert (real_cli / "cache" / "default_project_id.txt").is_file()
+
+
+def test_seed_isolated_agy_home_tolerates_missing_jetski_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A host that never ran agy's wizard seeds no TUI state — and never fails."""
+    fake_home = tmp_path / "real-home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+
+    iso_gemini = agy_gemini_dir(bridge_dir)
+    assert not (iso_gemini / "antigravity-cli" / "jetski_state.pbtxt").exists()
+    assert not (iso_gemini / "antigravity-cli" / "cache" / "default_project_id.txt").exists()
+
+
+def test_seed_isolated_agy_home_seeds_host_gcp_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The host's ``gcp`` settings object is merged into the isolated settings."""
+    fake_home = tmp_path / "real-home"
+    real_settings = fake_home / ".gemini" / "antigravity-cli" / "settings.json"
+    real_settings.parent.mkdir(parents=True)
+    gcp = {"project": "acme-prod", "location": "us-central1"}
+    real_settings.write_text(json.dumps({"colorScheme": "dark", "gcp": gcp}), encoding="utf-8")
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    workspace = tmp_path / "worktrees" / "feature-x"
+    workspace.mkdir(parents=True)
+    seed_isolated_agy_home(bridge_dir, trusted_workspace=workspace)
+
+    iso_settings = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "settings.json"
+    isolated = json.loads(iso_settings.read_text(encoding="utf-8"))
+    # The gcp object is copied verbatim from the host at seed time.
+    assert isolated["gcp"] == gcp
+    # It composes with the other settings writers instead of clobbering them.
+    assert isolated["trustedWorkspaces"] == [str(workspace.resolve())]
+    # Only the gcp object is imported — unrelated host settings stay host-only.
+    assert "colorScheme" not in isolated
+    # The real settings file is read-only to the seed.
+    assert json.loads(real_settings.read_text(encoding="utf-8")) == {
+        "colorScheme": "dark",
+        "gcp": gcp,
+    }
+
+
+def test_seed_isolated_agy_home_gcp_merge_preserves_isolated_settings_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-seeding merges gcp into isolated settings other writers already touched."""
+    fake_home = tmp_path / "real-home"
+    real_settings = fake_home / ".gemini" / "antigravity-cli" / "settings.json"
+    real_settings.parent.mkdir(parents=True)
+    real_settings.write_text(
+        json.dumps({"gcp": {"project": "acme-prod", "location": "global"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    iso_settings = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "settings.json"
+    iso_settings.parent.mkdir(parents=True)
+    iso_settings.write_text(
+        json.dumps({"showFeedbackSurvey": False, "trustedWorkspaces": ["/existing"]}),
+        encoding="utf-8",
+    )
+
+    seed_isolated_agy_home(bridge_dir)
+
+    isolated = json.loads(iso_settings.read_text(encoding="utf-8"))
+    assert isolated["gcp"] == {"project": "acme-prod", "location": "global"}
+    assert isolated["showFeedbackSurvey"] is False
+    assert isolated["trustedWorkspaces"] == ["/existing"]
+
+
+def test_seed_isolated_agy_home_skips_gcp_when_host_has_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No host gcp object (or no host settings at all) changes nothing."""
+    fake_home = tmp_path / "real-home"
+    real_settings = fake_home / ".gemini" / "antigravity-cli" / "settings.json"
+    real_settings.parent.mkdir(parents=True)
+    real_settings.write_text(json.dumps({"colorScheme": "dark"}), encoding="utf-8")
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+
+    # No gcp to import -> the seed writes no isolated settings file at all.
+    assert not (agy_gemini_dir(bridge_dir) / "antigravity-cli" / "settings.json").exists()
+
+
 def test_seed_isolated_agy_home_exposes_user_plugins(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
