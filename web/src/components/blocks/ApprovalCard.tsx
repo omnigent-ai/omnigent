@@ -51,6 +51,7 @@ import {
 } from "@/lib/askUserQuestion";
 import { isNativePolicyName, nativeCodingAgentForPolicyName } from "@/lib/nativeCodingAgents";
 import { formatPreview } from "@/lib/previewFormat";
+import type { ApprovalPresentation } from "@/lib/events";
 import type { RenderItem } from "@/lib/renderItems";
 import type { RememberScope } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
@@ -76,6 +77,129 @@ function extractOptionLabels(schema: Record<string, unknown>): string[] {
   return enumValues.filter((v): v is string => typeof v === "string" && v.length > 0);
 }
 
+interface ParsedApprovalPreview {
+  parsed: Record<string, unknown>;
+  args: Record<string, unknown>;
+  wrapper: string | null;
+  closed: boolean;
+}
+
+/** Parse object arguments while retaining the producer's wrapper form. */
+function parseApprovalPreview(raw: string): ParsedApprovalPreview | null {
+  const trimmed = raw.trim();
+  const hookMatch = trimmed.match(/^([A-Za-z0-9_.:-]+)\((.*)$/s);
+  const wrapper = hookMatch?.[1] ?? null;
+  let jsonText = hookMatch?.[2] ?? trimmed;
+  const closed = wrapper !== null && jsonText.endsWith(")");
+  if (closed) jsonText = jsonText.slice(0, -1);
+
+  let parsedValue: unknown;
+  try {
+    parsedValue = JSON.parse(jsonText);
+  } catch {
+    return null;
+  }
+  if (!parsedValue || typeof parsedValue !== "object" || Array.isArray(parsedValue)) return null;
+
+  const parsed = parsedValue as Record<string, unknown>;
+  let args = parsed;
+  if (
+    typeof parsed.name === "string" &&
+    parsed.arguments &&
+    typeof parsed.arguments === "object" &&
+    !Array.isArray(parsed.arguments) &&
+    Object.keys(parsed).every((key) => key === "name" || key === "arguments")
+  ) {
+    args = parsed.arguments as Record<string, unknown>;
+  }
+  return { parsed, args, wrapper, closed };
+}
+
+function formatApprovalPreview(preview: ParsedApprovalPreview, secondaryNames: string[]): string {
+  const filteredArgs = Object.fromEntries(
+    Object.entries(preview.args).filter(([name]) => !secondaryNames.includes(name)),
+  );
+  const filtered =
+    preview.args === preview.parsed ? filteredArgs : { ...preview.parsed, arguments: filteredArgs };
+  const json = JSON.stringify(filtered);
+  const raw = preview.wrapper ? `${preview.wrapper}(${json}${preview.closed ? ")" : ""}` : json;
+  return formatPreview(raw);
+}
+
+function ApprovalArgumentValue({ value }: { value: unknown }) {
+  if (typeof value === "string") {
+    return value.length > 100 || value.includes("\n") ? (
+      <pre className="max-h-40 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-[11px] whitespace-pre-wrap break-words">
+        {value}
+      </pre>
+    ) : (
+      <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px]">{value}</code>
+    );
+  }
+  if (value === null || typeof value === "number" || typeof value === "boolean") {
+    return (
+      <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px]">{String(value)}</code>
+    );
+  }
+  return (
+    <pre className="max-h-40 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-[11px] whitespace-pre-wrap break-words">
+      {JSON.stringify(value, null, 2)}
+    </pre>
+  );
+}
+
+function ApprovalTarget({ approval }: { approval: ApprovalPresentation }) {
+  let hostname: string | null = null;
+  if (approval.href) {
+    try {
+      const target = new URL(approval.href);
+      // Re-check HTTPS for replayed params and version-skewed servers.
+      hostname = target.protocol === "https:" ? target.hostname : null;
+    } catch {
+      hostname = null;
+    }
+  }
+  return (
+    <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1" data-testid="approval-target">
+      {approval.href && hostname ? (
+        <a
+          href={approval.href}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="font-medium text-foreground underline underline-offset-2"
+        >
+          {approval.title}
+        </a>
+      ) : (
+        <span className="font-medium text-foreground">{approval.title}</span>
+      )}
+      {hostname && (
+        <span className="text-muted-foreground text-xs" data-testid="approval-target-hostname">
+          {hostname}
+        </span>
+      )}
+    </div>
+  );
+}
+
+function SecondaryArgEntries({ args }: { args: Record<string, unknown> }) {
+  const entries = Object.entries(args);
+  if (entries.length === 0) return null;
+  return (
+    <div
+      className="flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-muted-foreground"
+      data-testid="approval-secondary-args"
+    >
+      {entries.map(([key, value]) => (
+        <div key={key} className="flex min-w-0 items-start gap-1">
+          <span className="shrink-0">{key}:</span>
+          <ApprovalArgumentValue value={value} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
 /**
  * Verdict submitter — same signature as `chatStore.submitApproval`.
  * Injectable so surfaces outside the active chat (the Inbox page)
@@ -94,6 +218,7 @@ interface ApprovalCardProps {
   policyName: string;
   contentPreview: string;
   requestedSchema: Record<string, unknown>;
+  approval?: ApprovalPresentation | null;
   /**
    * Standalone approval page URL when the elicitation uses URL mode.
    * When present, the pending card renders a link to the approval page
@@ -167,6 +292,7 @@ export function ApprovalCard({
   policyName,
   contentPreview,
   requestedSchema,
+  approval,
   url,
   status,
   response,
@@ -270,10 +396,22 @@ export function ApprovalCard({
   // button mode (the buttons render the choices). Codex command
   // approvals get a dedicated command render below, so showing the
   // transport JSON would expose unrelated ids and duplicate details.
+  const secondaryNames = approval?.secondaryArguments ?? [];
+  const parsedApprovalPreview =
+    secondaryNames.length > 0 ? parseApprovalPreview(contentPreview) : null;
+  const secondaryArgs = parsedApprovalPreview
+    ? Object.fromEntries(
+        secondaryNames
+          .filter((name) => Object.hasOwn(parsedApprovalPreview.args, name))
+          .map((name) => [name, parsedApprovalPreview.args[name]]),
+      )
+    : {};
   const formattedPreview =
     isAskUserQuestion || isExitPlanMode || isMultiChoice || isCodexCommandApproval
       ? ""
-      : formatPreview(contentPreview);
+      : parsedApprovalPreview
+        ? formatApprovalPreview(parsedApprovalPreview, Object.keys(secondaryArgs))
+        : formatPreview(contentPreview);
   const execPolicyAmendment =
     codexCommand?.execPolicyAmendment && codexCommand.execPolicyAmendment.length > 0
       ? codexCommand.execPolicyAmendment
@@ -420,6 +558,7 @@ export function ApprovalCard({
     // for the same reason: purposeful content instead of the raw ask.
     const showGatingMessage = !isCodexCommandApproval && !isAskUserQuestion && !isExitPlanMode;
     const hasBody =
+      (approval !== null && approval !== undefined) ||
       showGatingMessage ||
       isCodexCommandApproval ||
       submittedAnswers !== null ||
@@ -438,6 +577,7 @@ export function ApprovalCard({
         </AlertTitle>
         {hasBody && (
           <AlertDescription className="flex flex-col gap-1 text-sm">
+            {approval && <ApprovalTarget approval={approval} />}
             {isCodexCommandApproval ? (
               <>
                 {codexCommand.reason && <span>{codexCommand.reason}</span>}
@@ -544,12 +684,14 @@ export function ApprovalCard({
           </>
         ) : (
           <>
+            {approval && <ApprovalTarget approval={approval} />}
             <span>{message}</span>
             {formattedPreview && (
               <pre className="max-h-64 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-sm whitespace-pre-wrap break-words">
                 {formattedPreview}
               </pre>
             )}
+            <SecondaryArgEntries args={secondaryArgs} />
             {isExternalUrl ? (
               <div className="flex flex-wrap gap-2 pt-1">
                 <Button size="sm" asChild>
@@ -604,6 +746,7 @@ export function ElicitationCard({
       policyName={item.policyName}
       contentPreview={item.contentPreview}
       requestedSchema={item.requestedSchema}
+      approval={item.approval}
       url={item.url}
       status={item.status}
       response={item.response}

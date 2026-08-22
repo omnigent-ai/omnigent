@@ -486,6 +486,65 @@ def block_domains(blocked_domains: list[str]) -> callable:
 
 `state_updates` supports four actions: `"set"`, `"increment"`, `"delete"`, `"append"`.
 
+### Describing an approval target
+
+An `ASK` response may include policy-controlled presentation metadata derived
+from values the policy has evaluated. Core validates and transports the
+presentation; the approval renderer remains application-agnostic. The
+presentation changes visual hierarchy only. All raw arguments and the complete
+raw call remain available to the approver.
+
+Python policies can return the frozen dataclass on `PolicyResult`:
+
+```python
+from omnigent.policies import ApprovalPresentation, PolicyResult
+from omnigent.spec.types import PolicyAction
+
+return PolicyResult(
+    action=PolicyAction.ASK,
+    reason="Merge this pull request?",
+    approval=ApprovalPresentation(
+        title=f"{owner}/{repository} #{number}",
+        href=f"https://github.com/{owner}/{repository}/pull/{number}",
+        secondary_arguments=("grant_id", "idempotency_key"),
+    ),
+)
+```
+
+Dict-returning Python policies use the same nested shape. CEL policies return
+the presentation as a nested map:
+
+```cel
+{
+  "result": "ASK",
+  "reason": "Merge this pull request?",
+  "approval": {
+    "title": event.data.arguments.repository_owner + "/" +
+             event.data.arguments.repository_name + " #" +
+             string(event.data.arguments.pr_number),
+    "href": "https://github.com/" +
+            event.data.arguments.repository_owner + "/" +
+            event.data.arguments.repository_name + "/pull/" +
+            string(event.data.arguments.pr_number),
+    "secondary_arguments": ["grant_id", "idempotency_key"]
+  }
+}
+```
+
+`title` is required, trimmed, and capped at 256 characters. It must contain no
+C0/C1/DEL controls, Unicode line or paragraph separators (categories `Zl` and
+`Zp`), or Unicode bidi-formatting controls, including ALM, LRM, and RLM.
+`href` is optional; when present it must be an HTTPS URL with a hostname and no
+user information. Unknown names in `secondary_arguments` are ignored.
+Malformed presentations drop to the plain card and log at debug; validate your
+policy's presentation in policy configuration tests. The policy verdict never
+changes when presentation validation fails.
+
+When several policies return `ASK`, the first ASKing policy's presentation
+wins, matching the existing first-policy timeout and deciding-policy
+precedence. Reasons from later ASKing policies are still appended to the
+combined approval message.
+
 ### Making policies discoverable
 
 To make custom policies appear in the UI, export a `POLICY_REGISTRY` list from your module:

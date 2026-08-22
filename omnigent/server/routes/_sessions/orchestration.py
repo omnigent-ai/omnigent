@@ -79,8 +79,11 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import (
+    approval_presentation_to_dict,
+    arguments_from_preview,
     build_elicitation_request_event,
     resolve_ask_timeout,
+    validate_approval_presentation,
 )
 from omnigent.runtime.policies.builder import (
     _sum_subtree_usage,
@@ -1911,6 +1914,10 @@ async def _hold_native_ask_gate_impl(
     """
     tool_name = data.get("name")
     tool_input = data.get("arguments")
+    approval = validate_approval_presentation(
+        result.approval,
+        tool_input if isinstance(tool_input, dict) else {},
+    )
     params = ElicitationRequestParams(
         mode="form",
         message=result.reason or "Approval required",
@@ -1918,6 +1925,7 @@ async def _hold_native_ask_gate_impl(
         phase=phase.value,
         policy_name=result.deciding_policy or "unknown",
         content_preview=json.dumps(data)[:1024],
+        approval=approval_presentation_to_dict(approval),
     )
     # Per-policy ``ask_timeout`` override wins over the spec-level default.
     timeout_s = float(resolve_ask_timeout(engine, result))
@@ -6436,12 +6444,16 @@ async def _register_policy_elicitation(
         e.g. ``"elicit_a1b2c3..."``.
     """
     elicitation_id = f"elicit_{secrets.token_hex(16)}"
+    approval = validate_approval_presentation(
+        result.approval, arguments_from_preview(arguments_preview)
+    )
     elicitation = ElicitationRequest(
         message=result.reason or "Approval required",
         requested_schema={},
         phase=Phase.TOOL_CALL.value,
         policy_names=result.deciding_policies or ["unknown"],
         content_preview=arguments_preview[:1024],
+        approval=approval,
     )
     # Approval state lives on the runner (in-memory
     # _pending_approvals dict of elicitation_id → Future).

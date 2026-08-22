@@ -314,6 +314,7 @@ export function InboxPage() {
                   phase={item.elicitation.phase}
                   policyName={item.elicitation.policyName}
                   contentPreview={item.elicitation.contentPreview}
+                  approval={item.elicitation.approval}
                   requestedSchema={item.elicitation.requestedSchema}
                   url={item.elicitation.url}
                   status={verdict ? "responded" : "pending"}

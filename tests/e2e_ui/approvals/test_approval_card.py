@@ -66,6 +66,9 @@ def test_approval_card_renders_and_approves(
     card = page.locator(f'{_APPROVAL_CARD}[data-state="pending"]').first
     expect(card).to_be_visible(timeout=_AGENT_TURN_TIMEOUT_MS)
     expect(card.get_by_text("Approval required")).to_be_visible()
+    expect(card.get_by_role("link", name="acme/widgets: main -> origin")).to_be_visible()
+    expect(card.get_by_text("example.com", exact=True)).to_be_visible()
+    expect(card.locator('[data-testid="approval-secondary-args"]')).to_contain_text("command")
     # The server is genuinely parked on this prompt, not just an optimistic UI.
     assert _pending_elicitations(base_url, session_id), "server has no parked elicitation"
 

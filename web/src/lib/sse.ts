@@ -947,6 +947,39 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     const targetSessionId = p.target_session_id;
     const phase = String(p.phase ?? "");
     const policyName = String(p.policy_name ?? "");
+    const approvalRaw = p.approval;
+    const approvalRecord =
+      approvalRaw && typeof approvalRaw === "object" && !Array.isArray(approvalRaw)
+        ? (approvalRaw as Record<string, unknown>)
+        : null;
+    const secondaryArguments = approvalRecord?.secondary_arguments;
+    const approvalHref = approvalRecord?.href;
+    let approvalHrefIsSafe = approvalHref === null || approvalHref === undefined;
+    if (typeof approvalHref === "string" && !/\s/.test(approvalHref)) {
+      try {
+        const parsedHref = new URL(approvalHref);
+        approvalHrefIsSafe =
+          parsedHref.protocol === "https:" &&
+          parsedHref.hostname.length > 0 &&
+          parsedHref.username === "" &&
+          parsedHref.password === "";
+      } catch {
+        approvalHrefIsSafe = false;
+      }
+    }
+    const approval =
+      approvalRecord &&
+      typeof approvalRecord.title === "string" &&
+      approvalRecord.title.trim().length > 0 &&
+      approvalHrefIsSafe &&
+      Array.isArray(secondaryArguments) &&
+      secondaryArguments.every((name) => typeof name === "string")
+        ? {
+            title: approvalRecord.title.trim().slice(0, 256),
+            href: typeof approvalHref === "string" ? approvalHref : null,
+            secondaryArguments: secondaryArguments as string[],
+          }
+        : null;
     // The PermissionRequest endpoint stamps an `ask_user_question`
     // extra onto params when Claude is gating the built-in
     // AskUserQuestion tool. Surface it on the event so the UI's
@@ -1000,6 +1033,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       phase,
       policyName,
       contentPreview: String(p.content_preview ?? ""),
+      approval,
       askUserQuestion:
         askUserQuestionRaw &&
         typeof askUserQuestionRaw === "object" &&

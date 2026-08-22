@@ -14,7 +14,7 @@ from typing import Any
 import pytest
 
 from omnigent.policies.function import FunctionPolicy
-from omnigent.policies.types import PolicyResult
+from omnigent.policies.types import ApprovalPresentation, PolicyResult
 from omnigent.spec.types import FunctionPolicySpec, FunctionRef, PhaseSelector, PolicyAction
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -42,6 +42,7 @@ def make_fixed_policy(
     condition: dict[str, str] | None = None,
     config: dict[str, Any] | None = None,
     ask_timeout: int | None = None,
+    approval: ApprovalPresentation | None = None,
 ) -> FunctionPolicy:
     """
     Build a :class:`FunctionPolicy` that always returns a fixed result.
@@ -64,12 +65,14 @@ def make_fixed_policy(
         the fixed callable but stored on the spec.
     :param ask_timeout: Per-policy ASK timeout override in
         seconds. ``None`` inherits the spec-wide default.
+    :param approval: Optional target presentation returned with ASK.
     :returns: A :class:`FunctionPolicy` that always returns the
         specified result.
     """
     frozen_labels = dict(set_labels) if set_labels else None
     frozen_action = action
     frozen_reason = reason
+    frozen_approval = approval
 
     def _fixed(event: dict[str, Any]) -> PolicyResult:
         """Return the fixed result regardless of event content."""
@@ -77,6 +80,7 @@ def make_fixed_policy(
             action=frozen_action,
             reason=frozen_reason,
             set_labels=frozen_labels,
+            approval=frozen_approval,
         )
 
     spec = FunctionPolicySpec(

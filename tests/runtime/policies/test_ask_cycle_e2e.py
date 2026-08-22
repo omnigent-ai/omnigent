@@ -26,7 +26,7 @@ import pytest
 
 from omnigent.errors import ElicitationDeclinedError
 from omnigent.policies.function import FunctionPolicy
-from omnigent.policies.types import EvaluationContext, PolicyResult
+from omnigent.policies.types import ApprovalPresentation, EvaluationContext, PolicyResult
 from omnigent.runtime.policies import _await_elicitation
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.spec.types import (
@@ -332,6 +332,39 @@ async def test_ask_cycle_multiple_askers_combined_approval(
     # All three policies' set_labels landed — single
     # approval authorized every write.
     assert engine.labels == {"a": "1", "b": "2", "c": "3"}
+
+
+@pytest.mark.asyncio
+async def test_first_asking_policy_presentation_wins(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Composition keeps the first ASK target while combining reasons."""
+    first = ApprovalPresentation(title="first target")
+    second = ApprovalPresentation(title="second target")
+    p1 = make_fixed_policy(
+        "first",
+        action=PolicyAction.ASK,
+        reason="first reason",
+        on=[PhaseSelector(phase=Phase.TOOL_CALL)],
+        approval=first,
+    )
+    p2 = make_fixed_policy(
+        "second",
+        action=PolicyAction.ASK,
+        reason="second reason",
+        on=[PhaseSelector(phase=Phase.TOOL_CALL)],
+        approval=second,
+    )
+    engine = _build_engine(conversation_store, [p1, p2])
+    result = await engine.evaluate(
+        EvaluationContext(
+            phase=Phase.TOOL_CALL,
+            content={"name": "github_merge_pr", "arguments": {}},
+            tool_name="github_merge_pr",
+        )
+    )
+    assert result.approval == first
+    assert result.reason == "first: first reason; second: second reason"
 
 
 @pytest.mark.asyncio
