@@ -314,6 +314,7 @@ async def test_qwen_permission_request_hook_allow_round_trip(
         "operation_type": "run_shell_command",
         "message": "qwen wants to run run_shell_command",
         "content_preview": "echo hi > out.txt",
+        "ask_user_question": {"questions": [{"id": "0", "question": "Continue?", "options": []}]},
     }
 
     drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
@@ -332,6 +333,7 @@ async def test_qwen_permission_request_hook_allow_round_trip(
     assert params["phase"] == "pre_tool_use"
     assert params["policy_name"] == "qwen_native_permission"
     assert params["content_preview"] == "echo hi > out.txt"
+    assert params["ask_user_question"] == payload["ask_user_question"]
 
     verdict = await _post_approval(client, session_id, elicitation_id, "accept")
     assert verdict.status_code == 202, verdict.text
