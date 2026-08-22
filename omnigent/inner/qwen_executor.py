@@ -110,6 +110,7 @@ def _looks_like_missing_file(message: str) -> bool:
 _AGENT_METHOD_INITIALIZE = "initialize"
 _AGENT_METHOD_SESSION_NEW = "session/new"
 _AGENT_METHOD_SESSION_PROMPT = "session/prompt"
+_AGENT_METHOD_SESSION_CANCEL = "session/cancel"
 
 # Notifications sent *from* the agent to the client
 _CLIENT_NOTIFICATION_SESSION_UPDATE = "session/update"
@@ -1435,6 +1436,28 @@ class QwenExecutor(Executor):
 
     async def close_session(self, session_key: str) -> None:
         """Close a named session (no-op; sessions are per-process)."""
+
+    async def interrupt_session(self, session_key: str) -> bool:  # noqa: ARG002
+        """Cancel the active Qwen turn, falling back to process termination."""
+        proc = self._proc
+        if proc is None or proc.returncode is not None:
+            return False
+        if self._session_id is not None:
+            try:
+                await self._send(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": _AGENT_METHOD_SESSION_CANCEL,
+                        "params": {"sessionId": self._session_id},
+                    }
+                )
+                return True
+            except Exception as exc:  # noqa: BLE001 — interrupt is best-effort
+                logger.warning("qwen session/cancel failed; falling back to SIGTERM: %s", exc)
+        with contextlib.suppress(ProcessLookupError):
+            proc.terminate()
+            return True
+        return False
 
     async def close(self) -> None:
         """Terminate the qwen subprocess and clean up."""
