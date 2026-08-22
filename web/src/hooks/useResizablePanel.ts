@@ -1,10 +1,29 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useInputCapabilities } from "@/hooks/useInputCapabilities";
+import { MD_MIN_WIDTH_QUERY, isMobileViewport } from "@/lib/breakpoints";
 import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSizePreferences";
 
 const MIN_WIDTH_PX = 320;
 const MAX_WIDTH_RATIO = 0.8; // 80% of viewport
-/** Tailwind `md` breakpoint — must track the value in tailwind.config. */
-const MD_BREAKPOINT = 768;
+const PAINTED_HANDLE_WIDTH_PX = 4;
+export const HANDLE_OUTWARD_SLIVER_PX = 6;
+export const HANDLE_INWARD_SLIVER_PX = 8;
+export const HANDLE_COARSE_GUTTER_PX = 12;
+export const HANDLE_FINE_GUTTER_PX = 10;
+
+function handleGutterStyle(isCoarse: boolean): React.CSSProperties {
+  const gutter = isCoarse ? HANDLE_COARSE_GUTTER_PX : HANDLE_FINE_GUTTER_PX;
+  const inset = (gutter - PAINTED_HANDLE_WIDTH_PX) / 2;
+  return {
+    touchAction: "none",
+    boxSizing: "content-box",
+    paddingInlineStart: HANDLE_OUTWARD_SLIVER_PX + inset,
+    paddingInlineEnd: HANDLE_INWARD_SLIVER_PX + inset,
+    marginInlineStart: -HANDLE_OUTWARD_SLIVER_PX,
+    marginInlineEnd: -HANDLE_INWARD_SLIVER_PX,
+    backgroundClip: "content-box",
+  };
+}
 
 /** Clamp a width value to the allowed range for the current viewport. */
 function clampWidth(w: number, minPx = MIN_WIDTH_PX): number {
@@ -79,7 +98,7 @@ export function resetSharedWidthStoreForTesting(): void {
 }
 
 /**
- * Hook for making a right-side panel resizable via mouse drag on its left edge.
+ * Hook for making a right-side panel resizable via pointer drag on its left edge.
  *
  * On desktop (`≥ md`) the panel width is controlled via an inline style
  * driven by drag state. On mobile (`< md`) the panel is a full-screen
@@ -94,22 +113,25 @@ export function resetSharedWidthStoreForTesting(): void {
  * props to spread onto the resize handle element.
  */
 export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx = MIN_WIDTH_PX) {
+  const { coarsePrimary } = useInputCapabilities();
   const width = useSyncExternalStore(
     subscribeSharedWidth,
     getSharedWidthSnapshot,
     getSharedWidthServerSnapshot,
   );
-  const dragging = useRef(false);
+  const activePointerId = useRef<number | null>(null);
+  const documentFallbackCleanupRef = useRef<(() => void) | null>(null);
+  const overlayRef = useRef<HTMLDivElement | null>(null);
   const minWidthRef = useRef(minWidthPx);
   minWidthRef.current = minWidthPx;
 
   // Track whether we're on desktop — only apply inline width there.
   const [isDesktop, setIsDesktop] = useState(
-    () => typeof window !== "undefined" && window.innerWidth >= MD_BREAKPOINT,
+    () => typeof window !== "undefined" && !isMobileViewport(),
   );
 
   useEffect(() => {
-    const mql = window.matchMedia(`(min-width: ${MD_BREAKPOINT}px)`);
+    const mql = window.matchMedia(MD_MIN_WIDTH_QUERY);
     const handler = (e: MediaQueryListEvent) => setIsDesktop(e.matches);
     mql.addEventListener("change", handler);
     return () => mql.removeEventListener("change", handler);
@@ -147,15 +169,89 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
     minWidthPx,
   );
 
-  const onMouseDown = useCallback(
-    (e: React.MouseEvent) => {
+  const addDragOverlay = useCallback(() => {
+    if (overlayRef.current || typeof document === "undefined") return;
+    const element = document.createElement("div");
+    element.style.cssText =
+      "position:fixed;inset:0;z-index:2147483647;cursor:col-resize;background:transparent;";
+    document.body.appendChild(element);
+    overlayRef.current = element;
+  }, []);
+
+  const removeDragOverlay = useCallback(() => {
+    overlayRef.current?.remove();
+    overlayRef.current = null;
+  }, []);
+
+  const endDrag = useCallback(
+    (persist: boolean) => {
+      if (activePointerId.current === null) return;
+      activePointerId.current = null;
+      documentFallbackCleanupRef.current?.();
+      documentFallbackCleanupRef.current = null;
+      if (persist) persistSharedWidth();
+      removeDragOverlay();
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    },
+    [removeDragOverlay],
+  );
+
+  const onPointerDown = useCallback(
+    (e: React.PointerEvent<HTMLElement>) => {
       if (!open || !isDesktop) return;
+      if (activePointerId.current !== null) return;
+      if (e.button !== 0) return;
+      try {
+        e.currentTarget.setPointerCapture(e.pointerId);
+      } catch {
+        return;
+      }
       e.preventDefault();
-      dragging.current = true;
+      activePointerId.current = e.pointerId;
+      const onDocumentPointerUp = (event: PointerEvent) => {
+        if (event.pointerId === activePointerId.current) endDrag(true);
+      };
+      const onDocumentPointerCancel = (event: PointerEvent) => {
+        if (event.pointerId === activePointerId.current) endDrag(false);
+      };
+      document.addEventListener("pointerup", onDocumentPointerUp);
+      document.addEventListener("pointercancel", onDocumentPointerCancel);
+      documentFallbackCleanupRef.current = () => {
+        document.removeEventListener("pointerup", onDocumentPointerUp);
+        document.removeEventListener("pointercancel", onDocumentPointerCancel);
+      };
+      addDragOverlay();
       document.body.style.cursor = "col-resize";
       document.body.style.userSelect = "none";
     },
-    [open, isDesktop],
+    [addDragOverlay, endDrag, open, isDesktop],
+  );
+
+  const onPointerMove = useCallback((e: React.PointerEvent<HTMLElement>) => {
+    if (e.pointerId !== activePointerId.current) return;
+    // Update the live width only; persist once on pointerup to avoid a
+    // synchronous localStorage write per pointermove.
+    setSharedWidth(clampWidth(window.innerWidth - e.clientX, minWidthRef.current));
+  }, []);
+
+  const onPointerUp = useCallback(
+    (e: React.PointerEvent<HTMLElement>) => {
+      if (e.pointerId !== activePointerId.current) return;
+      endDrag(true);
+      if (e.currentTarget.hasPointerCapture?.(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      }
+    },
+    [endDrag],
+  );
+
+  const onPointerCancel = useCallback(
+    (e: React.PointerEvent<HTMLElement>) => {
+      if (e.pointerId !== activePointerId.current) return;
+      endDrag(false);
+    },
+    [endDrag],
   );
 
   // Keyboard resize: left/right arrow keys adjust width by 20px.
@@ -180,36 +276,11 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
     [open, isDesktop, resolvedWidth],
   );
 
+  useEffect(() => () => endDrag(false), [endDrag]);
+
   useEffect(() => {
-    function onMouseMove(e: MouseEvent) {
-      if (!dragging.current) return;
-      // Update the live width only; persisting on every move would fire a
-      // synchronous localStorage write per mousemove. We snapshot once on release.
-      setSharedWidth(clampWidth(window.innerWidth - e.clientX, minWidthRef.current));
-    }
-
-    function onMouseUp() {
-      if (!dragging.current) return;
-      dragging.current = false;
-      persistSharedWidth();
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-    }
-
-    window.addEventListener("mousemove", onMouseMove);
-    window.addEventListener("mouseup", onMouseUp);
-    return () => {
-      window.removeEventListener("mousemove", onMouseMove);
-      window.removeEventListener("mouseup", onMouseUp);
-      // Reset body styles if unmounted mid-drag (e.g. panel closed
-      // via Escape while dragging).
-      if (dragging.current) {
-        dragging.current = false;
-        document.body.style.cursor = "";
-        document.body.style.userSelect = "";
-      }
-    };
-  }, []);
+    if (!open || !isDesktop) endDrag(false);
+  }, [endDrag, isDesktop, open]);
 
   // On mobile the panel is a fixed full-screen overlay — no inline width.
   const panelWidth = isDesktop ? (open ? resolvedWidth : 0) : undefined;
@@ -219,11 +290,22 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
     panelWidth,
     /** Props to spread onto the resize handle element. */
     handleProps: {
-      onMouseDown,
+      onPointerDown,
+      onPointerMove,
+      onPointerUp,
+      onPointerCancel,
+      onLostPointerCapture: onPointerCancel,
       onKeyDown,
+      style: handleGutterStyle(coarsePrimary),
       role: "separator" as const,
       "aria-orientation": "vertical" as const,
       "aria-label": "Resize panel",
+      "aria-valuenow": resolvedWidth,
+      "aria-valuemin": minWidthPx,
+      "aria-valuemax":
+        typeof window === "undefined"
+          ? resolvedWidth
+          : Math.max(minWidthPx, window.innerWidth * MAX_WIDTH_RATIO),
       tabIndex: 0,
     },
     /** Whether the resize handle should be visible (desktop only). */

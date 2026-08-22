@@ -154,6 +154,7 @@ import {
   markConversationUnread,
   useUnseenTick,
 } from "@/hooks/useUnseenConversations";
+import { isMobileViewport } from "@/lib/breakpoints";
 import { cn } from "@/lib/utils";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
@@ -714,7 +715,7 @@ export function Sidebar({
         // conversations-sidebar only matters under the macOS Electron
         // shell, where it pushes the card below the traffic lights
         // (see the [data-electron-mac] rules in index.css).
-        "conversations-sidebar flex flex-col bg-card md:select-none",
+        "conversations-sidebar flex flex-col bg-card md:flex-row md:select-none",
         // Mobile (default): fixed full-screen overlay, slide via
         // translate-x. Stays edge-to-edge — the floating-card
         // treatment below is desktop-only.
@@ -738,7 +739,7 @@ export function Sidebar({
         // divider — no outer margin or rounding. Width (the user-resizable
         // variable) animates →0 to push main; when closed the border
         // collapses too so nothing lingers.
-        "md:translate-x-0 md:overflow-hidden",
+        "md:translate-x-0",
         // Normal desktop flow: relative panel that pushes main. Suppressed while
         // peeking so its `md:inset-auto`/`md:relative` don't override the
         // floating-card positioning below (same `md:` layer, source order wins).
@@ -748,7 +749,7 @@ export function Sidebar({
         // ringed and shadowed, sliding+fading in from the left so it reads as an
         // overlay rather than a push.
         peek &&
-          "is-peek md:absolute md:inset-2 p-0 md:max-w-[400px] ring-1 ring-border rounded-xl md:shadow-xl animate-in fade-in slide-in-from-left-4 duration-200 ease-out",
+          "is-peek md:absolute md:inset-2 p-0 md:max-w-[400px] md:overflow-hidden ring-1 ring-border rounded-xl md:shadow-xl animate-in fade-in slide-in-from-left-4 duration-200 ease-out",
       )}
       style={
         {
@@ -774,12 +775,17 @@ export function Sidebar({
           when closed also keeps it from being draggable while collapsed.
           Hidden while peeking too — the peek card is a fixed-width flyout, not
           a resizable panel. */}
-      {!peek && (
+      {open && !peek && (
         <div
           {...resizeHandleProps}
-          className="absolute inset-y-0 right-0 z-10 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block"
+          data-testid="sidebar-resize-handle"
+          className="z-10 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:absolute md:inset-y-0 md:right-0 md:block"
         />
       )}
+      {/* The content wrapper owns clipping while the absolutely positioned
+          handle enlarges the seam without consuming sidebar layout width. */}
+      {/* prettier-ignore */}
+      <div data-testid="sidebar-clipped-content" className="flex min-h-0 flex-1 flex-col md:overflow-hidden">
       {inSettings ? (
         <SettingsSidebarBody onNavClick={onNavClick} />
       ) : (
@@ -1001,6 +1007,7 @@ export function Sidebar({
           <SidebarServerPicker />
         </>
       )}
+      </div>
     </aside>
   );
 }
@@ -4902,20 +4909,6 @@ function BulkActionBar({
       </Dialog>
     </>
   );
-}
-
-/**
- * Returns true on mobile viewports (below the `md` breakpoint of
- * 768px). Used to gate the auto-close-on-navigation behavior — on
- * mobile the sidebar is a full-screen overlay so dismissing on action
- * is what reveals the destination; on desktop the sidebar pushes content
- * aside and staying open is more useful.
- *
- * SSR-safe (returns false when window is undefined).
- */
-export function isMobileViewport(): boolean {
-  if (typeof window === "undefined") return false;
-  return !window.matchMedia("(min-width: 768px)").matches;
 }
 
 // Default collapse state: every section (Pinned / Projects / Chats / Shared)

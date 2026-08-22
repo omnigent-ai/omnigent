@@ -15,6 +15,8 @@
 // resizes are also persisted so a full page reload restores the width.
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useInputCapabilities } from "@/hooks/useInputCapabilities";
+import { MD_MIN_WIDTH_QUERY, isMobileViewport } from "@/lib/breakpoints";
 import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSizePreferences";
 
 const DEFAULT_WIDTH_PX = 240; // matches the previous fixed `md:w-60`
@@ -22,8 +24,35 @@ const MIN_WIDTH_PX = 200;
 const MAX_WIDTH_PX = 640;
 /** Keep at least this much room for the code/diff viewer beside the panel. */
 const MIN_VIEWER_PX = 240;
-/** Tailwind `md` breakpoint — must track the value in tailwind.config. */
-const MD_BREAKPOINT = 768;
+// The handle is a dedicated divider gutter between the viewer and the panel —
+// a real flex child outside both scroll containers, so its hit area overlays
+// almost no content. The painted strip (`w-1`) sits centered in the gutter;
+// invisible padding fills the rest and overhangs each side by a small sliver
+// via negative margins. The slivers are capped so the viewer's scrollbar and
+// the panel's header/tabs/cards keep their taps and scroll starts — which
+// also caps the hit total at 26px coarse / 24px fine (TR-7's 24px floor; the
+// preferred 44px would need a visually wide gutter the layout doesn't permit).
+const PAINTED_STRIP_PX = 4; // must match the handle's `w-1` class
+const GUTTER_COARSE_PX = 8;
+const GUTTER_FINE_PX = 6;
+const VIEWER_SLIVER_PX = 10; // ≤10: a 14px viewer scrollbar keeps 4px + its own gutter
+const INWARD_SLIVER_PX = 8; // ≤8: stays within the panel's 12px content gutter
+
+/** Inline style for the divider-gutter handle: layout footprint = gutter
+ * width, hit box = gutter + both slivers, paint = the centered `w-1` strip. */
+function gutterStyle(isCoarse: boolean): React.CSSProperties {
+  const gutter = isCoarse ? GUTTER_COARSE_PX : GUTTER_FINE_PX;
+  const inset = (gutter - PAINTED_STRIP_PX) / 2;
+  return {
+    touchAction: "none",
+    boxSizing: "content-box",
+    paddingLeft: VIEWER_SLIVER_PX + inset,
+    paddingRight: INWARD_SLIVER_PX + inset,
+    marginLeft: -VIEWER_SLIVER_PX,
+    marginRight: -INWARD_SLIVER_PX,
+    backgroundClip: "content-box",
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Module-level width store (shared across panel remounts within a session)
@@ -95,16 +124,22 @@ export function resetCommentsWidthStoreForTesting(): void {
  * sibling viewer.
  */
 export function useResizableCommentsPanel() {
+  const { coarsePrimary } = useInputCapabilities();
   const raw = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
   const width = Math.max(MIN_WIDTH_PX, Math.min(raw ?? DEFAULT_WIDTH_PX, MAX_WIDTH_PX));
-  const dragging = useRef(false);
+  // Pointer id of the active drag; null when idle. A second concurrent
+  // pointer (e.g. another finger) is ignored — first pointer wins.
+  const activePointerId = useRef<number | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const overlayRef = useRef<HTMLDivElement | null>(null);
+  // Removes the document-level pointerup/pointercancel fallbacks installed
+  // for the active drag; null when idle.
+  const removeDocFallbacks = useRef<(() => void) | null>(null);
 
   // While dragging, a transparent full-window overlay sits above the panel so
-  // the pointer stream keeps reaching the parent document. Without it, dragging
-  // over a cross-origin/sandboxed iframe (e.g. the HTML preview) routes mousemove
-  // /mouseup into the frame, the parent never sees mouseup, and the drag sticks.
+  // the pointer stream keeps reaching the parent document even if capture is
+  // lost. Without it, dragging over a cross-origin/sandboxed iframe (e.g. the
+  // HTML preview) routes moves into the frame and the drag sticks.
   const addDragOverlay = useCallback(() => {
     if (overlayRef.current || typeof document === "undefined") return;
     const el = document.createElement("div");
@@ -120,34 +155,146 @@ export function useResizableCommentsPanel() {
   }, []);
 
   const [isDesktop, setIsDesktop] = useState(
-    () => typeof window !== "undefined" && window.innerWidth >= MD_BREAKPOINT,
+    () => typeof window !== "undefined" && !isMobileViewport(),
   );
 
   useEffect(() => {
-    const mql = window.matchMedia(`(min-width: ${MD_BREAKPOINT}px)`);
+    const mql = window.matchMedia(MD_MIN_WIDTH_QUERY);
     const handler = (e: MediaQueryListEvent) => setIsDesktop(e.matches);
     mql.addEventListener("change", handler);
     return () => mql.removeEventListener("change", handler);
   }, []);
 
+  // Coarse pointers get the deliberate capped 26px target; fine pointers
+  // (mouse, trackpad, pen tip) get a 24px target.
+
   // Clamp a candidate width to [MIN, dynamic max], leaving MIN_VIEWER_PX for
   // the sibling code/diff viewer so the panel can't swallow the whole row.
-  const clampWidth = useCallback((candidate: number): number => {
+  // The divider gutter is a third flex child in the row, so its footprint
+  // comes out of the budget too — always the coarse 8px, so a pointer-type
+  // flip mid-session can never shrink the viewer below its minimum.
+  const reachableMax = useCallback((): number => {
     const parent = containerRef.current?.parentElement;
-    const parentWidth = parent?.getBoundingClientRect().width ?? window.innerWidth;
-    const max = Math.max(MIN_WIDTH_PX, Math.min(MAX_WIDTH_PX, parentWidth - MIN_VIEWER_PX));
-    return Math.max(MIN_WIDTH_PX, Math.min(candidate, max));
+    const parentWidth =
+      parent?.getBoundingClientRect().width ??
+      (typeof window === "undefined" ? MAX_WIDTH_PX : window.innerWidth);
+    return Math.max(
+      MIN_WIDTH_PX,
+      Math.min(MAX_WIDTH_PX, parentWidth - MIN_VIEWER_PX - GUTTER_COARSE_PX),
+    );
   }, []);
 
-  const onMouseDown = useCallback(
-    (e: React.MouseEvent) => {
+  const clampWidth = useCallback(
+    (candidate: number): number => Math.max(MIN_WIDTH_PX, Math.min(candidate, reachableMax())),
+    [reachableMax],
+  );
+
+  // A row can resize without the window changing (for example, the sidebar
+  // opens). Re-render so the separator's reachable ARIA maximum stays in sync.
+  const [, setConstraintVersion] = useState(0);
+  useEffect(() => {
+    const parent = containerRef.current?.parentElement;
+    if (!parent || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      setStoredWidth((prev) => {
+        const base = preferredWidth ?? prev;
+        return base !== null ? clampWidth(base) : prev;
+      });
+      setConstraintVersion((version) => version + 1);
+    });
+    observer.observe(parent);
+    return () => observer.disconnect();
+  }, [clampWidth]);
+
+  // Ends the drag at the last applied width (never a half-state): clears the
+  // active pointer, drops the overlay, and restores the body cursor/selection.
+  // Only a deliberate release persists; aborts (cancel, capture loss, unmount)
+  // keep the width on screen but don't write storage. Idempotent so pointerup
+  // + the lostpointercapture it triggers don't double-run.
+  const endDrag = useCallback(
+    (persist: boolean) => {
+      if (activePointerId.current === null) return;
+      activePointerId.current = null;
+      removeDocFallbacks.current?.();
+      removeDocFallbacks.current = null;
+      removeDragOverlay();
+      if (persist) persistStoredWidth();
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    },
+    [removeDragOverlay],
+  );
+
+  const onPointerDown = useCallback(
+    (e: React.PointerEvent) => {
+      // First pointer wins; only the primary button/tip starts a drag. (A pen
+      // barrel button reports pointerType "pen" with button 2, so the guard
+      // must not be mouse-only; touch and pen tip are always button 0.)
+      if (activePointerId.current !== null) return;
+      if (e.button !== 0) return;
+      // Capture BEFORE publishing any drag state: if capture throws (pointer
+      // already gone, detached node), staying fully idle avoids a stale
+      // activePointerId that a later reused pointerId could match — which
+      // would spuriously end (and persist) a drag that never started.
+      try {
+        e.currentTarget.setPointerCapture?.(e.pointerId); // jsdom lacks capture
+      } catch {
+        return;
+      }
       e.preventDefault();
-      dragging.current = true;
+      activePointerId.current = e.pointerId;
+      // Document-level fallbacks: if the browser drops capture without
+      // delivering the handle's up/cancel, the drag still ends here so the
+      // max-z overlay can never outlive it.
+      const onDocPointerUp = (ev: PointerEvent) => {
+        if (ev.pointerId === activePointerId.current) endDrag(true);
+      };
+      const onDocPointerCancel = (ev: PointerEvent) => {
+        if (ev.pointerId === activePointerId.current) endDrag(false);
+      };
+      document.addEventListener("pointerup", onDocPointerUp);
+      document.addEventListener("pointercancel", onDocPointerCancel);
+      removeDocFallbacks.current = () => {
+        document.removeEventListener("pointerup", onDocPointerUp);
+        document.removeEventListener("pointercancel", onDocPointerCancel);
+      };
       addDragOverlay();
       document.body.style.cursor = "col-resize";
       document.body.style.userSelect = "none";
     },
-    [addDragOverlay],
+    [addDragOverlay, endDrag],
+  );
+
+  const onPointerMove = useCallback(
+    (e: React.PointerEvent) => {
+      if (e.pointerId !== activePointerId.current || !containerRef.current) return;
+      const right = containerRef.current.getBoundingClientRect().right;
+      // Update the live width only; persist once on release to avoid a
+      // synchronous localStorage write per move.
+      setStoredWidth(clampWidth(right - e.clientX));
+    },
+    [clampWidth],
+  );
+
+  const onPointerUp = useCallback(
+    (e: React.PointerEvent) => {
+      if (e.pointerId !== activePointerId.current) return;
+      if (e.currentTarget.hasPointerCapture?.(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      }
+      endDrag(true);
+    },
+    [endDrag],
+  );
+
+  // pointercancel (e.g. the browser reclaims the touch) and capture loss
+  // both abort cleanly to the last applied width, without persisting it.
+  const onPointerCancel = useCallback(
+    (e: React.PointerEvent) => {
+      if (e.pointerId !== activePointerId.current) return;
+      endDrag(false);
+    },
+    [endDrag],
   );
 
   // Keyboard resize: left/right arrows widen/narrow by 20px.
@@ -165,35 +312,14 @@ export function useResizableCommentsPanel() {
     [clampWidth],
   );
 
+  // Unmount mid-drag: abort (no persist) and clean up body/overlay state.
+  useEffect(() => () => endDrag(false), [endDrag]);
+
+  // The layout flipping to mobile mid-drag unmounts the handle, so its
+  // up/cancel can never arrive — abort so the overlay doesn't outlive the drag.
   useEffect(() => {
-    function onMouseMove(e: MouseEvent) {
-      if (!dragging.current || !containerRef.current) return;
-      const right = containerRef.current.getBoundingClientRect().right;
-      // Update the live width only; persist once on release to avoid a
-      // synchronous localStorage write per mousemove.
-      setStoredWidth(clampWidth(right - e.clientX));
-    }
-    function onMouseUp() {
-      if (!dragging.current) return;
-      dragging.current = false;
-      removeDragOverlay();
-      persistStoredWidth();
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-    }
-    window.addEventListener("mousemove", onMouseMove);
-    window.addEventListener("mouseup", onMouseUp);
-    return () => {
-      window.removeEventListener("mousemove", onMouseMove);
-      window.removeEventListener("mouseup", onMouseUp);
-      if (dragging.current) {
-        dragging.current = false;
-        document.body.style.cursor = "";
-        document.body.style.userSelect = "";
-      }
-      removeDragOverlay();
-    };
-  }, [clampWidth, removeDragOverlay]);
+    if (!isDesktop) endDrag(false);
+  }, [isDesktop, endDrag]);
 
   // Re-clamp the stored width when the viewport resizes so a width chosen on
   // a wider layout doesn't crowd out the viewer after the window shrinks.
@@ -217,14 +343,33 @@ export function useResizableCommentsPanel() {
     containerRef,
     /** Whether the resize handle should render (desktop only). */
     isDesktop,
-    /** Props to spread onto the resize handle element. */
+    /**
+     * Props to spread onto the divider-gutter handle. Render it as the
+     * panel's PRECEDING SIBLING in the split row (a `w-1 shrink-0` flex
+     * child), never inside either scroll container — the pads would be
+     * clipped and would steal the neighbors' pointer streams.
+     */
     handleProps: {
-      onMouseDown,
+      onPointerDown,
+      onPointerMove,
+      onPointerUp,
+      onPointerCancel,
+      onLostPointerCapture: onPointerCancel,
       onKeyDown,
       role: "separator" as const,
       "aria-orientation": "vertical" as const,
       "aria-label": "Resize comments panel",
+      "aria-valuenow": width,
+      "aria-valuemin": MIN_WIDTH_PX,
+      "aria-valuemax": reachableMax(),
       tabIndex: 0,
+      // The gutter owns its touches outright (no scroll/selection may start
+      // from it). With content-box sizing the `w-1` class is the painted
+      // strip; padding centers it in the gutter and adds the overhang
+      // slivers, whose footprint the negative margins cancel — so the
+      // element occupies exactly the gutter width and the hover/active
+      // background (content-box clipped) never widens visually.
+      style: gutterStyle(coarsePrimary),
     },
   };
 }

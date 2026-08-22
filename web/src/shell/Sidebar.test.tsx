@@ -217,10 +217,13 @@ function renderSidebar(
   open = true,
   initialEntry = "/",
   onOpenSearch?: () => void,
-  info?: ServerInfo,
+  infoOrPeek?: ServerInfo | boolean,
+  explicitPeek = false,
 ) {
+  const info = typeof infoOrPeek === "boolean" ? undefined : infoOrPeek;
+  const peek = typeof infoOrPeek === "boolean" ? infoOrPeek : explicitPeek;
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  const sidebar = <Sidebar open={open} onClose={vi.fn()} onOpenSearch={onOpenSearch} />;
+  const sidebar = <Sidebar open={open} peek={peek} onClose={vi.fn()} onOpenSearch={onOpenSearch} />;
   return render(
     <QueryClientProvider client={qc}>
       <TooltipProvider>
@@ -262,7 +265,33 @@ function closeProjectsMenu() {
   fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
 }
 
+// Evaluate min-/max-width media queries against a simulated viewport width,
+// so each test runs at an explicit real-browser width instead of inheriting
+// the global test-setup mock (which answers false to every query).
+function stubViewportWidth(width: number) {
+  Object.defineProperty(window, "matchMedia", {
+    writable: true,
+    configurable: true,
+    value: (query: string) => ({
+      matches: (() => {
+        const min = query.match(/^\(min-width: ([\d.]+)px\)$/);
+        if (min) return width >= parseFloat(min[1]);
+        const max = query.match(/^\(max-width: ([\d.]+)px\)$/);
+        if (max) return width <= parseFloat(max[1]);
+        return false;
+      })(),
+      media: query,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    }),
+  });
+}
+
 beforeEach(() => {
+  // Default to a desktop width: these suites assert hover affordances
+  // (session tooltips, project flyouts) that are gated off on mobile. Tests
+  // that need a mobile width re-pin it themselves.
+  stubViewportWidth(1280);
   useConvMock.mockReset();
   useHostsMock.mockReset();
   useHostsMock.mockReturnValue({ data: [] });
@@ -286,6 +315,72 @@ function seedPins(ids: string[]) {
   pinnedIdsRef.current = ids;
 }
 afterEach(cleanup);
+
+describe("Sidebar resize handle geometry", () => {
+  it("positions the seam handle outside flex layout and the clipped content", () => {
+    mockConversations([]);
+    renderSidebar();
+
+    const sidebar = screen.getByLabelText("Conversations");
+    const handle = screen.getByTestId("sidebar-resize-handle");
+    const clippedContent = screen.getByTestId("sidebar-clipped-content");
+
+    expect(handle.parentElement).toBe(sidebar);
+    expect(clippedContent.parentElement).toBe(sidebar);
+    expect(sidebar).toHaveClass("md:flex-row");
+    expect(sidebar).not.toHaveClass("md:overflow-hidden");
+    expect(clippedContent).toHaveClass("md:overflow-hidden");
+    expect(handle).toHaveClass("md:absolute", "md:inset-y-0", "md:right-0");
+    expect(handle).not.toHaveClass("shrink-0", "md:order-2");
+    expect(clippedContent).not.toHaveClass("md:order-1");
+  });
+
+  it("caps transcript annexation at 10px without reserving flex space", () => {
+    mockConversations([conv("edge-session", "Claude Code")]);
+    renderSidebar();
+
+    const handle = screen.getByTestId("sidebar-resize-handle");
+    expect(handle.style.paddingInlineStart).toBe("9px");
+    expect(handle.style.paddingInlineEnd).toBe("11px");
+    expect(handle.style.marginInlineStart).toBe("-8px");
+    expect(handle.style.marginInlineEnd).toBe("-10px");
+    expect(handle).toHaveClass("md:absolute");
+    expect(Math.abs(Number.parseInt(handle.style.marginInlineEnd, 10))).toBeLessThanOrEqual(10);
+    expect(screen.getByText("edge-session")).not.toBe(handle);
+  });
+
+  it("keeps the painted separator strip unchanged", () => {
+    mockConversations([]);
+    renderSidebar();
+
+    const handle = screen.getByTestId("sidebar-resize-handle");
+    expect(handle).toHaveClass(
+      "z-10",
+      "hidden",
+      "w-1",
+      "cursor-col-resize",
+      "transition-colors",
+      "hover:bg-primary/30",
+      "active:bg-primary/50",
+      "md:absolute",
+      "md:inset-y-0",
+      "md:right-0",
+      "md:block",
+    );
+    expect(handle).not.toHaveClass("absolute", "inset-y-0", "right-0");
+    expect(handle.style.width).toBe("");
+    expect(handle.style.backgroundClip).toBe("content-box");
+  });
+
+  it("restores desktop overflow clipping for the rounded peek card", () => {
+    mockConversations([]);
+    renderSidebar(false, "/", undefined, true);
+
+    const sidebar = screen.getByLabelText("Conversations");
+    expect(sidebar).toHaveClass("is-peek", "rounded-xl", "md:overflow-hidden");
+    expect(screen.queryByTestId("sidebar-resize-handle")).toBeNull();
+  });
+});
 
 describe("Sidebar session list", () => {
   it("uses the interface text token for the empty session-list state", () => {
@@ -1412,9 +1507,10 @@ describe("Sidebar project sections", () => {
   });
 
   it("closes the mobile overlay when the project pencil is tapped", () => {
-    // jsdom's matchMedia mock reports non-desktop, so isMobileViewport() is
-    // true: a plain pencil tap must close the full-screen sidebar overlay,
-    // otherwise the pre-filed new-session page is left hidden behind it.
+    // At a phone width isMobileViewport() is true: a plain pencil tap must
+    // close the full-screen sidebar overlay, otherwise the pre-filed
+    // new-session page is left hidden behind it.
+    stubViewportWidth(375);
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),

@@ -148,6 +148,35 @@ describe("Composer growth layout", () => {
   });
 });
 
+// Evaluate min-/max-width media queries against a simulated viewport width,
+// so each test runs at an explicit real-browser width instead of inheriting
+// the global test-setup mock (which answers false to every query).
+function stubViewportWidth(width: number) {
+  Object.defineProperty(window, "matchMedia", {
+    writable: true,
+    configurable: true,
+    value: (query: string) => ({
+      matches: (() => {
+        const min = query.match(/^\(min-width: ([\d.]+)px\)$/);
+        if (min) return width >= parseFloat(min[1]);
+        const max = query.match(/^\(max-width: ([\d.]+)px\)$/);
+        if (max) return width <= parseFloat(max[1]);
+        return false;
+      })(),
+      media: query,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    }),
+  });
+}
+
+// These suites assert desktop composer behavior (mount autofocus,
+// Enter-sends, hover affordances); tests that need a mobile width re-pin it
+// themselves.
+beforeEach(() => {
+  stubViewportWidth(1280);
+});
+
 describe("Composer Claude goal control", () => {
   afterEach(() => {
     cleanup();
@@ -1556,6 +1585,15 @@ describe("Composer reply-quote focus", () => {
       />,
     );
     expect(document.activeElement).toBe(ta);
+  });
+
+  // The mobile boundary is the canonical layout predicate (not provably at
+  // md+), not the historical bespoke 767px — 767.5px sits between the two,
+  // so this test pins the migrated boundary: suppression must apply there.
+  it("suppresses mount autofocus at 767.5px (below the canonical md boundary)", () => {
+    stubViewportWidth(767.5);
+    render(<Composer {...composerProps()} />);
+    expect(document.activeElement).not.toBe(textarea());
   });
 
   it("does not steal focus when a quote is removed", () => {
