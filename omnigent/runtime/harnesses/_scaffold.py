@@ -129,6 +129,13 @@ _TURN_IDLE_TIMEOUT_S = float(os.environ.get("HARNESS_TURN_TIMEOUT_S", "600"))
 # long turn. ``<= 0`` disables. Whichever of (idle, absolute) trips first.
 _TURN_ABSOLUTE_TIMEOUT_S = float(os.environ.get("HARNESS_TURN_ABSOLUTE_TIMEOUT_S", "3600"))
 
+# Human approval / elicitation waits are real progress blockers, not wedged
+# model/tool silence. While explicitly parked, extend the idle watchdog to the
+# absolute ceiling by default; the absolute watchdog remains the hard total cap.
+_TURN_AWAITING_HUMAN_TIMEOUT_S = float(
+    os.environ.get("HARNESS_TURN_AWAITING_HUMAN_TIMEOUT_S", str(_TURN_ABSOLUTE_TIMEOUT_S))
+)
+
 
 @dataclass(frozen=True)
 class PolicyVerdictPayload:
@@ -461,6 +468,24 @@ class TurnContext:
             self._reset_idle_watchdog()
         self._event_queue.put_nowait(event)
 
+    def _idle_watchdog_delay(self) -> float:
+        """
+        Return the idle-watchdog window appropriate for this turn state.
+
+        Normal turns use :data:`_TURN_IDLE_TIMEOUT_S`; turns explicitly
+        awaiting a human approval/elicitation use the longer
+        :data:`_TURN_AWAITING_HUMAN_TIMEOUT_S` so an unanswered approval
+        prompt does not look like a wedged model/tool call.
+        """
+        if self._pending_elicitations or self._pending_policy_evaluations:
+            return _TURN_AWAITING_HUMAN_TIMEOUT_S
+        return _TURN_IDLE_TIMEOUT_S
+
+    def _refresh_idle_watchdog(self) -> None:
+        """Reschedule the idle watchdog for the current wait state."""
+        if self._reset_idle_watchdog is not None:
+            self._reset_idle_watchdog()
+
     async def dispatch_tool(self, call_id: str, name: str, arguments: str, agent: str) -> str:
         """
         Emit a server-dispatched tool call and park until the result.
@@ -551,6 +576,7 @@ class TurnContext:
         """
         future: asyncio.Future[ElicitationResult] = asyncio.get_running_loop().create_future()
         self._pending_elicitations[elicitation_id] = future
+        self._refresh_idle_watchdog()
         self.emit(
             ElicitationRequestEvent(
                 type="response.elicitation_request",
@@ -562,6 +588,7 @@ class TurnContext:
             return await future
         finally:
             self._pending_elicitations.pop(elicitation_id, None)
+            self._refresh_idle_watchdog()
 
     async def next_injection(self, timeout: float | None = None) -> CreateResponseRequest | None:
         """
@@ -648,6 +675,7 @@ class TurnContext:
         """
         future: asyncio.Future[PolicyVerdictPayload] = asyncio.get_running_loop().create_future()
         self._pending_policy_evaluations[evaluation_id] = future
+        self._refresh_idle_watchdog()
         self.emit(
             PolicyEvaluationRequestEvent(
                 type="policy_evaluation.requested",
@@ -681,6 +709,7 @@ class TurnContext:
             )
         finally:
             self._pending_policy_evaluations.pop(evaluation_id, None)
+            self._refresh_idle_watchdog()
 
     def _complete_policy_evaluation(
         self, evaluation_id: str, verdict: PolicyVerdictPayload
@@ -1500,11 +1529,15 @@ class HarnessApp:
             loop = asyncio.get_running_loop()
 
             def _reset() -> None:
-                # Push ONLY the idle deadline ``idle_timeout`` s past now
+                # Push ONLY the idle deadline for the current turn state past now
                 # (the absolute ceiling is never rescheduled). Called from
                 # ``ctx.emit`` during ``run_turn`` (inside the active
                 # context), so the reschedule is always valid.
-                idle_wd.reschedule(loop.time() + idle_timeout)
+                delay = ctx._idle_watchdog_delay()
+                if delay > 0:
+                    idle_wd.reschedule(loop.time() + delay)
+                else:
+                    idle_wd.reschedule(None)
 
             ctx._reset_idle_watchdog = _reset
         try:
@@ -1514,6 +1547,12 @@ class HarnessApp:
                 await self.run_turn(request, ctx)
         except TimeoutError as exc:
             if idle_wd.expired():
+                if ctx._pending_elicitations or ctx._pending_policy_evaluations:
+                    raise RuntimeError(
+                        "turn exceeded the "
+                        f"{_TURN_AWAITING_HUMAN_TIMEOUT_S:.0f}s awaiting-human watchdog "
+                        "(pending human approval/elicitation did not resolve)"
+                    ) from exc
                 _logger.warning(
                     "run_turn for %s made no progress for %.0fs (idle turn watchdog); "
                     "marking the turn failed",

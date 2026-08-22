@@ -320,6 +320,15 @@ def use_elicitation(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
+def use_elicitation_short_watchdog(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Spawn the elicitation harness with a 2s idle watchdog."""
+    monkeypatch.setenv("HARNESS_TEST_FIXTURE", "elicitation")
+    monkeypatch.setenv("HARNESS_TURN_TIMEOUT_S", "2")
+    monkeypatch.setenv("HARNESS_TURN_AWAITING_HUMAN_TIMEOUT_S", "10")
+    monkeypatch.setenv("HARNESS_TURN_ABSOLUTE_TIMEOUT_S", "10")
+
+
+@pytest.fixture
 def use_cancellable(monkeypatch: pytest.MonkeyPatch) -> None:
     """Spawn the cancellable fixture harness for this test."""
     monkeypatch.setenv("HARNESS_TEST_FIXTURE", "cancellable")
@@ -1316,6 +1325,59 @@ async def test_session_approval_event_resolves_elicitation(
         text_deltas = [e for e in events if e.event == "response.output_text.delta"]
         assert len(text_deltas) == 1
         assert text_deltas[0].data["delta"] == "action:accept"
+    finally:
+        await side_client.aclose()
+
+
+async def test_pending_elicitation_outlives_idle_watchdog(
+    use_elicitation_short_watchdog: None,
+    manager: HarnessProcessManager,
+) -> None:
+    """
+    A turn parked on human approval must not trip the normal idle watchdog.
+
+    The harness emits ``response.elicitation_request`` and then waits on the
+    approval Future. The test intentionally leaves that Future pending longer
+    than ``HARNESS_TURN_TIMEOUT_S`` (2s) before resolving it. A regression
+    ends the stream with ``response.failed`` before the approval can land.
+    """
+    conv_id = "conv_session_elicit_idle_watchdog"
+    stream_client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    side_client = _make_side_client(str(manager.socket_path(conv_id)))
+    events: list[_ParsedSSEEvent] = []
+    start_body = {
+        "type": "message",
+        "role": "user",
+        "model": "test-agent",
+        "content": [],
+    }
+    try:
+        async with asyncio.timeout(20):
+            async with stream_client.stream(
+                "POST",
+                f"/v1/sessions/{conv_id}/events",
+                json=start_body,
+            ) as response:
+                replied = False
+                async for event in _stream_iter(response):
+                    events.append(event)
+                    if not replied and event.event == "response.elicitation_request":
+                        await asyncio.sleep(2.5)
+                        reply = await side_client.post(
+                            f"/v1/sessions/{conv_id}/events",
+                            json={
+                                "type": "approval",
+                                "elicitation_id": "elicit_test_1",
+                                "action": "accept",
+                            },
+                        )
+                        assert reply.status_code == 204
+                        replied = True
+        event_types = [event.event for event in events]
+        assert event_types[-1] == "response.completed", event_types
+        assert "response.failed" not in event_types
+        text_deltas = [e for e in events if e.event == "response.output_text.delta"]
+        assert text_deltas[-1].data["delta"] == "action:accept"
     finally:
         await side_client.aclose()
 
