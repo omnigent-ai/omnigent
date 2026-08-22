@@ -1572,6 +1572,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         lexicographically (zero-padded ``"YYYY-MM-DD"``), so the range is
         a plain ``>=`` on the string column; ``SUM`` returns ``NULL`` for
         an empty range, coalesced to ``0.0``.
+
+        Filters to daily rows only (``LENGTH(day_utc) = 10``) to exclude
+        period rollup rows (week/month/quarter/year) stored in the same table.
         """
         with self._session("sum_daily_cost") as session:
             total = session.execute(
@@ -1579,16 +1582,24 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .where(SqlUserDailyCost.workspace_id == current_workspace_id())
                 .where(SqlUserDailyCost.user_id == user_id)
                 .where(SqlUserDailyCost.day_utc >= since_day_utc)
+                .where(func.length(SqlUserDailyCost.day_utc) == 10)
             ).scalar_one()
             return float(total or 0.0)
 
     def list_daily_costs(self, user_id: str, since_day_utc: str) -> list[tuple[str, float]]:
+        """
+        List a user's per-day LLM spend for all days ``>= since_day_utc``.
+
+        Filters to daily rows only (``LENGTH(day_utc) = 10``) to exclude
+        period rollup rows (week/month/quarter/year) stored in the same table.
+        """
         with self._session("list_daily_costs") as session:
             rows = session.execute(
                 select(SqlUserDailyCost.day_utc, SqlUserDailyCost.cost_usd)
                 .where(SqlUserDailyCost.workspace_id == current_workspace_id())
                 .where(SqlUserDailyCost.user_id == user_id)
                 .where(SqlUserDailyCost.day_utc >= since_day_utc)
+                .where(func.length(SqlUserDailyCost.day_utc) == 10)
                 .order_by(SqlUserDailyCost.day_utc.asc())
             ).all()
             return [(row.day_utc, float(row.cost_usd)) for row in rows]

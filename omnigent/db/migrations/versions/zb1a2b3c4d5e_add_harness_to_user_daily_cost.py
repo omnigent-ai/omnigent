@@ -1,7 +1,7 @@
 """add harness column to user_daily_cost
 
 Revision ID: zb1a2b3c4d5e
-Revises: za2b3c4d5e6f
+Revises: za1b2c3d4e5f
 Create Date: 2026-08-21 00:00:00.000000
 
 Extends ``user_daily_cost`` to support both daily and other period granularities
