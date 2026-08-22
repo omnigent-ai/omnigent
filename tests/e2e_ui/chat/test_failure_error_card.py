@@ -79,6 +79,86 @@ def _seed_error_item(session_id: str, *, code: str, message: str) -> None:
     )
 
 
+def _seed_disconnect_failure(session_id: str, *, code: str, message: str) -> None:
+    """Seed a session as ``failed`` with a persisted ``last_task_error``.
+
+    Reproduces the durable shape a runner disconnect leaves behind: the
+    snapshot reads ``status="failed"`` from ``live_status`` and synthesizes
+    the error card from the ``last_task_error`` labels (no committed error
+    item, exactly as the relay's ``_publish_status`` + label persistence
+    does). A later live status edge is what should clear it.
+
+    :param session_id: Session to mark, e.g. ``"conv_abc123"``.
+    :param code: Failure classifier, e.g. ``"runner_disconnected"``.
+    :param message: Human-readable failure message stored alongside the code.
+    :raises RuntimeError: If the server under test isn't one we spawned.
+    """
+    from omnigent.server.routes._sessions.common import (
+        _LAST_TASK_ERROR_CODE_LABEL_KEY,
+        _LAST_TASK_ERROR_MESSAGE_LABEL_KEY,
+    )
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+
+    database_uri = _server_state.get("database_uri")
+    if not database_uri:
+        raise RuntimeError(
+            "seeding a disconnect failure needs the spawned server's database; "
+            "it is unavailable when running against --ui-base-url."
+        )
+    store = SqlAlchemyConversationStore(str(database_uri))
+    store.set_labels(
+        session_id,
+        {
+            _LAST_TASK_ERROR_CODE_LABEL_KEY: code,
+            _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: message,
+        },
+    )
+    store.set_session_live_status(session_id, "failed")
+
+
+def test_runner_disconnect_card_clears_when_the_runner_reports_a_live_status(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A ``runner_disconnected`` card disappears once the runner is live again.
+
+    A server that closed a runner tunnel on its way down (a deploy) lit a
+    "connection to the host dropped" card; the runner never died and its
+    next status edge on reconnect proves it is reachable. The card is an
+    observation, not a turn result, so a live (non-``failed``) status edge
+    must remove it — and the server clears the persisted ``last_task_error``
+    on the same ``running`` edge, so it does not come back on refetch.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` from the local server.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    _seed_disconnect_failure(
+        session_id,
+        code="runner_disconnected",
+        message="Runner disconnected unexpectedly.",
+    )
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    # The durable failure synthesizes the disconnect card on hydration.
+    pill = page.get_by_test_id("error-pill")
+    expect(pill).to_contain_text("The connection to the host dropped unexpectedly", timeout=15_000)
+
+    # The runner reconnects and reports a live turn: the card must clear,
+    # and stay cleared after the snapshot refetch the edge triggers (the
+    # server drops the last_task_error labels on the same running edge).
+    _publish_native_status(base_url, session_id, "running", response_id="codex_turn_recover")
+    expect(pill).to_have_count(0, timeout=15_000)
+    # Give the invalidation-driven snapshot refetch time to land; it must
+    # not resurrect the card from stale labels.
+    page.wait_for_timeout(1_000)
+    expect(pill).to_have_count(0)
+
+
 def test_unclassified_failure_renders_english_headline_not_raw_code(
     page: Page,
     seeded_session: tuple[str, str],
