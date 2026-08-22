@@ -5419,6 +5419,16 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
             } satisfies ErrorBlock,
           ];
         }
+        // A `runner_disconnected` card is an observation ("can't reach the
+        // runner"), not a turn result: any live status edge from the runner
+        // proves it is reachable again, so the stale card goes.
+        if (event.status !== "failed") {
+          const current = patch.blocks ?? s.blocks;
+          const reachable = current.filter(
+            (b) => !(b.type === "error" && b.code === "runner_disconnected"),
+          );
+          if (reachable.length !== current.length) patch.blocks = reachable;
+        }
         return patch;
       });
       // Refetch the snapshot at turn START too: the runner persists
