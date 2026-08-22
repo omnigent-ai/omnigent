@@ -2,6 +2,7 @@ import {
   type DragEvent,
   type FormEvent,
   type KeyboardEvent,
+  type ReactNode,
   createContext,
   memo,
   useCallback,
@@ -224,6 +225,19 @@ import { GoalControl, GoalStatusPill, useGoalState, type Goal } from "@/componen
 import { copyText } from "@/lib/clipboard";
 import { showToast } from "@/components/ui/toast";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+
+export function TerminalSurface({ isShown, children }: { isShown: boolean; children?: ReactNode }) {
+  return (
+    <div
+      className={cn("absolute inset-0 flex flex-col", !isShown && "pointer-events-none opacity-0")}
+      aria-hidden={!isShown}
+      // React 18 drops a boolean `inert`, so the attribute is forced through as an empty string.
+      inert={!isShown ? ("" as unknown as boolean) : undefined}
+    >
+      {children}
+    </div>
+  );
+}
 
 // Matches both wordings the native executors emit: "[Attached: <path>]"
 // (claude/pi/cursor) and "[Attached file: <path>]" (codex). Capturing group
@@ -2040,10 +2054,9 @@ function MainAgentSurface({
   // + full repaint) pre-warms in the background and survives both
   // Chat/Terminal flips AND session switches: a small LRU keeps the last
   // few sessions' surfaces alive after navigating away, so coming back is
-  // near-instant instead of re-dialing from scratch. `invisible` (not
-  // display:none) keeps a hidden overlay's layout size, so FitAddon
-  // geometry stays correct and no resize churn hits tmux; hidden elements
-  // don't paint, hit-test, or take focus. The chat surface still unmounts
+  // near-instant instead of re-dialing from scratch. Opacity keeps hidden
+  // overlays laid out for stable FitAddon geometry; inert prevents interaction.
+  // The chat surface still unmounts
   // while the terminal is shown — a heavy transcript shouldn't render
   // behind a live terminal.
   const mountTerminal = shouldMountTerminalSurface(conversationId, terminalFirst);
@@ -2068,11 +2081,7 @@ function MainAgentSurface({
     const isActive = mountTerminal && entry.conversationId === conversationId;
     const isShown = isActive && showTerminal;
     return (
-      <div
-        key={entry.conversationId}
-        className={cn("absolute inset-0 flex flex-col", !isShown && "invisible")}
-        aria-hidden={!isShown}
-      >
+      <TerminalSurface key={entry.conversationId} isShown={isShown}>
         <MainTerminalView
           conversationId={entry.conversationId}
           initialTerminalKey={isActive ? terminalFirst?.terminalViewKey : null}
@@ -2087,7 +2096,7 @@ function MainAgentSurface({
             surfaceFrontmost={surfaceFrontmost}
           />
         )}
-      </div>
+      </TerminalSurface>
     );
   });
 
