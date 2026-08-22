@@ -19,10 +19,10 @@ class SysSessionRenameTool(Tool):
     def description(cls) -> str:
         """Return the LLM-facing description."""
         return (
-            "Rename the current top-level session with a short summary-style title "
+            "Rename the current session with a short summary-style title "
             "(3-6 words, action-first). Strip filler and keep the noun plus verb. "
             "Never copy a conversational question or greeting verbatim. "
-            "The rename is ignored if the session title changed concurrently."
+            "The rename is silent and can be updated again as the work evolves."
         )
 
     def get_schema(self) -> dict[str, Any]:
