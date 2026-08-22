@@ -287,3 +287,88 @@ def compute_llm_cost(usage: dict[str, Any], pricing: ModelPricing) -> float:
         + cache_read * cache_read_rate
         + cache_write * cache_write_rate
     )
+
+
+def fetch_model_pricing_with_provider(
+    model: str,
+    provider_config: dict[str, Any] | None = None,
+    harness: str | None = None,
+) -> ModelPricing | None:
+    """
+    Fetch model pricing, checking provider config before the catalog.
+
+    Resolution order:
+    1. Provider config custom pricing (for self-hosted models)
+    2. MLflow catalog via :func:`fetch_model_pricing` (for known models)
+    3. ``None`` (unpriced)
+
+    This enables cost tracking for self-hosted models (Ollama, vLLM, custom
+    gateways) that aren't in the MLflow catalog. Users configure pricing in
+    their ``~/.omnigent/config.yaml`` provider definition, and this function
+    extracts and converts it (per-million → per-token).
+
+    Example provider config::
+
+        providers:
+          ollama-local:
+            kind: local
+            openai:
+              base_url: http://localhost:11434/v1
+              api_key: ollama
+              pricing:
+                input_per_million: 0.0
+                output_per_million: 0.0
+
+    :param model: Model identifier, e.g. ``"llama3.2:latest"`` or
+        ``"anthropic/claude-sonnet-4-6"``.
+    :param provider_config: Parsed provider config from
+        :func:`~omnigent.onboarding.provider_config.load_config`. When
+        ``None``, skips provider lookup and falls through to catalog.
+    :param harness: Harness name to determine which provider family to check,
+        e.g. ``"claude-sdk"`` or ``"codex"``. When ``None``, skips provider
+        lookup and falls through to catalog.
+    :returns: A :class:`ModelPricing` (per-token rates), or ``None`` when
+        pricing is unavailable.
+    """
+    # Step 1: Check provider config custom pricing
+    if provider_config is not None and harness is not None:
+        # Lazy import to avoid circular dependency. provider_config imports
+        # this module at top level, so we import it only when needed here.
+        from omnigent.onboarding.provider_config import (
+            default_provider_for_harness,
+            load_providers,
+        )
+
+        try:
+            provider = default_provider_for_harness(provider_config, harness)
+            if provider is not None:
+                # Determine which family (anthropic/openai) this harness uses
+                from omnigent.onboarding.provider_config import provider_family_for_harness
+
+                family_name = provider_family_for_harness(harness)
+                if family_name is not None:
+                    # Get the family config with custom pricing (if any)
+                    family = provider.family(family_name)
+                    if family is not None and family.pricing is not None:
+                        # Convert per-million prices to per-token
+                        return ModelPricing(
+                            input_per_token=family.pricing.input_per_million / 1_000_000,
+                            output_per_token=family.pricing.output_per_million / 1_000_000,
+                            cache_read_per_token=(
+                                family.pricing.cache_read_per_million / 1_000_000
+                                if family.pricing.cache_read_per_million is not None
+                                else None
+                            ),
+                            cache_write_per_token=(
+                                family.pricing.cache_write_per_million / 1_000_000
+                                if family.pricing.cache_write_per_million is not None
+                                else None
+                            ),
+                        )
+        except Exception:
+            # If provider lookup fails (e.g., malformed config, import error),
+            # fall through to catalog rather than breaking cost tracking entirely.
+            pass
+
+    # Step 2: Fall back to catalog (existing behavior)
+    return fetch_model_pricing(model)
