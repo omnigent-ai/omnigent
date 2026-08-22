@@ -9,8 +9,9 @@ import logging
 import os
 import queue
 import threading
+import time
 from collections.abc import Callable, Generator, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -5279,6 +5280,406 @@ async def test_subagent_watcher_retry_skips_previously_posted_items(
         "sa-user-retry:0:message",
         "sa-assistant-retry:0:message",
     }
+
+
+def _seed_subagent_state(
+    *,
+    subagent_id: str,
+    child_conversation_id: str,
+    seconds_since_activity: float,
+) -> forwarder.SubagentForwardState:
+    """
+    Build a single-entry sub-agent cursor map with a chosen amount of quiet.
+
+    :param subagent_id: Claude-side sub-agent id, e.g. ``"quiesce1"``.
+    :param child_conversation_id: Minted Omnigent child id, e.g.
+        ``"conv_child_502"``.
+    :param seconds_since_activity: Age of the entry's last observed item. Past
+        ``_SUBAGENT_IDLE_QUIESCENCE_S`` the next tick's quiescence heuristic
+        wants to publish a terminal edge.
+    :returns: State holding one ``running`` entry.
+    """
+    return forwarder.SubagentForwardState(
+        subagents={
+            subagent_id: forwarder.SubagentEntry(
+                subagent_id=subagent_id,
+                child_conversation_id=child_conversation_id,
+                last_activity_ts=time.time() - seconds_since_activity,
+                last_status="running",
+            )
+        }
+    )
+
+
+def _quiesce_subagent_state(
+    state: forwarder.SubagentForwardState,
+) -> forwarder.SubagentForwardState:
+    """
+    Push every entry's last-activity stamp past the quiescence window.
+
+    :param state: Cursor map returned by a previous watcher tick.
+    :returns: A copy whose entries read as quiet to the next tick.
+    """
+    quiet_since = time.time() - (forwarder._SUBAGENT_IDLE_QUIESCENCE_S + 60.0)
+    return forwarder.SubagentForwardState(
+        subagents={
+            subagent_id: replace(entry, last_activity_ts=quiet_since)
+            for subagent_id, entry in state.subagents.items()
+        }
+    )
+
+
+async def _tick_subagents(
+    client: httpx.AsyncClient,
+    *,
+    bridge_dir: Path,
+    transcript_path: Path,
+    state: forwarder.SubagentForwardState,
+    item_retry_tracker: forwarder._PostRetryTracker,
+) -> forwarder.SubagentForwardState:
+    """
+    Run one sub-agent watcher poll with throwaway start/status trackers.
+
+    :param client: Mock-transport Omnigent client.
+    :param bridge_dir: Native Claude bridge directory.
+    :param transcript_path: Parent transcript the watcher scans beside.
+    :param state: Cursor map from the previous tick.
+    :param item_retry_tracker: Carried across ticks so item failures accumulate
+        toward the permanent-drop budget.
+    :returns: The updated cursor map.
+    """
+    return await forwarder._forward_available_subagents(
+        client=client,
+        parent_session_id="conv_parent",
+        bridge_dir=bridge_dir,
+        transcript_path=transcript_path,
+        state=state,
+        agent_name="claude-native-ui",
+        start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        item_retry_tracker=item_retry_tracker,
+        status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+    )
+
+
+def _assistant_record(uuid: str, text: str) -> dict[str, Any]:
+    """
+    Build one sidechain assistant row for a sub-agent transcript.
+
+    :param uuid: Row uuid, which the parser turns into the item source id.
+    :param text: Assistant message text.
+    :returns: A decoded transcript record.
+    """
+    return {
+        "isSidechain": True,
+        "type": "assistant",
+        "uuid": uuid,
+        "message": {"role": "assistant", "content": [{"type": "text", "text": text}]},
+    }
+
+
+async def test_subagent_watcher_publishes_idle_for_a_healthy_quiet_child(
+    tmp_path: Path,
+) -> None:
+    """
+    A child whose items all landed still gets its ``idle`` edge once it is quiet.
+
+    Sub-agent transcripts carry no "done" record, so this quiescence edge is the
+    only thing that ends the parent's wait. The failure gating added around it
+    must not cost a healthy child its completion — without this the whole edge
+    could be disabled and every other sub-agent test would still pass.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="healthy1",
+        agent_type="Explore",
+        description="clean run",
+        tool_use_id="toolu_ok",
+        transcript_records=[_assistant_record("sa-assistant-ok", "the answer")],
+    )
+    state = _seed_subagent_state(
+        subagent_id="healthy1",
+        child_conversation_id="conv_child_ok",
+        seconds_since_activity=0.0,
+    )
+    statuses: list[tuple[str, dict[str, Any]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """
+        Accept every POST, recording status edges.
+
+        :param request: Request issued by the forwarder.
+        :returns: Canned Omnigent response.
+        """
+        body = json.loads(request.content.decode("utf-8"))
+        if body.get("type") == "external_session_status":
+            statuses.append((request.url.path, body["data"]))
+        return httpx.Response(202, json={})
+
+    item_retry_tracker = forwarder._PostRetryTracker(base_delay_s=0.0)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        state = await _tick_subagents(
+            client,
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=state,
+            item_retry_tracker=item_retry_tracker,
+        )
+        state = await _tick_subagents(
+            client,
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=_quiesce_subagent_state(state),
+            item_retry_tracker=item_retry_tracker,
+        )
+
+    assert ("/v1/sessions/conv_child_ok/events", {"status": "idle"}) in statuses, (
+        f"a healthy quiet child was never reported idle; posted={statuses}"
+    )
+
+
+async def test_subagent_watcher_holds_idle_while_child_items_are_failing(
+    tmp_path: Path,
+) -> None:
+    """
+    A 502 on a child item must not let quiescence report the child idle.
+
+    Item POSTs are retried across polls, so a child that has gone quiet only
+    because its POSTs are failing is not quiescent. Publishing ``idle`` anyway
+    is silent data loss: the edge carries no ``output`` (nothing persisted),
+    the runner turns a bare idle into a *completed* handle with empty output,
+    and the parent reads "produced no output" instead of an error.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="quiesce1",
+        agent_type="Explore",
+        description="502 under fan-out",
+        tool_use_id="toolu_502",
+        transcript_records=[_assistant_record("sa-assistant-502", "the answer")],
+    )
+    state = _seed_subagent_state(
+        subagent_id="quiesce1",
+        child_conversation_id="conv_child_502",
+        seconds_since_activity=forwarder._SUBAGENT_IDLE_QUIESCENCE_S + 60.0,
+    )
+    statuses: list[tuple[str, dict[str, Any]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """
+        Return a bad-gateway for every item POST, accepting everything else.
+
+        :param request: Request issued by the forwarder.
+        :returns: Canned Omnigent response.
+        """
+        body = json.loads(request.content.decode("utf-8"))
+        if body.get("type") == "external_conversation_item":
+            return httpx.Response(502, text="bad gateway")
+        if body.get("type") == "external_session_status":
+            statuses.append((request.url.path, body["data"]))
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        await _tick_subagents(
+            client,
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=state,
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    assert [data["status"] for _, data in statuses] == [], (
+        "a child whose item POSTs are still failing must not be reported idle"
+    )
+
+
+async def test_subagent_watcher_defers_failed_for_a_dropped_item_to_quiescence(
+    tmp_path: Path,
+) -> None:
+    """
+    A dropped child item turns that child's next quiescence edge into ``failed``.
+
+    The watcher drops a permanently-rejected item rather than block the
+    sub-agent forever, so the child's mirrored transcript is now short of what
+    it produced and its ``idle`` would reach the parent as a successful empty
+    completion. The edge is deferred to quiescence rather than fired at the
+    drop because ``failed`` is terminal for a sub-agent: firing it immediately
+    would abort a child that is still working.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="poison1",
+        agent_type="Explore",
+        description="rejected item",
+        tool_use_id="toolu_poison",
+        transcript_records=[_assistant_record("sa-assistant-poison", "the answer")],
+    )
+    state = _seed_subagent_state(
+        subagent_id="poison1",
+        child_conversation_id="conv_child_poison",
+        seconds_since_activity=0.0,
+    )
+    statuses: list[tuple[str, dict[str, Any]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """
+        Permanently reject every item POST, accepting everything else.
+
+        :param request: Request issued by the forwarder.
+        :returns: Canned Omnigent response.
+        """
+        body = json.loads(request.content.decode("utf-8"))
+        if body.get("type") == "external_conversation_item":
+            return httpx.Response(400, json={"error": "rejected"})
+        if body.get("type") == "external_session_status":
+            statuses.append((request.url.path, body["data"]))
+        return httpx.Response(202, json={})
+
+    item_retry_tracker = forwarder._PostRetryTracker(base_delay_s=0.0)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        for _ in range(forwarder._HTTP_POST_MAX_PERMANENT_FAILURES):
+            state = await _tick_subagents(
+                client,
+                bridge_dir=bridge_dir,
+                transcript_path=transcript_path,
+                state=state,
+                item_retry_tracker=item_retry_tracker,
+            )
+        assert state.subagents["poison1"].dropped_item is True
+        assert statuses == [], f"a still-working child was aborted at the drop; {statuses}"
+        state = await _tick_subagents(
+            client,
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=_quiesce_subagent_state(state),
+            item_retry_tracker=item_retry_tracker,
+        )
+
+    assert [(path, data["status"]) for path, data in statuses] == [
+        ("/v1/sessions/conv_child_poison/events", "failed")
+    ]
+    assert statuses[0][1]["output"] == forwarder._SUBAGENT_DROPPED_ITEM_REASON
+    # The marker has to survive a forwarder restart, or a reload re-opens the
+    # idle path on a child whose transcript is still incomplete.
+    reloaded = forwarder._read_subagent_forward_state(bridge_dir)
+    assert reloaded.subagents["poison1"].dropped_item is True
+
+
+async def test_subagent_watcher_keeps_the_drop_marker_across_a_later_item_failure(
+    tmp_path: Path,
+) -> None:
+    """
+    A drop plus a later transient failure in one tick still ends in ``failed``.
+
+    Both cursor-rebuild branches after the item loop have to carry the drop
+    marker forward. The ``had_item`` branch runs only when items flowed AND a
+    later one failed in the same tick, so a rebuild that re-read the entry as
+    it was before the loop would silently clear the marker and let the child's
+    eventual quiescence publish ``idle`` again — the original bug.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="mixed1",
+        agent_type="Explore",
+        description="drop then 502",
+        tool_use_id="toolu_mixed",
+        transcript_records=[
+            _assistant_record("sa-rejected", "lost work"),
+            _assistant_record("sa-accepted", "kept work"),
+            _assistant_record("sa-transient", "the answer"),
+        ],
+    )
+    state = _seed_subagent_state(
+        subagent_id="mixed1",
+        child_conversation_id="conv_child_mixed",
+        seconds_since_activity=0.0,
+    )
+    statuses: list[tuple[str, dict[str, Any]]] = []
+    transient_down = True
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """
+        Reject the first item forever and 502 the last one until recovery.
+
+        :param request: Request issued by the forwarder.
+        :returns: Canned Omnigent response.
+        """
+        raw = request.content.decode("utf-8")
+        body = json.loads(raw)
+        if body.get("type") == "external_conversation_item":
+            if "lost work" in raw:
+                return httpx.Response(400, json={"error": "rejected"})
+            if "the answer" in raw and transient_down:
+                return httpx.Response(502, text="bad gateway")
+        if body.get("type") == "external_session_status":
+            statuses.append((request.url.path, body["data"]))
+        return httpx.Response(202, json={})
+
+    item_retry_tracker = forwarder._PostRetryTracker(base_delay_s=0.0)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        # The drop of ``sa-rejected``, the successful ``sa-accepted`` and the
+        # 502 on ``sa-transient`` all land in this final tick.
+        for _ in range(forwarder._HTTP_POST_MAX_PERMANENT_FAILURES):
+            state = await _tick_subagents(
+                client,
+                bridge_dir=bridge_dir,
+                transcript_path=transcript_path,
+                state=state,
+                item_retry_tracker=item_retry_tracker,
+            )
+        assert state.subagents["mixed1"].dropped_item is True, (
+            "the drop marker was lost when a later item failed in the same tick"
+        )
+        transient_down = False
+        state = await _tick_subagents(
+            client,
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=_quiesce_subagent_state(state),
+            item_retry_tracker=item_retry_tracker,
+        )
+        state = await _tick_subagents(
+            client,
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=_quiesce_subagent_state(state),
+            item_retry_tracker=item_retry_tracker,
+        )
+
+    posted = [data["status"] for _, data in statuses]
+    assert "idle" not in posted, f"a child with a dropped item was reported idle; {statuses}"
+    assert posted[-1] == "failed"
+    assert statuses[-1] == (
+        "/v1/sessions/conv_child_mixed/events",
+        {"status": "failed", "output": forwarder._SUBAGENT_DROPPED_ITEM_REASON},
+    )
 
 
 async def test_subagent_watcher_skips_subagents_already_in_state(
