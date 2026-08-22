@@ -1,8 +1,9 @@
 import { useMemo, useState } from "react";
 import { Link } from "@/lib/routing";
-import { ArrowDownIcon, ArrowUpIcon } from "lucide-react";
+import { ArrowDownIcon, ArrowUpIcon, ChevronRightIcon } from "lucide-react";
 import type { SessionUsage } from "@/lib/usageApi";
 import { formatSessionCostUsd } from "@/lib/formatCost";
+import { CostBreakdownView } from "./CostBreakdownView";
 
 interface Props {
   sessions: SessionUsage[];
@@ -57,6 +58,7 @@ function compareSessions(a: SessionUsage, b: SessionUsage, key: SortKey, dir: So
 export function UsageSessionTable({ sessions }: Props) {
   const [sortKey, setSortKey] = useState<SortKey>("updatedAt");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
+  const [expandedSessionId, setExpandedSessionId] = useState<string | null>(null);
 
   const sorted = useMemo(
     () => [...sessions].sort((a, b) => compareSessions(a, b, sortKey, sortDir)),
@@ -70,6 +72,10 @@ export function UsageSessionTable({ sessions }: Props) {
       setSortKey(key);
       setSortDir("desc");
     }
+  }
+
+  function toggleExpanded(sessionId: string) {
+    setExpandedSessionId((current) => (current === sessionId ? null : sessionId));
   }
 
   if (sessions.length === 0) {
@@ -107,49 +113,76 @@ export function UsageSessionTable({ sessions }: Props) {
           </tr>
         </thead>
         <tbody>
-          {sorted.map((s) => (
-            <tr key={s.id} className="border-b border-border last:border-b-0 hover:bg-muted/30">
-              <td className="max-w-xs truncate px-3 py-2">
-                <Link to={`/c/${s.id}`} className="text-foreground hover:underline">
-                  {s.title ?? "Untitled"}
-                </Link>
-                {primaryModel(s.models) && (
-                  <span className="ml-2 text-xs text-muted-foreground">
-                    {primaryModel(s.models)}
-                    {Object.keys(s.models).length > 1 && (
+          {sorted.map((s) => {
+            const isExpanded = expandedSessionId === s.id;
+            return (
+              <>
+                <tr
+                  key={s.id}
+                  className="border-b border-border last:border-b-0 hover:bg-muted/30 cursor-pointer"
+                  onClick={() => toggleExpanded(s.id)}
+                >
+                  <td className="max-w-xs truncate px-3 py-2">
+                    <div className="flex items-center gap-2">
+                      <ChevronRightIcon
+                        className={`h-4 w-4 flex-shrink-0 text-muted-foreground transition-transform ${
+                          isExpanded ? "rotate-90" : ""
+                        }`}
+                      />
+                      <Link
+                        to={`/c/${s.id}`}
+                        className="text-foreground hover:underline"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        {s.title ?? "Untitled"}
+                      </Link>
+                      {primaryModel(s.models) && (
+                        <span className="ml-2 text-xs text-muted-foreground">
+                          {primaryModel(s.models)}
+                          {Object.keys(s.models).length > 1 && (
+                            <span
+                              className="ml-1.5 inline-flex items-center rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
+                              title={Object.entries(s.models)
+                                .sort(([, a], [, b]) => b - a)
+                                .slice(1)
+                                .map(([name]) => name)
+                                .join(", ")}
+                            >
+                              +{Object.keys(s.models).length - 1}
+                            </span>
+                          )}
+                        </span>
+                      )}
+                    </div>
+                  </td>
+                  <td className="px-3 py-2 text-muted-foreground">
+                    {s.harness ?? "—"}
+                    {s.otherHarnesses && s.otherHarnesses.length > 0 && (
                       <span
                         className="ml-1.5 inline-flex items-center rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
-                        title={Object.entries(s.models)
-                          .sort(([, a], [, b]) => b - a)
-                          .slice(1)
-                          .map(([name]) => name)
-                          .join(", ")}
+                        title={s.otherHarnesses.join(", ")}
                       >
-                        +{Object.keys(s.models).length - 1}
+                        +{s.otherHarnesses.length}
                       </span>
                     )}
-                  </span>
+                  </td>
+                  <td className="px-3 py-2 text-right tabular-nums">
+                    {formatSessionCostUsd(s.costUsd)}
+                  </td>
+                  <td className="whitespace-nowrap px-3 py-2 text-right text-muted-foreground">
+                    {formatRelativeDate(s.updatedAt)}
+                  </td>
+                </tr>
+                {isExpanded && (
+                  <tr key={`${s.id}-breakdown`}>
+                    <td colSpan={4} className="border-b border-border bg-muted/20 p-6">
+                      <CostBreakdownView sessionId={s.id} />
+                    </td>
+                  </tr>
                 )}
-              </td>
-              <td className="px-3 py-2 text-muted-foreground">
-                {s.harness ?? "—"}
-                {s.otherHarnesses && s.otherHarnesses.length > 0 && (
-                  <span
-                    className="ml-1.5 inline-flex items-center rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
-                    title={s.otherHarnesses.join(", ")}
-                  >
-                    +{s.otherHarnesses.length}
-                  </span>
-                )}
-              </td>
-              <td className="px-3 py-2 text-right tabular-nums">
-                {formatSessionCostUsd(s.costUsd)}
-              </td>
-              <td className="whitespace-nowrap px-3 py-2 text-right text-muted-foreground">
-                {formatRelativeDate(s.updatedAt)}
-              </td>
-            </tr>
-          ))}
+              </>
+            );
+          })}
         </tbody>
       </table>
     </div>
