@@ -368,7 +368,9 @@ async def test_is_alive_true_when_pane_live(
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="requires a real tmux binary")
 @pytest.mark.asyncio
-async def test_server_survives_inner_process_exit_real_tmux(tmp_path: Path) -> None:
+async def test_server_survives_inner_process_exit_real_tmux(
+    tmp_path: Path, short_tmp_parent: Path
+) -> None:
     """
     The private tmux server outlives an inner-process exit (issue #540).
 
@@ -384,7 +386,9 @@ async def test_server_survives_inner_process_exit_real_tmux(tmp_path: Path) -> N
     instance = TerminalInstance(
         name="bash",
         session_key="s1",
-        socket_path=tmp_path / "tmux.sock",
+        # short_tmp_parent (not tmp_path): tmux's AF_UNIX socket path overflows
+        # the macOS 103-byte cap when it embeds pytest's long tmp_path (#4279).
+        socket_path=short_tmp_parent / "tmux.sock",
         private_dir=tmp_path,
         command="sh",
         args=["-c", "exit 0"],

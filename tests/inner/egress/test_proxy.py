@@ -51,13 +51,14 @@ async def test_proxy_start_stop_tcp(
 
 
 @pytest.mark.asyncio
-async def test_proxy_start_unix(ca_paths: tuple[Path, Path, Path], tmp_path: Path) -> None:
+async def test_proxy_start_unix(ca_paths: tuple[Path, Path, Path], short_tmp_parent: Path) -> None:
     """Proxy can listen on a Unix socket."""
     cert_path, key_path, _ = ca_paths
     rules = parse_rules(["GET example.com/**"])
     proxy = EgressProxy(rules, cert_path, key_path)
 
-    sock_path = tmp_path / "test.sock"
+    # short_tmp_parent (not tmp_path): the AF_UNIX path cap overflows on macOS.
+    sock_path = short_tmp_parent / "test.sock"
     await proxy.start_unix(sock_path)
 
     # Socket file is created
