@@ -6,6 +6,8 @@ import asyncio
 import contextlib
 import errno
 import logging
+import os
+import signal
 import subprocess
 import threading
 import time
@@ -18,6 +20,7 @@ from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosedError, InvalidStatus, InvalidURI
 from websockets.http11 import Response
 
+from omnigent._platform import IS_POSIX
 from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.connect import (
     HostConnectError,
@@ -4746,3 +4749,69 @@ def test_post_connect_auth_rejection_escalates_without_going_fatal(
     assert "omnigent login http://localhost:8000" in escalated
     assert "no longer a transient network blip" in escalated
     assert host._auth_retry_streak == _AUTH_REJECT_ESCALATE_ATTEMPTS
+
+
+@pytest.mark.skipif(not IS_POSIX, reason="SIGTERM handling is POSIX-only")
+async def test_sigterm_runs_the_clean_shutdown_path(tmp_path: Path) -> None:
+    """Regression: SIGTERM must reach run()'s cleanup, not kill the daemon.
+
+    ``omnigent host stop`` signals a backgrounded daemon with SIGTERM. Without
+    a handler Python exits where it stands, so the cleanup that terminates
+    tracked runners never ran and they were left to their own parent-death
+    watchdog.
+    """
+    host = _make_host_process()
+    host._zygote = None
+    serving = asyncio.Event()
+    aborted = asyncio.Event()
+    # run() force-drops the live tunnel on a shutdown signal, so stand in a
+    # connection whose transport records the abort.
+    host._ws = SimpleNamespace(  # type: ignore[assignment]
+        transport=SimpleNamespace(abort=aborted.set)
+    )
+
+    async def _hang() -> None:
+        serving.set()
+        await aborted.wait()
+        raise ConnectionClosedError(None, None)
+
+    async def _noop() -> None:
+        return None
+
+    proc = subprocess.Popen(
+        ["sleep", "60"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    host._runners["runner_sigterm"] = _RunnerHandle(proc=proc, log_path=tmp_path / "runner.log")
+
+    with (
+        patch.object(host, "_connect_and_serve", _hang),
+        patch.object(host, "_initialize_capabilities", _noop),
+        patch.object(host, "_orphan_reaper_loop", _noop),
+        patch("omnigent.host.connect.watch_for_resume", lambda _cb: _noop()),
+    ):
+        run_task = asyncio.create_task(host.run())
+        await asyncio.wait_for(serving.wait(), timeout=5.0)
+        # The handler is installed by now; sending the real signal proves the
+        # wiring rather than just the helper it calls.
+        assert host._shutdown_event is not None
+        os.kill(os.getpid(), signal.SIGTERM)
+        await asyncio.wait_for(run_task, timeout=10.0)
+
+    assert proc.poll() is not None, "SIGTERM must terminate tracked runners"
+    assert host._runners == {}
+
+
+@pytest.mark.skipif(not IS_POSIX, reason="SIGTERM handling is POSIX-only")
+async def test_shutdown_signal_cuts_short_the_reconnect_backoff(tmp_path: Path) -> None:
+    """A SIGTERM during reconnect backoff must not wait out the sleep."""
+    host = _make_host_process()
+    host._shutdown_event = asyncio.Event()
+
+    host._request_shutdown(signal.SIGTERM)
+
+    start = time.monotonic()
+    await host._sleep_before_reconnect(30.0)
+    assert time.monotonic() - start < 5.0, "backoff should return early on shutdown"
+    assert host._shutdown_requested is True

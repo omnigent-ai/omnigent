@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import signal
 import subprocess
 import sys
 from collections.abc import Callable, Iterator, Mapping
@@ -930,6 +931,11 @@ class HostProcess:
         # detected resume; read+cleared in run()'s reconnect handler to force a
         # prompt reconnect (skip the backoff).
         self._woke_from_suspend = False
+        # Set by a shutdown signal (see _request_shutdown): the flag stops
+        # run()'s loop reconnecting, the event cuts short a backoff sleep so a
+        # SIGTERM mid-backoff doesn't wait it out.
+        self._shutdown_requested = False
+        self._shutdown_event: asyncio.Event | None = None
 
     def _tracked_runner_pids(self) -> set[int]:
         """PIDs of runners this host spawned and still tracks directly.
@@ -2691,7 +2697,9 @@ class HostProcess:
 
         Connects to the server, sends hello, and enters the
         receive loop. Reconnects with exponential backoff on
-        disconnect. Ctrl-C / SIGTERM exit cleanly.
+        disconnect. Ctrl-C / SIGTERM exit cleanly — see
+        :meth:`_install_shutdown_signal_handlers` for why SIGTERM needs
+        a handler to get there.
 
         :returns: None. Runs until the process is terminated.
         :raises HostConnectError: On a permanent failure — auth /
@@ -2702,6 +2710,11 @@ class HostProcess:
         # them once during daemon initialization. They are advisory: a broken
         # harness is reported as unknown and must not prevent registration.
         await self._initialize_capabilities()
+
+        # Route SIGTERM into the same clean shutdown Ctrl-C takes, so the
+        # cleanup in this method's finally block runs for a backgrounded
+        # daemon too.
+        self._install_shutdown_signal_handlers()
 
         # Reap orphaned harness/tool grandchildren that reparent here when a
         # runner dies (this host is PID 1 in a container, or a subreaper
@@ -2730,6 +2743,8 @@ class HostProcess:
         backoff = _RECONNECT_BASE_S
         try:
             while True:
+                if self._shutdown_requested:
+                    break
                 try:
                     await self._connect_and_serve()
                     backoff = _RECONNECT_BASE_S
@@ -2741,6 +2756,11 @@ class HostProcess:
                     # ``run_host_process`` can fail loud.
                     raise
                 except Exception as exc:
+                    if self._shutdown_requested:
+                        # We aborted this tunnel ourselves (see
+                        # _request_shutdown) — don't classify it as a
+                        # disconnect or announce a reconnect we won't make.
+                        break
                     if not isinstance(exc, InvalidURI):
                         # Any non-redirect failure (5xx bounce, network
                         # blip, mid-serve drop) breaks a login-redirect
@@ -2857,7 +2877,9 @@ class HostProcess:
                         if woke
                         else (" (recycle — prompt reconnect)" if recycle else ""),
                     )
-                    await asyncio.sleep(wait_s)
+                    await self._sleep_before_reconnect(wait_s)
+                    if self._shutdown_requested:
+                        break
                     import random
 
                     if recycle:
@@ -2903,6 +2925,78 @@ class HostProcess:
                 with contextlib.suppress(Exception):
                     self._zygote.stop()
                 self._zygote = None
+
+    def _install_shutdown_signal_handlers(self) -> None:
+        """Route SIGTERM into the clean shutdown path Ctrl-C already takes.
+
+        SIGINT arrives as ``KeyboardInterrupt``, which :meth:`run` catches on
+        its way into the cleanup that terminates tracked runners, drains
+        orphans and stops the zygote. SIGTERM has no such default: Python
+        exits where it stands, so a backgrounded daemon — the only kind
+        ``omnigent host stop`` can signal — never ran that cleanup. Its
+        runners were left to notice the dead parent themselves and hard-exit
+        after their 2s grace, skipping their own graceful drain.
+
+        Best-effort: a platform with no ``add_signal_handler`` (Windows) keeps
+        the previous behavior rather than failing daemon startup.
+
+        SIGINT is deliberately left alone: it already reaches the cleanup as
+        ``KeyboardInterrupt``, and ``omnigent host`` relies on that exception
+        to exit with the interrupt's status rather than a clean 0.
+
+        :returns: None.
+        """
+        loop = asyncio.get_running_loop()
+        self._shutdown_event = asyncio.Event()
+        with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+            loop.add_signal_handler(signal.SIGTERM, self._request_shutdown, signal.SIGTERM)
+
+    def _request_shutdown(self, sig: signal.Signals) -> None:
+        """Unwind :meth:`run` into its cleanup after a shutdown signal.
+
+        Force-drops the live tunnel the same way :meth:`_on_resume_from_suspend`
+        does, so ``_serve_frames``' ``recv`` raises at once, and wakes any
+        reconnect backoff. :meth:`run`'s loop then sees the flag and breaks
+        instead of reconnecting, reaching the cleanup in its ``finally``.
+
+        Deliberately does not cancel ``run()``'s own task: that cleanup awaits
+        the reaper and watcher tasks, which a pending cancellation would cut
+        short. Runs synchronously on the event loop, so reading ``self._ws``
+        is atomic w.r.t. ``_serve_frames``.
+
+        With no live tunnel (a shutdown that lands mid-handshake) there is
+        nothing to abort; the loop breaks once the handshake settles, bounded
+        by its own connect timeout.
+
+        :param sig: The signal received, e.g. ``signal.SIGTERM``.
+        :returns: None.
+        """
+        if self._shutdown_requested:
+            # A second signal means the operator is impatient; the sender's own
+            # SIGKILL escalation is the backstop, so just note it.
+            _logger.info("Received %s again; shutdown already in progress", sig.name)
+            return
+        self._shutdown_requested = True
+        _logger.info("Received %s; shutting down host", sig.name)
+        if self._shutdown_event is not None:
+            self._shutdown_event.set()
+        ws = self._ws
+        transport = getattr(ws, "transport", None) if ws is not None else None
+        if transport is not None:
+            with contextlib.suppress(Exception):
+                transport.abort()
+
+    async def _sleep_before_reconnect(self, wait_s: float) -> None:
+        """Wait out the reconnect backoff, returning early on shutdown.
+
+        :param wait_s: Backoff to wait, in seconds, e.g. ``0.5``.
+        :returns: None.
+        """
+        if self._shutdown_event is None:
+            await asyncio.sleep(wait_s)
+            return
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self._shutdown_event.wait(), timeout=wait_s)
 
     def _on_resume_from_suspend(self, gap_s: float) -> None:
         """Force-drop the tunnel after a detected wake from system suspend.
