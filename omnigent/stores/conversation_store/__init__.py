@@ -1172,6 +1172,101 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def add_period_cost(
+        self, user_id: str, period: str, delta_usd: float, harness: str | None = None
+    ) -> None:
+        """
+        Atomically add *delta_usd* to a user's spend for a time period.
+
+        UPSERTs the ``user_period_cost`` row keyed by
+        ``(user_id, period, harness)``: inserts ``delta_usd`` when no row
+        exists, otherwise increments the existing ``cost_usd`` by
+        ``delta_usd`` in a single atomic statement. Powers period-based
+        cost budget policies (week, month, quarter, year) with optional
+        per-harness scoping.
+
+        :param user_id: The user the cost is attributed to (the session
+            creator), e.g. ``"alice@example.com"``.
+        :param period: Period string in one of the formats: ``"YYYY-MM-DD"``
+            (day), ``"YYYY-Www"`` (ISO week), ``"YYYY-MM"`` (month),
+            ``"YYYY-Qq"`` (quarter), ``"YYYY"`` (year).
+        :param delta_usd: USD amount to add. A no-op when ``<= 0`` so a
+            zero-cost turn never creates a row.
+        :param harness: Optional harness identifier for per-harness budgets
+            (e.g. ``"codex-native"``). ``None`` for cross-harness budgets.
+        """
+        ...
+
+    @abstractmethod
+    def get_period_cost(self, user_id: str, period: str, harness: str | None = None) -> float:
+        """
+        Return a user's accumulated LLM spend for a time period.
+
+        :param user_id: The user to read, e.g. ``"alice@example.com"``.
+        :param period: Period string (day/week/month/quarter/year format).
+        :param harness: Optional harness filter. ``None`` for cross-harness.
+        :returns: The accumulated ``cost_usd`` for that
+            ``(user_id, period, harness)``, or ``0.0`` when no row exists.
+        """
+        ...
+
+    @abstractmethod
+    def sum_period_cost(self, user_id: str, period: str, harness: str | None = None) -> float:
+        """
+        Sum a user's LLM spend for a specific period.
+
+        Unlike ``sum_daily_cost`` which sums across multiple days, this
+        returns the cost for a single period identifier. For period-based
+        budgets, the period granularity is already encoded in the period
+        string.
+
+        :param user_id: The user to read, e.g. ``"alice@example.com"``.
+        :param period: Period string (day/week/month/quarter/year format).
+        :param harness: Optional harness filter. ``None`` for cross-harness.
+        :returns: The ``cost_usd`` for that period, or ``0.0`` when no row
+            exists.
+        """
+        ...
+
+    @abstractmethod
+    def get_period_cost_state(
+        self, user_id: str, period: str, harness: str | None = None
+    ) -> dict[str, float]:
+        """
+        Return a user's period cost rollup state for one time period.
+
+        Reads both the accumulated spend and the highest soft
+        checkpoint already approved for that period, in one lookup.
+
+        :param user_id: The user to read, e.g. ``"alice@example.com"``.
+        :param period: Period string (day/week/month/quarter/year format).
+        :param harness: Optional harness filter. ``None`` for cross-harness.
+        :returns: Dict with ``"cost_usd"`` and ``"ask_approved_usd"`` keys.
+        """
+        ...
+
+    @abstractmethod
+    def set_period_ask_approved(
+        self, user_id: str, period: str, ask_approved_usd: float, harness: str | None = None
+    ) -> None:
+        """
+        Record the highest approved soft checkpoint for a user+period.
+
+        Sets ``ask_approved_usd`` without altering ``cost_usd`` (insert
+        with ``cost_usd = 0`` when no row exists, else update only the
+        approval field). Called when a period cost-budget ASK is
+        approved.
+
+        :param user_id: The user the approval is for, e.g.
+            ``"alice@example.com"``.
+        :param period: Period string (day/week/month/quarter/year format).
+        :param ask_approved_usd: The crossed checkpoint value (USD) the
+            user approved continuing past, e.g. ``5.00``.
+        :param harness: Optional harness filter. ``None`` for cross-harness.
+        """
+        ...
+
+    @abstractmethod
     def get_session_owner(self, conversation_id: str) -> str | None:
         """
         Return the user id that owns a session (its creator).

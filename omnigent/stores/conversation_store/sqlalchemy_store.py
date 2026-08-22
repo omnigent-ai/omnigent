@@ -26,6 +26,7 @@ from sqlalchemy.sql.selectable import Subquery
 from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
 from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
+    CROSS_HARNESS_SENTINEL,
     LABEL_VALUE_MAX_LEN,
     SqlAgent,
     SqlComment,
@@ -1471,12 +1472,16 @@ class SqlAlchemyConversationStore(ConversationStore):
             # Generic dialect fallback — SELECT-then-INSERT/UPDATE in one
             # transaction (race-safe under SERIALIZABLE / SQLite's
             # single-writer semantics).
-            existing = session.get(SqlUserDailyCost, (current_workspace_id(), user_id, day_utc))
+            existing = session.get(
+                SqlUserDailyCost,
+                (current_workspace_id(), user_id, day_utc, CROSS_HARNESS_SENTINEL),
+            )
             if existing is None:
                 session.add(
                     SqlUserDailyCost(
                         user_id=user_id,
                         day_utc=day_utc,
+                        harness=CROSS_HARNESS_SENTINEL,
                         cost_usd=delta_usd,
                         updated_at=now,
                     )
@@ -1526,9 +1531,15 @@ class SqlAlchemyConversationStore(ConversationStore):
             from sqlalchemy.dialects.postgresql import insert as pg_insert
 
             stmt = pg_insert(SqlUserDailyCost)
-        stmt = stmt.values(user_id=user_id, day_utc=day_utc, cost_usd=delta_usd, updated_at=now)
+        stmt = stmt.values(
+            user_id=user_id,
+            day_utc=day_utc,
+            harness=CROSS_HARNESS_SENTINEL,
+            cost_usd=delta_usd,
+            updated_at=now,
+        )
         stmt = stmt.on_conflict_do_update(
-            index_elements=["workspace_id", "user_id", "day_utc"],
+            index_elements=["workspace_id", "user_id", "day_utc", "harness"],
             set_={
                 "cost_usd": SqlUserDailyCost.cost_usd + stmt.excluded.cost_usd,
                 "updated_at": stmt.excluded.updated_at,
@@ -1547,7 +1558,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             exists for ``(user_id, day_utc)``.
         """
         with self._session("get_daily_cost") as session:
-            row = session.get(SqlUserDailyCost, (current_workspace_id(), user_id, day_utc))
+            row = session.get(
+                SqlUserDailyCost,
+                (current_workspace_id(), user_id, day_utc, CROSS_HARNESS_SENTINEL),
+            )
             return float(row.cost_usd) if row is not None else 0.0
 
     def sum_daily_cost(self, user_id: str, since_day_utc: str) -> float:
@@ -1558,6 +1572,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         lexicographically (zero-padded ``"YYYY-MM-DD"``), so the range is
         a plain ``>=`` on the string column; ``SUM`` returns ``NULL`` for
         an empty range, coalesced to ``0.0``.
+
+        Filters to daily rows only (``LENGTH(day_utc) = 10``) to exclude
+        period rollup rows (week/month/quarter/year) stored in the same table.
         """
         with self._session("sum_daily_cost") as session:
             total = session.execute(
@@ -1565,16 +1582,24 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .where(SqlUserDailyCost.workspace_id == current_workspace_id())
                 .where(SqlUserDailyCost.user_id == user_id)
                 .where(SqlUserDailyCost.day_utc >= since_day_utc)
+                .where(func.length(SqlUserDailyCost.day_utc) == 10)
             ).scalar_one()
             return float(total or 0.0)
 
     def list_daily_costs(self, user_id: str, since_day_utc: str) -> list[tuple[str, float]]:
+        """
+        List a user's per-day LLM spend for all days ``>= since_day_utc``.
+
+        Filters to daily rows only (``LENGTH(day_utc) = 10``) to exclude
+        period rollup rows (week/month/quarter/year) stored in the same table.
+        """
         with self._session("list_daily_costs") as session:
             rows = session.execute(
                 select(SqlUserDailyCost.day_utc, SqlUserDailyCost.cost_usd)
                 .where(SqlUserDailyCost.workspace_id == current_workspace_id())
                 .where(SqlUserDailyCost.user_id == user_id)
                 .where(SqlUserDailyCost.day_utc >= since_day_utc)
+                .where(func.length(SqlUserDailyCost.day_utc) == 10)
                 .order_by(SqlUserDailyCost.day_utc.asc())
             ).all()
             return [(row.day_utc, float(row.cost_usd)) for row in rows]
@@ -1594,7 +1619,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             both ``0.0`` when no row exists for ``(user_id, day_utc)``.
         """
         with self._session("get_daily_cost_state") as session:
-            row = session.get(SqlUserDailyCost, (current_workspace_id(), user_id, day_utc))
+            row = session.get(
+                SqlUserDailyCost,
+                (current_workspace_id(), user_id, day_utc, CROSS_HARNESS_SENTINEL),
+            )
             if row is None:
                 return {"cost_usd": 0.0, "ask_approved_usd": 0.0}
             return {
@@ -1638,6 +1666,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 stmt = stmt.values(
                     user_id=user_id,
                     day_utc=day_utc,
+                    harness=CROSS_HARNESS_SENTINEL,
                     cost_usd=0.0,
                     ask_approved_usd=ask_approved_usd,
                     updated_at=now,
@@ -1645,7 +1674,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # On conflict touch only the approval (+ stamp) — never
                 # the accumulated cost.
                 stmt = stmt.on_conflict_do_update(
-                    index_elements=["workspace_id", "user_id", "day_utc"],
+                    index_elements=["workspace_id", "user_id", "day_utc", "harness"],
                     set_={
                         "ask_approved_usd": stmt.excluded.ask_approved_usd,
                         "updated_at": stmt.excluded.updated_at,
@@ -1654,12 +1683,286 @@ class SqlAlchemyConversationStore(ConversationStore):
                 session.execute(stmt)
                 return
             # Generic dialect fallback — SELECT-then-INSERT/UPDATE.
-            existing = session.get(SqlUserDailyCost, (current_workspace_id(), user_id, day_utc))
+            existing = session.get(
+                SqlUserDailyCost,
+                (current_workspace_id(), user_id, day_utc, CROSS_HARNESS_SENTINEL),
+            )
             if existing is None:
                 session.add(
                     SqlUserDailyCost(
                         user_id=user_id,
+                        harness=CROSS_HARNESS_SENTINEL,
                         day_utc=day_utc,
+                        cost_usd=0.0,
+                        ask_approved_usd=ask_approved_usd,
+                        updated_at=now,
+                    )
+                )
+            else:
+                existing.ask_approved_usd = ask_approved_usd
+                existing.updated_at = now
+
+    def add_period_cost(
+        self,
+        user_id: str,
+        period: str,
+        delta_usd: float,
+        harness: str | None = None,
+    ) -> None:
+        """
+        Atomically increment a user's period LLM spend for a harness.
+
+        UPSERT atomic increment (``cost_usd = cost_usd + :delta``) so
+        concurrent turns never lose updates. Other dialects fall back
+        to a SELECT-then-INSERT/UPDATE inside the same transaction.
+        ``delta_usd <= 0`` is a no-op (never creates a row).
+
+        :param user_id: The user the cost is attributed to (session
+            creator), e.g. ``"alice@example.com"``.
+        :param period: Time period string, format depends on granularity:
+            ``"YYYY-Www"`` (week), ``"YYYY-MM"`` (month), ``"YYYY-Qq"`` (quarter),
+            or ``"YYYY"`` (year). E.g. ``"2026-W34"``, ``"2026-08"``, ``"2026-Q3"``.
+        :param delta_usd: USD amount to add; ``<= 0`` is a no-op.
+        :param harness: The harness executing the turn, e.g.
+            ``"codex-native"``. ``None`` for cross-harness budgets (converted
+            to the sentinel value internally).
+        """
+        if delta_usd <= 0:
+            return
+        # Convert None → sentinel for cross-harness budgets (harness is part of PK, cannot be NULL)
+        harness_key = CROSS_HARNESS_SENTINEL if harness is None else harness
+        now = now_epoch()
+        with self._session("add_period_cost") as session:
+            dialect = session.bind.dialect.name if session.bind is not None else ""
+            if dialect in ("sqlite", "postgresql"):
+                self._upsert_period_cost_dialect(
+                    session, dialect, user_id, period, harness_key, delta_usd, now
+                )
+                return
+            # Generic dialect fallback — SELECT-then-INSERT/UPDATE in one
+            # transaction (race-safe under SERIALIZABLE / SQLite's
+            # single-writer semantics).
+            existing = session.get(
+                SqlUserDailyCost, (current_workspace_id(), user_id, period, harness_key)
+            )
+            if existing is None:
+                session.add(
+                    SqlUserDailyCost(
+                        user_id=user_id,
+                        day_utc=period,
+                        harness=harness_key,
+                        cost_usd=delta_usd,
+                        updated_at=now,
+                    )
+                )
+            else:
+                existing.cost_usd = existing.cost_usd + delta_usd
+                existing.updated_at = now
+
+    def _upsert_period_cost_dialect(
+        self,
+        session: Session,
+        dialect: str,
+        user_id: str,
+        period: str,
+        harness: str | None,
+        delta_usd: float,
+        now: int,
+    ) -> None:
+        """
+        Atomic ``INSERT ... ON CONFLICT DO UPDATE`` increment for
+        SQLite / PostgreSQL.
+
+        Extracted from :meth:`add_period_cost` so each method stays
+        small; the outer method selects the dialect branch and this
+        one executes the dedicated INSERT builder. The conflict target
+        is the ``(user_id, period, harness)`` primary key; on conflict the
+        existing ``cost_usd`` is incremented by the new row's value.
+
+        :param session: Active SQLAlchemy session.
+        :param dialect: ``"sqlite"`` or ``"postgresql"`` (the caller
+            gates all other dialects onto the generic fallback).
+        :param user_id: The user the cost is attributed to, e.g.
+            ``"alice@example.com"``.
+        :param period: Time period string, format depends on granularity:
+            ``"YYYY-Www"`` (week), ``"YYYY-MM"`` (month), ``"YYYY-Qq"`` (quarter),
+            or ``"YYYY"`` (year). E.g. ``"2026-W34"``, ``"2026-08"``, ``"2026-Q3"``.
+        :param harness: The harness executing the turn, e.g.
+            ``"codex-native"``. ``None`` when unknown/unstamped.
+        :param delta_usd: USD amount to add (already validated ``> 0``).
+        :param now: Unix epoch seconds to stamp on ``updated_at``.
+        """
+        # Typed as Any to sidestep the mypy variance between the two
+        # dialect-specific ``Insert`` classes; their runtime shape is
+        # identical for this UPSERT.
+        stmt: Any
+        if dialect == "sqlite":
+            from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+            stmt = sqlite_insert(SqlUserDailyCost)
+        else:
+            from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+            stmt = pg_insert(SqlUserDailyCost)
+        stmt = stmt.values(
+            user_id=user_id,
+            day_utc=period,
+            harness=harness,
+            cost_usd=delta_usd,
+            updated_at=now,
+        )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["workspace_id", "user_id", "day_utc", "harness"],
+            set_={
+                "cost_usd": SqlUserDailyCost.cost_usd + stmt.excluded.cost_usd,
+                "updated_at": stmt.excluded.updated_at,
+            },
+        )
+        session.execute(stmt)
+
+    def get_period_cost(self, user_id: str, period: str, harness: str | None = None) -> float:
+        """
+        Return a user's accumulated LLM spend for one UTC month and harness.
+
+        :param user_id: The user to read, e.g. ``"alice@example.com"``.
+        :param period: UTC month as ``"YYYY-MM"``, e.g. ``"2026-06"``.
+        :param harness: The harness to read, e.g. ``"codex-native"``.
+            ``None`` for cross-harness budgets.
+        :returns: The accumulated ``cost_usd``, or ``0.0`` when no row
+            exists for ``(user_id, period, harness)``.
+        """
+        harness_key = CROSS_HARNESS_SENTINEL if harness is None else harness
+        with self._session("get_period_cost") as session:
+            row = session.get(
+                SqlUserDailyCost, (current_workspace_id(), user_id, period, harness_key)
+            )
+            return float(row.cost_usd) if row is not None else 0.0
+
+    def sum_period_cost(self, user_id: str, period: str, harness: str | None = None) -> float:
+        """
+        Return a user's LLM spend for a period and harness.
+
+        For cross-harness budgets (``harness=None``), reads the single row
+        with ``harness="__all__"`` that accumulates cost across all harnesses.
+        For per-harness budgets, reads the specific harness row.
+
+        :param user_id: The user to read, e.g. ``"alice@example.com"``.
+        :param period: UTC month as ``"YYYY-MM"``, e.g. ``"2026-06"``.
+        :param harness: Optional harness filter. ``None`` for cross-harness
+            budgets; a specific value (e.g. ``"codex-native"``) for per-harness.
+        :returns: The ``cost_usd``, or ``0.0`` when no row exists.
+        """
+        # Cross-harness budgets read the sentinel row; per-harness read specific harness
+        harness_key = CROSS_HARNESS_SENTINEL if harness is None else harness
+        with self._session("sum_period_cost") as session:
+            row = session.get(
+                SqlUserDailyCost, (current_workspace_id(), user_id, period, harness_key)
+            )
+            return float(row.cost_usd) if row is not None else 0.0
+
+    def get_period_cost_state(
+        self, user_id: str, period: str, harness: str | None = None
+    ) -> dict[str, float]:
+        """
+        Return a user's period cost rollup state for one period and harness.
+
+        Reads both fields the per-user period cost-budget policy needs in
+        a single point lookup: the accumulated spend and the highest
+        soft checkpoint already approved for that period and harness.
+
+        :param user_id: The user to read, e.g. ``"alice@example.com"``.
+        :param period: Time period string, format depends on granularity:
+            ``"YYYY-Www"`` (week), ``"YYYY-MM"`` (month), ``"YYYY-Qq"`` (quarter),
+            or ``"YYYY"`` (year). E.g. ``"2026-W34"``, ``"2026-08"``, ``"2026-Q3"``.
+        :param harness: The harness to read, e.g. ``"codex-native"``.
+            ``None`` for cross-harness budgets.
+        :returns: ``{"cost_usd": <float>, "ask_approved_usd": <float>}``;
+            both ``0.0`` when no row exists for ``(user_id, period, harness)``.
+        """
+        harness_key = CROSS_HARNESS_SENTINEL if harness is None else harness
+        with self._session("get_period_cost_state") as session:
+            row = session.get(
+                SqlUserDailyCost, (current_workspace_id(), user_id, period, harness_key)
+            )
+            if row is None:
+                return {"cost_usd": 0.0, "ask_approved_usd": 0.0}
+            return {
+                "cost_usd": float(row.cost_usd),
+                "ask_approved_usd": float(row.ask_approved_usd or 0.0),
+            }
+
+    def set_period_ask_approved(
+        self,
+        user_id: str,
+        period: str,
+        ask_approved_usd: float,
+        harness: str | None = None,
+    ) -> None:
+        """
+        Record the highest approved soft checkpoint for a user+period+harness.
+
+        UPSERT that sets ``ask_approved_usd`` **without touching
+        ``cost_usd``** (inserts a ``cost_usd = 0`` row when none exists
+        yet, otherwise updates only the approval field). Called when a
+        per-user period cost-budget ASK is approved, so the same
+        checkpoint won't re-prompt for that user again that period — even
+        from a different session.
+
+        :param user_id: The user the approval is for, e.g.
+            ``"alice@example.com"``.
+        :param period: Time period string, format depends on granularity:
+            ``"YYYY-Www"`` (week), ``"YYYY-MM"`` (month), ``"YYYY-Qq"`` (quarter),
+            or ``"YYYY"`` (year). E.g. ``"2026-W34"``, ``"2026-08"``, ``"2026-Q3"``.
+        :param ask_approved_usd: The crossed checkpoint value (USD) the
+            user approved continuing past, e.g. ``0.05``.
+        :param harness: The harness the approval is for, e.g.
+            ``"codex-native"``. ``None`` for cross-harness budgets.
+        """
+        harness_key = CROSS_HARNESS_SENTINEL if harness is None else harness
+        now = now_epoch()
+        with self._session("set_period_ask_approved") as session:
+            dialect = session.bind.dialect.name if session.bind is not None else ""
+            if dialect in ("sqlite", "postgresql"):
+                # Typed as Any to sidestep the mypy variance between the
+                # two dialect-specific ``Insert`` classes.
+                stmt: Any
+                if dialect == "sqlite":
+                    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+                    stmt = sqlite_insert(SqlUserDailyCost)
+                else:
+                    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+                    stmt = pg_insert(SqlUserDailyCost)
+                stmt = stmt.values(
+                    user_id=user_id,
+                    day_utc=period,
+                    harness=harness_key,
+                    cost_usd=0.0,
+                    ask_approved_usd=ask_approved_usd,
+                    updated_at=now,
+                )
+                # On conflict touch only the approval (+ stamp) — never
+                # the accumulated cost.
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["workspace_id", "user_id", "day_utc", "harness"],
+                    set_={
+                        "ask_approved_usd": stmt.excluded.ask_approved_usd,
+                        "updated_at": stmt.excluded.updated_at,
+                    },
+                )
+                session.execute(stmt)
+                return
+            # Generic dialect fallback — SELECT-then-INSERT/UPDATE.
+            existing = session.get(
+                SqlUserDailyCost, (current_workspace_id(), user_id, period, harness_key)
+            )
+            if existing is None:
+                session.add(
+                    SqlUserDailyCost(
+                        user_id=user_id,
+                        day_utc=period,
+                        harness=harness_key,
                         cost_usd=0.0,
                         ask_approved_usd=ask_approved_usd,
                         updated_at=now,

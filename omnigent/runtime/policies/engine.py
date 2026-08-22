@@ -113,6 +113,7 @@ class PolicyEngine:
         initial_usage: dict[str, float] | None = None,
         initial_subtree_usage: dict[str, float] | None = None,
         initial_user_daily_cost: dict[str, float | str] | None = None,
+        initial_user_period_cost: dict[str, float | str | None] | None = None,
         token_pricing: ModelPricing | None = None,
         initial_model: str | None = None,
         conversation_store: ConversationStore,
@@ -158,6 +159,11 @@ class PolicyEngine:
         # ``None`` → not needed → never injected, so no owner/daily lookup
         # cost for sessions that don't use the daily policy.
         self._user_daily_cost = initial_user_daily_cost
+        # The session owner's per-UTC-month cost rollup
+        # ({"cost_usd", "ask_approved_usd", "harness"}), seeded at build
+        # time ONLY when a policy needs it (per-user monthly cost-budget
+        # configured). ``None`` → not needed → never injected.
+        self._user_period_cost = initial_user_period_cost
         self._token_pricing = token_pricing
         self._model = initial_model
         self._store = conversation_store
@@ -344,6 +350,7 @@ class PolicyEngine:
         ctx = self._inject_usage(ctx)
         ctx = self._inject_subtree_usage(ctx)
         ctx = self._inject_user_daily_cost(ctx)
+        ctx = self._inject_user_period_cost(ctx)
         ctx = self._inject_model(ctx)
         ctx = self._inject_labels(ctx)
         ctx = self._inject_llm_client(ctx)
@@ -536,11 +543,13 @@ class PolicyEngine:
             SESSION_COST_ASK_APPROVED_STATE_KEY,
             SESSION_COST_UNPRICED_APPROVED_KEY,
             USER_DAILY_ASK_APPROVED_STATE_KEY,
+            USER_PERIOD_ASK_APPROVED_STATE_KEY,
         )
 
-        # Two reserved keys are routed off this conversation's session_state:
+        # Three reserved keys are routed off this conversation's session_state:
         # the per-user daily approval goes to the user+day store column (so it
-        # persists across the user's sessions), and the per-SESSION cost
+        # persists across the user's sessions), the per-user monthly approval
+        # goes to the user+month+harness store column, and the per-SESSION cost
         # approval goes to the ROOT conversation (so approving once covers the
         # whole spawn tree — a sub-agent runs as its own conversation, and
         # build_policy_engine seeds the approval from the root). Every other
@@ -549,6 +558,8 @@ class PolicyEngine:
         for op in updates:
             if op.key == USER_DAILY_ASK_APPROVED_STATE_KEY:
                 self._record_user_daily_ask_approved(op.value)
+            elif op.key == USER_PERIOD_ASK_APPROVED_STATE_KEY:
+                self._record_user_period_ask_approved(op.value)
             elif (
                 op.key in (SESSION_COST_ASK_APPROVED_STATE_KEY, SESSION_COST_UNPRICED_APPROVED_KEY)
                 and self._root_conversation_id != self._conversation_id
@@ -617,6 +628,44 @@ class PolicyEngine:
         # approval stays current via _apply_one(self._session_state, ...).
         if self._user_daily_cost is not None:
             self._user_daily_cost["ask_approved_usd"] = approved
+
+    def _record_user_period_ask_approved(self, value: Any) -> None:
+        """
+        Persist a per-user period cost-budget ASK approval.
+
+        Writes the approved soft-checkpoint value to the session
+        owner's ``user_period_cost.ask_approved_usd`` for the current period
+        +harness, so the same checkpoint won't re-prompt that user again this
+        period (including from other sessions). A no-op when the session has no
+        owner grant (single-user mode) or *value* is not numeric.
+
+        :param value: The crossed checkpoint value (USD) the user
+            approved, e.g. ``50.0``.
+        """
+        if value is None:
+            return
+        try:
+            approved = float(value)
+        except (TypeError, ValueError):
+            return
+        owner = self._store.get_session_owner(self._conversation_id)
+        if owner is None:
+            return
+        # Extract the period and harness from the period cost context
+        if self._user_period_cost is None:
+            return
+        period_str = self._user_period_cost.get("period")
+        if not isinstance(period_str, str):
+            return
+        harness = self._user_period_cost.get("harness")
+        if harness is not None and not isinstance(harness, str):
+            return
+
+        self._store.set_period_ask_approved(owner, period_str, approved, harness=harness)
+        # Keep the in-memory snapshot current so any later evaluate() on
+        # this engine sees the approval and doesn't re-ASK the checkpoint
+        # the user just approved.
+        self._user_period_cost["ask_approved_usd"] = approved
 
     def record_usage(
         self,
@@ -735,6 +784,25 @@ class PolicyEngine:
         if self._user_daily_cost is None:
             return ctx
         return replace(ctx, user_daily_cost=dict(self._user_daily_cost))
+
+    def _inject_user_period_cost(self, ctx: EvaluationContext) -> EvaluationContext:
+        """
+        Return a copy of *ctx* with ``user_period_cost`` populated, when seeded.
+
+        Injects the session owner's per-UTC-month cost rollup (read once at
+        engine-build time) so the per-user monthly cost-budget policy can
+        read it via ``event["context"]["user_period_cost"]`` without
+        re-querying the store. When the engine was built without it
+        (``None`` — no policy needs it), *ctx* is returned unchanged so
+        sessions that don't use the monthly policy never carry it.
+
+        :param ctx: Original :class:`EvaluationContext` from the caller.
+        :returns: *ctx* unchanged when no monthly-cost was seeded, else a
+            copy with ``user_period_cost`` set to a defensive copy.
+        """
+        if self._user_period_cost is None:
+            return ctx
+        return replace(ctx, user_period_cost=dict(self._user_period_cost))
 
     def _inject_model(self, ctx: EvaluationContext) -> EvaluationContext:
         """

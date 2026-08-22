@@ -58,6 +58,12 @@ _logger = logging.getLogger(__name__)
 # nothing extra per evaluation.
 _USER_DAILY_COST_POLICY_PATH = "omnigent.policies.builtins.cost.user_daily_cost_budget"
 
+# Dotted path of the per-user monthly cost-budget factory. The engine is
+# seeded with the session owner's monthly-cost rollup ONLY when a policy
+# set includes this handler.
+# Dotted path of the generic per-user period cost-budget factory.
+_USER_PERIOD_COST_POLICY_PATH = "omnigent.policies.builtins.cost.user_period_cost_budget"
+
 # Dotted path of the per-subagent cost-budget factory. The engine is
 # seeded with the subtree-scoped usage ONLY when a policy set includes
 # this handler — otherwise the subtree usage lookup is skipped.
@@ -113,14 +119,21 @@ def _needs_user_daily_cost(specs: list[PolicySpec]) -> bool:
 
     :param specs: The merged policy specs for the engine.
     :returns: ``True`` when a :class:`FunctionPolicySpec` references the
-        ``user_daily_cost_budget`` factory.
+        ``user_daily_cost_budget`` factory OR the ``user_period_cost_budget``
+        factory with ``period="day"``.
     """
-    return any(
-        isinstance(s, FunctionPolicySpec)
-        and s.function is not None
-        and s.function.path == _USER_DAILY_COST_POLICY_PATH
-        for s in specs
-    )
+    for s in specs:
+        if not isinstance(s, FunctionPolicySpec) or s.function is None:
+            continue
+        # Legacy daily cost budget policy
+        if s.function.path == _USER_DAILY_COST_POLICY_PATH:
+            return True
+        # Generic period policy with period="day"
+        if s.function.path == _USER_PERIOD_COST_POLICY_PATH:
+            args = s.function.arguments or {}
+            if args.get("period") == "day":
+                return True
+    return False
 
 
 def _needs_subtree_usage(specs: list[PolicySpec]) -> bool:
@@ -140,6 +153,35 @@ def _needs_subtree_usage(specs: list[PolicySpec]) -> bool:
         and s.function.path == _SUBAGENT_COST_POLICY_PATH
         for s in specs
     )
+
+
+def _get_period_cost_requirements(specs: list[PolicySpec]) -> list[tuple[str, str | None]]:
+    """
+    Extract all period cost requirements from the policy specs.
+
+    Scans the specs for any user_period_cost_budget policies and returns a
+    list of (period, harness) tuples for which the engine needs to load cost
+    data. NOTE: Currently only ONE period cost policy is supported per engine;
+    callers must validate ``len(result) <= 1`` or raise an error.
+
+    :param specs: The merged policy specs for the engine.
+    :returns: List of ``(period, harness)`` tuples, e.g.
+        ``[("month", None)]`` or ``[("week", "codex-native")]``. Empty when no
+        period cost policies are configured. Contains at most one element in
+        current implementation.
+    """
+    requirements: list[tuple[str, str | None]] = []
+    for s in specs:
+        if not isinstance(s, FunctionPolicySpec) or s.function is None:
+            continue
+        # Generic period policy
+        if s.function.path == _USER_PERIOD_COST_POLICY_PATH:
+            args = s.function.arguments or {}
+            period = args.get("period")
+            harness = args.get("harness")
+            if period and period != "day":  # day uses user_daily_cost
+                requirements.append((period, harness))
+    return requirements
 
 
 def _normalize_usage_for_engine(usage: dict[str, float]) -> dict[str, float]:
@@ -210,6 +252,154 @@ def _load_user_daily_cost(
         conversation_store.get_daily_cost_state(owner, utc_day(now_epoch()))
     )
     state["user_id"] = owner
+    return state
+
+
+def _utc_day(epoch: int) -> str:
+    """Return the UTC calendar day for an epoch timestamp as ``"YYYY-MM-DD"``.
+
+    :param epoch: Unix epoch seconds.
+    :returns: UTC day string, e.g. ``"2026-08-21"``.
+    """
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+def _utc_week(epoch: int) -> str:
+    """Return the UTC ISO week for an epoch timestamp as ``"YYYY-Www"``.
+
+    :param epoch: Unix epoch seconds.
+    :returns: UTC ISO week string, e.g. ``"2026-W34"``.
+    """
+    from datetime import datetime, timezone
+
+    dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
+    year, week, _ = dt.isocalendar()
+    return f"{year}-W{week:02d}"
+
+
+def _utc_month(epoch: int) -> str:
+    """Return the UTC calendar month for an epoch timestamp as ``"YYYY-MM"``.
+
+    :param epoch: Unix epoch seconds.
+    :returns: UTC month string, e.g. ``"2026-08"``.
+    """
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m")
+
+
+def _utc_quarter(epoch: int) -> str:
+    """Return the UTC calendar quarter for an epoch timestamp as ``"YYYY-Qq"``.
+
+    :param epoch: Unix epoch seconds.
+    :returns: UTC quarter string, e.g. ``"2026-Q3"``.
+    """
+    from datetime import datetime, timezone
+
+    dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
+    quarter = (dt.month - 1) // 3 + 1
+    return f"{dt.year}-Q{quarter}"
+
+
+def _utc_year(epoch: int) -> str:
+    """Return the UTC calendar year for an epoch timestamp as ``"YYYY"``.
+
+    :param epoch: Unix epoch seconds.
+    :returns: UTC year string, e.g. ``"2026"``.
+    """
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y")
+
+
+def _load_user_period_cost(
+    conversation_id: str,
+    conversation_store: ConversationStore,
+    period: str,
+    harness: str | None = None,
+) -> dict[str, float | str | None]:
+    """
+    Read the session owner's per-period cost rollup as the engine seed.
+
+    Resolves the owner (cached) and reads ``{cost_usd, ask_approved_usd}``
+    for the current period (UTC), optionally scoped to a harness, tagged
+    with the owner's ``user_id``, ``period``, and ``harness`` so the budget
+    policy can name whose spend tripped the gate. When the session has no
+    owner grant (single-user mode), returns zeros (and no ``user_id``) so
+    the per-user period budget never trips.
+
+    When ``harness`` is ``None``, sums cost across all harnesses for
+    cross-harness budgets. When ``harness`` is set, reads only that
+    harness's cost for per-harness budgets.
+
+    :param conversation_id: The session, e.g. ``"conv_abc123"``.
+    :param conversation_store: Store for the owner + period-cost lookups.
+    :param period: Time period granularity: ``"day"``, ``"week"``,
+        ``"month"``, ``"quarter"``, or ``"year"``.
+    :param harness: Optional harness filter. ``None`` sums across all
+        harnesses; a specific value (e.g. ``"codex-native"``) reads only
+        that harness.
+    :returns: ``{"cost_usd": <float>, "ask_approved_usd": <float>,
+        "user_id": <owner>, "period": <period_str>, "harness": <harness>}``;
+        ``user_id`` omitted in single-user mode, ``period`` and ``harness``
+        always included.
+    """
+    from omnigent.db.utils import now_epoch
+
+    owner = _resolve_session_owner_cached(conversation_id, conversation_store)
+    if owner is None:
+        return {
+            "cost_usd": 0.0,
+            "ask_approved_usd": 0.0,
+            "period": period,
+            "harness": harness,
+        }
+
+    # Get the current period string based on granularity
+    now = now_epoch()
+    if period == "day":
+        period_str = _utc_day(now)
+    elif period == "week":
+        period_str = _utc_week(now)
+    elif period == "month":
+        period_str = _utc_month(now)
+    elif period == "quarter":
+        period_str = _utc_quarter(now)
+    elif period == "year":
+        period_str = _utc_year(now)
+    else:
+        # Shouldn't happen due to validation, but return zeros as fallback
+        return {
+            "cost_usd": 0.0,
+            "ask_approved_usd": 0.0,
+            "period": period,
+            "harness": harness,
+        }
+
+    # For cross-harness budgets (harness=None), sum across all harnesses.
+    # For per-harness budgets, read the specific harness's state.
+    if harness is None:
+        cost_usd = conversation_store.sum_period_cost(owner, period_str, harness=None)
+        # Cross-harness approval is tracked on the NULL harness row
+        state_row = conversation_store.get_period_cost_state(owner, period_str, harness=None)
+        state: dict[str, float | str | None] = {
+            "cost_usd": cost_usd,
+            "ask_approved_usd": state_row.get("ask_approved_usd", 0.0),
+            "user_id": owner,
+            "period": period_str,
+            "harness": None,
+        }
+    else:
+        state_row = conversation_store.get_period_cost_state(owner, period_str, harness=harness)
+        state = {
+            "cost_usd": state_row.get("cost_usd", 0.0),
+            "ask_approved_usd": state_row.get("ask_approved_usd", 0.0),
+            "user_id": owner,
+            "period": period_str,
+            "harness": harness,
+        }
     return state
 
 
@@ -551,6 +741,27 @@ def build_policy_engine(
         if _needs_user_daily_cost(all_policy_specs)
         else None
     )
+    # Conditional injection (#2): only pay the owner + period-cost lookups
+    # when a per-user period cost-budget policy is actually present.
+    # NOTE: Only ONE period policy is currently supported per engine. Multiple
+    # period policies would require seeding multiple context keys (e.g.,
+    # user_weekly_cost, user_monthly_cost) and updating each policy to read
+    # its specific context. For now, we validate this constraint.
+    period_requirements = _get_period_cost_requirements(all_policy_specs)
+    if len(period_requirements) > 1:
+        raise ValueError(
+            f"Multiple period cost policies are not yet supported. "
+            f"Found {len(period_requirements)} policies with periods: "
+            f"{[p for p, _ in period_requirements]}. "
+            "Configure at most one period cost policy (day, week, month, quarter, or year)."
+        )
+    initial_user_period_cost = None
+    if period_requirements:
+        # Load the single period requirement (period, harness)
+        period, harness = period_requirements[0]
+        initial_user_period_cost = _load_user_period_cost(
+            conversation_id, conversation_store, period=period, harness=harness
+        )
     # Session model: the conversation's model_override (set when a user
     # picks a model mid-session) wins over the spec's llm.model; None when
     # neither is available and cost policies treat it as undeterminable.
@@ -589,6 +800,7 @@ def build_policy_engine(
         initial_usage=initial_usage,
         initial_subtree_usage=initial_subtree_usage,
         initial_user_daily_cost=initial_user_daily_cost,
+        initial_user_period_cost=initial_user_period_cost,
         token_pricing=token_pricing,
         initial_model=initial_model,
         conversation_store=conversation_store,

@@ -928,7 +928,9 @@ class TestSqlUserDailyCost:
             session.add(row)
 
         with managed() as session:
-            loaded = session.get(SqlUserDailyCost, (0, "alice@example.com", "2026-06-16"))
+            loaded = session.get(
+                SqlUserDailyCost, (0, "alice@example.com", "2026-06-16", "__all__")
+            )
             assert loaded is not None
             assert loaded.cost_usd == pytest.approx(1.23)
             assert loaded.ask_approved_usd == pytest.approx(0.0)
