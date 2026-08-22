@@ -619,12 +619,18 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     del forward_calls[0]["subagent_router"]
     assert "turn_router" in forward_calls[0]
     del forward_calls[0]["turn_router"]
+    provenance = forward_calls[0].pop("trace_launch_provenance")
+    assert provenance.access_lane == "codex-direct"
+    assert provenance.provider == "openai-codex-subscription"
+    assert provenance.provider_fallback is False
     assert forward_calls == [
         {
             "session_id": session_id,
             "bridge_dir": bridge_dir,
             "codex_ws_url": app_server.listen_url,
             "thread_id": thread_id,
+            "requested_model": "gpt-5.4-mini",
+            "requested_effort": None,
         }
     ]
     bridge_state = codex_native_bridge.read_bridge_state(bridge_dir)

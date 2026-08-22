@@ -21,8 +21,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
+from opentelemetry.trace import StatusCode
 
 from omnigent import codex_native_forwarder as fwd
+from omnigent.codex_native_app_server import CodexTraceLaunchProvenance
 from omnigent.codex_native_bridge import (
     CodexNativeBridgeState,
     codex_home_for_bridge_dir,
@@ -2830,3 +2832,129 @@ async def test_delta_coalescer_survives_a_cancelled_flush_caller() -> None:
     )
     await asyncio.wait_for(coalescer.flush(), timeout=5.0)
     assert len(client.posts) > posts_before
+
+
+def test_codex_turn_span_records_metadata_without_content(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Native Codex turn spans expose provenance but no user payload."""
+
+    class Span:
+        def __init__(self) -> None:
+            self.status = None
+            self.ended = False
+
+        def set_status(self, status: object) -> None:
+            self.status = status
+
+        def end(self) -> None:
+            self.ended = True
+
+    class Tracer:
+        def start_span(self, name: str, *, attributes: dict[str, object]) -> Span:
+            assert name == "agent:codex-native-ui"
+            assert attributes["session.id"] == "session-1"
+            assert attributes["omnigent.codex.turn_id"] == "turn-1"
+            assert "omnigent.response.id" not in attributes
+            assert attributes["omnigent.requested_model"] == "gpt-requested"
+            assert attributes["gen_ai.response.model"] == "gpt-observed"
+            assert attributes["omnigent.requested_reasoning_effort"] == "medium"
+            assert attributes["omnigent.effective_reasoning_effort"] == "high"
+            assert attributes["omnigent.access_lane"] == "omniroute"
+            assert attributes["gen_ai.provider.name"] == "cx"
+            assert attributes["omnigent.provider.fallback"] is False
+            assert not any("input" in key or "output" in key for key in attributes)
+            return span
+
+    span = Span()
+    monkeypatch.setattr("opentelemetry.trace.get_tracer", lambda _name: Tracer())
+    state = fwd._CodexForwarderState(
+        model="gpt-observed",
+        effort="high",
+        requested_model="gpt-requested",
+        requested_effort="medium",
+        trace_launch_provenance=CodexTraceLaunchProvenance(
+            access_lane="omniroute", provider="cx", provider_fallback=False
+        ),
+    )
+
+    fwd._start_codex_turn_span("session-1", {"turn": {"id": "turn-1"}}, state)
+    fwd._end_codex_turn_span("turn/completed", {"turn": {"id": "turn-1"}}, state)
+
+    assert span.ended is True
+    assert state.telemetry_turn_span is None
+
+
+@pytest.mark.parametrize(
+    ("method", "params", "expected_status"),
+    [
+        ("turn/completed", {"turn": {"id": "turn-1"}}, StatusCode.OK),
+        ("turn/failed", {"turn": {"id": "turn-1"}}, StatusCode.ERROR),
+        (
+            "turn/completed",
+            {"turn": {"id": "turn-1", "error": {"message": "failed"}}},
+            StatusCode.ERROR,
+        ),
+    ],
+)
+def test_codex_turn_span_terminal_status(
+    method: str, params: dict[str, object], expected_status: object
+) -> None:
+    """Normal completion is OK; failed and error-bearing completion are ERROR."""
+
+    class Span:
+        status: object | None = None
+        ended = False
+
+        def set_status(self, status: object) -> None:
+            self.status = status
+
+        def end(self) -> None:
+            self.ended = True
+
+    span = Span()
+    state = fwd._CodexForwarderState(telemetry_turn_span=span, telemetry_turn_id="turn-current")
+    fwd._end_codex_turn_span(method, params, state)
+    assert span.status == expected_status
+    assert span.ended is True
+    assert state.telemetry_turn_span is None
+    assert state.telemetry_turn_id is None
+
+
+def test_codex_turn_span_omits_unavailable_effective_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Requested values remain useful without inventing effective model or effort."""
+    captured: dict[str, object] = {}
+
+    class Tracer:
+        def start_span(self, _name: str, *, attributes: dict[str, object]) -> object:
+            captured.update(attributes)
+            return object()
+
+    monkeypatch.setattr("opentelemetry.trace.get_tracer", lambda _name: Tracer())
+    state = fwd._CodexForwarderState(requested_model="gpt-requested", requested_effort="medium")
+
+    fwd._start_codex_turn_span("session-1", {"turn": {"id": "turn-1"}}, state)
+
+    assert captured["omnigent.requested_model"] == "gpt-requested"
+    assert captured["omnigent.requested_reasoning_effort"] == "medium"
+    assert "gen_ai.response.model" not in captured
+    assert "omnigent.effective_reasoning_effort" not in captured
+
+
+def test_codex_turn_span_clears_state_when_span_end_raises() -> None:
+    """A broken exporter cannot leave a stale active span in forwarder state."""
+
+    class Span:
+        def set_status(self, _status: object) -> None:
+            pass
+
+        def end(self) -> None:
+            raise RuntimeError("exporter failed")
+
+    state = fwd._CodexForwarderState(telemetry_turn_span=Span(), telemetry_turn_id="turn-current")
+
+    with pytest.raises(RuntimeError, match="exporter failed"):
+        fwd._end_codex_turn_span("turn/completed", {"turn": {"id": "turn-current"}}, state)
+
+    assert state.telemetry_turn_span is None
+    assert state.telemetry_turn_id is None
