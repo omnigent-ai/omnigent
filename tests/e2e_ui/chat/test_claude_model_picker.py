@@ -844,7 +844,7 @@ def test_claude_native_permission_mode_switch_persists(
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` for a real server-backed
         session; the browser snapshot is patched to a claude-native session
-        already in ``default`` (Manual) mode.
+        already in ``default`` mode.
     :returns: None.
     """
     base_url, session_id = seeded_session

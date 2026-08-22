@@ -3210,10 +3210,10 @@ describe("NewChatLandingScreen agent picker + config gear", () => {
     fireEvent.click(screen.getByTestId("new-chat-landing-config-cancel"));
     expect(screen.queryByTestId("new-chat-landing-config-modal")).toBeNull();
     fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
-    // Reopened: Plan was discarded, the permission select is back at Manual
-    // (Claude's label for the prompting `default` mode).
+    // Reopened: Plan was discarded, the permission select is back at Default
+    // (the label for the prompting `default` mode).
     expect(screen.getByTestId("new-chat-landing-config-permission").textContent).toContain(
-      "Manual",
+      "Default",
     );
   });
 
@@ -4264,14 +4264,14 @@ describe("NewChatLandingScreen Smart Routing harness row", () => {
     const permission = screen.getByTestId("new-chat-landing-config-permission");
     expect(permission.textContent).toContain("Default");
     expect(permission.textContent).not.toContain("Plan");
-    // Reads the state behind the locked row, not the row's own constant: the
-    // wrapper's full modal is back and shows the reset value.
+    // Reads the state behind the locked row: the wrapper's full modal is back
+    // and shows the reset value, with the remembered "plan" gone.
     fireEvent.click(screen.getByTestId("new-chat-landing-config-cancel"));
     selectAgent("a1");
     fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
-    expect(screen.getByTestId("new-chat-landing-config-permission").textContent).toContain(
-      "Manual",
-    );
+    const reopened = screen.getByTestId("new-chat-landing-config-permission");
+    expect(reopened.textContent).toContain("Default");
+    expect(reopened.textContent).not.toContain("Plan");
   });
 
   it("leaves Smart Routing by re-picking a harness row", () => {
