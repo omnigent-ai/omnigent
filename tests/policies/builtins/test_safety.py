@@ -19,7 +19,11 @@ from __future__ import annotations
 
 import pytest
 
-from omnigent.policies.builtins.safety import ask_on_os_tools, block_skills
+from omnigent.policies.builtins.safety import (
+    ask_on_os_tools,
+    block_skills,
+    max_tool_calls_per_session,
+)
 from omnigent.policies.schema import PolicyEvent
 from tests.policies.builtins.helpers import tool_call_event as tc
 
@@ -608,3 +612,43 @@ def test_block_skills_native_skill_tool_with_args() -> None:
     policy = block_skills(blocked=["deploy"])
     result = policy(tc("Skill", {"skill": "deploy", "args": "--force"}))
     assert result["result"] == "DENY"
+
+
+# ── max_tool_calls_per_session ──────────────────────────────────
+
+
+def test_max_tool_calls_allows_under_limit_then_denies() -> None:
+    """The gate allows up to *limit* tool calls, then DENYs.
+
+    The counter lives in ``session_state``; the first call under the limit
+    ALLOWs and increments, and a call at the limit DENYs.
+    """
+    policy = max_tool_calls_per_session(limit=2)
+    # Under the limit: ALLOW and request an increment.
+    under = policy(tc("sys_os_shell", {"command": "ls"}, session_state={}))
+    assert under["result"] == "ALLOW"
+    assert under["state_updates"][0]["key"] == "_policy_tool_call_count"
+    # At the limit: DENY.
+    at_limit = policy(
+        tc("sys_os_shell", {"command": "ls"}, session_state={"_policy_tool_call_count": 2})
+    )
+    assert at_limit["result"] == "DENY"
+
+
+def test_max_tool_calls_abstains_on_non_tool_call_phase() -> None:
+    """Only ``tool_call`` events are counted; other phases ALLOW."""
+    policy = max_tool_calls_per_session(limit=1)
+    assert policy({"type": "request", "data": "hello"})["result"] == "ALLOW"
+
+
+@pytest.mark.parametrize("bad_limit", [0, -1, -100])
+def test_max_tool_calls_rejects_non_positive_limit(bad_limit: int) -> None:
+    """A ``limit < 1`` fails loud at spec load rather than shipping a dead gate.
+
+    With ``limit <= 0`` the counter is ``>= limit`` from the very first
+    tool call, so the policy would DENY everything and silently brick the
+    session — exactly the kind of misconfiguration the sibling factories
+    (cost_budget, block_working_dir_changes) reject up front.
+    """
+    with pytest.raises(ValueError, match="limit must be >= 1"):
+        max_tool_calls_per_session(limit=bad_limit)
