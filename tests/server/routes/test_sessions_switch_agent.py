@@ -595,6 +595,52 @@ async def test_switch_publishes_agent_changed_event(
 
 
 @pytest.mark.asyncio
+async def test_switch_clears_the_runners_policy_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A switch tells the runner its cached policy gate is stale.
+
+    The target agent's spec may declare guardrails the old one didn't, so the
+    switch changes the governing policy set. A native harness caches "no
+    policy can fire for this session" to answer its blocking per-tool-call
+    hook without a round trip, and nothing else on this path revokes it — the
+    gate file outlives the rebind. Fails if the switch forgets to notify: a
+    session that was ungoverned before it would keep skipping enforcement
+    under the new agent's guardrails until the gate expired.
+    """
+    conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": _conv()})
+    agent_store = _AgentStore(
+        {
+            "a98bb825ebd41391c19637c58fe3c0b7": _CURRENT,
+            "52adb39f0c5ea92b5563da5327dac08f": _BUILTIN_CLAUDE,
+        }
+    )
+    _patch_family_helpers(monkeypatch, same_family=True, native=True, labels={})
+    forwarded: list[tuple[str, dict[str, object]]] = []
+
+    async def _capture(
+        session_id: str, _router: object, event: dict[str, object], **_kwargs: object
+    ) -> None:
+        """Record a control event the route forwarded to the runner."""
+        forwarded.append((session_id, event))
+
+    monkeypatch.setattr(sessions_mod, "_forward_session_change_to_runner", _capture)
+    client = TestClient(_build_app(conv_store, agent_store))
+
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/switch-agent",
+        json={"agent_id": "52adb39f0c5ea92b5563da5327dac08f"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert (
+        "e9f8f58523cec9a57d3bdf93be543e8c",
+        {"type": "policy_gate_changed"},
+    ) in forwarded
+
+
+@pytest.mark.asyncio
 async def test_switch_rejected_publishes_no_event(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

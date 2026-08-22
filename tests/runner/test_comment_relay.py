@@ -1296,3 +1296,80 @@ async def test_failed_launch_rolls_back_the_relay_it_started(tmp_path: Path) -> 
             ) as c:
                 await c.delete(f"/v1/sessions/{session_id}")
         shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_relay_hook_evaluate_skips_the_server_behind_a_live_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A recorded "no policy can fire" gate answers the hook with no upstream call.
+
+    This endpoint blocks Claude Code before every tool call, twice per call
+    counting PostToolUse, so from another region it is seconds a turn spent
+    being told the same thing. Fails if the relay still round-trips behind a
+    live gate (the saving disappears) or if it answers anything other than
+    "no opinion" (the harness's own consent prompt must still run).
+    """
+    import asyncio
+
+    from omnigent.claude_native_bridge import prepare_bridge_dir as _prep
+    from omnigent.claude_native_bridge import start_tool_relay
+    from omnigent.native_policy_gate import forget_session, record_gate
+
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+
+    bridge_dir = _prep("relay-gate-test", workspace=tmp_path)
+    session_id = "conv_relay_gate"
+    upstream_calls: list[object] = []
+
+    class _CountingServerClient:
+        """Fake server_client that records — and allows — every upstream POST."""
+
+        content = b'{"result":"POLICY_ACTION_ALLOW"}'
+        status_code = 200
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+
+        async def post(self, url: str, **kwargs: object) -> _CountingServerClient:
+            upstream_calls.append(kwargs.get("json"))
+            return self
+
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=[],
+        tool_executor=lambda name, args: {},  # type: ignore[arg-type]
+        loop=asyncio.get_running_loop(),
+        policy_client=_CountingServerClient(),
+        session_id=session_id,
+    )
+    try:
+        relay_info = json.loads((bridge_dir / _TOOL_RELAY_FILE).read_text())
+        hook_url = f"{relay_info['url']}/hook/claude/evaluate-policy"
+        headers = {"Authorization": f"Bearer {relay_info['token']}"}
+        hook_payload = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls"},
+        }
+
+        record_gate(bridge_dir, {"no_policies": True}, session_id=session_id)
+        async with httpx.AsyncClient() as c:
+            gated = await c.post(hook_url, json=hook_payload, headers=headers, timeout=5.0)
+        assert gated.status_code == 200
+        # "No opinion": an empty body leaves Claude's own permission gate intact.
+        assert gated.content == b""
+        assert upstream_calls == []
+
+        # Once the gate is revoked — as a policy mutation does — the very next
+        # event goes back to the server.
+        forget_session(session_id)
+        (bridge_dir / "policy_gate.json").unlink()
+        async with httpx.AsyncClient() as c:
+            ungated = await c.post(hook_url, json=hook_payload, headers=headers, timeout=5.0)
+        assert ungated.status_code == 200
+        assert len(upstream_calls) == 1
+    finally:
+        forget_session(session_id)
+        relay.close()

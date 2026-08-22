@@ -296,3 +296,46 @@ async def test_create_session_policy_no_telemetry_on_error(
         )
     assert resp.status_code == 409
     mock_emit.assert_not_called()
+
+
+# ── policy-gate invalidation ──────────────────────────────────────────
+
+
+async def test_policy_mutations_clear_the_runners_policy_gate(
+    client: httpx.AsyncClient, session_id: str
+) -> None:
+    """
+    Every session-policy mutation tells the bound runner its gate is stale.
+
+    A native harness caches "no policy can fire for this session" so its
+    blocking per-tool-call hook can answer without a round trip. Adding the
+    first policy must revoke that at once, or the session would go
+    unenforced until the gate expired. Fails if any of create / update /
+    delete forgets to notify — the enforcement gap is silent.
+    """
+    forwarded: list[tuple[str, dict[str, object]]] = []
+
+    async def _capture(
+        session: str, _router: object, event: dict[str, object], **_kwargs: object
+    ) -> None:
+        """Record a control event the route forwarded to the runner."""
+        forwarded.append((session, event))
+
+    with patch(
+        "omnigent.server.routes.sessions._forward_session_change_to_runner",
+        _capture,
+    ):
+        created = await client.post(
+            f"/v1/sessions/{session_id}/policies", json=_policy_payload(name="gate_probe")
+        )
+        assert created.status_code == 200
+        policy_id = created.json()["id"]
+        updated = await client.patch(
+            f"/v1/sessions/{session_id}/policies/{policy_id}",
+            json={"enabled": False},
+        )
+        assert updated.status_code == 200
+        deleted = await client.delete(f"/v1/sessions/{session_id}/policies/{policy_id}")
+        assert deleted.status_code in (200, 204)
+
+    assert forwarded == [(session_id, {"type": "policy_gate_changed"})] * 3

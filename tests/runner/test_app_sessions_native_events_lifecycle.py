@@ -3507,3 +3507,71 @@ async def test_events_stop_session_on_kiro_native_503_when_kill_fails(
         f"No session.status: idle should be enqueued when kill_session failed; "
         f"got {status_idle!r}."
     )
+
+
+async def test_policy_gate_changed_clears_the_sessions_local_gate(
+    tmp_path: Path,
+) -> None:
+    """
+    A ``policy_gate_changed`` event revokes the session's cached policy gate.
+
+    This is the invalidation half of the native policy gate: the harness
+    skips its blocking per-tool-call evaluate only while the server has said
+    nothing can fire, and the server sends this the moment that stops being
+    true. Fails if the runner ignores the event — a session that gained a
+    policy would go unenforced until the gate expired — or if it errors on a
+    session it holds no gate for (a routine, harmless case).
+    """
+    from omnigent.native_policy_gate import (
+        forget_session,
+        may_skip_policy_call,
+        record_gate,
+    )
+
+    conv_id = uuid.uuid4().hex
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "claude-native", "model": "claude-opus-4-7"},
+        ),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the claude-native spec for any agent_id."""
+        del agent_id, session_id
+        return spec
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    record_gate(bridge_dir, {"no_policies": True}, session_id=conv_id)
+    assert may_skip_policy_call(bridge_dir) is True
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    try:
+        async with _runner_client(app) as client:
+            create_resp = await client.post(
+                "/v1/sessions",
+                json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+            )
+            assert create_resp.status_code == 201, create_resp.text
+            resp = await client.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={"type": "policy_gate_changed"},
+            )
+            assert resp.status_code == 204, resp.text
+            # A session with no registered gate is a no-op, not an error.
+            unknown = await client.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={"type": "policy_gate_changed"},
+            )
+            assert unknown.status_code == 204, unknown.text
+    finally:
+        forget_session(conv_id)
+
+    assert may_skip_policy_call(bridge_dir) is False

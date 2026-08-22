@@ -2485,6 +2485,21 @@ def register_core_routes(
         # worktree (cwd comes from the runner workspace).
         background_tasks.add_task(_reset_runner_resources_after_switch, session_id)
 
+        # The new agent's spec may declare guardrails the old one didn't, so the
+        # governing policy set just changed. Clear any locally cached "no policy
+        # can fire" gate on the runner (see omnigent.native_policy_gate) —
+        # otherwise a session that was ungoverned before the switch would keep
+        # skipping its blocking policy hook until the gate expired.
+        from omnigent.server.routes._sessions.helpers import (
+            _forward_session_change_to_runner as _forward_change,
+        )
+
+        await _forward_change(
+            session_id,
+            get_server_runner_router(),
+            {"type": "policy_gate_changed"},
+        )
+
         items = await asyncio.to_thread(conversation_store.list_items, session_id, limit=10000)
         level = await _get_permission_level(user_id, session_id, permission_store)
         return _build_session_response(

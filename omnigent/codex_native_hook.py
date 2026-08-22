@@ -23,6 +23,7 @@ from omnigent.codex_native_bridge import (
     read_codex_config_model,
     read_policy_hook_config,
 )
+from omnigent.native_policy_gate import may_skip_policy_call, record_gate
 from omnigent.native_policy_hook import (
     evaluation_response_to_hook_output,
     fail_closed_hook_output,
@@ -127,6 +128,12 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         # Unrecognized hook event or an mcp__omnigent__* tool (relay-enforced).
         return 0
 
+    # This hook blocks the harness. When the server has already reported that
+    # no policy can fire for this session, answer "no opinion" without a round
+    # trip; the gate clears as soon as a policy is added, and expires anyway.
+    if may_skip_policy_call(bridge_dir, tool_name=payload.get("tool_name")):
+        return 0
+
     # Stamp the live model from this session's config.toml (what an in-TUI
     # ``/model`` writes) onto the request so the cost-budget gate evaluates
     # against the user's CURRENT selection.
@@ -190,6 +197,10 @@ def _main_evaluate_policy(argv: list[str]) -> int:
             file=sys.stderr,
         )
         return _fail_closed()
+
+    # Absence of ``gate`` clears any record, so a session that gained a policy
+    # stops skipping on the very next event.
+    record_gate(bridge_dir, eval_response.get("gate") if isinstance(eval_response, dict) else None)
 
     hook_output = evaluation_response_to_hook_output(hook_event, eval_response)
     if hook_output is not None:

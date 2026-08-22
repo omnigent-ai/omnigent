@@ -111,6 +111,32 @@ def _spec_to_response(spec: PolicySpec, source: str) -> dict[str, Any]:
     }
 
 
+async def _invalidate_session_policies(session_id: str) -> None:
+    """
+    Drop every cached answer that a session's policy set just changed.
+
+    Evicts the server-side spec cache, then clears the runner's local
+    "no policy can fire" gate (see :mod:`omnigent.native_policy_gate`) so a
+    native harness's next hook asks the server again instead of skipping it.
+    Without the second half, a session that had no policies when its gate was
+    recorded would keep skipping the gate for up to
+    :data:`~omnigent.native_policy_gate.GATE_TTL_S` after the first policy was
+    added. Best-effort — the gate expires on its own if the runner is gone.
+
+    :param session_id: The session whose policies changed.
+    :returns: None.
+    """
+    invalidate_session_policy_specs_cache(session_id)
+    from omnigent.server.routes._sessions.common import get_server_runner_router
+    from omnigent.server.routes._sessions.helpers import _forward_session_change_to_runner
+
+    await _forward_session_change_to_runner(
+        session_id,
+        get_server_runner_router(),
+        {"type": "policy_gate_changed"},
+    )
+
+
 def create_session_policies_router(
     store: PolicyStore,
     conversation_store: ConversationStore,
@@ -211,7 +237,7 @@ def create_session_policies_router(
                 f"Policy with name '{body.name}' already exists in this session",
                 code=ErrorCode.CONFLICT,
             ) from exc
-        invalidate_session_policy_specs_cache(session_id)
+        await _invalidate_session_policies(session_id)
         try:
             import hashlib as _hashlib
 
@@ -372,7 +398,7 @@ def create_session_policies_router(
             ) from exc
         if policy is None:
             raise OmnigentError("Policy not found", code=ErrorCode.NOT_FOUND)
-        invalidate_session_policy_specs_cache(session_id)
+        await _invalidate_session_policies(session_id)
         return _entity_to_response(policy)
 
     @router.delete("/sessions/{session_id}/policies/{policy_id}")
@@ -402,7 +428,7 @@ def create_session_policies_router(
                 user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
             )
         store.delete(policy_id, session_id)
-        invalidate_session_policy_specs_cache(session_id)
+        await _invalidate_session_policies(session_id)
         try:
             import hashlib as _hashlib
 
