@@ -85,6 +85,7 @@ from omnigent.stores.conversation_store import (
     FORK_SOURCE_LABEL_KEY,
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
+    SESSION_CREATE_IDEMPOTENCY_LABEL_PREFIX,
     SWITCH_PREVIOUS_BUILTIN_LABEL_KEY,
     ConversationAlreadyExistsError,
     ConversationNotFoundError,
@@ -870,6 +871,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         git_branch: str | None = None,
         terminal_launch_args: list[str] | None = None,
         conversation_id: str | None = None,
+        initial_labels: dict[str, str] | None = None,
     ) -> Conversation:
         """
         Create a new conversation in the database.
@@ -918,6 +920,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             terminal.
         :param conversation_id: Optional caller-supplied identifier.
             ``None`` generates a new random id.
+        :param initial_labels: Optional labels inserted atomically with the
+            conversation row. Intended for server-owned identity metadata;
+            ordinary callers should continue to use :meth:`set_labels`.
         :returns: The newly created :class:`Conversation`.
         :raises NameAlreadyExistsError: If
             ``parent_conversation_id`` is set and a sibling row
@@ -933,6 +938,22 @@ class SqlAlchemyConversationStore(ConversationStore):
             ConversationNotFoundError,
             NameAlreadyExistsError,
         )
+
+        if initial_labels is not None and (
+            conversation_id is None
+            or kind != "default"
+            or parent_conversation_id is not None
+            or runner_id is not None
+            or sub_agent_name is not None
+            or host_id is not None
+            or workspace is not None
+            or git_branch is not None
+            or terminal_launch_args is not None
+        ):
+            raise ValueError(
+                "initial_labels are reserved for a caller-identified, empty, "
+                "top-level default session shell"
+            )
 
         now = now_epoch()
         new_id = conversation_id if conversation_id is not None else generate_conversation_id()
@@ -990,6 +1011,15 @@ class SqlAlchemyConversationStore(ConversationStore):
                     agent_id=agent_id,
                 )
                 ap_sess.add(row)
+                if initial_labels:
+                    _upsert_labels(ap_sess, new_id, initial_labels, now)
+            if initial_labels is not None:
+                recovered = self.ensure_conversation_metadata(new_id)
+                if recovered is None:  # pragma: no cover - committed row must be readable
+                    raise RuntimeError(
+                        f"conversation {new_id!r} disappeared during metadata creation"
+                    )
+                return recovered
             meta = SqlConversationMetadata(
                 id=new_id,
                 kind=encode_conversation_kind(kind),
@@ -1032,6 +1062,74 @@ class SqlAlchemyConversationStore(ConversationStore):
                     f"conversation id {conversation_id!r} already exists"
                 ) from exc
             raise
+
+    def ensure_conversation_metadata(self, conversation_id: str) -> Conversation | None:
+        """Create missing default metadata without overwriting existing state.
+
+        Session creation spans the Agent Platform and Omnigent databases. A
+        process crash after the durable conversation+label transaction can
+        therefore leave a correctly bound shell without its operational
+        metadata row. This method repairs exactly that default top-level shell.
+        Dialect-native conflict-ignore makes concurrent original/replay calls
+        converge without clobbering runner, host, or other metadata.
+
+        :param conversation_id: Existing top-level conversation identifier.
+        :returns: The complete conversation, or ``None`` when the durable row
+            does not exist.
+        """
+        with self._conv_session("ensure_conversation_metadata.read") as ap_sess:
+            row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
+            if row is None:
+                return None
+            if row.parent_conversation_id is not None:
+                raise ValueError("metadata repair is limited to top-level session shells")
+            labels = _fetch_labels(ap_sess, conversation_id)
+
+        workspace_id = current_workspace_id()
+        values = {
+            "workspace_id": workspace_id,
+            "id": conversation_id,
+            "kind": encode_conversation_kind("default"),
+        }
+        with self._session("ensure_conversation_metadata.write") as meta_sess:
+            dialect = meta_sess.bind.dialect.name if meta_sess.bind is not None else ""
+            if dialect == "sqlite":
+                from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+                stmt = sqlite_insert(SqlConversationMetadata).values(**values)
+                meta_sess.execute(
+                    stmt.on_conflict_do_nothing(index_elements=["workspace_id", "id"])
+                )
+            elif dialect == "postgresql":
+                from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+                stmt = pg_insert(SqlConversationMetadata).values(**values)
+                meta_sess.execute(
+                    stmt.on_conflict_do_nothing(index_elements=["workspace_id", "id"])
+                )
+            elif dialect == "mysql":
+                from sqlalchemy.dialects.mysql import insert as mysql_insert
+
+                meta_sess.execute(
+                    mysql_insert(SqlConversationMetadata).values(**values).prefix_with("IGNORE")
+                )
+            else:
+                meta = meta_sess.get(
+                    SqlConversationMetadata,
+                    (workspace_id, conversation_id),
+                )
+                if meta is None:
+                    meta_sess.add(SqlConversationMetadata(**values))
+                    meta_sess.flush()
+            meta = meta_sess.get(
+                SqlConversationMetadata,
+                (workspace_id, conversation_id),
+            )
+            if meta is None:  # pragma: no cover - insert/get invariant
+                raise RuntimeError(
+                    f"failed to ensure metadata for conversation {conversation_id!r}"
+                )
+            return _to_conversation(row, meta, labels)
 
     def get_conversation(self, conversation_id: str) -> Conversation | None:
         """
@@ -3718,6 +3816,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 for key, value in _fetch_labels(session, source_conversation_id).items()
                 if key not in (_INSTANCE_SCOPED_LABEL_KEYS | _FORK_ONLY_DROPPED_LABEL_KEYS)
                 and not key.startswith(f"{PINNED_LABEL_KEY}.")
+                and not key.startswith(SESSION_CREATE_IDEMPOTENCY_LABEL_PREFIX)
             }
             source_workspace = source_meta_ref.workspace if source_meta_ref else None
             source_ext_session = source_meta_ref.external_session_id if source_meta_ref else None

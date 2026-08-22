@@ -8,13 +8,14 @@ import json
 import secrets
 import time
 from collections.abc import Callable
-from typing import Any
+from typing import Annotated, Any
 
 import httpx
 from fastapi import (
     APIRouter,
     BackgroundTasks,
     Depends,
+    Header,
     HTTPException,
     Query,
     Request,
@@ -178,6 +179,10 @@ from omnigent.server.schemas import (
     SessionSwitchAgentRequest,
     UpdateSessionRequest,
 )
+from omnigent.server.session_create_idempotency import (
+    IDEMPOTENCY_KEY_HEADER,
+    build_session_create_idempotency,
+)
 from omnigent.session_lifecycle import (
     labels_with_closed_status,
 )
@@ -234,6 +239,17 @@ def register_core_routes(
     )
     async def create_session(
         request: Request,
+        idempotency_key: Annotated[
+            str | None,
+            Header(
+                alias=IDEMPOTENCY_KEY_HEADER,
+                description=(
+                    "Replay key for an empty top-level external session shell. "
+                    "Unsupported create shapes fail closed instead of silently "
+                    "weakening idempotency."
+                ),
+            ),
+        ] = None,
     ) -> SessionResponse | CreatedSessionResponse:
         """
         Create a session.
@@ -248,6 +264,9 @@ def register_core_routes(
 
         :param request: FastAPI request containing either JSON or
             multipart form data.
+        :param idempotency_key: Optional replay key for an empty top-level
+            external JSON session shell. Multipart and side-effecting JSON
+            creates fail closed when this header is present.
         :returns: :class:`SessionResponse` for JSON create, or
             :class:`CreatedSessionResponse` for bundled create.
         :raises OmnigentError: If metadata, bundle, or agent lookup
@@ -257,6 +276,11 @@ def register_core_routes(
         user_id = _require_user(request, auth_provider)
         content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
         if content_type == "multipart/form-data":
+            if idempotency_key is not None:
+                raise OmnigentError(
+                    "Idempotency-Key is not supported for multipart bundled session creation",
+                    code=ErrorCode.INVALID_INPUT,
+                )
             result = await _create_bundled_session_from_multipart(request, user_id)
             if permission_store is not None and user_id is not None:
                 await asyncio.to_thread(permission_store.ensure_user, user_id)
@@ -291,6 +315,12 @@ def register_core_routes(
             # message survives in each entry's `msg`.
             raise HTTPException(status_code=422, detail=exc.errors(include_context=False)) from exc
 
+        idempotency = build_session_create_idempotency(
+            idempotency_key,
+            body,
+            user_id,
+        )
+
         resp = await _create_session_from_existing_agent(
             conversation_store,
             agent_store,
@@ -304,6 +334,7 @@ def register_core_routes(
             file_store=file_store,
             artifact_store=artifact_store,
             background_title_coordinator=background_title_coordinator,
+            idempotency=idempotency,
         )
         # Notify the runner about the new session so it can resolve
         # the spec and cache sub_agent_name before the first turn.

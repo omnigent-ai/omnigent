@@ -101,6 +101,40 @@ def test_create_conversation_rows_land_in_correct_db(
     assert _col(omnigent_db, "omnigent_conversation_metadata", "workspace") == ["/tmp/proj"]
 
 
+def test_idempotent_shell_binding_and_metadata_repair_cross_databases(
+    omnigent_db: Path,
+    conv_db: Path,
+    store: SqlAlchemyConversationStore,
+) -> None:
+    conversation_id = "d" * 32
+    labels = {"omnigent.idempotency.create.request_hash": "request-hash"}
+
+    created = store.create_conversation(
+        conversation_id=conversation_id,
+        initial_labels=labels,
+    )
+
+    assert created.labels == labels
+    assert _count(conv_db, "conversations") == 1
+    assert _count(conv_db, "conversation_labels") == 1
+    assert _count(omnigent_db, "omnigent_conversation_metadata") == 1
+
+    with sqlite3.connect(str(omnigent_db)) as conn:
+        conn.execute(
+            "DELETE FROM omnigent_conversation_metadata WHERE id = ?",
+            (bytes.fromhex(conversation_id),),
+        )
+
+    repaired = store.ensure_conversation_metadata(conversation_id)
+
+    assert repaired is not None
+    assert repaired.id == conversation_id
+    assert repaired.labels == labels
+    assert _count(conv_db, "conversations") == 1
+    assert _count(conv_db, "conversation_labels") == 1
+    assert _count(omnigent_db, "omnigent_conversation_metadata") == 1
+
+
 def test_create_sub_agent_conversation(
     omnigent_db: Path, conv_db: Path, store: SqlAlchemyConversationStore
 ) -> None:
