@@ -2509,6 +2509,7 @@ def _build_session_create_body(
     title: object,
     message: object,
     model: object = None,
+    terminal_launch_args: object = None,
 ) -> _JsonObject:
     """
     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
@@ -2537,6 +2538,12 @@ def _build_session_create_body(
         body["title"] = title
     if isinstance(model, str) and model:
         body["model_override"] = model
+    if isinstance(terminal_launch_args, list) and terminal_launch_args:
+        # Forward verbatim; the server bounds-checks via
+        # _validate_terminal_launch_args (flat list, no shell metachars).
+        body["terminal_launch_args"] = [
+            str(a) for a in terminal_launch_args if isinstance(a, str)
+        ]
     if isinstance(message, str) and message:
         body["initial_items"] = [
             {
@@ -2691,6 +2698,7 @@ async def _execute_session_create(
         args.get("title"),
         args.get("message"),
         model=args.get("model"),
+        terminal_launch_args=args.get("terminal_launch_args"),
     )
     try:
         resp = await server_client.post("/v1/sessions", json=body, timeout=30.0)
@@ -2857,6 +2865,14 @@ async def _upload_config_bundle(
     title = args.get("title")
     if isinstance(title, str) and title:
         metadata["title"] = title
+    terminal_launch_args = args.get("terminal_launch_args")
+    if isinstance(terminal_launch_args, list) and terminal_launch_args:
+        # Forward into the multipart metadata JSON; the server parses it
+        # via _parse_session_create_metadata -> SessionCreateMetadata, which
+        # already owns _validate_terminal_launch_args (bounds-checked).
+        metadata["terminal_launch_args"] = [
+            str(a) for a in terminal_launch_args if isinstance(a, str)
+        ]
     try:
         resp = await server_client.post(
             "/v1/sessions",

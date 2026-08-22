@@ -955,6 +955,25 @@ class SysSessionCreateTool(Tool):
                                 "agent's default."
                             ),
                         },
+                        "terminal_launch_args": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "Optional native-terminal pass-through args "
+                                "for the child session, e.g. "
+                                "[\"--yolo\"] for a headless cursor-native "
+                                "worker (cursor-agent's full-bypass flag) so it "
+                                "does not stall on in-terminal approval prompts "
+                                "that no human can answer. Forwarded verbatim "
+                                "into the server request body's "
+                                "terminal_launch_args (already validated and "
+                                "bounds-checked server-side); only meaningful "
+                                "for terminal-native harnesses "
+                                "(cursor/codex/claude-native). Top-level "
+                                "sessions keep these explicit args rather than "
+                                "deriving them from the bundle's yolo flag."
+                            ),
+                        },
                     },
                     # Only the always-optional fields are listed in
                     # ``required`` (none): the agent_id-vs-config_path

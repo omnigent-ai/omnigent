@@ -6426,6 +6426,50 @@ async def test_sys_session_create_spawns_child_under_caller() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sys_session_create_forwards_terminal_launch_args() -> None:
+    """
+    ``terminal_launch_args`` reaches the JSON create body verbatim.
+
+    Headless native-terminal workers (cursor/codex/claude-native) stall
+    on in-terminal approval prompts no human can answer; the caller
+    declares the bypass stance (e.g. ``["--yolo"]``) at launch, and the
+    server — which already validates + bounds-checks the list — threads
+    it into the child's terminal_launch_args. If the tool dropped the
+    field, a top-level agent_id/config_path cursor worker would silently
+    run WITHOUT ``--yolo`` and stall on every tool call.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    captured: dict[str, Any] = {}
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            captured.update(json.loads(request.content))
+            return httpx.Response(
+                201,
+                json={"id": "conv_child_tla", "agent_id": "ag_x", "status": "idle"},
+            )
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(
+                {"agent_id": "ag_x", "terminal_launch_args": ["--yolo"]}
+            ),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    # Forwarded verbatim into the create body the server validates.
+    assert captured["terminal_launch_args"] == ["--yolo"]
+    assert captured["parent_session_id"] == "conv_caller"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "arguments",
     [
