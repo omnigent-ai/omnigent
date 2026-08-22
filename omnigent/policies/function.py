@@ -232,6 +232,10 @@ def _build_event(ctx: EvaluationContext) -> PolicyEvent:
             # hook so policies can tailor messages to it. ``None`` when
             # unstamped (web / API).
             "harness": ctx.harness,
+            # The harness's own approval mode (e.g. "bypassPermissions"),
+            # stamped by a native tool hook. ``None`` when unstamped
+            # (web / API) — a gate must not read that as bypassed.
+            "permission_mode": ctx.permission_mode,
             # Conversation labels (engine hot cache), empty when unpopulated.
             "labels": dict(ctx.labels) if ctx.labels is not None else {},
             # Subtree-scoped cumulative cost (this conversation + its

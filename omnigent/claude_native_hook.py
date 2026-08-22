@@ -1082,6 +1082,12 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     status_model = read_claude_status_model(bridge_dir)
     if status_model:
         context["model"] = status_model
+    # Claude Code stamps its approval mode on every hook payload. Forwarding it
+    # lets a policy gate a session launched with approvals disabled — the flag
+    # itself never reaches the policy layer, only the resulting mode does.
+    permission_mode = payload.get("permission_mode")
+    if isinstance(permission_mode, str) and permission_mode:
+        context["permission_mode"] = permission_mode
 
     def _fail_closed(detail: str | None = None) -> int:
         out = fail_closed_hook_output(hook_event, detail)

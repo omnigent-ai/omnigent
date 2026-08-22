@@ -157,6 +157,11 @@ class EventContext(TypedDict, total=False):
         absent on web / API paths. Lets policies tailor messages to how
         the harness exposes model switching (codex-native is
         terminal-only). Read via ``event["context"]["harness"]``.
+    :param permission_mode: The harness's own approval mode, e.g.
+        ``"bypassPermissions"``, stamped by a native tool hook. ``None`` /
+        absent on web / API paths. Lets policies gate a session launched
+        with approvals disabled. Read via
+        ``event["context"]["permission_mode"]``.
     :param labels: Read-only snapshot of the conversation's guardrails
         labels, e.g. ``{"cost_control.plan": "{...}"}``. Populated by
         the server-side engine; empty on paths that don't carry labels
@@ -173,6 +178,7 @@ class EventContext(TypedDict, total=False):
     # unknown model (fail closed).
     model: str | None
     harness: str | None
+    permission_mode: str | None
     labels: dict[str, str]
 
 
