@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1581,6 +1582,55 @@ def test_seed_isolated_agy_home_tolerates_missing_credential(
     # No token copied (none existed), but the isolated Gemini dir + markers still exist.
     assert not (iso_gemini / "antigravity-cli" / "antigravity-oauth-token").exists()
     assert (iso_gemini / "antigravity-cli" / "cache" / "onboarding.json").is_file()
+
+
+@pytest.mark.parametrize("iso_body", ["{not json", '["a", "list"]'])
+def test_seed_isolated_agy_home_trust_never_clobbers_unparseable_isolated_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, iso_body: str
+) -> None:
+    """An isolated settings file that isn't a JSON object is left byte-identical.
+
+    The trust seeder previously fell through to ``data = {}`` and rewrote the
+    file with only its own keys; fail safe is to skip (agy re-prompts for trust)
+    rather than silently drop whatever the file held.
+    """
+    fake_home = tmp_path / "real-home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    workspace = tmp_path / "worktrees" / "feature-x"
+    workspace.mkdir(parents=True)
+    iso_settings = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "settings.json"
+    iso_settings.parent.mkdir(parents=True)
+    iso_settings.write_text(iso_body, encoding="utf-8")
+
+    seed_isolated_agy_home(bridge_dir, trusted_workspace=workspace)
+
+    assert iso_settings.read_text(encoding="utf-8") == iso_body
+
+
+def test_seed_isolated_agy_home_trust_write_is_0o600(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The trust seeder pins the settings file to 0o600 regardless of umask."""
+    fake_home = tmp_path / "real-home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    workspace = tmp_path / "worktrees" / "feature-x"
+    workspace.mkdir(parents=True)
+    old_umask = os.umask(0o000)
+    try:
+        seed_isolated_agy_home(bridge_dir, trusted_workspace=workspace)
+    finally:
+        os.umask(old_umask)
+
+    iso_settings = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "settings.json"
+    assert iso_settings.stat().st_mode & 0o777 == 0o600
 
 
 def test_seed_isolated_agy_home_exposes_user_plugins(
