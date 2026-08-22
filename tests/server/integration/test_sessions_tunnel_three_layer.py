@@ -1234,19 +1234,30 @@ def _isolated_session_status_cache() -> Iterator[None]:
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_isolated_session_status_cache")
+@pytest.mark.parametrize(
+    ("error_code", "error_message"),
+    [
+        ("runner_disconnected", "Runner disconnected unexpectedly."),
+        ("session_stream_lost", "Session stream lost unexpectedly."),
+    ],
+)
 async def test_on_runner_connect_clears_disconnect_failure_on_idle_reconnect(
     tunnel_three_layer_stack: _TunnelStack,
+    error_code: str,
+    error_message: str,
 ) -> None:
-    """Reconnect-to-idle clears a persisted ``runner_disconnected`` failure.
+    """Reconnect-to-idle clears a persisted transport failure.
 
     A transient WS blip drops and reconnects a runner whose process
-    survived, with no new turn. The disconnect left the session marked
-    ``failed`` with persisted ``runner_disconnected`` labels; before this
-    wiring nothing cleared them until the next user message, so the
-    Subagents panel kept the grey "Disconnected" dot forever. Drives a
-    real tunnel reconnect (which fires ``_on_runner_connect``) and asserts
-    the session leaves ``failed`` and the disconnect labels are cleared —
-    WITHOUT sending any message.
+    survived, with no new turn. The drop left the session marked
+    ``failed`` with persisted transport-failure labels — either
+    ``runner_disconnected`` (the runner went away) or
+    ``session_stream_lost`` (the stream died while the runner stayed
+    registered); before this wiring nothing cleared them until the next
+    user message, so the Subagents panel kept the grey "Disconnected" dot
+    forever. Drives a real tunnel reconnect (which fires
+    ``_on_runner_connect``) and asserts the session leaves ``failed`` and
+    the labels are cleared — WITHOUT sending any message.
     """
     from omnigent.runtime import get_conversation_store
     from omnigent.server.routes import sessions as sessions_module
@@ -1257,8 +1268,8 @@ async def test_on_runner_connect_clears_disconnect_failure_on_idle_reconnect(
 
     session_id = await _bind_failed_session(
         ap_client,
-        error_code="runner_disconnected",
-        error_message="Runner disconnected unexpectedly.",
+        error_code=error_code,
+        error_message=error_message,
     )
     store = get_conversation_store()
 
@@ -1266,8 +1277,8 @@ async def test_on_runner_connect_clears_disconnect_failure_on_idle_reconnect(
     conv = store.get_conversation(session_id)
     assert conv is not None
     assert sessions_module._last_task_error_from_labels(conv.labels) == {
-        "code": "runner_disconnected",
-        "message": "Runner disconnected unexpectedly.",
+        "code": error_code,
+        "message": error_message,
     }
     assert sessions_module._session_status_cache.get(session_id) == "failed"
 

@@ -440,6 +440,22 @@ def create_runner_tunnel_router(
 
         await ws.accept()
         session: RunnerSession | None = None
+        disconnect_notified = False
+
+        async def _notify_runner_disconnect() -> None:
+            # finally + outer except paths can both see one teardown.
+            nonlocal disconnect_notified
+            if disconnect_notified or on_runner_disconnect is None:
+                return
+            disconnect_notified = True
+            try:
+                await on_runner_disconnect(runner_id)
+            except Exception:
+                _logger.exception(
+                    "on_runner_disconnect callback failed for %s",
+                    runner_id,
+                )
+
         try:
             # 3. Receive hello frame.
             raw = await ws.receive_text()
@@ -568,14 +584,7 @@ def create_runner_tunnel_router(
                     return_exceptions=True,
                 )
                 registry.deregister(runner_id, session)
-                if on_runner_disconnect is not None:
-                    try:
-                        await on_runner_disconnect(runner_id)
-                    except Exception:
-                        _logger.exception(
-                            "on_runner_disconnect callback failed for %s",
-                            runner_id,
-                        )
+                await _notify_runner_disconnect()
 
         except WebSocketDisconnect as exc:
             _logger.warning(
@@ -584,28 +593,14 @@ def create_runner_tunnel_router(
                 getattr(exc, "code", None),
                 getattr(exc, "reason", None),
             )
-            if on_runner_disconnect is not None:
-                try:
-                    await on_runner_disconnect(runner_id)
-                except Exception:
-                    _logger.exception(
-                        "on_runner_disconnect callback failed for %s",
-                        runner_id,
-                    )
+            await _notify_runner_disconnect()
         except Exception:
             _logger.exception("Tunnel error for runner %s", runner_id)
+            # Only deregister the generation this handler registered; a
+            # pre-hello failure must not pop another live tunnel's session.
             if session is not None:
                 registry.deregister(runner_id, session)
-            else:
-                registry.deregister(runner_id)
-            if on_runner_disconnect is not None:
-                try:
-                    await on_runner_disconnect(runner_id)
-                except Exception:
-                    _logger.exception(
-                        "on_runner_disconnect callback failed for %s",
-                        runner_id,
-                    )
+            await _notify_runner_disconnect()
 
     return router
 
