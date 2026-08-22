@@ -2038,8 +2038,8 @@ def _record_period_costs(
         conversation_store.add_period_cost(owner, _utc_month(epoch), delta_usd, harness=None)
         conversation_store.add_period_cost(owner, _utc_quarter(epoch), delta_usd, harness=None)
         conversation_store.add_period_cost(owner, _utc_year(epoch), delta_usd, harness=None)
-    except Exception:
-        # Log and continue; a period rollup failure should not break turn accounting.
+    except Exception:  # noqa: BLE001
+        # Catch all exceptions to prevent rollup failure from breaking turn accounting.
         # The turn's daily cost was already recorded (via _record_daily_cost) so the
         # per-day rollup is safe even if period rollups fail.
         _logger.exception(
