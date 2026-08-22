@@ -1,22 +1,24 @@
-"""E2E: Cmd/Ctrl+Arrow switches sessions from the page body, but not the composer.
+"""E2E: Cmd/Ctrl+Arrow switches sessions, composer focus included.
 
 ``useSessionSwitchHotkey`` (window keydown) steps the sidebar's ordered
-sessions on Cmd/Ctrl+Up/Down. It bails when the keydown target is inside an
-editable field (``textarea``, ``input``, ``[contenteditable="true"]``) so
-typing in the composer keeps its native caret-to-start/end and the user isn't
-yanked to another session mid-edit. The chord still navigates when focus is
-outside an editable field.
+sessions on Cmd/Ctrl+Up/Down. It used to bail whenever the keydown target sat
+in an editable field, which killed the chord in the composer — the one place
+users spend their time, and the exact case the hotkey was meant to serve (the
+composer already declines modified arrows so this window hook can have them).
+It now yields on ``defaultPrevented`` instead, so a widget that genuinely
+claimed the chord for its own list navigation still wins.
 
-This exercises both halves of that contract through the real chain the unit
-tests mock out: live session list -> sidebar render order -> window keydown
-handler -> client-side navigation to ``/c/{id}``.
+This exercises the contract through the real chain the unit tests mock out:
+live session list -> sidebar render order -> window keydown handler ->
+client-side navigation to ``/c/{id}``.
 
-- ``test_ctrl_arrow_does_not_switch_session_from_focused_composer``: focus the
-  composer, leave a draft, press Ctrl+Down, and assert the route stays put.
-  A regression that drops the editable-field guard would route away here.
+- ``test_ctrl_arrow_switches_session_from_focused_composer``: focus the
+  composer, leave a draft, press Ctrl+Down, and assert the route moved and the
+  draft survives the round trip. A regression that restored the editable-field
+  guard would stay put here.
 - ``test_ctrl_arrow_still_switches_session_from_body_focus``: blur the
   composer so the keydown targets the body, press Ctrl+Down, and assert the
-  route leaves the current session — the happy path the guard must preserve.
+  route leaves the current session.
 
 No LLM turn is needed — pure client-side keyboard + routing — so this skips the
 nightly/real-agent markers the approval suites carry. Two runner-bound
@@ -42,40 +44,46 @@ def _set_title(base_url: str, session_id: str, title: str) -> None:
     resp.raise_for_status()
 
 
-def test_ctrl_arrow_does_not_switch_session_from_focused_composer(
+def test_ctrl_arrow_switches_session_from_focused_composer(
     page: Page,
     seeded_session_pair: tuple[str, str, str],
 ) -> None:
-    """Typing in the composer, then Ctrl+↓, stays on the current session."""
+    """Typing in the composer, then Ctrl+↓, still moves to another session."""
     base_url, session_a, session_b = seeded_session_pair
     _set_title(base_url, session_a, "e2e-switch-a")
     _set_title(base_url, session_b, "e2e-switch-b")
 
     page.goto(f"{base_url}/c/{session_a}")
 
-    # Both sessions must be present in the sidebar for the hotkey to have a
-    # step target — guaranteeing that staying put is the guard's doing, not an
-    # empty list.
     expect(page.locator(f'a[href="/c/{session_a}"]')).to_be_visible(timeout=30_000)
     expect(page.locator(f'a[href="/c/{session_b}"]')).to_be_visible()
 
-    # Put focus in the composer and leave an unsent draft — this is the exact
-    # condition under which the editable-field guard must suppress the chord.
+    # Focus the composer and leave an unsent draft — the exact condition the
+    # editable-field guard used to suppress.
     composer = page.get_by_placeholder(_COMPOSER)
     expect(composer).to_be_visible()
     composer.click()
-    composer.fill("an unsent draft that must not trigger a session switch")
+    composer.fill("an unsent draft that must survive the switch")
 
     # ControlOrMeta maps to the real platform modifier (Cmd on macOS, Ctrl
-    # elsewhere); CI runs Linux chromium, so this is Ctrl+Down. The keydown
-    # targets the focused composer, so the guard returns early.
+    # elsewhere); CI runs Linux chromium, so this is Ctrl+Down.
     page.keyboard.press("ControlOrMeta+ArrowDown")
 
-    # The SPA navigates synchronously in the keydown handler; with the guard,
-    # it never fires. Wait long enough that an unguarded chord would have
-    # routed, then confirm we stayed on session_a.
-    page.wait_for_timeout(500)
-    expect(page).to_have_url(f"{base_url}/c/{session_a}")
+    # Assert "switched away" rather than a hard-coded target: the suite shares
+    # one server, so the sidebar may hold sessions beyond this pair.
+    expect(page).not_to_have_url(f"{base_url}/c/{session_a}", timeout=10_000)
+    assert "/c/" in page.url and session_a not in page.url, (
+        f"expected to switch to another session, still at {page.url}"
+    )
+
+    # Drafts are per-session, so the composer we landed on is a different one;
+    # stepping back restores the draft, proving the chord navigated rather than
+    # clobbering composer state.
+    page.keyboard.press("ControlOrMeta+ArrowUp")
+    expect(page).to_have_url(f"{base_url}/c/{session_a}", timeout=10_000)
+    expect(page.get_by_placeholder(_COMPOSER)).to_have_value(
+        "an unsent draft that must survive the switch"
+    )
 
 
 def test_ctrl_arrow_still_switches_session_from_body_focus(
@@ -92,21 +100,20 @@ def test_ctrl_arrow_still_switches_session_from_body_focus(
     expect(page.locator(f'a[href="/c/{session_a}"]')).to_be_visible(timeout=30_000)
     expect(page.locator(f'a[href="/c/{session_b}"]')).to_be_visible()
 
-    # Move focus off the composer so the editable-field guard doesn't swallow
-    # the chord (the session page autofocuses the composer on load).
+    # Move focus off the composer (the session page autofocuses it on load) so
+    # the keydown targets the body rather than a text field.
     page.evaluate(
         "() => { const el = document.activeElement; "
         "if (el && typeof el.blur === 'function') el.blur(); }"
     )
 
-    # Dispatch the chord at the body; the keydown bubbles to the window hook,
-    # the guard sees a non-editable target, and we navigate to a neighbor.
+    # Dispatch the chord at the body; the keydown bubbles to the window hook
+    # and we navigate to a neighbor.
     page.locator("body").press("ControlOrMeta+ArrowDown")
 
     # Assert we left session_a for another /c/ route. We check "switched away"
     # rather than a hard-coded target id: the suite shares one server across
-    # tests, so the sidebar may hold sessions beyond this pair — but
-    # navigating at all from body focus is the behavior the guard preserves.
+    # tests, so the sidebar may hold sessions beyond this pair.
     expect(page).not_to_have_url(f"{base_url}/c/{session_a}", timeout=10_000)
     assert "/c/" in page.url and session_a not in page.url, (
         f"expected to switch to another session, still at {page.url}"
