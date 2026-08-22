@@ -15,6 +15,8 @@ Covers the hook behavior end to end:
 - ``useCommandPaletteHotkey`` — ``Cmd+K`` opens the palette even with a
   terminal focused (xterm drops Cmd chords), while ``Ctrl+K`` stays with the
   PTY, which turns it into ^K.
+- ``useSessionSwitchHotkey`` again — the switch chord yields to the open
+  command palette, which binds the same chord to its own row navigation.
 
 Focus is the whole point of the last two, so they assert against a real
 focused surface rather than a synthetic event target.
@@ -158,3 +160,41 @@ def test_command_palette_chord_with_a_terminal_focused(
     # Cmd+K reaches nothing else, so the palette claims it.
     page.keyboard.press("Meta+k")
     expect(page.get_by_placeholder(_PALETTE_INPUT)).to_be_visible(timeout=10_000)
+
+
+def test_session_switch_chord_yields_to_the_open_command_palette(
+    page: Page, seeded_session_pair: tuple[str, str, str]
+) -> None:
+    """With the palette open, ``Ctrl+↑/↓`` moves its highlight and nothing else.
+
+    ``useSessionSwitchHotkey`` yields on ``defaultPrevented`` rather than on
+    "focus is in a text field", so the guard only holds while cmdk really does
+    claim this chord (it binds Cmd/Ctrl+↑/↓ to jump to the first/last row).
+    Asserting the highlight *moved* is what pins that: a cmdk upgrade that
+    stopped binding these chords would fail here rather than silently start
+    navigating the app behind the open palette.
+    """
+    base_url, session_a, _session_b = seeded_session_pair
+    seed_committed_turn(session_a, prompt="ping a", reply="pong a")
+
+    page.goto(f"{base_url}/c/{session_a}")
+    expect(page.get_by_label("Message the agent")).to_be_visible(timeout=30_000)
+
+    page.keyboard.press("Control+k")
+    palette_input = page.get_by_placeholder(_PALETTE_INPUT)
+    expect(palette_input).to_be_visible(timeout=10_000)
+    # Wait for a highlighted row: cmdk selects one as soon as the list renders,
+    # and the chord below has nothing to move until it does.
+    selected = page.locator("[cmdk-item][data-selected=true]")
+    expect(selected).to_have_count(1, timeout=10_000)
+    before_row = selected.inner_text()
+
+    page.keyboard.press("Control+ArrowDown")
+
+    # cmdk consumed it: the highlight moved to the last row...
+    expect(page.locator("[cmdk-item][data-selected=true]")).not_to_have_text(
+        before_row, timeout=10_000
+    )
+    # ...and the app did NOT navigate behind the still-open palette.
+    expect(palette_input).to_be_visible()
+    assert page.url.endswith(f"/c/{session_a}"), f"route moved behind the palette: {page.url}"
