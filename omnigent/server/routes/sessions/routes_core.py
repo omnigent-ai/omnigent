@@ -1818,6 +1818,7 @@ def register_core_routes(
             _unset_subagent_routing_override=clear_subagent_routing,
             terminal_launch_args=terminal_launch_args,
             archived=body.archived,
+            git_head_sha=body.git_head_sha,
         )
         if updated is None:
             raise _session_not_found()

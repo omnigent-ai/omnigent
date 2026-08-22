@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any, Protocol, cast
 
 from sqlalchemy import (
@@ -96,17 +97,16 @@ from omnigent.stores.conversation_store import (
 
 _logger = logging.getLogger(__name__)
 
-# Server-side deadline (ms) for the content-search query in
-# ``list_conversations``. Session search matches ``LOWER(search_text) LIKE
-# '%q%'`` across ``conversation_items``; that is index-backed by the pg_trgm
-# GIN index (migration ``d5e9f1a2b3c4``), but if the index is ever missing the
-# scan can run unbounded and — since the query runs in a worker thread — a
-# client disconnect does not stop it. ``SET LOCAL statement_timeout`` caps it so
-# a degraded deployment fails the search fast instead of pinning a DB
-# connection. Postgres-only; ``SET LOCAL`` reverts on commit so it never leaks
-# to the connection's next pooled use. Longer than the client's own
-# ``SEARCH_FETCH_TIMEOUT_MS`` so the browser gives up first on the happy path.
 _SEARCH_STATEMENT_TIMEOUT_MS = 15_000
+
+_GIT_SHA_RE = re.compile(r"[0-9a-f]{7,64}")
+
+
+def _validated_git_sha(value: str | None) -> str | None:
+    if value is not None and not _GIT_SHA_RE.fullmatch(value):
+        msg = f"git_head_sha must be a 7-64 character hex SHA, got {value!r}"
+        raise ValueError(msg)
+    return value
 
 
 class _RowCountResult(Protocol):
@@ -228,6 +228,7 @@ def _to_conversation(
         ),
         workspace=meta.workspace if meta else None,
         git_branch=meta.git_branch if meta else None,
+        git_head_sha=meta.git_head_sha if meta else None,
         archived=row.archived,
         live_status=(
             decode_session_live_status(meta.live_status)
@@ -868,6 +869,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         host_id: str | None = None,
         workspace: str | None = None,
         git_branch: str | None = None,
+        git_head_sha: str | None = None,
         terminal_launch_args: list[str] | None = None,
         conversation_id: str | None = None,
     ) -> Conversation:
@@ -998,6 +1000,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 sub_agent_name=sub_agent_name,
                 workspace=workspace,
                 git_branch=git_branch,
+                git_head_sha=_validated_git_sha(git_head_sha),
                 terminal_launch_args=(
                     json.dumps(terminal_launch_args) if terminal_launch_args is not None else None
                 ),
@@ -2700,6 +2703,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
         reported_model: str | None = None,
+        git_head_sha: str | None = None,
     ) -> Conversation | None:
         """
         Update mutable fields on a conversation.
@@ -2803,17 +2807,12 @@ class SqlAlchemyConversationStore(ConversationStore):
             if ap_changed:
                 row.updated_at = now
             labels = _fetch_labels(ap_sess, conversation_id)
-        if terminal_launch_args is not None:
+        if terminal_launch_args is not None or git_head_sha is not None:
             with self._session("update_conversation") as meta_sess:
                 meta = meta_sess.get(
                     SqlConversationMetadata, (current_workspace_id(), conversation_id)
                 )
                 if meta is None:
-                    # Orphaned conversation (a crash between the AP and
-                    # metadata transactions during creation left no metadata
-                    # row). Recreate it rather than silently dropping the
-                    # update; kind derives from the parent pointer, same as
-                    # at creation.
                     _logger.warning(
                         "conversation %s has no metadata row; recreating it",
                         conversation_id,
@@ -2823,7 +2822,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                         parent_conversation_id=row.parent_conversation_id,
                     )
                     meta_sess.add(meta)
-                meta.terminal_launch_args = json.dumps(terminal_launch_args)
+                if terminal_launch_args is not None:
+                    meta.terminal_launch_args = json.dumps(terminal_launch_args)
+                if git_head_sha is not None and meta.git_head_sha is None:
+                    meta.git_head_sha = _validated_git_sha(git_head_sha)
         else:
             meta = self._get_meta(ap_sess, conversation_id)
         return _to_conversation(row, meta, labels)
