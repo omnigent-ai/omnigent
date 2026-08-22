@@ -6756,6 +6756,41 @@ def _compact_lock_impl(session_id: str) -> asyncio.Lock:
     return lock
 
 
+def _resolve_compaction_llm_config(spec: Any, conv: Conversation) -> Any:
+    """Resolve the ``LLMConfig`` server-side compaction should summarize with.
+
+    Precedence mirrors the turn and pricing paths (which already prefer
+    ``conv.model_override`` — see the ``llm_model`` resolution in
+    ``_apply_usage_delta`` and ``_resolve_display_model``):
+
+    1. ``conv.model_override`` — a ``/model`` switch (or the in-TUI picker).
+       For agents that pin no model in their spec (``polly``, ``debby``, and
+       provider-default subscription agents) this is the ONLY model the
+       server can see, so without honoring it ``/compact`` — the sole
+       recovery from a context-window overflow ("prompt is too long") — is
+       permanently unavailable and the session is bricked. The spec's
+       connection is reused so the override model reaches the same provider
+       the session already talks to.
+    2. ``spec.llm`` — the agent's declared LLM block.
+    3. ``spec.executor.model`` — the executor default.
+
+    :param spec: The loaded agent spec.
+    :param conv: The conversation row (carries ``model_override``).
+    :returns: An ``LLMConfig`` to compact with, or ``None`` when the agent
+        exposes no usable model (the caller raises a helpful error).
+    """
+    from omnigent.spec.types import LLMConfig
+
+    if conv.model_override:
+        connection = spec.llm.connection if spec.llm is not None else spec.executor.connection
+        return LLMConfig(model=conv.model_override, connection=connection)
+    if spec.llm is not None:
+        return spec.llm
+    if spec.executor.model is not None:
+        return LLMConfig(model=spec.executor.model, connection=spec.executor.connection)
+    return None
+
+
 async def _run_compact_locked(
     session_id: str,
     conv: Conversation,
@@ -6795,13 +6830,8 @@ async def _run_compact_locked(
             agent.id, agent.bundle_location, expand_env=agent.session_id is None
         )
         spec = loaded.spec
-        if spec.llm is not None:
-            llm_config = spec.llm
-        elif spec.executor.model is not None:
-            from omnigent.spec.types import LLMConfig
-
-            llm_config = LLMConfig(model=spec.executor.model, connection=spec.executor.connection)
-        else:
+        llm_config = _resolve_compaction_llm_config(spec, conv)
+        if llm_config is None:
             harness = spec.executor.harness_kind
             raise OmnigentError(
                 f"/compact is unavailable for this {harness} session because the agent "
@@ -9805,6 +9835,7 @@ __all__ = [
     "_require_permission_mode_forward",
     "_reset_runner_resources_after_switch",
     "_reset_runner_resources_after_switch_impl",
+    "_resolve_compaction_llm_config",
     "_resolve_harness",
     "_resolve_llm_model",
     "_resolve_skill_meta_text_via_runner",
