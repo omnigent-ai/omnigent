@@ -8,7 +8,7 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import click
 import httpx
@@ -83,6 +83,74 @@ from tests.runner.helpers import NullServerClient
 def _load_claude_invocation_settings(args: list[str]) -> dict[str, Any]:
     settings_path = Path(args[args.index("--settings") + 1])
     return json.loads(settings_path.read_text(encoding="utf-8"))
+
+
+@pytest.mark.asyncio
+async def test_auto_create_opencode_terminal_keeps_instructions_with_pinned_model(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The generated OpenCode config keeps both the model and agent instructions."""
+    from omnigent import opencode_native_app_server, opencode_native_bridge
+    from omnigent.runner import app as runner_app
+
+    class _StopAfterConfig(RuntimeError):
+        """Stop the launch after the configuration has been written."""
+
+    class _StoppingOpenCodeServer:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        async def start(self) -> None:
+            raise _StopAfterConfig
+
+    async def _launch_config(**_kwargs: object) -> runner_app._OpenCodeNativeLaunchConfig:
+        return runner_app._OpenCodeNativeLaunchConfig(
+            workspace=tmp_path,
+            policy_server_url="http://runner.invalid",
+            terminal_launch_args=None,
+            model_override=None,
+            external_session_id=None,
+        )
+
+    monkeypatch.setattr(runner_app, "_opencode_native_launch_config", _launch_config)
+    monkeypatch.setattr(opencode_native_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+    monkeypatch.setattr(opencode_native_bridge, "seed_opencode_auth", lambda _dir: None)
+    monkeypatch.setattr(
+        opencode_native_app_server, "OpenCodeNativeServer", _StoppingOpenCodeServer
+    )
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="reviewer",
+        instructions="Reply with the exact phrase REVIEW COMPLETE.",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "opencode-native"},
+            model="anthropic/claude-sonnet-4-5",
+        ),
+    )
+
+    with pytest.raises(_StopAfterConfig):
+        await runner_app._auto_create_opencode_terminal(
+            "conv_pinned_instructions",
+            cast(SessionResourceRegistry, object()),
+            lambda _event_type, _payload: None,
+            agent_spec=spec,
+        )
+
+    bridge_dir = opencode_native_bridge.bridge_dir_for_bridge_id("conv_pinned_instructions")
+    config_path = (
+        opencode_native_bridge.xdg_config_home_for_bridge_dir(bridge_dir)
+        / "opencode"
+        / "opencode.json"
+    )
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+
+    assert config["model"] == "anthropic/claude-sonnet-4-5"
+    assert config["instructions"]
+    instructions_path = Path(config["instructions"][0])
+    assert instructions_path.read_text(encoding="utf-8") == spec.instructions
 
 
 def test_read_relay_policy_config_returns_coords_from_tool_relay_json(

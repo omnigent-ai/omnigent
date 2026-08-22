@@ -6511,6 +6511,26 @@ def test_run_agent_with_native_terminal_harness_is_rejected() -> None:
         )
 
 
+def test_run_agent_with_opencode_harness_uses_agent_bundle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OpenCode's server-backed harness accepts an explicit agent bundle."""
+    captured: dict[str, object] = {}
+    monkeypatch.setattr("omnigent.chat.run_chat", lambda **kwargs: captured.update(kwargs))
+
+    _dispatch_run(
+        target="examples/hello_world.yaml",
+        tools=None,
+        harness="opencode",
+        model=None,
+        prompt=None,
+        system_prompt=None,
+    )
+
+    assert captured["target"] == "examples/hello_world.yaml"
+    assert captured["harness"] == "opencode-native"
+
+
 # ── omnigent setup: Qwen Code drill-in (_manage_qwen_harness) ────────────
 
 

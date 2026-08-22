@@ -1249,6 +1249,10 @@ async def _auto_create_opencode_terminal(
     # Accumulate the synthesized opencode.json: provider/model (Databricks
     # gateway or a pinned default) + the agent's MCP servers + force-ask.
     config: dict[str, object] = {}
+    instructions = _opencode_native_instructions_from_spec(agent_spec)
+    instructions_path = bridge_dir / "agent-instructions.md"
+    if instructions:
+        instructions_path.write_text(instructions, encoding="utf-8")
     gateway = resolve_databricks_gateway(
         _opencode_native_profile_from_spec(agent_spec), model_id=model_override
     )
@@ -1265,6 +1269,9 @@ async def _auto_create_opencode_terminal(
         # OpenCode resolves the provider from the model-id prefix against its own
         # auth.json, so no provider block is needed.
         config = dict(build_opencode_model_default_config(model_override))
+
+    if instructions:
+        config["instructions"] = [str(instructions_path)]
 
     # Build opencode's ``mcp`` block: the Omnigent builtin-tool relay (so the
     # model can call sys_*/load_skill/web_fetch — the real "connects to Omnigent
@@ -1625,6 +1632,18 @@ def _opencode_native_model_from_spec(
         spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
         return _resolve_spec_model(spec)
     except Exception:  # noqa: BLE001 - model resolution is best effort.
+        return None
+
+
+def _opencode_native_instructions_from_spec(agent_spec: Any | None) -> str | None:
+    """Return non-empty agent instructions for the OpenCode session config."""
+    if agent_spec is None:
+        return None
+    try:
+        spec = getattr(agent_spec, "spec", agent_spec)
+        instructions = getattr(spec, "instructions", None)
+        return instructions if isinstance(instructions, str) and instructions.strip() else None
+    except Exception:  # noqa: BLE001 - instruction resolution is best effort.
         return None
 
 

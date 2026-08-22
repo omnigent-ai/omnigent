@@ -28,6 +28,8 @@ from omnigent.opencode_native import (
     _resolve_session_id_for_resume,
     opencode_terminal_resource_id,
 )
+from omnigent.runner.app import _opencode_native_instructions_from_spec
+from omnigent.spec.types import AgentSpec
 
 
 class _FakeClient:
@@ -44,6 +46,16 @@ class _FakeClient:
     async def get(self, url: str, **kwargs: Any) -> httpx.Response:
         self.requests.append(("GET", url, kwargs))
         return self._response
+
+
+def test_opencode_native_instructions_come_from_agent_spec() -> None:
+    spec = AgentSpec(
+        spec_version=1,
+        name="reviewer",
+        instructions="Review changes before editing.",
+    )
+
+    assert _opencode_native_instructions_from_spec(spec) == "Review changes before editing."
 
 
 # ── _materialize_opencode_agent_spec ────────────────────────────────────────
