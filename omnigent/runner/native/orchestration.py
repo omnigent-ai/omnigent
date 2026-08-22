@@ -1243,15 +1243,17 @@ async def _auto_create_opencode_terminal(
         build_opencode_provider_config,
         maybe_merge_user_provider_config,
         resolve_databricks_gateway,
+        resolve_env_gateway,
         write_opencode_provider_config,
     )
 
     # Accumulate the synthesized opencode.json: provider/model (Databricks
-    # gateway or a pinned default) + the agent's MCP servers + force-ask.
+    # gateway, a generic env gateway like Bifrost, or a pinned default) + the
+    # agent's MCP servers + force-ask.
     config: dict[str, object] = {}
     gateway = resolve_databricks_gateway(
         _opencode_native_profile_from_spec(agent_spec), model_id=model_override
-    )
+    ) or resolve_env_gateway(model_id=model_override)
     if gateway is not None:
         # Pin the per-prompt model to the synthesized provider/endpoint id, and
         # write it as opencode's default model too so the TUI launches on it.
