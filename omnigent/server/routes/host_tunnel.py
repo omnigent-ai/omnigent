@@ -354,8 +354,22 @@ def create_host_tunnel_router(
                             host_id,
                         )
 
-        except WebSocketDisconnect:
-            _logger.warning("Host %s disconnected", host_id)
+        except WebSocketDisconnect as exc:
+            _logger.warning(
+                "Host %s disconnected: close_code=%s close_reason=%r stage=%s registered=%s",
+                host_id,
+                exc.code,
+                exc.reason,
+                stage,
+                conn is not None,
+                extra={
+                    "host_id": host_id,
+                    "ws_close_code": exc.code,
+                    "ws_close_reason": exc.reason,
+                    "ws_stage": stage,
+                    "ws_registered": conn is not None,
+                },
+            )
             # Only run disconnect cleanup if we actually registered this
             # host on THIS connection. A connect that failed before
             # register — e.g. the upsert IntegrityError when a peer
