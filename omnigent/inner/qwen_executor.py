@@ -41,6 +41,7 @@ from omnigent.inner.executor import (
     ExecutorError,
     ExecutorEvent,
     Message,
+    ReasoningChunk,
     TextChunk,
     ToolCallComplete,
     ToolCallRequest,
@@ -110,14 +111,21 @@ def _looks_like_missing_file(message: str) -> bool:
 _AGENT_METHOD_INITIALIZE = "initialize"
 _AGENT_METHOD_SESSION_NEW = "session/new"
 _AGENT_METHOD_SESSION_PROMPT = "session/prompt"
+_AGENT_METHOD_SESSION_CANCEL = "session/cancel"
+_AGENT_METHOD_SET_CONFIG_OPTION = "session/set_config_option"
 
 # Notifications sent *from* the agent to the client
 _CLIENT_NOTIFICATION_SESSION_UPDATE = "session/update"
 
 # session/update.update.sessionUpdate values we care about
 _UPDATE_AGENT_MESSAGE_CHUNK = "agent_message_chunk"
+_UPDATE_AGENT_THOUGHT_CHUNK = "agent_thought_chunk"
 _UPDATE_TOOL_CALL = "tool_call"
 _UPDATE_TOOL_CALL_UPDATE = "tool_call_update"
+
+_CONFIG_OPTION_MODEL = "model"
+_TOOL_STATUS_COMPLETED = "completed"
+_TOOL_STATUS_FAILED = "failed"
 
 # How long (seconds) to wait for qwen to respond to a JSON-RPC request
 # before treating the turn as timed out.
@@ -275,6 +283,11 @@ class QwenExecutor(Executor):
         # first user turn only (subsequent turns reuse the same session and
         # qwen retains the earlier context).
         self._system_prompt_sent: bool = False
+
+        self._config_option_ids: set[str] = set()
+        self._active_model: str | None = None
+        self._model_switch_supported: bool = True
+        self._tool_names: dict[str, str] = {}
 
         # Bridges the ExecutorAdapter installs (best-effort, via
         # ``getattr(..., None) is None``) so qwen's mid-turn
@@ -640,9 +653,6 @@ class QwenExecutor(Executor):
             "cwd": self._cwd,
             "mcpServers": mcp_servers,
         }
-        if self._model:
-            params["model"] = self._model
-
         resp = await self._rpc(
             _AGENT_METHOD_SESSION_NEW,
             params,
@@ -656,6 +666,7 @@ class QwenExecutor(Executor):
         # Qwen assigns (possibly remaps) the session id — always use what
         # the server returns, not what we sent.
         result = resp.get("result", {})
+        self._note_config_options(result.get("configOptions"))
         server_session_id = result.get("sessionId")
         if not server_session_id:
             raise RuntimeError(
@@ -663,6 +674,53 @@ class QwenExecutor(Executor):
             )
         self._session_id = server_session_id
         return self._session_id
+
+    def _note_config_options(self, options: object) -> str | None:
+        """Record advertised session options and the active model."""
+        if not isinstance(options, list):
+            return None
+        model_value: str | None = None
+        for option in options:
+            if not isinstance(option, dict):
+                continue
+            option_id = option.get("id")
+            if not isinstance(option_id, str):
+                continue
+            self._config_option_ids.add(option_id)
+            if option_id == _CONFIG_OPTION_MODEL:
+                current = option.get("currentValue")
+                if isinstance(current, str) and current:
+                    self._active_model = current
+                    model_value = current
+        return model_value
+
+    async def _apply_model_override(self, session_id: str, model: str | None) -> None:
+        """Apply a model through ACP's standard session config option."""
+        if not model or model == self._active_model or not self._model_switch_supported:
+            return
+        if self._config_option_ids and _CONFIG_OPTION_MODEL not in self._config_option_ids:
+            self._model_switch_supported = False
+            return
+        response = await self._rpc(
+            _AGENT_METHOD_SET_CONFIG_OPTION,
+            {"sessionId": session_id, "configId": _CONFIG_OPTION_MODEL, "value": model},
+        )
+        if "error" in response:
+            self._model_switch_supported = False
+            logger.warning(
+                "qwen model switch to %s rejected (%s); continuing on the current model",
+                model,
+                response["error"].get("message", response["error"]),
+            )
+            return
+        result = response.get("result")
+        echoed = (
+            self._note_config_options(result.get("configOptions"))
+            if isinstance(result, dict)
+            else None
+        )
+        if echoed is None:
+            self._active_model = model
 
     # ------------------------------------------------------------------
     # Server-initiated requests (agent → client)
@@ -1210,12 +1268,32 @@ class QwenExecutor(Executor):
     # Executor interface
     # ------------------------------------------------------------------
 
+    def handles_tools_internally(self) -> bool:
+        """Qwen executes the tool calls represented by ACP updates."""
+        return True
+
+    async def interrupt_session(self, session_key: str) -> bool:  # noqa: ARG002
+        """Cancel the active Qwen prompt, falling back to process termination."""
+        proc = self._proc
+        if proc is None or proc.returncode is not None:
+            return False
+        if self._session_id is not None:
+            try:
+                await self._notify(_AGENT_METHOD_SESSION_CANCEL, {"sessionId": self._session_id})
+                return True
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("qwen session/cancel failed; falling back to SIGTERM: %s", exc)
+        with contextlib.suppress(ProcessLookupError):
+            proc.terminate()
+            return True
+        return False
+
     async def run_turn(
         self,
         messages: list[Message],
         tools: list[ToolSpec],
         system_prompt: str,
-        config: ExecutorConfig | None = None,  # noqa: ARG002 — unused; required by the Executor interface
+        config: ExecutorConfig | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
         """Run one turn of the Qwen agent loop via ACP.
 
@@ -1242,6 +1320,13 @@ class QwenExecutor(Executor):
         except Exception as exc:  # noqa: BLE001
             yield ExecutorError(message=describe_exception(exc), retryable=False)
             return
+
+        requested_model = config.model if config is not None and config.model else self._model
+        try:
+            await self._apply_model_override(session_id, requested_model)
+        except Exception as exc:  # noqa: BLE001
+            self._model_switch_supported = False
+            logger.warning("qwen model switch failed: %s", exc)
 
         # A fresh ACP session (first turn of a new/respawned process, or after
         # a reset) holds no prior context. Captured before we flip the latch
@@ -1410,14 +1495,41 @@ class QwenExecutor(Executor):
                         accumulated_text.append(text)
                         yield TextChunk(text=text)
 
+                elif update_type == _UPDATE_AGENT_THOUGHT_CHUNK:
+                    content = update.get("content", {})
+                    text = content.get("text", "") if isinstance(content, dict) else ""
+                    if text:
+                        yield ReasoningChunk(delta=text, event_type="reasoning_text")
+
                 elif update_type == _UPDATE_TOOL_CALL:
-                    # Qwen is executing a built-in tool — surface it as info.
-                    tool_title = update.get("title", "tool_call")
-                    logger.debug("qwen tool_call: %s", tool_title)
+                    call_id = update.get("toolCallId")
+                    name = str(update.get("title") or update.get("kind") or "tool")
+                    raw_input = update.get("rawInput")
+                    if isinstance(call_id, str) and call_id:
+                        self._tool_names[call_id] = name
+                        yield ToolCallRequest(
+                            name=name,
+                            args=raw_input if isinstance(raw_input, dict) else {},
+                            metadata={"call_id": call_id},
+                        )
 
                 elif update_type == _UPDATE_TOOL_CALL_UPDATE:
-                    # Status update on an in-progress tool call — skip.
-                    pass
+                    call_id = update.get("toolCallId")
+                    status = update.get("status")
+                    if isinstance(call_id, str) and status in (
+                        _TOOL_STATUS_COMPLETED,
+                        _TOOL_STATUS_FAILED,
+                    ):
+                        yield ToolCallComplete(
+                            name=self._tool_names.pop(call_id, "tool"),
+                            status=(
+                                ToolCallStatus.SUCCESS
+                                if status == _TOOL_STATUS_COMPLETED
+                                else ToolCallStatus.ERROR
+                            ),
+                            result=update.get("content") or update.get("rawOutput"),
+                            metadata={"call_id": call_id},
+                        )
 
             elif notification.get("id") is not None and notification.get("method"):
                 # Server-initiated request (e.g. session/request_permission):
