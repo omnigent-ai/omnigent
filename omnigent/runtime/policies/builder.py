@@ -26,7 +26,7 @@ import cachetools
 from omnigent.entities import Conversation
 from omnigent.entities import Policy as StoredPolicy
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.llms.context_window import fetch_model_pricing, fetch_model_pricing_with_provider
+from omnigent.llms.context_window import fetch_model_pricing_with_provider
 from omnigent.policies.base import Policy
 from omnigent.policies.function import resolve_function_policy
 from omnigent.policies.schema import (

@@ -254,13 +254,9 @@ class ModelPricingConfig:
     def __post_init__(self) -> None:
         """Validate that all pricing values are non-negative."""
         if self.input_per_million < 0:
-            raise ValueError(
-                f"input_per_million must be >= 0, got {self.input_per_million}"
-            )
+            raise ValueError(f"input_per_million must be >= 0, got {self.input_per_million}")
         if self.output_per_million < 0:
-            raise ValueError(
-                f"output_per_million must be >= 0, got {self.output_per_million}"
-            )
+            raise ValueError(f"output_per_million must be >= 0, got {self.output_per_million}")
         if self.cache_read_per_million is not None and self.cache_read_per_million < 0:
             raise ValueError(
                 f"cache_read_per_million must be >= 0, got {self.cache_read_per_million}"
