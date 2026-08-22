@@ -2052,6 +2052,37 @@ describe("Right workspace card visibility", () => {
     expect(screen.getByRole("button", { name: "Expand right panel" })).toBeInTheDocument();
   });
 
+  it("carries the last collapse into sessions with no saved open-state", () => {
+    // Collapsing the rail is remembered app-wide, so the next chat the user
+    // opens starts collapsed instead of springing back to the open default —
+    // and reopening it restores the open start for the chat after that.
+    useEnvironmentMock.mockReturnValue({
+      data: { available: false, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([
+      { id: "conv_sticky_a", permission_level: null },
+      { id: "conv_sticky_b", permission_level: null },
+      { id: "conv_sticky_c", permission_level: null },
+    ]);
+
+    const first = renderShell("/c/conv_sticky_a");
+    fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
+    first.unmount();
+
+    // conv_sticky_b was never visited: no saved open-state of its own, so it
+    // follows the remembered collapse.
+    const second = renderShell("/c/conv_sticky_b");
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
+    second.unmount();
+
+    // Reopening flips the remembered state back for the next fresh session.
+    renderShell("/c/conv_sticky_c");
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
+  });
+
   it("restores the selected rail tab per session", () => {
     // Seed conv_tabmem open on the Agents tab; on mount the rail restores that
     // tab as selected rather than falling back to Files.

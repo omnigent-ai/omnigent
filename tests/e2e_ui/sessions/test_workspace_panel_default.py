@@ -10,9 +10,13 @@ AppShell applies that preference only when a session has no saved
 that chat's own open-state wins on restore — so changing Appearance later
 does not rewrite existing layouts.
 
-This covers the pair the feature exists for: a brand-new session starts
-collapsed after picking Collapsed, and a session the user already toggled
-keeps its saved open-state even when the Appearance default is Collapsed.
+Collapsing or expanding the rail from the header writes the same key, so the
+state the rail was last left in carries into the next chat.
+
+This covers what the feature exists for: a brand-new session starts collapsed
+after picking Collapsed, a session the user already toggled keeps its saved
+open-state even when the Appearance default is Collapsed, and a collapse
+sticks across a reload and into a never-visited session until it is reopened.
 No LLM turn is needed.
 """
 
@@ -153,3 +157,39 @@ def test_saved_session_open_state_wins_over_appearance_default(
     _wait_session_ready(page)
     expect(page.get_by_role("complementary", name="Workspace")).to_have_count(0)
     expect(page.get_by_role("button", name="Expand right panel")).to_be_visible()
+
+
+def test_collapsing_the_rail_sticks_across_reload_and_new_sessions(
+    page: Page, seeded_session_pair: tuple[str, str, str]
+) -> None:
+    """A collapsed rail stays collapsed on reload and in the next chat opened.
+
+    Collapsing in session A must not be undone by a reload, and must carry into
+    session B — a chat with no saved open-state of its own — instead of
+    springing back to the open product default. Reopening in B flips the
+    remembered state back, so the next fresh chat starts open again.
+    """
+    base_url, session_a, session_b = seeded_session_pair
+
+    page.goto(f"{base_url}/c/{session_a}")
+    _wait_session_ready(page)
+    expect(page.get_by_role("complementary", name="Workspace")).to_be_visible(timeout=30_000)
+    page.get_by_role("button", name="Collapse right panel").click()
+    expect(page.get_by_role("complementary", name="Workspace")).to_have_count(0)
+    assert _stored_default(page) == "collapsed", "collapsing did not record the rail state"
+
+    # A reload of the same chat keeps it collapsed.
+    page.reload()
+    _wait_session_ready(page)
+    expect(page.get_by_role("complementary", name="Workspace")).to_have_count(0)
+
+    # Session B has never been opened in this browser: it follows the
+    # remembered collapse rather than the open default.
+    page.goto(f"{base_url}/c/{session_b}")
+    _wait_session_ready(page)
+    expect(page.get_by_role("complementary", name="Workspace")).to_have_count(0)
+
+    # Reopening it there flips the remembered state back.
+    page.get_by_role("button", name="Expand right panel").click()
+    expect(page.get_by_role("complementary", name="Workspace")).to_be_visible()
+    assert _stored_default(page) is None, "reopening the rail did not clear the collapsed state"
