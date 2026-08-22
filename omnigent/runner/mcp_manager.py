@@ -83,6 +83,11 @@ class McpSchemasResult:
     schemas: list[_JsonObject]
     tool_names: set[str]
     failures: dict[str, str]  # server_name → error message
+    # Unique config name → InitializeResult.instructions from each healthy server.
+    # Empty when no server returned instructions.
+    server_instructions: dict[str, str] = field(default_factory=dict)
+    # Unique config name → display heading (serverInfo.name when present).
+    server_labels: dict[str, str] = field(default_factory=dict)
 
 
 def compute_spec_hash(configs: list[MCPServerConfig], cwd: Path | None = None) -> str:
@@ -348,7 +353,9 @@ class RunnerMcpManager:
         """Resolve MCP schemas for *spec*; awaits any in-flight connect."""
         configs = list(spec.mcp_servers or [])
         if not configs:
-            return McpSchemasResult(schemas=[], tool_names=set(), failures={})
+            return McpSchemasResult(
+                schemas=[], tool_names=set(), failures={}, server_instructions={}
+            )
         spec_hash = compute_spec_hash(configs, self._stdio_cwd)
         async with self._lock:
             entry = self._ensure_entry(spec_hash, configs)
@@ -372,6 +379,8 @@ class RunnerMcpManager:
             schemas: list[_JsonObject] = []
             tool_names: set[str] = set()
             failures: dict[str, str] = {}
+            server_instructions: dict[str, str] = {}
+            server_labels: dict[str, str] = {}
             for ref in refs:
                 server = ref.entry
                 if server.error is not None:
@@ -386,7 +395,22 @@ class RunnerMcpManager:
                     schema_name = schema["name"]
                     if isinstance(schema_name, str):
                         tool_names.add(schema_name)
-            return McpSchemasResult(schemas=schemas, tool_names=tool_names, failures=failures)
+                conn = server.connection
+                instructions = getattr(conn, "initialize_instructions", None) if conn else None
+                if isinstance(instructions, str) and instructions.strip():
+                    key = ref.config.name
+                    display = getattr(conn, "server_info_name", None)
+                    if not isinstance(display, str) or not display.strip():
+                        display = key
+                    server_instructions[key] = instructions.strip()
+                    server_labels[key] = display.strip()
+            return McpSchemasResult(
+                schemas=schemas,
+                tool_names=tool_names,
+                failures=failures,
+                server_instructions=server_instructions,
+                server_labels=server_labels,
+            )
         finally:
             async with self._lock:
                 for ref in refs:

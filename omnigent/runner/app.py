@@ -2072,6 +2072,10 @@ def create_runner_app(
     _session_sub_agent_names: dict[str, str] = {}
     _session_tool_schemas: dict[str, list[_JsonObject]] = {}  # session_id → cached tool schemas
     _session_mcp_spec_hash: dict[str, str] = {}  # session_id → last MCP spec hash
+    # session_id → InitializeResult.instructions keyed by unique config name
+    _session_mcp_instructions: dict[str, dict[str, str]] = {}
+    # session_id → config name → display heading (serverInfo.name when present)
+    _session_mcp_labels: dict[str, dict[str, str]] = {}
     _session_comment_relays: dict[str, _CommentRelayBinding] = {}
     _codex_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _pi_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
@@ -3520,6 +3524,9 @@ def create_runner_app(
         _session_fs_registries.pop(session_id, None)
         _session_agent_ids.pop(session_id, None)
         _session_tool_schemas.pop(session_id, None)
+        _session_mcp_spec_hash.pop(session_id, None)
+        _session_mcp_instructions.pop(session_id, None)
+        _session_mcp_labels.pop(session_id, None)
         if _binding := _session_comment_relays.pop(session_id, None):
             _binding.relay.close()
         _session_histories.pop(session_id, None)
@@ -5964,6 +5971,9 @@ def create_runner_app(
             _session_cursor_model_names.pop(conv, None)
             _drop_session_claude_launch_config(conv)
             _session_tool_schemas.pop(conv, None)
+            _session_mcp_spec_hash.pop(conv, None)
+            _session_mcp_instructions.pop(conv, None)
+            _session_mcp_labels.pop(conv, None)
             _session_snapshot_cache.pop(conv, None)
             if process_manager is not None:
                 await process_manager.release(conv)
@@ -6140,6 +6150,10 @@ def create_runner_app(
 
         if cached_spec and cached_spec.mcp_servers:
             from omnigent.runner.mcp_manager import compute_spec_hash
+            from omnigent.runtime.prompt import (
+                append_framework_instructions,
+                format_mcp_routing_guidance,
+            )
 
             _mcp_hash = compute_spec_hash(list(cached_spec.mcp_servers))
             if _mcp_hash != _session_mcp_spec_hash.get(conv):
@@ -6159,6 +6173,8 @@ def create_runner_app(
                     ]
                     _session_tool_schemas[conv] = _builtin_tools + list(mcp_result.schemas)
                     _session_mcp_spec_hash[conv] = _mcp_hash
+                    _session_mcp_instructions[conv] = dict(mcp_result.server_instructions)
+                    _session_mcp_labels[conv] = dict(mcp_result.server_labels)
                 except (
                     httpx.HTTPError,
                     RuntimeError,
@@ -6169,6 +6185,20 @@ def create_runner_app(
                         conv,
                         exc_info=True,
                     )
+            # Append after MCP connect so initialize.instructions are available.
+            # Agent AGENTS.md stays first.
+            mcp_guidance = format_mcp_routing_guidance(
+                _session_mcp_instructions.get(conv, {}),
+                server_labels=_session_mcp_labels.get(conv, {}),
+            )
+            if mcp_guidance:
+                combined = append_framework_instructions(
+                    cast(str | None, harness_body.get("instructions")),
+                    (mcp_guidance,),
+                )
+                if combined:
+                    harness_body["instructions"] = combined
+                    instructions = combined
 
         _spec_tools = _session_tool_schemas.get(conv) or []
         _client_tools = cast(list[_JsonObject], msg_body.get("tools") or [])
@@ -9128,6 +9158,8 @@ def create_runner_app(
         _drop_session_claude_launch_config(session_id)
         _session_tool_schemas.pop(session_id, None)
         _session_mcp_spec_hash.pop(session_id, None)
+        _session_mcp_instructions.pop(session_id, None)
+        _session_mcp_labels.pop(session_id, None)
         _session_snapshot_cache.pop(session_id, None)
         if agent_id:
             _spec_cache.pop(agent_id, None)
@@ -9273,6 +9305,8 @@ def create_runner_app(
                         "schemas": result.schemas,
                         "tool_names": list(result.tool_names),
                         "failures": result.failures,
+                        "server_instructions": result.server_instructions,
+                        "server_labels": result.server_labels,
                     }
                 }
             )

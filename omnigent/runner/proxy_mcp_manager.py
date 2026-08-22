@@ -39,6 +39,27 @@ from omnigent.spec.types import AgentSpec
 
 _logger = logging.getLogger(__name__)
 
+
+def _string_map(value: object) -> dict[str, str]:
+    """Keep non-blank string entries from a JSON object; drop everything else."""
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, str] = {}
+    for key, raw in value.items():
+        if isinstance(key, str) and isinstance(raw, str) and raw.strip():
+            out[key] = raw.strip()
+    return out
+
+
+def _extension_map(result: _JsonObject, *keys: str) -> dict[str, str]:
+    """Read an Omnigent tools/list extension, accepting snake_case or camelCase."""
+    for key in keys:
+        parsed = _string_map(result.get(key))
+        if parsed:
+            return parsed
+    return {}
+
+
 _EventPublisher = Callable[[str, _JsonObject], None]
 
 
@@ -129,7 +150,9 @@ class ProxyMcpManager:
             set, and per-server failure messages.
         """
         if not spec.mcp_servers:
-            return McpSchemasResult(schemas=[], tool_names=set(), failures={})
+            return McpSchemasResult(
+                schemas=[], tool_names=set(), failures={}, server_instructions={}
+            )
 
         payload: _JsonObject = {
             "jsonrpc": "2.0",
@@ -155,6 +178,7 @@ class ProxyMcpManager:
                 schemas=[],
                 tool_names=set(),
                 failures={"proxy": f"{type(exc).__name__}: {exc}"},
+                server_instructions={},
             )
 
         if "error" in data:
@@ -173,6 +197,7 @@ class ProxyMcpManager:
                 schemas=[],
                 tool_names=set(),
                 failures={"proxy": msg},
+                server_instructions={},
             )
 
         result = _json_object(data.get("result"))
@@ -186,6 +211,7 @@ class ProxyMcpManager:
                 schemas=[],
                 tool_names=set(),
                 failures={"proxy": msg},
+                server_instructions={},
             )
         tools_list = _json_object_list(result.get("tools"))
         schemas: list[_JsonObject] = []
@@ -216,7 +242,16 @@ class ProxyMcpManager:
             schemas.append(schema)
             tool_names.add(name)
 
-        return McpSchemasResult(schemas=schemas, tool_names=tool_names, failures={})
+        raw_instructions = _extension_map(result, "serverInstructions", "server_instructions")
+        raw_labels = _extension_map(result, "serverLabels", "server_labels")
+
+        return McpSchemasResult(
+            schemas=schemas,
+            tool_names=tool_names,
+            failures={},
+            server_instructions=raw_instructions,
+            server_labels=raw_labels,
+        )
 
     async def call_tool(
         self,
