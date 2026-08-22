@@ -31,6 +31,12 @@
 //     area pick) -- "the person who owns the issue reviews the fix".
 //   - Whoever ends up the reviewer is then assigned onto any linked issue that
 //     has NO assignee yet, so an unowned issue inherits the PR's reviewer.
+// The workflow also fires on `edited` so a `closes #N` link added AFTER open
+// (e.g. a PR opened with a stub body, then filled in) is not missed. On an
+// `edited` event the action is PROMOTE-ONLY: it adopts a linked-issue assignee
+// if there now is one, and otherwise leaves the existing pick untouched -- it
+// never re-runs the load-balanced fallback, so an unrelated edit can't thrash a
+// reviewer. See the guard in the body.
 // Adoption is restricted to the managed reviewers pool (not the wider MAINTAINER
 // set) so an adopted reviewer is always removable by the reconcile step -- a
 // MAINTAINER not in the pool would be unremovable and could break the "exactly
@@ -194,6 +200,20 @@ module.exports = async ({ github, context, core }) => {
   const issueReviewers = [
     ...new Set(linkedIssues.flatMap((li) => li.assignees)),
   ].filter((u) => managed.has(u.toLowerCase()) && u.toLowerCase() !== author);
+
+  // On an `edited` event, act ONLY to adopt a linked-issue assignee -- the case
+  // where a PR is opened with a stub body and the real description (carrying the
+  // `closes #N` link) is pasted in seconds later, after this workflow already
+  // ran on `opened` and saw no linked issue. A linked-issue assignee is a "more
+  // matched" reviewer than the load-balanced area pick, so it may override the
+  // current one; but with nothing to adopt, leave the existing reviewer/assignee
+  // untouched rather than re-running the load-balanced fallback -- otherwise a
+  // routine title/body edit would thrash a deliberately-chosen reviewer.
+  const action = context.payload && context.payload.action;
+  if (action === "edited" && issueReviewers.length === 0) {
+    core.info("Edited event with no linked-issue assignee to adopt; leaving reviewer/assignee unchanged.");
+    return;
+  }
 
   // --- Global open-review load (stateless fairness signal).
   const openPRs = await github.paginate(github.rest.pulls.list, {
