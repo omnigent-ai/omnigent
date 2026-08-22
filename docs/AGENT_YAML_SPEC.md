@@ -169,6 +169,24 @@ executor:
 CLI flags such as `--harness qwen` and `--model <id>` can override or supply
 missing executor values.
 
+## ZCode
+
+`harness: zcode` runs the installed ZCode Agent through the Apache-2.0
+[`zcode-acp-server`](https://github.com/william0wang/zcode-acp) adapter.
+Install ZCode, configure its model credentials, then install the adapter:
+
+```bash
+npm install -g zcode-acp-server
+```
+
+```yaml
+executor:
+  harness: zcode               # alias: z-code
+```
+
+See the [ZCode integration guide](zcode.md) for desktop-app discovery and the
+supported boundary.
+
 ## Custom ACP agents
 
 `harness: acp:<slug>` runs any configured Agent Client Protocol server command.
