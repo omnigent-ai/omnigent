@@ -58,6 +58,7 @@ from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from
 from omnigent.model_metadata import ModelWireAPI
 from omnigent.onboarding.provider_config import CHAT_WIRE_API, RESPONSES_WIRE_API
 from omnigent.pi_model_compatibility import (
+    PI_REASONING_OFF_LEVEL_MAP,
     SYSTEM_AI_RESPONSES_KEYWORDS,
     databricks_model_aliases,
     enrich_databricks_model_catalog,
@@ -808,7 +809,10 @@ def _build_models_json(
                     "supportsDeveloperRole": False,
                     "supportsStore": False,
                     "supportsStrictMode": False,
-                    "supportsReasoningEffort": False,
+                    # Gates reasoning_effort, which Pi sends only for entries
+                    # declaring reasoning: true — today just DeepSeek, whose
+                    # unreadable reasoning channel this switches off.
+                    "supportsReasoningEffort": True,
                     "supportsUsageInStreaming": False,
                 },
                 "models": provider_models["databricks-mlflow"],
@@ -824,7 +828,9 @@ def _build_models_json(
                     "supportsDeveloperRole": False,
                     "supportsStore": False,
                     "supportsStrictMode": False,
-                    "supportsReasoningEffort": False,
+                    # See the mlflow provider above: reaches only reasoning: true
+                    # entries, where it turns the unreadable channel off.
+                    "supportsReasoningEffort": True,
                     # Gemini/Qwen/Llama/inkling models reject stream_options
                     # (which carries include_usage) with 400 "unknown field".
                     "supportsUsageInStreaming": False,
@@ -856,6 +862,7 @@ def _build_models_json(
             entry: _JsonObject = {"id": model, "input": ["text", "image"]}
             if pi_model_is_reasoning(model):
                 entry["reasoning"] = True
+                entry["thinkingLevelMap"] = dict(PI_REASONING_OFF_LEVEL_MAP)
             provider["models"] = [*provider["models"], entry]
     return config
 

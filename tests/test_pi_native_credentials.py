@@ -1462,15 +1462,25 @@ def test_uncataloged_non_claude_model_routed_by_family(
     assert provider.unroutable_model_warning() is None
 
 
-def test_uncataloged_deepseek_declares_reasoning(monkeypatch: pytest.MonkeyPatch) -> None:
-    """DeepSeek streams on reasoning_content; Pi needs ``reasoning: true``.
+def test_deepseek_pins_reasoning_effort_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """DeepSeek asks the gateway for no reasoning, so Pi gets readable content.
 
-    Without the flag Pi sees empty content and the turn never completes.
+    Its chat surface streams reasoning as typed-array ``delta.content`` that Pi
+    concatenates into ``[object Object]``, and it serves no Responses wire. Pi
+    only sends ``reasoning_effort`` for an entry declaring ``reasoning``, and
+    takes the value from ``thinkingLevelMap``; every level maps to "none" so a
+    user's thinking level cannot put the unreadable channel back.
     """
     provider = _databricks_provider_without_catalog(monkeypatch, "databricks-deepseek-v3")
 
-    entry = provider.to_models_config()["providers"]["omnigent-completions"]["models"][0]
+    cfg = provider.to_models_config()
+    completions = cfg["providers"]["omnigent-completions"]
+    assert completions["compat"]["supportsReasoningEffort"] is True
+    entry = completions["models"][0]
     assert entry.get("reasoning") is True
+    assert set(entry["thinkingLevelMap"].values()) == {"none"}
+    assert "off" in entry["thinkingLevelMap"] and "high" in entry["thinkingLevelMap"]
+    assert provider.unroutable_model_warning() is None
 
 
 def test_uncataloged_claude_model_stays_on_primary(monkeypatch: pytest.MonkeyPatch) -> None:

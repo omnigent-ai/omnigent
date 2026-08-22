@@ -17,13 +17,20 @@ if TYPE_CHECKING:
 SYSTEM_AI_RESPONSES_KEYWORDS: tuple[str, ...] = ("kimi", "inkling", "qwen3", "glm-")
 
 
+# Pi's openai-completions reader appends ``delta.content`` with ``+=``, so an
+# endpoint streaming typed-array content renders as ``[object Object]``. These
+# stream it on every wire they offer, and unlike DeepSeek they expose no way to
+# turn the offending channel off. See :data:`PI_REASONING_OFF_LEVEL_MAP`.
+PI_UNPARSEABLE_MODEL_FRAGMENTS: tuple[str, ...] = ("gemini-2-5", "gpt-oss")
+
+
 def unsupported_in_pi(model_id_lower: str) -> bool:
     """Return whether Pi cannot parse the model's response content.
 
-    These endpoints return typed-array content that Pi renders as
-    ``[object Object]``; their available alternate wires do not fix it.
+    :param model_id_lower: A lowercased model id.
+    :returns: ``True`` when no wire the model offers yields parseable content.
     """
-    return "gemini-2-5" in model_id_lower or "gpt-oss" in model_id_lower
+    return any(fragment in model_id_lower for fragment in PI_UNPARSEABLE_MODEL_FRAGMENTS)
 
 
 class DatabricksPiSurface(Enum):
@@ -70,10 +77,19 @@ def databricks_pi_surface_for_model(model_id: str) -> DatabricksPiSurface:
     return DatabricksPiSurface.COMPLETIONS
 
 
-# DeepSeek streams its chain of thought on ``reasoning_content``; Pi only reads
-# that channel when the model entry sets ``reasoning``. GLM/kimi/inkling route
-# through the Responses API instead and do not need it.
+# DeepSeek's chat surface streams reasoning as typed-array content, which Pi
+# concatenates into ``[object Object]``, and it serves no Responses wire. The
+# gateway does suppress that channel for ``reasoning_effort: "none"``, leaving
+# plain string content Pi reads correctly.
 PI_REASONING_MODEL_FRAGMENTS: tuple[str, ...] = ("deepseek",)
+
+# Pi sends ``reasoning_effort`` only for an entry with ``reasoning: true`` under a
+# provider whose compat sets ``supportsReasoningEffort``, taking the value from
+# this map. Every level maps to "none" on purpose: mapping only "off" would let a
+# user's thinking level put the unreadable channel back.
+PI_REASONING_OFF_LEVEL_MAP: dict[str, str] = dict.fromkeys(
+    ("off", "minimal", "low", "medium", "high", "xhigh"), "none"
+)
 
 
 class PiModelEntry(TypedDict):
@@ -82,6 +98,7 @@ class PiModelEntry(TypedDict):
     id: str
     input: NotRequired[list[str]]
     reasoning: NotRequired[bool]
+    thinkingLevelMap: NotRequired[dict[str, str]]
     # Omitted when the catalog reports no limit; Pi then applies its own
     # defaults (128000 / 16384).
     contextWindow: NotRequired[int]
@@ -89,10 +106,10 @@ class PiModelEntry(TypedDict):
 
 
 def pi_model_is_reasoning(model_id: str) -> bool:
-    """Return whether *model_id* needs Pi's ``reasoning: true`` model flag.
+    """Return whether *model_id* needs Pi's reasoning model flags.
 
     :param model_id: A model id, e.g. ``"system.ai.deepseek-v3"``.
-    :returns: ``True`` when Pi must read the reasoning channel.
+    :returns: ``True`` when Pi must be told the model reasons.
     """
     lower = model_id.lower()
     return any(fragment in lower for fragment in PI_REASONING_MODEL_FRAGMENTS)
@@ -122,6 +139,7 @@ def pi_model_json_entry(model: ModelEntry) -> PiModelEntry:
         entry["maxTokens"] = model.metadata.max_output_tokens
     if pi_model_is_reasoning(model.id):
         entry["reasoning"] = True
+        entry["thinkingLevelMap"] = dict(PI_REASONING_OFF_LEVEL_MAP)
     return entry
 
 

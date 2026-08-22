@@ -51,11 +51,13 @@ from omnigent.onboarding.provider_config import (
     load_config,
 )
 from omnigent.pi_model_compatibility import (
+    PI_REASONING_OFF_LEVEL_MAP,
     SYSTEM_AI_RESPONSES_KEYWORDS,
     DatabricksPiSurface,
     PiModelEntry,
     databricks_pi_surface_for_model,
     enrich_databricks_model_catalog,
+    pi_model_is_reasoning,
     pi_model_json_entry,
     unsupported_in_pi,
 )
@@ -344,10 +346,9 @@ class PiProviderConfig:
         """Add the selected model to *additional* under *surface*'s provider."""
         provider_id = _SURFACE_PROVIDER_IDS[surface]
         entry: _PiModelEntry = {"id": self.model, "input": ["text", "image"]}
-        # DeepSeek streams on reasoning_content; Pi only reads that channel when
-        # the model entry declares reasoning.
-        if "deepseek" in self.model.lower():
+        if pi_model_is_reasoning(self.model):
             entry["reasoning"] = True
+            entry["thinkingLevelMap"] = dict(PI_REASONING_OFF_LEVEL_MAP)
         existing = additional.get(provider_id)
         if existing is not None:
             # Copy rather than mutate: the payload is shared with
@@ -541,7 +542,10 @@ def _databricks_openai_provider(
             "supportsDeveloperRole": False,
             "supportsStore": False,
             "supportsStrictMode": False,
-            "supportsReasoningEffort": False,
+            # Gates reasoning_effort, which Pi sends only for entries declaring
+            # reasoning: true — today just DeepSeek, whose unreadable reasoning
+            # channel this switches off via its thinkingLevelMap.
+            "supportsReasoningEffort": True,
             # stream_options is OpenAI-specific; Gemini and other non-OpenAI
             # models reject it with 400.
             "supportsUsageInStreaming": False,
