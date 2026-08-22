@@ -1268,6 +1268,7 @@ def create_app(
                 agent_store=agent_store,
                 conversation_store=conversation_store,
                 permission_store=permission_store,
+                policy_store=policy_store,
                 host_store=host_store,
                 host_registry=host_registry,
                 agent_cache=agent_cache,

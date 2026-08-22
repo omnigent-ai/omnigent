@@ -108,7 +108,7 @@ from omnigent.claude_native_state import (
 from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.host.daemon_launch import (
-    DAEMON_POLL_INTERVAL_S,
+    daemon_poll_intervals,
     error_text,
     launch_or_reuse_daemon_runner,
     open_daemon_client,
@@ -3824,11 +3824,12 @@ async def _wait_for_claude_terminal_ready(
     :raises click.ClickException: If no terminal appears in time.
     """
     deadline = asyncio.get_event_loop().time() + timeout_s
+    intervals = daemon_poll_intervals()
     while asyncio.get_event_loop().time() < deadline:
         terminal_id = await _find_running_claude_terminal(client, session_id)
         if terminal_id is not None:
             return terminal_id
-        await asyncio.sleep(DAEMON_POLL_INTERVAL_S)
+        await asyncio.sleep(next(intervals))
     raise click.ClickException(
         f"The runner did not create the Claude terminal for {session_id!r} "
         f"within {timeout_s:.0f}s."

@@ -185,8 +185,8 @@ _LOG_TAIL_MAX_BYTES = 4096
 # the error summary above it remains visible.
 _LOG_TAIL_MAX_LINES = 15
 
-# Poll cadence for the per-runner exit watcher. 0.5s matches the
-# client's online-poll cadence (daemon_launch.DAEMON_POLL_INTERVAL_S),
+# Poll cadence for the per-runner exit watcher. 0.5s matches the client's
+# steady-state online-poll cadence (daemon_launch.DAEMON_POLL_INTERVAL_S),
 # so a crashed runner is reported within about one client poll.
 _RUNNER_WATCH_INTERVAL_S = 0.5
 

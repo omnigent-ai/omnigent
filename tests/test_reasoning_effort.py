@@ -17,6 +17,7 @@ import pytest
 from omnigent.reasoning_effort import (
     ANTHROPIC_EFFORTS,
     CODEX_EFFORTS,
+    CODEX_NATIVE_EFFORTS,
     DEFAULT_MODEL_EFFORT_CAPS,
     EFFORT_VALUES,
     ModelEffortCaps,
@@ -37,14 +38,25 @@ def test_max_coerces_to_xhigh_for_codex() -> None:
     assert validate_effort("max", "codex", CODEX_EFFORTS) == "xhigh"
 
 
-def test_ultra_coerces_for_session_metadata_vocabulary() -> None:
-    """A terminal-observed ``ultra`` effort change is accepted as ``xhigh``.
+def test_codex_native_accepts_max_and_ultra() -> None:
+    """Codex-native honors the real per-model ladder — max/ultra pass through.
 
-    Regression: the codex-native forwarder posts the effort the codex TUI
-    reports; a ChatGPT-app-configured terminal reports ``ultra``, which the
-    server used to reject with ``invalid_input``.
+    The SDK/Responses codex ladder still caps at ``xhigh`` (see the tests
+    above), but codex-native drives the real codex process, which accepts
+    Sol's ``max``/``ultra``, so they must not fold to ``xhigh``.
     """
-    assert validate_effort("ultra", "session metadata", EFFORT_VALUES) == "xhigh"
+    assert validate_effort("ultra", "codex", CODEX_NATIVE_EFFORTS) == "ultra"
+    assert validate_effort("max", "codex", CODEX_NATIVE_EFFORTS) == "max"
+
+
+def test_ultra_preserved_in_session_metadata_vocabulary() -> None:
+    """A terminal-observed ``ultra`` effort change is stored as ``ultra``.
+
+    The codex-native forwarder mirrors the level the codex TUI reports; Sol's
+    ``ultra`` is a real reasoning level, so the session metadata keeps it
+    verbatim (the UI shows the true level) rather than folding it to ``xhigh``.
+    """
+    assert validate_effort("ultra", "session metadata", EFFORT_VALUES) == "ultra"
 
 
 def test_max_stays_max_where_supported() -> None:
@@ -83,9 +95,9 @@ def test_none_and_empty_clear_effort() -> None:
     "model",
     ["glm-5-2", "databricks-glm-5-2", "system.ai.glm-5-2", "GLM-5-2", "system.ai.glm-5.2"],
 )
-@pytest.mark.parametrize("effort", ["xhigh", "max"])
+@pytest.mark.parametrize("effort", ["xhigh", "max", "ultra"])
 def test_glm_clamps_unsupported_effort_to_medium(model: str, effort: str) -> None:
-    """Every GLM spelling coerces xhigh/max down to medium."""
+    """Every GLM spelling coerces every above-high rung (xhigh/max/ultra) to medium."""
     assert clamp_effort_for_model(effort, model) == "medium"
 
 
