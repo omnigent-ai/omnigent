@@ -11,6 +11,7 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
 } from "react";
 import {
   ArrowUpIcon,
@@ -37,6 +38,19 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { userColor, userColorTint, userInitials } from "@/lib/userBadge";
 import { useNavigate, useParams } from "@/lib/routing";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
+import {
+  captureActiveConversationScroll,
+  getConversationScrollPosition,
+  isConversationScrollPositionRestored,
+  registerActiveConversationScroller,
+  restoreConversationScrollPosition,
+  saveConversationScrollPosition,
+} from "@/lib/conversationScrollPositions";
+import {
+  DEFAULT_BOTTOM_LOCK_ENABLED,
+  readBottomLockEnabled,
+  subscribeBottomLockEnabled,
+} from "@/lib/bottomLockPreferences";
 import {
   Conversation,
   ConversationContent,
@@ -785,6 +799,7 @@ export function ChatPage() {
   // intentionally don't await it here. The store's `loadingConversation` flag
   // drives the loading UI below; `conversationLoadError` drives the error UI.
   useEffect(() => {
+    captureActiveConversationScroll(useChatStore.getState().conversationId);
     void useChatStore.getState().switchTo(urlConvId ?? null);
   }, [urlConvId]);
 
@@ -829,6 +844,7 @@ export function ChatPage() {
   // Subscribe to the bits of store state we render. Each is a
   // primitive selector so re-renders fire only when that specific
   // field changes — no `useShallow` needed.
+  const activeConversationId = useChatStore((s) => s.conversationId);
   const blocks = useChatStore((s) => s.blocks);
   const pendingUserMessages = useChatStore((s) => s.pendingUserMessages);
   const activeResponse = useChatStore((s) => s.activeResponse);
@@ -1365,7 +1381,9 @@ export function ChatPage() {
 
   const mainAgent = (
     <MainAgentSurface
-      conversationId={urlConvId ?? null}
+      // The URL leads the projected chat store by one render. Pair the scroll
+      // cache with the store id so its key changes in the same commit as bubbles.
+      conversationId={activeConversationId}
       bubbles={bubbles}
       status={status}
       isWorking={isWorking}
@@ -1999,6 +2017,11 @@ function MainAgentSurface({
     };
   }, [scroller]);
   const [sendScrollNonce, setSendScrollNonce] = useState(0);
+  const bottomLockEnabled = useSyncExternalStore(
+    subscribeBottomLockEnabled,
+    readBottomLockEnabled,
+    () => DEFAULT_BOTTOM_LOCK_ENABLED,
+  );
   const handleSend = useCallback(
     (text: string, files?: File[]) => {
       setSendScrollNonce((n) => n + 1);
@@ -2148,8 +2171,10 @@ function MainAgentSurface({
                 )}
               >
                 {/* Scroll helpers — must live inside StickToBottom to access context. */}
-                <ScrollToBottomOnSend nonce={sendScrollNonce} />
-                <KeepBottomOnViewportResize />
+                <BottomLockController enabled={bottomLockEnabled} />
+                <ScrollToBottomOnSend nonce={sendScrollNonce} enabled={bottomLockEnabled} />
+                <ReleaseBottomLockOnResponseEnd status={status} enabled={bottomLockEnabled} />
+                {bottomLockEnabled && <KeepBottomOnViewportResize />}
                 <ConversationScrollRefBridge onScroller={setScroller} />
                 <HistoryAutoLoader scrollElement={scroller?.el ?? null} />
                 {bubbles.length === 0 && !showWorkingIndicator && !mcpStartupActive ? (
@@ -2260,6 +2285,7 @@ function MainAgentSurface({
             accordion pinned above, this container already starts below the
             header, so the track drops its header-clearing top inset. */}
             <TranscriptScrollbar scroller={scroller} topInset={hasTasks ? 12 : undefined} />
+            <ConversationScrollPosition conversationId={conversationId} scroller={scroller} />
             {/* Hover the top edge to reveal a pill that loads all older history and
             scrolls to the first message. Rendered here (a wrapper sibling of
             Conversation) rather than inside it so it escapes the chat-scroll-fade
@@ -2414,19 +2440,183 @@ function UserMessageNavConnected(props: React.ComponentProps<typeof UserMessageN
 }
 
 /**
- * Forces the conversation back to the bottom when this client submits a
- * new message. StickToBottom intentionally respects a user who has scrolled
- * up while streaming, but an explicit send should bring the fresh user bubble
- * and ensuing response back into view.
+ * Keeps the library's implicit bottom lock released when automatic following
+ * is disabled. The scroll listener runs after the library's own listener, so
+ * reaching the bottom naturally does not silently re-arm the lock.
  */
-function ScrollToBottomOnSend({ nonce }: { nonce: number }) {
+export function BottomLockController({ enabled }: { enabled: boolean }) {
+  const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
+    scrollRef?: React.RefObject<HTMLElement>;
+    contentRef?: React.RefObject<HTMLElement>;
+    state: { isAtBottom: boolean; escapedFromLock: boolean };
+    stopScroll: () => void;
+  };
+  const scrollRef = ctx.scrollRef;
+  const contentRef = ctx.contentRef;
+  const state = ctx.state;
+  const stopScroll = ctx.stopScroll;
+
+  useLayoutEffect(() => {
+    if (enabled) return;
+    const scrollElement = scrollRef?.current;
+    const release = () => {
+      stopScroll();
+      state.isAtBottom = false;
+      state.escapedFromLock = true;
+    };
+    release();
+    if (!scrollElement) return;
+
+    scrollElement.addEventListener("scroll", release, { passive: true });
+    const observer =
+      typeof ResizeObserver === "undefined" ? null : new ResizeObserver(() => release());
+    const contentElement = contentRef?.current;
+    if (contentElement) observer?.observe(contentElement);
+    return () => {
+      scrollElement.removeEventListener("scroll", release);
+      observer?.disconnect();
+    };
+  }, [contentRef, enabled, scrollRef, state, stopScroll]);
+
+  return null;
+}
+
+/** Optionally jumps to and follows the response after a local send. */
+function ScrollToBottomOnSend({ nonce, enabled }: { nonce: number; enabled: boolean }) {
   const { scrollToBottom } = useStickToBottomContext();
 
   useLayoutEffect(() => {
-    if (nonce === 0) return;
+    if (!enabled || nonce === 0) return;
     scrollToBottom("instant");
     requestAnimationFrame(() => scrollToBottom("instant"));
-  }, [nonce, scrollToBottom]);
+  }, [enabled, nonce, scrollToBottom]);
+
+  return null;
+}
+
+/**
+ * Preserves each transcript's reading position while switching sessions.
+ *
+ * Session hydration temporarily unmounts the conversation, and StickToBottom
+ * initializes every mount at the end. A user-message anchor and its viewport
+ * offset restore the same visible turn even when transcript height changes.
+ */
+export function ConversationScrollPosition({
+  conversationId,
+  scroller,
+}: {
+  conversationId: string | null;
+  scroller: ConversationScroller | null;
+}) {
+  const scrollElement = scroller?.el ?? null;
+  const scrollState = scroller?.state ?? null;
+  const stopScroll = scroller?.stopScroll ?? null;
+
+  useLayoutEffect(() => {
+    const el = scrollElement;
+    if (!el || !conversationId || !scrollState || !stopScroll) return;
+    const unregister = registerActiveConversationScroller(conversationId, el);
+    const saved = getConversationScrollPosition(conversationId);
+    let restoring = saved !== undefined;
+    let frame = 0;
+
+    const persist = () => saveConversationScrollPosition(conversationId, el);
+    const onScroll = () => {
+      if (!restoring) persist();
+    };
+    const settleForUser = () => {
+      restoring = false;
+      cancelAnimationFrame(frame);
+      persist();
+    };
+
+    el.addEventListener("scroll", onScroll, { passive: true });
+    for (const event of ["wheel", "touchstart", "pointerdown"] as const) {
+      el.addEventListener(event, settleForUser, { passive: true });
+    }
+
+    if (saved) {
+      stopScroll();
+      scrollState.isAtBottom = false;
+      scrollState.escapedFromLock = true;
+      const deadline = performance.now() + 2_000;
+      let quietSince = performance.now();
+      let lastScrollHeight = el.scrollHeight;
+      const restore = () => {
+        const now = performance.now();
+        const wasRestored = isConversationScrollPositionRestored(el, saved);
+        restoreConversationScrollPosition(el, saved);
+        if (!wasRestored || el.scrollHeight !== lastScrollHeight) quietSince = now;
+        lastScrollHeight = el.scrollHeight;
+        const settled =
+          isConversationScrollPositionRestored(el, saved) && now - quietSince >= 150;
+        const done = settled || now >= deadline;
+        if (!done) {
+          frame = requestAnimationFrame(restore);
+          return;
+        }
+        restoreConversationScrollPosition(el, saved);
+        restoring = false;
+        persist();
+      };
+      restore();
+    }
+
+    return () => {
+      cancelAnimationFrame(frame);
+      unregister();
+      el.removeEventListener("scroll", onScroll);
+      for (const event of ["wheel", "touchstart", "pointerdown"] as const) {
+        el.removeEventListener(event, settleForUser);
+      }
+    };
+  }, [conversationId, scrollElement, scrollState, stopScroll]);
+
+  return null;
+}
+
+/** Prevent completion-time resizes from moving readers when bottom locking is disabled. */
+export function ReleaseBottomLockOnResponseEnd({
+  status,
+  enabled,
+}: {
+  status: "idle" | "streaming";
+  enabled: boolean;
+}) {
+  const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
+    scrollRef?: React.RefObject<HTMLElement>;
+    state: { isAtBottom: boolean; escapedFromLock: boolean };
+    stopScroll: () => void;
+  };
+  const previousStatusRef = useRef(status);
+
+  useLayoutEffect(() => {
+    const previousStatus = previousStatusRef.current;
+    previousStatusRef.current = status;
+    if (enabled || previousStatus !== "streaming" || status !== "idle") return;
+    const scrollElement = ctx.scrollRef?.current;
+    if (!scrollElement) return;
+    const scrollTop = scrollElement.scrollTop;
+    const physicallyAtBottom =
+      scrollElement.scrollHeight - scrollElement.clientHeight - scrollTop <= 1;
+    if (physicallyAtBottom) return;
+    const preserve = () => {
+      ctx.stopScroll();
+      ctx.state.isAtBottom = false;
+      ctx.state.escapedFromLock = true;
+      scrollElement.scrollTop = scrollTop;
+    };
+    preserve();
+    let secondFrame = 0;
+    const firstFrame = requestAnimationFrame(() => {
+      preserve();
+      secondFrame = requestAnimationFrame(preserve);
+    });
+    return () => {
+      cancelAnimationFrame(firstFrame);
+      if (secondFrame) cancelAnimationFrame(secondFrame);
+    };
+  }, [ctx.scrollRef, ctx.state, ctx.stopScroll, enabled, status]);
 
   return null;
 }
