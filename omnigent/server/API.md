@@ -1026,6 +1026,54 @@ mirror that status into the parent stream as `session.child_session.updated`
 when the child is registered for fan-out. New user-facing event types should
 default to the queue.
 
+### Post Events (batch)
+
+```
+POST /v1/sessions/{session_id}/events/batch
+Content-Type: application/json
+
+{
+  "events": [
+    {"type": "external_output_text_delta", "data": {"delta": "Hel"}},
+    {"type": "external_output_text_delta", "data": {"delta": "lo"}}
+  ],
+  "on_error": "stop"
+}
+```
+
+Dispatches a run of events through the same handler as `POST
+.../events`, in request order — one round trip instead of
+`len(events)`. Internal (hidden from the OpenAPI reference): the native
+harness forwarders use it to mirror a poll's transcript items and text
+deltas at once. Without it a client far from the server can push only
+about one event per round trip, so a long turn's live view falls tens of
+seconds behind the harness.
+
+`events` carries 1–256 `SessionEventInput` bodies. `on_error` selects
+what happens after a failure: `"stop"` (default) leaves the rest of the
+batch unattempted, matching a sequential caller that retries from its
+first failure; `"continue"` attempts every event, for best-effort
+streams (live deltas) where dropping one chunk beats stalling the tail.
+
+Always `200` with per-event outcomes; a rejected event does not fail the
+request, so a caller can advance a durable cursor over the delivered
+prefix instead of re-sending — and duplicating — events that landed:
+
+```
+{
+  "results": [
+    {"index": 0, "status": 202, "body": {"queued": false}},
+    {"index": 1, "status": 400, "error": "...", "code": "invalid_input"}
+  ],
+  "stopped_at": 1
+}
+```
+
+`results` is shorter than `events` when `stopped_at` is set — entries
+past it were never attempted. Clients tell "this deployment has no batch
+route" from "no such session" by the 404 body: a route miss has no
+`error` envelope, an application 404 does.
+
 ### Resolve Elicitation (URL-based)
 
 ```

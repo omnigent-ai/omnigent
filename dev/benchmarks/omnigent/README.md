@@ -62,6 +62,15 @@ see *Network* below).
 | `add_comment` | `POST /v1/sessions/{id}/comments` — create a review comment | write path |
 | `list_projects` | `GET /v1/sessions/projects` — sidebar project list (dual-read union) | project count |
 | `list_project_sessions` | `GET /v1/sessions?project=` — a project folder's sessions (dual-read filter) | sessions/project |
+| `forward_native_deltas_per_event` | `POST /v1/sessions/{id}/events` × 24 — a native forwarder mirroring one poll's streamed text one request at a time | round-trip count |
+| `forward_native_deltas_batched` | `POST /v1/sessions/{id}/events/batch` — the same poll's text in one request | round-trip count |
+
+The two `forward_native_deltas_*` journeys are a matched pair: same work, 24
+round trips versus 1. Run them with `--network-delay-ms` to price the wire,
+which is what a user in another region actually pays — at `--network-delay-ms
+100` the per-event journey takes ~2.5s per poll against ~0.14s batched, and a
+turn is many polls. They are also the regression guard: if the forwarder ever
+fans back out into per-event posts, the batched journey's `HTTP/op` climbs off 1.
 
 Read journeys target a **pre-seeded** session when the DB has a corpus; against
 an empty DB they self-seed a small fallback session over HTTP (the

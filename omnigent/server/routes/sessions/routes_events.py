@@ -14,7 +14,9 @@ from fastapi import (
     Request,
 )
 from fastapi.responses import StreamingResponse
+from sqlalchemy.exc import StatementError
 
+from omnigent.db.db_models import InvalidUuidError
 from omnigent.entities import (
     ErrorData,
     NewConversationItem,
@@ -200,6 +202,7 @@ from omnigent.server.schemas import (
     ElicitationRequestParams,
     ErrorDetail,
     McpServerStartup,
+    SessionEventBatchInput,
     SessionEventInput,
 )
 from omnigent.session_lifecycle import (
@@ -1737,6 +1740,120 @@ def register_events_routes(
         if dispatch.pending_id is not None:
             response["pending_id"] = dispatch.pending_id
         return response
+
+    # ── POST /sessions/{session_id}/events/batch ─────────────
+
+    @router.post(
+        "/sessions/{session_id}/events/batch",
+        # Internal event ingestion — hidden from the public API reference.
+        include_in_schema=False,
+        # response_model=None: the body is a small per-event outcome
+        # envelope, not a domain model.
+        response_model=None,
+    )
+    async def post_events_batch(
+        request: Request,
+        session_id: str,
+        body: SessionEventBatchInput,
+    ) -> dict[str, Any]:
+        """
+        Dispatch a run of session events in one round trip.
+
+        Every event runs through the same handler as
+        ``POST /sessions/{session_id}/events``, in request order, so a
+        batch is observationally equivalent to the sequence of single
+        posts it replaces. What it saves is round trips: a native
+        harness's forwarder posts one transcript item or text delta per
+        request, so a client an ocean away from the server can only push
+        a handful of events per second and its live view falls far behind
+        a long turn.
+
+        Per-event failures land in ``results`` instead of failing the
+        request, so a caller can advance its cursor over the successful
+        prefix and retry from the first failure rather than re-sending
+        (and duplicating) events that already landed. ``on_error="stop"``
+        leaves everything after the failure unattempted, matching a
+        sequential caller; ``"continue"`` attempts all of them, for
+        best-effort delta streams. Envelope-level problems (unparseable
+        body, oversized batch) are rejected by validation as usual.
+
+        :param session_id: Session/conversation identifier.
+        :param body: Events to dispatch plus the on-error policy.
+        :returns: ``{"results": [...], "stopped_at": int | None}`` — see
+            :class:`SessionEventBatchResponse`.
+        """
+        results: list[dict[str, Any]] = []
+        stopped_at: int | None = None
+        for index, event in enumerate(body.events):
+            try:
+                outcome = await post_event(request, session_id, event)
+            except OmnigentError as exc:
+                # A wrong-replica landing is a fact about the *request*, not the
+                # event: on a multi-replica deployment the caller is expected to
+                # re-address and re-send. Reporting it per-event would hand the
+                # caller an opaque 400 it reads as a permanent rejection — the
+                # forwarder would dead-letter and drop a live item instead of
+                # retrying it at the right replica. Every event in a batch
+                # shares the session's replica binding, so this fires before
+                # anything is dispatched; propagate then, exactly as a single
+                # post does. If it somehow lands mid-batch (a tunnel that moved
+                # under us), keep the delivered prefix accounted for and report
+                # it with its code so the caller can still re-address.
+                if exc.code == ErrorCode.WRONG_REPLICA and not results:
+                    raise
+                results.append(
+                    {
+                        "index": index,
+                        "status": exc.http_status,
+                        "error": str(exc),
+                        "code": exc.code,
+                    }
+                )
+            except StatementError as exc:
+                # A malformed id can address no row. The app's handler maps
+                # this to 404 for a single post; mirror it so a batched event
+                # reports the same status instead of a bogus 500.
+                if not isinstance(exc.orig, InvalidUuidError):
+                    raise
+                results.append(
+                    {
+                        "index": index,
+                        "status": 404,
+                        "error": "Not found.",
+                        "code": ErrorCode.NOT_FOUND,
+                    }
+                )
+            except Exception:
+                # A single post would have failed only its own request;
+                # propagating here would fail the whole batch and make the
+                # caller re-send events that already landed. Report it
+                # per-event and keep the log loud so the bug stays visible.
+                #
+                # The body carries the same generic message the app's 500
+                # handler returns, never the exception's text: an internal
+                # failure's detail (paths, SQL, stack context) must not reach
+                # a client just because it happened inside a batch.
+                _logger.exception(
+                    "Batched session event failed; session=%s index=%s type=%s",
+                    session_id,
+                    index,
+                    event.type,
+                )
+                results.append(
+                    {
+                        "index": index,
+                        "status": 500,
+                        "error": "An internal error occurred.",
+                        "code": ErrorCode.INTERNAL_ERROR,
+                    }
+                )
+            else:
+                results.append({"index": index, "status": 202, "body": dict(outcome)})
+                continue
+            if body.on_error == "stop":
+                stopped_at = index
+                break
+        return {"results": results, "stopped_at": stopped_at}
 
     # ── GET /sessions/{session_id}/stream ────────────────────────
 

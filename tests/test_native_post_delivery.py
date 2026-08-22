@@ -12,12 +12,16 @@ from omnigent._native_post_delivery import (
     _DEAD_LETTER_BACKUP_FILE,
     _DEAD_LETTER_FILE,
     _DEAD_LETTER_MAX_BYTES,
+    MAX_EVENTS_PER_BATCH,
     RepostResult,
     _dead_letter_record_replayable,
     append_dead_letter,
+    events_batch_supported,
     post_external_session_status,
     post_may_have_been_delivered,
+    post_session_events_batch,
     replay_dead_letters,
+    reset_events_batch_support,
 )
 
 # Status codes a forwarder treats as transient/retryable, used by the replay
@@ -676,3 +680,215 @@ async def test_post_external_session_status_attaches_failure_reason() -> None:
         "output": "transcript item item-1 rejected",
     }
     assert captured[1]["data"] == {"status": "idle"}
+
+
+def _batch_client(
+    requests: list[dict[str, object]],
+    *,
+    responder: object = None,
+) -> httpx.AsyncClient:
+    """
+    Build an AsyncClient recording every batch request body.
+
+    :param requests: List appended to with each parsed request body.
+    :param responder: Optional ``(index, body) -> httpx.Response`` override,
+        for exercising route misses and partial failures. Defaults to
+        accepting every event.
+    :returns: An ``httpx.AsyncClient`` bound to the recording transport.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests.append({"path": request.url.path, "body": body})
+        if responder is not None:
+            return responder(len(requests) - 1, body)  # type: ignore[operator]
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"index": index, "status": 202} for index in range(len(body["events"]))
+                ],
+                "stopped_at": None,
+            },
+        )
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://ap")
+
+
+@pytest.mark.asyncio
+async def test_batch_post_sends_one_request_and_reports_each_event() -> None:
+    """
+    A run of events costs one request, with one outcome per event.
+
+    This is the round-trip saving the whole change exists for: a client
+    far from the server can otherwise only push one event per RTT. Fails
+    if the helper fans back out into per-event posts or loses the
+    per-event acknowledgement callers key their cursor off.
+    """
+    requests: list[dict[str, object]] = []
+    events = [{"type": "external_output_text_delta", "data": {"delta": str(i)}} for i in range(5)]
+    async with _batch_client(requests) as client:
+        reset_events_batch_support(client)
+        outcomes = await post_session_events_batch(client, session_id="conv_x", events=events)
+
+    assert len(requests) == 1
+    assert requests[0]["path"] == "/v1/sessions/conv_x/events/batch"
+    assert outcomes is not None
+    assert [(o.index, o.delivered) for o in outcomes] == [(i, True) for i in range(5)]
+
+
+@pytest.mark.asyncio
+async def test_batch_post_chunks_runs_over_the_cap() -> None:
+    """
+    A run longer than the cap is split, not truncated or rejected.
+
+    A resumed session can replay a large backlog in one poll; the helper
+    must ship all of it. Fails if events past the cap are silently
+    dropped (the live view would be missing a chunk of the turn).
+    """
+    requests: list[dict[str, object]] = []
+    total = MAX_EVENTS_PER_BATCH + 3
+    events = [
+        {"type": "external_output_text_delta", "data": {"delta": str(i)}} for i in range(total)
+    ]
+    async with _batch_client(requests) as client:
+        reset_events_batch_support(client)
+        outcomes = await post_session_events_batch(client, session_id="conv_x", events=events)
+
+    assert [len(r["body"]["events"]) for r in requests] == [MAX_EVENTS_PER_BATCH, 3]  # type: ignore[index]
+    assert outcomes is not None
+    assert [o.index for o in outcomes] == list(range(total))
+    assert all(o.delivered for o in outcomes)
+
+
+@pytest.mark.asyncio
+async def test_batch_post_stops_after_a_failed_chunk() -> None:
+    """
+    With ``on_error="stop"`` a failure ends the run there.
+
+    A caller advancing a durable cursor must not have later events land
+    ahead of a failed one — on retry it re-sends from the failure, and a
+    delivered successor would then be duplicated. Fails if the helper
+    keeps sending chunks past a failure, or reports unattempted events as
+    delivered.
+    """
+    requests: list[dict[str, object]] = []
+    total = MAX_EVENTS_PER_BATCH + 2
+    events = [{"type": "external_conversation_item", "data": {"i": i}} for i in range(total)]
+
+    def responder(index: int, body: dict[str, object]) -> httpx.Response:
+        """Fail the second event of the first chunk."""
+        del index
+        results = [
+            {"index": position, "status": 202}
+            for position in range(len(body["events"]))  # type: ignore[arg-type]
+        ]
+        results[1] = {"index": 1, "status": 400, "error": "bad item"}
+        return httpx.Response(200, json={"results": results[:2], "stopped_at": 1})
+
+    async with _batch_client(requests, responder=responder) as client:
+        reset_events_batch_support(client)
+        outcomes = await post_session_events_batch(client, session_id="conv_x", events=events)
+
+    # Only the first chunk was sent.
+    assert len(requests) == 1
+    assert outcomes is not None
+    assert outcomes[0].delivered is True
+    assert outcomes[1].delivered is False
+    assert outcomes[1].error == "bad item"
+    # Everything after the failure is reported unattempted, never delivered.
+    assert not any(o.delivered for o in outcomes[1:])
+    assert [o.index for o in outcomes] == list(range(total))
+
+
+@pytest.mark.asyncio
+async def test_batch_post_returns_none_on_route_miss_and_latches_it() -> None:
+    """
+    An older server's route miss tells the caller to post singly, once.
+
+    A user's CLI can be newer than the deployment it talks to. Fails if
+    the miss surfaces as an error (the forwarder would drop the run) or
+    if every later run re-probes (a wasted round trip per poll, on the
+    very link this change is trying to spare).
+    """
+    requests: list[dict[str, object]] = []
+    events = [{"type": "external_output_text_delta", "data": {"delta": "a"}}]
+
+    def responder(index: int, body: dict[str, object]) -> httpx.Response:
+        """Answer with Starlette's route-miss shape."""
+        del index, body
+        return httpx.Response(404, json={"detail": "Not Found"})
+
+    async with _batch_client(requests, responder=responder) as client:
+        reset_events_batch_support(client)
+        assert await post_session_events_batch(client, session_id="conv_x", events=events) is None
+        assert events_batch_supported(client) is False
+        assert await post_session_events_batch(client, session_id="conv_x", events=events) is None
+
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_batch_post_keeps_batching_when_the_session_is_missing() -> None:
+    """
+    An application 404 is not a route miss and must not latch the fallback.
+
+    ``POST /events/batch`` answers 404 both when the deployment lacks the
+    route and when the session is gone; only the first should downgrade
+    the client. Fails if a deleted session permanently costs a
+    far-away client its batching.
+    """
+    requests: list[dict[str, object]] = []
+    events = [{"type": "external_output_text_delta", "data": {"delta": "a"}}]
+
+    def responder(index: int, body: dict[str, object]) -> httpx.Response:
+        """Answer with Omnigent's application-error envelope."""
+        del index, body
+        return httpx.Response(
+            404, json={"error": {"code": "not_found", "message": "Session not found."}}
+        )
+
+    async with _batch_client(requests, responder=responder) as client:
+        reset_events_batch_support(client)
+        with pytest.raises(httpx.HTTPStatusError):
+            await post_session_events_batch(client, session_id="conv_x", events=events)
+        assert events_batch_supported(client) is True
+
+
+@pytest.mark.asyncio
+async def test_batch_post_treats_a_malformed_response_as_an_http_error() -> None:
+    """
+    A non-JSON batch reply is an error, not silent success.
+
+    Callers advance cursors on delivery; an unparseable reply proves
+    nothing about delivery, so it must reach the caller's failure path.
+    Fails if the helper swallows it and reports the run as delivered.
+    """
+    requests: list[dict[str, object]] = []
+    events = [{"type": "external_output_text_delta", "data": {"delta": "a"}}]
+
+    def responder(index: int, body: dict[str, object]) -> httpx.Response:
+        """Answer 200 with a body that is not JSON."""
+        del index, body
+        return httpx.Response(200, content=b"<html>gateway</html>")
+
+    async with _batch_client(requests, responder=responder) as client:
+        reset_events_batch_support(client)
+        with pytest.raises(httpx.HTTPError):
+            await post_session_events_batch(client, session_id="conv_x", events=events)
+
+
+@pytest.mark.asyncio
+async def test_batch_post_of_nothing_is_a_noop() -> None:
+    """
+    An empty run makes no request.
+
+    The forwarder calls this every poll; an idle poll must not cross the
+    wire at all. Fails if an empty run posts an empty envelope (which the
+    server rejects) on every poll.
+    """
+    requests: list[dict[str, object]] = []
+    async with _batch_client(requests) as client:
+        reset_events_batch_support(client)
+        assert await post_session_events_batch(client, session_id="conv_x", events=[]) == []
+    assert requests == []

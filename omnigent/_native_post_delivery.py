@@ -23,6 +23,7 @@ import contextlib
 import json
 import logging
 import time
+import weakref
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from pathlib import Path
@@ -216,6 +217,199 @@ async def post_external_session_status(
         json={"type": "external_session_status", "data": data},
     )
     resp.raise_for_status()
+
+
+# Batch event ingestion (``POST /v1/sessions/{id}/events/batch``). A forwarder
+# far from the server is otherwise capped at one event per round trip, so a
+# turn's live text trickles in for tens of seconds after the harness produced
+# it. Batching collapses a poll's worth of events into one request.
+#
+# Kept at half the server's ``MAX_SESSION_EVENTS_PER_BATCH`` (256) so a client
+# never trips the server's envelope validation, and so one request stays small
+# enough to retry cheaply. Longer runs are chunked.
+MAX_EVENTS_PER_BATCH = 128
+
+# Clients whose server has no batch route. Latched on the first route-miss 404,
+# so talking to an older deployment costs one wasted request per client, not one
+# per event. Keyed by client (weakly) rather than by base URL: a forwarder holds
+# one client for its whole life, and nothing leaks into an unrelated client that
+# happens to share a server.
+_EVENTS_BATCH_UNSUPPORTED: weakref.WeakSet[httpx.AsyncClient] = weakref.WeakSet()
+
+
+def events_batch_supported(client: httpx.AsyncClient) -> bool:
+    """
+    Report whether this server is still believed to serve the batch route.
+
+    :param client: Omnigent HTTP client.
+    :returns: ``False`` once a route-miss 404 latched the fallback.
+    """
+    return client not in _EVENTS_BATCH_UNSUPPORTED
+
+
+def reset_events_batch_support(client: httpx.AsyncClient | None = None) -> None:
+    """
+    Clear the batch-unsupported latch (tests; and after a server upgrade).
+
+    :param client: Client to clear, or ``None`` to clear every latch.
+    :returns: None.
+    """
+    if client is None:
+        _EVENTS_BATCH_UNSUPPORTED.clear()
+        return
+    _EVENTS_BATCH_UNSUPPORTED.discard(client)
+
+
+def _is_route_miss(response: httpx.Response) -> bool:
+    """
+    Distinguish "this server has no such route" from "no such session".
+
+    Omnigent's error handler shapes application 404s as
+    ``{"error": {...}}``; Starlette's route miss answers
+    ``{"detail": "Not Found"}``. Only the latter means the deployment
+    predates the batch endpoint.
+
+    :param response: The 404 response to classify.
+    :returns: ``True`` when the 404 came from routing, not the handler.
+    """
+    try:
+        body = response.json()
+    except ValueError:
+        return True
+    return not (isinstance(body, dict) and "error" in body)
+
+
+@dataclass(frozen=True)
+class BatchedEventOutcome:
+    """
+    Per-event outcome of one batched session-event POST.
+
+    :param index: Position of the event in the submitted run.
+    :param delivered: ``True`` when the server accepted the event (the
+        status the equivalent single post would have returned was 2xx).
+    :param status: That status, or ``None`` when the event was never
+        attempted because an earlier failure stopped the batch.
+    :param error: Failure reason reported by the server, when present.
+    """
+
+    index: int
+    delivered: bool
+    status: int | None = None
+    error: str | None = None
+
+
+def _parse_batch_results(
+    payload: object,
+    *,
+    total: int,
+    offset: int,
+) -> list[BatchedEventOutcome]:
+    """
+    Convert one batch response body into per-event outcomes.
+
+    Events the server never attempted (it stopped at a failure) are
+    reported as not-delivered with a ``None`` status so callers keep them
+    for the next attempt instead of treating silence as success.
+
+    :param payload: Decoded JSON body of the batch response.
+    :param total: Number of events submitted in this request.
+    :param offset: Index of this request's first event within the caller's
+        full run, so outcomes are numbered in the caller's terms.
+    :returns: One outcome per submitted event, in order.
+    """
+    raw_results = payload.get("results") if isinstance(payload, dict) else None
+    by_index: dict[int, BatchedEventOutcome] = {}
+    if isinstance(raw_results, list):
+        for position, entry in enumerate(raw_results):
+            if not isinstance(entry, dict):
+                continue
+            raw_index = entry.get("index")
+            index = raw_index if isinstance(raw_index, int) else position
+            raw_status = entry.get("status")
+            status = raw_status if isinstance(raw_status, int) else None
+            raw_error = entry.get("error")
+            by_index[index] = BatchedEventOutcome(
+                index=offset + index,
+                delivered=status is not None and 200 <= status < 400,
+                status=status,
+                error=raw_error if isinstance(raw_error, str) else None,
+            )
+    return [
+        by_index.get(index, BatchedEventOutcome(index=offset + index, delivered=False))
+        for index in range(total)
+    ]
+
+
+async def post_session_events_batch(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    events: list[dict[str, object]],
+    on_error: str = "stop",
+) -> list[BatchedEventOutcome] | None:
+    """
+    POST a run of session events in as few round trips as possible.
+
+    Each event is the same ``{"type": ..., "data": ...}`` body a single
+    ``POST /v1/sessions/{id}/events`` would carry, and the server
+    dispatches them in order through that same handler — so this changes
+    only how many times the wire is crossed. That is the whole point: on
+    a client far from the server, per-event posting caps the forwarder at
+    a few events per second and its live view falls behind the harness.
+
+    Runs longer than :data:`MAX_EVENTS_PER_BATCH` are chunked. With
+    ``on_error="stop"`` a chunk that ends in a failure stops the run
+    there, so a caller advancing a cursor over the delivered prefix
+    behaves exactly as it did when posting one event at a time.
+
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent session/conversation id.
+    :param events: Event bodies to dispatch, in order. Empty is a no-op.
+    :param on_error: ``"stop"`` to leave the rest of a chunk unattempted
+        after a failure (the default, matching a sequential caller), or
+        ``"continue"`` to attempt every event — for best-effort streams
+        where dropping one chunk beats stalling the tail.
+    :returns: One outcome per event, in order; or ``None`` when this
+        server has no batch route and the caller should post singly.
+    :raises httpx.HTTPError: On a transport failure or an
+        envelope-level rejection. Delivery of the events in the failed
+        chunk is then unknown, exactly as for a single post whose
+        response was lost.
+    """
+    if not events:
+        return []
+    if not events_batch_supported(client):
+        return None
+    outcomes: list[BatchedEventOutcome] = []
+    for offset in range(0, len(events), MAX_EVENTS_PER_BATCH):
+        chunk = events[offset : offset + MAX_EVENTS_PER_BATCH]
+        response = await client.post(
+            f"/v1/sessions/{session_id}/events/batch",
+            json={"events": chunk, "on_error": on_error},
+        )
+        if response.status_code == 404 and _is_route_miss(response):
+            _EVENTS_BATCH_UNSUPPORTED.add(client)
+            _logger.debug(
+                "Server has no session-events batch route; falling back to per-event posts for %s",
+                client.base_url,
+            )
+            return None
+        response.raise_for_status()
+        note_native_post_success()
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise httpx.HTTPError(f"malformed session-events batch response: {exc}") from exc
+        chunk_outcomes = _parse_batch_results(payload, total=len(chunk), offset=offset)
+        outcomes.extend(chunk_outcomes)
+        if on_error == "stop" and not all(outcome.delivered for outcome in chunk_outcomes):
+            # The server stopped at a failure; everything after it in this
+            # chunk was never attempted, and later chunks must not jump the
+            # queue ahead of it.
+            for index in range(offset + len(chunk), len(events)):
+                outcomes.append(BatchedEventOutcome(index=index, delivered=False))
+            break
+    return outcomes
 
 
 async def post_session_event_with_retry(

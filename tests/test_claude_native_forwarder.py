@@ -24,6 +24,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 import omnigent.claude_native_forwarder as forwarder
+from omnigent._native_post_delivery import reset_events_batch_support
 from omnigent.claude_native_bridge import (
     BRIDGE_ID_LABEL_KEY,
     ClaudeMessageDelta,
@@ -5898,34 +5899,60 @@ def _write_deltas_file(bridge_dir: Path, records: list[dict[str, Any]]) -> None:
 def _delta_capture_client(
     captured: list[_CapturedDeltaPost],
     status_code: int = 202,
+    *,
+    batch_supported: bool = True,
+    batch_event_statuses: list[int] | None = None,
 ) -> httpx.AsyncClient:
     """
-    Build an AsyncClient whose ``/events`` POSTs are captured.
+    Build an AsyncClient whose ``/events`` and ``/events/batch`` POSTs are captured.
 
     :param captured: List appended to with each observed POST body.
     :param status_code: HTTP status the stub returns, e.g. ``202`` for
         success or ``500`` to exercise the best-effort drop path.
+    :param batch_supported: ``False`` answers the batch route with the
+        route-miss 404 an older deployment returns, so the caller's
+        per-event fallback runs.
+    :param batch_event_statuses: Per-event statuses for the batch reply,
+        to exercise a batch that partially fails. Defaults to all-202.
     :returns: An ``httpx.AsyncClient`` bound to the capturing transport.
     """
 
     def handler(request: httpx.Request) -> httpx.Response:
-        captured.append(
-            _CapturedDeltaPost(url_path=request.url.path, body=json.loads(request.content))
+        body = json.loads(request.content)
+        captured.append(_CapturedDeltaPost(url_path=request.url.path, body=body))
+        if not request.url.path.endswith("/events/batch"):
+            return httpx.Response(status_code, json={"queued": False})
+        if not batch_supported:
+            # Starlette's route miss — no ``error`` envelope, which is how
+            # the client tells "no such route" from "no such session".
+            return httpx.Response(404, json={"detail": "Not Found"})
+        if status_code >= 400:
+            return httpx.Response(status_code, json={"detail": "boom"})
+        statuses = batch_event_statuses or [202] * len(body["events"])
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"index": index, "status": status} for index, status in enumerate(statuses)
+                ],
+                "stopped_at": None,
+            },
         )
-        return httpx.Response(status_code, json={"queued": False})
 
     return httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://ap")
 
 
 async def test_forward_available_deltas_posts_each_and_advances_offset(tmp_path: Path) -> None:
     """
-    Each appended chunk is POSTed as an ``external_output_text_delta``.
+    A poll's chunks go out as one batch of ``external_output_text_delta`` events.
 
     Proves the forwarder turns deltas-file lines into the exact event
-    shape the Omnigent route expects (delta + message_id + index + final) and
-    advances+persists the byte offset so the next poll resumes after
-    them. Fails if a field is dropped (UI can't scope/order the buffer)
-    or the offset doesn't persist (chunks re-POST on restart).
+    shape the Omnigent route expects (delta + message_id + index + final),
+    ships the whole run in a single round trip, and advances+persists the
+    byte offset so the next poll resumes after them. Fails if a field is
+    dropped (UI can't scope/order the buffer), if the run costs a request
+    per chunk again (a far-from-server client then streams at one chunk
+    per RTT), or if the offset doesn't persist (chunks re-POST on restart).
     """
     bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
     _write_deltas_file(
@@ -5946,12 +5973,10 @@ async def test_forward_available_deltas_posts_each_and_advances_offset(tmp_path:
             seen_keys=seen,
         )
 
-    assert [c.url_path for c in captured] == [
-        "/v1/sessions/conv_x/events",
-        "/v1/sessions/conv_x/events",
-    ]
+    # One request, not one per chunk.
+    assert [c.url_path for c in captured] == ["/v1/sessions/conv_x/events/batch"]
     # Full event shape proves every field survived hook → file → POST.
-    assert [c.body for c in captured] == [
+    assert captured[0].body["events"] == [
         {
             "type": "external_output_text_delta",
             "data": {"delta": "Hello ", "message_id": "m1", "index": 0, "final": False},
@@ -5961,6 +5986,8 @@ async def test_forward_available_deltas_posts_each_and_advances_offset(tmp_path:
             "data": {"delta": "world", "message_id": "m1", "index": 1, "final": True},
         },
     ]
+    # Best-effort preview: a rejected chunk must not shadow the rest of the run.
+    assert captured[0].body["on_error"] == "continue"
     # Offset advanced to EOF and was persisted, so a reload resumes past
     # the two chunks instead of re-POSTing them.
     assert new_state.byte_offset == os.path.getsize(bridge_dir / "message_deltas.jsonl")
@@ -5996,11 +6023,12 @@ async def test_forward_available_deltas_dedupes_by_message_id_and_index(tmp_path
             seen_keys=seen,
         )
     # The duplicate (m1, 0) is collapsed: only the first (m1,0) and the
-    # distinct (m1,1) are POSTed — 2 requests, not 3.
-    assert [(c.body["data"]["message_id"], c.body["data"]["index"]) for c in captured] == [
-        ("m1", 0),
-        ("m1", 1),
-    ]
+    # distinct (m1,1) are sent — 2 events in the batch, not 3.
+    assert len(captured) == 1
+    assert [
+        (event["data"]["message_id"], event["data"]["index"])
+        for event in captured[0].body["events"]
+    ] == [("m1", 0), ("m1", 1)]
 
 
 async def test_forward_available_deltas_drops_on_http_error(tmp_path: Path) -> None:
@@ -6029,6 +6057,126 @@ async def test_forward_available_deltas_drops_on_http_error(tmp_path: Path) -> N
         )
     # The POST was attempted (and 500'd) but no exception escaped, and
     # the offset moved past the chunk so it won't be retried endlessly.
+    assert len(captured) == 1
+    assert captured[0].url_path == "/v1/sessions/conv_x/events/batch"
+    assert new_state.byte_offset == os.path.getsize(bridge_dir / "message_deltas.jsonl")
+
+
+async def test_forward_available_deltas_batches_a_long_run_in_one_round_trip(
+    tmp_path: Path,
+) -> None:
+    """
+    A whole turn's worth of chunks costs one request, not one per chunk.
+
+    This is the property that makes streaming usable from far away: an
+    assistant message is hundreds of chunks, and a per-chunk POST caps the
+    live preview at one chunk per round trip, so the web view falls tens of
+    seconds behind the pane. Fails the moment the run fans back out into
+    per-chunk requests.
+    """
+    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
+    _write_deltas_file(
+        bridge_dir,
+        [
+            {"message_id": "m1", "index": index, "final": index == 79, "delta": f"c{index}"}
+            for index in range(80)
+        ],
+    )
+    captured: list[_CapturedDeltaPost] = []
+    seen: dict[tuple[str, int], None] = {}
+    async with _delta_capture_client(captured) as client:
+        await forwarder._forward_available_deltas(
+            client=client,
+            session_id="conv_x",
+            bridge_dir=bridge_dir,
+            state=forwarder.DeltaForwardState(),
+            seen_keys=seen,
+        )
+    assert len(captured) == 1
+    assert len(captured[0].body["events"]) == 80
+
+
+async def test_forward_available_deltas_falls_back_when_server_lacks_batch_route(
+    tmp_path: Path,
+) -> None:
+    """
+    An older server's route-miss 404 falls back to one POST per chunk.
+
+    A user's CLI can be newer than the deployment it talks to, and the
+    live preview must keep working there — just without the round-trip
+    saving. Fails if a missing batch route silently drops the run (no
+    preview at all) or raises out of the poll loop.
+    """
+    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
+    _write_deltas_file(
+        bridge_dir,
+        [
+            {"message_id": "m1", "index": 0, "final": False, "delta": "Hello "},
+            {"message_id": "m1", "index": 1, "final": True, "delta": "world"},
+        ],
+    )
+    captured: list[_CapturedDeltaPost] = []
+    seen: dict[tuple[str, int], None] = {}
+    async with _delta_capture_client(captured, batch_supported=False) as client:
+        reset_events_batch_support(client)
+        await forwarder._forward_available_deltas(
+            client=client,
+            session_id="conv_x",
+            bridge_dir=bridge_dir,
+            state=forwarder.DeltaForwardState(),
+            seen_keys=seen,
+        )
+        # One probe, then both chunks the old way.
+        assert [c.url_path for c in captured] == [
+            "/v1/sessions/conv_x/events/batch",
+            "/v1/sessions/conv_x/events",
+            "/v1/sessions/conv_x/events",
+        ]
+        # The next poll must not re-probe: the miss is latched per client.
+        _write_deltas_file(
+            bridge_dir, [{"message_id": "m2", "index": 0, "final": True, "delta": "again"}]
+        )
+        captured.clear()
+        await forwarder._forward_available_deltas(
+            client=client,
+            session_id="conv_x",
+            bridge_dir=bridge_dir,
+            state=forwarder.DeltaForwardState(),
+            seen_keys=seen,
+        )
+    # The one new chunk went straight to the per-event route — no second probe.
+    assert [c.url_path for c in captured] == ["/v1/sessions/conv_x/events"]
+
+
+async def test_forward_available_deltas_keeps_going_when_one_batched_chunk_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """
+    One rejected chunk inside a batch doesn't stop the rest of the run.
+
+    Deltas are a preview the final message supersedes, so the tail matters
+    more than any single chunk. Fails if a mid-run rejection stalls the
+    cursor (chunks re-POST forever) or raises into the poll loop.
+    """
+    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
+    _write_deltas_file(
+        bridge_dir,
+        [
+            {"message_id": "m1", "index": 0, "final": False, "delta": "a"},
+            {"message_id": "m1", "index": 1, "final": False, "delta": "b"},
+            {"message_id": "m1", "index": 2, "final": True, "delta": "c"},
+        ],
+    )
+    captured: list[_CapturedDeltaPost] = []
+    seen: dict[tuple[str, int], None] = {}
+    async with _delta_capture_client(captured, batch_event_statuses=[202, 400, 202]) as client:
+        new_state = await forwarder._forward_available_deltas(
+            client=client,
+            session_id="conv_x",
+            bridge_dir=bridge_dir,
+            state=forwarder.DeltaForwardState(),
+            seen_keys=seen,
+        )
     assert len(captured) == 1
     assert new_state.byte_offset == os.path.getsize(bridge_dir / "message_deltas.jsonl")
 

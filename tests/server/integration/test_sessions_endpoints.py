@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.llms.context_window import ModelPricing
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
 from omnigent.server.background_session_titles import BackgroundTitleRequest
@@ -30,6 +31,7 @@ from omnigent.server.routes._sessions.helpers import (
     _NativeTerminalEnsureOutcome,
     _RunnerForwardResult,
 )
+from omnigent.server.schemas import MAX_SESSION_EVENTS_PER_BATCH
 from omnigent.spec.types import SkillSpec
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -3965,6 +3967,295 @@ async def test_post_external_output_text_delta_rejects_malformed_delta(
     assert resp.status_code == 400, resp.text
     assert "external_output_text_delta requires string data.delta" in resp.text
     assert published == []
+
+
+def _text_delta_event(text: str) -> dict[str, Any]:
+    """
+    Build one ``external_output_text_delta`` event body.
+
+    :param text: The chunk text, e.g. ``"hel"``.
+    :returns: An event body for ``/events`` or ``/events/batch``.
+    """
+    return {"type": "external_output_text_delta", "data": {"delta": text}}
+
+
+async def test_post_events_batch_dispatches_every_event_in_order(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A batch is the sequence of single posts it replaces, in one round trip.
+
+    Native forwarders post one transcript item or text chunk per request,
+    which caps a far-away client at a few events per second and leaves its
+    live view far behind the harness. Batching only changes the number of
+    round trips, so ordering and per-event acknowledgement must match the
+    single-post path exactly. Fails if events are reordered, dropped, or
+    reported without their individual status.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events/batch",
+        json={"events": [_text_delta_event(text) for text in ("a", "b", "c")]},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["stopped_at"] is None
+    assert [entry["status"] for entry in body["results"]] == [202, 202, 202]
+    assert [entry["index"] for entry in body["results"]] == [0, 1, 2]
+    assert [entry["body"] for entry in body["results"]] == [{"queued": False}] * 3
+    assert [event["delta"] for _sid, event in published] == ["a", "b", "c"]
+
+
+async def test_post_events_batch_persists_items_like_single_posts(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Batched ``external_conversation_item`` events land in history, in order.
+
+    This is the equivalence that lets a forwarder mirror a whole poll's
+    transcript in one request. Fails if the batch path skips persistence
+    or scrambles item order (resume would replay a garbled transcript).
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events/batch",
+        json={
+            "events": [
+                {
+                    "type": "external_conversation_item",
+                    "data": {
+                        "item_type": "message",
+                        "item_data": {
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": text}],
+                            "is_meta": True,
+                        },
+                        "response_id": "turn_1",
+                        "source_id": f"src-{index}",
+                    },
+                }
+                for index, text in enumerate(("first", "second", "third"))
+            ]
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert [entry["status"] for entry in resp.json()["results"]] == [202, 202, 202], resp.text
+
+    items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+    texts = [item["content"][0]["text"] for item in items if item["type"] == "message"]
+    assert texts == ["first", "second", "third"]
+
+
+async def test_post_events_batch_stops_at_the_first_failure(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    By default a failed event leaves the rest of the batch unattempted.
+
+    A sequential caller stops at its first failure and retries from
+    there; the batch must behave the same so a forwarder can advance its
+    cursor over the delivered prefix without re-sending — and therefore
+    duplicating — events that already landed. Fails if later events are
+    dispatched anyway (the caller then can't tell what to retry) or if
+    one bad event fails the whole request.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events/batch",
+        json={
+            "events": [
+                _text_delta_event("ok"),
+                {"type": "external_output_text_delta", "data": {"delta": {"bad": 1}}},
+                _text_delta_event("never"),
+            ]
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["stopped_at"] == 1
+    assert [entry["status"] for entry in body["results"]] == [202, 400]
+    assert "requires string data.delta" in body["results"][1]["error"]
+    # The third event was never attempted.
+    assert [event["delta"] for _sid, event in published] == ["ok"]
+
+
+async def test_post_events_batch_continue_attempts_every_event(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``on_error="continue"`` keeps going past a rejected event.
+
+    Live text deltas are a preview the final message supersedes, so
+    dropping one chunk beats stalling the tail behind it. Fails if a
+    mid-run rejection swallows the chunks after it.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events/batch",
+        json={
+            "events": [
+                _text_delta_event("a"),
+                {"type": "external_output_text_delta", "data": {"delta": None}},
+                _text_delta_event("c"),
+            ],
+            "on_error": "continue",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["stopped_at"] is None
+    assert [entry["status"] for entry in body["results"]] == [202, 400, 202]
+    assert [event["delta"] for _sid, event in published] == ["a", "c"]
+
+
+async def test_post_events_batch_rejects_an_oversized_or_empty_batch(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    The envelope caps how much work one request can queue.
+
+    Each event runs the full single-post dispatch, so an unbounded batch
+    is an unbounded amount of work behind one request. Fails if the cap
+    or the non-empty requirement stops being enforced.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    too_many = await client.post(
+        f"/v1/sessions/{session['id']}/events/batch",
+        json={"events": [_text_delta_event("x")] * (MAX_SESSION_EVENTS_PER_BATCH + 1)},
+    )
+    assert too_many.status_code == 422, too_many.text
+
+    empty = await client.post(
+        f"/v1/sessions/{session['id']}/events/batch",
+        json={"events": []},
+    )
+    assert empty.status_code == 422, empty.text
+
+
+async def test_post_events_batch_reports_a_missing_session_per_event(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    An application 404 lands in ``results``, not as a route miss.
+
+    Clients probe this endpoint to learn whether the deployment has it,
+    and tell "no such route" from "no such session" by the error
+    envelope. Fails if a missing session answers with a bare route-miss
+    shape, which would make a client permanently downgrade to per-event
+    posts against a server that supports batching.
+    """
+    resp = await client.post(
+        f"/v1/sessions/{'0' * 32}/events/batch",
+        json={"events": [_text_delta_event("a")]},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["stopped_at"] == 0
+    assert body["results"][0]["status"] == 404
+    assert body["results"][0]["code"]
+
+
+async def test_post_events_batch_propagates_a_wrong_replica_landing(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A wrong-replica miss fails the request, not one event inside it.
+
+    On a multi-replica deployment a session-scoped request can land on a
+    replica that doesn't hold the session's tunnel; the contract is a 400
+    carrying ``wrong_replica`` so the caller re-addresses and re-sends.
+    Reporting it per-event instead hands the caller an opaque 400 it reads
+    as a permanent rejection — the forwarder would dead-letter and drop a
+    live transcript item rather than retry it at the right replica. Fails
+    if the code is swallowed into ``results``.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    def _wrong_replica(*_args: Any, **_kwargs: Any) -> None:
+        """Raise the routing miss the real handler raises."""
+        raise OmnigentError(
+            "session runner is on another replica; retry",
+            code=ErrorCode.WRONG_REPLICA,
+        )
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        _wrong_replica,
+    )
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events/batch",
+        json={"events": [_text_delta_event("a"), _text_delta_event("b")]},
+    )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == ErrorCode.WRONG_REPLICA
+
+
+async def test_post_events_batch_never_leaks_an_internal_error_detail(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An unexpected server-side failure reports a generic message, not its text.
+
+    The batch route has to catch per-event failures rather than let them fail
+    the whole request — otherwise a caller re-sends events that already
+    landed — but that catch must not become a channel for internal detail
+    (paths, SQL, stack context) that the app's own 500 handler withholds.
+    Fails if the exception's text reaches the response body.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    _LEAK_MARKER = "internal-detail-that-must-not-escape"
+
+    def _boom(*_args: Any, **_kwargs: Any) -> None:
+        """Raise an error whose text must not reach the client."""
+        raise RuntimeError(f"{_LEAK_MARKER} at /srv/omnigent/state row 42")
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        _boom,
+    )
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events/batch",
+        json={"events": [_text_delta_event("a")]},
+    )
+    assert resp.status_code == 200, resp.text
+    entry = resp.json()["results"][0]
+    assert entry["status"] == 500
+    assert entry["error"] == "An internal error occurred."
+    assert _LEAK_MARKER not in resp.text
+    assert "RuntimeError" not in resp.text
 
 
 async def test_post_external_tool_output_delta_publishes_transient_delta(

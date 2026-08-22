@@ -1197,6 +1197,74 @@ class SessionEventInput(BaseModel):
     created_by: str | None = None
 
 
+# Cap on how many events one batch may carry. Bounds the worst-case work a
+# single request can queue behind the event loop (each event runs the full
+# ``POST /events`` dispatch) while staying far above what a forwarder poll
+# produces in practice.
+MAX_SESSION_EVENTS_PER_BATCH = 256
+
+
+class SessionEventBatchInput(BaseModel):
+    """
+    Body of ``POST /v1/sessions/{id}/events/batch``.
+
+    Carries a run of events that would otherwise be posted one at a
+    time. Events are dispatched **in order** through the same code path
+    as ``POST /v1/sessions/{id}/events``, so a batch is observationally
+    equivalent to the sequence of single posts it replaces — it just
+    costs one round trip instead of ``len(events)``. This matters most
+    for clients far from the server, where a native harness's transcript
+    and delta forwarders are otherwise rate-limited to one event per RTT.
+
+    :param events: The events to dispatch, in order. At least one, at
+        most :data:`MAX_SESSION_EVENTS_PER_BATCH`.
+    :param on_error: What to do when an event fails. ``"stop"`` (the
+        default) leaves the remaining events unattempted, mirroring a
+        sequential caller that stops at its first failure and retries
+        from there. ``"continue"`` attempts every event regardless, for
+        best-effort streams (live text deltas) where a dropped chunk is
+        preferable to stalling the tail.
+    """
+
+    events: list[SessionEventInput] = Field(min_length=1, max_length=MAX_SESSION_EVENTS_PER_BATCH)
+    on_error: Literal["stop", "continue"] = "stop"
+
+
+class SessionEventBatchResult(BaseModel):
+    """
+    Outcome of one event inside a ``POST /events/batch`` request.
+
+    :param index: Position of the event in the request's ``events``.
+    :param status: HTTP status the equivalent single post would have
+        returned — ``202`` on success, otherwise the error's status.
+    :param body: The single-post response body, on success.
+    :param error: Human-readable failure reason, on failure.
+    :param code: Machine-readable Omnigent error code, on failure.
+    """
+
+    index: int
+    status: int
+    body: dict[str, Any] | None = None
+    error: str | None = None
+    code: str | None = None
+
+
+class SessionEventBatchResponse(BaseModel):
+    """
+    Response of ``POST /v1/sessions/{id}/events/batch``.
+
+    :param results: One entry per *attempted* event, in request order.
+        Shorter than the request's ``events`` when ``on_error="stop"``
+        tripped: entries after ``stopped_at`` were never attempted and
+        the caller should re-send them.
+    :param stopped_at: Index of the failure that ended the batch early,
+        or ``None`` when every event was attempted.
+    """
+
+    results: list[SessionEventBatchResult]
+    stopped_at: int | None = None
+
+
 class SessionGitOptions(BaseModel):
     """
     Git worktree options for ``POST /v1/sessions``.

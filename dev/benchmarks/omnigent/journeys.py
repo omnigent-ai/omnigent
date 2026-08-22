@@ -51,6 +51,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Literal, cast
@@ -789,6 +790,68 @@ async def _measure_policy_evaluate(env: BenchEnvironment, ctx: JourneyContext) -
     resp.raise_for_status()
 
 
+# ── native-forwarder event mirroring (per-event vs batched) ──────────────────
+
+# Chunks in one simulated poll's worth of streamed assistant text. A native
+# harness produces this many in well under a second, and the forwarder used to
+# spend one round trip on each — which is why a far-from-server client's live
+# view fell behind. Pair these two journeys with ``--network-delay-ms`` to see
+# the round-trip cost directly: the per-event journey pays it 24 times, the
+# batched one once.
+_FORWARD_DELTA_COUNT = 24
+
+# One op is 24 requests for the per-event journey, so the default 100 iterations
+# would let this pair dominate the CI leg (and add tail noise to the journeys
+# after it). The pair exists to price round trips, which a handful of samples
+# establishes.
+_FORWARD_DELTA_MAX_ITERATIONS = 20
+
+
+def _forward_delta_events(message_id: str) -> list[dict[str, object]]:
+    """
+    Build one poll's worth of streamed-text events.
+
+    :param message_id: Assistant message the chunks belong to, so the
+        server scopes them to one in-flight buffer.
+    :returns: ``external_output_text_delta`` event bodies, in order.
+    """
+    return [
+        {
+            "type": "external_output_text_delta",
+            "data": {
+                "delta": f"chunk-{index} ",
+                "message_id": message_id,
+                "index": index,
+                "final": index == _FORWARD_DELTA_COUNT - 1,
+            },
+        }
+        for index in range(_FORWARD_DELTA_COUNT)
+    ]
+
+
+async def _measure_forward_deltas_per_event(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    """Mirror a poll's chunks one request at a time (the pre-batching path)."""
+    session_id = cast(str, ctx)  # _setup_target_session
+    assert env.client is not None
+    for event in _forward_delta_events(f"bench-{uuid.uuid4().hex}"):
+        resp = await env.client.post(f"/v1/sessions/{session_id}/events", json=event)
+        resp.raise_for_status()
+
+
+async def _measure_forward_deltas_batched(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    """Mirror the same chunks in one request."""
+    session_id = cast(str, ctx)  # _setup_target_session
+    assert env.client is not None
+    resp = await env.client.post(
+        f"/v1/sessions/{session_id}/events/batch",
+        json={
+            "events": _forward_delta_events(f"bench-{uuid.uuid4().hex}"),
+            "on_error": "continue",
+        },
+    )
+    resp.raise_for_status()
+
+
 # ── CLI startup (omnigent polly against the local bench server) ──────────────
 
 # Signal that the REPL is ready — the last spinner message before the prompt.
@@ -1014,6 +1077,31 @@ ALL_JOURNEYS: dict[str, Journey] = {
             concurrency_safe=True,
             description="POST /v1/sessions/{id}/policies/evaluate — PreToolUse hook "
             "(single tree scan, preloaded conversation row, caches warm).",
+        ),
+        Journey(
+            name="forward_native_deltas_per_event",
+            kind="latency",
+            measure=_measure_forward_deltas_per_event,
+            setup=_setup_target_session,
+            concurrency_safe=True,
+            max_iterations=_FORWARD_DELTA_MAX_ITERATIONS,
+            description=(
+                f"POST /v1/sessions/{{id}}/events × {_FORWARD_DELTA_COUNT} — a native "
+                "forwarder mirroring one poll's streamed text one request at a time."
+            ),
+        ),
+        Journey(
+            name="forward_native_deltas_batched",
+            kind="latency",
+            measure=_measure_forward_deltas_batched,
+            setup=_setup_target_session,
+            concurrency_safe=True,
+            max_iterations=_FORWARD_DELTA_MAX_ITERATIONS,
+            description=(
+                "POST /v1/sessions/{id}/events/batch — the same poll's streamed text "
+                "in one request. Compare against forward_native_deltas_per_event "
+                "under --network-delay-ms."
+            ),
         ),
         # Runner (full-turn) journeys — with_runner=True, openai-agents, mock LLM.
         Journey(

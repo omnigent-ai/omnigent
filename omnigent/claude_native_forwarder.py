@@ -20,6 +20,7 @@ from omnigent._native_post_delivery import (
     append_dead_letter,
     post_external_session_status,
     post_may_have_been_delivered,
+    post_session_events_batch,
 )
 from omnigent.claude_native_bridge import (
     BRIDGE_ID_LABEL_KEY,
@@ -4021,17 +4022,127 @@ async def _post_external_output_text_delta(
     """
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
-        json={
-            "type": "external_output_text_delta",
-            "data": {
-                "delta": delta.delta,
-                "message_id": delta.message_id,
-                "index": delta.index,
-                "final": delta.final,
-            },
-        },
+        json=_output_text_delta_event(delta),
     )
     resp.raise_for_status()
+
+
+def _output_text_delta_event(delta: ClaudeMessageDelta) -> dict[str, object]:
+    """
+    Build the ``external_output_text_delta`` event body for one chunk.
+
+    :param delta: Parsed streamed chunk.
+    :returns: The event body a single or batched post carries.
+    """
+    return {
+        "type": "external_output_text_delta",
+        "data": {
+            "delta": delta.delta,
+            "message_id": delta.message_id,
+            "index": delta.index,
+            "final": delta.final,
+        },
+    }
+
+
+def _log_dropped_delta(
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    delta: ClaudeMessageDelta,
+    http_status: int | None = None,
+    error_type: str | None = None,
+) -> None:
+    """
+    Note one streamed chunk that never reached the server.
+
+    Records the status and the exception's class, never a rendered
+    exception or server message: an httpx error's text carries the request
+    it was made with, and this log is not the place to spill anything that
+    travelled in a header.
+
+    :param session_id: Omnigent session/conversation id.
+    :param bridge_dir: Native Claude bridge directory.
+    :param delta: The chunk that was dropped.
+    :param http_status: Status the server reported, when it responded.
+    :param error_type: Exception class name, for a transport failure.
+    :returns: None.
+    """
+    _logger.debug(
+        "Dropping Claude streamed delta after HTTP failure; session=%s "
+        "bridge_dir=%s message_id=%s index=%s http_status=%s error_type=%s",
+        session_id,
+        bridge_dir,
+        delta.message_id,
+        delta.index,
+        http_status,
+        error_type,
+    )
+
+
+async def _forward_delta_run(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    deltas: list[ClaudeMessageDelta],
+) -> None:
+    """
+    Publish a poll's worth of streamed chunks in as few round trips as possible.
+
+    One request for the whole run when the server serves the batch route,
+    else one per chunk as before. Deltas are best-effort live preview, so
+    a failure is logged and dropped (the authoritative final text still
+    arrives via ``external_conversation_item``) — never retried, so a
+    transient blip can't wedge the tail. That is also why the batch runs
+    with ``on_error="continue"``: one rejected chunk must not shadow the
+    rest of the run.
+
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent session/conversation id.
+    :param bridge_dir: Native Claude bridge directory (logging only).
+    :param deltas: The new chunks to publish, in order.
+    :returns: None.
+    """
+    try:
+        outcomes = await post_session_events_batch(
+            client,
+            session_id=session_id,
+            events=[_output_text_delta_event(delta) for delta in deltas],
+            on_error="continue",
+        )
+    except httpx.HTTPError as exc:
+        for delta in deltas:
+            _log_dropped_delta(
+                session_id=session_id,
+                bridge_dir=bridge_dir,
+                delta=delta,
+                http_status=_http_status_for_log(exc),
+                error_type=type(exc).__name__,
+            )
+        return
+    if outcomes is not None:
+        for delta, outcome in zip(deltas, outcomes, strict=False):
+            if not outcome.delivered:
+                _log_dropped_delta(
+                    session_id=session_id,
+                    bridge_dir=bridge_dir,
+                    delta=delta,
+                    http_status=outcome.status,
+                )
+        return
+    # Server predates the batch route: post one at a time.
+    for delta in deltas:
+        try:
+            await _post_external_output_text_delta(client, session_id=session_id, delta=delta)
+        except httpx.HTTPError as exc:
+            _log_dropped_delta(
+                session_id=session_id,
+                bridge_dir=bridge_dir,
+                delta=delta,
+                http_status=_http_status_for_log(exc),
+                error_type=type(exc).__name__,
+            )
 
 
 async def _forward_available_deltas(
@@ -4076,6 +4187,7 @@ async def _forward_available_deltas(
     )
     if result.byte_offset == state.byte_offset and not result.deltas:
         return state
+    fresh: list[ClaudeMessageDelta] = []
     for delta in result.deltas:
         key = (delta.message_id, delta.index)
         if key in seen_keys:
@@ -4086,18 +4198,11 @@ async def _forward_available_deltas(
         # limit.
         while len(seen_keys) > _MAX_SEEN_DELTA_KEYS:
             del seen_keys[next(iter(seen_keys))]
-        try:
-            await _post_external_output_text_delta(client, session_id=session_id, delta=delta)
-        except httpx.HTTPError as exc:
-            _logger.debug(
-                "Dropping Claude streamed delta after HTTP failure; session=%s "
-                "bridge_dir=%s message_id=%s index=%s http_status=%s",
-                session_id,
-                bridge_dir,
-                delta.message_id,
-                delta.index,
-                _http_status_for_log(exc),
-            )
+        fresh.append(delta)
+    if fresh:
+        await _forward_delta_run(
+            client, session_id=session_id, bridge_dir=bridge_dir, deltas=fresh
+        )
     updated = DeltaForwardState(byte_offset=result.byte_offset)
     await _write_delta_forward_state_async(bridge_dir, updated)
     return updated
