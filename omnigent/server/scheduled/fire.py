@@ -120,6 +120,7 @@ class FireDeps:
     permission_store: Any | None
     host_store: Any | None
     host_registry: Any | None
+    policy_store: Any | None = None
     agent_cache: Any | None = None
     runner_router: Any | None = None
     tunnel_registry: Any | None = None
@@ -425,6 +426,8 @@ async def _run_fire_for_task(
             )
             return
 
+        await _attach_cost_budget(deps, task, conv.id)
+
         try:
             await _grant_owner(deps, task, conv.id)
         except Exception:
@@ -605,6 +608,38 @@ async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
         if updated is not None:
             conv = updated
     return conv
+
+
+_COST_BUDGET_HANDLER = "omnigent.policies.builtins.cost.cost_budget"
+_COST_BUDGET_POLICY_NAME = "__scheduled_task_cost_budget"
+
+
+async def _attach_cost_budget(deps: FireDeps, task: ScheduledTask, conversation_id: str) -> None:
+    """Attach a cost_budget policy to a session spawned by a scheduled task.
+
+    Non-fatal: a failure logs a warning but does not fail the fire — an
+    uncapped session is better than a dead run.
+    """
+    if task.max_cost_usd is None or deps.policy_store is None:
+        return
+    try:
+        await asyncio.to_thread(
+            deps.policy_store.create,
+            policy_id=_new_id(),
+            session_id=conversation_id,
+            name=_COST_BUDGET_POLICY_NAME,
+            type="python",
+            handler=_COST_BUDGET_HANDLER,
+            factory_params={"max_cost_usd": task.max_cost_usd},
+            enabled=True,
+        )
+    except Exception:  # noqa: BLE001
+        _logger.warning(
+            "scheduled fire: failed to attach cost budget for task %s (session %s)",
+            task.id,
+            conversation_id,
+            exc_info=True,
+        )
 
 
 async def _grant_owner(deps: FireDeps, task: ScheduledTask, conversation_id: str) -> None:

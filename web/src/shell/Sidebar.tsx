@@ -43,6 +43,7 @@ import {
   SearchIcon,
   Settings2Icon,
   ShareIcon,
+  SmilePlusIcon,
   SquareIcon,
   SquareCheckIcon,
   SquarePenIcon,
@@ -4158,7 +4159,7 @@ function ProjectFolderMenu({
                     {displayIcon ? (
                       <span className="text-xl leading-none">{displayIcon}</span>
                     ) : (
-                      <FolderIcon className="size-4 text-brand-accent" />
+                      <SmilePlusIcon className="size-4 text-brand-accent" />
                     )}
                   </button>
                 </PopoverTrigger>

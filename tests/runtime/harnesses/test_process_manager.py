@@ -745,6 +745,36 @@ async def test_idle_reaper_skips_in_flight_turn(
         await fast.shutdown()
 
 
+async def test_native_activity_refresh_prevents_idle_reaping(tmp_path: Path) -> None:
+    """Native terminal activity keeps a harness alive without proxy response ids."""
+    mgr = HarnessProcessManager(idle_timeout_s=0.5, reaper_interval_s=0.05, tmp_parent=tmp_path)
+    entry = _SubprocessEntry(
+        _FakeReapProc(),
+        _SlowCloseClient(0.0),
+        _FakeEndpoint(),
+        "codex-native",
+    )  # type: ignore[arg-type]
+    entry.last_used_at = time.monotonic()
+    mgr._entries = {"conv_native": entry}
+
+    reaper = asyncio.create_task(mgr._idle_reaper_loop())
+    try:
+        for _ in range(10):
+            await asyncio.sleep(0.1)
+            mgr.note_activity("conv_native")
+            assert not entry.process.killed, "active native harness was reaped"
+        assert not mgr.has_active_turn("conv_native")
+
+        deadline = time.monotonic() + 2.0
+        while not entry.process.killed:
+            assert time.monotonic() < deadline, "inactive native harness was never reaped"
+            await asyncio.sleep(0.02)
+    finally:
+        reaper.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await reaper
+
+
 class _FakeReapProc:
     """Minimal process stand-in recording whether the reaper killed it."""
 
@@ -813,9 +843,9 @@ async def test_idle_reaper_spares_turn_started_during_pass(tmp_path: Path) -> No
             assert time.monotonic() < deadline, "reaper never started a pass"
             await asyncio.sleep(0.01)
 
-        # While conv1 tears down, a new turn arrives for conv2: get_client
-        # refreshes last_used_at and the runner marks the response in flight.
-        e2.last_used_at = time.monotonic()
+        # While conv1 tears down, activity refreshes conv2's lease and the
+        # runner marks the response in flight.
+        mgr.note_activity("conv2")
         mgr.mark_in_flight("conv2", "resp_live")
 
         await asyncio.sleep(1.0)

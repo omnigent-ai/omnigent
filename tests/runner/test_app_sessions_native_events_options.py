@@ -34,12 +34,11 @@ from tests.runner.helpers import NullServerClient
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "effort_value",
-    # ``EFFORT_VALUES`` is a superset of ``CLAUDE_EFFORTS``:
-    # PATCH accepts {none, minimal, low, medium, high, xhigh, max}
-    # but Claude Code's ``/effort`` slash only accepts the last five.
-    # ``none`` and ``minimal`` must skip injection (typing ``/effort
-    # none`` would land as a TUI error). ``None`` (clear) must skip
-    # too — Claude has no slash form for "use spawn default".
+    # ``EFFORT_VALUES`` is a superset of ``CLAUDE_EFFORTS``: PATCH accepts the
+    # full effort vocabulary, but Claude Code's ``/effort`` slash only accepts
+    # low/medium/high/xhigh/max. ``none`` and ``minimal`` must skip injection
+    # (typing ``/effort none`` would land as a TUI error). ``None`` (clear) must
+    # skip too — Claude has no slash form for "use spawn default".
     ["none", "minimal", None],
 )
 async def test_events_effort_change_on_native_session_skips_inject_for_unsupported_level(

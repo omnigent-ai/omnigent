@@ -307,6 +307,7 @@ struct OmnigentWebView: UIViewRepresentable {
     private var rootBounces = 0
     private static let maxRootBounces = 1
     private var urlObservation: NSKeyValueObservation?
+    private let oidcLoginManager = OidcLoginManager()
 
     init(_ parent: OmnigentWebView) {
       self.parent = parent
@@ -329,6 +330,7 @@ struct OmnigentWebView: UIViewRepresentable {
     func detach() {
       parent.model.cancelServerSwitcherWatchdog()
       urlObservation = nil
+      oidcLoginManager.cancel()
       webView = nil
     }
 
@@ -461,6 +463,14 @@ struct OmnigentWebView: UIViewRepresentable {
     }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+      if let url = webView.url,
+        ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
+        url.omnigentOrigin != pinnedOrigin
+      {
+        webView.stopLoading()
+        startLogin(in: webView)
+        return
+      }
       parent.model.isLoading = true
       parent.model.currentURL = webView.url ?? parent.model.currentURL
       parent.model.serverSwitcherHidden = true
@@ -544,6 +554,19 @@ struct OmnigentWebView: UIViewRepresentable {
         return
       }
 
+      if navigationAction.targetFrame?.isMainFrame == true,
+        ["http", "https"].contains(scheme),
+        url.omnigentOrigin != pinnedOrigin
+      {
+        if navigationAction.navigationType == .linkActivated {
+          openExternal(url)
+        } else {
+          startLogin(in: webView)
+        }
+        decisionHandler(.cancel)
+        return
+      }
+
       if ["http", "https", "about", "blob", "data"].contains(scheme) {
         decisionHandler(.allow)
         return
@@ -611,6 +634,17 @@ struct OmnigentWebView: UIViewRepresentable {
         return
       }
       promptForExternalURL(url, scheme: scheme)
+    }
+
+    private func startLogin(in webView: WKWebView) {
+      guard let pinnedOrigin else { return }
+      oidcLoginManager.start(
+        origin: pinnedOrigin,
+        cookieStore: webView.configuration.websiteDataStore.httpCookieStore
+      ) { [weak self, weak webView] in
+        guard let self, let webView, let pinnedURL = self.pinnedURL else { return }
+        webView.load(URLRequest(url: pinnedURL))
+      }
     }
 
     private func promptForExternalURL(_ url: URL, scheme: String) {

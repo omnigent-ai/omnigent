@@ -722,14 +722,15 @@ def test_repl_approve_always_caches_for_later_turns(
         _read_pending(child, seconds=1.5)
 
         # Turn 2: the auto-approved audit line must appear
-        # AND the banner must NOT. After .expect() lands on
-        # the elapsed-time marker, ``child.before`` holds the
-        # full span from the last expect up to (but not
-        # including) the match. That's the whole turn 2
-        # output — banner (if any) + auto-approved line (if
-        # any) + LLM response + elapsed-time prefix.
+        # AND the banner must NOT. Sync on the scripted reply text
+        # (deterministic content) instead of the racy ``· ready``
+        # toolbar marker, which can match prematurely before the
+        # turn's output renders. The scripted response only appears
+        # after the LLM call completes, proving the full turn has
+        # rendered (including the "auto-approved" audit line that
+        # must precede it).
         child.send("follow up please" + "\r")
-        _wait_for_turn_complete(child, timeout=45)
+        child.expect("Following up as requested", timeout=45)
         turn_two_raw = child.before or ""
         if isinstance(turn_two_raw, bytes):
             turn_two_raw = turn_two_raw.decode("utf-8", errors="replace")

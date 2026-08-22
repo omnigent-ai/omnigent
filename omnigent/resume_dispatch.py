@@ -221,17 +221,20 @@ def _dispatch_by_runtime(
     """
     from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 
-    # Resolve the id the argument contains, then canonicalize to bare hex
-    # before any lookup: a paste drags punctuation along (trailing period,
-    # wrapping quotes or backticks), and none of it can ever be part of a
-    # valid id — so strip it and resume rather than erroring. A malformed
-    # id would otherwise surface as a raw StatementError traceback from
-    # the local store's Uuid16 bind, and downstream consumers key
-    # sessions on the bare spelling.
-    try:
-        target = uuid_to_bytes(target.strip(_PASTE_PUNCTUATION)).hex()
-    except InvalidUuidError as exc:
-        raise click.ClickException("Invalid session id.") from exc
+    # Paste punctuation (trailing period, wrapping quotes/backticks) is never
+    # part of an id, so strip it. Only the local path binds the id to the sqlite
+    # store's Uuid16 column, so it must be a real uuid — reject a malformed one
+    # loudly rather than surfacing a raw StatementError. The remote server owns
+    # its id space (a managed deployment keys sessions on non-uuid ids) and
+    # validates the id itself, so forward it untouched, like the runner and SDK.
+    stripped = target.strip(_PASTE_PUNCTUATION)
+    if server is None:
+        try:
+            target = uuid_to_bytes(stripped).hex()
+        except InvalidUuidError as exc:
+            raise click.ClickException("Invalid session id.") from exc
+    else:
+        target = stripped
 
     if server is not None:
         wrapper = _read_wrapper_label_remote(server=server, conv_id=target)
