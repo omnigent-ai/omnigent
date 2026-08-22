@@ -1365,6 +1365,62 @@ class SqlUserDailyCost(OmnigentBase):
     updated_at: Mapped[int] = mapped_column(Integer)
 
 
+class SqlTurnOperation(OmnigentBase):
+    """Durable idempotency and lifecycle journal for a submitted turn.
+
+    The four-column unique key is the external replay boundary. Digests keep
+    raw principals and idempotency keys out of the database while preserving
+    database-enforced uniqueness on SQLite, PostgreSQL, and MySQL.
+    """
+
+    __tablename__ = "turn_operations"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16, primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(Uuid16, nullable=False)
+    principal_hash: Mapped[bytes] = mapped_column(_CKSUM32, nullable=False)
+    idempotency_key_hash: Mapped[bytes] = mapped_column(_CKSUM32, nullable=False)
+    request_hash: Mapped[bytes] = mapped_column(_CKSUM32, nullable=False)
+    request_json: Mapped[str] = mapped_column(CompressedText, nullable=False)
+    dispatch_request_hash: Mapped[bytes | None] = mapped_column(_CKSUM32, nullable=True)
+    dispatch_request_json: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    state: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    item_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
+    runner_incarnation_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    dispatch_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    last_dispatch_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    terminal_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("state IN (1, 2, 3, 4, 5, 6, 7, 8)", name="ck_turn_operations_state"),
+        UniqueConstraint(
+            "workspace_id",
+            "conversation_id",
+            "principal_hash",
+            "idempotency_key_hash",
+            name="uq_turn_operations_replay_key",
+        ),
+        Index(
+            "ix_turn_operations_conversation_state",
+            "workspace_id",
+            "conversation_id",
+            "state",
+            "created_at",
+            "id",
+        ),
+    )
+
+
 class SqlScheduledTask(OmnigentBase):
     """
     SQLAlchemy model for the ``scheduled_tasks`` table.
