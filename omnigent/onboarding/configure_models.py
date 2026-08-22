@@ -154,6 +154,7 @@ _CATALOG_PROVIDER_FAMILY: dict[str, str] = {
     # SDK directly with a GEMINI_API_KEY).
     "gemini": GEMINI_FAMILY,
     "openrouter": OPENAI_FAMILY,
+    "edenai": OPENAI_FAMILY,
     "groq": OPENAI_FAMILY,
     "deepseek": OPENAI_FAMILY,
     "xai": OPENAI_FAMILY,
@@ -188,6 +189,7 @@ class _VendorEndpoint:
 # :func:`default_base_url_for_family` (and openai keeps the Responses default).
 _KEY_PROVIDER_ENDPOINT: dict[str, _VendorEndpoint] = {
     "openrouter": _VendorEndpoint("https://openrouter.ai/api/v1", CHAT_WIRE_API),
+    "edenai": _VendorEndpoint("https://api.edenai.run/v3", CHAT_WIRE_API),
     "groq": _VendorEndpoint("https://api.groq.com/openai/v1", CHAT_WIRE_API),
     "deepseek": _VendorEndpoint("https://api.deepseek.com", CHAT_WIRE_API),
     "xai": _VendorEndpoint("https://api.x.ai/v1", CHAT_WIRE_API),
@@ -244,6 +246,7 @@ _PROVIDER_DISPLAY_NAME: dict[str, str] = {
     "openai": "OpenAI",
     "anthropic": "Anthropic",
     "openrouter": "OpenRouter",
+    "edenai": "Eden AI",
     "groq": "Groq",
     "deepseek": "DeepSeek",
     "xai": "xAI",
@@ -389,7 +392,13 @@ class AddOption:
 # surface, a distinct family), so it must be excluded here too — otherwise it
 # leaks into the openai-family "Other provider" catch-all, whose tail is
 # documented as "all openai-family" (see :func:`_add_option_families`).
-_PRESET_KEY_PROVIDERS: tuple[str, ...] = ("openai", "anthropic", "openrouter", "gemini")
+_PRESET_KEY_PROVIDERS: tuple[str, ...] = (
+    "openai",
+    "anthropic",
+    "openrouter",
+    "edenai",
+    "gemini",
+)
 
 
 def add_menu_options() -> list[AddOption]:
@@ -407,10 +416,10 @@ def add_menu_options() -> list[AddOption]:
         each family-scoped subset (:func:`add_menu_options_for_family`,
         which filters while preserving this order): the first-party API
         key(s) and subscription(s) lead, the cross-vendor extras
-        (Gateway, OpenRouter) follow alphabetically, and Databricks sits
-        just above the catch-all "Other provider" at the bottom. Scoped
+        (Eden AI, Gateway, OpenRouter) follow alphabetically, and Databricks
+        sits just above the catch-all "Other provider" at the bottom. Scoped
         to one family this collapses to: API key → subscription →
-        Gateway [→ OpenRouter] → Databricks [→ Other].
+        Eden AI [→ Gateway] [→ OpenRouter] → Databricks [→ Other].
     """
 
     def _opt(text: str, description: str, kind: str, **kw: object) -> AddOption:
@@ -456,7 +465,13 @@ def add_menu_options() -> list[AddOption]:
             SUBSCRIPTION_KIND,
             cli="claude",
         ),
-        # Cross-vendor extras, alphabetical (Gateway before OpenRouter).
+        # Cross-vendor extras, alphabetical (Eden AI, Gateway, OpenRouter).
+        _opt(
+            "Eden AI — API key",
+            "One key, many models with EU data residency (edenai.co).",
+            KEY_KIND,
+            provider="edenai",
+        ),
         _opt(
             "Gateway — custom base URL + key",
             "An OpenAI/Anthropic-compatible proxy: LiteLLM, Ollama, vLLM, …",

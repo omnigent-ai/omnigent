@@ -27,6 +27,7 @@ PROVIDER_CONFIGS: dict[str, str | None] = {
     "deepseek": "https://api.deepseek.com/v1",
     "xai": "https://api.x.ai/v1",
     "openrouter": "https://openrouter.ai/api/v1",
+    "edenai": "https://api.edenai.run/v3",
     "ollama": "http://localhost:11434/v1",
     "moonshot": "https://api.moonshot.cn/v1",
 }

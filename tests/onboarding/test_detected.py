@@ -99,6 +99,25 @@ def test_synthesize_env_key_openrouter_uses_vendor_endpoint_and_chat_wire() -> N
     assert openai_block["api_key_ref"] == "env:OPENROUTER_API_KEY"
 
 
+def test_synthesize_env_key_edenai_uses_vendor_endpoint_and_chat_wire() -> None:
+    """A detected Eden AI key gets Eden AI's base_url + chat wire.
+
+    Eden AI is OpenAI-compatible but is NOT api.openai.com and only speaks
+    Chat Completions. Failure (defaulting to the openai endpoint or omitting
+    the chat wire) means an ambiently-detected EDENAI_API_KEY 401s against
+    api.openai.com instead of reaching Eden AI.
+    """
+    det = DetectedProvider(
+        name="edenai", kind="key", family=OPENAI_FAMILY, source="$EDENAI_API_KEY"
+    )
+    entries = synthesize_detected_entries([det])
+    openai_block = entries["edenai"]["openai"]
+    assert openai_block["base_url"] == "https://api.edenai.run/v3"
+    # Chat wire is required — Responses would 404 against Eden AI.
+    assert openai_block["wire_api"] == "chat"
+    assert openai_block["api_key_ref"] == "env:EDENAI_API_KEY"
+
+
 def test_synthesize_env_key_openai_honors_openai_base_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
