@@ -290,6 +290,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
         spec_version=spec_version,
         name=raw.get("name"),
         description=raw.get("description"),
+        short_description=raw.get("short_description"),
         llm=llm,
         interaction=interaction,
         tools=tools_config,
