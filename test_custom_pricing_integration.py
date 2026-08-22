@@ -27,9 +27,7 @@ def test_parse_family_with_custom_pricing():
             "input_per_million": 0.0,
             "output_per_million": 0.0,
         },
-        "models": {
-            "default": "llama3.2:latest"
-        }
+        "models": {"default": "llama3.2:latest"},
     }
 
     family = _parse_family("test-provider", "openai", raw)
@@ -95,7 +93,9 @@ def test_parse_family_pricing_missing_fields():
         },
     }
 
-    with pytest.raises(OmnigentError, match="requires both 'input_per_million' and 'output_per_million'"):
+    with pytest.raises(
+        OmnigentError, match="requires both 'input_per_million' and 'output_per_million'"
+    ):
         _parse_family("provider", "openai", raw)
 
 
@@ -114,16 +114,14 @@ def test_fetch_pricing_with_custom_provider():
                         "input_per_million": 0.0,
                         "output_per_million": 0.0,
                     },
-                }
+                },
             }
         }
     }
 
     # Fetch pricing for a codex harness (uses openai family)
     pricing = fetch_model_pricing_with_provider(
-        model="llama3.2:latest",
-        provider_config=provider_config,
-        harness="codex"
+        model="llama3.2:latest", provider_config=provider_config, harness="codex"
     )
 
     # Should get the custom pricing
@@ -144,21 +142,20 @@ def test_fetch_pricing_fallback_to_catalog():
                     "base_url": "https://api.anthropic.com",
                     "api_key": "test",
                     # No pricing block
-                }
+                },
             }
         }
     }
 
     # Fetch pricing for claude-sdk harness
     # This should fall back to catalog (which may return None if model not found)
-    pricing = fetch_model_pricing_with_provider(
-        model="claude-sonnet-4-20250514",
-        provider_config=provider_config,
-        harness="claude-sdk"
+    # Using a generic model name to avoid hardcoding specific model IDs
+    fetch_model_pricing_with_provider(
+        model="test-model", provider_config=provider_config, harness="claude-sdk"
     )
 
     # The catalog lookup happens (may or may not find pricing)
-    # This test just ensures no errors
+    # This test just ensures no errors and the function doesn't crash
 
 
 def test_compute_cost_with_custom_pricing():
@@ -176,15 +173,13 @@ def test_compute_cost_with_custom_pricing():
                         "input_per_million": 0.25,
                         "output_per_million": 1.0,
                     },
-                }
+                },
             }
         }
     }
 
     pricing = fetch_model_pricing_with_provider(
-        model="my-custom-model",
-        provider_config=provider_config,
-        harness="codex"
+        model="my-custom-model", provider_config=provider_config, harness="codex"
     )
 
     assert pricing is not None
@@ -206,32 +201,21 @@ def test_compute_cost_with_custom_pricing():
 def test_model_pricing_config_validation():
     """Test ModelPricingConfig validation."""
     # Valid config
-    config = ModelPricingConfig(
-        input_per_million=0.25,
-        output_per_million=1.0
-    )
+    config = ModelPricingConfig(input_per_million=0.25, output_per_million=1.0)
     assert config.input_per_million == 0.25
 
     # Negative input price should fail
     with pytest.raises(ValueError):
-        ModelPricingConfig(
-            input_per_million=-0.1,
-            output_per_million=1.0
-        )
+        ModelPricingConfig(input_per_million=-0.1, output_per_million=1.0)
 
     # Negative output price should fail
     with pytest.raises(ValueError):
-        ModelPricingConfig(
-            input_per_million=0.25,
-            output_per_million=-1.0
-        )
+        ModelPricingConfig(input_per_million=0.25, output_per_million=-1.0)
 
     # Negative cache prices should fail
     with pytest.raises(ValueError):
         ModelPricingConfig(
-            input_per_million=0.25,
-            output_per_million=1.0,
-            cache_read_per_million=-0.025
+            input_per_million=0.25, output_per_million=1.0, cache_read_per_million=-0.025
         )
 
 

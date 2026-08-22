@@ -336,7 +336,6 @@ def fetch_model_pricing_with_provider(
         # this module at top level, so we import it only when needed here.
         from omnigent.onboarding.provider_config import (
             default_provider_for_harness,
-            load_providers,
         )
 
         try:
