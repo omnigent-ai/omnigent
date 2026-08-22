@@ -6,6 +6,7 @@ import {
   CheckIcon,
   CopyIcon,
   AlertTriangleIcon,
+  FolderIcon,
   PencilIcon,
   InfoIcon,
   PlusIcon,
@@ -58,6 +59,7 @@ import { copyText } from "@/lib/clipboard";
 import { useChatStore } from "@/store/chatStore";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useSessionHostVersion } from "@/hooks/RunnerHealthProvider";
+import { useSession } from "@/hooks/useSession";
 
 const MCP_SERVERS_UPDATED_TOAST = (
   <span className="text-ui">MCP servers updated. Restart the session to apply changes.</span>
@@ -1263,7 +1265,14 @@ export function AgentInfoContent({
   const mcpEditable = agent?.mcp_servers_editable === true;
   const displayName = agent ? agentDisplayLabel(agent.name) : null;
   const [sessionIdCopied, setSessionIdCopied] = useState(false);
+  const [workspaceCopied, setWorkspaceCopied] = useState(false);
   const copyResetTimeoutRef = useRef<number | null>(null);
+  const workspaceCopyResetTimeoutRef = useRef<number | null>(null);
+  // The session's working directory, so a viewer can see and copy the cwd
+  // (e.g. to paste into the chat). ``null`` for sandbox sessions or while the
+  // snapshot loads, in which case the row is omitted.
+  const { session } = useSession(sessionId ?? null);
+  const workspace = session?.workspace ?? null;
   // Cumulative session spend, live from the store (seeded on bind, updated
   // by SSE ``session_usage``). ``null`` when the session is unpriced (no
   // turn priced yet) — omit the row rather than show "$0.00" / "—".
@@ -1304,6 +1313,8 @@ export function AgentInfoContent({
   useEffect(() => {
     return () => {
       if (copyResetTimeoutRef.current !== null) window.clearTimeout(copyResetTimeoutRef.current);
+      if (workspaceCopyResetTimeoutRef.current !== null)
+        window.clearTimeout(workspaceCopyResetTimeoutRef.current);
     };
   }, []);
 
@@ -1318,6 +1329,20 @@ export function AgentInfoContent({
     setSessionIdCopied(true);
     if (copyResetTimeoutRef.current !== null) window.clearTimeout(copyResetTimeoutRef.current);
     copyResetTimeoutRef.current = window.setTimeout(() => setSessionIdCopied(false), 2000);
+  }
+
+  async function copyWorkspace() {
+    if (!workspace) return;
+    try {
+      await copyText(workspace);
+    } catch (err) {
+      console.warn("Failed to copy working directory", err);
+      return;
+    }
+    setWorkspaceCopied(true);
+    if (workspaceCopyResetTimeoutRef.current !== null)
+      window.clearTimeout(workspaceCopyResetTimeoutRef.current);
+    workspaceCopyResetTimeoutRef.current = window.setTimeout(() => setWorkspaceCopied(false), 2000);
   }
 
   return (
@@ -1364,6 +1389,36 @@ export function AgentInfoContent({
               className="shrink-0"
             >
               {sessionIdCopied ? (
+                <CheckIcon className="size-3.5" />
+              ) : (
+                <CopyIcon className="size-3.5" />
+              )}
+            </Button>
+          </div>
+        </div>
+      )}
+      {workspace && (
+        <div className="flex flex-col gap-1.5 py-3">
+          <SectionLabel>Working directory</SectionLabel>
+          <div className="flex items-center gap-2">
+            <code
+              className="flex min-w-0 flex-1 items-center gap-1.5 py-1 font-mono text-xs text-muted-foreground"
+              data-testid="agent-info-workspace"
+              title={workspace}
+            >
+              <FolderIcon className="size-3.5 shrink-0" />
+              <span className="min-w-0 truncate">{workspace}</span>
+            </code>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              aria-label={workspaceCopied ? "Copied working directory" : "Copy working directory"}
+              data-testid="agent-info-copy-workspace"
+              onClick={copyWorkspace}
+              className="shrink-0"
+            >
+              {workspaceCopied ? (
                 <CheckIcon className="size-3.5" />
               ) : (
                 <CopyIcon className="size-3.5" />
