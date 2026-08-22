@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import math
 import secrets
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -1230,7 +1231,11 @@ def _accumulate_session_usage(
         )
     )
     if llm_model:
-        if isinstance(provider_cost, (int, float)):
+        if (
+            isinstance(provider_cost, (int, float))
+            and math.isfinite(provider_cost)
+            and provider_cost >= 0
+        ):
             cost_delta = float(provider_cost)
             priced = True
         else:
