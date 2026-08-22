@@ -451,7 +451,8 @@ def maybe_merge_user_provider_config(config: dict[str, object]) -> dict[str, obj
     server sees both the user's providers (with their custom base URLs) and
     any Omnigent-synthesized providers (e.g. Databricks gateway).
 
-    ``provider`` entries are merged, and the user config's top-level ``model``
+    ``provider`` entries are merged and top-level ``plugin`` entries are
+    preserved (with synthesized plugins taking precedence). The user config's ``model``
     default is adopted **only when the synthesized config pins none** — the
     synthesized config still takes precedence for all keys it sets (model, mcp,
     plugin, permission, etc.). The ``model`` carry-over matters because when
@@ -503,12 +504,26 @@ def maybe_merge_user_provider_config(config: dict[str, object]) -> dict[str, obj
         if isinstance(user_model, str) and user_model:
             target.setdefault("model", user_model)
 
+    def _merge_plugins(target: dict[str, object]) -> None:
+        """Preserve user plugins while retaining synthesized policy hooks."""
+        user_plugins = user_config.get("plugin")
+        if not isinstance(user_plugins, list):
+            return
+        existing = target.get("plugin")
+        merged: list[object] = list(existing) if isinstance(existing, list) else []
+        for plugin in user_plugins:
+            if plugin not in merged:
+                merged.append(plugin)
+        if merged:
+            target["plugin"] = merged
+
     user_providers = user_config.get("provider")
     if not isinstance(user_providers, dict) or not user_providers:
         # No custom providers to merge, but the user's default model still
         # applies when the synthesized config didn't pin one.
         result = dict(config)
         _carry_model(result)
+        _merge_plugins(result)
         return result
 
     result = dict(config)
@@ -526,6 +541,7 @@ def maybe_merge_user_provider_config(config: dict[str, object]) -> dict[str, obj
         result["provider"] = dict(user_providers)
 
     _carry_model(result)
+    _merge_plugins(result)
     result.setdefault("$schema", "https://opencode.ai/config.json")
 
     return result

@@ -421,6 +421,31 @@ def test_merge_user_provider_config_carries_model_without_user_providers(
     assert result["model"] == "databricks/databricks-claude-opus-4-8"
 
 
+def test_merge_user_provider_config_preserves_plugins_and_deduplicates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Global plugins survive per-session config synthesis."""
+    cfg_dir = tmp_path / "cfg" / "opencode"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "opencode.jsonc").write_text(
+        '{"plugin": ["/opt/pulse-agents-harnesses/marshal-opencode", '
+        '"/opt/pulse-agents-harnesses/other"]}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+
+    config: dict[str, object] = {
+        "plugin": ["/tmp/omnigent-policy.js", "/opt/pulse-agents-harnesses/other"]
+    }
+    result = maybe_merge_user_provider_config(config)
+
+    assert result["plugin"] == [
+        "/tmp/omnigent-policy.js",
+        "/opt/pulse-agents-harnesses/other",
+        "/opt/pulse-agents-harnesses/marshal-opencode",
+    ]
+
+
 def test_merge_user_provider_config_merges_alongside_synthesized_providers(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
