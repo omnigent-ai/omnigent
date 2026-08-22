@@ -144,6 +144,12 @@ import {
   writeHideUnconfiguredHarnesses,
 } from "@/lib/harnessVisibilityPreferences";
 import {
+  BOTTOM_LOCK_STORAGE_KEY,
+  DEFAULT_BOTTOM_LOCK_ENABLED,
+  readBottomLockEnabled,
+  writeBottomLockEnabled,
+} from "@/lib/bottomLockPreferences";
+import {
   applyThemePalette,
   DEFAULT_PALETTE,
   isThemeSelection,
@@ -823,6 +829,33 @@ function HideUnconfiguredHarnessesControl() {
   );
 }
 
+function BottomLockControl() {
+  const [enabled, setEnabled] = useState(() => readBottomLockEnabled());
+  const labelId = useId();
+  const toggle = useCallback((next: boolean) => {
+    setEnabled(next);
+    writeBottomLockEnabled(next);
+  }, []);
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <div className="flex flex-col">
+        <span id={labelId} className="text-ui font-medium">
+          Keep chat pinned to bottom
+        </span>
+        <span className="text-sm text-muted-foreground">
+          Jump to the latest message when you send, then follow new response content automatically.
+        </span>
+      </div>
+      <Switch
+        aria-labelledby={labelId}
+        checked={enabled}
+        onCheckedChange={toggle}
+        data-testid="bottom-lock-toggle"
+        className="mt-0.5 shrink-0"
+      />
+    </div>
+  );
+}
 function AppearanceSection() {
   // Embedded: the host owns light/dark, so the Mode and Color theme pickers
   // would be no-ops — hide them and say so (matching ThemeModeMenu). Terminal
@@ -847,6 +880,7 @@ function AppearanceSection() {
     writeWorkspacePanelDefault(WORKSPACE_PANEL_DEFAULT);
 
     writeHideUnconfiguredHarnesses(DEFAULT_HIDE_UNCONFIGURED_HARNESSES);
+    writeBottomLockEnabled(DEFAULT_BOTTOM_LOCK_ENABLED);
 
     applyDesktopUiFontSize(UI_FONT_SIZE_DEFAULT);
     applyUiFontFamily(UI_FONT_FAMILY_DEFAULT);
@@ -870,6 +904,7 @@ function AppearanceSection() {
           "omnigent:custom-theme",
           "omnigent:default-workspace-panel",
           "omnigent:hide-unconfigured-harnesses",
+          BOTTOM_LOCK_STORAGE_KEY,
         ]) {
           window.localStorage.removeItem(key);
         }
@@ -913,6 +948,8 @@ function AppearanceSection() {
         <WorkspacePanelDefaultControl />
 
         <HideUnconfiguredHarnessesControl />
+
+        <BottomLockControl />
 
         <UiFontSizeControl />
 

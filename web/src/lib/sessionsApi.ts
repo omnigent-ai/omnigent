@@ -820,6 +820,7 @@ export interface GetSessionSlimOptions {
    * refresh pierces stale server-side capability caches.
    */
   refreshState?: boolean;
+  signal?: AbortSignal;
 }
 
 export async function getSessionSlim(
@@ -833,6 +834,7 @@ export async function getSessionSlim(
   if (options.refreshState === true) params.set("refresh_state", "true");
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(sessionId)}?${params.toString()}`,
+    { signal: options.signal },
   );
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
 }
@@ -860,13 +862,18 @@ export interface SessionItemsPage {
  */
 export async function fetchSessionItemsPage(
   sessionId: string,
-  { olderThan, limit = SESSION_HISTORY_PAGE_SIZE }: { olderThan?: string; limit?: number } = {},
+  {
+    olderThan,
+    limit = SESSION_HISTORY_PAGE_SIZE,
+    signal,
+  }: { olderThan?: string; limit?: number; signal?: AbortSignal } = {},
 ): Promise<SessionItemsPage> {
   const params = new URLSearchParams({ limit: String(limit), order: "desc" });
   // "Older than the cursor" within a descending scan = items after it.
   if (olderThan) params.set("after", olderThan);
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(sessionId)}/items?${params}`,
+    { signal },
   );
   const page = await readJsonOrThrow<SessionItemsResponseWire>(res);
   // Server returns newest-first; reverse to chronological for rendering.

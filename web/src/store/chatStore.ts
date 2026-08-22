@@ -2999,18 +2999,20 @@ async function bindStream(
 ): Promise<void> {
   racedNativeModelOptions.delete(id);
   const controller = new AbortController();
+  // Install cancellation before waiting for a stream slot. A rapid switch can
+  // then dispose this cold bind before it consumes a slot or starts snapshot
+  // requests, rather than letting superseded loads starve the final session.
+  set({ abortController: controller });
   // Take an origin-wide stream slot before opening the connection, evicting our
   // own LRU background stream to make room. A fresh tab that finds every slot
   // held by other tabs opens over budget (no slot) and raises the banner.
   await acquireStreamSlot(id);
-  if (isConversationDisposed(id)) {
+  if (controller.signal.aborted || isConversationDisposed(id)) {
     // Switched away / evicted while awaiting the slot — don't open a dead
     // entry's stream, and hand any slot we took back to the origin.
     releaseStreamSlot(id);
     return;
   }
-  set({ abortController: controller });
-
   // Opening a conversation URL with no session list loaded yet leaves the
   // session→host map empty, so the SSE stream
   // (and every host-scoped request) would open UNKEYED and route to the default
@@ -3024,7 +3026,7 @@ async function bindStream(
   // agentbricks/mas/.claude/skills/sync-omnigents/SKILL.md.
   if (getOmnigentHostConfig().fetcher && getSessionHost(id) === null) {
     try {
-      await getSessionSlim(id);
+      await getSessionSlim(id, { signal: controller.signal });
     } catch {
       // Best-effort: a failed resolve (bad id, transient) falls through to the
       // unkeyed open; the snapshot fetch surfaces the real error.
@@ -3032,7 +3034,7 @@ async function bindStream(
     // Liveness, not the visible id: a background bind must survive a switch away
     // (that is the whole feature). Only a dispose (evicted) bails — and then the
     // slot taken above has to go back to the origin.
-    if (isConversationDisposed(id)) {
+    if (controller.signal.aborted || isConversationDisposed(id)) {
       releaseStreamSlot(id);
       return;
     }
@@ -3078,13 +3080,13 @@ async function bindStream(
     const [session, page] = await Promise.all([
       queryClient.fetchQuery({
         queryKey: ["session", id],
-        queryFn: () => getSessionSlim(id, { refreshState: true }),
+        queryFn: () => getSessionSlim(id, { refreshState: true, signal: controller.signal }),
         staleTime: 0,
         retry: false,
       }),
-      fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS }),
+      fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS, signal: controller.signal }),
     ]);
-    if (isConversationDisposed(id)) return;
+    if (controller.signal.aborted || isConversationDisposed(id)) return;
     const items = page.items;
 
     // Sticky-pref handoff for CLI-created sessions with no override.
@@ -3322,7 +3324,7 @@ async function bindStream(
     }
     racedNativeModelOptions.delete(id);
   } catch (err) {
-    if (isConversationDisposed(id)) return;
+    if (controller.signal.aborted || isConversationDisposed(id)) return;
     set({
       loadingConversation: false,
       conversationLoadError: err instanceof Error ? err : new Error(String(err)),
