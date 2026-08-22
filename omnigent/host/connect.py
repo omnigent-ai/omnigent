@@ -27,6 +27,7 @@ import websockets.asyncio.client
 from websockets.exceptions import ConnectionClosed, InvalidStatus, InvalidURI
 
 from omnigent._platform import IS_POSIX, WINDOWS_ENV_PASSTHROUGH
+from omnigent.cli_invocation import cli_invocation
 from omnigent.env_credentials import env_names_with_omnigent_prefix
 from omnigent.gateway_inference import gateway_inference_map
 from omnigent.harness_aliases import canonicalize_harness, is_claude_sdk_harness_name
@@ -1168,7 +1169,7 @@ class HostProcess:
             command, e.g. ``"Run `omnigent login <url>` ..."``.
         """
         return (
-            f"Run `omnigent login {self._server_url}` to authenticate (it "
+            f"Run `{cli_invocation()} login {self._server_url}` to authenticate (it "
             "detects Databricks-fronted servers and logs in to the right "
             "workspace), or check your ambient Databricks credentials."
         )
@@ -1190,7 +1191,7 @@ class HostProcess:
         """
         return (
             "If this server uses Omnigent accounts or OIDC login, run "
-            f"`omnigent login {self._server_url}` to authenticate."
+            f"`{cli_invocation()} login {self._server_url}` to authenticate."
         )
 
     def _fatal_upgrade_error(self, exc: InvalidURI | InvalidStatus) -> HostConnectError | None:
@@ -1289,7 +1290,7 @@ class HostProcess:
                         f"{self._auth_retry_streak} times in a row — this is no "
                         "longer a transient network blip. If it persists, the "
                         "stored credential is likely no longer valid: run "
-                        f"`omnigent login {self._server_url}` and restart the "
+                        f"`{cli_invocation()} login {self._server_url}` and restart the "
                         "host. Still retrying."
                     )
                     _logger.warning("%s", escalated)
@@ -2772,7 +2773,7 @@ class HostProcess:
                                 f"{self._refused_streak} consecutive connection "
                                 "attempts — nothing is listening on that local "
                                 "address anymore. Start the server, then run "
-                                "`omnigent host` again."
+                                f"`{cli_invocation()} host` again."
                             ) from exc
                     else:
                         self._refused_streak = 0

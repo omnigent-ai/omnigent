@@ -31,6 +31,7 @@ import httpx
 from omnigent._wrapper_labels import (
     WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY,
 )
+from omnigent.cli_invocation import cli_invocation
 from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.native_dispatch import resolve_hook_for_key
 
@@ -75,8 +76,8 @@ def run_resume(
     if target is None:
         if server is None:
             raise click.UsageError(
-                "`omnigent resume` (no id) requires `--server <url>`. "
-                "Pass a conversation id (`omnigent resume conv_...`) "
+                f"`{cli_invocation()} resume` (no id) requires `--server <url>`. "
+                f"Pass a conversation id (`{cli_invocation()} resume conv_...`) "
                 "to use the persistent local store.",
             )
         target = _pick_conversation_for_resume(server=server)
@@ -247,7 +248,7 @@ def _dispatch_by_runtime(
         raise click.ClickException(
             f"Conversation {target!r} is not a terminal-native session "
             f"(wrapper={wrapper!r}). To resume it, run "
-            f"`omnigent run --resume {target} <agent.yaml> --server "
+            f"`{cli_invocation()} run --resume {target} <agent.yaml> --server "
             f"{server}`. The agentless form is tracked separately.",
         )
 
@@ -261,7 +262,7 @@ def _dispatch_by_runtime(
     raise click.ClickException(
         f"Conversation {target!r} is not a terminal-native session "
         f"(wrapper={wrapper!r}). To resume it, run "
-        f"`omnigent run --resume {target} <agent.yaml>`. "
+        f"`{cli_invocation()} run --resume {target} <agent.yaml>`. "
         "The agentless form is tracked separately.",
     )
 
