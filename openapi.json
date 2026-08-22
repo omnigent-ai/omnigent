@@ -4482,6 +4482,17 @@
             "title": "Archived",
             "type": "boolean"
           },
+          "archived_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Archived At"
+          },
           "comments_count": {
             "default": 0,
             "description": "Total number of review comments (any status) on this session. Together with `comments_updated_at` it forms a change fingerprint: an add or edit bumps the timestamp, a delete changes the count, so the web client can invalidate its cached comment list when either field changes in a `WS /v1/sessions/updates` frame. `0` when the session has no comments or the server has no comment store wired.",
@@ -5250,6 +5261,17 @@
             "description": "Whether the session is archived. Archived sessions are hidden from the default sidebar listing and surface only behind the \"Show archived\" toggle. `False` for normal sessions. Toggled via `PATCH /v1/sessions/{id}`.",
             "title": "Archived",
             "type": "boolean"
+          },
+          "archived_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Archived At"
           },
           "background_task_count": {
             "anyOf": [

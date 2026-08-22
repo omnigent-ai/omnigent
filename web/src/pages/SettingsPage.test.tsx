@@ -104,6 +104,7 @@ vi.mock("@/hooks/useConversations", async () => {
       isPending: false,
     }),
     useStopAndDeleteConversation: () => ({ mutate: mocks.deleteMutate, isPending: false }),
+    useBulkDeleteConversations: () => ({ mutate: mocks.deleteMutate, isPending: false }),
   };
 });
 // Radix Select uses a portal + pointer events jsdom can't drive; stub it to a

@@ -857,6 +857,7 @@ def _build_session_list_item(
         workspace=conv.workspace,
         git_branch=conv.git_branch,
         archived=conv.archived,
+        archived_at=conv.archived_at,
         comments_count=comments_fingerprint.count if comments_fingerprint else 0,
         comments_updated_at=(
             comments_fingerprint.last_updated_at if comments_fingerprint else None
@@ -1112,6 +1113,7 @@ def _build_session_response(
         workspace=conv.workspace,
         git_branch=conv.git_branch,
         archived=conv.archived,
+        archived_at=conv.archived_at,
         # Replay the latest todo list for claude-native sessions.
         # Populated by _handle_external_session_todos; empty list for
         # non-claude-native sessions or before the first poll tick.

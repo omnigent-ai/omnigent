@@ -816,6 +816,8 @@ class SqlConversation(ConversationBase):
     archived: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=false()
     )
+    # Unix epoch seconds when the session was archived; NULL when not archived.
+    archived_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     __table_args__ = (
         # No bare created_at/updated_at indexes: the sessions list is ACL-scoped

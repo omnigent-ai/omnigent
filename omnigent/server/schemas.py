@@ -1927,6 +1927,7 @@ class SessionResponse(BaseModel):
     workspace: str | None = None
     git_branch: str | None = None
     archived: bool = False
+    archived_at: int | None = None
     todos: list[dict[str, Any]] = Field(default_factory=list)
     skills: list[SkillSummary] = Field(default_factory=list)
     model_options: list[NativeModelOption] = Field(default_factory=list)
@@ -2384,6 +2385,7 @@ class SessionListItem(BaseModel):
     workspace: str | None = None
     git_branch: str | None = None
     archived: bool = False
+    archived_at: int | None = None
     comments_count: int = 0
     comments_updated_at: int | None = None
     viewer_last_seen: int | None = None
