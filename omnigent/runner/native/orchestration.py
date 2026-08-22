@@ -4543,16 +4543,13 @@ async def _auto_create_antigravity_terminal(
     over tmux whether or not a web client has opened the Terminal panel (see
     the ``tmux_start_on_attach`` note on the spec below).
 
-    **Permissions are web-attended, not headless.** The web client attaches
-    to the agy pane through the runner tunnel and answers agy's
-    ``request-review`` TUI prompt there, so the launch is treated as
-    *attended* (``headless=False``). Auto-bypass comes only from the user's
-    persisted ``terminal_launch_args`` (which carry
-    ``--dangerously-skip-permissions`` when the user asked for bypass) —
-    the same pass-through mechanism codex/claude use. A server-spawned
-    launch must NOT key headlessness on the runner process's (absent) TTY,
-    which would silently disable the per-tool prompt for a watching web
-    user.
+    **Permissions distinguish attended sessions from dispatched children.** A
+    top-level web session is attended: its user can answer agy's
+    ``request-review`` prompt through the terminal tunnel. A sub-agent child
+    (identified by ``parent_session_id``) is autonomous: its parent cannot
+    answer the child TUI prompt. It therefore launches headlessly with agy's
+    bypass flag, preventing a first shell command from parking at an
+    elicitation and then being misreported as a completed child task.
 
     Fresh sessions launch with no ``--conversation``: the runner cold-starts
     the conversation over connect-RPC (11a) so the reader binds agy's real id
@@ -4599,6 +4596,8 @@ async def _auto_create_antigravity_terminal(
     snapshot = await _session_payload_for_host_spawn_check(server_client, session_id)
     if snapshot is None:
         raise RuntimeError(f"Could not fetch Antigravity launch config for {session_id!r}.")
+    parent_session_id = snapshot.get("parent_session_id")
+    autonomous_subagent = isinstance(parent_session_id, str) and bool(parent_session_id)
 
     session_workspace = snapshot.get("workspace")
     if session_workspace is not None and (
@@ -4665,12 +4664,12 @@ async def _auto_create_antigravity_terminal(
         conversation_id=external_session_id if resume else None,
         model=model,
         resume=resume,
-        # Web-attended: a web client drives agy's request-review prompt over the
-        # tunnel, so this is NOT headless. Bypass comes only via the pass-through
-        # args below (see docstring). permission_mode is left unset for the same
-        # reason — the runner has no separate per-tool mode to map here.
+        # A top-level web session is attended through the terminal tunnel, but a
+        # dispatched child has no human attached to answer agy's TUI prompt.
+        # The latter must launch headlessly so its first tool call cannot remain
+        # blocked forever and later be reported as an empty completion.
         permission_mode=None,
-        headless=False,
+        headless=autonomous_subagent,
         extra_args=terminal_launch_args,
     )
 

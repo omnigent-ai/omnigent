@@ -478,6 +478,27 @@ async def test_fetch_runner_models_orders_reported_cost_tiers() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fetch_runner_models_keeps_self_managed_worker_with_no_models() -> None:
+    """An empty self-managed row remains visible to model-advice callers."""
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        "workers": {
+            "goose": {
+                "source": "self-managed",
+                "verified": False,
+                "models": [],
+                "note": "Goose owns its model configuration.",
+            }
+        }
+    }
+    mock_response.raise_for_status = MagicMock()
+    mock_client = MagicMock()
+    mock_client.get = AsyncMock(return_value=mock_response)
+
+    assert await fetch_runner_models("conv_123", mock_client) == {"goose": []}
+
+
+@pytest.mark.asyncio
 async def test_fetch_runner_models_returns_none_on_http_error() -> None:
     import httpx
 

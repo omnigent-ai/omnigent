@@ -56,12 +56,17 @@ class SysListModelsTool(Tool):
             "itself, under 'self' — can actually run here, resolved from "
             "each worker's real model provider and filtered to its "
             "harness's model family. Call this BEFORE passing an "
-            "unfamiliar 'args.model' to sys_session_send, when the user "
-            "asks which models are available, or to preflight a worker "
-            "(source 'none' means dispatches to that worker cannot run "
-            "in this deployment). Each entry reports {source, verified, "
-            "models: [{id, family, context_window?}], note}; pick "
-            "'args.model' values verbatim from the target worker's list."
+            "unfamiliar 'args.model' to sys_session_send, or when the user "
+            "asks which models are available. Each entry reports {source, "
+            "verified, models: [{id, family, context_window?}], note}; pick "
+            "'args.model' values verbatim from the target worker's list. An "
+            "EMPTY list is not by itself a dead worker — read 'source': "
+            "'self-managed' means the harness authenticates itself and "
+            "Omnigent cannot enumerate its models, so dispatch normally and "
+            "omit 'args.model'; 'unconfigured' means no provider is set up "
+            "for that worker; 'unavailable' means its listing could not be "
+            "fetched. Only a note saying dispatches 'cannot run here' is a "
+            "launch-blocking verdict."
         )
 
     def get_schema(self) -> dict[str, Any]:

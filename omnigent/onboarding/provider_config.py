@@ -166,9 +166,9 @@ _HARNESS_FAMILY: dict[str, str] = {
     # normally maps it down via _provider_harness_name; accept both spellings
     # here so callers that pass the spec/CLI spelling directly resolve too.
     "openai-agents-sdk": OPENAI_FAMILY,
-    # Antigravity is Gemini-native but routes generic-provider traffic over
-    # the OpenAI-compatible wire, so it consumes the ``openai`` family.
-    "antigravity": OPENAI_FAMILY,
+    # Antigravity's SDK consumes Gemini credentials directly; it has no
+    # OpenAI-compatible provider path.
+    "antigravity": GEMINI_FAMILY,
     # NB: ``kimi`` is intentionally absent. Upstream Kimi Code CLI has no
     # per-spawn provider override flag, so Omnigent cannot thread a generic
     # provider through. Provider routing for kimi lives in ``~/.kimi/config.toml``
@@ -1184,10 +1184,12 @@ def default_provider_for_harness(config: dict[str, object], harness: str) -> Pro
     codex/native-codex/openai-agents→openai) and returns that family's
     default. The ``pi`` harness (and any unmapped harness) consumes both
     families: an explicit :data:`PI_SURFACE` default wins; otherwise it
-    falls back to the ``anthropic`` then ``openai`` family default,
-    skipping ``subscription`` and ``bedrock`` defaults (a CLI login is
-    unusable outside its own CLI, and ``bedrock`` is native-``omnigent
-    claude`` only — routing pi to either fails). A ``cli-config`` default is
+    walks the ``anthropic`` then ``openai`` candidates — each family's
+    default first, then its remaining providers in config order (see
+    :func:`_pi_candidate_providers`) — skipping ``subscription`` and
+    ``bedrock`` entries (a CLI login is unusable outside its own CLI, and
+    ``bedrock`` is native-``omnigent claude`` only — routing pi to either
+    fails). A ``cli-config`` entry is
     skipped UNLESS it is a pi-consumable Databricks AI Gateway (see
     :func:`_cli_config_serves_pi`): such a gateway exposes an Anthropic
     surface Pi speaks natively, so pi-native translates it
@@ -1214,28 +1216,60 @@ def default_provider_for_harness(config: dict[str, object], harness: str) -> Pro
     # and skip the CLI-bound kinds (unusable outside their own CLI). Gemini is
     # excluded (a gemini key serves only the Gemini surface, never pi).
     for fam in _PI_FALLBACK_FAMILIES:
-        provider = get_default_provider(config, fam)
-        if provider is None:
-            continue
-        # Subscription logins live in the claude/codex CLI's own login, which
-        # an unmapped harness doesn't wrap; a bedrock provider is
-        # native-``omnigent claude`` only (configure_agent_harness_with_provider
-        # raises for it). Neither can serve pi, so skip them and fall through —
-        # otherwise a bedrock Claude default would turn a working pi run (own
-        # login) into a hard error.
-        if provider.kind in (SUBSCRIPTION_KIND, BEDROCK_KIND):
-            continue
-        # A cli-config provider pins a model_provider in the codex CLI's own
-        # config.toml. Most such pins are unusable outside codex, BUT a
-        # Databricks AI Gateway exposes an Anthropic surface Pi speaks natively
-        # (translated by ``_cli_config_pi_provider`` for pi-native, and routed
-        # by ``configure_agent_harness_with_provider`` for the gateway-harness
-        # pi path). Route pi to it rather than skipping; a non-Databricks
-        # cli-config still falls through (it can't serve pi).
-        if provider.kind == CLI_CONFIG_KIND and not _cli_config_serves_pi(provider):
-            continue
-        return provider
+        for provider in _pi_candidate_providers(config, fam):
+            # Subscription logins live in the claude/codex CLI's own login,
+            # which an unmapped harness doesn't wrap; a bedrock provider is
+            # native-``omnigent claude`` only
+            # (configure_agent_harness_with_provider raises for it). Neither can
+            # serve pi, so skip them and keep looking — otherwise a bedrock
+            # Claude default would turn a working pi run (own login) into a
+            # hard error.
+            if provider.kind in (SUBSCRIPTION_KIND, BEDROCK_KIND):
+                continue
+            # A cli-config provider pins a model_provider in the codex CLI's own
+            # config.toml. Most such pins are unusable outside codex, BUT a
+            # Databricks AI Gateway exposes an Anthropic surface Pi speaks natively
+            # (translated by ``_cli_config_pi_provider`` for pi-native, and routed
+            # by ``configure_agent_harness_with_provider`` for the gateway-harness
+            # pi path). Route pi to it rather than skipping; a non-Databricks
+            # cli-config still falls through (it can't serve pi).
+            if provider.kind == CLI_CONFIG_KIND and not _cli_config_serves_pi(provider):
+                continue
+            return provider
     return None
+
+
+def _pi_candidate_providers(config: dict[str, object], family: str) -> list[ProviderEntry]:
+    """Order the providers an unmapped harness (pi) may fall back to in *family*.
+
+    The family's ``default: true`` provider first, then every other provider
+    serving *family* in config order. Both halves matter: the default is the
+    user's stated preference, and the remainder is what keeps a usable
+    credential reachable when that default is one of the kinds pi cannot
+    consume (``subscription`` / ``bedrock`` / non-Databricks ``cli-config``).
+
+    Iterating only the defaults — one per family — is what previously stranded
+    pi on a machine whose anthropic AND openai defaults were both subscription
+    CLI logins: the loop skipped the unusable default and moved to the next
+    *family*, never reaching a perfectly usable API-key provider one slot down
+    in the same family. The skip rules are unchanged; only the candidate set
+    they run against widened.
+
+    :param config: The parsed config mapping (``providers:`` block).
+    :param family: The pi-capable family to draw candidates from,
+        ``"anthropic"`` or ``"openai"``.
+    :returns: The candidate providers, most-preferred first.
+    :raises OmnigentError: If a provider is malformed, or more than one
+        ``default: true`` provider serves *family*.
+    """
+    default = get_default_provider(config, family)
+    candidates = [default] if default is not None else []
+    candidates.extend(
+        entry
+        for entry in load_providers(config).values()
+        if family in provider_families(entry) and (default is None or entry.name != default.name)
+    )
+    return candidates
 
 
 def surface_default_provider(config: dict[str, object], surface: str) -> ProviderEntry | None:
@@ -1334,6 +1368,40 @@ def _source_descriptor(family: FamilyConfig) -> str:
     )
 
 
+def harness_declares_own_auth(harness: str) -> bool:
+    """Whether *harness* authenticates itself, whatever its integration mode.
+
+    The broad form of the own-auth question: the harness's capability record
+    declares :attr:`~omnigent.harness_capabilities.AuthModel.OWN_AUTH` (a
+    vendor login or vendor-side API key) and the harness is not
+    provider-routed at spawn via :data:`_HARNESS_FAMILY`. True for the
+    ACP-backed harnesses (``acp``/``acp:<slug>``, ``goose``) AND for the
+    native harnesses whose launch copies the user's own vendor config forward
+    rather than wiring an Omnigent credential — ``goose-native``,
+    ``hermes``/``hermes-native``, ``opencode-native``, ``kiro-native``.
+
+    A harness mapped in :data:`_HARNESS_FAMILY` is provider-routed at spawn
+    (e.g. qwen consumes the openai family via its gateway env) even when its
+    capability record declares own-auth for the unconfigured fallback, so it
+    is never declined here — its family default is genuinely what it runs on.
+
+    Used by :mod:`omnigent.model_catalog` to tell "Omnigent enumerates no
+    models because the harness owns its auth" (dispatch works fine) apart
+    from "no provider is configured" (dispatch is at risk).
+
+    :param harness: The harness name, canonical or ``acp:<slug>``.
+    :returns: ``True`` when the harness supplies its own credential.
+    """
+    from omnigent.harness_capabilities import AuthModel
+    from omnigent.harness_plugins import harness_capabilities
+
+    canonical = canonicalize_harness(harness) or harness
+    if canonical in _HARNESS_FAMILY:
+        return False
+    caps = harness_capabilities().get(canonical)
+    return caps is not None and caps.auth is AuthModel.OWN_AUTH
+
+
 def harness_owns_its_credential(harness: str) -> bool:
     """Whether *harness* carries its own auth, so Omnigent resolves none.
 
@@ -1342,26 +1410,22 @@ def harness_owns_its_credential(harness: str) -> bool:
     the external agent authenticates itself, so describing an Omnigent
     provider for one would name a credential the session never uses.
 
-    A harness mapped in :data:`_HARNESS_FAMILY` is provider-routed at spawn
-    (e.g. qwen consumes the openai family via its gateway env) even when its
-    capability record declares own-auth for the unconfigured fallback, so it
-    is never declined here — its family default is genuinely what it runs on.
+    The narrow form of :func:`harness_declares_own_auth`, additionally
+    requiring the ACP subprocess integration mode. The credential readouts
+    (REPL header, ``describe_active_credential``) use this one: a native TUI
+    harness still shows its resolved provider row there.
 
     :param harness: The harness name, canonical or ``acp:<slug>``.
     :returns: ``True`` when the harness owns its own credential.
     """
-    from omnigent.harness_capabilities import AuthModel, IntegrationMode
+    from omnigent.harness_capabilities import IntegrationMode
     from omnigent.harness_plugins import harness_capabilities
 
+    if not harness_declares_own_auth(harness):
+        return False
     canonical = canonicalize_harness(harness) or harness
-    if canonical in _HARNESS_FAMILY:
-        return False
     caps = harness_capabilities().get(canonical)
-    if caps is None:
-        return False
-    return (
-        caps.integration_mode is IntegrationMode.ACP_SUBPROCESS and caps.auth is AuthModel.OWN_AUTH
-    )
+    return caps is not None and caps.integration_mode is IntegrationMode.ACP_SUBPROCESS
 
 
 def describe_active_credential(
