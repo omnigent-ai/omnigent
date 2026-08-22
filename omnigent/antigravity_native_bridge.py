@@ -345,9 +345,6 @@ _AGY_SEED_FILES = (
     Path("antigravity-cli") / "antigravity-oauth-token",
     Path("installation_id"),
     Path("antigravity-cli") / "installation_id",
-    # The GCP project agy resolved for this account. Seeding it spares a fresh
-    # session the project re-discovery round-trip (and its failure modes).
-    Path("antigravity-cli") / "cache" / "default_project_id.txt",
 )
 
 

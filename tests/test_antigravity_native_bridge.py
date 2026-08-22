@@ -1584,43 +1584,6 @@ def test_seed_isolated_agy_home_tolerates_missing_credential(
     assert (iso_gemini / "antigravity-cli" / "cache" / "onboarding.json").is_file()
 
 
-def test_seed_isolated_agy_home_seeds_cached_default_project_id(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The host's cached GCP project id is copied so agy skips re-discovery."""
-    fake_home = tmp_path / "real-home"
-    real_cache = fake_home / ".gemini" / "antigravity-cli" / "cache"
-    real_cache.mkdir(parents=True)
-    (real_cache / "default_project_id.txt").write_text("proj-123", encoding="utf-8")
-    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
-
-    bridge_dir = tmp_path / "bridge"
-    bridge_dir.mkdir()
-    seed_isolated_agy_home(bridge_dir)
-
-    iso_gemini = agy_gemini_dir(bridge_dir)
-    project_id = iso_gemini / "antigravity-cli" / "cache" / "default_project_id.txt"
-    assert project_id.read_text(encoding="utf-8") == "proj-123"
-    # Copied, never moved.
-    assert (real_cache / "default_project_id.txt").is_file()
-
-
-def test_seed_isolated_agy_home_tolerates_missing_default_project_id(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A host without the cached project id seeds nothing — never a failure."""
-    fake_home = tmp_path / "real-home"
-    fake_home.mkdir()
-    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
-
-    bridge_dir = tmp_path / "bridge"
-    bridge_dir.mkdir()
-    seed_isolated_agy_home(bridge_dir)
-
-    iso_gemini = agy_gemini_dir(bridge_dir)
-    assert not (iso_gemini / "antigravity-cli" / "cache" / "default_project_id.txt").exists()
-
-
 @pytest.mark.parametrize("iso_body", ["{not json", '["a", "list"]'])
 def test_seed_isolated_agy_home_trust_never_clobbers_unparseable_isolated_settings(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, iso_body: str
