@@ -389,26 +389,49 @@ def _invalidate_auth_token_factory(factory: Callable[[], str | None]) -> bool:
 
 
 class _InitialAuthTokenFactory:
-    """Use a host bearer until rejection, then lazily resolve runner auth."""
+    """Use a host bearer until rejection, then a host-refreshed bearer or local auth.
 
-    def __init__(self, token: str, server_url: str) -> None:
+    A host-launched runner is injected the host's Databricks bearer once at
+    spawn; it dies with the ~1h OAuth lifetime, and the runner holds no
+    self-refreshing Databricks credential of its own. The host, which does hold
+    refresh-capable auth, rewrites a fresh bearer into ``refresh_path`` before
+    the injected one expires. On rejection this factory re-reads that file and
+    adopts the newer host bearer, falling through to runner-local mint only when
+    no fresher bearer has been supplied.
+    """
+
+    def __init__(self, token: str, server_url: str, refresh_path: str | None = None) -> None:
         """
         :param token: Current bearer obtained from the connected host.
         :param server_url: Omnigent server URL used by the fallback resolver.
+        :param refresh_path: Optional file the host rewrites with a fresh
+            bearer; re-read when the active bearer is rejected. ``None`` keeps
+            the legacy behavior (fall straight through to runner-local auth).
         """
         self._initial_token: str | None = token
         self._last_initial_token: str = token  # retained for managed-mint proxy auth
         self._server_url = server_url
+        self._refresh_path = Path(refresh_path) if refresh_path else None
         self._fallback_factory: Callable[[], str | None] | None = None
         self._fallback_resolved = False
         self._no_credential_logged = False
         self._lock = threading.Lock()
 
     def __call__(self) -> str | None:
-        """Return the host bearer or a token from the lazy local fallback."""
+        """Return the host bearer, a host-refreshed bearer, or the local fallback."""
         with self._lock:
             if self._initial_token is not None:
                 return self._initial_token
+            # The active host bearer was rejected. Prefer a fresher bearer the
+            # host has since re-supplied over the runner-local mint, which a
+            # host-launched runner cannot drive on a Databricks-fronted server
+            # (its mint call needs a live edge bearer it has no way to renew).
+            refreshed = self._read_refreshed_token()
+            if refreshed is not None and refreshed != self._last_initial_token:
+                self._initial_token = refreshed
+                self._last_initial_token = refreshed
+                _logger.info("adopted host-refreshed bearer for runner auth")
+                return refreshed
             if not self._fallback_resolved:
                 self._fallback_factory = _make_auth_token_factory(
                     self._server_url,
@@ -438,6 +461,20 @@ class _InitialAuthTokenFactory:
                 )
             return token
 
+    def _read_refreshed_token(self) -> str | None:
+        """Return the host-refreshed bearer from ``refresh_path``, if present.
+
+        :returns: The token string, or ``None`` when no refresh file is
+            configured or it is missing, empty, or unreadable.
+        """
+        if self._refresh_path is None:
+            return None
+        try:
+            token = self._refresh_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        return token or None
+
     @property
     def declined(self) -> bool:
         """True when the inner fallback factory has definitively declined."""
@@ -446,7 +483,7 @@ class _InitialAuthTokenFactory:
             return getattr(f, "declined", False) and not getattr(f, "proxy_auth_failed", False)
 
     def invalidate(self) -> bool:
-        """Discard the host bearer so the next call resolves local auth."""
+        """Discard the host bearer; the next call re-reads the host's refresh file first."""
         with self._lock:
             if self._initial_token is None:
                 return False
@@ -519,6 +556,7 @@ def _make_auth_token_factory(
     # from os.environ here ensures later harness/terminal children cannot
     # inherit it even if a spawn path bypasses the standard secret scrubber.
     from omnigent.runner.identity import (
+        RUNNER_AUTH_TOKEN_REFRESH_FILE_ENV_VAR,
         RUNNER_DELEGATED_AUTH_ENV_VAR,
         RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
         RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
@@ -529,9 +567,19 @@ def _make_auth_token_factory(
         if _allow_initial_token
         else ""
     )
+    # Path the host rewrites with a fresh bearer before this one expires;
+    # popped alongside the token so a scrub-bypassing child cannot inherit a
+    # pointer to the on-disk credential.
+    initial_refresh_path = (
+        os.environ.pop(RUNNER_AUTH_TOKEN_REFRESH_FILE_ENV_VAR, "").strip()
+        if _allow_initial_token
+        else ""
+    )
     if initial_token and resolved_server_url:
         _logger.info("using host-provided bearer for runner bootstrap")
-        return _InitialAuthTokenFactory(initial_token, resolved_server_url)
+        return _InitialAuthTokenFactory(
+            initial_token, resolved_server_url, refresh_path=initial_refresh_path or None
+        )
 
     from omnigent.inner.databricks_executor import (
         DatabricksAuthError,

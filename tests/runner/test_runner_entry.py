@@ -43,6 +43,7 @@ from omnigent.runner._entry import (
     main,
 )
 from omnigent.runner.identity import (
+    RUNNER_AUTH_TOKEN_REFRESH_FILE_ENV_VAR,
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
     RUNNER_TUNNEL_TOKEN_HEADER,
 )
@@ -360,6 +361,100 @@ def test_initial_host_token_falls_back_to_managed_mint_when_no_sdk_auth(
 
     # After the initial bearer is rejected, the fallback must mint via the
     # managed-mint path rather than returning None and bricking callbacks.
+    assert captured == [
+        "Bearer host-bootstrap-token",
+        "Bearer managed-minted-token",
+    ]
+    assert len(mint_calls) >= 1
+
+
+def test_initial_host_token_adopts_refreshed_bearer_from_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """After the injected bearer is rejected, the runner adopts the host's
+    refreshed bearer from the re-supply file instead of wedging on managed mint.
+
+    A host-launched runner has no self-refreshing Databricks credential; the
+    host rewrites this file before the injected bearer expires, so recovery must
+    prefer the fresher host bearer over the managed-mint path (which such a
+    runner cannot drive through the Databricks edge).
+    """
+
+    def _unexpected_mint(*args: Any, **kwargs: Any) -> tuple[str, float]:
+        del args, kwargs
+        raise AssertionError("must adopt the refreshed host bearer, not managed mint")
+
+    refresh_file = tmp_path / "runner-auth.token"
+    refresh_file.write_text("host-refreshed-bearer")
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://app.databricksapps.com")
+    monkeypatch.setenv(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, "host-bootstrap-token")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "host-binding-token")
+    monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
+    monkeypatch.setenv(RUNNER_AUTH_TOKEN_REFRESH_FILE_ENV_VAR, str(refresh_file))
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _unexpected_mint)
+
+    factory = _make_auth_token_factory()
+
+    assert isinstance(factory, _InitialAuthTokenFactory)
+    # The refresh-file path is consumed from the env like the bearer itself.
+    assert RUNNER_AUTH_TOKEN_REFRESH_FILE_ENV_VAR not in os.environ
+    assert factory() == "host-bootstrap-token"
+
+    request = httpx.Request("GET", "https://app.databricksapps.com/api/version")
+    redirect = httpx.Response(302, headers={"Location": "/oidc/oauth2/v2.0/authorize"})
+    captured = _drive_auth_flow(_RunnerDatabricksAuth(factory), request, redirect)
+
+    assert captured == [
+        "Bearer host-bootstrap-token",
+        "Bearer host-refreshed-bearer",
+    ]
+
+
+def test_initial_host_token_falls_back_to_mint_when_refresh_file_is_stale(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A refresh file still holding the just-rejected bearer must not be re-adopted.
+
+    Guards the "only a *different* bearer is fresh" check: when the host has not
+    yet republished (the file still holds the rejected token), the runner falls
+    through to the managed-mint path rather than re-presenting a dead bearer.
+    """
+    mint_calls: list[int] = []
+
+    def _no_sdk_auth(*args: Any, **kwargs: Any) -> tuple[None, None]:
+        from omnigent.inner.databricks_executor import DatabricksAuthError
+
+        raise DatabricksAuthError("no credential configured")
+
+    def _mint(*args: Any, **kwargs: Any) -> tuple[str, float]:
+        mint_calls.append(1)
+        return "managed-minted-token", time.time() + 3600
+
+    refresh_file = tmp_path / "runner-auth.token"
+    # Same value as the injected bearer — the host has not refreshed it yet.
+    refresh_file.write_text("host-bootstrap-token")
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://app.databricksapps.com")
+    monkeypatch.setenv(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, "host-bootstrap-token")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "host-binding-token")
+    monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
+    monkeypatch.setenv(RUNNER_AUTH_TOKEN_REFRESH_FILE_ENV_VAR, str(refresh_file))
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth", _no_sdk_auth
+    )
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _mint)
+
+    factory = _make_auth_token_factory()
+
+    request = httpx.Request("GET", "https://app.databricksapps.com/api/version")
+    redirect = httpx.Response(302, headers={"Location": "/oidc/oauth2/v2.0/authorize"})
+    captured = _drive_auth_flow(_RunnerDatabricksAuth(factory), request, redirect)
+
     assert captured == [
         "Bearer host-bootstrap-token",
         "Bearer managed-minted-token",

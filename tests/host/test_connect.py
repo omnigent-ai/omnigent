@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import errno
 import logging
+import os
 import subprocess
 import threading
 import time
@@ -23,6 +24,7 @@ from omnigent.host.connect import (
     HostConnectError,
     HostProcess,
     HostRetryableConnectionError,
+    _atomic_write_secret,
     _build_runner_env,
     _RunnerHandle,
     run_host_process,
@@ -59,6 +61,7 @@ from omnigent.host.frames import (
 from omnigent.host.identity import HostIdentity
 from omnigent.host.runner_zygote import ZygoteUnavailable
 from omnigent.runner.identity import (
+    RUNNER_AUTH_TOKEN_REFRESH_FILE_ENV_VAR,
     RUNNER_DELEGATED_AUTH_ENV_VAR,
     RUNNER_ID_ENV_VAR,
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
@@ -357,12 +360,16 @@ def _cleanup_host(host: HostProcess) -> None:
     :param host: The host process under test.
     """
     host._cleanup_runners()
+    host._cleanup_auth_refresh_file()
+    if host._auth_refresh_task is not None:
+        host._auth_refresh_task.cancel()
     for task in host._watcher_tasks:
         task.cancel()
 
 
 async def test_handle_launch_spawns_subprocess(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     Verify that _handle_launch spawns a subprocess with the correct
@@ -371,6 +378,7 @@ async def test_handle_launch_spawns_subprocess(
     If the result status is not 'launched', the subprocess spawn
     failed or the result frame construction is wrong.
     """
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
     host = _make_host_process()
     host._auth_token_factory = lambda: "host-bootstrap-bearer"
     host._auth_token_factory_resolved = True
@@ -445,6 +453,145 @@ async def test_handle_launch_spawns_subprocess(
 
     # Clean up the spawned sleep process (and its exit watcher).
     _cleanup_host(host)
+
+
+async def test_handle_launch_publishes_and_injects_auth_refresh_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_handle_launch writes the host bearer to a 0600 refresh file and injects
+    its path.
+
+    This is the host-side half of the token-refresh channel: the runner
+    re-reads this file to recover after the bearer injected at spawn hits its
+    ~1h expiry, instead of wedging on a stale credential.
+    """
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_refresh",
+        binding_token="tok_refresh",
+        workspace=str(workspace),
+    )
+
+    spawned_env: dict[str, str] = {}
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        """Capture the runner env and spawn a harmless placeholder process."""
+        spawned_env.update(kwargs.get("env", {}))  # type: ignore[arg-type]
+        return original_popen(
+            ["sleep", "10"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+        result = await host._handle_launch(frame)
+
+    assert result.status == "launched", result.error
+
+    refresh_path = spawned_env.get(RUNNER_AUTH_TOKEN_REFRESH_FILE_ENV_VAR)
+    assert refresh_path, "runner env must carry the auth-refresh file path"
+    published = Path(refresh_path)
+    assert published.read_text() == "host-bootstrap-bearer"
+    # The bearer file must never be group- or world-readable.
+    assert (published.stat().st_mode & 0o077) == 0
+
+    _cleanup_host(host)
+    # Shutdown cleanup removes the published bearer file.
+    assert not published.exists()
+
+
+async def test_refresh_runner_auth_file_republishes_rotated_bearer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The periodic refresh rewrites the file with a newly-minted bearer.
+
+    This is what lets a live runner recover without a restart: the host
+    re-mints and republishes before the runner's injected bearer expires. When
+    the host credential rotates, the file must follow.
+    """
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "bearer-v1"
+    host._auth_token_factory_resolved = True
+
+    path = host._ensure_runner_auth_refresh_file("bearer-v1")
+    assert path is not None and Path(path).read_text() == "bearer-v1"
+
+    # The host's Databricks credential rotates on its own refresh cycle; the
+    # next periodic publish must carry the new bearer through to the file.
+    host._auth_token_factory = lambda: "bearer-v2"
+    host._refresh_runner_auth_file()
+    assert Path(path).read_text() == "bearer-v2"
+
+    host._cleanup_auth_refresh_file()
+
+
+async def test_auth_refresh_publish_is_fenced_after_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refresh tick that lands after shutdown cleanup must not recreate the file.
+
+    The tick runs in a worker thread that cannot be cancelled, so without the
+    fence it could republish a bearer that outlives the host.
+    """
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    host = _make_host_process()
+    path = host._ensure_runner_auth_refresh_file("bearer-v1")
+    assert path is not None
+
+    host._cleanup_auth_refresh_file()
+
+    assert host._ensure_runner_auth_refresh_file("bearer-late") is None
+    assert not Path(path).exists()
+
+
+async def test_first_publish_sweeps_bearer_files_of_dead_hosts_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A killed host's leftover bearer file is reclaimed; a live host's is kept."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    base = tmp_path / "data" / "host"
+    base.mkdir(parents=True)
+    dead = base / "runner-auth-4242.token"
+    dead_tmp = base / "runner-auth-4242.token.abc123.tmp"
+    live = base / "runner-auth-4343.token"
+    for leftover in (dead, dead_tmp, live):
+        leftover.write_text("stale")
+    monkeypatch.setattr("omnigent.host.connect._proc.process_alive", lambda pid: pid == 4343)
+    host = _make_host_process()
+
+    path = host._ensure_runner_auth_refresh_file("bearer-v1")
+
+    assert path is not None and Path(path).read_text() == "bearer-v1"
+    assert Path(path).name == f"runner-auth-{os.getpid()}.token"
+    assert not dead.exists() and not dead_tmp.exists()
+    assert live.exists()
+    host._cleanup_auth_refresh_file()
+
+
+def test_atomic_write_secret_leaves_no_temp_on_failed_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed rename must not strand a 0600 temp copy of the bearer."""
+    target = tmp_path / "runner-auth-1.token"
+
+    def _boom(src: str, dst: str) -> None:
+        raise OSError("replace failed")
+
+    monkeypatch.setattr("omnigent.host.connect.os.replace", _boom)
+    with pytest.raises(OSError, match="replace failed"):
+        _atomic_write_secret(target, "bearer")
+    assert list(tmp_path.iterdir()) == []
 
 
 async def test_handle_launch_fails_for_bad_workspace() -> None:
@@ -3832,6 +3979,7 @@ def test_run_host_process_announces_session_log_dir_on_start(
 
 async def test_launch_cancelled_midspawn_does_not_leak_untracked_runner(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Cancelling a launch mid-spawn tears the runner down instead of leaking it.
 
@@ -3841,6 +3989,7 @@ async def test_launch_cancelled_midspawn_does_not_leak_untracked_runner(
     would retain forever). The spawn is shielded and the abandoned process is
     terminated.
     """
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
     host = _make_host_process()
     host._auth_token_factory = lambda: "host-bootstrap-bearer"
     host._auth_token_factory_resolved = True

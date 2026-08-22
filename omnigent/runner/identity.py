@@ -22,6 +22,11 @@ RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR = "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN"
 # A host-launched runner uses this bearer for its initial server connection,
 # then falls back to its own refreshable auth when the bearer is rejected.
 RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR = "OMNIGENT_RUNNER_INITIAL_AUTH_TOKEN"
+# Path to a file the host rewrites with a fresh bearer before the injected one
+# expires. A host-launched runner re-reads it after the server rejects its
+# active bearer, so it recovers with the host's refreshed credential instead of
+# a stale one (the runner holds no self-refreshing Databricks credential).
+RUNNER_AUTH_TOKEN_REFRESH_FILE_ENV_VAR = "OMNIGENT_RUNNER_AUTH_TOKEN_REFRESH_FILE"
 # Host-launched runners use their binding token to obtain a short-lived,
 # owner-scoped server bearer instead of resolving the host user's credentials.
 RUNNER_DELEGATED_AUTH_ENV_VAR = "OMNIGENT_RUNNER_DELEGATED_AUTH"
@@ -72,6 +77,10 @@ RUNNER_AUTH_SECRET_ENV_VARS: frozenset[str] = frozenset(
     {
         RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
         RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
+        # Not a secret itself, but it points at the on-disk bearer file.
+        # Stripping it only withholds the pointer; the real boundary is the
+        # process uid, the same one that guards the CLI's own token cache.
+        RUNNER_AUTH_TOKEN_REFRESH_FILE_ENV_VAR,
     }
 )
 

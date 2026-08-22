@@ -18,6 +18,8 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
+import threading
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -108,6 +110,7 @@ from omnigent.process_logging import (
 )
 from omnigent.runner._zygote import ZYGOTE_ENABLED_ENV_VAR
 from omnigent.runner.identity import (
+    RUNNER_AUTH_TOKEN_REFRESH_FILE_ENV_VAR,
     RUNNER_DELEGATED_AUTH_ENV_VAR,
     RUNNER_ID_ENV_VAR,
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
@@ -629,6 +632,67 @@ class HostConnectError(Exception):
     """
 
 
+# Interval between rewrites of the shared runner-auth bearer file. Short enough
+# that the file tracks the host's token within a minute of its rotation, so a
+# runner rejected right at expiry finds the fresh bearer already published; the
+# tick is an in-memory token read plus a tiny atomic write.
+_RUNNER_AUTH_REFRESH_INTERVAL_S = 60.0
+
+
+def _atomic_write_secret(path: Path, contents: str) -> None:
+    """Write *contents* to *path* atomically with owner-only (0600) permissions.
+
+    Each call writes its own unique 0600 temp file (never a wider-mode window,
+    never shared with a concurrent writer) and renames it into place, so a
+    reader sees either the previous contents or the new ones, never a partial
+    write. The temp file never outlives a failure.
+
+    :param path: Destination file path.
+    :param contents: Text to write (a bearer token).
+    :returns: None.
+    :raises OSError: On write or rename failure.
+    """
+    fd, tmp = tempfile.mkstemp(prefix=f"{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(contents)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+# ``runner-auth-<pid>.token`` plus the ``.<random>.tmp`` a crashed write can
+# leave next to it; the pid names the host daemon that owned the file.
+_RUNNER_AUTH_FILE_RE = re.compile(r"^runner-auth-(\d+)\.token(?:\..*\.tmp)?$")
+
+
+def _sweep_dead_host_auth_files(base: Path) -> None:
+    """Delete runner-auth bearer files left behind by host daemons that died.
+
+    Shutdown removes a host's own file, but a killed or OOMed host leaves it
+    (with an expired bearer) on disk for good. Files whose owning pid is still
+    running — another live host on this machine — are left alone.
+
+    :param base: The ``<data-dir>/host`` directory holding the files.
+    :returns: None.
+    """
+    try:
+        entries = list(base.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        match = _RUNNER_AUTH_FILE_RE.match(entry.name)
+        if match is None:
+            continue
+        pid = int(match.group(1))
+        if pid == os.getpid() or _proc.process_alive(pid):
+            continue
+        with contextlib.suppress(OSError):
+            entry.unlink()
+
+
 def _build_runner_env(
     base_env: Mapping[str, str],
     *,
@@ -640,6 +704,7 @@ def _build_runner_env(
     initial_auth_token: str | None = None,
     host_id: str | None = None,
     harness: str | None = None,
+    auth_refresh_path: str | None = None,
 ) -> dict[str, str]:
     """
     Build the environment for a spawned runner subprocess.
@@ -669,6 +734,9 @@ def _build_runner_env(
     :param harness: Canonical harness of the launching session, e.g.
         ``"claude-native"``; lets the runner start harness-specific prewarms
         at boot. ``None`` (unknown / older server) omits the stamp.
+    :param auth_refresh_path: Path to the file the host rewrites with a fresh
+        bearer before the injected one expires, so the runner can recover after
+        expiry. Only forwarded when an ``initial_auth_token`` is present.
     :returns: The runner subprocess environment.
     """
     extra_names = {
@@ -707,6 +775,8 @@ def _build_runner_env(
     env[RUNNER_DELEGATED_AUTH_ENV_VAR] = "1"
     if initial_auth_token:
         env[RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR] = initial_auth_token
+        if auth_refresh_path:
+            env[RUNNER_AUTH_TOKEN_REFRESH_FILE_ENV_VAR] = auth_refresh_path
     env[RUNNER_WORKSPACE_ENV_VAR] = workspace
     env[RUNNER_PARENT_PID_ENV_VAR] = str(parent_pid)
     # Bound glibc allocator RSS in the runner (no-op off Linux). Injected
@@ -884,6 +954,18 @@ class HostProcess:
         self._watcher_tasks: set[asyncio.Task[None]] = set()
         # Strong ref to the orphan-reaper task (see :meth:`_orphan_reaper_loop`).
         self._reaper_task: asyncio.Task[None] | None = None
+        # Shared file the host rewrites with its current Databricks bearer so
+        # host-launched runners recover after their spawn-time bearer expires.
+        # Created lazily on the first launch that carries a bearer (see
+        # :meth:`_ensure_runner_auth_refresh_file`) and rewritten by
+        # :meth:`_auth_refresh_loop`; removed on shutdown.
+        self._auth_refresh_path: Path | None = None
+        self._auth_refresh_task: asyncio.Task[None] | None = None
+        # Launches and the refresh tick both publish from worker threads;
+        # the lock serializes them and the flag fences out a tick that is
+        # still in flight when shutdown removes the file.
+        self._auth_refresh_lock = threading.Lock()
+        self._auth_refresh_closed = False
         # Number of host-owned ``subprocess`` operations (e.g. the git worktree
         # commands in :mod:`omnigent.host.git_worktree`) currently in flight.
         # The orphan reaper skips its sweep while this is >0 so it never
@@ -1403,6 +1485,15 @@ class HostProcess:
             self._current_auth_token,
             initialize=False,
         )
+        # Publish the bearer to a file the runner can re-read after its injected
+        # copy expires; the refresh loop (started in run()) keeps it current.
+        # Only when there is a refreshable bearer — managed / credential-less
+        # hosts have nothing to publish.
+        auth_refresh_path: str | None = None
+        if initial_auth_token:
+            auth_refresh_path = await asyncio.to_thread(
+                self._ensure_runner_auth_refresh_file, initial_auth_token
+            )
         env = _build_runner_env(
             os.environ,
             server_url=self._server_url,
@@ -1413,6 +1504,7 @@ class HostProcess:
             initial_auth_token=initial_auth_token,
             host_id=self._identity.host_id,
             harness=frame.harness,
+            auth_refresh_path=auth_refresh_path,
         )
 
         # Embed the session id so operators can find all logs for a session
@@ -2727,6 +2819,11 @@ class HostProcess:
                 asyncio.to_thread(self._ensure_zygote_started),
                 name="host-zygote-prestart",
             )
+        # Keep the shared runner-auth bearer file fresh so host-launched runners
+        # survive their spawn-time bearer's ~1h expiry (see _auth_refresh_loop).
+        self._auth_refresh_task = asyncio.create_task(
+            self._auth_refresh_loop(), name="host-runner-auth-refresh"
+        )
         backoff = _RECONNECT_BASE_S
         try:
             while True:
@@ -2892,6 +2989,12 @@ class HostProcess:
             for watcher in list(self._watcher_tasks):
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await watcher
+            if self._auth_refresh_task is not None:
+                self._auth_refresh_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._auth_refresh_task
+                self._auth_refresh_task = None
+            self._cleanup_auth_refresh_file()
             self._cleanup_runners()
             # Final drain: _cleanup_runners has just reaped the tracked
             # runners via Popen, so any of their still-orphaned tool
@@ -3100,6 +3203,83 @@ class HostProcess:
         except Exception:  # noqa: BLE001
             _logger.debug("Could not obtain auth token", exc_info=True)
         return None
+
+    def _ensure_runner_auth_refresh_file(self, token: str) -> str | None:
+        """Write *token* to the shared runner-auth refresh file, creating it 0600.
+
+        Host-launched runners re-read this file to pick up a refreshed bearer
+        after the one injected at spawn expires. Created lazily under
+        ``<data-dir>/host`` on the first launch that carries a bearer, then
+        rewritten by :meth:`_auth_refresh_loop`.
+
+        :param token: The host's current bearer to publish for its runners.
+        :returns: The file path for runner-env injection, or ``None`` when the
+            file could not be written or the host is already shutting down.
+        """
+        with self._auth_refresh_lock:
+            if self._auth_refresh_closed:
+                return None
+            try:
+                if self._auth_refresh_path is None:
+                    from omnigent.process_logging import data_dir
+
+                    base = data_dir() / "host"
+                    base.mkdir(parents=True, exist_ok=True)
+                    _sweep_dead_host_auth_files(base)
+                    # The pid keeps concurrent host daemons on one machine from
+                    # clobbering each other's bearer file.
+                    self._auth_refresh_path = base / f"runner-auth-{os.getpid()}.token"
+                _atomic_write_secret(self._auth_refresh_path, token)
+                return str(self._auth_refresh_path)
+            except OSError:
+                _logger.debug("Could not write runner-auth refresh file", exc_info=True)
+                return None
+
+    async def _auth_refresh_loop(self) -> None:
+        """Rewrite the shared runner-auth bearer file before the token expires.
+
+        The host injects its Databricks bearer into each runner once at spawn,
+        but that bearer dies with the ~1h OAuth lifetime. The host holds
+        refresh-capable auth, so it re-mints and re-publishes a fresh bearer on
+        an interval comfortably under that lifetime, letting live runners
+        recover without a restart.
+
+        :returns: None. Runs until cancelled on shutdown.
+        """
+        while True:
+            await asyncio.sleep(_RUNNER_AUTH_REFRESH_INTERVAL_S)
+            await asyncio.to_thread(self._refresh_runner_auth_file)
+
+    def _refresh_runner_auth_file(self) -> None:
+        """Republish a freshly-minted bearer to the runner-auth file.
+
+        A no-op until the file has been created by the first launch that carried
+        a bearer, or when the host has no refreshable credential right now (e.g.
+        a transient SDK refresh failure) — the last-published bearer is left in
+        place rather than blanked.
+
+        :returns: None.
+        """
+        if self._auth_refresh_path is None:
+            return
+        token = self._current_auth_token(initialize=False)
+        if token:
+            self._ensure_runner_auth_refresh_file(token)
+
+    def _cleanup_auth_refresh_file(self) -> None:
+        """Remove the shared runner-auth bearer file on shutdown.
+
+        Also closes publishing, so a refresh tick that is still running in
+        its worker thread cannot recreate the file afterwards.
+
+        :returns: None.
+        """
+        with self._auth_refresh_lock:
+            self._auth_refresh_closed = True
+            if self._auth_refresh_path is not None:
+                with contextlib.suppress(OSError):
+                    self._auth_refresh_path.unlink()
+                self._auth_refresh_path = None
 
     async def _serve_frames(self, ws: websockets.asyncio.client.ClientConnection) -> None:
         """Send the cached host hello, then service frames until disconnect."""
