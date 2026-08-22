@@ -223,10 +223,10 @@ def _ws_scope(origin: str | None) -> dict[str, Any]:
     :param origin: Origin header value to include, or ``None`` to omit.
     :returns: An ASGI scope dict with ``type == "websocket"``.
     """
-    headers: list[tuple[bytes, bytes]] = []
+    headers: list[tuple[bytes, bytes]] = [(b"host", b"localhost:8000")]
     if origin is not None:
         headers.append((b"origin", origin.encode("latin-1")))
-    return {"type": "websocket", "headers": headers}
+    return {"type": "websocket", "scheme": "ws", "headers": headers}
 
 
 async def _drive_middleware(
@@ -494,3 +494,57 @@ def test_e2e_allowlist_denies_unlisted_origin_in_non_local_mode(
         assert ws.receive_text() == "echo:hi"
     # Only the allowlisted connection reached the route.
     assert app.state.accepted == [True]
+
+
+def test_e2e_local_mode_admits_mobile_origin_via_allowlist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-loopback mobile/LAN origin connects once allowlisted.
+
+    Android emulator WebViews reach the server through ``10.0.2.2``, a
+    non-loopback host. That origin must be explicitly added to
+    ``OMNIGENT_WS_ALLOWED_ORIGINS`` to be admitted in local mode.
+
+    :param monkeypatch: pytest env patcher.
+    :returns: None.
+    """
+    monkeypatch.setenv(_LOCAL_ENV, "1")
+    monkeypatch.setenv(_ALLOWLIST_ENV, "http://10.0.2.2:8000")
+    app = _make_app()
+    client = TestClient(app)
+
+    with client.websocket_connect(
+        "/ws",
+        headers={"origin": "http://10.0.2.2:8000", "host": "10.0.2.2:8000"},
+    ) as ws:
+        ws.send_text("hi")
+        assert ws.receive_text() == "echo:hi"
+    assert app.state.accepted == [True]
+
+
+def test_e2e_local_mode_rejects_dns_rebinding(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A Host-matching, non-allowlisted Origin is rejected (DNS rebinding).
+
+    ``Host`` is client-controllable, so an attacker hostname rebound to
+    the server's address can send an ``Origin`` that exactly equals
+    ``Host``. That must never be trusted on its own: this is the core
+    proof the DNS-rebinding hole is closed.
+
+    :param monkeypatch: pytest env patcher.
+    :returns: None.
+    """
+    monkeypatch.setenv(_LOCAL_ENV, "1")
+    app = _make_app()
+    client = TestClient(app)
+
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with client.websocket_connect(
+            "/ws",
+            headers={
+                "origin": "http://attacker.example:8000",
+                "host": "attacker.example:8000",
+            },
+        ):
+            pass
+    assert exc_info.value.code == FORBIDDEN_ORIGIN_CLOSE_CODE
+    assert app.state.accepted == []
