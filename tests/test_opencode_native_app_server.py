@@ -126,6 +126,32 @@ def test_filtered_server_env_drops_global_opencode_config(
     assert env["XDG_CONFIG_HOME"] == str(tmp_path / "xdg-config")
 
 
+def test_filtered_server_env_honors_runner_env_passthrough_names(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Operator-declared environment variables survive the server filter."""
+    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "GH_TOKEN, GH_CONFIG_DIR,,")
+    monkeypatch.setenv("GH_TOKEN", "ghp-token")
+    monkeypatch.setenv("GH_CONFIG_DIR", "/opt/gh-config")
+    monkeypatch.setenv("STILL_UNRELATED", "nope")
+    env = filtered_server_env(bridge_dir=tmp_path, auth_secret="pw")
+    assert env["GH_TOKEN"] == "ghp-token"
+    assert env["GH_CONFIG_DIR"] == "/opt/gh-config"
+    assert "STILL_UNRELATED" not in env
+    # The control list is runner metadata, not server configuration.
+    assert "OMNIGENT_RUNNER_ENV_PASSTHROUGH" not in env
+
+
+def test_filtered_server_env_denylist_beats_runner_passthrough(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Listing a denylisted name does not defeat per-session XDG isolation."""
+    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "OPENCODE_CONFIG")
+    monkeypatch.setenv("OPENCODE_CONFIG", "/home/user/.config/opencode/opencode.json")
+    env = filtered_server_env(bridge_dir=tmp_path, auth_secret="pw")
+    assert "OPENCODE_CONFIG" not in env
+
+
 def _server(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> OpenCodeNativeServer:
     monkeypatch.setattr(appsrv.shutil, "which", lambda name: f"/usr/bin/{name}")
     return OpenCodeNativeServer(
