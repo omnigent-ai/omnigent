@@ -1407,10 +1407,12 @@ class TerminalInstance:
         await self._stop_idle_watcher()
         self._stop_idle_watcher_thread()
 
-        if self.running:
+        # A launched terminal still owns its private tmux server after the
+        # inner pane exits and ``is_alive`` clears ``running``.
+        if self.launch_cwd is not None:
             with contextlib.suppress(RuntimeError):
                 await self._tmux("kill-server")
-            self.running = False
+        self.running = False
 
         if self.os_env is not None:
             self.os_env.close()
