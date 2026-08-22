@@ -3983,6 +3983,9 @@ def server(
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
         SqlAlchemyScheduledTaskStore,
     )
+    from omnigent.stores.turn_operation_store.sqlalchemy_store import (
+        SqlAlchemyTurnOperationStore,
+    )
 
     agent_store = SqlAlchemyAgentStore(db_uri, conv_db_uri)
     file_store = SqlAlchemyFileStore(db_uri)
@@ -3992,6 +3995,7 @@ def server(
     permission_store = SqlAlchemyPermissionStore(db_uri)
     scheduled_task_store = SqlAlchemyScheduledTaskStore(db_uri)
     project_store = SqlAlchemyProjectStore(db_uri)
+    turn_operation_store = SqlAlchemyTurnOperationStore(db_uri)
     artifact_store = _create_artifact_store(art_loc)
 
     # Initialize the runtime with store references so workflow code
@@ -4145,6 +4149,7 @@ def server(
         allowed_domains=config_str_list(cfg.get("allowed_domains")),
         sandbox_config=sandbox_config,
         server_config=cfg,
+        turn_operation_store=turn_operation_store,
     )
 
     click.echo(f"Starting omnigent server on {host}:{port}")
