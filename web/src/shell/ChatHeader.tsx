@@ -30,6 +30,7 @@ import { cn } from "@/lib/utils";
 import { TAB_BADGE_BASE } from "./railTabs";
 import { ViewModeToggle } from "./ViewModeToggle";
 import { useCallback, useEffect, useRef } from "react";
+import { ChatHeaderServerPicker } from "./ChatHeaderServerPicker";
 
 /**
  * Gating flags + handlers for the mobile-only session-menu FAB (the
@@ -161,9 +162,10 @@ interface ChatHeaderProps {
  * canvas shows through, and chat content dissolves before it slides
  * under the controls (the conversation viewport's ``chat-scroll-fade``
  * mask, index.css; chat reserves clearance via ``pt-20``,
- * terminal-first via ``pt-14``). Left slot: open-sidebar + a conversation
- * breadcrumb (``[folder] / <title> [/ <sub-agent>]``). Right slot: desktop
- * action buttons (Agent info ·
+ * terminal-first via ``pt-14``). On desktop, the conversation breadcrumb
+ * (``[folder] / <title> [/ <sub-agent>]``) is centered over the chat while
+ * the sidebar toggle and action buttons occupy equal outer columns. Right slot:
+ * desktop action buttons (Agent info ·
  * Share · right-panel toggle), a mobile three-dot menu mirroring the
  * same actions, and a mobile FAB that opens the rail tabs as
  * full-screen drawers. Stop session lives in the sidebar row's kebab
@@ -215,6 +217,7 @@ export function ChatHeader({
     }, 400);
   }, [isMobile, onOpenSidebar, cancelPeek]);
   useEffect(() => cancelPeek, [cancelPeek]);
+  const showConversationBreadcrumb = Boolean(conversationId && (conversationTitle || titleLinkTo));
   return (
     <header
       className={cn(
@@ -224,22 +227,17 @@ export function ChatHeader({
         // Scrolled chat text can't render through the controls because the
         // conversation viewport fades its top edge instead (chat-scroll-fade
         // in index.css, applied in ChatPage).
-        "chat-header absolute inset-x-0 top-0 z-30 flex h-14 md:h-12 items-center justify-between px-2 md:px-4 py-3 md:right-[var(--workspace-panel-offset,0px)]",
+        "chat-header absolute inset-x-0 top-0 z-30 flex h-14 items-center gap-1 px-2 py-3 md:right-[var(--workspace-panel-offset,0px)] md:grid md:h-12 md:grid-cols-[1fr_auto_1fr] md:px-4",
       )}
     >
-      {/* Left slot: sidebar toggle (when sidebar is closed) and a
-          back-to-parent link (when this is a sub-agent session). The
-          back link is the mobile-friendly counterpart of the nested
-          sidebar row — on a phone the sidebar is collapsed and the
-          nesting is invisible, so this affordance is the only way
-          out of a child session without opening the sidebar. */}
+      {/* Left slot: sidebar toggle when the sidebar is closed. */}
       {/* With the sidebar closed this slot reaches the window corner,
           where the macOS Electron shell's traffic lights float — drop
           just this slot below them (the right action cluster stays up
           in the title-bar strip). Inert outside the shell (index.css). */}
       <div
         className={cn(
-          "flex min-w-0 items-center gap-1 md:gap-6",
+          "flex shrink-0 items-center md:justify-self-start",
           !sidebarOpen && "traffic-light-clearance",
         )}
       >
@@ -275,14 +273,12 @@ export function ChatHeader({
             <TooltipContent side="bottom">Open sidebar</TooltipContent>
           </Tooltip>
         )}
-        {/* Conversation breadcrumb (see ConversationBreadcrumb). Empty on the
-            landing composer. A resolved title is enough; so is titleLinkTo —
-            a child must keep its climb-out while the parent title loads.
-            min-w-0 on this slot lets it truncate rather than push the
-            right-hand action cluster. On the macOS shell with the sidebar
-            collapsed, the slot's traffic-light-clearance pads it past the
-            window controls + title-bar cluster (index.css). */}
-        {conversationId && (conversationTitle || titleLinkTo) && (
+      </div>
+
+      {/* Conversation breadcrumb (see ConversationBreadcrumb). The desktop
+          grid centers it over the chat independently of either sidebar. */}
+      <div className="flex min-w-0 flex-1 items-center pr-1 md:col-start-2 md:row-start-1 md:max-w-full md:justify-self-center md:pr-0">
+        {showConversationBreadcrumb && (
           <ConversationBreadcrumb
             conversationTitle={conversationTitle ?? UNTITLED_CONVERSATION_LABEL}
             projectName={projectName}
@@ -290,12 +286,12 @@ export function ChatHeader({
             isChildSession={isChildSession}
             boundAgent={boundAgent}
             wrapperLabel={wrapperLabel}
-            className="pr-1"
           />
         )}
+        <ChatHeaderServerPicker showBrand={!showConversationBreadcrumb} />
       </div>
 
-      <div className="flex items-center gap-2">
+      <div className="ml-auto flex shrink-0 items-center gap-2 md:col-start-3 md:row-start-1 md:ml-0 md:justify-self-end">
         {/* Other users currently viewing this session (presence).
             Self-contained — reads the chat store directly, renders
             nothing when the user is alone. */}

@@ -155,6 +155,20 @@ describe("ChatHeader — workspace pane alignment", () => {
     expect(header).not.toBeNull();
     expect(header).toHaveClass("inset-x-0", "md:right-[var(--workspace-panel-offset,0px)]");
   });
+
+  it("centers the desktop title in the chat area", () => {
+    const { container } = renderHeader({
+      sidebarOpen: true,
+      conversationId: "conv-1",
+      conversationTitle: "Fix the login bug",
+    });
+    const header = container.querySelector("header");
+    const breadcrumb = screen.getByRole("navigation", { name: "Conversation" });
+    const title = breadcrumb.parentElement;
+
+    expect(header).toHaveClass("md:grid", "md:grid-cols-[1fr_auto_1fr]");
+    expect(title).toHaveClass("md:col-start-2", "md:justify-self-center");
+  });
 });
 
 describe("ChatHeader — open-sidebar toggle visibility", () => {
