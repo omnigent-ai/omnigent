@@ -41,10 +41,11 @@ from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlparse
 
 import click
-import httpx
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+
+    import httpx
 
     from omnigent.onboarding.sandboxes.base import RemoteProcess, SandboxLauncher
 
@@ -333,6 +334,8 @@ def _probe_server(server_url: str) -> httpx.Response | None:
         unreachable — the caller treats that as "shape unknown" and
         lets the in-sandbox login surface the real connectivity error.
     """
+    import httpx
+
     try:
         return httpx.get(f"{server_url}/v1/me", timeout=10.0)
     except httpx.HTTPError:
@@ -375,6 +378,8 @@ def _workspace_org_id(workspace_host: str) -> str | None:
     :returns: The id, e.g. ``"4168070633950167"``, or ``None`` when
         the header is absent or the workspace is unreachable.
     """
+    import httpx
+
     try:
         response = httpx.get(f"{workspace_host}/login.html", timeout=10.0)
     except httpx.HTTPError:
