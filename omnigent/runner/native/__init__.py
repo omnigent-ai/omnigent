@@ -125,7 +125,9 @@ from omnigent.runner.native.orchestration import (
     _terminal_tmux_pane,
     _unwrap_resolved_spec,
     teardown_all_codex_native_app_servers,
+    teardown_all_opencode_native_servers,
     teardown_codex_native_app_server,
+    teardown_opencode_native_server,
 )
 
 __all__ = [
@@ -253,5 +255,7 @@ __all__ = [
     "_terminal_tmux_pane",
     "_unwrap_resolved_spec",
     "teardown_all_codex_native_app_servers",
+    "teardown_all_opencode_native_servers",
     "teardown_codex_native_app_server",
+    "teardown_opencode_native_server",
 ]

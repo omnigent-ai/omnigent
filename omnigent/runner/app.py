@@ -2428,15 +2428,18 @@ def create_runner_app(
                 "session_id": event.session_id,
             },
         )
-        # A codex TUI pane that exits on its own (crash / OOM / host recycle)
-        # never runs the DELETE-session cleanup, so its per-session app-server
-        # + forwarder would linger with no TUI. Tear them down here; no-op for
-        # any session without a registered codex app-server.
-        _teardown_task = asyncio.create_task(
-            _native_runtime.teardown_codex_native_app_server(event.session_id)
-        )
-        _teardown_task.add_done_callback(_background_tasks.discard)
-        _background_tasks.add(_teardown_task)
+        # A codex / opencode TUI pane that exits on its own (crash / OOM /
+        # host recycle) never runs the DELETE-session cleanup, so its
+        # per-session server + forwarder would linger with no TUI. Tear them
+        # down here; each is a no-op for a session without that harness's
+        # registered server.
+        for _teardown in (
+            _native_runtime.teardown_codex_native_app_server,
+            _native_runtime.teardown_opencode_native_server,
+        ):
+            _teardown_task = asyncio.create_task(_teardown(event.session_id))
+            _teardown_task.add_done_callback(_background_tasks.discard)
+            _background_tasks.add(_teardown_task)
         if event.lifecycle != TerminalLifecycle.REQUIRED:
             return
 
@@ -9773,12 +9776,13 @@ def create_runner_app(
             try:
                 await resource_registry.close_terminal(pane.conversation_id, pane.terminal_id)
             finally:
-                # Closing the codex TUI pane leaves its per-session app-server
-                # (and forwarder) running — no-op for other harnesses. Tear it
-                # down in ``finally`` so an idle-reaped codex session can't orphan
-                # a ``codex app-server`` for the runner's lifetime even when the
-                # pane close above partially fails (the very leak this guards).
+                # Closing the codex / opencode TUI pane leaves its per-session
+                # server (and forwarder) running — no-op for other harnesses.
+                # Tear it down in ``finally`` so an idle-reaped session can't
+                # orphan its server for the runner's lifetime even when the pane
+                # close above partially fails (the very leak this guards).
                 await _native_runtime.teardown_codex_native_app_server(pane.conversation_id)
+                await _native_runtime.teardown_opencode_native_server(pane.conversation_id)
                 _publish_terminal_deleted_event(
                     conversation_id=pane.conversation_id,
                     terminal_name=pane.terminal_name,

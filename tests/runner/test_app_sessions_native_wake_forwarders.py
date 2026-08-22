@@ -520,6 +520,142 @@ async def test_teardown_all_codex_native_app_servers_closes_every_session() -> N
 
 
 @pytest.mark.asyncio
+async def test_teardown_opencode_native_server_cancels_forwarder_and_closes_server() -> None:
+    """
+    Opencode pane teardown cancels the forwarder and closes the server.
+
+    Opencode mirrors codex: the idle pane reaper and an unexpected TUI exit
+    both close only the tmux pane, so without this helper the per-session
+    ``opencode serve`` (and its forwarder) survives with no TUI, orphaning an
+    ``opencode`` process. Teardown must both cancel the registered forwarder
+    and close the registered server so neither leaks.
+    """
+    session_id = "0bc0de000000000000000000deadbeef"
+    run = _ForwarderRun()
+    closed = False
+
+    async def _parked() -> None:
+        run.task = asyncio.current_task()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            run.cancelled = True
+            raise
+
+    class _FakeServer:
+        async def close(self) -> None:
+            nonlocal closed
+            closed = True
+
+    try:
+        task = asyncio.create_task(_parked())
+        runner_app_mod._register_auto_forwarder_task(session_id, task)
+        runner_app_mod._AUTO_OPENCODE_SERVERS[session_id] = _FakeServer()
+        await asyncio.sleep(0)
+
+        await runner_app_mod.teardown_opencode_native_server(session_id)
+
+        assert task.cancelled(), "forwarder must be finished-cancelled after teardown"
+        assert run.cancelled is True
+        assert closed is True, "registered opencode server must be closed"
+        assert session_id not in runner_app_mod._AUTO_OPENCODE_SERVERS
+        assert session_id not in runner_app_mod._AUTO_FORWARDER_TASKS
+    finally:
+        runner_app_mod._AUTO_FORWARDER_TASKS.pop(session_id, None)
+        runner_app_mod._AUTO_OPENCODE_SERVERS.pop(session_id, None)
+        await _drain_forwarder_runs([run])
+
+
+@pytest.mark.asyncio
+async def test_teardown_opencode_native_server_noop_without_registered_server() -> None:
+    """
+    Teardown is a no-op for a session with no registered opencode server.
+
+    The shared pane-teardown paths fire for every native harness, so calling
+    this for a non-opencode session — or one whose server is already gone —
+    must not touch that session's forwarder or raise.
+    """
+    session_id = "3333333344444444ccccccccdddddddd"
+    run = _ForwarderRun()
+
+    async def _parked() -> None:
+        run.task = asyncio.current_task()
+        await asyncio.Event().wait()
+
+    try:
+        task = asyncio.create_task(_parked())
+        runner_app_mod._register_auto_forwarder_task(session_id, task)
+        await asyncio.sleep(0)
+
+        await runner_app_mod.teardown_opencode_native_server(session_id)
+
+        # No registered opencode server -> the forwarder is left untouched.
+        assert not task.done()
+        assert session_id in runner_app_mod._AUTO_FORWARDER_TASKS
+    finally:
+        runner_app_mod._AUTO_FORWARDER_TASKS.pop(session_id, None)
+        await _drain_forwarder_runs([run])
+
+
+@pytest.mark.asyncio
+async def test_teardown_all_opencode_native_servers_closes_every_session() -> None:
+    """
+    Runner shutdown closes every registered opencode server.
+
+    A host-initiated stop SIGTERMs the runner without a per-session
+    ``DELETE /v1/sessions``, so the shutdown sweep is the only thing that
+    closes the host-spawned ``opencode serve`` subprocesses. Every registered
+    session must be torn down, and the registry left empty.
+    """
+    session_ids = [
+        "dddd0000dddd0000dddd0000dddd0000",
+        "eeee1111eeee1111eeee1111eeee1111",
+        "ffff2222ffff2222ffff2222ffff2222",
+    ]
+    runs = [_ForwarderRun() for _ in session_ids]
+    closed: list[str] = []
+
+    def _make_parked(run: _ForwarderRun) -> Any:
+        async def _parked() -> None:
+            run.task = asyncio.current_task()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                run.cancelled = True
+                raise
+
+        return _parked
+
+    class _FakeServer:
+        def __init__(self, sid: str) -> None:
+            self._sid = sid
+
+        async def close(self) -> None:
+            closed.append(self._sid)
+
+    try:
+        for sid, run in zip(session_ids, runs, strict=True):
+            task = asyncio.create_task(_make_parked(run)())
+            runner_app_mod._register_auto_forwarder_task(sid, task)
+            runner_app_mod._AUTO_OPENCODE_SERVERS[sid] = _FakeServer(sid)
+        await asyncio.sleep(0)
+
+        await runner_app_mod.teardown_all_opencode_native_servers()
+
+        assert sorted(closed) == sorted(session_ids), "every opencode server must be closed"
+        assert all(sid not in runner_app_mod._AUTO_OPENCODE_SERVERS for sid in session_ids)
+        assert all(sid not in runner_app_mod._AUTO_FORWARDER_TASKS for sid in session_ids)
+        assert all(run.cancelled for run in runs), "every forwarder must be cancelled"
+        # Idempotent: a second sweep with an empty registry is a no-op.
+        await runner_app_mod.teardown_all_opencode_native_servers()
+    finally:
+        for sid in session_ids:
+            runner_app_mod._AUTO_FORWARDER_TASKS.pop(sid, None)
+            runner_app_mod._AUTO_OPENCODE_SERVERS.pop(sid, None)
+        await _drain_forwarder_runs(runs)
+
+
+@pytest.mark.asyncio
 async def test_register_auto_forwarder_task_replaces_incumbent_and_survives_stale_evict() -> None:
     """
     Re-registration cancels the incumbent; its done-callback can't evict the successor.
