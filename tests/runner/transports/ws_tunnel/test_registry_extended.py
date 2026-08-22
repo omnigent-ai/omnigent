@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import threading
 
 import pytest
 
@@ -381,3 +382,196 @@ async def test_wait_for_runner_zero_timeout_just_checks() -> None:
     assert await reg.wait_for_runner("r1", timeout_s=0) is None
     session = reg.register("r1", _NoopWS(), _hello())
     assert await reg.wait_for_runner("r1", timeout_s=-1) is session
+
+
+# ── Outbound queue backpressure ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_send_text_waits_out_a_full_queue_instead_of_failing() -> None:
+    """A momentarily full outbound queue is backpressure, not an error.
+
+    A burst can fill the queue before the sender task wakes; the send must
+    wait for drain (never dropping or failing the frame) and complete once
+    the sender frees a slot.
+    """
+    from omnigent.runner.transports.ws_tunnel.registry import _OUTBOUND_QUEUE_MAX_FRAMES
+
+    reg = TunnelRegistry()
+    session = reg.register("r1", _NoopWS(), _hello())
+    for _ in range(_OUTBOUND_QUEUE_MAX_FRAMES):
+        session.outbound_queue.put_nowait("frame")
+
+    send = asyncio.create_task(reg.send_text(session, "tail-frame"))
+    await asyncio.sleep(0.01)
+    assert not send.done(), "send failed instead of waiting for the sender to drain"
+
+    session.outbound_queue.get_nowait()  # the sender drains one slot
+    await asyncio.wait_for(send, timeout=2.0)  # frame accepted, never dropped
+
+
+@pytest.mark.asyncio
+async def test_send_text_fails_loud_when_sender_stalled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sender that frees no room within the deadline fails the send loudly.
+
+    Protocol frames must never be dropped silently — a lost frame strands its
+    RPC — so a truly stalled socket surfaces ConnectionError to the caller.
+    """
+    import omnigent.runner.transports.ws_tunnel.registry as registry_mod
+    from omnigent.runner.transports.ws_tunnel.registry import _OUTBOUND_QUEUE_MAX_FRAMES
+
+    monkeypatch.setattr(registry_mod, "_OUTBOUND_SEND_STALL_S", 0.05)
+    reg = TunnelRegistry()
+    session = reg.register("r1", _NoopWS(), _hello())
+    for _ in range(_OUTBOUND_QUEUE_MAX_FRAMES):
+        session.outbound_queue.put_nowait("frame")
+
+    with pytest.raises(ConnectionError, match="stalled"):
+        await reg.send_text(session, "frame-behind-stalled-sender")
+
+
+@pytest.mark.asyncio
+async def test_send_text_reports_replaced_when_session_swapped_mid_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A send parked on a full queue resolves as 'replaced' after a swap.
+
+    Replacing the session retires the old queue (stop sentinel keeps it
+    full), so the parked put can't complete — the send must still resolve
+    within the stall deadline and name the replacement, not a stall.
+    """
+    import omnigent.runner.transports.ws_tunnel.registry as registry_mod
+    from omnigent.runner.transports.ws_tunnel.registry import _OUTBOUND_QUEUE_MAX_FRAMES
+
+    monkeypatch.setattr(registry_mod, "_OUTBOUND_SEND_STALL_S", 0.2)
+    reg = TunnelRegistry()
+    session = reg.register("r1", _NoopWS(), _hello())
+    for _ in range(_OUTBOUND_QUEUE_MAX_FRAMES):
+        session.outbound_queue.put_nowait("frame")
+
+    send = asyncio.create_task(reg.send_text(session, "parked-frame"))
+    await asyncio.sleep(0.01)
+    assert not send.done(), "send resolved before the sender freed any room"
+
+    reg.register("r1", _NoopWS(), _hello())  # replaces + retires the old session
+    with pytest.raises(ConnectionError, match="replaced"):
+        await asyncio.wait_for(send, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_send_text_resolves_when_enqueue_task_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancelling the owner-loop enqueue task must never orphan the caller.
+
+    Route teardown cancels pending tasks on the session loop; a send parked
+    in the bounded-wait put must surface ConnectionError, not hang forever
+    on an ack nothing will ever settle.
+    """
+    import omnigent.runner.transports.ws_tunnel.registry as registry_mod
+    from omnigent.runner.transports.ws_tunnel.registry import _OUTBOUND_QUEUE_MAX_FRAMES
+
+    monkeypatch.setattr(registry_mod, "_OUTBOUND_SEND_STALL_S", 30.0)
+    reg = TunnelRegistry()
+    session = reg.register("r1", _NoopWS(), _hello())
+    for _ in range(_OUTBOUND_QUEUE_MAX_FRAMES):
+        session.outbound_queue.put_nowait("frame")
+
+    before = asyncio.all_tasks()
+    send = asyncio.create_task(reg.send_text(session, "parked-frame"))
+    await asyncio.sleep(0.01)
+    enqueue_tasks = asyncio.all_tasks() - before - {send}
+    assert enqueue_tasks, "expected the owner-loop enqueue task to be running"
+    for task in enqueue_tasks:
+        task.cancel()
+
+    with pytest.raises(ConnectionError):
+        await asyncio.wait_for(send, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_send_text_resolves_when_enqueue_task_cancelled_before_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A task cancelled before its coroutine's FIRST step must settle the ack.
+
+    Such a cancel never enters the coroutine body, so its try/finally cannot
+    run — only the task-done backstop keeps the caller from hanging forever.
+    """
+    import omnigent.runner.transports.ws_tunnel.registry as registry_mod
+    from omnigent.runner.transports.ws_tunnel.registry import _OUTBOUND_QUEUE_MAX_FRAMES
+
+    monkeypatch.setattr(registry_mod, "_OUTBOUND_SEND_STALL_S", 30.0)
+    reg = TunnelRegistry()
+    session = reg.register("r1", _NoopWS(), _hello())
+    for _ in range(_OUTBOUND_QUEUE_MAX_FRAMES):
+        session.outbound_queue.put_nowait("frame")
+
+    before = asyncio.all_tasks()
+    send = asyncio.create_task(reg.send_text(session, "parked-frame"))
+    # ONE bare yield: send_text has created the enqueue task, but the loop
+    # has not stepped it yet — the cancel below lands pre-start.
+    await asyncio.sleep(0)
+    enqueue_tasks = asyncio.all_tasks() - before - {send}
+    assert enqueue_tasks, "expected the enqueue task to exist before its first step"
+    for task in enqueue_tasks:
+        task.cancel()
+
+    with pytest.raises(ConnectionError):
+        await asyncio.wait_for(send, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_send_text_fails_loud_when_owner_loop_stopped() -> None:
+    """A stopped owner loop never runs the enqueue callback — fail loud.
+
+    In-process the owner loop is the server loop and stops only at shutdown
+    (the stopped-loop hang is not reachable in normal operation), but the
+    guard is cheap and turns a would-be forever-await into ConnectionError.
+    """
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    try:
+        reg = TunnelRegistry()
+
+        async def _register() -> object:
+            return reg.register("r1", _NoopWS(), _hello())
+
+        session = asyncio.run_coroutine_threadsafe(_register(), loop).result(timeout=5)
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5)
+        assert not loop.is_running()
+
+        with pytest.raises(ConnectionError, match="not running"):
+            await asyncio.wait_for(reg.send_text(session, "frame"), timeout=2.0)  # type: ignore[arg-type]
+    finally:
+        if loop.is_running():
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=5)
+        loop.close()
+
+
+@pytest.mark.asyncio
+async def test_retire_delivers_stop_sentinel_through_full_queue() -> None:
+    """Retiring a session with a full outbound queue still stops its sender.
+
+    The stop sentinel makes room by evicting one dead frame (the session's
+    in-flight requests are already aborted) instead of overflowing — so the
+    queue stays at its bound and the sender task still sees None and exits.
+    """
+    from omnigent.runner.transports.ws_tunnel.registry import _OUTBOUND_QUEUE_MAX_FRAMES
+
+    reg = TunnelRegistry()
+    old = reg.register("r1", _NoopWS(), _hello())
+    for _ in range(_OUTBOUND_QUEUE_MAX_FRAMES):
+        old.outbound_queue.put_nowait("frame")
+
+    reg.register("r1", _NoopWS(), _hello())  # newest-wins triggers retire of old
+    await asyncio.sleep(0)  # let the retire callback run on this loop
+
+    assert old.outbound_queue.qsize() == _OUTBOUND_QUEUE_MAX_FRAMES
+    drained = [old.outbound_queue.get_nowait() for _ in range(old.outbound_queue.qsize())]
+    assert drained[-1] is None

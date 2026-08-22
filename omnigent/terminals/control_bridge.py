@@ -74,8 +74,10 @@ from omnigent.terminals.ws_bridge import (
     WS_CLOSE_INTERNAL_ERROR,
     WS_CLOSE_TERMINAL_DETACHED,
     WS_CLOSE_TERMINAL_NOT_FOUND,
+    _ByteBoundedOutputQueue,
     _coalesce_limit_after_input,
     _forward_pty_to_ws,
+    _GapRepainter,
     _monotonic,
 )
 
@@ -113,6 +115,11 @@ _CONTROL_READ_CHUNK: Final[int] = 256 * 1024
 # single read; raise it so a large burst can be pulled in one wakeup.
 _CONTROL_STDOUT_BUFFER_LIMIT: Final[int] = 16 * 1024 * 1024
 
+# Bound on one buffered partial control line; a line that outgrows it is
+# discarded whole (%output records are lossy-safe and the queue's gap
+# handling repaints) instead of accumulating without limit across reads.
+_CONTROL_MAX_LINE_BYTES: Final[int] = _CONTROL_STDOUT_BUFFER_LIMIT
+
 # When the control reader ends with a send backlog still queued (a
 # burst-then-exit program), how long to let the forwarder finish draining that
 # sentinel-terminated backlog before teardown cancels it. Bounds teardown so a
@@ -133,6 +140,121 @@ _CLIPBOARD_READ_TIMEOUT_S: Final[float] = 2.0
 # Correlating the notification with this client's recent input prevents one
 # attached browser from overwriting every other viewer's local clipboard.
 _CLIPBOARD_RECENT_INPUT_WINDOW_S: Final[float] = 5.0
+
+
+async def _parse_control_stream(
+    stdout: asyncio.StreamReader,
+    handle_line: Callable[[bytes], bool],
+) -> None:
+    """Parse raw control-stream reads into lines routed via *handle_line*.
+
+    Reads with ``read()`` rather than ``readline()`` so one wakeup can pull
+    many buffered ``%output`` lines at once and an oversized line can't raise
+    ``LimitOverrunError``. ``read`` returns buffered data without suspending,
+    so the loop yields explicitly after each parsed batch to keep the event
+    loop live under a flood; a partial line that outgrows
+    :data:`_CONTROL_MAX_LINE_BYTES` is discarded whole rather than buffered
+    without bound.
+
+    :param stdout: The control client's stdout stream.
+    :param handle_line: Per-line router; returns ``False`` to stop reading.
+    :returns: None on stream EOF or when *handle_line* stops the read.
+    """
+    buffer = b""
+    discarding = False
+    while True:
+        data = await stdout.read(_CONTROL_READ_CHUNK)
+        if not data:
+            # tmux control client closed its stdout — server/session gone.
+            return
+        buffer += data
+        if discarding:
+            # Skip the tail of an oversized line through its newline; fall
+            # through either way so every batch reaches the yield below.
+            _, newline, buffer = buffer.partition(b"\n")
+            if newline:
+                discarding = False
+            else:
+                buffer = b""
+        # Parse all COMPLETE lines; keep any trailing partial for next read.
+        *lines, buffer = buffer.split(b"\n")
+        for raw_line in lines:
+            if len(raw_line) > _CONTROL_MAX_LINE_BYTES:
+                # A near-cap partial completed by this read can exceed the
+                # cap as a whole line without ever tripping the partial check.
+                _logger.warning(
+                    "control line exceeded %d bytes; discarding it whole",
+                    _CONTROL_MAX_LINE_BYTES,
+                )
+                continue
+            if not handle_line(raw_line.rstrip(b"\r")):
+                return
+        if len(buffer) > _CONTROL_MAX_LINE_BYTES:
+            _logger.warning(
+                "control line exceeded %d bytes; discarding it whole",
+                _CONTROL_MAX_LINE_BYTES,
+            )
+            buffer = b""
+            discarding = True
+        # Give the event loop a turn after each parsed batch.
+        await asyncio.sleep(0)
+
+
+async def _capture_pane_snapshot(socket_path: str, tmux_target: str) -> bytes | None:
+    """Capture the pane's screen as bytes that repaint a client terminal.
+
+    Gap recovery for control mode: ``refresh-client`` re-emits nothing to a
+    control client, so screen content lost to a drop gap is restored by
+    re-painting from a ``capture-pane`` snapshot — clear+home, the pane rows
+    with their escape sequences, then the cursor put back where tmux
+    reports it.
+
+    Ordering vs interleaved %output: records the reader enqueues before the
+    snapshot almost always predate the capture (tmux emits before we parse),
+    so the snapshot repainting over them is a no-op; anything emitted after
+    the capture lands behind it in FIFO order and re-renders on top. The
+    screen capture runs LAST (after the cursor query) to keep the window in
+    which output can both postdate the capture and precede it in the queue
+    to single milliseconds. Mode state flipped inside the gap (alt-screen,
+    cursor visibility) is not recaptured — capture-pane reports content only.
+
+    :param socket_path: Private tmux server socket path.
+    :param tmux_target: Pane target, e.g. a session name.
+    :returns: Snapshot bytes, or None when tmux is missing or the
+        capture fails (pane gone, server down).
+    """
+    tmux = shutil.which("tmux")
+    if tmux is None:
+        return None
+
+    async def _run(*args: str) -> bytes | None:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                tmux,
+                "-S",
+                socket_path,
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await proc.communicate()
+        except OSError:
+            return None
+        return out if proc.returncode == 0 else None
+
+    cursor_home = b""
+    cursor = await _run("display-message", "-p", "-t", tmux_target, "#{cursor_y} #{cursor_x}")
+    if cursor is not None:
+        try:
+            row, col = (int(v) for v in cursor.split())
+            cursor_home = f"\x1b[{row + 1};{col + 1}H".encode()
+        except ValueError:
+            pass
+    screen = await _run("capture-pane", "-p", "-e", "-t", tmux_target)
+    if screen is None:
+        return None
+    body = screen.rstrip(b"\n").replace(b"\n", b"\r\n")
+    return b"\x1b[H\x1b[2J" + body + cursor_home
 
 
 def unescape_control_output(value: bytes) -> bytes:
@@ -566,7 +688,11 @@ async def bridge_tmux_control_to_websocket(
     # (``None`` = EOF sentinel). The forwarder coalesces everything queued into
     # one bounded ``send_bytes``, so when the browser send lags tmux's firehose
     # a backlog of tiny per-line payloads collapses into a few large frames.
-    output_chunks: asyncio.Queue[bytes | None] = asyncio.Queue()
+    # Byte/item-bounded: saturation drops whole incoming %output records (never
+    # already-queued ones contiguous with sent bytes); each drop requests a
+    # captured-pane re-emit via the hook below (refresh-client is a no-op
+    # toward a control-mode client) and gap close injects parser-resync bytes.
+    output_chunks = _ByteBoundedOutputQueue()
     # Clipboard notifications are handled outside the raw output hot path: each
     # item names the immutable tmux buffer created by copy-mode; None is EOF.
     clipboard_buffers: asyncio.Queue[str | None] = asyncio.Queue()
@@ -592,6 +718,15 @@ async def bridge_tmux_control_to_websocket(
             await stdin.drain()
         except (ConnectionResetError, BrokenPipeError, OSError):
             return
+
+    async def _emit_pane_snapshot() -> None:
+        """Output was dropped: repaint from a pane snapshot, as synthetic output."""
+        snapshot = await _capture_pane_snapshot(socket_path, tmux_target)
+        if snapshot is not None:
+            output_chunks.put_nowait(snapshot)
+
+    repainter = _GapRepainter(_emit_pane_snapshot)
+    output_chunks.on_drop = repainter.request
 
     def _handle_control_line(line: bytes) -> bool:
         """Route one protocol line; return ``True`` to keep reading.
@@ -633,27 +768,9 @@ async def bridge_tmux_control_to_websocket(
         return True
 
     async def _read_control() -> None:
-        """Read raw control-stream chunks, parse lines, queue %output.
-
-        Reads with ``stdout.read()`` rather than ``readline()`` so one wakeup
-        can pull many buffered ``%output`` lines at once — letting the
-        forwarder coalesce them — and so an oversized line can't raise
-        ``LimitOverrunError``. Always enqueues the ``None`` EOF sentinel on exit
-        so the forwarder terminates.
-        """
-        buffer = b""
+        """Parse the control stream, queueing %output; EOF sentinel on exit."""
         try:
-            while True:
-                data = await stdout.read(_CONTROL_READ_CHUNK)
-                if not data:
-                    # tmux control client closed its stdout — server/session gone.
-                    return
-                buffer += data
-                # Parse all COMPLETE lines; keep any trailing partial for next read.
-                *lines, buffer = buffer.split(b"\n")
-                for raw_line in lines:
-                    if not _handle_control_line(raw_line.rstrip(b"\r")):
-                        return
+            await _parse_control_stream(stdout, _handle_control_line)
         finally:
             output_chunks.put_nowait(None)
             clipboard_buffers.put_nowait(None)
@@ -812,6 +929,7 @@ async def bridge_tmux_control_to_websocket(
         # Detach reflows the pane back to remaining clients — stamp it.
         if on_client_interaction is not None:
             on_client_interaction()
+        repainter.cancel()
         # Detach the control client: an empty command line detaches cleanly.
         await _send_command(b"\n")
         with contextlib.suppress(ProcessLookupError):

@@ -15,6 +15,7 @@ import asyncio
 import contextlib
 import fcntl
 import json
+import logging
 import os
 import pty
 import shutil
@@ -1536,3 +1537,274 @@ async def test_check_pane_dead_definitive_tri_state(
     # By calling with non-existent socket/target, tmux probe fails and returns None
     result = await _check_pane_dead_definitive("/nonexistent/socket", "nonexistent")
     assert result is None, "inconclusive probe should return None"
+
+
+# ── Output-queue backpressure ────────────────────────────
+
+
+def test_bounded_output_queue_rejects_new_chunks_past_byte_cap() -> None:
+    """A saturated bounded output queue drops the INCOMING chunk whole.
+
+    Evicting already-queued output could sever an escape sequence whose
+    prefix was already sent (wedging the client terminal parser), so the
+    queued backlog stays intact and the new chunk is shed instead.
+    """
+    from omnigent.terminals.ws_bridge import _ByteBoundedOutputQueue
+
+    queue = _ByteBoundedOutputQueue(max_bytes=10, max_items=100)
+    queue.put_nowait(b"aaaa")
+    queue.put_nowait(b"bbbb")
+    queue.put_nowait(b"cccc")  # would exceed 10 queued bytes -> dropped whole
+
+    assert queue.queued_bytes <= 10
+    assert queue.dropped_chunks == 1
+    assert queue.dropped_bytes == 4
+    remaining = [queue.get_nowait() for _ in range(queue.qsize())]
+    assert remaining == [b"aaaa", b"bbbb"]
+    assert queue.queued_bytes == 0  # _get accounting drains with the items
+
+
+def test_bounded_output_queue_enforces_item_cap() -> None:
+    """The item cap bounds object memory even when chunks are tiny."""
+    from omnigent.terminals.ws_bridge import _ByteBoundedOutputQueue
+
+    queue = _ByteBoundedOutputQueue(max_bytes=1_000_000, max_items=2)
+    queue.put_nowait(b"a")
+    queue.put_nowait(b"b")
+    queue.put_nowait(b"c")  # third item -> dropped
+
+    assert queue.qsize() == 2
+    assert queue.dropped_chunks == 1
+
+
+def test_bounded_output_queue_accounts_oversized_lone_chunk() -> None:
+    """A lone chunk above the byte budget is accepted at its REAL size.
+
+    Producers bound single-chunk size, so accepting one oversized chunk
+    into an empty queue keeps the backlog at most one chunk over budget —
+    and its real byte count must gate every subsequent put.
+    """
+    from omnigent.terminals.ws_bridge import _ByteBoundedOutputQueue
+
+    queue = _ByteBoundedOutputQueue(max_bytes=4, max_items=100)
+    queue.put_nowait(b"xxxxxxxx")  # alone: accepted despite exceeding budget
+    assert queue.queued_bytes == 8
+    queue.put_nowait(b"y")  # already over budget with company -> dropped
+    assert queue.dropped_chunks == 1
+    assert queue.get_nowait() == b"xxxxxxxx"
+
+
+def test_bounded_output_queue_gap_close_injects_resync() -> None:
+    """Closing a drop gap injects parser-resync bytes before resuming output.
+
+    The resync bytes (CAN + ST) unwedge a client parser left mid-escape by
+    the gap.
+    """
+    from omnigent.terminals.ws_bridge import _OUTPUT_GAP_RESYNC, _ByteBoundedOutputQueue
+
+    queue = _ByteBoundedOutputQueue(max_bytes=8, max_items=100)
+    queue.put_nowait(b"aaaa")
+    queue.put_nowait(b"bbbb")
+    queue.put_nowait(b"cccc")  # dropped -> gap opens
+
+    assert queue.get_nowait() == b"aaaa"  # consumer drains below budget
+    assert queue.get_nowait() == b"bbbb"
+    queue.put_nowait(b"dddd")  # gap closes: resync precedes resuming output
+    assert [queue.get_nowait(), queue.get_nowait()] == [_OUTPUT_GAP_RESYNC, b"dddd"]
+
+
+def test_bounded_output_queue_requests_repaint_on_each_drop() -> None:
+    """The DROP itself fires the recovery hook, not a later accepted chunk.
+
+    A flood tail can be the last output for a long while; recovery waiting
+    on a future accepted chunk would leave the screen stale indefinitely.
+    """
+    from omnigent.terminals.ws_bridge import _ByteBoundedOutputQueue
+
+    drops: list[int] = []
+    queue = _ByteBoundedOutputQueue(max_bytes=4, max_items=100)
+    queue.on_drop = lambda: drops.append(1)
+    queue.put_nowait(b"aaaa")
+    queue.put_nowait(b"bbbb")  # dropped -> hook fires immediately
+    assert drops == [1]
+    queue.put_nowait(b"cc")  # dropped again -> fires again (repainter throttles)
+    assert drops == [1, 1]
+
+
+def test_bounded_output_queue_eof_sentinel_always_lands_last() -> None:
+    """The None EOF sentinel is accepted even when saturated, in order.
+
+    Losing the sentinel would leave the forwarder blocked on get() forever;
+    displacing queued data for it would drop a live final chunk.
+    """
+    from omnigent.terminals.ws_bridge import _ByteBoundedOutputQueue
+
+    queue = _ByteBoundedOutputQueue(max_bytes=4, max_items=1)
+    queue.put_nowait(b"aaaaaaaa")  # lone oversized final chunk survives
+    queue.put_nowait(b"bb")  # saturated -> dropped
+    queue.put_nowait(None)
+
+    drained = [queue.get_nowait() for _ in range(queue.qsize())]
+    assert drained == [b"aaaaaaaa", None]
+
+
+def test_bounded_output_queue_saturation_warns_rate_limited(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Saturation logs one WARNING with counters, not one per dropped chunk."""
+    from omnigent.terminals.ws_bridge import _ByteBoundedOutputQueue
+
+    queue = _ByteBoundedOutputQueue(max_bytes=4, max_items=100)
+    queue.put_nowait(b"xxxxxxxx")
+    with caplog.at_level(logging.WARNING, logger="omnigent.terminals.ws_bridge"):
+        for _ in range(50):
+            queue.put_nowait(b"flood")
+    saturation_warnings = [r for r in caplog.records if "saturated" in r.message]
+    assert len(saturation_warnings) == 1
+    assert queue.dropped_chunks == 50
+
+
+@pytest.mark.asyncio
+async def test_gap_repainter_coalesces_bursts_and_paces_repaints() -> None:
+    """A burst of gap closes runs ONE repaint; the next waits out the floor.
+
+    Unthrottled, a slow-but-live consumer cycling gaps at send rate would
+    spawn a repaint subprocess per gap and each redraw amplifies the flood.
+    The trailing-edge behavior still guarantees the final gap repaints.
+    """
+    from omnigent.terminals.ws_bridge import _GapRepainter
+
+    runs: list[int] = []
+
+    async def _repaint() -> None:
+        runs.append(1)
+
+    repainter = _GapRepainter(_repaint, min_interval_s=0.1)
+    for _ in range(5):
+        repainter.request()  # burst: one outstanding repaint, not five
+    await asyncio.sleep(0.02)
+    assert len(runs) == 1
+
+    repainter.request()  # inside the cooldown: parked, not run yet
+    repainter.request()  # coalesced into the parked one
+    await asyncio.sleep(0.02)
+    assert len(runs) == 1, "repaint ran inside the min-interval floor"
+    await asyncio.sleep(0.15)
+    assert len(runs) == 2, "trailing gap close never repainted"
+
+
+@pytest.mark.asyncio
+async def test_gap_repainter_cancel_drops_pending_repaint() -> None:
+    """Teardown cancel stops a parked repaint from firing later."""
+    from omnigent.terminals.ws_bridge import _GapRepainter
+
+    runs: list[int] = []
+
+    async def _repaint() -> None:
+        runs.append(1)
+
+    repainter = _GapRepainter(_repaint, min_interval_s=0.05)
+    repainter.request()
+    await asyncio.sleep(0.01)
+    assert len(runs) == 1
+    repainter.request()  # parked on the cooldown
+    repainter.cancel()
+    await asyncio.sleep(0.15)
+    assert len(runs) == 1, "cancelled pending repaint still fired"
+
+
+@pytest.mark.asyncio
+async def test_gap_repainter_parks_trailing_request_during_inflight_capture() -> None:
+    """A request while a capture is in flight parks ONE trailing run.
+
+    The in-flight capture may predate the event that requested it; skipping
+    the request would leave that gap stale forever if nothing else arrives.
+    """
+    from omnigent.terminals.ws_bridge import _GapRepainter
+
+    gate = asyncio.Event()
+    runs: list[int] = []
+
+    async def _repaint() -> None:
+        runs.append(1)
+        await gate.wait()
+
+    repainter = _GapRepainter(_repaint, min_interval_s=0.01)
+    repainter.request()
+    await asyncio.sleep(0.01)
+    assert runs == [1]  # capture 1 in flight, blocked on the gate
+
+    repainter.request()  # arrives mid-capture: must park, not vanish
+    gate.set()
+    await asyncio.sleep(0.1)
+    assert len(runs) == 2, "request during in-flight capture was lost"
+
+
+@pytest.mark.asyncio
+async def test_dropped_snapshot_leaves_a_parked_repaint() -> None:
+    """A recovery snapshot that is itself dropped re-requests recovery.
+
+    Otherwise the drop reopens the gap with nothing scheduled and the screen
+    stays stale until unrelated output happens to arrive.
+    """
+    from omnigent.terminals.ws_bridge import (
+        _OUTPUT_GAP_RESYNC,
+        _ByteBoundedOutputQueue,
+        _GapRepainter,
+    )
+
+    queue = _ByteBoundedOutputQueue(max_bytes=4, max_items=100)
+    runs: list[int] = []
+
+    async def _repaint() -> None:
+        runs.append(1)
+        queue.put_nowait(b"SNAPSHOT!")  # above the byte budget
+
+    repainter = _GapRepainter(_repaint, min_interval_s=0.05)
+    queue.on_drop = repainter.request
+
+    queue.put_nowait(b"aaaa")  # fills the budget
+    queue.put_nowait(b"bbbb")  # dropped -> repaint requested
+    await asyncio.sleep(0.01)
+    assert runs == [1]  # ran, but its snapshot was itself dropped
+
+    assert queue.get_nowait() == b"aaaa"  # consumer finally drains
+    await asyncio.sleep(0.1)  # the parked trailing repaint fires post-cooldown
+    assert len(runs) == 2, "dropped snapshot left no repaint behind"
+    assert queue.get_nowait() == _OUTPUT_GAP_RESYNC
+    assert queue.get_nowait() == b"SNAPSHOT!"
+
+
+@pytest.mark.asyncio
+async def test_pump_pty_chunks_caps_reads_per_wakeup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One add_reader wakeup drains at most the per-wakeup read cap.
+
+    add_reader is level-triggered, so leaving data buffered just re-fires the
+    callback next loop pass — but an uncapped drain of a flooding PTY would
+    starve every other callback (tunnel heartbeats included) until EAGAIN.
+    """
+    from omnigent.terminals.ws_bridge import _pump_pty_chunks
+
+    monkeypatch.setattr(ws_bridge, "_PTY_READS_PER_WAKEUP", 4)
+    read_fd, write_fd = os.pipe()
+    try:
+        os.set_blocking(read_fd, False)
+        os.set_blocking(write_fd, False)
+        # More data than 4 reads can drain (reads are ≤ _PTY_READ_CHUNK each).
+        written = 0
+        with contextlib.suppress(BlockingIOError):
+            while written < 8 * ws_bridge._PTY_READ_CHUNK:
+                written += os.write(write_fd, b"z" * ws_bridge._PTY_READ_CHUNK)
+        assert written > 5 * ws_bridge._PTY_READ_CHUNK, "pipe buffer too small for test"
+
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+        _pump_pty_chunks(loop, read_fd, queue)
+
+        assert queue.qsize() <= 4, "single wakeup drained past the read cap"
+        assert os.read(read_fd, 1), "cap hit but pipe was fully drained"
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)

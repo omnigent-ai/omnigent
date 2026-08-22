@@ -52,6 +52,15 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 
 _logger = logging.getLogger(__name__)
 
+# Cap on frames queued for a runner's sender task (a count cap: individual
+# frames stay small because request/response bodies cross the tunnel as
+# chunked body frames). Protocol frames are never dropped or coalesced — a
+# lost frame strands its RPC silently — so a full queue makes ``send_text``
+# WAIT for the sender to drain, and only a sender that frees no room within
+# the stall deadline fails the send loudly with ConnectionError.
+_OUTBOUND_QUEUE_MAX_FRAMES = 1024
+_OUTBOUND_SEND_STALL_S = 10.0
+
 
 class WebSocketLike(Protocol):
     """Minimal WebSocket protocol used by the registry + transport.
@@ -272,7 +281,7 @@ class TunnelRegistry:
             ws=ws,
             hello=hello,
             loop=loop,
-            outbound_queue=asyncio.Queue(),
+            outbound_queue=asyncio.Queue(maxsize=_OUTBOUND_QUEUE_MAX_FRAMES),
             connected_at=now,
             last_frame_at=now,
             owner=owner,
@@ -685,26 +694,89 @@ class TunnelRegistry:
         :returns: None after the frame has been accepted into the
             route-loop outbound queue.
         :raises ConnectionError: If ``session`` is no longer the
-            registry's current generation for its runner id.
+            registry's current generation for its runner id, or its
+            sender freed no queue room within the stall deadline.
         """
         ack: concurrent.futures.Future[None] = concurrent.futures.Future()
 
-        def _enqueue() -> None:
-            """Run on ``session.loop`` and enqueue the outbound frame."""
-            error: ConnectionError | None = None
-            with self._lock:
-                if self._sessions.get(session.runner_id) is not session:
-                    error = ConnectionError(f"runner {session.runner_id!r} tunnel was replaced")
-                else:
-                    session.outbound_queue.put_nowait(data)
-            if error is not None:
-                if not ack.done():
-                    ack.set_exception(error)
+        def _resolve(error: BaseException | None) -> None:
+            """Settle ``ack`` once; later resolutions are no-ops."""
+            if ack.done():
+                return
+            if error is None:
+                ack.set_result(None)
             else:
-                if not ack.done():
-                    ack.set_result(None)
+                ack.set_exception(error)
 
-        _call_session_soon_threadsafe(session, _enqueue)
+        def _stale() -> bool:
+            with self._lock:
+                return self._sessions.get(session.runner_id) is not session
+
+        def _replaced_error() -> ConnectionError:
+            return ConnectionError(f"runner {session.runner_id!r} tunnel was replaced")
+
+        async def _enqueue() -> None:
+            """Run on ``session.loop``: bounded-wait enqueue of the frame."""
+            try:
+                if _stale():
+                    _resolve(_replaced_error())
+                    return
+                try:
+                    # A full queue is backpressure, not failure: a burst can
+                    # fill it faster than the sender wakes, so wait for drain
+                    # and only treat no room freed in the deadline as failure.
+                    await asyncio.wait_for(
+                        session.outbound_queue.put(data), timeout=_OUTBOUND_SEND_STALL_S
+                    )
+                except TimeoutError:
+                    if _stale():
+                        _resolve(_replaced_error())
+                        return
+                    _logger.warning(
+                        "runner %s outbound queue freed no room in %.0fs (%d frames); "
+                        "failing send (sender stalled, or outpaced by concurrent senders)",
+                        session.runner_id,
+                        _OUTBOUND_SEND_STALL_S,
+                        session.outbound_queue.qsize(),
+                    )
+                    _resolve(
+                        ConnectionError(
+                            f"runner {session.runner_id!r} outbound tunnel stalled "
+                            "(sender dead, or saturated by concurrent sends)"
+                        )
+                    )
+                    return
+                if _stale():
+                    # The frame landed in a retired queue no sender drains.
+                    _resolve(_replaced_error())
+                    return
+                _resolve(None)
+            finally:
+                # Route teardown can cancel this task mid-wait; the caller
+                # must never be left awaiting an ack nothing will settle.
+                _resolve(_replaced_error())
+
+        def _finalize_enqueue(task: asyncio.Task[None]) -> None:
+            """Backstop: a task cancelled before its coroutine's first step
+            never enters the try/finally, so settle the ack from done()."""
+            if not task.cancelled():
+                _ = task.exception()
+            _resolve(_replaced_error())
+
+        def _start_enqueue() -> None:
+            """Run on the owner loop; task-ify the bounded-wait put."""
+            task = asyncio.get_running_loop().create_task(_enqueue())
+            task.add_done_callback(_finalize_enqueue)
+
+        if not session.loop.is_running():
+            # A stopped owner loop never runs the scheduled callback (only
+            # expected at process shutdown) — fail loud, don't await forever.
+            raise ConnectionError(f"runner {session.runner_id!r} tunnel loop is not running")
+        try:
+            _call_session_soon_threadsafe(session, _start_enqueue)
+        except RuntimeError as exc:
+            # Loop closed between the check above and the schedule call.
+            raise ConnectionError(f"runner {session.runner_id!r} tunnel loop is closed") from exc
         await asyncio.wrap_future(ack)
 
     # ── Routing incoming frames ──────────────────────────
@@ -778,7 +850,13 @@ def _retire_session_writer(session: RunnerSession, *, code: int, reason: str) ->
 
     def _retire() -> None:
         """Run on the WebSocket owner loop."""
-        session.outbound_queue.put_nowait(None)
+        try:
+            session.outbound_queue.put_nowait(None)
+        except asyncio.QueueFull:
+            # A retired session's pending frames are already dead (in-flight
+            # requests were aborted) — make room so the stop sentinel lands.
+            session.outbound_queue.get_nowait()
+            session.outbound_queue.put_nowait(None)
         close = getattr(session.ws, "close", None)
         if close is not None:
             with contextlib.suppress(Exception):
