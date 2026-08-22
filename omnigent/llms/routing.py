@@ -33,6 +33,16 @@ PROVIDER_CONFIGS: dict[str, str | None] = {
 
 _DEFAULT_PROVIDER = "openai"
 
+# Maps model name prefixes to their default provider when no slash prefix is present
+_UNPREFIXED_MODEL_PREFIXES: dict[str, str] = {
+    "claude-": "anthropic",
+    "gemini-": "gemini",
+    "grok-": "xai",
+    "deepseek-": "deepseek",
+    "gpt-": "openai",
+    "databricks-": "databricks",
+}
+
 
 @dataclass
 class RoutedModel:
@@ -52,8 +62,8 @@ def parse_model_string(model: str) -> RoutedModel:
     """
     Parse a ``"provider/model-name"`` string into its components.
 
-    If no ``"/"`` is present, the provider defaults to ``"openai"``
-    for backward compatibility.
+    If no ``"/"`` is present, the provider is inferred from model name
+    prefixes (e.g. "claude-" -> "anthropic") or defaults to "openai".
 
     :param model: The model string, e.g.
         ``"anthropic/claude-sonnet-4-20250514"`` or ``"gpt-5.4"``.
@@ -64,6 +74,10 @@ def parse_model_string(model: str) -> RoutedModel:
         provider, model_name = model.split("/", 1)
     else:
         provider = _DEFAULT_PROVIDER
+        for prefix, p_name in _UNPREFIXED_MODEL_PREFIXES.items():
+            if model.startswith(prefix):
+                provider = p_name
+                break
         model_name = model
 
     if provider not in PROVIDER_CONFIGS:

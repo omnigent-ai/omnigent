@@ -74,6 +74,24 @@ def test_parse_without_prefix_defaults_to_openai() -> None:
     assert result == RoutedModel(provider="openai", model="gpt-5.4")
 
 
+@pytest.mark.parametrize(
+    ("unprefixed_model", "expected_provider"),
+    [
+        ("claude-opus-4-8", "anthropic"),
+        ("gemini-2.5-flash", "gemini"),
+        ("grok-2", "xai"),
+        ("deepseek-chat", "deepseek"),
+        ("databricks-gpt-5-4", "databricks"),
+    ],
+)
+def test_parse_without_prefix_infers_provider(
+    unprefixed_model: str,
+    expected_provider: str,
+) -> None:
+    result = parse_model_string(unprefixed_model)
+    assert result == RoutedModel(provider=expected_provider, model=unprefixed_model)
+
+
 def test_unknown_provider_raises() -> None:
     with pytest.raises(OmnigentError, match="Unknown provider 'foobar'"):
         parse_model_string("foobar/some-model")
