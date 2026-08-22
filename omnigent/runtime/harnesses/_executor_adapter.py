@@ -56,6 +56,7 @@ _logger = logging.getLogger(__name__)
 
 # Observed tool calls use "in_progress" (distinct from "action_required" for server-dispatched).
 _OBSERVED_TOOL_CALL_STATUS = "in_progress"
+_COMPLETED_TOOL_CALL_STATUS = "completed"
 
 
 # Prefix for Claude SDK MCP-registered tool names (e.g. ``mcp__omnigent__sys_terminal_launch``).
@@ -714,17 +715,24 @@ class ExecutorAdapter(HarnessApp):
             # so the post-stream dispatch reuses the same call_id for deduplication.
             # Emit bare names (strip MCP prefix) to match the Omnigent wire shape.
             tool_use_id = _call_id_from_metadata(event.metadata)
-            if tool_use_id is not None:
+            # Observed native tools already ran inside their harness. They must
+            # never enter the queue consumed by Omnigent's dispatch bridge.
+            if tool_use_id is not None and event.metadata.get("internally_executed") is not True:
                 self._pending_mcp_call_ids.append(tool_use_id)
             call_id = tool_use_id or f"call_{uuid.uuid4().hex[:12]}"
             bare_name = _strip_mcp_tool_prefix(event.name)
+            status = (
+                _COMPLETED_TOOL_CALL_STATUS
+                if event.metadata.get("observed_call_completed") is True
+                else _OBSERVED_TOOL_CALL_STATUS
+            )
             ctx.emit(
                 OutputItemDoneEvent(
                     type="response.output_item.done",
                     item={
                         "id": f"fc_{uuid.uuid4().hex[:12]}",
                         "type": "function_call",
-                        "status": _OBSERVED_TOOL_CALL_STATUS,
+                        "status": status,
                         "name": bare_name,
                         "arguments": _serialize_args(event.args),
                         "call_id": call_id,
