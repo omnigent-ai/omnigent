@@ -14,6 +14,8 @@ from pathlib import Path
 
 import tomllib
 
+from omnigent.native_bridge_ids import normalize_bridge_id
+
 CODEX_NATIVE_BRIDGE_ID_LABEL_KEY = "omnigent.codex_native.bridge_id"
 CODEX_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_CODEX_NATIVE_BRIDGE_DIR"
 CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR = "HARNESS_CODEX_NATIVE_REQUEST_SESSION_ID"
@@ -94,11 +96,13 @@ def bridge_dir_for_bridge_id(bridge_id: str) -> Path:
     """
     Return the bridge directory for a native Codex bridge id.
 
-    :param bridge_id: Opaque bridge id, e.g. ``"bridge_abc123"``.
+    :param bridge_id: Opaque bridge id, e.g. ``"bridge_abc123"``. A legacy
+        ``conv_``-prefixed id is normalised, so both spellings of a session
+        share one directory.
     :returns: Absolute bridge directory under
         ``~/.omnigent/codex-native``.
     """
-    digest = hashlib.sha256(bridge_id.encode("utf-8")).hexdigest()[:32]
+    digest = hashlib.sha256(normalize_bridge_id(bridge_id).encode("utf-8")).hexdigest()[:32]
     return _BRIDGE_ROOT / digest
 
 

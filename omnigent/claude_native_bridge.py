@@ -58,6 +58,7 @@ from omnigent.claude_native_message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.claude_native_status import CONTEXT_RAW_FILE
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.kiro_native_bridge import bridge_root as kiro_bridge_root
+from omnigent.native_bridge_ids import normalize_bridge_id
 
 if TYPE_CHECKING:
     import httpx
@@ -924,11 +925,13 @@ def bridge_dir_for_bridge_id(bridge_id: str) -> Path:
     """
     Return the deterministic bridge directory for a Claude-native bridge.
 
-    :param bridge_id: Opaque bridge id, e.g. ``"bridge_abc123"``.
+    :param bridge_id: Opaque bridge id, e.g. ``"bridge_abc123"``. A legacy
+        ``conv_``-prefixed id is normalised, so both spellings of a session
+        share one directory.
     :returns: Absolute bridge directory under
         ``/tmp/omnigent-<UID>/claude-native``.
     """
-    digest = hashlib.sha256(bridge_id.encode("utf-8")).hexdigest()[:32]
+    digest = hashlib.sha256(normalize_bridge_id(bridge_id).encode("utf-8")).hexdigest()[:32]
     return _BRIDGE_ROOT / digest
 
 
@@ -960,7 +963,7 @@ def build_claude_native_spawn_env(
     :returns: Environment variables needed by
         :class:`ClaudeNativeExecutor`.
     """
-    resolved_bridge_id = bridge_id or conversation_id
+    resolved_bridge_id = normalize_bridge_id(bridge_id or conversation_id)
     return {
         BRIDGE_DIR_ENV_VAR: str(bridge_dir_for_bridge_id(resolved_bridge_id)),
         REQUEST_SESSION_ID_ENV_VAR: conversation_id,
@@ -1029,7 +1032,7 @@ def prepare_bridge_dir(
         :func:`_bridge_sandbox_payload`.
     :returns: Bridge directory path.
     """
-    resolved_bridge_id = bridge_id or conversation_id
+    resolved_bridge_id = normalize_bridge_id(bridge_id or conversation_id)
     bridge_dir = bridge_dir_for_bridge_id(resolved_bridge_id)
     _ensure_secure_dir(bridge_dir)
     config = _read_json_file(bridge_dir / _CONFIG_FILE)

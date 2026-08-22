@@ -7048,9 +7048,12 @@ async def _claude_native_bridge_id_for_session(
         ``None`` selects the legacy labels callback.
     :returns: Opaque bridge id from
         ``omnigent.claude_native.bridge_id`` when present, otherwise
-        *session_id* for legacy single-session bridges.
+        *session_id* for legacy single-session bridges. A label written
+        before ids dropped their ``conv_`` prefix is normalised, so it still
+        compares equal to the ids every other path now spells bare.
     """
     from omnigent.claude_native_bridge import BRIDGE_ID_LABEL_KEY
+    from omnigent.native_bridge_ids import normalize_bridge_id
 
     labels = (
         session_labels
@@ -7062,7 +7065,7 @@ async def _claude_native_bridge_id_for_session(
     )
     bridge_id = labels.get(BRIDGE_ID_LABEL_KEY)
     if isinstance(bridge_id, str) and bridge_id:
-        return bridge_id
+        return normalize_bridge_id(bridge_id)
     return session_id
 
 
