@@ -70,6 +70,43 @@ def _normalize_host_id(host_id: str) -> str:
     return host_id
 
 
+def _validated_host_id(host_id: str, *, source: str, remedy: str) -> str:
+    """Normalize *host_id* and verify it is a valid (UUID-shaped) host id.
+
+    Host ids are stored server-side in a UUID column, so the tunnel route
+    normalises the ``{host_id}`` path segment through
+    :func:`omnigent.db.db_models.uuid_to_bytes` and refuses anything that
+    is not a 32-char hex uuid (optionally dashed or legacy-prefixed). A
+    refusal there happens *before* the WebSocket is accepted, so it reaches
+    the client as an opaque ``HTTP 403`` with no body — indistinguishable
+    from an auth failure. Validating the id here, where it enters the
+    process from the env override or config file, turns that confusing
+    remote rejection into a loud, local, actionable error.
+
+    Reuses the server's own ``uuid_to_bytes`` (imported lazily so the host
+    CLI's common auto-generate path never pulls in the DB/sqlalchemy
+    module) so the client and server accept exactly the same id shapes.
+
+    :param host_id: The raw host id from the env override or config file.
+    :param source: Where it came from, named in the error (e.g. the env var).
+    :param remedy: How to fix it, appended to the error message.
+    :returns: The normalized (to bare hex, legacy-prefix-stripped) host id.
+    :raises ValueError: If *host_id* is not a valid uuid-shaped host id.
+    """
+    from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
+
+    try:
+        # Validate and normalize to bare hex (16 bytes -> 32-char hex string)
+        normalized = uuid_to_bytes(host_id).hex()
+    except InvalidUuidError:
+        raise ValueError(
+            f"{source} is not a valid host id: {host_id!r}. Host ids must be "
+            'UUIDs (generate one with `python -c "import uuid; '
+            'print(uuid.uuid4().hex)"`). ' + remedy
+        ) from None
+    return normalized
+
+
 def load_or_create_host_identity(
     path: Path = CONFIG_PATH,
 ) -> HostIdentity:
@@ -107,7 +144,15 @@ def load_or_create_host_identity(
             "(managed-host launch sets both)"
         )
     if env_host_id is not None and env_name is not None:
-        return HostIdentity(host_id=_normalize_host_id(env_host_id), name=env_name)
+        return HostIdentity(
+            host_id=_validated_host_id(
+                env_host_id,
+                source=f"${HOST_ID_ENV_VAR}",
+                remedy=f"Set {HOST_ID_ENV_VAR} to a UUID, or unset {HOST_ID_ENV_VAR} "
+                f"and {HOST_NAME_ENV_VAR} to have one generated automatically.",
+            ),
+            name=env_name,
+        )
 
     cfg: dict[str, object] = {}
     if path.exists():
@@ -121,14 +166,31 @@ def load_or_create_host_identity(
     host_id = host_section.get("host_id")
     name = host_section.get("name")
 
+    # A host_id read from config.yaml must be a valid (UUID-shaped) id, same
+    # as the env override — an invalid one would only fail later, remotely, as
+    # an opaque tunnel 403.
+    config_host_id_remedy = (
+        f"Fix host_id in the `host:` block of {path} to a UUID, or remove it "
+        "to have one generated automatically."
+    )
+
     # Fully specified: honor the config as-is, nothing to persist.
     if host_id and name:
-        return HostIdentity(host_id=_normalize_host_id(host_id), name=name)
+        return HostIdentity(
+            host_id=_validated_host_id(
+                host_id, source=f"host_id in {path}", remedy=config_host_id_remedy
+            ),
+            name=name,
+        )
 
     # Otherwise complete the section, preserving any provided value and
     # generating only what's missing, then persist so the identity is
     # stable across calls.
-    host_id = _normalize_host_id(host_id) if host_id else uuid.uuid4().hex
+    host_id = (
+        _validated_host_id(host_id, source=f"host_id in {path}", remedy=config_host_id_remedy)
+        if host_id
+        else uuid.uuid4().hex
+    )
     name = name or socket.gethostname()
     identity = HostIdentity(host_id=host_id, name=name)
 
@@ -167,7 +229,15 @@ def load_host_identity_if_present(
             "(managed-host launch sets both)"
         )
     if env_host_id is not None and env_name is not None:
-        return HostIdentity(host_id=_normalize_host_id(env_host_id), name=env_name)
+        return HostIdentity(
+            host_id=_validated_host_id(
+                env_host_id,
+                source=f"${HOST_ID_ENV_VAR}",
+                remedy=f"Set {HOST_ID_ENV_VAR} to a UUID, or unset {HOST_ID_ENV_VAR} "
+                f"and {HOST_NAME_ENV_VAR} to have one generated automatically.",
+            ),
+            name=env_name,
+        )
 
     if not path.exists():
         return None
@@ -176,7 +246,12 @@ def load_host_identity_if_present(
     host_section = cfg.get("host")
     if isinstance(host_section, dict) and "host_id" in host_section and "name" in host_section:
         return HostIdentity(
-            host_id=_normalize_host_id(host_section["host_id"]),
+            host_id=_validated_host_id(
+                host_section["host_id"],
+                source=f"host_id in {path}",
+                remedy=f"Fix host_id in the `host:` block of {path} to a UUID, or "
+                "remove it to have one generated automatically.",
+            ),
             name=host_section["name"],
         )
     return None

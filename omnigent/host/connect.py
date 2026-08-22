@@ -1339,6 +1339,19 @@ class HostProcess:
                 "(the /v1/hosts tunnel route). Confirm you have access and that "
                 "the server is up to date, then retry. " + self._login_fix_hint()
             )
+        if status == 400:
+            # The server refuses the tunnel upgrade with a 400 (before accept)
+            # only for a malformed host id — one that is not a UUID. The client
+            # now validates the id up front (omnigent.host.identity), so this is
+            # a belt-and-suspenders message for a host built before that check
+            # or pointed at an id the server normalises differently.
+            return HostConnectError(
+                "Connection refused (HTTP 400): the server rejected the host id "
+                "as invalid. Host ids must be UUIDs. Set OMNIGENT_HOST_ID to a "
+                'UUID (generate one with `python -c "import uuid; '
+                'print(uuid.uuid4().hex)"`), or unset it to have one generated, '
+                "then restart the host."
+            )
         if status == 409:
             return HostConnectError(
                 "Connection refused (HTTP 409): this machine is already "
