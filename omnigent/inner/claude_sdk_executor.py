@@ -83,6 +83,7 @@ from .sandbox import (
     with_additional_write_files,
     with_additional_write_roots,
 )
+from .vertex_anthropic_shim import PLACEHOLDER_API_KEY, VertexAnthropicGatewayShim
 
 logger = logging.getLogger(__name__)
 
@@ -1422,6 +1423,8 @@ class ClaudeSDKExecutor(Executor):
         base_url_override: str | None = None,
         gateway_auth_command: str | None = None,
         gateway_auth_refresh_interval_ms: str | None = None,
+        vertex_project: str | None = None,
+        vertex_location: str = "global",
         retry_policy: RetryPolicy | None = None,
         bundle_dir: pathlib.Path | None = None,
         agent_name: str | None = None,
@@ -1469,6 +1472,22 @@ class ClaudeSDKExecutor(Executor):
             gateway_auth_refresh_interval_ms: Refresh TTL as a string,
                 e.g. ``"900000"``. Set from
                 ``HARNESS_CLAUDE_SDK_GATEWAY_AUTH_REFRESH_INTERVAL_MS``.
+            vertex_project: GCP project id with Claude enabled on Vertex
+                AI. When set, routes through
+                :class:`~omnigent.inner.vertex_anthropic_shim.VertexAnthropicGatewayShim`
+                instead of the generic/Databricks gateway path — Vertex's
+                Claude integration uses a different wire shape
+                (``:rawPredict``/``:streamRawPredict``, GCP OAuth2 bearer
+                auth resolved from Application Default Credentials in
+                this process, never inside the sandboxed CLI subprocess)
+                that the generic gateway shim doesn't translate. Set from
+                ``HARNESS_CLAUDE_SDK_VERTEX_PROJECT``. Mutually exclusive
+                with ``gateway=True`` — a spec that sets both is a config
+                error (see the constructor's validation).
+            vertex_location: Vertex location, e.g. ``"global"`` or
+                ``"us-east5"``. Set from
+                ``HARNESS_CLAUDE_SDK_VERTEX_LOCATION``, defaulting to
+                ``"global"``. Ignored unless *vertex_project* is set.
             bundle_dir: Materialized agent-bundle root, when the agent
                 ships its own ``skills/`` directory. Used to expose
                 bundled skills to Claude via ``--plugin-dir <bundle>``
@@ -1509,6 +1528,17 @@ class ClaudeSDKExecutor(Executor):
                 "Set executor.profile in the agent spec, or configure a "
                 "Databricks provider with `omnigent setup`, to route through "
                 "the Databricks Anthropic gateway."
+            )
+        # Fail loud: the two transports set ANTHROPIC_BASE_URL in
+        # incompatible ways (a real upstream to intercept vs. a sentinel
+        # this executor invents itself); combining them would silently
+        # pick whichever wins the extra_env update order.
+        if gateway and vertex_project is not None:
+            raise ValueError(
+                "ClaudeSDKExecutor got both gateway=True and vertex_project="
+                f"{vertex_project!r}; these are mutually exclusive transports. "
+                "Vertex AI is its own gateway-like path — do not also set "
+                "executor.profile / a generic gateway provider."
             )
         self._cwd = cwd
         self._os_env_spec = os_env
@@ -1597,6 +1627,16 @@ class ClaudeSDKExecutor(Executor):
         # Started on the first gateway turn — __init__ has no event loop.
         self._gateway_shim: ClaudeGatewayShim | None = None
 
+        # Lazily-started local proxy that translates Anthropic Messages
+        # API requests into Vertex AI's rawPredict/streamRawPredict shape
+        # (see vertex_anthropic_shim.py). Started on the first turn, same
+        # lifecycle as _gateway_shim, but a distinct attribute — the two
+        # transports are mutually exclusive (validated above) and proxy
+        # fundamentally different upstream contracts.
+        self._vertex_project = vertex_project
+        self._vertex_location = vertex_location
+        self._vertex_shim: VertexAnthropicGatewayShim | None = None
+
         # Eagerly resolve the gateway transport env so errors surface at
         # construction time.
         self._extra_env: dict[str, str] = {}
@@ -1615,6 +1655,17 @@ class ClaudeSDKExecutor(Executor):
                     "~/.databrickscfg profile."
                 )
             self._extra_env.update(gateway_env)
+        elif vertex_project is not None:
+            # No real upstream ANTHROPIC_BASE_URL exists to intercept here
+            # (unlike the gateway path) — Claude's own Vertex support goes
+            # through CLAUDE_CODE_USE_VERTEX, not ANTHROPIC_BASE_URL, and
+            # that path reads GCP credentials directly inside the CLI
+            # subprocess, which is exactly what this transport avoids. This
+            # sentinel exists only so an unexpected failure to reach
+            # _route_options_through_gateway_shim (a future bug, not a
+            # normal outcome) produces an obviously-broken URL instead of
+            # a silently wrong one.
+            self._extra_env["ANTHROPIC_BASE_URL"] = "https://vertex-anthropic.invalid"
         self._extra_env[_CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV] = "true"
 
         # Retry policy → Anthropic SDK env vars passed to the Claude
@@ -1648,8 +1699,17 @@ class ClaudeSDKExecutor(Executor):
         from its requests (experimental betas are disabled there),
         which silences opus thinking; the shim restores the field. See
         the :mod:`~omnigent.inner.claude_gateway_shim` module
-        docstring for the full failure chain. No-op off the gateway
-        path.
+        docstring for the full failure chain.
+
+        On the Vertex AI path (mutually exclusive with the gateway path;
+        validated in ``__init__``), routes through
+        :class:`~omnigent.inner.vertex_anthropic_shim.VertexAnthropicGatewayShim`
+        instead, which translates the request into Vertex's
+        ``:rawPredict``/``:streamRawPredict`` shape and resolves a GCP
+        access token in this process — the sandboxed CLI subprocess never
+        sees a GCP credential.
+
+        No-op when neither transport is configured.
 
         :param options: SDK options about to be passed to
             ``ClaudeSDKClient``; ``options.env["ANTHROPIC_BASE_URL"]``
@@ -1658,6 +1718,25 @@ class ClaudeSDKExecutor(Executor):
             without an ``ANTHROPIC_BASE_URL`` — a config bug that
             would silently bypass the shim.
         """
+        if self._vertex_project is not None:
+            if self._vertex_shim is None:
+                self._vertex_shim = VertexAnthropicGatewayShim(
+                    project=self._vertex_project,
+                    location=self._vertex_location,
+                )
+            await self._vertex_shim.start()
+            env = getattr(options, "env", None)
+            if isinstance(env, dict):
+                env["ANTHROPIC_BASE_URL"] = self._vertex_shim.base_url
+                # The shim never reads this value (its real auth is a GCP
+                # token attached upstream — see PLACEHOLDER_API_KEY docs),
+                # but the CLI itself refuses to run with no key at all and
+                # reports "Not logged in". ANTHROPIC_API_KEY is stripped
+                # from os.environ (not options.env) around the connect
+                # call below, so setting it here — a later merge layer —
+                # survives that strip.
+                env["ANTHROPIC_API_KEY"] = PLACEHOLDER_API_KEY
+            return
         if not self._gateway:
             return
         env = getattr(options, "env", None)
@@ -1719,6 +1798,20 @@ class ClaudeSDKExecutor(Executor):
                 # non-gateway branch re-adds the key through ``options.env``,
                 # which wins over os.environ, and a non-gateway session keeps
                 # whatever it inherited.
+                #
+                # On the vertex-shim path, the env vars the CLI's own native
+                # Vertex support keys off (CLAUDE_CODE_USE_VERTEX,
+                # ANTHROPIC_VERTEX_PROJECT_ID, CLOUD_ML_REGION — see
+                # ``onboarding/ambient.py``'s vertex-claude detection) must
+                # also be absent from the child env, not just left at
+                # whatever the calling process happens to have ambiently
+                # set (e.g. a developer's own shell already configured for
+                # Claude-on-Vertex). If left in place, the CLI ignores our
+                # ``ANTHROPIC_BASE_URL`` sentinel and goes straight to
+                # native Vertex-via-ADC inside the (possibly sandboxed)
+                # child process — silently defeating the entire point of
+                # the shim, which exists specifically to keep GCP ADC out
+                # of that child's reach.
                 sdk_env = getattr(options, "env", None)
                 with ExitStack() as env_stack:
                     env_stack.enter_context(_unset_env_var("CLAUDECODE"))
@@ -1727,6 +1820,14 @@ class ClaudeSDKExecutor(Executor):
                         env_stack.enter_context(
                             _unset_env_var("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS")
                         )
+                    if self._vertex_project is not None:
+                        for _native_vertex_var in (
+                            "CLAUDE_CODE_USE_VERTEX",
+                            "ANTHROPIC_VERTEX_PROJECT_ID",
+                            "ANTHROPIC_VERTEX_REGION",
+                            "CLOUD_ML_REGION",
+                        ):
+                            env_stack.enter_context(_unset_env_var(_native_vertex_var))
                     await asyncio.wait_for(client.connect(), timeout=_CONNECT_TIMEOUT_SECONDS)
             except asyncio.TimeoutError as exc:
                 await self._force_close_client(client)
@@ -1840,6 +1941,9 @@ class ClaudeSDKExecutor(Executor):
         if self._gateway_shim is not None:
             await self._gateway_shim.aclose()
             self._gateway_shim = None
+        if self._vertex_shim is not None:
+            await self._vertex_shim.aclose()
+            self._vertex_shim = None
 
     async def interrupt_session(self, session_key: str) -> bool:
         state = self._clients.get(session_key)
