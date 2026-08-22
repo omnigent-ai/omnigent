@@ -54,6 +54,11 @@ class AcpAgentEntry:
     :param session_id_mode: ``"server"`` (default) or ``"client"``.
     :param send_model: Send the model in ``session/new`` (Qwen-shaped agents).
     :param omnigent_mcp: Lend Omnigent's builtin MCP relay in ``session/new``.
+    :param inject_system_prompt: Fold the Omnigent system prompt into the first
+        ACP turn. Disable for agents that fully own their own system prompt (e.g.
+        Pi forks like ``omp``) to prevent XML tool-call fragments from leaking
+        into their responses when no MCP relay is active. See
+        :attr:`omnigent.inner.acp_executor.AcpAgentConfig.inject_system_prompt`.
     :param env_passthrough: Environment variable *names* the agent may read at
         spawn, e.g. ``("XAI_API_KEY",)``. The spawn env is deny-by-default and
         the executor cannot know which variable an arbitrary agent
@@ -69,6 +74,7 @@ class AcpAgentEntry:
     session_id_mode: str = "server"
     send_model: bool = False
     omnigent_mcp: bool = True
+    inject_system_prompt: bool = True
     env_passthrough: tuple[str, ...] = ()
 
 
@@ -159,6 +165,9 @@ def acp_agents(config: dict[str, object] | None = None) -> list[AcpAgentEntry]:
         omnigent_mcp = raw.get("omnigent_mcp", True)
         if not isinstance(omnigent_mcp, bool):
             raise ValueError("acp agent omnigent_mcp must be a boolean")
+        inject_system_prompt = raw.get("inject_system_prompt", True)
+        if not isinstance(inject_system_prompt, bool):
+            raise ValueError("acp agent inject_system_prompt must be a boolean")
         entries.append(
             AcpAgentEntry(
                 slug=slug,
@@ -168,6 +177,7 @@ def acp_agents(config: dict[str, object] | None = None) -> list[AcpAgentEntry]:
                 session_id_mode=mode if mode in ("server", "client") else "server",
                 send_model=bool(raw.get("send_model", False)),
                 omnigent_mcp=omnigent_mcp,
+                inject_system_prompt=inject_system_prompt,
                 env_passthrough=parse_env_passthrough(raw.get("env_passthrough")),
             )
         )
@@ -229,6 +239,8 @@ def acp_agents_settings(entries: list[AcpAgentEntry]) -> dict[str, object]:
             item["send_model"] = True
         if not e.omnigent_mcp:
             item["omnigent_mcp"] = False
+        if not e.inject_system_prompt:
+            item["inject_system_prompt"] = False
         if e.env_passthrough:
             item["env_passthrough"] = list(e.env_passthrough)
         agents.append(item)
