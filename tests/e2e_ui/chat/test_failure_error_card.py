@@ -79,6 +79,55 @@ def _seed_error_item(session_id: str, *, code: str, message: str) -> None:
     )
 
 
+def test_runner_disconnect_card_clears_when_the_runner_reports_a_live_status(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A ``runner_disconnected`` card disappears once the runner is live again.
+
+    A server that closed a runner tunnel on its way down (a deploy) lit a
+    "connection to the host dropped" card; the runner never died, and its
+    next status edge on reconnect proves it is reachable. That card is an
+    observation, not a turn result, so a live (non-``failed``) status edge
+    must remove it — the fix in the ``session_status`` handler. Other
+    failure cards (e.g. ``required_terminal_exited``) must NOT be cleared by
+    a status edge, so a control card is seeded alongside and asserted to
+    survive.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` from the local server.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    _seed_error_item(
+        session_id,
+        code="runner_disconnected",
+        message="Runner disconnected unexpectedly.",
+    )
+    _seed_error_item(
+        session_id,
+        code="required_terminal_exited",
+        message="Required terminal exited unexpectedly; the runtime is no longer available.",
+    )
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    pills = page.get_by_test_id("error-pill")
+    expect(pills).to_have_count(2, timeout=15_000)
+    disconnect_pill = page.get_by_test_id("error-pill").filter(
+        has_text="The connection to the host dropped unexpectedly"
+    )
+    expect(disconnect_pill).to_have_count(1)
+
+    # The runner reconnects and reports a live turn. The disconnect card
+    # clears; the genuine terminal-exit failure card stays.
+    _publish_native_status(base_url, session_id, "running", response_id="codex_turn_recover")
+    expect(disconnect_pill).to_have_count(0, timeout=15_000)
+    surviving = page.get_by_test_id("error-pill")
+    expect(surviving).to_have_count(1)
+    expect(surviving).to_contain_text("The agent's terminal exited unexpectedly")
+
+
 def test_unclassified_failure_renders_english_headline_not_raw_code(
     page: Page,
     seeded_session: tuple[str, str],

@@ -43,7 +43,7 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-from omnigent.server import session_live_state
+from omnigent.server import session_live_state, shutdown_state
 from omnigent.server.auth import AuthProvider, SharingMode
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
@@ -2383,6 +2383,11 @@ def create_app(
         :func:`_mark_runner_sessions_offline`, which fails only the
         interrupted turns and stamps the disconnect cause.
 
+        A server that is itself shutting down skips the marking too: it
+        closed the tunnel, and the runner cannot re-register with a
+        process that stopped listening — the replacement server re-adopts
+        it on reconnect (:mod:`omnigent.server.shutdown_state`).
+
         :param runner_id: The disconnected runner's id.
         """
         from omnigent.server.routes.sessions import (
@@ -2392,6 +2397,12 @@ def create_app(
         from omnigent.server.schemas import ErrorDetail
 
         await asyncio.sleep(RUNNER_DISCONNECT_GRACE_S)
+        if shutdown_state.server_shutting_down():
+            _logger.info(
+                "Runner %s dropped because this server is shutting down; skipping offline-marking",
+                runner_id,
+            )
+            return
         if tunnel_registry.get(runner_id) is not None:
             _logger.info(
                 "Runner %s reconnected within the disconnect grace; skipping offline-marking",

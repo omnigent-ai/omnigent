@@ -90,7 +90,7 @@ from omnigent.runtime.policies.builder import (
 )
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.workflow import _find_spec_by_name
-from omnigent.server import session_live_state
+from omnigent.server import session_live_state, shutdown_state
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -5677,8 +5677,11 @@ async def _relay_runner_stream(
     lost stream retries inside that window instead of failing the
     session. An intentional Stop exits quietly at once.
 
-    Past the grace the runner is genuinely gone, and only a session it
-    caught mid-turn (:func:`_runner_drop_interrupted_turn`) gets the
+    Past the grace the runner is genuinely gone — unless this server is the
+    one shutting down (:func:`omnigent.server.shutdown_state.server_shutting_down`):
+    it closed the tunnel itself, so the loss says nothing about the runner
+    and no session is failed. Otherwise only a session it caught mid-turn
+    (:func:`_runner_drop_interrupted_turn`) gets the
     ``failed`` status and durable ``runner_disconnected`` labels — the same
     rule :func:`_mark_runner_sessions_offline_impl` applies to the runner's
     other sessions. An idle session had no work to interrupt, so it stays
@@ -5737,6 +5740,15 @@ async def _relay_runner_stream(
                     session_id,
                     None,
                     conversation_store,
+                )
+            elif shutdown_state.server_shutting_down():
+                # This server closed the tunnel on its way down; the runner is
+                # reachable, just not by a process that stopped listening. The
+                # replacement server re-adopts it on reconnect.
+                _logger.info(
+                    "Relay: transport lost during server shutdown for session=%s; "
+                    "not failing the turn",
+                    session_id,
                 )
             elif not await _runner_drop_interrupted_turn(session_id, conversation_store):
                 # The runner went away while this session sat idle (host
