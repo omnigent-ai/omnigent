@@ -1519,6 +1519,12 @@ async def test_resolve_harness_config_applies_harness_override(
         "      api_key: $ANTHROPIC_API_KEY\n"
         "      models:\n"
         "        default: test-default\n"
+        "acp:\n"
+        "  agents:\n"
+        "    - name: Gemini CLI\n"
+        "      command: gemini --experimental-acp\n"
+        "    - name: Goose\n"
+        "      command: goose acp\n"
     )
     spec = AgentSpec(
         spec_version=1,
@@ -1553,6 +1559,15 @@ async def test_resolve_harness_config_applies_harness_override(
     assert spawn_env is not None and "HARNESS_PI_MODEL" in spawn_env, (
         f"Expected a pi spawn-env; got keys {sorted(spawn_env or {})!r}"
     )
+
+    harness, spawn_env = await _resolve_harness_config(
+        agent_id="ag_x",
+        spec_resolver=_resolver,
+        session_id="conv_x",
+        harness_override="acp:goose",
+    )
+    assert harness == "acp"
+    assert spawn_env is not None and spawn_env["HARNESS_ACP_COMMAND"] == "goose acp"
 
 
 @pytest.mark.asyncio

@@ -177,9 +177,11 @@ async def test_create_rejects_harness_override_for_non_omnigent_agent(
     assert "agents_sdk" in resp.text
 
 
+@pytest.mark.parametrize("harness_override", ["pi", "acp:goose"])
 async def test_runner_first_event_forwards_harness_override(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    harness_override: str,
 ) -> None:
     """A create-time override reaches the runner body on the first event.
 
@@ -193,7 +195,11 @@ async def test_runner_first_event_forwards_harness_override(
     agent = await create_test_agent(client)
     resp = await client.post(
         "/v1/sessions",
-        json={"agent_id": agent["id"], "initial_items": [], "harness_override": "pi"},
+        json={
+            "agent_id": agent["id"],
+            "initial_items": [],
+            "harness_override": harness_override,
+        },
     )
     assert resp.status_code == 201, resp.text
     sid = resp.json()["id"]
@@ -214,7 +220,7 @@ async def test_runner_first_event_forwards_harness_override(
         "Runner client was never POSTed to — _forward_event_to_runner "
         "did not run. Check the runner-stub wiring."
     )
-    assert captured["body"].get("harness_override") == "pi", (
+    assert captured["body"].get("harness_override") == harness_override, (
         f"First-event runner body missing the create-time harness "
         f"override; got {captured['body'].get('harness_override')!r}. The "
         f"create route did not persist harness_override before the first "

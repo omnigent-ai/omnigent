@@ -6051,6 +6051,7 @@ def create_runner_app(
                 cwd=await _session_runtime_cwd(conv),
                 model_override=cast(str | None, msg_body.get("model_override")),
                 session_id=conv,
+                harness_override=cast(str | None, msg_body.get("harness_override")),
             )
             from omnigent.runtime.prompt import build_instructions
 
@@ -9899,6 +9900,7 @@ async def _resolve_harness_config(
                 workdir=workdir,
                 model_override=model_override,
                 session_id=session_id,
+                harness_override=harness_override,
             )
             return harness, spawn_env
 
@@ -10001,6 +10003,7 @@ def _build_spawn_env_from_spec(
     workdir: Path | None = None,
     model_override: str | None = None,
     session_id: str | None = None,
+    harness_override: str | None = None,
 ) -> dict[str, str] | None:
     """Build spawn-env from spec — mirrors workflow.py's helpers.
 
@@ -10018,6 +10021,8 @@ def _build_spawn_env_from_spec(
         via ``--model`` in :func:`_build_claude_native_base_args`; the
         SDK harnesses have no such arg, so the override must land in the
         env var here.)
+    :param harness_override: The raw per-session harness override. Generic ACP
+        keeps its slug in the effective spec for agent selection.
     :returns: The spawn-env dict, or ``None`` for native / unknown harnesses.
     """
     # Namespaced generic-ACP ids (``acp:<slug>``) canonicalize to ``acp`` so the
@@ -10025,15 +10030,25 @@ def _build_spawn_env_from_spec(
     # the concrete agent's slug is read from the spec by ``_build_acp_spawn_env``.
     harness = canonicalize_harness(harness) or harness
     effective_spec = spec
+    if harness == "acp" and harness_override:
+        effective_spec = dataclasses.replace(
+            spec,
+            executor=dataclasses.replace(
+                spec.executor,
+                config={**spec.executor.config, "harness": harness_override},
+            ),
+        )
     if model_override is not None:
-        executor = getattr(spec, "executor", None)
-        if hasattr(spec, "model_copy") and hasattr(executor, "model_copy"):
+        executor = getattr(effective_spec, "executor", None)
+        if hasattr(effective_spec, "model_copy") and hasattr(executor, "model_copy"):
             copied_executor = cast(_ModelCopyValue, executor).model_copy(
                 update={"model": model_override}
             )
             effective_spec = cast(
                 AgentSpec,
-                cast(_ModelCopyValue, spec).model_copy(update={"executor": copied_executor}),
+                cast(_ModelCopyValue, effective_spec).model_copy(
+                    update={"executor": copied_executor}
+                ),
             )
     try:
         from omnigent.runtime.workflow import (

@@ -1840,7 +1840,10 @@ def _validated_harness_override(value: str | None, agent: Agent) -> str | None:
             f"declares executor.type {executor_type!r}",
             code=ErrorCode.INVALID_INPUT,
         )
-    return canonical
+    # Preserve the concrete ``acp:<slug>`` so the runner launches the picked
+    # agent; folding it to bare ``acp`` would drop the slug and always launch
+    # the first configured ACP agent. Non-acp overrides keep the canonical id.
+    return value if value.startswith("acp:") else canonical
 
 
 def _validated_harness_override_executor_type(agent: Agent) -> None:
