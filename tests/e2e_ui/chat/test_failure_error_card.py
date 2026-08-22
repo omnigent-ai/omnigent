@@ -242,16 +242,9 @@ def test_error_row_divider_spans_the_chat_column(
 ) -> None:
     """The banner's dashed rule spans the full chat column, not just the pill.
 
-    Regression net for the error-only shrink-wrap: ``MessageContent``
-    defaults to ``w-fit``, so an error-only bubble once clipped the rule to
-    the 560px pill (~592px) instead of the column. Widths are compared
-    against a long-text assistant turn measured in the same viewport — no
-    hardcoded pixel values. Runs at two widths since the column is
-    responsive below its ``max-w-3xl`` cap: 2400px lets the column reach
-    the cap (where the shrink-wrap shows — the pill fits inside it), while
-    1440px squeezes the column below the pill's width (``max-w-full`` caps
-    the pill either way) and locks the invariant against a wrapper that
-    narrows the row below the column.
+    Widths are compared against another assistant turn measured in the same
+    viewport, with no hardcoded pixel values. Running at two widths locks the
+    role-owned full-column invariant across responsive column caps.
 
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` from the local server.
@@ -300,4 +293,57 @@ def test_error_row_divider_spans_the_chat_column(
     )
     assert abs(widths["divider"] - widths["row"]) <= 1, (
         f"dashed rule spans {widths['divider']:.0f}px of its {widths['row']:.0f}px row"
+    )
+
+
+@pytest.mark.parametrize("viewport_width", [1440, 2400])
+def test_markdown_table_block_uses_the_full_assistant_column(
+    page: Page,
+    seeded_session: tuple[str, str],
+    viewport_width: int,
+) -> None:
+    """A markdown table inherits the assistant column without a content whitelist."""
+    base_url, session_id = seeded_session
+    seed_committed_turn(
+        session_id,
+        prompt="Summarize the release checks in a table.",
+        reply=(
+            "| Check | Owner | Status |\n"
+            "| --- | --- | --- |\n"
+            "| Unit tests | Runtime | Passing |\n"
+            "| Browser geometry | Web | Passing |"
+        ),
+        response_id="resp_geometry_table",
+    )
+
+    page.set_viewport_size({"width": viewport_width, "height": 1080})
+    page.goto(f"{base_url}/c/{session_id}")
+    table = page.locator('[data-streamdown="table"]').first
+    expect(table).to_be_visible(timeout=15_000)
+
+    widths = table.evaluate(
+        """(table) => {
+          const bubble = table.closest('[data-testid="message-bubble"]');
+          const content = bubble.firstElementChild;
+          const contentRect = content.getBoundingClientRect();
+          const tableRect = table.getBoundingClientRect();
+          return {
+            bubble: bubble.getBoundingClientRect().width,
+            content: contentRect.width,
+            table: tableRect.width,
+            leftInset: tableRect.left - contentRect.left,
+            rightInset: contentRect.right - tableRect.right,
+          };
+        }"""
+    )
+    assert abs(widths["content"] - widths["bubble"]) <= 1, (
+        f"table content spans {widths['content']:.0f}px but its assistant row spans "
+        f"{widths['bubble']:.0f}px"
+    )
+    assert widths["leftInset"] >= 0 and widths["rightInset"] >= 0, (
+        f"table overflows its {widths['content']:.0f}px content column"
+    )
+    assert abs(widths["leftInset"] - widths["rightInset"]) <= 1, (
+        f"table insets are asymmetric: {widths['leftInset']:.0f}px left and "
+        f"{widths['rightInset']:.0f}px right"
     )

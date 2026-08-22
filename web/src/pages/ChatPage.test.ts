@@ -18,7 +18,6 @@ import {
   collectPendingElicitations,
   computeIsWorking,
   computeShowsWorking,
-  containsMarkdownTable,
   dispatchInitialPrompt,
   isCostRoutingEligible,
   isSubagentRoutingEligible,
@@ -1140,34 +1139,6 @@ describe("subAgentComposerLabel", () => {
   it("falls back to a generic label when every name field is null", () => {
     // Degenerate snapshot — the tray still needs something to render.
     expect(subAgentComposerLabel(mkSession())).toBe("sub-agent");
-  });
-});
-
-// ── containsMarkdownTable ──────────────────────────────────────────────────
-
-describe("containsMarkdownTable", () => {
-  it("detects markdown tables in assistant text", () => {
-    const items: RenderItem[] = [
-      {
-        kind: "text",
-        itemId: "i1",
-        text: "| Name | Value |\n| --- | --- |\n| Alpha | 1 |",
-        final: true,
-      },
-    ];
-    expect(containsMarkdownTable(items)).toBe(true);
-  });
-
-  it("does not treat ordinary pipe text as a table", () => {
-    const items: RenderItem[] = [
-      {
-        kind: "text",
-        itemId: "i1",
-        text: "Use `cmd | grep foo` in a shell.",
-        final: true,
-      },
-    ];
-    expect(containsMarkdownTable(items)).toBe(false);
   });
 });
 
