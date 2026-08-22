@@ -2001,8 +2001,10 @@ def _record_period_costs(
     sentinel value internally; per-harness budgets would require harness
     detection (not yet implemented).
 
-    Recorded unconditionally (like daily cost) so the rollups are available
-    when a period cost policy is later configured.
+    Writes are wrapped in try/except to prevent a rollup failure from breaking
+    the synchronous relay path. The four period increments (week/month/quarter/year)
+    are independent transactions, not atomic; a mid-sequence crash leaves some
+    periods incremented and others not (acceptable for running totals).
 
     :param conv: The conversation row for the session, or ``None``
         (a no-op — no owner to attribute to).
@@ -2017,20 +2019,35 @@ def _record_period_costs(
         owner = conversation_store.get_session_owner(conv.root_conversation_id)
     if owner is None:
         return
-    from omnigent.db.utils import now_epoch
-    from omnigent.runtime.policies.builder import (
-        _utc_month,
-        _utc_quarter,
-        _utc_week,
-        _utc_year,
-    )
 
-    epoch = now_epoch()
-    # Record for all standard periods (cross-harness mode: harness=None → "__all__" sentinel)
-    conversation_store.add_period_cost(owner, _utc_week(epoch), delta_usd, harness=None)
-    conversation_store.add_period_cost(owner, _utc_month(epoch), delta_usd, harness=None)
-    conversation_store.add_period_cost(owner, _utc_quarter(epoch), delta_usd, harness=None)
-    conversation_store.add_period_cost(owner, _utc_year(epoch), delta_usd, harness=None)
+    try:
+        from omnigent.db.utils import now_epoch
+        from omnigent.runtime.policies.builder import (
+            _utc_month,
+            _utc_quarter,
+            _utc_week,
+            _utc_year,
+        )
+
+        epoch = now_epoch()
+        # Record for all standard periods (cross-harness mode: harness=None → "__all__" sentinel).
+        # NOTE: These four writes are independent transactions (not atomic). A crash mid-sequence
+        # will leave some periods incremented and others not, causing permanent undercount for the
+        # skipped buckets. This is acceptable for running totals.
+        conversation_store.add_period_cost(owner, _utc_week(epoch), delta_usd, harness=None)
+        conversation_store.add_period_cost(owner, _utc_month(epoch), delta_usd, harness=None)
+        conversation_store.add_period_cost(owner, _utc_quarter(epoch), delta_usd, harness=None)
+        conversation_store.add_period_cost(owner, _utc_year(epoch), delta_usd, harness=None)
+    except Exception:
+        # Log and continue; a period rollup failure should not break turn accounting.
+        # The turn's daily cost was already recorded (via _record_daily_cost) so the
+        # per-day rollup is safe even if period rollups fail.
+        import logging
+        logging.exception(
+            "Period cost rollup failed for user=%s, delta=$%.4f; continuing turn accounting",
+            owner,
+            delta_usd,
+        )
 
 
 def _priced_cost_for_display(usage: dict[str, Any]) -> float | None:

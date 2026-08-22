@@ -1735,7 +1735,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         with self._session("add_period_cost") as session:
             dialect = session.bind.dialect.name if session.bind is not None else ""
             if dialect in ("sqlite", "postgresql"):
-                self._upsert_monthly_cost_dialect(
+                self._upsert_period_cost_dialect(
                     session, dialect, user_id, period, harness_key, delta_usd, now
                 )
                 return
@@ -1759,7 +1759,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 existing.cost_usd = existing.cost_usd + delta_usd
                 existing.updated_at = now
 
-    def _upsert_monthly_cost_dialect(
+    def _upsert_period_cost_dialect(
         self,
         session: Session,
         dialect: str,
@@ -1784,7 +1784,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             gates all other dialects onto the generic fallback).
         :param user_id: The user the cost is attributed to, e.g.
             ``"alice@example.com"``.
-        :param period: UTC month as ``"YYYY-MM"``, e.g. ``"2026-06"``.
+        :param period: Time period string, format depends on granularity:
+            ``"YYYY-Www"`` (week), ``"YYYY-MM"`` (month), ``"YYYY-Qq"`` (quarter),
+            or ``"YYYY"`` (year). E.g. ``"2026-W34"``, ``"2026-08"``, ``"2026-Q3"``.
         :param harness: The harness executing the turn, e.g.
             ``"codex-native"``. ``None`` when unknown/unstamped.
         :param delta_usd: USD amount to add (already validated ``> 0``).
@@ -1897,18 +1899,20 @@ class SqlAlchemyConversationStore(ConversationStore):
         harness: str | None = None,
     ) -> None:
         """
-        Record the highest approved soft checkpoint for a user+month+harness.
+        Record the highest approved soft checkpoint for a user+period+harness.
 
         UPSERT that sets ``ask_approved_usd`` **without touching
         ``cost_usd``** (inserts a ``cost_usd = 0`` row when none exists
         yet, otherwise updates only the approval field). Called when a
-        per-user monthly cost-budget ASK is approved, so the same
-        checkpoint won't re-prompt for that user again that month — even
+        per-user period cost-budget ASK is approved, so the same
+        checkpoint won't re-prompt for that user again that period — even
         from a different session.
 
         :param user_id: The user the approval is for, e.g.
             ``"alice@example.com"``.
-        :param period: UTC month as ``"YYYY-MM"``, e.g. ``"2026-06"``.
+        :param period: Time period string, format depends on granularity:
+            ``"YYYY-Www"`` (week), ``"YYYY-MM"`` (month), ``"YYYY-Qq"`` (quarter),
+            or ``"YYYY"`` (year). E.g. ``"2026-W34"``, ``"2026-08"``, ``"2026-Q3"``.
         :param ask_approved_usd: The crossed checkpoint value (USD) the
             user approved continuing past, e.g. ``0.05``.
         :param harness: The harness the approval is for, e.g.

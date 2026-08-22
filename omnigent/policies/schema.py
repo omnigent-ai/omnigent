@@ -107,9 +107,6 @@ SESSION_COST_ASK_APPROVED_STATE_KEY = "_policy_cost_ask_approved_usd"
 # sessions, not just the one conversation.
 USER_PERIOD_ASK_APPROVED_STATE_KEY = "_policy_user_period_ask_approved_usd"
 
-# Legacy alias for backwards compatibility
-USER_MONTHLY_ASK_APPROVED_STATE_KEY = USER_PERIOD_ASK_APPROVED_STATE_KEY
-
 # Reserved ``state_updates`` key the cost-budget policy emits when the user
 # approves continuing despite an unpriced model. Like
 # ``SESSION_COST_ASK_APPROVED_STATE_KEY``, routed to the ROOT conversation so
@@ -176,10 +173,6 @@ class UserPeriodCostContext(TypedDict, total=False):
     user_id: str
     period: str
     harness: str | None
-
-
-# Legacy alias for backwards compatibility
-UserMonthlyCostContext = UserPeriodCostContext
 
 
 class EventContext(TypedDict, total=False):
@@ -461,7 +454,6 @@ def request_attachments(data: object) -> list[dict[str, object]]:
 
 __all__ = [
     "USER_DAILY_ASK_APPROVED_STATE_KEY",
-    "USER_MONTHLY_ASK_APPROVED_STATE_KEY",  # Legacy alias
     "USER_PERIOD_ASK_APPROVED_STATE_KEY",
     "ActorContext",
     "EventContext",
@@ -472,7 +464,6 @@ __all__ = [
     "StateUpdateEntry",
     "UsageContext",
     "UserDailyCostContext",
-    "UserMonthlyCostContext",  # Legacy alias
     "UserPeriodCostContext",
     "request_attachments",
     "request_user_text",
