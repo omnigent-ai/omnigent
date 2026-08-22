@@ -3803,6 +3803,15 @@ async def _auto_create_codex_terminal(
     # not the one registered below — and so it can't mirror alongside the new one.
     await _cancel_auto_forwarder_task(session_id)
     clear_bridge_state(bridge_dir)
+    # A previous runner's app-server for THIS session can outlive a hard runner
+    # exit (it runs in its own process session) while still holding the codex
+    # thread's writer lock, which makes the ``thread/resume`` below fail with
+    # "already has an active writer". Reap it before starting a replacement.
+    from omnigent.codex_native_process_registry import (
+        reap_codex_native_processes_for_state_dir,
+    )
+
+    await asyncio.to_thread(reap_codex_native_processes_for_state_dir, bridge_dir)
 
     # Forked clone with no native thread of its own yet: clone the SOURCE's
     # local Codex rollout into the clone's OWN CODEX_HOME under a thread id
@@ -4099,11 +4108,20 @@ async def _auto_create_codex_terminal(
     else:
         from omnigent.codex_native_bridge import CodexNativeBridgeState, write_bridge_state
 
-        await preload_codex_thread_for_resume(
-            codex_ws_url,
-            launch_config.external_session_id,
-            terminal_launch_args=launch_config.terminal_launch_args,
-        )
+        try:
+            await preload_codex_thread_for_resume(
+                codex_ws_url,
+                launch_config.external_session_id,
+                terminal_launch_args=launch_config.terminal_launch_args,
+            )
+        except Exception:
+            # The app-server started above must not outlive a refused resume:
+            # without this close, every retry stacked another live codex
+            # process (and only the newest stayed tracked for teardown).
+            with contextlib.suppress(Exception):
+                await app_server.close()
+            _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+            raise
         write_bridge_state(
             bridge_dir,
             CodexNativeBridgeState(
