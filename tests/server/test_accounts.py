@@ -1811,6 +1811,7 @@ def test_cli_accounts_login_happy_path_stores_token(
         assert body == {
             "username": "alice",
             "password": "alice-pw-1234",
+            "issue_refresh": True,
         }
         return _FakeResponse(
             200,
@@ -2049,3 +2050,45 @@ def test_browser_login_never_issues_refresh_token(accounts_app: TestClient) -> N
         "Browser /auth/login returned refresh_token — violates the security "
         "invariant that unattended credentials are issued only via CLI/device flows"
     )
+
+
+def test_cli_login_with_issue_refresh_returns_refresh_token(
+    accounts_app: TestClient,
+) -> None:
+    """``POST /auth/login`` with ``issue_refresh=true`` returns a refresh_token.
+
+    This is the accounts-mode counterpart to the OIDC cli-ticket grant
+    path. A CLI/host that logs in with ``issue_refresh`` can renew its
+    access token autonomously past session-JWT expiry via /oauth/token,
+    instead of dying with a misleading 403 and requiring a human to
+    re-run ``omnigent login``.
+    """
+    resp = accounts_app.post(
+        "/auth/login",
+        json={"username": "admin", "password": "admin-pw-12345", "issue_refresh": True},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+
+    assert "token" in body
+    assert "refresh_token" in body, (
+        "/auth/login with issue_refresh=True must return a refresh_token "
+        "so CLI-authenticated hosts can renew past session-JWT expiry"
+    )
+    refresh_token = body["refresh_token"]
+    assert isinstance(refresh_token, str) and len(refresh_token) > 10
+
+    # The refresh token must be immediately usable at /oauth/token.
+    refresh_resp = accounts_app.post(
+        "/oauth/token",
+        data={"grant_type": "refresh_token", "refresh_token": refresh_token},
+    )
+    assert refresh_resp.status_code == 200, (
+        f"Refresh token from accounts login was not accepted at /oauth/token: "
+        f"{refresh_resp.status_code} {refresh_resp.text}"
+    )
+    refresh_body = refresh_resp.json()
+    assert "access_token" in refresh_body
+    assert "refresh_token" in refresh_body
+    # Login grants don't rotate — same token is returned.
+    assert refresh_body["refresh_token"] == refresh_token
