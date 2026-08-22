@@ -679,6 +679,17 @@ async def test_edit_grant_blocked_from_stop_session_requires_owner(
         f"owner's session."
     )
 
+    # The dedicated public endpoint shares the same owner-only authority
+    # boundary; exposing a typed route must not weaken lifecycle control.
+    resp = await auth_client.post(
+        f"/v1/sessions/{session_id}/stop",
+        headers={"X-Forwarded-Email": "user-b"},
+    )
+    assert resp.status_code == 403, (
+        "the public stop endpoint must reject a shared editor; "
+        f"got {resp.status_code}: {resp.text}"
+    )
+
     # The owner (user-a) is NOT blocked by the gate. No runner is bound
     # in this app, so the forward is a best-effort no-op and the route
     # returns 202 — what matters is that it's not a 403.
@@ -691,6 +702,13 @@ async def test_edit_grant_blocked_from_stop_session_requires_owner(
         f"The session owner should pass the stop_session owner gate "
         f"and get 202, got {resp.status_code}: {resp.text}"
     )
+
+    resp = await auth_client.post(
+        f"/v1/sessions/{session_id}/stop",
+        headers={"X-Forwarded-Email": "user-a"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"session_id": session_id, "stopped": True}
 
 
 # ── Grant edit: can POST events but not manage permissions ───
