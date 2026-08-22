@@ -315,6 +315,18 @@ def test_files_panel_browses_to_a_directory_outside_the_workspace(
     expect(rail.get_by_text("sentinel.txt")).to_be_visible(timeout=30_000)
     rail.get_by_role("searchbox", name="Search all files").fill("")
 
+    # Opening a file swaps the panel for the viewer (unmounting it); closing
+    # the viewer must land back in THIS directory, not snap to the workspace
+    # root. The header path button only exists while the panel is mounted, so
+    # it naming the outside directory again is the whole assertion.
+    rail.get_by_role("button", name=re.compile(r"sentinel\.txt")).first.click()
+    expect(rail.get_by_role("searchbox", name="Search all files")).to_have_count(0, timeout=30_000)
+    rail.get_by_role("button", name="Close sentinel.txt", exact=True).click()
+    expect(path_button).to_contain_text(outside.name, timeout=30_000)
+    expect(rail.get_by_role("button", name=re.compile(r"sentinel\.txt")).first).to_be_visible(
+        timeout=30_000
+    )
+
     # One click back to where the agent actually is.
     path_button.click()
     page.get_by_test_id("workspace-picker-workspace").click()

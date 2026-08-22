@@ -1443,6 +1443,62 @@ describe("FilesPanel browse location", () => {
     );
   });
 
+  it("restores the browsed location across unmount/remount (file-viewer round trip)", () => {
+    // Opening a file swaps the panel for the FileViewer, unmounting it.
+    // Closing the viewer must land back in the directory the file was opened
+    // from, not snap to the workspace root.
+    const first = renderPanel({
+      conversationId: "conv_viewer_roundtrip",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: UNCONFINED,
+    });
+    fireEvent.click(screen.getByTestId("browse-location-path"));
+    fireEvent.click(screen.getByTestId("stub-picker-navigate"));
+    expect(useAllFilesMock).toHaveBeenLastCalledWith(
+      "conv_viewer_roundtrip",
+      expect.anything(),
+      "/etc",
+    );
+
+    first.unmount();
+    renderPanel({
+      conversationId: "conv_viewer_roundtrip",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: UNCONFINED,
+    });
+
+    expect(useAllFilesMock).toHaveBeenLastCalledWith(
+      "conv_viewer_roundtrip",
+      expect.anything(),
+      "/etc",
+    );
+  });
+
+  it("keeps a remembered location scoped to its own conversation", () => {
+    // The cache must not leak one session's directory into another: a
+    // different conversation opens at ITS root, exactly as before.
+    const first = renderPanel({
+      conversationId: "conv_loc_owner",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: UNCONFINED,
+    });
+    fireEvent.click(screen.getByTestId("browse-location-path"));
+    fireEvent.click(screen.getByTestId("stub-picker-navigate"));
+    first.unmount();
+
+    renderPanel({
+      conversationId: "conv_loc_other",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: UNCONFINED,
+    });
+
+    expect(useAllFilesMock).toHaveBeenLastCalledWith("conv_loc_other", expect.anything(), "");
+  });
+
   it("surfaces a refused location instead of an empty tree", () => {
     // An empty tree reads as "this directory is empty", which is a different
     // fact from "you may not look here".
