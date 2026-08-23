@@ -353,6 +353,15 @@ _AUTH_REJECT_ESCALATE_ATTEMPTS = 30
 # endpoint that accepts and never speaks is functionally down.
 _SILENT_CONNECT_ESCALATE_ATTEMPTS = 10
 
+# Set by the CLI when it spawns a background daemon: a file whose mtime the
+# daemon refreshes while its tunnel is registered, and removes when it drops.
+# Lets the next CLI invocation read tunnel health off the local filesystem
+# instead of paying a round trip to the server on every launch. Advisory —
+# absent (a foreground host, or a daemon from an older build) simply means the
+# CLI falls back to asking the server.
+TUNNEL_HEARTBEAT_ENV_VAR = "OMNIGENT_HOST_TUNNEL_HEARTBEAT_FILE"
+_TUNNEL_HEARTBEAT_INTERVAL_S = 15.0
+
 # Capability discovery is advisory and must not delay the host channel forever.
 _HOST_CAPABILITY_INIT_TIMEOUT_S = 15.0
 
@@ -627,6 +636,41 @@ class HostConnectError(Exception):
     The message is the full, user-facing explanation including the
     suggested fix; it is printed verbatim by :func:`run_host_process`.
     """
+
+
+def _tunnel_heartbeat_path() -> Path | None:
+    """Return the tunnel-health stamp path the CLI assigned, if any.
+
+    :returns: Path from :data:`TUNNEL_HEARTBEAT_ENV_VAR`, or ``None`` when
+        unset (a foreground host, or a daemon spawned by an older CLI).
+    """
+    value = os.environ.get(TUNNEL_HEARTBEAT_ENV_VAR)
+    return Path(value) if value else None
+
+
+def _touch_tunnel_heartbeat() -> None:
+    """Stamp the tunnel-health file with the current time."""
+    path = _tunnel_heartbeat_path()
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    except OSError as exc:
+        _logger.debug("Could not stamp tunnel heartbeat %s: %s", path, exc)
+
+
+def _clear_tunnel_heartbeat() -> None:
+    """Remove the tunnel-health stamp when the tunnel is no longer up.
+
+    Deleting it (rather than letting it age out) makes a dropped tunnel
+    visible to the next CLI invocation immediately.
+    """
+    path = _tunnel_heartbeat_path()
+    if path is None:
+        return
+    with contextlib.suppress(OSError):
+        path.unlink(missing_ok=True)
 
 
 def _build_runner_env(
@@ -3158,6 +3202,11 @@ class HostProcess:
         prewarm_task = asyncio.create_task(
             self._prewarm_model_options(), name="host-model-options-prewarm"
         )
+        # Bracketed by this registered connection, so the stamp means "the
+        # tunnel was up as of then" — not merely "the process is alive".
+        heartbeat_task = asyncio.create_task(
+            self._tunnel_heartbeat_loop(), name="host-tunnel-heartbeat"
+        )
         try:
             while True:
                 raw = await ws.recv()
@@ -3178,12 +3227,27 @@ class HostProcess:
                     # _runner_lifecycle_lock in _dispatch_host_frame.
                     self._start_frame_task(ws, raw)
         finally:
+            heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await heartbeat_task
+            _clear_tunnel_heartbeat()
             prewarm_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await prewarm_task
             readiness_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await readiness_task
+
+    async def _tunnel_heartbeat_loop(self) -> None:
+        """Refresh the tunnel-health stamp while this connection is registered.
+
+        Runs off the receive loop (a slow home directory must not delay
+        ``ws.recv()``). Errors are swallowed: the stamp is advisory, and a CLI
+        that finds it missing or stale just asks the server instead.
+        """
+        while True:
+            await asyncio.to_thread(_touch_tunnel_heartbeat)
+            await asyncio.sleep(_TUNNEL_HEARTBEAT_INTERVAL_S)
 
     async def _harness_readiness_loop(
         self,

@@ -632,6 +632,10 @@ _DAEMON_RECONNECT_GRACE_S = 5.0
 # a freshly-spawned daemon (possibly from a concurrent invocation) still
 # bringing its tunnel up. Avoids racing/thrashing sibling invocations.
 _DAEMON_REUSE_MIN_AGE_S = 6.0
+# A tunnel stamp older than this is treated as absent. Several times the
+# daemon's refresh interval, so an event loop that is merely busy does not
+# read as a dropped tunnel.
+_TUNNEL_HEARTBEAT_STALE_S = 60.0
 
 # How long uvicorn waits for active connections (WebSocket, SSE) after
 # SIGTERM before force-closing them.  SSE streams signal themselves via
@@ -2403,6 +2407,12 @@ class _HostDaemonRecord:
         ``None`` for legacy records written before config-signature
         tracking existed; a ``None`` signature is never treated as a
         config mismatch (we can't know what it was started with).
+    :param pkg_version: Installed ``omnigent`` version the daemon process
+        was started from, e.g. ``"0.4.12"``. Stamped separately from
+        *config_sig* because it is a property of this machine's code, not
+        of the server's config, so it can be checked in server mode too.
+        ``None`` for legacy records and source checkouts with no
+        registered distribution; never treated as a mismatch.
     """
 
     pid: int
@@ -2414,6 +2424,7 @@ class _HostDaemonRecord:
     host_id: str | None = None
     resolved_server_url: str | None = None
     config_sig: str | None = None
+    pkg_version: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2586,6 +2597,82 @@ def _daemon_host_online(record: _HostDaemonRecord, *, timeout_s: float = 2.0) ->
     return _daemon_host_state(record, timeout_s=timeout_s) == "online"
 
 
+def _installed_omnigent_version() -> str | None:
+    """
+    Return the installed ``omnigent`` distribution version.
+
+    :returns: Version string, e.g. ``"0.4.12"``, or ``None`` when running
+        from a source tree with no registered distribution (nothing to key
+        upgrade drift on).
+    """
+    import importlib.metadata
+
+    try:
+        return importlib.metadata.version("omnigent")
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def _daemon_build_changed(record: _HostDaemonRecord) -> bool:
+    """
+    Return whether a daemon is running code from a superseded install.
+
+    A daemon holds its code in memory and forks runners from a zygote that
+    imported that same code, so after an in-place upgrade (``omni upgrade``,
+    a refreshed ``isaac`` wheel) the old daemon keeps minting runners on
+    pre-upgrade code while the CLI speaks the new protocol. Mixed-version
+    runners then fail in confusing ways that a daemon restart resolves.
+
+    Unlike the config signature this is a property of the local install
+    rather than of the server's config, so it is checked in server mode too.
+
+    :param record: Daemon record being considered for reuse.
+    :returns: ``True`` when both versions are known and differ.
+    """
+    if record.pkg_version is None:
+        return False
+    current = _installed_omnigent_version()
+    return current is not None and current != record.pkg_version
+
+
+def _daemon_heartbeat_path(target: str) -> Path:
+    """
+    Return the tunnel-health stamp path for a daemon target.
+
+    Sits beside the target's registry record so both are removed together.
+
+    :param target: Normalized daemon target, e.g. ``"local"``.
+    :returns: Stamp path, e.g.
+        ``Path("~/.omnigent/daemons/abc.tunnel")``.
+    """
+    return _daemon_record_path(target).with_suffix(".tunnel")
+
+
+def _daemon_tunnel_heartbeat_fresh(record: _HostDaemonRecord) -> bool:
+    """
+    Return whether a daemon recently stamped its tunnel as up.
+
+    The daemon refreshes this file while its tunnel is registered and deletes
+    it on disconnect, so a fresh stamp answers "is the tunnel up?" from the
+    local filesystem — no round trip to the server on the common path where
+    everything is fine.
+
+    Treated as *not* fresh when the file is missing or stale, which is also
+    what a foreground host and any daemon from a build that predates the
+    stamp look like. Those fall through to the server probe, so a missing
+    stamp costs correctness nothing.
+
+    :param record: Daemon record to check.
+    :returns: ``True`` when the stamp was refreshed within
+        :data:`_TUNNEL_HEARTBEAT_STALE_S`.
+    """
+    try:
+        age_s = time.time() - _daemon_heartbeat_path(record.target).stat().st_mtime
+    except OSError:
+        return False
+    return 0 <= age_s < _TUNNEL_HEARTBEAT_STALE_S
+
+
 def _daemon_registry_dir() -> Path:
     """
     Return the directory containing per-target daemon registry records.
@@ -2640,6 +2727,7 @@ def _record_from_json(raw: _HostJsonObject) -> _HostDaemonRecord | None:
     host_id = raw.get("host_id")
     resolved_server_url = raw.get("resolved_server_url")
     config_sig = raw.get("config_sig")
+    pkg_version = raw.get("pkg_version")
     return _HostDaemonRecord(
         pid=pid,
         target=target,
@@ -2654,6 +2742,7 @@ def _record_from_json(raw: _HostJsonObject) -> _HostDaemonRecord | None:
             else None
         ),
         config_sig=config_sig if isinstance(config_sig, str) and config_sig else None,
+        pkg_version=pkg_version if isinstance(pkg_version, str) and pkg_version else None,
     )
 
 
@@ -2699,6 +2788,10 @@ def _delete_daemon_record(record: _HostDaemonRecord) -> None:
     """
     with contextlib.suppress(OSError):
         _daemon_record_path(record.target).unlink()
+    # The tunnel stamp belongs to this daemon; leaving it behind would
+    # outlive the record it describes.
+    with contextlib.suppress(OSError):
+        _daemon_heartbeat_path(record.target).unlink(missing_ok=True)
     legacy = _read_host_pid_file()
     if legacy is not None and legacy[1] == record.target:
         with contextlib.suppress(OSError):
@@ -2948,6 +3041,15 @@ def _reuse_existing_daemon_record(target: str) -> _DaemonReuseDecision:
     never silently killed — we don't tear down an interactive process or
     one whose config we can't verify.
 
+    Both local and remote daemons get the tunnel-health heal, but they judge
+    "offline" differently: a local daemon's server is on loopback, so an
+    unreachable probe is proof enough, while a remote daemon is torn down
+    only when its server explicitly reports the host as not connected
+    (see :func:`_daemon_host_definitely_offline`). Config-signature drift
+    applies to local mode alone — the remote's auth posture is not ours —
+    while upgrade drift applies to both, since the daemon process runs this
+    machine's code even when its server does not.
+
     :param target: Normalized daemon target, e.g. ``"local"``.
     :returns: A :class:`_DaemonReuseDecision`.
     """
@@ -2967,19 +3069,27 @@ def _reuse_existing_daemon_record(target: str) -> _DaemonReuseDecision:
         # Remote / explicit ``--server`` mode: the daemon connects to a server
         # we don't own and can't restart, so the config-signature and "re-run"
         # semantics below don't apply — auth posture is the remote's concern.
+        # Our own install still is: a daemon and its zygote hold superseded
+        # code after an in-place upgrade, and local mode only catches that
+        # because the version rides in its config signature.
+        if background and _daemon_build_changed(existing):
+            _terminate_host_unit(existing, reason="omnigent was upgraded")
+            return _DaemonReuseDecision(reuse=False, config_changed=False)
         #
         # Tunnel health still does. A daemon whose tunnel is gone for good is
         # a zombie either way: every later command waits out
         # ``wait_for_host_online`` and fails with "did not come online", which
         # is what made `omnigent host stop` the standing remedy. Heal it the
-        # way local mode does, with one extra guard — only on a definite
-        # "the server says offline", never on a probe we could not complete,
-        # since the daemon's own reconnect loop handles transient drops and we
-        # must not kill a healthy daemon over our own network blip.
+        # way local mode does, with two guards — a fresh stamp settles health
+        # locally, and only a definite "the server says offline" (never a probe
+        # we could not complete) justifies a teardown, since the daemon's own
+        # reconnect loop handles transient drops and we must not kill a healthy
+        # daemon over our own network blip.
         age_s = time.time() - existing.started_at
         if (
             background
             and age_s >= _DAEMON_REUSE_MIN_AGE_S
+            and not _daemon_tunnel_heartbeat_fresh(existing)
             and _daemon_host_definitely_offline(existing)
         ):
             _terminate_host_unit(existing, reason="host tunnel is offline")
@@ -3089,6 +3199,7 @@ def _persist_spawned_daemon(
             started_at=int(time.time()),
             host_id=_load_existing_host_id(),
             config_sig=config_sig,
+            pkg_version=_installed_omnigent_version(),
         )
     )
     _HOST_PID_PATH.write_text(f"{spawned.pid}\n{target}\n")
@@ -3241,10 +3352,11 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
     _HOST_PID_PATH.parent.mkdir(parents=True, exist_ok=True)
     mode_args = ["--local"] if not server_url else ["--server", server_url]
     args = [sys.executable, "-m", "omnigent.host._daemon_entry", *mode_args]
-    spawned = _spawn_host_daemon_process(
-        args=args,
-        env=_build_host_daemon_env(server_url=server_url),
-    )
+    from omnigent.host.connect import TUNNEL_HEARTBEAT_ENV_VAR
+
+    daemon_env = _build_host_daemon_env(server_url=server_url)
+    daemon_env[TUNNEL_HEARTBEAT_ENV_VAR] = str(_daemon_heartbeat_path(target))
+    spawned = _spawn_host_daemon_process(args=args, env=daemon_env)
     if spawned is None:
         return False
     _persist_spawned_daemon(

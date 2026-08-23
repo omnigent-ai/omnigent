@@ -4746,3 +4746,104 @@ def test_post_connect_auth_rejection_escalates_without_going_fatal(
     assert "omnigent login http://localhost:8000" in escalated
     assert "no longer a transient network blip" in escalated
     assert host._auth_retry_streak == _AUTH_REJECT_ESCALATE_ATTEMPTS
+
+
+class _HoldOpenTunnel:
+    """Tunnel that stays connected until released, then disconnects.
+
+    Lets a test observe work the host does *while* registered — the fake
+    tunnels that disconnect immediately give the heartbeat task no chance to
+    run before ``_serve_frames`` unwinds.
+    """
+
+    def __init__(self) -> None:
+        """Initialize the frame log and the release signal."""
+        self.sent: list[str] = []
+        self.release = asyncio.Event()
+
+    async def send(self, data: str) -> None:
+        """Record an outbound frame.
+
+        :param data: Encoded frame text.
+        """
+        self.sent.append(data)
+
+    async def recv(self) -> str:
+        """Block until released, then simulate a disconnect."""
+        await self.release.wait()
+        raise ConnectionError("test disconnect")
+
+
+async def test_tunnel_stamp_tracks_the_registered_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The host stamps its tunnel while registered and clears it on drop.
+
+    The stamp is what lets the next CLI invocation read tunnel health off the
+    filesystem instead of asking the server, so it must mean "the tunnel is
+    up" — present while serving, gone the moment the connection dies.
+    """
+    from omnigent.host.connect import TUNNEL_HEARTBEAT_ENV_VAR
+
+    stamp = tmp_path / "daemons" / "abc.tunnel"
+    monkeypatch.setenv(TUNNEL_HEARTBEAT_ENV_VAR, str(stamp))
+    host = _make_host_process()
+    tunnel = _HoldOpenTunnel()
+
+    serve = asyncio.create_task(host._serve_frames(tunnel))  # type: ignore[arg-type]
+    try:
+        for _ in range(200):
+            if stamp.exists():
+                break
+            await asyncio.sleep(0.01)
+        assert stamp.exists(), "a registered tunnel must be stamped"
+    finally:
+        tunnel.release.set()
+        with contextlib.suppress(ConnectionError):
+            await serve
+        _cleanup_host(host)
+
+    assert not stamp.exists(), "a dropped tunnel must clear its stamp"
+
+
+async def test_tunnel_stamp_is_optional(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host with no stamp path assigned serves normally.
+
+    Foreground ``omnigent host`` runs get no stamp path, and the daemon must
+    not treat that as an error.
+    """
+    from omnigent.host.connect import TUNNEL_HEARTBEAT_ENV_VAR
+
+    monkeypatch.delenv(TUNNEL_HEARTBEAT_ENV_VAR, raising=False)
+    host = _make_host_process()
+    tunnel = _FakeTunnel()
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type]
+    _cleanup_host(host)
+
+
+async def test_unwritable_stamp_path_is_not_fatal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stamp the daemon cannot write is swallowed, not raised.
+
+    The stamp is advisory — a read-only state dir must degrade to the server
+    probe, never take the tunnel down.
+    """
+    from omnigent.host.connect import (
+        TUNNEL_HEARTBEAT_ENV_VAR,
+        _clear_tunnel_heartbeat,
+        _touch_tunnel_heartbeat,
+    )
+
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("")
+    monkeypatch.setenv(TUNNEL_HEARTBEAT_ENV_VAR, str(blocker / "nested" / "abc.tunnel"))
+
+    _touch_tunnel_heartbeat()
+    _clear_tunnel_heartbeat()

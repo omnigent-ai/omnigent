@@ -8,7 +8,7 @@ import os
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -1003,3 +1003,344 @@ def test_start_hosts_on_explicit_server(
             "https://example.databricksapps.com",
         ]
     ]
+
+
+# ── remote daemon tunnel heal ──────────────────────────────────────
+
+
+_REMOTE_TARGET = "https://example.databricksapps.com"
+_REMOTE_HOST_ID = "host_remote_abc"
+
+
+def _remote_daemon_record(
+    tmp_path: Path,
+    *,
+    pid: int = 5150,
+    age_s: int = 600,
+    background: bool = True,
+) -> object:
+    """
+    Build a server-mode daemon record for reuse tests.
+
+    :param tmp_path: Test-scoped directory hosting the fake daemon log.
+    :param pid: Record pid, e.g. ``5150``.
+    :param age_s: Seconds since the daemon started, e.g. ``600``.
+    :param background: Whether the record carries a ``log_path`` (a daemon
+        this CLI spawned) rather than a foreground ``omnigent host``.
+    :returns: The daemon record.
+    """
+    from omnigent.cli import _HostDaemonRecord
+
+    return _HostDaemonRecord(
+        pid=pid,
+        target=_REMOTE_TARGET,
+        mode="server",
+        server_url=_REMOTE_TARGET,
+        log_path=str(tmp_path / "remote.log") if background else None,
+        started_at=int(time.time()) - age_s,
+        host_id=_REMOTE_HOST_ID,
+        config_sig="deadbeefdeadbeef",
+    )
+
+
+def _patch_remote_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    pid: int = 5150,
+) -> list[str]:
+    """
+    Isolate ``_reuse_existing_daemon_record`` for a server-mode record.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Test-scoped directory used as the config home.
+    :param pid: Pid treated as alive, e.g. ``5150``.
+    :returns: List that records teardown reasons.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr("omnigent.cli._pid_alive", lambda checked: checked == pid)
+    # The tmp config home has no identity file; match the record's id so the
+    # identity-drift check isn't what tears the daemon down.
+    monkeypatch.setattr("omnigent.cli._load_existing_host_id", lambda: _REMOTE_HOST_ID)
+    reasons: list[str] = []
+    monkeypatch.setattr(
+        "omnigent.cli._terminate_host_unit",
+        lambda record, *, reason: reasons.append(reason),
+    )
+    return reasons
+
+
+def _probe_result(status_code: int, body: object) -> object:
+    """
+    Build a canned management-HTTP result.
+
+    :param status_code: HTTP status, e.g. ``200`` (``0`` = transport failure).
+    :param body: Decoded body, e.g. ``{"status": "online"}``.
+    :returns: The result object.
+    """
+    from omnigent.cli import _HostHttpResult
+
+    return _HostHttpResult(status_code=status_code, body=body)
+
+
+def test_upgraded_install_restarts_remote_daemon(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A daemon from a superseded install is cycled onto the new code.
+
+    Server-mode records skip the config-signature check that carries the
+    version in local mode, so without a build stamp an in-place upgrade
+    (a refreshed ``isaac`` wheel) leaves the old daemon forking pre-upgrade
+    runners until the user stops it by hand.
+    """
+    from omnigent.cli import _HostDaemonRecord, _reuse_existing_daemon_record, _write_daemon_record
+
+    reasons = _patch_remote_reuse(monkeypatch, tmp_path)
+    record = _remote_daemon_record(tmp_path)
+    assert isinstance(record, _HostDaemonRecord)
+    _write_daemon_record(replace(record, pkg_version="0.4.11"))
+    monkeypatch.setattr("omnigent.cli._installed_omnigent_version", lambda: "0.4.12")
+    monkeypatch.setattr(
+        "omnigent.cli._daemon_host_definitely_offline",
+        lambda record: pytest.fail("upgrade drift must be caught before the tunnel probe"),
+    )
+
+    decision = _reuse_existing_daemon_record(_REMOTE_TARGET)
+
+    assert decision.reuse is False
+    assert reasons == ["omnigent was upgraded"]
+
+
+def test_matching_build_keeps_remote_daemon(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unchanged install is not a reason to cycle a healthy daemon."""
+    from omnigent.cli import _HostDaemonRecord, _reuse_existing_daemon_record, _write_daemon_record
+
+    reasons = _patch_remote_reuse(monkeypatch, tmp_path)
+    record = _remote_daemon_record(tmp_path)
+    assert isinstance(record, _HostDaemonRecord)
+    _write_daemon_record(replace(record, pkg_version="0.4.12"))
+    monkeypatch.setattr("omnigent.cli._installed_omnigent_version", lambda: "0.4.12")
+    monkeypatch.setattr(
+        "omnigent.cli._host_http_json",
+        lambda **kwargs: _probe_result(200, {"status": "online"}),
+    )
+
+    decision = _reuse_existing_daemon_record(_REMOTE_TARGET)
+
+    assert decision.reuse is True
+    assert reasons == []
+
+
+@pytest.mark.parametrize(
+    ("stamped", "installed"),
+    [
+        # Legacy record written before build stamping: we cannot know what it
+        # started with, so it is never torn down on this signal.
+        (None, "0.4.12"),
+        # Source checkout with no registered distribution: nothing to key on.
+        ("0.4.11", None),
+    ],
+)
+def test_unknown_build_is_never_a_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stamped: str | None,
+    installed: str | None,
+) -> None:
+    """
+    Build drift needs both versions known.
+
+    Guessing in either direction would cycle daemons on every launch for
+    contributors running from a source tree.
+    """
+    from omnigent.cli import _daemon_build_changed, _HostDaemonRecord
+
+    _patch_remote_reuse(monkeypatch, tmp_path)
+    monkeypatch.setattr("omnigent.cli._installed_omnigent_version", lambda: installed)
+    record = _remote_daemon_record(tmp_path)
+    assert isinstance(record, _HostDaemonRecord)
+
+    assert _daemon_build_changed(replace(record, pkg_version=stamped)) is False
+
+
+def test_daemon_record_round_trips_the_build_stamp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The build stamp survives the registry JSON round trip.
+
+    The reuse check reads it back from disk on a later invocation, so a field
+    that is written but not parsed would silently disable the upgrade heal.
+    """
+    from omnigent.cli import (
+        _find_daemon_record,
+        _HostDaemonRecord,
+        _write_daemon_record,
+    )
+
+    _patch_remote_reuse(monkeypatch, tmp_path)
+    record = _remote_daemon_record(tmp_path)
+    assert isinstance(record, _HostDaemonRecord)
+    _write_daemon_record(replace(record, pkg_version="0.4.12"))
+
+    reloaded = _find_daemon_record(_REMOTE_TARGET)
+
+    assert reloaded is not None
+    assert reloaded.pkg_version == "0.4.12"
+
+
+def test_fresh_tunnel_stamp_reuses_without_asking_the_server(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A recent stamp settles tunnel health locally.
+
+    The point of the stamp is that the common case — everything is fine —
+    costs no round trip to the server on every launch.
+    """
+    from omnigent.cli import (
+        _daemon_heartbeat_path,
+        _reuse_existing_daemon_record,
+        _write_daemon_record,
+    )
+
+    reasons = _patch_remote_reuse(monkeypatch, tmp_path)
+    _write_daemon_record(_remote_daemon_record(tmp_path))
+    stamp = _daemon_heartbeat_path(_REMOTE_TARGET)
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.touch()
+
+    def _fail_probe(**kwargs: object) -> object:
+        raise AssertionError("a fresh stamp must not trigger a server probe")
+
+    monkeypatch.setattr("omnigent.cli._host_http_json", _fail_probe)
+
+    decision = _reuse_existing_daemon_record(_REMOTE_TARGET)
+
+    assert decision.reuse is True
+    assert reasons == []
+
+
+def test_stale_tunnel_stamp_falls_back_to_the_server(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A stale stamp is not proof of a dead tunnel on its own.
+
+    Only the server can distinguish a wedged daemon from one whose stamp
+    aged out because the network — not the daemon — is broken.
+    """
+    from omnigent.cli import (
+        _daemon_heartbeat_path,
+        _reuse_existing_daemon_record,
+        _write_daemon_record,
+    )
+
+    reasons = _patch_remote_reuse(monkeypatch, tmp_path)
+    _write_daemon_record(_remote_daemon_record(tmp_path))
+    stamp = _daemon_heartbeat_path(_REMOTE_TARGET)
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.touch()
+    stale = time.time() - 3600
+    os.utime(stamp, (stale, stale))
+    probed: list[str] = []
+
+    def _probe(**kwargs: object) -> object:
+        probed.append(str(kwargs.get("path")))
+        return _probe_result(200, {"status": "online"})
+
+    monkeypatch.setattr("omnigent.cli._host_http_json", _probe)
+
+    decision = _reuse_existing_daemon_record(_REMOTE_TARGET)
+
+    assert decision.reuse is True, "the server said online — keep the daemon"
+    assert probed, "a stale stamp must be confirmed against the server"
+    assert reasons == [], "a stale stamp alone must not tear the daemon down"
+
+
+def test_missing_tunnel_stamp_falls_back_to_the_server(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    No stamp means "unknown", not "offline".
+
+    Foreground hosts and daemons from builds that predate the stamp never
+    write one, so its absence must not by itself condemn a daemon.
+    """
+    from omnigent.cli import _reuse_existing_daemon_record, _write_daemon_record
+
+    reasons = _patch_remote_reuse(monkeypatch, tmp_path)
+    _write_daemon_record(_remote_daemon_record(tmp_path))
+    monkeypatch.setattr(
+        "omnigent.cli._host_http_json",
+        lambda **kwargs: _probe_result(200, {"status": "online"}),
+    )
+
+    decision = _reuse_existing_daemon_record(_REMOTE_TARGET)
+
+    assert decision.reuse is True
+    assert reasons == []
+
+
+def test_deleting_a_daemon_record_removes_its_tunnel_stamp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The stamp must not outlive the record it describes."""
+    from omnigent.cli import (
+        _daemon_heartbeat_path,
+        _delete_daemon_record,
+        _write_daemon_record,
+    )
+
+    _patch_remote_reuse(monkeypatch, tmp_path)
+    record = _remote_daemon_record(tmp_path)
+    _write_daemon_record(record)
+    stamp = _daemon_heartbeat_path(_REMOTE_TARGET)
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.touch()
+
+    _delete_daemon_record(record)
+
+    assert not stamp.exists()
+
+
+def test_spawned_daemon_is_told_where_to_stamp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The daemon learns its stamp path from the environment.
+
+    Passing it (rather than recomputing it daemon-side) keeps one owner for
+    the registry layout and makes the stamp honor a patched data dir.
+    """
+    from omnigent.cli import _daemon_heartbeat_path, _ensure_host_daemon, _SpawnedDaemonProcess
+    from omnigent.host.connect import TUNNEL_HEARTBEAT_ENV_VAR
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr("omnigent.cli._pid_alive", lambda checked: False)
+    monkeypatch.setattr("omnigent.cli._load_existing_host_id", lambda: _REMOTE_HOST_ID)
+    captured: list[dict[str, str]] = []
+
+    def _fake_spawn(*, args: list[str], env: dict[str, str]) -> _SpawnedDaemonProcess:
+        captured.append(env)
+        return _SpawnedDaemonProcess(pid=4242, log_path=str(tmp_path / "host.log"))
+
+    monkeypatch.setattr("omnigent.cli._spawn_host_daemon_process", _fake_spawn)
+
+    _ensure_host_daemon(_REMOTE_TARGET)
+
+    assert captured, "the daemon must be spawned"
+    assert captured[0][TUNNEL_HEARTBEAT_ENV_VAR] == str(_daemon_heartbeat_path(_REMOTE_TARGET))
