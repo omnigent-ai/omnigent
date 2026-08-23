@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from typing import Any
 
 import pytest
 
@@ -402,12 +401,12 @@ class DataProcessor:
         total_savings = metrics.tokens_saved
         cost_savings = metrics.estimated_cost_savings_usd(cost_per_million_tokens=5.0)
 
-        print(f"\nProjected Monthly Savings (100 sessions):")
+        print("\nProjected Monthly Savings (100 sessions):")
         print(f"  Tokens saved: {total_savings:,}")
         print(f"  Cost saved: ${cost_savings:.2f}")
         print(f"  Compression ratio: {metrics.overall_compression_ratio:.2f}x")
         print(f"  Percent saved: {metrics.percent_saved:.1f}%")
-        print(f"\nBreakdown by type:")
+        print("\nBreakdown by type:")
         for method, count in metrics.compressions_by_type.items():
             saved = metrics.savings_by_type.get(method, 0)
             print(f"  {method}: {count} compressions, {saved:,} tokens saved")

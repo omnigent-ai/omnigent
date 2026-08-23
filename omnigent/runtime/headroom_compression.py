@@ -471,7 +471,7 @@ class HeadroomCompressor:
         if role == "tool":
             content = msg.get("content", "")
             return len(content) > self.json_threshold
-        elif role == "assistant":
+        if role == "assistant":
             content = msg.get("content", "")
             return len(content) > self.prose_threshold
         return False

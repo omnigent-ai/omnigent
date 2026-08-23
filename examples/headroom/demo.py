@@ -59,7 +59,7 @@ def demo_json_compression():
         tool_name="github_api_call",
     )
 
-    print(f"\nCompression Results:")
+    print("\nCompression Results:")
     print(f"  Method: {result.method}")
     print(f"  Original tokens: {result.original_tokens:,}")
     print(f"  Compressed tokens: {result.compressed_tokens:,}")
@@ -172,7 +172,7 @@ class DataProcessor:
         tool_name="read_file",
     )
 
-    print(f"\nCompression Results:")
+    print("\nCompression Results:")
     print(f"  Method: {result.method}")
     print(f"  Original tokens: {result.original_tokens:,}")
     print(f"  Compressed tokens: {result.compressed_tokens:,}")
@@ -201,7 +201,7 @@ def demo_conversation_history_compression():
             "results": [
                 {
                     "title": f"Article {i}",
-                    "content": f"Content about testing best practices... " * 50,
+                    "content": "Content about testing best practices... " * 50,
                     "url": f"https://example.com/{i}",
                 }
                 for i in range(20)
@@ -241,7 +241,7 @@ def demo_conversation_history_compression():
         compressor._estimate_tokens(str(msg.get("content", ""))) for msg in compressed_messages
     )
 
-    print(f"\nCompression Results:")
+    print("\nCompression Results:")
     print(f"  Compressed messages: {len(compressed_messages)}")
     print(f"  Compressed total tokens: {compressed_tokens:,}")
     print(f"  Tokens saved: {original_tokens - compressed_tokens:,}")

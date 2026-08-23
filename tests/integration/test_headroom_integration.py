@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import json
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
 from omnigent.entities import ConversationItem, MessageData
 from omnigent.runtime.compaction import compact, count_tokens
-from omnigent.runtime.headroom_compression import CompressionMetrics, HeadroomCompressor
 from omnigent.server.feature_flags import Feature
 from omnigent.spec.types import CompactionConfig
 
@@ -632,7 +631,7 @@ async def test_end_to_end_headroom_integration():
     # Recent messages should be preserved
     assert len(result.messages) >= 2  # At least the recent window
 
-    print(f"End-to-end test completed:")
+    print("End-to-end test completed:")
     print(f"  Original tokens: {original_tokens}")
     print(f"  Compressed tokens: {result.total_tokens}")
     if result.total_tokens:
