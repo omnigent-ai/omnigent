@@ -760,18 +760,18 @@ async def compact(
     # full context for recent interactions.
     #
     # Controlled by TWO settings:
-    # 1. Config setting: compaction.headroom_enabled: true (default)
-    # 2. Feature flag: OMNIGENT_FEATURES=headroom_compression (optional)
+    # 1. Feature flag: OMNIGENT_FEATURES=headroom_compression (required)
+    # 2. Config setting: compaction.headroom_enabled: true (default)
     #
-    # When feature_flags is None (not provided), only the config setting is checked.
-    # When feature_flags is provided, BOTH must be enabled for gradual rollout control.
-    feature_gate_enabled = True  # Default to enabled when feature_flags not provided
+    # BOTH must be enabled for Layer 0 to run. When feature_flags is None
+    # (tests, direct compact() calls), Layer 0 is disabled by default.
+    feature_gate_enabled = False  # Default to disabled when feature_flags not provided
     if feature_flags is not None:
         try:
             from omnigent.server.feature_flags import Feature
             feature_gate_enabled = feature_flags.enabled(Feature.HEADROOM_COMPRESSION)
         except (ImportError, AttributeError):
-            # Feature flags module not available, default to enabled
+            # Feature flags module not available, default to disabled
             pass
 
     config_enabled = config.headroom_enabled if config and hasattr(config, 'headroom_enabled') else True

@@ -11,7 +11,18 @@ import pytest
 from omnigent.entities import ConversationItem, MessageData
 from omnigent.runtime.compaction import compact, count_tokens
 from omnigent.runtime.headroom_compression import CompressionMetrics, HeadroomCompressor
+from omnigent.server.feature_flags import Feature
 from omnigent.spec.types import CompactionConfig
+
+
+class MockFeatureFlags:
+    """Mock FeatureFlags for testing."""
+
+    def __init__(self, enabled_features: set[Feature] | None = None):
+        self.enabled_features = enabled_features or set()
+
+    def enabled(self, feature: Feature) -> bool:
+        return feature in self.enabled_features
 
 
 class TestHeadroomCompactionIntegration:
@@ -174,6 +185,7 @@ class ExampleClass:
         )
 
         # Run compaction with Headroom
+        feature_flags = MockFeatureFlags({Feature.HEADROOM_COMPRESSION})
         result = await compact(
             messages=messages,
             history=history,
@@ -183,6 +195,7 @@ class ExampleClass:
             model="openai/gpt-4o",
             task_id="test_task",
             llm_client=mock_llm_client,
+            feature_flags=feature_flags,
         )
 
         # Verify compression occurred
