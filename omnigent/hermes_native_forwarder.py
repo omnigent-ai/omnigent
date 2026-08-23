@@ -69,6 +69,7 @@ from pathlib import Path
 import httpx
 
 from omnigent import hermes_native_status
+from omnigent.host.daemon_launch import error_text
 from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
 
 _logger = logging.getLogger(__name__)
@@ -1166,8 +1167,28 @@ async def forward_hermes_store_to_session(
                             f"/v1/sessions/{session_id}",
                             json={"external_session_id": hermes_session_id},
                         )
+                        if 400 <= resp.status_code < 500:
+                            _logger.warning(
+                                "hermes forwarder external_session_id PATCH rejected; "
+                                "not retrying: session=%s status=%s reason=%s",
+                                session_id,
+                                resp.status_code,
+                                error_text(resp),
+                            )
+                            # Deterministic 4xx rejections are not transient.
+                            # Latch off to avoid a hot PATCH loop.
+                            _external_id_synced = True
+                            continue
                         resp.raise_for_status()
                         _external_id_synced = True
+                    except httpx.HTTPStatusError as exc:
+                        _logger.debug(
+                            "hermes forwarder failed to PATCH external_session_id; "
+                            "will retry next poll; session=%s status=%s",
+                            session_id,
+                            exc.response.status_code,
+                            exc_info=True,
+                        )
                     except httpx.HTTPError:
                         _logger.debug(
                             "hermes forwarder failed to PATCH external_session_id; "

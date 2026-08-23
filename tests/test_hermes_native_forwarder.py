@@ -14,6 +14,7 @@ import json
 import sqlite3
 from pathlib import Path
 
+import httpx
 import pytest
 
 from omnigent import hermes_native_forwarder as f
@@ -543,6 +544,153 @@ async def test_forward_loop_patches_external_session_id_once(tmp_path, monkeypat
     url, body = patch_calls[0]
     assert url == "/v1/sessions/conv_patch"
     assert body["external_session_id"] == "20260620_1"
+
+
+@pytest.mark.asyncio
+async def test_external_session_id_patch_4xx_latches_and_logs(
+    tmp_path,
+    monkeypatch,
+    caplog,
+) -> None:
+    """A deterministic 4xx PATCH rejection logs once and does not retry-loop."""
+    workspace = str(tmp_path)
+    db = tmp_path / "state.db"
+    _seed_db(db, cwd=workspace, started_at=1000.0)
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    patched_calls: list[tuple[str, dict]] = []
+
+    class _Patch4xxClient:
+        async def patch(self, url: str, *, json: dict) -> httpx.Response:
+            patched_calls.append((url, json))
+            req = httpx.Request("PATCH", f"http://test{url}")
+            return httpx.Response(
+                400,
+                request=req,
+                json={"error": {"message": "external_session_id already set"}},
+            )
+
+    class _ClientCM:
+        async def __aenter__(self):
+            return _Patch4xxClient()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    monkeypatch.setattr(
+        "omnigent.cli_auth.open_server_client",
+        lambda *args, **kwargs: _ClientCM(),
+    )
+
+    # Keep loop alive for several polls; if latching is broken we'd see repeated PATCHes.
+    tick = {"n": 0}
+
+    async def _sleep(_s):
+        tick["n"] += 1
+        if tick["n"] >= 4:
+            raise asyncio.CancelledError
+
+    async def _noop_item(_client, *, session_id, item):
+        return None
+
+    monkeypatch.setattr(f.asyncio, "sleep", _sleep)
+    monkeypatch.setattr(f, "_post_conversation_item", _noop_item)
+    monkeypatch.setattr(f, "_persist_hermes_compaction_item", lambda *a, **k: _noop())
+
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(asyncio.CancelledError):
+            await f.forward_hermes_store_to_session(
+                base_url="http://test",
+                headers={},
+                session_id="conv_4xx",
+                bridge_dir=bridge_dir,
+                agent_name="hermes-native-ui",
+                workspace=workspace,
+                launch_epoch_s=1000.0,
+                db_path=db,
+                poll_interval_s=0.001,
+            )
+
+    assert len(patched_calls) == 1
+    assert any(
+        "PATCH rejected; not retrying" in rec.getMessage() and "status=400" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_external_session_id_patch_5xx_retries(tmp_path, monkeypatch, caplog) -> None:
+    """A 5xx PATCH rejection remains retryable across polls."""
+    workspace = str(tmp_path)
+    db = tmp_path / "state.db"
+    _seed_db(db, cwd=workspace, started_at=1000.0)
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    patched_calls: list[tuple[str, dict]] = []
+
+    class _Patch5xxClient:
+        async def patch(self, url: str, *, json: dict) -> httpx.Response:
+            patched_calls.append((url, json))
+            req = httpx.Request("PATCH", f"http://test{url}")
+            return httpx.Response(
+                503,
+                request=req,
+                json={"error": {"message": "temporary unavailable"}},
+            )
+
+    class _ClientCM:
+        async def __aenter__(self):
+            return _Patch5xxClient()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    monkeypatch.setattr(
+        "omnigent.cli_auth.open_server_client",
+        lambda *args, **kwargs: _ClientCM(),
+    )
+
+    tick = {"n": 0}
+
+    async def _sleep(_s):
+        tick["n"] += 1
+        if tick["n"] >= 4:
+            raise asyncio.CancelledError
+
+    async def _noop_item(_client, *, session_id, item):
+        return None
+
+    monkeypatch.setattr(f.asyncio, "sleep", _sleep)
+    monkeypatch.setattr(f, "_post_conversation_item", _noop_item)
+    monkeypatch.setattr(f, "_persist_hermes_compaction_item", lambda *a, **k: _noop())
+
+    import logging
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(asyncio.CancelledError):
+            await f.forward_hermes_store_to_session(
+                base_url="http://test",
+                headers={},
+                session_id="conv_5xx",
+                bridge_dir=bridge_dir,
+                agent_name="hermes-native-ui",
+                workspace=workspace,
+                launch_epoch_s=1000.0,
+                db_path=db,
+                poll_interval_s=0.001,
+            )
+
+    assert len(patched_calls) >= 2
+    assert any(
+        "will retry next poll" in rec.getMessage() and "status=503" in rec.getMessage()
+        for rec in caplog.records
+    )
 
 
 async def test_forward_loop_repins_to_child_after_compaction(tmp_path, monkeypatch) -> None:
