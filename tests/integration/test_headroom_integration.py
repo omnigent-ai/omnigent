@@ -368,7 +368,7 @@ class TestHeadroomConfigurationOptions:
         assert config.headroom_json_threshold == 500
         assert config.headroom_code_threshold == 1000
         assert config.headroom_prose_threshold == 2000
-        assert config.headroom_enable_ccr is True
+        assert config.headroom_enable_ccr is False  # Not yet implemented
 
     def test_custom_headroom_config(self):
         """Test custom Headroom configuration values."""

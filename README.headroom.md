@@ -1,22 +1,33 @@
 # Headroom Integration
 
-AI context compression for 15-95% token reduction.
+AI context compression integration for Omnigent. When the `headroom-ai` package is installed, provides 15-95% token reduction via content-aware compression.
+
+## Requirements
+
+This integration requires:
+1. `headroom-ai` package installed (`pip install headroom-ai`)
+2. Feature flag enabled: `OMNIGENT_FEATURES=headroom_compression`
+
+Without these, Layer 0 compression is disabled and no token reduction occurs.
 
 ## Quick Start
 
 ```bash
-# Run demo
-PYTHONPATH=. python examples/headroom/demo.py
+# Install headroom-ai (when available)
+pip install headroom-ai
+
+# Enable feature flag
+export OMNIGENT_FEATURES=headroom_compression
 
 # Run tests
-PYTHONPATH=. pytest tests/unit/test_headroom_compression.py -v
+pytest tests/unit/test_headroom_compression.py -v
 
-# Enable in agent
+# Enable in agent config
 compaction:
   headroom_enabled: true
 ```
 
-## What It Does
+## What It Does (When Installed)
 
 Adds Layer 0 compression before existing compaction layers:
 
@@ -27,16 +38,17 @@ Adds Layer 0 compression before existing compaction layers:
 ## Documentation
 
 - **User Guide:** [`docs/HEADROOM.md`](docs/HEADROOM.md)
-- **Examples:** [`examples/headroom/config_examples.yaml`](examples/headroom/config_examples.yaml)
 - **Demo:** [`examples/headroom/demo.py`](examples/headroom/demo.py)
+- **Examples:** See `docs/HEADROOM.md` for configuration examples
 
 ## Status
 
-✅ **Production Ready**
-- Implementation: Complete
-- Tests: 21/21 passing
-- Works with or without headroom-ai package
-- No TODOs remaining
+⚠️ **Integration Complete, Package Required**
+- Implementation: Integration layer complete
+- Tests: 21/21 passing (unit tests)
+- Requires: `headroom-ai` package to be installed for actual compression
+- Feature flag: `OMNIGENT_FEATURES=headroom_compression` required
+- CCR (reversible compression): Not yet implemented
 
 ## Files
 
@@ -50,42 +62,41 @@ Adds Layer 0 compression before existing compaction layers:
 - `tests/unit/test_headroom_compression.py`
 - `tests/integration/test_headroom_integration.py`
 
-**Examples (2):**
+**Examples (1):**
 - `examples/headroom/demo.py`
-- `examples/headroom/config_examples.yaml`
 
 **Documentation (1):**
 - `docs/HEADROOM.md`
 
 ## Deployment
 
-### Simulation Mode (Now)
-
-Works without headroom-ai package:
+### Installation
 
 ```bash
-# No installation needed
-PYTHONPATH=. python examples/headroom/demo.py
+# 1. Install headroom-ai package
+pip install headroom-ai
+
+# 2. Enable feature flag
+export OMNIGENT_FEATURES=headroom_compression
+
+# 3. Enable in agent config (optional, enabled by default)
+compaction:
+  headroom_enabled: true
 ```
 
-Uses simulated compression for planning/testing.
+### Without headroom-ai
 
-### Production Mode (When Available)
+If `headroom-ai` is not installed:
+- Layer 0 compression is skipped
+- No token reduction occurs
+- No fake metrics are reported
+- Compaction falls back to existing Layers 1-3
 
-Auto-upgrades when headroom-ai is installed:
+## Expected Impact (When Installed)
 
-```bash
-pip install "headroom-ai[all]>=0.1.0,<1"
-# No code changes needed - auto-detects
-```
-
-Uses real compression for actual token reduction.
-
-## Expected Impact
-
-**50-developer team:**
-- Token reduction: 25-50%
-- Cost savings: $425-575/month
-- Quality: Maintained via CCR
+**50-developer team with headroom-ai installed:**
+- Token reduction: 15-40% (content-dependent)
+- Cost savings: Variable, depends on content mix
+- Note: Some quality impact possible as CCR retrieval is not yet implemented
 
 See `docs/HEADROOM.md` for full documentation.

@@ -26,13 +26,16 @@ _logger = logging.getLogger(__name__)
 
 # Try to import headroom; gracefully degrade if unavailable
 try:
+    from headroom.compressors import (  # type: ignore[import-not-found]
+        CodeCompressor,
+        JsonCompressor,
+        ProseCompressor,
+    )
+
     HEADROOM_AVAILABLE = True
-    # These imports will be added when headroom-ai is in pyproject.toml
-    # from headroom import compress_content, CompressConfig
-    # from headroom.compressors import JsonCompressor, CodeCompressor, ProseCompressor
 except ImportError:
     HEADROOM_AVAILABLE = False
-    _logger.info("Headroom not available; compression will be skipped")
+    _logger.info("Headroom not available; simulation mode will be used")
 
 
 @dataclass
@@ -335,35 +338,26 @@ class HeadroomCompressor:
         falls back to placeholder compression for demonstration.
         """
         if HEADROOM_AVAILABLE:
-            try:
-                # Try to use real Headroom JsonCompressor
-                from headroom.compressors import JsonCompressor  # type: ignore[import-not-found]
+            compressor = JsonCompressor(enable_ccr=self.enable_ccr)
+            result = compressor.compress(content)
 
-                compressor = JsonCompressor(enable_ccr=self.enable_ccr)
-                result = compressor.compress(content)
+            return CompressionResult(
+                compressed=result.compressed,
+                original_tokens=result.original_tokens,
+                compressed_tokens=result.compressed_tokens,
+                compression_ratio=result.compression_ratio,
+                method="json",
+                retrieval_key=getattr(result, "retrieval_key", None),
+            )
 
-                return CompressionResult(
-                    compressed=result.compressed,
-                    original_tokens=result.original_tokens,
-                    compressed_tokens=result.compressed_tokens,
-                    compression_ratio=result.compression_ratio,
-                    method="json",
-                    retrieval_key=getattr(result, "retrieval_key", None),
-                )
-            except (ImportError, AttributeError) as e:
-                _logger.debug("Headroom JsonCompressor not available, using placeholder: %s", e)
-
-        # Fallback: simulate 70% compression for JSON (demonstration mode)
-        # This provides realistic metrics for planning/testing without real Headroom
-        compressed = content  # In demo mode, content is not actually compressed
-        compressed_tokens = int(estimated_tokens * 0.3)  # 70% reduction
-
+        # Fallback: headroom-ai not installed, return unchanged content with no compression
+        # This is honest no-op behavior when the real compressor is unavailable
         return CompressionResult(
-            compressed=compressed,
+            compressed=content,
             original_tokens=estimated_tokens,
-            compressed_tokens=compressed_tokens,
-            compression_ratio=estimated_tokens / max(compressed_tokens, 1),
-            method="json",
+            compressed_tokens=estimated_tokens,  # No actual compression
+            compression_ratio=1.0,  # 1:1 means no compression
+            method="none",
         )
 
     def _compress_code(
@@ -377,35 +371,25 @@ class HeadroomCompressor:
         falls back to placeholder compression for demonstration.
         """
         if HEADROOM_AVAILABLE:
-            try:
-                # Try to use real Headroom CodeCompressor
-                from headroom.compressors import CodeCompressor  # type: ignore[import-not-found]
+            compressor = CodeCompressor(enable_ccr=self.enable_ccr)
+            result = compressor.compress(content)
 
-                compressor = CodeCompressor(enable_ccr=self.enable_ccr)
-                result = compressor.compress(content)
+            return CompressionResult(
+                compressed=result.compressed,
+                original_tokens=result.original_tokens,
+                compressed_tokens=result.compressed_tokens,
+                compression_ratio=result.compression_ratio,
+                method="code",
+                retrieval_key=getattr(result, "retrieval_key", None),
+            )
 
-                return CompressionResult(
-                    compressed=result.compressed,
-                    original_tokens=result.original_tokens,
-                    compressed_tokens=result.compressed_tokens,
-                    compression_ratio=result.compression_ratio,
-                    method="code",
-                    retrieval_key=getattr(result, "retrieval_key", None),
-                )
-            except (ImportError, AttributeError) as e:
-                _logger.debug("Headroom CodeCompressor not available, using placeholder: %s", e)
-
-        # Fallback: simulate 18% compression for code (demonstration mode)
-        # This provides realistic metrics for planning/testing without real Headroom
-        compressed = content  # In demo mode, content is not actually compressed
-        compressed_tokens = int(estimated_tokens * 0.82)  # 18% reduction
-
+        # Fallback: headroom-ai not installed, return unchanged content with no compression
         return CompressionResult(
-            compressed=compressed,
+            compressed=content,
             original_tokens=estimated_tokens,
-            compressed_tokens=compressed_tokens,
-            compression_ratio=estimated_tokens / max(compressed_tokens, 1),
-            method="code",
+            compressed_tokens=estimated_tokens,
+            compression_ratio=1.0,
+            method="none",
         )
 
     def _compress_prose(
@@ -419,35 +403,25 @@ class HeadroomCompressor:
         falls back to placeholder compression for demonstration.
         """
         if HEADROOM_AVAILABLE:
-            try:
-                # Try to use real Headroom ProseCompressor
-                from headroom.compressors import ProseCompressor  # type: ignore[import-not-found]
+            compressor = ProseCompressor(model="kompress-v2-base", enable_ccr=self.enable_ccr)
+            result = compressor.compress(content)
 
-                compressor = ProseCompressor(model="kompress-v2-base", enable_ccr=self.enable_ccr)
-                result = compressor.compress(content)
+            return CompressionResult(
+                compressed=result.compressed,
+                original_tokens=result.original_tokens,
+                compressed_tokens=result.compressed_tokens,
+                compression_ratio=result.compression_ratio,
+                method="prose",
+                retrieval_key=getattr(result, "retrieval_key", None),
+            )
 
-                return CompressionResult(
-                    compressed=result.compressed,
-                    original_tokens=result.original_tokens,
-                    compressed_tokens=result.compressed_tokens,
-                    compression_ratio=result.compression_ratio,
-                    method="prose",
-                    retrieval_key=getattr(result, "retrieval_key", None),
-                )
-            except (ImportError, AttributeError) as e:
-                _logger.debug("Headroom ProseCompressor not available, using placeholder: %s", e)
-
-        # Fallback: simulate 25% compression for prose (demonstration mode)
-        # This provides realistic metrics for planning/testing without real Headroom
-        compressed = content  # In demo mode, content is not actually compressed
-        compressed_tokens = int(estimated_tokens * 0.75)  # 25% reduction
-
+        # Fallback: headroom-ai not installed, return unchanged content with no compression
         return CompressionResult(
-            compressed=compressed,
+            compressed=content,
             original_tokens=estimated_tokens,
-            compressed_tokens=compressed_tokens,
-            compression_ratio=estimated_tokens / max(compressed_tokens, 1),
-            method="prose",
+            compressed_tokens=estimated_tokens,
+            compression_ratio=1.0,
+            method="none",
         )
 
     def _no_compression_result(

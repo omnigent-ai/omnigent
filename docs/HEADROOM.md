@@ -1,6 +1,8 @@
 # Headroom Integration for Cost Optimization
 
-Omnigent integrates [Headroom](https://github.com/headroomlabs-ai/headroom) for intelligent context compression, reducing token usage by 15-95% while maintaining answer quality through reversible compression.
+Omnigent integrates [Headroom](https://github.com/headroomlabs-ai/headroom) for intelligent context compression. When the `headroom-ai` package is installed, it provides 15-95% token reduction via content-aware compression.
+
+**Note:** This integration currently requires the `headroom-ai` package to be installed separately. Without it, Layer 0 compression is disabled and no token reduction occurs.
 
 ## Overview
 
@@ -88,7 +90,6 @@ compaction:
 
 instructions: |
   Your agent instructions here.
-  Use headroom_retrieve() to access full context if needed.
 ```
 
 ### Default Values
@@ -135,19 +136,15 @@ Headroom automatically detects content type:
 
 ### 3. Content-Cache-Retrieval (CCR)
 
-When `headroom_enable_ccr: true`:
+**Status:** Not yet implemented. The `headroom_enable_ccr` config option is reserved for future use.
 
-1. Original content is cached locally
-2. Compressed version is sent to LLM
-3. LLM can call `headroom_retrieve(key)` to access full content
-4. No quality degradation
+When fully implemented, CCR would:
+1. Cache original content locally
+2. Send compressed version to LLM
+3. Allow LLM to retrieve full content via a tool call
+4. Enable reversible compression with no quality loss
 
-**Privacy Note:** Disable CCR for sensitive data:
-
-```yaml
-compaction:
-  headroom_enable_ccr: false  # No caching
-```
+Currently, compression is applied but retrieval is not available, so compressed content is permanent.
 
 ## Usage Examples
 
@@ -424,32 +421,13 @@ compaction:
 - Adjust thresholds based on workload
 - Track cost savings
 
-### 3. Enable CCR
-
-Unless privacy-sensitive, enable CCR:
-
-```yaml
-compaction:
-  headroom_enable_ccr: true
-```
-
-### 4. Protect Recent Context
+### 3. Protect Recent Context
 
 Keep recent window large enough:
 
 ```yaml
 compaction:
   recent_window: 5  # or more
-```
-
-### 5. Use Retrieval Tool
-
-Instruct agents to use `headroom_retrieve()`:
-
-```yaml
-instructions: |
-  Review code for bugs.
-  Use headroom_retrieve(key) to access full context if needed.
 ```
 
 ## Migration Guide
@@ -485,7 +463,7 @@ If you have custom compression:
 ## FAQ
 
 **Q: Does compression affect answer quality?**  
-A: No. CCR allows LLMs to retrieve full content when needed.
+A: When `headroom-ai` is installed and the feature flag is enabled, compression uses content-aware methods designed to preserve semantic meaning. However, some information loss may occur as retrieval (CCR) is not yet implemented.
 
 **Q: What's the latency impact?**  
 A: <100ms per compression, threshold-gated.
