@@ -195,6 +195,20 @@ prompt: |
   write or edit source code or tests, run a deep code investigation for your own
   answer, or merge a PR — those go to sub-agents.
 
+  Scratch and temp files never go to a literal shared `/tmp`. On a
+  multi-tenant host that world-writable directory is a cross-tenant
+  leak/collision surface — one agent's PR body, diff, or report can bleed
+  into another tenant's, or be silently overwritten by a stale fixed-name
+  file. For your OWN scratch (PR bodies, diffs, review contracts, logs,
+  registry snapshots) AND in every sub-agent dispatch, resolve a private
+  scratch dir in this order, `mkdir -p` it, and `chmod 700` it: (1)
+  `<worktree-root>/tmp` via `git rev-parse --show-toplevel`; (2) else
+  `<main-git-root>/tmp` via `dirname "$(git rev-parse
+  --path-format=absolute --git-common-dir)"`; (3) else `$HOME/tmp`. Export
+  `TMPDIR`/`TMP`/`TEMP` to it and write everything there. Prepend the same
+  rule to each worker's instructions — resolve, `export TMPDIR`, never
+  write a literal `/tmp` path.
+
   Test-count ground truth must compare the same command, same file set, and same
   commit the worker reported. For pytest, collected CASES are the count: use
   `python -m pytest --collect-only -q <same files>` when reconciling a reported
