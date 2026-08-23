@@ -1,8 +1,29 @@
 # Headroom Integration Scaffolding
 
-Integration scaffolding for [Headroom](https://github.com/headroomlabs-ai/headroom) AI context compression. The infrastructure is ready for when the `headroom-ai` package becomes publicly available.
+Integration scaffolding for [Headroom](https://github.com/headroomlabs-ai/headroom) AI context compression.
 
-**Current Status:** Integration layer complete with graceful degradation. The `headroom-ai` package is available on PyPI (v0.36.4+) but the dependency is kept commented in the `all` optional extra until reversible compression (CCR) is implemented. Without CCR, enabling compression would cause irreversible data loss in conversation context. Layer 0 currently returns unchanged content with honest no-op metrics.
+## Current Status - SCAFFOLDING ONLY
+
+⚠️ **This is integration infrastructure only. Compression is NOT ACTIVE.** ⚠️
+
+**What's Complete:**
+- ✅ Layer 0 compression integration point in compaction pipeline
+- ✅ CCR cache implementation with path-traversal protection
+- ✅ `headroom_retrieve(key)` tool function and schema defined
+- ✅ `UniversalCompressor` API integration
+- ✅ Feature flag and configuration options
+- ✅ Graceful degradation when package unavailable
+- ✅ 44 unit/integration tests passing
+
+**What's NOT Complete (Blocking Activation):**
+- ❌ `headroom_retrieve` tool registration in agent toolset
+- ❌ Out-of-band key storage mechanism
+- ❌ Session isolation for CCR cache
+- ❌ TTL/cleanup lifecycle for cached content
+
+**Current Behavior:** Layer 0 runs but does **NOT** compress or replace content. All compression code is commented out. The `headroom-ai` dependency is commented in `pyproject.toml`.
+
+See `HEADROOM_TODO.md` in the repo root for detailed checklist of remaining work.
 
 ## Overview
 
