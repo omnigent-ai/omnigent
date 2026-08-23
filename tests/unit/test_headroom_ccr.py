@@ -80,10 +80,11 @@ class TestCCRCache:
             assert cache.retrieve("key3") is None
 
     def test_default_cache_dir(self):
-        """Test that default cache directory is created."""
+        """Test that default cache directory is created with session isolation."""
         cache = CCRCache()
         assert cache.cache_dir.exists()
-        assert cache.cache_dir == Path.home() / ".headroom" / "cache"
+        # When no conversation_id is provided, "default" subdirectory is used
+        assert cache.cache_dir == Path.home() / ".headroom" / "cache" / "default"
 
     def test_store_empty_key(self):
         """Test that storing with empty key is a no-op."""
@@ -113,7 +114,8 @@ class TestHeadroomCCRIntegration:
             # Without headroom-ai, compression is a no-op, so no cache should be created
             # This test verifies the plumbing is in place
             assert compressor.ccr_cache is not None
-            assert compressor.ccr_cache.cache_dir == Path(tmpdir)
+            # When no conversation_id is provided, "default" subdirectory is used
+            assert compressor.ccr_cache.cache_dir == Path(tmpdir) / "default"
 
     def test_ccr_disabled_no_cache(self):
         """Test that CCR disabled means no cache is created."""

@@ -157,18 +157,18 @@ class CCRCache:
         :param cache_dir: Directory for cache storage. Defaults to
             ~/.headroom/cache if None.
         :param conversation_id: Conversation ID for session isolation.
-            If provided, files are stored in a subdirectory per conversation.
+            Uses "default" subdirectory if None to ensure consistency
+            between store and retrieve paths.
         """
         if cache_dir:
             base_dir = Path(cache_dir)
         else:
             base_dir = Path.home() / ".headroom" / "cache"
 
-        # Add conversation subdirectory for session isolation
-        if conversation_id:
-            self.cache_dir = base_dir / conversation_id
-        else:
-            self.cache_dir = base_dir
+        # Always use a subdirectory for session isolation - "default" when no conversation_id
+        # This ensures store and retrieve use the same path
+        session_id = conversation_id or "default"
+        self.cache_dir = base_dir / session_id
 
         self.cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         _logger.debug("CCR cache initialized at %s", self.cache_dir)
