@@ -533,12 +533,11 @@ def _apply_headroom_compression(
                     estimated_tokens=estimated_tokens,
                 )
 
-                # Only apply if compression ratio > 1.2 (>20% savings)
-                if result.compression_ratio > 1.2:
+                # Only apply if compression ratio > 1.2 (>20% savings) AND we have a CCR key
+                if result.compression_ratio > 1.2 and result.retrieval_key:
                     msg["output"] = result.compressed
-                    # Store retrieval key if CCR is enabled
-                    if result.retrieval_key:
-                        msg["_headroom_key"] = result.retrieval_key
+                    # TODO: Store retrieval key out-of-band, not in message
+                    # msg["_headroom_key"] = result.retrieval_key
 
         # Compress text content in message content blocks
         elif content and isinstance(content, list):
@@ -559,11 +558,10 @@ def _apply_headroom_compression(
                             estimated_tokens=estimated_tokens,
                         )
 
-                        if result.compression_ratio > 1.2:
+                        if result.compression_ratio > 1.2 and result.retrieval_key:
                             block["text"] = result.compressed
-                            # Store retrieval key if CCR is enabled
-                            if result.retrieval_key:
-                                block["_headroom_key"] = result.retrieval_key
+                            # TODO: Store retrieval key out-of-band
+                            # block["_headroom_key"] = result.retrieval_key
 
                 # Compress tool_result content
                 elif block_type == "tool_result":
@@ -581,11 +579,10 @@ def _apply_headroom_compression(
                             estimated_tokens=estimated_tokens,
                         )
 
-                        if result.compression_ratio > 1.2:
+                        if result.compression_ratio > 1.2 and result.retrieval_key:
                             block["content"] = result.compressed
-                            # Store retrieval key if CCR is enabled
-                            if result.retrieval_key:
-                                block["_headroom_key"] = result.retrieval_key
+                            # TODO: Store retrieval key out-of-band
+                            # block["_headroom_key"] = result.retrieval_key
 
         # Compress string content directly
         elif isinstance(content, str) and len(content) > compressor.prose_threshold:
@@ -596,11 +593,10 @@ def _apply_headroom_compression(
                 estimated_tokens=estimated_tokens,
             )
 
-            if result.compression_ratio > 1.2:
+            if result.compression_ratio > 1.2 and result.retrieval_key:
                 msg["content"] = result.compressed
-                # Store retrieval key if CCR is enabled
-                if result.retrieval_key:
-                    msg["_headroom_key"] = result.retrieval_key
+                # TODO: Store retrieval key out-of-band
+                # msg["_headroom_key"] = result.retrieval_key
 
 
 def compaction_to_history_items(
