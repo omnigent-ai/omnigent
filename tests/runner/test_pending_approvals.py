@@ -67,7 +67,7 @@ async def test_resolve_sets_result_and_returns_true() -> None:
     # between register and resolve.
     assert delivered is True
     assert fut.done()
-    assert fut.result() is True
+    assert fut.result() == (True, None)
 
 
 @pytest.mark.asyncio
@@ -138,7 +138,7 @@ async def test_wait_for_user_approval_returns_true_on_accept() -> None:
         pending_approvals.resolve("elicit_happy", True)
 
     resolve_task = asyncio.create_task(_resolve_after_delay())
-    approved = await pending_approvals.wait_for_user_approval(
+    approved, _ = await pending_approvals.wait_for_user_approval(
         elicitation_id="elicit_happy",
         conversation_id="conv_x",
         publish_event=_publish,
@@ -175,7 +175,7 @@ async def test_wait_for_user_approval_returns_false_on_timeout() -> None:
     def _publish(conv_id: str, event: dict[str, Any]) -> None:
         publishes.append((conv_id, event))
 
-    approved = await pending_approvals.wait_for_user_approval(
+    approved, _ = await pending_approvals.wait_for_user_approval(
         elicitation_id="elicit_timeout",
         conversation_id="conv_y",
         publish_event=_publish,
@@ -275,7 +275,7 @@ async def test_wait_for_user_approval_default_budget_gates_until_verdict() -> No
 
     # Only a real human verdict releases the gate, and the value is honored.
     assert pending_approvals.resolve("elicit_default_budget", approved=True) is True
-    assert await asyncio.wait_for(task, timeout=1.0) is True
+    assert await asyncio.wait_for(task, timeout=1.0) == (True, None)
     assert pending_approvals.has_pending("conv_default_budget") is False
 
 
@@ -329,7 +329,7 @@ async def test_has_pending_true_while_parked_then_false_after_accept() -> None:
     assert pending_approvals.has_pending("conv_hp1") is True
 
     pending_approvals.resolve("elicit_hp1", True)
-    assert await wait_task is True
+    assert await wait_task == (True, None)
     # Cleared on the verdict path — the gate is resolved, so messages may
     # flow (drive a continuation) again.
     assert pending_approvals.has_pending("conv_hp1") is False
@@ -342,7 +342,7 @@ async def test_has_pending_cleared_on_timeout() -> None:
     Without this, a session whose human walked away would reject all
     further messages forever even though the gate has lapsed.
     """
-    approved = await pending_approvals.wait_for_user_approval(
+    approved, _ = await pending_approvals.wait_for_user_approval(
         elicitation_id="elicit_hp_timeout",
         conversation_id="conv_hp_timeout",
         publish_event=_noop_publish,
@@ -401,10 +401,10 @@ async def test_has_pending_counts_concurrent_parks() -> None:
 
     # Resolve the first — the session is still awaiting the second.
     pending_approvals.resolve("elicit_multi_1", True)
-    assert await t1 is True
+    assert await t1 == (True, None)
     assert pending_approvals.has_pending("conv_multi") is True
 
     # Resolve the second — now the gate is fully clear.
     pending_approvals.resolve("elicit_multi_2", False)
-    assert await t2 is False
+    assert await t2 == (False, None)
     assert pending_approvals.has_pending("conv_multi") is False

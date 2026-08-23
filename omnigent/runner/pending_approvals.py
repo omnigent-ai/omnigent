@@ -28,6 +28,7 @@ Lifecycle contract:
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 from collections.abc import Callable
 
 # Default wait budget for a UI verdict, in seconds. Held at one day
@@ -45,7 +46,7 @@ _DEFAULT_WAIT_SECONDS: float = 86400.0
 # True = approved, False = declined/timed-out. Future is owned by the
 # caller that registered it — this module is just the routing table
 # the session-event handler reads to set the result.
-_pending: dict[str, asyncio.Future[bool]] = {}
+_pending: dict[str, asyncio.Future[Any]] = {}
 
 # Per-session count of outstanding ASK verdicts (a session may have more
 # than one parked at once — e.g. parallel tool calls that each tripped a
@@ -80,7 +81,7 @@ def has_any_pending() -> bool:
     return any(not fut.done() for fut in _pending.values())
 
 
-def register(elicitation_id: str) -> asyncio.Future[bool]:
+def register(elicitation_id: str) -> asyncio.Future[Any]:
     """
     Create and store a Future for an outstanding ASK verdict.
 
@@ -93,7 +94,7 @@ def register(elicitation_id: str) -> asyncio.Future[bool]:
     :returns: The newly created Future. Caller awaits with
         :func:`asyncio.wait_for` to bound the wait.
     """
-    fut: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+    fut: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
     _pending[elicitation_id] = fut
     return fut
 
@@ -111,28 +112,24 @@ def cleanup(elicitation_id: str) -> None:
     _pending.pop(elicitation_id, None)
 
 
-def resolve(elicitation_id: str, approved: bool) -> bool:
-    """
-    Set the verdict on a registered Future.
-
-    Called by the runner's session-event handler when an
-    ``approval`` event arrives. Idempotent: returns ``False`` for
-    unknown ids or already-completed Futures so callers can
-    distinguish "delivered" from "no-op."
+def resolve(
+    elicitation_id: str,
+    approved: bool,
+    content: dict[str, Any] | None = None,
+) -> bool:
+    """Set the verdict and payload on a registered Future.
 
     :param elicitation_id: Correlation id from the approval event.
-    :param approved: ``True`` on ``action == "accept"``, ``False``
-        on decline or other terminal actions.
-    :returns: ``True`` if the Future was unresolved and was set;
-        ``False`` if no Future was registered or it was already
-        completed (e.g. timed out before the verdict arrived).
+    :param approved: True on action == "accept", False on decline/other.
+    :param content: Optional form data or content payload from approval.
+    :returns: True if the Future was unresolved and set; False if missing/expired.
     """
+    """Set the verdict on a registered Future."""
     fut = _pending.get(elicitation_id)
     if fut is None or fut.done():
         return False
-    fut.set_result(approved)
+    fut.set_result((approved, content))
     return True
-
 
 async def wait_for_user_approval(
     *,
@@ -140,7 +137,7 @@ async def wait_for_user_approval(
     conversation_id: str,
     publish_event: Callable[[str, dict[str, object]], None],
     timeout_seconds: float | None = None,
-) -> bool:
+) -> tuple[bool, dict[str, Any] | None]:
     """
     Park on a registered Future until the user delivers a verdict.
 
@@ -177,9 +174,13 @@ async def wait_for_user_approval(
     # exit path (verdict, timeout, cancellation) so the flag never leaks.
     _session_pending[conversation_id] = _session_pending.get(conversation_id, 0) + 1
     try:
-        approved = await asyncio.wait_for(fut, timeout=effective_timeout)
+        res = await asyncio.wait_for(fut, timeout=effective_timeout)
+        if isinstance(res, tuple):
+            approved, content = res
+        else:
+            approved, content = res, None
     except asyncio.TimeoutError:
-        approved = False
+        approved, content = False, None
     finally:
         cleanup(elicitation_id)
         _remaining = _session_pending.get(conversation_id, 0) - 1
@@ -199,7 +200,7 @@ async def wait_for_user_approval(
                 "elicitation_id": elicitation_id,
             },
         )
-    return approved
+    return approved, content
 
 
 def reset_for_tests() -> None:
