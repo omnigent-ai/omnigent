@@ -533,11 +533,9 @@ def _apply_headroom_compression(
                     estimated_tokens=estimated_tokens,
                 )
 
-                # Only apply if we have savings - but skip entirely for now since
-                # tool registration is not complete (retrieval path not wired)
-                # TODO: Uncomment when headroom_retrieve is registered as a tool
-                # if result.compression_ratio > 1.2 and result.retrieval_key:
-                #     msg["output"] = result.compressed
+                # Only apply if compression ratio > 1.2 and we have a CCR key
+                if result.compression_ratio > 1.2 and result.retrieval_key:
+                    msg["output"] = result.compressed
 
         # Compress text content in message content blocks
         elif content and isinstance(content, list):
@@ -558,10 +556,8 @@ def _apply_headroom_compression(
                             estimated_tokens=estimated_tokens,
                         )
 
-                        # TODO: Uncomment when headroom_retrieve is registered
-                        # if result.compression_ratio > 1.2 and result.retrieval_key:
-                        #     block["text"] = result.compressed
-                        pass
+                        if result.compression_ratio > 1.2 and result.retrieval_key:
+                            block["text"] = result.compressed
 
                 # Compress tool_result content
                 elif block_type == "tool_result":
@@ -579,10 +575,8 @@ def _apply_headroom_compression(
                             estimated_tokens=estimated_tokens,
                         )
 
-                        # TODO: Uncomment when headroom_retrieve is registered
-                        # if result.compression_ratio > 1.2 and result.retrieval_key:
-                        #     block["content"] = result.compressed
-                        pass
+                        if result.compression_ratio > 1.2 and result.retrieval_key:
+                            block["content"] = result.compressed
 
         # Compress string content directly
         elif isinstance(content, str) and len(content) > compressor.prose_threshold:
@@ -593,10 +587,8 @@ def _apply_headroom_compression(
                 estimated_tokens=estimated_tokens,
             )
 
-            # TODO: Uncomment when headroom_retrieve is registered
-            # if result.compression_ratio > 1.2 and result.retrieval_key:
-            #     msg["content"] = result.compressed
-            pass
+            if result.compression_ratio > 1.2 and result.retrieval_key:
+                msg["content"] = result.compressed
 
 
 def compaction_to_history_items(

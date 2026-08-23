@@ -151,18 +151,26 @@ class CCRCache:
     cache directory with content-addressable keys.
     """
 
-    def __init__(self, cache_dir: str | None = None):
+    def __init__(self, cache_dir: str | None = None, conversation_id: str | None = None):
         """Initialize CCR cache.
 
         :param cache_dir: Directory for cache storage. Defaults to
             ~/.headroom/cache if None.
+        :param conversation_id: Conversation ID for session isolation.
+            If provided, files are stored in a subdirectory per conversation.
         """
         if cache_dir:
-            self.cache_dir = Path(cache_dir)
+            base_dir = Path(cache_dir)
         else:
-            self.cache_dir = Path.home() / ".headroom" / "cache"
+            base_dir = Path.home() / ".headroom" / "cache"
 
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        # Add conversation subdirectory for session isolation
+        if conversation_id:
+            self.cache_dir = base_dir / conversation_id
+        else:
+            self.cache_dir = base_dir
+
+        self.cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         _logger.debug("CCR cache initialized at %s", self.cache_dir)
 
     def _validate_key(self, key: str) -> bool:
@@ -200,6 +208,8 @@ class CCRCache:
 
         try:
             cache_file.write_text(content, encoding="utf-8")
+            # Set restrictive permissions (owner read/write only)
+            cache_file.chmod(0o600)
             _logger.debug("Stored CCR entry: %s (%d bytes)", key, len(content))
         except OSError as e:
             _logger.warning("Failed to cache content for key %s: %s", key, e)

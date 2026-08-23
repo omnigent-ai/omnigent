@@ -122,6 +122,18 @@ __all__ = [
 _BuiltinFactory = Callable[[dict[str, str]], Tool]
 
 
+def _create_headroom_retrieve(config: dict[str, str]) -> Tool:
+    """
+    Lazy factory for HeadroomRetrieveTool.
+
+    :param config: Tool config (unused).
+    :returns: A HeadroomRetrieveTool instance.
+    """
+    from omnigent.tools.builtins.headroom_retrieve import HeadroomRetrieveTool
+
+    return HeadroomRetrieveTool()
+
+
 def _create_upload_file(config: dict[str, str]) -> Tool:
     """
     Lazy factory for UploadFileTool.
@@ -249,6 +261,7 @@ def _create_hindsight_reflect(config: dict[str, str]) -> Tool:
 # instead.
 _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     # User-enablable tools (factory present).
+    "headroom_retrieve": _create_headroom_retrieve,
     "web_search": lambda config: WebSearchTool(config=config),
     "nimble_research": lambda config: NimbleResearchTool(config=config),
     "nimble_extract": lambda config: NimbleExtractTool(config=config),

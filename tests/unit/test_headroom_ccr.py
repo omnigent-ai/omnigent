@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 from pathlib import Path
 
 import pytest
 
 from omnigent.runtime.headroom_compression import CCRCache, HeadroomCompressor
-from omnigent.runtime.headroom_tool import headroom_retrieve
+from omnigent.tools.base import ToolContext
+from omnigent.tools.builtins.headroom_retrieve import HeadroomRetrieveTool
 
 
 class TestCCRCache:
@@ -120,61 +122,85 @@ class TestHeadroomCCRIntegration:
 
 
 class TestHeadroomRetrieveTool:
-    """Test the headroom_retrieve runtime tool."""
+    """Test the headroom_retrieve builtin tool."""
 
     def test_retrieve_existing_content(self):
         """Test retrieving content that exists in cache."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Setup cache with content
-            cache = CCRCache(cache_dir=tmpdir)
-            key = "test_key"
-            original_content = "Original uncompressed content here."
-            cache.store(key, original_content)
+        # Use default cache dir so tool and cache use the same location
+        conversation_id = "test_conv_retrieve"
+        cache = CCRCache(conversation_id=conversation_id)
+        key = "test_key_retrieve"
+        original_content = "Original uncompressed content here."
+        cache.store(key, original_content)
 
+        try:
             # Retrieve via tool
-            result = headroom_retrieve(key, cache_dir=tmpdir)
+            tool = HeadroomRetrieveTool()
+            ctx = ToolContext(task_id="test_task", agent_id="test_agent", conversation_id=conversation_id)
+            result_str = tool.invoke(json.dumps({"key": key}), ctx)
+            result = json.loads(result_str)
 
             assert "content" in result
             assert result["content"] == original_content
             assert "error" not in result
+        finally:
+            # Cleanup
+            cache.delete(key)
 
     def test_retrieve_nonexistent_key(self):
         """Test retrieving a key that doesn't exist."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            result = headroom_retrieve("nonexistent", cache_dir=tmpdir)
+        tool = HeadroomRetrieveTool()
+        ctx = ToolContext(task_id="test_task", agent_id="test_agent", conversation_id="test_conv_nokey")
+        result_str = tool.invoke(json.dumps({"key": "nonexistent_xyz"}), ctx)
+        result = json.loads(result_str)
 
-            assert "error" in result
-            assert "not found" in result["error"].lower()
-            assert "content" not in result
+        assert "error" in result
+        assert "not found" in result["error"].lower()
+        assert "content" not in result
 
     def test_retrieve_empty_key(self):
         """Test retrieving with no key provided."""
-        result = headroom_retrieve("")
+        tool = HeadroomRetrieveTool()
+        ctx = ToolContext(task_id="test_task", agent_id="test_agent", conversation_id="test_conv_empty")
+        result_str = tool.invoke(json.dumps({"key": ""}), ctx)
+        result = json.loads(result_str)
 
         assert "error" in result
         assert "no retrieval key" in result["error"].lower()
 
     def test_retrieve_with_unicode_content(self):
         """Test retrieving content with unicode characters."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            cache = CCRCache(cache_dir=tmpdir)
-            key = "unicode_test"
-            unicode_content = "Hello 世界! 🚀 Émojis and spëcial çhars."
-            cache.store(key, unicode_content)
+        conversation_id = "test_conv_unicode"
+        cache = CCRCache(conversation_id=conversation_id)
+        key = "unicode_test_key"
+        unicode_content = "Hello 世界! 🚀 Émojis and spëcial çhars."
+        cache.store(key, unicode_content)
 
-            result = headroom_retrieve(key, cache_dir=tmpdir)
+        try:
+            tool = HeadroomRetrieveTool()
+            ctx = ToolContext(task_id="test_task", agent_id="test_agent", conversation_id=conversation_id)
+            result_str = tool.invoke(json.dumps({"key": key}), ctx)
+            result = json.loads(result_str)
 
             assert result["content"] == unicode_content
+        finally:
+            cache.delete(key)
 
     def test_retrieve_large_content(self):
         """Test retrieving large content."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            cache = CCRCache(cache_dir=tmpdir)
-            key = "large_content"
-            large_content = "x" * 1_000_000  # 1MB of content
-            cache.store(key, large_content)
+        conversation_id = "test_conv_large"
+        cache = CCRCache(conversation_id=conversation_id)
+        key = "large_content_key"
+        large_content = "x" * 1_000_000  # 1MB of content
+        cache.store(key, large_content)
 
-            result = headroom_retrieve(key, cache_dir=tmpdir)
+        try:
+            tool = HeadroomRetrieveTool()
+            ctx = ToolContext(task_id="test_task", agent_id="test_agent", conversation_id=conversation_id)
+            result_str = tool.invoke(json.dumps({"key": key}), ctx)
+            result = json.loads(result_str)
 
             assert result["content"] == large_content
             assert len(result["content"]) == 1_000_000
+        finally:
+            cache.delete(key)
