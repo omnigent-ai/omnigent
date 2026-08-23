@@ -261,7 +261,6 @@ def _create_hindsight_reflect(config: dict[str, str]) -> Tool:
 # instead.
 _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     # User-enablable tools (factory present).
-    "headroom_retrieve": _create_headroom_retrieve,
     "web_search": lambda config: WebSearchTool(config=config),
     "nimble_research": lambda config: NimbleResearchTool(config=config),
     "nimble_extract": lambda config: NimbleExtractTool(config=config),
@@ -274,10 +273,12 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     # constructed by ToolManager before reaching this registry.
     # ``list_comments`` and ``update_comment`` are auto-registered by
     # ``ToolManager._register_comment_tools`` — they are reserved
-    # here so user specs cannot shadow them. (Policy ASKs are
-    # surfaced as MCP-shape elicitations on the SSE stream — not
-    # via the tool registry — see omnigent/runtime/policies/approval.py.)
+    # here so user specs cannot shadow them. ``headroom_retrieve`` is
+    # auto-registered when Headroom compression is enabled.
+    # (Policy ASKs are surfaced as MCP-shape elicitations on the SSE
+    # stream — not via the tool registry — see omnigent/runtime/policies/approval.py.)
     "web_fetch": None,
+    "headroom_retrieve": None,
     "list_comments": None,
     "update_comment": None,
     # ``sys_list_models`` is auto-registered by
