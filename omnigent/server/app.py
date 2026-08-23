@@ -2239,14 +2239,18 @@ def create_app(
         prefix="/v1",
         tags=["usage"],
     )
-    # Read-only built-in agent discovery (designs/BUILTIN_AGENTS.md).
-    # Successor to the removed GET /api/agents list; lists only
-    # built-in (session_id IS NULL) agents for the new-session picker.
+    # Template-agent discovery plus narrow admin publishing. GET still lists
+    # only session_id IS NULL agents for the new-session picker.
     app.include_router(
         create_builtin_agents_router(
             agent_store,
             agent_cache,
+            artifact_store=artifact_store,
+            conversation_store=conversation_store,
+            runner_router=runner_router,
             auth_provider=auth_provider,
+            permission_store=permission_store,
+            admin_list=admin_list,
         ),
         prefix="/v1",
         tags=["agents"],
