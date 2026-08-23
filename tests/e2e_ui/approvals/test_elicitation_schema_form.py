@@ -12,11 +12,10 @@ posts one, the SPA renders the card, and the test drives the controls. Unlike
 endpoint returns the elicitation id immediately rather than parking, which is
 how the runner's own callback uses it.
 
-The binary counterpart is ``test_approval_card.py`` (a policy ASK, which sends
-an empty schema and must keep its Approve / Reject), and the keyboard half of
-the story is ``test_approve_hotkey.py``: a prompt asking for fields must not be
-acceptable from the keyboard, since a keystroke would send the server none of
-what it asked for.
+The binary counterpart is ``test_approval_card.py``, which drives a real
+consent prompt, and the keyboard half of the story is ``test_approve_hotkey.py``:
+a prompt asking for fields must not be acceptable from the keyboard, since a
+keystroke would send the server none of what it asked for.
 """
 
 from __future__ import annotations
@@ -39,6 +38,9 @@ _RENDER_TIMEOUT_MS = 15_000
 # Loading the conversation is slower than rendering a card in it, and slower
 # again when the whole directory runs at once, so it gets its own budget.
 _LOAD_TIMEOUT_MS = 60_000
+# A wrong accept has to travel keydown -> handler -> POST -> server state, so
+# too short a window here reads as "nothing happened" on a loaded shard.
+_NON_EVENT_MS = 5_000
 # The composer's placeholder changes while a prompt is pending; its accessible
 # name does not, which is what makes it usable as a "transcript is up" signal.
 _COMPOSER = "Message the agent"
@@ -58,9 +60,26 @@ _SCHEMA = {
 
 def _pending_elicitations(base_url: str, session_id: str) -> list[dict]:
     """Return the session snapshot's pending elicitation events."""
-    resp = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
+    resp = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=30.0)
     resp.raise_for_status()
     return resp.json().get("pending_elicitations") or []
+
+
+def _parked(base_url: str, session_id: str, elicitation_id: str) -> bool:
+    """Whether the server still holds *elicitation_id* unanswered.
+
+    Named rather than counted, so a renamed snapshot key cannot make "drained"
+    pass by returning nothing.
+    """
+    return any(
+        e.get("elicitation_id") == elicitation_id or e.get("id") == elicitation_id
+        for e in _pending_elicitations(base_url, session_id)
+    )
+
+
+def _wait_for_parked(base_url: str, session_id: str, elicitation_id: str) -> None:
+    """Block until the prompt is in the snapshot the SPA is about to read."""
+    _wait_for(lambda: _parked(base_url, session_id, elicitation_id))
 
 
 def _wait_for(predicate, *, timeout_s: float = 30.0, interval_s: float = 0.5) -> None:
@@ -113,8 +132,8 @@ def test_a_schema_that_names_fields_renders_a_form_and_submits(
     base_url, session_id = seeded_session
     _log.info("seeded session ready: base_url=%s session_id=%s", base_url, session_id)
 
-    _raise_elicitation(base_url, session_id, _SCHEMA)
-    page.wait_for_timeout(500)
+    eid = _raise_elicitation(base_url, session_id, _SCHEMA)
+    _wait_for_parked(base_url, session_id, eid)
     _open_session(page, base_url, session_id)
 
     card = (
@@ -142,7 +161,10 @@ def test_a_schema_that_names_fields_renders_a_form_and_submits(
     submit = form.locator(_SUBMIT)
     expect(submit).to_be_disabled()
 
+    # Every required property, not just one of them: answering `branch` alone
+    # still leaves the server short of what it asked for.
     branch.fill("release/2.4")
+    expect(submit).to_be_disabled()
     channel.select_option("stable")
     expect(submit).to_be_enabled()
 
@@ -150,7 +172,7 @@ def test_a_schema_that_names_fields_renders_a_form_and_submits(
 
     responded = page.locator(f'{_APPROVAL_CARD}[data-state="responded"]').first
     expect(responded).to_be_visible(timeout=_RENDER_TIMEOUT_MS)
-    _wait_for(lambda: not _pending_elicitations(base_url, session_id))
+    _wait_for(lambda: not _parked(base_url, session_id, eid))
 
 
 @pytest.mark.timeout(180)
@@ -160,19 +182,27 @@ def test_a_consent_prompt_keeps_its_buttons(
 ) -> None:
     """A schema naming no fields is a yes/no question, and stays one.
 
-    A policy ASK sends ``requestedSchema: {}``. Rendering a form with no fields
-    for it would replace a working control with an unusable one.
+    A policy ASK carries no properties. Rendering an empty form for it would
+    replace a working control with an unusable one. This one passes against the
+    pre-change UI as well — it guards the path this change must not touch,
+    rather than proving the change.
     """
     base_url, session_id = seeded_session
 
-    _raise_elicitation(base_url, session_id, {"type": "object"})
-    page.wait_for_timeout(500)
+    eid = _raise_elicitation(base_url, session_id, {"type": "object"})
+    _wait_for_parked(base_url, session_id, eid)
     _open_session(page, base_url, session_id)
 
     card = page.locator(f'{_APPROVAL_CARD}[data-state="pending"]').first
     expect(card).to_be_visible(timeout=_RENDER_TIMEOUT_MS)
     expect(card.locator(_FORM)).to_have_count(0)
     expect(card.get_by_role("button", name="Approve")).to_be_visible()
+    reject = card.get_by_role("button", name="Reject")
+    expect(reject).to_be_visible()
+
+    # Answer it rather than leaving it parked for whatever runs next.
+    reject.click()
+    _wait_for(lambda: not _parked(base_url, session_id, eid))
 
 
 @pytest.mark.timeout(180)
@@ -185,11 +215,16 @@ def test_the_keyboard_cannot_accept_a_prompt_that_asks_for_fields(
     The hotkey accepts a pending prompt with no content. That is right for a
     yes/no gate and wrong here: the server asked for values, and accepting from
     the keyboard would send it none of them.
+
+    No wait proves a keystroke did nothing, so the same test goes on to answer
+    the form. Reaching ``responded`` that way is the control: the page was live
+    and taking input all along, so the earlier stillness was the guard working
+    rather than a keystroke that never landed.
     """
     base_url, session_id = seeded_session
 
-    _raise_elicitation(base_url, session_id, _SCHEMA)
-    page.wait_for_timeout(500)
+    eid = _raise_elicitation(base_url, session_id, _SCHEMA)
+    _wait_for_parked(base_url, session_id, eid)
     _open_session(page, base_url, session_id)
 
     card = (
@@ -198,10 +233,21 @@ def test_the_keyboard_cannot_accept_a_prompt_that_asks_for_fields(
         .first
     )
     expect(card).to_be_visible(timeout=_RENDER_TIMEOUT_MS)
+    form = card.locator(_FORM)
 
     page.keyboard.press("Control+Enter")
-    page.wait_for_timeout(1500)
+    page.wait_for_timeout(_NON_EVENT_MS)
 
-    # Still pending, on the card and on the server.
+    # Still pending, on the card and on the server, and still refusing a submit
+    # it has no values for.
     expect(card).to_be_visible()
-    assert _pending_elicitations(base_url, session_id), "the keystroke accepted it"
+    expect(form.locator(_SUBMIT)).to_be_disabled()
+    assert _parked(base_url, session_id, eid), "the keystroke accepted it"
+
+    form.locator(f'{_FIELD.format("branch")} input[type="text"]').fill("release/2.4")
+    form.locator(f"{_FIELD.format('channel')} select").select_option("stable")
+    form.locator(_SUBMIT).click()
+    expect(page.locator(f'{_APPROVAL_CARD}[data-state="responded"]').first).to_be_visible(
+        timeout=_RENDER_TIMEOUT_MS
+    )
+    _wait_for(lambda: not _parked(base_url, session_id, eid))
