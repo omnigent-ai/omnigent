@@ -5,21 +5,23 @@ Integration scaffolding for Headroom AI context compression. Infrastructure is r
 ## Requirements
 
 This integration requires:
-1. `headroom-ai` package installed (`pip install headroom-ai`)
+1. `headroom-ai` package (available on PyPI, but dependency commented until CCR implemented)
 2. Feature flag enabled: `OMNIGENT_FEATURES=headroom_compression`
 
-Without these, Layer 0 compression is disabled and no token reduction occurs.
+Currently disabled: Package is available but dependency kept commented until reversible compression (CCR) is implemented to prevent irreversible data loss.
 
 ## Quick Start
 
 ```bash
-# Install headroom-ai (when available)
-pip install headroom-ai
+# Package is available on PyPI but dependency commented until CCR implemented
+# pip install headroom-ai  # Available at version 0.36.4+
 
-# Enable feature flag
+# To enable once CCR is implemented:
+# 1. Uncomment dependency in pyproject.toml [project.optional-dependencies] all
+# 2. Set feature flag
 export OMNIGENT_FEATURES=headroom_compression
 
-# Run tests
+# Run tests (currently verify graceful degradation when package unavailable)
 pytest tests/unit/test_headroom_compression.py -v
 
 # Enable in agent config
@@ -43,12 +45,12 @@ Adds Layer 0 compression before existing compaction layers:
 
 ## Status
 
-**Integration Scaffolding** (ready for when `headroom-ai` becomes available)
+**Integration Scaffolding** (ready when CCR reversibility is implemented)
 - Implementation: Integration layer complete, tested with graceful degradation
-- Tests: 21/21 passing (unit tests verify no-op behavior when package unavailable)
-- Package: `headroom-ai` not yet publicly available (optional extra prepared)
+- Tests: 21/21 passing (verify no-op behavior when package unavailable)
+- Package: `headroom-ai` available on PyPI (v0.36.4+), dependency commented in `all` extra
+- Blocker: CCR (reversible compression) not yet implemented - dependency kept commented to prevent irreversible data loss when enabled
 - Feature flag: `OMNIGENT_FEATURES=headroom_compression` for future activation
-- CCR (reversible compression): Placeholder - not yet implemented
 
 ## Files
 
@@ -70,24 +72,25 @@ Adds Layer 0 compression before existing compaction layers:
 
 ## Deployment
 
-### Installation
+### Installation (when CCR is implemented)
 
 ```bash
-# 1. Install headroom-ai package
-pip install headroom-ai
+# 1. Uncomment headroom-ai dependency in pyproject.toml [project.optional-dependencies] all
+# 2. Install with the all extra
+pip install -e ".[all]"
 
-# 2. Enable feature flag
+# 3. Enable feature flag
 export OMNIGENT_FEATURES=headroom_compression
 
-# 3. Enable in agent config (optional, enabled by default)
+# 4. Enable in agent config (optional, enabled by default)
 compaction:
   headroom_enabled: true
 ```
 
-### Without headroom-ai
+### Current behavior (package unavailable/commented)
 
-If `headroom-ai` is not installed:
-- Layer 0 compression is skipped
+With `headroom-ai` dependency commented:
+- Layer 0 compression returns unchanged content (honest no-op)
 - No token reduction occurs
 - No fake metrics are reported
 - Compaction falls back to existing Layers 1-3

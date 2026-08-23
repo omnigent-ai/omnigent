@@ -2,7 +2,7 @@
 
 Integration scaffolding for [Headroom](https://github.com/headroomlabs-ai/headroom) AI context compression. The infrastructure is ready for when the `headroom-ai` package becomes publicly available.
 
-**Current Status:** Integration layer complete with graceful degradation. The `headroom-ai` package is not yet publicly available, so Layer 0 compression returns unchanged content with honest no-op metrics. When the package is released, uncomment the dependency in the `headroom` optional extra and compression will activate automatically.
+**Current Status:** Integration layer complete with graceful degradation. The `headroom-ai` package is available on PyPI (v0.36.4+) but the dependency is kept commented in the `all` optional extra until reversible compression (CCR) is implemented. Without CCR, enabling compression would cause irreversible data loss in conversation context. Layer 0 currently returns unchanged content with honest no-op metrics.
 
 ## Overview
 
@@ -44,26 +44,25 @@ Headroom adds **Layer 0 compression** to Omnigent's compaction system, applying 
 
 ## Installation
 
-### Option 1: Recommended (when headroom-ai is published)
+**Current Status:** Package is available on PyPI (v0.36.4+) but dependency is commented until CCR implemented.
+
+### When CCR is ready
+
+1. Uncomment `headroom-ai` in `pyproject.toml` `[project.optional-dependencies]` `all` section
+2. Install with all extras:
 
 ```bash
-pip install "headroom-ai[all]>=0.1.0,<1"
+pip install -e ".[all]"
 ```
 
-### Option 2: From source (development)
+### Current behavior
 
-```bash
-pip install git+https://github.com/headroomlabs-ai/headroom.git
-```
-
-### Option 3: Optional dependency
-
-Omnigent gracefully degrades if Headroom is unavailable. To skip Headroom:
+Omnigent gracefully degrades when `headroom-ai` is unavailable (commented):
 
 ```yaml
 # agent.yaml
 compaction:
-  headroom_enabled: false
+  headroom_enabled: true  # Safe to set - returns no-op when package unavailable
 ```
 
 ## Configuration
