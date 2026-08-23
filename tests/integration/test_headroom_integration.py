@@ -42,24 +42,27 @@ class TestHeadroomCompactionIntegration:
         return {
             "type": "function_call_output",
             "call_id": "call_123",
-            "output": json.dumps({
-                "status": "success",
-                "data": [
-                    {
-                        "id": i,
-                        "name": f"Item {i}",
-                        "details": {"value": f"Details for item {i}"}
-                    }
-                    for i in range(500)
-                ],
-                "pagination": {"page": 1, "total": 500}
-            }),
+            "output": json.dumps(
+                {
+                    "status": "success",
+                    "data": [
+                        {
+                            "id": i,
+                            "name": f"Item {i}",
+                            "details": {"value": f"Details for item {i}"},
+                        }
+                        for i in range(500)
+                    ],
+                    "pagination": {"page": 1, "total": 500},
+                }
+            ),
         }
 
     @pytest.fixture
     def large_code_message(self) -> dict[str, Any]:
         """Create a message with large code content."""
-        code = """
+        code = (
+            """
 def example_function():
     '''Example function with documentation.'''
     result = []
@@ -74,7 +77,9 @@ class ExampleClass:
     def process(self, items):
         for item in items:
             self.data.append(item)
-""" * 20
+"""
+            * 20
+        )
         return {
             "type": "message",
             "role": "user",
@@ -205,7 +210,9 @@ class ExampleClass:
 
         # The large JSON should be compressed, reducing total token count
         # Original ~24K tokens should compress to ~15K tokens (as shown in logs)
-        assert result.total_tokens < 20000, f"Expected compressed tokens < 20000, got {result.total_tokens}"
+        assert result.total_tokens < 20000, (
+            f"Expected compressed tokens < 20000, got {result.total_tokens}"
+        )
 
     async def test_layer0_skipped_when_disabled(
         self,
@@ -312,11 +319,13 @@ class ExampleClass:
         # Build messages from history
         messages = []
         for item in conversation_history:
-            if hasattr(item.data, 'content'):
-                messages.append({
-                    "role": item.data.role,
-                    "content": item.data.content,
-                })
+            if hasattr(item.data, "content"):
+                messages.append(
+                    {
+                        "role": item.data.role,
+                        "content": item.data.content,
+                    }
+                )
 
         config = CompactionConfig(
             trigger_threshold=0.8,
@@ -541,12 +550,14 @@ async def test_end_to_end_headroom_integration():
         {
             "type": "function_call_output",
             "call_id": "call_1",
-            "output": json.dumps({
-                "results": [
-                    {"id": i, "data": f"Item {i}", "metadata": {"key": "value"}}
-                    for i in range(200)
-                ]
-            }),
+            "output": json.dumps(
+                {
+                    "results": [
+                        {"id": i, "data": f"Item {i}", "metadata": {"key": "value"}}
+                        for i in range(200)
+                    ]
+                }
+            ),
         },
         # Old: Code file
         {
@@ -572,13 +583,13 @@ async def test_end_to_end_headroom_integration():
 
     history = [
         ConversationItem(
-                id=f"msg_{i}",
-                type="message",
-                status="completed",
-                response_id=f"resp_{i}",
-                created_at=1000000 + i,
-                data=MessageData(role="user", content=[]),
-            )
+            id=f"msg_{i}",
+            type="message",
+            status="completed",
+            response_id=f"resp_{i}",
+            created_at=1000000 + i,
+            data=MessageData(role="user", content=[]),
+        )
         for i in range(len(messages))
     ]
 

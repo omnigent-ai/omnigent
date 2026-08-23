@@ -196,23 +196,27 @@ def demo_conversation_history_compression():
     messages.append({"role": "user", "content": "Search for Python testing best practices"})
 
     # Add large tool result (search results)
-    search_results = json.dumps({
-        "results": [
-            {
-                "title": f"Article {i}",
-                "content": f"Content about testing best practices... " * 50,
-                "url": f"https://example.com/{i}",
-            }
-            for i in range(20)
-        ]
-    })
+    search_results = json.dumps(
+        {
+            "results": [
+                {
+                    "title": f"Article {i}",
+                    "content": f"Content about testing best practices... " * 50,
+                    "url": f"https://example.com/{i}",
+                }
+                for i in range(20)
+            ]
+        }
+    )
     messages.append({"role": "tool", "content": search_results})
 
     # Add assistant response
-    messages.append({
-        "role": "assistant",
-        "content": "Based on the search results, here are key testing best practices... " * 30,
-    })
+    messages.append(
+        {
+            "role": "assistant",
+            "content": "Based on the search results, here are key testing best practices... " * 30,
+        }
+    )
 
     # Add more conversation
     messages.append({"role": "user", "content": "Can you show me an example?"})
@@ -222,8 +226,7 @@ def demo_conversation_history_compression():
 
     # Calculate original total tokens
     original_tokens = sum(
-        compressor._estimate_tokens(str(msg.get("content", "")))
-        for msg in messages
+        compressor._estimate_tokens(str(msg.get("content", ""))) for msg in messages
     )
     print(f"Original total tokens: {original_tokens:,}")
 
@@ -235,15 +238,16 @@ def demo_conversation_history_compression():
 
     # Calculate compressed total tokens
     compressed_tokens = sum(
-        compressor._estimate_tokens(str(msg.get("content", "")))
-        for msg in compressed_messages
+        compressor._estimate_tokens(str(msg.get("content", ""))) for msg in compressed_messages
     )
 
     print(f"\nCompression Results:")
     print(f"  Compressed messages: {len(compressed_messages)}")
     print(f"  Compressed total tokens: {compressed_tokens:,}")
     print(f"  Tokens saved: {original_tokens - compressed_tokens:,}")
-    print(f"  Percent saved: {((original_tokens - compressed_tokens) / original_tokens * 100):.1f}%")
+    print(
+        f"  Percent saved: {((original_tokens - compressed_tokens) / original_tokens * 100):.1f}%"
+    )
 
 
 def demo_cost_savings():
@@ -258,7 +262,7 @@ def demo_cost_savings():
     # Simulate 50 sessions with various workloads
     print("\nSimulating 50 sessions...")
 
-    for session in range(50):
+    for _ in range(50):
         # Each session has multiple tool calls
 
         # 1. API calls (JSON responses)
@@ -306,8 +310,10 @@ def demo_cost_savings():
     for method, count in sorted(metrics.compressions_by_type.items()):
         saved = metrics.savings_by_type.get(method, 0)
         avg_saved = saved / count if count > 0 else 0
-        print(f"  {method:8s}: {count:3d} compressions, {saved:8,} tokens saved "
-              f"(avg: {avg_saved:6,.0f} per compression)")
+        print(
+            f"  {method:8s}: {count:3d} compressions, {saved:8,} tokens saved "
+            f"(avg: {avg_saved:6,.0f} per compression)"
+        )
 
     print("\n" + "-" * 60)
     print("Monthly Projection (50 sessions):")

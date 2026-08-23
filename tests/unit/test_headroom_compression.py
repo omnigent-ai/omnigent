@@ -78,7 +78,7 @@ class TestCompressionMetrics:
         assert metrics.compressions_by_type["json"] == 2
         assert metrics.compressions_by_type["code"] == 1
         assert metrics.savings_by_type["json"] == 2200  # (1000-300) + (2000-500) = 700 + 1500
-        assert metrics.savings_by_type["code"] == 100   # 500-400
+        assert metrics.savings_by_type["code"] == 100  # 500-400
 
     def test_overall_compression_ratio(self):
         """Test overall compression ratio calculation."""
@@ -175,7 +175,8 @@ class MyClass:
 
     def test_compress_code_tool_result(self, compressor: HeadroomCompressor):
         """Test compressing code file results."""
-        code_content = """
+        code_content = (
+            """
 def example_function():
     '''Docstring.'''
     x = 1
@@ -185,7 +186,9 @@ def example_function():
 class ExampleClass:
     def method(self):
         pass
-""" * 20  # Make it large enough
+"""
+            * 20
+        )  # Make it large enough
 
         result = compressor.compress_tool_result(
             content=code_content,
@@ -199,11 +202,14 @@ class ExampleClass:
 
     def test_compress_prose_tool_result(self, compressor: HeadroomCompressor):
         """Test compressing prose content."""
-        prose = """
+        prose = (
+            """
 This is a long prose text that would benefit from compression.
 It contains multiple sentences with various information.
 The compressor should detect this as prose and apply appropriate compression.
-""" * 50  # Make it large enough
+"""
+            * 50
+        )  # Make it large enough
 
         result = compressor.compress_tool_result(
             content=prose,
@@ -299,14 +305,16 @@ class TestIntegrationScenarios:
         compressor = HeadroomCompressor()
 
         # Simulate a large API response with nested data
-        api_response = json.dumps({
-            "status": "success",
-            "data": [
-                {"id": i, "name": f"Item {i}", "details": {"field": f"value {i}"}}
-                for i in range(1000)
-            ],
-            "meta": {"total": 1000, "page": 1},
-        })
+        api_response = json.dumps(
+            {
+                "status": "success",
+                "data": [
+                    {"id": i, "name": f"Item {i}", "details": {"field": f"value {i}"}}
+                    for i in range(1000)
+                ],
+                "meta": {"total": 1000, "page": 1},
+            }
+        )
 
         result = compressor.compress_tool_result(
             content=api_response,
@@ -316,15 +324,18 @@ class TestIntegrationScenarios:
         # Should achieve significant compression for JSON
         assert result.method == "json"
         assert result.compression_ratio > 2.0
-        print(f"API Response: {result.original_tokens} → {result.compressed_tokens} tokens "
-              f"({result.percent_saved:.1f}% saved)")
+        print(
+            f"API Response: {result.original_tokens} → {result.compressed_tokens} tokens "
+            f"({result.percent_saved:.1f}% saved)"
+        )
 
     def test_code_file_compression(self):
         """Simulate compressing a large code file."""
         compressor = HeadroomCompressor()
 
         # Simulate a Python file
-        code_file = """
+        code_file = (
+            """
 import os
 import sys
 from typing import List, Dict, Any
@@ -351,7 +362,9 @@ class DataProcessor:
             'value': item.get('value', 0) * 2,
             'status': 'processed',
         }
-""" * 10  # Simulate larger file
+"""
+            * 10
+        )  # Simulate larger file
 
         result = compressor.compress_tool_result(
             content=code_file,
@@ -361,8 +374,10 @@ class DataProcessor:
         # Should compress code with AST-aware compression
         assert result.method == "code"
         assert result.compression_ratio > 1.1
-        print(f"Code File: {result.original_tokens} → {result.compressed_tokens} tokens "
-              f"({result.percent_saved:.1f}% saved)")
+        print(
+            f"Code File: {result.original_tokens} → {result.compressed_tokens} tokens "
+            f"({result.percent_saved:.1f}% saved)"
+        )
 
     def test_monthly_cost_savings_projection(self):
         """Project monthly cost savings from compression."""

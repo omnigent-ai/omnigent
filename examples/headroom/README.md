@@ -25,35 +25,6 @@ PYTHONPATH=. python examples/headroom/demo.py
 - Cost projections
 - Monthly/annual savings estimates
 
-### config_examples.yaml
-
-10 configuration examples for different use cases:
-
-1. Basic agent (default settings)
-2. API-heavy workload (aggressive JSON)
-3. Code-focused (optimized for code files)
-4. Documentation writer (prose compression)
-5. Headroom disabled (fallback)
-6. Mixed workload (balanced)
-7. Conservative compression
-8. Cost-optimized (aggressive all)
-9. CCR disabled (privacy-focused)
-10. Data analysis (JSON-focused)
-
-**Usage:**
-
-```yaml
-# Copy relevant section to your agent.yaml
-name: my-agent
-harness: claude-sdk
-model: claude-sonnet-5
-
-compaction:
-  headroom_enabled: true
-  headroom_json_threshold: 500
-  # ... other settings
-```
-
 ## Quick Start
 
 ### Run the Demo
@@ -62,12 +33,9 @@ compaction:
 PYTHONPATH=. python examples/headroom/demo.py
 ```
 
-### Try Different Configurations
+### Configure Your Agent
 
-1. Review `config_examples.yaml`
-2. Find a configuration matching your workload
-3. Copy to your agent YAML file
-4. Test and tune thresholds
+See the main documentation at `docs/HEADROOM.md` for configuration examples and guidelines.
 
 ## Expected Results
 

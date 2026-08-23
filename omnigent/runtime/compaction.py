@@ -523,7 +523,7 @@ def _apply_headroom_compression(
                 # Look up tool name from history
                 hist_item = history_map.get(i)
                 tool_name = "unknown"
-                if hist_item and hasattr(hist_item.data, 'tool_name'):
+                if hist_item and hasattr(hist_item.data, "tool_name"):
                     tool_name = hist_item.data.tool_name
 
                 estimated_tokens = compressor._estimate_tokens(output)
@@ -564,7 +564,10 @@ def _apply_headroom_compression(
                     tool_content = block.get("content", "")
                     tool_name = block.get("tool_use_id", "unknown")
 
-                    if isinstance(tool_content, str) and len(tool_content) > compressor.json_threshold:
+                    if (
+                        isinstance(tool_content, str)
+                        and len(tool_content) > compressor.json_threshold
+                    ):
                         estimated_tokens = compressor._estimate_tokens(tool_content)
                         result = compressor.compress_tool_result(
                             content=tool_content,
@@ -769,12 +772,15 @@ async def compact(
     if feature_flags is not None:
         try:
             from omnigent.server.feature_flags import Feature
+
             feature_gate_enabled = feature_flags.enabled(Feature.HEADROOM_COMPRESSION)
         except (ImportError, AttributeError):
             # Feature flags module not available, default to disabled
             pass
 
-    config_enabled = config.headroom_enabled if config and hasattr(config, 'headroom_enabled') else True
+    config_enabled = (
+        config.headroom_enabled if config and hasattr(config, "headroom_enabled") else True
+    )
     headroom_enabled = feature_gate_enabled and config_enabled
     compression_metrics: CompressionMetrics | None = None
 
@@ -788,10 +794,10 @@ async def compact(
     if headroom_enabled:
         compression_metrics = CompressionMetrics()
         compressor = HeadroomCompressor(
-            json_threshold=getattr(config, 'headroom_json_threshold', 500) if config else 500,
-            code_threshold=getattr(config, 'headroom_code_threshold', 1000) if config else 1000,
-            prose_threshold=getattr(config, 'headroom_prose_threshold', 2000) if config else 2000,
-            enable_ccr=getattr(config, 'headroom_enable_ccr', True) if config else True,
+            json_threshold=getattr(config, "headroom_json_threshold", 500) if config else 500,
+            code_threshold=getattr(config, "headroom_code_threshold", 1000) if config else 1000,
+            prose_threshold=getattr(config, "headroom_prose_threshold", 2000) if config else 2000,
+            enable_ccr=getattr(config, "headroom_enable_ccr", True) if config else True,
             metrics=compression_metrics,
         )
 

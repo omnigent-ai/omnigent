@@ -98,11 +98,9 @@ class CompressionMetrics:
         self.total_original_tokens += original
         self.total_compressed_tokens += compressed
 
-        self.compressions_by_type[method] = (
-            self.compressions_by_type.get(method, 0) + 1
-        )
-        self.savings_by_type[method] = (
-            self.savings_by_type.get(method, 0) + max(0, original - compressed)
+        self.compressions_by_type[method] = self.compressions_by_type.get(method, 0) + 1
+        self.savings_by_type[method] = self.savings_by_type.get(method, 0) + max(
+            0, original - compressed
         )
 
     @property
@@ -284,26 +282,39 @@ class HeadroomCompressor:
         """Check if content is code based on tool and content patterns."""
         # Tools that typically return code
         code_tools = {
-            'read_file', 'Read', 'grep', 'Grep',
-            'git_diff', 'bash', 'Bash',
-            'list_directory', 'find_files',
+            "read_file",
+            "Read",
+            "grep",
+            "Grep",
+            "git_diff",
+            "bash",
+            "Bash",
+            "list_directory",
+            "find_files",
         }
 
         if tool_name in code_tools:
             return True
 
         # Check for code patterns
-        lines = content.split('\n')
+        lines = content.split("\n")
         if not lines:
             return False
 
         # Heuristics: indentation + code keywords
-        has_indentation = any(
-            line.startswith(('    ', '\t')) for line in lines
-        )
+        has_indentation = any(line.startswith(("    ", "\t")) for line in lines)
         code_keywords = [
-            'def ', 'class ', 'function ', 'const ', 'let ', 'var ',
-            'import ', 'from ', 'async ', 'await ', 'return ',
+            "def ",
+            "class ",
+            "function ",
+            "const ",
+            "let ",
+            "var ",
+            "import ",
+            "from ",
+            "async ",
+            "await ",
+            "return ",
         ]
         has_code_keywords = any(kw in content for kw in code_keywords)
 
@@ -336,13 +347,11 @@ class HeadroomCompressor:
                     original_tokens=result.original_tokens,
                     compressed_tokens=result.compressed_tokens,
                     compression_ratio=result.compression_ratio,
-                    method='json',
-                    retrieval_key=getattr(result, 'retrieval_key', None),
+                    method="json",
+                    retrieval_key=getattr(result, "retrieval_key", None),
                 )
             except (ImportError, AttributeError) as e:
-                _logger.debug(
-                    "Headroom JsonCompressor not available, using placeholder: %s", e
-                )
+                _logger.debug("Headroom JsonCompressor not available, using placeholder: %s", e)
 
         # Fallback: simulate 70% compression for JSON (demonstration mode)
         # This provides realistic metrics for planning/testing without real Headroom
@@ -354,7 +363,7 @@ class HeadroomCompressor:
             original_tokens=estimated_tokens,
             compressed_tokens=compressed_tokens,
             compression_ratio=estimated_tokens / max(compressed_tokens, 1),
-            method='json',
+            method="json",
         )
 
     def _compress_code(
@@ -380,13 +389,11 @@ class HeadroomCompressor:
                     original_tokens=result.original_tokens,
                     compressed_tokens=result.compressed_tokens,
                     compression_ratio=result.compression_ratio,
-                    method='code',
-                    retrieval_key=getattr(result, 'retrieval_key', None),
+                    method="code",
+                    retrieval_key=getattr(result, "retrieval_key", None),
                 )
             except (ImportError, AttributeError) as e:
-                _logger.debug(
-                    "Headroom CodeCompressor not available, using placeholder: %s", e
-                )
+                _logger.debug("Headroom CodeCompressor not available, using placeholder: %s", e)
 
         # Fallback: simulate 18% compression for code (demonstration mode)
         # This provides realistic metrics for planning/testing without real Headroom
@@ -398,7 +405,7 @@ class HeadroomCompressor:
             original_tokens=estimated_tokens,
             compressed_tokens=compressed_tokens,
             compression_ratio=estimated_tokens / max(compressed_tokens, 1),
-            method='code',
+            method="code",
         )
 
     def _compress_prose(
@@ -416,10 +423,7 @@ class HeadroomCompressor:
                 # Try to use real Headroom ProseCompressor
                 from headroom.compressors import ProseCompressor  # type: ignore[import-not-found]
 
-                compressor = ProseCompressor(
-                    model='kompress-v2-base',
-                    enable_ccr=self.enable_ccr
-                )
+                compressor = ProseCompressor(model="kompress-v2-base", enable_ccr=self.enable_ccr)
                 result = compressor.compress(content)
 
                 return CompressionResult(
@@ -427,13 +431,11 @@ class HeadroomCompressor:
                     original_tokens=result.original_tokens,
                     compressed_tokens=result.compressed_tokens,
                     compression_ratio=result.compression_ratio,
-                    method='prose',
-                    retrieval_key=getattr(result, 'retrieval_key', None),
+                    method="prose",
+                    retrieval_key=getattr(result, "retrieval_key", None),
                 )
             except (ImportError, AttributeError) as e:
-                _logger.debug(
-                    "Headroom ProseCompressor not available, using placeholder: %s", e
-                )
+                _logger.debug("Headroom ProseCompressor not available, using placeholder: %s", e)
 
         # Fallback: simulate 25% compression for prose (demonstration mode)
         # This provides realistic metrics for planning/testing without real Headroom
@@ -445,7 +447,7 @@ class HeadroomCompressor:
             original_tokens=estimated_tokens,
             compressed_tokens=compressed_tokens,
             compression_ratio=estimated_tokens / max(compressed_tokens, 1),
-            method='prose',
+            method="prose",
         )
 
     def _no_compression_result(
@@ -459,24 +461,24 @@ class HeadroomCompressor:
             original_tokens=estimated_tokens,
             compressed_tokens=estimated_tokens,
             compression_ratio=1.0,
-            method='none',
+            method="none",
         )
 
     def _should_compress_message(self, msg: dict[str, Any]) -> bool:
         """Check if message should be compressed."""
         # Compress tool_result and assistant messages with large content
-        role = msg.get('role')
-        if role == 'tool':
-            content = msg.get('content', '')
+        role = msg.get("role")
+        if role == "tool":
+            content = msg.get("content", "")
             return len(content) > self.json_threshold
-        elif role == 'assistant':
-            content = msg.get('content', '')
+        elif role == "assistant":
+            content = msg.get("content", "")
             return len(content) > self.prose_threshold
         return False
 
     def _compress_message(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Compress a single message's content."""
-        content = msg.get('content', '')
+        content = msg.get("content", "")
         if not content:
             return msg
 
@@ -490,6 +492,6 @@ class HeadroomCompressor:
 
         # Return message with compressed content
         compressed_msg = msg.copy()
-        compressed_msg['content'] = result.compressed
+        compressed_msg["content"] = result.compressed
 
         return compressed_msg
