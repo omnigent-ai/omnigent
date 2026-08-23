@@ -326,7 +326,7 @@ class HeadroomCompressor:
         if HEADROOM_AVAILABLE:
             try:
                 # Try to use real Headroom JsonCompressor
-                from headroom.compressors import JsonCompressor
+                from headroom.compressors import JsonCompressor  # type: ignore[import-not-found]
 
                 compressor = JsonCompressor(enable_ccr=self.enable_ccr)
                 result = compressor.compress(content)
@@ -370,7 +370,7 @@ class HeadroomCompressor:
         if HEADROOM_AVAILABLE:
             try:
                 # Try to use real Headroom CodeCompressor
-                from headroom.compressors import CodeCompressor
+                from headroom.compressors import CodeCompressor  # type: ignore[import-not-found]
 
                 compressor = CodeCompressor(enable_ccr=self.enable_ccr)
                 result = compressor.compress(content)
@@ -414,7 +414,7 @@ class HeadroomCompressor:
         if HEADROOM_AVAILABLE:
             try:
                 # Try to use real Headroom ProseCompressor
-                from headroom.compressors import ProseCompressor
+                from headroom.compressors import ProseCompressor  # type: ignore[import-not-found]
 
                 compressor = ProseCompressor(
                     model='kompress-v2-base',

@@ -504,7 +504,7 @@ def _apply_headroom_compression(
     # Build a mapping from message index to history item for tool name lookup
     history_map = {}
     msg_idx = 0
-    for hist_idx, item in enumerate(history):
+    for _hist_idx, item in enumerate(history):
         if item.type != "reasoning":
             history_map[msg_idx] = item
             msg_idx += 1
