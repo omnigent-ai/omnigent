@@ -165,17 +165,38 @@ class CCRCache:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         _logger.debug("CCR cache initialized at %s", self.cache_dir)
 
+    def _validate_key(self, key: str) -> bool:
+        """Validate CCR key to prevent path traversal attacks.
+
+        Only allows alphanumeric, dash, and underscore characters.
+        """
+        if not key:
+            return False
+        # Only allow safe characters (alphanumeric + dash + underscore)
+        return all(c.isalnum() or c in ('-', '_') for c in key) and len(key) <= 256
+
     def store(self, key: str, content: str) -> None:
         """Store original content for later retrieval.
 
         :param key: Retrieval key (from CompressionResult.retrieval_key).
         :param content: Original uncompressed content.
         """
-        if not key:
+        if not self._validate_key(key):
+            _logger.warning("Invalid CCR key rejected: %s", key)
             return
 
         # Use content hash as filename for content-addressable storage
         cache_file = self.cache_dir / f"{key}.txt"
+
+        # Verify path is within cache_dir to prevent traversal
+        try:
+            resolved = cache_file.resolve()
+            if not resolved.is_relative_to(self.cache_dir.resolve()):
+                _logger.error("Path traversal attempt blocked: key=%s", key)
+                return
+        except (ValueError, OSError) as e:
+            _logger.error("Path validation failed for key %s: %s", key, e)
+            return
 
         try:
             cache_file.write_text(content, encoding="utf-8")
@@ -189,10 +210,21 @@ class CCRCache:
         :param key: Retrieval key from compressed message.
         :returns: Original content if found, None if key doesn't exist.
         """
-        if not key:
+        if not self._validate_key(key):
+            _logger.warning("Invalid CCR key rejected: %s", key)
             return None
 
         cache_file = self.cache_dir / f"{key}.txt"
+
+        # Verify path is within cache_dir to prevent traversal
+        try:
+            resolved = cache_file.resolve()
+            if not resolved.is_relative_to(self.cache_dir.resolve()):
+                _logger.error("Path traversal attempt blocked: key=%s", key)
+                return None
+        except (ValueError, OSError) as e:
+            _logger.error("Path validation failed for key %s: %s", key, e)
+            return None
 
         try:
             if not cache_file.exists():
@@ -212,10 +244,21 @@ class CCRCache:
         :param key: Retrieval key to delete.
         :returns: True if deleted, False if key didn't exist.
         """
-        if not key:
+        if not self._validate_key(key):
+            _logger.warning("Invalid CCR key rejected: %s", key)
             return False
 
         cache_file = self.cache_dir / f"{key}.txt"
+
+        # Verify path is within cache_dir to prevent traversal
+        try:
+            resolved = cache_file.resolve()
+            if not resolved.is_relative_to(self.cache_dir.resolve()):
+                _logger.error("Path traversal attempt blocked: key=%s", key)
+                return False
+        except (ValueError, OSError) as e:
+            _logger.error("Path validation failed for key %s: %s", key, e)
+            return False
 
         try:
             if cache_file.exists():
@@ -455,102 +498,47 @@ class HeadroomCompressor:
         """Rough token estimate (4 chars ≈ 1 token)."""
         return len(content) // 4
 
-    def _compress_json(
+    def _compress_with_headroom(
         self,
         content: str,
         estimated_tokens: int,
+        content_type: str,
     ) -> CompressionResult:
-        """Compress JSON content with SmartCrusher.
+        """Compress content using Headroom UniversalCompressor.
 
-        Tries to use real Headroom JsonCompressor if available, otherwise
-        falls back to placeholder compression for demonstration.
+        The UniversalCompressor auto-detects content type and applies appropriate
+        compression. Falls back to no-op if headroom unavailable.
         """
-        if HEADROOM_AVAILABLE:
-            compressor = JsonCompressor(enable_ccr=self.enable_ccr)
-            result = compressor.compress(content)
+        if not self._compressor:
+            # Headroom not available - return no-op
+            return CompressionResult(
+                compressed=content,
+                original_tokens=estimated_tokens,
+                compressed_tokens=estimated_tokens,
+                compression_ratio=1.0,
+                method="none",
+            )
+
+        try:
+            result = self._compressor.compress(content)
 
             return CompressionResult(
                 compressed=result.compressed,
-                original_tokens=result.original_tokens,
-                compressed_tokens=result.compressed_tokens,
+                original_tokens=result.tokens_before,
+                compressed_tokens=result.tokens_after,
                 compression_ratio=result.compression_ratio,
-                method="json",
-                retrieval_key=getattr(result, "retrieval_key", None),
+                method=content_type,
+                retrieval_key=getattr(result, "ccr_key", None),
             )
-
-        # Fallback: headroom-ai not installed, return unchanged content with no compression
-        # This is honest no-op behavior when the real compressor is unavailable
-        return CompressionResult(
-            compressed=content,
-            original_tokens=estimated_tokens,
-            compressed_tokens=estimated_tokens,  # No actual compression
-            compression_ratio=1.0,  # 1:1 means no compression
-            method="none",
-        )
-
-    def _compress_code(
-        self,
-        content: str,
-        estimated_tokens: int,
-    ) -> CompressionResult:
-        """Compress code with AST-aware CodeCompressor.
-
-        Tries to use real Headroom CodeCompressor if available, otherwise
-        falls back to placeholder compression for demonstration.
-        """
-        if HEADROOM_AVAILABLE:
-            compressor = CodeCompressor(enable_ccr=self.enable_ccr)
-            result = compressor.compress(content)
-
+        except Exception as e:
+            _logger.warning("Headroom compression failed: %s, returning original", e)
             return CompressionResult(
-                compressed=result.compressed,
-                original_tokens=result.original_tokens,
-                compressed_tokens=result.compressed_tokens,
-                compression_ratio=result.compression_ratio,
-                method="code",
-                retrieval_key=getattr(result, "retrieval_key", None),
+                compressed=content,
+                original_tokens=estimated_tokens,
+                compressed_tokens=estimated_tokens,
+                compression_ratio=1.0,
+                method="none",
             )
-
-        # Fallback: headroom-ai not installed, return unchanged content with no compression
-        return CompressionResult(
-            compressed=content,
-            original_tokens=estimated_tokens,
-            compressed_tokens=estimated_tokens,
-            compression_ratio=1.0,
-            method="none",
-        )
-
-    def _compress_prose(
-        self,
-        content: str,
-        estimated_tokens: int,
-    ) -> CompressionResult:
-        """Compress prose with Kompress-v2 model.
-
-        Tries to use real Headroom ProseCompressor if available, otherwise
-        falls back to placeholder compression for demonstration.
-        """
-        if HEADROOM_AVAILABLE:
-            compressor = ProseCompressor(model="kompress-v2-base", enable_ccr=self.enable_ccr)
-            result = compressor.compress(content)
-
-            return CompressionResult(
-                compressed=result.compressed,
-                original_tokens=result.original_tokens,
-                compressed_tokens=result.compressed_tokens,
-                compression_ratio=result.compression_ratio,
-                method="prose",
-                retrieval_key=getattr(result, "retrieval_key", None),
-            )
-
-        # Fallback: headroom-ai not installed, return unchanged content with no compression
-        return CompressionResult(
-            compressed=content,
-            original_tokens=estimated_tokens,
-            compressed_tokens=estimated_tokens,
-            compression_ratio=1.0,
-            method="none",
-        )
 
     def _no_compression_result(
         self,
@@ -588,9 +576,9 @@ class HeadroomCompressor:
 
         # Detect type and compress
         if self._is_json(content):
-            result = self._compress_json(content, estimated_tokens)
+            result = self._compress_with_headroom(content, estimated_tokens, "json")
         else:
-            result = self._compress_prose(content, estimated_tokens)
+            result = self._compress_with_headroom(content, estimated_tokens, "prose")
 
         # Return message with compressed content
         compressed_msg = msg.copy()
