@@ -28,10 +28,9 @@ _logger = logging.getLogger(__name__)
 
 # Try to import headroom; gracefully degrade if unavailable
 try:
-    from headroom.compressors import (  # type: ignore[import-not-found]
-        CodeCompressor,
-        JsonCompressor,
-        ProseCompressor,
+    from headroom.compression import (  # type: ignore[import-not-found]
+        UniversalCompressor,
+        UniversalCompressorConfig,
     )
 
     HEADROOM_AVAILABLE = True
@@ -294,6 +293,20 @@ class HeadroomCompressor:
         if self.enable_ccr:
             self.ccr_cache = CCRCache(cache_dir=cache_dir)
 
+        # Initialize UniversalCompressor if available
+        self._compressor = None
+        if HEADROOM_AVAILABLE:
+            try:
+                config = UniversalCompressorConfig(
+                    compression_ratio_target=0.5,  # Target 50% compression
+                    enable_ccr=self.enable_ccr,
+                )
+                self._compressor = UniversalCompressor(config=config)
+                _logger.debug("HeadroomCompressor initialized with UniversalCompressor")
+            except Exception as e:
+                _logger.warning("Failed to initialize UniversalCompressor: %s", e)
+                self.enabled = False
+
         if not self.enabled:
             _logger.debug(
                 "HeadroomCompressor initialized but headroom-ai not available; "
@@ -328,11 +341,11 @@ class HeadroomCompressor:
 
         # Detect content type and apply appropriate compression
         if self._is_json(content) and estimated_tokens >= self.json_threshold:
-            result = self._compress_json(content, estimated_tokens)
+            result = self._compress_with_headroom(content, estimated_tokens, "json")
         elif self._is_code(content, tool_name) and estimated_tokens >= self.code_threshold:
-            result = self._compress_code(content, estimated_tokens)
+            result = self._compress_with_headroom(content, estimated_tokens, "code")
         elif estimated_tokens >= self.prose_threshold:
-            result = self._compress_prose(content, estimated_tokens)
+            result = self._compress_with_headroom(content, estimated_tokens, "prose")
         else:
             result = self._no_compression_result(content, estimated_tokens)
 

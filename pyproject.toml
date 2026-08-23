@@ -148,8 +148,8 @@ all = [
     "opentelemetry-instrumentation-fastapi>=0,<1",
     "opentelemetry-instrumentation-httpx>=0,<1",
     "opentelemetry-instrumentation-sqlalchemy>=0,<1",
-    # Headroom AI context compression (commented until reversible compression implemented).
-    # "headroom-ai>=0.36,<1",
+    # Headroom AI context compression for reversible compression (CCR).
+    "headroom-ai>=0.36,<1",
 ]
 # From omnigent.
 bedrock = ["boto3>=1.30,<2", "botocore>=1.30,<2"]
