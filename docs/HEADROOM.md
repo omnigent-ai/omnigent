@@ -89,6 +89,7 @@ compaction:
 
 instructions: |
   Your agent instructions here.
+  Use headroom_retrieve(key) to access full content from compressed messages.
 ```
 
 ### Default Values
@@ -135,15 +136,18 @@ Headroom automatically detects content type:
 
 ### 3. Content-Cache-Retrieval (CCR)
 
-**Status:** Not yet implemented. The `headroom_enable_ccr` config option is reserved for future use.
+**Status:** Fully implemented. Enabled by default via `headroom_enable_ccr: true`.
 
-When fully implemented, CCR would:
-1. Cache original content locally
-2. Send compressed version to LLM
-3. Allow LLM to retrieve full content via a tool call
-4. Enable reversible compression with no quality loss
+CCR makes compression reversible:
+1. **Cache original**: Original content is cached locally in `~/.headroom/cache/`
+2. **Send compressed**: Compressed version is sent to LLM with a retrieval key
+3. **Retrieve on demand**: LLM can call `headroom_retrieve(key)` to get full content
+4. **No quality loss**: Agents can access complete details whenever needed
 
-Currently, compression is applied but retrieval is not available, so compressed content is permanent.
+When `headroom_enable_ccr: false`:
+- Compression is still applied but originals are not cached
+- Compressed content becomes permanent (not reversible)
+- Suitable for non-sensitive data where reversibility isn't needed
 
 ## Usage Examples
 

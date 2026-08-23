@@ -536,6 +536,9 @@ def _apply_headroom_compression(
                 # Only apply if compression ratio > 1.2 (>20% savings)
                 if result.compression_ratio > 1.2:
                     msg["output"] = result.compressed
+                    # Store retrieval key if CCR is enabled
+                    if result.retrieval_key:
+                        msg["_headroom_key"] = result.retrieval_key
 
         # Compress text content in message content blocks
         elif content and isinstance(content, list):
@@ -558,6 +561,9 @@ def _apply_headroom_compression(
 
                         if result.compression_ratio > 1.2:
                             block["text"] = result.compressed
+                            # Store retrieval key if CCR is enabled
+                            if result.retrieval_key:
+                                block["_headroom_key"] = result.retrieval_key
 
                 # Compress tool_result content
                 elif block_type == "tool_result":
@@ -577,6 +583,9 @@ def _apply_headroom_compression(
 
                         if result.compression_ratio > 1.2:
                             block["content"] = result.compressed
+                            # Store retrieval key if CCR is enabled
+                            if result.retrieval_key:
+                                block["_headroom_key"] = result.retrieval_key
 
         # Compress string content directly
         elif isinstance(content, str) and len(content) > compressor.prose_threshold:
@@ -589,6 +598,9 @@ def _apply_headroom_compression(
 
             if result.compression_ratio > 1.2:
                 msg["content"] = result.compressed
+                # Store retrieval key if CCR is enabled
+                if result.retrieval_key:
+                    msg["_headroom_key"] = result.retrieval_key
 
 
 def compaction_to_history_items(
@@ -797,7 +809,7 @@ async def compact(
             json_threshold=getattr(config, "headroom_json_threshold", 500) if config else 500,
             code_threshold=getattr(config, "headroom_code_threshold", 1000) if config else 1000,
             prose_threshold=getattr(config, "headroom_prose_threshold", 2000) if config else 2000,
-            enable_ccr=getattr(config, "headroom_enable_ccr", False) if config else False,
+            enable_ccr=getattr(config, "headroom_enable_ccr", True) if config else True,
             metrics=compression_metrics,
         )
 

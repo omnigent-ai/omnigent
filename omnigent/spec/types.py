@@ -654,9 +654,9 @@ class CompactionConfig:
         code content (files, diffs). Defaults to ``1000``.
     :param headroom_prose_threshold: Minimum tokens before compressing
         prose content (logs, documentation). Defaults to ``2000``.
-    :param headroom_enable_ccr: Reserved for future Content-Cache-Retrieval
-        support. Currently not implemented - compression is applied without
-        retrieval capability. Defaults to ``False``.
+    :param headroom_enable_ccr: Enable Content-Cache-Retrieval for reversible
+        compression. When ``True``, original content is cached locally and can
+        be retrieved via ``headroom_retrieve(key)`` tool. Defaults to ``True``.
     """
 
     trigger_threshold: float = 0.8
@@ -665,7 +665,7 @@ class CompactionConfig:
     headroom_json_threshold: int = 500
     headroom_code_threshold: int = 1000
     headroom_prose_threshold: int = 2000
-    headroom_enable_ccr: bool = False  # Not yet implemented
+    headroom_enable_ccr: bool = True
 
 
 @dataclass

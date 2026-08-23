@@ -17,9 +17,11 @@ Example usage:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 _logger = logging.getLogger(__name__)
@@ -139,6 +141,110 @@ class CompressionMetrics:
         return self.tokens_saved * cost_per_token
 
 
+class CCRCache:
+    """Content-Cache-Retrieval cache for reversible compression.
+
+    Stores original uncompressed content keyed by retrieval IDs, allowing
+    agents to recover full details from compressed messages via the
+    headroom_retrieve tool.
+
+    Thread-safe for concurrent access. Entries are stored as files in the
+    cache directory with content-addressable keys.
+    """
+
+    def __init__(self, cache_dir: str | None = None):
+        """Initialize CCR cache.
+
+        :param cache_dir: Directory for cache storage. Defaults to
+            ~/.headroom/cache if None.
+        """
+        if cache_dir:
+            self.cache_dir = Path(cache_dir)
+        else:
+            self.cache_dir = Path.home() / ".headroom" / "cache"
+
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        _logger.debug("CCR cache initialized at %s", self.cache_dir)
+
+    def store(self, key: str, content: str) -> None:
+        """Store original content for later retrieval.
+
+        :param key: Retrieval key (from CompressionResult.retrieval_key).
+        :param content: Original uncompressed content.
+        """
+        if not key:
+            return
+
+        # Use content hash as filename for content-addressable storage
+        cache_file = self.cache_dir / f"{key}.txt"
+
+        try:
+            cache_file.write_text(content, encoding="utf-8")
+            _logger.debug("Stored CCR entry: %s (%d bytes)", key, len(content))
+        except OSError as e:
+            _logger.warning("Failed to cache content for key %s: %s", key, e)
+
+    def retrieve(self, key: str) -> str | None:
+        """Retrieve original content by key.
+
+        :param key: Retrieval key from compressed message.
+        :returns: Original content if found, None if key doesn't exist.
+        """
+        if not key:
+            return None
+
+        cache_file = self.cache_dir / f"{key}.txt"
+
+        try:
+            if not cache_file.exists():
+                _logger.warning("CCR key not found: %s", key)
+                return None
+
+            content = cache_file.read_text(encoding="utf-8")
+            _logger.debug("Retrieved CCR entry: %s (%d bytes)", key, len(content))
+            return content
+        except OSError as e:
+            _logger.warning("Failed to retrieve content for key %s: %s", key, e)
+            return None
+
+    def delete(self, key: str) -> bool:
+        """Delete a cached entry.
+
+        :param key: Retrieval key to delete.
+        :returns: True if deleted, False if key didn't exist.
+        """
+        if not key:
+            return False
+
+        cache_file = self.cache_dir / f"{key}.txt"
+
+        try:
+            if cache_file.exists():
+                cache_file.unlink()
+                _logger.debug("Deleted CCR entry: %s", key)
+                return True
+            return False
+        except OSError as e:
+            _logger.warning("Failed to delete key %s: %s", key, e)
+            return False
+
+    def clear(self) -> int:
+        """Clear all cached entries.
+
+        :returns: Number of entries deleted.
+        """
+        count = 0
+        try:
+            for cache_file in self.cache_dir.glob("*.txt"):
+                cache_file.unlink()
+                count += 1
+            _logger.info("Cleared %d CCR cache entries", count)
+        except OSError as e:
+            _logger.warning("Failed to clear cache: %s", e)
+
+        return count
+
+
 class HeadroomCompressor:
     """Headroom integration for Omnigent content compression.
 
@@ -183,6 +289,11 @@ class HeadroomCompressor:
         self.metrics = metrics or CompressionMetrics()
         self.enabled = HEADROOM_AVAILABLE
 
+        # Initialize CCR cache if enabled
+        self.ccr_cache: CCRCache | None = None
+        if self.enable_ccr:
+            self.ccr_cache = CCRCache(cache_dir=cache_dir)
+
         if not self.enabled:
             _logger.debug(
                 "HeadroomCompressor initialized but headroom-ai not available; "
@@ -224,6 +335,10 @@ class HeadroomCompressor:
             result = self._compress_prose(content, estimated_tokens)
         else:
             result = self._no_compression_result(content, estimated_tokens)
+
+        # Cache original content if CCR is enabled and we got a retrieval key
+        if self.ccr_cache and result.retrieval_key:
+            self.ccr_cache.store(result.retrieval_key, content)
 
         # Track metrics
         self.metrics.record_compression(
