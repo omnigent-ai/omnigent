@@ -4,14 +4,16 @@ description: Google Antigravity CLI coding sub-agent — implements, cross-vendo
 
 # Native Google Antigravity (`agy`) TUI/CLI harness: drives the `agy` binary
 # in its own terminal the human can open in the UI's Subagents panel and TAKE
-# OVER. Antigravity's in-terminal approval prompt still fires for dangerous
-# commands and is mirrored to the web UI, so risky actions surface as approval
-# cards rather than being auto-bypassed. agy is Gemini-native (own Google
+# OVER. Runs with permission_mode: bypassPermissions so headless dispatches do
+# not stall on terminal approval prompts. agy is Gemini-native (own Google
 # account auth via ~/.gemini) and does not run Claude/GPT-family models.
 executor:
   type: omnigent
   config:
     harness: antigravity-native
+    # Headless workers can't answer approval prompts in the terminal, so run agy
+    # with full bypass (translates to --dangerously-skip-permissions).
+    permission_mode: bypassPermissions
 
 prompt: |
   You are agy, Google Antigravity's CLI coding sub-agent, dispatched by the

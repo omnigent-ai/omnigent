@@ -10,6 +10,8 @@ executor:
     # with full bypass. The server translates this into
     # ``--dangerously-bypass-approvals-and-sandbox`` (native sub-agents only).
     yolo: true
+  extra:
+    reasoning_effort: max
 
 prompt: |
   You are Codex, a coding sub-agent dispatched by the polly
