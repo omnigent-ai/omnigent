@@ -322,6 +322,7 @@ class HeadroomCompressor:
         prose_threshold: int = 2000,
         enable_ccr: bool = True,
         cache_dir: str | None = None,
+        conversation_id: str | None = None,
         metrics: CompressionMetrics | None = None,
     ):
         """Initialize Headroom compressor with configuration.
@@ -331,6 +332,7 @@ class HeadroomCompressor:
         :param prose_threshold: Minimum tokens before compressing prose (default: 2000).
         :param enable_ccr: Enable content-cache-retrieval for reversible compression.
         :param cache_dir: Directory for CCR cache (None = default ~/.headroom/cache).
+        :param conversation_id: Conversation ID for session-isolated cache (required for CCR).
         :param metrics: Optional metrics tracker; creates new if None.
         """
         self.json_threshold = json_threshold
@@ -338,13 +340,14 @@ class HeadroomCompressor:
         self.prose_threshold = prose_threshold
         self.enable_ccr = enable_ccr
         self.cache_dir = cache_dir
+        self.conversation_id = conversation_id
         self.metrics = metrics or CompressionMetrics()
         self.enabled = HEADROOM_AVAILABLE
 
-        # Initialize CCR cache if enabled
+        # Initialize CCR cache if enabled (requires conversation_id for session isolation)
         self.ccr_cache: CCRCache | None = None
         if self.enable_ccr:
-            self.ccr_cache = CCRCache(cache_dir=cache_dir)
+            self.ccr_cache = CCRCache(cache_dir=cache_dir, conversation_id=conversation_id)
 
         # Initialize UniversalCompressor if available
         self._compressor = None

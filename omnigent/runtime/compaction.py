@@ -533,9 +533,10 @@ def _apply_headroom_compression(
                     estimated_tokens=estimated_tokens,
                 )
 
-                # Only apply if compression ratio > 1.2 and we have a CCR key
+                # Only apply if compression ratio > 1.2 and we have a verified CCR key
                 if result.compression_ratio > 1.2 and result.retrieval_key:
-                    msg["output"] = result.compressed
+                    # Include retrieval key in the message so agent can recover original
+                    msg["output"] = f"{result.compressed}\n\n[Compressed content. Retrieve full version: headroom_retrieve(key=\"{result.retrieval_key}\")]"
 
         # Compress text content in message content blocks
         elif content and isinstance(content, list):
@@ -557,7 +558,7 @@ def _apply_headroom_compression(
                         )
 
                         if result.compression_ratio > 1.2 and result.retrieval_key:
-                            block["text"] = result.compressed
+                            block["text"] = f"{result.compressed}\n\n[Compressed. Retrieve: headroom_retrieve(key=\"{result.retrieval_key}\")]"
 
                 # Compress tool_result content
                 elif block_type == "tool_result":
@@ -576,7 +577,7 @@ def _apply_headroom_compression(
                         )
 
                         if result.compression_ratio > 1.2 and result.retrieval_key:
-                            block["content"] = result.compressed
+                            block["content"] = f"{result.compressed}\n\n[Compressed. Retrieve: headroom_retrieve(key=\"{result.retrieval_key}\")]"
 
         # Compress string content directly
         elif isinstance(content, str) and len(content) > compressor.prose_threshold:
@@ -588,7 +589,7 @@ def _apply_headroom_compression(
             )
 
             if result.compression_ratio > 1.2 and result.retrieval_key:
-                msg["content"] = result.compressed
+                msg["content"] = f"{result.compressed}\n\n[Compressed. Retrieve: headroom_retrieve(key=\"{result.retrieval_key}\")]"
 
 
 def compaction_to_history_items(
@@ -798,6 +799,7 @@ async def compact(
             code_threshold=getattr(config, "headroom_code_threshold", 1000) if config else 1000,
             prose_threshold=getattr(config, "headroom_prose_threshold", 2000) if config else 2000,
             enable_ccr=getattr(config, "headroom_enable_ccr", True) if config else True,
+            conversation_id=conversation_id,
             metrics=compression_metrics,
         )
 
