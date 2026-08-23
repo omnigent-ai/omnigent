@@ -93,11 +93,13 @@ from omnigent.server.routes._sessions.common import (
     _EXTERNAL_MODEL_OPTIONS_TYPE,
     _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
     _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
+    _EXTERNAL_PERMISSION_MODE_CHANGE_TYPE,
     _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
     _EXTERNAL_SESSION_INTERRUPTED_TYPE,
     _EXTERNAL_SESSION_STATUS_TYPE,
     _EXTERNAL_SESSION_STATUS_VALUES,
     _EXTERNAL_SESSION_SUPERSEDED_TYPE,
+    _EXTERNAL_SESSION_TITLE_TYPE,
     _EXTERNAL_SESSION_TODOS_TYPE,
     _EXTERNAL_SESSION_USAGE_TYPE,
     _EXTERNAL_SUBAGENT_START_TYPE,
@@ -139,7 +141,9 @@ from omnigent.server.routes._sessions.helpers import (
     _persist_external_codex_collaboration_mode_change,
     _persist_external_model_change,
     _persist_external_model_options,
+    _persist_external_permission_mode_change,
     _persist_external_reasoning_effort_change,
+    _persist_external_session_title,
     _persist_external_subagent_start,
     _persist_policy_deny_sentinel,
     _persist_session_status_error_labels,
@@ -536,7 +540,9 @@ def register_events_routes(
             _EXTERNAL_MCP_STARTUP_TYPE,
             _EXTERNAL_MODEL_CHANGE_TYPE,
             _EXTERNAL_MODEL_OPTIONS_TYPE,
+            _EXTERNAL_PERMISSION_MODE_CHANGE_TYPE,
             _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
+            _EXTERNAL_SESSION_TITLE_TYPE,
             _EXTERNAL_SESSION_TODOS_TYPE,
             _EXTERNAL_SUBAGENT_START_TYPE,
             _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
@@ -1177,6 +1183,22 @@ def register_events_routes(
             return {"queued": False}
         if body.type == _EXTERNAL_MODEL_CHANGE_TYPE:
             await _persist_external_model_change(
+                session_id,
+                conv,
+                body,
+                conversation_store,
+            )
+            return {"queued": False}
+        if body.type == _EXTERNAL_PERMISSION_MODE_CHANGE_TYPE:
+            await _persist_external_permission_mode_change(
+                session_id,
+                conv,
+                body,
+                conversation_store,
+            )
+            return {"queued": False}
+        if body.type == _EXTERNAL_SESSION_TITLE_TYPE:
+            await _persist_external_session_title(
                 session_id,
                 conv,
                 body,

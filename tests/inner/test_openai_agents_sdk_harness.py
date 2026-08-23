@@ -77,6 +77,7 @@ def test_executor_factory_reads_databricks_profile_env(
         "https://example.databricks.com/ai-gateway/codex/v1",
     )
     monkeypatch.setenv("HARNESS_OPENAI_AGENTS_GATEWAY_AUTH_COMMAND", "printf token")
+    monkeypatch.delenv("HARNESS_OPENAI_AGENTS_REASONING_ITEM_ID_POLICY", raising=False)
 
     captured: dict[str, Any] = {}
 
@@ -92,6 +93,7 @@ def test_executor_factory_reads_databricks_profile_env(
         base_url_override: str | None = None,
         gateway_host: str | None = None,
         gateway_auth_command: str | None = None,
+        reasoning_item_id_policy: str | None = None,
     ) -> None:
         captured["client"] = client
         captured["profile"] = profile
@@ -101,6 +103,7 @@ def test_executor_factory_reads_databricks_profile_env(
         captured["base_url_override"] = base_url_override
         captured["gateway_host"] = gateway_host
         captured["gateway_auth_command"] = gateway_auth_command
+        captured["reasoning_item_id_policy"] = reasoning_item_id_policy
 
     with patch(
         "omnigent.inner.openai_agents_sdk_harness.OpenAIAgentsSDKExecutor.__init__",
@@ -113,6 +116,7 @@ def test_executor_factory_reads_databricks_profile_env(
     assert captured["gateway_host"] == "https://example.databricks.com"
     assert captured["base_url_override"] == "https://example.databricks.com/ai-gateway/codex/v1"
     assert captured["gateway_auth_command"] == "printf token"
+    assert captured["reasoning_item_id_policy"] is None
     # ``use_responses`` defaults True when env var absent.
     assert captured["use_responses"] is True
 
@@ -123,6 +127,7 @@ def test_executor_factory_use_responses_default_true(
     """``use_responses`` defaults to ``True`` when the env var is unset."""
     monkeypatch.delenv("HARNESS_OPENAI_AGENTS_MODEL", raising=False)
     monkeypatch.delenv("HARNESS_OPENAI_AGENTS_USE_RESPONSES", raising=False)
+    monkeypatch.delenv("HARNESS_OPENAI_AGENTS_REASONING_ITEM_ID_POLICY", raising=False)
 
     captured: dict[str, Any] = {}
 
@@ -288,6 +293,26 @@ def test_use_responses_env_var_truthy_parsing(
     assert captured["use_responses"] is expected
 
 
+@pytest.mark.parametrize("policy", ["preserve", "omit"])
+def test_executor_factory_threads_reasoning_item_id_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    policy: str,
+) -> None:
+    monkeypatch.setenv("HARNESS_OPENAI_AGENTS_REASONING_ITEM_ID_POLICY", policy)
+    captured: dict[str, Any] = {}
+
+    def _fake_init(self: Any, **kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    with patch(
+        "omnigent.inner.openai_agents_sdk_harness.OpenAIAgentsSDKExecutor.__init__",
+        _fake_init,
+    ):
+        openai_agents_sdk_harness._build_openai_agents_sdk_executor()
+
+    assert captured["reasoning_item_id_policy"] == policy
+
+
 def test_executor_factory_no_env_returns_blank_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -303,6 +328,7 @@ def test_executor_factory_no_env_returns_blank_config(
         "HARNESS_OPENAI_AGENTS_MODEL",
         "HARNESS_OPENAI_AGENTS_DATABRICKS_PROFILE",
         "HARNESS_OPENAI_AGENTS_USE_RESPONSES",
+        "HARNESS_OPENAI_AGENTS_REASONING_ITEM_ID_POLICY",
     ):
         monkeypatch.delenv(env_var, raising=False)
 
@@ -320,3 +346,4 @@ def test_executor_factory_no_env_returns_blank_config(
     assert captured["profile"] is None
     assert captured["model"] is None
     assert captured["use_responses"] is True
+    assert captured["reasoning_item_id_policy"] is None

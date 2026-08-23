@@ -123,8 +123,9 @@ def test_recent_server_connect_and_copy_actions_are_independent(page: Page) -> N
     _open_setup_page(page, [recent_url])
 
     recent = page.locator(".recent-btn")
-    expect(recent).to_have_text(recent_url)
-    expect(recent).to_have_attribute("title", recent_url)
+    label = "dbc-x.cloud.databricks.com/?o=12345678901234567890"
+    expect(recent).to_have_text(label)
+    expect(recent).to_have_attribute("title", label)
 
     page.click(".recent-copy")
     page.wait_for_function("() => window.__copiedTexts.length === 1")
@@ -148,12 +149,15 @@ def test_shared_url_module_defaults_scheme_in_browser(page: Page) -> None:
     """
     _open_setup_page(page)
 
-    # Remote host → https; the guide's /omnigent suffix is preserved.
+    # Remote host → https root while retaining the Databricks organization;
+    # the main process then probes and appends the canonical /omnigent mount.
     assert (
         page.evaluate(
-            "() => window.omnigentUrl.normalizeUrl('dbc-x.cloud.databricks.com/omnigent')"
+            """() => window.omnigentUrl.normalizeUrl(
+              'dbc-x.cloud.databricks.com/omnigent?ignored=yes&o=1965859176160743#page'
+            )"""
         )
-        == "https://dbc-x.cloud.databricks.com/omnigent"
+        == "https://dbc-x.cloud.databricks.com/?o=1965859176160743"
     )
     # Loopback stays http for local dev.
     assert (

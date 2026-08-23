@@ -17,7 +17,7 @@ export type NativeCodingAgentIconKind =
   | "kimi"
   | "hermes";
 export type NativeCodingAgentCapability =
-  "permissionMode" | "approvalMode" | "cursorMode" | "skipPermissions";
+  "permissionMode" | "approvalMode" | "cursorMode" | "skipPermissions" | "modelPicker";
 
 export interface NativeCodingAgentSpec {
   key: NativeCodingAgentIconKind;
@@ -53,7 +53,7 @@ export const NATIVE_CODING_AGENTS = [
     displayName: "Claude Code",
     iconKind: "claude",
     sortRank: 10,
-    capabilities: ["permissionMode"],
+    capabilities: ["permissionMode", "modelPicker"],
     fullySupported: true,
   },
   {
@@ -106,6 +106,7 @@ export const NATIVE_CODING_AGENTS = [
     displayName: "Pi",
     iconKind: "pi",
     sortRank: 40,
+    capabilities: ["modelPicker"],
   },
   {
     key: "kiro",
@@ -379,6 +380,23 @@ export function isNativeTerminalSession(
   const wrapper = session.labels?.[WRAPPER_LABEL_KEY];
   if (isNativeWrapper(wrapper)) return true;
   return nativeCodingAgentForHarness(session.harness) !== undefined;
+}
+
+/**
+ * Resolve the native coding agent a session runs, from its wrapper label
+ * (authoritative) or its harness field.
+ *
+ * @param session - Session-shaped object with `harness` and `labels`.
+ * @returns The agent spec, or undefined for non-native sessions.
+ */
+export function nativeCodingAgentForSession(
+  session: { harness?: string | null; labels?: Record<string, string> } | null | undefined,
+): NativeCodingAgentSpec | undefined {
+  if (session == null) return undefined;
+  return (
+    nativeCodingAgentForWrapper(session.labels?.[WRAPPER_LABEL_KEY]) ??
+    nativeCodingAgentForHarness(session.harness)
+  );
 }
 
 export function nativeWrapperLabelsForAgent(

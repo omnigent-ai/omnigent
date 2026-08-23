@@ -118,6 +118,7 @@ class _RowCountResult(Protocol):
 _SESSION_OVERRIDE_KEYS = (
     "reasoning_effort",
     "model_override",
+    "reported_model",
     "cost_control_mode_override",
     "subagent_routing_override",
     "harness_override",
@@ -209,6 +210,7 @@ def _to_conversation(
         session_usage=session_usage,
         reasoning_effort=overrides["reasoning_effort"],
         model_override=overrides["model_override"],
+        reported_model=overrides["reported_model"],
         cost_control_mode_override=overrides["cost_control_mode_override"],
         subagent_routing_override=overrides["subagent_routing_override"],
         harness_override=overrides["harness_override"],
@@ -1136,10 +1138,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversationMetadata.id.in_(unique_ids),
                 )
             ).all()
-        # Fork-source label is in the AP DB.
+        # Connectivity markers are in the AP DB. Both signal on presence:
+        # the fork-source label forces an unbound clone to pick a workspace;
+        # the import-source label marks a transcript with no live executor.
         with self._conv_session("get_session_connectivity") as ap_sess:
-            # One pass over the fork-source connectivity marker, which
-            # signals on presence (its value is the source id).
             label_rows = ap_sess.execute(
                 select(
                     SqlConversationLabel.conversation_id,
@@ -1148,17 +1150,21 @@ class SqlAlchemyConversationStore(ConversationStore):
                 ).where(
                     SqlConversationLabel.workspace_id == current_workspace_id(),
                     SqlConversationLabel.conversation_id.in_(unique_ids),
-                    SqlConversationLabel.key.in_([FORK_SOURCE_LABEL_KEY]),
+                    SqlConversationLabel.key.in_([FORK_SOURCE_LABEL_KEY, IMPORT_SOURCE_LABEL_KEY]),
                 )
             ).all()
         needs_workspace_ids = {
             row.conversation_id for row in label_rows if row.key == FORK_SOURCE_LABEL_KEY
+        }
+        imported_ids = {
+            row.conversation_id for row in label_rows if row.key == IMPORT_SOURCE_LABEL_KEY
         }
         return {
             row.id: SessionConnectivity(
                 runner_id=row.runner_id,
                 host_id=row.host_id,
                 needs_workspace=row.id in needs_workspace_ids,
+                imported=row.id in imported_ids,
                 runner_last_seen=row.runner_last_seen,
             )
             for row in meta_rows
@@ -2693,6 +2699,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         _unset_harness_override: bool = False,
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
+        reported_model: str | None = None,
     ) -> Conversation | None:
         """
         Update mutable fields on a conversation.
@@ -2704,10 +2711,15 @@ class SqlAlchemyConversationStore(ConversationStore):
             e.g. ``"high"``. ``None`` leaves unchanged.
         :param _unset_reasoning_effort: When ``True``, clear
             ``reasoning_effort`` to ``None``.
-        :param model_override: Per-session LLM model override,
-            e.g. ``"claude-opus-4-7"``. ``None`` leaves unchanged.
+        :param model_override: Per-session LLM model override — the
+            user's request, e.g. ``"claude-opus-4-7"``. ``None``
+            leaves unchanged.
         :param _unset_model_override: When ``True``, clear
             ``model_override`` to ``None``.
+        :param reported_model: The model the harness last reported the
+            session is actually on, verbatim, e.g.
+            ``"claude-opus-4-8[1m]"``. ``None`` leaves unchanged.
+            No ``_unset`` variant — reports only ever move forward.
         :param cost_control_mode_override: Per-session cost-control
             switch, ``"on"`` or ``"off"``. ``None`` leaves unchanged.
         :param _unset_cost_control_mode_override: When ``True``, clear
@@ -2759,6 +2771,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                 overrides_changed = True
             elif model_override is not None:
                 overrides["model_override"] = model_override
+                overrides_changed = True
+            if reported_model is not None:
+                overrides["reported_model"] = reported_model
                 overrides_changed = True
             if _unset_cost_control_mode_override:
                 overrides["cost_control_mode_override"] = None

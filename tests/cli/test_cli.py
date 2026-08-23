@@ -24,6 +24,9 @@ from omnigent.cli import (
     _CLICK_SUBCOMMANDS,
     _GLOBAL_CONFIG_KEYS,
     _NATIVE_TERMINAL_DISPATCH_SPECS,
+    REQUIRE_WRAPPER_ENV,
+    WRAPPER_BYPASS_ENV,
+    WRAPPER_COMMAND_ENV,
     _bundle,
     _bundled_example_path,
     _dispatch_native_terminal_harness,
@@ -49,6 +52,7 @@ from omnigent.cli import (
     _save_local_config,
     _server_uvicorn_log_config,
     _start_cli_runner_process,
+    _wrapper_guard_error,
     cli,
 )
 from omnigent.cli_config import (
@@ -116,6 +120,39 @@ def _restore_logging_state() -> Iterator[None]:
         logger.propagate = propagate
 
 
+def test_global_profiling_writes_summary_and_timestamped_stats(tmp_path: Path) -> None:
+    """The real entry point profiles any command selected after the root flag."""
+    repo_root = Path(__file__).resolve().parents[2]
+    pythonpath = os.pathsep.join(
+        part for part in (str(repo_root), os.environ.get("PYTHONPATH")) if part
+    )
+    result = subprocess.run(
+        [sys.executable, "-m", "omnigent", "--profiling", "version"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "PYTHONPATH": pythonpath,
+            "OMNIGENT_DATA_DIR": str(tmp_path / "data"),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "CLI profile:" in result.stderr
+    assert "Top Omnigent call paths" in result.stderr
+    assert "Top Omnigent functions by self time" in result.stderr
+    self_time_table = result.stderr.split("Top Omnigent functions by self time", 1)[1]
+    assert "<built-in method" not in self_time_table
+    assert "Full profile data:" in result.stderr
+    [profile_path] = list((tmp_path / "data" / "profiles").glob("omnigent-cli-*.prof"))
+
+    import pstats
+
+    assert pstats.Stats(str(profile_path)).total_calls > 0
+
+
 def test_python_module_entrypoint_uses_unified_click_cli() -> None:
     """
     ``python -m omnigent`` must dispatch through the same click CLI
@@ -141,12 +178,53 @@ def test_python_module_entrypoint_uses_unified_click_cli() -> None:
     assert "Omnigent quick chat" not in result.stdout
 
 
+def _run_entrypoint(*args: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    """Invoke the real CLI entry point in a subprocess with an augmented env."""
+    return subprocess.run(
+        [sys.executable, "-m", "omnigent", *args],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, **env},
+    )
+
+
+def test_wrapper_guard_blocks_naked_call_end_to_end() -> None:
+    """With the toggle set, a naked call is refused before any CLI dispatch."""
+    result = _run_entrypoint(
+        "--help",
+        env={REQUIRE_WRAPPER_ENV: "1", WRAPPER_COMMAND_ENV: "isaac omni"},
+    )
+
+    assert result.returncode == 2
+    assert "running `omnigent` directly is disabled" in result.stderr
+    assert "`isaac omni`" in result.stderr
+    # The block short-circuits before click renders help.
+    assert "Usage: python -m omnigent" not in result.stdout
+
+
+def test_wrapper_guard_bypass_reaches_cli_end_to_end() -> None:
+    """The bypass token lets the wrapped call dispatch normally."""
+    result = _run_entrypoint(
+        "--help",
+        env={
+            REQUIRE_WRAPPER_ENV: "1",
+            WRAPPER_COMMAND_ENV: "isaac omni",
+            WRAPPER_BYPASS_ENV: "1",
+        },
+    )
+
+    assert result.returncode == 0
+    assert "Usage: python -m omnigent [OPTIONS] COMMAND [ARGS]..." in result.stdout
+
+
 @pytest.mark.parametrize(
     ("argv", "expected"),
     [
         (["run", "tests/resources/examples/hello_world.yaml"], False),
         (["attach", "tests/resources/examples/hello_world.yaml"], False),
         (["--help"], False),
+        (["--profiling", "--help"], False),
         (["what does this repo do?"], True),
         (["--system-prompt", "You are terse"], True),
         # A single command-shaped word is an unknown subcommand, not
@@ -164,6 +242,49 @@ def test_removed_ad_hoc_detection(argv: list[str], expected: bool) -> None:
         prompt shape.
     """
     assert _is_removed_ad_hoc_invocation(argv) is expected
+
+
+def test_wrapper_guard_inactive_when_toggle_unset() -> None:
+    """No block without the opt-in toggle, whatever else is set."""
+    assert _wrapper_guard_error({WRAPPER_COMMAND_ENV: "isaac omni"}, "omni") is None
+
+
+def test_wrapper_guard_blocks_naked_call_and_suggests_redirect() -> None:
+    """A naked call is refused with the configured redirect command."""
+    env = {REQUIRE_WRAPPER_ENV: "1", WRAPPER_COMMAND_ENV: "isaac omni"}
+
+    message = _wrapper_guard_error(env, "omni")
+
+    assert message is not None
+    assert "running `omni` directly is disabled" in message
+    assert "`isaac omni`" in message
+    assert f"set {WRAPPER_BYPASS_ENV}=1" in message
+
+
+def test_wrapper_guard_message_without_redirect() -> None:
+    """With no redirect command the block only offers the bypass escape hatch."""
+    message = _wrapper_guard_error({REQUIRE_WRAPPER_ENV: "1"}, "omnigent")
+
+    assert message is not None
+    assert "instead" not in message
+    assert f"Set {WRAPPER_BYPASS_ENV}=1" in message
+
+
+def test_wrapper_guard_bypass_passes_through() -> None:
+    """The wrapper's bypass token lets the wrapped call proceed."""
+    env = {
+        REQUIRE_WRAPPER_ENV: "1",
+        WRAPPER_COMMAND_ENV: "isaac omni",
+        WRAPPER_BYPASS_ENV: "1",
+    }
+
+    assert _wrapper_guard_error(env, "omni") is None
+
+
+@pytest.mark.parametrize("falsey", ["", "0", "false", "no", "off"])
+def test_wrapper_guard_toggle_falsey_values_do_not_block(falsey: str) -> None:
+    """Falsey toggle values are treated as unset."""
+    assert _wrapper_guard_error({REQUIRE_WRAPPER_ENV: falsey}, "omni") is None
 
 
 def test_extract_global_logging_flags_preserves_run_shorthand() -> None:
@@ -955,10 +1076,11 @@ def test_kiro_command_is_registered_in_click_help() -> None:
 
 
 def test_help_groups_harnesses_and_other_commands() -> None:
-    """``--help`` lists a ``Harnesses`` section separate from ``Commands``."""
+    """``--help`` lists global options and separates command categories."""
     result = CliRunner().invoke(cli, ["--help"])
 
     assert result.exit_code == 0, result.output
+    assert "--profiling" in result.output
     assert "Harnesses:" in result.output
     assert "Commands:" in result.output
     # A harness launcher lands under Harnesses; a management command
@@ -3369,6 +3491,63 @@ def test_run_profile_sets_databricks_config_profile_env(
 
     assert result.exit_code == 0, result.output
     assert seen["value"] == "my-sp"
+
+
+def test_bare_run_profile_shorthand_still_selects_databricks_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The new root flag must not consume the historical bare-run spelling."""
+    from omnigent.cli import main
+
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    seen = _capture_profile_env_at_dispatch(monkeypatch)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "omnigent",
+            "--profile",
+            "my-sp",
+            "--server",
+            "https://example.com",
+            "-p",
+            "hi",
+        ],
+    )
+
+    main()
+
+    assert seen["value"] == "my-sp"
+
+
+def test_global_profiling_coexists_with_run_databricks_profile(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Root profiling and ``run --profile NAME`` keep distinct semantics."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    seen = _capture_profile_env_at_dispatch(monkeypatch)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--profiling",
+            "run",
+            "--server",
+            "https://example.com",
+            "--profile",
+            "my-sp",
+            "-p",
+            "hi",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen["value"] == "my-sp"
+    assert "Top Omnigent call paths" in result.stderr
+    profiles = tmp_path / "data" / "profiles"
+    assert len(list(profiles.glob("omnigent-cli-*.prof"))) == 1
 
 
 def test_run_profile_wins_over_preset_env(

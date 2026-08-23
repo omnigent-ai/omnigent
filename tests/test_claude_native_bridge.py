@@ -3855,16 +3855,19 @@ def test_kill_session_raises_when_tmux_target_never_published(
         kill_session(tmp_path / "bridge", timeout_s=0.0)
 
 
-def test_kill_session_raises_on_tmux_failure(
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "no server running on /tmp/example/tmux.sock",
+        "can't find session: main",
+    ],
+)
+def test_kill_session_is_idempotent_when_tmux_is_absent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    stderr: str,
 ) -> None:
-    """
-    Non-zero ``tmux kill-session`` exit propagates as a RuntimeError.
-
-    The runner handler maps this to a 503 so a wedged tmux server
-    surfaces as a failed stop rather than a silent success.
-    """
+    """A stale tmux advertisement still counts as a successful stop."""
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(
         bridge_dir,
@@ -3877,21 +3880,36 @@ def test_kill_session_raises_on_tmux_failure(
 
         returncode = 1
         stdout = ""
-        stderr = "no server running on /tmp/example/tmux.sock"
 
     def _fake_run(cmd: list[str], **kwargs: object) -> _FakeCompleted:
-        """
-        Return a fake non-zero CompletedProcess.
-
-        :param cmd: Argv list passed to subprocess.run.
-        :param kwargs: Subprocess kwargs (ignored).
-        :returns: A fake CompletedProcess with rc=1.
-        """
+        """Return a fake non-zero CompletedProcess."""
         del cmd, kwargs
-        return _FakeCompleted()
+        result = _FakeCompleted()
+        result.stderr = stderr
+        return result
 
     monkeypatch.setattr("subprocess.run", _fake_run)
-    with pytest.raises(RuntimeError, match="no server running"):
+    kill_session(bridge_dir)
+
+
+def test_kill_session_raises_on_unexpected_tmux_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unexpected tmux failures remain visible to the stop caller."""
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="main",
+    )
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del cmd, kwargs
+        return SimpleNamespace(returncode=1, stdout="", stderr="permission denied")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with pytest.raises(RuntimeError, match="permission denied"):
         kill_session(bridge_dir)
 
 
@@ -4004,6 +4022,380 @@ def test_inject_slash_command_rejects_invalid_commands(
     monkeypatch.setattr("subprocess.run", _fake_run)
     with pytest.raises(ValueError):
         claude_native_bridge.inject_slash_command(bridge_dir, command=bad_command)
+
+
+def test_cycleable_permission_modes_match_the_server_patch_vocabulary() -> None:
+    """
+    The bridge and the Sessions API accept the same set of modes.
+
+    PATCH validates ``permission_mode`` against its own frozenset before
+    forwarding, so a mode in one set but not the other is either
+    unreachable (rejected at the API after the UI offered it) or
+    reachable but un-offerable. Pin them together.
+    """
+    from omnigent.server.routes._sessions.common import _CLAUDE_NATIVE_PERMISSION_MODES
+
+    assert set(claude_native_bridge.CYCLEABLE_PERMISSION_MODES) == set(
+        _CLAUDE_NATIVE_PERMISSION_MODES
+    ), "Bridge cycleable modes and the Sessions API's accepted modes must match."
+
+
+class _FakeModeCycleTmux:
+    """
+    Stand-in tmux whose pane renders Claude's permission-mode footer.
+
+    ``BTab`` advances a cycle of modes; ``capture-pane`` renders the
+    current one exactly as Claude Code's TUI does, so the cycler under
+    test reads real footer text. Construct with a cycle that omits
+    ``auto`` to model an account where the mode is unreachable.
+    """
+
+    def __init__(
+        self,
+        cycle: list[str],
+        *,
+        start: str = "default",
+        stale_reads: int = 0,
+    ) -> None:
+        self.cycle = cycle
+        self.index = cycle.index(start)
+        self.presses = 0
+        # Captures right after a BTab that still render the PREVIOUS mode,
+        # modelling the TUI's asynchronous repaint.
+        self.stale_reads = stale_reads
+        self._pending_stale = 0
+        self._prev_index = self.index
+
+    _FOOTERS = {
+        "default": "⏸ manual mode on",
+        "acceptEdits": "⏵⏵ accept edits on (shift+tab to cycle)",
+        "plan": "⏸ plan mode on (shift+tab to cycle)",
+        "auto": "⏵⏵ auto mode on (shift+tab to cycle)",
+        "bypassPermissions": "⏵⏵ bypass permissions on (shift+tab to cycle)",
+    }
+
+    def run(self, cmd: list[str], **kwargs: object) -> object:
+        """Serve capture-pane / send-keys like the real tmux binary."""
+        del kwargs
+        if "capture-pane" in cmd:
+            # Serve the pre-keystroke mode for the first `stale_reads`
+            # captures after a press, the way a mid-repaint pane does.
+            index = self.index
+            if self._pending_stale > 0:
+                self._pending_stale -= 1
+                index = self._prev_index
+            # Include the input box so the readiness gate passes, then
+            # the status + mode footer rows Claude renders beneath it.
+            pane = (
+                "╭──────────────╮\n"
+                "❯ \n"
+                "╰──────────────╯\n"
+                "  Opus 5 │ 0/1M (0%)\n"
+                f"  {self._FOOTERS[self.cycle[index]]}\n"
+            )
+            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
+        if cmd[-1] == "BTab":
+            self.presses += 1
+            self._prev_index = self.index
+            self.index = (self.index + 1) % len(self.cycle)
+            self._pending_stale = self.stale_reads
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["auto", "plan", "acceptEdits", "default"],
+)
+def test_set_permission_mode_cycles_until_target_renders(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+) -> None:
+    """
+    Every cycle-reachable mode is reached by pressing shift+tab.
+
+    Claude Code has no non-interactive mode command, so the switch
+    walks its shift+tab cycle and reads the pane footer to confirm
+    where it landed.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    fake = _FakeModeCycleTmux(["default", "acceptEdits", "plan", "auto"])
+    monkeypatch.setattr("subprocess.run", fake.run)
+
+    got = claude_native_bridge.set_permission_mode(bridge_dir, mode=target, timeout_s=5.0)
+
+    assert got == target, f"Expected the pane to settle on {target!r}, got {got!r}."
+
+
+def test_set_permission_mode_waits_out_a_stale_mode_footer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A pane still showing the old mode doesn't stall the walk.
+
+    Claude repaints the footer asynchronously, so a capture taken right
+    after shift+tab can still render the PREVIOUS mode. Treating that as
+    the landed mode makes the cycler think the keystroke did nothing: it
+    keeps pressing while reading one mode behind, and a reachable target
+    (e.g. ``auto``, the last mode in the cycle) is reported unreachable.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    # Two stale captures per press — enough that a reader accepting the
+    # first non-empty footer always lags a mode behind.
+    fake = _FakeModeCycleTmux(
+        ["default", "acceptEdits", "plan", "auto"],
+        stale_reads=2,
+    )
+    monkeypatch.setattr("subprocess.run", fake.run)
+
+    got = claude_native_bridge.set_permission_mode(bridge_dir, mode="auto", timeout_s=5.0)
+
+    assert got == "auto", f"Expected the walk to reach auto despite stale reads, got {got!r}."
+    # 3 presses walk default → acceptEdits → plan → auto. More means the
+    # cycler was re-pressing on stale reads and lapped past the target.
+    assert fake.presses == 3, f"Expected 3 presses to reach auto, got {fake.presses}."
+
+
+def test_set_permission_mode_is_a_noop_when_already_in_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Re-requesting the current mode sends no keystrokes.
+
+    Without this the cycler would lap the whole cycle to return to
+    where it started, flashing every intermediate mode on the pane.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    fake = _FakeModeCycleTmux(["default", "acceptEdits", "plan", "auto"], start="auto")
+    monkeypatch.setattr("subprocess.run", fake.run)
+
+    got = claude_native_bridge.set_permission_mode(bridge_dir, mode="auto", timeout_s=5.0)
+
+    assert got == "auto"
+    assert fake.presses == 0, f"Expected no shift+tab presses, got {fake.presses}."
+
+
+def test_set_permission_mode_raises_when_target_not_in_cycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An unreachable mode fails loud instead of landing somewhere else.
+
+    ``auto`` is only in the cycle for accounts that have the mode. A
+    fixed press count would silently leave the session in whatever mode
+    it happened to land on, so the cycler gives up and reports the modes
+    it actually saw.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    # No ``auto`` in this session's cycle.
+    fake = _FakeModeCycleTmux(["default", "acceptEdits", "plan"])
+    monkeypatch.setattr("subprocess.run", fake.run)
+
+    with pytest.raises(RuntimeError, match="not available in this session's cycle"):
+        claude_native_bridge.set_permission_mode(bridge_dir, mode="auto", timeout_s=5.0)
+
+
+@pytest.mark.parametrize("bad_mode", ["dontAsk", "bypassPermissions", "", "nonsense"])
+def test_set_permission_mode_rejects_non_cycleable_modes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bad_mode: str,
+) -> None:
+    """
+    Modes shift+tab can't reach are rejected before touching tmux.
+
+    ``dontAsk`` is never in the cycle and ``bypassPermissions`` only
+    joins it when the session launched into it — cycling toward either
+    would wander through unrelated modes and then fail.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> object:
+        """Fail the test if tmux is invoked for a rejected mode."""
+        del cmd, kwargs
+        raise AssertionError("subprocess.run must not be called for a non-cycleable mode")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with pytest.raises(ValueError, match="cannot be switched on a running session"):
+        claude_native_bridge.set_permission_mode(bridge_dir, mode=bad_mode, timeout_s=5.0)
+
+
+def test_set_permission_mode_raises_when_footer_never_renders(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A pane with no mode footer fails loud rather than blind-cycling.
+
+    Reading the current mode is what makes the walk deterministic; with
+    no footer the cycler cannot know where it started, so pressing
+    shift+tab would move the session to an unknown mode.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> object:
+        """Render a mounted input box that never shows a mode footer."""
+        del kwargs
+        if "capture-pane" in cmd:
+            pane = "╭────────╮\n❯ \n╰────────╯\n  Opus 5 │ 0/1M (0%)\n"
+            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
+        if cmd[-1] == "BTab":
+            raise AssertionError("must not cycle when the current mode is unknown")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with pytest.raises(RuntimeError, match="did not render a permission-mode footer"):
+        claude_native_bridge.set_permission_mode(bridge_dir, mode="auto", timeout_s=5.0)
+
+
+def test_set_permission_mode_raises_when_tmux_target_never_published(
+    tmp_path: Path,
+) -> None:
+    """
+    Missing tmux.json surfaces RuntimeError, mirroring inject_slash_command.
+
+    The runner route catches it and returns 503 so the web UI can show
+    "couldn't switch mode" instead of claiming a switch that never
+    reached the pane.
+    """
+    with pytest.raises(RuntimeError, match="tmux target is not advertised"):
+        claude_native_bridge.set_permission_mode(
+            tmp_path / "bridge",
+            mode="auto",
+            timeout_s=0.0,
+        )
+
+
+def test_permission_mode_from_pane_reads_the_footer_below_the_input_box() -> None:
+    """
+    The footer is found beneath the box rule, not at a fixed tail offset.
+
+    A tall footer (extra status rows, concurrent subagent lines) pushes the
+    mode line further from the bottom than a fixed window would reach, so a
+    tail-only scan would report "unknown" and the picker would hide.
+    """
+    pane = (
+        "● Working on it\n"
+        "╭──────────────╮\n"
+        "❯ \n"
+        "╰──────────────╯\n"
+        "  Opus 5 │ 0/1M (0%)\n"
+        "  ⏵⏵ auto mode on (shift+tab to cycle)\n"
+        "  ↓ 2 subagents running\n"
+        "  ⧉ In omnigent\n"
+    )
+
+    assert claude_native_bridge._permission_mode_from_pane(pane) == "auto"
+
+
+def test_permission_mode_from_pane_ignores_a_mode_named_in_the_transcript() -> None:
+    """
+    Transcript text above the input box can't be misread as the live mode.
+
+    Claude echoing "plan mode on" while *discussing* modes sits above the
+    box rule; only the region below it is the live footer. Without the
+    anchor the UI would flip to Plan because the agent said the words.
+    """
+    pane = (
+        "● You asked about plan mode on vs auto mode on — here's how they differ.\n"
+        "╭──────────────╮\n"
+        "❯ \n"
+        "╰──────────────╯\n"
+        "  ⏸ manual mode on\n"
+    )
+
+    assert claude_native_bridge._permission_mode_from_pane(pane) == "default"
+
+
+def test_permission_mode_from_pane_returns_none_without_a_footer() -> None:
+    """
+    A footerless pane reads as unknown, never as a guessed default.
+
+    The forwarder treats ``None`` as "no fresh observation" so a mid-repaint
+    capture can't post a spurious switch, and the web picker hides instead
+    of showing a mode the session may not be in.
+    """
+    assert claude_native_bridge._permission_mode_from_pane("") is None
+    assert (
+        claude_native_bridge._permission_mode_from_pane(
+            "╭────────╮\n❯ \n╰────────╯\n  Opus 5 │ 0/1M (0%)\n"
+        )
+        is None
+    )
+
+
+def test_read_permission_mode_reports_the_pane_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``read_permission_mode`` captures the pane and returns its footer mode.
+
+    This is the forwarder's only window onto an in-TUI shift+tab: Claude Code
+    emits no event on a mode change, so the rendered footer is the signal.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> object:
+        """Render a pane sitting in plan mode."""
+        del kwargs
+        if "capture-pane" in cmd:
+            pane = "╭────────╮\n❯ \n╰────────╯\n  ⏸ plan mode on (shift+tab to cycle)\n"
+            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    assert claude_native_bridge.read_permission_mode(bridge_dir) == "plan"
+
+
+def test_read_permission_mode_returns_none_without_a_tmux_target(tmp_path: Path) -> None:
+    """
+    No published tmux.json reads as unknown instead of raising.
+
+    The forwarder calls this every poll, including before the terminal is up.
+    Raising would have to be swallowed by the caller's poll loop; returning
+    ``None`` keeps "terminal not ready" and "no footer" on one quiet path.
+    """
+    assert claude_native_bridge.read_permission_mode(tmp_path / "bridge") is None
 
 
 def test_inject_slash_command_raises_when_tmux_target_never_published(
@@ -5187,6 +5579,122 @@ def test_read_transcript_items_from_offset_returns_latest_model(
     assert result.latest_model == "claude-opus-4-7"
 
 
+def test_read_transcript_items_surfaces_custom_title_without_an_item(
+    tmp_path: Path,
+) -> None:
+    """
+    A ``/rename`` record surfaces on ``latest_custom_title`` and renders nothing.
+
+    Claude writes the operator's title as a ``custom-title`` metadata
+    record carrying no ``message``, so it must not become a conversation
+    item — the forwarder mirrors it onto the session title instead.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "u1",
+                        "message": {"role": "user", "content": "hi"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "custom-title",
+                        "customTitle": "auth-refactor",
+                        "sessionId": "s1",
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = read_transcript_items_from_offset(
+        transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+    )
+
+    assert result.latest_custom_title == "auth-refactor"
+    # The rename record itself is metadata, not a user/assistant bubble.
+    assert [item.item_type for item in result.items] == ["message"]
+
+
+def test_read_transcript_items_custom_title_last_write_wins(tmp_path: Path) -> None:
+    """Renaming twice in one window leaves the most recent title."""
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "custom-title", "customTitle": "first", "sessionId": "s1"}),
+                json.dumps({"type": "custom-title", "customTitle": "second", "sessionId": "s1"}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = read_transcript_items_from_offset(
+        transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+    )
+
+    assert result.latest_custom_title == "second"
+
+
+def test_read_transcript_items_ignores_ai_title_and_blank_custom_title(
+    tmp_path: Path,
+) -> None:
+    """
+    Claude's own ``aiTitle`` and a blank ``customTitle`` are both ignored.
+
+    Omnigent runs its own background titler, so forwarding Claude's
+    generated title would put two auto-titlers in a fight over one field;
+    only an explicit ``/rename`` propagates.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "ai-title",
+                        "aiTitle": "Generated summary of the session",
+                        "sessionId": "s1",
+                    }
+                ),
+                json.dumps({"type": "custom-title", "customTitle": "   ", "sessionId": "s1"}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = read_transcript_items_from_offset(
+        transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+    )
+
+    assert result.latest_custom_title is None
+    assert result.items == []
+
+
+def test_read_transcript_items_since_surfaces_custom_title(tmp_path: Path) -> None:
+    """The legacy line-cursor reader surfaces the rename too."""
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps({"type": "custom-title", "customTitle": "auth-refactor", "sessionId": "s1"})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = claude_native_bridge.read_transcript_items_since_with_position(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+
+    assert result.latest_custom_title == "auth-refactor"
+
+
 def test_read_claude_context_state_returns_parsed_payload(tmp_path: Path) -> None:
     """
     ``context.json`` round-trips into a dict with both fields.
@@ -5404,6 +5912,48 @@ def test_model_env_round_trips_the_launch_vocabulary(
     assert read_model_env(bridge_dir) == {
         "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-4-8",
         "ANTHROPIC_CUSTOM_MODEL_OPTION": "databricks-claude-sonnet-5",
+    }
+
+
+def test_record_model_vocabulary_backfills_a_runner_prepared_bridge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The runner path records the vocabulary AFTER preparing the bridge.
+
+    The runner prepares the bridge before it resolves the provider config,
+    so the pins and launch model land via a second write — and must read
+    back exactly as the CLI path's prepare-time record does.
+    """
+    from omnigent.claude_native_bridge import (
+        read_launch_model,
+        read_model_env,
+        record_model_vocabulary,
+    )
+
+    root = tmp_path / "root"
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", root)
+
+    bridge_dir = prepare_bridge_dir("conv_abc", workspace=tmp_path)
+    assert read_model_env(bridge_dir) == {}
+
+    record_model_vocabulary(
+        bridge_dir,
+        launch_env={
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-4-8",
+            "ANTHROPIC_BASE_URL": "https://example.invalid",
+        },
+        launch_model="databricks-claude-opus-4-8",
+    )
+    assert read_model_env(bridge_dir) == {
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-4-8",
+    }
+    assert read_launch_model(bridge_dir) == "databricks-claude-opus-4-8"
+
+    # A bare subscription launch records nothing and disturbs nothing.
+    record_model_vocabulary(bridge_dir, launch_env=None, launch_model=None)
+    assert read_model_env(bridge_dir) == {
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-4-8",
     }
 
 

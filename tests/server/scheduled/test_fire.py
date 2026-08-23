@@ -183,12 +183,46 @@ class FakeHostRegistry:
         return None
 
 
+class FakePolicyStore:
+    """Records policy create calls."""
+
+    def __init__(self, *, fail_create: bool = False) -> None:
+        self.created: list[dict[str, Any]] = []
+        self.fail_create = fail_create
+
+    def create(
+        self,
+        policy_id: str,
+        session_id: str,
+        name: str,
+        type: str,
+        handler: str,
+        factory_params: dict[str, Any] | None = None,
+        enabled: bool = True,
+    ) -> Any:
+        if self.fail_create:
+            raise RuntimeError("policy create failed")
+        self.created.append(
+            {
+                "policy_id": policy_id,
+                "session_id": session_id,
+                "name": name,
+                "type": type,
+                "handler": handler,
+                "factory_params": factory_params,
+                "enabled": enabled,
+            }
+        )
+        return None
+
+
 def _deps(sched_store: FakeScheduledTaskStore, **overrides: Any) -> FireDeps:
     return FireDeps(
         scheduled_task_store=sched_store,
         agent_store=overrides.get("agent_store", FakeAgentStore()),
         conversation_store=overrides.get("conversation_store", FakeConversationStore()),
         permission_store=overrides.get("permission_store", FakePermissionStore()),
+        policy_store=overrides.get("policy_store"),
         host_store=overrides.get("host_store", FakeHostStore()),
         host_registry=overrides.get("host_registry", FakeHostRegistry()),
         agent_cache=overrides.get("agent_cache"),
@@ -1082,3 +1116,99 @@ async def test_run_now_skips_when_already_in_flight() -> None:
     release.set()
     await _drain()
     assert len(store.runs) == 1
+
+
+# ── Cost budget policy attachment ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_max_cost_usd_attaches_cost_budget_policy() -> None:
+    """When a task has max_cost_usd set, a cost_budget policy is attached to the
+    spawned session."""
+    policy_store = FakePolicyStore()
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(max_cost_usd=5.0)})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _deps(store, conversation_store=conv_store, policy_store=policy_store),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert len(conv_store.created) == 1
+    assert len(policy_store.created) == 1
+    pol = policy_store.created[0]
+    assert pol["session_id"] == "conv_1"
+    assert pol["handler"] == "omnigent.policies.builtins.cost.cost_budget"
+    assert pol["factory_params"] == {"max_cost_usd": 5.0}
+    assert pol["enabled"] is True
+    assert store.runs[0]["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_no_max_cost_usd_skips_policy_attachment() -> None:
+    """When max_cost_usd is None, no policy is attached."""
+    policy_store = FakePolicyStore()
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(max_cost_usd=None)})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _deps(store, conversation_store=conv_store, policy_store=policy_store),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert len(conv_store.created) == 1
+    assert policy_store.created == []
+    assert store.runs[0]["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_no_policy_store_skips_attachment() -> None:
+    """When policy_store is None, cost budget attachment is silently skipped."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(max_cost_usd=5.0)})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _deps(store, conversation_store=conv_store, policy_store=None),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert len(conv_store.created) == 1
+    assert store.runs[0]["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_policy_create_failure_does_not_fail_fire() -> None:
+    """A policy store failure is non-fatal: the session proceeds without a cap."""
+    policy_store = FakePolicyStore(fail_create=True)
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(max_cost_usd=5.0)})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    on_fire = build_on_fire(
+        _deps(store, conversation_store=conv_store, policy_store=policy_store),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert len(conv_store.created) == 1
+    assert len(launched) == 1
+    assert store.runs[0]["status"] == "running"

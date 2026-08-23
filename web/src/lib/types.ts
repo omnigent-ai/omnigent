@@ -292,6 +292,13 @@ export interface Session {
    */
   workspace?: string | null;
   /**
+   * Native-terminal CLI args the session was launched with, e.g.
+   * ``["--permission-mode", "plan"]``. Reflects the LAUNCH command only:
+   * a later permission-mode switch lands in `labels`, so read the mode
+   * via `claudePermissionModeFromSession` rather than from these args.
+   */
+  terminalLaunchArgs?: string[] | null;
+  /**
    * Git branch checked out in a server-created worktree, e.g.
    * ``"feature/login"``. ``null`` when the session uses no worktree.
    * When set on the source, the picker offers a worktree/branch

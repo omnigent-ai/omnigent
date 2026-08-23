@@ -20,14 +20,25 @@ import {
   selectionHintText,
 } from "./TerminalView";
 
+const clipboardMock = vi.hoisted(() => ({
+  copyText: vi.fn<(text: string) => Promise<void>>(),
+  showToast: vi.fn(),
+}));
+
+vi.mock("@/lib/clipboard", () => ({ copyText: clipboardMock.copyText }));
+vi.mock("@/components/ui/toast", () => ({ showToast: clipboardMock.showToast }));
+
 const terminalSessionMock = vi.hoisted(() => ({
   instances: [] as {
     url: string;
     container: HTMLDivElement;
     nativeSelection: boolean;
+    clipboardEnabled: boolean;
+    onClipboardRequest?: (text: string) => void;
     onState: (state: ConnectionState) => void;
     dispose: ReturnType<typeof vi.fn>;
     setTheme: ReturnType<typeof vi.fn>;
+    setClipboardEnabled: ReturnType<typeof vi.fn>;
     focus: ReturnType<typeof vi.fn>;
   }[],
 }));
@@ -39,6 +50,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
   TerminalSession: class {
     dispose = vi.fn();
     setTheme = vi.fn();
+    setClipboardEnabled = vi.fn();
     focus = vi.fn();
 
     constructor(
@@ -49,14 +61,19 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
       _onActivity?: () => void,
       _onInput?: () => void,
       nativeSelection = false,
+      clipboardEnabled = true,
+      onClipboardRequest?: (text: string) => void,
     ) {
       terminalSessionMock.instances.push({
         url,
         container,
         nativeSelection,
+        clipboardEnabled,
+        onClipboardRequest,
         onState,
         dispose: this.dispose,
         setTheme: this.setTheme,
+        setClipboardEnabled: this.setClipboardEnabled,
         focus: this.focus,
       });
     }
@@ -65,6 +82,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
 
 beforeEach(() => {
   terminalSessionMock.instances = [];
+  clipboardMock.copyText.mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -151,6 +169,19 @@ describe("control-mode transport", () => {
     expect(inst.nativeSelection).toBe(true);
   });
 
+  it("disables clipboard bridging for read-only attaches", async () => {
+    render(
+      <TerminalView
+        sessionId="conv_abc"
+        terminalId="terminal_bash_s1"
+        transport="control"
+        readOnly
+      />,
+    );
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    expect(terminalSessionMock.instances[0].clipboardEnabled).toBe(false);
+  });
+
   it("hides the selection hint bar in control mode", async () => {
     render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" transport="control" />);
     await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
@@ -164,6 +195,38 @@ describe("control-mode transport", () => {
     expect(inst.url).not.toContain("transport");
     expect(inst.nativeSelection).toBe(false);
     expect(screen.getByTestId("terminal-selection-hint")).toBeInTheDocument();
+  });
+});
+
+describe("tmux clipboard", () => {
+  it("writes validated terminal copies through the shared clipboard helper", async () => {
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+
+    terminalSessionMock.instances[0].onClipboardRequest?.("copied text");
+
+    await waitFor(() => expect(clipboardMock.copyText).toHaveBeenCalledWith("copied text"));
+    expect(clipboardMock.showToast).toHaveBeenCalledWith("Copied from terminal.", {
+      duration: 1500,
+    });
+    expect(terminalSessionMock.instances[0].focus).toHaveBeenCalled();
+  });
+
+  it("offers a gesture-backed retry when automatic clipboard access fails", async () => {
+    clipboardMock.copyText
+      .mockRejectedValueOnce(new Error("permission denied"))
+      .mockResolvedValueOnce(undefined);
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+
+    terminalSessionMock.instances[0].onClipboardRequest?.("retry text");
+    await waitFor(() => expect(clipboardMock.showToast).toHaveBeenCalled());
+    const retryContent = clipboardMock.showToast.mock.calls[0][0];
+    render(retryContent);
+    fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+
+    await waitFor(() => expect(clipboardMock.copyText).toHaveBeenCalledTimes(2));
+    expect(clipboardMock.copyText).toHaveBeenLastCalledWith("retry text");
   });
 });
 
@@ -191,6 +254,19 @@ describe("hidden pre-warmed surface", () => {
     rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active={false} />);
     expect(inst.dispose).not.toHaveBeenCalled();
     expect(inst.focus).toHaveBeenCalledTimes(1);
+  });
+
+  it("toggles clipboard bridging when a warm surface is revealed", async () => {
+    const { rerender } = render(
+      <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active={false} />,
+    );
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    const inst = terminalSessionMock.instances[0];
+    expect(inst.clipboardEnabled).toBe(false);
+
+    rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active />);
+    await waitFor(() => expect(inst.setClipboardEnabled).toHaveBeenCalledWith(true));
+    expect(terminalSessionMock.instances).toHaveLength(1);
   });
 
   it("does not focus on a plain active mount (WS-open handles it)", async () => {

@@ -176,15 +176,16 @@ def test_runner_resource_attach_selects_control_bridge_on_transport_query(
 ) -> None:
     """``?transport=control`` dispatches to the control-mode bridge, not the PTY one.
 
-    Both bridges share the same signature and browser wire protocol, so the
-    route just picks one. Patch each to record which was invoked and close the
+    The route selects one bridge and gives PTY attaches the explicit OSC 52
+    trust capability. Patch each to record which was invoked and close the
     socket cleanly, then assert on the selection per query.
 
     :param tmp_path: Pytest tmp directory.
     :param monkeypatch: Pytest monkeypatch fixture.
     """
     registry = TerminalRegistry()
-    _seed_registry(registry, "conv_abc", _make_running_instance("bash", "s1", tmp_path))
+    instance = _make_running_instance("bash", "s1", tmp_path)
+    _seed_registry(registry, "conv_abc", instance)
     app = create_runner_app(
         terminal_registry=registry,
         server_client=NullServerClient(),  # type: ignore[arg-type]
@@ -196,8 +197,8 @@ def test_runner_resource_attach_selects_control_bridge_on_transport_query(
         calls.append("control")
         await websocket.close()
 
-    async def fake_pty(websocket, **_kwargs):  # type: ignore[no-untyped-def]
-        calls.append("pty")
+    async def fake_pty(websocket, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append(f"pty:{kwargs.get('allow_osc52_clipboard')}")
         await websocket.close()
 
     monkeypatch.setattr("omnigent.runner.app.bridge_tmux_control_to_websocket", fake_control)
@@ -218,8 +219,14 @@ def test_runner_resource_attach_selects_control_bridge_on_transport_query(
     with contextlib.suppress(WebSocketDisconnect):
         with client.websocket_connect(base):  # no query → control default
             pass
+    # Passthrough can carry pane-crafted OSC 52 around tmux's external-only
+    # clipboard policy, so PTY attaches must explicitly disable browser OSC 52.
+    instance.tmux_allow_passthrough = True
+    with contextlib.suppress(WebSocketDisconnect):
+        with client.websocket_connect(f"{base}?transport=pty"):
+            pass
 
-    assert calls == ["control", "pty", "control"], (
+    assert calls == ["control", "pty:True", "control", "pty:False"], (
         f"transport query did not select the expected bridge: {calls!r}"
     )
 

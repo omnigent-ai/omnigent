@@ -20,6 +20,8 @@
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",
+    "@emoji-mart/data": "^1.2.1",
+    "@emoji-mart/react": "^1.1.1",
     "@fontsource-variable/geist-mono": "^5.2.7",
     "@lobehub/fluent-emoji": "^4.1.0",
     "@lobehub/icons": "^5.6.0",
@@ -61,6 +63,7 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "cmdk": "^1.1.1",
+    "emoji-mart": "^5.6.0",
     "katex": "^0.16.47",
     "lucide-react": "^1.12.0",
     "monaco-editor": "^0.55.1",
