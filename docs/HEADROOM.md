@@ -1,22 +1,26 @@
-# Headroom Integration Scaffolding
+# Headroom Integration
 
-Integration scaffolding for [Headroom](https://github.com/headroomlabs-ai/headroom) AI context compression.
+Integration for [Headroom](https://github.com/headroomlabs-ai/headroom) AI context compression.
 
-## Current Status - FUNCTIONAL
+## Current Status
 
-✅ **Compression is ACTIVE when `headroom-ai` is installed.** ✅
+**Compression is ACTIVE when `headroom-ai` is installed.**
 
 **What's Complete:**
 - ✅ Layer 0 compression integration point in compaction pipeline
 - ✅ CCR cache implementation with path-traversal protection and session isolation
-- ✅ `headroom_retrieve` tool registered as builtin (accessible to agents)
+- ✅ `headroom_retrieve` tool registered as builtin
 - ✅ `UniversalCompressor` API integration
 - ✅ Feature flag and configuration options
 - ✅ Graceful degradation when package unavailable
-- ✅ 44 unit/integration tests passing
 - ✅ Content replacement active (compression ratio > 1.2x triggers replacement)
 
-**Current Behavior:** Layer 0 compression is ACTIVE. When `headroom-ai` is installed and `headroom_enabled: true`, compression replaces large content with compressed versions. CCR cache stores originals for retrieval via the `headroom_retrieve` tool.
+**Important Limitations:**
+- ⚠️ **Local cache only**: CCR cache is stored on local disk (`~/.headroom/cache`). In multi-host deployments, retrieval only works if the same host processes the request.
+- ⚠️ **Manual cleanup required**: Cached originals persist indefinitely (no automatic expiry). Use file-based cleanup or mount a shared volume for multi-host setups.
+- ⚠️ **Tool must be enabled**: Agents using compression must include `headroom_retrieve` in their tool list to recover compressed content.
+
+**Current Behavior:** When `headroom-ai` is installed and `headroom_enabled: true`, compression replaces large content with compressed versions. Originals are cached locally for retrieval via the `headroom_retrieve` tool.
 
 ## Overview
 
@@ -248,7 +252,7 @@ Falls back to standard Layers 1-3.
 
 - **CCR cache:** ~50MB per 1M tokens compressed
 - **Streaming:** Compression operates in chunks
-- **Cleanup:** Cache auto-expires after 24 hours
+- **Cleanup:** Manual cleanup required (no automatic expiry). Cache persists in `~/.headroom/cache/<conversation_id>/`
 
 ### Quality
 
