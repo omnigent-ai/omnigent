@@ -354,7 +354,7 @@ class HeadroomCompressor:
             try:
                 config = UniversalCompressorConfig(
                     compression_ratio_target=0.5,  # Target 50% compression
-                    enable_ccr=self.enable_ccr,
+                    ccr_enabled=self.enable_ccr,  # Actual API uses ccr_enabled, not enable_ccr
                 )
                 self._compressor = UniversalCompressor(config=config)
                 _logger.debug("HeadroomCompressor initialized with UniversalCompressor")
