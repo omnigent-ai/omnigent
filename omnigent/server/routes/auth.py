@@ -432,9 +432,7 @@ def create_auth_router(
             caller = auth_provider.get_user_id(request)
             if caller is None:
                 return JSONResponse(status_code=401, content={"error": "not authenticated"})
-            is_admin = (
-                permission_store is not None and permission_store.is_admin(caller)
-            ) or admin_list.is_admin(caller)
+            is_admin = permission_store is not None and permission_store.is_admin(caller)
             if not is_admin:
                 return JSONResponse(status_code=403, content={"error": "admin only"})
 
@@ -584,9 +582,7 @@ def create_auth_router(
         caller = auth_provider.get_user_id(request)
         if caller is None:
             return JSONResponse(status_code=401, content={"error": "not authenticated"})
-        is_admin = (
-            permission_store is not None and permission_store.is_admin(caller)
-        ) or admin_list.is_admin(caller)
+        is_admin = permission_store is not None and permission_store.is_admin(caller)
         if not is_admin:
             return JSONResponse(status_code=403, content={"error": "admin only"})
 

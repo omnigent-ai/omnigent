@@ -124,3 +124,24 @@ def test_users_route_rejects_non_admin(
     )
     resp = client.get("/auth/users", headers={"Authorization": f"Bearer {member_jwt}"})
     assert resp.status_code == 403
+
+
+def test_users_route_ignores_roster_until_login(
+    oidc_users_client: tuple[TestClient, str], tmp_path: Path
+) -> None:
+    """A roster-listed identity whose DB flag has not flipped is NOT an admin.
+
+    ``users.is_admin`` is the only request-time truth; the roster file is
+    consulted at login only (``promote_if_listed``). Reporting it earlier
+    claimed admin for callers the session routes still refused.
+    """
+    client, _admin_jwt = oidc_users_client
+    (tmp_path / "admins").write_text("member@example.com\n")
+    member_jwt = mint_session_cookie(
+        user_id="member@example.com",
+        cookie_secret=_TEST_SECRET,
+        ttl_hours=8,
+        provider="oidc",
+    )
+    resp = client.get("/auth/users", headers={"Authorization": f"Bearer {member_jwt}"})
+    assert resp.status_code == 403

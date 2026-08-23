@@ -2251,15 +2251,14 @@ def create_app(
                 status_code=401,
                 content={"user_id": None, "login_url": login_url},
             )
-        # Mirror the admin check the auth routes use
-        # (``permission_store.is_admin(caller) or admin_list.is_admin(caller)``)
-        # so the SPA's admin chrome never under-reports relative to what the
-        # endpoints actually authorize — e.g. for an identity added to the
-        # admin-list file who hasn't re-logged-in yet (so ``promote_if_listed``
-        # hasn't flipped the DB flag).
-        is_admin = user_id is not None and (
-            (permission_store is not None and permission_store.is_admin(user_id))
-            or admin_list.is_admin(user_id)
+        # ``users.is_admin`` is the ONLY request-time admin truth. The roster
+        # file is consulted at login only (``promote_if_listed``): reporting
+        # it here would claim admin for an identity the session/host routes
+        # (which read the DB column) still refuse — a lie until re-login.
+        is_admin = (
+            user_id is not None
+            and permission_store is not None
+            and permission_store.is_admin(user_id)
         )
         return {"user_id": user_id, "is_admin": is_admin}
 
