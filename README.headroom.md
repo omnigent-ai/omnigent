@@ -1,6 +1,6 @@
-# Headroom Integration
+# Headroom Integration Scaffolding
 
-AI context compression integration for Omnigent. When the `headroom-ai` package is installed, provides 15-95% token reduction via content-aware compression.
+Integration scaffolding for Headroom AI context compression. Infrastructure is ready for when the `headroom-ai` package becomes publicly available.
 
 ## Requirements
 
@@ -43,12 +43,12 @@ Adds Layer 0 compression before existing compaction layers:
 
 ## Status
 
-⚠️ **Integration Complete, Package Required**
-- Implementation: Integration layer complete
-- Tests: 21/21 passing (unit tests)
-- Requires: `headroom-ai` package to be installed for actual compression
-- Feature flag: `OMNIGENT_FEATURES=headroom_compression` required
-- CCR (reversible compression): Not yet implemented
+**Integration Scaffolding** (ready for when `headroom-ai` becomes available)
+- Implementation: Integration layer complete, tested with graceful degradation
+- Tests: 21/21 passing (unit tests verify no-op behavior when package unavailable)
+- Package: `headroom-ai` not yet publicly available (optional extra prepared)
+- Feature flag: `OMNIGENT_FEATURES=headroom_compression` for future activation
+- CCR (reversible compression): Placeholder - not yet implemented
 
 ## Files
 
@@ -92,11 +92,13 @@ If `headroom-ai` is not installed:
 - No fake metrics are reported
 - Compaction falls back to existing Layers 1-3
 
-## Expected Impact (When Installed)
+## Expected Impact (When Package Becomes Available)
 
-**50-developer team with headroom-ai installed:**
-- Token reduction: 15-40% (content-dependent)
-- Cost savings: Variable, depends on content mix
-- Note: Some quality impact possible as CCR retrieval is not yet implemented
+**Projected for 50-developer team once headroom-ai is installed:**
+- Token reduction: 15-95% (content-type dependent: JSON 60-95%, code 15-20%, prose 20-40%)
+- Cost savings: Variable, depends on content mix and model pricing
+- Quality: Compression is lossy as CCR retrieval not yet implemented
+
+**Current behavior:** Returns unchanged content with no compression when package unavailable.
 
 See `docs/HEADROOM.md` for full documentation.

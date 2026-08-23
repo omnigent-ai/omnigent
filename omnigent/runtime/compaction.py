@@ -797,7 +797,7 @@ async def compact(
             json_threshold=getattr(config, "headroom_json_threshold", 500) if config else 500,
             code_threshold=getattr(config, "headroom_code_threshold", 1000) if config else 1000,
             prose_threshold=getattr(config, "headroom_prose_threshold", 2000) if config else 2000,
-            enable_ccr=getattr(config, "headroom_enable_ccr", True) if config else True,
+            enable_ccr=getattr(config, "headroom_enable_ccr", False) if config else False,
             metrics=compression_metrics,
         )
 

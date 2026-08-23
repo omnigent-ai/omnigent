@@ -88,10 +88,6 @@ dependencies = [
     # so per-conversation JSON/text is stored uniformly compressed across SQLite,
     # PostgreSQL, and MySQL rather than depending on each backend's storage engine.
     "zstandard>=0.22,<1",
-    # Headroom: AI context compression layer for 15-95% token reduction.
-    # Content-aware compression (JSON, code, prose) with reversible CCR.
-    # NOTE: Optional dependency - graceful degradation if unavailable.
-    # "headroom-ai[all]>=0.1.0,<1",
     "tiktoken>=0.7,<1",
     # Server performance metrics use the no-op API even when tracing is off.
     "opentelemetry-api>=1.20,<2",
@@ -152,6 +148,11 @@ all = [
     "opentelemetry-instrumentation-fastapi>=0,<1",
     "opentelemetry-instrumentation-httpx>=0,<1",
     "opentelemetry-instrumentation-sqlalchemy>=0,<1",
+]
+# Headroom AI context compression for token reduction (15-95% when available).
+# Integration scaffolding is present; package not yet publicly available.
+headroom = [
+    # "headroom-ai[all]>=0.1.0,<1",
 ]
 # From omnigent.
 bedrock = ["boto3>=1.30,<2", "botocore>=1.30,<2"]

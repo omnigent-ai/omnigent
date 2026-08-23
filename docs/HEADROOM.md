@@ -1,8 +1,8 @@
-# Headroom Integration for Cost Optimization
+# Headroom Integration Scaffolding
 
-Omnigent integrates [Headroom](https://github.com/headroomlabs-ai/headroom) for intelligent context compression. When the `headroom-ai` package is installed, it provides 15-95% token reduction via content-aware compression.
+Integration scaffolding for [Headroom](https://github.com/headroomlabs-ai/headroom) AI context compression. The infrastructure is ready for when the `headroom-ai` package becomes publicly available.
 
-**Note:** This integration currently requires the `headroom-ai` package to be installed separately. Without it, Layer 0 compression is disabled and no token reduction occurs.
+**Current Status:** Integration layer complete with graceful degradation. The `headroom-ai` package is not yet publicly available, so Layer 0 compression returns unchanged content with honest no-op metrics. When the package is released, uncomment the dependency in the `headroom` optional extra and compression will activate automatically.
 
 ## Overview
 
