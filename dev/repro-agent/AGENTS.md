@@ -270,6 +270,41 @@ Recording is best-effort: if the tooling below is missing, skip it, keep
 `recordings: []`, and say what was missing in `evidence` — never let recording
 block or distort the reproduction itself.
 
+**The recorder needs its own server — spawn one with a scrubbed env.** A `web`
+recording runs the `tests/e2e_ui/` suite, which drives a live server. Do **not**
+point it at the app you were launched against: that app is typically auth-gated
+(a Databricks Apps deployment bounces an unauthenticated Playwright to SSO), so
+the recorder can't drive it. Let the `tests/e2e_ui/` fixtures **spawn their own
+local server + runner** instead (the default when no `--ui-base-url` is passed).
+
+But when you are yourself running inside a server-spawned runner (the `--server`
+CI path), that fixture's runner **inherits your runner's environment and never
+tunnels** — it silently hangs with an empty `runner.log` and stays
+`online: false`. The conflict is the ambient runner/host vars leaking into the
+child. Launch the recorder with them **stripped** so the fixture starts clean:
+
+```bash
+env -u OMNIGENT_RUNNER_ID -u OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN \
+    -u OMNIGENT_RUNNER_TUNNEL_TOKEN -u OMNIGENT_RUNNER_PARENT_PID \
+    -u OMNIGENT_RUNNER_ISOLATE_SESSION -u OMNIGENT_RUNNER_WORKSPACE \
+    -u OMNIGENT_HOST_ID -u OMNIGENT_HOST_TOKEN -u OMNIGENT_HOST_NAME \
+    -u RUNNER_SERVER_URL -u OMNIGENT_REMOTE_AUTH_TOKEN \
+    $(env | grep -oE '^OMNIGENT_RUNNER_ZYGOTE[A-Z_]*' | sed 's/^/-u /' | tr '\n' ' ') \
+    pytest <test_path> --video on --screenshot on --output recordings/<slug>
+```
+
+The `OMNIGENT_RUNNER_ZYGOTE*` FDs are the usual culprit — they make the child
+runner take the fork path and block on control FDs it doesn't have. If the
+spawned runner still won't go `online: true` within the fixture's timeout, that
+lane is genuinely unreachable here: keep `recordings: []` for it and say so in
+`evidence` (a real environment limit, not a bug verdict).
+
+The `tests/e2e_ui/` server also needs the built SPA at
+`omnigent/server/static/web-ui/` in **your** checkout. If it is missing (the
+suite says so on boot), build it first — `pnpm --filter web install && pnpm
+--filter web run build` — since the deploy's pre-built bundle lives elsewhere and
+is not visible from your worktree.
+
 - **`web` facets** — run the authored Playwright test with recording on:
   `pytest <test_path> --video on --screenshot on --output recordings/<slug>`
   (the `tests/e2e_ui/` suite is pytest-playwright, so the flags need no extra
