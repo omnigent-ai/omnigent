@@ -41,6 +41,7 @@ def _cognee_usable(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(memory_mod, "cognee_available", lambda: True)
     monkeypatch.setattr(memory_mod, "cognee_settings", dict)
+    monkeypatch.setattr(memory_mod, "ensure_agent_registered", MagicMock())
     real_get = builtins_mod.get_builtin_tool
 
     def serving_get(name: str, config: dict[str, str] | None = None) -> object | None:

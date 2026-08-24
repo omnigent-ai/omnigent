@@ -173,7 +173,11 @@ class CogneeSearchTool(_CogneeToolBase):
         }
 
     def invoke(self, arguments: str, ctx: ToolContext) -> str:
-        from omnigent.runtime.memory import memory_search, sanitize_dataset_name
+        from omnigent.runtime.memory import (
+            ensure_agent_registered,
+            memory_search,
+            sanitize_dataset_name,
+        )
 
         try:
             args = json.loads(arguments) if arguments else {}
@@ -181,6 +185,9 @@ class CogneeSearchTool(_CogneeToolBase):
             if not query:
                 return "Error: 'query' parameter is required."
             grants = self._grants(ctx)
+            ensure_agent_registered(
+                grants, session_id=ctx.conversation_id, settings=self._settings()
+            )
             if args.get("dataset"):
                 target = sanitize_dataset_name(args["dataset"])
                 if not grants.can_read(target):
@@ -283,7 +290,11 @@ class CogneeRememberTool(_CogneeToolBase):
         }
 
     def invoke(self, arguments: str, ctx: ToolContext) -> str:
-        from omnigent.runtime.memory import memory_add, sanitize_dataset_name
+        from omnigent.runtime.memory import (
+            ensure_agent_registered,
+            memory_add,
+            sanitize_dataset_name,
+        )
 
         try:
             args = json.loads(arguments) if arguments else {}
@@ -291,6 +302,9 @@ class CogneeRememberTool(_CogneeToolBase):
             if not content:
                 return "Error: 'content' parameter is required."
             grants = self._grants(ctx)
+            ensure_agent_registered(
+                grants, session_id=ctx.conversation_id, settings=self._settings()
+            )
             scope = args.get("scope") or "agent"
             if args.get("dataset"):
                 dataset = sanitize_dataset_name(args["dataset"])

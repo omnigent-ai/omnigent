@@ -62,8 +62,12 @@ def fake_store(
     monkeypatch.setattr(
         memory_mod, "cognee_settings", lambda: {"data_root": str(tmp_path / "cognee")}
     )
+    # Registration mirroring is covered by its own unit tests; keep it inert
+    # here so the flow doesn't reach the real cognee agent registry.
+    monkeypatch.setattr(memory_mod, "ensure_agent_registered", MagicMock())
     memory_mod.breaker.reset()
     memory_mod._store_configured = False
+    memory_mod._registered_agent_connections.clear()
     # Serve the tools even though the real registry gated them out at import
     # (the cognee package is absent from the dev environment).
     import omnigent.tools.builtins as builtins_mod

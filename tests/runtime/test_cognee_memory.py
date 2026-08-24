@@ -38,9 +38,11 @@ def _reset_memory_state(monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.delenv(memory_mod.COGNEE_DISABLE_ENV, raising=False)
     memory_mod.breaker.reset()
     memory_mod._store_configured = False
+    memory_mod._registered_agent_connections.clear()
     yield
     memory_mod.breaker.reset()
     memory_mod._store_configured = False
+    memory_mod._registered_agent_connections.clear()
     if memory_mod._background_executor is not None:
         memory_mod._background_executor.shutdown(wait=True)
         memory_mod._background_executor = None
@@ -360,6 +362,98 @@ def test_add_failure_returns_false_and_skips_cognify(
     monkeypatch.setattr(memory_mod, "_cognify_blocking", cognified.append)
     assert memory_add("fact", "ds_a", settings=_settings(tmp_path)) is False
     assert cognified == []
+
+
+class _InlineExecutor:
+    """Executor stub that runs submissions synchronously for assertions."""
+
+    def submit(self, fn: Any, *args: Any) -> None:
+        fn(*args)
+
+
+def test_agent_registration_submits_once_per_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(memory_mod, "cognee_installed", lambda: True)
+    monkeypatch.setattr(memory_mod, "_get_background_executor", _InlineExecutor)
+    posted: list[tuple[str, str | None]] = []
+    monkeypatch.setattr(
+        memory_mod,
+        "_register_agent_blocking",
+        lambda grants, session_id, settings: posted.append((grants.private, session_id)),
+    )
+    grants = resolve_grants({}, agent_id="ag_me", conversation_id=None)
+    memory_mod.ensure_agent_registered(grants, session_id="conv_1", settings={})
+    memory_mod.ensure_agent_registered(grants, session_id="conv_1", settings={})
+    memory_mod.ensure_agent_registered(grants, session_id="conv_2", settings={})
+    assert posted == [("ag_me", "conv_1"), ("ag_me", "conv_2")]
+
+
+def test_agent_registration_skips_when_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(memory_mod, "cognee_installed", lambda: False)
+    monkeypatch.setattr(
+        memory_mod,
+        "_register_agent_blocking",
+        lambda *a: pytest.fail("must not register when unavailable"),
+    )
+    grants = resolve_grants({}, agent_id="ag_me", conversation_id=None)
+    memory_mod.ensure_agent_registered(grants, session_id="conv_1", settings={})
+    assert memory_mod._registered_agent_connections == set()
+
+
+def _install_registration_fakes(
+    monkeypatch: pytest.MonkeyPatch, fake: MagicMock
+) -> tuple[MagicMock, AsyncMock]:
+    """Fake the cognee agent-registry submodules for the blocking body."""
+    _install(monkeypatch, fake)
+    models = MagicMock()
+    request_kwargs = MagicMock(side_effect=lambda **kw: kw)
+    models.RegisterAgentRequest = request_kwargs
+    operations = MagicMock()
+    operations.register_agent_from_request = AsyncMock()
+    users = MagicMock()
+    users.get_default_user = AsyncMock(return_value="default-user")
+    monkeypatch.setitem(sys.modules, "cognee.modules", MagicMock())
+    monkeypatch.setitem(sys.modules, "cognee.modules.agents", MagicMock())
+    monkeypatch.setitem(sys.modules, "cognee.modules.agents.models", models)
+    monkeypatch.setitem(sys.modules, "cognee.modules.agents.operations", operations)
+    monkeypatch.setitem(sys.modules, "cognee.modules.users", MagicMock())
+    monkeypatch.setitem(sys.modules, "cognee.modules.users.methods", users)
+    return request_kwargs, operations.register_agent_from_request
+
+
+def test_registration_mirrors_grants_into_request(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    request_kwargs, register = _install_registration_fakes(monkeypatch, _fake_cognee())
+    grants = resolve_grants(
+        {"shared_dataset": "team", "read_datasets": "ag_peer_r", "write_datasets": "ag_peer_w"},
+        agent_id="ag_me",
+        conversation_id=None,
+    )
+    memory_mod._register_agent_blocking(grants, "conv_9", _settings(tmp_path))
+    kwargs = request_kwargs.call_args.kwargs
+    assert kwargs["agent_session_name"] == "ag_me"
+    assert kwargs["session_id"] == "conv_9"
+    assert kwargs["type"] == "omnigent"
+    assert kwargs["memory_mode"] == "cognee"
+    # Readable first, then write-only grants — flat names for the request...
+    assert kwargs["dataset_names"] == ["ag_me", "team", "ag_peer_r", "ag_peer_w"]
+    # ...with the precise read/write split preserved in metadata.
+    assert kwargs["metadata"]["grants"] == {
+        "readable": ["ag_me", "team", "ag_peer_r"],
+        "writable": ["ag_me", "team", "ag_peer_w"],
+    }
+    assert register.await_count == 1
+
+
+def test_registration_failure_is_swallowed_and_spares_breaker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _, register = _install_registration_fakes(monkeypatch, _fake_cognee())
+    register.side_effect = RuntimeError("registry down")
+    grants = resolve_grants({}, agent_id="ag_me", conversation_id=None)
+    memory_mod._register_agent_blocking(grants, "conv_9", _settings(tmp_path))
+    # Observability-only: no exception escaped and the breaker is untouched.
+    assert memory_mod.breaker.allow() is True
 
 
 def test_local_store_configured_once_with_llm_settings(

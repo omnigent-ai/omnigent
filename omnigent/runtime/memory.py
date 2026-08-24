@@ -462,7 +462,6 @@ def memory_add(
     fast — eventual consistency within the same session is accepted.
     Returns ``False`` (never raises) when the write failed.
     """
-    global _background_executor
     effective = cognee_settings() if settings is None else settings
     if not cognee_available() or not breaker.allow():
         return False
@@ -483,13 +482,19 @@ def memory_add(
         _logger.error("cognee add failed: %s", e)
         return False
 
+    _get_background_executor().submit(_cognify_blocking, dataset)
+    return True
+
+
+def _get_background_executor() -> ThreadPoolExecutor:
+    """Return the shared single-worker executor for off-turn cognee work."""
+    global _background_executor
     with _background_lock:
         if _background_executor is None:
             _background_executor = ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="cognee-cognify"
+                max_workers=1, thread_name_prefix="cognee-background"
             )
-    _background_executor.submit(_cognify_blocking, dataset)
-    return True
+        return _background_executor
 
 
 def _cognify_blocking(dataset: str) -> None:
@@ -505,3 +510,76 @@ def _cognify_blocking(dataset: str) -> None:
     except Exception as e:
         breaker.record_failure()
         _logger.error("cognee cognify failed for dataset %r: %s", dataset, e)
+
+
+# Agent connections already mirrored into cognee's registry this process,
+# keyed by (private dataset, session id) so a new session re-registers with
+# its current session id but repeat tool calls don't re-post.
+_registered_agent_connections: set[tuple[str, str]] = set()
+_registration_lock = threading.Lock()
+
+REGISTER_TIMEOUT_S = 10.0
+
+
+def ensure_agent_registered(
+    grants: MemoryGrants,
+    *,
+    session_id: str | None,
+    settings: dict[str, Any] | None = None,
+) -> None:
+    """Mirror this agent's :class:`MemoryGrants` into cognee's agent registry.
+
+    Best-effort observability only: cognee >=1.5 tracks agent connections
+    (``cognee.modules.agents``) so its tooling can show which agents touch
+    which memory pools. The registration runs on the background worker —
+    it never blocks a turn, never counts toward the circuit breaker, and
+    silently skips on cognee builds without the agents module (the extra
+    allows any 1.x). Authorization stays with :class:`MemoryGrants`; the
+    registration is a descriptive mirror, and the precise read/write split
+    rides ``metadata`` because ``RegisterAgentRequest`` only carries flat
+    dataset names.
+    """
+    if not cognee_available():
+        return
+    key = (grants.private, session_id or "")
+    with _registration_lock:
+        if key in _registered_agent_connections:
+            return
+        _registered_agent_connections.add(key)
+    effective = cognee_settings() if settings is None else settings
+    _get_background_executor().submit(_register_agent_blocking, grants, session_id, effective)
+
+
+def _register_agent_blocking(
+    grants: MemoryGrants,
+    session_id: str | None,
+    settings: dict[str, Any] | None,
+) -> None:
+    """Background worker body: post the agent connection, log-and-drop errors."""
+    try:
+        import importlib
+
+        _ensure_local_store(settings or {})
+        models = importlib.import_module("cognee.modules.agents.models")
+        operations = importlib.import_module("cognee.modules.agents.operations")
+        users = importlib.import_module("cognee.modules.users.methods")
+        readable = list(grants.readable())
+        writable = list(grants.writable())
+        request = models.RegisterAgentRequest(
+            agent_session_name=grants.private,
+            type="omnigent",
+            memory_mode="cognee",
+            session_id=session_id,
+            dataset_names=readable + [name for name in writable if name not in readable],
+            source="api",
+            origin_function="omnigent.runtime.memory",
+            metadata={"grants": {"readable": readable, "writable": writable}},
+        )
+
+        async def _register() -> Any:
+            user = await users.get_default_user()
+            return await operations.register_agent_from_request(user, request)
+
+        _run_bounded(_register, REGISTER_TIMEOUT_S)
+    except Exception as e:
+        _logger.debug("cognee agent registration skipped: %s", e)

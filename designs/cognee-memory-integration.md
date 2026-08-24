@@ -35,11 +35,25 @@ Decisions taken after the plan was drafted:
   `shared` | `peers`) and a `dataset` argument targeting one granted
   dataset; requests outside the grants return an error listing what is
   granted. Enforcement lives in the framework module, not the tools.
+- **Agent-registry mirroring (cognee ≥1.5):** on first memory use per
+  session, `ensure_agent_registered` (runtime/memory.py) mirrors the
+  resolved `MemoryGrants` into cognee's agent registry
+  (`cognee.modules.agents`) — connection named by the private dataset,
+  flat dataset names on the request, precise read/write split in
+  `metadata.grants`. Best-effort/fail-open on the background worker;
+  observability only — `MemoryGrants` stays the authorization source of
+  truth. Real per-user login/tenancy (cognee 1.5.2 defaults the *server*
+  API to `authentication=required, multi_tenant=enabled`) is deferred to
+  the served-cognee mode in Phase 5.
+- **cognee pinned via cooldown exemption:** 1.5.2 (published 2026-08-22)
+  taken through a dated `exclude-newer-package` entry in uv.toml; drop the
+  exemption once it ages past the P7D window.
 - **Implemented so far:** Phases 0–3 (extra + lock, `runtime/memory.py` gate +
   client boundary with timeouts/breaker/embedded store, `cognee_search` /
   `cognee_remember` builtins wired through the registry, runner dispatch,
-  native relay, and the gated framework instruction). Phases 4–7 (ingest
-  coordinator, server recall endpoint, push-based recall, hardening) remain.
+  native relay, and the gated framework instruction), plus the
+  agent-registry mirroring above. Phases 4–7 (ingest coordinator, server
+  recall endpoint, push-based recall, hardening) remain.
 
 ## Spine and rationale
 

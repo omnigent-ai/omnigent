@@ -20,11 +20,18 @@ from omnigent.tools.builtins.cognee import CogneeRememberTool, CogneeSearchTool
 
 
 @pytest.fixture(autouse=True)
-def _default_settings(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep tool settings hermetic — never read the user's config.yaml."""
+def _default_settings(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    """Keep tool settings hermetic and registration inert.
+
+    Never read the user's config.yaml, and capture the agent-registry
+    mirroring instead of letting it reach a real store.
+    """
     import omnigent.runtime.memory as memory_mod
 
     monkeypatch.setattr(memory_mod, "cognee_settings", dict)
+    registered = MagicMock()
+    monkeypatch.setattr(memory_mod, "ensure_agent_registered", registered)
+    return registered
 
 
 def _patch_search(monkeypatch: pytest.MonkeyPatch, results: list[str]) -> MagicMock:
@@ -143,6 +150,22 @@ def test_search_missing_query_returns_error(
 ) -> None:
     _patch_search(monkeypatch, ["m"])
     assert "query" in CogneeSearchTool({}).invoke(json.dumps({}), tool_ctx).lower()
+
+
+def test_invoke_mirrors_grants_into_agent_registry(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_ctx: ToolContext,
+    _default_settings: MagicMock,
+) -> None:
+    """Both tools register the agent connection (grants + session) on use."""
+    _patch_search(monkeypatch, ["m"])
+    _patch_add(monkeypatch)
+    CogneeSearchTool({}).invoke(json.dumps({"query": "q"}), tool_ctx)
+    CogneeRememberTool({}).invoke(json.dumps({"content": "x"}), tool_ctx)
+    assert _default_settings.call_count == 2
+    grants = _default_settings.call_args.args[0]
+    assert grants.private == "agent_test"
+    assert _default_settings.call_args.kwargs["session_id"] is None
 
 
 def test_search_passes_top_k_and_search_type(
