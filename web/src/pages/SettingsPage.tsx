@@ -41,6 +41,8 @@ import {
 import {
   ArchiveRestoreIcon,
   AlertTriangleIcon,
+  ChevronDownIcon,
+  CodeIcon,
   KeyRoundIcon,
   Loader2Icon,
   LaptopMinimalIcon,
@@ -58,6 +60,7 @@ import {
   SquareIcon,
   TerminalIcon,
   Trash2Icon,
+  TypeIcon,
   UserCogIcon,
   XIcon,
 } from "lucide-react";
@@ -71,7 +74,16 @@ import {
   PaletteSwatchPreview,
 } from "@/components/theme/AppearancePreviews";
 import { Button } from "@/components/ui/button";
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "@/components/ui/command";
 import { Input } from "@/components/ui/input";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Switch } from "@/components/ui/switch";
 import {
   Select,
@@ -144,6 +156,7 @@ import {
   writeCodeFontFamily,
   writeCodeFontSizePx,
   writeCodeFontWeight,
+  type CodeFontWeight,
 } from "@/lib/codeFontPreferences";
 import {
   readTerminalThemeMode,
@@ -838,19 +851,7 @@ function AppearanceSection() {
 
         <HideUnconfiguredHarnessesControl />
 
-        <UiFontSizeControl />
-
-        <UiFontFamilyControl />
-
-        {/* Code font (Monaco + xterm) sits as its own rows — labelled in full
-            ("Code font size" / "Code font family" / "Code font weight") rather than under a shared
-            heading — so each control reads unambiguously next to the UI-font rows
-            above and it's clear these don't scale the surrounding chrome. */}
-        <UiCodeFontSizeControl />
-
-        <UiCodeFontFamilyControl />
-
-        <UiCodeFontWeightControl />
+        <TypographyControl />
       </div>
 
       <div className="mt-8 flex items-center justify-end">
@@ -982,6 +983,70 @@ function DefaultBaseBranchControl() {
   );
 }
 
+function TypographyControl() {
+  const [codeSize, setCodeSize] = useState(() => readCodeFontSizePx());
+  const [codeFamily, setCodeFamily] = useState(() => readCodeFontFamily());
+  const [codeWeight, setCodeWeight] = useState(() => readCodeFontWeight());
+  const labelId = useId();
+
+  return (
+    <ThemeSubsection
+      labelId={labelId}
+      title="Typography"
+      helper="Choose fonts for the app chrome and coding surfaces."
+    >
+      <div className="flex flex-col gap-3">
+        <TypographyGroup
+          icon={TypeIcon}
+          title="Interface"
+          hint="Affects menus, settings, sidebars, and conversation text."
+        >
+          <UiFontSizeControl />
+          <UiFontFamilyControl />
+        </TypographyGroup>
+
+        <TypographyGroup
+          icon={CodeIcon}
+          title="Editor & terminal"
+          hint="Affects source code, diffs, and terminal output."
+        >
+          <UiCodeFontSizeControl onValueChange={setCodeSize} />
+          <UiCodeFontFamilyControl onValueChange={setCodeFamily} />
+          <UiCodeFontWeightControl onValueChange={setCodeWeight} />
+          <CodeFontPreview size={codeSize} family={codeFamily} weight={codeWeight} />
+        </TypographyGroup>
+      </div>
+    </ThemeSubsection>
+  );
+}
+
+function TypographyGroup({
+  icon: Icon,
+  title,
+  hint,
+  children,
+}: {
+  icon: typeof TypeIcon;
+  title: string;
+  hint: string;
+  children: ReactNode;
+}) {
+  return (
+    <div className="rounded-xl border bg-card/55 shadow-xs">
+      <div className="flex items-center gap-2.5 border-b border-border/70 px-4 py-3">
+        <span className="flex size-7 shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground">
+          <Icon className="size-4" />
+        </span>
+        <div className="min-w-0">
+          <h3 className="text-ui font-semibold">{title}</h3>
+          <p className="text-sm text-muted-foreground">{hint}</p>
+        </div>
+      </div>
+      <div className="flex flex-col gap-5 p-4">{children}</div>
+    </div>
+  );
+}
+
 /**
  * Desktop UI font size stepper. Maps one of the supported discrete px values
  * into typography tokens via --desktop-ui-font-size (see
@@ -1032,8 +1097,8 @@ function UiFontSizeControl() {
 
   return (
     <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
-      <div className="flex flex-col">
-        <span className="text-ui font-medium">Interface font size</span>
+      <div className="flex flex-col gap-0.5">
+        <span className="text-ui font-medium">Size</span>
         <span className="text-sm text-muted-foreground">
           Set text across the desktop interface. Icons and spacing stay fixed.
         </span>
@@ -1089,14 +1154,129 @@ function UiFontSizeControl() {
   );
 }
 
-/**
- * UI font family picker. Free-text (Cursor-style): type any font installed on
- * this device; blank means "System default", which falls back to the existing
- * --font-sans stack. Applies live and persists on every change via the
- * --ui-font-family variable (see lib/uiFontPreferences.ts). Like the size
- * control it stays visible when embedded — a per-device readability pref that
- * doesn't conflict with host theming.
- */
+const UI_FONT_OPTIONS = [
+  { label: "System", value: "" },
+  { label: "Inter", value: "Inter" },
+  { label: "Helvetica Neue", value: "Helvetica Neue" },
+  { label: "Arial", value: "Arial" },
+  { label: "Verdana", value: "Verdana" },
+] as const;
+
+/** "Editor default" is the shared mono stack, whose first face is Geist Mono. */
+const CODE_FONT_OPTIONS = [
+  { label: "Editor default", value: "" },
+  { label: "Menlo", value: "Menlo" },
+  { label: "Monaco", value: "Monaco" },
+  { label: "SF Mono", value: "SF Mono" },
+  { label: "Courier New", value: "Courier New" },
+  { label: "Consolas", value: "Consolas" },
+  { label: "JetBrains Mono", value: "JetBrains Mono" },
+  { label: "Fira Code", value: "Fira Code" },
+] as const;
+
+function FontFamilyCombobox({
+  ariaLabel,
+  testId,
+  value,
+  defaultLabel,
+  options,
+  fallback,
+  onChange,
+}: {
+  ariaLabel: string;
+  testId: string;
+  value: string;
+  defaultLabel: string;
+  options: readonly { label: string; value: string }[];
+  /** Stack appended behind each option so a missing face still renders. */
+  fallback: string;
+  onChange: (value: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+
+  const choose = (next: string) => {
+    onChange(next);
+    setQuery("");
+    setOpen(false);
+  };
+
+  const preview = (family: string) =>
+    family ? { fontFamily: `${family}, ${fallback}` } : undefined;
+
+  const typed = query.trim();
+  const typedIsNew =
+    typed !== "" && !options.some((option) => option.label.toLowerCase() === typed.toLowerCase());
+
+  const selectedLabel =
+    options.find((option) => option.value === value)?.label || value.trim() || defaultLabel;
+
+  return (
+    <Popover
+      open={open}
+      onOpenChange={(next) => {
+        setOpen(next);
+        if (!next) setQuery("");
+      }}
+    >
+      <PopoverTrigger asChild>
+        <Button
+          type="button"
+          variant="outline"
+          role="combobox"
+          aria-label={ariaLabel}
+          aria-expanded={open}
+          data-testid={testId}
+          className="h-9 w-56 cursor-pointer justify-between font-normal"
+        >
+          <span className="truncate" style={preview(value)}>
+            {selectedLabel}
+          </span>
+          <ChevronDownIcon className="size-4 shrink-0 text-muted-foreground" />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent align="end" className="w-64 p-0">
+        <Command>
+          <CommandInput
+            placeholder="Search or type a font name…"
+            value={query}
+            onValueChange={setQuery}
+          />
+          <CommandList>
+            <CommandEmpty>No fonts found.</CommandEmpty>
+            <CommandGroup>
+              {typedIsNew && (
+                <CommandItem
+                  value={typed}
+                  data-testid={`${testId}-use-typed`}
+                  onSelect={() => choose(typed)}
+                >
+                  <span className="truncate" style={preview(typed)}>
+                    Use “{typed}”
+                  </span>
+                </CommandItem>
+              )}
+              {options.map((option) => (
+                <CommandItem
+                  key={option.label}
+                  value={option.label}
+                  data-checked={option.value === value}
+                  data-testid={`${testId}-option-${option.label}`}
+                  onSelect={() => choose(option.value)}
+                >
+                  <span className="truncate" style={preview(option.value)}>
+                    {option.label}
+                  </span>
+                </CommandItem>
+              ))}
+            </CommandGroup>
+          </CommandList>
+        </Command>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
 function UiFontFamilyControl() {
   const [family, setFamily] = useState(() => readUiFontFamily());
 
@@ -1113,10 +1293,10 @@ function UiFontFamilyControl() {
       {/* Take the remaining width (and let the longer description wrap within
           this column) so the input stays inline instead of dropping to its own
           row — matches the font-size row's alignment. */}
-      <div className="flex min-w-0 flex-1 flex-col">
-        <span className="text-ui font-medium">Font family</span>
+      <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+        <span className="text-ui font-medium">Family</span>
         <span className="text-sm text-muted-foreground">
-          Use any font installed on this device. Leave blank for the system default.
+          Use any font installed on this device.
         </span>
       </div>
       {/* Reset sits left of the input so the input is the rightmost element and
@@ -1135,17 +1315,14 @@ function UiFontFamilyControl() {
         >
           Reset
         </Button>
-        <Input
-          type="text"
-          aria-label="UI font family"
-          data-testid="ui-font-family-input"
-          placeholder="System default"
-          spellCheck={false}
-          autoCapitalize="off"
-          autoCorrect="off"
-          className="h-9 w-56"
+        <FontFamilyCombobox
+          ariaLabel="UI font family"
+          testId="ui-font-family-combobox"
+          defaultLabel="System"
+          options={UI_FONT_OPTIONS}
+          fallback="var(--font-sans)"
           value={family}
-          onChange={(e) => update(e.target.value)}
+          onChange={update}
         />
       </div>
     </div>
@@ -1159,7 +1336,7 @@ function UiFontFamilyControl() {
  * lib/codeFontPreferences.ts). Same free-editing draft/commit + blur-clamp
  * behavior as UiFontSizeControl; only the bounds and storage differ.
  */
-function UiCodeFontSizeControl() {
+function UiCodeFontSizeControl({ onValueChange }: { onValueChange?: (value: number) => void }) {
   // `px` is the committed value; `draft` is the raw text in the box, kept
   // separate so a transient out-of-range/empty mid-edit state isn't clamped or
   // persisted on every keystroke. We only commit while typing when the draft is
@@ -1167,25 +1344,33 @@ function UiCodeFontSizeControl() {
   const [px, setPx] = useState(() => readCodeFontSizePx());
   const [draft, setDraft] = useState(() => String(px));
 
-  const commit = useCallback((next: number) => {
-    const clamped = clampCodeFontSizePx(next);
-    setPx(clamped);
-    setDraft(String(clamped));
-    writeCodeFontSizePx(clamped);
-  }, []);
+  const commit = useCallback(
+    (next: number) => {
+      const clamped = clampCodeFontSizePx(next);
+      setPx(clamped);
+      setDraft(String(clamped));
+      writeCodeFontSizePx(clamped);
+      onValueChange?.(clamped);
+    },
+    [onValueChange],
+  );
 
-  const onDraftChange = useCallback((text: string) => {
-    setDraft(text);
-    // Apply live only once the field holds a valid, in-range whole number;
-    // leave partial/out-of-range/empty drafts untouched until blur.
-    if (/^\d+$/.test(text)) {
-      const value = Number(text);
-      if (value >= CODE_FONT_SIZE_MIN && value <= CODE_FONT_SIZE_MAX) {
-        setPx(value);
-        writeCodeFontSizePx(value);
+  const onDraftChange = useCallback(
+    (text: string) => {
+      setDraft(text);
+      // Apply live only once the field holds a valid, in-range whole number;
+      // leave partial/out-of-range/empty drafts untouched until blur.
+      if (/^\d+$/.test(text)) {
+        const value = Number(text);
+        if (value >= CODE_FONT_SIZE_MIN && value <= CODE_FONT_SIZE_MAX) {
+          setPx(value);
+          writeCodeFontSizePx(value);
+          onValueChange?.(value);
+        }
       }
-    }
-  }, []);
+    },
+    [onValueChange],
+  );
 
   // Clamp and re-sync the text to the committed value. An empty or invalid
   // draft reverts to the last committed size rather than a bogus one.
@@ -1199,8 +1384,8 @@ function UiCodeFontSizeControl() {
 
   return (
     <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
-      <div className="flex flex-col">
-        <span className="text-ui font-medium">Code font size</span>
+      <div className="flex flex-col gap-0.5">
+        <span className="text-ui font-medium">Size</span>
         <span className="text-sm text-muted-foreground">
           Size of code in the editor and terminal.
         </span>
@@ -1256,28 +1441,26 @@ function UiCodeFontSizeControl() {
   );
 }
 
-/**
- * Code font family picker. Free-text (Cursor-style): type any monospace font
- * installed on this device; blank means the editor/terminal default (the shared
- * mono stack). Applies live and persists on every change via the code-font
- * pub/sub (see lib/codeFontPreferences.ts). Mirrors UiFontFamilyControl.
- */
-function UiCodeFontFamilyControl() {
+function UiCodeFontFamilyControl({ onValueChange }: { onValueChange?: (value: string) => void }) {
   const [family, setFamily] = useState(() => readCodeFontFamily());
 
-  const update = useCallback((next: string) => {
-    setFamily(next);
-    writeCodeFontFamily(next);
-  }, []);
+  const update = useCallback(
+    (next: string) => {
+      setFamily(next);
+      writeCodeFontFamily(next);
+      onValueChange?.(next);
+    },
+    [onValueChange],
+  );
 
   const isDefault = family.trim() === CODE_FONT_FAMILY_DEFAULT;
 
   return (
     <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
-      <div className="flex min-w-0 flex-1 flex-col">
-        <span className="text-ui font-medium">Code font family</span>
+      <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+        <span className="text-ui font-medium">Family</span>
         <span className="text-sm text-muted-foreground">
-          Font for the code editor and terminal. Leave blank for the default.
+          Font for the code editor and terminal.
         </span>
       </div>
       {/* Reset sits left of the input so the input's right edge lines up flush
@@ -1296,17 +1479,14 @@ function UiCodeFontFamilyControl() {
         >
           Reset
         </Button>
-        <Input
-          type="text"
-          aria-label="Code font family"
-          data-testid="code-font-family-input"
-          placeholder="Editor default"
-          spellCheck={false}
-          autoCapitalize="off"
-          autoCorrect="off"
-          className="h-9 w-56"
+        <FontFamilyCombobox
+          ariaLabel="Code font family"
+          testId="code-font-family-combobox"
+          defaultLabel="Editor default"
+          options={CODE_FONT_OPTIONS}
+          fallback="var(--font-mono)"
           value={family}
-          onChange={(e) => update(e.target.value)}
+          onChange={update}
         />
       </div>
     </div>
@@ -1314,12 +1494,18 @@ function UiCodeFontFamilyControl() {
 }
 
 /** Font weight preset shared by Monaco and xterm code surfaces. */
-function UiCodeFontWeightControl() {
+function UiCodeFontWeightControl({
+  onValueChange,
+}: {
+  onValueChange?: (value: CodeFontWeight) => void;
+}) {
   const [heavier, setHeavier] = useState(() => readCodeFontWeight() === CODE_FONT_WEIGHT_HEAVIER);
 
   const toggle = (enabled: boolean) => {
+    const weight = enabled ? CODE_FONT_WEIGHT_HEAVIER : CODE_FONT_WEIGHT_NORMAL;
     setHeavier(enabled);
-    writeCodeFontWeight(enabled ? CODE_FONT_WEIGHT_HEAVIER : CODE_FONT_WEIGHT_NORMAL);
+    writeCodeFontWeight(weight);
+    onValueChange?.(weight);
   };
 
   return (
@@ -1338,6 +1524,35 @@ function UiCodeFontWeightControl() {
         className="shrink-0"
         componentId="settings.appearance.heavier_code_text"
       />
+    </div>
+  );
+}
+
+function CodeFontPreview({
+  size,
+  family,
+  weight,
+}: {
+  size: number;
+  family: string;
+  weight: CodeFontWeight;
+}) {
+  return (
+    <div className="min-w-0 self-stretch rounded-lg border bg-muted/35 p-3">
+      <div className="mb-2 text-sm font-medium text-muted-foreground">Preview</div>
+      <pre className="overflow-x-auto whitespace-pre rounded-md bg-background/80 p-3 leading-relaxed">
+        {/* Styled here, not on <pre>: preflight sets font-family on `code`. */}
+        <code
+          data-testid="code-font-preview"
+          style={{
+            fontFamily: family ? `${family}, var(--font-mono)` : "var(--font-mono)",
+            fontSize: `${size}px`,
+            fontWeight: weight,
+          }}
+        >{`const greet = (name) => {
+  return \`Hello, \${name}!\`;
+};`}</code>
+      </pre>
     </div>
   );
 }
@@ -1370,7 +1585,7 @@ function StepperButton({
         onClick();
       }}
       className={cn(
-        "flex w-9 items-center justify-center text-muted-foreground transition-colors",
+        "flex w-9 cursor-pointer items-center justify-center text-muted-foreground transition-colors",
         "hover:bg-muted hover:text-foreground dark:hover:bg-muted/50",
         "disabled:pointer-events-none disabled:opacity-40",
       )}
@@ -1928,6 +2143,8 @@ function ArchivedSection() {
     }
   }, [project, projectNames, namesQuery.isSuccess, namesQuery.isFetching]);
 
+  // The visible list, filtered server-side via ?project= when one is picked.
+  // Search and project are both in the query key, so either change re-pages.
   const listQuery = useConversations(debouncedSearch, true, undefined, project);
   const archived = useMemo(
     () => (listQuery.data?.pages ?? []).flatMap((p) => p.data).filter((c) => c.archived === true),
