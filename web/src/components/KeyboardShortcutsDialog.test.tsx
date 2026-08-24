@@ -45,6 +45,24 @@ describe("KeyboardShortcutsDialog", () => {
     expect(screen.getByText("Navigate suggestions")).toBeTruthy();
   });
 
+  it("lists both archive routes: the ⌘⌥A hotkey and the menu-scoped 'A'", () => {
+    render(<KeyboardShortcutsDialog />);
+    toggleViaHotkey();
+
+    // Two rows share the label — the chat-scoped chord and the menu key.
+    const rows = screen.getAllByText("Archive session").map((el) => el.closest("li"));
+    expect(rows).toHaveLength(2);
+    // jsdom's navigator is non-mac → "Ctrl" / "Alt".
+    const chord = rows.find((row) => within(row!).queryByText("Ctrl") !== null);
+    expect(chord).toBeTruthy();
+    expect(within(chord!).getByText("Alt")).toBeTruthy();
+    expect(within(chord!).getByText("A")).toBeTruthy();
+    // The menu row is the bare letter, with no modifier chips.
+    const menuRow = rows.find((row) => row !== chord);
+    expect(within(menuRow!).getByText("A")).toBeTruthy();
+    expect(within(menuRow!).queryByText("Ctrl")).toBeNull();
+  });
+
   it("toggles closed on a second hotkey press", async () => {
     render(<KeyboardShortcutsDialog />);
     toggleViaHotkey();

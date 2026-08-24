@@ -17,7 +17,7 @@
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
@@ -108,14 +108,28 @@ function mockConversations(conversations: Conversation[]) {
   useConvMock.mockImplementation(() => withData);
 }
 
-function renderSidebar() {
+function renderSidebar(initialEntry = "/") {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
       <TooltipProvider>
-        <MemoryRouter initialEntries={["/"]}>
-          <Sidebar open={true} onClose={vi.fn()} />
-          <Toaster />
+        <MemoryRouter initialEntries={[initialEntry]}>
+          {/* Routed (not a bare Sidebar) so `/c/:conversationId` populates the
+              active-session param the ⌘⌥A hotkey reads. */}
+          <Routes>
+            {["/", "/c/:conversationId"].map((path) => (
+              <Route
+                key={path}
+                path={path}
+                element={
+                  <>
+                    <Sidebar open={true} onClose={vi.fn()} />
+                    <Toaster />
+                  </>
+                }
+              />
+            ))}
+          </Routes>
         </MemoryRouter>
       </TooltipProvider>
     </QueryClientProvider>,
@@ -233,5 +247,69 @@ describe("archive flow", () => {
 
     expect(screen.queryByTestId("conversation-archiving")).not.toBeInTheDocument();
     expect(screen.getByRole("link", { name: /My Session/ })).toBeInTheDocument();
+  });
+});
+
+// Two keyboard routes to the same archive: "A" while the row's action menu is
+// open (mirroring the kebab menus in Claude Code), and ⌘⌥A while the session is
+// the one on screen. Both must land on the identical single-PATCH flow above.
+describe("archive shortcuts", () => {
+  it("archives on 'A' with the row's action menu open", () => {
+    mockConversations([CONV]);
+    renderSidebar();
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+
+    const item = screen.getByTestId("archive-conversation");
+    // The item advertises its key so the shortcut is discoverable in the menu.
+    expect(within(item).getByText("A")).toBeInTheDocument();
+
+    fireEvent.keyDown(item, { key: "a" });
+
+    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+    expect(mocks.archive.mutate).toHaveBeenCalledWith(
+      { id: "conv_1", archived: true },
+      expect.objectContaining({ onSuccess: expect.any(Function) }),
+    );
+  });
+
+  it("leaves 'A' alone when it carries a modifier (Radix typeahead keeps it)", () => {
+    mockConversations([CONV]);
+    renderSidebar();
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    fireEvent.keyDown(screen.getByTestId("archive-conversation"), { key: "a", metaKey: true });
+
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+  });
+
+  it("archives the open session on the ⌘⌥A hotkey", () => {
+    mockConversations([CONV]);
+    renderSidebar("/c/conv_1");
+
+    fireEvent.keyDown(window, { code: "KeyA", key: "a", metaKey: true, altKey: true });
+
+    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+    expect(mocks.archive.mutate).toHaveBeenCalledWith(
+      { id: "conv_1", archived: true },
+      expect.objectContaining({ onSuccess: expect.any(Function) }),
+    );
+    expect(mocks.stop.mutate).not.toHaveBeenCalled();
+  });
+
+  it("ignores the hotkey when no session is open", () => {
+    mockConversations([CONV]);
+    renderSidebar("/");
+
+    fireEvent.keyDown(window, { code: "KeyA", key: "a", metaKey: true, altKey: true });
+
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+  });
+
+  it("ignores a bare ⌘A (Select All) on the open session", () => {
+    mockConversations([CONV]);
+    renderSidebar("/c/conv_1");
+
+    fireEvent.keyDown(window, { code: "KeyA", key: "a", metaKey: true });
+
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
   });
 });
