@@ -1,4 +1,11 @@
-import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type FormEvent,
+  type KeyboardEvent,
+  type ReactNode,
+} from "react";
 import {
   ArchiveIcon,
   CheckIcon,
@@ -61,6 +68,8 @@ interface HeaderConversationMenuProps {
   onShare: () => void;
   hasAgentInfo?: boolean;
   onAgentInfo?: () => void;
+  /** Mobile workspace-rail entries (Files · Agents · Shells · Logs). */
+  workspaceItems?: ReactNode;
 }
 
 function ArchivedToast() {
@@ -144,6 +153,7 @@ export function HeaderConversationMenu({
   onShare,
   hasAgentInfo = false,
   onAgentInfo,
+  workspaceItems = null,
 }: HeaderConversationMenuProps) {
   const navigate = useNavigate();
   const isMobile = useIsMobileViewport();
@@ -295,6 +305,12 @@ export function HeaderConversationMenu({
             <ProjectPicker currentProject={currentProject} onSelect={handleProjectSelect} />
           </DropdownMenuSubContent>
         </DropdownMenuSub>
+      )}
+      {workspaceItems && (
+        <>
+          <DropdownMenuSeparator />
+          {workspaceItems}
+        </>
       )}
       <DropdownMenuSeparator />
       <DropdownMenuItem

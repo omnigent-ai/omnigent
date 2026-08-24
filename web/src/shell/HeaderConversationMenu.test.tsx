@@ -4,6 +4,7 @@ import { MemoryRouter } from "react-router-dom";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as ConversationsModule from "@/hooks/useConversations";
 import type * as UnseenConversationsModule from "@/hooks/useUnseenConversations";
+import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
 
 const mocks = vi.hoisted(() => ({
@@ -287,6 +288,41 @@ describe("HeaderConversationMenu", () => {
       "Archive",
       "Delete",
     ]);
+  });
+
+  it("slots workspace entries between the session actions and the destructive block", () => {
+    // On mobile these are the rail drawers folded into this same menu; Archive
+    // and Delete must stay last so a mis-tap doesn't land on them.
+    mocks.isMobile = true;
+    renderMenu({
+      workspaceItems: <DropdownMenuItem data-testid="rail-files">Files</DropdownMenuItem>,
+    });
+    openMenu();
+
+    expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
+      "Pin",
+      "Share",
+      "Rename",
+      "Mark as unread",
+      "Add to project",
+      "Files",
+      "Archive",
+      "Delete",
+    ]);
+  });
+
+  it("renders no workspace section when there are no entries", () => {
+    const view = renderMenu();
+    openMenu();
+    const baseSeparators = screen.getAllByRole("separator").length;
+
+    view.unmount();
+    renderMenu({
+      workspaceItems: <DropdownMenuItem data-testid="rail-files">Files</DropdownMenuItem>,
+    });
+    openMenu();
+    // The entries bring exactly one separator of their own.
+    expect(screen.getAllByRole("separator")).toHaveLength(baseSeparators + 1);
   });
 
   it("reflects pinned state and preserves the disabled share reason", () => {
