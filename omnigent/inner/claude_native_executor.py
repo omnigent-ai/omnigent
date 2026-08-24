@@ -212,9 +212,16 @@ class ClaudeNativeExecutor(Executor):
         try:
             kill_session(self._bridge_dir, timeout_s=1.0)
         except TmuxSessionNotAdvertised:
-            _logger.debug("claude-native: timed-out session already disappeared")
+            _logger.debug(
+                "claude-native: timed-out session already disappeared",
+                extra={"session_id": self._request_session_id},
+            )
         except RuntimeError as exc:
-            _logger.warning("claude-native: failed to reap timed-out session", exc_info=True)
+            _logger.warning(
+                "claude-native: failed to reap timed-out session",
+                exc_info=True,
+                extra={"session_id": self._request_session_id},
+            )
             return describe_exception(exc)
         return None
 
@@ -238,12 +245,16 @@ class ClaudeNativeExecutor(Executor):
             should be typed.
         """
         if wanted_model is None:
-            _logger.info("claude-native: turn carries no routed model; not typing /model")
+            _logger.info(
+                "claude-native: turn carries no routed model; not typing /model",
+                extra={"session_id": self._request_session_id},
+            )
             return None
         if not self._should_switch_model(wanted_model):
             _logger.info(
                 "claude-native: skipping /model — pane is already on %s",
                 wanted_model,
+                extra={"session_id": self._request_session_id},
             )
             return None
         env = read_model_env(self._bridge_dir) or None
@@ -254,6 +265,7 @@ class ClaudeNativeExecutor(Executor):
                 "session accepts (pins=%s); sending the turn on the current model",
                 wanted_model,
                 sorted(env or ()),
+                extra={"session_id": self._request_session_id},
             )
             return None
         if (
@@ -266,12 +278,14 @@ class ClaudeNativeExecutor(Executor):
                 "claude-native: skipping /model — %r resolves to %r, already applied",
                 wanted_model,
                 wanted_arg,
+                extra={"session_id": self._request_session_id},
             )
             return None
         _logger.info(
             "claude-native: typing /model %s for routed model %s",
             wanted_arg,
             wanted_model,
+            extra={"session_id": self._request_session_id},
         )
         return wanted_arg
 
