@@ -456,6 +456,9 @@ class ZerobusLogHandler(logging.Handler):
                 self._queue.get_nowait()
                 self._queue.put_nowait(row)
             except queue.Empty:
+                # The uploader drained the queue between our full put and this
+                # get — there is room now and this one row is dropped, which is
+                # acceptable for a best-effort sink shedding under overflow.
                 pass
 
     def _run(self) -> None:
@@ -538,11 +541,16 @@ class ZerobusLogHandler(logging.Handler):
     def close(self) -> None:
         if self._closed:
             return
+        # Capture the worker we are tearing down first. A concurrent emit()
+        # (which runs under the handler lock) can revive the sink during the
+        # join below — reassigning self._stop/_thread/_client to fresh ones — so
+        # stop and close the captured locals, never the revived worker.
+        stop, thread, client = self._stop, self._thread, self._client
         self._closed = True
-        self._stop.set()
-        self._thread.join(timeout=5.0)
+        stop.set()
+        thread.join(timeout=5.0)
         try:
-            self._client.close()
+            client.close()
         finally:
             super().close()
 
@@ -566,7 +574,14 @@ def attach_debug_log_sink(loggers: list[logging.Logger], *, source: str, level: 
         return
     with _sink_lock:
         if _active_sink is None or _active_sink.closed:
-            _active_sink = ZerobusLogHandler(config, source)
+            try:
+                _active_sink = ZerobusLogHandler(config, source)
+            except Exception:  # noqa: BLE001 — the sink must never break logging setup
+                # Honor the module's best-effort contract: handler construction
+                # (httpx client, uploader thread, probe timer) failing must not
+                # take down configure_process_logging() and thus process startup.
+                _logger.warning("debug-log sink disabled: handler init failed", exc_info=True)
+                return
             _logger.info(
                 "debug-log sink enabled: source=%s table=%s endpoint=%s",
                 source,

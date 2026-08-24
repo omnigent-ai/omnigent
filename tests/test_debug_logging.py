@@ -230,3 +230,55 @@ def test_runner_primary_session_id(monkeypatch: pytest.MonkeyPatch) -> None:
     assert dl.runner_primary_session_id() == "conv_primary"
     monkeypatch.setenv(dl.PRIMARY_SESSION_ID_ENV_VAR, "")
     assert dl.runner_primary_session_id() is None
+
+
+def test_close_tears_down_captured_worker_not_a_concurrent_revive(
+    _configured_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A concurrent emit() can revive the sink (fresh client/thread) during
+    # close()'s join. close() must tear down the worker it captured at entry,
+    # never the revived one — otherwise it closes a live client out from under
+    # the new uploader thread.
+    config = dl.config_from_env()
+    assert config is not None
+    sink = dl.ZerobusLogHandler(config, "server")
+    sink._probe_timer.cancel()
+    old_client = sink._client
+    old_thread = sink._thread
+    orig_join = old_thread.join
+
+    def _join_then_revive(timeout: float | None = None) -> None:
+        orig_join(timeout)
+        sink._closed = False
+        sink._start_worker()  # stand in for a concurrent emit() revive
+
+    monkeypatch.setattr(old_thread, "join", _join_then_revive)
+    try:
+        sink.close()
+        assert old_client.is_closed  # the captured worker is torn down
+        assert sink._client is not old_client  # the revived worker survives
+        assert not sink._client.is_closed
+        assert sink._thread is not old_thread
+        assert sink._thread.is_alive()
+    finally:
+        sink._closed = False
+        sink.close()
+
+
+def test_attach_suppresses_handler_init_failure(
+    _configured_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Handler construction (httpx client, uploader thread, probe timer) failing
+    # must not break configure_process_logging(), per the module's best-effort
+    # contract — attach swallows it and stays disabled.
+    monkeypatch.setattr(dl, "_active_sink", None)
+
+    def _boom(config: dl.DebugLogConfig, source: str) -> dl.ZerobusLogHandler:
+        raise RuntimeError("handler init failed")
+
+    monkeypatch.setattr(dl, "ZerobusLogHandler", _boom)
+    target = logging.getLogger("test.debug_logging.initfail")
+    target.handlers.clear()
+    dl.attach_debug_log_sink([target], source="server", level=logging.INFO)
+    assert target.handlers == []
+    assert dl._active_sink is None
