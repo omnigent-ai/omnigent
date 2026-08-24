@@ -299,11 +299,17 @@ spawned runner still won't go `online: true` within the fixture's timeout, that
 lane is genuinely unreachable here: keep `recordings: []` for it and say so in
 `evidence` (a real environment limit, not a bug verdict).
 
-The `tests/e2e_ui/` server also needs the built SPA at
-`omnigent/server/static/web-ui/` in **your** checkout. If it is missing (the
-suite says so on boot), build it first — `pnpm --filter web install && pnpm
---filter web run build` — since the deploy's pre-built bundle lives elsewhere and
-is not visible from your worktree.
+**A missing SPA build is not a reason to skip recording.** The `tests/e2e_ui/`
+server serves the SPA from `omnigent/server/static/web-ui/`, which starts empty
+in your worktree (the deploy's pre-built bundle lives in the serving layer, not
+the source tree). That is expected and cheap to resolve — the `tests/e2e_ui/`
+harness **builds the SPA itself** as part of its normal boot (a `pnpm install
+--filter web && pnpm --filter web run build`, a few minutes, well within your
+turn budget), so you do **not** need to pre-check for the directory. Just run the
+recorder and let the suite build it. If you prefer to build it explicitly first
+for determinism, run `pnpm --filter web install && pnpm --filter web run build`
+from your checkout — but never skip recording merely because the dir is empty on
+first look; that is the normal starting state, not a blocker.
 
 - **`web` facets** — run the authored Playwright test with recording on:
   `pytest <test_path> --video on --screenshot on --output recordings/<slug>`
