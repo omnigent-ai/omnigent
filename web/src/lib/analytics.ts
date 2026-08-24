@@ -24,9 +24,11 @@ import { useLocation } from "@/lib/routing";
 // them here so this module stays the single import surface for analytics.
 export {
   emitOmnigentAnalytics,
+  emitInteractionPhase,
   useOmnigentAnalytics,
   type OmnigentAnalytics,
   type TrackValueChangeOptions,
+  type InteractionPhaseArgs,
 } from "@/lib/analyticsEmit";
 import { emitOmnigentAnalytics } from "@/lib/analyticsEmit";
 

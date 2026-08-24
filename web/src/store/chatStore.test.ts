@@ -36,6 +36,11 @@ import { INITIAL_WINDOW_ITEMS, SESSION_HISTORY_PAGE_SIZE } from "@/lib/sessionsA
 import { SSE_STALL_TIMEOUT_MS } from "@/lib/sse";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { PRESENCE_IDLE_AFTER_MS } from "@/lib/presenceIdle";
+import {
+  setOmnigentHostConfig,
+  type OmnigentAnalyticsEvent,
+  type OmnigentInteractionKind,
+} from "@/lib/host";
 import type {
   SessionCreatedEvent,
   SessionInputConsumedEvent,
@@ -11490,5 +11495,202 @@ describe("chatStore — origin-wide stream slots", () => {
     await useChatStore.getState().switchTo("conv_c");
     expect(useChatStore.getState().streamBudgetExceeded).toBe(true);
     expect(useChatStore.getState().streamBudgetBannerDismissed).toBe(false);
+  });
+});
+
+describe("chatStore — interaction_phase analytics", () => {
+  const setState = useChatStore.setState as unknown as Parameters<typeof pumpStreamEvents>[3];
+  const getState = useChatStore.getState as unknown as Parameters<typeof pumpStreamEvents>[4];
+  // Commit synchronously so each pushed frame lands without waiting a frame.
+  const immediate: FrameScheduler = { schedule: (cb) => cb(), cancel: () => {} };
+
+  type InteractionPhaseEvent = Extract<OmnigentAnalyticsEvent, { type: "interaction_phase" }>;
+  let events: OmnigentAnalyticsEvent[];
+
+  beforeEach(() => {
+    events = [];
+    setOmnigentHostConfig({ analytics: (e) => events.push(e) });
+  });
+  afterEach(() => {
+    // Drop the sink so no other suite's pump emits leak here. No fetcher is set
+    // in this file, so the empty-config guard lets this reset through.
+    setOmnigentHostConfig({});
+  });
+
+  const phases = (kind: OmnigentInteractionKind): InteractionPhaseEvent[] =>
+    events.filter(
+      (e): e is InteractionPhaseEvent =>
+        e.type === "interaction_phase" && e.interactionKind === kind,
+    );
+
+  it("emits agent_run start on response.created and complete+duration on response.completed", async () => {
+    useChatStore.setState({ conversationId: "conv_ip_run", blocks: [] });
+    const sink = pushableStream();
+    const controller = new AbortController();
+    void pumpStreamEvents("conv_ip_run", sink.stream, controller, setState, getState, immediate);
+
+    sink.push(sse("response.created", { id: "resp_ip_run", status: "in_progress", output: [] }));
+    await tick();
+    sink.push(sse("response.completed", { id: "resp_ip_run", status: "completed", output: [] }));
+    await tick();
+
+    const runs = phases("agent_run");
+    expect(runs).toHaveLength(2);
+    expect(runs[0]).toEqual({
+      type: "interaction_phase",
+      interactionId: "resp_ip_run",
+      interactionKind: "agent_run",
+      phase: "start",
+    });
+    expect(runs[1]).toMatchObject({
+      interactionId: "resp_ip_run",
+      interactionKind: "agent_run",
+      phase: "complete",
+      status: "success",
+    });
+    expect(typeof runs[1]!.durationMs).toBe("number");
+
+    controller.abort();
+  });
+
+  it("emits agent_run start only once for a re-delivered response.created", async () => {
+    // SSE re-delivery on reconnect must not double-count a run: the id-keyed
+    // start map guards the second `response.created`.
+    useChatStore.setState({ conversationId: "conv_ip_dup", blocks: [] });
+    const sink = pushableStream();
+    const controller = new AbortController();
+    void pumpStreamEvents("conv_ip_dup", sink.stream, controller, setState, getState, immediate);
+
+    sink.push(sse("response.created", { id: "resp_ip_dup", status: "in_progress", output: [] }));
+    await tick();
+    sink.push(sse("response.created", { id: "resp_ip_dup", status: "in_progress", output: [] }));
+    await tick();
+
+    const starts = phases("agent_run").filter((e) => e.phase === "start");
+    expect(starts).toHaveLength(1);
+
+    controller.abort();
+  });
+
+  it("maps run terminal status (completed→success, failed→failure, incomplete→cancelled)", async () => {
+    async function runToTerminal(
+      id: string,
+      terminalType: string,
+      terminalData: Record<string, unknown>,
+    ): Promise<void> {
+      useChatStore.setState({ conversationId: id, blocks: [] });
+      const sink = pushableStream();
+      const controller = new AbortController();
+      void pumpStreamEvents(id, sink.stream, controller, setState, getState, immediate);
+      sink.push(sse("response.created", { id, status: "in_progress", output: [] }));
+      await tick();
+      sink.push(sse(terminalType, { id, ...terminalData }));
+      await tick();
+      controller.abort();
+    }
+
+    await runToTerminal("resp_ip_ok", "response.completed", { status: "completed", output: [] });
+    await runToTerminal("resp_ip_fail", "response.failed", { status: "failed", output: [] });
+    await runToTerminal("resp_ip_inc", "response.incomplete", {
+      status: "incomplete",
+      output: [],
+      reason: "max_iterations",
+    });
+
+    const completes = phases("agent_run").filter((e) => e.phase === "complete");
+    expect(completes.map((e) => e.status)).toEqual(["success", "failure", "cancelled"]);
+  });
+
+  it("emits tool_call start (with name) and complete (with name + duration)", async () => {
+    useChatStore.setState({ conversationId: "conv_ip_tool", blocks: [] });
+    const sink = pushableStream();
+    const controller = new AbortController();
+    void pumpStreamEvents("conv_ip_tool", sink.stream, controller, setState, getState, immediate);
+
+    sink.push(sse("response.created", { id: "resp_ip_tool", status: "in_progress", output: [] }));
+    sink.push(
+      sse("response.output_item.done", {
+        item: {
+          id: "fc_ip_1",
+          type: "function_call",
+          response_id: "resp_ip_tool",
+          call_id: "call_ip_1",
+          name: "shell",
+          arguments: "{}",
+          status: "in_progress",
+        },
+      }),
+    );
+    sink.push(
+      sse("response.output_item.done", {
+        item: {
+          id: "fco_ip_1",
+          type: "function_call_output",
+          response_id: "resp_ip_tool",
+          call_id: "call_ip_1",
+          status: "completed",
+          output: "done",
+        },
+      }),
+    );
+    await tick();
+
+    const tools = phases("tool_call");
+    expect(tools).toHaveLength(2);
+    expect(tools[0]).toEqual({
+      type: "interaction_phase",
+      interactionId: "call_ip_1",
+      interactionKind: "tool_call",
+      phase: "start",
+      name: "shell",
+    });
+    expect(tools[1]).toMatchObject({
+      interactionId: "call_ip_1",
+      interactionKind: "tool_call",
+      phase: "complete",
+      name: "shell",
+    });
+    expect(typeof tools[1]!.durationMs).toBe("number");
+
+    controller.abort();
+  });
+
+  it("emits an approval complete with the mapped status for each verdict", async () => {
+    useChatStore.setState({
+      conversationId: "conv_ip_appr",
+      blocks: [
+        elicitationBlock("elic_ok"),
+        elicitationBlock("elic_no"),
+        elicitationBlock("elic_x"),
+      ],
+    });
+
+    await useChatStore.getState().submitApproval("elic_ok", "accept");
+    await useChatStore.getState().submitApproval("elic_no", "decline");
+    await useChatStore.getState().submitApproval("elic_x", "cancel");
+
+    expect(phases("approval")).toEqual([
+      {
+        type: "interaction_phase",
+        interactionId: "elic_ok",
+        interactionKind: "approval",
+        phase: "complete",
+        status: "success",
+      },
+      {
+        type: "interaction_phase",
+        interactionId: "elic_no",
+        interactionKind: "approval",
+        phase: "complete",
+        status: "failure",
+      },
+      {
+        type: "interaction_phase",
+        interactionId: "elic_x",
+        interactionKind: "approval",
+        phase: "complete",
+        status: "cancelled",
+      },
+    ]);
   });
 });
