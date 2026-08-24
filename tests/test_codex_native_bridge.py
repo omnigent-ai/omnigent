@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 import pytest
 
+from omnigent import codex_native_bridge
 from omnigent.codex_native_bridge import (
     CodexNativeBridgeState,
     cancel_pending_mcp_startup,
@@ -24,6 +26,7 @@ from omnigent.codex_native_bridge import (
     read_mcp_startup,
     read_policy_hook_config,
     settle_pending_mcp_startup,
+    update_active_turn_id,
     update_mcp_server_startup,
     write_bridge_startup_error,
     write_bridge_state,
@@ -292,6 +295,58 @@ def test_clear_active_turn_id_if_matches_no_state_returns_true(bridge_dir: Path)
     """
     # bridge_dir exists (fixture) but no state.json was written.
     assert clear_active_turn_id_if_matches(bridge_dir, "turn_1") is True
+
+
+def test_active_turn_compare_and_clear_is_atomic_with_concurrent_update(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Clearing turn A cannot overwrite a concurrent turn-B state update."""
+    _seed_active_turn(bridge_dir, "turn_a")
+    original_write = codex_native_bridge._write_bridge_state_unlocked
+    clear_write_entered = threading.Event()
+    release_clear_write = threading.Event()
+    update_finished = threading.Event()
+    clear_result: list[bool] = []
+
+    def blocking_write(path: Path, state: CodexNativeBridgeState) -> None:
+        """Hold turn A's clear after its read while it owns the state lock."""
+        if state.active_turn_id is None:
+            clear_write_entered.set()
+            assert release_clear_write.wait(timeout=5.0)
+        original_write(path, state)
+
+    monkeypatch.setattr(codex_native_bridge, "_write_bridge_state_unlocked", blocking_write)
+
+    def clear_turn_a() -> None:
+        """Clear turn A through the compare-and-swap helper."""
+        clear_result.append(clear_active_turn_id_if_matches(bridge_dir, "turn_a"))
+
+    def publish_turn_b() -> None:
+        """Publish the newer turn B and signal when its locked update lands."""
+        update_active_turn_id(bridge_dir, "turn_b")
+        update_finished.set()
+
+    clear_thread = threading.Thread(target=clear_turn_a)
+    update_thread = threading.Thread(target=publish_turn_b)
+    clear_thread.start()
+    assert clear_write_entered.wait(timeout=5.0)
+    update_thread.start()
+    try:
+        assert not update_finished.wait(timeout=0.1), (
+            "turn B wrote while turn A's compare-and-clear still held the state lock"
+        )
+    finally:
+        release_clear_write.set()
+        clear_thread.join(timeout=5.0)
+        update_thread.join(timeout=5.0)
+
+    assert not clear_thread.is_alive()
+    assert not update_thread.is_alive()
+    assert clear_result == [True]
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.active_turn_id == "turn_b"
 
 
 def test_bridge_startup_error_round_trips_and_is_cleared(bridge_dir: Path) -> None:
