@@ -1541,11 +1541,7 @@ async def _persist_external_session_usage(
                 session_id=session_id,
                 input_tokens=int(_native_in) if _native_in is not None else None,
                 output_tokens=int(_native_out) if _native_out is not None else None,
-                cost_usd=(
-                    float(_native_cost)
-                    if isinstance(_native_cost, (int, float))
-                    else None
-                ),
+                cost_usd=(float(_native_cost) if isinstance(_native_cost, (int, float)) else None),
                 model=_native_model,
                 is_cumulative=True,
             )
@@ -6186,9 +6182,7 @@ async def _relay_runner_stream_once(
                                 _TelTurnTokenUsageEvent(
                                     installation_id=_get_installation_id(),
                                     session_id=session_id,
-                                    input_tokens=(
-                                        int(_turn_in) if _turn_in is not None else None
-                                    ),
+                                    input_tokens=(int(_turn_in) if _turn_in is not None else None),
                                     output_tokens=(
                                         int(_turn_out) if _turn_out is not None else None
                                     ),
