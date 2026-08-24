@@ -71,8 +71,35 @@ def test_cognee_tools_relayed_to_native_harnesses(name: str) -> None:
 
 
 @pytest.mark.usefixtures("_cognee_usable")
+def test_search_dispatch_defaults_dataset_to_spec_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The private dataset defaults to the STABLE spec name, not the agent id.
+
+    Runtime agent ids are minted per registration, so an id-keyed dataset
+    silently resets every ``omnigent run`` — the exact bug this locks out.
+    """
+    import omnigent.runtime.memory as memory_mod
+
+    search = MagicMock(return_value=["m"])
+    monkeypatch.setattr(memory_mod, "memory_search", search)
+    spec = _spec({})
+    spec.name = "memory-test"
+    asyncio.run(
+        _execute_cognee_tool(
+            {"query": "q"},
+            tool_name="cognee_search",
+            agent_spec=spec,
+            conversation_id="conv_1",
+            agent_id="a6a5762aa32347c5a74d1b19d7608f8f",
+        )
+    )
+    assert search.call_args.args[1] == ["memory_test"]
+
+
+@pytest.mark.usefixtures("_cognee_usable")
 def test_search_dispatch_uses_agent_id_as_dataset(monkeypatch: pytest.MonkeyPatch) -> None:
-    """With no config dataset, the dataset defaults to the threaded agent_id."""
+    """Without a spec name or config dataset, the dataset falls back to agent_id."""
     import omnigent.runtime.memory as memory_mod
 
     search = MagicMock(return_value=["cognee is a knowledge graph"])

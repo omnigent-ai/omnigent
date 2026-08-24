@@ -365,6 +365,12 @@ class ToolManager:
             from omnigent.tools.builtins.upload_file import UploadFileTool
 
             return UploadFileTool()
+        if name in ("cognee_search", "cognee_remember"):
+            # Default the private memory dataset to the stable agent NAME:
+            # runtime agent ids are minted per registration, so an id-keyed
+            # dataset would silently reset every session.
+            if self._spec.name and not (config or {}).get("dataset"):
+                config = {**(config or {}), "dataset": self._spec.name}
         return get_builtin_tool(name, config=config)
 
     def _create_web_search(self, config: dict[str, str] | None) -> Tool:

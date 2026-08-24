@@ -3754,10 +3754,11 @@ async def _execute_cognee_tool(
 
     Builds the tool from the spec's builtin config and runs its synchronous
     ``invoke`` off the event loop (it runs bounded cognee operations on a
-    private loop). The dataset is resolved inside the tool from
-    ``config.dataset`` → ``ctx.agent_id`` → ``ctx.conversation_id``, so the
-    real ``agent_id`` is threaded through here. The runtime kill-switch is
-    re-checked per call — the registry gate only runs at import time.
+    private loop). The private dataset defaults to the agent's stable spec
+    name (injected into the config here); the tool falls back to
+    ``ctx.agent_id`` → ``ctx.conversation_id`` only when no name exists.
+    The runtime kill-switch is re-checked per call — the registry gate only
+    runs at import time.
 
     :param args: Parsed LLM arguments (``content`` for remember, ``query``
         for search, plus the optional ``scope``).
@@ -3775,6 +3776,12 @@ async def _execute_cognee_tool(
     if not cognee_available():
         return f"cognee tool {tool_name!r} is not available (cognee memory is disabled)."
     config = _cognee_config_from_spec(agent_spec, tool_name)
+    spec_name = getattr(agent_spec, "name", None)
+    if spec_name and not config.get("dataset"):
+        # Default the private memory dataset to the stable agent NAME:
+        # runtime agent ids are minted per registration, so an id-keyed
+        # dataset would silently reset every session.
+        config = {**config, "dataset": spec_name}
     tool = get_builtin_tool(tool_name, config)
     if tool is None:
         return f"cognee tool {tool_name!r} is not available."

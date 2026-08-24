@@ -27,8 +27,10 @@ Usage in config.yaml::
 
 Config keys (all optional):
 
-- ``dataset``: Private dataset name. Defaults to the agent id (falling back
-  to the conversation id), so memory isolates per agent out of the box.
+- ``dataset``: Private dataset name. When unset, the constructing layer
+  (ToolManager / runner dispatch) injects the agent's spec NAME so memory is
+  stable across sessions; the runtime agent id and conversation id are
+  last-resort fallbacks only (agent ids are minted per registration).
 - ``user_dataset`` / ``team_dataset`` / ``org_dataset``: Tier pools —
   read/write for every agent granted the same name. Each falls back to the
   same key in the global ``cognee:`` config block, so a deployment can set
