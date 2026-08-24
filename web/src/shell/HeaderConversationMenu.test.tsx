@@ -235,6 +235,60 @@ describe("HeaderConversationMenu", () => {
     });
   });
 
+  it("heads the mobile menu with the session title and drops it in the picker", () => {
+    // The mobile chat header shows no title of its own (the native shells hide
+    // the breadcrumb), so the menu itself has to name the session.
+    mocks.isMobile = true;
+    renderMenu();
+    openMenu();
+    const label = screen.getByText("Quarterly planning");
+    expect(label).toHaveAttribute("data-slot", "dropdown-menu-label");
+
+    fireEvent.click(screen.getByTestId("header-move-to-project"));
+    expect(screen.queryByText("Quarterly planning")).toBeNull();
+  });
+
+  it("omits the title header on desktop, where the breadcrumb already shows it", () => {
+    renderMenu();
+    openMenu();
+
+    expect(screen.queryByText("Quarterly planning")).toBeNull();
+  });
+
+  it("sizes the trigger and rows for touch on mobile only", () => {
+    const view = renderMenu();
+    const desktopTrigger = screen.getByRole("button", { name: "Conversation actions" });
+    expect(desktopTrigger.querySelector("svg")).toHaveClass("size-3.5");
+    openMenu();
+    expect(screen.getByRole("menuitem", { name: "Pin" })).not.toHaveClass("py-2");
+
+    view.unmount();
+    mocks.isMobile = true;
+    renderMenu();
+    const mobileTrigger = screen.getByRole("button", { name: "Conversation actions" });
+    expect(mobileTrigger.querySelector("svg")).toHaveClass("size-4");
+    openMenu();
+    expect(screen.getByRole("menuitem", { name: "Pin" })).toHaveClass("gap-2.5", "px-2.5", "py-2");
+  });
+
+  it("keeps every session action reachable on mobile", () => {
+    // Regression guard for the native mobile shells, where this menu is the
+    // only entry point to the session operations.
+    mocks.isMobile = true;
+    renderMenu();
+    openMenu();
+
+    expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
+      "Pin",
+      "Share",
+      "Rename",
+      "Mark as unread",
+      "Add to project",
+      "Archive",
+      "Delete",
+    ]);
+  });
+
   it("reflects pinned state and preserves the disabled share reason", () => {
     renderMenu({
       conversation: {

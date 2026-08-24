@@ -28,6 +28,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuSub,
   DropdownMenuSubContent,
@@ -48,6 +49,7 @@ import { markConversationUnread } from "@/hooks/useUnseenConversations";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { Link, useNavigate } from "@/lib/routing";
 import { showToast } from "@/components/ui/toast";
+import { cn } from "@/lib/utils";
 import { conversationDisplayLabel } from "./sidebarNav";
 
 interface HeaderConversationMenuProps {
@@ -159,6 +161,8 @@ export function HeaderConversationMenu({
   const previousConversationId = useRef(conversation.id);
   const isPinned = conversation.labels?.[PINNED_LABEL_KEY] != null;
   const label = conversationDisplayLabel(conversation);
+  // Mobile taps need a bigger target than the dense desktop row.
+  const itemClass = isMobile ? "gap-2.5 px-2.5 py-2" : undefined;
   const gitBranch = conversation.git_branch ?? null;
 
   useEffect(() => {
@@ -222,6 +226,7 @@ export function HeaderConversationMenu({
     <>
       <DropdownMenuItem
         data-testid="header-pin-conversation"
+        className={itemClass}
         onSelect={() => togglePinned.mutate({ id: conversation.id, pinned: !isPinned })}
       >
         {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
@@ -230,6 +235,7 @@ export function HeaderConversationMenu({
       {canShare && (
         <DropdownMenuItem
           data-testid="header-share-conversation"
+          className={itemClass}
           disabled={shareDisabled}
           title={shareDisabledReason}
           onSelect={shareDisabled ? undefined : onShare}
@@ -239,13 +245,18 @@ export function HeaderConversationMenu({
         </DropdownMenuItem>
       )}
       {hasAgentInfo && onAgentInfo && (
-        <DropdownMenuItem data-testid="header-agent-info" onSelect={onAgentInfo}>
+        <DropdownMenuItem
+          data-testid="header-agent-info"
+          className={itemClass}
+          onSelect={onAgentInfo}
+        >
           <InfoIcon className="size-3.5" />
           Agent info
         </DropdownMenuItem>
       )}
       <DropdownMenuItem
         data-testid="header-rename-conversation"
+        className={itemClass}
         onSelect={() => setRenameOpen(true)}
       >
         <PencilIcon className="size-3.5" />
@@ -253,6 +264,7 @@ export function HeaderConversationMenu({
       </DropdownMenuItem>
       <DropdownMenuItem
         data-testid="header-mark-unread-conversation"
+        className={itemClass}
         onSelect={() => markConversationUnread(conversation.id, conversation.updated_at)}
       >
         <MailIcon className="size-3.5" />
@@ -261,7 +273,7 @@ export function HeaderConversationMenu({
       {isMobile ? (
         <DropdownMenuItem
           data-testid="header-move-to-project"
-          className="whitespace-nowrap"
+          className={cn("whitespace-nowrap", itemClass)}
           onSelect={(event) => {
             event.preventDefault();
             setProjectPickerOpen(true);
@@ -285,12 +297,17 @@ export function HeaderConversationMenu({
         </DropdownMenuSub>
       )}
       <DropdownMenuSeparator />
-      <DropdownMenuItem data-testid="header-archive-conversation" onSelect={archiveConversation}>
+      <DropdownMenuItem
+        data-testid="header-archive-conversation"
+        className={itemClass}
+        onSelect={archiveConversation}
+      >
         <ArchiveIcon className="size-3.5" />
         Archive
       </DropdownMenuItem>
       <DropdownMenuItem
         data-testid="header-delete-conversation"
+        className={itemClass}
         variant="destructive"
         onSelect={() => setDeleteOpen(true)}
       >
@@ -313,19 +330,31 @@ export function HeaderConversationMenu({
           <Button
             type="button"
             variant="ghost"
-            size="icon-xs"
+            size={isMobile ? "icon" : "icon-xs"}
             aria-label="Conversation actions"
             data-testid="header-conversation-actions"
             className="shrink-0 border-none text-muted-foreground hover:text-foreground"
           >
-            <EllipsisVerticalIcon className="size-3.5" />
+            <EllipsisVerticalIcon className={isMobile ? "size-4" : "size-3.5"} />
           </Button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="start" className="min-w-56">
+        <DropdownMenuContent
+          align={isMobile ? "end" : "start"}
+          className={cn("min-w-56", isMobile && "max-w-[min(20rem,calc(100vw-1rem))]")}
+        >
+          {isMobile && !projectPickerOpen && (
+            <>
+              <DropdownMenuLabel className="truncate px-2.5 pb-1.5 text-foreground">
+                {label}
+              </DropdownMenuLabel>
+              <DropdownMenuSeparator />
+            </>
+          )}
           {isMobile && projectPickerOpen ? (
             <>
               <DropdownMenuItem
                 data-testid="header-project-picker-back"
+                className={itemClass}
                 onSelect={(event) => {
                   event.preventDefault();
                   setProjectPickerOpen(false);

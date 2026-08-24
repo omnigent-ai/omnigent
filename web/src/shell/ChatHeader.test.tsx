@@ -12,9 +12,14 @@ import {
   type TerminalFirstContextValue,
 } from "./TerminalFirstContext";
 
-const { isIOSShellMock, isAndroidShellMock } = vi.hoisted(() => ({
+const { isIOSShellMock, isAndroidShellMock, isMobileMock } = vi.hoisted(() => ({
   isIOSShellMock: vi.fn(() => false),
   isAndroidShellMock: vi.fn(() => false),
+  isMobileMock: vi.fn(() => false),
+}));
+
+vi.mock("@/hooks/useIsMobileViewport", () => ({
+  useIsMobileViewport: () => isMobileMock(),
 }));
 
 vi.mock("@/lib/nativeBridge", async (importOriginal) => {
@@ -64,6 +69,8 @@ function renderHeader(props: {
   canShare?: boolean;
   shareDisabled?: boolean;
   shareDisabledReason?: string;
+  hasHeaderMenu?: boolean;
+  hasAgentInfo?: boolean;
 }) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
@@ -88,9 +95,9 @@ function renderHeader(props: {
             shareDisabled={props.shareDisabled}
             shareDisabledReason={props.shareDisabledReason}
             onShare={() => {}}
-            hasAgentInfo={false}
+            hasAgentInfo={props.hasAgentInfo ?? false}
             onAgentInfo={() => {}}
-            hasHeaderMenu={false}
+            hasHeaderMenu={props.hasHeaderMenu ?? false}
             showFilesPanel={false}
             hasRailContent={false}
             rightPanelOpen={false}
@@ -107,6 +114,7 @@ afterEach(() => {
   cleanup();
   isIOSShellMock.mockReturnValue(false);
   isAndroidShellMock.mockReturnValue(false);
+  isMobileMock.mockReturnValue(false);
 });
 
 describe("ChatHeader — deployed Share presentation", () => {
@@ -418,6 +426,59 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     expect(title).toHaveClass("min-w-0", "truncate");
     expect(title.parentElement).toBe(trigger.parentElement);
     expect(title.compareDocumentPosition(trigger) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("moves the trigger out of the breadcrumb on mobile", () => {
+    isMobileMock.mockReturnValue(true);
+    isIOSShellMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      conversationTitle: conversation.title,
+      actionConversation: conversation,
+    });
+
+    // The native shells hide the breadcrumb, so the kebab has to live in the
+    // header's own control cluster to stay reachable.
+    const trigger = screen.getByRole("button", { name: "Conversation actions" });
+    expect(trigger.closest("nav.conversation-breadcrumb")).toBeNull();
+    // Rightmost control in the header's action cluster.
+    expect(trigger.parentElement?.lastElementChild).toBe(trigger);
+    expect(screen.getByText(conversation.title as string)).toBeInTheDocument();
+  });
+
+  it("renders a single kebab on mobile, not one per menu", () => {
+    // The legacy Share · Agent info menu must yield to the full session menu,
+    // or a phone header ends up with two adjacent three-dot triggers.
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      conversationTitle: conversation.title,
+      actionConversation: conversation,
+      canShare: true,
+      hasHeaderMenu: true,
+      hasAgentInfo: true,
+    });
+
+    expect(screen.getByRole("button", { name: "Conversation actions" })).toBeInTheDocument();
+    expect(screen.queryByTestId("session-actions-menu")).toBeNull();
+  });
+
+  it("falls back to the Share · Agent info menu when the session isn't owner-managed", () => {
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      conversationTitle: conversation.title,
+      actionConversation: null,
+      canShare: true,
+      hasHeaderMenu: true,
+      hasAgentInfo: true,
+    });
+
+    expect(screen.queryByRole("button", { name: "Conversation actions" })).toBeNull();
+    expect(screen.getByTestId("session-actions-menu")).toBeInTheDocument();
   });
 
   it("does not add a management menu to a sub-agent breadcrumb", () => {

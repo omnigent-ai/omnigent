@@ -166,13 +166,14 @@ interface ChatHeaderProps {
  * under the controls (the conversation viewport's ``chat-scroll-fade``
  * mask, index.css; chat reserves clearance via ``pt-20``,
  * terminal-first via ``pt-14``). Left slot: open-sidebar + a conversation
- * breadcrumb (``[folder] / <title> [/ <sub-agent>]``). Right slot: desktop
- * action buttons (Agent info ·
- * Share · right-panel toggle), a mobile three-dot menu mirroring the
- * same actions, and a mobile FAB that opens the rail tabs as
- * full-screen drawers. Stop session lives in the sidebar row's kebab
- * menu; Clone lives on each assistant message's "Fork from here"
- * action (ChatPage), not here.
+ * breadcrumb (``[folder] / <title> [/ <sub-agent>]``, with the session-actions
+ * kebab on desktop). Right slot: desktop action buttons (Agent info ·
+ * Share · right-panel toggle), a mobile FAB that opens the rail tabs as
+ * full-screen drawers, and — on mobile — the session-actions kebab itself
+ * (pin/share/rename/project/archive/delete), which falls back to a smaller
+ * Share · Agent info menu when the session isn't owner-managed. Stop session
+ * lives in the sidebar row's kebab menu; Clone lives on each assistant
+ * message's "Fork from here" action (ChatPage), not here.
  *
  * All state lives in AppShell — this is a pure presentational component.
  */
@@ -220,6 +221,23 @@ export function ChatHeader({
     }, 400);
   }, [isMobile, onOpenSidebar, cancelPeek]);
   useEffect(() => cancelPeek, [cancelPeek]);
+  // Session actions (pin/share/rename/project/archive/delete). Desktop hangs
+  // them off the breadcrumb title; mobile puts the kebab in the right-hand
+  // control cluster instead — the native iOS/Android shells hide the
+  // breadcrumb entirely (their own chrome names the session), so a
+  // title-adjacent trigger would be unreachable there.
+  const conversationMenu = actionConversation ? (
+    <HeaderConversationMenu
+      conversation={actionConversation}
+      currentProject={projectName}
+      canShare={canShare}
+      shareDisabled={shareDisabled}
+      shareDisabledReason={shareDisabledReason}
+      onShare={onShare}
+      hasAgentInfo={isMobile && hasAgentInfo}
+      onAgentInfo={onAgentInfo}
+    />
+  ) : null;
   return (
     <header
       className={cn(
@@ -295,20 +313,7 @@ export function ChatHeader({
             isChildSession={isChildSession}
             boundAgent={boundAgent}
             wrapperLabel={wrapperLabel}
-            actions={
-              actionConversation ? (
-                <HeaderConversationMenu
-                  conversation={actionConversation}
-                  currentProject={projectName}
-                  canShare={canShare}
-                  shareDisabled={shareDisabled}
-                  shareDisabledReason={shareDisabledReason}
-                  onShare={onShare}
-                  hasAgentInfo={isMobile && hasAgentInfo}
-                  onAgentInfo={onAgentInfo}
-                />
-              ) : undefined
-            }
+            actions={isMobile ? undefined : (conversationMenu ?? undefined)}
             className="pr-1"
           />
         )}
@@ -552,6 +557,9 @@ export function ChatHeader({
               </DropdownMenuContent>
             </DropdownMenu>
           )}
+        {/* Mobile-only session-actions kebab, rightmost in the cluster. Same
+            menu the desktop breadcrumb hangs off its title. */}
+        {isMobile && conversationMenu}
       </div>
     </header>
   );
