@@ -195,6 +195,16 @@ class AcpAgentConfig:
         it skips the human approval card for a request no policy had an opinion
         on, matching claude-sdk's ``can_use_tool`` gate. Policy still runs in
         every mode, so a DENY still blocks and an explicit ASK still prompts.
+    :param inject_system_prompt: Fold the Omnigent system prompt into the first
+        ACP turn (ACP has no dedicated system-prompt field). On by default. Set
+        to ``False`` for agents like Pi forks (``omp``) that fully own their own
+        system prompt: those agents prepend Omnigent's text to the user message,
+        which can confuse their internal Claude model into emitting XML tool-call
+        fragments (``</function></tool_call>``) when there is no MCP relay
+        backing the described tools. Disabling injection leaves the first turn as
+        plain user content and lets the agent's own system prompt take effect
+        unmodified. When ``omnigent_mcp`` is ``False`` and the agent manages its
+        own context, setting this to ``False`` is strongly recommended.
     """
 
     command: str
@@ -205,6 +215,7 @@ class AcpAgentConfig:
     omnigent_mcp: bool = True
     env_passthrough: tuple[str, ...] = ()
     permission_mode: str = "auto"
+    inject_system_prompt: bool = True
 
 
 class _AcpRequestError(Exception):
@@ -1324,9 +1335,13 @@ class AcpExecutor(Executor):
 
         ``tools`` (Omnigent's builtin tool schemas) are captured for the Omnigent
         MCP relay set up at ``session/new`` — the agent still runs its OWN tools.
+        When ``omnigent_mcp`` is ``False`` the relay is disabled, so the schemas
+        serve no purpose and are discarded immediately rather than stored.
         """
-        # Captured before the (lazy) session so the MCP relay can advertise them.
-        self._omnigent_tools = tools or []
+        # Only keep builtin tools when the relay is enabled — they exist solely
+        # to back the MCP relay. Storing them when the relay is disabled would
+        # let stale data accidentally reach the session/prompt path (#4917).
+        self._omnigent_tools = (tools or []) if self._config.omnigent_mcp else []
         try:
             if self._proc is None or self._proc.returncode is not None:
                 await self._start_process()
@@ -1377,9 +1392,14 @@ class AcpExecutor(Executor):
             history_prefix = self._history_prefix(messages[:latest_user_idx])
             user_text = f"{history_prefix}\n\nuser: {user_text}" if user_text else history_prefix
 
-        # ACP has no system-prompt field, so fold it into the first turn.
+        # ACP has no system-prompt field. When inject_system_prompt is enabled
+        # (the default), fold the Omnigent system prompt into the first turn so
+        # the agent's model sees the spec instructions. When disabled (e.g. for
+        # Pi forks like omp that fully own their own system prompt), skip the
+        # injection to avoid prepending text that confuses the agent's internal
+        # Claude model into emitting XML tool-call fragments (#4917).
         if fresh_session:
-            if system_prompt:
+            if system_prompt and self._config.inject_system_prompt:
                 user_text = f"{system_prompt}\n\n{user_text}" if user_text else system_prompt
             self._system_prompt_sent = True
 

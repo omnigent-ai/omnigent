@@ -8,6 +8,7 @@ import json
 import logging
 import os
 
+from omnigent.debug_logging import runner_primary_session_id
 from omnigent.runner.background_titles.service import (
     BACKGROUND_TITLE_INFERENCE_TIMEOUT_SECONDS,
     BACKGROUND_TITLE_INSTRUCTIONS,
@@ -33,6 +34,7 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
             "background Claude Code title could not resolve provider config; "
             "falling back to Claude Code's native login",
             exc_info=True,
+            extra={"session_id": runner_primary_session_id()},
         )
         claude_config = None
     effective_model = (
@@ -89,6 +91,7 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
             "background Claude Code title failed returncode=%s detail=%s",
             process.returncode,
             detail[-1000:],
+            extra={"session_id": runner_primary_session_id()},
         )
         return None
     return stdout.decode(errors="replace").strip()

@@ -1,7 +1,12 @@
 import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Outlet, useParams, useSearchParams } from "@/lib/routing";
-import { PROJECT_LABEL_KEY, useConversations, useProjects } from "@/hooks/useConversations";
+import {
+  PROJECT_LABEL_KEY,
+  type Conversation,
+  useConversations,
+  useProjects,
+} from "@/hooks/useConversations";
 import { conversationDisplayLabel, UNTITLED_CONVERSATION_LABEL } from "./sidebarNav";
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
@@ -29,7 +34,10 @@ import {
   type DesignModeElement,
 } from "@/lib/designModePrompt";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
-import { readDefaultWorkspacePanelOpen } from "@/lib/workspacePanelPreferences";
+import {
+  readDefaultWorkspacePanelOpen,
+  writeDefaultWorkspacePanelOpen,
+} from "@/lib/workspacePanelPreferences";
 import {
   Dialog,
   DialogContent,
@@ -468,8 +476,30 @@ export function AppShell() {
   // revealed ``parentSessionId``. A session present in the sidebar list is
   // known top-level immediately (children are omitted from that query);
   // otherwise we wait for the snapshot rather than optimistically showing.
+  const activeSessionMatchesRoute = activeSession?.id === conversationId;
   const isKnownTopLevel =
-    activeConv != null || (activeSession != null && activeSession.parentSessionId == null);
+    activeConv != null ||
+    (activeSessionMatchesRoute && activeSession != null && activeSession.parentSessionId == null);
+  const actionConversation = useMemo<Conversation | null>(() => {
+    if (!isKnownTopLevel || !isOwnerLevel(permissionLevel)) return null;
+    if (activeConv) return activeConv;
+    if (!activeSessionMatchesRoute || !activeSession) return null;
+    return {
+      id: activeSession.id,
+      object: "conversation",
+      title: activeSession.title,
+      created_at: activeSession.createdAt,
+      updated_at: activeSession.createdAt,
+      labels: activeSession.labels ?? {},
+      permission_level: activeSession.permissionLevel,
+      runner_id: activeSession.runnerId ?? null,
+      host_id: activeSession.hostId ?? null,
+      workspace: activeSession.workspace ?? null,
+      agent_id: activeSession.agentId,
+      agent_name: activeSession.agentName,
+      git_branch: activeSession.gitBranch ?? null,
+    };
+  }, [activeConv, activeSession, activeSessionMatchesRoute, isKnownTopLevel, permissionLevel]);
   // Header action gating, hoisted so the desktop buttons and the mobile
   // three-dot menu render the exact same set (they can't drift apart).
   // Stop session is not a header action — it lives in the sidebar row's
@@ -1010,7 +1040,16 @@ export function AppShell() {
   // advertises a panel that isn't shown.
   const toggleRightPanel = () => {
     const next = !rightPanelOpen;
-    if (conversationId) writeSessionWorkspaceState(conversationId, { open: next });
+    if (conversationId) {
+      writeSessionWorkspaceState(conversationId, { open: next });
+      // Remember the choice app-wide as well, so a collapsed rail stays
+      // collapsed in the next chat the user opens (and on reload) until they
+      // reopen it. Sessions with their own saved open-state still win over
+      // this. Guarded on a conversation like the per-session write: off a
+      // session route the rail can't render, so the hotkey's flip is inert and
+      // must not rewrite the remembered state.
+      writeDefaultWorkspacePanelOpen(next);
+    }
     if (next) {
       if (selectedFilePath) {
         // Reopening lands back on the file remembered in per-session
@@ -1682,6 +1721,7 @@ export function AppShell() {
                   }}
                   isChildSession={isChildSession}
                   conversationId={conversationId}
+                  actionConversation={actionConversation}
                   conversationTitle={headerConversationTitle}
                   projectName={headerProjectName}
                   titleLinkTo={headerTitleLinkTo}

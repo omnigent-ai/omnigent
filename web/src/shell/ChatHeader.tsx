@@ -22,10 +22,13 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { AgentInfoButton } from "@/components/AgentInfo";
 import { ConversationBreadcrumb } from "./ConversationBreadcrumb";
+import { HeaderConversationMenu } from "./HeaderConversationMenu";
 import { UNTITLED_CONVERSATION_LABEL } from "./sidebarNav";
 import { PresenceAvatars } from "@/components/PresenceAvatars";
 import type { Agent } from "@/hooks/useAgents";
+import type { Conversation } from "@/hooks/useConversations";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useOmnigentAnalytics } from "@/lib/analytics";
 import { cn } from "@/lib/utils";
 import { TAB_BADGE_BASE } from "./railTabs";
 import { ViewModeToggle } from "./ViewModeToggle";
@@ -95,6 +98,8 @@ interface ChatHeaderProps {
   isChildSession: boolean;
   /** Active session id, or undefined on the landing composer. */
   conversationId: string | undefined;
+  /** Owner-managed top-level row backing the title-adjacent action menu. */
+  actionConversation?: Conversation | null;
   /**
    * Breadcrumb title: the active conversation's display name, or its
    * immediate parent's when viewing a sub-agent. ``null`` while unresolved.
@@ -177,6 +182,7 @@ export function ChatHeader({
   onOpenSidebar,
   isChildSession,
   conversationId,
+  actionConversation = null,
   conversationTitle,
   projectName,
   titleLinkTo,
@@ -200,6 +206,7 @@ export function ChatHeader({
   // hover affordance — on mobile the toggle just opens the full-screen overlay,
   // so a tap's synthetic pointerenter must not trigger it.
   const isMobile = useIsMobileViewport();
+  const { trackClick } = useOmnigentAnalytics();
   const peekTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const cancelPeek = useCallback(() => {
     if (peekTimer.current) {
@@ -254,6 +261,7 @@ export function ChatHeader({
                 // md:size-6 override replaces the variant's md:size-8.
                 size="icon"
                 aria-label="Open sidebar"
+                componentId="chat.header.open_sidebar"
                 onClick={() => {
                   cancelPeek();
                   onOpenSidebar(false);
@@ -290,6 +298,20 @@ export function ChatHeader({
             isChildSession={isChildSession}
             boundAgent={boundAgent}
             wrapperLabel={wrapperLabel}
+            actions={
+              actionConversation ? (
+                <HeaderConversationMenu
+                  conversation={actionConversation}
+                  currentProject={projectName}
+                  canShare={canShare}
+                  shareDisabled={shareDisabled}
+                  shareDisabledReason={shareDisabledReason}
+                  onShare={onShare}
+                  hasAgentInfo={isMobile && hasAgentInfo}
+                  onAgentInfo={onAgentInfo}
+                />
+              ) : undefined
+            }
             className="pr-1"
           />
         )}
@@ -315,7 +337,7 @@ export function ChatHeader({
             (Share · Agent info) so the header stays
             uncluttered on a phone. The right-panel/rail control is
             deliberately left out — it has its own affordance below. */}
-        {hasHeaderMenu && (
+        {hasHeaderMenu && (!actionConversation || !isMobile) && (
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button
@@ -332,7 +354,14 @@ export function ChatHeader({
             <DropdownMenuContent align="end" className="min-w-44">
               {canShare && (
                 <DropdownMenuItem
-                  onSelect={shareDisabled ? undefined : onShare}
+                  onSelect={
+                    shareDisabled
+                      ? undefined
+                      : () => {
+                          trackClick("chat.header.mobile_share", "button");
+                          onShare();
+                        }
+                  }
                   disabled={shareDisabled}
                   data-testid="mobile-share-session"
                   title={shareDisabledReason}
@@ -344,7 +373,10 @@ export function ChatHeader({
               )}
               {hasAgentInfo && (
                 <DropdownMenuItem
-                  onSelect={onAgentInfo}
+                  onSelect={() => {
+                    trackClick("chat.header.mobile_agent_info", "button");
+                    onAgentInfo();
+                  }}
                   data-testid="mobile-agent-info"
                   className="gap-2.5 px-2.5 py-2 text-ui"
                 >
@@ -388,6 +420,7 @@ export function ChatHeader({
             type="button"
             aria-label="Share session"
             onClick={onShare}
+            componentId="chat.header.share"
             // share-button-glassy (index.css) paints the pink gradient,
             // shadow, and white text in both light and dark mode.
             className="share-button-glassy hidden h-6 gap-1 rounded-[6px] px-2 text-ui font-normal text-white md:inline-flex"
@@ -407,6 +440,7 @@ export function ChatHeader({
                 size="icon-xs"
                 aria-label={rightPanelOpen ? "Collapse right panel" : "Expand right panel"}
                 onClick={onToggleRightPanel}
+                componentId="chat.header.toggle_right_panel"
                 className="hidden md:inline-flex text-muted-foreground hover:text-foreground border-none"
               >
                 {rightPanelOpen ? (

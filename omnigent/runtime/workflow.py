@@ -1620,6 +1620,9 @@ def _build_acp_spawn_env(
         omnigent_mcp = embedded.get("omnigent_mcp", True)
         if not isinstance(omnigent_mcp, bool):
             raise ValueError("executor acp_agent omnigent_mcp must be a boolean")
+        inject_system_prompt = embedded.get("inject_system_prompt", True)
+        if not isinstance(inject_system_prompt, bool):
+            raise ValueError("executor acp_agent inject_system_prompt must be a boolean")
         session_id_mode = embedded.get("session_id_mode", "server")
         if session_id_mode not in ("server", "client"):
             raise ValueError(
@@ -1640,6 +1643,7 @@ def _build_acp_spawn_env(
             session_id_mode=session_id_mode,
             send_model=send_model,
             omnigent_mcp=omnigent_mcp,
+            inject_system_prompt=inject_system_prompt,
             env_passthrough=parse_env_passthrough(embedded.get("env_passthrough")),
         )
     else:
@@ -1655,6 +1659,8 @@ def _build_acp_spawn_env(
         if agent.send_model:
             env["HARNESS_ACP_SEND_MODEL"] = "1"
         env["HARNESS_ACP_OMNIGENT_MCP"] = "1" if agent.omnigent_mcp else "0"
+        if not agent.inject_system_prompt:
+            env["HARNESS_ACP_INJECT_SYSTEM_PROMPT"] = "0"
         if agent.env_passthrough:
             # Names only; the harness reads each value from its own environment.
             env["HARNESS_ACP_ENV_PASSTHROUGH"] = ",".join(agent.env_passthrough)

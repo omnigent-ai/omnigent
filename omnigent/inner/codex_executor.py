@@ -2123,6 +2123,9 @@ class _CodexAppServerSession:
         # on the next ``turn/completed`` so each TurnComplete carries the
         # usage for the turn that just finished.
         self._last_turn_usage: dict[str, object] | None = None
+        # Serialize concurrent writes to the subprocess stdin so that parallel
+        # tool-call responses don't interleave bytes on the pipe.
+        self._stdin_lock = asyncio.Lock()
 
     async def start(self) -> None:
         if self._started:
@@ -2947,8 +2950,9 @@ class _CodexAppServerSession:
 
     async def _send_message(self, payload: CodexMessage) -> None:
         assert self._proc is not None and self._proc.stdin is not None
-        self._proc.stdin.write((json.dumps(payload) + "\n").encode("utf-8"))
-        await self._proc.stdin.drain()
+        async with self._stdin_lock:
+            self._proc.stdin.write((json.dumps(payload) + "\n").encode("utf-8"))
+            await self._proc.stdin.drain()
 
     @staticmethod
     async def _iter_stream_chunks(stream: asyncio.StreamReader) -> AsyncIterator[bytes]:

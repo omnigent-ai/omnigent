@@ -1272,25 +1272,22 @@ function FileViewerBody({
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end" className="w-auto min-w-40">
                   {toolbarActions.map((action) =>
-                    action.options || action.menu ? (
-                      // Pickers and settings menus collapse to a nested submenu
-                      // of their items. Toggle items (keepOpen) prevent the
-                      // submenu from closing so several can be flipped in a row.
+                    action.options ? (
+                      // A mutually-exclusive picker (e.g. view mode) collapses to
+                      // a nested submenu so its "selected choice" semantics — one
+                      // highlighted option — stay intact.
                       <DropdownMenuSub key={action.key}>
                         <DropdownMenuSubTrigger className="whitespace-nowrap">
                           {action.icon}
                           {action.tooltip ?? action.label}
                         </DropdownMenuSubTrigger>
                         <DropdownMenuSubContent>
-                          {(action.options ?? action.menu ?? []).map((option) => (
+                          {action.options.map((option) => (
                             <DropdownMenuItem
                               key={option.key}
-                              // Settings-menu items lean on the check mark alone;
-                              // the mutually-exclusive picker also highlights the
-                              // active choice.
                               className={cn(
                                 "whitespace-nowrap",
-                                action.options && option.active && "bg-muted dark:bg-muted/50",
+                                option.active && "bg-muted dark:bg-muted/50",
                               )}
                               onSelect={(e) => {
                                 if (option.keepOpen) e.preventDefault();
@@ -1306,6 +1303,26 @@ function FileViewerBody({
                           ))}
                         </DropdownMenuSubContent>
                       </DropdownMenuSub>
+                    ) : action.menu ? (
+                      // The settings menu's items are already independent
+                      // toggles/actions, so flatten them straight into this "⋯"
+                      // overflow rather than nesting a "⋯"-in-"⋯" submenu.
+                      action.menu.map((option) => (
+                        <DropdownMenuItem
+                          key={option.key}
+                          className="whitespace-nowrap"
+                          onSelect={(e) => {
+                            if (option.keepOpen) e.preventDefault();
+                            option.onSelect();
+                          }}
+                        >
+                          {option.icon}
+                          {option.label}
+                          {option.active && !option.noActiveCheck && (
+                            <CheckIcon className="ml-auto size-4" />
+                          )}
+                        </DropdownMenuItem>
+                      ))
                     ) : (
                       <DropdownMenuItem
                         key={action.key}

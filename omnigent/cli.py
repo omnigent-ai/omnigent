@@ -2980,6 +2980,7 @@ def _spawn_host_daemon_process(
             proc = subprocess.Popen(
                 args,
                 env=env,
+                stdin=subprocess.DEVNULL,
                 stdout=log_fh,
                 stderr=log_fh,
                 **_proc.spawn_kwargs(),
@@ -4202,7 +4203,11 @@ def server(
             import asyncio as _asyncio
 
             from omnigent.runtime import session_stream as _session_stream
+            from omnigent.server import shutdown_state as _shutdown_state
 
+            # The runner tunnels close next; their disconnect handlers must
+            # read that loss as ours, not as the runners dying.
+            _shutdown_state.mark_server_shutting_down()
             _session_stream.shutdown_all()
             # Yield to the event loop so generators can consume _DONE,
             # flush their final "data: [DONE]\n\n" chunk, and exit before

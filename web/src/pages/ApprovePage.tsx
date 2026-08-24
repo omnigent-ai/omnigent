@@ -165,11 +165,16 @@ export function ApprovePage() {
               </pre>
             )}
             <div className="flex flex-wrap gap-2 pt-1">
-              <Button size="sm" onClick={() => void submit("accept")}>
+              <Button size="sm" onClick={() => void submit("accept")} componentId="approve.approve">
                 <CheckIcon className="mr-1 size-3.5" />
                 Approve
               </Button>
-              <Button size="sm" variant="outline" onClick={() => void submit("decline")}>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => void submit("decline")}
+                componentId="approve.reject"
+              >
                 <XIcon className="mr-1 size-3.5" />
                 Reject
               </Button>

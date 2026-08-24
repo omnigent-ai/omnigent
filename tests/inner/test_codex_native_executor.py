@@ -973,6 +973,40 @@ def test_settings_update_drops_invalid_effort_keeps_model(
     assert "effort" not in params
 
 
+@pytest.mark.parametrize("effort", ["ultra", "max"])
+def test_settings_update_forwards_codex_high_reasoning_levels(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    effort: str,
+) -> None:
+    """
+    Sol's ``max``/``ultra`` reach the wire instead of coercing to ``xhigh``.
+
+    Codex advertises these as per-model reasoning levels and honors a turn at
+    them (Sol's ``ultra`` runs subagents), so a web-picked level must ride
+    through on ``thread/settings/update`` unchanged rather than being clamped.
+    """
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _start_state(tmp_path)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    _run_turn_with_config(
+        executor,
+        "hi",
+        ExecutorConfig(model="gpt-5.6-sol", extra={"reasoning_effort": effort}),
+    )
+
+    method, params = _FakeCodexNativeClient.requests[0]
+    assert method == "thread/settings/update"
+    assert params["effort"] == effort
+
+
 def test_run_turn_surfaces_recorded_startup_error(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

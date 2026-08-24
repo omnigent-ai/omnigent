@@ -364,7 +364,7 @@ describe("Sidebar session list", () => {
     expect(row.className).not.toContain("focus-within");
   });
 
-  it("offers the four display filters and defaults to All sessions", () => {
+  it("offers the four display filters and defaults to My sessions", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
 
@@ -377,9 +377,9 @@ describe("Sidebar session list", () => {
     for (const value of ["all", "mine", "shared", "archived"]) {
       expect(screen.getByTestId(`session-filter-${value}`)).toBeInTheDocument();
     }
-    // Radio semantics: exactly one option is checked, and it's "All sessions".
-    expect(screen.getByTestId("session-filter-all")).toHaveAttribute("aria-checked", "true");
-    expect(screen.getByTestId("session-filter-mine")).toHaveAttribute("aria-checked", "false");
+    // Radio semantics: exactly one option is checked, and it's "My sessions".
+    expect(screen.getByTestId("session-filter-mine")).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("session-filter-all")).toHaveAttribute("aria-checked", "false");
   });
 
   it("keeps the picked filter across a remount", () => {
@@ -389,22 +389,24 @@ describe("Sidebar session list", () => {
     ]);
     renderSidebar();
 
-    selectSessionFilter("mine");
-    expect(screen.queryByText("conv_shared")).toBeNull();
+    // Pick a non-default slice (default is "mine") so the remount below proves
+    // the pick was persisted, not just that we landed back on the default.
+    selectSessionFilter("shared");
+    expect(screen.queryByText("conv_mine")).toBeNull();
 
-    // Fresh mount re-reads localStorage: still scoped to the viewer's own
-    // sessions. If this fails, the pick lived only in memory and a reload
-    // silently snapped the list back to "All sessions".
+    // Fresh mount re-reads localStorage: still scoped to shared sessions. If
+    // this fails, the pick lived only in memory and a reload silently snapped
+    // the list back to the default.
     cleanup();
     renderSidebar();
-    expect(screen.getByText("conv_mine")).toBeInTheDocument();
-    expect(screen.queryByText("conv_shared")).toBeNull();
+    expect(screen.getByText("conv_shared")).toBeInTheDocument();
+    expect(screen.queryByText("conv_mine")).toBeNull();
     fireEvent.pointerDown(screen.getByTestId("session-filter"), {
       button: 0,
       ctrlKey: false,
       pointerType: "mouse",
     });
-    expect(screen.getByTestId("session-filter-mine")).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("session-filter-shared")).toHaveAttribute("aria-checked", "true");
   });
 
   it("drops a persisted Shared filter on a single-user server", () => {
@@ -422,7 +424,7 @@ describe("Sidebar session list", () => {
       ctrlKey: false,
       pointerType: "mouse",
     });
-    expect(screen.getByTestId("session-filter-all")).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("session-filter-mine")).toHaveAttribute("aria-checked", "true");
     expect(screen.queryByTestId("session-filter-shared")).toBeNull();
   });
 
@@ -460,11 +462,11 @@ describe("Sidebar session list", () => {
       archived: screen.queryByText("conv_archived") !== null,
     });
 
-    // Default: everything except archived.
-    expect(visible()).toEqual({ owned: true, shared: true, archived: false });
-
-    selectSessionFilter("mine");
+    // Default: the viewer's own sessions only ("My sessions").
     expect(visible()).toEqual({ owned: true, shared: false, archived: false });
+
+    selectSessionFilter("all");
+    expect(visible()).toEqual({ owned: true, shared: true, archived: false });
 
     selectSessionFilter("shared");
     expect(visible()).toEqual({ owned: false, shared: true, archived: false });
@@ -472,9 +474,9 @@ describe("Sidebar session list", () => {
     selectSessionFilter("archived");
     expect(visible()).toEqual({ owned: false, shared: false, archived: true });
 
-    // Back to All: leaving Archived restores the unarchived rows.
-    selectSessionFilter("all");
-    expect(visible()).toEqual({ owned: true, shared: true, archived: false });
+    // Back to My sessions: leaving Archived restores the viewer's own rows.
+    selectSessionFilter("mine");
+    expect(visible()).toEqual({ owned: true, shared: false, archived: false });
 
     // And Archived is still reachable a second time (state isn't one-shot).
     selectSessionFilter("archived");
@@ -999,7 +1001,8 @@ describe("Sidebar sections", () => {
     ]);
     renderSidebar();
 
-    // Default ("All sessions"): everything the viewer can see.
+    // "All sessions": everything the viewer can see.
+    selectSessionFilter("all");
     const recentSection = screen.getByText("Sessions").closest("section")!;
     expect(within(recentSection).getByText("conv_mine_legacy")).toBeInTheDocument();
     expect(within(recentSection).getByText("conv_mine_acl")).toBeInTheDocument();
@@ -1158,9 +1161,11 @@ describe("Sidebar tabs", () => {
     ]);
     renderSidebar();
 
-    // The owned session is filed (peeled out of the flat list into its
-    // collapsed folder), but the shared collision stays in the flat Sessions
-    // list rather than being pulled into the viewer's folder.
+    // The shared session shows on "All sessions" (the default "My sessions" tab
+    // scopes it out). The owned session is filed (peeled out of the flat list
+    // into its collapsed folder), but the shared collision stays in the flat
+    // Sessions list rather than being pulled into the viewer's folder.
+    selectSessionFilter("all");
     const sessionsSection = screen.getByText("Sessions").closest("section")!;
     expect(within(sessionsSection).queryByText("conv_owned")).toBeNull();
     expect(within(sessionsSection).getByText("conv_shared_alpha")).toBeInTheDocument();

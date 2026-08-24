@@ -650,7 +650,7 @@ def test_ensure_local_omnigent_server_spawn_records_and_returns_log_path(
     monkeypatch.setattr(local_server, "_LOCAL_SERVER_SIG_PATH", sig_file)
     monkeypatch.setattr(local_server, "_LOCAL_SERVER_LOG_REF_PATH", log_ref)
     # Point the persistent data dir at tmp so logs/server lands under tmp.
-    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / ".omnigent"))
 
     class _Proc:
         pid = 9001

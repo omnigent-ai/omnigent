@@ -1485,7 +1485,7 @@ class SessionCreateMetadata(BaseModel):
     :param reasoning_effort: Optional per-session reasoning-effort
         hint. Accepted metadata values are ``"none"``,
         ``"minimal"``, ``"low"``, ``"medium"``, ``"high"``,
-        ``"xhigh"``, and ``"max"``. Provider-specific support is
+        ``"xhigh"``, ``"max"``, and ``"ultra"``. Provider-specific support is
         validated when a turn executes. ``None`` means use the agent
         default.
     :param host_id: Optional host to launch the runner on, e.g.
@@ -1631,6 +1631,30 @@ class ModelUsage(BaseModel):
     total_cost_usd: float | None = None
 
 
+class BackgroundTaskInfo(BaseModel):
+    """
+    One still-running background shell from the claude-native ``Stop`` hook.
+
+    Claude Code leaves finished shells in the hook's ``background_tasks``
+    array, so the list surfaced here is filtered to the non-terminal ones —
+    its length matches the ``background_task_count`` tally. Every field is
+    best-effort: the hook shape is external, so an entry missing one field
+    still yields a usable row (e.g. a ``description`` with no ``command``).
+
+    :param id: Opaque per-shell identifier, e.g. ``"abc123"``.
+    :param type: Task kind, e.g. ``"shell"``.
+    :param status: Per-task status, e.g. ``"running"``.
+    :param description: Human-readable label, e.g. ``"Wait for CI"``.
+    :param command: Command the shell is running, e.g. ``"sleep 120"``.
+    """
+
+    id: str | None = None
+    type: str | None = None
+    status: str | None = None
+    description: str | None = None
+    command: str | None = None
+
+
 class SessionResponse(BaseModel):
     """
     API representation of a session.
@@ -1659,6 +1683,9 @@ class SessionResponse(BaseModel):
         running as of the last status edge, so a reload re-shows "N shells
         still running" even though the session has settled to ``"idle"``.
         ``None`` (the default / omitted) when no shells are tracked.
+    :param background_tasks: Per-shell detail for the running tally above,
+        so a reload can restore each shell's description/command. ``None`` when
+        none are tracked (or when an older runner reported only the count).
     :param created_at: Unix epoch seconds of creation.
     :param title: Optional human-readable title, e.g.
         ``"debugging auth flow"``. ``None`` when unset.
@@ -1887,6 +1914,7 @@ class SessionResponse(BaseModel):
     agent_name: str | None = None
     status: Literal["idle", "running", "waiting", "failed"]
     background_task_count: int | None = None
+    background_tasks: list[BackgroundTaskInfo] | None = None
     created_at: int
     updated_at: int | None = None
     title: str | None = None
@@ -2668,6 +2696,12 @@ class SessionStatusEvent(_SSEEventBase):
         is emitted. ``None`` for every non-failed transition.
         Clients render ``error.message`` as the terminal error
         line; without it a setup failure shows as a silent end.
+    :param background_task_count: Background shells still running at this
+        edge (claude-native ``Stop`` hook). ``None`` when the edge carries no
+        information (leave the sticky tally untouched); ``0`` clears it.
+    :param background_tasks: Per-shell detail backing that tally, so the UI
+        can name each running shell. ``None`` when the edge reports no detail
+        (an older runner may send only the count).
     :param blocked_on: Short human phrase naming what a still-``running``
         session is parked on, e.g. ``"permission prompt"`` or
         ``"dialog open"``. Set by terminal-backed integrations whose agent
@@ -2688,6 +2722,7 @@ class SessionStatusEvent(_SSEEventBase):
     response_id: str | None = None
     error: ErrorDetail | None = None
     background_task_count: int | None = None
+    background_tasks: list[BackgroundTaskInfo] | None = None
     blocked_on: str | None = None
 
 

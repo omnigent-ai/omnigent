@@ -249,6 +249,7 @@ class _FakeProcessManager:
         # idle reaper's guard is actually populated for a live turn.
         self.marked_in_flight: list[tuple[str, str]] = []
         self.cleared_in_flight: list[str] = []
+        self.activity_noted: list[str] = []
 
     async def get_client(
         self, conversation_id: str, harness: str, env: Any = None
@@ -265,6 +266,10 @@ class _FakeProcessManager:
     def has_active_turn(self, conversation_id: str) -> bool:
         """Check if a turn is marked active for this conversation."""
         return conversation_id in self._active_turns
+
+    def note_activity(self, conversation_id: str) -> None:
+        """Record an activity lease refresh for a conversation."""
+        self.activity_noted.append(conversation_id)
 
     def mark_turn_active(self, conversation_id: str) -> None:
         """Mark a conversation as having an active turn (test helper)."""

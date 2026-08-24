@@ -16,7 +16,9 @@ import type { McpServerStartup } from "./events";
 import { authenticatedFetch } from "./identity";
 import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
 import { setSessionHost } from "./sessionHost";
+import { parseBackgroundTasks } from "./sse";
 import type {
+  BackgroundTaskInfo,
   ModelUsage,
   NativeModelOption,
   NestedSessionItem,
@@ -128,6 +130,11 @@ interface SessionResponseWire {
    * has settled to ``"idle"``. Absent/0 when none are tracked.
    */
   background_task_count?: number | null;
+  /**
+   * Per-shell detail behind `background_task_count`, so a reload can restore
+   * it. Absent when none are tracked.
+   */
+  background_tasks?: BackgroundTaskInfo[] | null;
   created_at: number;
   /**
    * Human-readable session title, e.g. ``"researcher:auth"`` for a
@@ -307,6 +314,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     hostResumable: wire.host_resumable ?? false,
     status: wire.status,
     backgroundTaskCount: wire.background_task_count ?? undefined,
+    backgroundTasks: parseBackgroundTasks(wire.background_tasks),
     createdAt: wire.created_at,
     title: wire.title ?? null,
     labels: wire.labels,

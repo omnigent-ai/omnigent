@@ -93,6 +93,25 @@ class SysScheduledTaskCreateTool(Tool):
                             "type": "string",
                             "description": "Optional per-run reasoning-effort hint, e.g. 'high'.",
                         },
+                        "permission_mode": {
+                            "type": "string",
+                            "description": (
+                                "Optional permission mode for native coding agents that "
+                                "support one (Claude Code): 'default', 'auto', "
+                                "'acceptEdits', 'plan', 'dontAsk', or 'bypassPermissions'. "
+                                "Runs are unattended, so a prompting mode ('default'/'plan') "
+                                "stalls waiting for approval — prefer an auto-running mode. "
+                                "Omit for the agent default."
+                            ),
+                        },
+                        "max_cost_usd": {
+                            "type": "number",
+                            "description": (
+                                "Optional per-firing cost budget in USD. When set, each "
+                                "fired session is capped at this spend — all models are "
+                                "blocked once the limit is reached. Omit for no cap."
+                            ),
+                        },
                         "workspace": {
                             "type": "string",
                             "description": (
@@ -187,6 +206,20 @@ class SysScheduledTaskUpdateTool(Tool):
                         "reasoning_effort": {
                             "type": "string",
                             "description": "New reasoning-effort hint.",
+                        },
+                        "permission_mode": {
+                            "type": "string",
+                            "description": (
+                                "New permission mode for native coding agents (Claude "
+                                "Code): 'default', 'auto', 'acceptEdits', 'plan', "
+                                "'dontAsk', or 'bypassPermissions'."
+                            ),
+                        },
+                        "max_cost_usd": {
+                            "type": "number",
+                            "description": (
+                                "New per-firing cost budget in USD. Null clears the cap."
+                            ),
                         },
                         "workspace": {
                             "type": "string",

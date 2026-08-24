@@ -23,6 +23,7 @@ import pytest
 
 from omnigent import claude_native_bridge, native_cost_popup
 from omnigent.claude_native_bridge import (
+    _BACKGROUND_TASK_FIELD_MAX_CHARS,
     _build_tools,
     _claude_prompt_rendered,
     _escape_unsupported_slash_command,
@@ -7312,6 +7313,92 @@ def test_hook_record_non_stop_event_has_zero_background_tasks() -> None:
         )
     )
     assert record.background_task_count == 0
+
+
+def test_hook_record_stop_collects_background_task_detail() -> None:
+    """``Stop`` populates ``background_tasks`` with the running shells' detail.
+
+    The detail list backs the UI's per-shell display. It carries only the
+    still-running shells (matching the count), each trimmed to the display
+    fields; terminal entries and non-dict junk drop out of the detail even
+    though the junk still counts.
+    """
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "Stop",
+                "background_tasks": [
+                    {
+                        "id": "a",
+                        "type": "shell",
+                        "status": "running",
+                        "description": "Wait for CI",
+                        "command": "sleep 120",
+                    },
+                    {"id": "b", "status": "completed", "description": "done"},  # terminal
+                    {"id": "c", "status": "running"},  # partial, still running
+                    "garbage",  # non-dict: counts, but no detail
+                ],
+            }
+        )
+    )
+    # running + partial + garbage = 3 counted; only the 2 dicts yield detail.
+    assert record.background_task_count == 3
+    assert record.background_tasks == [
+        {
+            "id": "a",
+            "type": "shell",
+            "status": "running",
+            "description": "Wait for CI",
+            "command": "sleep 120",
+        },
+        {"id": "c", "status": "running"},
+    ]
+
+
+def test_hook_record_stop_background_tasks_none_when_no_usable_detail() -> None:
+    """A count with no dict entries leaves ``background_tasks`` ``None``.
+
+    A non-dict entry counts as running (never under-count) but yields no
+    detail, so the field stays ``None`` rather than an empty list.
+    """
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record({"hook_event_name": "Stop", "background_tasks": ["garbage", 123]})
+    )
+    assert record.background_task_count == 2
+    assert record.background_tasks is None
+
+
+def test_hook_record_stop_background_task_fields_are_truncated() -> None:
+    """Over-long detail fields are clamped so a payload can't bloat the event."""
+    long_value = "x" * 5000
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "Stop",
+                "background_tasks": [
+                    {
+                        "id": "a",
+                        "status": "running",
+                        "description": long_value,
+                        "command": long_value,
+                    }
+                ],
+            }
+        )
+    )
+    assert record.background_tasks is not None
+    task = record.background_tasks[0]
+    assert len(task["description"]) == _BACKGROUND_TASK_FIELD_MAX_CHARS
+    assert len(task["command"]) == _BACKGROUND_TASK_FIELD_MAX_CHARS
+
+
+def test_hook_record_non_stop_event_has_no_background_task_detail() -> None:
+    """Non-Stop events never carry ``background_tasks`` detail."""
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record({"hook_event_name": "PostToolUse", "tool_name": "Bash"})
+    )
+    assert record.background_tasks is None
 
 
 # ── /model switching + pane readiness ───────────────────────────────────

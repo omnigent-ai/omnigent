@@ -93,7 +93,10 @@ Your first turn is a fixed checklist — do all of it before Step 1:
    for UI journeys, and `sys_session_*` / HTTP for backend journeys. Confirm you
    can read the report: `gh` is available for a GitHub issue, or a Linear key
    (`LINEAR_API_KEY` or `DATABRICKS_LINEAR_API_KEY`) is set for a Linear ticket
-   (if it isn't, stop with `needs_more_info`).
+   (if it isn't, stop with `needs_more_info`). Also note — without failing —
+   whether the recorders are available (Playwright browsers for
+   `pytest --video`, `vhs` for CLI tapes): Step 4 degrades gracefully when they
+   are missing.
 
 If you cannot reach the app at all, stop and say so. Don't narrate a clean
 preflight.
@@ -162,6 +165,15 @@ the named code path. Whether the cause is exactly the function the report finger
 is something your live reproduction and root-cause work establish — you do not
 take it on faith and you do not let it stand in for driving the real journey.
 
+**Stamp each sub-symptom with the user-facing surface it shows on.** Alongside
+the verdict you will give each facet (Step 2), record where a user *sees* the
+failure: `web` (the web SPA), `terminal` (a TUI or shell pane rendered inside
+the app — a native-harness pane, an embedded shell), or `cli` (a command-line
+surface outside the app: the `omnigent` CLI, the REPL, a host daemon's output).
+A facet with no user-visible surface (an internal-only defect) gets `api`. The
+surface picks the kind of test you author (Step 3) and the recorder that
+captures it (Step 4).
+
 **Enumerate every distinct symptom the report claims — do not collapse them.**
 Many reports describe a *compound* bug: a title like "picker is unavailable **and**
 defaults/router catalog lag" is really two claims, and they can have *different*
@@ -211,6 +223,10 @@ Match the repo's existing e2e conventions:
 
 - **UI journeys** → a Playwright test under `tests/e2e_ui/` (the suite that drives
   the web SPA against a live server), e.g. `tests/e2e_ui/<area>/test_<slug>.py`.
+- **CLI/REPL journeys** → a PTY-driven test under `tests/e2e/` following the
+  existing pexpect pattern (see `tests/e2e/test_repl_approval_e2e.py`): spawn
+  the real command under a pseudo-TTY, feed the user's inputs, and assert on the
+  observable output.
 - **Backend journeys** → a test under `tests/e2e/`, e.g. `tests/e2e/test_<slug>.py`.
 
 `<slug>` derives from the bug (issue number or ticket key). Assert tightly enough
@@ -235,6 +251,98 @@ code block is the last thing in the message before the final ```json fence. The
 parser reads only the *last* ```json fence, so a preceding code block for the
 test is safe. If you authored more than one test file, include each in full, back
 to back, still before the JSON block.
+
+## Step 4 — Record the reproduction
+
+A verdict is stronger when a human can *watch* the outcome. After authoring the
+test, record each facet you settled live, on the surface the user sees it on,
+saved under `recordings/<slug>/` in your workspace:
+
+- a **`reproduced`** facet → **before-fix footage** (`kind: "before"`): run the
+  authored test so it FAILS; the failing run's video is the proof the bug is live
+  (e.g. `recordings/1234/before-picker.webm`).
+- an **`already_fixed`** facet → **proof-it-works footage** (`kind: "fixed"`): run
+  the same authored test so it PASSES; the passing run's video shows the journey
+  behaving correctly on the running build (e.g. `recordings/1234/fixed-picker.webm`).
+
+`not_reproduced` and `needs_more_info` facets have nothing to film — skip them.
+Recording is best-effort: if the tooling below is missing, skip it, keep
+`recordings: []`, and say what was missing in `evidence` — never let recording
+block or distort the reproduction itself.
+
+**The recorder needs its own server — spawn one with a scrubbed env.** A `web`
+recording runs the `tests/e2e_ui/` suite, which drives a live server. Do **not**
+point it at the app you were launched against: that app is typically auth-gated
+(a Databricks Apps deployment bounces an unauthenticated Playwright to SSO), so
+the recorder can't drive it. Let the `tests/e2e_ui/` fixtures **spawn their own
+local server + runner** instead (the default when no `--ui-base-url` is passed).
+
+But when you are yourself running inside a server-spawned runner (the `--server`
+CI path), that fixture's runner **inherits your runner's environment and never
+tunnels** — it silently hangs with an empty `runner.log` and stays
+`online: false`. The conflict is the ambient runner/host vars leaking into the
+child. Launch the recorder with them **stripped** so the fixture starts clean:
+
+```bash
+env -u OMNIGENT_RUNNER_ID -u OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN \
+    -u OMNIGENT_RUNNER_TUNNEL_TOKEN -u OMNIGENT_RUNNER_PARENT_PID \
+    -u OMNIGENT_RUNNER_ISOLATE_SESSION -u OMNIGENT_RUNNER_WORKSPACE \
+    -u OMNIGENT_HOST_ID -u OMNIGENT_HOST_TOKEN -u OMNIGENT_HOST_NAME \
+    -u RUNNER_SERVER_URL -u OMNIGENT_REMOTE_AUTH_TOKEN \
+    $(env | grep -oE '^OMNIGENT_RUNNER_ZYGOTE[A-Z_]*' | sed 's/^/-u /' | tr '\n' ' ') \
+    pytest <test_path> --video on --screenshot on --output recordings/<slug>
+```
+
+The `OMNIGENT_RUNNER_ZYGOTE*` FDs are the usual culprit — they make the child
+runner take the fork path and block on control FDs it doesn't have. If the
+spawned runner still won't go `online: true` within the fixture's timeout, that
+lane is genuinely unreachable here: keep `recordings: []` for it and say so in
+`evidence` (a real environment limit, not a bug verdict).
+
+**A missing SPA build is not a reason to skip recording.** The `tests/e2e_ui/`
+server serves the SPA from `omnigent/server/static/web-ui/`, which starts empty
+in your worktree (the deploy's pre-built bundle lives in the serving layer, not
+the source tree). That is expected and cheap to resolve — the `tests/e2e_ui/`
+harness **builds the SPA itself** as part of its normal boot (a `pnpm install
+--filter web && pnpm --filter web run build`, a few minutes, well within your
+turn budget), so you do **not** need to pre-check for the directory. Just run the
+recorder and let the suite build it. If you prefer to build it explicitly first
+for determinism, run `pnpm --filter web install && pnpm --filter web run build`
+from your checkout — but never skip recording merely because the dir is empty on
+first look; that is the normal starting state, not a blocker.
+
+- **`web` facets** — run the authored Playwright test with recording on:
+  `pytest <test_path> --video on --screenshot on --output recordings/<slug>`
+  (the `tests/e2e_ui/` suite is pytest-playwright, so the flags need no extra
+  plumbing). pytest-playwright writes the video into a per-test subdir under
+  `--output` as `video.webm`; **move** it (do not copy) to a stable name at the
+  `recordings/<slug>/` root and delete the leftover per-test subdir, so the same
+  footage isn't left twice (a copy plus the raw `video.webm` both get collected).
+  For a `reproduced` facet the
+  run must FAIL — the failing run's video *is* the before-fix footage
+  (`before-<facet>.webm`). For an `already_fixed` facet the same test PASSES
+  (it already asserts the correct behavior, per Step 3) — that passing run's video
+  is the proof-it-works footage (`fixed-<facet>.webm`).
+- **`terminal` facets** — the pane renders inside the web app, so record it the
+  same way as `web`: the Playwright test drives the session page with the terminal
+  view shown, and the pane's contents land in the browser video (`before-`/`fixed-`
+  by the facet's verdict, as above). Save `tmux capture-pane -e` text dumps
+  alongside as machine-checkable evidence.
+- **`cli` facets** — author a VHS tape (`recordings/<slug>/journey.tape`) that
+  replays the SAME numbered journey steps as your PTY test: `Type`/`Enter` the
+  user's commands, `Wait /pattern/` on the observable outcome (the failure for a
+  `reproduced` facet, the correct output for an `already_fixed` one), with an
+  `Output recordings/<slug>/<before|fixed>-<facet>.mp4` directive. Render it with
+  `vhs recordings/<slug>/journey.tape`. The tape is the replayable journey
+  artifact for terminals — the fix step re-renders the same tape for the
+  after-fix recording. If `vhs` is unavailable, still author and keep the tape;
+  note that rendering was skipped.
+
+A recording must end on the outcome the user observes — the failure (wrong screen
+state, bad output, error) for a `before` recording, or the correct end state for a
+`fixed` one. Convert to `.mp4` with `ffmpeg` when available; `.webm`/`.gif` are
+fine otherwise. Recordings are workspace artifacts exactly like the test — leave
+them uncommitted; in CI the artifact bundle collects them.
 
 ## Output — the reproduction artifacts
 
@@ -271,10 +379,13 @@ choice:
   "bug_url": "https://github.com/omnigent-ai/omnigent/issues/1234",
   "verdict": "reproduced",
   "facets": [
-    {"symptom": "picker display", "verdict": "reproduced", "evidence": "raw IDs shown"},
-    {"symptom": "catalog default", "verdict": "already_fixed", "evidence": "#3448"}
+    {"symptom": "picker display", "verdict": "reproduced", "surface": "web", "evidence": "raw IDs shown"},
+    {"symptom": "catalog default", "verdict": "already_fixed", "surface": "web", "evidence": "#3448"}
   ],
   "test_path": "tests/e2e_ui/model_catalog/test_1234.py",
+  "recordings": [
+    {"surface": "web", "kind": "before", "path": "recordings/1234/before-picker.webm", "format": "webm"}
+  ],
   "session_id": "dc59e331-...",
   "journey": "open model picker → select catalog → picker shows raw IDs",
   "evidence": "snapshot ref / response / log excerpt, plus root-cause leads"
@@ -288,7 +399,8 @@ Field meanings:
   overall `reproduced`; only when *every* sub-symptom is fixed is it
   `already_fixed`).
 - `facets` — an array of the per-sub-symptom breakdown from Steps 1–2, each an
-  object with `symptom`, its own `verdict` (same four literals), and one line of
+  object with `symptom`, its own `verdict` (same four literals), its `surface`
+  (`web` / `terminal` / `cli` / `api`, from Step 1), and one line of
   `evidence`. Always a list, even for a single-symptom bug (then it's one
   element). This is what stops a partially-landed fix from being averaged into a
   misleading single verdict.
@@ -310,8 +422,42 @@ Field meanings:
 - `evidence` — what you observed live (snapshot reference, response, or log
   excerpt), plus any root-cause leads you noticed while reproducing (hypotheses
   only — you do not fix).
+- `recordings` — the Step 4 captures: a list of
+  `{"surface", "kind", "path", "format"}` objects. `kind` is `"before"` for a
+  `reproduced` facet's failing run or `"fixed"` for an `already_fixed` facet's
+  passing run (the fix step later re-records the same drivers post-fix as
+  `"after"`); `path` workspace-relative. Include an entry for the
+  authored-but-unrendered VHS tape too (`"format": "tape"`) when rendering was
+  skipped. Empty list when nothing was recorded — then say what was missing in
+  `evidence`.
 
 Keep the prose before the block terse — the one exception is the full test
 source, which you paste in full. You produce the live-confirmed reproduction +
 the test; the fix step takes it from here. You take no further
 action — no fix, no merge, no push.
+
+## Appendix — driving the omnigent web UI (hard-won pitfalls)
+
+Check these before debugging a Playwright driver against the SPA:
+
+- **`networkidle` never fires on a session page** — it keeps an SSE stream and
+  a terminal WebSocket open. Wait for concrete UI (the composer, a testid),
+  never for network idle.
+- **Locate the composer by `aria-label` ("Message the agent"), not by its
+  placeholder** — the placeholder mutates with state ("Send a follow-up
+  (queued)…" while streaming; "Respond to the pending request above…" during a
+  pending elicitation, which also DISABLES the textarea).
+- **Turn waits need the working→idle transition.** Polling for
+  `status == "idle"` right after send false-fires on the pre-turn idle;
+  require the session to leave idle first.
+- **`main-terminal-view` mounts hidden** (`data-visible="false"`) while chat is
+  shown, so a bare visibility wait on it hangs. Switch views via the header
+  `view-mode-toggle` (buttons labelled "Chat view" / "Terminal view").
+- **Match TUI states by their distinctive chrome, not by content words** — e.g.
+  Claude's question picker is "Enter to select" plus a numbered option line;
+  the option words alone also match the echoed prompt text.
+- **Use a minimal single-model agent for journeys.** Orchestrator agents fan
+  out sub-agents and land the observable moment in a later inbox-wake turn,
+  past any fixed wait.
+- **Finalize video in `finally`.** Close the Playwright context even when the
+  drive fails, so a failed take still yields footage.
