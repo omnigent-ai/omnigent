@@ -15,7 +15,7 @@
 
 import { TerminalIcon, XIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { TerminalView } from "@/components/blocks/TerminalView";
+import { LazyTerminalView } from "@/components/blocks/LazyTerminalView";
 import { AGENT_TERMINAL_IDS, terminalTabKey, useTerminals } from "@/hooks/useTerminals";
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { TerminalStatusBadge } from "./terminalStatus";
@@ -191,7 +191,7 @@ export function MainTerminalView({
                   key={`${conversationId}:${activeTerminal.id}`}
                   className="flex h-full flex-col"
                 >
-                  <TerminalView
+                  <LazyTerminalView
                     sessionId={conversationId}
                     terminalId={activeTerminal.id}
                     readOnly={readOnly}

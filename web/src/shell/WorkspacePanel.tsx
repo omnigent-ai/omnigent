@@ -27,7 +27,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { TerminalView } from "@/components/blocks/TerminalView";
+import { LazyTerminalView } from "@/components/blocks/LazyTerminalView";
 import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
@@ -520,7 +520,7 @@ function RailTerminalView({
   }
   return (
     <div key={terminal.id} className="flex h-full min-h-0 flex-col">
-      <TerminalView
+      <LazyTerminalView
         sessionId={conversationId}
         terminalId={terminal.id}
         readOnly={readOnly}

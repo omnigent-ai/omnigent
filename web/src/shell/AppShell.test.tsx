@@ -1092,7 +1092,7 @@ describe("Right-rail terminals card", () => {
 });
 
 describe("Chat-mode terminal panel layout", () => {
-  it("hosts an open shell as a rail tab (not the full-width push panel) and keeps chat visible", () => {
+  it("hosts an open shell as a rail tab (not the full-width push panel) and keeps chat visible", async () => {
     // A shell opens as a tab inside the workspace rail — its xterm surfaces in
     // the rail's content slot, the full-width push panel stays closed, and chat
     // is not hidden. Seed a restored (open + selected) shell tab so it's live on
@@ -1115,8 +1115,9 @@ describe("Chat-mode terminal panel layout", () => {
 
     renderShell("/c/conv_abc");
 
-    // The shell tab's xterm is mounted in the rail...
-    expect(screen.getByTestId("terminal-view-stub")).toHaveTextContent("terminal_main");
+    // The shell tab's xterm is mounted in the rail... (`findBy` — it sits
+    // behind a lazy chunk boundary.)
+    expect(await screen.findByTestId("terminal-view-stub")).toHaveTextContent("terminal_main");
     // ...while the push panel stays closed and chat stays visible. The
     // md:hidden gate lives on the chat+workspace group (main's parent).
     const chatGroup = () => screen.getByRole("main").parentElement as HTMLElement;

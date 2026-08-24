@@ -26,7 +26,7 @@
 import { TerminalIcon, XIcon } from "lucide-react";
 import type { CSSProperties } from "react";
 import { useEffect, useRef, useState } from "react";
-import { TerminalView } from "@/components/blocks/TerminalView";
+import { LazyTerminalView } from "@/components/blocks/LazyTerminalView";
 import { Button } from "@/components/ui/button";
 import { useResizablePanel } from "@/hooks/useResizablePanel";
 import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
@@ -239,7 +239,7 @@ export function TerminalsPanel({
             // across same-shape sessions (e.g. `terminal_claude_main`), so id
             // alone reuses the xterm mount and shows stale scrollback.
             <div key={`${conversationId}:${activeTerminal.id}`} className="flex h-full flex-col">
-              <TerminalView
+              <LazyTerminalView
                 sessionId={conversationId}
                 terminalId={activeTerminal.id}
                 readOnly={readOnly}
