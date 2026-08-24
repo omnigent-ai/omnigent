@@ -476,6 +476,22 @@ def _get_head_db_revision(db_uri: str) -> str:
     return head
 
 
+def _revision_unknown_to_this_client(revision: str, db_uri: str) -> bool:
+    """
+    Whether *revision* exists in this build's migrations at all.
+
+    A revision recorded by a newer omnigent build is absent from this
+    build's script map; detecting that distinguishes "database ahead of
+    the client" (fix: upgrade the client) from "database behind" (fix:
+    migrate), which share only the ``current != head`` observable.
+    """
+    from alembic.script import ScriptDirectory
+
+    config = _build_alembic_config(db_uri)
+    script = ScriptDirectory.from_config(config)
+    return revision not in {rev.revision for rev in script.walk_revisions()}
+
+
 def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
     """
     Bring a fresh or stale database to head before the server starts.
@@ -504,6 +520,22 @@ def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
     if current is None:
         _run_migrations(engine, db_uri)
         return
+
+    if current != head and _revision_unknown_to_this_client(current, db_uri):
+        # A database written by a NEWER omnigent contains revisions this
+        # build's migrations cannot name, so the automatic upgrade below
+        # cannot resolve it -- Alembic fails with "Can't locate revision"
+        # and the generic handler misreports that as a stale schema with
+        # retry advice that can never work. Say what actually happened
+        # (#4963).
+        raise RuntimeError(
+            f"Omnigent database schema was written by a newer omnigent "
+            f"(found revision {current!r}, this build only knows up to {head!r}). "
+            f"Upgrade omnigent to a version at or beyond the one that wrote "
+            f"this database, then try again. (Running an older omnigent against "
+            f"a newer database is unsupported; the suggested db-upgrade cannot "
+            f"resolve revisions this build does not contain.)"
+        )
 
     if current != head:
         _logger.warning(
