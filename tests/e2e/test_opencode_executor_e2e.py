@@ -134,6 +134,7 @@ def test_opencode_run_turn_streams_text_against_real_binary(
 
     Skipped without ``OMNIGENT_E2E_OPENCODE=1`` and the binary.
     """
+
     async def _run() -> list[ExecutorEvent]:
         try:
             return await _collect_turn(
@@ -181,6 +182,7 @@ def test_opencode_run_turn_session_resume_carries_history(
 
     Skipped without ``OMNIGENT_E2E_OPENCODE=1`` and the binary.
     """
+
     async def _run_resume() -> list[ExecutorEvent]:
         try:
             await _collect_turn(
