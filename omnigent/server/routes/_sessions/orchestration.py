@@ -33,6 +33,7 @@ from omnigent.entities import (
     MessageData,
     NewConversationItem,
     ResourceEventData,
+    TurnOperation,
 )
 from omnigent.entities.conversation import (
     FunctionCallData,
@@ -321,6 +322,13 @@ from omnigent.server.schemas import (
     SessionUsageEvent,
     SkillSummary,
 )
+from omnigent.server.turn_operation_coordinator import (
+    RunnerOperationDispatchUnknown,
+    RunnerOperationProtocolError,
+    RunnerOperationRejected,
+    RunnerOperationUnavailable,
+    TurnOperationCoordinator,
+)
 from omnigent.session_lifecycle import (
     labels_with_closed_status,
     title_without_closed_marker,
@@ -340,6 +348,7 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.turn_operation_store import TurnOperationStore
 from omnigent.telemetry import emit as _tel_emit
 from omnigent.telemetry.events import SessionCreatedEvent as _TelSessionCreatedEvent
 from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
@@ -4594,6 +4603,45 @@ def _runner_reject_detail(response: httpx.Response) -> str:
     return f"{code}: {detail}" if code else detail
 
 
+async def _dispatch_durable_turn_operation(
+    session_id: str,
+    operation_id: str,
+    store: TurnOperationStore,
+    runner_client: httpx.AsyncClient,
+    conversation_store: ConversationStore,
+) -> TurnOperation:
+    """Dispatch one prepared operation and retain ambiguity for replay."""
+    coordinator = TurnOperationCoordinator(
+        store,
+        runner_client,
+        timeout=60.0,
+    )
+    try:
+        return await coordinator.dispatch(operation_id, session_id)
+    except RunnerOperationRejected as exc:
+        error = ErrorDetail(code="runner_rejected_event", message=str(exc))
+        await _persist_session_status_error_labels(session_id, error, conversation_store)
+        _publish_status(session_id, "failed", error)
+        raise OmnigentError(
+            f"Runner rejected the message: {exc}",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        ) from exc
+    except RunnerOperationDispatchUnknown as exc:
+        _publish_status(session_id, "idle")
+        raise OmnigentError(
+            "Runner acceptance is unknown; retry this operation with the same "
+            "Idempotency-Key to reconcile it safely.",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        ) from exc
+    except (RunnerOperationUnavailable, RunnerOperationProtocolError) as exc:
+        _publish_status(session_id, "idle")
+        raise OmnigentError(
+            "Runner operation status is unavailable; retry this operation with "
+            "the same Idempotency-Key.",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        ) from exc
+
+
 async def _forward_event_to_runner(
     session_id: str,
     conv: Conversation,
@@ -4606,6 +4654,8 @@ async def _forward_event_to_runner(
     has_mcp_servers: bool = False,
     created_by: str | None = None,
     host_store: HostStore | None = None,
+    turn_operation: TurnOperation | None = None,
+    turn_operation_store: TurnOperationStore | None = None,
 ) -> str:
     """
     Persist a user event and forward it to the runner.
@@ -4641,18 +4691,56 @@ async def _forward_event_to_runner(
     """
     import uuid
 
-    turn_id = f"turn_{uuid.uuid4().hex}"
+    if (turn_operation is None) != (turn_operation_store is None):
+        raise ValueError("turn operation and store must be supplied together")
+    durable_store = cast(TurnOperationStore, turn_operation_store)
+    turn_id = (
+        f"turn_{turn_operation.id}" if turn_operation is not None else f"turn_{uuid.uuid4().hex}"
+    )
     item = _build_new_item(body, turn_id, created_by=created_by)
-    persisted_items = await asyncio.to_thread(
-        conversation_store.append,
-        session_id,
-        [item],
+    if turn_operation is not None and turn_operation.item_id is not None:
+        if turn_operation.dispatch_request_json is None:
+            raise ValueError("prepared turn operation has no runner request")
+        try:
+            frozen_runner_body = json.loads(turn_operation.dispatch_request_json)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("prepared turn operation runner request is invalid") from exc
+        if not isinstance(frozen_runner_body, dict):
+            raise ValueError("prepared turn operation runner request is not an object")
+        persisted, _ = await asyncio.to_thread(
+            conversation_store.append_idempotent,
+            session_id,
+            item,
+            turn_operation.item_id,
+        )
+        await _seed_missing_title_from_user_message(conv, item, conversation_store)
+        await asyncio.to_thread(
+            durable_store.mark_input_persisted,
+            turn_operation.id,
+            persisted.id,
+            frozen_runner_body,
+        )
+        await _dispatch_durable_turn_operation(
+            session_id,
+            turn_operation.id,
+            durable_store,
+            runner_client,
+            conversation_store,
+        )
+        _publish_input_consumed(session_id, persisted)
+        return persisted.id
+
+    persisted_items = (
+        []
+        if turn_operation is not None
+        else await asyncio.to_thread(conversation_store.append, session_id, [item])
     )
-    await _seed_missing_title_from_user_message(
-        conv,
-        item,
-        conversation_store,
-    )
+    if turn_operation is None:
+        await _seed_missing_title_from_user_message(
+            conv,
+            item,
+            conversation_store,
+        )
     # Don't publish status="running" or input.consumed here —
     # wait until after the forward to the runner succeeds.
     # Publishing early causes the REPL to start its streaming
@@ -4721,7 +4809,9 @@ async def _forward_event_to_runner(
         # cache the runner reloads history (which includes this item in
         # PRE-resolution form) and drops it by id, appending its own
         # resolved copy — id-based dedup, not a role/content guess.
-        "persisted_item_id": persisted_items[0].id,
+        "persisted_item_id": (
+            turn_operation.id if turn_operation is not None else persisted_items[0].id
+        ),
     }
     # Persist the turn-initiating actor so /policies/evaluate and MCP
     # tools/call can read it back on any server replica.  Skip system-driven
@@ -5047,48 +5137,65 @@ async def _forward_event_to_runner(
     if _effective_harness is not None and _effective_harness != "auto":
         runner_body["harness_override"] = _effective_harness
 
+    if turn_operation is not None:
+        await asyncio.to_thread(
+            durable_store.prepare_input,
+            turn_operation.id,
+            turn_operation.id,
+            runner_body,
+        )
+        persisted, _ = await asyncio.to_thread(
+            conversation_store.append_idempotent,
+            session_id,
+            item,
+            turn_operation.id,
+        )
+        persisted_items = [persisted]
+        await _seed_missing_title_from_user_message(conv, item, conversation_store)
+        await asyncio.to_thread(
+            durable_store.mark_input_persisted,
+            turn_operation.id,
+            persisted.id,
+            runner_body,
+        )
+
     # The runner's sessions-native POST returns 202 immediately
     # and starts the turn as a background task. No streaming
     # response to drain — events flow through GET /stream.
     try:
-        _forward_resp = await runner_client.post(
-            f"/v1/sessions/{session_id}/events",
-            json=runner_body,
-            timeout=_RUNNER_FORWARD_TIMEOUT,
-        )
-        # httpx only raises on transport errors, so a rejection (e.g. a 400 on a
-        # malformed body, or a 501 from a runner with no process manager) would
-        # otherwise read as a started turn: input.consumed would tell the client
-        # the runner has the message and the session would sit "running" until
-        # something else moved it. The turn's own failures do NOT come back here
-        # — the runner accepts with 202 and reports them over the relay — so
-        # this only catches "the runner never took the message". Checked on the
-        # status rather than via ``raise_for_status`` so the runner-client fakes
-        # that only expose ``status_code`` behave as they do in production.
-        if _forward_resp.status_code >= 400:
-            # The live runner took nothing, so ``idle`` would read as a finished
-            # turn that never ran. Persist the reason: the status edge is
-            # SSE-only and would vanish on reload. Not strictly terminal — the
-            # item stays persisted, so a later reconnect can still replay it as
-            # a recovery turn.
-            _reject_detail = _runner_reject_detail(_forward_resp)
-            _logger.warning(
-                "Runner rejected forwarded event for session=%s status=%s detail=%s",
+        if turn_operation is not None:
+            await _dispatch_durable_turn_operation(
                 session_id,
-                _forward_resp.status_code,
-                _reject_detail,
+                turn_operation.id,
+                durable_store,
+                runner_client,
+                conversation_store,
             )
-            _reject_error = ErrorDetail(code="runner_rejected_event", message=_reject_detail)
-            # Persist before publishing: a client that reloads on the ``failed``
-            # edge must not race a snapshot that has no ``last_task_error`` yet.
-            await _persist_session_status_error_labels(
-                session_id, _reject_error, conversation_store
+        else:
+            _forward_resp = await runner_client.post(
+                f"/v1/sessions/{session_id}/events",
+                json=runner_body,
+                timeout=_RUNNER_FORWARD_TIMEOUT,
             )
-            _publish_status(session_id, "failed", _reject_error)
-            raise OmnigentError(
-                f"Runner rejected the message: {_reject_detail}",
-                code=ErrorCode.RUNNER_UNAVAILABLE,
-            )
+            # httpx only raises on transport errors, so a rejection (e.g. a 400
+            # on a malformed body) would otherwise read as a started turn.
+            if _forward_resp.status_code >= 400:
+                _reject_detail = _runner_reject_detail(_forward_resp)
+                _logger.warning(
+                    "Runner rejected forwarded event for session=%s status=%s detail=%s",
+                    session_id,
+                    _forward_resp.status_code,
+                    _reject_detail,
+                )
+                _reject_error = ErrorDetail(code="runner_rejected_event", message=_reject_detail)
+                await _persist_session_status_error_labels(
+                    session_id, _reject_error, conversation_store
+                )
+                _publish_status(session_id, "failed", _reject_error)
+                raise OmnigentError(
+                    f"Runner rejected the message: {_reject_detail}",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                )
         # Publish input.consumed AFTER the forward succeeds —
         # the runner has the message and will start the turn.
         _publish_input_consumed(session_id, persisted_items[0])
@@ -5289,6 +5396,8 @@ async def _dispatch_session_event_to_runner_impl(
     runner_router: RunnerRouter | None = None,
     native_terminal_ready: bool = False,
     host_store: HostStore | None = None,
+    turn_operation: TurnOperation | None = None,
+    turn_operation_store: TurnOperationStore | None = None,
 ) -> _SessionEventDispatchResult:
     """
     Forward an item-event to the runner with harness-aware dispatch.
@@ -5366,6 +5475,12 @@ async def _dispatch_session_event_to_runner_impl(
         (claude-native message bypass).
     """
     if body.type == "message" and _is_native_terminal_session(conv):
+        if turn_operation is not None:
+            raise OmnigentError(
+                "Durable turn operations do not yet support transcript-owned "
+                "native terminal sessions.",
+                code=ErrorCode.INVALID_INPUT,
+            )
         # Validate before touching the runner. The ensure probe is only
         # for syntactically valid user messages; assistant/system-shaped
         # inputs should still fail locally without creating terminals.
@@ -5587,6 +5702,8 @@ async def _dispatch_session_event_to_runner_impl(
         has_mcp_servers=has_mcp_servers,
         created_by=created_by,
         host_store=host_store,
+        turn_operation=turn_operation,
+        turn_operation_store=turn_operation_store,
     )
     return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
 

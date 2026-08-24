@@ -2001,8 +2001,54 @@ class SqlAlchemyConversationStore(ConversationStore):
         :returns: The persisted :class:`ConversationItem` list
             with store-assigned IDs and timestamps.
         """
+        persisted, _ = self._append_with_ids(
+            conversation_id,
+            items,
+            [generate_item_id(item.type) for item in items],
+        )
+        return persisted
+
+    def append_idempotent(
+        self,
+        conversation_id: str,
+        item: NewConversationItem,
+        item_id: str,
+    ) -> tuple[ConversationItem, bool]:
+        """Append one deterministic item, accepting only exact replays."""
+        persisted, replayed_ids = self._append_with_ids(
+            conversation_id,
+            [item],
+            [item_id],
+            replay_exact=True,
+        )
+        return persisted[0], item_id not in replayed_ids
+
+    @staticmethod
+    def _validate_idempotent_item(
+        existing: ConversationItem,
+        expected: NewConversationItem,
+    ) -> None:
+        if (
+            existing.type != expected.type
+            or existing.response_id != expected.response_id
+            or existing.data != expected.data
+            or existing.created_by != expected.created_by
+        ):
+            raise ValueError("conversation item id was already used for different content")
+
+    def _append_with_ids(
+        self,
+        conversation_id: str,
+        items: list[NewConversationItem],
+        item_ids: list[str],
+        *,
+        replay_exact: bool = False,
+    ) -> tuple[list[ConversationItem], set[str]]:
+        if len(items) != len(item_ids):
+            raise ValueError("one item id is required per conversation item")
         now = now_epoch()
         persisted: list[ConversationItem] = []
+        replayed_ids: set[str] = set()
 
         with self._conv_session("append_conversation_items") as session:
             # Lock the conversation row to serialize position writes.
@@ -2010,9 +2056,29 @@ class SqlAlchemyConversationStore(ConversationStore):
             # SQLite the database-level lock already serializes.
             self._lock_conversation(session, conversation_id)
 
+            existing_by_id: dict[str, ConversationItem] = {}
+            if replay_exact and item_ids:
+                existing_rows = (
+                    session.execute(
+                        select(SqlConversationItem).where(
+                            SqlConversationItem.workspace_id == current_workspace_id(),
+                            SqlConversationItem.conversation_id == conversation_id,
+                            SqlConversationItem.id.in_(item_ids),
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                decoded = self._decode_item_data_batch([row.data for row in existing_rows])
+                existing_by_id = {
+                    row.id: _to_item(row, data)
+                    for row, data in zip(existing_rows, decoded, strict=True)
+                }
+            will_insert = any(item_id not in existing_by_id for item_id in item_ids)
+
             # Bump updated_at on the conversation.
             conv_row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
-            if conv_row is not None:
+            if conv_row is not None and will_insert:
                 conv_row.updated_at = now
 
             # Allocate item positions from the conversation's maintained
@@ -2028,7 +2094,13 @@ class SqlAlchemyConversationStore(ConversationStore):
             # existed have next_position = NULL; fall back to a one-time
             # MAX(position) scan (coalesce to -1 so the first item gets 0), then
             # persist the counter below so every later append is scan-free.
-            if conv_row is not None and conv_row.next_position is not None:
+            if not will_insert:
+                next_pos = (
+                    conv_row.next_position
+                    if conv_row is not None and conv_row.next_position is not None
+                    else 0
+                )
+            elif conv_row is not None and conv_row.next_position is not None:
                 next_pos = conv_row.next_position
             else:
                 next_pos = (
@@ -2042,7 +2114,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
 
             fts_rows: list[tuple[str, str, str]] = []
-            for item in items:
+            for item, item_id in zip(items, item_ids, strict=True):
+                existing = existing_by_id.get(item_id)
+                if existing is not None:
+                    self._validate_idempotent_item(existing, item)
+                    persisted.append(existing)
+                    replayed_ids.add(item_id)
+                    continue
                 position = next_pos
                 next_pos += 1
                 data_dict = item.data.model_dump(exclude_none=True)
@@ -2052,7 +2130,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # the whole INSERT aborts and the item never persists.
                 data = self._encode_item_data(strip_nul_bytes(json.dumps(data_dict)))
                 search = self._item_search_text(item)
-                item_id = generate_item_id(item.type)
                 row = SqlConversationItem(
                     id=item_id,
                     conversation_id=conversation_id,
@@ -2089,10 +2166,10 @@ class SqlAlchemyConversationStore(ConversationStore):
 
             # Persist the advanced counter so the next append reads it instead
             # of scanning; this also lazily backfills a pre-counter conversation.
-            if conv_row is not None:
+            if conv_row is not None and will_insert:
                 conv_row.next_position = next_pos
 
-        return persisted
+        return persisted, replayed_ids
 
     def list_projects(
         self,

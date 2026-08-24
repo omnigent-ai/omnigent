@@ -6,18 +6,22 @@ import asyncio
 import secrets
 import weakref
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any, Literal, cast
 
 import httpx
 from fastapi import (
     APIRouter,
+    Header,
     Request,
 )
 from fastapi.responses import StreamingResponse
 
 from omnigent.entities import (
+    TURN_OPERATION_TERMINAL_STATES,
     ErrorData,
     NewConversationItem,
+    TurnOperation,
 )
 from omnigent.entities.conversation import (
     parse_item_data,
@@ -49,6 +53,7 @@ from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
     LEVEL_READ,
+    RESERVED_USER_LOCAL,
     AuthProvider,
 )
 from omnigent.server.background_session_titles import (
@@ -201,6 +206,13 @@ from omnigent.server.schemas import (
     ErrorDetail,
     McpServerStartup,
     SessionEventInput,
+    TurnOperationRequest,
+    TurnOperationResponse,
+)
+from omnigent.server.turn_operation_coordinator import (
+    RunnerOperationProtocolError,
+    RunnerOperationUnavailable,
+    TurnOperationCoordinator,
 )
 from omnigent.session_lifecycle import (
     is_session_closed,
@@ -210,6 +222,11 @@ from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import host_is_live
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.turn_operation_store import (
+    TurnOperationConflict,
+    TurnOperationStateError,
+    TurnOperationStore,
+)
 from omnigent.telemetry import emit as _tel_emit
 from omnigent.telemetry.events import SessionDeletedEvent as _TelSessionDeletedEvent
 from omnigent.telemetry.events import SessionStoppedEvent as _TelSessionStoppedEvent
@@ -220,6 +237,34 @@ _retry_recovery_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )
 _retry_recovery_tasks: dict[str, asyncio.Task[dict[str, bool | str]]] = {}
+
+
+@dataclass
+class _TurnOperationSubmission:
+    request: dict[str, Any]
+    idempotency_key: str
+    operation: TurnOperation | None = None
+    created: bool = False
+
+
+def _turn_operation_response(
+    operation: TurnOperation,
+    *,
+    replayed: bool | None = None,
+) -> TurnOperationResponse:
+    return TurnOperationResponse(
+        id=operation.id,
+        session_id=operation.conversation_id,
+        state=cast(Any, operation.state),
+        item_id=operation.item_id,
+        dispatch_attempts=operation.dispatch_attempts,
+        created_at=operation.created_at,
+        updated_at=operation.updated_at,
+        terminal_at=operation.terminal_at,
+        error_code=operation.error_code,
+        error=operation.error,
+        replayed=replayed,
+    )
 
 
 def _retry_recovery_lock(session_id: str) -> asyncio.Lock:
@@ -363,6 +408,7 @@ def register_events_routes(
     host_registry: HostRegistry | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
     runner_tunnel_tokens: frozenset[str] | None = None,
+    turn_operation_store: TurnOperationStore | None = None,
 ) -> None:
     """Register the events, stream, and delete routes on router."""
 
@@ -472,6 +518,10 @@ def register_events_routes(
             control and internal transient events.
         :raises OmnigentError: 404 if no session exists.
         """
+        turn_submission = cast(
+            _TurnOperationSubmission | None,
+            getattr(request.state, "turn_operation_submission", None),
+        )
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
             user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
@@ -726,6 +776,39 @@ def register_events_routes(
             # persist or relay to the harness (which rejects
             # ``function_call`` as an unknown inbound event type).
             return {"verdict": "allow"}
+
+        if turn_submission is not None:
+            if turn_operation_store is None:
+                raise OmnigentError(
+                    "Durable turn operations are not configured on this server.",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                )
+            if _is_native_terminal_session(conv):
+                raise OmnigentError(
+                    "Durable turn operations do not yet support transcript-owned "
+                    "native terminal sessions.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            principal = user_id or RESERVED_USER_LOCAL
+            try:
+                operation, created = await asyncio.to_thread(
+                    turn_operation_store.create_or_get,
+                    conversation_id=session_id,
+                    principal=principal,
+                    idempotency_key=turn_submission.idempotency_key,
+                    request=turn_submission.request,
+                )
+            except TurnOperationConflict as exc:
+                raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
+            except ValueError as exc:
+                raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+            turn_submission.operation = operation
+            turn_submission.created = created
+            if operation.state in TURN_OPERATION_TERMINAL_STATES:
+                terminal_response: dict[str, bool | str] = {"queued": True}
+                if operation.item_id is not None:
+                    terminal_response["item_id"] = operation.item_id
+                return terminal_response
 
         if body.type == _INTERRUPT_TYPE:
             _publish_interrupted(session_id)
@@ -1706,23 +1789,36 @@ def register_events_routes(
             if pending_background_title is not None:
                 pending_background_title.schedule()
             return {"queued": True, "item_id": item_id}
-        dispatch = await _dispatch_session_event_to_runner(
-            session_id,
-            conv,
-            body,
-            conversation_store,
-            runner_client,
-            agent_name=_agent.name if _agent else None,
-            file_store=file_store,
-            artifact_store=artifact_store,
-            has_mcp_servers=_has_mcp_servers,
-            created_by=created_by,
-            runner_router=runner_router,
-            native_terminal_ready=native_terminal_ready,
-            # Read only for the gateway-backing check that decides which router
-            # serves this turn; absent, routing keeps its default posture.
-            host_store=getattr(request.app.state, "host_store", None),
-        )
+        try:
+            dispatch = await _dispatch_session_event_to_runner(
+                session_id,
+                conv,
+                body,
+                conversation_store,
+                runner_client,
+                agent_name=_agent.name if _agent else None,
+                file_store=file_store,
+                artifact_store=artifact_store,
+                has_mcp_servers=_has_mcp_servers,
+                created_by=created_by,
+                runner_router=runner_router,
+                native_terminal_ready=native_terminal_ready,
+                # Read only for the gateway-backing check that decides which router
+                # serves this turn; absent, routing keeps its default posture.
+                host_store=getattr(request.app.state, "host_store", None),
+                turn_operation=(
+                    turn_submission.operation if turn_submission is not None else None
+                ),
+                turn_operation_store=(
+                    turn_operation_store if turn_submission is not None else None
+                ),
+            )
+        except TurnOperationStateError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
+        except ValueError as exc:
+            if turn_submission is None:
+                raise
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
         if pending_background_title is not None:
             pending_background_title.schedule()
         response: dict[str, Any] = {"queued": True}
@@ -1737,6 +1833,83 @@ def register_events_routes(
         if dispatch.pending_id is not None:
             response["pending_id"] = dispatch.pending_id
         return response
+
+    @router.post(
+        "/sessions/{session_id}/turn-operations",
+        status_code=202,
+        response_model=TurnOperationResponse,
+    )
+    async def post_turn_operation(
+        request: Request,
+        session_id: str,
+        body: TurnOperationRequest,
+        idempotency_key: str = Header(alias="Idempotency-Key"),
+    ) -> TurnOperationResponse:
+        """Submit or exactly replay one durable user-message turn."""
+        _require_user(request, auth_provider)
+        submission = _TurnOperationSubmission(
+            request=body.model_dump(mode="json", exclude_none=True),
+            idempotency_key=idempotency_key,
+        )
+        request.state.turn_operation_submission = submission
+        try:
+            result = await post_event(request, session_id, body.event)
+        finally:
+            del request.state.turn_operation_submission
+        if result.get("denied") is True:
+            raise OmnigentError(
+                str(result.get("reason") or "Denied by policy"),
+                code=ErrorCode.FORBIDDEN,
+            )
+        if submission.operation is None or turn_operation_store is None:
+            raise RuntimeError("turn operation submission completed without a journal row")
+        operation = await asyncio.to_thread(
+            turn_operation_store.get,
+            submission.operation.id,
+        )
+        if operation is None:
+            raise RuntimeError("turn operation disappeared after submission")
+        return _turn_operation_response(operation, replayed=not submission.created)
+
+    @router.get(
+        "/sessions/{session_id}/turn-operations/{operation_id}",
+        response_model=TurnOperationResponse,
+    )
+    async def get_turn_operation(
+        request: Request,
+        session_id: str,
+        operation_id: str,
+    ) -> TurnOperationResponse:
+        """Return and, when possible, reconcile one durable turn."""
+        user_id = _require_user(request, auth_provider)
+        await _require_access_and_level(
+            user_id,
+            session_id,
+            LEVEL_EDIT,
+            permission_store,
+            conversation_store,
+        )
+        if turn_operation_store is None:
+            raise OmnigentError(
+                "Durable turn operations are not configured on this server.",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            )
+        operation = await asyncio.to_thread(turn_operation_store.get, operation_id)
+        if operation is None or operation.conversation_id != session_id:
+            raise _session_not_found()
+        if operation.state not in TURN_OPERATION_TERMINAL_STATES:
+            runner_client = await _get_runner_client(session_id, runner_router)
+            if runner_client is not None:
+                coordinator = TurnOperationCoordinator(turn_operation_store, runner_client)
+                try:
+                    operation = await coordinator.reconcile(operation_id, session_id)
+                except (RunnerOperationUnavailable, RunnerOperationProtocolError):
+                    # Status reads remain available from the durable journal
+                    # while the runner is transiently unreachable.
+                    operation = await asyncio.to_thread(turn_operation_store.get, operation_id)
+                    if operation is None:
+                        raise _session_not_found() from None
+        return _turn_operation_response(operation)
 
     # ── GET /sessions/{session_id}/stream ────────────────────────
 

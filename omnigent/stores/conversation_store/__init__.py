@@ -599,6 +599,23 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def append_idempotent(
+        self,
+        conversation_id: str,
+        item: NewConversationItem,
+        item_id: str,
+    ) -> tuple[ConversationItem, bool]:
+        """Append one item under a caller-bound id, or replay it exactly.
+
+        :param conversation_id: Owning conversation id.
+        :param item: Item whose semantic fields must match on replay.
+        :param item_id: Stable 32-character UUID hex identity.
+        :returns: ``(item, created)``; ``created`` is false on exact replay.
+        :raises ValueError: If ``item_id`` already identifies different data.
+        """
+        ...
+
+    @abstractmethod
     def list_conversations(
         self,
         limit: int = 20,
