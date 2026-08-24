@@ -1046,12 +1046,14 @@ async def forward_claude_transcript_to_session(
                     session_id,
                     bridge_dir,
                     exc_info=True,
+                    extra={"session_id": session_id},
                 )
             except Exception:
                 _logger.exception(
                     "Claude transcript forwarder loop failed; session=%s bridge_dir=%s",
                     session_id,
                     bridge_dir,
+                    extra={"session_id": session_id},
                 )
             await asyncio.sleep(poll_interval_s)
 
@@ -1379,6 +1381,7 @@ async def _forward_available_subagents(
                     subagent_id,
                     decision.attempts,
                     _http_status_for_log(exc),
+                    extra={"session_id": parent_session_id},
                 )
                 # Dead-letter the dropped payload for recovery (#1120; replay #1579).
                 append_dead_letter(
@@ -1423,6 +1426,7 @@ async def _forward_available_subagents(
                 decision.delay_s,
                 _http_status_for_log(exc),
                 exc_info=True,
+                extra={"session_id": parent_session_id},
             )
             continue
         start_retry_tracker.clear(retry_key)
@@ -1917,6 +1921,7 @@ async def _forward_session_cost(
             _http_status_for_log(exc),
             delay,
             exc_info=True,
+            extra={"session_id": session_id},
         )
         return
     dedupe.cost_retry_failures = 0
@@ -2037,6 +2042,7 @@ async def supervise_forwarder(
                 "session=%s bridge_dir=%s",
                 session_id,
                 bridge_dir,
+                extra={"session_id": session_id},
             )
         except asyncio.CancelledError:
             raise
@@ -2055,6 +2061,7 @@ async def supervise_forwarder(
                 session_id,
                 bridge_dir,
                 exc_info=crash_exc,
+                extra={"session_id": session_id},
             )
         await _supervisor_sleep(backoff_s)
         backoff_s = min(backoff_s * 2.0, _SUPERVISOR_MAX_BACKOFF_S)
@@ -2123,6 +2130,7 @@ async def _maybe_rotate_session_on_clear(
             "Claude /clear rotation failed; consuming the clear hook to avoid a "
             "re-rotation loop. old_session=%s",
             session_id,
+            extra={"session_id": session_id},
         )
     await _write_hook_state_async(bridge_dir, durable)
     reset_transcript_forward_state(bridge_dir, reset_hooks=False)
@@ -2250,6 +2258,7 @@ async def _create_clear_replacement_session(
             new_session_id,
             clear_resp.status_code,
             clear_resp.text,
+            extra={"session_id": old_session_id},
         )
     return new_session_id
 
@@ -2313,6 +2322,7 @@ async def _maybe_rotate_session_on_fork(
             "Claude /fork rotation failed; consuming the fork hook to avoid a "
             "re-rotation loop. old_session=%s",
             session_id,
+            extra={"session_id": session_id},
         )
     await _write_hook_state_async(bridge_dir, durable)
     await _seed_fork_transcript_forward_state(
@@ -2384,6 +2394,7 @@ async def _create_fork_replacement_session(
             new_session_id,
             clear_resp.status_code,
             clear_resp.text,
+            extra={"session_id": old_session_id},
         )
     return new_session_id
 
@@ -2514,12 +2525,14 @@ async def _maybe_mirror_external_session_id(
                 exc.response.status_code,
                 session_id,
                 claude_sid,
+                extra={"session_id": session_id},
             )
             return True
         _logger.warning(
             "Transient Omnigent error PATCHing external_session_id (%s); session=%s — will retry",
             exc.response.status_code,
             session_id,
+            extra={"session_id": session_id},
         )
         return False
     except httpx.HTTPError:
@@ -2527,6 +2540,7 @@ async def _maybe_mirror_external_session_id(
             "Transient transport error PATCHing external_session_id; session=%s — will retry",
             session_id,
             exc_info=True,
+            extra={"session_id": session_id},
         )
         return False
     return True
@@ -2712,6 +2726,7 @@ async def _forward_available_status_events(
                 record.event_name,
                 status,
                 record.transcript_path,
+                extra={"session_id": session_id},
             )
             durable = next_durable
             await _write_hook_state_async(bridge_dir, durable)
@@ -2738,6 +2753,7 @@ async def _forward_available_status_events(
                         record.event_cursor,
                         compaction_status,
                         exc_info=True,
+                        extra={"session_id": session_id},
                     )
                 if compaction_status == "in_progress":
                     # ``PreCompact`` mints a durable pending token that the
@@ -2833,6 +2849,7 @@ async def _forward_available_status_events(
                                         seq,
                                         decision.attempts,
                                         _http_status_for_log(exc),
+                                        extra={"session_id": session_id},
                                     )
                                     # Fall through to advance the cursor.
                                 else:
@@ -2848,6 +2865,7 @@ async def _forward_available_status_events(
                                         decision.delay_s,
                                         _http_status_for_log(exc),
                                         exc_info=True,
+                                        extra={"session_id": session_id},
                                     )
                                     return durable
                         except Exception:  # noqa: BLE001
@@ -2924,6 +2942,7 @@ async def _forward_available_status_events(
                         session_id,
                         record.event_cursor,
                         exc_info=True,
+                        extra={"session_id": session_id},
                     )
             durable = next_durable
             await _write_hook_state_async(bridge_dir, durable)
@@ -2960,6 +2979,7 @@ async def _forward_available_status_events(
                     status,
                     decision.attempts,
                     _http_status_for_log(exc),
+                    extra={"session_id": session_id},
                 )
                 if status != "failed":
                     await _post_forwarder_failed_status(
@@ -2985,6 +3005,7 @@ async def _forward_available_status_events(
                 decision.delay_s,
                 _http_status_for_log(exc),
                 exc_info=True,
+                extra={"session_id": session_id},
             )
             return durable
         retry_tracker.clear(retry_key)
@@ -3206,6 +3227,7 @@ async def _handle_compact_summary_item(
                 session_id,
                 bridge_dir,
                 _compaction_skip_stats.precompact_miss,
+                extra={"session_id": session_id},
             )
         else:
             _compaction_skip_stats.expected_skip += 1
@@ -3215,6 +3237,7 @@ async def _handle_compact_summary_item(
                 session_id,
                 bridge_dir,
                 _compaction_skip_stats.expected_skip,
+                extra={"session_id": session_id},
             )
         await _note_transcript_summary_without_token(bridge_dir)
         return True
@@ -3254,6 +3277,7 @@ async def _handle_compact_summary_item(
             decision.delay_s,
             _http_status_for_log(exc),
             exc_info=True,
+            extra={"session_id": session_id},
         )
         return False
     except Exception:  # noqa: BLE001
@@ -3409,6 +3433,7 @@ async def _forward_available_items(
                     item.item_type,
                     decision.attempts,
                     _http_status_for_log(exc),
+                    extra={"session_id": session_id},
                 )
                 # Dead-letter the dropped item for recovery (#1120; replay #1579).
                 append_dead_letter(
@@ -3463,6 +3488,7 @@ async def _forward_available_items(
                     item.item_type,
                     _http_status_for_log(exc),
                     exc_info=True,
+                    extra={"session_id": session_id},
                 )
                 retry_tracker.clear(retry_key)
                 seen.add(item.source_id)
@@ -3492,6 +3518,7 @@ async def _forward_available_items(
                 decision.delay_s,
                 _http_status_for_log(exc),
                 exc_info=True,
+                extra={"session_id": session_id},
             )
             return updated
         retry_tracker.clear(retry_key)
@@ -3591,6 +3618,7 @@ async def _forward_available_items(
                 bridge_dir,
                 _http_status_for_log(exc),
                 exc_info=True,
+                extra={"session_id": session_id},
             )
     # Report the transcript's model verbatim. This transcript-derived
     # observation only fires when a turn produces a fresh
@@ -3714,6 +3742,7 @@ def _validated_hook_state(
             session_id,
             bridge_dir,
             state.byte_offset,
+            extra={"session_id": session_id},
         )
     elif state.cursor_fingerprint is None:
         _logger.warning(
@@ -3722,6 +3751,7 @@ def _validated_hook_state(
             session_id,
             bridge_dir,
             state.byte_offset,
+            extra={"session_id": session_id},
         )
     elif current_fingerprint == state.cursor_fingerprint:
         return state
@@ -3732,6 +3762,7 @@ def _validated_hook_state(
             session_id,
             bridge_dir,
             state.byte_offset,
+            extra={"session_id": session_id},
         )
     return HookForwardState(
         event_cursor=0,
@@ -3806,6 +3837,7 @@ def _validated_transcript_state(
             bridge_dir,
             state.transcript_path,
             state.byte_offset,
+            extra={"session_id": session_id},
         )
     elif state.cursor_fingerprint is None:
         if state.byte_offset == 0 and state.line_cursor == 0:
@@ -3830,6 +3862,7 @@ def _validated_transcript_state(
             bridge_dir,
             state.transcript_path,
             state.byte_offset,
+            extra={"session_id": session_id},
         )
     elif current_fingerprint == state.cursor_fingerprint:
         return state
@@ -3841,6 +3874,7 @@ def _validated_transcript_state(
             bridge_dir,
             state.transcript_path,
             state.byte_offset,
+            extra={"session_id": session_id},
         )
     end_offset = _transcript_end_offset(state.transcript_path)
     return TranscriptForwardState(
@@ -3908,6 +3942,7 @@ async def _post_clear_supersession(
             old_session_id,
             new_session_id,
             exc_info=True,
+            extra={"session_id": old_session_id},
         )
     notice = (
         "This conversation was ended by `/clear`. "
@@ -3936,6 +3971,7 @@ async def _post_clear_supersession(
             old_session_id,
             new_session_id,
             exc_info=True,
+            extra={"session_id": old_session_id},
         )
     try:
         event_resp = await client.post(
@@ -3952,6 +3988,7 @@ async def _post_clear_supersession(
             old_session_id,
             new_session_id,
             exc_info=True,
+            extra={"session_id": old_session_id},
         )
 
 
@@ -4097,6 +4134,7 @@ async def _forward_available_deltas(
                 delta.message_id,
                 delta.index,
                 _http_status_for_log(exc),
+                extra={"session_id": session_id},
             )
     updated = DeltaForwardState(byte_offset=result.byte_offset)
     await _write_delta_forward_state_async(bridge_dir, updated)
@@ -4268,6 +4306,7 @@ async def _forward_permission_mode_from_pane(
             session_id,
             mode,
             exc_info=True,
+            extra={"session_id": session_id},
         )
         return
     dedupe.posted_permission_mode = mode
@@ -4377,6 +4416,7 @@ async def _post_title_change_if_new(
             "list may show a stale title until the next poll",
             session_id,
             exc_info=True,
+            extra={"session_id": session_id},
         )
 
 
@@ -4429,6 +4469,7 @@ async def _post_model_change_if_new(
             "cost-budget gate may lag until the next poll",
             session_id,
             exc_info=True,
+            extra={"session_id": session_id},
         )
 
 
@@ -4667,6 +4708,7 @@ async def _maybe_sync_effort_from_slash_command(
             level,
             session_id,
             exc_info=True,
+            extra={"session_id": session_id},
         )
 
 
@@ -4708,6 +4750,7 @@ async def _post_forwarder_failed_status(
             bridge_dir,
             reason,
             exc_info=True,
+            extra={"session_id": session_id},
         )
 
 

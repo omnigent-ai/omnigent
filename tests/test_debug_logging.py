@@ -1,0 +1,221 @@
+"""Tests for the client-side debug-log sink."""
+
+from __future__ import annotations
+
+import json
+import logging
+
+import pytest
+
+from omnigent import debug_logging as dl
+
+_INSERT_URL = (
+    "https://3272836215725701.zerobus.us-west-2.cloud.databricks.com"
+    "/zerobus/v1/tables/omnigents.omnigent_daniel.omnigent_debug_logs/insert"
+)
+_TABLE = "omnigents.omnigent_daniel.omnigent_debug_logs"
+
+
+@pytest.fixture
+def _configured_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(dl.CLIENT_ID_ENV_VAR, "cid")
+    monkeypatch.setenv(dl.CLIENT_SECRET_ENV_VAR, "secret")
+    monkeypatch.setenv(dl.WORKSPACE_URL_ENV_VAR, "https://ws.cloud.databricks.com/")
+    monkeypatch.setenv(dl.ENDPOINT_ENV_VAR, _INSERT_URL)
+
+
+@pytest.fixture(autouse=True)
+def _clear_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in (
+        dl.CLIENT_ID_ENV_VAR,
+        dl.CLIENT_SECRET_ENV_VAR,
+        dl.WORKSPACE_URL_ENV_VAR,
+        dl.ENDPOINT_ENV_VAR,
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_disabled_without_env() -> None:
+    assert dl.config_from_env() is None
+
+
+def test_config_parses_table_and_workspace_id(_configured_env: None) -> None:
+    config = dl.config_from_env()
+    assert config is not None
+    assert config.table == _TABLE
+    assert config.workspace_id == "3272836215725701"
+    # Trailing slash on the workspace URL is trimmed so token minting can append.
+    assert config.workspace_url == "https://ws.cloud.databricks.com"
+
+
+def test_malformed_endpoint_disables(
+    monkeypatch: pytest.MonkeyPatch, _configured_env: None
+) -> None:
+    monkeypatch.setenv(dl.ENDPOINT_ENV_VAR, "https://host.example.com/no-tables-segment")
+    assert dl.config_from_env() is None
+
+
+def test_authorization_details_splits_catalog_schema_table(_configured_env: None) -> None:
+    config = dl.config_from_env()
+    assert config is not None
+    source = dl._TokenSource(config, client=None)  # type: ignore[arg-type]
+    by_type = {
+        entry["object_type"]: entry["object_full_path"]
+        for entry in json.loads(source._authorization_details())
+    }
+    assert by_type == {
+        "CATALOG": "omnigents",
+        "SCHEMA": "omnigents.omnigent_daniel",
+        "TABLE": _TABLE,
+    }
+
+
+def test_record_to_row_shape_and_coercions() -> None:
+    record = logging.LogRecord(
+        "omnigent.runner", logging.INFO, __file__, 10, "hello %s", ("world",), None, func="do_it"
+    )
+    record.event_name = "turn_started"
+    record.attributes = {"model": "claude-opus-4-8", "count": 3, "skip": None}
+
+    row = dl.record_to_row(record, source="runner")
+
+    assert row["message"] == "hello world"
+    assert row["source"] == "runner"
+    assert row["event_name"] == "turn_started"
+    assert row["app_version"] == dl.VERSION
+    # TIMESTAMP column wants epoch microseconds as an integer, not an ISO string.
+    assert isinstance(row["client_time"], int)
+    assert row["client_time"] == int(record.created * 1_000_000)
+    # MAP<STRING,STRING>: values coerced to str, null values dropped.
+    assert row["attributes"] == {"model": "claude-opus-4-8", "count": "3"}
+    assert set(row) == {
+        "session_id",
+        "turn_id",
+        "source",
+        "event_name",
+        "level",
+        "message",
+        "client_time",
+        "hostname",
+        "logger_name",
+        "func_name",
+        "app_version",
+        "stack_trace",
+        "attributes",
+        "log_id",
+        "user_id",
+    }
+
+
+def test_record_to_row_reads_session_id_from_extra() -> None:
+    # session_id is passed explicitly at the callsite via extra= and read off
+    # the record; there is no ambient contextvar fallback.
+    record = logging.LogRecord(
+        "omnigent.runner", logging.INFO, __file__, 1, "hi", (), None, func="f"
+    )
+    record.session_id = "conv_row"
+    row = dl.record_to_row(record, source="runner")
+    assert row["session_id"] == "conv_row"
+
+
+def test_record_to_row_null_correlation_without_extra() -> None:
+    record = logging.LogRecord("omnigent", logging.INFO, __file__, 1, "hi", (), None)
+    row = dl.record_to_row(record, source="server")
+    assert row["session_id"] is None
+    assert row["turn_id"] is None
+
+
+def test_record_to_row_without_event_or_attributes() -> None:
+    record = logging.LogRecord("omnigent", logging.DEBUG, __file__, 1, "freeform", (), None)
+    row = dl.record_to_row(record, source="host")
+    assert row["event_name"] is None
+    assert row["attributes"] == {}
+
+
+def test_record_to_row_captures_stack_trace() -> None:
+    try:
+        raise ValueError("boom")
+    except ValueError:
+        import sys
+
+        record = logging.LogRecord(
+            "omnigent", logging.ERROR, __file__, 1, "failed", (), sys.exc_info()
+        )
+    row = dl.record_to_row(record, source="server")
+    assert "ValueError: boom" in (row["stack_trace"] or "")
+
+
+def test_debug_event_builds_extra() -> None:
+    assert dl.debug_event("evt", a=1, b="x") == {
+        "event_name": "evt",
+        "attributes": {"a": 1, "b": "x"},
+    }
+
+
+def test_debug_event_includes_explicit_correlation() -> None:
+    extra = dl.debug_event("evt", session_id="conv_1", turn_id="turn_1", a=1)
+    assert extra == {
+        "event_name": "evt",
+        "attributes": {"a": 1},
+        "session_id": "conv_1",
+        "turn_id": "turn_1",
+    }
+
+
+def test_emit_revives_closed_uploader(_configured_env: None) -> None:
+    # dictConfig() (uvicorn) calls logging.shutdown() → close() on the handler,
+    # and os.fork() (the zygote) kills the thread — both leave it attached to
+    # root. A subsequent emit must revive it so records keep getting delivered
+    # instead of queuing forever.
+    config = dl.config_from_env()
+    assert config is not None
+    sink = dl.ZerobusLogHandler(config, "server")
+    try:
+        first_thread = sink._thread
+        assert first_thread.is_alive()
+        # Simulate dictConfig's close() of the handler.
+        sink.close()
+        assert sink._closed
+        assert not first_thread.is_alive()
+        # A subsequent record revives the worker (fresh thread) and enqueues.
+        record = logging.LogRecord("omnigent.x", logging.INFO, __file__, 1, "hi", (), None)
+        sink.emit(record)
+        assert not sink._closed
+        assert sink._thread is not first_thread
+        assert sink._thread.is_alive()
+    finally:
+        sink.close()
+
+
+def test_ignored_loggers_are_dropped() -> None:
+    # httpx/httpcore records are chatty HTTP-client noise and must be dropped;
+    # everything else is kept.
+    assert dl._is_ignored_logger("httpx")
+    assert dl._is_ignored_logger("httpx._client")
+    assert dl._is_ignored_logger("httpcore.connection")
+    assert not dl._is_ignored_logger("omnigent.server.routes.sessions")
+    assert not dl._is_ignored_logger("runner.native")
+
+
+def test_startup_probe_emits_sink_online(
+    _configured_env: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The startup probe emits a `sink_online` record so every boot has a
+    # definitive health signal (and revives the worker even when idle).
+    config = dl.config_from_env()
+    assert config is not None
+    sink = dl.ZerobusLogHandler(config, "server")
+    try:
+        with caplog.at_level(logging.INFO, logger="omnigent.debug_logging"):
+            sink._probe()
+        assert any(getattr(r, "event_name", None) == "sink_online" for r in caplog.records)
+    finally:
+        sink._probe_timer.cancel()
+        sink.close()
+
+
+def test_attach_is_noop_when_disabled() -> None:
+    target = logging.getLogger("test.debug_logging.disabled")
+    target.handlers.clear()
+    dl.attach_debug_log_sink([target], source="runner", level=logging.INFO)
+    assert not any(isinstance(h, dl.ZerobusLogHandler) for h in target.handlers)

@@ -413,6 +413,15 @@ def configure_process_logging(
             for handler in handlers:
                 _add_handler_once(logger, handler)
 
+    # Mirror the file handler's reach with the optional debug-log upload sink,
+    # so it captures the same records this process writes to disk.
+    from omnigent.debug_logging import attach_debug_log_sink
+
+    sink_targets = (
+        [logging.getLogger()] if root else [logging.getLogger(name) for name in logger_names]
+    )
+    attach_debug_log_sink(sink_targets, source=destination, level=resolved_level)
+
     logging.captureWarnings(True)
     return path
 
