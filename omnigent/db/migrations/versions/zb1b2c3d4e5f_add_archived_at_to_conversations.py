@@ -1,6 +1,6 @@
 """Add archived_at timestamp to conversations.
 
-Revision ID: za1b2c3d4e5f
+Revision ID: zb1b2c3d4e5f
 Revises: za2b3c4d5e6f
 Create Date: 2026-08-10 00:00:00.000000
 
@@ -16,7 +16,7 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "za1b2c3d4e5f"
+revision: str = "zb1b2c3d4e5f"
 down_revision: str | None = "za2b3c4d5e6f"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
