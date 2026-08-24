@@ -918,6 +918,8 @@ def _populate_codex_home_config(
 def materialize_codex_provider_config(
     codex_home: Path,
     config_overrides: Iterable[str],
+    *,
+    retry_policy: RetryPolicy | None = None,
 ) -> list[str]:
     """Move generated provider definitions into a private Codex config.
 
@@ -928,6 +930,8 @@ def materialize_codex_provider_config(
 
     :param codex_home: Private session ``CODEX_HOME`` directory.
     :param config_overrides: Pending Codex config override strings.
+    :param retry_policy: Omnigent retry policy to apply through Codex's native
+        provider settings. ``None`` uses :class:`RetryPolicy` defaults.
     :returns: Overrides safe to retain in subprocess arguments.
     """
     codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -941,9 +945,9 @@ def materialize_codex_provider_config(
             provider_overrides.append(override)
         else:
             argv_overrides.append(override)
-    if not provider_overrides:
-        if config_path.is_file() and not config_path.is_symlink():
-            os.chmod(config_path, 0o600)
+    if not provider_overrides and not config_path.is_file():
+        return argv_overrides
+    if not provider_overrides and config_path.is_symlink():
         return argv_overrides
 
     import tomlkit
@@ -951,6 +955,10 @@ def materialize_codex_provider_config(
     existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
     document = tomlkit.parse(existing) if existing else tomlkit.document()
     providers = document.get("model_providers")
+    if providers is None and not provider_overrides:
+        if config_path.is_file() and not config_path.is_symlink():
+            os.chmod(config_path, 0o600)
+        return argv_overrides
     if providers is None:
         document["model_providers"] = tomlkit.table()
         providers = document["model_providers"]
@@ -964,6 +972,21 @@ def materialize_codex_provider_config(
             raise ValueError("Codex provider override must define model_providers")
         for provider_name, provider_config in generated.items():
             providers[provider_name] = provider_config
+
+    policy = retry_policy if retry_policy is not None else RetryPolicy()
+    for provider_name, provider_config in list(providers.items()):
+        if not isinstance(provider_config, MutableMapping):
+            continue
+        if not isinstance(provider_config, tomlkit.items.Table):
+            provider_table = tomlkit.table()
+            for key, value in provider_config.items():
+                provider_table[key] = value
+            providers[provider_name] = provider_table
+            provider_config = provider_table
+        provider_config["request_max_retries"] = policy.max_retries
+        provider_config["stream_max_retries"] = policy.max_retries
+        if policy.timeout_per_request_s is not None:
+            provider_config["stream_idle_timeout_ms"] = int(policy.timeout_per_request_s * 1000)
 
     fd, tmp_name = tempfile.mkstemp(prefix="config.toml.", dir=str(codex_home))
     try:
@@ -2195,6 +2218,7 @@ class _CodexAppServerSession:
         env: dict[str, str],
         tool_executor: CodexToolExecutor | None,
         codex_config_overrides: list[str] | None = None,
+        retry_policy: RetryPolicy | None = None,
         disable_native_tools: bool = False,
         bundle_dir: Path | None = None,
         skills_filter: str | list[str] = "all",
@@ -2204,6 +2228,7 @@ class _CodexAppServerSession:
         self._env = env
         self._tool_executor = tool_executor
         self._codex_config_overrides = list(codex_config_overrides or [])
+        self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
         self._disable_native_tools = disable_native_tools
         self._bundle_dir = bundle_dir
         self._skills_filter = skills_filter
@@ -2313,6 +2338,7 @@ class _CodexAppServerSession:
         self._codex_config_overrides = materialize_codex_provider_config(
             self._codex_home_dir,
             self._codex_config_overrides,
+            retry_policy=self._retry_policy,
         )
         if router_bridge_dir is not None:
             write_codex_router_hooks_file(
@@ -3212,6 +3238,7 @@ class _AppSessionFactory(Protocol):
         env: dict[str, str],
         tool_executor: CodexToolExecutor | None,
         codex_config_overrides: list[str] | None,
+        retry_policy: RetryPolicy,
         disable_native_tools: bool,
         bundle_dir: Path | None,
         skills_filter: str | list[str],
@@ -3225,6 +3252,7 @@ def _default_app_session_factory(
     env: dict[str, str],
     tool_executor: CodexToolExecutor | None,
     codex_config_overrides: list[str] | None,
+    retry_policy: RetryPolicy,
     disable_native_tools: bool,
     bundle_dir: Path | None,
     skills_filter: str | list[str],
@@ -3235,6 +3263,7 @@ def _default_app_session_factory(
         env=env,
         tool_executor=tool_executor,
         codex_config_overrides=codex_config_overrides,
+        retry_policy=retry_policy,
         disable_native_tools=disable_native_tools,
         bundle_dir=bundle_dir,
         skills_filter=skills_filter,
@@ -3555,6 +3584,7 @@ class CodexExecutor(Executor):
             env=self._env,
             tool_executor=self._tool_executor,
             codex_config_overrides=self._codex_config_overrides,
+            retry_policy=self._retry_policy,
             disable_native_tools=self._disable_native_tools,
             bundle_dir=self._bundle_dir,
             skills_filter=self._skills_filter,
