@@ -89,7 +89,7 @@ OMNIGENT_HARNESSES = frozenset(
     },
 )
 # User-facing aliases accepted in specs and normalized before runtime dispatch.
-OMNIGENT_HARNESSES = valid_harnesses()
+OMNIGENT_HARNESSES = valid_harnesses() | frozenset({"opencode"})
 OMNIGENT_HARNESS_ALIASES = frozenset(registry_harness_aliases())
 _OMNIGENT_ACCEPTED_HARNESSES = accepted_harnesses()
 
