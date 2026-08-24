@@ -16,6 +16,8 @@ import {
   getOmnigentAnalytics,
   type OmnigentAnalyticsEvent,
   type OmnigentComponentKind,
+  type OmnigentInteractionKind,
+  type OmnigentInteractionStatus,
 } from "@/lib/host";
 
 /**
@@ -30,6 +32,29 @@ export function emitOmnigentAnalytics(event: OmnigentAnalyticsEvent): void {
   } catch {
     // ignore
   }
+}
+
+export interface InteractionPhaseArgs {
+  /** Correlates the `start` and `complete` of one interaction. */
+  interactionId: string;
+  interactionKind: OmnigentInteractionKind;
+  phase: "start" | "complete";
+  /** Set on `complete`. */
+  status?: OmnigentInteractionStatus;
+  /** Optional bounded, non-PII label (e.g. a tool name). Never user content. */
+  name?: string;
+  /** Elapsed time, set on `complete` when known. */
+  durationMs?: number;
+}
+
+/**
+ * Emit an interaction-phase event (agent run / tool call / approval, start or
+ * completion). A routing-free free function so non-React call sites — the event
+ * reducer in `lib/blockStream.ts`, store thunks in `store/chatStore.ts` — can
+ * report outcomes. No-op when no host sink is configured.
+ */
+export function emitInteractionPhase(args: InteractionPhaseArgs): void {
+  emitOmnigentAnalytics({ type: "interaction_phase", ...args });
 }
 
 export interface TrackValueChangeOptions {
@@ -49,6 +74,8 @@ export interface OmnigentAnalytics {
     value?: string | number | boolean,
     options?: TrackValueChangeOptions,
   ) => void;
+  /** Report an interaction-phase event (agent run / tool call / approval). */
+  trackInteraction: (args: InteractionPhaseArgs) => void;
 }
 
 /**
@@ -70,6 +97,7 @@ export function useOmnigentAnalytics(): OmnigentAnalytics {
           // it carries no PII.
           value: options?.valueHasNoPii ? value : undefined,
         }),
+      trackInteraction: (args) => emitInteractionPhase(args),
     }),
     [],
   );
