@@ -327,7 +327,9 @@ def fetch_model_pricing_with_provider(
         ``None``, skips provider lookup and falls through to catalog.
     :param harness: Harness name to determine which provider family to check,
         e.g. ``"claude-sdk"`` or ``"codex"``. When ``None``, skips provider
-        lookup and falls through to catalog.
+        lookup and falls through to catalog. SDK executors may pass
+        executor-style spellings (``claude_sdk``, ``agents_sdk``) which are
+        normalized internally.
     :returns: A :class:`ModelPricing` (per-token rates), or ``None`` when
         pricing is unavailable.
     """
@@ -337,7 +339,11 @@ def fetch_model_pricing_with_provider(
         return catalog_pricing
 
     # Step 2: Check provider config custom pricing for models not in catalog
+    # Canonicalize harness to handle SDK executor spellings (claude_sdk -> claude-sdk)
     if provider_config is not None and harness is not None:
+        from omnigent.harness_aliases import canonicalize_harness
+
+        canonical_harness = canonicalize_harness(harness) or harness
         # Lazy import to avoid circular dependency. provider_config imports
         # this module at top level, so we import it only when needed here.
         from omnigent.onboarding.provider_config import (
@@ -345,12 +351,12 @@ def fetch_model_pricing_with_provider(
         )
 
         try:
-            provider = default_provider_for_harness(provider_config, harness)
+            provider = default_provider_for_harness(provider_config, canonical_harness)
             if provider is not None:
                 # Determine which family (anthropic/openai) this harness uses
                 from omnigent.onboarding.provider_config import provider_family_for_harness
 
-                family_name = provider_family_for_harness(harness)
+                family_name = provider_family_for_harness(canonical_harness)
                 if family_name is not None:
                     # Get the family config with custom pricing (if any)
                     family = provider.family(family_name)
