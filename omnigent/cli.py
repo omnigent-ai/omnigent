@@ -4874,6 +4874,7 @@ def _upgrade_vcs_install(
         _probe_installed_distribution,
         _remote_git_head,
         _run_upgrade_command,
+        _upgrade_failure_message,
     )
 
     current_sha = info.commit_sha or ""
@@ -4928,7 +4929,7 @@ def _upgrade_vcs_install(
     code = _run_upgrade_command(suggestion.command, console)
     if code != 0:
         raise click.ClickException(
-            f"Upgrade command exited with status {code}; your previous install is intact."
+            _upgrade_failure_message(code, set(info.extras) | set(extra_overrides))
         )
 
     # Verify by commit, not exit code: a re-pull of a ref that hasn't moved (or
@@ -4997,6 +4998,7 @@ def _upgrade_to_nightly(
         _latest_nightly_version,
         _probe_installed_distribution,
         _run_upgrade_command,
+        _upgrade_failure_message,
         _uv_tool_receipt_path,
     )
 
@@ -5073,7 +5075,7 @@ def _upgrade_to_nightly(
     code = _run_upgrade_command(suggestion.command, console)
     if code != 0:
         raise click.ClickException(
-            f"Upgrade command exited with status {code}; your previous install is intact."
+            _upgrade_failure_message(code, set(info.extras) | set(extra_overrides))
         )
 
     # Same trust-the-disk verification as the release path: re-read the
@@ -5195,6 +5197,7 @@ def upgrade(
         _probe_installed_distribution,
         _read_installed_wheel_info,
         _run_upgrade_command,
+        _upgrade_failure_message,
         _uv_tool_receipt_path,
         fetch_latest_version,
     )
@@ -5341,7 +5344,7 @@ def upgrade(
     code = _run_upgrade_command(suggestion.command, console)
     if code != 0:
         raise click.ClickException(
-            f"Upgrade command exited with status {code}; your previous install is intact."
+            _upgrade_failure_message(code, set(info.extras) | set(extra_overrides))
         )
 
     # Trust the installed version, not the installer's exit code. The running
