@@ -60,19 +60,6 @@ jobs:
           uv sync --extra databricks
           uv pip install pexpect
 
-      - name: Debug migrations
-        run: |
-          echo "=== Migration files count ==="
-          ls -1 omnigent/db/migrations/versions/*.py | wc -l
-          echo "=== Last 5 migrations ==="
-          ls -1 omnigent/db/migrations/versions/*.py | sort | tail -5
-          echo "=== Z* migrations ==="
-          ls -1 omnigent/db/migrations/versions/z*.py | sort | tail -10
-          echo "=== Checking for e5d9bc8ac650 ==="
-          grep -r "e5d9bc8ac650" omnigent/db/migrations/versions/ || echo "Not found"
-          echo "=== Alembic heads ==="
-          python -c "from omnigent.db.utils import _get_head_db_revision; print(_get_head_db_revision('sqlite:///:memory:'))" || echo "Failed"
-
       # Use the same corpus size as the nightly so baseline numbers are
       # directly comparable. Cache the seeded DB on the schema head + seed
       # script hash to avoid re-seeding on every push (same contract as
