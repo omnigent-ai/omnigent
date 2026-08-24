@@ -30,6 +30,7 @@ from omnigent.inner.executor import (
 from omnigent.inner.opencode_executor import OpenCodeExecutor
 
 _GATE_ENV = "OMNIGENT_E2E_OPENCODE"
+_RESUME_MARKER = "amber-lantern-42"
 _SKIP_REASON = (
     f"opencode e2e needs `opencode` on PATH and {_GATE_ENV}=1 to run (costs real provider tokens)"
 )
@@ -136,7 +137,8 @@ def test_opencode_run_turn_session_resume_carries_history() -> None:
         _collect_turn(
             executor,
             prompt=(
-                "Remember the secret word 'cactus'. Reply with just OK; do not call any tools."
+                f"For this harmless continuity test, the reference label is {_RESUME_MARKER}. "
+                "Reply with just OK; do not call any tools."
             ),
             session_key="e2e_resume",
         )
@@ -150,14 +152,14 @@ def test_opencode_run_turn_session_resume_carries_history() -> None:
         _collect_turn(
             executor,
             prompt=(
-                "What was the secret word I just told you? "
-                "Reply with only the word; do not call any tools."
+                "What reference label did I provide in the previous turn? "
+                "Reply with only the exact label; do not call any tools."
             ),
             session_key="e2e_resume",
         )
     )
     text = "".join(e.text for e in second if isinstance(e, TextChunk)).lower()
-    assert "cactus" in text, (
+    assert _RESUME_MARKER in text, (
         "second turn did not recall the first turn's content — "
         f"session resume likely broken. Got: {text!r}"
     )
