@@ -318,8 +318,8 @@ class CogneeRememberTool(_CogneeToolBase):
                 return "cognee remember failed: the memory store is unavailable."
             if dataset != grants.private:
                 return (
-                    f"Stored to shared long-term memory dataset {dataset!r} "
-                    "(visible to agents granted access)."
+                    f"Stored to long-term memory dataset {dataset!r} "
+                    "(visible to agents granted access to it)."
                 )
             return "Stored to long-term memory."
         except Exception as e:

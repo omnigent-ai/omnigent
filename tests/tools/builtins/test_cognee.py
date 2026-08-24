@@ -289,7 +289,8 @@ def test_remember_shared_scope_publishes_to_exchange_dataset(
     add = _patch_add(monkeypatch)
     tool = CogneeRememberTool({"shared_dataset": "team"})
     result = tool.invoke(json.dumps({"content": "x", "scope": "shared"}), tool_ctx)
-    assert "shared" in result.lower()
+    assert "'team'" in result
+    assert "granted access" in result
     assert add.call_args.args == ("x", "team")
 
 

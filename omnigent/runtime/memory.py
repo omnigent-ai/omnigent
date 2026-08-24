@@ -7,14 +7,16 @@ tool registration, runner dispatch, and the memory framework instruction —
 goes through this module, so the enable/disable policy lives in exactly
 one place (see CLAUDE.md "Framework-owned instructions").
 
-Gate precedence, strongest first:
+The availability gate (:func:`cognee_available`) has two conditions:
 
 1. ``OMNIGENT_DISABLE_COGNEE`` env kill-switch — truthy disables everything.
-2. The optional top-level ``cognee:`` block in config.yaml — settings such
-   as the store location and search behavior. Non-``harness`` config keys
-   shallow-replace between global and project config, so a project-level
-   ``cognee:`` block overrides the global one wholesale.
-3. ``importlib.util.find_spec("cognee")`` — the extra must be installed.
+2. ``importlib.util.find_spec("cognee")`` — the extra must be installed.
+
+Separately, the optional top-level ``cognee:`` block in config.yaml carries
+settings (store location, search behavior, tier-dataset grants) — it does
+not enable or disable the integration. Non-``harness`` config keys
+shallow-replace between global and project config, so a project-level
+``cognee:`` block overrides the global one wholesale.
 
 Memory must never fail or slow a turn: every cognee call is bounded by a
 timeout, failures return empty results / error strings (never raise), and a

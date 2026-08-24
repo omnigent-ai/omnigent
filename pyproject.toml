@@ -272,7 +272,7 @@ nimble = ["nimble-python>=1.2.0,<2"]
 # memory tool need this extra. Bounded to the Python versions we ship wheels
 # for: on the resolver's speculative >=3.15 split, cognee's dep tree forces
 # websockets>=16, colliding with our websockets<16 cap.
-cognee = ["cognee>=0.2,<1 ; python_version < '3.15'"]
+cognee = ["cognee>=1,<2 ; python_version < '3.15'"]
 # Slack integration (`omni integration slack`). The @omnigent socket-mode bot
 # lives in the separate `omnigent-slack` package (heavy deps — slack_bolt /
 # aiohttp — kept out of the baseline install). The CLI launches it as a

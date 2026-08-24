@@ -109,7 +109,7 @@ def test_remember_dispatch_honors_shared_dataset_grant(
             agent_id="ag_remy",
         )
     )
-    assert "shared" in result.lower()
+    assert "'team_knowledge'" in result
     assert add.call_args.args == ("release friday", "team_knowledge")
 
 

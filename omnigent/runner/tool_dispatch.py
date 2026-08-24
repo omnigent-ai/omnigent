@@ -3717,7 +3717,7 @@ async def _execute_hindsight_tool(
     return await asyncio.to_thread(tool.invoke, json.dumps(args), ctx)
 
 
-def _cognee_config_from_spec(agent_spec: Any | None, tool_name: str) -> dict[str, str]:
+def _cognee_config_from_spec(agent_spec: AgentSpec | None, tool_name: str) -> dict[str, str]:
     """
     Return a cognee builtin's config dict from the parent spec.
 
@@ -3741,10 +3741,10 @@ def _cognee_config_from_spec(agent_spec: Any | None, tool_name: str) -> dict[str
 
 
 async def _execute_cognee_tool(
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
     tool_name: str,
-    agent_spec: Any | None,
+    agent_spec: AgentSpec | None,
     conversation_id: str | None = None,
     task_id: str | None = None,
     agent_id: str | None = None,
