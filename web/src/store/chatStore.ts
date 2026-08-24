@@ -4753,7 +4753,8 @@ export async function pumpStreamEvents(
             interactionId: endedId,
             interactionKind: "agent_run",
             phase: "complete",
-            status: active?.state === "cancelled" ? "cancelled" : mapRunStatus(String(block.status)),
+            status:
+              active?.state === "cancelled" ? "cancelled" : mapRunStatus(String(block.status)),
             durationMs: Date.now() - runStart,
           });
         }
