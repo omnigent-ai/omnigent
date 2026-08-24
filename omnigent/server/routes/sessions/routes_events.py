@@ -741,6 +741,8 @@ def register_events_routes(
 
             :param wake_conv: The session row (may have a stale binding).
             :returns: ``(conversation, runner_client_or_None)``.
+            :raises OmnigentError: ``WRONG_REPLICA`` when the host tunnel is
+                absent here but the host is live on another replica.
             """
             _app_state = request.app.state
             if wake_conv.host_id is not None and await _maybe_wake_stale_resumable_managed_sandbox(
@@ -758,6 +760,25 @@ def register_events_routes(
             if _client is None and wake_conv.host_id is not None:
                 _host_reg = getattr(_app_state, "host_registry", None)
                 _tunnel_reg = getattr(_app_state, "tunnel_registry", None)
+                # Wrong-replica routing miss, checked before we try to launch:
+                # the runner tunnel registers on the same replica as its host,
+                # so an absent tunnel here while the host is live elsewhere
+                # means the key routed to the wrong replica. Signal it (same as
+                # the message path) so the client re-addresses without the key,
+                # rather than getting a false "reconnect" 503 for a session that
+                # is actually wakeable on another replica.
+                _host_store = getattr(_app_state, "host_store", None)
+                if (
+                    _host_reg is not None
+                    and _host_store is not None
+                    and _host_reg.get(wake_conv.host_id) is None
+                ):
+                    _elsewhere = await asyncio.to_thread(_host_store.get_host, wake_conv.host_id)
+                    if _elsewhere is not None and host_is_live(_elsewhere):
+                        raise OmnigentError(
+                            "session runner is on another replica; retry",
+                            code=ErrorCode.WRONG_REPLICA,
+                        )
                 _relaunched_runner_id: str | None = None
                 _host_conn = _host_reg.get(wake_conv.host_id) if _host_reg is not None else None
                 if _host_conn is not None:
@@ -800,6 +821,12 @@ def register_events_routes(
                 wake_conv = _refreshed
             # Bring the terminal + transcript forwarder up before the control
             # is injected, mirroring the message-dispatch relaunch path.
+            # suppress_recovery_turn=True: unlike the message path (which
+            # suppresses because the server already persisted a pending message
+            # the runner's history load would otherwise start a recovery turn
+            # for), /compact persists nothing — so there is no pending item to
+            # trigger recovery. Suppression is a harmless no-op here; kept for
+            # parity so a wake never spuriously starts a turn.
             await _ensure_runner_session_initialized(
                 session_id,
                 wake_conv,
@@ -1022,10 +1049,17 @@ def register_events_routes(
             if runner_result is None and _is_native_terminal_session(conv):
                 conv, woke_client = await _wake_bound_runner_for_control(conv)
                 if woke_client is not None:
+                    # Same TUI-inject budget as the initial forward: a
+                    # just-relaunched runner is the slow case (cold pane, just
+                    # advertised), and the claude-native injector's worst case
+                    # (~16s) exceeds the 5s default — a timeout there returns
+                    # None and would wrongly fall through to the "reconnect"
+                    # 503 while Claude Code is actually compacting.
                     runner_result = await _forward_session_change_to_runner(
                         session_id,
                         runner_router,
                         {"type": _COMPACT_TYPE},
+                        timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
                     )
                     if runner_result is not None and runner_result.status_code == 200:
                         return {"queued": False}
