@@ -108,6 +108,7 @@ export function RoutingModelSelect({
   children?: ReactNode;
 }) {
   return (
+    // valueHasNoPii assumes a bounded catalog; drop it if reused for typed values.
     <Select value={value} onValueChange={onValueChange} componentId={componentId} valueHasNoPii>
       <SelectTrigger className="w-full" data-testid={testId} aria-label={ariaLabel}>
         <SelectValue />
@@ -223,6 +224,7 @@ export function DescribedSelect({
       value={value}
       onValueChange={onValueChange}
       componentId={componentId}
+      // valueHasNoPii assumes fixed option enums; drop it if reused for free text.
       valueHasNoPii
       disabled={disabled}
       // Reset the preview when the list closes so the next open starts on the

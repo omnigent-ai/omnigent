@@ -23,7 +23,13 @@ import {
  * Safe to call from anywhere (event handlers, effects) — it is not a hook.
  */
 export function emitOmnigentAnalytics(event: OmnigentAnalyticsEvent): void {
-  getOmnigentAnalytics()?.(event);
+  // Wrappers emit before the caller's handler runs, so a throwing sink must not
+  // suppress the user's action.
+  try {
+    getOmnigentAnalytics()?.(event);
+  } catch {
+    // ignore
+  }
 }
 
 export interface TrackValueChangeOptions {

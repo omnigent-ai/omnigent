@@ -29,6 +29,17 @@ describe("emitOmnigentAnalytics", () => {
     emitOmnigentAnalytics(event);
     expect(analytics).toHaveBeenCalledExactlyOnceWith(event);
   });
+
+  it("swallows a throwing host sink so it can't break the primary action", () => {
+    // The wrappers emit BEFORE running the caller's handler, so a sink that
+    // throws must not propagate up and suppress the user's action.
+    setOmnigentHostConfig({
+      analytics: () => {
+        throw new Error("host sink blew up");
+      },
+    });
+    expect(() => emitOmnigentAnalytics({ type: "click", componentId: "x" })).not.toThrow();
+  });
 });
 
 describe("useOmnigentAnalytics", () => {
