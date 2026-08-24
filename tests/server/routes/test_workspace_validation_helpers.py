@@ -9,6 +9,7 @@ from __future__ import annotations
 from omnigent.server.routes._workspace_validation import (
     _is_relative_cwd,
     _is_subpath_of,
+    restore_host_filesystem_url_path,
 )
 
 
@@ -58,3 +59,34 @@ class TestIsSubpathOf:
 
     def test_trailing_slash_boundary(self) -> None:
         assert _is_subpath_of("/a/b/c", "/a/b/") is True
+
+    def test_windows_backslash_child(self) -> None:
+        assert _is_subpath_of("C:\\a\\b", "C:\\a") is True
+
+    def test_windows_drive_case_insensitive(self) -> None:
+        assert _is_subpath_of("C:\\Users\\me\\work", "c:\\Users\\me") is True
+
+    def test_windows_prefix_collision(self) -> None:
+        assert _is_subpath_of("C:\\a\\foo", "C:\\a\\fo") is False
+
+
+class TestRestoreHostFilesystemUrlPath:
+    """FastAPI :path capture restoration for POSIX vs Windows paths."""
+
+    def test_posix_stripped_slash_is_restored(self) -> None:
+        assert restore_host_filesystem_url_path("Users/corey/proj") == "/Users/corey/proj"
+
+    def test_posix_already_absolute(self) -> None:
+        assert restore_host_filesystem_url_path("/Users/corey/proj") == "/Users/corey/proj"
+
+    def test_tilde_is_unchanged(self) -> None:
+        assert restore_host_filesystem_url_path("~/proj") == "~/proj"
+
+    def test_windows_drive_forward_slash_is_not_prefixed(self) -> None:
+        assert restore_host_filesystem_url_path("C:/Users/s0sem/work") == "C:/Users/s0sem/work"
+
+    def test_windows_drive_backslash_is_not_prefixed(self) -> None:
+        assert restore_host_filesystem_url_path(r"C:\Users\s0sem\work") == r"C:\Users\s0sem\work"
+
+    def test_unc_is_not_prefixed(self) -> None:
+        assert restore_host_filesystem_url_path("//server/share/proj") == "//server/share/proj"
