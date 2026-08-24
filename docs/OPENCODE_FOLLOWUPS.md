@@ -1,8 +1,9 @@
 # OpenCode harness — known follow-ups
 
-`opencode` is the canonical headless CLI harness. `opencode-native` is the
-explicit terminal-owned OpenCode TUI/server bridge; these names resolve to
-different runtime implementations.
+`omnigent run --harness opencode` is the canonical headless OpenCode CLI
+path. `omnigent opencode` is the explicit terminal-owned OpenCode TUI/server
+bridge (`opencode-native`); these paths resolve to different runtime
+implementations.
 
 The parent workflow's `HARNESS_OPENCODE_*` values are wrapper-only inputs.
 Gateway and MCP overrides are written to a private temporary `opencode.json`
@@ -55,10 +56,10 @@ Test gating: same pattern as
 
 ## 2. Native TUI launch (tmux-pane parity with `omnigent claude`)
 
-**Status.** `omnigent run --harness opencode` is the canonical headless
-OpenCode CLI path. The explicit `opencode-native` harness provides the
-terminal-owned OpenCode TUI/server bridge; the two harness names intentionally
-resolve to different runtime implementations.
+**Status.** `omnigent opencode` launches the terminal-owned OpenCode TUI/server
+bridge through the `opencode-native` harness. For headless execution, use
+`omnigent run --harness opencode`; the two harness names intentionally resolve
+to different runtime implementations.
 
 The native bridge uses OpenCode's `serve`/`attach` flow, keeping TUI-owned
 turns separate from the per-turn headless executor.

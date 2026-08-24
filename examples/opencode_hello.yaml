@@ -49,5 +49,8 @@ prompt: |
 #   omnigent run examples/opencode_hello.yaml -p "summarise the README"
 #   omnigent run examples/opencode_hello.yaml -m openai/gpt-5
 #
-# Or as a shortcut for any opencode-harness run:
-#   omnigent opencode -p "list the files in the current directory"
+# For a direct headless invocation without this YAML:
+#   omnigent run --harness opencode -p "list the files in the current directory"
+#
+# The terminal-owned native TUI/server bridge is a separate entry point:
+#   omnigent opencode
