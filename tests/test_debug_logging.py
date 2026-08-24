@@ -257,23 +257,6 @@ def test_ignored_loggers_are_dropped() -> None:
     assert not dl._is_ignored_logger("runner.native")
 
 
-def test_startup_probe_emits_sink_online(
-    _configured_env: None, caplog: pytest.LogCaptureFixture
-) -> None:
-    # The startup probe emits a `sink_online` record so every boot has a
-    # definitive health signal (and revives the worker even when idle).
-    config = dl.config_from_env()
-    assert config is not None
-    sink = dl.ZerobusLogHandler(config, "server")
-    try:
-        with caplog.at_level(logging.INFO, logger="omnigent.debug_logging"):
-            sink._probe()
-        assert any(getattr(r, "event_name", None) == "sink_online" for r in caplog.records)
-    finally:
-        sink._probe_timer.cancel()
-        sink.close()
-
-
 def test_attach_is_noop_when_disabled() -> None:
     target = logging.getLogger("test.debug_logging.disabled")
     target.handlers.clear()
@@ -302,7 +285,6 @@ def test_close_tears_down_captured_worker_not_a_concurrent_revive(
     config = dl.config_from_env()
     assert config is not None
     sink = dl.ZerobusLogHandler(config, "server")
-    sink._probe_timer.cancel()
     old_client = sink._client
     old_thread = sink._thread
     orig_join = old_thread.join
