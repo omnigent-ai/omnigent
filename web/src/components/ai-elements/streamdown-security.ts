@@ -1,8 +1,8 @@
 import { cjk } from "@streamdown/cjk";
 import { createMathPlugin } from "@streamdown/math";
-import { mermaid } from "@streamdown/mermaid";
 import { defaultRehypePlugins, type LinkSafetyConfig, type StreamdownProps } from "streamdown";
 import { lazyCodePlugin } from "./lazyCodePlugin";
+import { lazyMermaidPlugin } from "./lazyMermaidPlugin";
 
 type StreamdownRehypePlugins = NonNullable<StreamdownProps["rehypePlugins"]>;
 type StreamdownRehypePlugin = StreamdownRehypePlugins[number];
@@ -28,7 +28,7 @@ export const STREAMDOWN_PLUGINS = {
   // delimiters (`\(…\)`, `\[…\]`), which is what LLMs emit for real math, are
   // rewritten to `$$…$$` by `normalizeExplicitMathDelimiters`.
   math: createMathPlugin({ singleDollarTextMath: false }),
-  mermaid,
+  mermaid: lazyMermaidPlugin,
 };
 export const SECURE_STREAMDOWN_REHYPE_PLUGINS = createStreamdownRehypePlugins(false);
 export const FILE_LINK_STREAMDOWN_REHYPE_PLUGINS = createStreamdownRehypePlugins(true);
