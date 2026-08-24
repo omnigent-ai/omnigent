@@ -803,6 +803,32 @@ def test_build_spawn_env_filters_unrelated_secrets_and_uses_private_roots(
     assert Path(env["OPENCODE_CONFIG_DIR"]) == Path(env["XDG_CONFIG_HOME"]) / "opencode"
 
 
+def test_build_spawn_env_preserves_supported_provider_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ambient auth for every workflow-supported OpenCode provider survives."""
+    credentials = {
+        "GROQ_API_KEY": "groq-secret",
+        "OPENROUTER_API_KEY": "openrouter-secret",
+        "XAI_API_KEY": "xai-secret",
+        "MISTRAL_API_KEY": "mistral-secret",
+        "DEEPSEEK_API_KEY": "deepseek-secret",
+        "TOGETHERAI_API_KEY": "together-secret",
+        "FIREWORKS_AI_API_KEY": "fireworks-secret",
+    }
+    for name, value in credentials.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "unrelated-secret")
+    monkeypatch.setenv("GITHUB_TOKEN", "unrelated-token")
+
+    env = opencode_executor.OpenCodeExecutor()._build_spawn_env()
+
+    for name, value in credentials.items():
+        assert env[name] == value
+    assert "AWS_SECRET_ACCESS_KEY" not in env
+    assert "GITHUB_TOKEN" not in env
+
+
 def test_build_spawn_env_copies_existing_opencode_auth_into_private_data_home(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

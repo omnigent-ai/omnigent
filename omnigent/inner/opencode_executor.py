@@ -113,6 +113,23 @@ _OPENCODE_CHILD_DENY_ENV = frozenset(
     }
 )
 
+# OpenCode resolves ambient credentials for the direct providers exposed by
+# the workflow's provider catalog. Keep this list explicit so unrelated cloud
+# credential families such as ``AWS_`` and ``DATABRICKS_`` remain denied.
+_OPENCODE_PROVIDER_ENV_PREFIXES = (
+    "ANTHROPIC_",
+    "OPENAI_",
+    "GEMINI_",
+    "GOOGLE_",
+    "GROQ_",
+    "OPENROUTER_",
+    "XAI_",
+    "MISTRAL_",
+    "DEEPSEEK_",
+    "TOGETHERAI_",
+    "FIREWORKS_AI_",
+)
+
 # OpenCode emits one JSON object per line on stdout when invoked
 # with ``--format json``. Per packages/opencode/src/cli/cmd/run.ts
 # the event envelope is::
@@ -561,7 +578,7 @@ class OpenCodeExecutor(Executor):
         the gateway env vars or config-content override to the OpenCode child.
         """
         env = clean_agent_env(
-            allow_prefixes=("ANTHROPIC_", "OPENAI_", "GEMINI_", "GOOGLE_"),
+            allow_prefixes=_OPENCODE_PROVIDER_ENV_PREFIXES,
             deny_exact=_OPENCODE_CHILD_DENY_ENV,
         )
         config_home, data_home, state_home, cache_home = self._private_opencode_roots()
