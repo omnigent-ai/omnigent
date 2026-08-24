@@ -4536,61 +4536,95 @@ function SubagentComposerTray({ label }: { label: string }) {
   );
 }
 
+// Shared pill chrome for the collapsed tally and each expanded task pill.
+const BACKGROUND_TASK_PILL_CLASS =
+  "flex min-w-0 items-center gap-1.5 rounded-full border border-border bg-card px-3 py-1 text-sm text-muted-foreground shadow-sm";
+
 /**
  * Pill above the composer tallying background tasks that are running (a dev
  * server, a background shell, a sub-agent). Independent of the "Working…"
  * shimmer: while the turn is active both show — the shimmer for the turn, the
  * pill for the tally — and once the turn ends the pill carries on alone.
- * Hovering reveals each running shell's description/command when the runner
- * reported them; an older runner (count-only) falls back to a generic line.
+ *
+ * Click the tally to expand it in place into one pill per running shell, each
+ * labelled with its description; moving the mouse out of that row (or pressing
+ * Escape) collapses it back to the single tally. A count-only edge (older
+ * runner, no per-shell detail) renders the plain, non-interactive tally.
  */
 function BackgroundTaskPill() {
   const bgCount = useChatStore((s) => s.backgroundTaskCount);
   const bgTasks = useChatStore((s) => s.backgroundTasks);
+  const [expanded, setExpanded] = useState(false);
+  const canExpand = bgTasks.length > 0;
+
+  // Fall back to the tally when the shells drain or there is nothing to expand,
+  // so a stale expanded row never lingers after the work ends.
+  useEffect(() => {
+    if (bgCount <= 0 || !canExpand) setExpanded(false);
+  }, [bgCount, canExpand]);
+
+  // Escape collapses too — a keyboard user has no "mouse out" of the row.
+  useEffect(() => {
+    if (!expanded) return;
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      if (e.key === "Escape") setExpanded(false);
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [expanded]);
+
   if (bgCount <= 0) return null;
+
+  const label = (
+    <>
+      <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
+      <span>
+        {bgCount} background task{bgCount === 1 ? "" : "s"}
+      </span>
+    </>
+  );
+
   return (
     <div className={cn("mx-auto flex w-full px-1 pb-1.5", CHAT_COLUMN_WIDTH)}>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <div
-            role="status"
-            data-testid="background-task-pill"
-            aria-label={`${bgCount} background task${bgCount === 1 ? "" : "s"} still running`}
-            className="flex items-center gap-1.5 rounded-full border border-border bg-card px-3 py-1 text-sm text-muted-foreground shadow-sm"
-          >
-            <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
-            <span>
-              {bgCount} background task{bgCount === 1 ? "" : "s"}
-            </span>
-          </div>
-        </TooltipTrigger>
-        <TooltipContent side="top" align="start" className="max-w-xs">
-          {bgTasks.length > 0 ? (
-            <ul
-              className="flex flex-col gap-1.5 text-left"
-              data-testid="background-task-tooltip-list"
-            >
-              {bgTasks.map((task, i) => {
-                // `description` is the human label; `command` the raw shell.
-                // Show whichever exists, and both (label over mono command)
-                // when they differ, so a bare-command shell still reads.
-                const label = task.description || task.command || "Background shell";
-                const showCommand = task.command && task.command !== label;
-                return (
-                  <li key={task.id ?? i} className="flex flex-col gap-0.5">
-                    <span className="text-sm">{label}</span>
-                    {showCommand ? (
-                      <span className="break-all font-mono text-xs opacity-70">{task.command}</span>
-                    ) : null}
-                  </li>
-                );
-              })}
-            </ul>
-          ) : (
-            <p className="text-sm">Background work is still running.</p>
+      {expanded && canExpand ? (
+        <div
+          className="flex flex-wrap items-center gap-1.5"
+          onMouseLeave={() => setExpanded(false)}
+          data-testid="background-task-pill-expanded"
+        >
+          {bgTasks.map((task, i) => (
+            <div key={task.id ?? i} className={cn(BACKGROUND_TASK_PILL_CLASS, "max-w-full")}>
+              <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
+              <span className="min-w-0 truncate">
+                {task.description || task.command || "Background shell"}
+              </span>
+            </div>
+          ))}
+        </div>
+      ) : canExpand ? (
+        <button
+          type="button"
+          data-testid="background-task-pill"
+          aria-expanded={false}
+          aria-label={`${bgCount} background task${bgCount === 1 ? "" : "s"} still running; activate to list them`}
+          onClick={() => setExpanded(true)}
+          className={cn(
+            BACKGROUND_TASK_PILL_CLASS,
+            "cursor-pointer transition-colors hover:bg-accent hover:text-accent-foreground",
           )}
-        </TooltipContent>
-      </Tooltip>
+        >
+          {label}
+        </button>
+      ) : (
+        <div
+          role="status"
+          data-testid="background-task-pill"
+          aria-label={`${bgCount} background task${bgCount === 1 ? "" : "s"} still running`}
+          className={BACKGROUND_TASK_PILL_CLASS}
+        >
+          {label}
+        </div>
+      )}
     </div>
   );
 }
