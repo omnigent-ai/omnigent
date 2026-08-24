@@ -3,13 +3,7 @@
 
 const STORAGE_KEY = "omnigent:default-workspace-tab";
 
-export const defaultWorkspaceTabs = [
-  "files",
-  "subagents",
-  "terminals",
-  "todos",
-  "browser",
-] as const;
+export const defaultWorkspaceTabs = ["files", "changes", "subagents", "browser"] as const;
 export type DefaultWorkspaceTab = (typeof defaultWorkspaceTabs)[number];
 
 /** Match today's product default: sessions without remembered state open Files. */
