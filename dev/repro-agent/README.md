@@ -65,11 +65,12 @@ with `git worktree remove <path>` when done.
 3. Authors a durable e2e test (`tests/e2e_ui/` for UI, PTY/pexpect for CLI
    journeys, `tests/e2e/` for backend) keyed to the concrete failure, so a fix
    has a fail→pass regression guard.
-4. Records each live facet on its user-facing surface under `recordings/<slug>/`
-   — the failing e2e_ui test run with `--video on` for web/terminal facets, a
-   rendered VHS tape for CLI facets — as before-fix footage the fix step pairs
-   with its after-fix re-recording. Best-effort: skipped (and noted) when the
-   recorders aren't installed.
+4. Records each settled facet on its user-facing surface under `recordings/<slug>/`
+   — the e2e_ui test run with `--video on` for web/terminal facets, a rendered VHS
+   tape for CLI facets. A reproduced facet is filmed failing (before-fix footage
+   the fix step pairs with its after-fix re-recording); an already-fixed facet is
+   filmed passing (proof-it-works footage). Best-effort: skipped (and noted) when
+   the recorders aren't installed.
 5. Emits a single fenced ```json block (the machine-readable handoff) whose
    `verdict` is exactly one of `reproduced` / `not_reproduced` / `already_fixed`
    / `needs_more_info`, alongside the per-facet breakdown (each facet stamped

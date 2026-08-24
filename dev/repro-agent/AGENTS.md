@@ -254,37 +254,51 @@ to back, still before the JSON block.
 
 ## Step 4 — Record the reproduction
 
-A verdict is stronger when a human can *watch* the failure. After authoring the
-test, capture each **live** (`reproduced`) facet as a recording on the surface
-the user sees it on, saved under `recordings/<slug>/` in your workspace (e.g.
-`recordings/1234/before-picker.webm`). Recording is best-effort: if the tooling
-below is missing, skip it, keep `recordings: []`, and say what was missing in
-`evidence` — never let recording block or distort the reproduction itself.
+A verdict is stronger when a human can *watch* the outcome. After authoring the
+test, record each facet you settled live, on the surface the user sees it on,
+saved under `recordings/<slug>/` in your workspace:
+
+- a **`reproduced`** facet → **before-fix footage** (`kind: "before"`): run the
+  authored test so it FAILS; the failing run's video is the proof the bug is live
+  (e.g. `recordings/1234/before-picker.webm`).
+- an **`already_fixed`** facet → **proof-it-works footage** (`kind: "fixed"`): run
+  the same authored test so it PASSES; the passing run's video shows the journey
+  behaving correctly on the running build (e.g. `recordings/1234/fixed-picker.webm`).
+
+`not_reproduced` and `needs_more_info` facets have nothing to film — skip them.
+Recording is best-effort: if the tooling below is missing, skip it, keep
+`recordings: []`, and say what was missing in `evidence` — never let recording
+block or distort the reproduction itself.
 
 - **`web` facets** — run the authored Playwright test with recording on:
   `pytest <test_path> --video on --screenshot on --output recordings/<slug>`
   (the `tests/e2e_ui/` suite is pytest-playwright, so the flags need no extra
-  plumbing). The run must FAIL — the failing run's video *is* the before-fix
-  footage. Rename the saved video/screenshots to stable names
-  (`before-<facet>.webm`).
+  plumbing). pytest-playwright writes the video into a per-test subdir under
+  `--output`, so move it to a stable name afterward. For a `reproduced` facet the
+  run must FAIL — the failing run's video *is* the before-fix footage
+  (`before-<facet>.webm`). For an `already_fixed` facet the same test PASSES
+  (it already asserts the correct behavior, per Step 3) — that passing run's video
+  is the proof-it-works footage (`fixed-<facet>.webm`).
 - **`terminal` facets** — the pane renders inside the web app, so record it the
-  same way: the Playwright test drives the session page with the terminal view
-  shown, and the pane's contents land in the browser video. Save
-  `tmux capture-pane -e` text dumps alongside as machine-checkable evidence.
+  same way as `web`: the Playwright test drives the session page with the terminal
+  view shown, and the pane's contents land in the browser video (`before-`/`fixed-`
+  by the facet's verdict, as above). Save `tmux capture-pane -e` text dumps
+  alongside as machine-checkable evidence.
 - **`cli` facets** — author a VHS tape (`recordings/<slug>/journey.tape`) that
   replays the SAME numbered journey steps as your PTY test: `Type`/`Enter` the
-  user's commands, `Wait /pattern/` on the observable failure, with an
-  `Output recordings/<slug>/before-<facet>.mp4` directive. Render it with
+  user's commands, `Wait /pattern/` on the observable outcome (the failure for a
+  `reproduced` facet, the correct output for an `already_fixed` one), with an
+  `Output recordings/<slug>/<before|fixed>-<facet>.mp4` directive. Render it with
   `vhs recordings/<slug>/journey.tape`. The tape is the replayable journey
   artifact for terminals — the fix step re-renders the same tape for the
   after-fix recording. If `vhs` is unavailable, still author and keep the tape;
   note that rendering was skipped.
 
-A recording must end on the failure the user observes (the wrong screen state,
-the bad output, the error). Convert to `.mp4` with `ffmpeg` when available;
-`.webm`/`.gif` are fine otherwise. Recordings are workspace artifacts exactly
-like the test — leave them uncommitted; in CI the artifact bundle collects
-them.
+A recording must end on the outcome the user observes — the failure (wrong screen
+state, bad output, error) for a `before` recording, or the correct end state for a
+`fixed` one. Convert to `.mp4` with `ffmpeg` when available; `.webm`/`.gif` are
+fine otherwise. Recordings are workspace artifacts exactly like the test — leave
+them uncommitted; in CI the artifact bundle collects them.
 
 ## Output — the reproduction artifacts
 
@@ -365,11 +379,13 @@ Field meanings:
   excerpt), plus any root-cause leads you noticed while reproducing (hypotheses
   only — you do not fix).
 - `recordings` — the Step 4 captures: a list of
-  `{"surface", "kind", "path", "format"}` objects, `kind` always `"before"` for
-  you (the fix step re-records the same drivers post-fix as `"after"`), `path`
-  workspace-relative. Include an entry for the authored-but-unrendered VHS tape
-  too (`"format": "tape"`) when rendering was skipped. Empty list when nothing
-  was recorded — then say what was missing in `evidence`.
+  `{"surface", "kind", "path", "format"}` objects. `kind` is `"before"` for a
+  `reproduced` facet's failing run or `"fixed"` for an `already_fixed` facet's
+  passing run (the fix step later re-records the same drivers post-fix as
+  `"after"`); `path` workspace-relative. Include an entry for the
+  authored-but-unrendered VHS tape too (`"format": "tape"`) when rendering was
+  skipped. Empty list when nothing was recorded — then say what was missing in
+  `evidence`.
 
 Keep the prose before the block terse — the one exception is the full test
 source, which you paste in full. You produce the live-confirmed reproduction +

@@ -38,9 +38,10 @@ description: >-
   through the journey until the failure happens live, and
   authors an e2e test (Playwright tests/e2e_ui/ for UI bugs, PTY/pexpect
   tests/e2e/ for CLI journeys, or tests/e2e/ for backend) as the regression
-  artifact, then records each live facet on its user-facing surface (a
+  artifact, then records each settled facet on its user-facing surface (a
   pytest-playwright --video run for web/terminal facets, a VHS tape for CLI
-  facets) as before-fix footage. Reproducing is its job, so its session,
+  facets) — a reproduced facet as before-fix footage, an already-fixed facet as
+  proof-it-works footage. Reproducing is its job, so its session,
   logs, and recordings are outputs it produces. It does not fix the bug or run
   a fix proof — it hands off the reproduction (its session: journey, e2e test,
   recordings, root-cause leads) to a fix step. It does not merge or push.
