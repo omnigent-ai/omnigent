@@ -27,6 +27,7 @@ import websockets.asyncio.client
 from websockets.exceptions import ConnectionClosed, InvalidStatus, InvalidURI
 
 from omnigent._platform import IS_POSIX, WINDOWS_ENV_PASSTHROUGH
+from omnigent.debug_logging import PRIMARY_SESSION_ID_ENV_VAR
 from omnigent.env_credentials import env_names_with_omnigent_prefix
 from omnigent.gateway_inference import gateway_inference_map
 from omnigent.harness_aliases import canonicalize_harness, is_claude_sdk_harness_name
@@ -1424,6 +1425,10 @@ class HostProcess:
             host_id=self._identity.host_id,
             harness=frame.harness,
         )
+        # The runner serves one primary session (plus any co-located subagents);
+        # pass it so runner-level log records can be attributed to that session.
+        if frame.session_id:
+            env[PRIMARY_SESSION_ID_ENV_VAR] = frame.session_id
 
         # Embed the session id so operators can find all logs for a session
         # with `omnigent debug logs --session <id>`. Cap at 32 chars to keep

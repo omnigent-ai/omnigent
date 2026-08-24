@@ -43,6 +43,7 @@ import httpx
 from fastapi.responses import JSONResponse, Response
 
 from omnigent._platform import IS_WINDOWS
+from omnigent.debug_logging import runner_primary_session_id
 from omnigent.entities.session_resources import (
     SessionResourceView,
     session_resource_view_to_dict,
@@ -5381,6 +5382,7 @@ def _cursor_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) 
             "cursor-native: pinned model %r is not a cursor-agent model id; "
             "launching cursor-agent on its configured default instead.",
             model,
+            extra={"session_id": runner_primary_session_id()},
         )
         return None
     return model
@@ -5716,6 +5718,7 @@ def _measured_prefix_bytes(transcript_path: Path) -> int | None:
             "forwarder will seed from the live transcript end; transcript=%s",
             transcript_path,
             exc_info=True,
+            extra={"session_id": runner_primary_session_id()},
         )
         return None
 
@@ -5732,7 +5735,13 @@ def _native_terminal_start_error_payload(exc: BaseException, runtime_name: str) 
         the runner's log file; the raw cause is logged there for operators,
         not surfaced to the caller.
     """
-    _logger.warning("Native %s terminal start failed: %s", runtime_name, exc, exc_info=exc)
+    _logger.warning(
+        "Native %s terminal start failed: %s",
+        runtime_name,
+        exc,
+        exc_info=exc,
+        extra={"session_id": runner_primary_session_id()},
+    )
     if IS_WINDOWS:
         # Native terminals are tmux/PTY-based and disabled on Windows by design.
         # Give the client an actionable message instead of a log pointer.
@@ -5871,6 +5880,7 @@ def _ensure_orchestrator_skills_in_bundle(
         _logger.debug(
             "Orchestrator skill source %s is not a directory; skipping injection",
             source,
+            extra={"session_id": runner_primary_session_id()},
         )
         return
     try:
@@ -5882,6 +5892,7 @@ def _ensure_orchestrator_skills_in_bundle(
             skill_name,
             bundle_dir,
             exc_info=True,
+            extra={"session_id": runner_primary_session_id()},
         )
 
 
@@ -7988,6 +7999,7 @@ def _resolve_sub_agent_spec_entry(parent_entry: Any, sub_agent_name: str) -> Res
             "Sub-agent %r not found under spec %r; no workdir resolved",
             sub_agent_name,
             getattr(parent_spec, "name", None),
+            extra={"session_id": runner_primary_session_id()},
         )
         return None
     return ResolvedSpec(

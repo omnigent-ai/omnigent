@@ -219,3 +219,14 @@ def test_attach_is_noop_when_disabled() -> None:
     target.handlers.clear()
     dl.attach_debug_log_sink([target], source="runner", level=logging.INFO)
     assert not any(isinstance(h, dl.ZerobusLogHandler) for h in target.handlers)
+
+
+def test_runner_primary_session_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The host sets this when it spawns a runner for a session; runner-level
+    # callsites read it as the best-available attribution. Unset/empty is None.
+    monkeypatch.delenv(dl.PRIMARY_SESSION_ID_ENV_VAR, raising=False)
+    assert dl.runner_primary_session_id() is None
+    monkeypatch.setenv(dl.PRIMARY_SESSION_ID_ENV_VAR, "conv_primary")
+    assert dl.runner_primary_session_id() == "conv_primary"
+    monkeypatch.setenv(dl.PRIMARY_SESSION_ID_ENV_VAR, "")
+    assert dl.runner_primary_session_id() is None

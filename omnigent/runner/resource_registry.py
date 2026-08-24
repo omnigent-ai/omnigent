@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Literal
 
 from cachetools import TTLCache
 
+from omnigent.debug_logging import runner_primary_session_id
 from omnigent.entities.pagination import PagedList
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
@@ -209,7 +210,10 @@ def _terminal_exit_diagnostics(
         try:
             raw_last_output = read_last_output()
         except Exception:
-            _logger.exception("Failed to read terminal pane diagnostics")
+            _logger.exception(
+                "Failed to read terminal pane diagnostics",
+                extra={"session_id": runner_primary_session_id()},
+            )
         else:
             if isinstance(raw_last_output, str):
                 last_output = _trim_terminal_exit_output(raw_last_output)
@@ -220,7 +224,10 @@ def _terminal_exit_diagnostics(
         try:
             raw_exit_status = read_exit_status()
         except Exception:
-            _logger.exception("Failed to read terminal exit status")
+            _logger.exception(
+                "Failed to read terminal exit status",
+                extra={"session_id": runner_primary_session_id()},
+            )
         else:
             if isinstance(raw_exit_status, int):
                 exit_status = raw_exit_status
@@ -527,6 +534,7 @@ class SessionResourceRegistry:
                 len(sessions),
                 len(pollers),
                 sessions,
+                extra={"session_id": runner_primary_session_id()},
             )
 
     def note_session_turn_started(self, session_id: str) -> None:

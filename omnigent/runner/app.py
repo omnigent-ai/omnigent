@@ -44,6 +44,7 @@ from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+from omnigent.debug_logging import runner_primary_session_id
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
     SessionResourceView,
@@ -290,6 +291,7 @@ def _version_supports_waiting_status(server_version: str) -> bool:
         _logger.warning(
             "server version %r is not PEP 440; treating waiting status support as unknown",
             server_version,
+            extra={"session_id": runner_primary_session_id()},
         )
         return False
 
@@ -313,9 +315,17 @@ async def _get_server_version(server_client: httpx.AsyncClient) -> str | None:
         resp = await server_client.get("/api/version")
         resp.raise_for_status()
         _server_version = resp.json()["version"]
-        _logger.info("resolved server version: %s", _server_version)
+        _logger.info(
+            "resolved server version: %s",
+            _server_version,
+            extra={"session_id": runner_primary_session_id()},
+        )
     except Exception as exc:  # noqa: BLE001 — degrade gracefully; never 500 an old server
-        _logger.warning("could not probe server /api/version (%s); treating as unknown", exc)
+        _logger.warning(
+            "could not probe server /api/version (%s); treating as unknown",
+            exc,
+            extra={"session_id": runner_primary_session_id()},
+        )
     return _server_version
 
 
@@ -342,7 +352,13 @@ def _client_safe_error_detail(exc: BaseException, *, context: str) -> str:
         ``"Request failed on the runner; see the runner log for details:
         ~/.omnigent/logs/runner/runner-conv_ab12.log"``.
     """
-    _logger.warning("%s failed: %s", context, exc, exc_info=exc)
+    _logger.warning(
+        "%s failed: %s",
+        context,
+        exc,
+        exc_info=exc,
+        extra={"session_id": runner_primary_session_id()},
+    )
     log_reference = process_log_reference("runner")
     return f"Request failed on the runner; see the runner log for details: {log_reference}"
 
@@ -1571,6 +1587,7 @@ async def _deliver_subagent_wake_post(
                     "Sub-agent wake POST attribution rejected for parent=%s; "
                     "retrying without actor",
                     parent_id,
+                    extra={"session_id": runner_primary_session_id()},
                 )
                 attribution_created_by = None
                 continue
@@ -1583,6 +1600,7 @@ async def _deliver_subagent_wake_post(
                 parent_id,
                 retryable,
                 exc,
+                extra={"session_id": runner_primary_session_id()},
             )
             if last_attempt or not retryable:
                 return False
@@ -3772,12 +3790,14 @@ def create_runner_app(
                 "_convert_raw_items_to_input: skipped %d items with types: %s",
                 len(_skipped_types),
                 _skipped_types,
+                extra={"session_id": runner_primary_session_id()},
             )
         _logger.info(
             "_convert_raw_items_to_input: %d raw items → %d converted (compaction_idx=%s)",
             len(items),
             len(result),
             compaction_idx,
+            extra={"session_id": runner_primary_session_id()},
         )
         return result
 
@@ -4314,7 +4334,11 @@ def create_runner_app(
                 model_catalog_store.write_catalog, "codex-native", fingerprint, shaped
             )
         except Exception:  # noqa: BLE001 — write-back is best-effort
-            _logger.debug("codex model-catalog write-back skipped", exc_info=True)
+            _logger.debug(
+                "codex model-catalog write-back skipped",
+                exc_info=True,
+                extra={"session_id": runner_primary_session_id()},
+            )
 
     async def _handle_pi_native_model_change(
         conv_id: str,
@@ -5707,6 +5731,7 @@ def create_runner_app(
                 parent_id,
                 child_id,
                 _WAKE_POST_MAX_ATTEMPTS,
+                extra={"session_id": runner_primary_session_id()},
             )
 
     def _schedule_subagent_wake(entry: _SubagentWorkEntry, *, is_rewake: bool = False) -> None:
@@ -9628,6 +9653,7 @@ def create_runner_app(
                 "/v1/summarize: failed to resolve provider %r",
                 provider_name,
                 exc_info=True,
+                extra={"session_id": runner_primary_session_id()},
             )
             return None
 
@@ -9647,6 +9673,7 @@ def create_runner_app(
                 profile,
                 context,
                 exc_info=True,
+                extra={"session_id": runner_primary_session_id()},
             )
             return None
         return {
@@ -9764,7 +9791,11 @@ def create_runner_app(
             try:
                 resource_registry.resync_session_statuses()
             except Exception:  # noqa: BLE001 — best-effort; never block catch-up.
-                _logger.warning("Session status resync failed after reconnect", exc_info=True)
+                _logger.warning(
+                    "Session status resync failed after reconnect",
+                    exc_info=True,
+                    extra={"session_id": runner_primary_session_id()},
+                )
         for session_id in list(_session_histories):
             if _is_native_harness(session_id):
                 continue

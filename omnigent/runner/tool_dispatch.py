@@ -51,6 +51,7 @@ from omnigent._wrapper_labels import (
     CLAUDE_NATIVE_WRAPPER_VALUE,
     CODEX_NATIVE_WRAPPER_VALUE,
 )
+from omnigent.debug_logging import runner_primary_session_id
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.model_override import (
     harness_supports_model_override,
@@ -594,7 +595,10 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
         finally:
             _os_env.close()
     except Exception:  # noqa: BLE001 — OS env setup is best-effort for schema only
-        _logger.debug("Could not create OSEnvironment for native relay OS tool schemas")
+        _logger.debug(
+            "Could not create OSEnvironment for native relay OS tool schemas",
+            extra={"session_id": runner_primary_session_id()},
+        )
 
     return schemas
 
@@ -1804,6 +1808,7 @@ def _normalize_subagent_model(
             sub_agent_name,
             harness,
             provider.kind,
+            extra={"session_id": runner_primary_session_id()},
         )
     return normalized
 
@@ -6903,6 +6908,7 @@ def _apply_subagent_policy_verdict(
             _logger.warning(
                 "Sub-agent inbox TOOL_RESULT policy data must be str; got %s",
                 type(transformed).__name__,
+                extra={"session_id": runner_primary_session_id()},
             )
         return _SubagentInboxEvaluation(
             {
@@ -6913,6 +6919,7 @@ def _apply_subagent_policy_verdict(
     _logger.warning(
         "Sub-agent inbox TOOL_RESULT policy evaluation returned unknown result=%r",
         result,
+        extra={"session_id": runner_primary_session_id()},
     )
     return _SubagentInboxEvaluation(
         _subagent_policy_failure_payload(payload),

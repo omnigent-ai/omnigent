@@ -42,6 +42,12 @@ CLIENT_SECRET_ENV_VAR = "OMNIGENT_DEBUG_LOG_CLIENT_SECRET"
 WORKSPACE_URL_ENV_VAR = "OMNIGENT_DEBUG_LOG_WORKSPACE_URL"
 ENDPOINT_ENV_VAR = "OMNIGENT_DEBUG_LOG_ENDPOINT"
 
+# The host spawns a runner for one *primary* session and names the runner's log
+# file after it. Subagent child sessions co-locate in the same runner process,
+# so this is the primary session, not the only one — pass it explicitly at
+# runner-level log callsites that have no per-request session id in scope.
+PRIMARY_SESSION_ID_ENV_VAR = "OMNIGENT_RUNNER_PRIMARY_SESSION_ID"
+
 # Batching / delivery defaults.
 _BATCH_MAX_RECORDS = 100
 _FLUSH_INTERVAL_S = 2.0
@@ -170,6 +176,19 @@ def config_from_env() -> DebugLogConfig | None:
         table=table,
         workspace_id=workspace_id,
     )
+
+
+def runner_primary_session_id() -> str | None:
+    """Return the runner's primary (spawn-time) session id, or ``None``.
+
+    The host sets ``OMNIGENT_RUNNER_PRIMARY_SESSION_ID`` when it spawns a runner
+    for a session. It is the best-available attribution for runner-level log
+    callsites that have no per-request session id in scope (tunnel lifecycle,
+    startup, infra). Prefer an explicit per-request session id wherever one is
+    available -- a subagent turn runs in the same runner process, so this
+    primary id would otherwise mis-attribute it to the parent.
+    """
+    return os.environ.get(PRIMARY_SESSION_ID_ENV_VAR) or None
 
 
 def debug_event(
