@@ -28,6 +28,8 @@ import time
 import traceback
 import urllib.parse
 import uuid
+from collections.abc import Iterator
+from contextvars import ContextVar
 from dataclasses import dataclass
 
 import httpx
@@ -47,6 +49,13 @@ ENDPOINT_ENV_VAR = "OMNIGENT_DEBUG_LOG_ENDPOINT"
 # so this is the primary session, not the only one — pass it explicitly at
 # runner-level log callsites that have no per-request session id in scope.
 PRIMARY_SESSION_ID_ENV_VAR = "OMNIGENT_RUNNER_PRIMARY_SESSION_ID"
+
+# Authenticated user id (email) attribution. The multi-tenant server sets a
+# request-scoped ContextVar per request; the single-user runner/host set the
+# env var once at startup (a process constant — an env var, not a ContextVar,
+# because a ContextVar set at startup is invisible to run_in_executor threads).
+USER_ID_ENV_VAR = "OMNIGENT_USER_ID"
+_user_id_var: ContextVar[str | None] = ContextVar("omnigent_debug_user_id", default=None)
 
 # Batching / delivery defaults.
 _BATCH_MAX_RECORDS = 100
@@ -191,11 +200,39 @@ def runner_primary_session_id() -> str | None:
     return os.environ.get(PRIMARY_SESSION_ID_ENV_VAR) or None
 
 
+def set_current_user_id(user_id: str | None) -> None:
+    """Bind the current request's authenticated user (server middleware / WS boundary)."""
+    _user_id_var.set(user_id or None)
+
+
+@contextlib.contextmanager
+def current_user_id_scope(user_id: str | None) -> Iterator[None]:
+    """Bind ``user_id`` for the duration of the block, restoring the prior value on exit."""
+    token = _user_id_var.set(user_id or None)
+    try:
+        yield
+    finally:
+        _user_id_var.reset(token)
+
+
+def current_user_id() -> str | None:
+    """Best-available user attribution the sink stamps when a record has no explicit user_id.
+
+    Request-scoped ContextVar first (multi-tenant server, per request), then the
+    process-constant ``OMNIGENT_USER_ID`` env (single-user runner/host). Both
+    empty -> ``None``. On the runner/host this is the process **owner** (session/
+    host owner), which in a shared session can differ from the per-turn initiator
+    the server records -- inherent to a per-process attribution column.
+    """
+    return _user_id_var.get() or os.environ.get(USER_ID_ENV_VAR) or None
+
+
 def debug_event(
     event_name: str,
     *,
     session_id: str | None = None,
     turn_id: str | None = None,
+    user_id: str | None = None,
     **attributes: object,
 ) -> dict[str, object]:
     """Build a logging ``extra=`` payload naming a semantic event.
@@ -208,16 +245,20 @@ def debug_event(
             "tool_call_dispatched", session_id=session_id,
             tool_call_id=tc.id, model=model))
 
-    The correlation columns are populated only from what the callsite passes --
-    the sink reads them off the record, with no ambient fallback. Freeform
-    ``_logger.debug("…")`` calls need no ``extra``; they ship with null
-    correlation columns and an empty attributes map.
+    ``session_id``/``turn_id`` are populated only from what the callsite passes;
+    ``user_id`` additionally has an ambient fallback the sink applies when the
+    record carries none (a request-scoped ContextVar on the server, the
+    ``OMNIGENT_USER_ID`` env on the runner/host). Freeform ``_logger.debug("…")``
+    calls need no ``extra``; they ship with null correlation columns and an empty
+    attributes map.
     """
     extra: dict[str, object] = {"event_name": event_name, "attributes": dict(attributes)}
     if session_id is not None:
         extra["session_id"] = session_id
     if turn_id is not None:
         extra["turn_id"] = turn_id
+    if user_id is not None:
+        extra["user_id"] = user_id
     return extra
 
 
@@ -257,7 +298,7 @@ def record_to_row(record: logging.LogRecord, source: str) -> dict[str, object]:
         "stack_trace": _stack_trace(record),
         "attributes": _attributes(record),
         "log_id": uuid.uuid4().hex,
-        "user_id": getattr(record, "user_id", None),
+        "user_id": getattr(record, "user_id", None) or current_user_id(),
     }
 
 

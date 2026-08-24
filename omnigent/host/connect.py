@@ -27,7 +27,7 @@ import websockets.asyncio.client
 from websockets.exceptions import ConnectionClosed, InvalidStatus, InvalidURI
 
 from omnigent._platform import IS_POSIX, WINDOWS_ENV_PASSTHROUGH
-from omnigent.debug_logging import PRIMARY_SESSION_ID_ENV_VAR
+from omnigent.debug_logging import PRIMARY_SESSION_ID_ENV_VAR, USER_ID_ENV_VAR
 from omnigent.env_credentials import env_names_with_omnigent_prefix
 from omnigent.gateway_inference import gateway_inference_map
 from omnigent.harness_aliases import canonicalize_harness, is_claude_sdk_harness_name
@@ -856,6 +856,11 @@ class HostProcess:
         # to retry credential discovery.
         self._auth_token_factory: Callable[[], str | None] | None = None
         self._auth_token_factory_resolved = False
+        # This host's owning user, resolved once after the first accepted tunnel
+        # upgrade (GET /v1/me). Injected into every runner it spawns and published
+        # to OMNIGENT_USER_ID so host/runner debug-log rows carry it. None until
+        # resolved, or on a single-user server / managed host where it is absent.
+        self._owner_user_id: str | None = None
         # Set on the first accepted WS upgrade. Distinguishes a host that
         # never authenticated (login redirects / 401 / 403 turn fatal) from a
         # live host hit by a transient failure — a server restart or a dropped
@@ -1429,6 +1434,11 @@ class HostProcess:
         # pass it so runner-level log records can be attributed to that session.
         if frame.session_id:
             env[PRIMARY_SESSION_ID_ENV_VAR] = frame.session_id
+        # The runner is 1:1 with this host's owner (cross-owner co-location is
+        # rejected server-side), so hand it our resolved owner for user_id
+        # attribution of runner-level log records.
+        if self._owner_user_id:
+            env[USER_ID_ENV_VAR] = self._owner_user_id
 
         # Embed the session id so operators can find all logs for a session
         # with `omnigent debug logs --session <id>`. Cap at 32 chars to keep
@@ -3024,6 +3034,7 @@ class HostProcess:
         self._auth_retry_streak = 0
         self._refused_streak = 0
         self._conn_upgrade_accepted = True
+        await self._ensure_owner_user_id()
         try:
             await self._serve_frames(ws)
         finally:
@@ -3036,6 +3047,32 @@ class HostProcess:
             # ``async with`` this replaced; the manual enter is only so the
             # upgrade-time exception can be classified above.
             await ws_cm.__aexit__(*sys.exc_info())
+
+    async def _ensure_owner_user_id(self) -> None:
+        """Resolve this host's owning user once and publish it for attribution.
+
+        Best-effort ``GET /v1/me`` (the same call the CLI resume picker uses),
+        run after the tunnel upgrade is accepted so credentials are known to
+        work. On success, store it on the handler (injected into every runner
+        this host spawns) and in ``OMNIGENT_USER_ID`` (so the host's own
+        debug-log rows carry it). A single-user server / managed host answers no
+        owner, and any failure is swallowed -- attribution must never disrupt the
+        host, and those rows simply ship ``user_id = NULL``.
+        """
+        if self._owner_user_id is not None:
+            return
+        try:
+            from omnigent.resume_dispatch import _resolve_current_user_id
+
+            headers = self._build_connect_headers()
+            owner = await asyncio.to_thread(
+                _resolve_current_user_id, base_url=self._server_url, headers=headers
+            )
+        except Exception:  # noqa: BLE001 — attribution is best-effort
+            return
+        if owner:
+            self._owner_user_id = owner
+            os.environ[USER_ID_ENV_VAR] = owner
 
     def _build_connect_headers(self) -> dict[str, str]:
         """Build the WebSocket upgrade headers for the tunnel connection.
