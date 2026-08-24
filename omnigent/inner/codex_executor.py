@@ -46,7 +46,11 @@ from omnigent.codex_model_vocabulary import (
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, CODEX_DEFAULT_MODEL
-from omnigent.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
+from omnigent.reasoning_effort import (
+    CODEX_EFFORTS,
+    EFFORT_ALIASES,
+    validate_effort,
+)
 from omnigent.spec.types import RetryPolicy
 
 from . import _proc
@@ -777,6 +781,7 @@ def _populate_codex_home_config(
     minimal_config: bool | None = None,
     inject_hooks: bool = False,
     extend_model_catalog: bool = False,
+    supported_efforts: frozenset[str] = CODEX_EFFORTS,
 ) -> None:
     """
     Bridge user config files from the real ``CODEX_HOME`` into the temp one.
@@ -897,7 +902,7 @@ def _populate_codex_home_config(
             continue
         shutil.copy2(source_file, dest_path)
         if filename == "config.toml":
-            _normalize_copied_codex_effort(dest_path)
+            _normalize_copied_codex_effort(dest_path, supported_efforts=supported_efforts)
             if extend_model_catalog:
                 # Routed turns and spawns can land on an arm codex's bundled
                 # catalog has no entry for, which it then refuses client-side.
@@ -1601,7 +1606,11 @@ def set_codex_model_catalog_path(config_path: Path, catalog_path: Path) -> bool:
 _EFFORT_KEY_RE = re.compile(r'^(\s*model_reasoning_effort\s*=\s*")([^"]*)("\s*(?:#.*)?)$')
 
 
-def _normalize_copied_codex_effort(config_path: Path) -> None:
+def _normalize_copied_codex_effort(
+    config_path: Path,
+    *,
+    supported_efforts: frozenset[str] = CODEX_EFFORTS,
+) -> None:
     """Rewrite a deprecated top-level ``model_reasoning_effort`` in the
     session's private copy of ``config.toml``.
 
@@ -1613,15 +1622,19 @@ def _normalize_copied_codex_effort(config_path: Path) -> None:
     verbatim into every per-session ``CODEX_HOME``, that one app-written key
     fails **every** codex turn on such machines.
 
-    Values already in :data:`CODEX_EFFORTS` are left untouched, as are
-    values with no known alias (codex surfaces its own error for those) and
-    anything below the first table header. Only the session's private copy
+    Values already in *supported_efforts* (defaults to :data:`CODEX_EFFORTS`,
+    or :data:`CODEX_NATIVE_EFFORTS` for native CLI runs) are left untouched,
+    as are values with no known alias (codex surfaces its own error for those)
+    and anything below the first table header. Only the session's private copy
     is modified — never the user's real ``~/.codex/config.toml``.
 
     :param config_path: The copied ``config.toml`` inside the per-session
         ``CODEX_HOME``. Unreadable/unwritable files are skipped (best
         effort — the copy already succeeded, so this only degrades back to
         the pre-normalization behavior).
+    :param supported_efforts: Set of effort values considered supported for
+        this session runtime (e.g. :data:`CODEX_EFFORTS` or
+        :data:`CODEX_NATIVE_EFFORTS`).
     """
     try:
         text = config_path.read_text(encoding="utf-8")
@@ -1640,7 +1653,7 @@ def _normalize_copied_codex_effort(config_path: Path) -> None:
             match = _EFFORT_KEY_RE.match(content)
             if match is not None:
                 value = match.group(2)
-                if value not in CODEX_EFFORTS:
+                if value not in supported_efforts:
                     replacement = EFFORT_ALIASES.get(value)
                     if replacement is not None:
                         line_ending = line[len(content) :]

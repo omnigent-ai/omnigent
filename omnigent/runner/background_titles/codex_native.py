@@ -30,6 +30,7 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
         _populate_codex_home_config,
         materialize_codex_provider_config,
     )
+    from omnigent.reasoning_effort import CODEX_NATIVE_EFFORTS
     from omnigent.runner.native.orchestration import _codex_native_model_from_spec
 
     model = context.model_override or _codex_native_model_from_spec(context.session_spec)
@@ -45,6 +46,7 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
             codex_home,
             _codex_home_config_source_from_env(),
             minimal_config=True,
+            supported_efforts=CODEX_NATIVE_EFFORTS,
         )
         native_server = build_codex_native_server(
             socket_path=temp_root / "unused.sock",

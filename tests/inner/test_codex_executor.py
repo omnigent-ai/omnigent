@@ -2630,6 +2630,29 @@ def test_populate_codex_home_config_keeps_valid_effort(tmp_path: Path) -> None:
     assert (target / "config.toml").read_text() == original
 
 
+def test_populate_codex_home_config_preserves_native_effort(tmp_path: Path) -> None:
+    """Native Codex sessions preserve max and ultra reasoning effort."""
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+    from omnigent.reasoning_effort import CODEX_NATIVE_EFFORTS
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    original = (
+        'model = "gpt-5.6-luna"\n'
+        'model_reasoning_effort = "max"\n'
+        "[profiles.other]\n"
+        'model_reasoning_effort = "ultra"\n'
+    )
+    (source / "config.toml").write_text(original)
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source, supported_efforts=CODEX_NATIVE_EFFORTS)
+
+    copied = (target / "config.toml").read_text()
+    assert copied == original
+
+
 def test_populate_codex_home_config_normalizes_effort_after_multiline_array(
     tmp_path: Path,
 ) -> None:
