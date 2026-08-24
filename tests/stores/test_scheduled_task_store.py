@@ -52,6 +52,7 @@ def test_create_returns_scheduled_task_with_all_fields(
         timezone="America/Los_Angeles",
         model_override="claude-opus-4-7",
         reasoning_effort="high",
+        permission_mode="acceptEdits",
         workspace="/home/alice/repo",
         host_id=_uid("host_abc123"),
     )
@@ -65,6 +66,7 @@ def test_create_returns_scheduled_task_with_all_fields(
     assert task.timezone == "America/Los_Angeles"
     assert task.model_override == "claude-opus-4-7"
     assert task.reasoning_effort == "high"
+    assert task.permission_mode == "acceptEdits"
     assert task.workspace == "/home/alice/repo"
     assert task.base_branch is None
     assert task.execution_target == "connected_host"
@@ -89,6 +91,7 @@ def test_create_minimal_defaults(store: SqlAlchemyScheduledTaskStore) -> None:
     )
     assert task.model_override is None
     assert task.reasoning_effort is None
+    assert task.permission_mode is None
     assert task.workspace is None
     assert task.base_branch is None
     assert task.execution_target == "connected_host"

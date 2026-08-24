@@ -53,6 +53,7 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         rrule=row.rrule,
         model_override=row.model_override,
         reasoning_effort=row.reasoning_effort,
+        permission_mode=row.permission_mode,
         max_cost_usd=row.max_cost_usd,
         workspace=row.workspace,
         base_branch=row.base_branch,
@@ -128,6 +129,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         *,
         model_override: str | None = None,
         reasoning_effort: str | None = None,
+        permission_mode: str | None = None,
         max_cost_usd: float | None = None,
         workspace: str | None = None,
         host_id: str | None = None,
@@ -144,6 +146,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             timezone=timezone,
             model_override=model_override,
             reasoning_effort=reasoning_effort,
+            permission_mode=permission_mode,
             max_cost_usd=max_cost_usd,
             workspace=workspace,
             base_branch=None,
@@ -249,6 +252,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         timezone: str | None = None,
         model_override: str | None = None,
         reasoning_effort: str | None = None,
+        permission_mode: str | None = None,
         max_cost_usd: float | None = _UNSET,
         workspace: str | None = None,
         host_id: str | None = _UNSET,
@@ -286,6 +290,9 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 changed = True
             if reasoning_effort is not None and row.reasoning_effort != reasoning_effort:
                 row.reasoning_effort = reasoning_effort
+                changed = True
+            if permission_mode is not None and row.permission_mode != permission_mode:
+                row.permission_mode = permission_mode
                 changed = True
             if max_cost_usd is not _UNSET and row.max_cost_usd != max_cost_usd:
                 row.max_cost_usd = max_cost_usd

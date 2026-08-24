@@ -239,6 +239,39 @@ async def test_create_rejects_invalid_reasoning_effort(
     assert resp.status_code == 400, resp.text
 
 
+async def test_create_persists_permission_mode(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A valid permission mode round-trips on create and read."""
+    _make_user(db_uri)
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(permission_mode="acceptEdits"),
+        headers=_headers(),
+    )
+    assert resp.status_code == 200, resp.text
+    created = resp.json()
+    assert created["permission_mode"] == "acceptEdits"
+    task_id = created["id"]
+
+    got = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
+    assert got.status_code == 200
+    assert got.json()["permission_mode"] == "acceptEdits"
+
+
+@pytest.mark.parametrize("permission_mode", ["yolo", "--danger", "Auto"])
+async def test_create_rejects_invalid_permission_mode(
+    auth_client: httpx.AsyncClient, db_uri: str, permission_mode: str
+) -> None:
+    _make_user(db_uri)
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(permission_mode=permission_mode),
+        headers=_headers(),
+    )
+    assert resp.status_code == 400, resp.text
+
+
 async def test_create_rejects_relative_workspace(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:

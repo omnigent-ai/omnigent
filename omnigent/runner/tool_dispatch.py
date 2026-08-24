@@ -3714,6 +3714,7 @@ _SCHEDULED_TASK_CREATE_FIELDS = (
     "timezone",
     "model_override",
     "reasoning_effort",
+    "permission_mode",
     "workspace",
     "host_id",
 )
@@ -3725,6 +3726,7 @@ _SCHEDULED_TASK_UPDATE_FIELDS = (
     "timezone",
     "model_override",
     "reasoning_effort",
+    "permission_mode",
     "workspace",
     "host_id",
     "state",

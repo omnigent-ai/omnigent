@@ -58,14 +58,16 @@ def _create_task(
     workspace: str | None = None,
     model_override: str | None = None,
     reasoning_effort: str | None = None,
+    permission_mode: str | None = None,
 ) -> str:
     """Seed one scheduled task via ``POST /v1/scheduled-tasks``.
 
-    ``model_override`` / ``reasoning_effort`` are optional so a test can seed a
-    task carrying the model/effort overrides the create/edit dialog persists —
-    used by the edit-prefill test, where the dialog must read them back onto the
-    ``task-model-trigger`` / ``task-effort-trigger`` controls. Left ``None`` they
-    are omitted from the body (the row persists null, the agent's own defaults).
+    ``model_override`` / ``reasoning_effort`` / ``permission_mode`` are optional
+    so a test can seed a task carrying the overrides the create/edit dialog
+    persists — used by the edit-prefill tests, where the dialog must read them
+    back onto the ``task-model-trigger`` / ``task-effort-trigger`` /
+    ``task-permission-trigger`` controls. Left ``None`` they are omitted from the
+    body (the row persists null, the agent's own defaults).
 
     :returns: The created task id.
     """
@@ -84,6 +86,8 @@ def _create_task(
         body["model_override"] = model_override
     if reasoning_effort is not None:
         body["reasoning_effort"] = reasoning_effort
+    if permission_mode is not None:
+        body["permission_mode"] = permission_mode
     resp = httpx.post(
         f"{base_url}/v1/scheduled-tasks",
         json=body,
@@ -462,10 +466,13 @@ def test_scheduled_task_model_effort_controls_visible_for_capable_agent(
     expect(page.get_by_test_id("task-model-effort-row")).to_be_visible(timeout=30_000)
     model_trigger = page.get_by_test_id("task-model-trigger")
     effort_trigger = page.get_by_test_id("task-effort-trigger")
+    permission_trigger = page.get_by_test_id("task-permission-trigger")
     expect(model_trigger).to_be_visible()
     expect(effort_trigger).to_be_visible()
+    expect(permission_trigger).to_be_visible()
     expect(model_trigger).to_have_text("Default")
     expect(effort_trigger).to_have_text("Default")
+    expect(permission_trigger).to_have_text("Default")
 
 
 def test_scheduled_task_model_effort_controls_hidden_for_incapable_agent(
@@ -496,9 +503,10 @@ def test_scheduled_task_model_effort_controls_hidden_for_incapable_agent(
 
     dialog = page.get_by_test_id("create-scheduled-task-dialog")
     expect(dialog).to_be_visible(timeout=30_000)
-    # Capability gate off → the row is never rendered, and the "uses defaults"
-    # helper hint stands in for it.
+    # Capability gate off → the row is never rendered (nor the permission
+    # control), and the "uses defaults" helper hint stands in for it.
     expect(page.get_by_test_id("task-model-effort-row")).to_be_hidden()
+    expect(page.get_by_test_id("task-permission-control")).to_be_hidden()
     expect(dialog.get_by_text("Uses this agent")).to_be_visible()
 
 
@@ -594,3 +602,99 @@ def test_scheduled_task_edit_prefills_model_and_effort(
     expect(page.get_by_test_id("task-model-effort-row")).to_be_visible()
     expect(page.get_by_test_id("task-model-trigger")).to_have_text("Opus")
     expect(page.get_by_test_id("task-effort-trigger")).to_have_text("High")
+
+
+# ── Permission-mode selector ───────────────────────────────────────────────
+#
+# The dialog renders a Permission-mode select alongside Model/Effort, gated on
+# the same ``permissionMode`` capability (Claude Code). Because an automation
+# fires a fresh session each run, the whole launch vocabulary is offered —
+# including the launch-only ``dontAsk`` / ``bypassPermissions``. Left on
+# "Default" the field is omitted (agent default); a concrete pick persists
+# ``permission_mode``, which the fire path turns into the runner's
+# ``--permission-mode`` launch arg. Like the sibling tests these are LLM-free:
+# they exercise only the dialog, REST, and the rendered row.
+
+
+def test_scheduled_task_create_persists_permission_mode(
+    page: Page,
+    live_server: str,
+) -> None:
+    """Picking a Permission mode on create persists it via the API.
+
+    Opens the create dialog on Claude Code, picks "Accept edits" through the
+    ``task-permission-trigger`` select, submits, then reads the created row back
+    from ``GET /v1/scheduled-tasks`` and asserts its ``permission_mode`` is the
+    persisted pick (``"acceptEdits"`` — the wire value behind the "Accept edits"
+    label).
+    """
+    page.goto(f"{live_server}/tasks")
+    _open_create_dialog(page)
+
+    page.get_by_test_id("task-name-input").fill("Permission create")
+    page.get_by_test_id("task-prompt-input").fill("Summarize the day.")
+    _pick_select_option(page, "task-permission-trigger", "Accept edits")
+    expect(page.get_by_test_id("task-permission-trigger")).to_have_text("Accept edits")
+    page.get_by_test_id("create-scheduled-task-submit").click()
+
+    expect(_row_by_name(page, "Permission create")).to_be_visible(timeout=30_000)
+    tasks = httpx.get(f"{live_server}/v1/scheduled-tasks", timeout=10.0).json()["scheduled_tasks"]
+    created = next(t for t in tasks if t["name"] == "Permission create")
+    assert created["permission_mode"] == "acceptEdits", created
+
+
+def test_scheduled_task_create_default_omits_permission_mode(
+    page: Page,
+    live_server: str,
+) -> None:
+    """Leaving the Permission control on 'Default' persists a null mode.
+
+    A create that never touches the permission control must omit the field so
+    the row inherits the agent's configured mode. Confirms the "Default"
+    sentinel maps to a null override, not the literal sentinel string.
+    """
+    page.goto(f"{live_server}/tasks")
+    _open_create_dialog(page)
+
+    page.get_by_test_id("task-name-input").fill("Default permission")
+    page.get_by_test_id("task-prompt-input").fill("Summarize the day.")
+    # Permission control left on its default "Default" sentinel — no pick.
+    page.get_by_test_id("create-scheduled-task-submit").click()
+
+    expect(_row_by_name(page, "Default permission")).to_be_visible(timeout=30_000)
+    tasks = httpx.get(f"{live_server}/v1/scheduled-tasks", timeout=10.0).json()["scheduled_tasks"]
+    created = next(t for t in tasks if t["name"] == "Default permission")
+    assert created["permission_mode"] is None, created
+
+
+def test_scheduled_task_edit_prefills_permission_mode(
+    page: Page,
+    live_server: str,
+) -> None:
+    """The edit dialog prefills the Permission control from the loaded task.
+
+    Seeds a Claude Code task carrying ``permission_mode="bypassPermissions"`` (a
+    launch-only mode, valid for automations), opens its Edit dialog, and asserts
+    ``task-permission-trigger`` renders the stored pick ("Bypass permissions"),
+    not the "Default" sentinel.
+    """
+    claude_agent_id = _builtin_agent_id(live_server, "claude-native-ui")
+    _create_task(
+        live_server,
+        claude_agent_id,
+        "Permission prefill",
+        "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+        permission_mode="bypassPermissions",
+    )
+
+    page.goto(f"{live_server}/tasks")
+    row = _row_by_name(page, "Permission prefill")
+    expect(row).to_be_visible(timeout=30_000)
+    row.hover()
+    row.get_by_test_id("task-row-menu").click()
+    page.get_by_test_id("task-edit").click()
+
+    dialog = page.get_by_test_id("create-scheduled-task-dialog")
+    expect(dialog).to_be_visible(timeout=30_000)
+    expect(page.get_by_test_id("task-permission-control")).to_be_visible()
+    expect(page.get_by_test_id("task-permission-trigger")).to_have_text("Bypass permissions")

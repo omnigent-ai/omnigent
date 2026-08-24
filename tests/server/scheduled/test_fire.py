@@ -371,6 +371,46 @@ async def test_active_creates_session_grant_and_run() -> None:
 
 
 @pytest.mark.asyncio
+async def test_permission_mode_becomes_terminal_launch_args() -> None:
+    """A task's permission_mode fires as the runner's --permission-mode args."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(permission_mode="acceptEdits")})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _deps(store, permission_store=FakePermissionStore(), conversation_store=conv_store),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert len(conv_store.created) == 1
+    assert conv_store.created[0]["terminal_launch_args"] == ["--permission-mode", "acceptEdits"]
+
+
+@pytest.mark.asyncio
+async def test_unset_permission_mode_sends_no_launch_args() -> None:
+    """No permission_mode → no terminal_launch_args (agent default applies)."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _deps(store, permission_store=FakePermissionStore(), conversation_store=conv_store),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert len(conv_store.created) == 1
+    assert conv_store.created[0]["terminal_launch_args"] is None
+
+
+@pytest.mark.asyncio
 async def test_fire_runs_under_task_workspace_scope() -> None:
     perm = FakePermissionStore()
     conv_store = FakeConversationStore()

@@ -60,6 +60,7 @@ from omnigent.server.routes._session_create_validation import (
     validate_existing_host_workspace,
     validate_session_agent,
     validate_session_model_metadata,
+    validate_session_permission_mode,
 )
 from omnigent.server.schemas import SessionEventInput
 
@@ -586,6 +587,19 @@ async def _resolve_default_workspace(deps: FireDeps, host_id: str) -> str:
     return canonical
 
 
+def _permission_mode_launch_args(permission_mode: str | None) -> list[str] | None:
+    """Derive the native-terminal ``--permission-mode`` args for a task.
+
+    Mirrors how the interactive New Chat dialog builds ``terminal_launch_args``:
+    a set permission mode becomes ``["--permission-mode", <value>]``, which the
+    runner appends to a native coding CLI's argv (Claude Code). ``None`` (agent
+    default) sets nothing, so the fire uses the agent's configured mode.
+    """
+    if permission_mode is None:
+        return None
+    return ["--permission-mode", permission_mode]
+
+
 async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
     """Create a conversation bound to the task's agent, carrying the stored spec."""
     # Connected-host, existing-workspace runs create the conversation directly.
@@ -597,6 +611,7 @@ async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
         title=task.name,
         host_id=task.host_id,
         workspace=task.workspace,
+        terminal_launch_args=_permission_mode_launch_args(task.permission_mode),
     )
     if task.model_override is not None or task.reasoning_effort is not None:
         updated: Conversation | None = await asyncio.to_thread(
@@ -728,6 +743,7 @@ async def _validate_fire_session_inputs(
             model_override=task.model_override,
             reasoning_effort=task.reasoning_effort,
         )
+        validate_session_permission_mode(task.permission_mode)
         if validate_workspace:
             if task.host_id is None or task.workspace is None:
                 return (
