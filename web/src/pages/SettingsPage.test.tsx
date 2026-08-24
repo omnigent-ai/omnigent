@@ -4,7 +4,7 @@
 // Archived sessions list (which moved here out of the sidebar).
 
 import type { ReactNode } from "react";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -37,6 +37,7 @@ const mocks = vi.hoisted(() => ({
   projectNames: [] as string[],
   hasNextPage: false,
   fetchNextPage: vi.fn(),
+  useConversationsCalls: vi.fn(),
 }));
 
 vi.mock("next-themes", () => ({
@@ -63,24 +64,30 @@ vi.mock("@/hooks/useConversations", async () => {
   // A stateful mock that emulates useInfiniteQuery pagination: it tracks how
   // many pages are "loaded" and reveals the next on fetchNextPage, so a click
   // on "Load more" re-renders with more rows (as the real hook would).
-  const { useState } = await import("react");
+  const { useEffect, useState } = await import("react");
   return {
     PROJECT_LABEL_KEY: "omni_project",
     // The Archived view drives the visible list from this hook; filter on the
     // fourth (`project`) arg so the mock mirrors the server-side ?project=
     // scoping.
     useConversations: (
-      _searchQuery?: string,
+      searchQuery = "",
       _includeArchived?: boolean,
       _options?: unknown,
       project?: string,
     ) => {
+      mocks.useConversationsCalls(searchQuery, _includeArchived, _options, project);
       // `mocks.pages` (array of per-page row arrays) drives multi-page tests;
       // otherwise serve a single page of `mocks.conversations`.
       const source = mocks.pages ?? [mocks.conversations];
       const [shown, setShown] = useState(1);
+      useEffect(() => setShown(1), [searchQuery, project]);
       const pages = source.slice(0, shown).map((rows) => ({
-        data: project ? rows.filter((c) => c.labels?.["omni_project"] === project) : rows,
+        data: rows.filter((c) => {
+          const matchesProject = !project || c.labels?.["omni_project"] === project;
+          const haystack = `${c.title ?? ""} ${c.search_snippet ?? ""}`.toLowerCase();
+          return matchesProject && (!searchQuery || haystack.includes(searchQuery.toLowerCase()));
+        }),
       }));
       return {
         data: { pages },
@@ -209,6 +216,7 @@ beforeEach(() => {
   mocks.bulkArchiveMutate.mockReset();
   mocks.bulkDeleteMutate.mockReset();
   mocks.fetchNextPage.mockReset();
+  mocks.useConversationsCalls.mockReset();
   mocks.theme = "system";
   mocks.accountsEnabled = true;
   mocks.loginUrl = "/login";
@@ -921,6 +929,84 @@ describe("SettingsPage", () => {
     });
     // Unarchiving opens the restored session (the mock mutate runs onSuccess).
     expect(screen.getByTestId("location").textContent).toBe("/c/conv_archived");
+  });
+
+  it("debounces archived-session search before querying", () => {
+    vi.useFakeTimers();
+    try {
+      renderPage("/settings/archived");
+      fireEvent.change(screen.getByRole("searchbox", { name: "Search archived sessions" }), {
+        target: { value: "needle" },
+      });
+
+      expect(mocks.useConversationsCalls).not.toHaveBeenCalledWith(
+        "needle",
+        true,
+        undefined,
+        undefined,
+      );
+      act(() => vi.advanceTimersByTime(299));
+      expect(mocks.useConversationsCalls).not.toHaveBeenCalledWith(
+        "needle",
+        true,
+        undefined,
+        undefined,
+      );
+      act(() => vi.advanceTimersByTime(1));
+      expect(mocks.useConversationsCalls).toHaveBeenCalledWith(
+        "needle",
+        true,
+        undefined,
+        undefined,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("combines archived project filtering with search", () => {
+    vi.useFakeTimers();
+    try {
+      mocks.projectNames = ["Alpha", "Beta"];
+      mocks.conversations = [
+        conv("a1", { archived: true, title: "Release notes", labels: { omni_project: "Alpha" } }),
+        conv("a2", { archived: true, title: "Planning", labels: { omni_project: "Alpha" } }),
+        conv("b1", { archived: true, title: "Release notes", labels: { omni_project: "Beta" } }),
+      ];
+      renderPage("/settings/archived");
+
+      fireEvent.change(screen.getByTestId("archived-project-filter"), {
+        target: { value: "project:Alpha" },
+      });
+      fireEvent.change(screen.getByRole("searchbox", { name: "Search archived sessions" }), {
+        target: { value: "release" },
+      });
+      act(() => vi.advanceTimersByTime(300));
+
+      expect(mocks.useConversationsCalls).toHaveBeenCalledWith("release", true, undefined, "Alpha");
+      const rows = screen.getAllByTestId("archived-row");
+      expect(rows).toHaveLength(1);
+      expect(within(rows[0]).getByText("Release notes")).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shows a search-specific empty state for archived sessions", () => {
+    vi.useFakeTimers();
+    try {
+      mocks.conversations = [conv("old", { archived: true, title: "Old chat" })];
+      renderPage("/settings/archived");
+
+      fireEvent.change(screen.getByRole("searchbox", { name: "Search archived sessions" }), {
+        target: { value: "missing" },
+      });
+      act(() => vi.advanceTimersByTime(300));
+
+      expect(screen.getByText("No archived sessions match.")).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("deletes an archived session after confirming, with no row-click navigation", () => {

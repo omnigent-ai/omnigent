@@ -52,6 +52,7 @@ import {
   PanelRightCloseIcon,
   PanelRightIcon,
   PlusIcon,
+  SearchIcon,
   SunIcon,
   SquareCheckIcon,
   SquareIcon,
@@ -1896,6 +1897,13 @@ function ImportSection() {
 function ArchivedSection() {
   // `undefined` = all projects; a name scopes the list to that project.
   const [project, setProject] = useState<string | undefined>(undefined);
+  const [search, setSearch] = useState("");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
+
+  useEffect(() => {
+    const timeout = window.setTimeout(() => setDebouncedSearch(search.trim()), 300);
+    return () => window.clearTimeout(timeout);
+  }, [search]);
 
   // Picker options: every project that has an archived session. Sourced from a
   // dedicated hook that pages through ALL archived sessions server-side —
@@ -1920,8 +1928,7 @@ function ArchivedSection() {
     }
   }, [project, projectNames, namesQuery.isSuccess, namesQuery.isFetching]);
 
-  // The visible list, filtered server-side via ?project= when one is picked.
-  const listQuery = useConversations("", true, undefined, project);
+  const listQuery = useConversations(debouncedSearch, true, undefined, project);
   const archived = useMemo(
     () => (listQuery.data?.pages ?? []).flatMap((p) => p.data).filter((c) => c.archived === true),
     [listQuery.data],
@@ -1988,7 +1995,21 @@ function ArchivedSection() {
       title="Archived sessions"
       description="Sessions you've archived. Restore one to the sidebar, or delete it for good."
     >
-      <div className="mb-4 flex items-center gap-2">
+      <div className="mb-4 flex flex-wrap items-center gap-3">
+        <div className="relative min-w-56 flex-1">
+          <SearchIcon
+            aria-hidden
+            className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground"
+          />
+          <Input
+            type="search"
+            aria-label="Search archived sessions"
+            placeholder="Search archived sessions"
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+            className="pl-9"
+          />
+        </div>
         {items.length > 0 && (
           <>
             <label htmlFor="archived-project-filter" className="text-ui text-muted-foreground">
@@ -2050,7 +2071,11 @@ function ArchivedSection() {
         // Definitive empty only when there are no archived rows AND no further
         // pages to fetch.
         <p className="text-ui text-muted-foreground">
-          {project ? "No archived sessions in this project." : "No archived sessions."}
+          {debouncedSearch
+            ? "No archived sessions match."
+            : project
+              ? "No archived sessions in this project."
+              : "No archived sessions."}
         </p>
       ) : (
         <>
