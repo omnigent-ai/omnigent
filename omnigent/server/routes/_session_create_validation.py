@@ -16,7 +16,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.model_override import validate_model_override
 from omnigent.reasoning_effort import EFFORT_VALUES, validate_effort
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.server.auth import LEVEL_READ
+from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, local_single_user_enabled
 from omnigent.server.routes._auth_helpers import require_access
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.host_store import host_is_live
@@ -84,8 +84,17 @@ async def validate_session_agent(
     # at least READ access to that owning session — otherwise they can execute
     # another user's private agent by guessing the raw agent id.
     if agent.session_id is not None:
+        # Single-user servers persist the local owner as NULL (scheduled tasks
+        # store user_id=None), but session grants are keyed by the "local"
+        # sentinel — the same identity POST /v1/sessions checks. Resolve None to
+        # it here so a session-scoped agent authorizes, instead of tripping the
+        # require_access unauthenticated guard. Multi-user servers leave None as
+        # None, which still correctly 401s.
+        access_user = user_id
+        if access_user is None and local_single_user_enabled():
+            access_user = RESERVED_USER_LOCAL
         await require_access(
-            user_id,
+            access_user,
             agent.session_id,
             LEVEL_READ,
             permission_store,
