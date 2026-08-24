@@ -366,6 +366,53 @@ def _isolate_codex_native_state(
 
 
 @pytest.fixture()
+def claude_managed_settings() -> None:
+    """Opt back in to the host's real Claude Code managed-settings chain.
+
+    Request this alongside a test that must read the machine's actual
+    ``managed-settings.json``; :func:`_isolate_claude_managed_settings` then
+    leaves the path list alone.
+
+    :returns: None.
+    """
+
+
+@pytest.fixture(autouse=True)
+def _isolate_claude_managed_settings(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep the host's Claude Code managed settings out of ambient detection.
+
+    ``omnigent.onboarding.ambient`` reads Claude Code's enterprise managed
+    settings to detect a gateway the CLI authenticates itself (the shape ``isaac
+    configure claude`` writes). Those paths are **absolute and machine-global**
+    (``/Library/Application Support/ClaudeCode/…``, ``/etc/claude-code/…``), so
+    unlike ``~/.claude`` they are not redirected by a test's tmp ``$HOME`` — a
+    developer's or CI runner's real enterprise install would otherwise add a
+    phantom ``claude-databricks`` provider to every detection assertion.
+
+    Neutralizing the ambient tuple covers **every** reader: ``claude_native``
+    resolves the chain through ``_managed_settings_paths()`` at call time rather
+    than binding its own copy, so its Smart-Routing gateway check and managed
+    model overrides are isolated by this one patch too.
+
+    ``autouse=True`` because the alternative leaves us one missed test away from
+    host-dependent failures that reproduce only on configured machines. Tests
+    that exercise the detection pass an explicit ``paths=`` argument (the
+    reader takes one) or request :func:`claude_managed_settings`.
+
+    :param request: Pytest request, inspected for the opt-in fixture.
+    :param monkeypatch: Pytest monkeypatch fixture; restores the tuple at
+        teardown.
+    :returns: None.
+    """
+    if "claude_managed_settings" in request.fixturenames:
+        return
+    monkeypatch.setattr("omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
+
+
+@pytest.fixture()
 def untracked_cache_start() -> None:
     """Opt back in to the real :meth:`GitFilesystemRegistry.start`.
 

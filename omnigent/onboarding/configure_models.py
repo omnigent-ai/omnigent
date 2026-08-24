@@ -670,7 +670,9 @@ def _entry_models_summary(entry: ProviderEntry) -> str:
     if entry.kind == DATABRICKS_KIND:
         return f"profile: {entry.profile}"
     if entry.kind == CLI_CONFIG_KIND:
-        return f"~/.{entry.cli}/config.toml: {entry.model_provider}"
+        if entry.cli == "codex":
+            return f"~/.codex/config.toml: {entry.model_provider}"
+        return "via Claude Code managed settings"
     # Inline-family kinds: list each family's default model, else note the
     # base_url is set (a gateway without a pinned default model still works
     # — the spec/override picks the model).
@@ -839,34 +841,36 @@ def build_subscription_provider_entry(cli: str) -> dict[str, object]:
 
 def build_cli_config_provider_entry(
     cli: str,
-    model_provider: str,
+    model_provider: str | None,
     display_name: str | None,
 ) -> dict[str, object]:
     """Build a ``kind: cli-config`` provider entry body (config shape).
 
-    A cli-config provider pins a custom model provider defined in the
-    harness CLI's own config file (today: a ``[model_providers.X]`` table
-    in ``~/.codex/config.toml`` with self-contained auth, e.g. the
-    Databricks AI Gateway written by ``isaac configure codex``). The
-    provider definition and credential stay in that file; this entry only
-    records which provider the launch selects.
+    A cli-config provider names a credential the harness CLI's own config file
+    already defines and authenticates, so the entry carries no secret:
 
-    :param cli: The CLI whose config file defines the provider —
-        ``"codex"`` (the only CLI with config-file model providers today).
+    - ``codex`` — a ``[model_providers.X]`` table in ``~/.codex/config.toml``
+      with self-contained auth (the Databricks AI Gateway written by ``isaac
+      configure codex``), pinned by *model_provider*;
+    - ``claude`` — a gateway ``env.ANTHROPIC_BASE_URL`` plus a credential helper
+      in Claude Code's managed settings (the shape ``isaac configure claude``
+      writes). Claude Code applies these itself at launch, so there is nothing
+      to pin and *model_provider* is ``None``.
+
+    :param cli: The CLI whose config file defines the provider — ``"codex"`` or
+        ``"claude"`` (see :data:`~omnigent.onboarding.provider_config.CLI_CONFIG_CLIS`).
     :param model_provider: The ``[model_providers.X]`` id to pin, e.g.
-        ``"Databricks"``.
-    :param display_name: The provider table's ``name`` field, snapshotted
-        for display, e.g. ``"Databricks AI Gateway"``; ``None`` omits it
-        (labels fall back to the entry name).
+        ``"Databricks"``; ``None`` for ``claude`` (and omitted from the body).
+    :param display_name: The provider's display name, snapshotted for display,
+        e.g. ``"Databricks AI Gateway"``; ``None`` omits it (labels fall back to
+        the entry name).
     :returns: A provider entry body, e.g. ``{"kind": "cli-config", "cli":
         "codex", "model_provider": "Databricks", "display_name":
         "Databricks AI Gateway"}``.
     """
-    body: dict[str, object] = {
-        "kind": CLI_CONFIG_KIND,
-        "cli": cli,
-        "model_provider": model_provider,
-    }
+    body: dict[str, object] = {"kind": CLI_CONFIG_KIND, "cli": cli}
+    if model_provider:
+        body["model_provider"] = model_provider
     if display_name:
         body["display_name"] = display_name
     return body

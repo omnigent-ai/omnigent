@@ -265,10 +265,10 @@ def test_full_fork_replays_whole_history(
     )
 
 
-# Compaction-cursor remapping is server-side behavior introduced in v0.11.
+# Compaction-cursor remapping is server-side behavior introduced after v0.11.
 # A new runner paired with an old server must skip this new-server contract.
 @pytest.mark.compat_smoke
-@pytest.mark.min_server_version("0.11.0")
+@pytest.mark.min_server_version("0.12.0")
 def test_fork_preserves_compacted_context_boundary(
     http_client: httpx.Client,
     live_runner_id: str,

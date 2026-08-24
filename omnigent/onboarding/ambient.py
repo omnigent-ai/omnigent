@@ -34,6 +34,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 import tomllib
 
@@ -72,6 +73,19 @@ _OLLAMA_URL = f"http://{_OLLAMA_HOST}:{_OLLAMA_PORT}"
 # when nothing is listening.
 _OLLAMA_PROBE_TIMEOUT = 0.25
 
+# Claude Code's enterprise "managed settings" chain, in the CLI's own precedence
+# order. An enterprise install (the shape ``isaac configure claude`` writes)
+# configures Claude Code here and nowhere else: an ``env`` block pinning
+# ``ANTHROPIC_BASE_URL`` at a gateway plus a top-level ``apiKeyHelper`` command
+# that prints the bearer token. Managed settings win at Claude Code's own
+# launch, so this file alone is a complete, working credential — the Claude
+# analogue of a custom ``[model_providers.X]`` in ``~/.codex/config.toml``.
+CLAUDE_CODE_MANAGED_SETTINGS_PATHS: tuple[Path, ...] = (
+    Path("/Library/Application Support/ClaudeCode/managed-settings.json"),
+    Path("/etc/claude-code/managed-settings.json"),
+    Path(os.environ.get("PROGRAMDATA", "C:/ProgramData")) / "ClaudeCode" / "managed-settings.json",
+)
+
 # Maps each provider whose env key we surface to the served model family.
 # Providers absent here (or mapped to ``None``) are reported with
 # ``family=None`` — their key is detected but no harness surface is
@@ -104,10 +118,17 @@ class DetectedProvider:
     :param source: A human-readable descriptor of where the credential
         comes from, e.g. ``"$ANTHROPIC_API_KEY"``, ``"claude CLI login"``,
         or ``"http://localhost:11434"``.
-    :param model_provider: For ``kind="cli-config"`` only: the custom
-        provider id the CLI's config file selects, e.g. ``"Databricks"``
-        (the ``model_provider`` key in ``~/.codex/config.toml``). ``None``
-        for other kinds.
+    :param cli: For ``kind="cli-config"`` only: the CLI whose own config
+        file defines and authenticates the provider — ``"codex"`` (a
+        ``[model_providers.X]`` table in ``~/.codex/config.toml``) or
+        ``"claude"`` (a gateway ``env`` block + credential helper in Claude
+        Code's settings chain). ``None`` for other kinds.
+    :param model_provider: For a ``codex`` ``kind="cli-config"`` only: the
+        custom provider id the CLI's config file selects, e.g.
+        ``"Databricks"`` (the ``model_provider`` key in
+        ``~/.codex/config.toml``). ``None`` for other kinds — Claude Code has
+        no ``model_provider`` concept, its settings chain pins the endpoint
+        directly.
     :param display_name: For ``kind="cli-config"`` only: the provider's
         human display name from its config table (``name = "Databricks AI
         Gateway"``), falling back to :attr:`model_provider` when the table
@@ -118,6 +139,7 @@ class DetectedProvider:
     kind: DetectedKind
     family: str | None
     source: str
+    cli: str | None = None
     model_provider: str | None = None
     display_name: str | None = None
 
@@ -485,6 +507,7 @@ def codex_config_detection() -> DetectedProvider | None:
         kind=CLI_CONFIG_KIND,
         family=OPENAI_FAMILY,
         source=f"~/.codex/config.toml provider {codex_config.provider_id!r}",
+        cli="codex",
         model_provider=codex_config.provider_id,
         display_name=codex_config.display_name,
     )
@@ -601,6 +624,138 @@ def _claude_login_detected() -> bool:
 
         return harness_cli_logged_in(ANTHROPIC_FAMILY)
     return False
+
+
+@dataclass(frozen=True)
+class ClaudeConfigProvider:
+    """A gateway Claude Code's own settings chain defines and authenticates.
+
+    The Claude-side counterpart of :class:`CodexConfigProvider`. Claude Code has
+    no ``[model_providers.X]`` concept — its settings pin the endpoint directly —
+    so there is no provider id to record, only where requests go and the name to
+    show for it.
+
+    :param base_url: The settings' ``env.ANTHROPIC_BASE_URL``, e.g.
+        ``"https://<workspace>.cloud.databricks.com/ai-gateway/anthropic"``.
+    :param display_name: A human name for the endpoint, e.g. ``"Databricks AI
+        Gateway"`` for a recognized Databricks gateway, else its hostname.
+    :param slug: The config-name fragment identifying the endpoint kind, e.g.
+        ``"databricks"``, giving the stable entry name ``claude-databricks``.
+    """
+
+    base_url: str
+    display_name: str
+    slug: str
+
+
+def claude_managed_gateway(
+    paths: tuple[Path, ...] | None = None,
+) -> tuple[str | None, bool]:
+    """Read the gateway backing Claude Code applies from its managed settings.
+
+    The canonical parser for Claude Code's managed-settings credential, shared
+    by ambient detection and the Smart-Routing gateway check
+    (:func:`omnigent.claude_native.managed_claude_gateway_signal` delegates
+    here). A credential counts as delivered when the file carries a top-level
+    ``apiKeyHelper`` (a token-printing command) or a truthy
+    ``env.CLAUDE_CODE_USE_GATEWAY``.
+
+    The **first readable, object-shaped** file decides, matching Claude Code's
+    own precedence chain: a managed settings file that exists but pins no
+    ``ANTHROPIC_BASE_URL`` reports "no gateway" rather than falling through to a
+    lower-precedence file it would itself override.
+
+    :param paths: Settings files to read, highest precedence first; defaults to
+        :data:`CLAUDE_CODE_MANAGED_SETTINGS_PATHS`.
+    :returns: ``(base_url, has_credential)`` from the first readable file, or
+        ``(None, False)`` when none is present or parseable.
+    """
+    for path in CLAUDE_CODE_MANAGED_SETTINGS_PATHS if paths is None else paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        raw_env = payload.get("env")
+        env = raw_env if isinstance(raw_env, dict) else {}
+        raw_base_url = env.get("ANTHROPIC_BASE_URL")
+        base_url = raw_base_url.strip() if isinstance(raw_base_url, str) else None
+        has_helper = bool(payload.get("apiKeyHelper"))
+        use_gateway = str(env.get("CLAUDE_CODE_USE_GATEWAY", "")).strip().lower() not in (
+            "",
+            "0",
+            "false",
+        )
+        return base_url or None, has_helper or use_gateway
+    return None, False
+
+
+def claude_config_custom_provider(
+    paths: tuple[Path, ...] | None = None,
+) -> ClaudeConfigProvider | None:
+    """Detect a self-authenticating gateway in Claude Code's settings chain.
+
+    The Claude mirror of :func:`codex_config_custom_provider`. Enterprise
+    tooling configures Claude Code by writing its managed settings only — a
+    gateway ``ANTHROPIC_BASE_URL`` plus an ``apiKeyHelper`` that prints a bearer
+    token — so no ``.credentials.json`` / Keychain subscription is ever written
+    and the login detection sees nothing routable. This is the detection for
+    that state.
+
+    A settings file counts only when it pins **both** an endpoint and a way to
+    authenticate against it; either alone is not a usable credential (a bare
+    ``ANTHROPIC_BASE_URL`` still needs a key omnigent cannot supply).
+
+    :param paths: Settings files to read; defaults to
+        :data:`CLAUDE_CODE_MANAGED_SETTINGS_PATHS`.
+    :returns: The :class:`ClaudeConfigProvider`, or ``None`` when the chain
+        pins no gateway or delivers no credential for it.
+    """
+    base_url, has_credential = claude_managed_gateway(paths)
+    if base_url is None or not has_credential:
+        return None
+    # Lazy: the gateway-URL allowlist lives in its own module and is only
+    # needed once a gateway is actually present.
+    from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
+
+    if is_databricks_ai_gateway_url(base_url):
+        return ClaudeConfigProvider(
+            base_url=base_url, display_name="Databricks AI Gateway", slug="databricks"
+        )
+    # A non-Databricks gateway is still a real credential; name it after its
+    # host so the entry stays stable and unambiguous.
+    host = urlsplit(base_url).hostname or base_url
+    return ClaudeConfigProvider(base_url=base_url, display_name=host, slug=_slug(host))
+
+
+def claude_config_detection(
+    paths: tuple[Path, ...] | None = None,
+) -> DetectedProvider | None:
+    """Return the ``cli-config`` detection for Claude Code's settings, if any.
+
+    The Claude twin of :func:`codex_config_detection` — the single constructor
+    for this detection, so callers that need to identify it on its own (the
+    setup add menu, the readiness gate) agree with :func:`detect_providers`.
+
+    :param paths: Settings files to read; defaults to
+        :data:`CLAUDE_CODE_MANAGED_SETTINGS_PATHS`.
+    :returns: A ``kind="cli-config"`` :class:`DetectedProvider` (stable name
+        ``claude-<slug>``, e.g. ``"claude-databricks"``) carrying no
+        ``model_provider`` — Claude Code has none to pin — or ``None`` when the
+        settings chain carries no self-authenticating gateway.
+    """
+    provider = claude_config_custom_provider(paths)
+    if provider is None:
+        return None
+    return DetectedProvider(
+        name=f"claude-{provider.slug}",
+        kind=CLI_CONFIG_KIND,
+        family=ANTHROPIC_FAMILY,
+        source=f"Claude Code managed settings gateway {provider.display_name!r}",
+        cli="claude",
+        display_name=provider.display_name,
+    )
 
 
 def _ollama_reachable() -> bool:
@@ -746,12 +901,32 @@ def _detect_providers_now() -> list[DetectedProvider]:
             )
         )
 
-    # 2. Claude CLI login. Like codex (below), existence alone is not enough —
+    # 2. A self-authenticating gateway in Claude Code's managed settings (e.g.
+    #    the Databricks AI Gateway written by ``isaac configure claude``, which
+    #    writes that file only — never a subscription credential — so the login
+    #    check below cannot see it). Ordered BEFORE the login check for the same
+    #    reason codex's config detection is: managed settings win at Claude
+    #    Code's own launch, so the auto-default must match what a plain
+    #    ``claude`` invocation actually does.
+    claude_config_det = claude_config_detection()
+    if claude_config_det is not None:
+        detected.append(claude_config_det)
+
+    # 2b. Claude CLI login. Like codex (below), existence alone is not enough —
     #    an empty / logged-out ``.credentials.json`` carries no usable login.
     #    On macOS the credential lives in the Keychain rather than the file, so
     #    detection falls back to the CLI's own status check there. See
     #    ``_claude_login_detected`` / ``claude_auth_has_credential``.
-    if _claude_login_detected():
+    #
+    #    Skipped when the gateway above was found: ``claude auth status`` reports
+    #    a managed ``apiKeyHelper`` as logged in (``authMethod:
+    #    "api_key_helper"``), so that probe is describing the very same
+    #    credential. Reporting it again as a ``subscription`` would double-count
+    #    one gateway as two providers and mislabel it as a Claude plan login.
+    #    A host with a managed gateway AND a separate personal Pro/Max login
+    #    therefore surfaces only the gateway — correct for routing, since managed
+    #    settings win at Claude Code's own launch either way.
+    if claude_config_det is None and _claude_login_detected():
         detected.append(
             DetectedProvider(
                 name="claude",

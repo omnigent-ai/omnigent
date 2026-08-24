@@ -43,6 +43,7 @@ import rehypeRaw from "rehype-raw";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import { rehypeGithubAlerts } from "rehype-github-alerts";
 import { mermaid } from "@streamdown/mermaid";
+import { MarkdownErrorBoundary } from "@/components/ai-elements/MarkdownErrorBoundary";
 import { Streamdown } from "streamdown";
 import type { Comment } from "@/hooks/useComments";
 import {
@@ -143,9 +144,11 @@ const MERMAID_STREAMDOWN_PLUGINS = { mermaid };
 function MermaidPreview({ source }: { source: string }) {
   return (
     <div data-testid="mermaid-preview" className="not-prose my-4 overflow-auto">
-      <Streamdown plugins={MERMAID_STREAMDOWN_PLUGINS}>
-        {`\`\`\`mermaid\n${source.replace(/\n$/, "")}\n\`\`\``}
-      </Streamdown>
+      <MarkdownErrorBoundary source={source}>
+        <Streamdown plugins={MERMAID_STREAMDOWN_PLUGINS}>
+          {`\`\`\`mermaid\n${source.replace(/\n$/, "")}\n\`\`\``}
+        </Streamdown>
+      </MarkdownErrorBoundary>
     </div>
   );
 }
