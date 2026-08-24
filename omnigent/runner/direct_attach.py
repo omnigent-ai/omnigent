@@ -45,6 +45,8 @@ import uvicorn
 from fastapi import FastAPI, Query, WebSocket
 from starlette import status
 
+from omnigent.debug_logging import runner_primary_session_id
+
 _logger = logging.getLogger(__name__)
 
 # Bind loopback by literal IPv4 address, matching the URL the server
@@ -200,7 +202,11 @@ async def _await_quietly(task: asyncio.Task[None]) -> None:
     if not task.done() or task.cancelled():
         return
     if (exc := task.exception()) is not None:
-        _logger.warning("direct-attach listener exited with an error", exc_info=exc)
+        _logger.warning(
+            "direct-attach listener exited with an error",
+            exc_info=exc,
+            extra={"session_id": runner_primary_session_id()},
+        )
 
 
 class DirectAttachListener:
@@ -242,7 +248,10 @@ async def start_direct_attach_listener(app: FastAPI) -> DirectAttachListener | N
     deadline = asyncio.get_running_loop().time() + _STARTUP_TIMEOUT_S
     while not server.started:
         if task.done() or asyncio.get_running_loop().time() >= deadline:
-            _logger.warning("direct-attach listener failed to start; relay-only")
+            _logger.warning(
+                "direct-attach listener failed to start; relay-only",
+                extra={"session_id": runner_primary_session_id()},
+            )
             task.cancel()
             await _await_quietly(task)
             return None
@@ -251,8 +260,16 @@ async def start_direct_attach_listener(app: FastAPI) -> DirectAttachListener | N
         sockets = server.servers[0].sockets
         port = int(sockets[0].getsockname()[1])
     except (IndexError, AttributeError, OSError):
-        _logger.warning("direct-attach listener has no bound socket; relay-only")
+        _logger.warning(
+            "direct-attach listener has no bound socket; relay-only",
+            extra={"session_id": runner_primary_session_id()},
+        )
         await DirectAttachListener(server, task, 0).stop()
         return None
-    _logger.info("direct-attach listener on %s:%d", DIRECT_ATTACH_BIND_HOST, port)
+    _logger.info(
+        "direct-attach listener on %s:%d",
+        DIRECT_ATTACH_BIND_HOST,
+        port,
+        extra={"session_id": runner_primary_session_id()},
+    )
     return DirectAttachListener(server, task, port)

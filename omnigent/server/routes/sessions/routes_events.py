@@ -727,6 +727,125 @@ def register_events_routes(
             # ``function_call`` as an unknown inbound event type).
             return {"verdict": "allow"}
 
+        async def _wake_bound_runner_for_control(
+            wake_conv: Any,
+        ) -> tuple[Any, httpx.AsyncClient | None]:
+            """
+            Relaunch a disconnected-but-wakeable runner for a control event.
+
+            A native-terminal /compact must run in the vendor TUI, so when no
+            runner is bound we wake it the same way the message-dispatch path
+            does (resume a managed sandbox / relaunch the runner on its still-
+            online host), wait for the tunnel to connect, then re-run the
+            session-init handshake and relay so the forwarded control reaches
+            a live harness. Returns the (possibly re-read) conversation row and
+            the resolved runner client, or ``(conv, None)`` when the session
+            can't be woken (e.g. the host is offline).
+
+            :param wake_conv: The session row (may have a stale binding).
+            :returns: ``(conversation, runner_client_or_None)``.
+            :raises OmnigentError: ``WRONG_REPLICA`` when the host tunnel is
+                absent here but the host is live on another replica.
+            """
+            _app_state = request.app.state
+            if wake_conv.host_id is not None and await _maybe_wake_stale_resumable_managed_sandbox(
+                session_id=session_id,
+                conv=wake_conv,
+                app_state=_app_state,
+                conversation_store=conversation_store,
+            ):
+                _refreshed = await asyncio.to_thread(
+                    conversation_store.get_conversation, session_id
+                )
+                if _refreshed is not None:
+                    wake_conv = _refreshed
+            _client = await _get_runner_client(session_id, runner_router)
+            if _client is None and wake_conv.host_id is not None:
+                _host_reg = getattr(_app_state, "host_registry", None)
+                _tunnel_reg = getattr(_app_state, "tunnel_registry", None)
+                # Wrong-replica routing miss, checked before we try to launch:
+                # the runner tunnel registers on the same replica as its host,
+                # so an absent tunnel here while the host is live elsewhere
+                # means the key routed to the wrong replica. Signal it (same as
+                # the message path) so the client re-addresses without the key,
+                # rather than getting a false "reconnect" 503 for a session that
+                # is actually wakeable on another replica.
+                _host_store = getattr(_app_state, "host_store", None)
+                if (
+                    _host_reg is not None
+                    and _host_store is not None
+                    and _host_reg.get(wake_conv.host_id) is None
+                ):
+                    _elsewhere = await asyncio.to_thread(_host_store.get_host, wake_conv.host_id)
+                    if _elsewhere is not None and host_is_live(_elsewhere):
+                        raise OmnigentError(
+                            "session runner is on another replica; retry",
+                            code=ErrorCode.WRONG_REPLICA,
+                        )
+                _relaunched_runner_id: str | None = None
+                _host_conn = _host_reg.get(wake_conv.host_id) if _host_reg is not None else None
+                if _host_conn is not None:
+                    _attempt = await _launch_runner_on_host(
+                        wake_conv,
+                        conversation_store,
+                        _host_reg,
+                        _host_conn,
+                    )
+                    # A structured refusal (harness not configured / workspace
+                    # missing) leaves no runner to compact against — treat as
+                    # unwakeable; the caller surfaces the reconnect error.
+                    if _attempt.error_code is None:
+                        _relaunched_runner_id = _attempt.runner_id
+                elif await _maybe_relaunch_managed_sandbox(
+                    session_id=session_id,
+                    conv=wake_conv,
+                    app_state=_app_state,
+                    conversation_store=conversation_store,
+                ):
+                    _refreshed = await asyncio.to_thread(
+                        conversation_store.get_conversation, session_id
+                    )
+                    if _refreshed is not None:
+                        wake_conv = _refreshed
+                    _client = await _get_runner_client(session_id, runner_router)
+                if _client is None:
+                    _client = await _wait_for_runner_client(
+                        session_id,
+                        runner_router,
+                        _tunnel_reg,
+                        runner_id=_relaunched_runner_id,
+                        timeout_s=_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
+                        runner_exit_reports=runner_exit_reports,
+                    )
+            if _client is None:
+                return wake_conv, None
+            _refreshed = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if _refreshed is not None:
+                wake_conv = _refreshed
+            # Bring the terminal + transcript forwarder up before the control
+            # is injected, mirroring the message-dispatch relaunch path.
+            # suppress_recovery_turn=True: unlike the message path (which
+            # suppresses because the server already persisted a pending message
+            # the runner's history load would otherwise start a recovery turn
+            # for), /compact persists nothing — so there is no pending item to
+            # trigger recovery. Suppression is a harmless no-op here; kept for
+            # parity so a wake never spuriously starts a turn.
+            await _ensure_runner_session_initialized(
+                session_id,
+                wake_conv,
+                _client,
+                conversation_store,
+                initializer=getattr(_app_state, "runner_session_initializer", None),
+                suppress_recovery_turn=True,
+            )
+            await _ensure_runner_relay_ready(
+                session_id,
+                wake_conv.runner_id,
+                _client,
+                conversation_store,
+            )
+            return wake_conv, _client
+
         if body.type == _INTERRUPT_TYPE:
             _publish_interrupted(session_id)
             # Fence the cancelled turn (see _interrupt_fenced_sessions).
@@ -921,6 +1040,47 @@ def register_events_routes(
                 raise OmnigentError(
                     f"Compaction failed: runner returned {runner_result.status_code}",
                     code=ErrorCode.INTERNAL_ERROR,
+                )
+            # ``runner_result is None`` means no runner was reachable. For a
+            # native-terminal session /compact MUST run in the vendor TUI —
+            # falling through to server-side in-process compaction is wrong
+            # (it wouldn't compact the terminal's own context) and errors for
+            # a harness that declares no LLM model. A disconnected-but-wakeable
+            # session (runner_asleep / host_asleep) should wake and compact
+            # just like sending a message does, so relaunch the runner the same
+            # way the message-dispatch path does, then retry the forward once.
+            if runner_result is None and _is_native_terminal_session(conv):
+                conv, woke_client = await _wake_bound_runner_for_control(conv)
+                if woke_client is not None:
+                    # Same TUI-inject budget as the initial forward: a
+                    # just-relaunched runner is the slow case (cold pane, just
+                    # advertised), and the claude-native injector's worst case
+                    # (~16s) exceeds the 5s default — a timeout there returns
+                    # None and would wrongly fall through to the "reconnect"
+                    # 503 while Claude Code is actually compacting.
+                    runner_result = await _forward_session_change_to_runner(
+                        session_id,
+                        runner_router,
+                        {"type": _COMPACT_TYPE},
+                        timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
+                    )
+                    if runner_result is not None and runner_result.status_code == 200:
+                        return {"queued": False}
+                    if runner_result is not None and runner_result.status_code != 204:
+                        raise OmnigentError(
+                            f"Compaction failed: runner returned {runner_result.status_code}",
+                            code=ErrorCode.INTERNAL_ERROR,
+                        )
+                # Native session that couldn't be woken (host offline) — the
+                # runner is the only thing that can compact it, so surface a
+                # clear "reconnect first" error rather than falling through to
+                # in-process compaction (which fails with a confusing
+                # no-LLM-model message).
+                raise OmnigentError(
+                    "Can't compact this session while its runner is offline. "
+                    "Reconnect the session (send a message to wake it), then "
+                    "run /compact again.",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
                 )
             await _run_compact_locked(
                 session_id,

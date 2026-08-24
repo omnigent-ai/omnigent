@@ -22,9 +22,11 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { AgentInfoButton } from "@/components/AgentInfo";
 import { ConversationBreadcrumb } from "./ConversationBreadcrumb";
+import { HeaderConversationMenu } from "./HeaderConversationMenu";
 import { UNTITLED_CONVERSATION_LABEL } from "./sidebarNav";
 import { PresenceAvatars } from "@/components/PresenceAvatars";
 import type { Agent } from "@/hooks/useAgents";
+import type { Conversation } from "@/hooks/useConversations";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { cn } from "@/lib/utils";
 import { TAB_BADGE_BASE } from "./railTabs";
@@ -95,6 +97,8 @@ interface ChatHeaderProps {
   isChildSession: boolean;
   /** Active session id, or undefined on the landing composer. */
   conversationId: string | undefined;
+  /** Owner-managed top-level row backing the title-adjacent action menu. */
+  actionConversation?: Conversation | null;
   /**
    * Breadcrumb title: the active conversation's display name, or its
    * immediate parent's when viewing a sub-agent. ``null`` while unresolved.
@@ -177,6 +181,7 @@ export function ChatHeader({
   onOpenSidebar,
   isChildSession,
   conversationId,
+  actionConversation = null,
   conversationTitle,
   projectName,
   titleLinkTo,
@@ -290,6 +295,20 @@ export function ChatHeader({
             isChildSession={isChildSession}
             boundAgent={boundAgent}
             wrapperLabel={wrapperLabel}
+            actions={
+              actionConversation ? (
+                <HeaderConversationMenu
+                  conversation={actionConversation}
+                  currentProject={projectName}
+                  canShare={canShare}
+                  shareDisabled={shareDisabled}
+                  shareDisabledReason={shareDisabledReason}
+                  onShare={onShare}
+                  hasAgentInfo={isMobile && hasAgentInfo}
+                  onAgentInfo={onAgentInfo}
+                />
+              ) : undefined
+            }
             className="pr-1"
           />
         )}
@@ -315,7 +334,7 @@ export function ChatHeader({
             (Share · Agent info) so the header stays
             uncluttered on a phone. The right-panel/rail control is
             deliberately left out — it has its own affordance below. */}
-        {hasHeaderMenu && (
+        {hasHeaderMenu && (!actionConversation || !isMobile) && (
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button

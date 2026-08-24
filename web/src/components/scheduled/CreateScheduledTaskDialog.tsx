@@ -86,12 +86,15 @@ export function CreateScheduledTaskDialog({
   // below), reusing lightweight scheduled-local pickers rather than the
   // interactive dialog's 26-prop HarnessConfigModal (bound to smart-routing /
   // cost-control / per-turn model loading — disproportionate for a saved task).
-  // "" = unselected → `model_override` / `reasoning_effort` are omitted so the
-  // fire path uses the agent's configured defaults. Permission/approval/cursor
-  // mode is intentionally NOT offered here.
+  // "" = unselected → `model_override` / `reasoning_effort` / `permission_mode`
+  // are omitted so the fire path uses the agent's configured defaults. Permission
+  // mode is offered for native coding agents that support it (Claude Code); each
+  // fire launches a fresh session, so the whole launch vocabulary is valid —
+  // including the launch-only `dontAsk` / `bypassPermissions`.
   const [pickedAgentId, setPickedAgentId] = useState<string | null>(null);
   const [pickedModel, setPickedModel] = useState<string>("");
   const [pickedEffort, setPickedEffort] = useState<string>("");
+  const [pickedPermission, setPickedPermission] = useState<string>("");
 
   const agentList = useMemo(
     () => sortAgentsForDisplay((agents ?? []).filter((a) => !HIDDEN_PICKER_AGENTS.has(a.name))),
@@ -188,9 +191,10 @@ export function CreateScheduledTaskDialog({
         setName(editingTask.name);
         setPrompt(editingTask.prompt);
         setPickedAgentId(editingTask.agentId);
-        // Prefill the model/effort controls from the loaded task; null → "".
+        // Prefill the model/effort/permission controls from the loaded task; null → "".
         setPickedModel(editingTask.modelOverride ?? "");
         setPickedEffort(editingTask.reasoningEffort ?? "");
+        setPickedPermission(editingTask.permissionMode ?? "");
         setSchedule(parsedSchedule ?? DEFAULT_SCHEDULE_MODEL);
         setScheduleUnsupported(parsedSchedule === null);
         setHostId(editingTask.hostId ?? "");
@@ -201,6 +205,7 @@ export function CreateScheduledTaskDialog({
         setPickedAgentId(null);
         setPickedModel("");
         setPickedEffort("");
+        setPickedPermission("");
         setSchedule(DEFAULT_SCHEDULE_MODEL);
         setScheduleUnsupported(false);
         setHostId("");
@@ -247,6 +252,7 @@ export function CreateScheduledTaskDialog({
     setPickedAgentId(null);
     setPickedModel("");
     setPickedEffort("");
+    setPickedPermission("");
     setSchedule(DEFAULT_SCHEDULE_MODEL);
     setHostId("");
     setWorkspace("");
@@ -279,6 +285,7 @@ export function CreateScheduledTaskDialog({
           ? {
               modelOverride: pickedModel === "" ? null : pickedModel,
               reasoningEffort: pickedEffort === "" ? null : pickedEffort,
+              permissionMode: pickedPermission === "" ? null : pickedPermission,
             }
           : {};
         await updateMutation.mutateAsync({
@@ -295,6 +302,9 @@ export function CreateScheduledTaskDialog({
           // the create uses the agent's configured defaults.
           ...(showModelEffort && pickedModel !== "" ? { modelOverride: pickedModel } : {}),
           ...(showModelEffort && pickedEffort !== "" ? { reasoningEffort: pickedEffort } : {}),
+          ...(showModelEffort && pickedPermission !== ""
+            ? { permissionMode: pickedPermission }
+            : {}),
         });
       }
       handleOpenChange(false);
@@ -427,21 +437,25 @@ export function CreateScheduledTaskDialog({
             )}
           </div>
 
-          {/* Model + reasoning effort — only for native coding agents that
-              carry the model/effort surface (Claude Code). Unselected controls
-              fall back to the agent's configured defaults. */}
+          {/* Model + reasoning effort + permission mode — only for native
+              coding agents that carry the model/effort surface (Claude Code).
+              Unselected controls fall back to the agent's configured defaults. */}
           {showModelEffort && (
             <div data-testid="task-model-effort-field">
               <ModelEffortFields
                 model={pickedModel}
                 effort={pickedEffort}
+                permissionMode={pickedPermission}
                 hostId={hostId}
                 onModelChange={setPickedModel}
                 onEffortChange={setPickedEffort}
+                onPermissionModeChange={setPickedPermission}
                 onSelectOpenChange={handleSelectOpenChange}
               />
               <p className="mt-1.5 text-sm text-muted-foreground">
-                Leave on Default to use the agent&apos;s configured model and effort.
+                Leave on Default to use the agent&apos;s configured model, effort, and permission
+                mode. Automations run unattended, so a prompting mode (Manual or Plan) will wait for
+                approval that never comes.
               </p>
             </div>
           )}

@@ -27,6 +27,7 @@ import websockets.asyncio.client
 from websockets.exceptions import ConnectionClosed, InvalidStatus, InvalidURI
 
 from omnigent._platform import IS_POSIX, WINDOWS_ENV_PASSTHROUGH
+from omnigent.debug_logging import PRIMARY_SESSION_ID_ENV_VAR
 from omnigent.env_credentials import env_names_with_omnigent_prefix
 from omnigent.gateway_inference import gateway_inference_map
 from omnigent.harness_aliases import canonicalize_harness, is_claude_sdk_harness_name
@@ -447,6 +448,16 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "OMNIGENT_LOG_LEVEL",
         "OMNIGENT_LOG_TO_STDERR",
         LOG_TTY_FD_ENV_VAR,
+        # Debug-log sink config + creds (OMNI-4198). The runner uploads its OWN
+        # process logs to the debug-logs table, so it needs these — including the
+        # service-principal secret. That is the one deliberate exception to the
+        # "no secrets" rule: it is the app's SP creds for log upload (not a user
+        # secret), and the runner is a trusted child. Without them the runner's
+        # sink never arms and runner logs never reach the table.
+        "OMNIGENT_DEBUG_LOG_CLIENT_ID",
+        "OMNIGENT_DEBUG_LOG_CLIENT_SECRET",
+        "OMNIGENT_DEBUG_LOG_WORKSPACE_URL",
+        "OMNIGENT_DEBUG_LOG_ENDPOINT",
         # Secret-store backend selector. The CLI's `configure harnesses` stores
         # pasted API keys via the file backend when this is set (headless /
         # locked-keyring hosts), writing `keychain:<name>` refs. The runner
@@ -1414,6 +1425,10 @@ class HostProcess:
             host_id=self._identity.host_id,
             harness=frame.harness,
         )
+        # The runner serves one primary session (plus any co-located subagents);
+        # pass it so runner-level log records can be attributed to that session.
+        if frame.session_id:
+            env[PRIMARY_SESSION_ID_ENV_VAR] = frame.session_id
 
         # Embed the session id so operators can find all logs for a session
         # with `omnigent debug logs --session <id>`. Cap at 32 chars to keep

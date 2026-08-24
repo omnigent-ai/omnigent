@@ -53,6 +53,7 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         rrule=row.rrule,
         model_override=row.model_override,
         reasoning_effort=row.reasoning_effort,
+        permission_mode=row.permission_mode,
         max_cost_usd=row.max_cost_usd,
         workspace=row.workspace,
         base_branch=row.base_branch,
@@ -128,6 +129,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         *,
         model_override: str | None = None,
         reasoning_effort: str | None = None,
+        permission_mode: str | None = None,
         max_cost_usd: float | None = None,
         workspace: str | None = None,
         host_id: str | None = None,
@@ -144,6 +146,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             timezone=timezone,
             model_override=model_override,
             reasoning_effort=reasoning_effort,
+            permission_mode=permission_mode,
             max_cost_usd=max_cost_usd,
             workspace=workspace,
             base_branch=None,
@@ -247,8 +250,9 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         prompt: str | None = None,
         rrule: str | None = None,
         timezone: str | None = None,
-        model_override: str | None = None,
-        reasoning_effort: str | None = None,
+        model_override: str | None = _UNSET,
+        reasoning_effort: str | None = _UNSET,
+        permission_mode: str | None = _UNSET,
         max_cost_usd: float | None = _UNSET,
         workspace: str | None = None,
         host_id: str | None = _UNSET,
@@ -258,11 +262,14 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
     ) -> ScheduledTask | None:
         """Update mutable fields.
 
-        ``None`` leaves most fields unchanged. For ``host_id``,
-        ``max_cost_usd``, and ``last_run_conversation_id``, the sentinel
-        default means "not provided / leave unchanged"; passing ``None``
-        explicitly sets the column to NULL. Passing ``rrule`` updates the
-        recurring trigger; ``None`` leaves it unchanged.
+        ``None`` leaves most fields unchanged. For the per-task overrides
+        (``model_override``, ``reasoning_effort``, ``permission_mode``),
+        ``host_id``, ``max_cost_usd``, and ``last_run_conversation_id``, the
+        sentinel default means "not provided / leave unchanged"; passing
+        ``None`` explicitly sets the column to NULL — so resetting an override
+        to the agent default actually clears it (a set ``bypassPermissions``
+        can be turned back off). Passing ``rrule`` updates the recurring
+        trigger; ``None`` leaves it unchanged.
         """
         with self._session("update_task") as session:
             row = session.get(SqlScheduledTask, (current_workspace_id(), scheduled_task_id))
@@ -281,11 +288,14 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             if timezone is not None and row.timezone != timezone:
                 row.timezone = timezone
                 changed = True
-            if model_override is not None and row.model_override != model_override:
+            if model_override is not _UNSET and row.model_override != model_override:
                 row.model_override = model_override
                 changed = True
-            if reasoning_effort is not None and row.reasoning_effort != reasoning_effort:
+            if reasoning_effort is not _UNSET and row.reasoning_effort != reasoning_effort:
                 row.reasoning_effort = reasoning_effort
+                changed = True
+            if permission_mode is not _UNSET and row.permission_mode != permission_mode:
+                row.permission_mode = permission_mode
                 changed = True
             if max_cost_usd is not _UNSET and row.max_cost_usd != max_cost_usd:
                 row.max_cost_usd = max_cost_usd

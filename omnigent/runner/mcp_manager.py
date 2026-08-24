@@ -15,6 +15,7 @@ import httpx
 from mcp.types import ElicitRequestParams, ElicitResult
 from mcp.types import Tool as McpToolDef
 
+from omnigent.debug_logging import runner_primary_session_id
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.spec.types import AgentSpec, MCPServerConfig, RetryPolicy
 from omnigent.tools.base import is_valid_tool_name
@@ -186,6 +187,7 @@ def _mcp_tool_schema(
             "(must match [a-zA-Z0-9_-]{1,256}) — skipping",
             bare_name,
             server_name,
+            extra={"session_id": runner_primary_session_id()},
         )
         return None
     # Namespace: ``{server_name}__{bare_name}`` so two servers with a tool
@@ -269,6 +271,7 @@ class RunnerMcpManager:
             if server_client is None:
                 _logger.warning(
                     "MCP elicitation callback: no Omnigent server client available — declining",
+                    extra={"session_id": session_id},
                 )
                 return ElicitResult(action="decline")
 
@@ -296,6 +299,7 @@ class RunnerMcpManager:
                 _logger.warning(
                     "MCP elicitation callback: Omnigent server POST failed (%s) — declining",
                     exc,
+                    extra={"session_id": session_id},
                 )
                 return ElicitResult(action="decline")
 
@@ -304,6 +308,7 @@ class RunnerMcpManager:
                 _logger.warning(
                     "MCP elicitation callback: Omnigent server returned no "
                     "elicitation_id — declining",
+                    extra={"session_id": session_id},
                 )
                 return ElicitResult(action="decline")
 
@@ -367,7 +372,10 @@ class RunnerMcpManager:
                 try:
                     await asyncio.gather(*connect_tasks.values())
                 except Exception:
-                    _logger.exception("runner mcp connect task raised; surfacing partial results")
+                    _logger.exception(
+                        "runner mcp connect task raised; surfacing partial results",
+                        extra={"session_id": runner_primary_session_id()},
+                    )
 
             schemas: list[_JsonObject] = []
             tool_names: set[str] = set()
@@ -610,6 +618,7 @@ class RunnerMcpManager:
                     "error closing MCP %r (%s) during shutdown",
                     server.config.name,
                     server.server_hash,
+                    extra={"session_id": runner_primary_session_id()},
                 )
 
         if self._evict_tasks:
@@ -657,6 +666,7 @@ class RunnerMcpManager:
                 "runner mcp pool evicting spec %s (over capacity %d)",
                 victim,
                 _POOL_SPEC_CAPACITY,
+                extra={"session_id": runner_primary_session_id()},
             )
             self._release_spec_entry(victim, entry)
 
@@ -672,7 +682,12 @@ class RunnerMcpManager:
         try:
             await conn.close()
         except Exception:
-            _logger.exception("error closing MCP %r for %s", name, owner)
+            _logger.exception(
+                "error closing MCP %r for %s",
+                name,
+                owner,
+                extra={"session_id": runner_primary_session_id()},
+            )
 
     def _schedule_close(self, conn: McpServerConnection, owner: str, name: str) -> None:
         task = asyncio.create_task(
@@ -748,6 +763,7 @@ class RunnerMcpManager:
                         server.server_hash,
                         server.config.name,
                         server.error,
+                        extra={"session_id": runner_primary_session_id()},
                     )
                     return
 
@@ -767,6 +783,7 @@ class RunnerMcpManager:
                     server.server_hash,
                     server.config.name,
                     len(tools),
+                    extra={"session_id": runner_primary_session_id()},
                 )
         finally:
             cleanup_conn: McpServerConnection | None = None
