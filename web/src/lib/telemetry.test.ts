@@ -59,10 +59,10 @@ describe("initBrowserTelemetry", () => {
     vi.stubEnv("VITE_OTEL_EXPORTER_OTLP_ENDPOINT", "");
     const { initBrowserTelemetry } = await import("./telemetry");
 
-    initBrowserTelemetry();
+    await initBrowserTelemetry();
 
-    // With no collector, nothing is registered — production builds without
-    // a backend pay zero overhead and never patch fetch.
+    // With no collector, nothing is registered and the SDK chunk is never
+    // fetched — builds without a backend never patch fetch.
     expect(m.WebTracerProvider).not.toHaveBeenCalled();
     expect(m.registerInstrumentations).not.toHaveBeenCalled();
   });
@@ -71,7 +71,7 @@ describe("initBrowserTelemetry", () => {
     vi.stubEnv("VITE_OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318");
     const { initBrowserTelemetry } = await import("./telemetry");
 
-    initBrowserTelemetry();
+    await initBrowserTelemetry();
 
     expect(m.WebTracerProvider).toHaveBeenCalledTimes(1);
     expect(m.register).toHaveBeenCalledTimes(1);
@@ -88,8 +88,8 @@ describe("initBrowserTelemetry", () => {
     vi.stubEnv("VITE_OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318");
     const { initBrowserTelemetry } = await import("./telemetry");
 
-    initBrowserTelemetry();
-    initBrowserTelemetry();
+    await initBrowserTelemetry();
+    await initBrowserTelemetry();
 
     expect(m.WebTracerProvider).toHaveBeenCalledTimes(1);
   });
@@ -98,7 +98,7 @@ describe("initBrowserTelemetry", () => {
     vi.stubEnv("VITE_OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318/");
     const { initBrowserTelemetry } = await import("./telemetry");
 
-    initBrowserTelemetry();
+    await initBrowserTelemetry();
 
     expect(m.OTLPTraceExporter).toHaveBeenCalledWith({
       url: "http://localhost:4318/v1/traces",

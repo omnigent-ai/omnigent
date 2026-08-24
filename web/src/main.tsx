@@ -28,10 +28,11 @@ import "katex/dist/katex.min.css";
 import "streamdown/styles.css";
 import "./index.css";
 
-// Start tracing before any request fires so fetch/XHR are patched in time
-// and a trace begins in the browser. No-op unless a collector endpoint is
-// configured (VITE_OTEL_EXPORTER_OTLP_ENDPOINT).
-initBrowserTelemetry();
+// Arm tracing before any request fires so fetch/XHR are patched in time and a
+// trace begins in the browser. No-op unless a collector endpoint is configured
+// (VITE_OTEL_EXPORTER_OTLP_ENDPOINT); the SDK loads on demand, so an
+// unconfigured build never downloads it.
+const telemetryReady = initBrowserTelemetry();
 
 // Single client at module scope — shared across the whole app.
 //
@@ -52,8 +53,10 @@ initChatStore(queryClient);
 
 // Discover the current user identity from the server. Once resolved,
 // all subsequent fetch calls include X-Forwarded-Email so session
-// routes know who's making the request.
-void resolveIdentity();
+// routes know who's making the request. Chained off `telemetryReady` so the
+// probe is traced when tracing is on; `resolveIdentity` memoizes its promise,
+// so this is only a warm-up kick — later callers await the same request.
+void telemetryReady.then(resolveIdentity);
 
 // Mirror the iOS shell's native bar footprints into the inset CSS variables.
 // No-op off the iOS shell (the inset vars stay at their env()-only defaults).
