@@ -34,6 +34,58 @@ CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES: frozenset[str] = frozenset(
 )
 
 
+# The only harness that accepts a ``--permission-mode`` launch arg — the same
+# ``permissionMode`` capability the web dialog gates its permission control on.
+# Other native CLIs (codex / cursor / …) use different flags, so injecting
+# ``--permission-mode`` there would be an unknown flag that breaks the launch.
+_PERMISSION_MODE_HARNESS = "claude-native"
+
+
+async def validate_permission_mode_agent_support(
+    *,
+    permission_mode: str | None,
+    agent: Any,
+    agent_cache: AgentCache | None,
+) -> None:
+    """Reject a ``permission_mode`` on an agent whose harness has no such flag.
+
+    Mirrors the web dialog's capability gate on the server so the REST endpoint
+    and agent tools enforce the same rule the UI does: only a ``claude-native``
+    agent may carry a ``permission_mode``. Without this, a task on a codex /
+    cursor agent could persist a mode the fire path would inject as an unknown
+    ``--permission-mode`` flag, breaking the launch.
+
+    A ``None`` mode is always allowed (nothing to gate). When the harness cannot
+    be resolved (no bundle / cache), this is a no-op — the value has already
+    passed the vocabulary allowlist, and the fire path only injects the flag for
+    a Claude launch.
+    """
+    if permission_mode is None or agent is None:
+        return
+    if agent_cache is None or getattr(agent, "bundle_location", None) is None:
+        return
+    from omnigent.harness_aliases import canonicalize_harness
+
+    try:
+        loaded = await asyncio.to_thread(agent_cache.load, agent.id, agent.bundle_location)
+        executor = getattr(loaded.spec, "executor", None)
+        raw_harness = None
+        if executor is not None:
+            raw_harness = executor.config.get("harness") or executor.type
+        harness = canonicalize_harness(raw_harness) or raw_harness
+    except Exception:
+        # A spec that won't load fails elsewhere (workspace validation / fire);
+        # don't turn an unrelated load error into a permission_mode rejection.
+        _logger.exception("Failed to load agent spec for permission_mode gating")
+        return
+    if harness != _PERMISSION_MODE_HARNESS:
+        raise OmnigentError(
+            f"permission_mode is only supported for {_PERMISSION_MODE_HARNESS} agents, "
+            f"not {harness!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+
 def validate_session_permission_mode(permission_mode: str | None) -> str | None:
     """Validate a persisted per-task permission mode shared by schedules.
 

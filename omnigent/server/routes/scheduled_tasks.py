@@ -29,6 +29,7 @@ from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import resolve_host_owner
 from omnigent.server.routes._session_create_validation import (
     validate_existing_host_workspace,
+    validate_permission_mode_agent_support,
     validate_session_agent,
     validate_session_model_metadata,
     validate_session_permission_mode,
@@ -217,6 +218,7 @@ def create_scheduled_tasks_router(
         workspace: str | None,
         model_override: str | None,
         reasoning_effort: str | None,
+        permission_mode: str | None,
     ) -> tuple[str | None, str | None, str | None]:
         """Validate inputs that scheduled tasks persist into future sessions.
 
@@ -239,6 +241,14 @@ def create_scheduled_tasks_router(
         validated_model, validated_effort = validate_session_model_metadata(
             model_override=model_override,
             reasoning_effort=reasoning_effort,
+        )
+        # Gate permission_mode on the resolved agent's harness (Claude Code
+        # only), mirroring the web dialog's capability gate. A non-Claude agent
+        # carrying a mode would break the fire (unknown --permission-mode flag).
+        await validate_permission_mode_agent_support(
+            permission_mode=permission_mode,
+            agent=agent,
+            agent_cache=agent_cache,
         )
         if workspace is None:
             # No pinned workspace: the fire path defaults it to the launch host's
@@ -301,6 +311,7 @@ def create_scheduled_tasks_router(
         owner = _owner(request)
         _validate_rrule_or_400(body.rrule)
         _validate_timezone_or_400(body.timezone)
+        permission_mode = validate_session_permission_mode(body.permission_mode)
         workspace, model_override, reasoning_effort = await _validate_launch_inputs(
             request,
             owner=owner,
@@ -309,8 +320,8 @@ def create_scheduled_tasks_router(
             workspace=body.workspace,
             model_override=body.model_override,
             reasoning_effort=body.reasoning_effort,
+            permission_mode=permission_mode,
         )
-        permission_mode = validate_session_permission_mode(body.permission_mode)
         task = store.create(
             scheduled_task_id=uuid.uuid4().hex,
             name=body.name,
@@ -495,7 +506,23 @@ def create_scheduled_tasks_router(
             if "reasoning_effort" in fields:
                 fields["reasoning_effort"] = reasoning_effort
         if "permission_mode" in fields:
-            fields["permission_mode"] = validate_session_permission_mode(fields["permission_mode"])
+            new_mode = validate_session_permission_mode(fields["permission_mode"])
+            fields["permission_mode"] = new_mode
+            # Gate a newly-SET mode on the (immutable) agent's harness. Clearing
+            # to null needs no gate — the fire path injects nothing for null.
+            if new_mode is not None:
+                agent = await validate_session_agent(
+                    user_id=owner_id,
+                    agent_id=existing.agent_id,
+                    agent_store=agent_store,
+                    permission_store=permission_store,
+                    conversation_store=conversation_store,
+                )
+                await validate_permission_mode_agent_support(
+                    permission_mode=new_mode,
+                    agent=agent,
+                    agent_cache=agent_cache,
+                )
         if {"workspace", "host_id"}.intersection(fields):
             workspace, _, _ = await _validate_launch_inputs(
                 request,
@@ -505,6 +532,7 @@ def create_scheduled_tasks_router(
                 workspace=fields.get("workspace", existing.workspace),
                 model_override=fields.get("model_override", existing.model_override),
                 reasoning_effort=fields.get("reasoning_effort", existing.reasoning_effort),
+                permission_mode=None,
             )
             if "workspace" in fields:
                 fields["workspace"] = workspace

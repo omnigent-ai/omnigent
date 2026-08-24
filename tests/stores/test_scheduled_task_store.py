@@ -635,6 +635,65 @@ def test_update_host_id_can_be_cleared_to_null(store: SqlAlchemyScheduledTaskSto
     assert fetched.host_id is None
 
 
+def test_update_overrides_can_be_cleared_to_null(store: SqlAlchemyScheduledTaskStore) -> None:
+    """Passing ``None`` for an override clears it to NULL (set→agent default).
+
+    Covers the security-relevant case: a task launched with
+    ``permission_mode="bypassPermissions"`` must be resettable to the agent
+    default through the same edit-then-save path the dialog uses (control reset
+    to Default → the API sends an explicit ``null``). Same for model/effort.
+    """
+    store.create(
+        scheduled_task_id=_uid("st_clear_ovr"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=MINUTELY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        model_override="opus",
+        reasoning_effort="high",
+        permission_mode="bypassPermissions",
+    )
+    updated = store.update(
+        _uid("st_clear_ovr"),
+        model_override=None,
+        reasoning_effort=None,
+        permission_mode=None,
+    )
+    assert updated is not None
+    assert updated.model_override is None
+    assert updated.reasoning_effort is None
+    assert updated.permission_mode is None
+    fetched = store.get(_uid("st_clear_ovr"))
+    assert fetched is not None
+    assert fetched.permission_mode is None
+
+
+def test_update_omitting_overrides_leaves_them_unchanged(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """Omitting the override params does NOT clear them (sentinel = unchanged)."""
+    store.create(
+        scheduled_task_id=_uid("st_keep_ovr"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=MINUTELY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        model_override="opus",
+        reasoning_effort="high",
+        permission_mode="acceptEdits",
+    )
+    # Update name only — the overrides must be untouched.
+    updated = store.update(_uid("st_keep_ovr"), name="renamed")
+    assert updated is not None
+    assert updated.model_override == "opus"
+    assert updated.reasoning_effort == "high"
+    assert updated.permission_mode == "acceptEdits"
+
+
 def test_update_last_run_conversation_id_can_be_cleared_to_null(
     store: SqlAlchemyScheduledTaskStore,
 ) -> None:
