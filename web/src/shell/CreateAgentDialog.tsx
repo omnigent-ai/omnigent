@@ -1,5 +1,16 @@
 import { useState } from "react";
-import { PlusIcon, TrashIcon } from "lucide-react";
+import {
+  BlocksIcon,
+  BookOpenIcon,
+  BotIcon,
+  CloudIcon,
+  DatabaseIcon,
+  PlusIcon,
+  SearchIcon,
+  ServerIcon,
+  TrashIcon,
+} from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -11,6 +22,15 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+  CommandSeparator,
+} from "@/components/ui/command";
+import {
   Select,
   SelectContent,
   SelectItem,
@@ -18,13 +38,29 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { BRAIN_HARNESS_LABELS, useBrainHarnessLabels } from "@/lib/agentLabels";
+import { cn } from "@/lib/utils";
 import type { AgentBundleInput, MCPServerInput } from "@/lib/agentBundle";
+import {
+  getMCPServerPreset,
+  groupMCPServerPresets,
+  type MCPIntegrationIcon,
+  type MCPServerPreset,
+} from "@/lib/mcpPresets";
 
 /**
  * Harness options for the picker. "default" uses the server's default
  * executor (no explicit harness in the bundle).
  */
 const DEFAULT_HARNESS = Object.keys(BRAIN_HARNESS_LABELS)[0];
+
+const MCP_INTEGRATION_ICONS: Record<MCPIntegrationIcon, LucideIcon> = {
+  book: BookOpenIcon,
+  browser: BotIcon,
+  cloud: CloudIcon,
+  data: DatabaseIcon,
+  "dev-tools": BlocksIcon,
+  search: SearchIcon,
+};
 
 /** A single MCP server row in the form. */
 interface MCPFormEntry {
@@ -49,6 +85,23 @@ function emptyMCPEntry(key: number): MCPFormEntry {
     command: "",
     args: "",
     env: "",
+  };
+}
+
+function mcpInputToFormEntry(input: MCPServerInput, key: number): MCPFormEntry {
+  return {
+    key,
+    name: input.name,
+    transport: input.transport,
+    url: input.url ?? "",
+    headers: Object.entries(input.headers ?? {})
+      .map(([name, value]) => `${name}: ${value}`)
+      .join("\n"),
+    command: input.command ?? "",
+    args: input.args?.join(" ") ?? "",
+    env: Object.entries(input.env ?? {})
+      .map(([name, value]) => `${name}=${value}`)
+      .join("\n"),
   };
 }
 
@@ -137,6 +190,9 @@ export function CreateAgentDialog({
   const [model, setModel] = useState("");
   const [mcpEntries, setMcpEntries] = useState<MCPFormEntry[]>([]);
   const [nextKey, setNextKey] = useState(0);
+  const [presetOpen, setPresetOpen] = useState(false);
+  const [selectedPresetId, setSelectedPresetId] = useState<string | null>(null);
+  const [presetValues, setPresetValues] = useState<Record<string, string>>({});
 
   function reset() {
     setName("");
@@ -146,6 +202,9 @@ export function CreateAgentDialog({
     setModel("");
     setMcpEntries([]);
     setNextKey(0);
+    setPresetOpen(false);
+    setSelectedPresetId(null);
+    setPresetValues({});
   }
 
   function handleOpenChange(next: boolean) {
@@ -153,9 +212,33 @@ export function CreateAgentDialog({
     onOpenChange(next);
   }
 
+  function closePicker() {
+    setPresetOpen(false);
+    setSelectedPresetId(null);
+    setPresetValues({});
+  }
+
   function addMCPServer() {
     setMcpEntries((prev) => [...prev, emptyMCPEntry(nextKey)]);
     setNextKey((k) => k + 1);
+    setPresetOpen(false);
+  }
+
+  function addMCPPreset(preset: MCPServerPreset) {
+    setMcpEntries((prev) => [...prev, mcpInputToFormEntry(preset.create(presetValues), nextKey)]);
+    setNextKey((key) => key + 1);
+    setSelectedPresetId(null);
+    setPresetValues({});
+    setPresetOpen(false);
+  }
+
+  function selectPreset(preset: MCPServerPreset) {
+    if (!preset.fields?.length) {
+      addMCPPreset(preset);
+      return;
+    }
+    setSelectedPresetId(preset.id);
+    setPresetValues({});
   }
 
   function removeMCPServer(key: number) {
@@ -183,144 +266,297 @@ export function CreateAgentDialog({
   }
 
   const canSubmit = name.trim().length > 0 && model.trim().length > 0;
+  const selectedPreset = selectedPresetId ? getMCPServerPreset(selectedPresetId) : undefined;
+  const canAddSelectedPreset =
+    selectedPreset?.fields?.every(
+      (field) => !field.required || Boolean(presetValues[field.id]?.trim()),
+    ) ?? false;
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent
         data-testid="create-agent-dialog"
-        className="flex max-h-[85vh] flex-col gap-4 sm:max-w-lg"
+        className={cn(
+          "flex max-h-[85vh] flex-col gap-4 sm:max-w-lg",
+          presetOpen && "h-[min(85vh,40rem)]",
+        )}
       >
         <DialogHeader>
-          <DialogTitle>Create custom agent</DialogTitle>
+          <DialogTitle>{presetOpen ? "Add MCP integration" : "Create custom agent"}</DialogTitle>
         </DialogHeader>
 
-        <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto">
-          {/* Name */}
-          <div className="flex flex-col gap-1.5">
-            <label
-              htmlFor="create-agent-name"
-              className="text-sm font-medium text-muted-foreground"
-            >
-              Name <span className="text-destructive">*</span>
-            </label>
-            <Input
-              id="create-agent-name"
-              data-testid="create-agent-name"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="my-agent"
-              autoFocus
-            />
-          </div>
-
-          {/* Description */}
-          <div className="flex flex-col gap-1.5">
-            <label
-              htmlFor="create-agent-description"
-              className="text-sm font-medium text-muted-foreground"
-            >
-              Description
-            </label>
-            <Input
-              id="create-agent-description"
-              data-testid="create-agent-description"
-              value={description}
-              onChange={(e) => setDescription(e.target.value)}
-              placeholder="A short summary of what this agent does"
-            />
-          </div>
-
-          {/* Harness */}
-          <div className="flex flex-col gap-1.5">
-            <label className="text-sm font-medium text-muted-foreground">
-              Harness <span className="text-destructive">*</span>
-            </label>
-            <Select value={harness} onValueChange={setHarness}>
-              <SelectTrigger data-testid="create-agent-harness" className="w-full">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {harnessOptions.map((opt) => (
-                  <SelectItem key={opt.value} value={opt.value}>
-                    {opt.label}
-                  </SelectItem>
+        {presetOpen ? (
+          selectedPreset ? (
+            <>
+              <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto">
+                <div className="flex flex-col gap-1">
+                  <span className="text-sm font-medium">{selectedPreset.label}</span>
+                  <span className="text-sm text-muted-foreground">
+                    {selectedPreset.description}
+                  </span>
+                </div>
+                {selectedPreset.fields?.map((field, index) => (
+                  <div key={field.id} className="flex flex-col gap-1.5">
+                    <label
+                      htmlFor={`mcp-preset-${field.id}`}
+                      className="text-xs font-medium text-muted-foreground"
+                    >
+                      {field.label}
+                    </label>
+                    <Input
+                      id={`mcp-preset-${field.id}`}
+                      data-testid={`mcp-preset-field-${field.id}`}
+                      value={presetValues[field.id] ?? ""}
+                      onChange={(event) =>
+                        setPresetValues((values) => ({
+                          ...values,
+                          [field.id]: event.target.value,
+                        }))
+                      }
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" && canAddSelectedPreset) {
+                          event.preventDefault();
+                          addMCPPreset(selectedPreset);
+                        }
+                      }}
+                      placeholder={field.placeholder}
+                      autoFocus={index === 0}
+                    />
+                  </div>
                 ))}
-              </SelectContent>
-            </Select>
-          </div>
+                {selectedPreset.prerequisites ? (
+                  <p className="text-sm leading-relaxed text-muted-foreground">
+                    {selectedPreset.prerequisites}
+                  </p>
+                ) : null}
+              </div>
+              <DialogFooter>
+                <Button
+                  variant="ghost"
+                  onClick={() => {
+                    setSelectedPresetId(null);
+                    setPresetValues({});
+                  }}
+                >
+                  Back
+                </Button>
+                <Button
+                  data-testid="mcp-preset-add"
+                  disabled={!canAddSelectedPreset}
+                  onClick={() => addMCPPreset(selectedPreset)}
+                >
+                  Add {selectedPreset.label}
+                </Button>
+              </DialogFooter>
+            </>
+          ) : (
+            <>
+              <Command className="-mx-1 min-h-0 flex-1 bg-transparent p-0">
+                <CommandInput
+                  data-testid="mcp-integration-search"
+                  placeholder="Search integrations, providers, or categories..."
+                />
+                <CommandList className="max-h-none min-h-0 flex-1 overflow-y-auto overscroll-contain">
+                  <CommandEmpty>No matching integrations.</CommandEmpty>
+                  {groupMCPServerPresets().map(([category, presets]) => (
+                    <CommandGroup key={category} heading={category}>
+                      {presets.map((preset) => (
+                        <MCPIntegrationOption
+                          key={preset.id}
+                          preset={preset}
+                          onClick={() => selectPreset(preset)}
+                        />
+                      ))}
+                    </CommandGroup>
+                  ))}
+                  <CommandSeparator />
+                  <CommandGroup heading="Advanced">
+                    <CommandItem
+                      value="custom server manual command remote url advanced"
+                      onSelect={addMCPServer}
+                      data-testid="create-agent-add-custom-mcp"
+                      className="items-start py-2"
+                    >
+                      <ServerIcon className="mt-0.5 size-4 text-muted-foreground" />
+                      <span className="flex flex-col gap-0.5">
+                        <span className="text-sm font-medium">Custom server</span>
+                        <span className="text-xs text-muted-foreground">
+                          Enter a command or remote URL manually.
+                        </span>
+                      </span>
+                    </CommandItem>
+                  </CommandGroup>
+                </CommandList>
+              </Command>
+              <DialogFooter>
+                <Button variant="ghost" onClick={closePicker}>
+                  Back
+                </Button>
+              </DialogFooter>
+            </>
+          )
+        ) : (
+          <>
+            <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto">
+              {/* Name */}
+              <div className="flex flex-col gap-1.5">
+                <label
+                  htmlFor="create-agent-name"
+                  className="text-xs font-medium text-muted-foreground"
+                >
+                  Name <span className="text-destructive">*</span>
+                </label>
+                <Input
+                  id="create-agent-name"
+                  data-testid="create-agent-name"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  placeholder="my-agent"
+                  autoFocus
+                />
+              </div>
 
-          {/* Model */}
-          <div className="flex flex-col gap-1.5">
-            <label
-              htmlFor="create-agent-model"
-              className="text-sm font-medium text-muted-foreground"
-            >
-              Model <span className="text-destructive">*</span>
-            </label>
-            <Input
-              id="create-agent-model"
-              data-testid="create-agent-model"
-              value={model}
-              onChange={(e) => setModel(e.target.value)}
-              placeholder="claude-sonnet-4-20250514"
-            />
-          </div>
+              {/* Description */}
+              <div className="flex flex-col gap-1.5">
+                <label
+                  htmlFor="create-agent-description"
+                  className="text-xs font-medium text-muted-foreground"
+                >
+                  Description
+                </label>
+                <Input
+                  id="create-agent-description"
+                  data-testid="create-agent-description"
+                  value={description}
+                  onChange={(e) => setDescription(e.target.value)}
+                  placeholder="A short summary of what this agent does"
+                />
+              </div>
 
-          {/* Instructions / System Prompt */}
-          <div className="flex flex-col gap-1.5">
-            <label
-              htmlFor="create-agent-instructions"
-              className="text-sm font-medium text-muted-foreground"
-            >
-              System instructions
-            </label>
-            <Textarea
-              id="create-agent-instructions"
-              data-testid="create-agent-instructions"
-              value={instructions}
-              onChange={(e) => setInstructions(e.target.value)}
-              placeholder="You are a helpful assistant that..."
-              className="min-h-[120px]"
-            />
-          </div>
+              {/* Harness */}
+              <div className="flex flex-col gap-1.5">
+                <label className="text-xs font-medium text-muted-foreground">
+                  Harness <span className="text-destructive">*</span>
+                </label>
+                <Select value={harness} onValueChange={setHarness}>
+                  <SelectTrigger data-testid="create-agent-harness" className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {harnessOptions.map((opt) => (
+                      <SelectItem key={opt.value} value={opt.value}>
+                        {opt.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
 
-          {/* MCP Servers */}
-          <div className="flex flex-col gap-2">
-            <div className="flex items-center justify-between">
-              <span className="text-sm font-medium text-muted-foreground">MCP Tools</span>
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                onClick={addMCPServer}
-                data-testid="create-agent-add-mcp"
-                className="h-6 gap-1 px-2 text-sm text-muted-foreground"
-              >
-                <PlusIcon className="size-3" />
-                Add server
-              </Button>
+              {/* Model */}
+              <div className="flex flex-col gap-1.5">
+                <label
+                  htmlFor="create-agent-model"
+                  className="text-xs font-medium text-muted-foreground"
+                >
+                  Model <span className="text-destructive">*</span>
+                </label>
+                <Input
+                  id="create-agent-model"
+                  data-testid="create-agent-model"
+                  value={model}
+                  onChange={(e) => setModel(e.target.value)}
+                  placeholder="claude-sonnet-4-20250514"
+                />
+              </div>
+
+              {/* Instructions / System Prompt */}
+              <div className="flex flex-col gap-1.5">
+                <label
+                  htmlFor="create-agent-instructions"
+                  className="text-xs font-medium text-muted-foreground"
+                >
+                  System instructions
+                </label>
+                <Textarea
+                  id="create-agent-instructions"
+                  data-testid="create-agent-instructions"
+                  value={instructions}
+                  onChange={(e) => setInstructions(e.target.value)}
+                  placeholder="You are a helpful assistant that..."
+                  className="min-h-[120px]"
+                />
+              </div>
+
+              {/* MCP Servers */}
+              <div className="flex flex-col gap-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-medium text-muted-foreground">MCP Tools</span>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    data-testid="create-agent-add-mcp"
+                    className="h-6 gap-1 px-2 text-xs text-muted-foreground"
+                    onClick={() => setPresetOpen(true)}
+                  >
+                    <PlusIcon className="size-3" />
+                    Add server
+                  </Button>
+                </div>
+                {mcpEntries.map((entry) => (
+                  <MCPServerRow
+                    key={entry.key}
+                    entry={entry}
+                    onChange={(patch) => updateMCPEntry(entry.key, patch)}
+                    onRemove={() => removeMCPServer(entry.key)}
+                  />
+                ))}
+              </div>
             </div>
-            {mcpEntries.map((entry) => (
-              <MCPServerRow
-                key={entry.key}
-                entry={entry}
-                onChange={(patch) => updateMCPEntry(entry.key, patch)}
-                onRemove={() => removeMCPServer(entry.key)}
-              />
-            ))}
-          </div>
-        </div>
 
-        <DialogFooter>
-          <Button variant="ghost" onClick={() => handleOpenChange(false)}>
-            Cancel
-          </Button>
-          <Button data-testid="create-agent-submit" onClick={handleSubmit} disabled={!canSubmit}>
-            Create
-          </Button>
-        </DialogFooter>
+            <DialogFooter>
+              <Button variant="ghost" onClick={() => handleOpenChange(false)}>
+                Cancel
+              </Button>
+              <Button
+                data-testid="create-agent-submit"
+                onClick={handleSubmit}
+                disabled={!canSubmit}
+              >
+                Create
+              </Button>
+            </DialogFooter>
+          </>
+        )}
       </DialogContent>
     </Dialog>
+  );
+}
+
+function MCPIntegrationOption({
+  preset,
+  onClick,
+}: {
+  preset: MCPServerPreset;
+  onClick: () => void;
+}) {
+  const Icon = MCP_INTEGRATION_ICONS[preset.icon];
+  return (
+    <CommandItem
+      value={`${preset.label} ${preset.provider} ${preset.category} ${preset.description}`}
+      data-testid={`create-agent-add-preset-${preset.id}`}
+      className="items-start py-2"
+      onSelect={onClick}
+    >
+      <Icon className="mt-0.5 size-4 text-muted-foreground" />
+      <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+        <span className="flex items-center gap-1.5 text-sm font-medium">
+          <span>{preset.label}</span>
+          <span className="text-xs font-normal text-muted-foreground">{preset.provider}</span>
+        </span>
+        <span className="text-xs text-muted-foreground">{preset.description}</span>
+      </span>
+    </CommandItem>
   );
 }
 
@@ -390,7 +626,7 @@ function MCPServerRow({
             value={entry.env}
             onChange={(e) => onChange({ env: e.target.value })}
             placeholder={"Environment variables (KEY=VALUE per line)\ne.g. GITHUB_TOKEN=ghp_..."}
-            className="min-h-[60px] font-mono text-sm"
+            className="min-h-[60px] font-mono text-xs"
           />
         </>
       ) : (
@@ -406,7 +642,7 @@ function MCPServerRow({
             value={entry.headers}
             onChange={(e) => onChange({ headers: e.target.value })}
             placeholder={"HTTP headers (one per line)\ne.g. Authorization: Bearer tok_..."}
-            className="min-h-[60px] font-mono text-sm"
+            className="min-h-[60px] font-mono text-xs"
           />
         </>
       )}
