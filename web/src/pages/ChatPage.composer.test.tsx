@@ -1804,7 +1804,9 @@ describe("Composer — Enter steers queued head", () => {
       sendSpy,
     );
     const onSend = vi.fn();
-    render(<Composer {...composerProps({ onSend, status: "streaming", isWorking: true })} />);
+    renderWithTooltips(
+      <Composer {...composerProps({ onSend, status: "streaming", isWorking: true })} />,
+    );
 
     fireEvent.keyDown(textarea(), { key: "Enter" });
 
@@ -1826,7 +1828,7 @@ describe("Composer — Enter steers queued head", () => {
       ],
       sendSpy,
     );
-    render(<Composer {...composerProps({ status: "streaming", isWorking: true })} />);
+    renderWithTooltips(<Composer {...composerProps({ status: "streaming", isWorking: true })} />);
     const ta = textarea();
 
     fireEvent.keyDown(ta, { key: "Enter" });
@@ -1841,7 +1843,9 @@ describe("Composer — Enter steers queued head", () => {
     const sendSpy = vi.fn().mockResolvedValue(undefined);
     busyQueuedState([{ queueId: "q_1", text: "queued", conversationId: CONV }], sendSpy);
     const onSend = vi.fn();
-    render(<Composer {...composerProps({ onSend, status: "streaming", isWorking: true })} />);
+    renderWithTooltips(
+      <Composer {...composerProps({ onSend, status: "streaming", isWorking: true })} />,
+    );
     const ta = textarea();
     fireEvent.change(ta, { target: { value: "new follow-up" } });
     fireEvent.keyDown(ta, { key: "Enter" });
@@ -1855,7 +1859,9 @@ describe("Composer — Enter steers queued head", () => {
     const sendSpy = vi.fn().mockResolvedValue(undefined);
     busyQueuedState([{ queueId: "other_1", text: "other", conversationId: "conv_other" }], sendSpy);
     const onSend = vi.fn();
-    render(<Composer {...composerProps({ onSend, status: "streaming", isWorking: true })} />);
+    renderWithTooltips(
+      <Composer {...composerProps({ onSend, status: "streaming", isWorking: true })} />,
+    );
 
     fireEvent.keyDown(textarea(), { key: "Enter" });
 
@@ -1892,7 +1898,7 @@ describe("Composer — Enter steers queued head", () => {
         },
       ],
     });
-    render(<Composer {...composerProps({ status: "streaming", isWorking: true })} />);
+    renderWithTooltips(<Composer {...composerProps({ status: "streaming", isWorking: true })} />);
 
     fireEvent.keyDown(textarea(), { key: "Enter" });
 
@@ -1903,7 +1909,7 @@ describe("Composer — Enter steers queued head", () => {
   it("does not steer when Enter confirms active IME composition on an empty composer", () => {
     const sendSpy = vi.fn().mockResolvedValue(undefined);
     busyQueuedState([{ queueId: "q_1", text: "queued", conversationId: CONV }], sendSpy);
-    render(<Composer {...composerProps({ status: "streaming", isWorking: true })} />);
+    renderWithTooltips(<Composer {...composerProps({ status: "streaming", isWorking: true })} />);
     const ta = textarea();
     fireEvent.compositionStart(ta);
 
@@ -1916,7 +1922,7 @@ describe("Composer — Enter steers queued head", () => {
   it("Shift+Enter on an empty composer does not steer", () => {
     const sendSpy = vi.fn().mockResolvedValue(undefined);
     busyQueuedState([{ queueId: "q_1", text: "queued", conversationId: CONV }], sendSpy);
-    render(<Composer {...composerProps({ status: "streaming", isWorking: true })} />);
+    renderWithTooltips(<Composer {...composerProps({ status: "streaming", isWorking: true })} />);
 
     fireEvent.keyDown(textarea(), { key: "Enter", shiftKey: true });
 

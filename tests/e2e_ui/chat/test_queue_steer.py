@@ -7,8 +7,8 @@ Guards the steer affordance of the client-side queue:
     (busy). A follow-up typed into the composer is then held in the
     client-side queue — shown in the docked strip, NOT POSTed (the idle
     auto-flush never fires because idle never comes). Clicking the row's
-    "Steer" button POSTs it immediately — the only thing that could send
-    it here, since the session never went idle.
+    "Steer" button or pressing Enter on the empty composer POSTs it
+    immediately — the only actions that can send it while the session is busy.
 
 Why async Playwright (not the sync ``page`` fixture): the route handler
 inspects and fulfills every ``/events`` POST to record which messages the
@@ -32,6 +32,7 @@ import threading
 from collections.abc import Coroutine
 from typing import Any
 
+import pytest
 from playwright.async_api import Route, async_playwright, expect
 
 _COMPOSER_PLACEHOLDER = "Ask the agent anything…"
@@ -84,20 +85,22 @@ async def _wait_until(predicate, *, timeout_s: float = 15.0) -> None:
     raise AssertionError(f"condition not met within {timeout_s:.0f}s")
 
 
+@pytest.mark.parametrize("steer_action", ["button", "empty-enter"])
 def test_steer_sends_queued_message_while_busy(
     seeded_session: tuple[str, str],
+    steer_action: str,
 ) -> None:
-    """Steering a queued message POSTs it immediately, mid-turn.
+    """Button or empty-composer Enter POSTs the queued head mid-turn.
 
     Failure mode this catches: steer does nothing (message stays queued),
     or the message is only sent after the turn ends (indistinguishable
     from auto-flush) — either means the steer path is broken.
     """
     base_url, session_id = seeded_session
-    _run_in_fresh_loop(_drive_steer(base_url, session_id))
+    _run_in_fresh_loop(_drive_steer(base_url, session_id, steer_action))
 
 
-async def _drive_steer(base_url: str, session_id: str) -> None:
+async def _drive_steer(base_url: str, session_id: str, steer_action: str) -> None:
     """Async body of the steer test. See the test docstring.
 
     :param base_url: Spawned server base URL.
@@ -154,22 +157,27 @@ async def _drive_steer(base_url: str, session_id: str) -> None:
                 f"msg2 was POSTed before steer (should be held client-side): {event_posts}"
             )
 
-            # The icon-only action explains itself on hover, with the tooltip
-            # placed above the control rather than covering the queued row.
-            steer_button = page.get_by_role("button", name="Send queued message now")
-            await steer_button.hover()
-            tooltip = page.locator("[data-slot=tooltip-content]", has_text="Send now")
-            await expect(tooltip).to_be_visible(timeout=5_000)
-            button_box = await steer_button.bounding_box()
-            tooltip_box = await tooltip.bounding_box()
-            assert button_box is not None
-            assert tooltip_box is not None
-            assert tooltip_box["y"] + tooltip_box["height"] <= button_box["y"]
+            if steer_action == "button":
+                # The icon-only action explains itself on hover, with the tooltip
+                # placed above the control rather than covering the queued row.
+                steer_button = page.get_by_role("button", name="Send queued message now")
+                await steer_button.hover()
+                tooltip = page.locator("[data-slot=tooltip-content]", has_text="Send now")
+                await expect(tooltip).to_be_visible(timeout=5_000)
+                button_box = await steer_button.bounding_box()
+                tooltip_box = await tooltip.bounding_box()
+                assert button_box is not None
+                assert tooltip_box is not None
+                assert tooltip_box["y"] + tooltip_box["height"] <= button_box["y"]
+                await steer_button.click()
+            else:
+                # With no draft in the composer, bare Enter steers the FIFO head
+                # through the same action as the per-row button.
+                assert await composer.input_value() == ""
+                await composer.press("Enter")
 
-            # Steer msg2 → it must POST now, even though the session never went
-            # idle. This is what distinguishes steer from the idle auto-flush:
-            # the only reason msg2 could POST here is the explicit steer.
-            await steer_button.click()
+            # msg2 must POST now, even though the session never went idle. This
+            # distinguishes both explicit steer actions from idle auto-flush.
             await _wait_until(lambda: any(text == _MSG2 for _, text in event_posts))
 
             # The steered message left the queue (strip empties).
