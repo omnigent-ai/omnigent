@@ -315,7 +315,10 @@ first look; that is the normal starting state, not a blocker.
   `pytest <test_path> --video on --screenshot on --output recordings/<slug>`
   (the `tests/e2e_ui/` suite is pytest-playwright, so the flags need no extra
   plumbing). pytest-playwright writes the video into a per-test subdir under
-  `--output`, so move it to a stable name afterward. For a `reproduced` facet the
+  `--output` as `video.webm`; **move** it (do not copy) to a stable name at the
+  `recordings/<slug>/` root and delete the leftover per-test subdir, so the same
+  footage isn't left twice (a copy plus the raw `video.webm` both get collected).
+  For a `reproduced` facet the
   run must FAIL — the failing run's video *is* the before-fix footage
   (`before-<facet>.webm`). For an `already_fixed` facet the same test PASSES
   (it already asserts the correct behavior, per Step 3) — that passing run's video
