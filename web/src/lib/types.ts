@@ -240,7 +240,7 @@ export interface ModelUsage {
  * One still-running background shell reported by the claude-native `Stop`
  * hook, backing the composer pill's "N background tasks" tally. Every field
  * is optional — the hook shape is external, so an entry may carry only a
- * `description`, only a `command`, etc. Rendered on the pill's hover.
+ * `description`, only a `command`, etc.
  */
 export interface BackgroundTaskInfo {
   /** Opaque per-shell id, e.g. `"abc123"`. */
@@ -293,8 +293,8 @@ export interface Session {
   backgroundTaskCount?: number;
   /**
    * Per-shell detail behind {@link backgroundTaskCount}, so a reload can
-   * re-populate the pill's hover. Absent when none are tracked (or an older
-   * runner reported only the count).
+   * restore it. Absent when none are tracked (or an older runner reported only
+   * the count).
    */
   backgroundTasks?: BackgroundTaskInfo[];
   createdAt: number;

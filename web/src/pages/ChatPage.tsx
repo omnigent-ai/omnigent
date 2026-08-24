@@ -4536,29 +4536,21 @@ function SubagentComposerTray({ label }: { label: string }) {
   );
 }
 
-// Shared pill chrome for the collapsed tally and each expanded task pill.
 const BACKGROUND_TASK_PILL_CLASS =
   "flex min-w-0 items-center gap-1.5 rounded-full border border-border bg-card px-3 py-1 text-sm text-muted-foreground shadow-sm";
 
-// Grace period before an expanded row collapses after the mouse leaves, so a
-// near-miss or a reach toward a pill doesn't snap it shut.
 const BACKGROUND_TASK_COLLAPSE_DELAY_MS = 1000;
-// Matches the pills' fade/zoom-out duration below — the combine animation plays
-// for this long before the row unmounts back to the tally.
+// Keep in sync with the pills' fade/zoom duration below.
 const BACKGROUND_TASK_ANIM_MS = 150;
 
 /**
- * Pill above the composer tallying background tasks that are running (a dev
- * server, a background shell, a sub-agent). Independent of the "Working…"
- * shimmer: while the turn is active both show — the shimmer for the turn, the
- * pill for the tally — and once the turn ends the pill carries on alone.
+ * Pill above the composer tallying running background tasks (a dev server, a
+ * background shell, a sub-agent), shown independently of the "Working…" shimmer.
  *
- * Click the tally to split it into one pill per running shell (each labelled
- * with its description). The row collapses ~1s after the mouse leaves it (or on
- * Escape); re-entering cancels the pending collapse. Expand/collapse play a
- * staggered fade/zoom in-out so the split and combine read smoothly. A
- * count-only edge (older runner, no per-shell detail) renders the plain,
- * non-interactive tally.
+ * Clicking the tally splits it into one pill per running shell; the row
+ * collapses shortly after the mouse leaves (or on Escape), and re-entering
+ * cancels the pending collapse. A count-only edge (older runner, no per-shell
+ * detail) renders the plain, non-interactive tally.
  */
 function BackgroundTaskPill() {
   const bgCount = useChatStore((s) => s.backgroundTaskCount);
@@ -4582,8 +4574,6 @@ function BackgroundTaskPill() {
     setExpanded(false);
   }, [clearTimers]);
 
-  // Wait out the grace period, then play the combine-out animation before
-  // unmounting the pills back to the tally.
   const scheduleCollapse = useCallback(() => {
     clearTimers();
     collapseDelayRef.current = setTimeout(() => {
@@ -4592,18 +4582,16 @@ function BackgroundTaskPill() {
     }, BACKGROUND_TASK_COLLAPSE_DELAY_MS);
   }, [clearTimers, collapseNow]);
 
-  // Re-entering the row cancels a pending (or in-flight) collapse.
   const cancelCollapse = useCallback(() => {
     clearTimers();
     setCollapsing(false);
   }, [clearTimers]);
 
-  // Reset to the tally when the shells drain or there is nothing to expand.
   useEffect(() => {
     if (bgCount <= 0 || !canExpand) collapseNow();
   }, [bgCount, canExpand, collapseNow]);
 
-  // Escape collapses immediately — a keyboard user has no "mouse out".
+  // Escape collapses too — keyboard users have no "mouse out".
   useEffect(() => {
     if (!expanded) return;
     const onKey = (e: globalThis.KeyboardEvent) => {
@@ -4613,7 +4601,6 @@ function BackgroundTaskPill() {
     return () => document.removeEventListener("keydown", onKey);
   }, [expanded, collapseNow]);
 
-  // Drop any pending timer on unmount.
   useEffect(() => clearTimers, [clearTimers]);
 
   if (bgCount <= 0) return null;
@@ -4639,8 +4626,7 @@ function BackgroundTaskPill() {
           {bgTasks.map((task, i) => (
             <div
               key={task.id ?? i}
-              // Stagger the entrance so the pills read as splitting apart; on
-              // collapse they fade/zoom out together (no delay) then unmount.
+              // Stagger entrance for a split-apart feel; collapse out together.
               style={{ animationDelay: collapsing ? "0ms" : `${Math.min(i * 40, 240)}ms` }}
               className={cn(
                 BACKGROUND_TASK_PILL_CLASS,

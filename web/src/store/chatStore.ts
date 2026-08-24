@@ -273,8 +273,8 @@ export interface ConversationState {
   backgroundTaskCount: number;
   /**
    * Per-shell detail behind `backgroundTaskCount`, kept in lockstep with it,
-   * so the composer pill's hover can name each running background shell.
-   * Empty when none are tracked (or an older runner reported only the count).
+   * so the UI can list each running background shell. Empty when none are
+   * tracked (or an older runner reported only the count).
    */
   backgroundTasks: BackgroundTaskInfo[];
   /**
@@ -5322,8 +5322,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           patch.backgroundTaskCount = event.backgroundTaskCount;
           // Detail rides with the authoritative count on the same edge, so it
           // is authoritative too: a Stop hook that names its shells sets the
-          // list; an older runner that sent count-only clears it to []. This
-          // keeps the hover in lockstep with the number the pill shows.
+          // list; an older runner that sent count-only clears it to []. Keeps
+          // the detail in lockstep with the number the pill shows.
           patch.backgroundTasks = event.backgroundTasks ?? [];
         } else if (event.status === "failed") {
           patch.backgroundTaskCount = 0;

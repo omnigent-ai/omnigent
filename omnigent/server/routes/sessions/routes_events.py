@@ -1205,10 +1205,10 @@ def register_events_routes(
                 and raw_bg_count >= 0
                 else None
             )
-            # Per-shell detail behind that count, so the composer pill's hover
-            # can name each running shell. Best-effort: an older runner sends the
-            # count with no detail, and the server keeps it in lockstep with the
-            # tally (see ``_publish_status``).
+            # Per-shell detail behind that count, so the UI can name each
+            # running shell. Best-effort: an older runner sends the count with no
+            # detail, and the server keeps it in lockstep with the tally (see
+            # ``_publish_status``).
             bg_tasks = _parse_background_tasks(body.data.get("background_tasks"))
             # Why a still-running session is parked, e.g. a permission prompt
             # the web UI does not mirror. Absent or blank = not parked, so the

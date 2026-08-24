@@ -469,9 +469,9 @@ export interface SessionStatusEvent {
   responseId?: string;
   backgroundTaskCount?: number;
   /**
-   * Per-shell detail behind `backgroundTaskCount`, so the composer pill's
-   * hover can name each running shell. Rides alongside an authoritative count
-   * on the `Stop` edge; absent when the edge carries no detail.
+   * Per-shell detail behind `backgroundTaskCount`, so the UI can name each
+   * running shell. Rides alongside an authoritative count on the `Stop` edge;
+   * absent when the edge carries no detail.
    */
   backgroundTasks?: BackgroundTaskInfo[];
   /**

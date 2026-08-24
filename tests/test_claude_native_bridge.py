@@ -7318,7 +7318,7 @@ def test_hook_record_non_stop_event_has_zero_background_tasks() -> None:
 def test_hook_record_stop_collects_background_task_detail() -> None:
     """``Stop`` populates ``background_tasks`` with the running shells' detail.
 
-    The detail list backs the composer pill's hover. It carries only the
+    The detail list backs the UI's per-shell display. It carries only the
     still-running shells (matching the count), each trimmed to the display
     fields; terminal entries and non-dict junk drop out of the detail even
     though the junk still counts.

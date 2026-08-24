@@ -113,12 +113,12 @@ def test_failure_clears_tally_and_wins_over_count() -> None:
     assert _session_status_with_child_rollup(_SID, []) == "failed"
 
 
-# ── background-task detail (hover tooltip) rides with the tally ─────────────
+# ── background-task detail rides with the tally ─────────────────────────────
 
 
 def test_background_tasks_detail_stored_with_positive_count() -> None:
-    # The per-shell detail behind the hover is cached in lockstep with the
-    # count so a reload/reconnect can re-populate the pill's tooltip.
+    # The per-shell detail is cached in lockstep with the count so a
+    # reload/reconnect can restore the individual shells.
     tasks = _tasks("Wait for CI", "Build check")
     _publish_status(_SID, "idle", background_task_count=2, background_tasks=tasks)
     assert _sessions_mod._session_background_task_count_cache.get(_SID) == 2
@@ -127,7 +127,7 @@ def test_background_tasks_detail_stored_with_positive_count() -> None:
 
 def test_background_tasks_detail_empty_when_count_only() -> None:
     # An older runner posts the count with no detail: the tally sticks and the
-    # detail cache holds [] (pill shows the number, hover has no names).
+    # detail cache holds [] (pill shows the number, no per-shell detail).
     _publish_status(_SID, "idle", background_task_count=1, background_tasks=None)
     assert _sessions_mod._session_background_task_count_cache.get(_SID) == 1
     assert _sessions_mod._session_background_tasks_cache.get(_SID) == []

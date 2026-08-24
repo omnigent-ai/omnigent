@@ -216,7 +216,7 @@ describe("parseEvent — session.status (background_tasks detail)", () => {
     return (ev as SessionStatusEvent | null)?.backgroundTasks;
   }
 
-  it("threads the per-shell detail so the pill's hover can name the shells", () => {
+  it("threads the per-shell detail so the UI can list the shells", () => {
     expect(
       bgTasks({
         background_task_count: 2,

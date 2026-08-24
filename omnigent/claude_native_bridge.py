@@ -556,8 +556,8 @@ class ClaudeHookRecord:
     :param background_tasks: Display detail for those still-running shells —
         the ``id``/``type``/``status``/``description``/``command`` fields from
         each counted entry (see :func:`_normalize_background_task`), so the UI
-        can name them on hover. ``None`` for non-``Stop`` events, when the
-        array is absent, or when no counted entry carried a usable field.
+        can name them. ``None`` for non-``Stop`` events, when the array is
+        absent, or when no counted entry carried a usable field.
     """
 
     event_cursor: int
@@ -2760,10 +2760,8 @@ _TERMINAL_BACKGROUND_TASK_STATUSES: frozenset[str] = frozenset(
     {"completed", "failed", "stopped", "killed"}
 )
 
-# Cap what we forward so a pathological hook payload can't bloat the status
-# event: at most this many shells, each string field clamped to this length.
-# The composer pill only needs a short label per shell, and real sessions run
-# a handful of background shells at once.
+# Bound the forwarded detail so a pathological hook payload can't bloat the
+# status event: at most this many shells, each string field clamped in length.
 _BACKGROUND_TASK_FORWARD_LIMIT = 100
 _BACKGROUND_TASK_FIELD_MAX_CHARS = 512
 _BACKGROUND_TASK_FIELDS: tuple[str, ...] = ("id", "type", "status", "description", "command")
@@ -2885,8 +2883,8 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
                 )
             ]
             background_task_count = len(running)
-            # Detail for the UI hover. Non-dict / field-less entries drop out
-            # here but still count above, so the tally can't under-count.
+            # Detail for the UI. Non-dict / field-less entries drop out here
+            # but still count above, so the tally can't under-count.
             details = [
                 detail
                 for task in running[:_BACKGROUND_TASK_FORWARD_LIMIT]

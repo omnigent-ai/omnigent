@@ -1644,8 +1644,7 @@ class BackgroundTaskInfo(BaseModel):
     :param id: Opaque per-shell identifier, e.g. ``"abc123"``.
     :param type: Task kind, e.g. ``"shell"``.
     :param status: Per-task status, e.g. ``"running"``.
-    :param description: Human-readable label, e.g. ``"Wait for CI"`` — the
-        text the composer pill's hover surfaces.
+    :param description: Human-readable label, e.g. ``"Wait for CI"``.
     :param command: Command the shell is running, e.g. ``"sleep 120"``.
     """
 
@@ -1685,9 +1684,8 @@ class SessionResponse(BaseModel):
         still running" even though the session has settled to ``"idle"``.
         ``None`` (the default / omitted) when no shells are tracked.
     :param background_tasks: Per-shell detail for the running tally above,
-        so a reload can re-populate the composer pill's hover with each
-        shell's description/command. ``None`` when none are tracked (or when
-        an older runner reported only the count).
+        so a reload can restore each shell's description/command. ``None`` when
+        none are tracked (or when an older runner reported only the count).
     :param created_at: Unix epoch seconds of creation.
     :param title: Optional human-readable title, e.g.
         ``"debugging auth flow"``. ``None`` when unset.
@@ -2701,9 +2699,9 @@ class SessionStatusEvent(_SSEEventBase):
     :param background_task_count: Background shells still running at this
         edge (claude-native ``Stop`` hook). ``None`` when the edge carries no
         information (leave the sticky tally untouched); ``0`` clears it.
-    :param background_tasks: Per-shell detail backing that tally, so the
-        composer pill's hover can name each running shell. ``None`` when the
-        edge reports no detail (an older runner may send only the count).
+    :param background_tasks: Per-shell detail backing that tally, so the UI
+        can name each running shell. ``None`` when the edge reports no detail
+        (an older runner may send only the count).
     :param blocked_on: Short human phrase naming what a still-``running``
         session is parked on, e.g. ``"permission prompt"`` or
         ``"dialog open"``. Set by terminal-backed integrations whose agent

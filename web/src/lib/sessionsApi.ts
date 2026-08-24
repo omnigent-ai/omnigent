@@ -131,8 +131,8 @@ interface SessionResponseWire {
    */
   background_task_count?: number | null;
   /**
-   * Per-shell detail behind `background_task_count`, so a reload can
-   * re-populate the pill's hover. Absent when none are tracked.
+   * Per-shell detail behind `background_task_count`, so a reload can restore
+   * it. Absent when none are tracked.
    */
   background_tasks?: BackgroundTaskInfo[] | null;
   created_at: number;

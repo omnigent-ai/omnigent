@@ -198,7 +198,7 @@ async def post_external_session_status(
         default for edges that know nothing about background shells.
     :param background_tasks: Per-shell detail backing that count (each a dict of
         ``id``/``type``/``status``/``description``/``command``), forwarded so the
-        UI can name the shells on hover. ``None`` omits the field — the default
+        UI can name the individual shells. ``None`` omits the field — the default
         for edges with no detail; sent alongside a positive count by the
         claude-native ``Stop`` hook.
     :param response_id: Optional id of the assistant turn this status edge

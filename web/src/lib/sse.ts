@@ -546,9 +546,6 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
         typeof data.background_task_count === "number" && data.background_task_count >= 0
           ? data.background_task_count
           : undefined;
-      // Per-shell detail behind that count, so the pill's hover can name the
-      // shells. Best-effort: non-object entries and entries with no usable
-      // string field drop out; an empty result is treated as "no detail".
       const backgroundTasks = parseBackgroundTasks(data.background_tasks);
       const rawError = data.error;
       // Parse via parseErrorInfo so a classified failure's optional

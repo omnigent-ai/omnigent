@@ -2998,8 +2998,8 @@ describe("chatStore — background-shell tally (claude-native)", () => {
 
   it("clears the detail to [] when a count-only edge arrives (older runner)", () => {
     // An authoritative count with no detail (an older runner) is authoritative
-    // for the detail too: it clears to [] so the hover never shows stale names
-    // beside a fresh count.
+    // for the detail too: it clears to [] so the expanded list never shows
+    // stale names beside a fresh count.
     useChatStore.setState({
       conversationId: "conv_abc",
       sessionStatus: "waiting",

@@ -466,9 +466,8 @@ _session_background_task_count_cache: dict[str, int] = {}
 
 
 # Per-shell detail behind the tally above, kept sticky in lockstep with it (see
-# ``_publish_status``) so a reload/reconnect can re-populate the composer pill's
-# hover. Absent when the count cache is absent, or when a runner reported only
-# the count with no detail.
+# ``_publish_status``) so a reload/reconnect can restore it. Absent when the
+# count cache is absent, or when a runner reported only the count with no detail.
 _session_background_tasks_cache: dict[str, list[BackgroundTaskInfo]] = {}
 
 

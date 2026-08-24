@@ -978,7 +978,7 @@ def _build_session_response(
         still running" even after the session settles to ``"idle"``. ``None``
         when none are tracked.
     :param background_tasks: Per-shell detail for that tally, so a reload can
-        re-populate the composer pill's hover. ``None`` when none are tracked.
+        restore it. ``None`` when none are tracked.
     :param permission_level: The requesting user's numeric level
         on this session (1=read, 2=edit, 3=manage), or ``None``
         when permissions are disabled.
