@@ -266,6 +266,17 @@ saved under `recordings/<slug>/` in your workspace:
   behaving correctly on the running build (e.g. `recordings/1234/fixed-picker.webm`).
 
 `not_reproduced` and `needs_more_info` facets have nothing to film — skip them.
+
+**Record exactly the verdict-appropriate clip per facet — nothing else.** One
+recording per `reproduced` facet (`kind: "before"`) and one per `already_fixed`
+facet (`kind: "fixed"`); the `kind` must match that facet's verdict, and every
+recording must correspond to a facet in `facets`. Do **not** add a "contrast" or
+"control" clip of a *different*, working journey next to a `reproduced` facet
+(e.g. filming an interactive session working beside the automation session that's
+broken) — an unrequested extra video with no facet behind it only confuses the
+reader about what reproduces. The `before` clip of a `reproduced` facet already
+shows the bug; that is the whole recording for that facet.
+
 Recording is best-effort: if the tooling below is missing, skip it, keep
 `recordings: []`, and say what was missing in `evidence` — never let recording
 block or distort the reproduction itself.
