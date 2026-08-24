@@ -27,9 +27,7 @@ function Select({
         onValueChange?.(value);
       }
     : onValueChange;
-  return (
-    <SelectPrimitive.Root data-slot="select" onValueChange={handleValueChange} {...props} />
-  );
+  return <SelectPrimitive.Root data-slot="select" onValueChange={handleValueChange} {...props} />;
 }
 
 function SelectGroup({ className, ...props }: React.ComponentProps<typeof SelectPrimitive.Group>) {
