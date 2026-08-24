@@ -235,7 +235,12 @@ export function CreateAgentDialog({
             <label className="text-sm font-medium text-muted-foreground">
               Harness <span className="text-destructive">*</span>
             </label>
-            <Select value={harness} onValueChange={setHarness}>
+            <Select
+              value={harness}
+              onValueChange={setHarness}
+              componentId="create_agent.harness"
+              valueHasNoPii
+            >
               <SelectTrigger data-testid="create-agent-harness" className="w-full">
                 <SelectValue />
               </SelectTrigger>
@@ -281,6 +286,7 @@ export function CreateAgentDialog({
               onChange={(e) => setInstructions(e.target.value)}
               placeholder="You are a helpful assistant that..."
               className="min-h-[120px]"
+              componentId="create_agent.instructions"
             />
           </div>
 
@@ -350,6 +356,8 @@ function MCPServerRow({
         <Select
           value={entry.transport}
           onValueChange={(v: "http" | "stdio") => onChange({ transport: v })}
+          componentId="create_agent.mcp_transport"
+          valueHasNoPii
         >
           <SelectTrigger data-testid="create-agent-mcp-transport" className="w-24">
             <SelectValue />

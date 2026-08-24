@@ -149,6 +149,7 @@ import {
   sortAgentsForDisplay,
 } from "@/lib/agentGrouping";
 import { cn } from "@/lib/utils";
+import { useOmnigentAnalytics } from "@/lib/analytics";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import {
   isFullySupportedNativeCodingAgent,
@@ -506,7 +507,7 @@ export function ConnectHostInstructions({
     <div className="flex flex-col gap-4 rounded-lg border border-dashed border-border p-4">
       {label && <p className="text-sm text-muted-foreground">{label}</p>}
       {databricksFeatures ? (
-        <Tabs defaultValue="local">
+        <Tabs defaultValue="local" componentId="new_chat.host_tabs">
           <TabsList className="w-full">
             <TabsTrigger value="local" className="text-sm">
               Local machine
@@ -766,6 +767,7 @@ function HarnessSetupNotice({
   featureEnabled: boolean;
   onSetup: () => void;
 }) {
+  const { trackClick } = useOmnigentAnalytics();
   return (
     <p
       // pl-2 lines the icon up with the chips tray directly above (which has
@@ -785,7 +787,10 @@ function HarnessSetupNotice({
             type="button"
             data-testid="new-chat-landing-harness-setup"
             className="inline-flex h-5 shrink-0 items-center rounded-md border border-amber-300 px-2 text-sm font-medium text-amber-700 hover:bg-amber-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400 dark:border-amber-500/40 dark:text-amber-400 dark:hover:bg-amber-500/20"
-            onClick={onSetup}
+            onClick={() => {
+              trackClick("new_chat.setup", "button");
+              onSetup();
+            }}
           >
             Set up {agentName}
           </button>
@@ -1764,6 +1769,7 @@ function HarnessConfigModal({
                   models={claudeModelSelectOptions}
                   defaultLabel={defaultModelLabel(claudeModelOptions)}
                   contentClassName="[&_[data-slot=select-item]]:pl-2.5"
+                  componentId="new_chat.config.model"
                 >
                   {claudeModelsLoading && (
                     <div className="px-2.5 py-1 text-sm text-muted-foreground">Loading models…</div>
@@ -1815,6 +1821,7 @@ function HarnessConfigModal({
                   options={CLAUDE_NATIVE_PERMISSION_MODES}
                   testId="new-chat-landing-config-permission"
                   ariaLabel="Permissions"
+                  componentId="new_chat.config.permission"
                 />
               </ConfigRow>
             </>
@@ -1835,6 +1842,7 @@ function HarnessConfigModal({
                   models={codexModelSelectOptions}
                   defaultLabel={defaultModelLabel(codexModelOptions)}
                   contentClassName="[&_[data-slot=select-item]]:pl-2.5"
+                  componentId="new_chat.config.model"
                 >
                   {codexModelsLoading && (
                     <div className="px-2.5 py-1 text-sm text-muted-foreground">Loading models…</div>
@@ -1868,6 +1876,7 @@ function HarnessConfigModal({
                   }
                   testId="new-chat-landing-config-approval"
                   ariaLabel="Approval"
+                  componentId="new_chat.config.approval"
                 />
               </ConfigRow>
             </>
@@ -1881,6 +1890,7 @@ function HarnessConfigModal({
                 options={CURSOR_NATIVE_EXEC_MODES}
                 testId="new-chat-landing-config-cursor-mode"
                 ariaLabel="Mode"
+                componentId="new_chat.config.cursor_mode"
               />
             </ConfigRow>
           )}
@@ -1894,6 +1904,7 @@ function HarnessConfigModal({
                   options={AGY_NATIVE_SKIP_MODES}
                   testId="new-chat-landing-config-agy-skip"
                   ariaLabel="Permissions"
+                  componentId="new_chat.config.permission"
                 />
               </ConfigRow>
               {/* Persistent danger banner while the bypass is selected. agy has
@@ -1920,7 +1931,12 @@ function HarnessConfigModal({
           read it back or switch away without cancelling. */}
           {!hasPermission && !hasApproval && !hasCursor && !hasAgySkip && brainDefault && (
             <ConfigRow label="Agent Harness" description="Underlying coding harness">
-              <Select value={draftHarness ?? brainDefault} onValueChange={setDraftHarness}>
+              <Select
+                value={draftHarness ?? brainDefault}
+                onValueChange={setDraftHarness}
+                componentId="new_chat.config.harness"
+                valueHasNoPii
+              >
                 <SelectTrigger
                   className="w-full cursor-pointer"
                   data-testid="new-chat-landing-config-harness"
@@ -1996,7 +2012,13 @@ function HarnessConfigModal({
           >
             Cancel
           </Button>
-          <Button type="button" onClick={save} data-testid="new-chat-landing-config-save" size="lg">
+          <Button
+            type="button"
+            onClick={save}
+            data-testid="new-chat-landing-config-save"
+            size="lg"
+            componentId="new_chat.save_config"
+          >
             Save
           </Button>
         </DialogFooter>
@@ -4464,6 +4486,7 @@ export function NewChatLandingScreen() {
                   onClick={() => fileInputRef.current?.click()}
                   title="Attach files"
                   data-testid="new-chat-landing-attach"
+                  componentId="new_chat.attach_files"
                 >
                   <PaperclipIcon className="size-4" data-icon-size="16" />
                   <span className="sr-only">Attach files</span>
@@ -4531,6 +4554,7 @@ export function NewChatLandingScreen() {
                               disabled={creating}
                               onClick={() => setConfigOpen(true)}
                               data-testid="new-chat-landing-config-gear"
+                              componentId="new_chat.open_config"
                             >
                               <SettingsIcon className="size-4" data-icon-size="16" />
                               <span className="sr-only">
@@ -4619,6 +4643,7 @@ export function NewChatLandingScreen() {
                           aria-busy={creating}
                           data-testid="new-chat-landing-submit"
                           className="size-8 rounded-lg bg-foreground disabled:bg-muted disabled:text-muted-foreground transition-opacity hover:opacity-80 disabled:opacity-100 "
+                          componentId="new_chat.start_session"
                         >
                           {creating ? (
                             <Loader2Icon className="size-4 animate-spin" />

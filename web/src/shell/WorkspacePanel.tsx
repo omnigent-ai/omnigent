@@ -763,6 +763,7 @@ export function WorkspacePanel({
               : rightRailTab
           }
           onValueChange={(v) => onRightRailTabChange(v as RightRailTab)}
+          componentId="chat.right_rail.tabs"
         >
           <TabsList variant="pill" className="gap-1">
             {showFilesPanel && (

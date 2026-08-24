@@ -155,6 +155,7 @@ import {
   useUnseenTick,
 } from "@/hooks/useUnseenConversations";
 import { cn } from "@/lib/utils";
+import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
@@ -800,6 +801,7 @@ export function Sidebar({
               to="/"
               onClick={onNavClick}
               data-testid="sidebar-brand"
+              componentId="sidebar.home"
               className="sidebar-brand rounded-none transition-opacity duration-200 ease-[var(--ease-otto)] hover:opacity-70"
             >
               {branding.app_name ? (
@@ -854,6 +856,7 @@ export function Sidebar({
               (the button stays visible on both tabs). */}
               <Link
                 to="/"
+                componentId="sidebar.new_chat"
                 onClick={(e) => {
                   switchTab("mine");
                   onNavClick(e);
@@ -885,7 +888,7 @@ export function Sidebar({
               variant="ghost"
               data-testid="scheduled-tasks-nav"
             >
-              <Link to="/tasks" onClick={onNavClick}>
+              <Link to="/tasks" onClick={onNavClick} componentId="sidebar.tasks">
                 <ClockIcon
                   className={cn(
                     "ui-icon",
@@ -908,7 +911,7 @@ export function Sidebar({
               )}
               data-testid="inbox-button"
             >
-              <Link to="/inbox" onClick={onNavClick}>
+              <Link to="/inbox" onClick={onNavClick} componentId="sidebar.inbox">
                 <InboxIcon
                   className={cn(
                     "ui-icon",
@@ -950,7 +953,7 @@ export function Sidebar({
                 )}
                 data-testid="usage-nav"
               >
-                <Link to="/usage" onClick={onNavClick}>
+                <Link to="/usage" onClick={onNavClick} componentId="sidebar.usage">
                   <WalletIcon
                     className={cn(
                       "ui-icon",
@@ -2722,6 +2725,7 @@ function ConversationMenuItems({
   // to the side. `view` swaps between the main actions and that sub-view;
   // desktop always renders the native side-flyout submenu regardless.
   const isMobile = useIsMobileViewport();
+  const { trackClick } = useOmnigentAnalytics();
   const [view, setView] = useState<"main" | "projects">("main");
 
   // The project pick / create / remove flow — shared verbatim by the desktop
@@ -2815,7 +2819,13 @@ function ConversationMenuItems({
           </Tooltip>
         ))}
       {isOwner ? (
-        <C.Item data-testid="rename-conversation" onSelect={() => setIsEditing(true)}>
+        <C.Item
+          data-testid="rename-conversation"
+          onSelect={() => {
+            trackClick("sidebar.conversation.rename", "button");
+            setIsEditing(true);
+          }}
+        >
           <PencilIcon className="size-3.5" />
           Rename
         </C.Item>
@@ -3734,6 +3744,7 @@ function ConversationRow({
               variant="destructive"
               onClick={confirmDelete}
               disabled={del.isPending}
+              componentId="sidebar.conversation.delete"
             >
               Delete
             </Button>
@@ -3769,6 +3780,7 @@ function ConversationRow({
               data-testid="confirm-leave-conversation"
               onClick={confirmLeave}
               disabled={leave.isPending}
+              componentId="sidebar.conversation.leave"
             >
               Leave
             </Button>
@@ -3816,6 +3828,7 @@ function ConversationRow({
                 stopSession.mutate(conversation.id, { onSuccess: () => setStopOpen(false) })
               }
               loading={stopSession.isPending}
+              componentId="sidebar.conversation.stop"
             >
               Stop session
             </Button>
@@ -4245,6 +4258,7 @@ function ProjectFolderMenu({
                 data-testid="rename-project-confirm"
                 loading={renameProject.isPending || updateConfig.isPending}
                 disabled={renameValue.trim() === ""}
+                componentId="sidebar.project.rename"
               >
                 Confirm
               </Button>

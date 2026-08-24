@@ -30,7 +30,7 @@ export interface UserSuggestion {
  * telemetry taxonomy uses. Omitted when the element doesn't fit any of these.
  */
 export type OmnigentComponentKind =
-  "button" | "link" | "input" | "textarea" | "checkbox" | "toggle" | "select";
+  "button" | "link" | "input" | "textarea" | "checkbox" | "toggle" | "select" | "tabs";
 
 /**
  * A product-analytics event forwarded to the host. Each carries a stable,

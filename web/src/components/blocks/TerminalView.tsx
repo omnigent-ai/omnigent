@@ -218,6 +218,7 @@ export function TerminalView({
             size="xs"
             variant="secondary"
             onClick={() => void copyAndRefocus().then(copied, failed)}
+            componentId="diagnostics.terminal.copy"
           >
             Copy
           </Button>
@@ -611,6 +612,7 @@ function StatusOverlay({
               onClick={onResume}
               disabled={resumePending}
               className="border-zinc-500/50 bg-zinc-100 text-zinc-950 hover:bg-white"
+              componentId="diagnostics.terminal.resume"
             >
               {resumePending ? "Resuming…" : "Resume session"}
             </Button>

@@ -2990,6 +2990,7 @@ export function JumpToTopButton({
         disabled={jumping}
         onClick={() => void jumpToTop()}
         aria-label="Jump to the first message"
+        componentId="chat.nav.jump_to_top"
         // When hidden (opacity-0 / pointer-events-none) keep the button out of
         // the tab order and the accessibility tree so it can't take focus or be
         // announced while invisible.
@@ -3866,7 +3867,12 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             )}
             {text && (
               <MessageActions>
-                <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
+                <MessageAction
+                  tooltip="Copy"
+                  size="icon-xxs"
+                  onClick={handleCopy}
+                  componentId="chat.message.copy_user"
+                >
                   {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
                 </MessageAction>
               </MessageActions>
@@ -3992,7 +3998,12 @@ function AssistantBubble({
           <div className="flex items-center gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
             {markdownText && (
               <MessageActions>
-                <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
+                <MessageAction
+                  tooltip="Copy"
+                  size="icon-xxs"
+                  onClick={handleCopy}
+                  componentId="chat.message.copy_assistant"
+                >
                   {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
                 </MessageAction>
                 {/* Fork from this response: clone the session with history
@@ -4005,6 +4016,7 @@ function AssistantBubble({
                     size="icon-xxs"
                     data-testid="fork-from-response"
                     onClick={() => forkDialog.openForkDialog({ upToResponseId: bubble.responseId })}
+                    componentId="chat.message.fork"
                   >
                     <GitForkIcon size={14} />
                   </MessageAction>
@@ -5737,6 +5749,7 @@ export function Composer({
               disabled={disabled || isReadOnly || hasPendingElicitation}
               onClick={() => fileInputRef.current?.click()}
               title="Attach files"
+              componentId="chat.composer.attach_files"
             >
               <PaperclipIcon className="size-4" data-icon-size="16" />
               <span className="sr-only">Attach files</span>
@@ -5787,6 +5800,7 @@ export function Composer({
                     data-testid="codex-plan-mode-toggle"
                     data-active={codexPlanMode ? "true" : undefined}
                     onClick={() => void toggleCodexPlanMode()}
+                    componentId="chat.composer.toggle_plan_mode"
                   >
                     {planModeBusy ? (
                       <Loader2Icon className="size-3.5 animate-spin" />
@@ -6548,6 +6562,7 @@ function SessionConfigModal({
                     : undefined
                 }
                 activeModelId={draftModelId}
+                componentId="chat.composer.model"
               />
             </ConfigRow>
           )}
@@ -6560,6 +6575,8 @@ function SessionConfigModal({
                 value={draftRoutingOn ? "" : (draftEffort ?? EFFORT_SELECT_NONE)}
                 onValueChange={(v) => setDraftEffort(v === EFFORT_SELECT_NONE ? null : v)}
                 disabled={draftRoutingOn}
+                componentId="chat.composer.effort"
+                valueHasNoPii
               >
                 <SelectTrigger
                   className="w-full"
@@ -6594,7 +6611,12 @@ function SessionConfigModal({
               footer in some pane states, and a guess would misreport it. */}
           {showClaudePermissionMode && claudePermissionMode !== "" && (
             <ConfigRow label="Permissions" description="How much Claude asks before acting">
-              <Select value={draftPermissionMode} onValueChange={setDraftPermissionMode}>
+              <Select
+                value={draftPermissionMode}
+                onValueChange={setDraftPermissionMode}
+                componentId="chat.composer.permission_mode"
+                valueHasNoPii
+              >
                 <SelectTrigger
                   className="w-full"
                   data-testid="composer-config-permission-mode"
@@ -6632,6 +6654,8 @@ function SessionConfigModal({
               <Select
                 value={subagentRoutingValue}
                 onValueChange={(v) => setPickedSubagentRouting(v === "on" ? "on" : "off")}
+                componentId="chat.composer.subagent_routing"
+                valueHasNoPii
               >
                 <SelectTrigger
                   className="w-full"
