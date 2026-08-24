@@ -724,6 +724,8 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const flashing = useChatStore((s) => s.flashItemId === bubble.itemId);
   const { isCopied, handleCopy } = useCopyMessage(() => text);
   const ts = formatBubbleTimestamp(bubble.createdAtS);
+  const forkDialog = useForkDialog();
+  const canFork = Boolean(forkDialog?.canFork && bubble.responseId);
   const { isLinkCopied, handleCopyLink } = useCopyMessageLink(
     bubble.pending ? null : bubble.itemId,
   );
@@ -924,6 +926,17 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             >
               {isLinkCopied ? <CheckIcon size={14} /> : <Link2Icon size={14} />}
             </MessageAction>
+            {canFork && (
+              <MessageAction
+                tooltip="Fork from here"
+                size="icon-xxs"
+                data-testid="fork-from-user-message"
+                onClick={() => forkDialog?.openForkDialog({ upToResponseId: bubble.responseId })}
+                componentId="chat.message.fork"
+              >
+                <SplitIcon size={14} />
+              </MessageAction>
+            )}
           </MessageActions>
         </div>
       </div>

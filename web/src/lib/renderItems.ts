@@ -166,6 +166,8 @@ export type Bubble =
       itemId: string;
       /** Queued input that does not yet have a persisted transcript item. */
       pending?: boolean;
+      /** Server response identifier used as the inclusive fork anchor. */
+      responseId?: string;
       content: MessageContentBlock[];
       /** Human author email, when known. */
       createdBy?: string;
@@ -862,6 +864,7 @@ function walkBubbles(
       bubbles.push({
         kind: "user",
         itemId: b.ctx.itemId ?? `user_${i}`,
+        responseId: b.ctx.responseId,
         content: b.content,
         ...(b.ctx.createdBy !== undefined ? { createdBy: b.ctx.createdBy } : {}),
         // Server stamp on cold load, client stamp while live — display
@@ -1851,6 +1854,7 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
     if (
       a.itemId !== b.itemId ||
       Boolean(a.pending) !== Boolean(b.pending) ||
+      a.responseId !== b.responseId ||
       a.createdBy !== b.createdBy ||
       a.createdAtS !== b.createdAtS ||
       a.stableKey !== b.stableKey ||
