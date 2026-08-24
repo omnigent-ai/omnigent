@@ -46,6 +46,7 @@ import {
   AlertTriangleIcon,
   BotIcon,
   DownloadIcon,
+  FileDiffIcon,
   FilesIcon,
   GlobeIcon,
   KeyRoundIcon,
@@ -59,7 +60,6 @@ import {
   PanelRightCloseIcon,
   PanelRightIcon,
   PlusIcon,
-  SquareTerminalIcon,
   SunIcon,
   SquareCheckIcon,
   SquareIcon,
@@ -69,7 +69,6 @@ import {
   UserCogIcon,
   XIcon,
   ClockIcon,
-  ListTodoIcon,
 } from "lucide-react";
 import { useTheme } from "next-themes";
 import { PageScroll } from "@/components/PageScroll";
@@ -387,9 +386,8 @@ const workspaceTabCards: {
   icon: typeof FilesIcon;
 }[] = [
   { value: "files", label: "Files", icon: FilesIcon },
+  { value: "changes", label: "Changes", icon: FileDiffIcon },
   { value: "subagents", label: "Agents", icon: BotIcon },
-  { value: "terminals", label: "Shells", icon: SquareTerminalIcon },
-  { value: "todos", label: "Tasks", icon: ListTodoIcon },
   { value: "browser", label: "Browser", icon: GlobeIcon },
 ];
 
@@ -576,7 +574,7 @@ function WorkspaceTabDefaultControl() {
         labelledBy={labelId}
         value={value}
         onSelect={choose}
-        className="grid grid-cols-2 gap-3 sm:grid-cols-5"
+        className="grid grid-cols-2 gap-3 sm:grid-cols-4"
         cardClassName="items-center gap-2 p-4"
         items={workspaceTabCards.map((card) => ({
           value: card.value,

@@ -30,14 +30,11 @@ describe("workspaceTabPreferences — read/write", () => {
 });
 
 describe("normalizeDefaultWorkspaceTab", () => {
-  it.each(["files", "subagents", "terminals", "todos", "browser"] as const)(
-    "passes through %s",
-    (value) => {
-      expect(normalizeDefaultWorkspaceTab(value)).toBe(value);
-    },
-  );
+  it.each(["files", "changes", "subagents", "browser"] as const)("passes through %s", (value) => {
+    expect(normalizeDefaultWorkspaceTab(value)).toBe(value);
+  });
 
-  it.each(["changes", "unknown", null, undefined])("maps %s to files", (value) => {
+  it.each(["terminals", "todos", "unknown", null, undefined])("maps %s to files", (value) => {
     expect(normalizeDefaultWorkspaceTab(value)).toBe("files");
   });
 });

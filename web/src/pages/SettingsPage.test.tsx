@@ -377,10 +377,10 @@ describe("SettingsPage", () => {
   });
 
   it("seeds the default Workspace tab from storage", () => {
-    localStorage.setItem("omnigent:default-workspace-tab", "todos");
+    localStorage.setItem("omnigent:default-workspace-tab", "changes");
     renderPage("/settings/appearance");
 
-    expect(screen.getByTestId("workspace-tab-default-todos")).toHaveAttribute(
+    expect(screen.getByTestId("workspace-tab-default-changes")).toHaveAttribute(
       "aria-checked",
       "true",
     );

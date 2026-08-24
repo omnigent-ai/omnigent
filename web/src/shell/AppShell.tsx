@@ -1038,7 +1038,7 @@ export function AppShell() {
   // so an unavailable restored choice cannot overwrite its own fallback.
   useEffect(() => {
     if (railTabsAvailable[rightRailTab]) return;
-    const next = (["files", "changes", "subagents", "terminals", "todos", "browser"] as const).find(
+    const next = (["files", "changes", "subagents", "browser"] as const).find(
       (tab) => railTabsAvailable[tab],
     );
     if (next) setRightRailTab(next);
