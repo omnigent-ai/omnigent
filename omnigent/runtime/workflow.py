@@ -648,10 +648,10 @@ def configure_agent_harness_with_provider(
         # the Databricks profile (Databricks-specific, used by the executor
         # for token refresh), then delegate gateway enrichment to ucode.
         if harness_type == "opencode":
-            # OpenCode does not consume ucode's gateway-state map (it
-            # routes through OPENCODE_CONFIG_CONTENT instead). Resolve
-            # the Databricks workspace directly and write the two
-            # env vars the opencode executor reads.
+            # OpenCode does not consume ucode's gateway-state map. Resolve
+            # the Databricks workspace directly and write the wrapper-only
+            # env vars the OpenCode executor reads before it writes its
+            # private config file.
             _apply_databricks_profile_to_opencode(env, entry.profile)
             return
         profile = entry.profile
@@ -791,9 +791,10 @@ def _apply_databricks_profile_to_opencode(env: dict[str, str], profile: str | No
     OpenCode's config schema has no ``gateway`` flag and no dynamic
     auth-command surface. To route it through the Databricks AI
     gateway we resolve the workspace host + token here, then bake
-    them into ``HARNESS_OPENCODE_GATEWAY_BASE_URL`` +
-    ``HARNESS_OPENCODE_GATEWAY_API_KEY`` so the executor's
-    ``OPENCODE_CONFIG_CONTENT`` synthesis picks them up.
+    them into the wrapper-only ``HARNESS_OPENCODE_GATEWAY_BASE_URL`` +
+    ``HARNESS_OPENCODE_GATEWAY_API_KEY`` values. The executor consumes
+    those values and writes a mode-restricted private config file; they
+    are not passed to the OpenCode child.
 
     The Anthropic-compatible Databricks gateway endpoint is the
     default: it matches OpenCode's default provider (``"anthropic"``)
@@ -830,11 +831,10 @@ def _apply_provider_to_opencode(env: dict[str, str], entry: ProviderEntry) -> No
     here, this looks for the first family the entry actually provides
     in the order ``anthropic`` → ``openai`` (matching ``pi``'s family
     preference) and writes the resulting base URL + key into
-    ``HARNESS_OPENCODE_GATEWAY_*`` env vars. The executor synthesises
-    these into an ``OPENCODE_CONFIG_CONTENT`` payload at spawn time
-    per ``packages/opencode/src/config/config.ts`` so the override is
-    per-invocation and non-destructive for the user's global
-    ``~/.config/opencode/config.json``.
+    ``HARNESS_OPENCODE_GATEWAY_*`` env vars. The executor writes those
+    values into a mode-restricted private config at spawn time, so the
+    override is per-invocation and the user's global OpenCode config is
+    neither mutated nor exposed to the child.
 
     Mirrors the inline-family dispatch in
     :func:`_apply_provider_to_openai_agents` — the executor takes the
@@ -862,7 +862,7 @@ def _apply_provider_to_opencode(env: dict[str, str], entry: ProviderEntry) -> No
         raise OmnigentError(
             f"provider {entry.name!r} has no 'anthropic' or 'openai' family — "
             "the 'opencode' harness needs one of them to route through its "
-            "OPENCODE_CONFIG_CONTENT provider override. Add an "
+            "private OpenCode provider override. Add an "
             "'anthropic:' or 'openai:' family block to that provider in "
             "~/.omnigent/config.yaml.",
             code=ErrorCode.INVALID_INPUT,
@@ -2077,10 +2077,9 @@ def _build_opencode_spawn_env(
     defined in :mod:`omnigent.inner.opencode_harness`.
 
     Compared with the SDK-wrapping builders, this one is short
-    because OpenCode's executor is configured by a single
-    ``OPENCODE_CONFIG_CONTENT`` JSON payload synthesised at spawn
-    time from the gateway env vars — no per-family base-URL maps,
-    no separate ``WIRE_API`` knob.
+    because the executor writes one private ``opencode.json`` at
+    spawn time from the wrapper-only gateway env vars — no per-family
+    base-URL maps, no separate ``WIRE_API`` knob.
 
     Auth resolution (highest first):
 
@@ -2090,8 +2089,8 @@ def _build_opencode_spawn_env(
     2. ``executor.auth: {type: databricks, profile: P}`` *or* legacy
        ``executor.profile`` / ``config["profile"]`` — resolves the
        workspace creds via :func:`_apply_databricks_profile_to_opencode`.
-    3. Nothing configured — OpenCode uses its own
-       ``opencode auth login`` credentials.
+    3. Nothing configured — the executor copies the user's
+       ``opencode auth login`` credentials into its private data root.
 
     :param spec: The agent spec.
     :param workdir: The bundle's on-disk path. Threaded through as

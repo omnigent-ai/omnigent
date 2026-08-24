@@ -36,9 +36,12 @@ import json
 import logging
 import os
 import shutil
+import tempfile
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
+from omnigent.inner.agent_env import clean_agent_env
 from omnigent.inner.executor import (
     EnqueuedContent,
     Executor,
@@ -69,18 +72,17 @@ _ENV_VARIANT = "HARNESS_OPENCODE_VARIANT"
 _ENV_THINKING = "HARNESS_OPENCODE_THINKING"
 _ENV_SKIP_PERMISSIONS = "HARNESS_OPENCODE_DANGEROUSLY_SKIP_PERMISSIONS"
 
-# Gateway-routing env vars — when set, the executor synthesises an
-# ``OPENCODE_CONFIG_CONTENT`` JSON payload that overrides the chosen
-# provider's ``baseURL`` / ``apiKey`` per ``packages/opencode/src/
-# config/config.ts`` (the ``Flag.OPENCODE_CONFIG_CONTENT`` merge path).
-# This keeps gateway routing per-invocation and out of the user's
-# global ``~/.config/opencode/config.json``.
+# Gateway-routing env vars — when set, the executor synthesises a
+# private ``opencode.json`` payload that overrides the chosen provider's
+# ``baseURL`` / ``apiKey`` per ``packages/opencode/src/config/config.ts``.
+# This keeps gateway routing per-invocation and out of the user's global
+# config and out of the OpenCode child's environment.
 _ENV_GATEWAY_PROVIDER = "HARNESS_OPENCODE_GATEWAY_PROVIDER"
 _ENV_GATEWAY_BASE_URL = "HARNESS_OPENCODE_GATEWAY_BASE_URL"
 _ENV_GATEWAY_API_KEY = "HARNESS_OPENCODE_GATEWAY_API_KEY"
 
 # MCP-bridge env var: a JSON object of ``{server_name: ConfigMCPV1.Info}``
-# entries merged into ``OPENCODE_CONFIG_CONTENT``'s ``mcp`` map per
+# entries written to the private ``opencode.json`` ``mcp`` map per
 # ``packages/opencode/src/config/config.ts`` so OpenCode connects to
 # Omnigent's tool dispatch endpoint as an MCP server. v0 reads this
 # raw rather than synthesising it inside the executor — the producer
@@ -88,15 +90,28 @@ _ENV_GATEWAY_API_KEY = "HARNESS_OPENCODE_GATEWAY_API_KEY"
 # the MCP endpoint and writes the URL here.
 _ENV_MCP_SERVERS = "HARNESS_OPENCODE_MCP_SERVERS"
 
-# Set together with ``OPENCODE_CONFIG_CONTENT``: tells OpenCode to
+# Set when a generated config override is used: tells OpenCode to
 # skip walking the cwd for ``opencode.json`` so user-project config
 # never silently overrides the per-session settings the executor
-# generated. The global ``~/.config/opencode/`` is still merged
-# (OpenCode has no flag to suppress it), so producers that need a
-# truly isolated config should also write a temp global config dir
-# via ``OPENCODE_CONFIG_DIR`` before spawning the harness subprocess.
+# generated. Private XDG roots hide the user's global OpenCode
+# config/data/state/cache from the headless child.
 _OPENCODE_CONFIG_CONTENT_ENV = "OPENCODE_CONFIG_CONTENT"
 _OPENCODE_DISABLE_PROJECT_CONFIG_ENV = "OPENCODE_DISABLE_PROJECT_CONFIG"
+_OPENCODE_CONFIG_DIR_ENV = "OPENCODE_CONFIG_DIR"
+_OPENCODE_CONFIG_FILENAME = "opencode.json"
+
+# OpenCode provider credentials are materialized into the private config file
+# below. Never forward the parent-runner's config injection or server secrets.
+_OPENCODE_CHILD_DENY_ENV = frozenset(
+    {
+        _OPENCODE_CONFIG_CONTENT_ENV,
+        "OPENCODE_CONFIG",
+        _OPENCODE_CONFIG_DIR_ENV,
+        _OPENCODE_DISABLE_PROJECT_CONFIG_ENV,
+        "OPENCODE_SERVER_PASSWORD",
+        "OPENCODE_SERVER_USERNAME",
+    }
+)
 
 # OpenCode emits one JSON object per line on stdout when invoked
 # with ``--format json``. Per packages/opencode/src/cli/cmd/run.ts
@@ -216,6 +231,22 @@ def _latest_user_text(messages: list[Message]) -> str:
     return ""
 
 
+def _build_turn_prompt(
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    resumed: bool,
+) -> str:
+    """Fold system instructions into the first headless CLI prompt.
+
+    ``opencode run`` has no separate system-prompt option. Once a session is
+    resumed, OpenCode already retains the first prompt in its own history.
+    """
+    if resumed or not system_prompt.strip():
+        return user_prompt
+    return f"{system_prompt.rstrip()}\n\n{user_prompt}"
+
+
 def _build_argv(
     binary: str,
     *,
@@ -250,7 +281,10 @@ def _build_argv(
     if thinking:
         argv.append("--thinking")
     if skip_permissions:
-        argv.append("--dangerously-skip-permissions")
+        # OpenCode 1.17.x exposes the headless permission switch as ``--auto``.
+        # The older ``--dangerously-skip-permissions`` spelling is rejected by
+        # the real binary before a turn starts.
+        argv.append("--auto")
     argv.append(prompt)
     return argv
 
@@ -362,10 +396,10 @@ def _resolve_mcp_servers_env() -> dict[str, Any]:
           }
         }
 
-    Producers that want to suppress a user's globally-registered MCP
-    server (because it would leak into orchestrator-driven turns) can
-    include an entry like ``{"<server>": {"enabled": false}}`` —
-    OpenCode's ``Config.layer`` merge preserves disabled entries.
+    Producers that want to disable a named MCP server in the generated
+    configuration can include an entry like
+    ``{"<server>": {"enabled": false}}`` — OpenCode's
+    ``Config.layer`` merge preserves disabled entries.
 
     A malformed value RAISES rather than silently dropping, since the
     env var is written by the parent omnigent process and a bad value
@@ -394,13 +428,12 @@ def _resolve_mcp_servers_env() -> dict[str, Any]:
 
 
 def _build_opencode_config_content() -> dict[str, Any] | None:
-    """Synthesise the ``OPENCODE_CONFIG_CONTENT`` payload, if any.
+    """Synthesise the private OpenCode config payload, if any.
 
     Combines the gateway-routing env vars and the MCP-bridge env var
     into one JSON-serialisable dict matching OpenCode's
     ``ConfigV1.Info`` schema. Returns ``None`` when nothing is
-    configured — callers pass through without setting the env var so
-    OpenCode's normal config-discovery path runs unchanged.
+    configured.
 
     Gateway override (per
     ``packages/opencode/src/provider/provider.ts`` ``resolveSDK``)
@@ -459,6 +492,8 @@ class OpenCodeExecutor(Executor):
         skip_raw = os.environ.get(_ENV_SKIP_PERMISSIONS)
         self._skip_permissions = True if skip_raw is None else _parse_truthy(skip_raw)
         self._session_ids: dict[str, str] = {}
+        self._opencode_tempdir: tempfile.TemporaryDirectory[str] | None = None
+        self._opencode_root: Path | None = None
         # One-time guard for the "spec tools declared but no MCP
         # bridge wired" warning — see run_turn.
         self._warned_no_mcp_bridge = False
@@ -469,29 +504,77 @@ class OpenCodeExecutor(Executor):
             self._binary = _resolve_opencode_binary()
         return self._binary
 
+    def _private_opencode_roots(self) -> tuple[Path, Path, Path, Path]:
+        """Return private XDG roots shared by this executor's turns."""
+        if self._opencode_root is None:
+            tempdir = tempfile.TemporaryDirectory(prefix="omnigent-opencode-")
+            root = Path(tempdir.name)
+            self._opencode_tempdir = tempdir
+            self._opencode_root = root
+            for name in ("config", "data", "state", "cache"):
+                (root / name).mkdir(mode=0o700)
+            self._copy_opencode_auth(root / "data")
+        root = self._opencode_root
+        assert root is not None
+        return root / "config", root / "data", root / "state", root / "cache"
+
+    def _copy_opencode_auth(self, data_home: Path) -> None:
+        """Copy the user's OpenCode auth into the private data root, if any."""
+        source_home = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share"))
+        source = source_home / "opencode" / "auth.json"
+        if not source.is_file():
+            return
+        destination_dir = data_home / "opencode"
+        destination_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            destination = destination_dir / "auth.json"
+            shutil.copyfile(source, destination)
+            os.chmod(destination, 0o600)
+        except OSError:
+            logger.debug("opencode harness: could not copy private auth state", exc_info=True)
+
+    def _write_private_config(self, config_home: Path, payload: dict[str, Any]) -> None:
+        """Write a private, mode-restricted OpenCode config atomically."""
+        config_dir = config_home / "opencode"
+        config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f"{_OPENCODE_CONFIG_FILENAME}.",
+            dir=str(config_dir),
+            text=True,
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, separators=(",", ":"))
+                handle.write("\n")
+            os.chmod(temp_name, 0o600)
+            os.replace(temp_name, config_dir / _OPENCODE_CONFIG_FILENAME)
+        finally:
+            if os.path.exists(temp_name):
+                os.unlink(temp_name)
+
     def _build_spawn_env(self) -> dict[str, str]:
-        """Return the env mapping for the per-turn ``opencode run`` subprocess.
+        """Return a filtered env with private OpenCode config/data roots.
 
-        Inherits the harness subprocess's environment so user PATH /
-        XDG vars / shell config stay accessible, then layers in the
-        gateway / MCP overrides that the producer wrote into the
-        ``HARNESS_OPENCODE_GATEWAY_*`` and ``HARNESS_OPENCODE_MCP_*``
-        env vars. The resulting ``OPENCODE_CONFIG_CONTENT`` is merged
-        on top of the user's global config by ``Config.layer`` in
-        OpenCode itself — so this is non-destructive for the
-        operator's ``~/.config/opencode/config.json``.
-
-        ``OPENCODE_DISABLE_PROJECT_CONFIG=1`` is set unconditionally
-        when we generate a config override so a user-project
-        ``opencode.json`` cannot silently re-introduce the
-        provider/MCP entries the producer wanted suppressed.
+        The parent harness receives gateway values through the existing
+        ``HARNESS_OPENCODE_GATEWAY_*`` contract. Consume those values here,
+        write them to a mode-restricted per-executor config, and do not pass
+        the gateway env vars or config-content override to the OpenCode child.
         """
-        env = dict(os.environ)
+        env = clean_agent_env(
+            allow_prefixes=("ANTHROPIC_", "OPENAI_", "GEMINI_", "GOOGLE_"),
+            deny_exact=_OPENCODE_CHILD_DENY_ENV,
+        )
+        config_home, data_home, state_home, cache_home = self._private_opencode_roots()
+        env["XDG_CONFIG_HOME"] = str(config_home)
+        env["XDG_DATA_HOME"] = str(data_home)
+        env["XDG_STATE_HOME"] = str(state_home)
+        env["XDG_CACHE_HOME"] = str(cache_home)
+        env[_OPENCODE_CONFIG_DIR_ENV] = str(config_home / "opencode")
+
         payload = _build_opencode_config_content()
-        if payload is None:
-            return env
-        env[_OPENCODE_CONFIG_CONTENT_ENV] = json.dumps(payload, separators=(",", ":"))
-        env[_OPENCODE_DISABLE_PROJECT_CONFIG_ENV] = "1"
+        if payload is not None:
+            self._write_private_config(config_home, payload)
+            env[_OPENCODE_DISABLE_PROJECT_CONFIG_ENV] = "1"
         return env
 
     def _session_key_for(self, messages: list[Message]) -> str | None:
@@ -520,9 +603,9 @@ class OpenCodeExecutor(Executor):
     ) -> AsyncIterator[ExecutorEvent]:
         """Run one OpenCode turn.
 
-        ``system_prompt`` is accepted for ABI compatibility but
-        ignored — OpenCode loads instructions from its own
-        configuration (``opencode auth`` + ``opencode.json``).
+        ``system_prompt`` is folded into the first headless CLI prompt because
+        ``opencode run`` has no separate system-prompt option. Resumed turns
+        rely on OpenCode's retained session history and do not repeat it.
 
         ``tools`` is forwarded by the adapter but **not yet bridged
         into the OpenCode subprocess** in this build. The producer
@@ -530,7 +613,7 @@ class OpenCodeExecutor(Executor):
         ``HARNESS_OPENCODE_MCP_SERVERS`` to register an Omnigent
         MCP endpoint that exposes spec tools — that env var is
         consumed by :func:`_build_opencode_config_content` and
-        flows into ``OPENCODE_CONFIG_CONTENT.mcp``. The in-process
+        flows into the private ``opencode.json`` ``mcp`` block. The in-process
         FastMCP server that would serve that endpoint is intentionally
         out of scope for v1 (it needs careful lifecycle and
         :attr:`_tool_executor` callback plumbing); when ``tools`` is
@@ -538,7 +621,6 @@ class OpenCodeExecutor(Executor):
         warning so the user knows their spec tools aren't reaching
         OpenCode.
         """
-        del system_prompt
         if tools and not os.environ.get(_ENV_MCP_SERVERS) and not self._warned_no_mcp_bridge:
             logger.warning(
                 "opencode harness: %d spec tool(s) declared but no Omnigent "
@@ -554,13 +636,18 @@ class OpenCodeExecutor(Executor):
             self._session_ids.get(omnigent_session_key) if omnigent_session_key else None
         )
 
-        prompt = _latest_user_text(messages)
-        if not prompt:
+        user_prompt = _latest_user_text(messages)
+        if not user_prompt:
             yield ExecutorError(
                 message="opencode harness: no user message in request",
                 retryable=False,
             )
             return
+        prompt = _build_turn_prompt(
+            system_prompt,
+            user_prompt,
+            resumed=opencode_session_id is not None,
+        )
 
         # Per-turn model override (config.model) wins over the
         # harness default, matching the supervisor/codex executors.
@@ -725,6 +812,10 @@ class OpenCodeExecutor(Executor):
         mapping so a future turn on the same key starts fresh.
         """
         self._session_ids.pop(session_key, None)
+        if not self._session_ids and self._opencode_tempdir is not None:
+            self._opencode_tempdir.cleanup()
+            self._opencode_tempdir = None
+            self._opencode_root = None
 
     async def interrupt_session(self, session_key: str) -> bool:
         """:returns: ``False`` — per-turn subprocess has no out-of-band cancel.

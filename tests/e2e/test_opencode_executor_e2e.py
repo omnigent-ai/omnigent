@@ -36,18 +36,26 @@ _SKIP_REASON = (
 )
 
 
-def _e2e_enabled() -> bool:
-    """Return whether the opencode e2e gate is open.
-
-    Two conditions: the opt-in env var is set, and the CLI exists on
-    ``PATH``. Either alone is insufficient — the env var alone risks
-    a confusing error on a machine without opencode, and the binary
-    alone risks spending tokens during a default ``pytest`` run.
-    """
-    return os.environ.get(_GATE_ENV) == "1" and shutil.which("opencode") is not None
+def _e2e_opted_in() -> bool:
+    """Return whether the explicit real-token gate is open."""
+    return os.environ.get(_GATE_ENV) == "1"
 
 
-pytestmark = pytest.mark.skipif(not _e2e_enabled(), reason=_SKIP_REASON)
+_E2E_OPT_IN_MARK = pytest.mark.skipif(not _e2e_opted_in(), reason=_SKIP_REASON)
+_REAL_E2E_MARK = pytest.mark.skipif(
+    not _e2e_opted_in() or shutil.which("opencode") is None,
+    reason=_SKIP_REASON,
+)
+
+
+@_E2E_OPT_IN_MARK
+def test_opted_in_e2e_requires_opencode_binary() -> None:
+    """Explicit opt-in fails loudly when the real CLI is unavailable."""
+    binary = shutil.which("opencode")
+    assert binary is not None, (
+        f"{_GATE_ENV}=1 but the opencode binary is missing from PATH; "
+        "install OpenCode or unset the opt-in gate"
+    )
 
 
 async def _collect_turn(
@@ -80,6 +88,7 @@ async def _collect_turn(
     return events
 
 
+@_REAL_E2E_MARK
 def test_opencode_run_turn_streams_text_against_real_binary() -> None:
     """One-shot turn returns a non-empty :class:`TurnComplete`.
 
@@ -120,6 +129,7 @@ def test_opencode_run_turn_streams_text_against_real_binary() -> None:
     )
 
 
+@_REAL_E2E_MARK
 def test_opencode_run_turn_session_resume_carries_history() -> None:
     """Second turn on the same ``session_key`` recalls the first.
 

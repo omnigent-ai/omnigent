@@ -12,10 +12,11 @@ description: >-
 # layout under ``examples/polly/`` / ``examples/debby/``.
 executor:
   harness: opencode
+  # ``opencode`` is the headless CLI executor. Use ``opencode-native``
+  # explicitly when the OpenCode TUI/server bridge is intended.
   # Override per-invocation via ``-m openai/gpt-5`` or ``/model`` in
   # the REPL. With no model pinned, OpenCode picks its configured
   # default for the chosen provider.
-  model: anthropic/claude-sonnet-4-5
 
 prompt: |
   You are OpenCode, running headlessly inside Omnigent. Help the user
@@ -23,15 +24,19 @@ prompt: |
   and explain your reasoning. Keep responses concise and prefer
   showing the user diffs / commands over describing them in prose.
 
-# OpenCode is a multi-provider coding agent. Credentials live inside
-# OpenCode's own ``opencode auth login`` flow, NOT in Omnigent's
-# provider config — so this spec declares no ``executor.auth`` block.
+# OpenCode is a multi-provider coding agent. Credentials come from
+# OpenCode's own ``opencode auth login`` flow and are copied into the
+# headless executor's private XDG data root — so this spec declares
+# no ``executor.auth`` block.
 #
 # To route through a gateway (Databricks AI gateway / vendor-neutral
-# proxy) instead, either set ``HARNESS_OPENCODE_GATEWAY_BASE_URL`` +
+# proxy) instead, either set the wrapper-only
+# ``HARNESS_OPENCODE_GATEWAY_BASE_URL`` +
 # ``HARNESS_OPENCODE_GATEWAY_API_KEY`` in the shell, or declare a
 # ``executor.auth: {type: databricks, profile: …}`` block and let
-# Omnigent resolve the workspace.
+# Omnigent resolve the workspace. The resulting provider/MCP override
+# is written to a private mode-0600 ``opencode.json``; it is not passed
+# as ``OPENCODE_CONFIG_CONTENT`` or as a gateway key to the child.
 #
 # OpenCode owns its own file/shell tools (bash, edit, read, …) and
 # runs them inside its own loop. The harness therefore advertises

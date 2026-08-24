@@ -21,12 +21,15 @@ subprocess spawn, no real CLI.
 from __future__ import annotations
 
 import logging
+import json
+import stat
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import yaml as _yaml
 
+from omnigent.inner.opencode_executor import OpenCodeExecutor
 from omnigent.runtime.workflow import (
     _build_claude_sdk_spawn_env,
     _build_codex_spawn_env,
@@ -503,7 +506,7 @@ def test_opencode_uses_anthropic_global_default(config_home: Path) -> None:
     # Static key → flows directly into the gateway override (no auth-command
     # surface in OpenCode's config schema). A regression that emitted a
     # ``printf %s ...`` here would land a non-resolvable shell command inside
-    # OPENCODE_CONFIG_CONTENT.apiKey.
+    # the generated private config's provider apiKey.
     assert env["HARNESS_OPENCODE_GATEWAY_API_KEY"] == "sk-ant-secret"
     # No spec model → the family's models.default supplies the model.
     assert env["HARNESS_OPENCODE_MODEL"] == "claude-default-model"
@@ -542,6 +545,40 @@ def test_opencode_workdir_threads_through_as_cwd(config_home: Path, tmp_path: Pa
     env = _build_opencode_spawn_env(spec, workdir=tmp_path)
 
     assert env["HARNESS_OPENCODE_CWD"] == str(tmp_path)
+
+
+def test_opencode_workflow_env_is_consumed_into_private_child_config(
+    config_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The workflow producer and executor agree on the private-file contract."""
+    _write_config(config_home, _anthropic_default_config())
+    spec = _make_spec(harness="opencode")
+    producer_env = _build_opencode_spawn_env(spec, workdir=None)
+
+    for key, value in producer_env.items():
+        monkeypatch.setenv(key, value)
+    assert producer_env["HARNESS_OPENCODE_GATEWAY_BASE_URL"] == "https://anthropic.example.com/v1"
+    assert producer_env["HARNESS_OPENCODE_GATEWAY_API_KEY"] == "sk-ant-secret"
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "unrelated-secret")
+    monkeypatch.setenv("OPENCODE_CONFIG_CONTENT", '{"provider":{"evil":{}}}')
+
+    executor = OpenCodeExecutor()
+    child_env = executor._build_spawn_env()
+    config_path = Path(child_env["XDG_CONFIG_HOME"]) / "opencode" / "opencode.json"
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+
+    assert payload["provider"]["anthropic"]["options"] == {
+        "baseURL": "https://anthropic.example.com/v1",
+        "apiKey": "sk-ant-secret",
+    }
+    assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+    assert child_env["XDG_CONFIG_HOME"] != str(config_home)
+    for key in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"):
+        assert stat.S_IMODE(Path(child_env[key]).stat().st_mode) == 0o700
+    assert "HARNESS_OPENCODE_GATEWAY_API_KEY" not in child_env
+    assert "OPENCODE_CONFIG_CONTENT" not in child_env
+    assert "AWS_SECRET_ACCESS_KEY" not in child_env
 
 
 def test_pi_uses_anthropic_global_default(config_home: Path) -> None:

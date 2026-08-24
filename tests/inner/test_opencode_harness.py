@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import stat
+from pathlib import Path
 
 import pytest
 
@@ -38,6 +40,7 @@ def test_harness_module_registered_in_module_registry() -> None:
     ``create_app()``.
     """
     assert _HARNESS_MODULES.get("opencode") == "omnigent.inner.opencode_harness"
+    assert _HARNESS_MODULES.get("opencode-native") == "omnigent.inner.opencode_native_harness"
 
 
 def test_harness_accepted_by_spec_validator() -> None:
@@ -237,7 +240,8 @@ def test_build_argv_all_flags_set() -> None:
     assert "--agent" in argv and argv[argv.index("--agent") + 1] == "build"
     assert "--variant" in argv and argv[argv.index("--variant") + 1] == "high"
     assert "--thinking" in argv
-    assert "--dangerously-skip-permissions" in argv
+    assert "--auto" in argv
+    assert "--dangerously-skip-permissions" not in argv
     assert argv[-1] == "ship it"
 
 
@@ -414,13 +418,18 @@ class _FakeProcess:
         self.returncode = -9
 
 
-async def _collect(executor: opencode_executor.OpenCodeExecutor, prompt: str) -> list:
+async def _collect(
+    executor: opencode_executor.OpenCodeExecutor,
+    prompt: str,
+    *,
+    system_prompt: str = "",
+) -> list:
     """Drain one ``run_turn`` into a list for assertion."""
     events = []
     async for event in executor.run_turn(
         messages=[{"role": "user", "content": prompt, "session_id": "omni_sess_1"}],
         tools=[],
-        system_prompt="",
+        system_prompt=system_prompt,
         config=None,
     ):
         events.append(event)
@@ -470,8 +479,7 @@ def test_run_turn_streams_text_and_emits_turn_complete(
     executor = opencode_executor.OpenCodeExecutor()
     events = asyncio.run(_collect(executor, "hi"))
 
-    # argv shape: ``opencode run --format json
-    # --dangerously-skip-permissions hi`` (no --session on the first
+    # argv shape: ``opencode run --format json --auto hi`` (no --session on the first
     # turn since the cache was empty; permissions are skipped by
     # default because a headless meta-harness has nowhere to surface
     # interactive prompts — see OpenCodeExecutor.__init__).
@@ -481,7 +489,7 @@ def test_run_turn_streams_text_and_emits_turn_complete(
             "run",
             "--format",
             "json",
-            "--dangerously-skip-permissions",
+            "--auto",
             "hi",
         ]
     ]
@@ -496,6 +504,25 @@ def test_run_turn_streams_text_and_emits_turn_complete(
     # The captured opencode session ID is cached against the
     # Omnigent session_key so the next turn can reattach.
     assert executor._session_ids["omni_sess_1"] == "opencode_sess_1"
+
+
+def test_run_turn_forwards_system_prompt_in_first_subprocess_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Agent/framework instructions reach OpenCode despite its CLI-only API."""
+    monkeypatch.setenv("HARNESS_OPENCODE_PATH", "/fake/opencode")
+    recorded_argv: list[list[str]] = []
+
+    async def _fake_subprocess(*argv: str, **_: object) -> _FakeProcess:
+        recorded_argv.append(list(argv))
+        return _FakeProcess([b""], return_code=0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_subprocess)
+
+    executor = opencode_executor.OpenCodeExecutor()
+    asyncio.run(_collect(executor, "do the work", system_prompt="FRAMEWORK: be precise"))
+
+    assert recorded_argv[0][-1] == "FRAMEWORK: be precise\n\ndo the work"
 
 
 def test_run_turn_reuses_captured_session_on_second_turn(
@@ -624,9 +651,7 @@ def test_close_session_drops_cached_session_id() -> None:
 def test_build_config_content_returns_none_when_nothing_set(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No env vars → ``None`` → executor passes through to opencode's
-    own config discovery without injecting ``OPENCODE_CONFIG_CONTENT``.
-    """
+    """No gateway/MCP override → no generated private config payload."""
     for env_var in (
         "HARNESS_OPENCODE_GATEWAY_PROVIDER",
         "HARNESS_OPENCODE_GATEWAY_BASE_URL",
@@ -690,10 +715,8 @@ def test_build_config_content_decodes_mcp_servers(
 ) -> None:
     """``HARNESS_OPENCODE_MCP_SERVERS`` decodes into ``payload["mcp"]``.
 
-    OpenCode's ``Config.layer`` merges this into the user's global
-    config (per ``packages/opencode/src/config/config.ts``), so this
-    is the per-invocation hook for registering an Omnigent MCP
-    endpoint without mutating ``~/.config/opencode/config.json``.
+    The executor writes this map into its private per-invocation config
+    without reading or mutating the user's global OpenCode config.
     """
     monkeypatch.delenv("HARNESS_OPENCODE_GATEWAY_BASE_URL", raising=False)
     monkeypatch.delenv("HARNESS_OPENCODE_GATEWAY_API_KEY", raising=False)
@@ -732,7 +755,7 @@ def test_resolve_mcp_servers_env_rejects_wrong_shape(
     assert "object" in str(excinfo.value)
 
 
-def test_build_spawn_env_injects_config_content_and_disables_project_config(
+def test_build_spawn_env_writes_private_config_and_disables_project_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """When a payload is synthesised, the spawn-env also sets
@@ -742,24 +765,68 @@ def test_build_spawn_env_injects_config_content_and_disables_project_config(
     """
     monkeypatch.setenv("HARNESS_OPENCODE_GATEWAY_BASE_URL", "https://x/")
     monkeypatch.setenv("HARNESS_OPENCODE_GATEWAY_API_KEY", "k")
-    monkeypatch.delenv("HARNESS_OPENCODE_MCP_SERVERS", raising=False)
+    servers = {"omnigent": {"type": "remote", "url": "http://127.0.0.1:9999/mcp"}}
+    monkeypatch.setenv("HARNESS_OPENCODE_MCP_SERVERS", json.dumps(servers))
     executor = opencode_executor.OpenCodeExecutor()
 
     env = executor._build_spawn_env()
 
-    assert "OPENCODE_CONFIG_CONTENT" in env
+    config_path = Path(env["XDG_CONFIG_HOME"]) / "opencode" / "opencode.json"
+    assert config_path.is_file()
+    assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
     assert env["OPENCODE_DISABLE_PROJECT_CONFIG"] == "1"
-    decoded = json.loads(env["OPENCODE_CONFIG_CONTENT"])
+    assert "OPENCODE_CONFIG_CONTENT" not in env
+    assert "HARNESS_OPENCODE_GATEWAY_API_KEY" not in env
+    decoded = json.loads(config_path.read_text(encoding="utf-8"))
     assert decoded["provider"]["anthropic"]["options"]["apiKey"] == "k"
+    assert decoded["mcp"] == servers
 
 
-def test_build_spawn_env_pass_through_when_nothing_to_inject(
+def test_build_spawn_env_filters_unrelated_secrets_and_uses_private_roots(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No gateway / MCP env vars → spawn-env doesn't synthesise
-    ``OPENCODE_CONFIG_CONTENT`` or set the disable flag, so a user
-    who runs opencode outside Omnigent gets identical behavior.
-    """
+    """The OpenCode child gets only safe env plus its private XDG roots."""
+    monkeypatch.setenv("HARNESS_OPENCODE_GATEWAY_API_KEY", "gateway-secret")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "unrelated-secret")
+    monkeypatch.setenv("GITHUB_TOKEN", "unrelated-token")
+    monkeypatch.setenv("DATABRICKS_TOKEN", "unrelated-token")
+
+    executor = opencode_executor.OpenCodeExecutor()
+    env = executor._build_spawn_env()
+
+    assert "HARNESS_OPENCODE_GATEWAY_API_KEY" not in env
+    assert "AWS_SECRET_ACCESS_KEY" not in env
+    assert "GITHUB_TOKEN" not in env
+    assert "DATABRICKS_TOKEN" not in env
+    for key in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"):
+        assert Path(env[key]).is_dir()
+    assert Path(env["OPENCODE_CONFIG_DIR"]) == Path(env["XDG_CONFIG_HOME"]) / "opencode"
+
+
+def test_build_spawn_env_copies_existing_opencode_auth_into_private_data_home(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Private XDG data preserves OpenCode's own auth without global state."""
+    source = tmp_path / "source" / "opencode"
+    source.mkdir(parents=True)
+    (source / "auth.json").write_text('{"provider":"test"}\n', encoding="utf-8")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "source"))
+
+    executor = opencode_executor.OpenCodeExecutor()
+    env = executor._build_spawn_env()
+
+    private_auth = Path(env["XDG_DATA_HOME"]) / "opencode" / "auth.json"
+    assert private_auth.read_text(encoding="utf-8") == '{"provider":"test"}\n'
+    assert private_auth.parent != source
+    assert stat.S_IMODE(private_auth.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(private_auth.stat().st_mode) == 0o600
+
+
+def test_build_spawn_env_uses_private_roots_without_generated_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No gateway/MCP override still uses private XDG roots."""
     for env_var in (
         "HARNESS_OPENCODE_GATEWAY_PROVIDER",
         "HARNESS_OPENCODE_GATEWAY_BASE_URL",
@@ -775,6 +842,8 @@ def test_build_spawn_env_pass_through_when_nothing_to_inject(
 
     assert "OPENCODE_CONFIG_CONTENT" not in env
     assert "OPENCODE_DISABLE_PROJECT_CONFIG" not in env
+    for key in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"):
+        assert Path(env[key]).is_dir()
 
 
 # ── run_turn: tools-without-MCP-bridge warning ─────────────────────

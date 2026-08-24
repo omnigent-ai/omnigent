@@ -476,6 +476,18 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         # NATIVE_SERVER, not driven by the bench's native-tui tool probe, so
         # shell_tool_* stay None.
     ),
+    "opencode": _C(
+        _IM.CLI_SUBPROCESS,
+        _EL.NONE,
+        _RS.WARM_REATTACH,
+        _EF.NONE,
+        _MF.MULTI,
+        _AU.OWN_AUTH,
+        subagents=False,
+        interrupt=True,
+        streaming=True,
+        fork_history=_FH.PREAMBLE,
+    ),
     "hermes-native": _C(
         _IM.NATIVE_TUI,
         _EL.APPROVAL_MIRROR,
@@ -682,6 +694,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "kimi-native",
             "kiro-native",
             "open-responses",
+            "opencode",
             "openai-agents",
             "opencode-native",
             "pi",
@@ -717,6 +730,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "kimi-native": "omnigent.inner.kimi_native_harness",
         "kiro-native": "omnigent.inner.kiro_native_harness",
         "openai-agents": "omnigent.inner.openai_agents_sdk_harness",
+        "opencode": "omnigent.inner.opencode_harness",
         "opencode-native": "omnigent.inner.opencode_native_harness",
         "pi": "omnigent.inner.pi_harness",
         "pi-native": "omnigent.inner.pi_native_harness",
@@ -740,7 +754,6 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "native-opencode": "opencode-native",
         "native-pi": "pi-native",
         "native-qwen": "qwen-native",
-        "opencode": "opencode-native",
         "openai-agents-sdk": "openai-agents",
         "qwen-code": "qwen",
     },

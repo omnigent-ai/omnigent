@@ -32,19 +32,19 @@ Env vars read at startup:
   ``--thinking``, surfacing reasoning blocks as
   :class:`ReasoningChunk` events. Default off — matches the CLI.
 - ``HARNESS_OPENCODE_DANGEROUSLY_SKIP_PERMISSIONS``: ``"1"`` /
-  ``"true"`` to pass ``--dangerously-skip-permissions``.
+  ``"true"`` to pass OpenCode's supported ``--auto`` permission flag.
   **Defaults to ``True``** because a headless meta-harness has
   nowhere to surface interactive permission prompts; set to
   ``"0"`` only when you've arranged for permission UI elsewhere.
 
-Gateway-routing env vars — synthesise an ``OPENCODE_CONFIG_CONTENT``
-provider override per ``packages/opencode/src/config/config.ts``.
-The override is layered on top of the user's global
-``~/.config/opencode/config.json`` (non-destructive); the executor
-also sets ``OPENCODE_DISABLE_PROJECT_CONFIG=1`` whenever any of
-these are non-empty, so a user-project ``opencode.json`` cannot
-silently re-introduce a provider/MCP entry the operator wanted
-suppressed.
+Gateway-routing env vars are a parent-to-wrapper contract. The
+executor writes the provider override to a mode-restricted private
+``opencode.json`` under temporary XDG roots and removes gateway
+credentials from the OpenCode child environment. It sets
+``OPENCODE_DISABLE_PROJECT_CONFIG=1`` when an override is present,
+so a user-project ``opencode.json`` cannot silently re-introduce a
+provider/MCP entry the operator wanted suppressed. The user's
+global OpenCode config is not visible through the private XDG roots.
 
 - ``HARNESS_OPENCODE_GATEWAY_PROVIDER``: provider id whose
   ``options`` get overridden, e.g. ``"anthropic"`` (default) or
@@ -59,13 +59,12 @@ suppressed.
 MCP-bridge env var:
 
 - ``HARNESS_OPENCODE_MCP_SERVERS``: JSON object of
-  ``{server_name: ConfigMCPV1.Info}`` entries merged into the
-  ``OPENCODE_CONFIG_CONTENT`` ``mcp`` map. Used by the workflow to
-  point OpenCode at an Omnigent-owned MCP endpoint so spec tools
-  round-trip through the standard dispatch path. Include
-  ``{"<server>": {"enabled": false}}`` entries to suppress any of
-  the user's globally-registered MCP servers that would otherwise
-  leak in.
+  ``{server_name: ConfigMCPV1.Info}`` entries written to the private
+  ``opencode.json`` ``mcp`` map. Used by the workflow to point OpenCode
+  at an Omnigent-owned MCP endpoint so spec tools round-trip through
+  the standard dispatch path. Include
+  ``{"<server>": {"enabled": false}}`` entries to disable an
+  explicitly named server in the generated configuration.
 """
 
 from __future__ import annotations

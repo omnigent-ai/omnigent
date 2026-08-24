@@ -1,5 +1,16 @@
 # OpenCode harness — known follow-ups
 
+`opencode` is the canonical headless CLI harness. `opencode-native` is the
+explicit terminal-owned OpenCode TUI/server bridge; these names resolve to
+different runtime implementations.
+
+The parent workflow's `HARNESS_OPENCODE_*` values are wrapper-only inputs.
+Gateway and MCP overrides are written to a private temporary `opencode.json`
+under the headless executor's XDG roots, and the user's `opencode auth login`
+file is copied into the matching private data root. Neither the overrides nor
+the auth secret are passed through the OpenCode child's ambient environment;
+in particular, `OPENCODE_CONFIG_CONTENT` is not used.
+
 The OpenCode harness landed in #45 with the runtime, CLI, onboarding,
 frontend, and gateway-routing wiring complete. This file tracks the
 gaps deliberately deferred so they don't get lost. Each item lists
@@ -35,7 +46,7 @@ Lands cleanest as its own focused PR with the same test gating.
    `{"omnigent": {"type": "remote", "url": f"http://127.0.0.1:{port}/mcp"}}`.
    The synthesis path in `_build_opencode_config_content`
    (`omnigent/inner/opencode_executor.py`) already merges that into
-   `OPENCODE_CONFIG_CONTENT.mcp` correctly.
+   the private `opencode.json` `mcp` block correctly.
 4. Shutdown on `close_session`.
 
 Test gating: same pattern as
@@ -44,27 +55,18 @@ Test gating: same pattern as
 
 ## 2. Native TUI launch (tmux-pane parity with `omnigent claude`)
 
-**Gap.** `omnigent opencode` is a discoverability shortcut for
-`omnigent run --harness opencode` — it runs OpenCode headlessly
-behind the standard Omnigent REPL, not the OpenCode TUI in a tmux
-pane. There is no `opencode-native` harness analogous to
-`claude-native` / `codex-native`.
+**Status.** `omnigent run --harness opencode` is the canonical headless
+OpenCode CLI path. The explicit `opencode-native` harness provides the
+terminal-owned OpenCode TUI/server bridge; the two harness names intentionally
+resolve to different runtime implementations.
 
-**Why deferred.** Native TUI integration is a separate piece of
-work (~300–500 lines): a `tmux`-based pane manager, a
-`OpenCodeNativeExecutor` that wraps the subprocess and bridges
-input/output through Omnigent's terminal layer, and the equivalent
-of `omnigent/claude_native_*.py` / `omnigent/codex_native_*.py`.
-OpenCode's CLI already supports a `--attach` mode aimed at exactly
-this use case (see `packages/opencode/src/cli/cmd/attach.ts`), so
-the implementation should be easier than Claude/Codex's were.
+The native bridge uses OpenCode's `serve`/`attach` flow, keeping TUI-owned
+turns separate from the per-turn headless executor.
 
-**Starting point.** Model on `omnigent/codex_native_executor.py` +
-`omnigent/codex_native_harness.py`. Adding `opencode-native` to
-`OMNIGENT_HARNESSES`, `_HARNESS_MODULES`, and the
-`omnigent.codex_native_*` analogue file set is the bulk of the
-work. The `--attach` flag means most of the TUI-rendering plumbing
-already lives in OpenCode itself.
+Further native bridge changes should build on the existing
+`omnigent/opencode_native_*.py` modules and their focused tests.
+The `--attach` flag keeps most of the TUI-rendering plumbing in OpenCode
+itself.
 
 ## 3. Dedicated OpenCode glyph
 
@@ -172,5 +174,5 @@ skipping `--session`.
 - **`ucode` integration** (`_UCODE_HARNESS_CONFIGS` in
   `omnigent/runtime/workflow.py`). The ucode path pre-caches
   gateway state for SDK-wrapping harnesses; OpenCode reads its
-  config per-spawn from `OPENCODE_CONFIG_CONTENT`, so the ucode
+private per-spawn `opencode.json`, so the ucode
   cache layer is genuinely redundant for it.

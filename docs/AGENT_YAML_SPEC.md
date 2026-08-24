@@ -74,7 +74,7 @@ Supported `harness` values:
 | `pi` | Pi multi-model CLI agent. |
 | `cursor` | Cursor's `cursor-agent` CLI. Talks only to Cursor's backend; see notes below. |
 | `antigravity` | Google Antigravity SDK (Gemini-native, also drives Claude / GPT-OSS). See section below. |
-| `opencode` | [OpenCode](https://opencode.ai) CLI driven headlessly via `opencode run --format json` (`omnigent opencode`). Multi-provider; credentials live in `opencode auth login`. Gateway routing via `HARNESS_OPENCODE_GATEWAY_*` env vars or `executor.auth: {type: databricks, profile: …}`. |
+| `opencode` | [OpenCode](https://opencode.ai) CLI driven headlessly via `opencode run --format json` (`omnigent opencode`). Multi-provider; credentials come from `opencode auth login` and are copied into private per-run XDG data. Gateway routing via wrapper-only `HARNESS_OPENCODE_GATEWAY_*` env vars or `executor.auth: {type: databricks, profile: …}`; overrides are written to a private mode-restricted `opencode.json`. |
 | `databricks_supervisor` | Databricks Agent Bricks Supervisor API. |
 
 Set the Databricks profile under `executor.auth`. The older top-level
