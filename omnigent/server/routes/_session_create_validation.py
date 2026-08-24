@@ -55,10 +55,13 @@ async def validate_permission_mode_agent_support(
     cursor agent could persist a mode the fire path would inject as an unknown
     ``--permission-mode`` flag, breaking the launch.
 
-    A ``None`` mode is always allowed (nothing to gate). When the harness cannot
-    be resolved (no bundle / cache), this is a no-op — the value has already
-    passed the vocabulary allowlist, and the fire path only injects the flag for
-    a Claude launch.
+    This is an early, friendly 4xx at persist time. A ``None`` mode is always
+    allowed (nothing to gate). When the harness cannot be resolved (no bundle /
+    cache / a load error), this is a no-op rather than a rejection: the value has
+    already passed the vocabulary allowlist, and the fire path's launch-arg
+    derivation is itself harness-gated fail-safe (it injects ``--permission-mode``
+    ONLY for a confirmed ``claude-native`` agent, omitting it otherwise), so a
+    non-Claude mode can never actually reach the launch args regardless.
     """
     if permission_mode is None or agent is None:
         return
