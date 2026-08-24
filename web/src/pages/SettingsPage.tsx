@@ -554,7 +554,7 @@ function WorkspacePanelDefaultControl() {
     <ThemeSubsection
       labelId={labelId}
       title="Workspace panel"
-      helper="Whether new chats open with the Files / Agents / Shells panel visible. Existing chats keep their last layout."
+      helper="Whether new chats open with the Files / Agents / Shells panel visible. Collapsing or expanding the panel updates this. Existing chats keep their last layout."
     >
       <CardRadioGroup<WorkspacePanelDefault>
         labelledBy={labelId}

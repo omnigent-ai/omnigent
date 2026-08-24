@@ -12,7 +12,8 @@ the sandbox config per test group, mirroring how ``omnigent setup`` flips the
 Every test drives the product the way a person uses it: the browser drives the
 rig server's real SPA (Playwright sync API), and harness truth is read where a
 user reads it — the tmux pane and the harness's own on-disk state. REST reads
-are secondary probes only.
+are secondary probes only, and REST writes are reserved for the rows whose
+actor is not the browser (a REPL ``/model``, a routing pin, an API client).
 """
 
 from __future__ import annotations
@@ -522,6 +523,24 @@ class PaneWatcher:
         )
 
 
+def kill_pane(pane: PaneWatcher) -> None:
+    """
+    End the session's pane the way an idle reap or a host restart does.
+
+    Kills the pane's whole tmux server, so the harness process goes with it
+    and the runner's next turn has to re-create the terminal (its cold-resume
+    launch path).
+
+    :param pane: The session's discovered pane.
+    """
+    assert pane.socket is not None, "call wait_for_pane first"
+    subprocess.run(
+        ["tmux", "-S", str(pane.socket), "kill-server"],
+        capture_output=True,
+        timeout=15,
+    )
+
+
 def codex_config_copy_model(session_id: str) -> str | None:
     """Return the ``model =`` line of a codex session's private config copy.
 
@@ -550,6 +569,96 @@ def codex_config_copy_model(session_id: str) -> str | None:
                 return match.group("model")
         return None
     return None
+
+
+# ---------------------------------------------------------------------------
+# REST driving (the SPA's own calls, for rows whose actor is not the browser)
+# ---------------------------------------------------------------------------
+
+
+def rest_create_session(
+    base_url: str,
+    *,
+    agent_name: str,
+    host_id: str,
+    workspace: Path,
+    terminal_launch_args: list[str] | None = None,
+) -> str:
+    """
+    Create a host-spawned native session with the create call the SPA makes.
+
+    :param base_url: Rig server base URL.
+    :param agent_name: Built-in wrapper agent, e.g. ``"claude-native-ui"``.
+    :param host_id: Host to launch on.
+    :param workspace: Absolute workspace path on that host.
+    :param terminal_launch_args: Pass-through CLI args, e.g. :func:`bypass_args`.
+    :returns: The new session id.
+    """
+    agents = httpx.get(f"{base_url}/v1/agents", timeout=30)
+    agents.raise_for_status()
+    agent_id = next((a["id"] for a in agents.json()["data"] if a["name"] == agent_name), None)
+    assert agent_id is not None, f"{agent_name!r} is not registered on the rig server"
+    body: dict[str, Any] = {"agent_id": agent_id, "host_id": host_id, "workspace": str(workspace)}
+    if terminal_launch_args:
+        body["terminal_launch_args"] = list(terminal_launch_args)
+    resp = httpx.post(f"{base_url}/v1/sessions", json=body, timeout=120)
+    assert resp.status_code < 400, f"create failed {resp.status_code}: {resp.text[:2000]}"
+    return str(resp.json()["id"])
+
+
+def rest_patch_session(base_url: str, session_id: str, **fields: Any) -> dict[str, Any]:
+    """
+    PATCH session fields — a REPL ``/model`` and an API client write this way.
+
+    A native model change is forwarded to the pane and answered only once the
+    harness confirmed it, so the call may take a while.
+
+    :param base_url: Rig server base URL.
+    :param session_id: Session id.
+    :param fields: Wire fields, e.g. ``model_override="claude-opus-4-8"``.
+    :returns: The updated session payload.
+    """
+    resp = httpx.patch(f"{base_url}/v1/sessions/{session_id}", json=fields, timeout=180)
+    assert resp.status_code < 400, (
+        f"PATCH {sorted(fields)} failed {resp.status_code}: {resp.text[:2000]}"
+    )
+    return dict(resp.json())
+
+
+def rest_post_user_message(base_url: str, session_id: str, text: str) -> None:
+    """
+    POST a user message the way the composer does.
+
+    :param base_url: Rig server base URL.
+    :param session_id: Session id.
+    :param text: The message text.
+    """
+    resp = httpx.post(
+        f"{base_url}/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
+        },
+        timeout=60,
+    )
+    assert resp.status_code < 400, f"message POST failed {resp.status_code}: {resp.text[:1000]}"
+
+
+def assistant_message_count(snapshot: dict[str, Any]) -> int:
+    """
+    Count the assistant messages a session snapshot carries.
+
+    :param snapshot: A ``GET /v1/sessions/{id}`` payload.
+    :returns: The number of assistant ``message`` items.
+    """
+    count = 0
+    for item in snapshot.get("items") or []:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        data = item.get("data") if isinstance(item.get("data"), dict) else item
+        if data.get("role") == "assistant":
+            count += 1
+    return count
 
 
 # ---------------------------------------------------------------------------

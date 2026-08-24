@@ -108,7 +108,7 @@ from omnigent.claude_native_state import (
 from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.host.daemon_launch import (
-    DAEMON_POLL_INTERVAL_S,
+    daemon_poll_intervals,
     error_text,
     launch_or_reuse_daemon_runner,
     open_daemon_client,
@@ -413,6 +413,57 @@ def _serves_canonical_anthropic_ids(claude_config: ClaudeNativeUcodeConfig) -> b
         return True
     host = (urlparse(base_url).hostname or "").lower()
     return host == "anthropic.com" or host.endswith(".anthropic.com")
+
+
+def _claude_family(token: str) -> str | None:
+    """
+    The family alias a model id or alias folds onto, bracket markers dropped.
+
+    :param token: A picker id or model id, e.g. ``"opus[1m]"``,
+        ``"claude-opus-4-8"``.
+    :returns: The family alias, e.g. ``"opus"``, or ``None`` for none.
+    """
+    from omnigent.claude_model_vocabulary import claude_model_alias
+
+    alias = claude_model_alias(token, {})
+    return alias.partition("[")[0] if alias else None
+
+
+def claude_catalog_serves_model(
+    rows: list[dict[str, object]],
+    model: str,
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> bool:
+    """
+    Whether a launch of *model* is backed by this config's catalog.
+
+    An exact row — a picker id or its wire model — always serves. A canonical
+    Anthropic id no row spells exactly still launches when the endpoint takes
+    canonical spellings (``--model`` passes any string through, and a pane's
+    ``/model`` persists exactly this id) and the catalog lists the id's
+    family: the same family fold ``/model`` applies to an unpinned canonical
+    id. A gateway that routes only its own ids, and a family the catalog
+    does not list, refuse — a genuinely stale pick still fails fast.
+
+    :param rows: Catalog rows, e.g.
+        ``[{"id": "opus", "model": "claude-opus-5"}]``.
+    :param model: A picker id or model id, e.g. ``"claude-opus-4-8"``.
+    :param claude_config: The resolved launch config, or ``None`` (Claude's
+        own login).
+    :returns: ``True`` when the launch can run *model* against this catalog.
+    """
+    from omnigent.model_catalog_store import catalog_contains
+
+    if catalog_contains(rows, model):
+        return True
+    if claude_config is not None and not _serves_canonical_anthropic_ids(claude_config):
+        return False
+    if not model.lower().startswith("claude-"):
+        return False
+    family = _claude_family(model)
+    return family is not None and any(
+        _claude_family(str(row.get("id") or row.get("model") or "")) == family for row in rows
+    )
 
 
 def resolve_claude_native_model_selection(
@@ -3773,11 +3824,12 @@ async def _wait_for_claude_terminal_ready(
     :raises click.ClickException: If no terminal appears in time.
     """
     deadline = asyncio.get_event_loop().time() + timeout_s
+    intervals = daemon_poll_intervals()
     while asyncio.get_event_loop().time() < deadline:
         terminal_id = await _find_running_claude_terminal(client, session_id)
         if terminal_id is not None:
             return terminal_id
-        await asyncio.sleep(DAEMON_POLL_INTERVAL_S)
+        await asyncio.sleep(next(intervals))
     raise click.ClickException(
         f"The runner did not create the Claude terminal for {session_id!r} "
         f"within {timeout_s:.0f}s."

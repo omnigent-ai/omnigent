@@ -914,10 +914,11 @@ describe("NewChatLandingScreen create flow", () => {
     // in — the permission select sits at its Default.
     openAgentConfig("ag_native");
     expect(screen.queryByTestId("new-chat-landing-config-approval")).toBeNull();
-    // The permission select's trigger displays its current value — "Default",
-    // not Codex's stored "full-access" (which isn't even a valid value here).
+    // The permission select's trigger displays its current value — "Manual"
+    // (Claude's own label for the prompting `default` mode), not Codex's
+    // stored "full-access" (which isn't even a valid value here).
     expect(screen.getByTestId("new-chat-landing-config-permission").textContent).toContain(
-      "Default",
+      "Manual",
     );
   });
 

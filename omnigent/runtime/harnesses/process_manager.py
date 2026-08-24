@@ -989,6 +989,20 @@ class HarnessProcessManager:
         """
         return conversation_id in self._in_flight_response_ids
 
+    def note_activity(self, conversation_id: str) -> None:
+        """Refresh the idle lease for an existing harness subprocess.
+
+        Native terminal turns do not pass through ``proxy_stream``, so their
+        terminal activity calls this method instead. No-op when the
+        conversation has no registered subprocess.
+
+        :param conversation_id: AP-allocated conversation id,
+            e.g. ``"conv_abc123"``.
+        """
+        entry = self._entries.get(conversation_id)
+        if entry is not None:
+            entry.last_used_at = time.monotonic()
+
     def mark_in_flight(self, conversation_id: str, response_id: str) -> None:
         """
         Record that *conversation_id* has a live harness turn.

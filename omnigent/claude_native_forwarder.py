@@ -36,6 +36,7 @@ from omnigent.claude_native_bridge import (
     read_hook_events_from_offset,
     read_hook_events_since_with_position,
     read_message_deltas_from_offset,
+    read_permission_mode,
     read_transcript_items_from_offset,
     read_transcript_items_since_with_position,
     read_transcript_path,
@@ -82,6 +83,11 @@ _SUBAGENT_IDLE_QUIESCENCE_S = 5.0
 # ``agent-<id>.jsonl`` transcript.
 _SUBAGENT_META_GLOB = "agent-*.meta.json"
 _DEFAULT_POLL_INTERVAL_S = 0.25
+# Minimum spacing between permission-mode pane reads. Unlike the model mirror
+# (which reads a JSON file), this spawns a ``tmux capture-pane`` subprocess, so
+# it runs well below the poll interval; a mode switch is a human action and 2s
+# of lag is imperceptible.
+_PERMISSION_MODE_POLL_INTERVAL_S = 2.0
 # Hard ceiling on one poll iteration of the forward loop. A silently stalled
 # await anywhere in the pipeline used to stop mirroring, status and the busy
 # signal forever; the deadline cancels the stall (the traceback names it) and
@@ -542,6 +548,13 @@ class _ForwardDedupeState:
     # sub-agent spend so the gate can block mid-turn. Separate baseline
     # because it can advance while ``posted_cost`` (S) is frozen.
     posted_policy_cost: float | None = None
+    # Last permission mode POSTed as ``external_permission_mode_change`` —
+    # mirrors the launch mode and any in-pane shift+tab switch, neither of
+    # which the web UI can observe on its own.
+    posted_permission_mode: str | None = None
+    # Monotonic deadline before which the next pane read is skipped, so the
+    # subprocess spawn runs at _PERMISSION_MODE_POLL_INTERVAL_S, not every poll.
+    permission_mode_next_read: float = 0.0
     # Turn-settle latch driving the scheduled-wake boundary. The Stop edge
     # records the ended turn's id as PENDING; it activates (moves to
     # ``settled_response_id``) only once a fully-consumed transcript batch
@@ -1006,6 +1019,14 @@ async def forward_claude_transcript_to_session(
                         # before the user's next message, so model-gated policies
                         # (cost-budget hard cap) no longer lag a switch by one turn.
                         await _forward_model_from_status(
+                            client=client,
+                            session_id=current_session_id,
+                            bridge_dir=bridge_dir,
+                            dedupe=dedupe,
+                        )
+                        # Same rationale for the permission mode: a shift+tab in
+                        # the pane emits no event, so poll the footer.
+                        await _forward_permission_mode_from_pane(
                             client=client,
                             session_id=current_session_id,
                             bridge_dir=bridge_dir,
@@ -4173,6 +4194,83 @@ def _gen_ai_usage_tokens(usage: Mapping[str, float | str] | None) -> dict[str, i
     if "input_tokens" not in tokens and "output_tokens" not in tokens:
         return None
     return tokens
+
+
+async def _post_external_permission_mode_change(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    mode: str,
+) -> None:
+    """
+    Post one ``external_permission_mode_change`` event to the Sessions API.
+
+    Lets the web mode picker reflect a shift+tab switch made inside the Claude
+    Code terminal, which Omnigent has no other way to observe.
+
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent session/conversation id, e.g. ``"conv_abc123"``.
+    :param mode: Permission mode the pane now shows, e.g. ``"auto"``.
+    :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
+    """
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "external_permission_mode_change", "data": {"permission_mode": mode}},
+    )
+    resp.raise_for_status()
+
+
+async def _forward_permission_mode_from_pane(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    dedupe: _ForwardDedupeState,
+) -> None:
+    """
+    Mirror the pane's permission-mode footer to the session label each poll.
+
+    A shift+tab pressed inside the TUI produces no event Omnigent can see, so
+    without this the web picker shows a stale mode until the next UI-driven
+    switch. Polling the footer is the only signal available: Claude Code emits
+    nothing on a mode change, and hook payloads only arrive on tool use.
+
+    The launch mode is posted too, not just later switches: a session started
+    in manual mode carries no ``--permission-mode`` arg and no mode label, so
+    with nothing posted the web picker has no mode to render and hides itself.
+    Best-effort and idempotent — the server ignores a mode equal to the stored
+    label, an unchanged mode or unreadable pane is a no-op, and a failed POST
+    is retried next poll.
+
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent session/conversation id.
+    :param bridge_dir: Native Claude bridge directory.
+    :param dedupe: Shared per-session dedupe state; mutated in place.
+    """
+    # Throttled: this spawns a tmux subprocess, unlike the file-backed model
+    # mirror that shares this poll loop.
+    now = time.monotonic()
+    if now < dedupe.permission_mode_next_read:
+        return
+    dedupe.permission_mode_next_read = now + _PERMISSION_MODE_POLL_INTERVAL_S
+    mode = await asyncio.to_thread(read_permission_mode, bridge_dir)
+    if mode is None or mode == dedupe.posted_permission_mode:
+        return
+    try:
+        await _post_external_permission_mode_change(
+            client,
+            session_id=session_id,
+            mode=mode,
+        )
+    except httpx.HTTPError:
+        _logger.debug(
+            "external_permission_mode_change post failed; session=%s mode=%s",
+            session_id,
+            mode,
+            exc_info=True,
+        )
+        return
+    dedupe.posted_permission_mode = mode
 
 
 async def _post_external_model_change(

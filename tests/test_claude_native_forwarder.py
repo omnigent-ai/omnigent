@@ -3926,6 +3926,221 @@ async def test_forwarder_retries_model_post_after_transient_failure(tmp_path: Pa
         assert dedupe.posted_model == "claude-sonnet-5"
 
 
+@pytest.mark.asyncio
+async def test_forwarder_mirrors_in_pane_permission_mode_switch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Both the launch mode and a later shift+tab reach the session label.
+
+    Claude Code emits no event on a mode change, so the pane footer is polled.
+    The launch mode is posted as well: a manual-mode session has no mode label
+    and no launch flag, so skipping it would leave the web picker with nothing
+    to render. Repeat polls of an unchanged footer stay quiet.
+    """
+    bridge_dir = tmp_path / "bridge"
+    pane_mode: str | None = "default"
+    reads = 0
+
+    def _fake_read(_bridge_dir: Path) -> str | None:
+        """Serve the pane's current mode, counting each capture."""
+        nonlocal reads
+        reads += 1
+        return pane_mode
+
+    monkeypatch.setattr(forwarder, "read_permission_mode", _fake_read)
+    # Reads are throttled off a monotonic deadline; zero the interval so each
+    # call in this test performs a capture instead of returning early.
+    monkeypatch.setattr(forwarder, "_PERMISSION_MODE_POLL_INTERVAL_S", 0.0)
+    dedupe = forwarder._ForwardDedupeState()
+
+    posts: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """Accept every POST and record its payload."""
+        posts.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+
+        async def _poll() -> None:
+            """Run one permission-mode mirror pass."""
+            await forwarder._forward_permission_mode_from_pane(
+                client=client,
+                session_id="conv_abc",
+                bridge_dir=bridge_dir,
+                dedupe=dedupe,
+            )
+
+        # Poll 1: the launch mode is posted, so the picker has a mode to show.
+        await _poll()
+        assert [p["type"] for p in posts] == ["external_permission_mode_change"]
+        assert posts[0]["data"] == {"permission_mode": "default"}
+        assert dedupe.posted_permission_mode == "default"
+
+        # Poll 2: unchanged footer is a no-op, not a repeat POST.
+        await _poll()
+        assert len(posts) == 1
+
+        # Poll 3: the user presses shift+tab into auto mode.
+        pane_mode = "auto"
+        await _poll()
+        assert posts[-1]["data"] == {"permission_mode": "auto"}
+        assert dedupe.posted_permission_mode == "auto"
+
+        # Poll 4: still auto — the switch isn't re-posted every poll.
+        await _poll()
+        assert len(posts) == 2
+
+        # A footerless pane reads as unknown and must not post a reversal.
+        pane_mode = None
+        await _poll()
+        assert len(posts) == 2
+        assert dedupe.posted_permission_mode == "auto"
+    assert reads == 5
+
+
+@pytest.mark.asyncio
+async def test_forwarder_posts_manual_launch_mode_so_picker_renders(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A manual-mode launch publishes a mode, keeping the picker reachable.
+
+    Manual is the default, and launching into it writes no
+    ``--permission-mode`` arg and no mode label, leaving the pane footer as the
+    only source. The first poll must post it: with no mode stored the web
+    picker hides itself, and manual becomes a state no one can switch out of.
+    """
+    bridge_dir = tmp_path / "bridge"
+    monkeypatch.setattr(forwarder, "read_permission_mode", lambda _bridge_dir: "default")
+    monkeypatch.setattr(forwarder, "_PERMISSION_MODE_POLL_INTERVAL_S", 0.0)
+    dedupe = forwarder._ForwardDedupeState()
+
+    posts: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """Accept the POST and record its payload."""
+        posts.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        await forwarder._forward_permission_mode_from_pane(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            dedupe=dedupe,
+        )
+
+    assert posts == [
+        {"type": "external_permission_mode_change", "data": {"permission_mode": "default"}}
+    ]
+    assert dedupe.posted_permission_mode == "default"
+
+
+@pytest.mark.asyncio
+async def test_forwarder_retries_permission_mode_post_after_transient_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A failed mode POST is retried, so the switch isn't silently dropped.
+
+    The pane is the source of truth but the poll window moves on; if a 503
+    advanced the baseline, the web picker would stay stale until the user
+    switched modes again.
+    """
+    pane_mode = "default"
+
+    def _fake_read(_bridge_dir: Path) -> str | None:
+        """Serve the pane's current mode."""
+        return pane_mode
+
+    monkeypatch.setattr(forwarder, "read_permission_mode", _fake_read)
+    monkeypatch.setattr(forwarder, "_PERMISSION_MODE_POLL_INTERVAL_S", 0.0)
+    dedupe = forwarder._ForwardDedupeState()
+
+    posts: list[dict[str, Any]] = []
+    fail_modes = {"plan"}
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """Fail the first ``plan`` POST with 503; accept everything else."""
+        payload = json.loads(request.content.decode("utf-8"))
+        posts.append(payload)
+        mode = payload["data"]["permission_mode"]
+        if mode in fail_modes:
+            fail_modes.discard(mode)
+            return httpx.Response(503, json={})
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+
+        async def _poll() -> None:
+            """Run one permission-mode mirror pass."""
+            await forwarder._forward_permission_mode_from_pane(
+                client=client,
+                session_id="conv_abc",
+                bridge_dir=tmp_path / "bridge",
+                dedupe=dedupe,
+            )
+
+        await _poll()  # the launch mode lands
+        assert dedupe.posted_permission_mode == "default"
+
+        pane_mode = "plan"
+        await _poll()
+        assert len(posts) == 2
+        assert dedupe.posted_permission_mode == "default"  # NOT advanced — POST failed
+
+        await _poll()
+        assert [p["data"] for p in posts] == [
+            {"permission_mode": "default"},
+            {"permission_mode": "plan"},
+            {"permission_mode": "plan"},
+        ]
+        assert dedupe.posted_permission_mode == "plan"  # now committed
+
+
+@pytest.mark.asyncio
+async def test_forwarder_throttles_permission_mode_pane_reads(tmp_path: Path) -> None:
+    """
+    Pane reads are spaced by the throttle, not run on every poll.
+
+    Unlike the file-backed model mirror sharing this loop, each read spawns a
+    ``tmux capture-pane`` subprocess. The poll loop is far tighter than the
+    throttle, so an unthrottled read would spawn processes continuously for a
+    signal that only changes when a human presses shift+tab.
+    """
+    reads = 0
+
+    def _fake_read(_bridge_dir: Path) -> str | None:
+        """Count captures; the mode itself is irrelevant here."""
+        nonlocal reads
+        reads += 1
+        return "default"
+
+    with patch.object(forwarder, "read_permission_mode", _fake_read):
+        dedupe = forwarder._ForwardDedupeState()
+        transport = httpx.MockTransport(lambda _req: httpx.Response(202, json={}))
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            for _ in range(5):
+                await forwarder._forward_permission_mode_from_pane(
+                    client=client,
+                    session_id="conv_abc",
+                    bridge_dir=tmp_path / "bridge",
+                    dedupe=dedupe,
+                )
+
+    # Five back-to-back polls inside one throttle window capture once.
+    assert reads == 1
+    assert dedupe.permission_mode_next_read > 0.0
+
+
 def test_validated_transcript_state_resets_legacy_byte_cursor_without_fingerprint(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,

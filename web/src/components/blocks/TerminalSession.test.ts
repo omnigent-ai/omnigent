@@ -286,6 +286,13 @@ describe("isUnexpectedTerminalClose", () => {
     expect(isUnexpectedTerminalClose(1006)).toBe(true);
     expect(isUnexpectedTerminalClose(1012)).toBe(true);
     expect(isUnexpectedTerminalClose(1013)).toBe(true);
+    // 1005 "no status" is the browser's other no-clean-close sentinel
+    // (mirror of 1006); a server redeploy behind an ingress surfaces as
+    // 1005. 1011/1014 are the proxy's server-error / bad-gateway codes
+    // while the backend restarts.
+    expect(isUnexpectedTerminalClose(1005)).toBe(true);
+    expect(isUnexpectedTerminalClose(1011)).toBe(true);
+    expect(isUnexpectedTerminalClose(1014)).toBe(true);
   });
 
   it("treats deliberate closes (normal, policy, app 4xxx) as terminal", () => {

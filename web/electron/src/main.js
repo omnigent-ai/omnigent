@@ -682,6 +682,33 @@ function activeWindow() {
   return windows.keys().next().value ?? null;
 }
 
+/**
+ * Effective version for development update checks and UI. Packaged builds
+ * always use Electron's real app version.
+ */
+function configureDesktopVersion() {
+  const override = !app.isPackaged
+    ? process.env.OMNIGENT_DESKTOP_VERSION_OVERRIDE?.trim()
+    : undefined;
+  if (!override) return app.getVersion();
+
+  try {
+    // electron-updater stores a SemVer instance here and reads it when deciding
+    // eligibility. Reuse its constructor so comparisons keep the expected type.
+    const Version = autoUpdater.currentVersion.constructor;
+    const version = new Version(override);
+    autoUpdater.currentVersion = version;
+    return version.version;
+  } catch (err) {
+    throw new Error(
+      `OMNIGENT_DESKTOP_VERSION_OVERRIDE must be a valid semantic version (received ${JSON.stringify(override)})`,
+      { cause: err },
+    );
+  }
+}
+
+const currentDesktopVersion = configureDesktopVersion();
+
 // Desktop auto-update orchestration lives in its own module; the main process
 // only composes it with its main-process dependencies and wires the four thin
 // seams below (startup init, the Updates menu, the update IPC surface, and the
@@ -700,12 +727,11 @@ const updater = createDesktopUpdater({
   isPinnedOriginSender,
   pinnedOrigin,
   iconPath: ICON_PNG,
-  // Dev builds always use the local dev feed (dev-app-update.yml ->
-  // 127.0.0.1:8765); packaged builds always use the baked app-update.yml.
-  // Tying this to !app.isPackaged — not an env var — closes a redirect attack:
-  // an OMNIGENT_FORCE_DEV_UPDATE_CONFIG-style env var could otherwise point a
-  // packaged (production) app at an untrusted HTTP local feed and push a
-  // malicious update. A packaged build can never be redirected to the dev feed.
+  getCurrentVersion: () => currentDesktopVersion,
+  // Dev builds use dev-app-update.yml, which mirrors the production HTTPS
+  // endpoint; packaged builds always use their baked app-update.yml. Tying
+  // this to !app.isPackaged — not an env var — ensures a packaged app can
+  // never be redirected to a repository-local update configuration.
   forceDevUpdateConfig: !app.isPackaged,
 });
 
@@ -1870,9 +1896,9 @@ function buildMenu() {
           if (status.state === "none") {
             await dialog.showMessageBox(activeWindow(), {
               type: "info",
-              title: "Omnigent",
+              title: "Omnigent Desktop",
               message: "You're up to date!",
-              detail: `Omnigent ${app.getVersion()} is the latest version.`,
+              detail: `Omnigent Desktop ${currentDesktopVersion} is the latest version.`,
               buttons: ["OK"],
             });
           }

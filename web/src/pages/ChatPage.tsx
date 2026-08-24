@@ -57,7 +57,11 @@ import {
   FilePathAwareMessageResponse,
   rendersOnlyWorkedFold,
 } from "@/components/blocks/BlockRenderer";
-import { CompactionMarker, RoutingDecisionCard } from "@/components/blocks/StatusBlocks";
+import {
+  CompactionMarker,
+  ErrorBanner,
+  RoutingDecisionCard,
+} from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
 import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
@@ -212,6 +216,11 @@ import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { useForkDialog } from "@/shell/ForkDialogContext";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
+import {
+  CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES,
+  claudePermissionModeLabel,
+  isClaudeNativeSession,
+} from "@/lib/claudePermissionMode";
 import { isCodexNativeSession } from "@/lib/codexPlanMode";
 import { getCliServerUrl } from "@/lib/host";
 import { SessionImage } from "@/components/SessionImage";
@@ -1392,6 +1401,7 @@ export function ChatPage() {
       modelPickerKind={modelPickerKind}
       codexModelOptions={codexModelOptions}
       showCodexPlanMode={shouldShowCodexPlanModeControl(capabilitySource)}
+      showClaudePermissionMode={shouldShowClaudePermissionModeControl(capabilitySource)}
       showGoalControl={shouldShowGoalControl(capabilitySource)}
       showClaudeGoalControl={shouldShowPollyClaudeGoalControl(activeSession)}
       showPollyCodexGoalControl={shouldShowPollyCodexGoalControl(activeSession)}
@@ -1636,6 +1646,7 @@ interface MainAgentSurfaceProps {
   codexModelOptions: readonly NativeModelOption[];
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
+  showClaudePermissionMode?: boolean;
   /** Show the session Goal control. */
   showGoalControl?: boolean;
   /** Show Polly's Claude SDK command-backed Goal control. */
@@ -1780,6 +1791,7 @@ function MainAgentSurface({
   modelPickerKind,
   codexModelOptions,
   showCodexPlanMode,
+  showClaudePermissionMode = false,
   showGoalControl = false,
   showClaudeGoalControl = false,
   showPollyCodexGoalControl = false,
@@ -1893,20 +1905,16 @@ function MainAgentSurface({
     [streamBubbles],
   );
 
-  // Cmd+Alt+↑/↓ (Ctrl+Alt on win/linux) — guarded so the composer's
-  // own unmodified ArrowUp/Down history-recall still works.
+  // Cmd+Alt+↑/↓ (Ctrl+Alt on win/linux) — the composer's own unmodified
+  // ArrowUp/Down history-recall skips modified arrows, so this fires there too.
   useEffect(() => {
     // globalThis prefix because React's KeyboardEvent is imported above.
     const handler = (e: globalThis.KeyboardEvent) => {
       if (!(e.metaKey || e.ctrlKey) || !e.altKey) return;
       if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
-      const target = e.target;
-      if (
-        target instanceof HTMLElement &&
-        target.closest('textarea, input, [contenteditable="true"]')
-      ) {
-        return;
-      }
+      // Yield to a focused widget that already claimed the chord for its own
+      // list navigation (command palette, mention / slash menus).
+      if (e.defaultPrevented) return;
       e.preventDefault();
       if (e.key === "ArrowUp") nav.goPrev();
       else nav.goNext();
@@ -2309,6 +2317,7 @@ function MainAgentSurface({
             modelPickerKind={modelPickerKind}
             codexModelOptions={codexModelOptions}
             showCodexPlanMode={showCodexPlanMode}
+            showClaudePermissionMode={showClaudePermissionMode}
             showGoalControl={showGoalControl}
             showClaudeGoalControl={showClaudeGoalControl}
             showPollyCodexGoalControl={showPollyCodexGoalControl}
@@ -3166,13 +3175,9 @@ export function SandboxFailedIndicator({ status }: { status: SandboxStatus }) {
     <div
       data-testid="sandbox-failed-indicator"
       role="status"
-      className={cn(
-        "mx-auto mb-4 flex w-full items-center justify-center gap-2 px-6 py-1.5 text-destructive text-sm",
-        CHAT_COLUMN_WIDTH,
-      )}
+      className={cn("mx-auto w-full", CHAT_COLUMN_WIDTH)}
     >
-      <AlertTriangleIcon className="size-3.5 shrink-0" aria-hidden />
-      <span>Sandbox launch failed{status.error ? `: ${status.error}` : ""}</span>
+      <ErrorBanner message={status.error ?? ""} source="" code="" title="Sandbox launch failed" />
     </div>
   );
 }
@@ -3239,22 +3244,29 @@ export function ConnectionIndicator({
       return null;
     }
     return (
-      <button
-        type="button"
-        data-testid="disconnected-indicator"
-        onClick={onShowReconnectHelp}
-        className={cn(
-          "mx-auto mb-4 flex w-full items-center justify-center gap-2 px-6 py-1.5 text-sm text-destructive underline-offset-2 hover:underline",
-          CHAT_COLUMN_WIDTH,
-        )}
-      >
-        <WifiOffIcon className="size-3.5 shrink-0" />
-        <span>
-          {liveness.kind === "host_offline"
-            ? "Host is offline — click to reconnect"
-            : "Agent disconnected — click to reconnect"}
-        </span>
-      </button>
+      <div className={cn("mx-auto mb-4 flex w-full justify-center px-6", CHAT_COLUMN_WIDTH)}>
+        {/* Reconnect affordance styled as the destructive error pill (never
+            raw red text). Keeps its own click → reconnect dialog rather than
+            the ErrorBanner's async Retry, since some states need the picker. */}
+        <button
+          type="button"
+          data-testid="disconnected-indicator"
+          onClick={onShowReconnectHelp}
+          className="flex items-center gap-2 rounded-[12px] px-4 py-2 text-sm text-destructive transition-[filter] hover:brightness-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+          style={{
+            background:
+              "color-mix(in srgb, var(--destructive) 4%, var(--app-shell-bg, var(--background)))",
+            border: "1px solid color-mix(in srgb, var(--destructive) 32%, transparent)",
+          }}
+        >
+          <WifiOffIcon className="size-3.5 shrink-0" />
+          <span>
+            {liveness.kind === "host_offline"
+              ? "Host is offline — click to reconnect"
+              : "Agent disconnected — click to reconnect"}
+          </span>
+        </button>
+      </div>
     );
   }
 
@@ -4011,8 +4023,12 @@ function AssistantBubble({
         )}
       </Message>
 
-      {bubble.lifecycle === "failed" && (
-        <p className="text-destructive text-sm">Error: {bubble.error}</p>
+      {/* Surface a turn-level failure (a failed send or stream) as the same
+          destructive pill an error block renders — never raw red text. A
+          dropped host connection already carries its own error pill inside the
+          bubble and leaves `bubble.error` null, so this stays hidden there. */}
+      {bubble.lifecycle === "failed" && bubble.error && (
+        <ErrorBanner message={bubble.error} source="" code="" />
       )}
     </>
   );
@@ -4070,6 +4086,7 @@ interface ComposerProps {
   codexModelOptions: readonly NativeModelOption[];
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
+  showClaudePermissionMode?: boolean;
   /** Show the session Goal control. */
   showGoalControl?: boolean;
   /** Show Polly's Claude SDK command-backed Goal control. */
@@ -4571,6 +4588,7 @@ export function Composer({
   modelPickerKind,
   codexModelOptions,
   showCodexPlanMode,
+  showClaudePermissionMode = false,
   showGoalControl = false,
   showClaudeGoalControl = false,
   showPollyCodexGoalControl = false,
@@ -5823,6 +5841,7 @@ export function Composer({
                 harnessLabel={harnessLabel}
                 showModels={showModels}
                 showEffort={showEffort}
+                showClaudePermissionMode={showClaudePermissionMode}
                 effortLevels={effortLevels}
                 modelPickerKind={modelPickerKind}
                 codexModelOptions={codexModelOptions}
@@ -6207,6 +6226,22 @@ export function shouldShowCodexPlanModeControl(
 }
 
 /**
+ * True when the claude-native permission-mode picker should be visible.
+ *
+ * Claude-native sessions only: the switch drives Claude Code's own
+ * shift+tab cycle, which no other harness has.
+ *
+ * :param conv: Session-like object carrying `labels`; a missing session
+ *     or missing labels fails closed.
+ * :returns: True only for sessions running the claude-native wrapper.
+ */
+export function shouldShowClaudePermissionModeControl(
+  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+): boolean {
+  return isClaudeNativeSession(conv);
+}
+
+/**
  * True when the session Goal control should be visible.
  *
  * @param conv - Session or sidebar row carrying labels. ``null`` or missing
@@ -6271,6 +6306,7 @@ function SessionConfigModal({
   harnessLabel,
   showModels,
   showEffort,
+  showClaudePermissionMode = false,
   effortLevels,
   modelPickerKind,
   codexModelOptions,
@@ -6282,6 +6318,7 @@ function SessionConfigModal({
   harnessLabel: string | null;
   showModels: boolean;
   showEffort: boolean;
+  showClaudePermissionMode?: boolean;
   effortLevels: readonly string[];
   modelPickerKind: NativeModelPickerKind | null;
   codexModelOptions: readonly NativeModelOption[];
@@ -6289,6 +6326,7 @@ function SessionConfigModal({
   subagentRoutingEligible: boolean;
 }) {
   const selectedEffort = useSessionEffort();
+  const claudePermissionMode = useChatStore((s) => s.claudePermissionMode);
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const subagentRoutingOverride = useChatStore((s) => s.subagentRoutingOverride);
   const conversationId = useChatStore((s) => s.conversationId);
@@ -6318,6 +6356,7 @@ function SessionConfigModal({
   const [draftModelId, setDraftModelId] = useState<string | null>(resolvedModelId);
   const [draftEffort, setDraftEffort] = useState<string | null>(selectedEffort);
   const [draftRoutingOn, setDraftRoutingOn] = useState(liveRoutingOn);
+  const [draftPermissionMode, setDraftPermissionMode] = useState(claudePermissionMode);
   // The sub-agent row is stored as a PICK, not a pre-seeded draft:
   // `undefined` means "untouched", so the row mirrors the live stored value for
   // as long as the user hasn't chosen anything. A draft seeded once per open
@@ -6332,6 +6371,7 @@ function SessionConfigModal({
     setDraftModelId(resolvedModelId);
     setDraftEffort(selectedEffort);
     setDraftRoutingOn(liveRoutingOn);
+    setDraftPermissionMode(claudePermissionMode);
     setPickedSubagentRouting(undefined);
     // Nothing pushes a routing-switch change to the client (no SSE event, and
     // the session query never goes stale), so re-read them here — otherwise the
@@ -6346,6 +6386,33 @@ function SessionConfigModal({
   // drafted model, else the "Default" sentinel (no override).
   const modelValue = draftRoutingOn ? MODEL_SELECT_SMART : (draftModelId ?? MODEL_SELECT_DEFAULT);
 
+  // Codex advertises a per-model effort ladder, so the dropdown must follow the
+  // DRAFTED model, not the committed one the parent computed — else picking
+  // Luna still lists Sol's "ultra". "Default" (null) resolves to the catalog
+  // default; non-codex harnesses use a model-independent ladder, so keep the
+  // parent's list.
+  const draftEffortLevels = useMemo(() => {
+    if (modelPickerKind !== "codex") return effortLevels;
+    const modelForEffort =
+      draftModelId ?? codexModelOptions.find((o) => o.isDefault)?.id ?? llmModel;
+    const levels = codexEffortLevelsForModel(codexModelOptions, modelForEffort);
+    return levels.length > 0 ? levels : effortLevels;
+  }, [modelPickerKind, codexModelOptions, draftModelId, llmModel, effortLevels]);
+
+  // Drop a picked level the newly-drafted model doesn't offer (Sol's "ultra"
+  // when switching to Luna) so no stale rung shows and Save never submits a
+  // level the model rejects.
+  const clampDraftEffortToModel = (modelId: string | null) => {
+    if (modelPickerKind !== "codex") return;
+    setDraftEffort((prev) => {
+      if (prev === null) return null;
+      const modelForEffort = modelId ?? codexModelOptions.find((o) => o.isDefault)?.id ?? llmModel;
+      return codexEffortLevelsForModel(codexModelOptions, modelForEffort).includes(prev)
+        ? prev
+        : null;
+    });
+  };
+
   const onModelChange = (value: string) => {
     if (value === MODEL_SELECT_SMART) {
       setDraftRoutingOn(true);
@@ -6356,10 +6423,12 @@ function SessionConfigModal({
     } else if (value === MODEL_SELECT_DEFAULT) {
       setDraftModelId(null);
       setDraftRoutingOn(false);
+      clampDraftEffortToModel(null);
     } else {
       // Pinning a model turns routing off (mutually exclusive).
       setDraftModelId(value);
       setDraftRoutingOn(false);
+      clampDraftEffortToModel(value);
     }
   };
 
@@ -6409,6 +6478,10 @@ function SessionConfigModal({
         // stray ``/effort`` injection would just be noise.
         if (showEffort && !draftRoutingOn && draftEffort !== selectedEffort)
           await store.setEffort(draftEffort);
+        // Same pane as /model + /effort, so this must stay in the awaited
+        // sequence rather than firing concurrently.
+        if (showClaudePermissionMode && draftPermissionMode !== claudePermissionMode)
+          await store.setClaudePermissionMode(draftPermissionMode);
         // Sub-agent routing is independent of this session's own model — a
         // plain PATCH with no slash-command injection, so ordering is free.
         // Only an explicit pick is written, and only when it still differs from
@@ -6501,7 +6574,7 @@ function SessionConfigModal({
                   className="w-(--radix-select-trigger-width)"
                 >
                   <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
-                  {effortLevels.map((level) => (
+                  {draftEffortLevels.map((level) => (
                     <SelectItem
                       key={level}
                       value={level}
@@ -6511,6 +6584,35 @@ function SessionConfigModal({
                       className={modelPickerKind === "codex" ? undefined : "capitalize"}
                     >
                       {formatStatusEffortLabel(level, modelPickerKind === "codex") ?? level}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </ConfigRow>
+          )}
+          {/* Hidden when the mode is unknown — Claude only renders its mode
+              footer in some pane states, and a guess would misreport it. */}
+          {showClaudePermissionMode && claudePermissionMode !== "" && (
+            <ConfigRow label="Permissions" description="How much Claude asks before acting">
+              <Select value={draftPermissionMode} onValueChange={setDraftPermissionMode}>
+                <SelectTrigger
+                  className="w-full"
+                  data-testid="composer-config-permission-mode"
+                  aria-label="Permission mode"
+                >
+                  <SelectValue>{claudePermissionModeLabel(draftPermissionMode)}</SelectValue>
+                </SelectTrigger>
+                <SelectContent position="popper" align="start">
+                  {CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES.map((mode) => (
+                    <SelectItem
+                      key={mode.value}
+                      value={mode.value}
+                      data-permission-mode={mode.value}
+                    >
+                      <span className="flex flex-col items-start">
+                        <span>{mode.label}</span>
+                        <span className="text-muted-foreground text-xs">{mode.description}</span>
+                      </span>
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -6583,6 +6685,7 @@ function ComposerConfigGear({
   harnessLabel,
   showModels,
   showEffort,
+  showClaudePermissionMode = false,
   effortLevels,
   modelPickerKind,
   codexModelOptions,
@@ -6594,6 +6697,7 @@ function ComposerConfigGear({
   harnessLabel: string | null;
   showModels: boolean;
   showEffort: boolean;
+  showClaudePermissionMode?: boolean;
   effortLevels: readonly string[];
   modelPickerKind: NativeModelPickerKind | null;
   codexModelOptions: readonly NativeModelOption[];
@@ -6622,7 +6726,14 @@ function ComposerConfigGear({
     costRoutingEligible,
   });
 
-  if (!showModels && !showEffort && !costRoutingEligible && !subagentRoutingEligible) return null;
+  if (
+    !showModels &&
+    !showEffort &&
+    !costRoutingEligible &&
+    !subagentRoutingEligible &&
+    !showClaudePermissionMode
+  )
+    return null;
 
   return (
     <>
@@ -6678,6 +6789,7 @@ function ComposerConfigGear({
         harnessLabel={harnessLabel}
         showModels={showModels}
         showEffort={showEffort}
+        showClaudePermissionMode={showClaudePermissionMode}
         effortLevels={effortLevels}
         modelPickerKind={modelPickerKind}
         codexModelOptions={codexModelOptions}
@@ -6691,7 +6803,7 @@ function ComposerConfigGear({
 /**
  * Label/value rows summarizing the session's live run-config, for the gear
  * icon's hover tooltip. Mirrors the new-session summary but with in-session
- * values and no Permissions row (permission mode is launch-time only).
+ * values. The Permissions row lives in the modal itself, not this summary.
  */
 function useSessionConfigSummary({
   harnessLabel,

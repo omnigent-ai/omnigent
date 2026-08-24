@@ -969,6 +969,7 @@ def _build_accounts_app(
         admin is created and ``/v1/info`` reports ``needs_setup``.
     """
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / ".omnigent"))
     # Accounts is the default provider now, but pin it explicitly
     # so this fixture doesn't depend on the global default.
     monkeypatch.setenv("OMNIGENT_AUTH_PROVIDER", "accounts")

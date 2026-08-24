@@ -52,6 +52,7 @@ class CreateScheduledTaskRequest(BaseModel):
     timezone: str = "UTC"
     model_override: str | None = None
     reasoning_effort: str | None = None
+    max_cost_usd: float | None = Field(default=None, gt=0)
     # Optional: no PINNED host/workspace. When both are unset the fire path
     # resolves the owner's online host at fire time and defaults the workspace to
     # that host's home directory (a failed run is recorded if none is online) —
@@ -74,6 +75,7 @@ class UpdateScheduledTaskRequest(BaseModel):
     timezone: str | None = None
     model_override: str | None = None
     reasoning_effort: str | None = None
+    max_cost_usd: float | None = Field(default=None, gt=0)  # null clears the cap
     workspace: str | None = Field(default=None, min_length=1)
     host_id: str | None = Field(default=None, min_length=1)
     state: str | None = None
@@ -121,6 +123,7 @@ def _to_response(
         "created_at": task.created_at,
         "model_override": task.model_override,
         "reasoning_effort": task.reasoning_effort,
+        "max_cost_usd": task.max_cost_usd,
         "workspace": task.workspace,
         "host_id": task.host_id,
         "state": task.state,
@@ -311,6 +314,7 @@ def create_scheduled_tasks_router(
             timezone=body.timezone,
             model_override=model_override,
             reasoning_effort=reasoning_effort,
+            max_cost_usd=body.max_cost_usd,
             workspace=workspace,
             host_id=body.host_id,
         )

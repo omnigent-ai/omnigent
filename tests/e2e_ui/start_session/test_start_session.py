@@ -583,7 +583,7 @@ async def _drive_permission_mode(base_url: str, session_id: str) -> None:
             await expect(perm).to_be_visible()
             await perm.click()
             perm_labels = (
-                "Default",
+                "Manual",
                 "Auto",
                 "Accept edits",
                 "Plan",

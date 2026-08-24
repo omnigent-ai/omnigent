@@ -2394,3 +2394,14 @@ aside[aria-label="Workspace"][data-maximized] {
     animation: none;
   }
 }
+
+/* Project emoji picker (rename modal + new-session landing). emoji-mart's web
+ * component hard-codes `:host { height: 435px; min-height: 230px }`, which
+ * overflows and clips on short / mobile screens. Force it down to the height the
+ * popover published in `--emoji-picker-height` so emoji-mart scrolls its own
+ * grid internally (one scrollbar, nav + search pinned). A Tailwind arbitrary
+ * variant can't target the custom element, so this lives here. */
+.emoji-picker-popover em-emoji-picker {
+  height: var(--emoji-picker-height, 420px) !important;
+  min-height: 0 !important;
+}

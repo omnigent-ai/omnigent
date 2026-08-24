@@ -3803,6 +3803,15 @@ async def _auto_create_codex_terminal(
     # not the one registered below — and so it can't mirror alongside the new one.
     await _cancel_auto_forwarder_task(session_id)
     clear_bridge_state(bridge_dir)
+    # A previous runner's app-server for THIS session can outlive a hard runner
+    # exit (it runs in its own process session) while still holding the codex
+    # thread's writer lock, which makes the ``thread/resume`` below fail with
+    # "already has an active writer". Reap it before starting a replacement.
+    from omnigent.codex_native_process_registry import (
+        reap_codex_native_processes_for_state_dir,
+    )
+
+    await asyncio.to_thread(reap_codex_native_processes_for_state_dir, bridge_dir)
 
     # Forked clone with no native thread of its own yet: clone the SOURCE's
     # local Codex rollout into the clone's OWN CODEX_HOME under a thread id
@@ -4099,11 +4108,20 @@ async def _auto_create_codex_terminal(
     else:
         from omnigent.codex_native_bridge import CodexNativeBridgeState, write_bridge_state
 
-        await preload_codex_thread_for_resume(
-            codex_ws_url,
-            launch_config.external_session_id,
-            terminal_launch_args=launch_config.terminal_launch_args,
-        )
+        try:
+            await preload_codex_thread_for_resume(
+                codex_ws_url,
+                launch_config.external_session_id,
+                terminal_launch_args=launch_config.terminal_launch_args,
+            )
+        except Exception:
+            # The app-server started above must not outlive a refused resume:
+            # without this close, every retry stacked another live codex
+            # process (and only the newest stayed tracked for teardown).
+            with contextlib.suppress(Exception):
+                await app_server.close()
+            _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+            raise
         write_bridge_state(
             bridge_dir,
             CodexNativeBridgeState(
@@ -6486,8 +6504,8 @@ async def _auto_create_claude_terminal(
     # or to resolve a Default launch that would otherwise pass no ``--model``
     # and leave the model to invisible CLI-private state.
     if session_model_override or launch_model is None:
-        from omnigent.claude_native import claude_launch_catalog
-        from omnigent.model_catalog_store import catalog_contains, default_row
+        from omnigent.claude_native import claude_catalog_serves_model, claude_launch_catalog
+        from omnigent.model_catalog_store import default_row
 
         launch_catalog: list[dict[str, object]] | None = None
         try:
@@ -6501,9 +6519,11 @@ async def _auto_create_claude_terminal(
                 resolve_claude_native_model_selection(session_model_override, claude_config)
                 or session_model_override
             )
+            # A pane's ``/model`` persists the exact id it runs; the catalog
+            # may spell that model only by its family alias.
             if not (
-                catalog_contains(launch_catalog, session_model_override)
-                or catalog_contains(launch_catalog, resolved_request)
+                claude_catalog_serves_model(launch_catalog, session_model_override, claude_config)
+                or claude_catalog_serves_model(launch_catalog, resolved_request, claude_config)
             ):
                 raise click.ClickException(
                     f"the requested model {session_model_override!r} is not in this "

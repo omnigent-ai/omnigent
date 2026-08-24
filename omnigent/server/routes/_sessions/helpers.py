@@ -136,6 +136,8 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY,
     _CLAUDE_NATIVE_EDIT_TOOLS,
     _CLAUDE_NATIVE_HARNESS,
+    _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY,
+    _CLAUDE_NATIVE_PERMISSION_MODES,
     _CLAUDE_NATIVE_REMEMBER_INELIGIBLE_TOOLS,
     _CLAUDE_NATIVE_SUBAGENT_ID_LABEL_KEY,
     _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
@@ -249,6 +251,7 @@ from omnigent.server.schemas import (
     SessionMcpStartupEvent,
     SessionModelEvent,
     SessionModelOptionsEvent,
+    SessionPermissionModeEvent,
     SessionReasoningEffortEvent,
     SessionResourceListPage,
     SessionResourcePaginatedList,
@@ -307,6 +310,22 @@ def _publish_collaboration_mode(session_id: str, mode: str) -> None:
         type="session.collaboration_mode",
         conversation_id=session_id,
         mode=mode,
+    )
+    session_stream.publish(session_id, event.model_dump())
+
+
+def _publish_permission_mode(session_id: str, mode: str) -> None:
+    """
+    Publish the live claude-native permission mode for a session.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param mode: The active permission mode, e.g. ``"auto"``.
+    :returns: None.
+    """
+    event = SessionPermissionModeEvent(
+        type="session.permission_mode",
+        conversation_id=session_id,
+        permission_mode=mode,
     )
     session_stream.publish(session_id, event.model_dump())
 
@@ -2429,6 +2448,51 @@ async def _persist_external_codex_collaboration_mode_change(
     _publish_collaboration_mode(session_id, mode)
 
 
+async def _persist_external_permission_mode_change(
+    session_id: str,
+    conv: Conversation,
+    body: SessionEventInput,
+    conversation_store: ConversationStore,
+) -> None:
+    """
+    Persist a pane-observed claude-native permission mode as a session label.
+
+    The forwarder posts this when the pane's mode footer differs from what it
+    last reported — i.e. the user pressed shift+tab in the TUI. Unlike the
+    PATCH path this needs no runner confirmation: the pane IS the source, so
+    the mode is already in effect.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param conv: Conversation row for ``session_id`` at the route boundary.
+    :param body: Event body; ``data.permission_mode`` must be a switchable mode.
+    :param conversation_store: Store used to upsert the mode label.
+    :returns: None.
+    :raises OmnigentError: If ``data.permission_mode`` is missing or unsupported.
+    """
+    raw_mode = body.data.get("permission_mode")
+    if not isinstance(raw_mode, str) or not raw_mode.strip():
+        raise OmnigentError(
+            "external_permission_mode_change requires data.permission_mode "
+            "to be a non-empty string",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    mode = raw_mode.strip()
+    if mode not in _CLAUDE_NATIVE_PERMISSION_MODES:
+        raise OmnigentError(
+            "external_permission_mode_change requires data.permission_mode in "
+            f"{sorted(_CLAUDE_NATIVE_PERMISSION_MODES)}; got {mode!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if conv.labels.get(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY) == mode:
+        return
+    await asyncio.to_thread(
+        conversation_store.set_labels,
+        session_id,
+        {_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY: mode},
+    )
+    _publish_permission_mode(session_id, mode)
+
+
 async def _persist_external_codex_approval_mode_change(
     session_id: str,
     conv: Conversation,
@@ -3727,6 +3791,58 @@ def _require_collaboration_mode_forward(
             f"Reconnect the session and try again.",
             code=ErrorCode.RUNNER_UNAVAILABLE,
         )
+
+
+def _require_permission_mode_forward(
+    session_id: str,
+    mode: str,
+    runner_result: _RunnerForwardResult | None,
+) -> str:
+    """
+    Fail when a live claude-native permission-mode switch wasn't applied.
+
+    The mode lives in the running TUI, so persisting the label without a
+    confirmed 2xx forward would let the UI claim auto mode while Claude still
+    prompts on every edit. Returns the mode the runner actually reached, so
+    the caller stores what the pane shows rather than what was asked for.
+
+    :param session_id: Session/conversation identifier, e.g.
+        ``"conv_abc123"``.
+    :param mode: Requested permission mode, e.g. ``"auto"``.
+    :param runner_result: HTTP result returned by the runner, or ``None``
+        when no runner could be reached.
+    :returns: The mode the runner reports the pane is now in — the
+        requested *mode* when the runner didn't echo one back.
+    :raises OmnigentError: If no runner was reachable or the runner could
+        not switch the session into *mode*.
+    """
+    if runner_result is None:
+        raise OmnigentError(
+            f"Could not switch to {mode} mode: no live Claude runner is available "
+            f"for session {session_id!r}. Reconnect the session and try again.",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        )
+    if not 200 <= runner_result.status_code < 300:
+        # The runner's body carries why the cycle failed (e.g. the mode
+        # isn't in this session's cycle); surface it so the UI banner
+        # explains the failure instead of showing a bare status code.
+        detail = ""
+        try:
+            payload = json.loads(runner_result.body)
+        except (TypeError, ValueError):
+            payload = None
+        if isinstance(payload, dict) and isinstance(payload.get("detail"), str):
+            detail = f" {payload['detail']}"
+        raise OmnigentError(
+            f"Could not switch to {mode} mode for session {session_id!r}.{detail}",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        )
+    try:
+        body = json.loads(runner_result.body)
+    except (TypeError, ValueError):
+        return mode
+    settled = body.get("permission_mode") if isinstance(body, dict) else None
+    return settled if isinstance(settled, str) and settled else mode
 
 
 def _publish_status(
@@ -9623,6 +9739,7 @@ __all__ = [
     "_persist_external_codex_collaboration_mode_change",
     "_persist_external_model_change",
     "_persist_external_model_options",
+    "_persist_external_permission_mode_change",
     "_persist_external_reasoning_effort_change",
     "_persist_external_session_title",
     "_persist_external_subagent_start",
@@ -9659,6 +9776,7 @@ __all__ = [
     "_publish_interrupted",
     "_publish_mcp_startup",
     "_publish_model_options",
+    "_publish_permission_mode",
     "_publish_policy_denied",
     "_publish_policy_deny",
     "_publish_runner_skills",
@@ -9684,6 +9802,7 @@ __all__ = [
     "_require_declared_subagent",
     "_require_external_status_forward",
     "_require_host_conn_for_worktree",
+    "_require_permission_mode_forward",
     "_reset_runner_resources_after_switch",
     "_reset_runner_resources_after_switch_impl",
     "_resolve_harness",

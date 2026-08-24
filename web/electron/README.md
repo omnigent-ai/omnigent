@@ -387,6 +387,22 @@ server (see below), Connect, and you're in.
 > **not** run the Vite dev server. To develop the web UI itself with hot
 > reload, run `pnpm run dev` (plain Vite in a browser) from `web/` as usual.
 
+### Test desktop updates
+
+To override the current version used by development update checks, launch the
+unpackaged app with a valid semantic version:
+
+```bash
+OMNIGENT_DESKTOP_VERSION_OVERRIDE=0.9.0 pnpm start
+```
+
+The override controls both the **Current version** shown in update prompts and
+the baseline `electron-updater` uses to decide whether a production release is
+newer. It does not change Electron's real app/package version. Packaged builds
+ignore it. `pnpm start` rebuilds the shell-owned update overlay before launching
+it. Unpackaged runs read `dev-app-update.yml`, which intentionally checks the
+same production HTTPS update server as packaged builds.
+
 ## Build a distributable
 
 From `web/electron/`:

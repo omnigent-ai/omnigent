@@ -240,7 +240,10 @@ export interface UpdateConfig {
   skippedVersion: string | null;
 }
 
-export type UpdateStatus =
+export type UpdateStatus = {
+  /** Installed Electron app version; absent on older desktop shells. */
+  currentVersion?: string;
+} & (
   | {
       state: "idle" | "checking" | "none";
       info?: undefined;
@@ -264,7 +267,8 @@ export type UpdateStatus =
       info?: { version: string; releaseNotes?: string };
       progress?: undefined;
       lastError?: string;
-    };
+    }
+);
 
 export interface ElectronUpdateBridge {
   getConfig: () => Promise<UpdateConfig>;
