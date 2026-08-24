@@ -102,14 +102,6 @@ jobs:
             -f content=eyes --silent || true
           echo "skip=false" >> "$GITHUB_OUTPUT"
 
-      - name: Mint App token
-        id: app-token
-        if: steps.trigger.outputs.skip != 'true' && vars.OMNIGENT_BOT_APP_ID != ''
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          client-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
-          private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
-
       # A commit needs reviewing once. Several triggers can fire for the same
       # head SHA (open then `/review`, or `/review` then maintainer approval),
       # which used to post two reviews of identical code. Skip the repeat and
@@ -118,7 +110,7 @@ jobs:
         id: dupe
         if: steps.trigger.outputs.skip != 'true'
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
           COMMENT_BODY: ${{ github.event.comment.body }}
@@ -133,9 +125,11 @@ jobs:
             exit 0
           fi
 
-          # One page-walk gives both markers and the prior comment's URL.
+          # One page-walk gives both markers and the prior comment's URL. Only
+          # bot comments count: a human quoting a marker must not suppress a review.
           gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
-            --jq '.[] | [.html_url, (.body | gsub("\n"; " "))] | @tsv' > /tmp/pr_comments.tsv
+            --jq '.[] | select(.user.type == "Bot")
+                  | [.html_url, (.body | gsub("\n"; " "))] | @tsv' > /tmp/pr_comments.tsv
 
           if grep -qF "<!-- polly-skipped-sha: ${head_sha} -->" /tmp/pr_comments.tsv; then
             echo "::notice::Already posted a skip notice for ${head_sha}."
@@ -158,7 +152,8 @@ jobs:
             echo ""
             echo "Push a commit or comment \`/review force\` to review it again."
           } > /tmp/skip_comment.md
-          gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/skip_comment.md
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/skip_comment.md \
+            || echo "::notice::Could not post the skip note (read-only token); skipping anyway."
 
       - name: Check LLM credentials available
         if: steps.trigger.outputs.skip != 'true' && steps.dupe.outputs.duplicate != 'true'
@@ -490,6 +485,14 @@ jobs:
           """
           pathlib.Path("/tmp/review_prompt.txt").write_text(prompt)
           PYEOF
+
+      - name: Mint App token
+        id: app-token
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true' && vars.OMNIGENT_BOT_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
+          private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
 
       - name: Run Polly review
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
