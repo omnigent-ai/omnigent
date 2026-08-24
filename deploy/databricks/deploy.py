@@ -743,6 +743,10 @@ def _ensure_compute_size(
 
 def _bundle_vars(args: argparse.Namespace) -> list[str]:
     """CLI args to pass to `databricks bundle` as --var pairs."""
+    # The Apps API rejects an environment entry with an empty source. A single
+    # space is trimmed by the feature parser and therefore preserves the
+    # documented "no features" behavior while providing a valid value source.
+    features = args.features if args.features.strip() else " "
     return [
         "--var",
         f"app_name={args.app_name}",
@@ -755,7 +759,7 @@ def _bundle_vars(args: argparse.Namespace) -> list[str]:
         "--var",
         f"otel_table_schema={args.otel_table_schema}",
         "--var",
-        f"features={args.features}",
+        f"features={features}",
     ]
 
 
