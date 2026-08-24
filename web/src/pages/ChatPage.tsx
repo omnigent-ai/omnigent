@@ -4540,38 +4540,81 @@ function SubagentComposerTray({ label }: { label: string }) {
 const BACKGROUND_TASK_PILL_CLASS =
   "flex min-w-0 items-center gap-1.5 rounded-full border border-border bg-card px-3 py-1 text-sm text-muted-foreground shadow-sm";
 
+// Grace period before an expanded row collapses after the mouse leaves, so a
+// near-miss or a reach toward a pill doesn't snap it shut.
+const BACKGROUND_TASK_COLLAPSE_DELAY_MS = 2000;
+// Matches the pills' fade/zoom-out duration below — the combine animation plays
+// for this long before the row unmounts back to the tally.
+const BACKGROUND_TASK_ANIM_MS = 150;
+
 /**
  * Pill above the composer tallying background tasks that are running (a dev
  * server, a background shell, a sub-agent). Independent of the "Working…"
  * shimmer: while the turn is active both show — the shimmer for the turn, the
  * pill for the tally — and once the turn ends the pill carries on alone.
  *
- * Click the tally to expand it in place into one pill per running shell, each
- * labelled with its description; moving the mouse out of that row (or pressing
- * Escape) collapses it back to the single tally. A count-only edge (older
- * runner, no per-shell detail) renders the plain, non-interactive tally.
+ * Click the tally to split it into one pill per running shell (each labelled
+ * with its description). The row collapses ~2s after the mouse leaves it (or on
+ * Escape); re-entering cancels the pending collapse. Expand/collapse play a
+ * staggered fade/zoom in-out so the split and combine read smoothly. A
+ * count-only edge (older runner, no per-shell detail) renders the plain,
+ * non-interactive tally.
  */
 function BackgroundTaskPill() {
   const bgCount = useChatStore((s) => s.backgroundTaskCount);
   const bgTasks = useChatStore((s) => s.backgroundTasks);
   const [expanded, setExpanded] = useState(false);
+  const [collapsing, setCollapsing] = useState(false);
+  const collapseDelayRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const exitAnimRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const canExpand = bgTasks.length > 0;
 
-  // Fall back to the tally when the shells drain or there is nothing to expand,
-  // so a stale expanded row never lingers after the work ends.
-  useEffect(() => {
-    if (bgCount <= 0 || !canExpand) setExpanded(false);
-  }, [bgCount, canExpand]);
+  const clearTimers = useCallback(() => {
+    if (collapseDelayRef.current) clearTimeout(collapseDelayRef.current);
+    if (exitAnimRef.current) clearTimeout(exitAnimRef.current);
+    collapseDelayRef.current = null;
+    exitAnimRef.current = null;
+  }, []);
 
-  // Escape collapses too — a keyboard user has no "mouse out" of the row.
+  const collapseNow = useCallback(() => {
+    clearTimers();
+    setCollapsing(false);
+    setExpanded(false);
+  }, [clearTimers]);
+
+  // Wait out the grace period, then play the combine-out animation before
+  // unmounting the pills back to the tally.
+  const scheduleCollapse = useCallback(() => {
+    clearTimers();
+    collapseDelayRef.current = setTimeout(() => {
+      setCollapsing(true);
+      exitAnimRef.current = setTimeout(collapseNow, BACKGROUND_TASK_ANIM_MS);
+    }, BACKGROUND_TASK_COLLAPSE_DELAY_MS);
+  }, [clearTimers, collapseNow]);
+
+  // Re-entering the row cancels a pending (or in-flight) collapse.
+  const cancelCollapse = useCallback(() => {
+    clearTimers();
+    setCollapsing(false);
+  }, [clearTimers]);
+
+  // Reset to the tally when the shells drain or there is nothing to expand.
+  useEffect(() => {
+    if (bgCount <= 0 || !canExpand) collapseNow();
+  }, [bgCount, canExpand, collapseNow]);
+
+  // Escape collapses immediately — a keyboard user has no "mouse out".
   useEffect(() => {
     if (!expanded) return;
     const onKey = (e: globalThis.KeyboardEvent) => {
-      if (e.key === "Escape") setExpanded(false);
+      if (e.key === "Escape") collapseNow();
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [expanded]);
+  }, [expanded, collapseNow]);
+
+  // Drop any pending timer on unmount.
+  useEffect(() => clearTimers, [clearTimers]);
 
   if (bgCount <= 0) return null;
 
@@ -4589,11 +4632,24 @@ function BackgroundTaskPill() {
       {expanded && canExpand ? (
         <div
           className="flex flex-wrap items-center gap-1.5"
-          onMouseLeave={() => setExpanded(false)}
+          onMouseEnter={cancelCollapse}
+          onMouseLeave={scheduleCollapse}
           data-testid="background-task-pill-expanded"
         >
           {bgTasks.map((task, i) => (
-            <div key={task.id ?? i} className={cn(BACKGROUND_TASK_PILL_CLASS, "max-w-full")}>
+            <div
+              key={task.id ?? i}
+              // Stagger the entrance so the pills read as splitting apart; on
+              // collapse they fade/zoom out together (no delay) then unmount.
+              style={{ animationDelay: collapsing ? "0ms" : `${Math.min(i * 40, 240)}ms` }}
+              className={cn(
+                BACKGROUND_TASK_PILL_CLASS,
+                "max-w-full fill-mode-both duration-150",
+                collapsing
+                  ? "animate-out fade-out-0 zoom-out-95"
+                  : "animate-in fade-in-0 zoom-in-95",
+              )}
+            >
               <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
               <span className="min-w-0 truncate">
                 {task.description || task.command || "Background shell"}
@@ -4607,10 +4663,15 @@ function BackgroundTaskPill() {
           data-testid="background-task-pill"
           aria-expanded={false}
           aria-label={`${bgCount} background task${bgCount === 1 ? "" : "s"} still running; activate to list them`}
-          onClick={() => setExpanded(true)}
+          onClick={() => {
+            clearTimers();
+            setCollapsing(false);
+            setExpanded(true);
+          }}
           className={cn(
             BACKGROUND_TASK_PILL_CLASS,
-            "cursor-pointer transition-colors hover:bg-accent hover:text-accent-foreground",
+            "animate-in fade-in-0 duration-150",
+            "cursor-pointer transition-colors hover:bg-muted hover:text-foreground dark:hover:bg-muted/50",
           )}
         >
           {label}
