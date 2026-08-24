@@ -295,17 +295,18 @@ def fetch_model_pricing_with_provider(
     harness: str | None = None,
 ) -> ModelPricing | None:
     """
-    Fetch model pricing, checking provider config before the catalog.
+    Fetch model pricing, checking catalog first then provider config.
 
     Resolution order:
-    1. Provider config custom pricing (for self-hosted models)
-    2. MLflow catalog via :func:`fetch_model_pricing` (for known models)
+    1. MLflow catalog via :func:`fetch_model_pricing` (for known models)
+    2. Provider config custom pricing (for self-hosted models not in catalog)
     3. ``None`` (unpriced)
 
     This enables cost tracking for self-hosted models (Ollama, vLLM, custom
-    gateways) that aren't in the MLflow catalog. Users configure pricing in
-    their ``~/.omnigent/config.yaml`` provider definition, and this function
-    extracts and converts it (per-million → per-token).
+    gateways) that aren't in the MLflow catalog. Custom pricing is used ONLY
+    when the model is not found in the catalog, so catalog-priced models
+    (e.g. ``claude-opus-4``, ``databricks-claude-*``) are never repriced by
+    a self-hosted provider's ``pricing`` block.
 
     Example provider config::
 
@@ -330,7 +331,12 @@ def fetch_model_pricing_with_provider(
     :returns: A :class:`ModelPricing` (per-token rates), or ``None`` when
         pricing is unavailable.
     """
-    # Step 1: Check provider config custom pricing
+    # Step 1: Check catalog first (catalog models take precedence over custom pricing)
+    catalog_pricing = fetch_model_pricing(model)
+    if catalog_pricing is not None:
+        return catalog_pricing
+
+    # Step 2: Check provider config custom pricing for models not in catalog
     if provider_config is not None and harness is not None:
         # Lazy import to avoid circular dependency. provider_config imports
         # this module at top level, so we import it only when needed here.
@@ -366,8 +372,8 @@ def fetch_model_pricing_with_provider(
                         )
         except Exception:
             # If provider lookup fails (e.g., malformed config, import error),
-            # fall through to catalog rather than breaking cost tracking entirely.
+            # return None rather than breaking cost tracking entirely.
             pass
 
-    # Step 2: Fall back to catalog (existing behavior)
-    return fetch_model_pricing(model)
+    # Step 3: No pricing available
+    return None

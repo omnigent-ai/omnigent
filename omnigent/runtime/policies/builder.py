@@ -566,11 +566,15 @@ def build_policy_engine(
     token_pricing: Any = None
     if spec.llm:
         # Load provider config to check for custom pricing
+        from omnigent.harness_aliases import canonicalize_harness
         from omnigent.onboarding.provider_config import load_config
 
         provider_config = load_config()
-        # Get harness kind from spec to determine which provider family to check
-        harness = spec.harness_kind if hasattr(spec, "harness_kind") else None
+        # Get harness kind from spec and canonicalize it (SDK executors return
+        # executor-type spellings like "claude_sdk" which need to be normalized
+        # to "claude-sdk" for provider resolution)
+        raw_harness = spec.harness_kind if hasattr(spec, "harness_kind") else None
+        harness = canonicalize_harness(raw_harness) if raw_harness else None
         token_pricing = fetch_model_pricing_with_provider(
             spec.llm.model, provider_config=provider_config, harness=harness
         )
