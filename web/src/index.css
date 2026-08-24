@@ -1938,6 +1938,119 @@ aside[aria-label="Workspace"][data-maximized] {
   }
 }
 
+/* ── Omnigent Paper / Plum — warm paper and deep plum surfaces ───────────── */
+:root:not(.dark)[data-theme="otto-ink"] {
+  --background: #fdfdfc;
+  --foreground: #11171c;
+  --card: #fff;
+  --card-solid: #fff;
+  --card-foreground: #11171c;
+  --tray: #fff;
+  --popover: #fff;
+  --popover-foreground: #11171c;
+  --primary: #d4387f;
+  --primary-foreground: #fff;
+  --secondary: #f2f1ee;
+  --secondary-foreground: #11171c;
+  --muted: rgb(61 57 41 / 6%);
+  --muted-foreground: #6e6c68;
+  --code-bg: #f2f1ee;
+  --accent: #f5e9ef;
+  --accent-foreground: #6e304c;
+  --destructive: #c8324c;
+  --destructive-foreground: #fff;
+  --success: #2ea65c;
+  --success-foreground: color-mix(in srgb, var(--success) 70%, #11171c);
+  --warning: #d4972a;
+  --warning-foreground: color-mix(in srgb, var(--warning) 65%, #11171c);
+  --info: #3b8ff5;
+  --info-foreground: color-mix(in srgb, var(--info) 70%, #11171c);
+  --session-active: #237d63;
+  --brand-accent: #df3c85;
+  --status-blue: #3b8ff5;
+  --status-green: #2ea65c;
+  --status-yellow: #d4972a;
+  --status-red: #f04858;
+  --status-gray: #8e99a4;
+  --border: rgb(61 57 41 / 10%);
+  --border-strong: rgb(61 57 41 / 18%);
+  --button-border: rgb(61 57 41 / 14%);
+  --input: rgb(61 57 41 / 10%);
+  --ring: #0969da;
+  --chart-1: #3b8ff5;
+  --chart-2: #2272b4;
+  --chart-3: #2ea65c;
+  --chart-4: #d4972a;
+  --chart-5: #8e99a4;
+  --sidebar: #fff;
+  --sidebar-foreground: #11171c;
+  --sidebar-primary: #d4387f;
+  --sidebar-primary-foreground: #fff;
+  --sidebar-accent: #f3e7ed;
+  --sidebar-accent-foreground: #653047;
+  --sidebar-border: rgb(61 57 41 / 10%);
+  --sidebar-ring: #0969da;
+}
+
+.dark[data-theme="otto-ink"] {
+  --background: #121113;
+  --foreground: oklch(0.965 0.003 240);
+  --card: rgb(36 33 38 / 72%);
+  --card-solid: #242126;
+  --card-foreground: oklch(0.965 0.003 240);
+  --tray: rgb(36 33 38 / 72%);
+  --popover: rgb(33 30 35 / 96%);
+  --popover-foreground: oklch(0.965 0.003 240);
+  --primary: #e8ecf0;
+  --primary-foreground: #121113;
+  --secondary: #201e22;
+  --secondary-foreground: #e8ecf0;
+  --muted: color-mix(in srgb, var(--muted-foreground) 13%, #242126);
+  --muted-foreground: #999397;
+  --code-bg: #201d22;
+  --accent: #30262c;
+  --accent-foreground: #e8b0ca;
+  --destructive: #e65b77;
+  --destructive-foreground: #fff;
+  --success: #2ea65c;
+  --success-foreground: color-mix(in srgb, var(--success) 72%, white);
+  --warning: #d4972a;
+  --warning-foreground: color-mix(in srgb, var(--warning) 76%, white);
+  --info: #3b8ff5;
+  --info-foreground: color-mix(in srgb, var(--info) 76%, white);
+  --session-active: #4dc5a0;
+  --brand-accent: #df3c85;
+  --status-blue: #3b8ff5;
+  --status-green: #2ea65c;
+  --status-yellow: #d4972a;
+  --status-red: #f04858;
+  --status-gray: #8e99a4;
+  --border: rgb(255 255 255 / 8%);
+  --border-strong: rgb(255 255 255 / 14%);
+  --button-border: rgb(255 255 255 / 10%);
+  --input: rgb(255 255 255 / 8%);
+  --ring: #e8ecf0;
+  --chart-1: oklch(0.64 0.22 254);
+  --chart-2: oklch(0.65 0.14 200);
+  --chart-3: oklch(0.68 0.15 145);
+  --chart-4: oklch(0.75 0.16 70);
+  --chart-5: oklch(0.65 0.008 240);
+  --sidebar: #1d1d1f;
+  --sidebar-foreground: oklch(0.965 0.003 240);
+  --sidebar-primary: oklch(0.64 0.22 254);
+  --sidebar-primary-foreground: oklch(0.12 0.004 240);
+  --sidebar-accent: #2b2328;
+  --sidebar-accent-foreground: #e5b2c8;
+  --sidebar-border: rgb(255 255 255 / 8%);
+  --sidebar-ring: oklch(0.92 0.003 240 / 40%);
+  --tooltip-bg: #242126;
+}
+
+:root:not(.dark)[data-theme="otto-ink"] .app-shell,
+.dark[data-theme="otto-ink"] .app-shell {
+  background: var(--background);
+}
+
 /* ── GitHub — clean neutrals, signal blue, green primary ──────────────────── */
 :root:not(.dark)[data-theme="github"] {
   --background: #f6f8fa;

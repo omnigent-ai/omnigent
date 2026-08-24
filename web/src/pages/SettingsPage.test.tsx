@@ -14,6 +14,7 @@ import type { ElectronUpdateBridge, UpdateConfig, UpdateStatus } from "@/lib/nat
 const mocks = vi.hoisted(() => ({
   setTheme: vi.fn(),
   theme: "system" as string,
+  resolvedTheme: "light" as string,
   archiveMutate: vi.fn(),
   deleteMutate: vi.fn(),
   accountsEnabled: true,
@@ -38,7 +39,12 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("next-themes", () => ({
-  useTheme: () => ({ theme: mocks.theme, systemTheme: "light", setTheme: mocks.setTheme }),
+  useTheme: () => ({
+    theme: mocks.theme,
+    resolvedTheme: mocks.resolvedTheme,
+    systemTheme: "light",
+    setTheme: mocks.setTheme,
+  }),
 }));
 vi.mock("@/lib/embedded", () => ({ useIsEmbedded: () => false }));
 vi.mock("@/lib/CapabilitiesContext", () => ({
@@ -195,6 +201,7 @@ beforeEach(() => {
   mocks.deleteMutate.mockReset();
   mocks.fetchNextPage.mockReset();
   mocks.theme = "system";
+  mocks.resolvedTheme = "light";
   mocks.accountsEnabled = true;
   mocks.loginUrl = "/login";
   mocks.me = { id: "alice", is_admin: false };
@@ -321,6 +328,19 @@ describe("SettingsPage", () => {
     expect(select.value).toBe("github");
     expect(document.documentElement.getAttribute("data-theme")).toBe("github");
     expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("github"));
+  });
+
+  it("shows the mode-specific Omnigent palette name", () => {
+    localStorage.setItem("omnigent:ui-theme-palette", JSON.stringify("otto-ink"));
+    const light = renderPage("/settings/appearance");
+    expect(screen.getAllByText("Omnigent Paper").length).toBeGreaterThan(0);
+    expect(screen.queryByText("Omnigent Plum")).not.toBeInTheDocument();
+
+    light.unmount();
+    mocks.resolvedTheme = "dark";
+    renderPage("/settings/appearance");
+    expect(screen.getAllByText("Omnigent Plum").length).toBeGreaterThan(0);
+    expect(screen.queryByText("Omnigent Paper")).not.toBeInTheDocument();
   });
 
   it("creates and applies a custom theme when a guided color control changes", () => {
