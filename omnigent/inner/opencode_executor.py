@@ -110,6 +110,10 @@ _OPENCODE_CHILD_DENY_ENV = frozenset(
         _OPENCODE_DISABLE_PROJECT_CONFIG_ENV,
         "OPENCODE_SERVER_PASSWORD",
         "OPENCODE_SERVER_USERNAME",
+        # These legacy vendor aliases are not recognized by OpenCode. The
+        # Fireworks spelling would otherwise match the FIREWORKS_ family.
+        "TOGETHERAI_API_KEY",
+        "FIREWORKS_AI_API_KEY",
     }
 )
 
@@ -126,8 +130,8 @@ _OPENCODE_PROVIDER_ENV_PREFIXES = (
     "XAI_",
     "MISTRAL_",
     "DEEPSEEK_",
-    "TOGETHERAI_",
-    "FIREWORKS_AI_",
+    "TOGETHER_",
+    "FIREWORKS_",
 )
 
 # OpenCode emits one JSON object per line on stdout when invoked

@@ -813,10 +813,16 @@ def test_build_spawn_env_preserves_supported_provider_credentials(
         "XAI_API_KEY": "xai-secret",
         "MISTRAL_API_KEY": "mistral-secret",
         "DEEPSEEK_API_KEY": "deepseek-secret",
-        "TOGETHERAI_API_KEY": "together-secret",
-        "FIREWORKS_AI_API_KEY": "fireworks-secret",
+        "TOGETHER_API_KEY": "together-secret",
+        "FIREWORKS_API_KEY": "fireworks-secret",
+    }
+    unsupported_aliases = {
+        "TOGETHERAI_API_KEY": "unsupported-together-alias",
+        "FIREWORKS_AI_API_KEY": "unsupported-fireworks-alias",
     }
     for name, value in credentials.items():
+        monkeypatch.setenv(name, value)
+    for name, value in unsupported_aliases.items():
         monkeypatch.setenv(name, value)
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "unrelated-secret")
     monkeypatch.setenv("GITHUB_TOKEN", "unrelated-token")
@@ -825,6 +831,8 @@ def test_build_spawn_env_preserves_supported_provider_credentials(
 
     for name, value in credentials.items():
         assert env[name] == value
+    for name in unsupported_aliases:
+        assert name not in env
     assert "AWS_SECRET_ACCESS_KEY" not in env
     assert "GITHUB_TOKEN" not in env
 
