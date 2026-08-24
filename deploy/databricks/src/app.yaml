@@ -6,3 +6,5 @@ env:
     valueFrom: artifact_volume
   - name: OTEL_TRACES_SAMPLER
     value: 'always_on'
+  - name: UV_INDEX_URL
+    value: 'https://pypi.org/simple'

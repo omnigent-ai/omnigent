@@ -407,6 +407,20 @@ def run_uv_lock(src: Path) -> None:
         check=True,
     )
 
+    # Local uv configuration can rewrite the lockfile to the Databricks proxy,
+    # which may advertise artifacts that are unavailable at install time.
+    import runpy
+
+    normalize_text = runpy.run_path(
+        str(_repo_root() / "scripts" / "normalize_uv_lock_registry.py")
+    )["normalize_text"]
+    lockfile = src / "uv.lock"
+    original = lockfile.read_text()
+    normalized = normalize_text(original)
+    if normalized != original:
+        lockfile.write_text(normalized)
+        _log("normalized src/uv.lock to public PyPI URLs")
+
 
 def write_uv_dependency_files(
     src: Path,
