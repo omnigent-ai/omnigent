@@ -452,7 +452,16 @@ describe("BlockRenderer dispatch", () => {
 
       fireEvent.click(screen.getByText("Worked"));
       expect(screen.getByText("Planning the run.")).toBeDefined();
-      expect(screen.getByText("Ran 2 shell commands, called 3 other tools")).toBeDefined();
+      const runLabel = screen.getByText("Ran 2 shell commands, called 3 other tools");
+      const runTrigger = runLabel.closest("button");
+      expect(runTrigger?.firstElementChild).toBe(runLabel);
+      expect(runTrigger?.lastElementChild?.tagName.toLowerCase()).toBe("svg");
+      expect(runTrigger).toHaveClass("text-chat");
+      expect(runTrigger).not.toHaveClass("text-sm");
+      fireEvent.click(runTrigger!);
+      const individualToolTrigger = screen.getByText(/tool_3/).closest("button");
+      expect(individualToolTrigger).toHaveClass("text-chat");
+      expect(individualToolTrigger).not.toHaveClass("text-sm");
       // The answer remains visible after expansion too.
       expect(screen.getByText("All done here.")).toBeDefined();
     });
@@ -477,8 +486,12 @@ describe("BlockRenderer dispatch", () => {
       expect(trigger).toHaveAttribute("type", "button");
       expect(trigger).toHaveAttribute("aria-expanded", "false");
       expect(trigger).toHaveClass("gap-2", "py-1");
+      expect(trigger).toHaveClass("text-chat");
+      expect(trigger).not.toHaveClass("text-sm");
       expect(trigger).not.toHaveClass("w-full");
       expect(trigger.querySelector(".border-t")).toBeNull();
+      expect(trigger.firstElementChild).toBe(screen.getByText("Worked"));
+      expect(trigger.lastElementChild?.tagName.toLowerCase()).toBe("svg");
 
       trigger.focus();
       expect(document.activeElement).toBe(trigger);
@@ -489,7 +502,7 @@ describe("BlockRenderer dispatch", () => {
       const pinLine = screen.getByTestId("turn-worked-fold-pin-line");
       expect(pinLine).toHaveAttribute("aria-hidden", "true");
       expect(pinLine).toHaveClass("top-2", "bottom-0", "left-1", "w-px", "bg-border");
-      expect(pinLine.parentElement).toHaveClass("relative", "gap-2", "pt-2", "pl-4");
+      expect(pinLine.parentElement).toHaveClass("relative", "gap-1", "pt-2", "pl-4");
       expect(screen.getByText("Called 1 tool")).toBeDefined();
 
       fireEvent.click(trigger);
