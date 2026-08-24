@@ -31,6 +31,7 @@ import yaml
 from omnigent.entities import Conversation
 from omnigent.entities.conversation import MessageData, NewConversationItem
 from omnigent.server.routes import sessions as sessions_module
+from omnigent.server.routes.sessions import routes_core as routes_core_module
 from omnigent.server.routes.sessions import routes_events as routes_events_module
 from omnigent.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -1315,6 +1316,57 @@ async def test_native_subagent_yolo_args_derived_from_trusted_spec(
     # The persisted child session carries exactly the YOLO bypass flags;
     # an empty / None value would mean the worker launches prompting.
     assert resp.json()["terminal_launch_args"] == expected_args
+
+
+async def test_live_runner_child_create_receives_persisted_workspace_snapshot(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The eager runner notification carries the child's persisted workspace."""
+    parent = await _create_parent_with_subagents(
+        client,
+        name="orch-child-workspace-snapshot",
+        sub_agents=[{"name": "impl", "harness": "claude-native"}],
+    )
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    assert conv_store.set_runner_id(parent["session_id"], "runner-live-parent")
+
+    notifications: list[dict[str, Any]] = []
+
+    def _runner_handler(request: httpx.Request) -> httpx.Response:
+        notifications.append(json.loads(request.content))
+        return httpx.Response(200, json={"session_init_protocol_version": 2})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_runner_handler),
+        base_url="http://runner",
+    )
+
+    async def _runner_live(*_args: Any, **_kwargs: Any) -> httpx.AsyncClient:
+        return fake_runner
+
+    monkeypatch.setattr(routes_core_module, "_get_runner_client", _runner_live)
+    try:
+        resp = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": parent["agent_id"],
+                "parent_session_id": parent["session_id"],
+                "title": "impl:assigned",
+                "sub_agent_name": "impl",
+                "workspace": "/assigned/child-worktree",
+            },
+        )
+    finally:
+        await fake_runner.aclose()
+
+    assert resp.status_code == 201, resp.text
+    assert len(notifications) == 1
+    envelope = notifications[0]["session_init"]
+    assert envelope["session_id"] == resp.json()["id"]
+    assert envelope["sub_agent_name"] == "impl"
+    assert envelope["snapshot"]["workspace"] == "/assigned/child-worktree"
 
 
 async def test_native_subagent_yolo_args_reject_overlong_spec_value(

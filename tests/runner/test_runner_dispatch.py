@@ -3074,7 +3074,9 @@ async def test_sys_session_send_existing_child_retries_without_rejected_actor(
     assert "created_by" not in event_posts[1]
 
 
-def _spec_with_subagent_harness(harness: str) -> SimpleNamespace:
+def _spec_with_subagent_harness(
+    harness: str, workspace_root: Path | None = None
+) -> SimpleNamespace:
     """
     Build a parent-spec stub declaring one ``worker`` sub-agent.
 
@@ -3091,9 +3093,244 @@ def _spec_with_subagent_harness(harness: str) -> SimpleNamespace:
             SimpleNamespace(
                 name="worker",
                 executor=SimpleNamespace(type="omnigent", config={"harness": harness}),
+                os_env=(
+                    SimpleNamespace(cwd=str(workspace_root))
+                    if workspace_root is not None
+                    else None
+                ),
             )
         ]
     )
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_workspace_lands_in_child_create_body(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A fresh child create receives the canonical assigned workspace."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    worker_root = tmp_path / "workers"
+    workspace = worker_root / "task"
+    workspace.mkdir(parents=True)
+    create_bodies: list[dict[str, Any]] = []
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/child_sessions"):
+            return httpx.Response(200, json={"data": []})
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_bodies.append(json.loads(request.content))
+            return httpx.Response(201, json={"id": "conv_child_workspace"})
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler), base_url="http://server"
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(
+                    {
+                        "agent": "worker",
+                        "title": "task",
+                        "args": {
+                            "input": "do it",
+                            "workspace": str(workspace),
+                        },
+                    }
+                ),
+                server_client=server_client,
+                conversation_id="conv_parent_workspace",
+                agent_spec=_spec_with_subagent_harness("claude-native", worker_root),
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_child_workspace")
+            runner_app._session_inboxes_ref.pop("conv_parent_workspace", None)
+
+    assert json.loads(output)["status"] == "launching"
+    assert create_bodies == [
+        {
+            "agent_id": "ag_parent",
+            "parent_session_id": "conv_parent_workspace",
+            "title": "worker:task",
+            "sub_agent_name": "worker",
+            "workspace": str(workspace.resolve()),
+        }
+    ]
+
+
+def test_subagent_workspace_resolves_relative_os_env_cwd(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A common ``cwd: .`` boundary resolves from the runner's cwd."""
+    from omnigent.runner.tool_dispatch import _canonical_subagent_workspace
+
+    workspace = tmp_path / "task"
+    workspace.mkdir()
+    monkeypatch.chdir(tmp_path)
+
+    assert _canonical_subagent_workspace(
+        str(workspace),
+        sub_agent_name="worker",
+        agent_spec=_spec_with_subagent_harness("claude-native", Path(".")),
+    ) == str(workspace.resolve())
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_rejects_workspace_outside_worker_root(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A canonical workspace cannot escape the worker's os_env.cwd."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    worker_root = tmp_path / "workers"
+    worker_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    requests_seen = 0
+
+    async def _server_handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests_seen
+        requests_seen += 1
+        return httpx.Response(500)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler), base_url="http://server"
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(
+                    {
+                        "agent": "worker",
+                        "title": "task",
+                        "args": {"input": "do it", "workspace": str(outside)},
+                    }
+                ),
+                server_client=server_client,
+                conversation_id="conv_parent_outside",
+                agent_spec=_spec_with_subagent_harness("claude-native", worker_root),
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app._session_inboxes_ref.pop("conv_parent_outside", None)
+
+    assert output.startswith("Error:")
+    assert "outside" in output
+    assert requests_seen == 0
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_rejects_workspace_in_by_id_mode(tmp_path: Path) -> None:
+    """A create-time workspace cannot alter a child addressed by id."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    requests_seen = 0
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests_seen
+        requests_seen += 1
+        return httpx.Response(500)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler), base_url="http://server"
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(
+                    {
+                        "session_id": "conv_existing",
+                        "args": {"input": "continue", "workspace": str(tmp_path)},
+                    }
+                ),
+                server_client=server_client,
+                conversation_id="conv_parent_existing_workspace",
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app._session_inboxes_ref.pop("conv_parent_existing_workspace", None)
+
+    assert output.startswith("Error:")
+    assert "workspace" in output
+    assert requests_seen == 0
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_rejects_workspace_for_existing_named_child(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A create-time workspace cannot alter an existing named child."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    worker_root = tmp_path / "workers"
+    worker_root.mkdir()
+    writes_seen = 0
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal writes_seen
+        if request.method == "GET" and request.url.path.endswith("/child_sessions"):
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": "conv_existing_workspace",
+                            "tool": "worker",
+                            "session_name": "task",
+                            "busy": False,
+                        }
+                    ]
+                },
+            )
+        if request.method == "POST":
+            writes_seen += 1
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler), base_url="http://server"
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(
+                    {
+                        "agent": "worker",
+                        "title": "task",
+                        "args": {"input": "continue", "workspace": str(worker_root)},
+                    }
+                ),
+                server_client=server_client,
+                conversation_id="conv_parent_named_workspace",
+                agent_spec=_spec_with_subagent_harness("claude-native", worker_root),
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app._session_inboxes_ref.pop("conv_parent_named_workspace", None)
+
+    assert output.startswith("Error:")
+    assert "conv_existing_workspace" in output
+    assert "sys_session_close" in output
+    assert writes_seen == 0
 
 
 @pytest.mark.asyncio
