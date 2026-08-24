@@ -246,9 +246,10 @@ cursor = ["cursor-sdk>=0.1.7"]
 # _reflect). The tools import the client lazily, so only users who enable a
 # Hindsight memory tool need this extra.
 hindsight = ["hindsight-client>=0.4.0"]
-# Nimble research runs (the `nimble_research` builtin). The tool imports the
-# nimble-python client lazily, so only users who enable nimble_research need
-# this extra. nimble_extract talks raw httpx and needs no extra.
+# The Nimble builtins (`nimble_research`, `nimble_extract`). nimble_research
+# imports the nimble-python client lazily; nimble_extract talks raw httpx and
+# needs no client at runtime. Installing this extra is the opt-in signal that
+# surfaces both tools in the onboarding assistant's builtin list.
 nimble = ["nimble-python>=1.2.0,<2"]
 # Slack integration (`omni integration slack`). The @omnigent socket-mode bot
 # lives in the separate `omnigent-slack` package (heavy deps — slack_bolt /
