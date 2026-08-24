@@ -553,6 +553,11 @@ class ClaudeHookRecord:
         ``background_tasks`` array whose per-task ``status`` is not terminal
         (see :data:`_TERMINAL_BACKGROUND_TASK_STATUSES`). ``0`` for all other
         events or when absent.
+    :param background_tasks: Display detail for those still-running shells —
+        the ``id``/``type``/``status``/``description``/``command`` fields from
+        each counted entry (see :func:`_normalize_background_task`), so the UI
+        can name them. ``None`` for non-``Stop`` events, when the array is
+        absent, or when no counted entry carried a usable field.
     """
 
     event_cursor: int
@@ -572,6 +577,7 @@ class ClaudeHookRecord:
     task_subject: str | None = None
     task_status: str | None = None
     background_task_count: int = 0
+    background_tasks: list[_JsonObject] | None = None
 
 
 @dataclass(frozen=True)
@@ -2754,6 +2760,35 @@ _TERMINAL_BACKGROUND_TASK_STATUSES: frozenset[str] = frozenset(
     {"completed", "failed", "stopped", "killed"}
 )
 
+# Bound the forwarded detail so a pathological hook payload can't bloat the
+# status event: at most this many shells, each string field clamped in length.
+_BACKGROUND_TASK_FORWARD_LIMIT = 100
+_BACKGROUND_TASK_FIELD_MAX_CHARS = 512
+_BACKGROUND_TASK_FIELDS: tuple[str, ...] = ("id", "type", "status", "description", "command")
+
+
+def _normalize_background_task(raw: object) -> _JsonObject | None:
+    """
+    Pick the display fields off one raw ``background_tasks`` entry.
+
+    Keeps only the string fields the UI renders (see
+    :data:`_BACKGROUND_TASK_FIELDS`), each clamped to
+    :data:`_BACKGROUND_TASK_FIELD_MAX_CHARS`. Non-dict entries and entries
+    with no usable field return ``None`` so callers can drop them — the count
+    still includes them, but there is nothing to show.
+
+    :param raw: One element of the hook payload's ``background_tasks`` array.
+    :returns: A trimmed field dict, or ``None`` when nothing usable remains.
+    """
+    if not isinstance(raw, dict):
+        return None
+    out: _JsonObject = {}
+    for key in _BACKGROUND_TASK_FIELDS:
+        value = raw.get(key)
+        if isinstance(value, str) and value:
+            out[key] = value[:_BACKGROUND_TASK_FIELD_MAX_CHARS]
+    return out or None
+
 
 def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
     """
@@ -2830,20 +2865,32 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
             task_id = raw_task_id
         task_status = "completed"
     background_task_count = 0
+    background_tasks: list[_JsonObject] | None = None
     if event_name == "Stop" and isinstance(payload, dict):
         raw_bg = payload.get("background_tasks")
         if isinstance(raw_bg, list):
-            # Count only shells still running: Claude Code leaves finished
+            # Keep only shells still running: Claude Code leaves finished
             # shells in the array (see _TERMINAL_BACKGROUND_TASK_STATUSES), so a
-            # raw len() over-counts and pins the indicator after they exit.
-            background_task_count = sum(
-                1
+            # raw len() over-counts and pins the indicator after they exit. An
+            # unknown/absent status counts as running so a payload variant can
+            # never re-hide a genuinely running shell.
+            running = [
+                task
                 for task in raw_bg
                 if not (
                     isinstance(task, dict)
                     and task.get("status") in _TERMINAL_BACKGROUND_TASK_STATUSES
                 )
-            )
+            ]
+            background_task_count = len(running)
+            # Detail for the UI. Non-dict / field-less entries drop out here
+            # but still count above, so the tally can't under-count.
+            details = [
+                detail
+                for task in running[:_BACKGROUND_TASK_FORWARD_LIMIT]
+                if (detail := _normalize_background_task(task)) is not None
+            ]
+            background_tasks = details or None
     return ClaudeHookRecord(
         event_cursor=record.line_number,
         byte_offset=record.next_byte_offset,
@@ -2886,6 +2933,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         task_subject=task_subject,
         task_status=task_status,
         background_task_count=background_task_count,
+        background_tasks=background_tasks,
     )
 
 

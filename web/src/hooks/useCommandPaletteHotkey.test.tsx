@@ -79,19 +79,44 @@ describe("useCommandPaletteHotkey", () => {
     expect(e.defaultPrevented).toBe(false);
   });
 
-  it("bails when focus sits inside a terminal or code editor", () => {
-    const onToggle = vi.fn();
-    renderHook(() => useCommandPaletteHotkey(onToggle));
-
-    const term = document.createElement("div");
-    term.className = "xterm";
+  /** Focus an input inside a container with `className`, e.g. "xterm". */
+  function focusInside(className: string): void {
+    const surface = document.createElement("div");
+    surface.className = className;
     const input = document.createElement("input");
-    term.appendChild(input);
-    document.body.appendChild(term);
+    surface.appendChild(input);
+    document.body.appendChild(surface);
     input.focus();
     expect(document.activeElement).toBe(input);
+  }
+
+  it("bails on Ctrl+K in a terminal — xterm sends it to the PTY as ^K", () => {
+    const onToggle = vi.fn();
+    renderHook(() => useCommandPaletteHotkey(onToggle));
+    focusInside("xterm");
+
+    press({ key: "k", ctrlKey: true });
+
+    expect(onToggle).not.toHaveBeenCalled();
+  });
+
+  it("claims Cmd+K in a terminal — xterm drops Cmd chords, so nothing owns it", () => {
+    const onToggle = vi.fn();
+    renderHook(() => useCommandPaletteHotkey(onToggle));
+    focusInside("xterm");
 
     press({ key: "k", metaKey: true });
+
+    expect(onToggle).toHaveBeenCalledTimes(1);
+  });
+
+  it("bails on both variants inside the code editor (⌘K is a chord prefix)", () => {
+    const onToggle = vi.fn();
+    renderHook(() => useCommandPaletteHotkey(onToggle));
+    focusInside("monaco-editor");
+
+    press({ key: "k", metaKey: true });
+    press({ key: "k", ctrlKey: true });
 
     expect(onToggle).not.toHaveBeenCalled();
   });

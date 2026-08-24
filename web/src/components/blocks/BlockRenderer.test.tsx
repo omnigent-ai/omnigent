@@ -452,7 +452,16 @@ describe("BlockRenderer dispatch", () => {
 
       fireEvent.click(screen.getByText("Worked"));
       expect(screen.getByText("Planning the run.")).toBeDefined();
-      expect(screen.getByText("Ran 2 shell commands, called 3 other tools")).toBeDefined();
+      const runLabel = screen.getByText("Ran 2 shell commands, called 3 other tools");
+      const runTrigger = runLabel.closest("button");
+      expect(runTrigger?.firstElementChild).toBe(runLabel);
+      expect(runTrigger?.lastElementChild?.tagName.toLowerCase()).toBe("svg");
+      expect(runTrigger).toHaveClass("text-chat");
+      expect(runTrigger).not.toHaveClass("text-sm");
+      fireEvent.click(runTrigger!);
+      const individualToolTrigger = screen.getByText(/tool_3/).closest("button");
+      expect(individualToolTrigger).toHaveClass("text-chat");
+      expect(individualToolTrigger).not.toHaveClass("text-sm");
       // The answer remains visible after expansion too.
       expect(screen.getByText("All done here.")).toBeDefined();
     });
@@ -464,6 +473,63 @@ describe("BlockRenderer dispatch", () => {
       ];
       render(<BlockRenderer items={items} sessionStatus="idle" workedForS={106} />);
       expect(screen.getByText("Worked for 1m 46s")).toBeDefined();
+    });
+
+    it("uses a compact accessible trigger and pins expanded work to a vertical line", () => {
+      const items: RenderItem[] = [
+        tool(1),
+        { kind: "text", itemId: "m1", text: "Done.", final: true },
+      ];
+      render(<BlockRenderer items={items} sessionStatus="idle" />);
+
+      const trigger = screen.getByRole("button", { name: "Worked" });
+      expect(trigger).toHaveAttribute("type", "button");
+      expect(trigger).toHaveAttribute("aria-expanded", "false");
+      expect(trigger).toHaveClass("gap-2", "py-1");
+      expect(trigger).toHaveClass("text-chat");
+      expect(trigger).not.toHaveClass("text-sm");
+      expect(trigger).not.toHaveClass("w-full");
+      expect(trigger.querySelector(".border-t")).toBeNull();
+      expect(trigger.firstElementChild).toBe(screen.getByText("Worked"));
+      expect(trigger.lastElementChild?.tagName.toLowerCase()).toBe("svg");
+
+      trigger.focus();
+      expect(document.activeElement).toBe(trigger);
+      fireEvent.click(trigger);
+
+      expect(trigger).toHaveAttribute("aria-expanded", "true");
+      expect(trigger).toHaveAttribute("aria-controls");
+      const pinLine = screen.getByTestId("turn-worked-fold-pin-line");
+      expect(pinLine).toHaveAttribute("aria-hidden", "true");
+      expect(pinLine).toHaveClass("top-2", "bottom-0", "left-1", "w-px", "bg-border");
+      expect(pinLine.parentElement).toHaveClass("relative", "gap-1", "pt-2", "pl-4");
+      expect(screen.getByText("Called 1 tool")).toBeDefined();
+
+      fireEvent.click(trigger);
+      expect(trigger).toHaveAttribute("aria-expanded", "false");
+      expect(screen.queryByTestId("turn-worked-fold-pin-line")).toBeNull();
+    });
+
+    it("preserves an expanded Worked section when its duration updates", () => {
+      const items: RenderItem[] = [
+        tool(1),
+        { kind: "text", itemId: "m1", text: "Done.", final: true },
+      ];
+      const view = (workedForS: number) => (
+        <BlockRenderer items={items} sessionStatus="idle" workedForS={workedForS} />
+      );
+      const { rerender } = render(view(106));
+
+      fireEvent.click(screen.getByRole("button", { name: "Worked for 1m 46s" }));
+      expect(screen.getByText("Called 1 tool")).toBeDefined();
+
+      rerender(view(107));
+      expect(screen.getByRole("button", { name: "Worked for 1m 47s" })).toHaveAttribute(
+        "aria-expanded",
+        "true",
+      );
+      expect(screen.getByTestId("turn-worked-fold-pin-line")).toBeDefined();
+      expect(screen.getByText("Called 1 tool")).toBeDefined();
     });
 
     describe("expand scroll-into-view", () => {

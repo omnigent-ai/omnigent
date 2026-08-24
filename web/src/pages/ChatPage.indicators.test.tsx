@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { useChatStore } from "@/store/chatStore";
 import type { Bubble } from "@/lib/renderItems";
@@ -24,18 +24,21 @@ afterEach(() => {
 });
 
 describe("SandboxFailedIndicator", () => {
-  it("renders the recorded failure reason so a dead launch explains itself", () => {
-    // WHY: a silently dead chat is the bug this band exists to prevent — the
-    // reason must reach the DOM.
+  it("surfaces the recorded failure reason in the pill so a dead launch explains itself", () => {
+    // WHY: a silently dead chat is the bug this pill exists to prevent — the
+    // reason must reach the DOM, reachable in the pill's expandable body.
     render(<SandboxFailedIndicator status={{ stage: "failed", error: "out of quota" }} />);
-    expect(screen.getByText(/Sandbox launch failed: out of quota/)).toBeInTheDocument();
+    expect(screen.getByTestId("error-headline")).toHaveTextContent("Sandbox launch failed");
+    fireEvent.click(screen.getByTestId("error-pill"));
+    expect(screen.getByTestId("error-message-content")).toHaveTextContent("out of quota");
   });
 
-  it("omits the colon suffix when no error detail is recorded", () => {
-    // WHY: a missing error must not render a dangling "failed: " — the
-    // ternary guards the suffix.
+  it("shows just the failure headline with no dangling colon when no reason is recorded", () => {
+    // WHY: a missing reason must not render a dangling "failed: " — the pill
+    // shows only the headline.
     render(<SandboxFailedIndicator status={{ stage: "failed", error: null }} />);
-    expect(screen.getByText("Sandbox launch failed")).toBeInTheDocument();
+    expect(screen.getByTestId("error-headline")).toHaveTextContent("Sandbox launch failed");
+    expect(screen.queryByText(/Sandbox launch failed:/)).not.toBeInTheDocument();
   });
 });
 
@@ -270,11 +273,25 @@ describe("BubbleView dispatch", () => {
     expect(screen.getByTestId("assistant-interrupted-indicator")).toHaveTextContent("Interrupted");
   });
 
-  it("renders the error text for a failed assistant turn", () => {
-    // WHY: the failed branch must surface the error so a dead turn explains
-    // itself instead of vanishing.
+  it("surfaces a failed turn's error as a destructive pill, never raw text", () => {
+    // WHY: a failed send/stream must render through the same error pill an error
+    // block uses — never bare red "Error:" text — and the message stays
+    // reachable in the pill's expandable body so a dead turn still explains itself.
     render(<BubbleView bubble={{ ...assistantText("", "failed"), error: "rate limited" }} />);
-    expect(screen.getByText(/Error: rate limited/)).toBeInTheDocument();
+    const pill = screen.getByTestId("error-pill");
+    expect(pill).toBeInTheDocument();
+    expect(screen.queryByText(/^Error:/)).not.toBeInTheDocument();
+    fireEvent.click(pill);
+    expect(screen.getByTestId("error-message-content")).toHaveTextContent("rate limited");
+  });
+
+  it("adds no error pill for a failed turn whose message rides on its block", () => {
+    // WHY: a dropped-host turn ends "failed" but carries its explanation as an
+    // error block inside the bubble, leaving `error` null — the bubble must add
+    // no second pill (and never a bare "Error:") of its own.
+    render(<BubbleView bubble={{ ...assistantText("", "failed"), error: null }} />);
+    expect(screen.queryByTestId("error-pill")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Error:/)).not.toBeInTheDocument();
   });
 
   const toolItem = (callId: string): AssistantBubble["items"][number] => ({

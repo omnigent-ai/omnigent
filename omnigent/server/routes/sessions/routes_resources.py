@@ -478,6 +478,40 @@ def register_resources_routes(
         """
         return LEVEL_OWNER if ntpath.isabs(client_path) else within_workspace
 
+    def _resolve_browse_path(request: Request, client_path: str) -> tuple[bool, str]:
+        """Resolve a filesystem request path against its declared base.
+
+        The ``{path}`` segment names a location two ways can reach:
+
+        - **workspace-relative** (``base=workspace``, the default) — a path
+          under the session's workspace root, e.g. ``src/app.ts``.
+        - **host-absolute** (``base=host``) — an absolute path on the host,
+          sent WITHOUT its leading slash so the ``{path}`` converter carries
+          it, exactly as ``/v1/hosts/{id}/filesystem/{path}`` already does.
+          The leading slash is re-added here.
+
+        Naming the base in the query — rather than marking absolute paths with
+        a leading ``%2F`` in the segment — is what makes browsing outside the
+        workspace survive a reverse proxy. A leading ``%2F`` decodes to a
+        boundary ``//`` that proxies such as the Databricks Apps front door
+        merge back to a single ``/`` (``//x`` 301-redirects to ``/x``), which
+        silently turns ``/Users/me`` into a workspace-relative ``Users/me`` and
+        lists a nonexistent path. A query value rides through that merge
+        untouched, and a plain path segment never forms a ``//`` to begin with.
+
+        A genuine leading slash on ``{path}`` is still honored, so a direct
+        (unproxied) caller that sends ``%2F`` keeps working.
+
+        :param request: Incoming request, for the ``base`` query value.
+        :param client_path: Path captured from the route's ``{path}``.
+        :returns: ``(absolute, path)`` — ``path`` carries a leading slash iff
+            ``absolute``.
+        """
+        absolute = request.query_params.get("base") == "host" or client_path.startswith("/")
+        if absolute:
+            return True, "/" + client_path.lstrip("/")
+        return False, client_path
+
     async def _authorize_absolute_browse(
         conversation: Conversation,
         absolute_path: str,
@@ -1735,6 +1769,25 @@ def register_resources_routes(
         :param order: Sort order, ``"asc"`` or ``"desc"``.
         :returns: PaginatedList of filesystem entries.
         """
+        # A host-absolute browse of the filesystem root reaches here: its path
+        # segment is empty, so it lands on the no-path route, and only
+        # ``base=host`` distinguishes it from a workspace-root listing. Hand it
+        # to the path handler so it gets the same owner gate and reach check as
+        # any other absolute location instead of listing the workspace root.
+        # ``read_or_list_environment_path`` runs its own ``_validate_session``
+        # at the owner level for an absolute path, so this delegation is gated
+        # there, not here.
+        if request.query_params.get("base") == "host":
+            return await read_or_list_environment_path(
+                request,
+                session_id,
+                environment_id,
+                "/",
+                limit=limit,
+                after=after,
+                before=before,
+                order=order,
+            )
         params: dict[str, str] = {"limit": str(limit), "order": order}
         if after is not None:
             params["after"] = after
@@ -1866,7 +1919,7 @@ def register_resources_routes(
         if exclude is not None:
             params["exclude"] = exclude
 
-        absolute = path.startswith("/")
+        absolute, path = _resolve_browse_path(request, path)
         conv = await _validate_session(
             session_id, request, _browse_level(path, within_workspace=LEVEL_READ)
         )
@@ -2004,7 +2057,7 @@ def register_resources_routes(
         # shared context, everything past it is the owner's own machine. See
         # `_mutating_level` for why anything weaker would make this route a
         # way around the owner-scoped host filesystem endpoint.
-        absolute = relative_path.startswith("/")
+        absolute, relative_path = _resolve_browse_path(request, relative_path)
         conv = await _validate_session(
             session_id, request, _browse_level(relative_path, within_workspace=LEVEL_READ)
         )
@@ -2069,6 +2122,7 @@ def register_resources_routes(
         :returns: Write result.
         """
         body = await request.json()
+        _, relative_path = _resolve_browse_path(request, relative_path)
         path = _mutating_runner_path(session_id, environment_id, relative_path)
         return await _proxy_fs_response(
             session_id,
@@ -2101,6 +2155,7 @@ def register_resources_routes(
         :returns: Edit result.
         """
         body = await request.json()
+        _, relative_path = _resolve_browse_path(request, relative_path)
         path = _mutating_runner_path(session_id, environment_id, relative_path)
         return await _proxy_fs_response(
             session_id,
@@ -2132,6 +2187,7 @@ def register_resources_routes(
         :param relative_path: Path relative to environment root.
         :returns: Delete result.
         """
+        _, relative_path = _resolve_browse_path(request, relative_path)
         path = _mutating_runner_path(session_id, environment_id, relative_path)
         return await _proxy_fs_response(
             session_id,

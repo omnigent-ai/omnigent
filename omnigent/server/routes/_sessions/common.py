@@ -37,6 +37,7 @@ from omnigent.harness_plugins import (
 from omnigent.runner.routing import RunnerRouter
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.schemas import (
+    BackgroundTaskInfo,
     McpServerStartup,
     SandboxStatus,
     ServerStreamEvent,
@@ -462,6 +463,12 @@ _session_active_response_cache: dict[str, str] = {}
 
 
 _session_background_task_count_cache: dict[str, int] = {}
+
+
+# Per-shell detail behind the tally above, kept sticky in lockstep with it (see
+# ``_publish_status``) so a reload/reconnect can restore it. Absent when the
+# count cache is absent, or when a runner reported only the count with no detail.
+_session_background_tasks_cache: dict[str, list[BackgroundTaskInfo]] = {}
 
 
 _read_last_seen: dict[str, dict[str, int]] = {}
@@ -960,6 +967,7 @@ __all__ = [
     "_server_runner_router",
     "_session_active_response_cache",
     "_session_background_task_count_cache",
+    "_session_background_tasks_cache",
     "_session_mcp_startup_cache",
     "_session_sandbox_status_cache",
     "_session_status_cache",

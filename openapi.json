@@ -223,6 +223,73 @@
         "title": "AutomaticSessionRenameResponse",
         "type": "object"
       },
+      "BackgroundTaskInfo": {
+        "description": "One still-running background shell from the claude-native `Stop` hook.\n\nClaude Code leaves finished shells in the hook's `background_tasks`\narray, so the list surfaced here is filtered to the non-terminal ones \u2014\nits length matches the `background_task_count` tally. Every field is\nbest-effort: the hook shape is external, so an entry missing one field\nstill yields a usable row (e.g. a `description` with no `command`).",
+        "properties": {
+          "command": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Command the shell is running, e.g. `\"sleep 120\"`.",
+            "title": "Command"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Human-readable label, e.g. `\"Wait for CI\"`.",
+            "title": "Description"
+          },
+          "id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Opaque per-shell identifier, e.g. `\"abc123\"`.",
+            "title": "Id"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Per-task status, e.g. `\"running\"`.",
+            "title": "Status"
+          },
+          "type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Task kind, e.g. `\"shell\"`.",
+            "title": "Type"
+          }
+        },
+        "title": "BackgroundTaskInfo",
+        "type": "object"
+      },
       "Body_update_session_agent_v1_sessions__session_id__agent_put": {
         "properties": {
           "bundle": {
@@ -5263,6 +5330,21 @@
             "description": "Background shells (claude-native) still running as of the last status edge, so a reload re-shows \"N shells still running\" even though the session has settled to `\"idle\"`. `None` (the default / omitted) when no shells are tracked.",
             "title": "Background Task Count"
           },
+          "background_tasks": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/BackgroundTaskInfo"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Per-shell detail for the running tally above, so a reload can restore each shell's description/command. `None` when none are tracked (or when an older runner reported only the count).",
+            "title": "Background Tasks"
+          },
           "context_window": {
             "anyOf": [
               {
@@ -5823,7 +5905,24 @@
               }
             ],
             "default": null,
+            "description": "Background shells still running at this edge (claude-native `Stop` hook). `None` when the edge carries no information (leave the sticky tally untouched); `0` clears it.",
             "title": "Background Task Count"
+          },
+          "background_tasks": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/BackgroundTaskInfo"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Per-shell detail backing that tally, so the UI can name each running shell. `None` when the edge reports no detail (an older runner may send only the count).",
+            "title": "Background Tasks"
           },
           "blocked_on": {
             "anyOf": [

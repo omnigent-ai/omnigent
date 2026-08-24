@@ -79,6 +79,55 @@ def _seed_error_item(session_id: str, *, code: str, message: str) -> None:
     )
 
 
+def test_runner_disconnect_card_clears_when_the_runner_reports_a_live_status(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A ``runner_disconnected`` card disappears once the runner is live again.
+
+    A server that closed a runner tunnel on its way down (a deploy) lit a
+    "connection to the host dropped" card; the runner never died, and its
+    next status edge on reconnect proves it is reachable. That card is an
+    observation, not a turn result, so a live (non-``failed``) status edge
+    must remove it — the fix in the ``session_status`` handler. Other
+    failure cards (e.g. ``required_terminal_exited``) must NOT be cleared by
+    a status edge, so a control card is seeded alongside and asserted to
+    survive.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` from the local server.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    _seed_error_item(
+        session_id,
+        code="runner_disconnected",
+        message="Runner disconnected unexpectedly.",
+    )
+    _seed_error_item(
+        session_id,
+        code="required_terminal_exited",
+        message="Required terminal exited unexpectedly; the runtime is no longer available.",
+    )
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    pills = page.get_by_test_id("error-pill")
+    expect(pills).to_have_count(2, timeout=15_000)
+    disconnect_pill = page.get_by_test_id("error-pill").filter(
+        has_text="The connection to the host dropped unexpectedly"
+    )
+    expect(disconnect_pill).to_have_count(1)
+
+    # The runner reconnects and reports a live turn. The disconnect card
+    # clears; the genuine terminal-exit failure card stays.
+    _publish_native_status(base_url, session_id, "running", response_id="codex_turn_recover")
+    expect(disconnect_pill).to_have_count(0, timeout=15_000)
+    surviving = page.get_by_test_id("error-pill")
+    expect(surviving).to_have_count(1)
+    expect(surviving).to_contain_text("The agent's terminal exited unexpectedly")
+
+
 def test_unclassified_failure_renders_english_headline_not_raw_code(
     page: Page,
     seeded_session: tuple[str, str],
@@ -140,6 +189,42 @@ def test_live_native_failure_status_surfaces_each_turn(
     second_pill = pills.nth(1)
     second_pill.locator('button[aria-expanded="false"]').click()
     expect(second_pill.get_by_test_id("error-message-content")).to_contain_text(message)
+
+
+def test_failed_turn_surfaces_error_as_pill_not_raw_text(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A failed turn shows its error through the pill, never a bare red "Error:".
+
+    A native ``failed`` status leaves the assistant bubble at
+    ``lifecycle == "failed"`` with a null free-form ``error`` — the message
+    rides on the error pill. The bubble must not paint a separate raw
+    ``Error:`` line beneath it (the empty-content red text a dropped host
+    connection used to show); the failure reads through the pill alone.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` from the local server.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_role("textbox", name="Message the agent")).to_be_visible(timeout=15_000)
+
+    _publish_native_status(base_url, session_id, "running", response_id="codex_turn_fail")
+    _publish_native_status(
+        base_url,
+        session_id,
+        "failed",
+        response_id="codex_turn_fail",
+        output="You've hit your usage limit.",
+    )
+
+    # The failure surfaces as the standard error pill...
+    expect(page.get_by_test_id("error-pill")).to_have_count(1, timeout=15_000)
+    # ...and never as a bare, raw-red "Error:" line beneath the bubble.
+    expect(page.get_by_text("Error:", exact=True)).to_have_count(0)
 
 
 def test_persisted_failure_expands_retries_and_dismisses_locally(

@@ -7930,7 +7930,21 @@ async def test_forwarder_posts_idle_with_count_when_stop_has_background_tasks(
     assert request["path"] == "/v1/sessions/conv_abc/events"
     assert request["body"] == {
         "type": "external_session_status",
-        "data": {"status": "idle", "background_task_count": 1},
+        "data": {
+            "status": "idle",
+            "background_task_count": 1,
+            # Per-shell detail rides alongside the count so the UI can name the
+            # running shells (see BackgroundTaskInfo / _normalize_background_task).
+            "background_tasks": [
+                {
+                    "id": "abc123",
+                    "type": "shell",
+                    "status": "running",
+                    "description": "Wait for CI",
+                    "command": "sleep 120",
+                }
+            ],
+        },
     }
 
 

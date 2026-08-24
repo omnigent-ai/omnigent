@@ -1708,12 +1708,18 @@ describe("Composer — queued-message flush gating", () => {
     });
 
     // Idle + a waiting head, but unreachable → the effect must not flush.
-    const { rerender } = render(<Composer {...composerProps({ unreachable: true })} />);
+    // Wrapped in TooltipProvider since the queued-message strip renders the
+    // steer button's tooltip.
+    const { rerender } = renderWithTooltips(<Composer {...composerProps({ unreachable: true })} />);
     await waitFor(() => expect(sendSpy).not.toHaveBeenCalled());
     expect(useChatStore.getState().queuedMessages).toHaveLength(1);
 
     // Becomes reachable → the effect re-fires and drains the head.
-    rerender(<Composer {...composerProps({ unreachable: false })} />);
+    rerender(
+      <TooltipProvider>
+        <Composer {...composerProps({ unreachable: false })} />
+      </TooltipProvider>,
+    );
     await waitFor(() => expect(sendSpy).toHaveBeenCalledTimes(1));
     expect(sendSpy.mock.calls[0]!.slice(0, 2)).toEqual(["held", "agent_xyz"]);
     expect(useChatStore.getState().queuedMessages).toHaveLength(0);
@@ -2069,6 +2075,76 @@ describe("Composer config gear", () => {
     resolveModel();
     await waitFor(() => expect(setEffort).toHaveBeenCalledWith("low"));
     expect(calls).toEqual(["model", "effort"]);
+  });
+
+  it("recomputes the Codex effort ladder for the drafted model and drops an unsupported level", async () => {
+    // Codex advertises a per-model effort ladder. Drafting a lower-ceiling
+    // model (Luna, no "ultra") must refresh the dropdown to that model's levels
+    // and drop a picked level it can't run — else Save would send Sol's "ultra"
+    // to Luna, and the dropdown would show a rung Luna rejects.
+    const codexOptions = [
+      {
+        id: "gpt-5.6-sol",
+        model: "gpt-5.6-sol",
+        displayName: "GPT-5.6-Sol",
+        isDefault: true,
+        supportedReasoningEfforts: [
+          { reasoningEffort: "low" },
+          { reasoningEffort: "medium" },
+          { reasoningEffort: "high" },
+          { reasoningEffort: "xhigh" },
+          { reasoningEffort: "max" },
+          { reasoningEffort: "ultra" },
+        ],
+      },
+      {
+        id: "gpt-5.6-luna",
+        model: "gpt-5.6-luna",
+        displayName: "GPT-5.6-Luna",
+        supportedReasoningEfforts: [
+          { reasoningEffort: "low" },
+          { reasoningEffort: "medium" },
+          { reasoningEffort: "high" },
+          { reasoningEffort: "xhigh" },
+          { reasoningEffort: "max" },
+        ],
+      },
+    ] as never;
+    useChatStore.setState({
+      setModel: vi.fn().mockResolvedValue(undefined),
+      setEffort: vi.fn().mockResolvedValue(undefined),
+      selectedEffort: "ultra",
+      llmModel: "gpt-5.6-sol",
+      codexModelOptions: codexOptions,
+      refreshSessionOverrides: vi.fn().mockResolvedValue(undefined),
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showModels: true,
+          showEffort: true,
+          modelPickerKind: "codex",
+          effortLevels: ["low", "medium", "high", "xhigh", "max", "ultra"],
+          codexModelOptions: codexOptions,
+        })}
+      />,
+    );
+    fireEvent.click(gear()!);
+    await screen.findByTestId("composer-config-modal");
+
+    // Sol starts on ultra.
+    expect(screen.getByTestId("composer-config-effort")).toHaveTextContent("ultra");
+
+    // Draft a switch to Luna, whose ceiling is "max".
+    fireEvent.click(document.querySelector('[data-testid="composer-config-model"]') as Element);
+    fireEvent.click(document.querySelector('[data-model-id="gpt-5.6-luna"]') as Element);
+
+    // The picked ultra is dropped (back to Default) and no longer offered,
+    // while Luna's own max stays.
+    expect(screen.getByTestId("composer-config-effort")).toHaveTextContent("Default");
+    fireEvent.click(document.querySelector('[data-testid="composer-config-effort"]') as Element);
+    expect(document.querySelector('[data-effort-level="ultra"]')).toBeNull();
+    expect(document.querySelector('[data-effort-level="max"]')).not.toBeNull();
   });
 
   it("skips unchanged knobs on Save (no spurious slash-command injection)", async () => {

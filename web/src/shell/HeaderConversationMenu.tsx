@@ -1,0 +1,437 @@
+import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
+import {
+  ArchiveIcon,
+  CheckIcon,
+  ChevronLeftIcon,
+  EllipsisVerticalIcon,
+  FolderInputIcon,
+  GitBranchIcon,
+  InfoIcon,
+  MailIcon,
+  PencilIcon,
+  PinIcon,
+  PinOffIcon,
+  SearchIcon,
+  ShareIcon,
+  Trash2Icon,
+} from "lucide-react";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
+  PINNED_LABEL_KEY,
+  type Conversation,
+  useArchiveConversation,
+  useMoveToProject,
+  useProjects,
+  useRenameConversation,
+  useStopAndDeleteConversation,
+  useTogglePinnedConversation,
+} from "@/hooks/useConversations";
+import { markConversationUnread } from "@/hooks/useUnseenConversations";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { Link, useNavigate } from "@/lib/routing";
+import { showToast } from "@/components/ui/toast";
+import { conversationDisplayLabel } from "./sidebarNav";
+
+interface HeaderConversationMenuProps {
+  conversation: Conversation;
+  currentProject: string | null;
+  canShare: boolean;
+  shareDisabled?: boolean;
+  shareDisabledReason?: string;
+  onShare: () => void;
+  hasAgentInfo?: boolean;
+  onAgentInfo?: () => void;
+}
+
+function ArchivedToast() {
+  return (
+    <span>
+      View archived sessions in{" "}
+      <Link to="/settings/archived" className="font-medium text-primary hover:underline">
+        Settings
+      </Link>
+    </span>
+  );
+}
+
+function showArchivedToast() {
+  showToast(<ArchivedToast />);
+}
+
+function ProjectPicker({
+  currentProject,
+  onSelect,
+}: {
+  currentProject: string | null;
+  onSelect: (project: string) => void;
+}) {
+  const { data: projects = [] } = useProjects();
+  const [search, setSearch] = useState("");
+  const filtered = search
+    ? projects.filter((project) => project.name.toLowerCase().includes(search.toLowerCase()))
+    : projects;
+
+  return (
+    <>
+      <div className="flex items-center gap-2 border-b px-2 py-1.5">
+        <SearchIcon className="size-3.5 shrink-0 text-muted-foreground" />
+        <input
+          aria-label="Search projects"
+          className="w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
+          placeholder="Search projects"
+          value={search}
+          onChange={(event) => setSearch(event.target.value)}
+          onKeyDown={(event) => event.stopPropagation()}
+        />
+      </div>
+      <div className="max-h-48 overflow-y-auto">
+        {filtered.map((project) => (
+          <DropdownMenuItem
+            key={project.name}
+            className="px-2 py-1"
+            onSelect={() => onSelect(project.name)}
+          >
+            <span className="flex-1 truncate text-left">{project.name}</span>
+            {currentProject === project.name && (
+              <CheckIcon className="size-3.5 shrink-0 text-primary" />
+            )}
+          </DropdownMenuItem>
+        ))}
+        {filtered.length === 0 && (
+          <p className="px-2 py-1.5 text-sm text-muted-foreground">No projects yet.</p>
+        )}
+      </div>
+      {currentProject && (
+        <div className="border-t pt-1">
+          <DropdownMenuItem className="px-2 py-1" onSelect={() => onSelect("")}>
+            Remove from{" "}
+            <span className="rounded bg-muted px-1 py-0.5 font-mono text-[0.95em]">
+              {currentProject}
+            </span>
+          </DropdownMenuItem>
+        </div>
+      )}
+    </>
+  );
+}
+
+export function HeaderConversationMenu({
+  conversation,
+  currentProject,
+  canShare,
+  shareDisabled = false,
+  shareDisabledReason,
+  onShare,
+  hasAgentInfo = false,
+  onAgentInfo,
+}: HeaderConversationMenuProps) {
+  const navigate = useNavigate();
+  const isMobile = useIsMobileViewport();
+  const togglePinned = useTogglePinnedConversation();
+  const rename = useRenameConversation();
+  const moveToProject = useMoveToProject();
+  const archive = useArchiveConversation();
+  const deleteConversation = useStopAndDeleteConversation();
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [projectPickerOpen, setProjectPickerOpen] = useState(false);
+  const [renameOpen, setRenameOpen] = useState(false);
+  const [renameTitle, setRenameTitle] = useState(conversation.title ?? "");
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [deleteBranch, setDeleteBranch] = useState(false);
+  const previousConversationId = useRef(conversation.id);
+  const isPinned = conversation.labels?.[PINNED_LABEL_KEY] != null;
+  const label = conversationDisplayLabel(conversation);
+  const gitBranch = conversation.git_branch ?? null;
+
+  useEffect(() => {
+    if (!renameOpen) setRenameTitle(conversation.title ?? "");
+  }, [conversation.title, renameOpen]);
+
+  useEffect(() => {
+    if (previousConversationId.current === conversation.id) return;
+    previousConversationId.current = conversation.id;
+    setMenuOpen(false);
+    setProjectPickerOpen(false);
+    setRenameOpen(false);
+    setRenameTitle(conversation.title ?? "");
+    setDeleteOpen(false);
+    setDeleteBranch(false);
+  }, [conversation.id, conversation.title]);
+
+  const closeMenu = () => {
+    setMenuOpen(false);
+    setProjectPickerOpen(false);
+  };
+
+  const handleProjectSelect = (project: string) => {
+    closeMenu();
+    moveToProject.mutate({ id: conversation.id, project });
+  };
+
+  const submitRename = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const title = renameTitle.trim();
+    if (title && title !== (conversation.title ?? "")) {
+      rename.mutate({ id: conversation.id, title });
+    }
+    setRenameOpen(false);
+  };
+
+  const confirmDelete = () => {
+    setDeleteOpen(false);
+    setDeleteBranch(false);
+    navigate("/", { replace: true });
+    deleteConversation.mutate({
+      id: conversation.id,
+      deleteBranch: gitBranch !== null && deleteBranch,
+    });
+  };
+
+  const archiveConversation = () => {
+    closeMenu();
+    archive.mutate(
+      { id: conversation.id, archived: true },
+      {
+        onSuccess: () => {
+          navigate("/", { replace: true });
+          showArchivedToast();
+        },
+      },
+    );
+  };
+
+  const mainItems = (
+    <>
+      <DropdownMenuItem
+        data-testid="header-pin-conversation"
+        onSelect={() => togglePinned.mutate({ id: conversation.id, pinned: !isPinned })}
+      >
+        {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
+        {isPinned ? "Unpin" : "Pin"}
+      </DropdownMenuItem>
+      {canShare && (
+        <DropdownMenuItem
+          data-testid="header-share-conversation"
+          disabled={shareDisabled}
+          title={shareDisabledReason}
+          onSelect={shareDisabled ? undefined : onShare}
+        >
+          <ShareIcon className="size-3.5" />
+          Share
+        </DropdownMenuItem>
+      )}
+      {hasAgentInfo && onAgentInfo && (
+        <DropdownMenuItem data-testid="header-agent-info" onSelect={onAgentInfo}>
+          <InfoIcon className="size-3.5" />
+          Agent info
+        </DropdownMenuItem>
+      )}
+      <DropdownMenuItem
+        data-testid="header-rename-conversation"
+        onSelect={() => setRenameOpen(true)}
+      >
+        <PencilIcon className="size-3.5" />
+        Rename
+      </DropdownMenuItem>
+      <DropdownMenuItem
+        data-testid="header-mark-unread-conversation"
+        onSelect={() => markConversationUnread(conversation.id, conversation.updated_at)}
+      >
+        <MailIcon className="size-3.5" />
+        Mark as unread
+      </DropdownMenuItem>
+      {isMobile ? (
+        <DropdownMenuItem
+          data-testid="header-move-to-project"
+          className="whitespace-nowrap"
+          onSelect={(event) => {
+            event.preventDefault();
+            setProjectPickerOpen(true);
+          }}
+        >
+          <FolderInputIcon className="size-3.5" />
+          {currentProject ? "Move session" : "Add to project"}
+        </DropdownMenuItem>
+      ) : (
+        <DropdownMenuSub>
+          <DropdownMenuSubTrigger
+            data-testid="header-move-to-project"
+            className="whitespace-nowrap"
+          >
+            <FolderInputIcon className="size-3.5" />
+            {currentProject ? "Move session" : "Add to project"}
+          </DropdownMenuSubTrigger>
+          <DropdownMenuSubContent className="min-w-56">
+            <ProjectPicker currentProject={currentProject} onSelect={handleProjectSelect} />
+          </DropdownMenuSubContent>
+        </DropdownMenuSub>
+      )}
+      <DropdownMenuSeparator />
+      <DropdownMenuItem data-testid="header-archive-conversation" onSelect={archiveConversation}>
+        <ArchiveIcon className="size-3.5" />
+        Archive
+      </DropdownMenuItem>
+      <DropdownMenuItem
+        data-testid="header-delete-conversation"
+        variant="destructive"
+        onSelect={() => setDeleteOpen(true)}
+      >
+        <Trash2Icon className="size-3.5" />
+        Delete
+      </DropdownMenuItem>
+    </>
+  );
+
+  return (
+    <>
+      <DropdownMenu
+        open={menuOpen}
+        onOpenChange={(open) => {
+          setMenuOpen(open);
+          if (!open) setProjectPickerOpen(false);
+        }}
+      >
+        <DropdownMenuTrigger asChild>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            aria-label="Conversation actions"
+            data-testid="header-conversation-actions"
+            className="shrink-0 border-none text-muted-foreground hover:text-foreground"
+          >
+            <EllipsisVerticalIcon className="size-3.5" />
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="start" className="min-w-56">
+          {isMobile && projectPickerOpen ? (
+            <>
+              <DropdownMenuItem
+                data-testid="header-project-picker-back"
+                onSelect={(event) => {
+                  event.preventDefault();
+                  setProjectPickerOpen(false);
+                }}
+              >
+                <ChevronLeftIcon className="size-3.5" />
+                Back
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <ProjectPicker currentProject={currentProject} onSelect={handleProjectSelect} />
+            </>
+          ) : (
+            mainItems
+          )}
+        </DropdownMenuContent>
+      </DropdownMenu>
+
+      <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
+        <DialogContent>
+          <form onSubmit={submitRename}>
+            <DialogHeader>
+              <DialogTitle>Rename session</DialogTitle>
+              <DialogDescription>Choose a short name that is easy to find later.</DialogDescription>
+            </DialogHeader>
+            <input
+              autoFocus
+              aria-label="Session name"
+              data-testid="header-rename-conversation-input"
+              value={renameTitle}
+              onChange={(event) => setRenameTitle(event.target.value)}
+              onKeyDown={(event: KeyboardEvent<HTMLInputElement>) => {
+                if (event.key === "Escape") setRenameOpen(false);
+              }}
+              className="mt-4 h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/50"
+            />
+            <DialogFooter className="mt-4 border-t-0 bg-transparent">
+              <Button type="button" variant="ghost" onClick={() => setRenameOpen(false)}>
+                Cancel
+              </Button>
+              <Button type="submit" disabled={!renameTitle.trim() || rename.isPending}>
+                Rename
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={deleteOpen}
+        onOpenChange={(open) => {
+          setDeleteOpen(open);
+          if (!open) setDeleteBranch(false);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Delete conversation?</DialogTitle>
+            <DialogDescription>
+              <span className="font-medium break-all">{label}</span> and all of its history will be
+              removed. This cannot be undone.
+            </DialogDescription>
+          </DialogHeader>
+          {gitBranch !== null && (
+            <div className="flex flex-col gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-3">
+              <p className="text-sm text-muted-foreground">
+                Optionally clean up the git worktree. These actions are{" "}
+                <span className="font-semibold text-destructive">irreversible</span>.
+              </p>
+              <label className="flex cursor-pointer items-start gap-2 text-ui">
+                <input
+                  type="checkbox"
+                  data-testid="header-delete-branch-checkbox"
+                  checked={deleteBranch}
+                  onChange={(event) => setDeleteBranch(event.target.checked)}
+                  className="mt-0.5 size-4 shrink-0 accent-destructive"
+                />
+                <GitBranchIcon className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
+                <span className="min-w-0">
+                  Delete local branch{" "}
+                  <code className="break-all rounded bg-muted px-1 py-0.5 text-sm">
+                    {gitBranch}
+                  </code>
+                </span>
+              </label>
+            </div>
+          )}
+          <DialogFooter className="border-t-0 bg-transparent">
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={() => setDeleteOpen(false)}
+              disabled={deleteConversation.isPending}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              onClick={confirmDelete}
+              disabled={deleteConversation.isPending}
+            >
+              Delete
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}

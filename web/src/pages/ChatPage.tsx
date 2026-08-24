@@ -57,7 +57,11 @@ import {
   FilePathAwareMessageResponse,
   rendersOnlyWorkedFold,
 } from "@/components/blocks/BlockRenderer";
-import { CompactionMarker, RoutingDecisionCard } from "@/components/blocks/StatusBlocks";
+import {
+  CompactionMarker,
+  ErrorBanner,
+  RoutingDecisionCard,
+} from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
 import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
@@ -1901,20 +1905,16 @@ function MainAgentSurface({
     [streamBubbles],
   );
 
-  // Cmd+Alt+↑/↓ (Ctrl+Alt on win/linux) — guarded so the composer's
-  // own unmodified ArrowUp/Down history-recall still works.
+  // Cmd+Alt+↑/↓ (Ctrl+Alt on win/linux) — the composer's own unmodified
+  // ArrowUp/Down history-recall skips modified arrows, so this fires there too.
   useEffect(() => {
     // globalThis prefix because React's KeyboardEvent is imported above.
     const handler = (e: globalThis.KeyboardEvent) => {
       if (!(e.metaKey || e.ctrlKey) || !e.altKey) return;
       if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
-      const target = e.target;
-      if (
-        target instanceof HTMLElement &&
-        target.closest('textarea, input, [contenteditable="true"]')
-      ) {
-        return;
-      }
+      // Yield to a focused widget that already claimed the chord for its own
+      // list navigation (command palette, mention / slash menus).
+      if (e.defaultPrevented) return;
       e.preventDefault();
       if (e.key === "ArrowUp") nav.goPrev();
       else nav.goNext();
@@ -2990,6 +2990,7 @@ export function JumpToTopButton({
         disabled={jumping}
         onClick={() => void jumpToTop()}
         aria-label="Jump to the first message"
+        componentId="chat.nav.jump_to_top"
         // When hidden (opacity-0 / pointer-events-none) keep the button out of
         // the tab order and the accessibility tree so it can't take focus or be
         // announced while invisible.
@@ -3175,13 +3176,9 @@ export function SandboxFailedIndicator({ status }: { status: SandboxStatus }) {
     <div
       data-testid="sandbox-failed-indicator"
       role="status"
-      className={cn(
-        "mx-auto mb-4 flex w-full items-center justify-center gap-2 px-6 py-1.5 text-destructive text-sm",
-        CHAT_COLUMN_WIDTH,
-      )}
+      className={cn("mx-auto w-full", CHAT_COLUMN_WIDTH)}
     >
-      <AlertTriangleIcon className="size-3.5 shrink-0" aria-hidden />
-      <span>Sandbox launch failed{status.error ? `: ${status.error}` : ""}</span>
+      <ErrorBanner message={status.error ?? ""} source="" code="" title="Sandbox launch failed" />
     </div>
   );
 }
@@ -3248,22 +3245,29 @@ export function ConnectionIndicator({
       return null;
     }
     return (
-      <button
-        type="button"
-        data-testid="disconnected-indicator"
-        onClick={onShowReconnectHelp}
-        className={cn(
-          "mx-auto mb-4 flex w-full items-center justify-center gap-2 px-6 py-1.5 text-sm text-destructive underline-offset-2 hover:underline",
-          CHAT_COLUMN_WIDTH,
-        )}
-      >
-        <WifiOffIcon className="size-3.5 shrink-0" />
-        <span>
-          {liveness.kind === "host_offline"
-            ? "Host is offline — click to reconnect"
-            : "Agent disconnected — click to reconnect"}
-        </span>
-      </button>
+      <div className={cn("mx-auto mb-4 flex w-full justify-center px-6", CHAT_COLUMN_WIDTH)}>
+        {/* Reconnect affordance styled as the destructive error pill (never
+            raw red text). Keeps its own click → reconnect dialog rather than
+            the ErrorBanner's async Retry, since some states need the picker. */}
+        <button
+          type="button"
+          data-testid="disconnected-indicator"
+          onClick={onShowReconnectHelp}
+          className="flex items-center gap-2 rounded-[12px] px-4 py-2 text-sm text-destructive transition-[filter] hover:brightness-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+          style={{
+            background:
+              "color-mix(in srgb, var(--destructive) 4%, var(--app-shell-bg, var(--background)))",
+            border: "1px solid color-mix(in srgb, var(--destructive) 32%, transparent)",
+          }}
+        >
+          <WifiOffIcon className="size-3.5 shrink-0" />
+          <span>
+            {liveness.kind === "host_offline"
+              ? "Host is offline — click to reconnect"
+              : "Agent disconnected — click to reconnect"}
+          </span>
+        </button>
+      </div>
     );
   }
 
@@ -3863,7 +3867,12 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             )}
             {text && (
               <MessageActions>
-                <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
+                <MessageAction
+                  tooltip="Copy"
+                  size="icon-xxs"
+                  onClick={handleCopy}
+                  componentId="chat.message.copy_user"
+                >
                   {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
                 </MessageAction>
               </MessageActions>
@@ -3989,7 +3998,12 @@ function AssistantBubble({
           <div className="flex items-center gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
             {markdownText && (
               <MessageActions>
-                <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
+                <MessageAction
+                  tooltip="Copy"
+                  size="icon-xxs"
+                  onClick={handleCopy}
+                  componentId="chat.message.copy_assistant"
+                >
                   {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
                 </MessageAction>
                 {/* Fork from this response: clone the session with history
@@ -4002,6 +4016,7 @@ function AssistantBubble({
                     size="icon-xxs"
                     data-testid="fork-from-response"
                     onClick={() => forkDialog.openForkDialog({ upToResponseId: bubble.responseId })}
+                    componentId="chat.message.fork"
                   >
                     <GitForkIcon size={14} />
                   </MessageAction>
@@ -4020,8 +4035,12 @@ function AssistantBubble({
         )}
       </Message>
 
-      {bubble.lifecycle === "failed" && (
-        <p className="text-destructive text-sm">Error: {bubble.error}</p>
+      {/* Surface a turn-level failure (a failed send or stream) as the same
+          destructive pill an error block renders — never raw red text. A
+          dropped host connection already carries its own error pill inside the
+          bubble and leaves `bubble.error` null, so this stays hidden there. */}
+      {bubble.lifecycle === "failed" && bubble.error && (
+        <ErrorBanner message={bubble.error} source="" code="" />
       )}
     </>
   );
@@ -4530,27 +4549,133 @@ function SubagentComposerTray({ label }: { label: string }) {
 }
 
 /**
- * Pill above the composer tallying background tasks that are running (a dev
- * server, a background shell, a sub-agent). Independent of the "Working…"
- * shimmer: while the turn is active both show — the shimmer for the turn, the
- * pill for the tally — and once the turn ends the pill carries on alone.
- * Label-only: the count spans shells, sub-agents, and tools, so there's no
- * single terminal to open.
+ * Pill above the composer tallying running background tasks (a dev server, a
+ * background shell, a sub-agent), shown independently of the "Working…" shimmer.
+ *
+ * The tally expands into a card listing each running shell by name: on hover
+ * for a mouse, on tap for touch (which focuses it, so a tap outside closes it
+ * via blur), and on focus for the keyboard. It morphs in place — the same
+ * element tweens width and height to the measured content size at a constant
+ * corner radius (CSS can't animate to an `auto` size), growing upward out of an
+ * absolute layer over a hidden spacer so the composer below never shifts. A
+ * count-only edge (older runner, no per-shell detail) stays a plain tally.
  */
 function BackgroundTaskPill() {
   const bgCount = useChatStore((s) => s.backgroundTaskCount);
+  const bgTasks = useChatStore((s) => s.backgroundTasks);
+  const [open, setOpen] = useState(false);
+  const contentRef = useRef<HTMLDivElement>(null);
+  const [box, setBox] = useState<{ width: number; height: number } | null>(null);
+  const canExpand = bgTasks.length > 0;
+
+  useEffect(() => {
+    if (bgCount <= 0 || !canExpand) setOpen(false);
+  }, [bgCount, canExpand]);
+
+  // Measure the current content so the container tweens to a concrete size in
+  // both dimensions. Re-measured whenever the state or the task list changes.
+  useLayoutEffect(() => {
+    const el = contentRef.current;
+    if (el) setBox({ width: el.offsetWidth, height: el.offsetHeight });
+  }, [open, canExpand, bgCount, bgTasks]);
+
   if (bgCount <= 0) return null;
+
+  const showCard = open && canExpand;
+
   return (
     <div className={cn("mx-auto flex w-full px-1 pb-1.5", CHAT_COLUMN_WIDTH)}>
-      <div
-        role="status"
-        data-testid="background-task-pill"
-        className="flex items-center gap-1.5 rounded-full border border-border bg-card px-3 py-1 text-sm text-muted-foreground shadow-sm"
-      >
-        <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
-        <span>
-          {bgCount} background task{bgCount === 1 ? "" : "s"}
-        </span>
+      <div className="relative">
+        {/* Reserves the collapsed footprint so the absolute, upward-growing
+            card never shoves the composer. */}
+        <div aria-hidden className="invisible px-3 py-1.5 text-sm">
+          <div className="flex items-center gap-1.5 whitespace-nowrap">
+            <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
+            <span>
+              {bgCount} background task{bgCount === 1 ? "" : "s"}
+            </span>
+          </div>
+        </div>
+        <div
+          role="status"
+          data-testid="background-task-pill"
+          aria-label={`${bgCount} background task${bgCount === 1 ? "" : "s"} still running`}
+          tabIndex={canExpand ? 0 : undefined}
+          // Hover opens ONLY for a real mouse. On touch, opening on emulated
+          // hover triggers iOS's "first tap reveals hover, second tap clicks"
+          // heuristic — which swallows the first tap inconsistently. Touch opens
+          // via onClick instead, so the first tap always lands.
+          onPointerEnter={(e) => {
+            if (e.pointerType === "mouse" && canExpand) setOpen(true);
+          }}
+          onPointerLeave={(e) => {
+            if (e.pointerType === "mouse") setOpen(false);
+          }}
+          // Tap/click: open and focus the pill so onBlur can close it on
+          // tap-out (a gesture-driven focus() works even on iOS, where tapping a
+          // non-button element otherwise won't focus it).
+          onClick={(e) => {
+            if (!canExpand) return;
+            setOpen(true);
+            e.currentTarget.focus({ preventScroll: true });
+          }}
+          onFocus={() => canExpand && setOpen(true)}
+          onBlur={(e) => {
+            // Close when focus leaves the pill entirely (tap/click outside,
+            // Tab away); staying open if it moves to a child.
+            if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setOpen(false);
+          }}
+          style={box ? { width: box.width, height: box.height } : undefined}
+          className={cn(
+            "absolute bottom-0 left-0 overflow-hidden rounded-2xl bg-card text-sm shadow-sm ring-1 ring-border transition-[width,height,box-shadow] duration-200 ease-out",
+            showCard && "z-10 shadow-menu",
+          )}
+        >
+          <div
+            ref={contentRef}
+            // Cap at Tailwind's `md` container (28rem/448px), but never wider
+            // than the viewport minus a margin so it can't overflow on a narrow
+            // screen. The margin exceeds the composer's own px-4/px-6 inset (this
+            // pill sits at px-1) so the card's right edge, ring included, stays
+            // inside the composer rather than overhanging it.
+            style={
+              showCard ? { maxWidth: "min(var(--container-md, 28rem), 100vw - 3rem)" } : undefined
+            }
+            className={cn("w-max text-left", showCard ? "px-3 py-2" : "px-3 py-1.5")}
+          >
+            {showCard ? (
+              <ul className="flex animate-in flex-col gap-1.5 fade-in-0 duration-200">
+                {bgTasks.map((task, i) => {
+                  const label = task.description || task.command || "Background shell";
+                  const cmd = task.command && task.command !== label ? task.command : null;
+                  return (
+                    <li key={task.id ?? i} className="flex items-start gap-2">
+                      <SquareTerminalIcon
+                        className="mt-0.5 size-3.5 shrink-0 text-muted-foreground"
+                        aria-hidden="true"
+                      />
+                      <div className="min-w-0">
+                        <div className="truncate text-foreground">{label}</div>
+                        {cmd ? (
+                          <div className="truncate font-mono text-xs text-muted-foreground">
+                            {cmd}
+                          </div>
+                        ) : null}
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            ) : (
+              <div className="flex items-center gap-1.5 whitespace-nowrap text-muted-foreground">
+                <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
+                <span>
+                  {bgCount} background task{bgCount === 1 ? "" : "s"}
+                </span>
+              </div>
+            )}
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -5730,6 +5855,7 @@ export function Composer({
               disabled={disabled || isReadOnly || hasPendingElicitation}
               onClick={() => fileInputRef.current?.click()}
               title="Attach files"
+              componentId="chat.composer.attach_files"
             >
               <PaperclipIcon className="size-4" data-icon-size="16" />
               <span className="sr-only">Attach files</span>
@@ -5780,6 +5906,7 @@ export function Composer({
                     data-testid="codex-plan-mode-toggle"
                     data-active={codexPlanMode ? "true" : undefined}
                     onClick={() => void toggleCodexPlanMode()}
+                    componentId="chat.composer.toggle_plan_mode"
                   >
                     {planModeBusy ? (
                       <Loader2Icon className="size-3.5 animate-spin" />
@@ -6379,6 +6506,33 @@ function SessionConfigModal({
   // drafted model, else the "Default" sentinel (no override).
   const modelValue = draftRoutingOn ? MODEL_SELECT_SMART : (draftModelId ?? MODEL_SELECT_DEFAULT);
 
+  // Codex advertises a per-model effort ladder, so the dropdown must follow the
+  // DRAFTED model, not the committed one the parent computed — else picking
+  // Luna still lists Sol's "ultra". "Default" (null) resolves to the catalog
+  // default; non-codex harnesses use a model-independent ladder, so keep the
+  // parent's list.
+  const draftEffortLevels = useMemo(() => {
+    if (modelPickerKind !== "codex") return effortLevels;
+    const modelForEffort =
+      draftModelId ?? codexModelOptions.find((o) => o.isDefault)?.id ?? llmModel;
+    const levels = codexEffortLevelsForModel(codexModelOptions, modelForEffort);
+    return levels.length > 0 ? levels : effortLevels;
+  }, [modelPickerKind, codexModelOptions, draftModelId, llmModel, effortLevels]);
+
+  // Drop a picked level the newly-drafted model doesn't offer (Sol's "ultra"
+  // when switching to Luna) so no stale rung shows and Save never submits a
+  // level the model rejects.
+  const clampDraftEffortToModel = (modelId: string | null) => {
+    if (modelPickerKind !== "codex") return;
+    setDraftEffort((prev) => {
+      if (prev === null) return null;
+      const modelForEffort = modelId ?? codexModelOptions.find((o) => o.isDefault)?.id ?? llmModel;
+      return codexEffortLevelsForModel(codexModelOptions, modelForEffort).includes(prev)
+        ? prev
+        : null;
+    });
+  };
+
   const onModelChange = (value: string) => {
     if (value === MODEL_SELECT_SMART) {
       setDraftRoutingOn(true);
@@ -6389,10 +6543,12 @@ function SessionConfigModal({
     } else if (value === MODEL_SELECT_DEFAULT) {
       setDraftModelId(null);
       setDraftRoutingOn(false);
+      clampDraftEffortToModel(null);
     } else {
       // Pinning a model turns routing off (mutually exclusive).
       setDraftModelId(value);
       setDraftRoutingOn(false);
+      clampDraftEffortToModel(value);
     }
   };
 
@@ -6512,6 +6668,7 @@ function SessionConfigModal({
                     : undefined
                 }
                 activeModelId={draftModelId}
+                componentId="chat.composer.model"
               />
             </ConfigRow>
           )}
@@ -6524,6 +6681,8 @@ function SessionConfigModal({
                 value={draftRoutingOn ? "" : (draftEffort ?? EFFORT_SELECT_NONE)}
                 onValueChange={(v) => setDraftEffort(v === EFFORT_SELECT_NONE ? null : v)}
                 disabled={draftRoutingOn}
+                componentId="chat.composer.effort"
+                valueHasNoPii
               >
                 <SelectTrigger
                   className="w-full"
@@ -6538,7 +6697,7 @@ function SessionConfigModal({
                   className="w-(--radix-select-trigger-width)"
                 >
                   <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
-                  {effortLevels.map((level) => (
+                  {draftEffortLevels.map((level) => (
                     <SelectItem
                       key={level}
                       value={level}
@@ -6558,7 +6717,12 @@ function SessionConfigModal({
               footer in some pane states, and a guess would misreport it. */}
           {showClaudePermissionMode && claudePermissionMode !== "" && (
             <ConfigRow label="Permissions" description="How much Claude asks before acting">
-              <Select value={draftPermissionMode} onValueChange={setDraftPermissionMode}>
+              <Select
+                value={draftPermissionMode}
+                onValueChange={setDraftPermissionMode}
+                componentId="chat.composer.permission_mode"
+                valueHasNoPii
+              >
                 <SelectTrigger
                   className="w-full"
                   data-testid="composer-config-permission-mode"
@@ -6596,6 +6760,8 @@ function SessionConfigModal({
               <Select
                 value={subagentRoutingValue}
                 onValueChange={(v) => setPickedSubagentRouting(v === "on" ? "on" : "off")}
+                componentId="chat.composer.subagent_routing"
+                valueHasNoPii
               >
                 <SelectTrigger
                   className="w-full"

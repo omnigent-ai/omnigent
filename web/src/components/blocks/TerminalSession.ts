@@ -134,12 +134,19 @@ export type ConnectionState =
  * Transport-shaped closes happen *to* the connection rather than
  * being decided by either end's terminal logic:
  *
- * - 1006: abnormal closure, no close frame. The classic background-tab
- *   case — the tab freezes, buffered output stalls the socket, the
- *   server's keepalive ping times out, and the browser discovers a
- *   dead TCP connection on thaw.
+ * - 1005 / 1006: the browser's own "closed without a clean app code"
+ *   sentinels — 1005 is "no status code" (a Close frame with an empty
+ *   payload, e.g. a fronting proxy collapsing the close of a backend
+ *   that went away), 1006 is "no close frame at all" (a dead TCP
+ *   connection discovered on tab thaw). Neither is a code any endpoint
+ *   sets deliberately, so both are always a transport drop. A server
+ *   redeploy behind an ingress surfaces as 1005 here.
  * - 1001: "going away" — a server or proxy restarting.
  * - 1012 / 1013: service restart / try again later.
+ * - 1011 / 1014: server internal error / bad gateway — the fronting
+ *   proxy (e.g. Databricks Apps) emits these while the backend is
+ *   mid-restart. The app's OWN internal error is the explicit 4500, so
+ *   a raw 1011/1014 is infrastructure, not a deliberate terminal end.
  *
  * Pure helper — exported for direct unit testing.
  *
@@ -149,7 +156,15 @@ export type ConnectionState =
  *     reconnect attempt is appropriate.
  */
 export function isUnexpectedTerminalClose(code: number): boolean {
-  return code === 1001 || code === 1006 || code === 1012 || code === 1013;
+  return (
+    code === 1001 ||
+    code === 1005 ||
+    code === 1006 ||
+    code === 1011 ||
+    code === 1012 ||
+    code === 1013 ||
+    code === 1014
+  );
 }
 
 /** Listener for `ConnectionState` transitions. */
