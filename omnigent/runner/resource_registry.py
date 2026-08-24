@@ -12,6 +12,7 @@ See ``designs/SESSION_RESOURCES_API_DESIGN.md`` §Runner internal model.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import os
 import re
@@ -38,6 +39,11 @@ from omnigent.entities.session_resources import (
     terminal_resource_view,
 )
 from omnigent.inner.sandbox import contained_realpath, containment_prefix
+from omnigent.session_directories import (
+    DEFAULT_DIRECTORY_ID,
+    SessionDirectory,
+    validate_session_directories,
+)
 
 if TYPE_CHECKING:
     from omnigent.claude_native_status_file import SessionStatusPoller
@@ -347,6 +353,7 @@ class SessionResourceRegistry:
         self._runner_workspace = runner_workspace
         self._per_session_workspace = per_session_workspace
         self._primary_envs: dict[str, OSEnvironment] = {}
+        self._session_directories: dict[str, tuple[SessionDirectory, ...]] = {}
         self._terminal_roles: dict[tuple[str, str], str] = {}
         self._terminal_lifecycles: dict[tuple[str, str], TerminalLifecycle] = {}
         self._is_alive_cache: TTLCache[str, bool] = TTLCache(
@@ -394,6 +401,47 @@ class SessionResourceRegistry:
         # instead of polling. Entries self-remove on completion.
         self._terminal_exit_tasks: set[asyncio.Task[None]] = set()
         self._terminal_exit_scheduled: asyncio.Event = asyncio.Event()
+
+    def configure_session_directories(
+        self,
+        session_id: str,
+        directories: tuple[SessionDirectory, ...],
+    ) -> None:
+        """Register the immutable project roots for a session.
+
+        Configuration must happen before the primary environment is
+        materialized. A changed set therefore requires a session relaunch.
+        """
+        values = validate_session_directories(directories)
+        with self._lock:
+            existing = self._session_directories.get(session_id)
+            if existing is not None and existing != values:
+                raise ValueError("session directory changes require a relaunch")
+            primary = self._primary_envs.get(session_id)
+            if primary is not None and existing != values:
+                # Legacy callers may materialize the environment before the
+                # first session snapshot is fetched. Registering that same cwd
+                # as the sole default directory is metadata-only: it neither
+                # changes the environment cwd nor adds sandbox roots.
+                is_matching_legacy_default = (
+                    len(values) == 1
+                    and values[0].id == DEFAULT_DIRECTORY_ID
+                    and Path(values[0].path).resolve() == primary.cwd.resolve()
+                )
+                if not is_matching_legacy_default:
+                    raise ValueError("session directory changes require a relaunch")
+            self._session_directories[session_id] = values
+
+    def session_directories(self, session_id: str) -> tuple[SessionDirectory, ...]:
+        """Return configured roots in stable session order."""
+        with self._lock:
+            return self._session_directories.get(session_id, ())
+
+    def _configured_default_root(self, session_id: str) -> str | None:
+        for directory in self._session_directories.get(session_id, ()):
+            if directory.id == DEFAULT_DIRECTORY_ID:
+                return directory.path
+        return None
 
     def set_terminal_activity_publisher(
         self,
@@ -789,11 +837,23 @@ class SessionResourceRegistry:
         from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
         from omnigent.inner.os_env import create_os_environment
 
+        configured = self._session_directories.get(session_id)
+        configured_default = self._configured_default_root(session_id)
+
+        # Prefer the session's stable default directory. A scoped child with
+        # roots but no ``default`` starts in private scratch so it does not
+        # regain access to its parent's primary cwd through runner affinity.
+        if configured_default is not None:
+            default_cwd = configured_default
+        elif configured is not None:
+            default_cwd = _session_workspace(session_id)
+            os.makedirs(default_cwd, mode=0o700, exist_ok=True)
+            os.chmod(default_cwd, 0o700)
         # Prefer the CLI launch workspace so that the OS environment
         # cwd matches the filesystem-registry watch path.  Fall back
         # to the per-session temp dir for remote/cloud runners that
         # have no workspace affinity.
-        if self._runner_workspace is not None:
+        elif self._runner_workspace is not None:
             if self._per_session_workspace:
                 # Isolate sessions under the shared workspace.
                 default_cwd = _contained_session_dir(self._runner_workspace, session_id)
@@ -818,17 +878,32 @@ class SessionResourceRegistry:
             # Otherwise the spec's absolute cwd wins; otherwise we
             # fall back to the per-session tmpdir (default_cwd).
             if (
-                self._runner_workspace is not None
+                configured is not None
+                or self._runner_workspace is not None
                 or spec_os_env.cwd is None
                 or spec_os_env.cwd in (".", "./")
             ):
                 cwd = default_cwd
             else:
                 cwd = spec_os_env.cwd
+            additional_roots = [
+                directory.path for directory in configured or () if directory.path != cwd
+            ]
+            sandbox_spec = spec_os_env.sandbox
+            if sandbox_spec is not None and additional_roots:
+                sandbox_spec = dataclasses.replace(
+                    sandbox_spec,
+                    read_paths=list(
+                        dict.fromkeys([*(sandbox_spec.read_paths or []), *additional_roots])
+                    ),
+                    write_paths=list(
+                        dict.fromkeys([*(sandbox_spec.write_paths or []), *additional_roots])
+                    ),
+                )
             effective_spec = OSEnvSpec(
                 type=spec_os_env.type,
                 cwd=cwd,
-                sandbox=spec_os_env.sandbox,
+                sandbox=sandbox_spec,
                 fork=spec_os_env.fork,
                 start_in_scratch=spec_os_env.start_in_scratch,
             )
@@ -889,6 +964,13 @@ class SessionResourceRegistry:
             spec_os_env = getattr(agent_spec, "os_env", None)
             if spec_os_env is None:
                 return None
+
+        configured = self._session_directories.get(session_id)
+        configured_default = self._configured_default_root(session_id)
+        if configured_default is not None:
+            return str(Path(configured_default).resolve())
+        if configured is not None:
+            return str(Path(_session_workspace(session_id)).resolve())
 
         # Runner workspace wins when set. Per-session subdirectory
         # isolation is preserved so concurrent sessions
@@ -1600,6 +1682,7 @@ class SessionResourceRegistry:
         self._take_session_status_memo(session_id)
         with self._lock:
             primary = self._primary_envs.pop(session_id, None)
+            self._session_directories.pop(session_id, None)
             stale_role_keys = [key for key in self._terminal_roles if key[0] == session_id]
             for key in stale_role_keys:
                 self._terminal_roles.pop(key, None)

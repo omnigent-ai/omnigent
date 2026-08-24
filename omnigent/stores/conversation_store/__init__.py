@@ -13,6 +13,7 @@ from omnigent.entities import (
     NewConversationItem,
     PagedList,
 )
+from omnigent.session_directories import SessionDirectory
 from omnigent.session_import import IMPORT_PROVENANCE_LABEL_KEYS
 
 # Label set on a fork of a session that had a working directory. Its
@@ -343,6 +344,7 @@ class ConversationStore(ABC):
         sub_agent_name: str | None = None,
         host_id: str | None = None,
         workspace: str | None = None,
+        directories: tuple[SessionDirectory, ...] = (),
         git_branch: str | None = None,
         terminal_launch_args: list[str] | None = None,
         conversation_id: str | None = None,
@@ -388,6 +390,8 @@ class ConversationStore(ABC):
             the canonicalized realpath returned by ``host.stat``;
             this method does no path expansion. When a git worktree
             was created, this is the worktree directory path.
+        :param directories: Stable project roots attached to this
+            session. Empty preserves the legacy workspace-only shape.
         :param git_branch: Git branch checked out in the session's
             worktree, e.g. ``"feature/login"``. Set only when the
             session was created with a server-created worktree;
@@ -1311,7 +1315,8 @@ class ConversationStore(ABC):
     def clear_host_binding(self, conversation_id: str) -> Conversation:
         """
         Revert a session to fully unbound: NULL ``host_id``,
-        ``workspace``, ``git_branch``, and ``runner_id`` together.
+        ``workspace``, ``directories``, ``git_branch``, and
+        ``runner_id`` together.
 
         Used to undo a failed per-session bind (``POST
         /v1/hosts/{id}/runners``) after the runner was atomically
@@ -1383,6 +1388,9 @@ class ConversationStore(ABC):
             existing row has ``workspace=NULL`` (DB constraint
             ``ck_conversations_workspace_required_for_host``).
             ``None`` leaves the workspace untouched.
+            When provided, the stored ``default`` directory is updated
+            atomically to the same path while additional roots retain
+            their stable ids.
         :param git_branch: Optional git branch checked out in a
             server-created worktree, e.g. ``"feature/login"``. Set
             when binding an existing session to a freshly created
@@ -1393,6 +1401,26 @@ class ConversationStore(ABC):
             with ``conversation_id`` exists.
         """
         ...
+
+    @abstractmethod
+    def set_directory_nickname(
+        self,
+        conversation_id: str,
+        directory_id: str,
+        nickname: str | None,
+    ) -> Conversation:
+        """Persist or clear one attached directory's display nickname.
+
+        :param conversation_id: Session/conversation identifier.
+        :param directory_id: Stable attached-directory id.
+        :param nickname: Normalized nickname, or ``None`` to restore the
+            default display name.
+        :returns: The updated :class:`Conversation`.
+        :raises ConversationNotFoundError: If the conversation does not exist.
+        :raises ValueError: If the directory is not attached or the nickname
+            is invalid.
+        """
+        raise NotImplementedError
 
     @abstractmethod
     def set_external_session_id(
@@ -1442,6 +1470,7 @@ class ConversationStore(ABC):
         labels: dict[str, str] | None = None,
         reasoning_effort: str | None = None,
         workspace: str | None = None,
+        directories: tuple[SessionDirectory, ...] = (),
         terminal_launch_args: list[str] | None = None,
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
@@ -1471,6 +1500,7 @@ class ConversationStore(ABC):
         :param workspace: Optional starting cwd to record on the
             session, e.g. ``"/Users/corey/projects/myapp"``.
             ``None`` leaves the column NULL.
+        :param directories: Stable project roots visible to the session.
         :param terminal_launch_args: Optional pass-through CLI args
             for a native terminal wrapper (claude / codex), e.g.
             ``["--dangerously-skip-permissions"]``. ``None`` leaves

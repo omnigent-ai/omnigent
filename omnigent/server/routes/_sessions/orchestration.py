@@ -64,7 +64,10 @@ from omnigent.policies.types import (
     PolicyResult,
 )
 from omnigent.runner.routing import RunnerRouter
-from omnigent.runner.session_init_protocol import build_runner_session_init_payload
+from omnigent.runner.session_init_protocol import (
+    SESSION_INIT_PROTOCOL_VERSION,
+    build_runner_session_init_payload,
+)
 from omnigent.runner.subagent_routing import (
     ROUTING_DECISION_LABEL_KEY,
     auto_harness_session,
@@ -294,6 +297,7 @@ from omnigent.server.routes._sessions.helpers import (
     _spec_harness,
     _stop_session_via_runner,
     _usage_by_model_for_display,
+    _validate_session_directory,
     _validate_session_workspace,
     _validate_terminal_launch_args,
     _validated_cost_control_mode_override,
@@ -323,6 +327,11 @@ from omnigent.server.schemas import (
     SessionStatusEvent,
     SessionUsageEvent,
     SkillSummary,
+)
+from omnigent.session_directories import (
+    DEFAULT_DIRECTORY_ID,
+    build_session_directories,
+    select_session_directories,
 )
 from omnigent.session_lifecycle import (
     labels_with_closed_status,
@@ -859,6 +868,7 @@ def _build_session_list_item(
             else pending_count
         ),
         workspace=conv.workspace,
+        directories=[directory.as_dict() for directory in conv.directories],
         git_branch=conv.git_branch,
         archived=conv.archived,
         comments_count=comments_fingerprint.count if comments_fingerprint else 0,
@@ -1118,6 +1128,7 @@ def _build_session_response(
         # (their message is already persisted into ``items``).
         pending_inputs=pending_inputs.snapshot_for(conv.id),
         workspace=conv.workspace,
+        directories=[directory.as_dict() for directory in conv.directories],
         git_branch=conv.git_branch,
         archived=conv.archived,
         # Replay the latest todo list for claude-native sessions.
@@ -3684,7 +3695,7 @@ async def _ensure_runner_session_initialized(
             return False
         return bool(
             isinstance(payload, dict)
-            and payload.get("session_init_protocol_version") == 2
+            and payload.get("session_init_protocol_version") == SESSION_INIT_PROTOCOL_VERSION
             and payload.get("terminal_ready") is True
         )
     except (httpx.HTTPError, ConnectionError) as exc:
@@ -7867,6 +7878,7 @@ async def _create_session_from_existing_agent(
     # otherwise a forged parent link lets them inherit runner
     # bindings and establish a parent-child relationship with a
     # session they don't control.
+    parent_conv: Conversation | None = None
     if body.parent_session_id is not None:
         await _require_access(
             user_id,
@@ -7875,6 +7887,11 @@ async def _create_session_from_existing_agent(
             permission_store,
             conversation_store,
         )
+        parent_conv = await asyncio.to_thread(
+            conversation_store.get_conversation, body.parent_session_id
+        )
+        if parent_conv is None:
+            raise _session_not_found()
 
     # Reject an undeclared sub-agent before persisting the row. Downstream
     # spec swaps are all guarded by ``if ... is not None`` with no
@@ -8022,20 +8039,13 @@ async def _create_session_from_existing_agent(
     # Inherit runner affinity from the parent session so the child
     # is assigned to the same runner (sub-agent co-location).
     inherited_runner_id: str | None = None
-    if body.parent_session_id is not None:
-        parent_conv = conversation_store.get_conversation(body.parent_session_id)
-        if parent_conv is not None:
-            inherited_runner_id = parent_conv.runner_id
-            # Defense-in-depth: don't inherit a runner the
-            # caller doesn't own.
-            if (
-                inherited_runner_id is not None
-                and user_id is not None
-                and runner_router is not None
-            ):
-                runner_owner = runner_router.runner_owner(inherited_runner_id)
-                if runner_owner is not None and runner_owner != user_id:
-                    inherited_runner_id = None
+    if parent_conv is not None:
+        inherited_runner_id = parent_conv.runner_id
+        # Defense-in-depth: don't inherit a runner the caller doesn't own.
+        if inherited_runner_id is not None and user_id is not None and runner_router is not None:
+            runner_owner = runner_router.runner_owner(inherited_runner_id)
+            if runner_owner is not None and runner_owner != user_id:
+                inherited_runner_id = None
 
     # Workspace validation: if the caller is binding to a host,
     # they must also pass a workspace, and the workspace must
@@ -8044,8 +8054,9 @@ async def _create_session_from_existing_agent(
     # create_conversation so a bad workspace never produces a row.
     # With git worktree creation, the validated path is the source
     # repo; the worktree it produces becomes the stored workspace.
-    canonical_workspace: str | None = body.workspace
-    if body.host_id is not None:
+    canonical_workspace: str | None = None if body.host_type == "managed" else body.workspace
+    canonical_additional_paths = [directory.path for directory in body.directories]
+    if body.host_id is not None and parent_conv is None:
         canonical_workspace = await _validate_session_workspace(
             user_id=user_id,
             host_id=body.host_id,
@@ -8053,6 +8064,19 @@ async def _create_session_from_existing_agent(
             agent=agent,
             agent_cache=agent_cache,
             request=request,
+        )
+        canonical_additional_paths = list(
+            await asyncio.gather(
+                *(
+                    _validate_session_directory(
+                        user_id=user_id,
+                        host_id=body.host_id,
+                        directory=directory.path,
+                        request=request,
+                    )
+                    for directory in body.directories
+                )
+            )
         )
 
     # Git worktree options (optional). Two modes on body.git:
@@ -8089,6 +8113,43 @@ async def _create_session_from_existing_agent(
             canonical_workspace = created_worktree.worktree_path
             git_branch = created_worktree.branch
             created_worktree_path = created_worktree.worktree_path
+
+    try:
+        if parent_conv is not None:
+            session_directories = select_session_directories(
+                parent_conv.directories,
+                body.directory_ids,
+            )
+            default_directory = next(
+                (
+                    directory
+                    for directory in session_directories
+                    if directory.id == DEFAULT_DIRECTORY_ID
+                ),
+                None,
+            )
+            canonical_workspace = default_directory.path if default_directory is not None else None
+        else:
+            session_directories = build_session_directories(
+                canonical_workspace,
+                canonical_additional_paths,
+                requested_additional_paths=(directory.path for directory in body.directories),
+            )
+    except ValueError as exc:
+        if (
+            created_worktree_path is not None
+            and body.host_id is not None
+            and git_branch is not None
+        ):
+            await _remove_session_worktree_best_effort(
+                host_id=body.host_id,
+                worktree_path=created_worktree_path,
+                branch=git_branch,
+                delete_branch=True,
+                request=request,
+                reason="create-rollback",
+            )
+        raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
 
     # Native-terminal pass-through args.
     #
@@ -8144,6 +8205,7 @@ async def _create_session_from_existing_agent(
             sub_agent_name=body.sub_agent_name,
             host_id=body.host_id,
             workspace=canonical_workspace,
+            directories=session_directories,
             git_branch=git_branch,
             terminal_launch_args=validated_launch_args,
         )

@@ -157,6 +157,11 @@ from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
     BackgroundSessionTitleResponse,
 )
+from omnigent.session_directories import (
+    SessionDirectory,
+    build_session_directories,
+    validate_session_directories,
+)
 from omnigent.spec.skill_sources import SkillSourceContext, resolve_harness_skills
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
 from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
@@ -706,10 +711,35 @@ class _SessionSnapshot:
     status_code: int | None
     created_at: float
     workspace: str | None
+    directories: tuple[SessionDirectory, ...]
     agent_id: str | None
     sub_agent_name: str | None = None
     parent_session_id: str | None = None
     agent_name: str | None = None
+
+
+def _session_directories_from_wire(
+    raw: object,
+    workspace: str | None,
+) -> tuple[SessionDirectory, ...]:
+    """Parse a session snapshot's stable roots with legacy fallback."""
+    if raw is None:
+        return build_session_directories(workspace)
+    if not isinstance(raw, list):
+        raise ValueError("session directories must be a list")
+    directories: list[SessionDirectory] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ValueError("session directory entries must be objects")
+        directory_id = item.get("id")
+        path = item.get("path")
+        nickname = item.get("nickname")
+        if not isinstance(directory_id, str) or not isinstance(path, str):
+            raise ValueError("session directory entries require string id and path")
+        if nickname is not None and not isinstance(nickname, str):
+            raise ValueError("session directory nickname must be a string or null")
+        directories.append(SessionDirectory(directory_id, path, nickname))
+    return validate_session_directories(directories)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2053,6 +2083,7 @@ def create_runner_app(
     _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
     _session_cursor_model_names: dict[str, dict[str, str]] = {}
+    _session_directories_cache: dict[str, tuple[SessionDirectory, ...]] = {}
     _session_claude_launch_configs: dict[str, ClaudeNativeUcodeConfig | None] = {}
     _session_claude_launch_config_tasks: dict[
         str, asyncio.Task[ClaudeNativeUcodeConfig | None]
@@ -2518,6 +2549,7 @@ def create_runner_app(
             status_code: int | None = None
             created_at: float | None = None
             workspace: str | None = None
+            directories: tuple[SessionDirectory, ...] = ()
             agent_id: str | None = None
             sub_agent_name: str | None = None
             parent_session_id: str | None = None
@@ -2531,6 +2563,9 @@ def create_runner_app(
                     if raw_created is not None:
                         created_at = float(raw_created)
                     workspace = body.get("workspace")
+                    directories = _session_directories_from_wire(
+                        body.get("directories"), workspace
+                    )
                     raw_agent_id = body.get("agent_id")
                     if isinstance(raw_agent_id, str) and raw_agent_id:
                         agent_id = raw_agent_id
@@ -2550,6 +2585,7 @@ def create_runner_app(
                 status_code=status_code,
                 created_at=created_at if created_at is not None else time.time(),
                 workspace=workspace,
+                directories=directories,
                 agent_id=agent_id,
                 sub_agent_name=sub_agent_name,
                 parent_session_id=parent_session_id,
@@ -2567,12 +2603,34 @@ def create_runner_app(
             if not snapshot.ok:
                 return None
             _session_workspace_cache[session_id] = snapshot.workspace
+            _session_directories_cache[session_id] = snapshot.directories
+            if snapshot.directories or snapshot.parent_session_id is not None:
+                resource_registry.configure_session_directories(session_id, snapshot.directories)
         return _session_workspace_cache.get(session_id)
+
+    async def _session_directory_values(
+        session_id: str,
+    ) -> tuple[SessionDirectory, ...]:
+        """Return and configure immutable roots for one session."""
+        if session_id not in _session_directories_cache:
+            snapshot = await _session_snapshot(session_id)
+            if not snapshot.ok:
+                return ()
+            _session_workspace_cache[session_id] = snapshot.workspace
+            _session_directories_cache[session_id] = snapshot.directories
+            if snapshot.directories or snapshot.parent_session_id is not None:
+                resource_registry.configure_session_directories(session_id, snapshot.directories)
+        return _session_directories_cache[session_id]
 
     async def _session_runtime_cwd(session_id: str) -> Path | None:
         workspace = await _session_workspace_value(session_id)
         if workspace and workspace.strip():
             return Path(workspace.strip()).expanduser().resolve()
+        directories = await _session_directory_values(session_id)
+        snapshot = await _session_snapshot(session_id)
+        if directories or snapshot.parent_session_id is not None:
+            root = resource_registry.compute_default_env_root(session_id, None)
+            return Path(root).resolve() if root is not None else None
         return runner_workspace.resolve() if runner_workspace is not None else None
 
     async def _load_legacy_session_init_context() -> _SessionInitContext:
@@ -2596,12 +2654,24 @@ def create_runner_app(
             status_code=200,
             created_at=float(snapshot.created_at),
             workspace=snapshot.workspace,
+            directories=tuple(
+                SessionDirectory(directory.id, directory.path, directory.nickname)
+                for directory in snapshot.directories
+            ),
             agent_id=agent_id,
             sub_agent_name=envelope.sub_agent_name,
             parent_session_id=snapshot.parent_session_id,
         )
         _session_start_cache[session_id] = float(snapshot.created_at)
         _session_workspace_cache[session_id] = snapshot.workspace
+        _session_directories_cache[session_id] = tuple(
+            SessionDirectory(directory.id, directory.path, directory.nickname)
+            for directory in snapshot.directories
+        )
+        if _session_directories_cache[session_id] or snapshot.parent_session_id is not None:
+            resource_registry.configure_session_directories(
+                session_id, _session_directories_cache[session_id]
+            )
         if envelope.sub_agent_name:
             _session_sub_agent_names[session_id] = envelope.sub_agent_name
         _session_init_envelopes[session_id] = (time.monotonic(), envelope)
@@ -3548,6 +3618,7 @@ def create_runner_app(
         _drop_session_claude_launch_config(session_id)
         _session_start_cache.pop(session_id, None)
         _session_workspace_cache.pop(session_id, None)
+        _session_directories_cache.pop(session_id, None)
         _session_snapshot_cache.pop(session_id, None)
         _session_snapshot_locks.pop(session_id, None)
         _session_init_envelopes.pop(session_id, None)
@@ -8694,6 +8765,9 @@ def create_runner_app(
         # fetch is re-resolved lazily by _session_workspace_value.
         if snapshot.ok:
             _session_workspace_cache[session_id] = snapshot.workspace
+            _session_directories_cache[session_id] = snapshot.directories
+            if snapshot.directories or snapshot.parent_session_id is not None:
+                resource_registry.configure_session_directories(session_id, snapshot.directories)
 
     async def _resolve_session_spec_entry(session_id: str) -> _SpecEntry | None:
         if session_id in _session_spec_cache:

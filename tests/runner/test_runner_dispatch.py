@@ -3160,6 +3160,7 @@ async def test_sys_session_send_model_lands_in_child_create_body(
                         "args": {
                             "input": "fix the auth bug",
                             "model": model,
+                            "directory_ids": [],
                         },
                     }
                 ),
@@ -3178,6 +3179,7 @@ async def test_sys_session_send_model_lands_in_child_create_body(
     # server persists and the harness launch consumes.
     assert len(create_bodies) == 1, "fresh named send must create exactly one child"
     assert create_bodies[0]["model_override"] == model
+    assert create_bodies[0]["directory_ids"] == []
     assert create_bodies[0]["sub_agent_name"] == "worker"
 
 
@@ -3258,18 +3260,28 @@ async def test_sys_session_send_blocks_fresh_dispatch_when_harness_cli_missing(
 
 
 @pytest.mark.asyncio
-async def test_sys_session_send_model_rejected_for_existing_child(
+@pytest.mark.parametrize(
+    ("create_only_args", "field"),
+    [
+        ({"model": "claude-opus-4-8"}, "model"),
+        ({"directory_ids": []}, "directory_ids"),
+    ],
+)
+async def test_sys_session_send_create_only_args_rejected_for_existing_child(
     monkeypatch: pytest.MonkeyPatch,
+    create_only_args: dict[str, Any],
+    field: str,
 ) -> None:
     """
-    Passing ``model`` on a continuation send fails loud, sends nothing.
+    Passing create-time metadata on a continuation fails loud, sends nothing.
 
-    A native child bakes ``--model`` in at terminal launch, so applying
-    a new model to an existing session would be silently ignored. The
-    tool must return an actionable error (continue without ``model`` or
-    close and respawn) instead of continuing on the wrong model.
+    Models and directory scopes are fixed at launch. The tool must return
+    an actionable error (continue without the field or close and respawn)
+    instead of silently ignoring a requested change.
 
     :param monkeypatch: Pytest monkeypatch fixture.
+    :param create_only_args: Metadata that cannot change after launch.
+    :param field: Field name expected in the actionable error.
     """
     from omnigent.runner import app as runner_app
     from omnigent.runner.tool_dispatch import execute_tool
@@ -3320,7 +3332,7 @@ async def test_sys_session_send_model_rejected_for_existing_child(
                     {
                         "agent": "worker",
                         "title": "fix-auth",
-                        "args": {"input": "continue", "model": "claude-opus-4-8"},
+                        "args": {"input": "continue", **create_only_args},
                     }
                 ),
                 server_client=server_client,
@@ -3332,22 +3344,33 @@ async def test_sys_session_send_model_rejected_for_existing_child(
             runner_app._session_inboxes_ref.pop("conv_parent_model_cont", None)
 
     assert output.startswith("Error:"), output
+    assert field in output
     # The error must name the existing session and the recovery paths.
     assert "conv_existing_model" in output
     assert "sys_session_close" in output
-    # No write happened: the wrong-model continuation never started.
+    # No write happened: the invalid continuation never started.
     assert create_posts == 0
     assert event_posts == 0
 
 
 @pytest.mark.asyncio
-async def test_sys_session_send_model_rejected_in_by_id_mode() -> None:
+@pytest.mark.parametrize(
+    ("create_only_args", "field"),
+    [
+        ({"model": "claude-opus-4-8"}, "model"),
+        ({"directory_ids": []}, "directory_ids"),
+    ],
+)
+async def test_sys_session_send_create_only_args_rejected_in_by_id_mode(
+    create_only_args: dict[str, Any],
+    field: str,
+) -> None:
     """
-    ``model`` plus ``session_id`` fails loud before any server call.
+    Create-time metadata plus ``session_id`` fails before any server call.
 
-    By-id mode always targets an existing session, where a model
-    override cannot take effect — the tool must reject it instead of
-    silently dropping the field.
+    By-id mode always targets an existing session, where model and directory
+    scope overrides cannot take effect. The tool rejects them rather than
+    silently dropping either field.
     """
     from omnigent.runner import app as runner_app
     from omnigent.runner.tool_dispatch import execute_tool
@@ -3371,7 +3394,7 @@ async def test_sys_session_send_model_rejected_in_by_id_mode() -> None:
                 arguments=json.dumps(
                     {
                         "session_id": "conv_some_child",
-                        "args": {"input": "continue", "model": "claude-opus-4-8"},
+                        "args": {"input": "continue", **create_only_args},
                     }
                 ),
                 server_client=server_client,
@@ -3382,7 +3405,7 @@ async def test_sys_session_send_model_rejected_in_by_id_mode() -> None:
             runner_app._session_inboxes_ref.pop("conv_parent_by_id_model", None)
 
     assert output.startswith("Error:"), output
-    assert "model" in output
+    assert field in output
     # Rejected before lookup: a misaddressed override must not even read
     # the target session.
     assert requests_seen == 0
@@ -6408,7 +6431,14 @@ async def test_sys_session_create_spawns_child_under_caller() -> None:
     ) as server_client:
         output = await execute_tool(
             tool_name="sys_session_create",
-            arguments=json.dumps({"agent_id": "ag_x", "title": "auth", "message": "start"}),
+            arguments=json.dumps(
+                {
+                    "agent_id": "ag_x",
+                    "title": "auth",
+                    "message": "start",
+                    "directory_ids": [],
+                }
+            ),
             server_client=server_client,
             conversation_id="conv_caller",
         )
@@ -6418,6 +6448,7 @@ async def test_sys_session_create_spawns_child_under_caller() -> None:
     assert captured["parent_session_id"] == "conv_caller"
     assert captured["agent_id"] == "ag_x"
     assert captured["title"] == "auth"
+    assert captured["directory_ids"] == []
     assert captured["initial_items"][0]["data"]["content"][0]["text"] == "start"
     handle = json.loads(output)
     assert handle["conversation_id"] == "conv_child"
@@ -6542,7 +6573,12 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
         output = await execute_tool(
             tool_name="sys_session_create",
             arguments=json.dumps(
-                {"config_path": "helper.yaml", "title": "auth", "message": "start"}
+                {
+                    "config_path": "helper.yaml",
+                    "title": "auth",
+                    "message": "start",
+                    "directory_ids": [],
+                }
             ),
             server_client=server_client,
             conversation_id="conv_caller",
@@ -6555,7 +6591,11 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
         f"expected exactly one create POST, got {len(create_requests)}"
     )
     parts = _parse_multipart_create(create_requests[0])
-    assert parts["metadata"] == {"parent_session_id": "conv_caller", "title": "auth"}
+    assert parts["metadata"] == {
+        "parent_session_id": "conv_caller",
+        "directory_ids": [],
+        "title": "auth",
+    }
 
     # The uploaded bundle is a gzipped tar holding the authored config
     # verbatim — proves the local file traversed materialize → tar.

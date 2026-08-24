@@ -118,6 +118,7 @@ def test_optional_bench_capabilities_default_to_unknown() -> None:
     assert capability.fork_history is ForkHistory.NONE
     assert capability.shell_tool_name is None
     assert capability.shell_tool_prompt is None
+    assert capability.additional_directories is False
     assert capability.as_dict() == {
         "integration_mode": "sdk-in-process",
         "elicitation": "none",
@@ -128,6 +129,7 @@ def test_optional_bench_capabilities_default_to_unknown() -> None:
         "subagents": False,
         "interrupt": True,
         "streaming": True,
+        "additional_directories": False,
         "steering": None,
         "live_queue": None,
         "images": None,

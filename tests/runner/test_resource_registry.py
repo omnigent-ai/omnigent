@@ -27,6 +27,7 @@ from omnigent.runner.resource_registry import (
     _terminal_exit_diagnostics,
     _trim_terminal_exit_output,
 )
+from omnigent.session_directories import SessionDirectory
 from omnigent.terminals import TerminalRegistry
 from tests.runner.helpers import make_test_terminal_instance
 
@@ -1287,6 +1288,98 @@ def test_compute_default_env_root_runner_workspace_overrides_relative_cwd(
     root = reg.compute_default_env_root("conv_rel", spec)
 
     assert root == str(workspace.resolve())
+
+
+def test_configured_directories_control_cwd_and_sandbox_reach(tmp_path: Path) -> None:
+    """The default root becomes cwd and every additional root is writable."""
+    primary = tmp_path / "primary"
+    shared = tmp_path / "shared"
+    primary.mkdir()
+    shared.mkdir()
+    registry = SessionResourceRegistry(runner_workspace=tmp_path / "wrong-runner-root")
+    registry.configure_session_directories(
+        "conv_multi",
+        (
+            SessionDirectory("default", str(primary)),
+            SessionDirectory(f"dir_{1:032x}", str(shared)),
+        ),
+    )
+    spec = SimpleNamespace(
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=".",
+            sandbox=OSEnvSandboxSpec(type="none"),
+        )
+    )
+
+    env = registry.resolve_environment("conv_multi", DEFAULT_ENVIRONMENT_ID, spec)
+
+    assert env.cwd == primary.resolve()
+    assert env.sandbox.read_roots == [shared.resolve()]
+    assert env.sandbox.write_roots == [shared.resolve()]
+    # Core deliberately exposes only the legacy/default environment. The
+    # per-root Files/Git resource surface is layered in a child PR.
+    assert [resource.id for resource in registry.list_resources("conv_multi").data] == [
+        DEFAULT_ENVIRONMENT_ID
+    ]
+
+
+def test_child_without_default_directory_gets_private_scratch(tmp_path: Path) -> None:
+    """A narrowed child cannot regain the runner's primary cwd."""
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    runner_root = tmp_path / "runner"
+    runner_root.mkdir()
+    registry = SessionResourceRegistry(
+        runner_workspace=runner_root,
+        per_session_workspace=False,
+    )
+    registry.configure_session_directories(
+        "conv_scoped",
+        (SessionDirectory(f"dir_{1:032x}", str(shared)),),
+    )
+    spec = _agent_spec_with_sandbox_none(tmp_path / "spec-root")
+
+    env = registry.resolve_environment("conv_scoped", DEFAULT_ENVIRONMENT_ID, spec)
+
+    assert env.cwd != runner_root.resolve()
+    assert env.cwd != shared.resolve()
+    assert env.sandbox.write_roots == [shared.resolve()]
+
+
+def test_session_directory_configuration_is_immutable() -> None:
+    """Changing attached roots requires relaunching the session."""
+    registry = SessionResourceRegistry()
+    initial = (SessionDirectory("default", "/repo/one"),)
+    registry.configure_session_directories("conv_immutable", initial)
+    registry.configure_session_directories("conv_immutable", initial)
+
+    with pytest.raises(ValueError, match="require a relaunch"):
+        registry.configure_session_directories(
+            "conv_immutable",
+            (SessionDirectory("default", "/repo/two"),),
+        )
+
+
+def test_matching_legacy_default_can_be_registered_after_environment(
+    tmp_path: Path,
+) -> None:
+    """A lazy legacy snapshot may describe the already-materialized cwd."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    registry = SessionResourceRegistry(runner_workspace=workspace)
+    spec = _agent_spec_with_sandbox_none(tmp_path / "spec-root")
+    environment = registry.resolve_environment("conv_legacy", DEFAULT_ENVIRONMENT_ID, spec)
+
+    registry.configure_session_directories(
+        "conv_legacy",
+        (SessionDirectory("default", str(workspace)),),
+    )
+
+    assert environment.cwd == workspace.resolve()
+    assert registry.session_directories("conv_legacy") == (
+        SessionDirectory("default", str(workspace)),
+    )
 
 
 def test_compute_default_env_root_runner_workspace_overrides_absolute_cwd(
