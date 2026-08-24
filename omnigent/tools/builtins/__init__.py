@@ -221,6 +221,48 @@ def _create_hindsight_recall(config: dict[str, str]) -> Tool:
     return HindsightRecallTool(config=config)
 
 
+def _cognee_available() -> bool:
+    """
+    Return ``True`` if the optional ``cognee`` package is usable.
+
+    Probes via :func:`importlib.util.find_spec` (not ``import``) so the check
+    never loads cognee or its transitive deps, and honors the
+    ``OMNIGENT_DISABLE_COGNEE`` kill-switch inline (not via
+    :mod:`omnigent.runtime.memory` — the canonical gate — to keep this
+    module's import graph free of the runtime package).
+    """
+    import importlib.util
+    import os
+
+    if os.environ.get("OMNIGENT_DISABLE_COGNEE", "").strip().lower() in ("true", "1", "yes"):
+        return False
+    return importlib.util.find_spec("cognee") is not None
+
+
+def _create_cognee_search(config: dict[str, str]) -> Tool:
+    """
+    Lazy factory for CogneeSearchTool.
+
+    :param config: Tool config (dataset, shared_dataset, etc.).
+    :returns: A CogneeSearchTool instance.
+    """
+    from omnigent.tools.builtins.cognee import CogneeSearchTool
+
+    return CogneeSearchTool(config=config)
+
+
+def _create_cognee_remember(config: dict[str, str]) -> Tool:
+    """
+    Lazy factory for CogneeRememberTool.
+
+    :param config: Tool config (dataset, shared_dataset, etc.).
+    :returns: A CogneeRememberTool instance.
+    """
+    from omnigent.tools.builtins.cognee import CogneeRememberTool
+
+    return CogneeRememberTool(config=config)
+
+
 def _create_hindsight_reflect(config: dict[str, str]) -> Tool:
     """
     Lazy factory for HindsightReflectTool.
@@ -302,6 +344,17 @@ if _hindsight_available():
             "hindsight_retain": _create_hindsight_retain,
             "hindsight_recall": _create_hindsight_recall,
             "hindsight_reflect": _create_hindsight_reflect,
+        }
+    )
+
+# Cognee knowledge-graph memory (optional ``cognee`` extra). Registered only
+# when the package is installed and not kill-switched, so the tools are
+# absent from the builtin list on installs without the extra.
+if _cognee_available():
+    _BUILTIN_REGISTRY.update(
+        {
+            "cognee_search": _create_cognee_search,
+            "cognee_remember": _create_cognee_remember,
         }
     )
 

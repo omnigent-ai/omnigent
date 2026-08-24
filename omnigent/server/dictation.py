@@ -536,7 +536,9 @@ class _RemoteStream:
     def __init__(self, url: str) -> None:
         from websockets.sync.client import connect
 
-        self._ws = connect(url, open_timeout=5)
+        # proxy=None: direct connection to the relay worker — a system/env
+        # proxy would stall the loopback handshake on macOS (issue #1514).
+        self._ws = connect(url, open_timeout=5, proxy=None)
         try:
             deadline = time.monotonic() + _REMOTE_READY_TIMEOUT_S
             while True:

@@ -346,6 +346,11 @@ _NIMBLE_EXTRACT_TOOLS = frozenset({"nimble_extract"})
 # falls through to the harness, which has no such tool, and silently no-ops.
 _HINDSIGHT_TOOLS = frozenset({"hindsight_retain", "hindsight_recall", "hindsight_reflect"})
 
+# Cognee knowledge-graph memory builtins. Runner-local for the same reason as
+# the Hindsight set above: without this entry a wrapped harness's call falls
+# through to the harness, which has no such tool, and silently no-ops.
+_COGNEE_TOOLS = frozenset({"cognee_search", "cognee_remember"})
+
 # Priority 5f.2: sys_list_models — runner-local because provider resolution
 # reads the runner host's config/credentials, same as the spawn paths.
 _LIST_MODELS_TOOLS = frozenset({"sys_list_models"})
@@ -469,6 +474,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     # Memory builtins are relayed to native harnesses too — unlike web_search,
     # native harnesses have no built-in long-term memory of their own.
     | _HINDSIGHT_TOOLS
+    | _COGNEE_TOOLS
     # Skills ride the relay for the same reason memory does: ``load_skill`` is
     # what discovers host-scope skills (``.agents/skills`` and friends), and a
     # native session's only tool surface is this relay.
@@ -887,6 +893,7 @@ _ALL_LOCAL_TOOLS = (
     | _NIMBLE_RESEARCH_TOOLS
     | _NIMBLE_EXTRACT_TOOLS
     | _HINDSIGHT_TOOLS
+    | _COGNEE_TOOLS
     | _TIMER_TOOLS
     | _TASK_LIFECYCLE_TOOLS
     | _SKILL_TOOLS
@@ -3710,6 +3717,75 @@ async def _execute_hindsight_tool(
     return await asyncio.to_thread(tool.invoke, json.dumps(args), ctx)
 
 
+def _cognee_config_from_spec(agent_spec: Any | None, tool_name: str) -> dict[str, str]:
+    """
+    Return a cognee builtin's config dict from the parent spec.
+
+    Mirrors ``_hindsight_config_from_spec``: scans ``spec.tools.builtins`` for
+    the entry named *tool_name* (e.g. ``"cognee_search"``) and returns its
+    ``config`` (dataset, shared_dataset, etc.). Empty dict when declared bare
+    or absent.
+
+    :param agent_spec: Parent agent's spec, or ``None``.
+    :param tool_name: The cognee tool name to look up.
+    :returns: The builtin's config dict.
+    """
+    if agent_spec is None:
+        return {}
+    tools = getattr(agent_spec, "tools", None)
+    builtins = getattr(tools, "builtins", None) or []
+    for entry in builtins:
+        if getattr(entry, "name", None) == tool_name:
+            return getattr(entry, "config", None) or {}
+    return {}
+
+
+async def _execute_cognee_tool(
+    args: dict[str, Any],
+    *,
+    tool_name: str,
+    agent_spec: Any | None,
+    conversation_id: str | None = None,
+    task_id: str | None = None,
+    agent_id: str | None = None,
+) -> str:
+    """
+    Dispatch a cognee memory tool call (search / remember).
+
+    Builds the tool from the spec's builtin config and runs its synchronous
+    ``invoke`` off the event loop (it runs bounded cognee operations on a
+    private loop). The dataset is resolved inside the tool from
+    ``config.dataset`` → ``ctx.agent_id`` → ``ctx.conversation_id``, so the
+    real ``agent_id`` is threaded through here. The runtime kill-switch is
+    re-checked per call — the registry gate only runs at import time.
+
+    :param args: Parsed LLM arguments (``content`` for remember, ``query``
+        for search, plus the optional ``scope``).
+    :param tool_name: The cognee tool name being dispatched.
+    :param agent_spec: Parent agent's spec; carries the cognee builtin config.
+    :param conversation_id: Parent session id, threaded into the context.
+    :param task_id: Calling task id, threaded into the context.
+    :param agent_id: Calling agent id — the default memory dataset.
+    :returns: The tool's string result, or an error string.
+    """
+    from omnigent.runtime.memory import cognee_available
+    from omnigent.tools.base import ToolContext
+    from omnigent.tools.builtins import get_builtin_tool
+
+    if not cognee_available():
+        return f"cognee tool {tool_name!r} is not available (cognee memory is disabled)."
+    config = _cognee_config_from_spec(agent_spec, tool_name)
+    tool = get_builtin_tool(tool_name, config)
+    if tool is None:
+        return f"cognee tool {tool_name!r} is not available."
+    ctx = ToolContext(
+        task_id=task_id or tool_name,
+        agent_id=agent_id or tool_name,
+        conversation_id=conversation_id,
+    )
+    return await asyncio.to_thread(tool.invoke, json.dumps(args), ctx)
+
+
 def _has_subagent(
     sub_agent_name: str,
     agent_spec: AgentSpec | None,
@@ -6146,6 +6222,15 @@ async def execute_tool(
             )
         elif tool_name in _HINDSIGHT_TOOLS:
             output = await _execute_hindsight_tool(
+                args,
+                tool_name=tool_name,
+                agent_spec=agent_spec,
+                conversation_id=conversation_id,
+                task_id=task_id,
+                agent_id=agent_id,
+            )
+        elif tool_name in _COGNEE_TOOLS:
+            output = await _execute_cognee_tool(
                 args,
                 tool_name=tool_name,
                 agent_spec=agent_spec,
