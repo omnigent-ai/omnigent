@@ -187,6 +187,7 @@ describe("BubbleView dispatch", () => {
         bubble={{
           kind: "user",
           itemId: "u1",
+          responseId: "turn_u1",
           content: [{ type: "input_text", text: "hello there" }],
         }}
       />,
