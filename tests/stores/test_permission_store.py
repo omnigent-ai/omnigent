@@ -11,8 +11,10 @@ SQLite file and tears it down automatically.
 from __future__ import annotations
 
 import pytest
+from sqlalchemy import event
 
 from omnigent.entities import SessionPermission
+from omnigent.server.auth import RESERVED_USER_PUBLIC
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -1121,3 +1123,226 @@ def test_list_for_sessions_no_grants(store: SqlAlchemyPermissionStore, db_uri: s
     conv = _create_conversation(db_uri)
     result = store.list_for_sessions([conv])
     assert result == {conv: []}
+
+
+# ── resolve_access short-lived cache ──────────────────────────────────────────
+
+
+def _checkout_counter(store: SqlAlchemyPermissionStore) -> tuple[list[int], object]:
+    """Count pool checkouts on the store's engine.
+
+    Attach *after* any setup writes so only the reads under test are counted.
+
+    :returns: ``(count, detach)`` — a one-element list incremented per checkout,
+        and a zero-arg callable that removes the listener.
+    """
+    count = [0]
+
+    def _on_checkout(_dbapi: object, _record: object, _proxy: object) -> None:
+        count[0] += 1
+
+    event.listen(store._engine, "checkout", _on_checkout)
+    return count, lambda: event.remove(store._engine, "checkout", _on_checkout)
+
+
+def test_resolve_access_caches_positive_result(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """A repeat resolve for a granted user is served from cache — no DB checkout."""
+    _ensure_user(store, "alice@test.com")
+    conv_id = _create_conversation(db_uri)
+    store.grant("alice@test.com", conv_id, level=2)
+
+    count, detach = _checkout_counter(store)
+    try:
+        first = store.resolve_access("alice@test.com", conv_id)
+        second = store.resolve_access("alice@test.com", conv_id)
+    finally:
+        detach()
+
+    assert first.user_grant_level == 2
+    assert second == first
+    assert count[0] == 1, f"second resolve must hit cache (no checkout), got {count[0]}"
+
+
+def test_resolve_access_does_not_cache_no_access(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """A no-access result is never cached, so a freshly granted user is
+    authorized on their very next request rather than after the TTL."""
+    _ensure_user(store, "bob@test.com")
+    conv_id = _create_conversation(db_uri)
+
+    denied = store.resolve_access("bob@test.com", conv_id)
+    assert denied.user_grant_level is None
+
+    store.grant("bob@test.com", conv_id, level=1)
+    # No stale "deny" is cached — the grant is visible immediately.
+    granted = store.resolve_access("bob@test.com", conv_id)
+    assert granted.user_grant_level == 1
+
+
+def test_grant_evicts_resolve_cache(store: SqlAlchemyPermissionStore, db_uri: str) -> None:
+    """Re-granting at a new level evicts the cached decision."""
+    _ensure_user(store, "carol@test.com")
+    conv_id = _create_conversation(db_uri)
+    store.grant("carol@test.com", conv_id, level=1)
+
+    assert store.resolve_access("carol@test.com", conv_id).user_grant_level == 1
+    store.grant("carol@test.com", conv_id, level=3)
+    assert store.resolve_access("carol@test.com", conv_id).user_grant_level == 3
+
+
+def test_revoke_evicts_resolve_cache(store: SqlAlchemyPermissionStore, db_uri: str) -> None:
+    """A revoke evicts the cache so the removed user is denied on the next check."""
+    _ensure_user(store, "dave@test.com")
+    conv_id = _create_conversation(db_uri)
+    store.grant("dave@test.com", conv_id, level=2)
+
+    assert store.resolve_access("dave@test.com", conv_id).user_grant_level == 2
+    store.revoke("dave@test.com", conv_id)
+    assert store.resolve_access("dave@test.com", conv_id).user_grant_level is None
+
+
+def test_revoking_public_grant_evicts_all_users_for_session(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """The shared __public__ grant is session-scoped, so revoking it evicts
+    every user's cached decision for that session."""
+    _ensure_user(store, "erin@test.com")
+    conv_id = _create_conversation(db_uri)
+    store.grant(RESERVED_USER_PUBLIC, conv_id, level=1)
+
+    # erin has no personal grant but is allowed via the public grant — cached.
+    assert store.resolve_access("erin@test.com", conv_id).public_grant_level == 1
+    store.revoke(RESERVED_USER_PUBLIC, conv_id)
+    assert store.resolve_access("erin@test.com", conv_id).public_grant_level is None
+
+
+def test_set_admin_evicts_resolve_cache(store: SqlAlchemyPermissionStore, db_uri: str) -> None:
+    """Flipping the admin flag evicts cached decisions across all sessions."""
+    _ensure_user(store, "frank@test.com")
+    store.set_admin("frank@test.com", True)
+    conv_id = _create_conversation(db_uri)
+
+    assert store.resolve_access("frank@test.com", conv_id).is_admin is True
+    store.set_admin("frank@test.com", False)
+    assert store.resolve_access("frank@test.com", conv_id).is_admin is False
+
+
+def test_resolve_access_cache_expires_after_ttl(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """Once the TTL elapses the entry is dropped and the next resolve re-reads."""
+    now = [1000.0]
+    store._resolve_cache_clock = lambda: now[0]
+    _ensure_user(store, "grace@test.com")
+    conv_id = _create_conversation(db_uri)
+    store.grant("grace@test.com", conv_id, level=2)
+
+    count, detach = _checkout_counter(store)
+    try:
+        store.resolve_access("grace@test.com", conv_id)  # miss → read + cache
+        store.resolve_access("grace@test.com", conv_id)  # hit
+        assert count[0] == 1, "within TTL the repeat must be a cache hit"
+        now[0] += store._resolve_cache_ttl_s + 1.0
+        store.resolve_access("grace@test.com", conv_id)  # expired → re-read
+        assert count[0] == 2, "after TTL the entry must be re-read from the DB"
+    finally:
+        detach()
+
+
+def test_resolve_access_cache_disabled_when_ttl_zero(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """With the cache disabled every resolve reads the DB (no staleness at all)."""
+    store._resolve_cache_ttl_s = 0.0
+    _ensure_user(store, "heidi@test.com")
+    conv_id = _create_conversation(db_uri)
+    store.grant("heidi@test.com", conv_id, level=2)
+
+    count, detach = _checkout_counter(store)
+    try:
+        store.resolve_access("heidi@test.com", conv_id)
+        store.resolve_access("heidi@test.com", conv_id)
+    finally:
+        detach()
+    assert count[0] == 2, "a disabled cache must read on every call"
+
+
+def test_reassign_user_grants_evicts_resolve_cache(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """Moving grants between users evicts both users' cached decisions."""
+    _ensure_user(store, "local")
+    _ensure_user(store, "alice@test.com")
+    conv_id = _create_conversation(db_uri)
+    store.grant("local", conv_id, level=3)
+
+    assert store.resolve_access("local", conv_id).user_grant_level == 3  # cached
+    store.reassign_user_grants("local", "alice@test.com")
+    # The grant moved: local must be denied and alice granted, both fresh.
+    assert store.resolve_access("local", conv_id).user_grant_level is None
+    assert store.resolve_access("alice@test.com", conv_id).user_grant_level == 3
+
+
+def test_resolve_access_cache_refuses_store_racing_a_write(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """A reader whose rows predate a revoke must not re-cache that stale positive.
+
+    The read and the eviction are separate operations, so a resolve that read
+    the old grant can finish *after* the revoke evicted. Storing then would
+    keep the removed user authorized for a full TTL on the very instance that
+    performed the revoke. The generation guard drops that store instead.
+    """
+    _ensure_user(store, "judy@test.com")
+    conv_id = _create_conversation(db_uri)
+    store.grant("judy@test.com", conv_id, level=2)
+
+    original_store = store._resolve_cache_store
+
+    def _revoke_then_store(
+        conversation_id: str, user_id: str, access: object, generation: int
+    ) -> None:
+        """Land the revoke between this reader's DB read and its cache store."""
+        store.revoke(user_id, conversation_id)
+        original_store(conversation_id, user_id, access, generation)  # type: ignore[arg-type]
+
+    store._resolve_cache_store = _revoke_then_store  # type: ignore[assignment]
+    racing = store.resolve_access("judy@test.com", conv_id)
+    store._resolve_cache_store = original_store  # type: ignore[assignment]
+
+    # The read legitimately saw the pre-revoke grant...
+    assert racing.user_grant_level == 2
+    # ...but it must not have been cached on top of the revoke's eviction.
+    assert len(store._resolve_cache) == 0, "a read racing a write must not re-poison the cache"
+    assert store.resolve_access("judy@test.com", conv_id).user_grant_level is None
+
+
+def test_resolve_access_cache_evicts_least_recently_used_over_cap(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """The LRU entry cap bounds the cache — the oldest entry is dropped and
+    must be re-read, so a long-lived replica cannot grow it without limit."""
+    store._resolve_cache_max_entries = 2
+    _ensure_user(store, "ivan@test.com")
+    # Distinct conversations so grants don't evict each other's cache entries.
+    conv_a = _create_conversation(db_uri)
+    conv_b = _create_conversation(db_uri)
+    conv_c = _create_conversation(db_uri)
+    for conv_id in (conv_a, conv_b, conv_c):
+        store.grant("ivan@test.com", conv_id, level=1)
+
+    # Populate in order a, b, c → with cap 2, conv_a (oldest) is evicted.
+    for conv_id in (conv_a, conv_b, conv_c):
+        store.resolve_access("ivan@test.com", conv_id)
+    assert len(store._resolve_cache) == 2, "cache must not exceed its entry cap"
+
+    count, detach = _checkout_counter(store)
+    try:
+        store.resolve_access("ivan@test.com", conv_a)  # evicted → re-read
+        store.resolve_access("ivan@test.com", conv_c)  # still cached → hit
+    finally:
+        detach()
+    assert count[0] == 1, f"only the LRU-evicted entry should re-read, got {count[0]}"

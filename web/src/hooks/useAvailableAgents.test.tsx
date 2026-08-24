@@ -26,6 +26,7 @@ const fetchMock = vi.fn();
 
 const BUILTINS_URL = "/v1/agents";
 const SCAN_URL = "/v1/sessions?limit=100&kind=any";
+const HARNESSES_URL = "/v1/harnesses";
 
 /**
  * Stub the global fetch with per-URL responses. Unrouted URLs reject
@@ -88,6 +89,47 @@ describe("useAvailableAgents", () => {
     const urls = fetchMock.mock.calls.map((c) => c[0] as string);
     expect(urls).toContain(BUILTINS_URL);
     expect(urls).toContain(SCAN_URL);
+  });
+
+  it("labels and flags generic-ACP agents from the server harness catalog", async () => {
+    // A seeded ACP agent's name is a slug, so without the catalog the picker
+    // renders Grok Build as "Grok" and — lacking `acpHarness` — groups it under
+    // "Agents" instead of "Harnesses". Both come from the server so a new
+    // builtin ACP row needs no frontend change.
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        object: "list",
+        data: [
+          { id: "ag_grok", name: "grok", harness: "grok", builtin: true },
+          { id: "ag_polly", name: "polly", harness: "claude-sdk", builtin: true },
+        ],
+        has_more: false,
+      }),
+      [SCAN_URL]: EMPTY_SCAN,
+      [HARNESSES_URL]: mockResponse({
+        data: [
+          { id: "grok", label: "Grok Build", capabilities: { integration_mode: "acp-subprocess" } },
+          {
+            id: "claude-sdk",
+            label: "Claude SDK",
+            capabilities: { integration_mode: "sdk-in-process" },
+          },
+        ],
+      }),
+    });
+
+    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
+    // The catalog is a second query, so wait for the enrichment specifically.
+    await waitFor(() =>
+      expect(result.current.data?.find((a) => a.name === "grok")?.acpHarness).toBe(true),
+    );
+    expect(result.current.data?.find((a) => a.name === "grok")?.display_name).toBe("Grok Build");
+
+    // A composed agent on a non-ACP harness keeps its own name: it must not
+    // inherit the harness label ("Claude SDK") nor move into the Harnesses group.
+    const polly = result.current.data?.find((a) => a.name === "polly");
+    expect(polly?.display_name).toBe("Polly");
+    expect(polly?.acpHarness).toBeUndefined();
   });
 
   it("paginates built-ins so defaults pushed past fork rows are still listed", async () => {

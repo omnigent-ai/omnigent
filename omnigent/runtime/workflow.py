@@ -1556,6 +1556,12 @@ def _build_acp_cli_spawn_env(
     os_env_payload = _serialize_os_env(spec.os_env)
     if os_env_payload is not None:
         env["HARNESS_ACP_OS_ENV"] = os_env_payload
+    # Permission stance for approval cards. Absent leaves the harness wrap on its
+    # ``auto`` default (prompt); ``bypassPermissions`` skips the card for a call no
+    # policy had an opinion on, so a headless ACP worker doesn't park on a prompt.
+    permission_mode = spec.executor.config.get("permission_mode")
+    if permission_mode is not None:
+        env["HARNESS_ACP_PERMISSION_MODE"] = str(permission_mode)
     return env
 
 
@@ -1614,6 +1620,9 @@ def _build_acp_spawn_env(
         omnigent_mcp = embedded.get("omnigent_mcp", True)
         if not isinstance(omnigent_mcp, bool):
             raise ValueError("executor acp_agent omnigent_mcp must be a boolean")
+        inject_system_prompt = embedded.get("inject_system_prompt", True)
+        if not isinstance(inject_system_prompt, bool):
+            raise ValueError("executor acp_agent inject_system_prompt must be a boolean")
         session_id_mode = embedded.get("session_id_mode", "server")
         if session_id_mode not in ("server", "client"):
             raise ValueError(
@@ -1634,6 +1643,7 @@ def _build_acp_spawn_env(
             session_id_mode=session_id_mode,
             send_model=send_model,
             omnigent_mcp=omnigent_mcp,
+            inject_system_prompt=inject_system_prompt,
             env_passthrough=parse_env_passthrough(embedded.get("env_passthrough")),
         )
     else:
@@ -1649,6 +1659,8 @@ def _build_acp_spawn_env(
         if agent.send_model:
             env["HARNESS_ACP_SEND_MODEL"] = "1"
         env["HARNESS_ACP_OMNIGENT_MCP"] = "1" if agent.omnigent_mcp else "0"
+        if not agent.inject_system_prompt:
+            env["HARNESS_ACP_INJECT_SYSTEM_PROMPT"] = "0"
         if agent.env_passthrough:
             # Names only; the harness reads each value from its own environment.
             env["HARNESS_ACP_ENV_PASSTHROUGH"] = ",".join(agent.env_passthrough)
@@ -1668,6 +1680,12 @@ def _build_acp_spawn_env(
     os_env_payload = _serialize_os_env(spec.os_env)
     if os_env_payload is not None:
         env["HARNESS_ACP_OS_ENV"] = os_env_payload
+    # Permission stance for approval cards. Absent leaves the harness wrap on its
+    # ``auto`` default (prompt); ``bypassPermissions`` skips the card for a call no
+    # policy had an opinion on, so a headless ACP worker doesn't park on a prompt.
+    permission_mode = spec.executor.config.get("permission_mode")
+    if permission_mode is not None:
+        env["HARNESS_ACP_PERMISSION_MODE"] = str(permission_mode)
     return env
 
 
@@ -1735,6 +1753,18 @@ def _config_flag_is_true(value: object) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes"}
 
 
+def _set_openai_agents_reasoning_item_id_policy_env(
+    env: dict[str, str],
+    value: object | None,
+) -> None:
+    """Validate and encode the OpenAI Agents SDK reasoning replay policy."""
+    if value is None:
+        return
+    if not isinstance(value, str) or value not in {"preserve", "omit"}:
+        raise ValueError("reasoning_item_id_policy must be 'preserve', 'omit', or unset")
+    env["HARNESS_OPENAI_AGENTS_REASONING_ITEM_ID_POLICY"] = value
+
+
 def _build_openai_agents_sdk_spawn_env(spec: AgentSpec) -> dict[str, str]:
     """
     Build the env-var dict the openai-agents harness wrap reads.
@@ -1742,7 +1772,7 @@ def _build_openai_agents_sdk_spawn_env(spec: AgentSpec) -> dict[str, str]:
     Maps spec.executor fields → the ``HARNESS_OPENAI_AGENTS_*``
     env vars defined in
     ``omnigent/inner/openai_agents_sdk_harness.py``. Threads
-    model + auth + use_responses.
+    model + auth + Responses replay settings.
 
     Auth resolution order (highest priority first):
 
@@ -1770,6 +1800,10 @@ def _build_openai_agents_sdk_spawn_env(spec: AgentSpec) -> dict[str, str]:
     model = _resolve_spec_model(spec)
     if model is not None:
         env["HARNESS_OPENAI_AGENTS_MODEL"] = model
+    _set_openai_agents_reasoning_item_id_policy_env(
+        env,
+        spec.executor.config.get("reasoning_item_id_policy"),
+    )
 
     # ── Auth resolution ────────────────────────────────────────────────
     # Priority: generic provider → spec.executor.auth → global config auth →

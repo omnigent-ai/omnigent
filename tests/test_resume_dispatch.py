@@ -480,6 +480,42 @@ def test_dispatch_by_runtime_legacy_prefixed_id_canonicalized_to_bare_hex(
     assert captured["session_id"] == "415c9954e2fe4b9276083a4d2c66f689"
 
 
+def test_dispatch_by_runtime_remote_forwards_non_uuid_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A remote server owns its id space, so a non-uuid id (e.g. a managed
+    deployment's numeric node id) must reach the lookup and wrapper
+    unchanged. Forcing the local uuid rule on the remote path would
+    reject a valid id before the server — the one thing the server is
+    there to resolve — ever sees it.
+    """
+    seen: dict[str, str] = {}
+
+    def _label(*, server: str, conv_id: str) -> str:
+        """Record the id the remote lookup receives."""
+        seen["conv_id"] = conv_id
+        return "claude-code-native-ui"
+
+    monkeypatch.setattr(resume_dispatch, "_read_wrapper_label_remote", _label)
+    captured: dict[str, Any] = {}
+
+    def _capture(**kwargs: Any) -> None:
+        """Record the kwargs ``run_claude_native`` was called with."""
+        captured.update(kwargs)
+
+    monkeypatch.setattr("omnigent.claude_native.run_claude_native", _capture)
+
+    resume_dispatch._dispatch_by_runtime(
+        target="2048200000527758",
+        server="https://example.com",
+    )
+
+    # The raw non-uuid id flows through untouched — not rejected, not reshaped.
+    assert seen["conv_id"] == "2048200000527758"
+    assert captured["session_id"] == "2048200000527758"
+
+
 def test_dispatch_by_runtime_non_wrapper_local_raises_with_hint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

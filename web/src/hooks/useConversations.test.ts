@@ -21,6 +21,7 @@ import {
   useProjects,
   useProjectConfig,
   useProjectSessions,
+  useRenameProject,
   useUpdateProjectConfig,
   useMoveToProject,
   useRenameConversation,
@@ -340,6 +341,46 @@ describe("fetchAllArchivedProjectNames", () => {
 
     expect(names).toEqual([]);
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("useRenameProject", () => {
+  function renderRenameHook() {
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    return renderHook(() => useRenameProject(), { wrapper });
+  }
+
+  // Regression: promoting a label-only folder must return the created id so a
+  // follow-up icon write targets that row instead of re-creating it (409).
+  it("creates and returns the new id when promoting a label-only folder", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ id: "proj_new", name: "Renamed" })); // POST create
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ data: [], first_id: null, last_id: null, has_more: false }), // members page
+    );
+
+    const { result } = renderRenameHook();
+    const id = await result.current.mutateAsync({ id: null, oldName: "old", newName: "Renamed" });
+
+    expect(id).toBe("proj_new");
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/projects");
+  });
+
+  it("returns the existing id for a first-class rename", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ id: "proj_1", name: "Renamed" })); // PATCH rename
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
+    );
+
+    const { result } = renderRenameHook();
+    const id = await result.current.mutateAsync({
+      id: "proj_1",
+      oldName: "old",
+      newName: "Renamed",
+    });
+
+    expect(id).toBe("proj_1");
   });
 });
 
@@ -1425,11 +1466,36 @@ describe("useBulkDeleteConversations", () => {
       .mockResolvedValueOnce(mockResponse({ deleted: true })); // delete conv_b
 
     const { queryClient, rendered } = renderBulkDeleteHook();
-    rendered.result.current.mutate(["conv_a", "conv_b"]);
+    rendered.result.current.mutate({ ids: ["conv_a", "conv_b"] });
     await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
 
     const data = queryClient.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
     expect(data!.pages[0].data.map((c) => c.id)).toEqual(["conv_keep"]);
+  });
+
+  it("appends ?delete_branch=true only for ids in deleteBranchIds", async () => {
+    // conv_a opts into branch cleanup, conv_b does not.
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ queued: false })) // stop conv_a
+      .mockResolvedValueOnce(mockResponse({ deleted: true })) // delete conv_a
+      .mockResolvedValueOnce(mockResponse({ queued: false })) // stop conv_b
+      .mockResolvedValueOnce(mockResponse({ deleted: true })); // delete conv_b
+
+    const { rendered } = renderBulkDeleteHook();
+    rendered.result.current.mutate({
+      ids: ["conv_a", "conv_b"],
+      deleteBranchIds: new Set(["conv_a"]),
+    });
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+
+    // Each session deletes independently, so the per-session flag must ride
+    // only on the DELETE for the id the user ticked.
+    const deleteUrls = fetchMock.mock.calls
+      .map((call) => call[0] as string)
+      .filter((url) => url.startsWith("/v1/sessions/conv_") && !url.includes("/events"));
+    expect(deleteUrls).toContain("/v1/sessions/conv_a?delete_branch=true");
+    expect(deleteUrls).toContain("/v1/sessions/conv_b");
+    expect(deleteUrls).not.toContain("/v1/sessions/conv_b?delete_branch=true");
   });
 
   it("evicts succeeded ids from cache even when some deletes fail", async () => {
@@ -1441,7 +1507,7 @@ describe("useBulkDeleteConversations", () => {
       .mockResolvedValueOnce(mockResponse({}, { ok: false, status: 500 })); // delete conv_b fails
 
     const { queryClient, rendered } = renderBulkDeleteHook();
-    rendered.result.current.mutate(["conv_a", "conv_b"]);
+    rendered.result.current.mutate({ ids: ["conv_a", "conv_b"] });
     await waitFor(() => expect(rendered.result.current.isError).toBe(true));
 
     // conv_a was successfully deleted and should be evicted; conv_b stays.

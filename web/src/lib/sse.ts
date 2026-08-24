@@ -48,7 +48,9 @@ import type {
   SessionTerminalActivityEvent,
   SessionStatusEvent,
   SessionModelEvent,
+  SessionTitleEvent,
   SessionCollaborationModeEvent,
+  SessionPermissionModeEvent,
   SessionReasoningEffortEvent,
   SessionAgentChangedEvent,
   SessionTodosEvent,
@@ -68,7 +70,7 @@ import type {
 } from "./events";
 import { NATIVE_TOOL_TYPES } from "./events";
 import { routingExtrasFromWire } from "./routingDecision";
-import type { ErrorInfo, ModelUsage, RememberScope, Response } from "./types";
+import type { BackgroundTaskInfo, ErrorInfo, ModelUsage, RememberScope, Response } from "./types";
 
 /**
  * Out-param for `parseSseStream`: `sawDone` is set when the server's `[DONE]`
@@ -77,6 +79,86 @@ import type { ErrorInfo, ModelUsage, RememberScope, Response } from "./types";
  */
 export interface SseStreamResult {
   sawDone: boolean;
+}
+
+// The server heartbeats the session live-tail every 15 s of queue idleness
+// (`_SESSION_STREAM_HEARTBEAT_INTERVAL_S`), so a healthy connection is never
+// byte-silent for long. `fetch` has no read timeout: on a half-open socket
+// (laptop sleep, network path change, a proxy reaping the connection without
+// a close) `reader.read()` blocks forever and the transcript silently
+// freezes. Three missed heartbeats in a row trip the guard; one late
+// heartbeat doesn't.
+export const SSE_STALL_TIMEOUT_MS = 45_000;
+
+/**
+ * Wrap an SSE byte stream with a silence watchdog.
+ *
+ * Chunks pass through unchanged; a stall timer is armed while a read is
+ * pending on the wire. If no bytes arrive within `stallMs` the upstream
+ * reader is cancelled, which ends the wrapped stream cleanly — consumers
+ * see the same shape as a transport drop without `[DONE]`, so the chat
+ * pump's reconnect loop answers with its usual re-subscribe + snapshot
+ * reconcile.
+ *
+ * @param source The fetch response body to guard.
+ * @param opts.stallMs Silence window before the stream is declared dead;
+ *   defaults to {@link SSE_STALL_TIMEOUT_MS}.
+ * @param opts.onActivity Called on every received chunk — a liveness stamp
+ *   for callers that want to judge staleness on external signals (tab
+ *   visibility, network regained) without waiting out the full window.
+ * @param opts.onStall Called once when the guard trips.
+ * @returns The guarded stream to consume in place of `source`.
+ */
+export function withStallGuard(
+  source: ReadableStream<Uint8Array>,
+  opts: { stallMs?: number; onActivity?: () => void; onStall?: () => void } = {},
+): ReadableStream<Uint8Array> {
+  const stallMs = opts.stallMs ?? SSE_STALL_TIMEOUT_MS;
+  const reader = source.getReader();
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const clearTimer = (): void => {
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  };
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      // Cancelling the reader resolves the pending read as `done`, which
+      // closes the wrapped stream through the normal path below.
+      timer = setTimeout(() => {
+        timer = null;
+        opts.onStall?.();
+        reader.cancel().catch(() => {});
+      }, stallMs);
+      let result: ReadableStreamReadResult<Uint8Array>;
+      try {
+        result = await reader.read();
+      } catch (err) {
+        clearTimer();
+        reader.releaseLock();
+        controller.error(err);
+        return;
+      }
+      clearTimer();
+      if (result.done) {
+        // Release the source on every terminal path: a consumer that
+        // re-reads the same body (a rebind against a mocked response)
+        // must find it unlocked, exactly as it did before the guard
+        // sat between it and the raw stream.
+        reader.releaseLock();
+        controller.close();
+        return;
+      }
+      opts.onActivity?.();
+      controller.enqueue(result.value);
+    },
+    async cancel(reason) {
+      clearTimer();
+      await reader.cancel(reason);
+      reader.releaseLock();
+    },
+  });
 }
 
 /**
@@ -256,6 +338,32 @@ function normalizeEventType(eventType: string): string {
     return `response.${status}`;
   }
   return eventType;
+}
+
+const BACKGROUND_TASK_KEYS = ["id", "type", "status", "description", "command"] as const;
+
+/**
+ * Parse the `background_tasks` detail off a `session.status` payload.
+ *
+ * Keeps only the string display fields (see {@link BACKGROUND_TASK_KEYS}) and
+ * drops non-object / field-less entries. Returns `undefined` when the value is
+ * not an array or nothing usable survives, so callers can treat "no detail"
+ * uniformly (the count alone still drives the pill).
+ */
+export function parseBackgroundTasks(raw: unknown): BackgroundTaskInfo[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const tasks: BackgroundTaskInfo[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const record = entry as Record<string, unknown>;
+    const info: BackgroundTaskInfo = {};
+    for (const key of BACKGROUND_TASK_KEYS) {
+      const value = record[key];
+      if (typeof value === "string" && value) info[key] = value;
+    }
+    if (Object.keys(info).length > 0) tasks.push(info);
+  }
+  return tasks.length > 0 ? tasks : undefined;
 }
 
 /**
@@ -438,6 +546,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
         typeof data.background_task_count === "number" && data.background_task_count >= 0
           ? data.background_task_count
           : undefined;
+      const backgroundTasks = parseBackgroundTasks(data.background_tasks);
       const rawError = data.error;
       // Parse via parseErrorInfo so a classified failure's optional
       // title/cause/remediation flow through, but keep the guard that both
@@ -459,6 +568,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
         status,
         responseId,
         backgroundTaskCount,
+        ...(backgroundTasks !== undefined ? { backgroundTasks } : {}),
         ...(blockedOn !== undefined ? { blockedOn } : {}),
         ...(error !== undefined ? { error } : {}),
       } satisfies SessionStatusEvent;
@@ -529,6 +639,13 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     if (typeof model !== "string" || !model) return null;
     return { type: "session_model", conversationId, model } satisfies SessionModelEvent;
   }
+  if (eventType === "session.title") {
+    const conversationId = data.conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    const title = data.title;
+    if (typeof title !== "string" || !title) return null;
+    return { type: "session_title", conversationId, title } satisfies SessionTitleEvent;
+  }
   if (eventType === "session.reasoning_effort") {
     const conversationId = data.conversation_id;
     if (typeof conversationId !== "string" || !conversationId) return null;
@@ -550,6 +667,17 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       conversationId,
       mode,
     } satisfies SessionCollaborationModeEvent;
+  }
+  if (eventType === "session.permission_mode") {
+    const conversationId = data.conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    const permissionMode = data.permission_mode;
+    if (typeof permissionMode !== "string" || !permissionMode) return null;
+    return {
+      type: "session_permission_mode",
+      conversationId,
+      permissionMode,
+    } satisfies SessionPermissionModeEvent;
   }
   if (eventType === "session.agent_changed") {
     const conversationId = data.conversation_id;

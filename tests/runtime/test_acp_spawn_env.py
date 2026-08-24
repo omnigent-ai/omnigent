@@ -50,12 +50,15 @@ def _make_spec(
     harness: str,
     model: str | None = None,
     acp_agent: object = _MISSING,
+    permission_mode: str | None = None,
 ) -> AgentSpec:
     config: dict[str, object] = {"harness": harness}
     if model is not None:
         config["model"] = model
     if acp_agent is not _MISSING:
         config["acp_agent"] = acp_agent
+    if permission_mode is not None:
+        config["permission_mode"] = permission_mode
     return AgentSpec(
         spec_version=1,
         name="test-acp",
@@ -315,3 +318,25 @@ def test_embedded_agent_round_trip_preserves_all_fields(
     # env_passthrough preservation
     if "expected_env_passthrough" in agent_fields:
         assert env["HARNESS_ACP_ENV_PASSTHROUGH"] == agent_fields["expected_env_passthrough"]
+
+
+def test_permission_mode_threads_into_env_var(_isolate_config: Path) -> None:
+    """``executor.config.permission_mode`` sets ``HARNESS_ACP_PERMISSION_MODE``.
+
+    Closes spec -> spawn env; the wrap's half is covered in
+    ``tests/inner/test_acp_executor.py``. Without this the option is inert:
+    the child never learns the user opted out of approval cards.
+    """
+    _write_acp_config(_isolate_config)
+    env = _build_acp_spawn_env(
+        _make_spec(harness="acp:goose", permission_mode="bypassPermissions")
+    )
+    assert env["HARNESS_ACP_PERMISSION_MODE"] == "bypassPermissions"
+
+
+def test_no_permission_mode_omits_env_var(_isolate_config: Path) -> None:
+    """Absent ``permission_mode`` leaves the harness wrap on its ``auto`` default."""
+    _write_acp_config(_isolate_config)
+    assert "HARNESS_ACP_PERMISSION_MODE" not in _build_acp_spawn_env(
+        _make_spec(harness="acp:goose")
+    )

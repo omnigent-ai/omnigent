@@ -12,6 +12,10 @@ function loadMainHarness({
   forceDevUpdateConfig = false,
   dialogResponses = [{ response: 1, checkboxChecked: false }],
   serverShutdown = () => Promise.resolve(),
+  isPackaged = false,
+  platform = process.platform,
+  developerMode = false,
+  desktopVersionOverride,
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-update-test-"));
   fs.writeFileSync(path.join(userData, "settings.json"), JSON.stringify(settings), "utf8");
@@ -43,7 +47,21 @@ function loadMainHarness({
     focus: () => {},
   };
 
+  class FakeSemVer {
+    constructor(version) {
+      if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {
+        throw new Error(`Invalid version: ${version}`);
+      }
+      this.version = version;
+    }
+
+    format() {
+      return this.version;
+    }
+  }
+
   const autoUpdater = new EventEmitter();
+  autoUpdater.currentVersion = new FakeSemVer("0.3.0");
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;
   autoUpdater.forceDevUpdateConfig = forceDevUpdateConfig;
@@ -61,8 +79,9 @@ function loadMainHarness({
 
   const electron = {
     app: {
-      isPackaged: false,
+      isPackaged,
       getPath: (name) => (name === "userData" ? userData : userData),
+      getVersion: () => "0.3.0",
       setName: () => {},
       requestSingleInstanceLock: () => true,
       on: (name, listener) => appEvents.set(name, listener),
@@ -103,7 +122,10 @@ function loadMainHarness({
     screen: {},
     session: { defaultSession: {} },
     shell: {},
-    systemPreferences: {},
+    systemPreferences: {
+      getUserDefault: (key, type) =>
+        key === "DeveloperMode" && type === "boolean" ? developerMode : false,
+    },
   };
 
   const localRequires = {
@@ -113,6 +135,7 @@ function loadMainHarness({
       expandDatabricksWorkspaceUrl: async (url) => url,
     },
     "./workspace-chrome": { registerWorkspaceChromeHide: () => {} },
+    "./workspace-root-bounce": { registerWorkspaceRootBounce: () => {} },
     "./omnigent_cli": {
       isExecutableFile: () => false,
       resolveCliPath: () => null,
@@ -154,8 +177,10 @@ function loadMainHarness({
     module,
     process: {
       ...process,
+      platform,
       env: {
         ...process.env,
+        OMNIGENT_DESKTOP_VERSION_OVERRIDE: desktopVersionOverride,
         // No OMNIGENT_FORCE_DEV_UPDATE_CONFIG injection: main.js now derives
         // forceDevUpdateConfig from !app.isPackaged (always true in this
         // harness), not an env var. The harness still controls the
@@ -213,6 +238,67 @@ function findMenuItem(menu, id) {
   }
   return null;
 }
+
+function hasDebugMenu(menu) {
+  return menu.template.some((item) => item.label === "Debug");
+}
+
+describe("new session menu action", () => {
+  it("routes Cmd/Ctrl+N to the current window without replacing the New Window action", (t) => {
+    const harness = loadMainHarness();
+    t.after(harness.cleanup);
+
+    harness.api.buildMenu();
+    const menu = harness.calls.setApplicationMenu.at(-1);
+    const newSessionItem = findMenuItem(menu, "new_session");
+    const newWindowItem = findMenuItem(menu, "new_window");
+
+    assert.equal(newSessionItem.label, "New Session");
+    assert.equal(newSessionItem.accelerator, "CmdOrCtrl+N");
+    assert.equal(newWindowItem.accelerator, undefined);
+
+    newSessionItem.click();
+
+    assert.deepEqual(harness.calls.sent, [{ channel: "omnigent:open-path", payload: "/" }]);
+  });
+});
+
+describe("developer-mode menu wiring", () => {
+  it("keeps the Debug menu in development builds", (t) => {
+    const harness = loadMainHarness({ isPackaged: false, platform: "linux" });
+    t.after(harness.cleanup);
+
+    harness.api.buildMenu();
+
+    assert.equal(hasDebugMenu(harness.calls.setApplicationMenu.at(-1)), true);
+  });
+
+  it("hides the Debug menu in packaged builds by default", (t) => {
+    const harness = loadMainHarness({
+      isPackaged: true,
+      platform: "darwin",
+      developerMode: false,
+    });
+    t.after(harness.cleanup);
+
+    harness.api.buildMenu();
+
+    assert.equal(hasDebugMenu(harness.calls.setApplicationMenu.at(-1)), false);
+  });
+
+  it("shows the Debug menu when a packaged macOS build opts in", (t) => {
+    const harness = loadMainHarness({
+      isPackaged: true,
+      platform: "darwin",
+      developerMode: true,
+    });
+    t.after(harness.cleanup);
+
+    harness.api.buildMenu();
+
+    assert.equal(hasDebugMenu(harness.calls.setApplicationMenu.at(-1)), true);
+  });
+});
 
 describe("auto-update main-process wiring", () => {
   it("preserves unrelated settings keys when writing update config", (t) => {
@@ -563,6 +649,41 @@ describe("auto-update main-process wiring", () => {
     assert.equal(harness.api.updater.installPending, false);
   });
 
+  it("allows only development builds to override the effective desktop version", async (t) => {
+    const development = loadMainHarness({
+      settings: { update_mode: "manual" },
+      desktopVersionOverride: " 0.2.0 ",
+    });
+    t.after(development.cleanup);
+    assert.equal(development.autoUpdater.currentVersion.version, "0.2.0");
+    assert.equal(development.autoUpdater.currentVersion.format(), "0.2.0");
+
+    development.api.updater.init();
+    development.autoUpdater.emit("update-available", { version: "0.4.0" });
+    assert.equal(development.api.updater.getStatus().currentVersion, "0.2.0");
+
+    development.autoUpdater.emit("update-not-available");
+    development.api.buildMenu();
+    await findMenuItem(development.calls.setApplicationMenu.at(-1), "check_for_updates").click();
+    assert.equal(development.calls.showMessageBox.at(-1).options.title, "Omnigent Desktop");
+    assert.equal(
+      development.calls.showMessageBox.at(-1).options.detail,
+      "Omnigent Desktop 0.2.0 is the latest version.",
+    );
+
+    const packaged = loadMainHarness({
+      isPackaged: true,
+      settings: { update_mode: "manual" },
+      desktopVersionOverride: "0.2.0",
+    });
+    t.after(packaged.cleanup);
+    assert.equal(packaged.autoUpdater.currentVersion.version, "0.3.0");
+
+    packaged.api.updater.init();
+    packaged.autoUpdater.emit("update-available", { version: "0.4.0" });
+    assert.equal(packaged.api.updater.getStatus().currentVersion, "0.3.0");
+  });
+
   it("supports forceDevUpdateConfig and broadcasts updater events", (t) => {
     const harness = loadMainHarness({
       forceDevUpdateConfig: true,
@@ -576,12 +697,17 @@ describe("auto-update main-process wiring", () => {
     assert.equal(harness.autoUpdater.forceDevUpdateConfig, true);
     assert.deepEqual(plain(harness.api.updater.getStatus()), {
       state: "available",
+      currentVersion: "0.3.0",
       info: { version: "0.4.0" },
     });
     assert.deepEqual(plain(harness.calls.sent), [
       {
         channel: "omnigent:update-status",
-        payload: { state: "available", info: { version: "0.4.0" } },
+        payload: {
+          state: "available",
+          currentVersion: "0.3.0",
+          info: { version: "0.4.0" },
+        },
       },
     ]);
   });

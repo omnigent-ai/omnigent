@@ -294,8 +294,9 @@ def _tmux_input_option_commands(scrollback: int) -> list[list[str]]:
     Build tmux options for scrollback and pane input behavior.
 
     ``history-limit`` is generated per terminal because it comes from
-    ``TerminalEnvSpec.scrollback``. ``mouse on`` makes the attached web
-    terminal scrollable. ``focus-events on`` lets interactive programs
+    ``TerminalEnvSpec.scrollback``. ``set-clipboard external`` exports tmux
+    copy-mode selections without trusting pane OSC 52 requests. ``mouse on``
+    makes the attached web terminal scrollable. ``focus-events on`` lets interactive programs
     observe pane focus changes. ``extended-keys`` with CSI-u formatting
     lets programs inside tmux receive Kitty Keyboard Protocol keys such
     as Shift+Enter when the attached terminal supports them. Terminals
@@ -311,6 +312,9 @@ def _tmux_input_option_commands(scrollback: int) -> list[list[str]]:
         ["set-option", "-g", "history-limit", str(scrollback)],
         ["set-option", "-sq", "extended-keys", "on"],
         ["set-option", "-sq", "extended-keys-format", "csi-u"],
+        # Export tmux copy-mode selections to attached terminals without letting
+        # pane applications create tmux buffers through OSC 52.
+        ["set-option", "-sq", "set-clipboard", "external"],
         ["set-option", "-g", "mouse", "on"],
         ["set-option", "-g", "focus-events", "on"],
         ["set-option", "-g", "escape-time", "0"],

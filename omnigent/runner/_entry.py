@@ -25,6 +25,7 @@ import httpx
 from fastapi import FastAPI
 
 from omnigent._platform import IS_WINDOWS
+from omnigent.debug_logging import runner_primary_session_id
 from omnigent.inner import _proc
 from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
 from omnigent.version import VERSION
@@ -245,6 +246,7 @@ async def _run_inactivity_monitor(
             _logger.info(
                 "runner idle timeout reached after %.1fs with no active work; shutting down",
                 elapsed_s,
+                extra={"session_id": runner_primary_session_id()},
             )
             request_shutdown()
             return
@@ -434,7 +436,8 @@ class _InitialAuthTokenFactory:
                 self._no_credential_logged = True
                 _logger.error(
                     "host bootstrap bearer expired and no SDK/OIDC credential is available "
-                    "to renew it; run `databricks auth login` to re-authenticate"
+                    "to renew it; run `databricks auth login` to re-authenticate",
+                    extra={"session_id": runner_primary_session_id()},
                 )
             return token
 
@@ -451,7 +454,10 @@ class _InitialAuthTokenFactory:
             if self._initial_token is None:
                 return False
             self._initial_token = None
-            _logger.info("host bootstrap bearer rejected; resolving runner-local auth")
+            _logger.info(
+                "host bootstrap bearer rejected; resolving runner-local auth",
+                extra={"session_id": runner_primary_session_id()},
+            )
             return True
 
 
@@ -530,7 +536,10 @@ def _make_auth_token_factory(
         else ""
     )
     if initial_token and resolved_server_url:
-        _logger.info("using host-provided bearer for runner bootstrap")
+        _logger.info(
+            "using host-provided bearer for runner bootstrap",
+            extra={"session_id": runner_primary_session_id()},
+        )
         return _InitialAuthTokenFactory(initial_token, resolved_server_url)
 
     from omnigent.inner.databricks_executor import (
@@ -613,11 +622,34 @@ def _make_auth_token_factory(
         """
         # Check stored OIDC token first.
         if resolved_server_url:
-            from omnigent.cli_auth import load_token
+            from omnigent.cli_auth import (
+                REFRESH_MIN_REMAINING_SECONDS,
+                load_token,
+                refresh_stored_token,
+            )
 
-            oidc_token = load_token(resolved_server_url)
+            # Require enough remaining life that the token cannot lapse
+            # mid-handshake; a token inside that window falls through to
+            # the renewal path below rather than being used and rejected.
+            oidc_token = load_token(
+                resolved_server_url,
+                min_remaining_seconds=REFRESH_MIN_REMAINING_SECONDS,
+            )
             if oidc_token:
                 return oidc_token
+            # Expired or near-lapse: renew from the login-issued refresh
+            # grant when one exists. This is what keeps an unattended host
+            # alive past session-JWT expiry — the tunnel rebuilds headers
+            # through this factory on every reconnect.
+            refreshed = refresh_stored_token(resolved_server_url)
+            if refreshed:
+                return refreshed
+            # Nothing to renew with: a near-expiry token that has NOT
+            # actually lapsed still authenticates, so prefer it over
+            # falling through to no credential at all.
+            still_valid = load_token(resolved_server_url)
+            if still_valid:
+                return still_valid
         return _sdk_token()
 
     # Probe once to check if a user credential is available.
@@ -1012,6 +1044,7 @@ def _run_parent_death_killer(
         "runner exiting: parent process died and graceful shutdown did not "
         "complete within %.1fs; forcing hard exit",
         grace_s,
+        extra={"session_id": runner_primary_session_id()},
     )
     # os._exit skips buffer flushing, so flush logs first for diagnosability.
     with contextlib.suppress(Exception):
@@ -1115,6 +1148,7 @@ async def _resolve_agent_spec_from_server(
         _logger.info(
             "spec_resolver: GET %s returned 404 for missing agent",
             path,
+            extra={"session_id": session_id},
         )
         return None
     if resp.status_code != 200:
@@ -1295,6 +1329,7 @@ def create_app(
         _logger.info(
             "Reaped %d orphaned terminal tmux server(s) from prior runs",
             _reaped_terminals,
+            extra={"session_id": runner_primary_session_id()},
         )
 
     # Reuse the tunnel binding token for runner-side request auth.
@@ -1332,9 +1367,14 @@ def create_app(
                     "runner MCP prewarm registered for %s (servers=%d)",
                     prewarm_path,
                     len(prewarm_spec.mcp_servers or []),
+                    extra={"session_id": runner_primary_session_id()},
                 )
             except Exception:
-                _logger.exception("runner MCP prewarm failed for %s", prewarm_path)
+                _logger.exception(
+                    "runner MCP prewarm failed for %s",
+                    prewarm_path,
+                    extra={"session_id": runner_primary_session_id()},
+                )
         # Native-pane idle reaper (#1349): reclaims idle native CLI panes.
         _pane_reaper = getattr(app.state, "native_pane_reaper", None)
         if _pane_reaper is not None:
@@ -1437,7 +1477,11 @@ async def _run_tunnel_from_env() -> None:
 
         telemetry.init("omni-runner")
     except Exception:  # noqa: BLE001 — best-effort; tracing failure must not crash the runner
-        _logger.debug("telemetry init failed in runner", exc_info=True)
+        _logger.debug(
+            "telemetry init failed in runner",
+            exc_info=True,
+            extra={"session_id": runner_primary_session_id()},
+        )
 
     # Reuse the tunnel's token factory for the app's httpx client so the
     # runner resolves Databricks auth once at boot, not twice.
@@ -1452,6 +1496,30 @@ async def _run_tunnel_from_env() -> None:
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     last_activity_at = loop.time()
+
+    # asyncio funnels unretrieved task exceptions and callback errors through
+    # the loop's exception handler. Those are not our own _logger callsites
+    # (e.g. a discarded ``ws.recv()`` task on a normal tunnel close), so this is
+    # the one place we can attribute them to the runner's session and keep them
+    # out of asyncio's default, untagged "Task exception was never retrieved".
+    from websockets.exceptions import ConnectionClosedOK
+
+    def _handle_loop_exception(
+        loop: asyncio.AbstractEventLoop,  # noqa: ARG001 — signature mandated by asyncio
+        context: dict[str, object],
+    ) -> None:
+        exc = context.get("exception")
+        message = context.get("message") or "unhandled asyncio exception"
+        extra = {"session_id": runner_primary_session_id()}
+        if isinstance(exc, asyncio.CancelledError | ConnectionClosedOK):
+            # Benign teardown — keep it quiet but still attributed.
+            _logger.debug("asyncio: %s", message, exc_info=exc, extra=extra)
+        elif isinstance(exc, BaseException):
+            _logger.error("asyncio: %s", message, exc_info=exc, extra=extra)
+        else:
+            _logger.error("asyncio: %s (context=%r)", message, context, extra=extra)
+
+    loop.set_exception_handler(_handle_loop_exception)
 
     def _mark_activity() -> None:
         """Record real runner work for the inactivity watchdog.
@@ -1508,6 +1576,39 @@ async def _run_tunnel_from_env() -> None:
     # drains its session streams and closes cleanly — the server then sees an
     # end-of-stream, not an abrupt drop that renders a scary error banner.
     tunnel_shutdown_event = asyncio.Event()
+    # Loopback direct-attach listener: lets a browser on this machine attach
+    # to terminals with zero relay legs. Best-effort — any failure keeps the
+    # runner relay-only. Windows never runs the web terminal bridges, so the
+    # listener is POSIX-only like the bridges themselves.
+    direct_attach_listener = None
+    direct_attach_token: str | None = None
+    if sys.platform != "win32":
+        try:
+            from omnigent.runner.direct_attach import (
+                allowed_origin_for_server,
+                create_direct_attach_app,
+                new_direct_attach_token,
+                start_direct_attach_listener,
+            )
+
+            attach_handler = getattr(app.state, "terminal_attach_handler", None)
+            allowed_origin = allowed_origin_for_server(server_url)
+            if attach_handler is not None and allowed_origin is not None:
+                direct_attach_token = new_direct_attach_token()
+                direct_attach_listener = await start_direct_attach_listener(
+                    create_direct_attach_app(
+                        attach_handler,
+                        token=direct_attach_token,
+                        allowed_origins=frozenset({allowed_origin}),
+                    )
+                )
+        except Exception:  # noqa: BLE001 — optimization only; never block the tunnel
+            _logger.warning(
+                "direct-attach listener setup failed",
+                exc_info=True,
+                extra={"session_id": runner_primary_session_id()},
+            )
+            direct_attach_listener = None
     tunnel_task = asyncio.create_task(
         serve_tunnel(
             cast("_ASGIApp", app),  # FastAPI is ASGI-compatible; cast narrows for mypy
@@ -1521,6 +1622,12 @@ async def _run_tunnel_from_env() -> None:
             on_activity=_mark_activity,
             shutdown_event=tunnel_shutdown_event,
             on_graceful_shutdown=getattr(app.state, "drain_session_streams", None),
+            direct_attach_port=(
+                direct_attach_listener.port if direct_attach_listener is not None else None
+            ),
+            direct_attach_token=(
+                direct_attach_token if direct_attach_listener is not None else None
+            ),
         ),
         name=f"runner-ws-tunnel:{runner_id}",
     )
@@ -1603,7 +1710,11 @@ async def _run_tunnel_from_env() -> None:
         # A crash unwinding through here is attributed by sys.excepthook with
         # its traceback, so only record the reason for an orderly shutdown.
         if sys.exc_info()[0] is None:
-            _logger.info("runner exiting: %s", exit_reason or "shutdown requested")
+            _logger.info(
+                "runner exiting: %s",
+                exit_reason or "shutdown requested",
+                extra={"session_id": runner_primary_session_id()},
+            )
         for task in wait_tasks:
             task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -1613,6 +1724,9 @@ async def _run_tunnel_from_env() -> None:
         if idle_task is not None:
             with contextlib.suppress(asyncio.CancelledError):
                 await idle_task
+        if direct_attach_listener is not None:
+            with contextlib.suppress(Exception):
+                await direct_attach_listener.stop()
         await _lifespan_cm.__aexit__(None, None, None)
 
 
@@ -1675,6 +1789,7 @@ def _install_signal_handlers(
                 "Signal handler registration failed; continuing without "
                 "graceful-shutdown signal handling",
                 exc_info=True,
+                extra={"session_id": runner_primary_session_id()},
             )
 
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -1724,11 +1839,35 @@ def _install_crash_logging() -> None:
                 exc_type.__name__,
                 exc,
                 exc_info=(exc_type, exc, traceback),
+                extra={"session_id": runner_primary_session_id()},
             )
         previous_hook(exc_type, exc, traceback)
 
     _log_uncaught._omnigent_runner_crash_hook = True  # type: ignore[attr-defined]
     sys.excepthook = _log_uncaught
+
+
+def _maybe_prewarm_ambient_detection() -> None:
+    """Prewarm ambient provider detection for claude-native launches.
+
+    Terminal auto-create resolves the session's provider config, and on a
+    machine with no explicit provider that runs ambient detection — on macOS
+    a ``claude auth status`` subprocess (~0.6-0.9s) — inside the
+    user-visible "Starting up…" window. Starting the sweep at boot overlaps
+    it with tunnel connect and session init instead.
+
+    Gated on the launch-harness stamp the host injects (absent for CLI-local
+    runners and hosts that predate it), so other harnesses don't pay a
+    speculative subprocess on every launch.
+    """
+    from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
+    from omnigent.runner.identity import RUNNER_LAUNCH_HARNESS_ENV_VAR
+
+    if os.environ.get(RUNNER_LAUNCH_HARNESS_ENV_VAR) != CLAUDE_NATIVE_CODING_AGENT.harness:
+        return
+    from omnigent.onboarding.ambient import prewarm_detect_providers
+
+    prewarm_detect_providers()
 
 
 def main() -> None:
@@ -1747,6 +1886,7 @@ def main() -> None:
 
     configure_process_logging("runner", force=True)
     _install_crash_logging()
+    _maybe_prewarm_ambient_detection()
     try:
         asyncio.run(_run_tunnel_from_env())
     except RuntimeError as exc:
@@ -1754,7 +1894,7 @@ def main() -> None:
             raise
         # A fatal server rejection is an expected, actionable exit — log the
         # reason but keep stderr to the concise message (no traceback).
-        _logger.error("runner exiting: %s", exc)
+        _logger.error("runner exiting: %s", exc, extra={"session_id": runner_primary_session_id()})
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(1) from None
 

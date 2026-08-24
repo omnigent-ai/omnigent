@@ -9,6 +9,7 @@ import {
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { quoteShellArgument } from "@/lib/shell";
 import { CliCommandBlock } from "./CliCommandBlock";
 import { ForkSessionForm } from "./ForkSessionDialog";
 import { SwitchHostDialog } from "./SwitchHostDialog";
@@ -68,20 +69,21 @@ export function buildReconnectCommand({
 }): string {
   // Backslash-continued so the command stays readable inside a narrow
   // dialog AND remains valid when pasted into a shell.
+  const quotedServerUrl = quoteShellArgument(serverUrl);
   if (state === "host_offline") {
-    return ["omnigent host \\", `  --server ${serverUrl}`].join("\n");
+    return ["omnigent host \\", `  --server ${quotedServerUrl}`].join("\n");
   }
   if (wrapper === CLAUDE_NATIVE_WRAPPER) {
     return [
       "omnigent claude \\",
       `  --resume ${conversationId} \\`,
-      `  --server ${serverUrl}`,
+      `  --server ${quotedServerUrl}`,
     ].join("\n");
   }
   return [
     "omnigent run path/to/agent.yaml \\",
     `  --resume ${conversationId} \\`,
-    `  --server ${serverUrl}`,
+    `  --server ${quotedServerUrl}`,
   ].join("\n");
 }
 
@@ -175,6 +177,7 @@ export function ReconnectSessionDialog({
           <Tabs
             defaultValue={showCommand ? "reconnect" : "clone"}
             className="flex min-h-0 flex-1 flex-col gap-4"
+            componentId="reconnect.tabs"
           >
             <TabsList className="w-full">
               <TabsTrigger value="reconnect" data-testid="reconnect-session-tab-reconnect">

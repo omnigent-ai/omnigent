@@ -12,6 +12,8 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
+import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 
 // Project mocks are declared via vi.hoisted so they exist before the hoisted
 // vi.mock factory runs. projectsMock is mutated per-test to drive project
@@ -211,13 +213,19 @@ function mockConversations(convs: Conversation[]) {
   useConvMock.mockImplementation(() => result(convs));
 }
 
-function renderSidebar(open = true, initialEntry = "/", onOpenSearch?: () => void) {
+function renderSidebar(
+  open = true,
+  initialEntry = "/",
+  onOpenSearch?: () => void,
+  info?: ServerInfo,
+) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const sidebar = <Sidebar open={open} onClose={vi.fn()} onOpenSearch={onOpenSearch} />;
   return render(
     <QueryClientProvider client={qc}>
       <TooltipProvider>
         <MemoryRouter initialEntries={[initialEntry]}>
-          <Sidebar open={open} onClose={vi.fn()} onOpenSearch={onOpenSearch} />
+          {info ? <CapabilitiesProvider info={info}>{sidebar}</CapabilitiesProvider> : sidebar}
         </MemoryRouter>
       </TooltipProvider>
     </QueryClientProvider>,
@@ -356,7 +364,7 @@ describe("Sidebar session list", () => {
     expect(row.className).not.toContain("focus-within");
   });
 
-  it("offers the four display filters and defaults to All sessions", () => {
+  it("offers the four display filters and defaults to My sessions", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
 
@@ -369,9 +377,9 @@ describe("Sidebar session list", () => {
     for (const value of ["all", "mine", "shared", "archived"]) {
       expect(screen.getByTestId(`session-filter-${value}`)).toBeInTheDocument();
     }
-    // Radio semantics: exactly one option is checked, and it's "All sessions".
-    expect(screen.getByTestId("session-filter-all")).toHaveAttribute("aria-checked", "true");
-    expect(screen.getByTestId("session-filter-mine")).toHaveAttribute("aria-checked", "false");
+    // Radio semantics: exactly one option is checked, and it's "My sessions".
+    expect(screen.getByTestId("session-filter-mine")).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("session-filter-all")).toHaveAttribute("aria-checked", "false");
   });
 
   it("keeps the picked filter across a remount", () => {
@@ -381,22 +389,24 @@ describe("Sidebar session list", () => {
     ]);
     renderSidebar();
 
-    selectSessionFilter("mine");
-    expect(screen.queryByText("conv_shared")).toBeNull();
+    // Pick a non-default slice (default is "mine") so the remount below proves
+    // the pick was persisted, not just that we landed back on the default.
+    selectSessionFilter("shared");
+    expect(screen.queryByText("conv_mine")).toBeNull();
 
-    // Fresh mount re-reads localStorage: still scoped to the viewer's own
-    // sessions. If this fails, the pick lived only in memory and a reload
-    // silently snapped the list back to "All sessions".
+    // Fresh mount re-reads localStorage: still scoped to shared sessions. If
+    // this fails, the pick lived only in memory and a reload silently snapped
+    // the list back to the default.
     cleanup();
     renderSidebar();
-    expect(screen.getByText("conv_mine")).toBeInTheDocument();
-    expect(screen.queryByText("conv_shared")).toBeNull();
+    expect(screen.getByText("conv_shared")).toBeInTheDocument();
+    expect(screen.queryByText("conv_mine")).toBeNull();
     fireEvent.pointerDown(screen.getByTestId("session-filter"), {
       button: 0,
       ctrlKey: false,
       pointerType: "mouse",
     });
-    expect(screen.getByTestId("session-filter-mine")).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("session-filter-shared")).toHaveAttribute("aria-checked", "true");
   });
 
   it("drops a persisted Shared filter on a single-user server", () => {
@@ -414,7 +424,7 @@ describe("Sidebar session list", () => {
       ctrlKey: false,
       pointerType: "mouse",
     });
-    expect(screen.getByTestId("session-filter-all")).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("session-filter-mine")).toHaveAttribute("aria-checked", "true");
     expect(screen.queryByTestId("session-filter-shared")).toBeNull();
   });
 
@@ -452,11 +462,11 @@ describe("Sidebar session list", () => {
       archived: screen.queryByText("conv_archived") !== null,
     });
 
-    // Default: everything except archived.
-    expect(visible()).toEqual({ owned: true, shared: true, archived: false });
-
-    selectSessionFilter("mine");
+    // Default: the viewer's own sessions only ("My sessions").
     expect(visible()).toEqual({ owned: true, shared: false, archived: false });
+
+    selectSessionFilter("all");
+    expect(visible()).toEqual({ owned: true, shared: true, archived: false });
 
     selectSessionFilter("shared");
     expect(visible()).toEqual({ owned: false, shared: true, archived: false });
@@ -464,9 +474,9 @@ describe("Sidebar session list", () => {
     selectSessionFilter("archived");
     expect(visible()).toEqual({ owned: false, shared: false, archived: true });
 
-    // Back to All: leaving Archived restores the unarchived rows.
-    selectSessionFilter("all");
-    expect(visible()).toEqual({ owned: true, shared: true, archived: false });
+    // Back to My sessions: leaving Archived restores the viewer's own rows.
+    selectSessionFilter("mine");
+    expect(visible()).toEqual({ owned: true, shared: false, archived: false });
 
     // And Archived is still reachable a second time (state isn't one-shot).
     selectSessionFilter("archived");
@@ -597,7 +607,60 @@ describe("Sidebar session list", () => {
     expect(within(primaryNav).queryByTestId("toggle-selection-mode")).toBeNull();
   });
 
-  it("reveals session selection as an icon action on the Sessions header", () => {
+  it("paints the Inbox count with the shared active treatment while Inbox is inactive", () => {
+    // Off the /inbox route the badge is the only carrier of the count's
+    // treatment, so it wears the same --sidebar-active wash and foreground as
+    // a selected session row.
+    mockConversations([conv("conv_awaiting", "Claude Code", { pending_elicitations_count: 2 })]);
+    renderSidebar();
+
+    const inbox = screen.getByTestId("inbox-button");
+    expect(inbox).not.toHaveClass("bg-[var(--sidebar-active)]");
+    const badge = within(inbox).getByLabelText("2 inbox items waiting");
+    expect(badge).toHaveClass(
+      "bg-[var(--sidebar-active)]",
+      "text-[var(--sidebar-active-foreground)]",
+    );
+    expect(badge.className).not.toContain("brand-accent");
+  });
+
+  it("lets the active Inbox row show through the count badge", () => {
+    // On /inbox the row itself paints the translucent --sidebar-active wash.
+    // The badge keeps the shared active foreground but stays transparent so
+    // the wash is not double-composited into a darker fill.
+    mockConversations([conv("conv_awaiting", "Claude Code", { pending_elicitations_count: 2 })]);
+    renderSidebar(true, "/inbox");
+
+    const inbox = screen.getByTestId("inbox-button");
+    expect(inbox).toHaveClass(
+      "bg-[var(--sidebar-active)]",
+      "text-[var(--sidebar-active-foreground)]",
+    );
+    const badge = within(inbox).getByLabelText("2 inbox items waiting");
+    expect(badge).toHaveClass("bg-transparent", "text-[var(--sidebar-active-foreground)]");
+    expect(badge).not.toHaveClass("bg-[var(--sidebar-active)]");
+  });
+
+  it("hides Usage navigation while the release feature is off", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar();
+
+    expect(screen.queryByTestId("usage-nav")).toBeNull();
+  });
+
+  it("shows and highlights Usage navigation when the release feature is on", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/usage", undefined, {
+      ...FALLBACK_SERVER_INFO,
+      features: { usage_page: true },
+    });
+
+    const usage = screen.getByTestId("usage-nav");
+    expect(usage).toHaveAttribute("href", "/usage");
+    expect(usage).toHaveClass("bg-[var(--sidebar-active)]");
+  });
+
+  it("keeps filtering visible while session selection remains hover-revealed", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
 
@@ -611,13 +674,18 @@ describe("Sidebar session list", () => {
     expect(selectSessions).toHaveAttribute("data-size", "icon-xs");
     expect(selectSessions).toHaveClass("text-muted-foreground", "hover:text-foreground");
     expect(selectSessions).not.toHaveTextContent("Select sessions");
-    // The select + filter buttons share a flex wrapper inside the header's
-    // hover-reveal slot, so the reveal classes sit on the grandparent.
-    expect(selectSessions.parentElement?.parentElement).toHaveClass(
+    expect(selectSessions.parentElement).toHaveClass(
       "md:opacity-0",
       "md:group-hover/header:opacity-100",
       "md:group-focus-within/header:opacity-100",
+      "md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100",
     );
+
+    const filterSessions = within(sessionsSection!).getByRole("button", {
+      name: "Filter sessions",
+    });
+    expect(filterSessions.parentElement).not.toHaveClass("md:opacity-0");
+    expect(filterSessions.parentElement).toHaveClass("absolute", "right-1", "flex");
 
     fireEvent.click(selectSessions);
     expect(screen.getByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
@@ -933,7 +1001,8 @@ describe("Sidebar sections", () => {
     ]);
     renderSidebar();
 
-    // Default ("All sessions"): everything the viewer can see.
+    // "All sessions": everything the viewer can see.
+    selectSessionFilter("all");
     const recentSection = screen.getByText("Sessions").closest("section")!;
     expect(within(recentSection).getByText("conv_mine_legacy")).toBeInTheDocument();
     expect(within(recentSection).getByText("conv_mine_acl")).toBeInTheDocument();
@@ -1092,9 +1161,11 @@ describe("Sidebar tabs", () => {
     ]);
     renderSidebar();
 
-    // The owned session is filed (peeled out of the flat list into its
-    // collapsed folder), but the shared collision stays in the flat Sessions
-    // list rather than being pulled into the viewer's folder.
+    // The shared session shows on "All sessions" (the default "My sessions" tab
+    // scopes it out). The owned session is filed (peeled out of the flat list
+    // into its collapsed folder), but the shared collision stays in the flat
+    // Sessions list rather than being pulled into the viewer's folder.
+    selectSessionFilter("all");
     const sessionsSection = screen.getByText("Sessions").closest("section")!;
     expect(within(sessionsSection).queryByText("conv_owned")).toBeNull();
     expect(within(sessionsSection).getByText("conv_shared_alpha")).toBeInTheDocument();

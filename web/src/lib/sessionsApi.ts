@@ -16,7 +16,9 @@ import type { McpServerStartup } from "./events";
 import { authenticatedFetch } from "./identity";
 import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
 import { setSessionHost } from "./sessionHost";
+import { parseBackgroundTasks } from "./sse";
 import type {
+  BackgroundTaskInfo,
   ModelUsage,
   NativeModelOption,
   NestedSessionItem,
@@ -73,6 +75,10 @@ export interface PostEventResponse {
    * events.
    */
   pendingId?: string;
+  /** True only when retry performed a usable runner or terminal recovery. */
+  recovered?: boolean;
+  /** Machine-readable recovery outcome for retry_session control events. */
+  recovery?: "already_connected" | "native_terminal_ready" | "runner_relaunched";
 }
 
 /**
@@ -124,6 +130,11 @@ interface SessionResponseWire {
    * has settled to ``"idle"``. Absent/0 when none are tracked.
    */
   background_task_count?: number | null;
+  /**
+   * Per-shell detail behind `background_task_count`, so a reload can restore
+   * it. Absent when none are tracked.
+   */
+  background_tasks?: BackgroundTaskInfo[] | null;
   created_at: number;
   /**
    * Human-readable session title, e.g. ``"researcher:auth"`` for a
@@ -134,6 +145,12 @@ interface SessionResponseWire {
   labels?: Record<string, string>;
   /** Canonical working directory; ``null`` when unbound. */
   workspace?: string | null;
+  /**
+   * Native-terminal CLI args the session launched with, e.g.
+   * ``["--permission-mode", "plan"]``. Records only the LAUNCH flags —
+   * a later mode switch is reflected in `labels`, not here.
+   */
+  terminal_launch_args?: string[] | null;
   /** Worktree branch; ``null`` when the session uses no worktree. */
   git_branch?: string | null;
   items?: SessionItem[];
@@ -297,10 +314,12 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     hostResumable: wire.host_resumable ?? false,
     status: wire.status,
     backgroundTaskCount: wire.background_task_count ?? undefined,
+    backgroundTasks: parseBackgroundTasks(wire.background_tasks),
     createdAt: wire.created_at,
     title: wire.title ?? null,
     labels: wire.labels,
     workspace: wire.workspace ?? null,
+    terminalLaunchArgs: wire.terminal_launch_args ?? null,
     gitBranch: wire.git_branch ?? null,
     items: wire.items ?? [],
     queuedItems: wire.queued_items,
@@ -398,12 +417,16 @@ function postEventResponseFromWire(wire: {
   item_id?: string;
   denied?: boolean;
   pending_id?: string;
+  recovered?: boolean;
+  recovery?: PostEventResponse["recovery"];
 }): PostEventResponse {
   return {
     queued: wire.queued,
     itemId: wire.item_id,
     denied: wire.denied,
     pendingId: wire.pending_id,
+    recovered: wire.recovered,
+    recovery: wire.recovery,
   };
 }
 
@@ -675,6 +698,14 @@ export async function updateSession(
     reasoningEffort?: string | null;
     modelOverride?: string | null;
     codexPlanMode?: boolean;
+    /**
+     * Claude-native permission mode to switch a RUNNING session to, e.g.
+     * `"auto"`. Rejected by the server unless it's shift+tab-reachable
+     * (see `CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES`), and the PATCH
+     * fails if the live TUI didn't actually land on it — so a resolved
+     * promise means the mode really changed.
+     */
+    claudePermissionMode?: string;
     costControlModeOverride?: "on" | "off" | null;
     subagentRoutingOverride?: "on" | "off" | null;
     runnerId?: string;
@@ -691,6 +722,9 @@ export async function updateSession(
   }
   if (updates.codexPlanMode !== undefined) {
     body.collaboration_mode = updates.codexPlanMode ? "plan" : "default";
+  }
+  if (updates.claudePermissionMode !== undefined) {
+    body.permission_mode = updates.claudePermissionMode;
   }
   if ("costControlModeOverride" in updates) {
     body.cost_control_mode_override = updates.costControlModeOverride ?? null;
@@ -913,6 +947,8 @@ export async function postEvent(
       item_id?: string;
       denied?: boolean;
       pending_id?: string;
+      recovered?: boolean;
+      recovery?: PostEventResponse["recovery"];
     },
   );
 }
@@ -963,6 +999,11 @@ export function interrupt(sessionId: string): Promise<PostEventResponse> {
  */
 export function stopSession(sessionId: string): Promise<PostEventResponse> {
   return postEvent(sessionId, { type: "stop_session", data: {} });
+}
+
+/** Reconnect or relaunch the existing runner without replaying user input. */
+export function retrySession(sessionId: string): Promise<PostEventResponse> {
+  return postEvent(sessionId, { type: "retry_session", data: {} });
 }
 
 /**

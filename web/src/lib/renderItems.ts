@@ -26,6 +26,7 @@ import type {
   ToolResultBlock,
 } from "./blocks";
 import { LIVE_ITEM_PREFIX } from "./blocks";
+import { isUserInputElicitation } from "./askUserQuestion";
 import {
   type RoutingDecisionExtras,
   isSessionScopedDecision,
@@ -188,8 +189,9 @@ export type Bubble =
        * trailing answer of its own.
        */
       continued?: boolean;
-      /** Epoch seconds of the first block in the group — server-stamped
-       *  from history, client-stamped while live. Display-only. */
+      /** Freshest epoch stamp in the group (latest activity) —
+       *  server-stamped from history, client-stamped while live.
+       *  Display-only. */
       createdAtS?: number;
     }
   | { kind: "compaction_loading"; itemId: string }
@@ -530,12 +532,26 @@ function isAnonymousRid(rid: string): boolean {
  * Blocks stamped a distinct response id ON PURPOSE so they render as
  * their own bubble: deny/failure sentinels aren't part of any turn's
  * work, and REQUEST-phase elicitations get a unique id precisely so
- * `isRequestElicitationBubble` can lift them out. A response-id change
+ * `isStandaloneElicitationBubble` can lift them out. A response-id change
  * into or out of one of these is a real bubble boundary, not a
  * same-turn continuation.
  */
 function isStandaloneSentinelBlock(b: AnyBlock): boolean {
   return b.type === "policy_denied" || b.type === "error" || b.type === "elicitation";
+}
+
+/**
+ * A card that asks the USER — a question to answer, a plan to review —
+ * rather than approval to run something (see `isUserInputElicitation`).
+ *
+ * Such a card ends the assistant bubble it lands in and takes one of
+ * its own, so it renders where the answer belongs: outside the "Worked
+ * for" fold, with the work that follows the answer folding under a new
+ * one. Grouped with the turn it would collapse into the trace as if it
+ * were the agent's own step, hiding what the user said.
+ */
+function isUserInputElicitationBlock(b: AnyBlock): boolean {
+  return b.type === "elicitation" && isUserInputElicitation(b);
 }
 
 /** Whether a later assistant bubble continues the turn started at `from`. */
@@ -863,12 +879,18 @@ function walkBubbles(
     // a DISTINCT id on purpose still open their own bubble: deny/failure
     // sentinels (`policy_denied` / `error`) are not part of the turn's
     // work, and REQUEST-phase elicitations are stamped a unique id
-    // precisely so they stand alone (`isRequestElicitationBubble`).
+    // precisely so they stand alone (`isStandaloneElicitationBubble`).
+    // Question/plan cards split the turn on their own (see
+    // `isUserInputElicitationBlock`) — they carry the turn's id, but the
+    // user answering one is a boundary, not a step of the work.
     let groupResponseId = b.ctx.responseId;
     const groupStart = i;
     // Sentinel-headed groups never absorb a different turn's blocks, in
     // either direction (see the id-change handling below).
     const groupOpenedOnSentinel = isStandaloneSentinelBlock(b);
+    // A question/plan card is the user's own answer point, so it takes a
+    // bubble of its own even under the turn's response id.
+    const groupOpenedOnUserInput = isUserInputElicitationBlock(b);
     while (i < blocks.length) {
       const cur = blocks[i]!;
       // Break on boundaries that start a new top-level bubble. Include
@@ -887,6 +909,10 @@ function walkBubbles(
         i += 1;
         continue;
       }
+      // Break at a question/plan card the same way a user message
+      // breaks: the work before it and the work after the answer are
+      // separate stretches, each folding under its own "Worked for".
+      if (i > groupStart && (groupOpenedOnUserInput || isUserInputElicitationBlock(cur))) break;
       // A bare tool_result never renders standalone (it folds into its
       // call's card by callId) — don't let a backdated one split the
       // open bubble. Anonymous blocks never carry turn identity.
@@ -935,10 +961,31 @@ function walkBubbles(
     lastBubbleCount = 1;
     const workedForS = turnWorkedForS(groupBlocks);
     const lastActivityAtS = turnLastActivityAtS(groupBlocks);
-    // Server stamp on cold load, client stamp while live — display only.
+    // Freshest stamp in the group — server stamp on cold load, client
+    // stamp while live, either clock display-only. The max tracks latest
+    // activity and never jumps back for a backdated tail block.
+    // A delayed result backdated to an earlier turn is absorbed into this
+    // group but renders into its own turn's card (crossBubbleResults), so
+    // only results whose call lives here count as this bubble's activity.
+    const localResultKeys = new Set<string>();
+    for (const bk of groupBlocks) {
+      if (bk.type === "tool_group") {
+        for (const ex of bk.executions) {
+          localResultKeys.add(`${bk.ctx.responseId}:${ex.callId}`);
+        }
+      }
+    }
     const groupCreatedAtS = groupBlocks
+      .filter(
+        (bk) =>
+          bk.type !== "tool_result" || localResultKeys.has(`${bk.ctx.responseId}:${bk.callId}`),
+      )
       .map((bk) => bk.ctx.createdAtS ?? bk.ctx.clientCreatedAtS)
-      .find((v) => v !== undefined);
+      .reduce<number | undefined>(
+        (freshest, v) =>
+          v !== undefined && (freshest === undefined || v > freshest) ? v : freshest,
+        undefined,
+      );
     bubbles.push({
       kind: "assistant",
       responseId: groupResponseId,

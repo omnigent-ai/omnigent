@@ -1821,7 +1821,7 @@ async def test_turn_catalog_refetches_a_stale_pre_launch_catalog() -> None:
         assert await _native_turn_catalog(session_id, conv, runner_client) == [
             "databricks-claude-opus-4-8"
         ]
-        assert requested == [f"/v1/sessions/{session_id}/claude-model-options"]
+        assert requested == [f"/v1/sessions/{session_id}/model-options"]
         assert session_id not in _model_options_stale
         # The same refreshed vocabulary now spells the pick for the apply.
         assert (
@@ -1984,7 +1984,7 @@ async def test_routed_live_session_still_warms_both_catalogs() -> None:
         await asyncio.gather(options_task, *started)
 
         assert sorted(requested) == [
-            f"/v1/sessions/{session_id}/claude-model-options",
+            f"/v1/sessions/{session_id}/model-options",
             f"/v1/sessions/{session_id}/models",
         ]
         assert _model_options_cache[session_id] == [

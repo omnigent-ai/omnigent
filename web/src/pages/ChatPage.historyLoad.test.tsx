@@ -3,10 +3,20 @@ import { Profiler, useEffect, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { UserMessageBlock } from "@/lib/blocks";
 import { useChatStore } from "@/store/chatStore";
-import { HistoryAutoLoader, JumpToTopButton, LatestTurnSpacer } from "./ChatPage";
+import {
+  HistoryAutoLoader,
+  JumpToTopButton,
+  KeepBottomOnViewportResize,
+  LatestTurnSpacer,
+} from "./ChatPage";
 
 const stickContext = vi.hoisted(() => ({
   scrollRef: { current: null as HTMLElement | null },
+  contentRef: { current: null as HTMLElement | null },
+  isAtBottom: false,
+  scrollToBottom: vi.fn(),
+  state: { isAtBottom: false, escapedFromLock: true },
+  stopScroll: undefined as (() => void) | undefined,
 }));
 
 vi.mock("use-stick-to-bottom", () => ({
@@ -58,6 +68,174 @@ function setScrollMetrics(
     get: () => metrics.clientHeight ?? 0,
   });
 }
+
+describe("KeepBottomOnViewportResize", () => {
+  let resize: (() => void) | null;
+  let disconnectSpy = vi.fn<() => void>();
+  let nextFrameId: number;
+  let frames: Map<number, FrameRequestCallback>;
+
+  beforeEach(() => {
+    resize = null;
+    disconnectSpy.mockClear();
+    nextFrameId = 1;
+    frames = new Map();
+    stickContext.scrollRef.current = null;
+    stickContext.contentRef.current = null;
+    stickContext.isAtBottom = false;
+    stickContext.state.isAtBottom = false;
+    stickContext.state.escapedFromLock = true;
+    stickContext.scrollToBottom.mockReset();
+
+    class StubResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resize = () => callback([], this as unknown as ResizeObserver);
+      }
+      observe() {}
+      disconnect() {
+        disconnectSpy();
+      }
+    }
+    vi.stubGlobal("ResizeObserver", StubResizeObserver);
+    vi.stubGlobal(
+      "requestAnimationFrame",
+      vi.fn((callback: FrameRequestCallback) => {
+        const id = nextFrameId++;
+        frames.set(id, callback);
+        return id;
+      }),
+    );
+    vi.stubGlobal(
+      "cancelAnimationFrame",
+      vi.fn((id: number) => {
+        frames.delete(id);
+      }),
+    );
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    stickContext.scrollRef.current = null;
+    stickContext.contentRef.current = null;
+    stickContext.isAtBottom = false;
+    stickContext.state.isAtBottom = false;
+    stickContext.state.escapedFromLock = true;
+  });
+
+  function flushFrames() {
+    act(() => {
+      const callbacks = [...frames.values()];
+      frames.clear();
+      for (const callback of callbacks) callback(performance.now());
+    });
+  }
+
+  function makeScrollRoot(scrollTop = 1300) {
+    const metrics = { scrollTop, scrollHeight: 2000, clientHeight: 700 };
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, metrics);
+    stickContext.scrollRef.current = scrollRoot;
+    return { metrics, scrollRoot };
+  }
+
+  it("keeps a bottom-locked transcript pinned after its viewport shrinks", () => {
+    const { metrics } = makeScrollRoot();
+    stickContext.isAtBottom = true;
+    stickContext.state.isAtBottom = true;
+    stickContext.state.escapedFromLock = false;
+    render(<KeepBottomOnViewportResize />);
+
+    metrics.clientHeight = 650;
+    act(() => resize?.());
+
+    expect(stickContext.scrollToBottom).toHaveBeenCalledOnce();
+    expect(stickContext.scrollToBottom).toHaveBeenCalledWith("instant");
+    expect(frames.size).toBe(1);
+
+    flushFrames();
+    expect(stickContext.scrollToBottom).toHaveBeenCalledTimes(2);
+  });
+
+  it("leaves an escaped reader anchored by the browser", () => {
+    const { metrics } = makeScrollRoot(800);
+    render(<KeepBottomOnViewportResize />);
+
+    metrics.clientHeight = 650;
+    act(() => resize?.());
+
+    expect(stickContext.scrollToBottom).not.toHaveBeenCalled();
+    expect(frames.size).toBe(0);
+    expect(metrics.scrollTop).toBe(800);
+  });
+
+  it("ignores the public near-bottom alias when the live lock is escaped", () => {
+    const { metrics } = makeScrollRoot(1250);
+    stickContext.isAtBottom = true;
+    stickContext.state.isAtBottom = false;
+    stickContext.state.escapedFromLock = true;
+    render(<KeepBottomOnViewportResize />);
+
+    metrics.clientHeight = 650;
+    act(() => resize?.());
+
+    expect(stickContext.scrollToBottom).not.toHaveBeenCalled();
+    expect(frames.size).toBe(0);
+    expect(metrics.scrollTop).toBe(1250);
+  });
+
+  it("keeps a user escape after a same-resize library reclassification", () => {
+    const { metrics, scrollRoot } = makeScrollRoot();
+    stickContext.isAtBottom = true;
+    stickContext.state.isAtBottom = true;
+    stickContext.state.escapedFromLock = false;
+    render(<KeepBottomOnViewportResize />);
+
+    metrics.scrollTop = 1250;
+    stickContext.state.isAtBottom = false;
+    stickContext.state.escapedFromLock = true;
+    fireEvent.scroll(scrollRoot);
+
+    stickContext.state.isAtBottom = true;
+    stickContext.state.escapedFromLock = false;
+    metrics.clientHeight = 650;
+    act(() => resize?.());
+
+    expect(stickContext.scrollToBottom).not.toHaveBeenCalled();
+    expect(frames.size).toBe(0);
+    expect(metrics.scrollTop).toBe(1250);
+  });
+
+  it("ignores content-only resize notifications", () => {
+    const { metrics } = makeScrollRoot();
+    stickContext.isAtBottom = true;
+    render(<KeepBottomOnViewportResize />);
+
+    metrics.scrollHeight = 2200;
+    act(() => resize?.());
+
+    expect(stickContext.scrollToBottom).not.toHaveBeenCalled();
+    expect(frames.size).toBe(0);
+  });
+
+  it("disconnects the observer and cancels a queued follow-up frame", () => {
+    const { metrics } = makeScrollRoot();
+    stickContext.isAtBottom = true;
+    stickContext.state.isAtBottom = true;
+    stickContext.state.escapedFromLock = false;
+    const { unmount } = render(<KeepBottomOnViewportResize />);
+
+    metrics.clientHeight = 650;
+    act(() => resize?.());
+    expect(frames.size).toBe(1);
+
+    unmount();
+
+    expect(disconnectSpy).toHaveBeenCalledOnce();
+    expect(cancelAnimationFrame).toHaveBeenCalled();
+    expect(frames.size).toBe(0);
+  });
+});
 
 describe("HistoryAutoLoader", () => {
   beforeEach(() => {

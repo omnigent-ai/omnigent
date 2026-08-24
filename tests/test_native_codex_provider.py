@@ -440,6 +440,74 @@ def test_resolve_native_codex_launch_undismissed_config_provider_routes_via_pin(
     assert launch.profile is None
 
 
+def test_config_provider_shadowed_by_nondefault_explicit_entry_still_pins(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A nondefault adopted entry cannot hide Codex's active config provider.
+
+    The explicit entry shadows ambient synthesis by name, but Codex itself
+    still selects the provider from config.toml. An empty launch would make a
+    synthesized resume rollout record OpenAI and lose this provider's auth.
+    """
+    monkeypatch.setattr("omnigent.onboarding.ambient._ollama_reachable", lambda: False)
+    codex_dir = _isolated / ".codex"
+    codex_dir.mkdir()
+    (codex_dir / "config.toml").write_text(_DISMISSIBLE_CODEX_CONFIG)
+    _seed(
+        _isolated,
+        {
+            "codex-databricks": {
+                "kind": "cli-config",
+                "cli": "codex",
+                "model_provider": "Databricks",
+                "display_name": "Databricks AI Gateway",
+            }
+        },
+    )
+
+    launch = resolve_native_codex_launch(model="test-model")
+
+    assert launch.config_overrides == ['model_provider="Databricks"']
+    assert launch.model == "test-model"
+    assert launch.profile is None
+
+
+def test_shadowed_config_detection_uses_active_profile_provider(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fallback pins the provider selected by Codex's active profile."""
+    monkeypatch.setattr("omnigent.onboarding.ambient._ollama_reachable", lambda: False)
+    codex_dir = _isolated / ".codex"
+    codex_dir.mkdir()
+    (codex_dir / "config.toml").write_text(
+        'profile = "work"\n'
+        'model_provider = "UnusedTopLevel"\n'
+        "[profiles.work]\n"
+        'model_provider = "Databricks"\n'
+        "[model_providers.Databricks]\n"
+        'name = "Databricks AI Gateway"\n'
+        'base_url = "https://example.ai-gateway.cloud.databricks.com/codex/v1"\n'
+        "[model_providers.Databricks.auth]\n"
+        'command = "jq"\n'
+    )
+    _seed(
+        _isolated,
+        {
+            "codex-databricks": {
+                "kind": "cli-config",
+                "cli": "codex",
+                "model_provider": "Databricks",
+                "display_name": "Databricks AI Gateway",
+            }
+        },
+    )
+
+    launch = resolve_native_codex_launch(model=None)
+
+    assert launch.config_overrides == ['model_provider="Databricks"']
+    assert launch.profile is None
+
+
 # ── Spec-level credentials (issue #2744) ────────────────────────────────────
 
 

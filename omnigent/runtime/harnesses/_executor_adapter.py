@@ -16,7 +16,7 @@ import logging
 import secrets
 import uuid
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from fastapi import Response
@@ -171,6 +171,15 @@ class ExecutorAdapter(HarnessApp):
             executor._tool_executor = self._stable_tool_executor  # type: ignore[attr-defined]
         if getattr(executor, "_elicitation_handler", None) is None:
             executor._elicitation_handler = self._stable_elicitation_handler  # type: ignore[attr-defined]
+        # ACP-shaped executors also accept a choice bridge, to offer the agent's own
+        # permission scopes; the others don't define the attribute at all.
+        if (
+            hasattr(executor, "_elicitation_choice_handler")
+            and executor._elicitation_choice_handler is None  # type: ignore[attr-defined]
+        ):
+            executor._elicitation_choice_handler = (  # type: ignore[attr-defined]
+                self._stable_elicitation_choice_handler
+            )
         if getattr(executor, "_policy_evaluator", None) is None:
             executor._policy_evaluator = self._stable_policy_evaluator  # type: ignore[attr-defined]
         self._current_ctx = ctx
@@ -544,6 +553,25 @@ class ExecutorAdapter(HarnessApp):
             return False
 
         elicitation_id = f"elicit_{secrets.token_hex(16)}"
+        params = self._permission_card(tool_name, tool_input)
+        result = await ctx.elicit(elicitation_id, params)
+        if result.action == "decline":
+            # Signal via ctx.cancelled (the SDK swallows exceptions from control-request tasks).
+            ctx.cancelled.set()
+        return result.action == "accept"
+
+    def _permission_card(
+        self,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        *,
+        requested_schema: dict[str, Any] | None = None,
+    ) -> ElicitationRequestParams:
+        """Build the approval-card params for a tool-permission elicitation.
+
+        With *requested_schema* the card renders one button per choice instead of
+        Approve/Reject; without it, the usual binary card.
+        """
         # Build a concise preview: truncate long args so the UI widget
         # stays readable. 300 chars matches AP's policy-engine preview.
         try:
@@ -553,21 +581,61 @@ class ExecutorAdapter(HarnessApp):
         preview = preview[:300]
 
         label = self._harness_label
-        policy_name = f"{label.lower()}_sdk_permission"
-        params = ElicitationRequestParams(
+        return ElicitationRequestParams(
             mode="form",
             message=f"{label} wants to use **{tool_name}**",
-            requestedSchema=None,
+            requestedSchema=requested_schema,
             url=None,
             phase="tool_call",
-            policy_name=policy_name,
+            policy_name=f"{label.lower()}_sdk_permission",
             content_preview=f"{tool_name}({preview})",
         )
+
+    async def _stable_elicitation_choice_handler(
+        self,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        options: Sequence[str],
+    ) -> str | None:
+        """Stable bridge for a multiple-choice tool-permission elicitation.
+
+        Same gate as :meth:`_stable_elicitation_handler`, but the card offers the
+        harness's own permission scopes as buttons and the chosen label comes back,
+        so the user can grant the scope the agent already supports instead of
+        re-approving the same action every time.
+
+        :returns: The chosen label, or ``None`` when declined, cancelled, or the
+            reply carried no readable answer.
+        """
+        ctx = self._current_ctx
+        if ctx is None:
+            # No active turn — decline by default, as the binary card does.
+            _logger.error(
+                "elicitation choice callback fired with no active turn context "
+                "(tool=%s); declining by default",
+                tool_name,
+            )
+            return None
+
+        elicitation_id = f"elicit_{secrets.token_hex(16)}"
+        # An ``answer`` enum is what the approval card renders as one button per
+        # option, and the reply names the chosen label in ``content["answer"]``.
+        params = self._permission_card(
+            tool_name,
+            tool_input,
+            requested_schema={
+                "type": "object",
+                "properties": {"answer": {"type": "string", "enum": list(options)}},
+                "required": ["answer"],
+            },
+        )
         result = await ctx.elicit(elicitation_id, params)
-        if result.action == "decline":
-            # Signal via ctx.cancelled (the SDK swallows exceptions from control-request tasks).
-            ctx.cancelled.set()
-        return result.action == "accept"
+        if result.action != "accept":
+            if result.action == "decline":
+                ctx.cancelled.set()
+            return None
+        answer = (result.content or {}).get("answer")
+        return answer if isinstance(answer, str) else None
 
     async def _stable_policy_evaluator(
         self,

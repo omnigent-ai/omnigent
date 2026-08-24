@@ -206,6 +206,7 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
     server_version: null,
     smart_routing_enabled: false,
     smart_routing_sources: { external: false, oss: false },
+    features: {},
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
@@ -687,6 +688,16 @@ describe("leave a shared session", () => {
     // row must not offer Leave — it falls back to Delete.
     mockConversations([{ ...CONV, owner: "other@example.com" }]);
     renderSidebar(undefined, serverInfo({ single_user: true }));
+
+    // The default filter is "My sessions", which scopes out this owner:other
+    // row; the single-user menu still offers "All sessions", so switch to it to
+    // surface the row this test is about.
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByTestId("session-filter-all"));
 
     fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
 

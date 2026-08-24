@@ -3,8 +3,10 @@
 // resulting `AnyBlock[]`.
 
 import { describe, expect, it } from "vitest";
+import { castAskUserQuestionPayload, exitPlanModePlan } from "./askUserQuestion";
 import type {
   CompactionBlock,
+  ElicitationBlock,
   ErrorBlock,
   NativeToolBlock,
   ReasoningBlock,
@@ -51,6 +53,7 @@ function functionCall(
   name: string,
   args: Record<string, unknown>,
   id = `fc_${callId}`,
+  model?: string,
 ): ConversationItem {
   return {
     id,
@@ -60,6 +63,7 @@ function functionCall(
     name,
     arguments: JSON.stringify(args),
     call_id: callId,
+    ...(model === undefined ? {} : { model }),
   };
 }
 
@@ -332,6 +336,117 @@ describe("itemsToBlocks — tool calls", () => {
     const blocks = itemsToBlocks(items);
     const group = blocks.find((b): b is ToolGroup => b.type === "tool_group");
     expect(group?.executions[0]!.arguments).toEqual({});
+  });
+});
+
+describe("itemsToBlocks — answered question and plan cards", () => {
+  const QUESTIONS = {
+    questions: [
+      {
+        question: "Which library should we use?",
+        header: "Library",
+        multiSelect: false,
+        options: [{ label: "date-fns", description: "Small" }],
+      },
+      {
+        question: 'Ship the "fast path" too?',
+        header: "Scope",
+        multiSelect: false,
+        options: [{ label: "Yes", description: "Both" }],
+      },
+    ],
+  };
+
+  it("rebuilds the answered card ahead of the tool row it was gated on", () => {
+    const items: ConversationItem[] = [
+      userMessage("resp_1", "Pick for me"),
+      functionCall("resp_1", "c1", "AskUserQuestion", QUESTIONS, "fc_c1", "claude-native-ui"),
+      functionCallOutput(
+        "resp_1",
+        "c1",
+        'Your questions have been answered: "Which library should we use?"="date-fns", ' +
+          '"Ship the "fast path" too?"="Yes". You can now continue with these answers in mind.',
+      ),
+      assistantMessage("resp_1", "Using date-fns."),
+    ];
+    const blocks = itemsToBlocks(items);
+    expect(blocks.map((b) => b.type)).toEqual([
+      "user_message",
+      "elicitation",
+      "tool_group",
+      "tool_result",
+      "text_done",
+    ]);
+    const card = blocks[1] as ElicitationBlock;
+    expect(card.status).toBe("responded");
+    expect(card.response).toEqual({
+      action: "accept",
+      content: {
+        "Which library should we use?": "date-fns",
+        'Ship the "fast path" too?': "Yes",
+      },
+    });
+    // Keyed off the call's item id so re-hydration converges, and stamped
+    // with the vendor so the card still reads "Claude Code".
+    expect(card.ctx.itemId).toBe("fc_c1:answer");
+    expect(card.policyName).toBe("claude_native_permission");
+    expect(castAskUserQuestionPayload(card.askUserQuestion)?.questions).toHaveLength(2);
+  });
+
+  it("reads answers out of the free-text result shape too", () => {
+    const items: ConversationItem[] = [
+      functionCall("resp_1", "c1", "AskUserQuestion", QUESTIONS, "fc_c1"),
+      functionCallOutput(
+        "resp_1",
+        "c1",
+        'The user answered: "Which library should we use?"="whatever you think". Read the answers carefully.',
+      ),
+    ];
+    const card = itemsToBlocks(items)[0] as ElicitationBlock;
+    expect(card.response?.content).toEqual({
+      "Which library should we use?": "whatever you think",
+    });
+  });
+
+  it("leaves an unanswered question as a plain tool row", () => {
+    // No output yet (still parked, or the pair split across history pages):
+    // the live snapshot owns the pending card, and a rebuilt one would have
+    // to invent a verdict.
+    const blocks = itemsToBlocks([
+      functionCall("resp_1", "c1", "AskUserQuestion", QUESTIONS, "fc_c1"),
+    ]);
+    expect(blocks.map((b) => b.type)).toEqual(["tool_group"]);
+  });
+
+  it("leaves a dismissed question as a plain tool row", () => {
+    const blocks = itemsToBlocks([
+      functionCall("resp_1", "c1", "AskUserQuestion", QUESTIONS, "fc_c1"),
+      functionCallOutput("resp_1", "c1", "The user doesn't want to proceed with this tool use."),
+    ]);
+    expect(blocks.map((b) => b.type)).toEqual(["tool_group", "tool_result"]);
+  });
+
+  it("rebuilds an approved plan card from the ExitPlanMode result", () => {
+    const blocks = itemsToBlocks([
+      functionCall("resp_1", "c1", "ExitPlanMode", { plan: "## Steps\n1. Do it" }, "fc_c1"),
+      functionCallOutput("resp_1", "c1", "User has approved your plan. You can now start coding."),
+    ]);
+    const card = blocks[0] as ElicitationBlock;
+    expect(card.type).toBe("elicitation");
+    expect(card.response).toEqual({ action: "accept" });
+    expect(exitPlanModePlan(card.exitPlanMode)).toBe("## Steps\n1. Do it");
+  });
+
+  it("carries the feedback a rejected plan came back with", () => {
+    const blocks = itemsToBlocks([
+      functionCall("resp_1", "c1", "ExitPlanMode", { plan: "## Steps" }, "fc_c1"),
+      functionCallOutput("resp_1", "c1", "Your time estimates are BS. Revise plan."),
+    ]);
+    const card = blocks[0] as ElicitationBlock;
+    expect(card.response).toEqual({
+      action: "decline",
+      content: { feedback: "Your time estimates are BS. Revise plan." },
+    });
   });
 });
 
