@@ -4536,142 +4536,135 @@ function SubagentComposerTray({ label }: { label: string }) {
   );
 }
 
-const BACKGROUND_TASK_PILL_CLASS =
-  "flex min-w-0 items-center gap-1.5 rounded-full border border-border bg-card px-3 py-1 text-sm text-muted-foreground shadow-sm";
-
-const BACKGROUND_TASK_COLLAPSE_DELAY_MS = 1000;
-// Keep in sync with the pills' fade/zoom duration below.
-const BACKGROUND_TASK_ANIM_MS = 150;
-
 /**
  * Pill above the composer tallying running background tasks (a dev server, a
  * background shell, a sub-agent), shown independently of the "Working…" shimmer.
  *
- * Clicking the tally splits it into one pill per running shell; the row
- * collapses shortly after the mouse leaves (or on Escape), and re-entering
- * cancels the pending collapse. A count-only edge (older runner, no per-shell
- * detail) renders the plain, non-interactive tally.
+ * The tally expands into a card listing each running shell by name: on hover
+ * for a mouse, on tap for touch (which focuses it, so a tap outside closes it
+ * via blur), and on focus for the keyboard. It morphs in place — the same
+ * element tweens width and height to the measured content size at a constant
+ * corner radius (CSS can't animate to an `auto` size), growing upward out of an
+ * absolute layer over a hidden spacer so the composer below never shifts. A
+ * count-only edge (older runner, no per-shell detail) stays a plain tally.
  */
 function BackgroundTaskPill() {
   const bgCount = useChatStore((s) => s.backgroundTaskCount);
   const bgTasks = useChatStore((s) => s.backgroundTasks);
-  const [expanded, setExpanded] = useState(false);
-  const [collapsing, setCollapsing] = useState(false);
-  const collapseDelayRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const exitAnimRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [open, setOpen] = useState(false);
+  const contentRef = useRef<HTMLDivElement>(null);
+  const [box, setBox] = useState<{ width: number; height: number } | null>(null);
   const canExpand = bgTasks.length > 0;
 
-  const clearTimers = useCallback(() => {
-    if (collapseDelayRef.current) clearTimeout(collapseDelayRef.current);
-    if (exitAnimRef.current) clearTimeout(exitAnimRef.current);
-    collapseDelayRef.current = null;
-    exitAnimRef.current = null;
-  }, []);
-
-  const collapseNow = useCallback(() => {
-    clearTimers();
-    setCollapsing(false);
-    setExpanded(false);
-  }, [clearTimers]);
-
-  const scheduleCollapse = useCallback(() => {
-    clearTimers();
-    collapseDelayRef.current = setTimeout(() => {
-      setCollapsing(true);
-      exitAnimRef.current = setTimeout(collapseNow, BACKGROUND_TASK_ANIM_MS);
-    }, BACKGROUND_TASK_COLLAPSE_DELAY_MS);
-  }, [clearTimers, collapseNow]);
-
-  const cancelCollapse = useCallback(() => {
-    clearTimers();
-    setCollapsing(false);
-  }, [clearTimers]);
-
   useEffect(() => {
-    if (bgCount <= 0 || !canExpand) collapseNow();
-  }, [bgCount, canExpand, collapseNow]);
+    if (bgCount <= 0 || !canExpand) setOpen(false);
+  }, [bgCount, canExpand]);
 
-  // Escape collapses too — keyboard users have no "mouse out".
-  useEffect(() => {
-    if (!expanded) return;
-    const onKey = (e: globalThis.KeyboardEvent) => {
-      if (e.key === "Escape") collapseNow();
-    };
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, [expanded, collapseNow]);
-
-  useEffect(() => clearTimers, [clearTimers]);
+  // Measure the current content so the container tweens to a concrete size in
+  // both dimensions. Re-measured whenever the state or the task list changes.
+  useLayoutEffect(() => {
+    const el = contentRef.current;
+    if (el) setBox({ width: el.offsetWidth, height: el.offsetHeight });
+  }, [open, canExpand, bgCount, bgTasks]);
 
   if (bgCount <= 0) return null;
 
-  const label = (
-    <>
-      <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
-      <span>
-        {bgCount} background task{bgCount === 1 ? "" : "s"}
-      </span>
-    </>
-  );
+  const showCard = open && canExpand;
 
   return (
     <div className={cn("mx-auto flex w-full px-1 pb-1.5", CHAT_COLUMN_WIDTH)}>
-      {expanded && canExpand ? (
-        <div
-          className="flex flex-wrap items-center gap-1.5"
-          onMouseEnter={cancelCollapse}
-          onMouseLeave={scheduleCollapse}
-          data-testid="background-task-pill-expanded"
-        >
-          {bgTasks.map((task, i) => (
-            <div
-              key={task.id ?? i}
-              // Stagger entrance for a split-apart feel; collapse out together.
-              style={{ animationDelay: collapsing ? "0ms" : `${Math.min(i * 40, 240)}ms` }}
-              className={cn(
-                BACKGROUND_TASK_PILL_CLASS,
-                "max-w-full fill-mode-both duration-150",
-                collapsing
-                  ? "animate-out fade-out-0 zoom-out-95"
-                  : "animate-in fade-in-0 zoom-in-95",
-              )}
-            >
-              <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
-              <span className="min-w-0 truncate">
-                {task.description || task.command || "Background shell"}
-              </span>
-            </div>
-          ))}
+      <div className="relative">
+        {/* Reserves the collapsed footprint so the absolute, upward-growing
+            card never shoves the composer. */}
+        <div aria-hidden className="invisible px-3 py-1.5 text-sm">
+          <div className="flex items-center gap-1.5 whitespace-nowrap">
+            <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
+            <span>
+              {bgCount} background task{bgCount === 1 ? "" : "s"}
+            </span>
+          </div>
         </div>
-      ) : canExpand ? (
-        <button
-          type="button"
-          data-testid="background-task-pill"
-          aria-expanded={false}
-          aria-label={`${bgCount} background task${bgCount === 1 ? "" : "s"} still running; activate to list them`}
-          onClick={() => {
-            clearTimers();
-            setCollapsing(false);
-            setExpanded(true);
-          }}
-          className={cn(
-            BACKGROUND_TASK_PILL_CLASS,
-            "animate-in fade-in-0 duration-150",
-            "cursor-pointer transition-colors hover:bg-muted hover:text-foreground dark:hover:bg-muted/50",
-          )}
-        >
-          {label}
-        </button>
-      ) : (
         <div
           role="status"
           data-testid="background-task-pill"
           aria-label={`${bgCount} background task${bgCount === 1 ? "" : "s"} still running`}
-          className={BACKGROUND_TASK_PILL_CLASS}
+          tabIndex={canExpand ? 0 : undefined}
+          // Hover opens ONLY for a real mouse. On touch, opening on emulated
+          // hover triggers iOS's "first tap reveals hover, second tap clicks"
+          // heuristic — which swallows the first tap inconsistently. Touch opens
+          // via onClick instead, so the first tap always lands.
+          onPointerEnter={(e) => {
+            if (e.pointerType === "mouse" && canExpand) setOpen(true);
+          }}
+          onPointerLeave={(e) => {
+            if (e.pointerType === "mouse") setOpen(false);
+          }}
+          // Tap/click: open and focus the pill so onBlur can close it on
+          // tap-out (a gesture-driven focus() works even on iOS, where tapping a
+          // non-button element otherwise won't focus it).
+          onClick={(e) => {
+            if (!canExpand) return;
+            setOpen(true);
+            e.currentTarget.focus({ preventScroll: true });
+          }}
+          onFocus={() => canExpand && setOpen(true)}
+          onBlur={(e) => {
+            // Close when focus leaves the pill entirely (tap/click outside,
+            // Tab away); staying open if it moves to a child.
+            if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setOpen(false);
+          }}
+          style={box ? { width: box.width, height: box.height } : undefined}
+          className={cn(
+            "absolute bottom-0 left-0 overflow-hidden rounded-2xl bg-card text-sm shadow-sm ring-1 ring-border transition-[width,height,box-shadow] duration-200 ease-out",
+            showCard && "z-10 shadow-menu",
+          )}
         >
-          {label}
+          <div
+            ref={contentRef}
+            // Cap at Tailwind's `md` container (28rem/448px), but never wider
+            // than the viewport minus a margin so it can't overflow on a narrow
+            // screen. The margin exceeds the composer's own px-4/px-6 inset (this
+            // pill sits at px-1) so the card's right edge, ring included, stays
+            // inside the composer rather than overhanging it.
+            style={
+              showCard ? { maxWidth: "min(var(--container-md, 28rem), 100vw - 3rem)" } : undefined
+            }
+            className={cn("w-max text-left", showCard ? "px-3 py-2" : "px-3 py-1.5")}
+          >
+            {showCard ? (
+              <ul className="flex animate-in flex-col gap-1.5 fade-in-0 duration-200">
+                {bgTasks.map((task, i) => {
+                  const label = task.description || task.command || "Background shell";
+                  const cmd = task.command && task.command !== label ? task.command : null;
+                  return (
+                    <li key={task.id ?? i} className="flex items-start gap-2">
+                      <SquareTerminalIcon
+                        className="mt-0.5 size-3.5 shrink-0 text-muted-foreground"
+                        aria-hidden="true"
+                      />
+                      <div className="min-w-0">
+                        <div className="truncate text-foreground">{label}</div>
+                        {cmd ? (
+                          <div className="truncate font-mono text-xs text-muted-foreground">
+                            {cmd}
+                          </div>
+                        ) : null}
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            ) : (
+              <div className="flex items-center gap-1.5 whitespace-nowrap text-muted-foreground">
+                <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
+                <span>
+                  {bgCount} background task{bgCount === 1 ? "" : "s"}
+                </span>
+              </div>
+            )}
+          </div>
         </div>
-      )}
+      </div>
     </div>
   );
 }
