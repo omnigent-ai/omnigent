@@ -4396,8 +4396,6 @@ export function formatStatusModelLabel(
   if (codexOption) {
     return formatModelDisplayName(codexOption.displayName ?? codexOption.id);
   }
-  const known = CLAUDE_NATIVE_MODELS.find((m) => m.id === lower);
-  if (known) return known.label;
   // An alias-shaped id the session's catalog doesn't list (e.g. during
   // the pre-catalog window): render it friendly mechanically — "sonnet"
   // → "Sonnet", "sonnet_5" → "Sonnet 5", "sonnet[1m]" → "Sonnet
