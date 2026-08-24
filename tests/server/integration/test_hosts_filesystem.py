@@ -201,6 +201,7 @@ async def fs_setup(
                                 request_id=frame.request_id,
                                 status=reply.get("status", "ok"),
                                 models=reply.get("models", []),
+                                routable_models=reply.get("routable_models", []),
                                 error=reply.get("error"),
                             )
                         ),
@@ -265,7 +266,8 @@ async def test_host_model_options_returns_prelaunch_catalog(
                 "model": "system.ai.claude-sonnet-4-6[1m]",
                 "displayName": "Sonnet 4.6",
             }
-        ]
+        ],
+        "routable_models": ["system.ai.claude-sonnet-4-6[1m]"],
     }
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -281,7 +283,10 @@ async def test_host_model_options_returns_prelaunch_catalog(
                 "model": "system.ai.claude-sonnet-4-6[1m]",
                 "displayName": "Sonnet 4.6",
             }
-        ]
+        ],
+        # The frame's routable set reaches the web client instead of being
+        # dropped at the route boundary.
+        "routable_models": ["system.ai.claude-sonnet-4-6[1m]"],
     }
 
 

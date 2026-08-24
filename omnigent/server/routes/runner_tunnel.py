@@ -35,7 +35,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     encode_frame,
 )
 from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
-from omnigent.server import session_live_state
+from omnigent.server import session_live_state, shutdown_state
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.host_registry import RunnerExitReports
 from omnigent.server.routes._auth_helpers import require_user
@@ -538,6 +538,7 @@ def create_runner_tunnel_router(
                         )
                         continue
                     if isinstance(task_error, WebSocketDisconnect):
+                        shutdown_state.note_tunnel_close_code(getattr(task_error, "code", None))
                         _logger.warning(
                             "Tunnel helper task disconnected for runner %s: %s "
                             "(code=%s, reason=%r)",
@@ -578,6 +579,7 @@ def create_runner_tunnel_router(
                         )
 
         except WebSocketDisconnect as exc:
+            shutdown_state.note_tunnel_close_code(getattr(exc, "code", None))
             _logger.warning(
                 "Runner %s websocket disconnected (code=%s, reason=%r)",
                 runner_id,

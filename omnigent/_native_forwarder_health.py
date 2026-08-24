@@ -49,6 +49,19 @@ def record_post_failure(event_type: str, error: BaseException) -> None:
     _state["last_post_failure"] = (time.monotonic(), f"{event_type}: {error!r}")
 
 
+def record_transport_failure(detail: str) -> None:
+    """Record an already-formatted transport failure into the shared slot.
+
+    The SDK codex head has no forwarder POST path, but its subprocess still
+    runs under the same idle-turn watchdog. When the model gateway rejects the
+    CLI (e.g. a 401 read off the CLI's stderr), the turn emits no events and the
+    watchdog would otherwise blame a generic "wedged LLM". Recording the parsed
+    cause here lets the watchdog attribute the real failure, exactly as the
+    native forwarder path does. *detail* is a ready-to-surface human string.
+    """
+    _state["last_post_failure"] = (time.monotonic(), detail)
+
+
 def note_post_success() -> None:
     """
     Clear the failure record after a POST that reached the server.

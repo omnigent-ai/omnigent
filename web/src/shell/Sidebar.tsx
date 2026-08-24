@@ -43,6 +43,7 @@ import {
   SearchIcon,
   Settings2Icon,
   ShareIcon,
+  SmilePlusIcon,
   SquareIcon,
   SquareCheckIcon,
   SquarePenIcon,
@@ -101,6 +102,7 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
   type Conversation,
   type PinnedConversationsResult,
@@ -115,6 +117,8 @@ import {
   useMoveToProject,
   useDeleteProject,
   useRenameProject,
+  useProjectConfig,
+  useUpdateProjectConfig,
   PROJECT_LABEL_KEY,
   PINNED_CONVERSATIONS_KEY,
   usePinnedConversations,
@@ -133,6 +137,7 @@ import { relativeTime } from "@/lib/relativeTime";
 import { showToast } from "@/components/ui/toast";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
+import { EmojiPicker } from "@/components/ProjectIconPicker";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useActiveRootSessionId } from "@/hooks/useSession";
@@ -150,6 +155,7 @@ import {
   useUnseenTick,
 } from "@/hooks/useUnseenConversations";
 import { cn } from "@/lib/utils";
+import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
@@ -795,6 +801,7 @@ export function Sidebar({
               to="/"
               onClick={onNavClick}
               data-testid="sidebar-brand"
+              componentId="sidebar.home"
               className="sidebar-brand rounded-none transition-opacity duration-200 ease-[var(--ease-otto)] hover:opacity-70"
             >
               {branding.app_name ? (
@@ -849,6 +856,7 @@ export function Sidebar({
               (the button stays visible on both tabs). */}
               <Link
                 to="/"
+                componentId="sidebar.new_chat"
                 onClick={(e) => {
                   switchTab("mine");
                   onNavClick(e);
@@ -880,7 +888,7 @@ export function Sidebar({
               variant="ghost"
               data-testid="scheduled-tasks-nav"
             >
-              <Link to="/tasks" onClick={onNavClick}>
+              <Link to="/tasks" onClick={onNavClick} componentId="sidebar.tasks">
                 <ClockIcon
                   className={cn(
                     "ui-icon",
@@ -903,7 +911,7 @@ export function Sidebar({
               )}
               data-testid="inbox-button"
             >
-              <Link to="/inbox" onClick={onNavClick}>
+              <Link to="/inbox" onClick={onNavClick} componentId="sidebar.inbox">
                 <InboxIcon
                   className={cn(
                     "ui-icon",
@@ -945,7 +953,7 @@ export function Sidebar({
                 )}
                 data-testid="usage-nav"
               >
-                <Link to="/usage" onClick={onNavClick}>
+                <Link to="/usage" onClick={onNavClick} componentId="sidebar.usage">
                   <WalletIcon
                     className={cn(
                       "ui-icon",
@@ -1071,6 +1079,7 @@ function InfiniteScrollSentinel({
 function ProjectFolder({
   name,
   projectId,
+  icon,
   windowConversations,
   expanded,
   active,
@@ -1091,6 +1100,9 @@ function ProjectFolder({
   name: string;
   /** First-class project id, or null for a label-only folder. */
   projectId: string | null;
+  /** Chosen emoji icon (unicode grapheme), or null/absent for the default
+      folder glyph. */
+  icon?: string | null;
   /** This folder's members from the globally-loaded window (may lag or lead
       the folder's own pages — e.g. a just-moved row carries its optimistic
       membership here before the folder query returns it). */
@@ -1169,7 +1181,9 @@ function ProjectFolder({
       <ConversationSection
         title={name}
         icon={
-          expanded ? (
+          icon ? (
+            <span className="text-[14px] leading-none">{icon}</span>
+          ) : expanded ? (
             <FolderOpenIcon
               className={cn(
                 "ui-icon",
@@ -1218,7 +1232,12 @@ function ProjectFolder({
         }
         indentRows
         headerAction={
-          <ProjectFolderActions projectName={name} projectId={projectId} onNavigate={onRowClick} />
+          <ProjectFolderActions
+            projectName={name}
+            projectId={projectId}
+            icon={icon}
+            onNavigate={onRowClick}
+          />
         }
         footer={
           loadingFirstPage ? (
@@ -1442,24 +1461,29 @@ function ConversationList({
     // (and out of the flat Shared list via filedIds). Each folder holds its
     // non-pinned sessions — pinning a project's last one leaves it empty.
     const filedIds = new Set<string>();
-    const projectGroups: { id: string | null; name: string; conversations: Conversation[] }[] =
-      projects.map(({ id, name }) => {
-        // Dual-read membership: a session belongs to this folder if it has
-        // the first-class id OR the legacy omni_project label of this name,
-        // and (filing being owner-only) the viewer owns it.
-        const inProject = notArchived.filter(
-          (c) =>
-            isOwnedByViewer(c, viewerId) &&
-            ((id !== null && c.project_id === id) || c.labels?.[PROJECT_LABEL_KEY] === name) &&
-            !pinnedIdSet.has(c.id),
-        );
-        inProject.forEach((c) => filedIds.add(c.id));
-        return {
-          id,
-          name,
-          conversations: sortByUpdatedAtDesc(inProject, activeOverride, frozenKeys),
-        };
-      });
+    const projectGroups: {
+      id: string | null;
+      name: string;
+      icon?: string | null;
+      conversations: Conversation[];
+    }[] = projects.map(({ id, name, icon }) => {
+      // Dual-read membership: a session belongs to this folder if it has
+      // the first-class id OR the legacy omni_project label of this name,
+      // and (filing being owner-only) the viewer owns it.
+      const inProject = notArchived.filter(
+        (c) =>
+          isOwnedByViewer(c, viewerId) &&
+          ((id !== null && c.project_id === id) || c.labels?.[PROJECT_LABEL_KEY] === name) &&
+          !pinnedIdSet.has(c.id),
+      );
+      inProject.forEach((c) => filedIds.add(c.id));
+      return {
+        id,
+        name,
+        icon,
+        conversations: sortByUpdatedAtDesc(inProject, activeOverride, frozenKeys),
+      };
+    });
     // NOTE: empty projects are intentionally NOT filtered out. A project comes
     // from the server project list (useProjects), so it can have zero *loaded*
     // conversations — either genuinely empty or because its chats live on an
@@ -1942,6 +1966,7 @@ function ConversationList({
                       key={group.name}
                       name={group.name}
                       projectId={group.id}
+                      icon={group.icon}
                       windowConversations={group.conversations}
                       expanded={expandedProjects.includes(group.name)}
                       active={newSessionProjectName === group.name}
@@ -2700,6 +2725,7 @@ function ConversationMenuItems({
   // to the side. `view` swaps between the main actions and that sub-view;
   // desktop always renders the native side-flyout submenu regardless.
   const isMobile = useIsMobileViewport();
+  const { trackClick } = useOmnigentAnalytics();
   const [view, setView] = useState<"main" | "projects">("main");
 
   // The project pick / create / remove flow — shared verbatim by the desktop
@@ -2793,7 +2819,13 @@ function ConversationMenuItems({
           </Tooltip>
         ))}
       {isOwner ? (
-        <C.Item data-testid="rename-conversation" onSelect={() => setIsEditing(true)}>
+        <C.Item
+          data-testid="rename-conversation"
+          onSelect={() => {
+            trackClick("sidebar.conversation.rename", "button");
+            setIsEditing(true);
+          }}
+        >
           <PencilIcon className="size-3.5" />
           Rename
         </C.Item>
@@ -3712,6 +3744,7 @@ function ConversationRow({
               variant="destructive"
               onClick={confirmDelete}
               disabled={del.isPending}
+              componentId="sidebar.conversation.delete"
             >
               Delete
             </Button>
@@ -3747,6 +3780,7 @@ function ConversationRow({
               data-testid="confirm-leave-conversation"
               onClick={confirmLeave}
               disabled={leave.isPending}
+              componentId="sidebar.conversation.leave"
             >
               Leave
             </Button>
@@ -3794,6 +3828,7 @@ function ConversationRow({
                 stopSession.mutate(conversation.id, { onSuccess: () => setStopOpen(false) })
               }
               loading={stopSession.isPending}
+              componentId="sidebar.conversation.stop"
             >
               Stop session
             </Button>
@@ -3886,11 +3921,14 @@ function ArchivingRow({ label }: { label: string }) {
 function ProjectFolderActions({
   projectName,
   projectId,
+  icon,
   onNavigate,
 }: {
   projectName: string;
   /** First-class project id, or null for a label-only folder. */
   projectId: string | null;
+  /** Current emoji icon, or null/absent when unset. */
+  icon?: string | null;
   /** Plain-left-click nav handler — closes the mobile overlay so the
       pre-filed new-session page isn't left hidden behind the sidebar. */
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
@@ -3927,7 +3965,12 @@ function ProjectFolderActions({
         </TooltipTrigger>
         <TooltipContent side="bottom">New session in project</TooltipContent>
       </Tooltip>
-      <ProjectFolderMenu projectName={projectName} projectId={projectId} onNavigate={onNavigate} />
+      <ProjectFolderMenu
+        projectName={projectName}
+        projectId={projectId}
+        icon={icon}
+        onNavigate={onNavigate}
+      />
     </div>
   );
 }
@@ -3943,10 +3986,13 @@ function ProjectFolderActions({
 function ProjectFolderMenu({
   projectName,
   projectId,
+  icon,
   onNavigate,
 }: {
   projectName: string;
   projectId: string | null;
+  /** Current emoji icon, or null/absent when unset (gates "Remove icon"). */
+  icon?: string | null;
   /** Nav handler for the mobile-only "New session" item (desktop uses the
       hover-revealed pencil). Closes the sidebar overlay on mobile. */
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
@@ -3955,9 +4001,33 @@ function ProjectFolderMenu({
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [renameOpen, setRenameOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [emojiOpen, setEmojiOpen] = useState(false);
   const [renameValue, setRenameValue] = useState(projectName);
+  // The icon staged in the rename modal, committed only on Confirm:
+  //   undefined = untouched (show the saved icon), string = a picked emoji,
+  //   null = staged removal. Reset to `undefined` each time the modal opens.
+  const [pendingIcon, setPendingIcon] = useState<string | null | undefined>(undefined);
   const deleteProject = useDeleteProject();
   const renameProject = useRenameProject();
+  const updateConfig = useUpdateProjectConfig();
+  // Fetch the full config only while the menu or rename modal is open, so we can
+  // merge the icon onto the other stored defaults (host / workspace / agent)
+  // without a per-folder request on every sidebar render — and without wiping
+  // those defaults on save.
+  const { data: iconConfig, isError: iconConfigError } = useProjectConfig(
+    menuOpen || renameOpen ? projectId : null,
+  );
+  // The config PATCH replaces the whole blob, so an ICON save must merge onto a
+  // fully-loaded config or it silently wipes the other defaults. "Ready" means
+  // the config actually resolved (`!== undefined` — `isLoading` alone is false
+  // on a query *error* too, leaving no data to merge onto) — except a
+  // label-only folder (`projectId === null`), whose base is legitimately `{}`.
+  // This gates only the icon path; renaming the name never needs the config.
+  const configReady = projectId === null || iconConfig !== undefined;
+  const savedIcon = iconConfig !== undefined ? iconConfig?.icon : icon;
+  // What the modal's tile shows: the staged pick when touched, else the saved
+  // icon. `null` (staged removal) renders as the empty folder.
+  const displayIcon = pendingIcon !== undefined ? pendingIcon : savedIcon;
 
   return (
     <>
@@ -3995,6 +4065,7 @@ function ProjectFolderMenu({
             data-testid="rename-project"
             onSelect={() => {
               setRenameValue(projectName);
+              setPendingIcon(undefined);
               setRenameOpen(true);
             }}
           >
@@ -4016,7 +4087,23 @@ function ProjectFolderMenu({
         </DropdownMenuContent>
       </DropdownMenu>
       <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
-        <DialogContent onClick={(e) => e.stopPropagation()}>
+        <DialogContent
+          onClick={(e) => e.stopPropagation()}
+          // emoji-mart preventDefaults the pointer event, so Radix's own
+          // outside-dismissal never fires for clicks elsewhere in the modal.
+          // Catch them in the capture phase and close the picker ourselves,
+          // unless the pointer is inside the picker or on its trigger tile.
+          onPointerDownCapture={(e) => {
+            if (!emojiOpen) return;
+            const target = e.target as Element;
+            if (
+              target.closest('[data-slot="popover-content"]') ||
+              target.closest('[data-testid="rename-project-icon"]')
+            )
+              return;
+            setEmojiOpen(false);
+          }}
+        >
           <DialogHeader>
             <DialogTitle>Rename project</DialogTitle>
           </DialogHeader>
@@ -4024,34 +4111,137 @@ function ProjectFolderMenu({
               doesn't wrap children in one) instead of relying on a manual
               key handler + button lookup. */}
           <form
-            onSubmit={(e) => {
+            onSubmit={async (e) => {
               e.preventDefault();
               const newName = renameValue.trim();
-              if (newName === "" || newName === projectName) {
-                setRenameOpen(false);
-                setMenuOpen(false);
+              const nameChanged = newName !== "" && newName !== projectName;
+              const iconChanged = pendingIcon !== undefined && pendingIcon !== (savedIcon ?? null);
+              // Only the icon write needs a loaded config to merge onto; a
+              // name-only rename must proceed even if the config fetch failed.
+              if (iconChanged && !configReady) return;
+              try {
+                // Name first: it promotes a label-only folder (creating the
+                // first-class row) and reconciles members. Capture the resolved
+                // id so the icon write below targets that row — passing the
+                // stale render-time `null` would make the config write try to
+                // create the project a second time and 409 on the duplicate.
+                let targetId = projectId;
+                if (nameChanged) {
+                  targetId = await renameProject.mutateAsync({
+                    id: projectId,
+                    oldName: projectName,
+                    newName,
+                  });
+                }
+                if (iconChanged) {
+                  const next = { ...(iconConfig ?? {}) };
+                  if (pendingIcon === null) delete next.icon;
+                  else next.icon = pendingIcon;
+                  await updateConfig.mutateAsync({
+                    id: targetId,
+                    name: nameChanged ? newName : projectName,
+                    config: next,
+                  });
+                }
+              } catch {
+                // Errors surface via the mutation state below. A rename that
+                // lands before a failed icon write is already persisted; only
+                // the icon needs retrying.
                 return;
               }
-              renameProject.mutate(
-                { id: projectId, oldName: projectName, newName },
-                {
-                  onSuccess: () => {
-                    setRenameOpen(false);
-                    setMenuOpen(false);
-                  },
-                },
-              );
+              setRenameOpen(false);
+              setMenuOpen(false);
             }}
           >
-            <input
-              autoFocus
-              className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none"
-              value={renameValue}
-              onChange={(e) => setRenameValue(e.target.value)}
-            />
-            {renameProject.isError && (
+            {/* One combined control: emoji tile (left) + name (right) share a
+                single border, so it reads as a single input. The tile opens a
+                picker popover; the pick is staged and committed on Confirm. */}
+            <div className="flex items-stretch overflow-hidden rounded-lg border border-input">
+              <Popover open={emojiOpen} onOpenChange={setEmojiOpen}>
+                <PopoverTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label="Change project icon"
+                    data-testid="rename-project-icon"
+                    disabled={!configReady}
+                    className={cn(
+                      "flex size-[38px] shrink-0 cursor-pointer items-center justify-center outline-none transition-colors disabled:cursor-default disabled:opacity-50",
+                      displayIcon ? "bg-muted" : "bg-tag-pink",
+                    )}
+                  >
+                    {displayIcon ? (
+                      <span className="text-xl leading-none">{displayIcon}</span>
+                    ) : (
+                      <SmilePlusIcon className="size-4 text-brand-accent" />
+                    )}
+                  </button>
+                </PopoverTrigger>
+                <PopoverContent
+                  align="start"
+                  // Publish the collision-aware available viewport height (Radix
+                  // exposes it as a CSS var), less the optional "Remove icon"
+                  // header and capped at the picker's natural size, so the
+                  // .emoji-picker-popover rule in index.css shrinks emoji-mart to
+                  // fit — it then scrolls its grid internally (nav + search
+                  // pinned) instead of clipping on short screens.
+                  collisionPadding={8}
+                  style={
+                    {
+                      "--emoji-picker-height": `min(420px, calc(var(--radix-popover-content-available-height) - ${displayIcon ? "38px" : "0px"}))`,
+                    } as CSSProperties
+                  }
+                  className="emoji-picker-popover flex max-h-[var(--radix-popover-content-available-height)] w-auto flex-col overflow-hidden p-0"
+                  // The rename Dialog's scroll lock (react-remove-scroll)
+                  // preventDefaults wheel events over the picker — it can't see
+                  // emoji-mart's scroll region inside shadow DOM. Stop the wheel
+                  // from reaching the document-level lock so the grid scrolls.
+                  onWheel={(e) => e.stopPropagation()}
+                  // Nested in the rename Dialog, emoji-mart's own focus handling
+                  // swallows Radix's default outside-pointer dismissal, so a
+                  // click elsewhere in the modal wouldn't close the picker.
+                  // Close it explicitly on any outside interaction.
+                >
+                  {displayIcon ? (
+                    <div className="shrink-0 border-b p-1">
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="w-full justify-start"
+                        data-testid="rename-project-remove-icon"
+                        onClick={() => {
+                          setPendingIcon(null);
+                          setEmojiOpen(false);
+                        }}
+                      >
+                        <Trash2Icon className="size-3.5" />
+                        Remove icon
+                      </Button>
+                    </div>
+                  ) : null}
+                  <EmojiPicker
+                    onSelect={(native) => {
+                      setPendingIcon(native);
+                      setEmojiOpen(false);
+                    }}
+                  />
+                </PopoverContent>
+              </Popover>
+              <input
+                className="w-full bg-transparent px-3 py-2 text-ui outline-none"
+                value={renameValue}
+                onChange={(e) => setRenameValue(e.target.value)}
+              />
+            </div>
+            {iconConfigError && (
               <p className="text-ui text-destructive" role="alert">
-                {(renameProject.error as Error).message}
+                Couldn&apos;t load this project&apos;s icon settings. You can still rename it;
+                changing the icon is unavailable until this loads.
+              </p>
+            )}
+            {(renameProject.isError || updateConfig.isError) && (
+              <p className="text-ui text-destructive" role="alert">
+                {((renameProject.error ?? updateConfig.error) as Error).message}
               </p>
             )}
             <DialogFooter className="border-t-0 bg-transparent">
@@ -4059,17 +4249,18 @@ function ProjectFolderMenu({
                 type="button"
                 variant="ghost"
                 onClick={() => setRenameOpen(false)}
-                disabled={renameProject.isPending}
+                disabled={renameProject.isPending || updateConfig.isPending}
               >
                 Cancel
               </Button>
               <Button
                 type="submit"
                 data-testid="rename-project-confirm"
-                loading={renameProject.isPending}
+                loading={renameProject.isPending || updateConfig.isPending}
                 disabled={renameValue.trim() === ""}
+                componentId="sidebar.project.rename"
               >
-                Rename
+                Confirm
               </Button>
             </DialogFooter>
           </form>

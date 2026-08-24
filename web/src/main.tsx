@@ -11,8 +11,8 @@ import { QueueFlushProvider } from "./hooks/QueueFlushProvider";
 import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
 import { resolveServerInfo, type ServerInfo } from "./lib/capabilities";
 import { CapabilitiesProvider } from "./lib/CapabilitiesContext";
-import { createBootServerInfo } from "./lib/bootCapabilities";
-import { resolveIdentity } from "./lib/identity";
+import { createBootServerInfo, withBootTimeout } from "./lib/bootCapabilities";
+import { isLoginRedirectPending, resolveIdentity } from "./lib/identity";
 import { initNativeInsets } from "./lib/nativeInsets";
 import { initBrowserTelemetry } from "./lib/telemetry";
 import {
@@ -53,7 +53,16 @@ initChatStore(queryClient);
 // Discover the current user identity from the server. Once resolved,
 // all subsequent fetch calls include X-Forwarded-Email so session
 // routes know who's making the request.
-void resolveIdentity();
+//
+// Started here but AWAITED at the render gate below, alongside the
+// /v1/info probe. The app's shell mounts ~8 queries (hosts, agents,
+// conversations, projects, harnesses) with no auth gating of their own,
+// so rendering before this settles fans them all out at once — logged
+// out, every one 401s in parallel and the login redirect races the
+// burst. Kicked off at module scope so it runs CONCURRENTLY with
+// `resolveServerInfo()`; the gate waits on the slower of the two rather
+// than chaining a second round-trip onto first paint.
+const bootIdentity = resolveIdentity();
 
 // Mirror the iOS shell's native bar footprints into the inset CSS variables.
 // No-op off the iOS shell (the inset vars stay at their env()-only defaults).
@@ -85,6 +94,11 @@ applyThemePalette(readThemePalette());
 // safety timeout (1.5s) so users on a flaky network still get
 // something on screen.
 const bootServerInfo = createBootServerInfo(resolveServerInfo());
+
+// Same 1.5s safety net for the identity probe: a hung /v1/me must not
+// deadlock first paint. On timeout we render anyway and the app degrades
+// exactly as it did before this gate existed.
+const bootIdentityGate = withBootTimeout<string | null>(bootIdentity, null);
 
 function RootApp({ initialInfo }: { initialInfo: ServerInfo }) {
   const [info, setInfo] = useState(initialInfo);
@@ -133,7 +147,13 @@ function RootApp({ initialInfo }: { initialInfo: ServerInfo }) {
   );
 }
 
-void bootServerInfo.initial.then((initialInfo) => {
+void Promise.all([bootServerInfo.initial, bootIdentityGate]).then(([initialInfo]) => {
+  // `/v1/me` came back 401 with a login page and we're already on our way
+  // there. Mounting now would start a navigation race we lose either way:
+  // the shell's queries fire against a session we know is invalid, 401,
+  // and get torn down mid-flight when the login page commits. Header mode
+  // never lands here (no login page), so a proxy-less deploy still renders.
+  if (isLoginRedirectPending()) return;
   createRoot(document.getElementById("root")!).render(
     <StrictMode>
       <RootApp initialInfo={initialInfo} />

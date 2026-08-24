@@ -12,6 +12,8 @@ import { Loader2Icon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTheme } from "next-themes";
 import { Button } from "@/components/ui/button";
+import { showToast } from "@/components/ui/toast";
+import { copyText } from "@/lib/clipboard";
 import { isDatabricksWorkspace, resolveWebSocketUrl } from "@/lib/host";
 import { subscribeCodeFont } from "@/lib/codeFontPreferences";
 import { resolveInitialAttachUrl, watchDirectUpgrade, withAttachParams } from "@/lib/terminals";
@@ -37,9 +39,26 @@ import {
  * when the schedule is exhausted the closed overlay stays up and the
  * user falls back to a manual refresh / resume.
  *
+ * The cumulative budget must outlast a server outage so a terminal
+ * watched through one recovers on its own instead of dead-ending while
+ * the backend is still coming back. The fast ramp covers the common
+ * case — a Databricks Apps redeploy reroutes the ingress in ~20-25s —
+ * and the schedule then holds at 30s for several minutes so a slow
+ * redeploy, a stuck rollout, or a longer infra blip still self-heals
+ * rather than stranding the user on a manual refresh. ~5 min total.
+ * (A backgrounded tab also re-dials with a fresh budget on the
+ * visibilitychange reveal, so this budget is really about a foreground
+ * terminal the user is actively watching.)
+ *
  * Exported for direct unit testing (fake timers advance through it).
  */
-export const RECONNECT_BACKOFF_MS = [500, 1000, 2000, 4000, 8000] as const;
+export const RECONNECT_BACKOFF_MS = [
+  // Fast ramp: recover promptly from the common ~20-25s redeploy.
+  500, 1000, 2000, 4000, 8000, 15000,
+  // Then hold at 30s for the rest of a ~5-minute budget, so a longer
+  // outage still auto-recovers at a calm cadence instead of dead-ending.
+  30000, 30000, 30000, 30000, 30000, 30000, 30000, 30000, 30000,
+] as const;
 
 /**
  * A connection that stayed open at least this long before dropping is
@@ -157,6 +176,8 @@ export function TerminalView({
   onActivityRef.current = onActivity;
   const onInputRef = useRef(onInput);
   onInputRef.current = onInput;
+  const activeRef = useRef(active);
+  activeRef.current = active;
   // Track whether this terminal has already tried a keyless re-dial after a
   // 4400 wrong-replica close. If keyless still fails with 4400, the host is
   // genuinely unreachable — stop retrying.
@@ -181,6 +202,30 @@ export function TerminalView({
 
   const notifyInput = useCallback(() => {
     onInputRef.current?.();
+  }, []);
+
+  const notifyClipboardRequest = useCallback((text: string) => {
+    const copyAndRefocus = () => copyText(text).finally(() => sessionRef.current?.focus());
+    const copied = () => showToast("Copied from terminal.", { duration: 1500 });
+    const failed = () =>
+      showToast("Couldn't copy terminal selection to the clipboard.", { duration: 0 });
+    void copyAndRefocus().then(copied, () => {
+      showToast(
+        <span className="flex items-center gap-2">
+          <span>Terminal copy is ready.</span>
+          <Button
+            type="button"
+            size="xs"
+            variant="secondary"
+            onClick={() => void copyAndRefocus().then(copied, failed)}
+            componentId="diagnostics.terminal.copy"
+          >
+            Copy
+          </Button>
+        </span>,
+        { duration: 0 },
+      );
+    });
   }, []);
 
   // Dispose the outgoing session before a remount re-dials. React 18
@@ -276,6 +321,8 @@ export function TerminalView({
           notifyActivity,
           notifyInput,
           controlMode,
+          !readOnly && activeRef.current,
+          notifyClipboardRequest,
         );
         sessionRef.current = terminalSession;
         // Relay-connected with a direct URL on offer: negotiate the
@@ -309,6 +356,7 @@ export function TerminalView({
       notifyState,
       notifyActivity,
       notifyInput,
+      notifyClipboardRequest,
       disposeActiveSession,
     ],
   );
@@ -317,6 +365,10 @@ export function TerminalView({
   useEffect(() => {
     sessionRef.current?.setTheme(isDark);
   }, [isDark]);
+
+  useEffect(() => {
+    sessionRef.current?.setClipboardEnabled(!readOnly && active);
+  }, [readOnly, active]);
 
   // On the hidden→visible edge of a pre-warmed surface: focus the
   // terminal (the session's WS-open focus is a no-op while the element is
@@ -560,6 +612,7 @@ function StatusOverlay({
               onClick={onResume}
               disabled={resumePending}
               className="border-zinc-500/50 bg-zinc-100 text-zinc-950 hover:bg-white"
+              componentId="diagnostics.terminal.resume"
             >
               {resumePending ? "Resuming…" : "Resume session"}
             </Button>

@@ -689,6 +689,16 @@ describe("leave a shared session", () => {
     mockConversations([{ ...CONV, owner: "other@example.com" }]);
     renderSidebar(undefined, serverInfo({ single_user: true }));
 
+    // The default filter is "My sessions", which scopes out this owner:other
+    // row; the single-user menu still offers "All sessions", so switch to it to
+    // surface the row this test is about.
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByTestId("session-filter-all"));
+
     fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
 
     expect(screen.queryByTestId("leave-conversation")).toBeNull();

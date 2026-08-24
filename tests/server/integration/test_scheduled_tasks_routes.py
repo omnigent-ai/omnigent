@@ -239,6 +239,39 @@ async def test_create_rejects_invalid_reasoning_effort(
     assert resp.status_code == 400, resp.text
 
 
+async def test_create_persists_permission_mode(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A valid permission mode round-trips on create and read."""
+    _make_user(db_uri)
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(permission_mode="acceptEdits"),
+        headers=_headers(),
+    )
+    assert resp.status_code == 200, resp.text
+    created = resp.json()
+    assert created["permission_mode"] == "acceptEdits"
+    task_id = created["id"]
+
+    got = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
+    assert got.status_code == 200
+    assert got.json()["permission_mode"] == "acceptEdits"
+
+
+@pytest.mark.parametrize("permission_mode", ["yolo", "--danger", "Auto"])
+async def test_create_rejects_invalid_permission_mode(
+    auth_client: httpx.AsyncClient, db_uri: str, permission_mode: str
+) -> None:
+    _make_user(db_uri)
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(permission_mode=permission_mode),
+        headers=_headers(),
+    )
+    assert resp.status_code == 400, resp.text
+
+
 async def test_create_rejects_relative_workspace(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
@@ -388,6 +421,88 @@ async def test_update_changes_fields_and_validates_rrule(
         headers=_headers(),
     )
     assert deleted_state.status_code == 422, deleted_state.text
+
+
+async def test_create_rejects_permission_mode_for_non_claude_agent(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A valid mode on a non-Claude agent is rejected (server capability gate).
+
+    The web dialog only shows the permission control for Claude Code; the server
+    enforces the same gate so a codex/cursor/etc. task can't persist a mode the
+    fire path would inject as an unknown ``--permission-mode`` flag. The value
+    itself is a valid Claude mode — the rejection is purely about the agent's
+    harness.
+    """
+    from omnigent.native_coding_agents import CODEX_NATIVE_AGENT_NAME
+
+    _make_user(db_uri)
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(
+            agent_id=builtin_agent_id(CODEX_NATIVE_AGENT_NAME),
+            permission_mode="acceptEdits",
+        ),
+        headers=_headers(),
+    )
+    assert resp.status_code == 400, resp.text
+    assert "permission_mode" in resp.text
+
+
+async def test_update_clears_permission_mode_with_explicit_null(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """PATCH ``permission_mode: null`` clears a previously-set mode end-to-end.
+
+    The edit dialog resets the control to Default by sending an explicit null,
+    so a task launched with ``bypassPermissions`` must actually revert to the
+    agent default (not silently keep the dangerous mode). Asserts the PERSISTED
+    value via a read-back, not just the response.
+    """
+    _make_user(db_uri)
+    created = (
+        await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(permission_mode="bypassPermissions"),
+            headers=_headers(),
+        )
+    ).json()
+    task_id = created["id"]
+    assert created["permission_mode"] == "bypassPermissions"
+
+    patched = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}",
+        json={"permission_mode": None},
+        headers=_headers(),
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["permission_mode"] is None
+
+    got = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
+    assert got.json()["permission_mode"] is None
+
+
+async def test_update_omitting_permission_mode_leaves_it_unchanged(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A PATCH that omits ``permission_mode`` must not clear a set mode."""
+    _make_user(db_uri)
+    created = (
+        await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(permission_mode="acceptEdits"),
+            headers=_headers(),
+        )
+    ).json()
+    task_id = created["id"]
+
+    patched = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}",
+        json={"name": "renamed"},
+        headers=_headers(),
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["permission_mode"] == "acceptEdits"
 
 
 async def test_update_rejects_invalid_model_override(

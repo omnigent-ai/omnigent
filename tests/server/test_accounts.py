@@ -969,6 +969,7 @@ def _build_accounts_app(
         admin is created and ``/v1/info`` reports ``needs_setup``.
     """
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / ".omnigent"))
     # Accounts is the default provider now, but pin it explicitly
     # so this fixture doesn't depend on the global default.
     monkeypatch.setenv("OMNIGENT_AUTH_PROVIDER", "accounts")
@@ -1807,7 +1808,10 @@ def test_cli_accounts_login_happy_path_stores_token(
         calls["n"] += 1
         assert url.endswith("/auth/login")
         body = kw["json"]
-        assert body == {"username": "alice", "password": "alice-pw-1234"}
+        assert body == {
+            "username": "alice",
+            "password": "alice-pw-1234",
+        }
         return _FakeResponse(
             200,
             {
@@ -2021,3 +2025,27 @@ def test_setup_is_single_use(accounts_app_needs_setup: TestClient) -> None:
     user_ids = {u["id"] for u in client.get("/auth/users").json()["users"]}
     assert "alice" in user_ids
     assert "bob" not in user_ids
+
+
+def test_browser_login_never_issues_refresh_token(accounts_app: TestClient) -> None:
+    """Regression test for P1 security: browser /auth/login must NEVER issue
+    a refresh_token, regardless of client input. Refresh grants are for
+    unattended flows (CLI/device); browser logins should never get long-lived
+    credentials that bypass session expiry.
+
+    This was broken when LoginRequest.issue_refresh was a client-controllable
+    bool — XSS or form-hijack could POST issue_refresh=true and obtain a
+    30-day unattended credential.
+    """
+    resp = accounts_app.post(
+        "/auth/login",
+        json={"username": "admin", "password": "admin-pw-12345"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+
+    # Browser login must NEVER include refresh_token in response.
+    assert "refresh_token" not in body, (
+        "Browser /auth/login returned refresh_token — violates the security "
+        "invariant that unattended credentials are issued only via CLI/device flows"
+    )

@@ -290,6 +290,7 @@ class _FakeNetwork:
     def __init__(self, policy: object = None, **kwargs: object) -> None:
         self.kind = "custom"
         self.policy = policy
+        self.profiles: tuple[object, ...] = ()
 
     @staticmethod
     def allow_all() -> _FakeNetwork:
@@ -298,9 +299,10 @@ class _FakeNetwork:
         return network
 
     @staticmethod
-    def public_only() -> _FakeNetwork:
+    def from_profiles(*profiles: object) -> _FakeNetwork:
         network = _FakeNetwork()
-        network.kind = "public-only"
+        network.kind = "profiles"
+        network.profiles = profiles
         return network
 
 
@@ -342,6 +344,10 @@ class _FakeRule:
 
 class _FakeDestGroup:
     HOST = "host"
+    PUBLIC = "public"
+
+
+class _FakeNetworkProfile:
     PUBLIC = "public"
 
 
@@ -415,6 +421,7 @@ def _install_fake_microsandbox(monkeypatch: pytest.MonkeyPatch) -> _FakeMicrosan
     fake.Rule = _FakeRule  # type: ignore[attr-defined]
     fake.Destination = _FakeDestination  # type: ignore[attr-defined]
     fake.DestGroup = _FakeDestGroup  # type: ignore[attr-defined]
+    fake.NetworkProfile = _FakeNetworkProfile  # type: ignore[attr-defined]
     fake.Protocol = _FakeProtocol  # type: ignore[attr-defined]
     fake.Stdin = _FakeStdin  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "microsandbox", fake)
@@ -672,7 +679,7 @@ def test_provision_network_mode_public_only(fake_microsandbox: _FakeMicrosandbox
     """``public-only`` maps to the SDK's stock public-egress network."""
     MicrosandboxSandboxLauncher(network="public-only").provision("a")
     [create] = fake_microsandbox.create_calls
-    assert create.kwargs["network"].kind == "public-only"
+    assert create.kwargs["network"].profiles == (_FakeNetworkProfile.PUBLIC,)
 
 
 def test_provision_network_mode_all(fake_microsandbox: _FakeMicrosandboxState) -> None:

@@ -11,7 +11,9 @@ and the detach close code.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import json
 import os
 import shutil
 import tempfile
@@ -19,9 +21,12 @@ from pathlib import Path
 
 import pytest
 
+import omnigent.terminals.control_bridge as control_bridge
 from omnigent.terminals.control_bridge import (
     _SEND_KEYS_HEX_BYTES_PER_CALL,
+    _clipboard_buffer_name,
     _hex_send_keys_commands,
+    _read_tmux_buffer,
     bridge_tmux_control_to_websocket,
     unescape_control_output,
 )
@@ -36,6 +41,52 @@ def test_unescape_control_output_round_trips_control_bytes() -> None:
     assert unescape_control_output(rb"a\134b") == b"a\\b"
     # Printable bytes pass through untouched.
     assert unescape_control_output(b"plain text 123") == b"plain text 123"
+
+
+def test_clipboard_buffer_name_accepts_only_safe_notifications() -> None:
+    """Only ordinary tmux copy-buffer names are accepted as command targets."""
+    assert _clipboard_buffer_name(b"%paste-buffer-changed buffer0") == "buffer0"
+    assert _clipboard_buffer_name(b"%paste-buffer-changed named-buffer.1") == "named-buffer.1"
+    assert _clipboard_buffer_name(b"%paste-buffer-changed bad name") is None
+    assert _clipboard_buffer_name(b"%paste-buffer-changed ../bad") is None
+    assert _clipboard_buffer_name(b"%output %0 text") is None
+
+
+@pytest.mark.asyncio
+async def test_tmux_buffer_read_cancellation_reaps_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancelling an in-flight clipboard read kills and awaits its tmux child."""
+
+    class _BlockedProcess:
+        def __init__(self) -> None:
+            self.stdout = asyncio.StreamReader()
+            self.returncode: int | None = None
+            self.killed = False
+
+        def kill(self) -> None:
+            self.killed = True
+            self.returncode = -9
+            self.stdout.feed_eof()
+
+        async def wait(self) -> int:
+            while self.returncode is None:
+                await asyncio.sleep(0)
+            return self.returncode
+
+    proc = _BlockedProcess()
+
+    async def _spawn(*_args: object, **_kwargs: object) -> _BlockedProcess:
+        return proc
+
+    monkeypatch.setattr(control_bridge.asyncio, "create_subprocess_exec", _spawn)
+    task = asyncio.create_task(_read_tmux_buffer("tmux", "socket", "buffer0"))
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert proc.killed is True
+    assert proc.returncode == -9
 
 
 def test_hex_send_keys_commands_encodes_and_chunks() -> None:
@@ -61,6 +112,7 @@ class _FakeWebSocket:
     def __init__(self, inbound: list[dict[str, object]], send_delay_s: float = 0.0) -> None:
         self._inbound = list(inbound)
         self.sent: list[bytes] = []
+        self.sent_text: list[str] = []
         self.close_code: int | None = None
         self.close_reason: str | None = None
         self._recv_gate = asyncio.Event()
@@ -72,6 +124,11 @@ class _FakeWebSocket:
         if self._send_delay_s:
             await asyncio.sleep(self._send_delay_s)
         self.sent.append(data)
+
+    async def send_text(self, data: str) -> None:
+        if self._send_delay_s:
+            await asyncio.sleep(self._send_delay_s)
+        self.sent_text.append(data)
 
     async def receive(self) -> dict[str, object]:
         if self._inbound:
@@ -544,6 +601,123 @@ async def test_seed_plain_shell_replays_no_modes() -> None:
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
 @pytest.mark.asyncio
+async def test_tmux_clipboard_buffer_read_is_exact_and_bounded(tmp_path: Path) -> None:
+    """Named buffer reads preserve bytes and reject missing/oversized buffers."""
+    sock, _target = await _new_private_tmux("sleep 30")
+    tmux = shutil.which("tmux")
+    assert tmux
+    try:
+        payload = b"exact\x00bytes\n"
+        payload_path = tmp_path / "clipboard.bin"
+        payload_path.write_bytes(payload)
+        proc = await asyncio.create_subprocess_exec(
+            tmux,
+            "-S",
+            str(sock),
+            "load-buffer",
+            "-b",
+            "buffer-exact",
+            str(payload_path),
+        )
+        await proc.communicate()
+        assert proc.returncode == 0
+        assert await _read_tmux_buffer(tmux, str(sock), "buffer-exact") == payload
+        assert await _read_tmux_buffer(tmux, str(sock), "buffer-missing") is None
+
+        payload_path.write_bytes(b"X" * (1024 * 1024 + 1))
+        proc = await asyncio.create_subprocess_exec(
+            tmux,
+            "-S",
+            str(sock),
+            "load-buffer",
+            "-b",
+            "buffer-oversized",
+            str(payload_path),
+        )
+        await proc.communicate()
+        assert proc.returncode == 0
+        assert await _read_tmux_buffer(tmux, str(sock), "buffer-oversized") is None
+    finally:
+        await _kill_tmux(sock)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_control_bridge_forwards_recent_copy_buffer_as_text_frame() -> None:
+    """A copy after input on this attach becomes a bounded clipboard message."""
+    sock, target = await _new_private_tmux("sleep 30")
+    await asyncio.sleep(0.2)
+
+    ws = _FakeWebSocket(inbound=[{"type": "websocket.receive", "bytes": b"x"}])
+    task = asyncio.create_task(
+        bridge_tmux_control_to_websocket(
+            ws, socket_path=str(sock), tmux_target=target, read_only=False
+        )
+    )
+    await asyncio.sleep(0.5)
+
+    tmux = shutil.which("tmux")
+    assert tmux
+    # TUI applications may update tmux's paste buffer directly rather than
+    # entering tmux's outer copy-mode UI, especially over control transport.
+    copied = "copied λ\nsecond line".encode()
+    proc = await asyncio.create_subprocess_exec(
+        tmux,
+        "-S",
+        str(sock),
+        "set-buffer",
+        "-b",
+        "buffer-copy-test",
+        copied.decode(),
+    )
+    await proc.communicate()
+    assert proc.returncode == 0
+
+    async def _clipboard_arrived() -> bool:
+        for _ in range(50):
+            if ws.sent_text:
+                return True
+            await asyncio.sleep(0.05)
+        return False
+
+    assert await _clipboard_arrived(), "clipboard control frame was not sent"
+    message = json.loads(ws.sent_text[-1])
+    assert message["type"] == "clipboard-write"
+    assert message["encoding"] == "base64"
+    assert base64.b64decode(message["data"]) == copied
+
+    await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_control_bridge_ignores_copy_without_recent_input() -> None:
+    """A buffer update not attributable to this attach must not copy locally."""
+    sock, target = await _new_private_tmux("sleep 30")
+    await asyncio.sleep(0.2)
+
+    ws = _FakeWebSocket(inbound=[])
+    task = asyncio.create_task(
+        bridge_tmux_control_to_websocket(
+            ws, socket_path=str(sock), tmux_target=target, read_only=False
+        )
+    )
+    await asyncio.sleep(0.5)
+
+    tmux = shutil.which("tmux")
+    assert tmux
+    proc = await asyncio.create_subprocess_exec(
+        tmux, "-S", str(sock), "set-buffer", "-b", "buffer-unrelated", "secret"
+    )
+    await proc.communicate()
+    await asyncio.sleep(0.3)
+    assert ws.sent_text == []
+
+    await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
 async def test_control_bridge_read_only_drops_input() -> None:
     """read_only=True must not inject typed bytes into the pane."""
     sock, target = await _new_private_tmux("cat")
@@ -557,5 +731,14 @@ async def test_control_bridge_read_only_drops_input() -> None:
     )
     await asyncio.sleep(0.8)
     assert b"should-not-appear" not in b"".join(ws.sent)
+
+    tmux = shutil.which("tmux")
+    assert tmux
+    proc = await asyncio.create_subprocess_exec(
+        tmux, "-S", str(sock), "set-buffer", "-b", "buffer-read-only", "secret"
+    )
+    await proc.communicate()
+    await asyncio.sleep(0.2)
+    assert ws.sent_text == []
 
     await _kill_and_join(sock, task)

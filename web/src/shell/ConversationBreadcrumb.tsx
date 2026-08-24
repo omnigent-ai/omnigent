@@ -1,4 +1,5 @@
 import { BotIcon, ChevronLeftIcon, FolderIcon } from "lucide-react";
+import type { ReactNode } from "react";
 import { Link } from "@/lib/routing";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
@@ -27,6 +28,7 @@ export function ConversationBreadcrumb({
   isChildSession,
   boundAgent,
   wrapperLabel,
+  actions,
   className,
 }: {
   /** The conversation's display name. */
@@ -41,6 +43,8 @@ export function ConversationBreadcrumb({
   boundAgent: Agent | undefined;
   /** The session's `omnigent.wrapper` label — names a native sub-agent's vendor. */
   wrapperLabel: string | null;
+  /** Session-management menu rendered immediately after the title. */
+  actions?: ReactNode;
   /** Extra classes for the context (header vs title-bar strip). */
   className?: string;
 }) {
@@ -92,7 +96,7 @@ export function ConversationBreadcrumb({
           to={titleLinkTo}
           aria-label="Back to parent session"
           className={cn(
-            "breadcrumb-parent-link text-muted-foreground hover:text-foreground",
+            "breadcrumb-parent-link min-w-0 text-muted-foreground hover:text-foreground",
             nativeMobileBack
               ? "inline-flex shrink-0 items-center gap-0.5"
               : "truncate hover:underline",
@@ -108,8 +112,9 @@ export function ConversationBreadcrumb({
           )}
         </Link>
       ) : (
-        <span className="truncate text-foreground">{conversationTitle}</span>
+        <span className="min-w-0 truncate text-foreground">{conversationTitle}</span>
       )}
+      {actions}
       {isChildSession && (
         <>
           <span aria-hidden className="shrink-0 text-muted-foreground opacity-40">

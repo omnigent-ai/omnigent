@@ -9,7 +9,14 @@
 // Python class name lowercased (e.g. ResponseCreated → "response_created").
 
 import type { RoutingDecisionExtras } from "./routingDecision";
-import type { ErrorInfo, ModelUsage, RememberScope, Response, SandboxLaunchStage } from "./types";
+import type {
+  BackgroundTaskInfo,
+  ErrorInfo,
+  ModelUsage,
+  RememberScope,
+  Response,
+  SandboxLaunchStage,
+} from "./types";
 
 /** Provider-native tool item types. */
 export const NATIVE_TOOL_TYPES = new Set<string>([
@@ -462,6 +469,12 @@ export interface SessionStatusEvent {
   responseId?: string;
   backgroundTaskCount?: number;
   /**
+   * Per-shell detail behind `backgroundTaskCount`, so the UI can name each
+   * running shell. Rides alongside an authoritative count on the `Stop` edge;
+   * absent when the edge carries no detail.
+   */
+  backgroundTasks?: BackgroundTaskInfo[];
+  /**
    * Short phrase naming what a still-`running` session is parked on, e.g.
    * "permission prompt". Terminal-backed agents can block on a dialog the
    * web UI does not mirror; this says why nothing is moving. Absent when
@@ -519,6 +532,19 @@ export interface SessionModelEvent {
 }
 
 /**
+ * `session.title` — session rename from a claude-native session.
+ *
+ * Emitted by the Omnigent server when the claude-native forwarder observes a
+ * `/rename` typed inside the Claude Code terminal. Carries the operator's
+ * new title so the session list stops showing the auto-generated one.
+ */
+export interface SessionTitleEvent {
+  type: "session_title";
+  conversationId: string;
+  title: string;
+}
+
+/**
  * `session.reasoning_effort` — active thinking-level switch from a native
  * session.
  *
@@ -543,6 +569,18 @@ export interface SessionCollaborationModeEvent {
   type: "session_collaboration_mode";
   conversationId: string;
   mode: string;
+}
+
+/**
+ * `session.permission_mode` — active claude-native permission-mode switch.
+ *
+ * Emitted when the web picker switches the mode, and when the Claude
+ * forwarder sees the pane's footer change (a shift+tab pressed in the TUI).
+ */
+export interface SessionPermissionModeEvent {
+  type: "session_permission_mode";
+  conversationId: string;
+  permissionMode: string;
 }
 
 /**
@@ -573,8 +611,8 @@ export interface SessionAgentChangedEvent {
  * Each todo item has:
  * - `content`: the task description string
  * - `status`: `"pending"` | `"in_progress"` | `"completed"`
- * - `activeForm`: present-continuous form of the task (e.g. `"Running tests"`).
- *   Shown by the TodoPanel under in-progress items when distinct from `content`.
+ * - `activeForm`: present-continuous form of the task (e.g. `"Running tests"`),
+ *   the present-continuous label for an in-progress item when distinct from `content`.
  */
 export interface SessionTodosEvent {
   type: "session_todos";
@@ -903,8 +941,10 @@ export type StreamEvent =
   | SessionStatusEvent
   | SessionUsageEvent
   | SessionModelEvent
+  | SessionTitleEvent
   | SessionReasoningEffortEvent
   | SessionCollaborationModeEvent
+  | SessionPermissionModeEvent
   | SessionAgentChangedEvent
   | SessionTodosEvent
   | SessionTerminalPendingEvent

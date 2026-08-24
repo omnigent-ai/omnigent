@@ -559,7 +559,7 @@ class MicrosandboxSandboxLauncher(SandboxLauncher):
         if self._network_mode == "all":
             return msb.Network.allow_all()
         if self._network_mode == "public-only":
-            return msb.Network.public_only()
+            return msb.Network.from_profiles(msb.NetworkProfile.PUBLIC)
         host = msb.Destination.group(msb.DestGroup.HOST)
         host_rules: tuple[msb.Rule, ...]
         if self._host_ports is None:

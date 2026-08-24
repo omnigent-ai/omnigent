@@ -76,6 +76,8 @@ class CodexNativeBridgeState:
         ``"0196..."``.
     :param codex_home: Private per-session ``CODEX_HOME`` path, e.g.
         ``"/home/user/.omnigent/codex-native/x/codex-home"``.
+    :param cwd: Native Codex thread working directory, e.g.
+        ``"/home/user/project"``.
     :param active_turn_id: Current Codex turn id, if one is running,
         e.g. ``"turn_abc123"``.
     """
@@ -85,6 +87,7 @@ class CodexNativeBridgeState:
     thread_id: str
     codex_home: str
     active_turn_id: str | None = None
+    cwd: str | None = None
 
 
 def bridge_dir_for_bridge_id(bridge_id: str) -> Path:
@@ -339,9 +342,23 @@ def read_codex_config_model(bridge_dir: Path) -> str | None:
     :returns: The top-level ``model`` from ``config.toml`` (e.g.
         ``"gpt-5.4"``), or ``None`` when undeterminable.
     """
-    config_path = codex_home_for_bridge_dir(bridge_dir) / "config.toml"
+    return read_codex_home_config_model(codex_home_for_bridge_dir(bridge_dir))
+
+
+def read_codex_home_config_model(codex_home: Path) -> str | None:
+    """
+    Read the active model straight from a session's ``CODEX_HOME``.
+
+    Same value and fail-safe behaviour as :func:`read_codex_config_model`,
+    for callers that hold the ``CODEX_HOME`` path (e.g. a live bridge
+    state) rather than the bridge directory.
+
+    :param codex_home: The session's private ``CODEX_HOME`` directory.
+    :returns: The top-level ``model`` from ``config.toml`` (e.g.
+        ``"gpt-5.4"``), or ``None`` when undeterminable.
+    """
     try:
-        data = tomllib.loads(config_path.read_text())
+        data = tomllib.loads((codex_home / "config.toml").read_text())
     except (OSError, tomllib.TOMLDecodeError):
         return None
     model = data.get("model")
@@ -425,6 +442,7 @@ def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
                     "thread_id": state.thread_id,
                     "codex_home": state.codex_home,
                     "active_turn_id": state.active_turn_id,
+                    "cwd": state.cwd,
                 },
                 handle,
                 sort_keys=True,
@@ -686,6 +704,7 @@ def read_bridge_state(bridge_dir: Path) -> CodexNativeBridgeState | None:
     thread_id = raw.get("thread_id")
     codex_home = raw.get("codex_home")
     active_turn_id = raw.get("active_turn_id")
+    cwd = raw.get("cwd")
     if (
         not isinstance(session_id, str)
         or not session_id
@@ -706,6 +725,7 @@ def read_bridge_state(bridge_dir: Path) -> CodexNativeBridgeState | None:
         thread_id=thread_id,
         codex_home=codex_home,
         active_turn_id=parsed_active_turn_id,
+        cwd=cwd if isinstance(cwd, str) and cwd else None,
     )
 
 
@@ -729,6 +749,7 @@ def update_active_turn_id(bridge_dir: Path, active_turn_id: str | None) -> None:
             thread_id=state.thread_id,
             codex_home=state.codex_home,
             active_turn_id=active_turn_id,
+            cwd=state.cwd,
         ),
     )
 
@@ -757,6 +778,7 @@ def update_thread_id(bridge_dir: Path, thread_id: str, active_turn_id: str | Non
             thread_id=thread_id,
             codex_home=state.codex_home,
             active_turn_id=active_turn_id,
+            cwd=state.cwd,
         ),
     )
 
@@ -802,6 +824,7 @@ def clear_active_turn_id_if_matches(bridge_dir: Path, completed_turn_id: str | N
             thread_id=state.thread_id,
             codex_home=state.codex_home,
             active_turn_id=None,
+            cwd=state.cwd,
         ),
     )
     return True

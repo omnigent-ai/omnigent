@@ -185,3 +185,16 @@ def test_build_routing_defaults_without_a_routing_block() -> None:
     client, settings = _build_routing({}, None)
     assert client is None
     assert settings == RoutingSettings()
+
+
+@pytest.mark.parametrize(
+    ("cfg", "expected_timeout"),
+    [
+        ({"execution_timeout": 86_400}, 86_400),
+        ({}, 7_200),
+    ],
+)
+def test_resolve_execution_timeout(cfg: dict[str, int], expected_timeout: int) -> None:
+    from deploy.docker.entrypoint import _resolve_execution_timeout
+
+    assert _resolve_execution_timeout(cfg) == expected_timeout

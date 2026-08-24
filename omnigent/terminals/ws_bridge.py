@@ -16,7 +16,9 @@ Used by:
 
 Wire protocol (same as the original server route):
 
-- **Server → client**: every PTY read becomes a *binary* WS frame.
+- **Server → client**: every PTY read becomes a *binary* WS frame. Production
+  attaches first send a text OSC 52 capability frame so the browser can reject
+  clipboard escapes when tmux passthrough weakens the normal trust boundary.
 - **Client → server**:
     - **Text frames** are JSON control messages. Currently only
       ``{"type": "resize", "cols": N, "rows": M}`` (applied via
@@ -417,6 +419,7 @@ async def _forward_pty_to_ws(
     pty_chunks: asyncio.Queue[bytes | None],
     *,
     max_coalesce_bytes: int | Callable[[], int] = _WS_COALESCE_MAX_BYTES,
+    send_lock: asyncio.Lock | None = None,
 ) -> None:
     """
     Forward queued PTY output to *websocket*, coalescing ready chunks.
@@ -440,6 +443,9 @@ async def _forward_pty_to_ws(
         :data:`_WS_COALESCE_MAX_BYTES`; ``bridge_tmux_pty_to_websocket``
         supplies a callable so recently-typed redraws can use the smaller
         interactive cap while normal output keeps the larger flood cap.
+    :param send_lock: Optional lock shared with another server-to-browser
+        sender. Control mode uses it to serialize terminal bytes with clipboard
+        control frames; PTY mode has only this sender and leaves it unset.
     :returns: None on EOF or websocket disconnect.
     """
     pending = bytearray()
@@ -468,7 +474,11 @@ async def _forward_pty_to_ws(
             frame = bytes(pending[:limit])
             del pending[:limit]
             try:
-                await websocket.send_bytes(frame)
+                if send_lock is None:
+                    await websocket.send_bytes(frame)
+                else:
+                    async with send_lock:
+                        await websocket.send_bytes(frame)
             except (RuntimeError, WebSocketDisconnect):
                 return
         if eof_seen:
@@ -517,6 +527,7 @@ async def bridge_tmux_pty_to_websocket(
     tmux_target: str,
     read_only: bool,
     on_client_interaction: Callable[[], None] | None = None,
+    allow_osc52_clipboard: bool | None = None,
 ) -> None:
     """
     Bridge a tmux attach PTY to an already-accepted *websocket*.
@@ -545,12 +556,31 @@ async def bridge_tmux_pty_to_websocket(
         mis-reading them as agent activity. ``None`` (e.g. the
         server-direct attach path, which is out-of-process from the
         watcher) disables that attribution.
+    :param allow_osc52_clipboard: Whether the browser may honor OSC 52 from this
+        PTY. Production passes ``False`` when tmux passthrough is enabled, since
+        pane output could otherwise bypass ``set-clipboard external``. ``None``
+        omits the capability frame for low-level test compatibility.
     """
     # Attaching is itself a client interaction: tmux resizes the window to
     # the new client, which reflows the pane. Stamp it before the bridge
     # starts so that reflow is discounted.
     if on_client_interaction is not None:
         on_client_interaction()
+
+    if allow_osc52_clipboard is not None:
+        try:
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "osc52-clipboard-capability",
+                        "enabled": allow_osc52_clipboard and not read_only,
+                    },
+                    separators=(",", ":"),
+                )
+            )
+        except (RuntimeError, WebSocketDisconnect):
+            return
+
     argv = ["tmux", "-S", socket_path, "attach"]
     if read_only:
         argv.append("-r")

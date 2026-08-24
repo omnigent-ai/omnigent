@@ -136,6 +136,8 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY,
     _CLAUDE_NATIVE_EDIT_TOOLS,
     _CLAUDE_NATIVE_HARNESS,
+    _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY,
+    _CLAUDE_NATIVE_PERMISSION_MODES,
     _CLAUDE_NATIVE_REMEMBER_INELIGIBLE_TOOLS,
     _CLAUDE_NATIVE_SUBAGENT_ID_LABEL_KEY,
     _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
@@ -205,6 +207,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _runner_skills_inflight,
     _session_active_response_cache,
     _session_background_task_count_cache,
+    _session_background_tasks_cache,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
@@ -220,6 +223,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     user_session_stream,
 )
 from omnigent.server.schemas import (
+    BackgroundTaskInfo,
     ChildSessionSummary,
     CompletedEvent,
     CreatedSessionResponse,
@@ -249,6 +253,7 @@ from omnigent.server.schemas import (
     SessionMcpStartupEvent,
     SessionModelEvent,
     SessionModelOptionsEvent,
+    SessionPermissionModeEvent,
     SessionReasoningEffortEvent,
     SessionResourceListPage,
     SessionResourcePaginatedList,
@@ -257,6 +262,7 @@ from omnigent.server.schemas import (
     SessionStatusEvent,
     SessionSupersededEvent,
     SessionTerminalPendingEvent,
+    SessionTitleEvent,
     SessionTodosEvent,
     SkillSummary,
     ToolOutputDeltaEvent,
@@ -306,6 +312,22 @@ def _publish_collaboration_mode(session_id: str, mode: str) -> None:
         type="session.collaboration_mode",
         conversation_id=session_id,
         mode=mode,
+    )
+    session_stream.publish(session_id, event.model_dump())
+
+
+def _publish_permission_mode(session_id: str, mode: str) -> None:
+    """
+    Publish the live claude-native permission mode for a session.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param mode: The active permission mode, e.g. ``"auto"``.
+    :returns: None.
+    """
+    event = SessionPermissionModeEvent(
+        type="session.permission_mode",
+        conversation_id=session_id,
+        permission_mode=mode,
     )
     session_stream.publish(session_id, event.model_dump())
 
@@ -2125,28 +2147,32 @@ async def _persist_external_model_change(
     conversation_store: ConversationStore,
 ) -> None:
     """
-    Persist and broadcast a model switch made inside the terminal.
+    Persist and broadcast the model the harness reports it is running.
 
-    Mirrors a ``/model`` change typed into a claude-native session's
-    Claude Code pane (or picked via its in-TUI model picker) onto the
-    Omnigent session: writes ``model_override`` so the value survives reload
-    and publishes a ``session.model`` SSE event so the web picker
-    updates live. Unlike the PATCH path
-    (:func:`update_session`), this deliberately does NOT forward a
-    ``model_change`` back to the runner — the terminal is already on
-    the model, so re-injecting ``/model`` would loop.
+    Mirrors a harness-side model report — the launch's own model, or a
+    ``/model`` change made inside the pane — onto the Omnigent session:
+    writes ``reported_model`` VERBATIM (the harness's own spelling,
+    never collapsed to a picker alias) so the value survives reload,
+    and publishes a ``session.model`` SSE event so every surface
+    re-renders from it. The user's request (``model_override``) is
+    deliberately untouched: requests and reports are separate roles,
+    and only reports are ever displayed. Unlike the PATCH path
+    (:func:`update_session`), this does NOT forward a ``model_change``
+    back to the runner — the terminal is already on the model, so
+    re-injecting ``/model`` would loop.
 
-    No-ops (no write, no event) when the observed model already equals
-    the persisted ``model_override`` — the common case on the web→TUI
-    round-trip where the web PATCH set the override moments earlier.
+    No-ops (no write, no event) when the reported model already equals
+    the persisted ``reported_model`` — the steady state between real
+    changes, since forwarders re-observe on every poll.
 
     :param session_id: Session/conversation identifier, e.g.
         ``"conv_abc123"``.
     :param conv: Conversation row for ``session_id`` (read at the route
-        boundary); ``conv.model_override`` is the dedupe baseline.
+        boundary); ``conv.reported_model`` is the dedupe baseline.
     :param body: External model-change event body. ``data.model`` must
-        be a non-empty string tier alias, e.g. ``"opus"``.
-    :param conversation_store: Store used to upsert ``model_override``.
+        be a non-empty string — the harness's verbatim model, e.g.
+        ``"claude-opus-4-8[1m]"`` or ``"gpt-5.6-luna"``.
+    :param conversation_store: Store used to upsert ``reported_model``.
     :raises OmnigentError: If ``data.model`` is missing or not a
         non-empty string.
     """
@@ -2157,17 +2183,89 @@ async def _persist_external_model_change(
             code=ErrorCode.INVALID_INPUT,
         )
     model = raw_model.strip()
-    if conv.model_override == model:
+    if conv.reported_model == model:
         return
     await asyncio.to_thread(
         conversation_store.update_conversation,
         session_id,
-        model_override=model,
+        reported_model=model,
     )
     event = SessionModelEvent(
         type="session.model",
         conversation_id=session_id,
         model=model,
+    )
+    session_stream.publish(session_id, event.model_dump())
+
+
+async def _persist_external_session_title(
+    session_id: str,
+    conv: Conversation,
+    body: SessionEventInput,
+    conversation_store: ConversationStore,
+) -> None:
+    """
+    Persist and broadcast a session rename made inside the terminal.
+
+    Mirrors a ``/rename`` typed into a claude-native session's Claude Code
+    pane onto the Omnigent session: writes ``title`` so the new name
+    survives reload and publishes a ``session.title`` SSE event so the
+    web session list updates live.
+
+    The rename is authoritative — an operator typing ``/rename`` is an
+    explicit act, so it overwrites whatever title the session currently
+    carries, including one set from the web UI. This is why it uses a
+    plain ``update_conversation`` rather than the seed-only
+    compare-and-swap behind ``POST /sessions/{id}/auto-title``, which
+    exists to stop an *automatic* titler from clobbering a human's name.
+
+    No-ops (no write, no event) when the title already matches, so a
+    forwarder that re-sends after a cursor rewind, or a rename echoing
+    back a name the web UI just set, costs nothing.
+
+    Declined for child sessions, whose titles are structural rather than
+    display text: ``sys_session_send`` writes them as ``"<agent>:<label>"``
+    and the sub-agent tooling parses them back apart. That also covers the
+    legacy ``:closed:`` title marker, which only ever lands on a child row
+    (both writers reject a non-sub-agent title).
+
+    :param session_id: Session/conversation identifier, e.g.
+        ``"conv_abc123"``.
+    :param conv: Conversation row for ``session_id`` (read at the route
+        boundary); ``conv.title`` is the dedupe baseline.
+    :param body: External title event body. ``data.title`` must be a
+        non-empty single-line string, e.g. ``"auth-refactor"``.
+    :param conversation_store: Store used to upsert ``title``.
+    :raises OmnigentError: If ``data.title`` is not a non-empty single line.
+    """
+    raw_title = body.data.get("title")
+    # Newlines are rejected outright rather than folded into spaces — a
+    # multi-line title means the sender is confused, not that it wants one
+    # long line. Mirrors ``POST /sessions/{id}/auto-title``.
+    if not isinstance(raw_title, str) or "\n" in raw_title or "\r" in raw_title:
+        raise OmnigentError(
+            "external_session_title requires data.title to be a single-line string",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    title = " ".join(raw_title.split())
+    if not title:
+        raise OmnigentError(
+            "external_session_title requires data.title to be non-empty",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if conv.parent_conversation_id is not None:
+        return
+    if conv.title == title:
+        return
+    await asyncio.to_thread(
+        conversation_store.update_conversation,
+        session_id,
+        title=title,
+    )
+    event = SessionTitleEvent(
+        type="session.title",
+        conversation_id=session_id,
+        title=title,
     )
     session_stream.publish(session_id, event.model_dump())
 
@@ -2350,6 +2448,51 @@ async def _persist_external_codex_collaboration_mode_change(
         {_CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY: mode},
     )
     _publish_collaboration_mode(session_id, mode)
+
+
+async def _persist_external_permission_mode_change(
+    session_id: str,
+    conv: Conversation,
+    body: SessionEventInput,
+    conversation_store: ConversationStore,
+) -> None:
+    """
+    Persist a pane-observed claude-native permission mode as a session label.
+
+    The forwarder posts this when the pane's mode footer differs from what it
+    last reported — i.e. the user pressed shift+tab in the TUI. Unlike the
+    PATCH path this needs no runner confirmation: the pane IS the source, so
+    the mode is already in effect.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param conv: Conversation row for ``session_id`` at the route boundary.
+    :param body: Event body; ``data.permission_mode`` must be a switchable mode.
+    :param conversation_store: Store used to upsert the mode label.
+    :returns: None.
+    :raises OmnigentError: If ``data.permission_mode`` is missing or unsupported.
+    """
+    raw_mode = body.data.get("permission_mode")
+    if not isinstance(raw_mode, str) or not raw_mode.strip():
+        raise OmnigentError(
+            "external_permission_mode_change requires data.permission_mode "
+            "to be a non-empty string",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    mode = raw_mode.strip()
+    if mode not in _CLAUDE_NATIVE_PERMISSION_MODES:
+        raise OmnigentError(
+            "external_permission_mode_change requires data.permission_mode in "
+            f"{sorted(_CLAUDE_NATIVE_PERMISSION_MODES)}; got {mode!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if conv.labels.get(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY) == mode:
+        return
+    await asyncio.to_thread(
+        conversation_store.set_labels,
+        session_id,
+        {_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY: mode},
+    )
+    _publish_permission_mode(session_id, mode)
 
 
 async def _persist_external_codex_approval_mode_change(
@@ -3312,6 +3455,37 @@ def _background_task_delivery_status(
     return status
 
 
+# Cap the per-shell detail a single edge can carry, mirroring the forwarder's
+# own cap so a malformed payload can't bloat the status event server-side.
+_MAX_FORWARDED_BACKGROUND_TASKS = 100
+
+
+def _parse_background_tasks(raw: object) -> list[BackgroundTaskInfo] | None:
+    """
+    Validate the ``background_tasks`` detail off an external status edge.
+
+    The claude-native forwarder sends this alongside a positive
+    ``background_task_count`` (see :func:`_background_task_delivery_status`).
+    It is best-effort display data: non-dict / unvalidatable entries are
+    dropped rather than failing the whole edge, and the list is capped at
+    :data:`_MAX_FORWARDED_BACKGROUND_TASKS`.
+
+    :param raw: The raw ``data.background_tasks`` value off the wire.
+    :returns: Parsed detail, or ``None`` when absent or nothing validated.
+    """
+    if not isinstance(raw, list):
+        return None
+    parsed: list[BackgroundTaskInfo] = []
+    for entry in raw[:_MAX_FORWARDED_BACKGROUND_TASKS]:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            parsed.append(BackgroundTaskInfo.model_validate(entry))
+        except ValidationError:
+            continue
+    return parsed or None
+
+
 def _codex_subagent_labels_from_body(
     thread_id: str,
     body: SessionEventInput,
@@ -3652,12 +3826,65 @@ def _require_collaboration_mode_forward(
         )
 
 
+def _require_permission_mode_forward(
+    session_id: str,
+    mode: str,
+    runner_result: _RunnerForwardResult | None,
+) -> str:
+    """
+    Fail when a live claude-native permission-mode switch wasn't applied.
+
+    The mode lives in the running TUI, so persisting the label without a
+    confirmed 2xx forward would let the UI claim auto mode while Claude still
+    prompts on every edit. Returns the mode the runner actually reached, so
+    the caller stores what the pane shows rather than what was asked for.
+
+    :param session_id: Session/conversation identifier, e.g.
+        ``"conv_abc123"``.
+    :param mode: Requested permission mode, e.g. ``"auto"``.
+    :param runner_result: HTTP result returned by the runner, or ``None``
+        when no runner could be reached.
+    :returns: The mode the runner reports the pane is now in — the
+        requested *mode* when the runner didn't echo one back.
+    :raises OmnigentError: If no runner was reachable or the runner could
+        not switch the session into *mode*.
+    """
+    if runner_result is None:
+        raise OmnigentError(
+            f"Could not switch to {mode} mode: no live Claude runner is available "
+            f"for session {session_id!r}. Reconnect the session and try again.",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        )
+    if not 200 <= runner_result.status_code < 300:
+        # The runner's body carries why the cycle failed (e.g. the mode
+        # isn't in this session's cycle); surface it so the UI banner
+        # explains the failure instead of showing a bare status code.
+        detail = ""
+        try:
+            payload = json.loads(runner_result.body)
+        except (TypeError, ValueError):
+            payload = None
+        if isinstance(payload, dict) and isinstance(payload.get("detail"), str):
+            detail = f" {payload['detail']}"
+        raise OmnigentError(
+            f"Could not switch to {mode} mode for session {session_id!r}.{detail}",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        )
+    try:
+        body = json.loads(runner_result.body)
+    except (TypeError, ValueError):
+        return mode
+    settled = body.get("permission_mode") if isinstance(body, dict) else None
+    return settled if isinstance(settled, str) and settled else mode
+
+
 def _publish_status(
     session_id: str,
     status: str,
     error: ErrorDetail | None = None,
     response_id: str | None = None,
     background_task_count: int | None = None,
+    background_tasks: list[BackgroundTaskInfo] | None = None,
     blocked_on: str | None = None,
 ) -> None:
     """
@@ -3749,13 +3976,20 @@ def _publish_status(
     # working shimmer) until the next authoritative count. Only a failure
     # clears it: a dead session may never post another count to drop a stale
     # tally.
+    # The per-shell detail rides in lockstep with the count: they arrive on the
+    # same Stop edge, so an authoritative count owns both caches (a positive
+    # count stores the detail — possibly empty when a runner sent count-only —
+    # and a ``0`` / failure clears it). ``None`` leaves both untouched.
     if background_task_count is not None:
         if background_task_count > 0:
             _session_background_task_count_cache[session_id] = background_task_count
+            _session_background_tasks_cache[session_id] = background_tasks or []
         else:
             _session_background_task_count_cache.pop(session_id, None)
+            _session_background_tasks_cache.pop(session_id, None)
     elif status == "failed":
         _session_background_task_count_cache.pop(session_id, None)
+        _session_background_tasks_cache.pop(session_id, None)
     event = SessionStatusEvent(
         type="session.status",
         conversation_id=session_id,
@@ -3763,6 +3997,7 @@ def _publish_status(
         response_id=response_id,
         error=error,
         background_task_count=background_task_count,
+        background_tasks=background_tasks,
         blocked_on=blocked_on,
     )
     payload = event.model_dump()
@@ -3770,6 +4005,11 @@ def _publish_status(
         payload.pop("response_id", None)
     if background_task_count is None:
         payload.pop("background_task_count", None)
+    # Only put detail on the wire when there's something to show — an absent or
+    # empty list stays off (the count alone drives the pill; the client clears
+    # its detail when the count clears).
+    if not background_tasks:
+        payload.pop("background_tasks", None)
     if blocked_on is None:
         payload.pop("blocked_on", None)
     session_stream.publish(session_id, payload)
@@ -5149,6 +5389,13 @@ def _surface_model_change_forward_failure(
     if 200 <= runner_result.status_code < 300:
         return
     reason = f"the runner returned status {runner_result.status_code}"
+    # The runner's own detail names the concrete cause (e.g. "a dialog may
+    # be open in the pane"); carry it into the visible notice when present.
+    with contextlib.suppress(ValueError, TypeError):
+        parsed_body = json.loads(runner_result.body)
+        detail = parsed_body.get("detail") if isinstance(parsed_body, dict) else None
+        if isinstance(detail, str) and detail.strip():
+            reason = f"{reason} ({detail.strip()})"
     _logger.warning(
         "Model change not applied to the terminal for session=%s model=%r: %s (body=%s)",
         session_id,
@@ -9178,14 +9425,19 @@ async def _load_model_options(
     runner_client: httpx.AsyncClient,
     session_id: str,
     path: str,
+    fallback_path: str | None = None,
 ) -> None:
     """
     Background single-flight fetch of a session's native model catalog.
 
     :param runner_client: HTTP client pointed at the bound runner.
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
-    :param path: Runner route to query, e.g.
-        ``"/v1/sessions/conv_abc/cursor-model-options"``.
+    :param path: Runner route to query — the unified
+        ``"/v1/sessions/conv_abc/model-options"``.
+    :param fallback_path: Legacy harness-named route to fall back to when
+        *path* 404s (an older runner without the unified route), e.g.
+        ``"/v1/sessions/conv_abc/cursor-model-options"``. ``None`` disables
+        the fallback.
     """
     # Read the retry schedule off the facade so tests patching
     # ``sessions._MODEL_OPTIONS_RETRY_DELAYS_S`` reach this impl.
@@ -9199,6 +9451,11 @@ async def _load_model_options(
             _logger.debug("Runner model-options query failed for %s", session_id)
             return
         if resp.status_code != 200:
+            # An older runner has no unified route; drop to the harness-named
+            # one without consuming a retry.
+            if resp.status_code == 404 and fallback_path and path != fallback_path:
+                path = fallback_path
+                continue
             # 503 means the native backend (Codex app-server bridge / cursor
             # login) is still booting. Keep the background single-flight alive
             # so the web picker fills without a second manual refresh.
@@ -9328,7 +9585,10 @@ def prefetch_session_routing_catalogs(
         options_task = asyncio.create_task(
             _run_catalog_prefetch(
                 _load_model_options(
-                    runner_client, session_id, f"/v1/sessions/{session_id}/{endpoint}"
+                    runner_client,
+                    session_id,
+                    f"/v1/sessions/{session_id}/model-options",
+                    fallback_path=f"/v1/sessions/{session_id}/{endpoint}",
                 ),
                 session_id,
             )
@@ -9526,7 +9786,9 @@ __all__ = [
     "_persist_external_codex_collaboration_mode_change",
     "_persist_external_model_change",
     "_persist_external_model_options",
+    "_persist_external_permission_mode_change",
     "_persist_external_reasoning_effort_change",
+    "_persist_external_session_title",
     "_persist_external_subagent_start",
     "_persist_native_policy_notice",
     "_persist_policy_deny_sentinel",
@@ -9561,6 +9823,7 @@ __all__ = [
     "_publish_interrupted",
     "_publish_mcp_startup",
     "_publish_model_options",
+    "_publish_permission_mode",
     "_publish_policy_denied",
     "_publish_policy_deny",
     "_publish_runner_skills",
@@ -9586,6 +9849,7 @@ __all__ = [
     "_require_declared_subagent",
     "_require_external_status_forward",
     "_require_host_conn_for_worktree",
+    "_require_permission_mode_forward",
     "_reset_runner_resources_after_switch",
     "_reset_runner_resources_after_switch_impl",
     "_resolve_harness",

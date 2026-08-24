@@ -89,6 +89,20 @@ _DRIFTED_WITH_SLOT = {
         # Empty / whitespace-only input is never a spellable model.
         ("", _PINNED_ENV, None),
         ("   ", _PINNED_ENV, None),
+        # UNPINNED (canonical endpoint): a full Anthropic id names an exact
+        # generation and ``/model`` accepts it verbatim — stepping down to
+        # the family alias would land on claude's CURRENT generation (picking
+        # Opus 4.8 (1M) used to type ``/model opus`` and run Opus 5).
+        ("claude-opus-4-8[1m]", {}, "claude-opus-4-8[1m]"),
+        ("claude-sonnet-4-6", {}, "claude-sonnet-4-6"),
+        # Bare family aliases stay aliases on an unpinned env.
+        ("opus", {}, "opus"),
+        ("sonnet[1m]", {}, "sonnet[1m]"),
+        # A gateway spelling still cannot be typed on an unpinned session.
+        ("databricks-claude-opus-4-8", {}, "opus"),
+        # With pins, a full id no alias resolves to stays unspeakable —
+        # the caller fails loud instead of switching to something else.
+        ("claude-fable-5", _PINNED_ENV, None),
     ],
 )
 def test_command_arg_spells_the_routed_model_or_nothing(
@@ -143,3 +157,34 @@ def test_catalog_prefixes_match_the_routing_defaults() -> None:
     from omnigent.server.smart_routing import MODEL_ID_PREFIXES
 
     assert _CATALOG_PREFIXES == MODEL_ID_PREFIXES
+
+
+@pytest.mark.parametrize(
+    ("candidate", "env"),
+    [
+        ("sonnet[1m]", {}),
+        ("sonnet[1m]", _PINNED_ENV),
+        ("opus[1m]", _PINNED_ENV),
+        ("Fable[1M]", {}),
+    ],
+)
+def test_bracket_family_aliases_are_their_own_model_arguments(
+    candidate: str,
+    env: dict[str, str],
+) -> None:
+    """``sonnet[1m]`` is a settable alias the harness enumerates itself.
+
+    It must pass through verbatim on pinned and bare envs alike: stepping
+    down to ``sonnet`` silently drops the context marker, and ``None``
+    blocks a switch the pane would accept.
+    """
+    assert claude_model_alias(candidate, env) == candidate.lower()
+    assert claude_model_command_arg(candidate, env) == candidate.lower()
+
+
+def test_bracket_marker_on_a_non_alias_is_not_an_argument() -> None:
+    """The bracket pass-through covers only Claude's own family aliases."""
+    assert claude_model_alias("gpt-5.5[1m]", {}) is None
+    # A dangling bracket is not a marker; on a pinned env nothing else
+    # claims it either (the bare-login segment fallback is separate).
+    assert claude_model_alias("sonnet[", _PINNED_ENV) is None
