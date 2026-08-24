@@ -24,6 +24,12 @@ variables:
   features:
     description: "Comma-separated deployment-wide release features."
     default: ""
+  web_ui_dist:
+    description: >
+      OMNIGENT_WEB_UI_DIST override. Empty (the default) serves the SPA from
+      the wheel's package data; deploy.py sets /Workspace/.../src/web-ui when
+      it stages the SPA as loose files for a full-UI deploy (#5003).
+    default: ""
 
 resources:
   apps:
@@ -49,6 +55,11 @@ resources:
             value: 'always_on'
           - name: OMNIGENT_FEATURES
             value: "${var.features}"
+          # When deploy.py stages the SPA as loose files under src/web-ui
+          # (a full-UI deploy, #5003), serve them from there instead of the
+          # wheel's package data. Empty default keeps the wheel-internal path.
+          - name: OMNIGENT_WEB_UI_DIST
+            value: "${var.web_ui_dist}"
       resources:
         - name: postgres
           postgres:
