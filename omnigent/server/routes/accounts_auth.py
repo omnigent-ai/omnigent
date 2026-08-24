@@ -74,18 +74,24 @@ class LoginRequest(BaseModel):
         before lookup.
     :param password: Plaintext password, length-validated against
         :data:`_MIN_PASSWORD_LENGTH` but otherwise opaque.
-    :param issue_refresh: When ``True`` the server issues a login-scoped
-        refresh grant alongside the session JWT and includes
-        ``refresh_token`` in the response. CLI clients set this;
-        the web browser form never does, so long-lived unattended
-        credentials never reach a browser session. Ignored when the
-        server has no ``device_grant_store`` (older or non-grant
-        deployments return only the session JWT as before).
     """
 
     username: str = Field(min_length=1, max_length=128)
     password: str = Field(min_length=1, max_length=1024)
-    issue_refresh: bool = False
+
+
+class CliLoginRequest(BaseModel):
+    """Body of ``POST /auth/cli-login``.
+
+    Identical to :class:`LoginRequest` — a separate model so the
+    two endpoints are independently documented and typed.
+
+    :param username: The user's chosen username.
+    :param password: Plaintext password.
+    """
+
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=1024)
 
 
 class RegisterRequest(BaseModel):
@@ -331,18 +337,9 @@ def create_accounts_auth_router(
             "user": {"id": user.id, "is_admin": user.is_admin},
         }
         # Browser login must never receive refresh material — only CLI/device
-        # flows do (via /auth/cli-poll or device-grant callback). This is
+        # flows do (via /auth/cli-login or device-grant callback). This is
         # enforced server-side so an XSS or form-hijack cannot obtain
         # long-lived unattended credentials.
-        if body.issue_refresh and device_grant_store is not None:
-            from omnigent.server.routes.device_auth import issue_login_grant
-
-            grant_refresh = issue_login_grant(
-                device_grant_store,
-                user_id=username,
-                cookie_secret=config.cookie_secret,
-            )
-            body_payload["refresh_token"] = grant_refresh
         resp = JSONResponse(status_code=200, content=body_payload)
         _set_session_cookie(
             resp,
@@ -353,6 +350,98 @@ def create_accounts_auth_router(
         )
         _logger.info("auth/login: success for %s", _redact_for_log(username))
         return resp
+
+    # ── CLI login (JSON, includes refresh grant) ──────────────────
+
+    @router.post("/cli-login")
+    async def cli_login(body: CliLoginRequest) -> Response:
+        """Authenticate a CLI/host and return a session JWT + refresh grant.
+
+        Like ``POST /auth/login`` but intended only for non-browser
+        clients (``omnigent login``, ``omnigent host``). The key
+        difference is that it **always** returns ``refresh_token``
+        when a grant store is available — so an unattended host can
+        renew its access past the session-JWT TTL via ``/oauth/token``
+        without a human re-running ``omnigent login``.
+
+        This is a SEPARATE endpoint from ``/auth/login`` so the
+        browser-facing handler never returns refresh material.
+        Security: the shared ``/auth/login`` handler is unchanged and
+        provably never issues refresh tokens regardless of request
+        content. Browser code that calls this endpoint instead of
+        ``/auth/login`` would not receive a session cookie (there is
+        none here), so it would not be useful to a CSRF/XSS attacker
+        looking to escalate a session — the refresh token here is only
+        actionable as a standalone long-lived credential, and a browser
+        that already has valid ``username``/``password`` could already
+        perform the same operations through ``/auth/login``. The
+        endpoint is not additionally gated because it produces no
+        additional capability beyond what the credentials already admit;
+        the grant's 30-day ceiling is the same as an operator-configured
+        session TTL extension.
+
+        **Does NOT set a session cookie** — the CLI stores the JWT and
+        refresh token in ``~/.omnigent/auth_tokens.json``; it does not
+        use browser cookie sessions.
+        """
+        username = body.username.strip().lower()
+        password_hash = account_store.get_password_hash(username)
+        if password_hash is None:
+            with contextlib.suppress(InvalidPasswordError):
+                verify_password(body.password, _DUMMY_HASH)
+            _logger.info("auth/cli-login: unknown user %s", _redact_for_log(username))
+            return JSONResponse(status_code=401, content={"error": "invalid username or password"})
+
+        try:
+            verify_password(body.password, password_hash)
+        except InvalidPasswordError:
+            _logger.info("auth/cli-login: bad password for %s", _redact_for_log(username))
+            return JSONResponse(status_code=401, content={"error": "invalid username or password"})
+
+        if needs_rehash(password_hash):
+            try:
+                account_store.update_password(username, hash_password(body.password))
+            except Exception as exc:  # noqa: BLE001
+                _logger.warning(
+                    "auth/cli-login: rehash failed for %s: %s",
+                    _redact_for_log(username),
+                    exc,
+                )
+
+        now = int(time.time())
+        account_store.mark_logged_in(username, now)
+        promote_if_listed(admin_list, account_store, username)
+
+        session_jwt = mint_session_cookie(
+            user_id=username,
+            cookie_secret=config.cookie_secret,
+            ttl_hours=config.session_ttl_hours,
+            provider="accounts",
+        )
+
+        user = account_store.get_user(username)
+        assert user is not None
+        content: dict[str, object] = {
+            "token": session_jwt,
+            "expires_in": _session_max_age,
+            "user": {"id": user.id, "is_admin": user.is_admin},
+        }
+        if device_grant_store is not None:
+            from omnigent.server.routes.device_auth import issue_login_grant
+
+            try:
+                content["refresh_token"] = issue_login_grant(
+                    device_grant_store,
+                    user_id=username,
+                    cookie_secret=config.cookie_secret,
+                )
+            except Exception:
+                _logger.exception(
+                    "auth/cli-login: refresh grant issuance failed for %s",
+                    _redact_for_log(username),
+                )
+        _logger.info("auth/cli-login: success for %s", _redact_for_log(username))
+        return JSONResponse(status_code=200, content=content)
 
     @router.post("/logout")
     async def logout() -> Response:
