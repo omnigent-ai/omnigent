@@ -104,6 +104,15 @@ PROJECT_LABEL_KEY = "omni_project"
 # mirrors the canonical key as ``PINNED_LABEL_KEY``.
 PINNED_LABEL_KEY = "omnigent.pinned"
 
+# Server-owned binding for replay-safe JSON session-shell creation. The entire
+# namespace is hidden from API label surfaces, rejected on client writes, and
+# dropped when a conversation is forked so a new session never inherits the
+# source request's identity.
+SESSION_CREATE_IDEMPOTENCY_LABEL_PREFIX = "omnigent.idempotency.create."
+SESSION_CREATE_KEY_HASH_LABEL = f"{SESSION_CREATE_IDEMPOTENCY_LABEL_PREFIX}key_hash"
+SESSION_CREATE_OWNER_HASH_LABEL = f"{SESSION_CREATE_IDEMPOTENCY_LABEL_PREFIX}owner_hash"
+SESSION_CREATE_REQUEST_HASH_LABEL = f"{SESSION_CREATE_IDEMPOTENCY_LABEL_PREFIX}request_hash"
+
 # Single-user / no-auth sentinel for the per-user pin key suffix, mirroring the
 # reserved ``"local"`` identity used elsewhere (see ``RESERVED_USER_LOCAL``).
 _PINNED_LABEL_LOCAL_USER = "local"
@@ -346,6 +355,7 @@ class ConversationStore(ABC):
         git_branch: str | None = None,
         terminal_launch_args: list[str] | None = None,
         conversation_id: str | None = None,
+        initial_labels: dict[str, str] | None = None,
     ) -> Conversation:
         """
         Create a new conversation. Generates a unique
@@ -401,6 +411,10 @@ class ConversationStore(ABC):
         :param conversation_id: Optional caller-supplied identifier.
             ``None`` generates a new random id. Reserved for flows that
             require database-enforced idempotency.
+        :param initial_labels: Optional labels inserted in the same Agent
+            Platform transaction as the conversation row. This is reserved
+            for identity or idempotency metadata that must never be visible
+            on a partially-created row without its binding.
         :returns: The newly created :class:`Conversation`.
         :raises NameAlreadyExistsError: If
             ``parent_conversation_id`` is not ``None`` and a
@@ -411,6 +425,20 @@ class ConversationStore(ABC):
             row does not exist (root id can't be inherited).
         :raises ConversationAlreadyExistsError: If a caller-supplied
             ``conversation_id`` is already in use.
+        """
+        ...
+
+    @abstractmethod
+    def ensure_conversation_metadata(self, conversation_id: str) -> Conversation | None:
+        """Ensure default operational metadata exists for a safe session shell.
+
+        This is a recovery primitive for a conversation whose durable Agent
+        Platform row committed before the separate Omnigent metadata
+        transaction. It must never overwrite an existing metadata row.
+
+        :param conversation_id: Existing top-level conversation identifier.
+        :returns: The repaired conversation, or ``None`` if its durable row
+            does not exist.
         """
         ...
 

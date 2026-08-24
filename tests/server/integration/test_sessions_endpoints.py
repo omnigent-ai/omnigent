@@ -22,7 +22,9 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
+from sqlalchemy import delete
 
+from omnigent.db.db_models import SqlConversationMetadata, current_workspace_id
 from omnigent.llms.context_window import ModelPricing
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
 from omnigent.server.background_session_titles import BackgroundTitleRequest
@@ -144,6 +146,110 @@ async def test_create_session_without_title_returns_none(
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
     assert session["title"] is None
+
+
+async def test_idempotent_session_shell_replay_converges_without_exposing_binding(
+    client: httpx.AsyncClient,
+) -> None:
+    agent = await create_test_agent(client)
+    payload = {"agent_id": agent["id"], "title": "automation shell"}
+    headers = {"Idempotency-Key": "agentfactory-attempt-42"}
+
+    first, replay = await asyncio.gather(
+        client.post("/v1/sessions", json=payload, headers=headers),
+        client.post("/v1/sessions", json=payload, headers=headers),
+    )
+
+    assert first.status_code == 201, first.text
+    assert replay.status_code == 201, replay.text
+    assert first.json()["id"] == replay.json()["id"]
+    assert not any(
+        key.startswith("omnigent.idempotency.create.")
+        for key in first.json()["labels"] | replay.json()["labels"]
+    )
+
+
+async def test_idempotent_session_shell_rejects_key_reuse_with_changed_body(
+    client: httpx.AsyncClient,
+) -> None:
+    agent = await create_test_agent(client)
+    headers = {"Idempotency-Key": "agentfactory-attempt-43"}
+
+    first = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "title": "first"},
+        headers=headers,
+    )
+    conflict = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "title": "changed"},
+        headers=headers,
+    )
+
+    assert first.status_code == 201, first.text
+    assert conflict.status_code == 409, conflict.text
+
+
+async def test_idempotent_session_shell_repairs_missing_metadata(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    agent = await create_test_agent(client)
+    headers = {"Idempotency-Key": "agentfactory-attempt-44"}
+    payload = {"agent_id": agent["id"], "title": "repair shell"}
+    first = await client.post("/v1/sessions", json=payload, headers=headers)
+    assert first.status_code == 201, first.text
+
+    store = SqlAlchemyConversationStore(db_uri)
+    with store._session("test_delete_metadata") as session:
+        session.execute(
+            delete(SqlConversationMetadata).where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.id == first.json()["id"],
+            )
+        )
+
+    replay = await client.post("/v1/sessions", json=payload, headers=headers)
+    repaired = store.get_conversation(first.json()["id"])
+
+    assert replay.status_code == 201, replay.text
+    assert replay.json()["id"] == first.json()["id"]
+    assert repaired is not None
+
+
+async def test_idempotent_session_shell_isolated_by_key_and_rejects_side_effects(
+    client: httpx.AsyncClient,
+) -> None:
+    agent = await create_test_agent(client)
+    payload = {"agent_id": agent["id"]}
+    first = await client.post(
+        "/v1/sessions",
+        json=payload,
+        headers={"Idempotency-Key": "agentfactory-key-a"},
+    )
+    second = await client.post(
+        "/v1/sessions",
+        json=payload,
+        headers={"Idempotency-Key": "agentfactory-key-b"},
+    )
+    unsupported = await client.post(
+        "/v1/sessions",
+        json={**payload, "labels": {"client": "value"}},
+        headers={"Idempotency-Key": "agentfactory-key-c"},
+    )
+    reserved = await client.post(
+        "/v1/sessions",
+        json={
+            **payload,
+            "labels": {"omnigent.idempotency.create.request_hash": "forged"},
+        },
+    )
+
+    assert first.status_code == 201, first.text
+    assert second.status_code == 201, second.text
+    assert first.json()["id"] != second.json()["id"]
+    assert unsupported.status_code == 400, unsupported.text
+    assert reserved.status_code == 400, reserved.text
 
 
 async def test_first_message_schedules_background_semantic_title(

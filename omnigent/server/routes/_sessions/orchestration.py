@@ -324,6 +324,7 @@ from omnigent.server.schemas import (
     SessionUsageEvent,
     SkillSummary,
 )
+from omnigent.server.session_create_idempotency import SessionCreateIdempotency
 from omnigent.session_lifecycle import (
     labels_with_closed_status,
     title_without_closed_marker,
@@ -337,6 +338,8 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
+    SESSION_CREATE_IDEMPOTENCY_LABEL_PREFIX,
+    ConversationAlreadyExistsError,
     ConversationNotFoundError,
     NameAlreadyExistsError,
     pinned_label_key,
@@ -756,7 +759,9 @@ def _labels_for_viewer(labels: dict[str, str], user_id: str | None) -> dict[str,
     cleaned = {
         k: v
         for k, v in labels.items()
-        if k != PINNED_LABEL_KEY and not k.startswith(f"{PINNED_LABEL_KEY}.")
+        if k != PINNED_LABEL_KEY
+        and not k.startswith(f"{PINNED_LABEL_KEY}.")
+        and not k.startswith(SESSION_CREATE_IDEMPOTENCY_LABEL_PREFIX)
     }
     if my_pin is not None:
         cleaned[PINNED_LABEL_KEY] = my_pin
@@ -7742,6 +7747,7 @@ async def _create_session_from_existing_agent(
     file_store: FileStore | None = None,
     artifact_store: ArtifactStore | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
+    idempotency: SessionCreateIdempotency | None = None,
 ) -> SessionResponse:
     """
     Create a session bound to an already-registered agent.
@@ -7771,6 +7777,8 @@ async def _create_session_from_existing_agent(
         ``file_id`` references in ``initial_items`` before forwarding
         to the runner.
     :param artifact_store: Optional binary content store for the same.
+    :param idempotency: Optional server-owned binding for a replay-safe,
+        side-effect-free session-shell create.
     :returns: The newly created session snapshot.
     :raises OmnigentError: 404 if no agent matches ``body.agent_id``;
         403/404 if ``parent_session_id`` or session-scoped ``agent_id``
@@ -7786,6 +7794,12 @@ async def _create_session_from_existing_agent(
         permission_store=permission_store,
         conversation_store=conversation_store,
     )
+    if idempotency is not None and native_coding_agent_for_agent_name(agent.name) is not None:
+        raise OmnigentError(
+            "Idempotency-Key session-shell creation does not yet support native "
+            "terminal wrapper agents",
+            code=ErrorCode.INVALID_INPUT,
+        )
 
     # Top-level Smart Routing: "auto" on a native wrapper agent means the client
     # picked Smart Routing with no bundle agent, and its ``agent_id`` is only a
@@ -8146,6 +8160,35 @@ async def _create_session_from_existing_agent(
             workspace=canonical_workspace,
             git_branch=git_branch,
             terminal_launch_args=validated_launch_args,
+            conversation_id=idempotency.conversation_id if idempotency is not None else None,
+            initial_labels=idempotency.labels if idempotency is not None else None,
+        )
+    except ConversationAlreadyExistsError as exc:
+        if idempotency is None:
+            raise
+        existing = await asyncio.to_thread(
+            conversation_store.get_conversation,
+            idempotency.conversation_id,
+        )
+        if existing is None or not idempotency.matches(existing.labels):
+            raise OmnigentError(
+                "Idempotency-Key is already bound to a different session-create request",
+                code=ErrorCode.CONFLICT,
+            ) from exc
+        repaired = await asyncio.to_thread(
+            conversation_store.ensure_conversation_metadata,
+            existing.id,
+        )
+        if repaired is None:  # pragma: no cover - collision proves the row exists
+            raise RuntimeError(
+                f"idempotent session {existing.id!r} disappeared during replay"
+            ) from exc
+        return await _get_session_snapshot(
+            conversation_store,
+            repaired.id,
+            agent_store=agent_store,
+            agent_cache=agent_cache,
+            liveness_lookup=liveness_lookup,
         )
     except NameAlreadyExistsError as exc:
         if (
