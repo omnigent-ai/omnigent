@@ -324,6 +324,7 @@ from omnigent.server.routes._sessions.common import (
     _server_runner_router as _server_runner_router,
     _session_active_response_cache as _session_active_response_cache,
     _session_background_task_count_cache as _session_background_task_count_cache,
+    _session_background_tasks_cache as _session_background_tasks_cache,
     _session_mcp_startup_cache as _session_mcp_startup_cache,
     _session_sandbox_status_cache as _session_sandbox_status_cache,
     _session_status_cache as _session_status_cache,

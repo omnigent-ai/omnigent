@@ -2965,6 +2965,83 @@ describe("chatStore — background-shell tally (claude-native)", () => {
     expect(state.backgroundTaskCount).toBe(0);
   });
 
+  it("adopts the per-shell detail alongside an authoritative count", () => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      backgroundTaskCount: 0,
+      backgroundTasks: [],
+    });
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "waiting",
+      backgroundTaskCount: 2,
+      backgroundTasks: [{ description: "Wait for CI" }, { description: "Build check" }],
+    });
+    expect(useChatStore.getState().backgroundTasks).toEqual([
+      { description: "Wait for CI" },
+      { description: "Build check" },
+    ]);
+  });
+
+  it("keeps the sticky detail when a trailing PTY idle (no count) lands", () => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      sessionStatus: "waiting",
+      backgroundTaskCount: 1,
+      backgroundTasks: [{ description: "Wait for CI" }],
+      activeResponse: null,
+    });
+    handleSessionEvent({ type: "session_status", conversationId: "conv_abc", status: "idle" });
+    expect(useChatStore.getState().backgroundTasks).toEqual([{ description: "Wait for CI" }]);
+  });
+
+  it("clears the detail to [] when a count-only edge arrives (older runner)", () => {
+    // An authoritative count with no detail (an older runner) is authoritative
+    // for the detail too: it clears to [] so the hover never shows stale names
+    // beside a fresh count.
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      sessionStatus: "waiting",
+      backgroundTaskCount: 1,
+      backgroundTasks: [{ description: "stale" }],
+      activeResponse: null,
+    });
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "idle",
+      backgroundTaskCount: 2,
+    });
+    expect(useChatStore.getState().backgroundTasks).toEqual([]);
+  });
+
+  it("clears the detail on an authoritative zero and on a failure", () => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      sessionStatus: "waiting",
+      backgroundTaskCount: 1,
+      backgroundTasks: [{ description: "Wait for CI" }],
+      activeResponse: null,
+    });
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "idle",
+      backgroundTaskCount: 0,
+    });
+    expect(useChatStore.getState().backgroundTasks).toEqual([]);
+
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      backgroundTaskCount: 1,
+      backgroundTasks: [{ description: "Wait for CI" }],
+      activeResponse: null,
+    });
+    handleSessionEvent({ type: "session_status", conversationId: "conv_abc", status: "failed" });
+    expect(useChatStore.getState().backgroundTasks).toEqual([]);
+  });
+
   it("frees the local send lifecycle on a Stop-derived waiting edge (with responseId)", () => {
     // Regression: the claude/cursor-native Stop hook posts the turn-end
     // `waiting` edge WITH the ended turn's `response_id`. It must finalize the

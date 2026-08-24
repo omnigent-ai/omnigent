@@ -180,6 +180,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _runner_skills_inflight,
     _session_active_response_cache,
     _session_background_task_count_cache,
+    _session_background_tasks_cache,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
@@ -305,6 +306,7 @@ from omnigent.server.routes._sessions.helpers import (
 )
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.schemas import (
+    BackgroundTaskInfo,
     ChildSessionSummary,
     CreatedSessionResponse,
     ElicitationRequestEvent,
@@ -942,6 +944,7 @@ def _build_session_response(
     status: Literal["idle", "running", "waiting", "failed"],
     permission_level: int | None = None,
     background_task_count: int | None = None,
+    background_tasks: list[BackgroundTaskInfo] | None = None,
     llm_model: str | None = None,
     context_window: int | None = None,
     last_total_tokens: int | None = None,
@@ -974,6 +977,8 @@ def _build_session_response(
         last status edge (claude-native), so a reload re-shows "N shells
         still running" even after the session settles to ``"idle"``. ``None``
         when none are tracked.
+    :param background_tasks: Per-shell detail for that tally, so a reload can
+        re-populate the composer pill's hover. ``None`` when none are tracked.
     :param permission_level: The requesting user's numeric level
         on this session (1=read, 2=edit, 3=manage), or ``None``
         when permissions are disabled.
@@ -1055,6 +1060,7 @@ def _build_session_response(
         agent_name=agent_name,
         status=status,
         background_task_count=background_task_count,
+        background_tasks=background_tasks,
         created_at=conv.created_at,
         updated_at=conv.updated_at,
         title=title_without_closed_marker(conv.title),
@@ -9394,6 +9400,7 @@ async def _get_session_snapshot(
         status,
         permission_level,
         background_task_count=_session_background_task_count_cache.get(session_id),
+        background_tasks=_session_background_tasks_cache.get(session_id),
         llm_model=llm_model,
         context_window=context_window,
         last_total_tokens=last_total_tokens,

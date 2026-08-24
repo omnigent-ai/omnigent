@@ -136,6 +136,7 @@ from omnigent.server.routes._sessions.helpers import (
     _handle_external_session_todos,
     _is_codex_native_subagent,
     _launch_runner_on_host,
+    _parse_background_tasks,
     _persist_external_assistant_message,
     _persist_external_codex_approval_mode_change,
     _persist_external_codex_collaboration_mode_change,
@@ -195,6 +196,7 @@ from omnigent.server.routes._sessions.orchestration import (
     ensure_runner_connected,
 )
 from omnigent.server.schemas import (
+    BackgroundTaskInfo,
     ConversationDeleted,
     ElicitationRequestEvent,
     ElicitationRequestParams,
@@ -1203,6 +1205,11 @@ def register_events_routes(
                 and raw_bg_count >= 0
                 else None
             )
+            # Per-shell detail behind that count, so the composer pill's hover
+            # can name each running shell. Best-effort: an older runner sends the
+            # count with no detail, and the server keeps it in lockstep with the
+            # tally (see ``_publish_status``).
+            bg_tasks = _parse_background_tasks(body.data.get("background_tasks"))
             # Why a still-running session is parked, e.g. a permission prompt
             # the web UI does not mirror. Absent or blank = not parked, so the
             # indicator falls back to its ordinary working label.
@@ -1226,6 +1233,7 @@ def register_events_routes(
                 status_error,
                 response_id=response_id,
                 background_task_count=bg_count,
+                background_tasks=bg_tasks,
                 blocked_on=blocked_on,
             )
             forward_body = body.model_dump()

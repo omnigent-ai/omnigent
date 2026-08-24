@@ -97,6 +97,7 @@ import { overlayTitleIntoCaches, type ConversationsInfiniteData } from "@/lib/se
 import { useTerminalActivityStore } from "./terminalActivity";
 import { terminalInfoFromResource, terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
 import type {
+  BackgroundTaskInfo,
   ContentBlock,
   ModelUsage,
   NativeModelOption,
@@ -270,6 +271,12 @@ export interface ConversationState {
    */
   sessionStatus: SessionStatus;
   backgroundTaskCount: number;
+  /**
+   * Per-shell detail behind `backgroundTaskCount`, kept in lockstep with it,
+   * so the composer pill's hover can name each running background shell.
+   * Empty when none are tracked (or an older runner reported only the count).
+   */
+  backgroundTasks: BackgroundTaskInfo[];
   /**
    * Why a still-`running` session is parked, e.g. "permission prompt".
    * Terminal-backed agents can block on a dialog the web UI does not
@@ -1285,6 +1292,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   status: "idle",
   sessionStatus: "idle",
   backgroundTaskCount: 0,
+  backgroundTasks: [],
   blockedOn: null,
   isNativeTerminalSession: false,
   nativeVendorOwnsModel: false,
@@ -1684,6 +1692,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             patch.status = "idle";
             patch.sessionStatus = "idle";
             patch.backgroundTaskCount = 0;
+            patch.backgroundTasks = [];
           }
           return patch;
         });
@@ -1749,7 +1758,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           // instead of being left on a silent, empty composer.
           failSet((s) => ({ blocks: [...s.blocks, makeClientErrorBlock(message, code)] }));
         }
-        failSet({ status: "idle", sessionStatus: "idle", backgroundTaskCount: 0 });
+        failSet({
+          status: "idle",
+          sessionStatus: "idle",
+          backgroundTaskCount: 0,
+          backgroundTasks: [],
+        });
       } else {
         // Sent alongside an already-streaming turn (or a stranded latch): the
         // bubble is rolled back above, so without a block the message vanishes
@@ -1836,6 +1850,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             patch.status = "idle";
             patch.sessionStatus = "idle";
             patch.backgroundTaskCount = 0;
+            patch.backgroundTasks = [];
           }
           return patch;
         });
@@ -1900,6 +1915,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         status: "idle",
         sessionStatus: "idle",
         backgroundTaskCount: 0,
+        backgroundTasks: [],
         blockedOn: null,
       };
       if (s.activeResponse?.state === "streaming") {
@@ -3289,6 +3305,7 @@ async function bindStream(
         // live SSE edge that set this is long gone, so the count rides in on
         // the snapshot (server keeps it sticky past the trailing PTY `idle`).
         backgroundTaskCount: session.backgroundTaskCount ?? 0,
+        backgroundTasks: session.backgroundTasks ?? [],
         blockedOn: null,
         // `selectedEffort` / `selectedModel` are app-global sticky picks, not
         // conversation state, so they are applied below — and only while this
@@ -3445,6 +3462,7 @@ function reconnectStatusPatch(session: Session, s: ChatState): Partial<ChatState
   // Recover the background-shell tally across the gap too, so the spinner
   // returns to "N background tasks still running" rather than vanishing on reconnect.
   patch.backgroundTaskCount = session.backgroundTaskCount ?? 0;
+  patch.backgroundTasks = session.backgroundTasks ?? [];
   if (session.contextWindow != null) patch.contextWindow = session.contextWindow;
   if (session.lastTotalTokens != null) patch.tokensUsed = session.lastTotalTokens;
   if (session.totalCostUsd != null) patch.sessionCostUsd = session.totalCostUsd;
@@ -5302,8 +5320,14 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         // a stale tally). Mirrors the server's `_publish_status`.
         if (event.backgroundTaskCount !== undefined) {
           patch.backgroundTaskCount = event.backgroundTaskCount;
+          // Detail rides with the authoritative count on the same edge, so it
+          // is authoritative too: a Stop hook that names its shells sets the
+          // list; an older runner that sent count-only clears it to []. This
+          // keeps the hover in lockstep with the number the pill shows.
+          patch.backgroundTasks = event.backgroundTasks ?? [];
         } else if (event.status === "failed") {
           patch.backgroundTaskCount = 0;
+          patch.backgroundTasks = [];
         }
         if (event.responseId !== undefined && event.status === "running") {
           patch.status = "streaming";

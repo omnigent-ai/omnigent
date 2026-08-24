@@ -4541,24 +4541,56 @@ function SubagentComposerTray({ label }: { label: string }) {
  * server, a background shell, a sub-agent). Independent of the "Working…"
  * shimmer: while the turn is active both show — the shimmer for the turn, the
  * pill for the tally — and once the turn ends the pill carries on alone.
- * Label-only: the count spans shells, sub-agents, and tools, so there's no
- * single terminal to open.
+ * Hovering reveals each running shell's description/command when the runner
+ * reported them; an older runner (count-only) falls back to a generic line.
  */
 function BackgroundTaskPill() {
   const bgCount = useChatStore((s) => s.backgroundTaskCount);
+  const bgTasks = useChatStore((s) => s.backgroundTasks);
   if (bgCount <= 0) return null;
   return (
     <div className={cn("mx-auto flex w-full px-1 pb-1.5", CHAT_COLUMN_WIDTH)}>
-      <div
-        role="status"
-        data-testid="background-task-pill"
-        className="flex items-center gap-1.5 rounded-full border border-border bg-card px-3 py-1 text-sm text-muted-foreground shadow-sm"
-      >
-        <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
-        <span>
-          {bgCount} background task{bgCount === 1 ? "" : "s"}
-        </span>
-      </div>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <div
+            role="status"
+            data-testid="background-task-pill"
+            aria-label={`${bgCount} background task${bgCount === 1 ? "" : "s"} still running`}
+            className="flex items-center gap-1.5 rounded-full border border-border bg-card px-3 py-1 text-sm text-muted-foreground shadow-sm"
+          >
+            <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
+            <span>
+              {bgCount} background task{bgCount === 1 ? "" : "s"}
+            </span>
+          </div>
+        </TooltipTrigger>
+        <TooltipContent side="top" align="start" className="max-w-xs">
+          {bgTasks.length > 0 ? (
+            <ul
+              className="flex flex-col gap-1.5 text-left"
+              data-testid="background-task-tooltip-list"
+            >
+              {bgTasks.map((task, i) => {
+                // `description` is the human label; `command` the raw shell.
+                // Show whichever exists, and both (label over mono command)
+                // when they differ, so a bare-command shell still reads.
+                const label = task.description || task.command || "Background shell";
+                const showCommand = task.command && task.command !== label;
+                return (
+                  <li key={task.id ?? i} className="flex flex-col gap-0.5">
+                    <span className="text-sm">{label}</span>
+                    {showCommand ? (
+                      <span className="break-all font-mono text-xs opacity-70">{task.command}</span>
+                    ) : null}
+                  </li>
+                );
+              })}
+            </ul>
+          ) : (
+            <p className="text-sm">Background work is still running.</p>
+          )}
+        </TooltipContent>
+      </Tooltip>
     </div>
   );
 }
