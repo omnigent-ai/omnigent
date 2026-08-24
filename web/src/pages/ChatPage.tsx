@@ -4542,7 +4542,7 @@ const BACKGROUND_TASK_PILL_CLASS =
 
 // Grace period before an expanded row collapses after the mouse leaves, so a
 // near-miss or a reach toward a pill doesn't snap it shut.
-const BACKGROUND_TASK_COLLAPSE_DELAY_MS = 2000;
+const BACKGROUND_TASK_COLLAPSE_DELAY_MS = 1000;
 // Matches the pills' fade/zoom-out duration below — the combine animation plays
 // for this long before the row unmounts back to the tally.
 const BACKGROUND_TASK_ANIM_MS = 150;
@@ -4554,7 +4554,7 @@ const BACKGROUND_TASK_ANIM_MS = 150;
  * pill for the tally — and once the turn ends the pill carries on alone.
  *
  * Click the tally to split it into one pill per running shell (each labelled
- * with its description). The row collapses ~2s after the mouse leaves it (or on
+ * with its description). The row collapses ~1s after the mouse leaves it (or on
  * Escape); re-entering cancels the pending collapse. Expand/collapse play a
  * staggered fade/zoom in-out so the split and combine read smoothly. A
  * count-only edge (older runner, no per-shell detail) renders the plain,
