@@ -28,6 +28,7 @@ import pytest
 import yaml
 
 from omnigent.entities.session_resources import SessionResourceView
+from omnigent.errors import OmnigentError
 from omnigent.runner import create_runner_app
 from omnigent.runner import tool_dispatch as _tool_dispatch
 from omnigent.runner.app import _resolve_harness_config, _spec_with_workdir_paths
@@ -198,6 +199,28 @@ async def test_child_harness_still_wins_over_the_parents(tmp_path: Path) -> None
     assert harness == "codex"
     assert spawn_env is not None
     assert spawn_env["HARNESS_CODEX_BUNDLE_DIR"] == str(root / "agents" / "worker")
+
+
+@pytest.mark.asyncio
+async def test_harness_config_rejects_unresolved_sub_agent(tmp_path: Path) -> None:
+    """Harness resolution never substitutes the parent for a missing child."""
+    root, _child = _bundle_with_child(tmp_path)
+
+    async def _resolver(agent_id: str, session_id: str | None) -> Any:
+        return ResolvedSpec(spec=parse(root), workdir=root)
+
+    with pytest.raises(OmnigentError) as exc_info:
+        await _resolve_harness_config(
+            agent_id="agent-1",
+            spec_resolver=_resolver,
+            session_id="sess-1",
+            sub_agent_name="renamed-worker",
+        )
+
+    assert exc_info.value.code == "sub_agent_unresolved"
+    assert "renamed-worker" in exc_info.value.message
+    assert "root" in exc_info.value.message
+    assert "worker" in exc_info.value.message
 
 
 # ── Native harnesses: launch-time bundle root ─────────────────

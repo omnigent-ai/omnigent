@@ -2946,6 +2946,27 @@ def _find_spec_by_name(
     return None
 
 
+def _sub_agent_unresolved_error(spec: AgentSpec, name: str) -> OmnigentError:
+    """Build the structured error for a name absent from a parent spec tree."""
+    available = sorted(_sub_agent_names(spec))
+    searched = ", ".join(repr(candidate) for candidate in available) or "(none)"
+    return OmnigentError(
+        f"Sub-agent {name!r} did not resolve in spec tree {spec.name!r}; "
+        f"searched sub-agents: {searched}",
+        code=ErrorCode.SUB_AGENT_UNRESOLVED,
+    )
+
+
+def _sub_agent_names(spec: AgentSpec) -> list[str]:
+    """Return every declared sub-agent name below *spec*."""
+    names: list[str] = []
+    for sub_agent in spec.sub_agents:
+        if sub_agent.name is not None:
+            names.append(sub_agent.name)
+        names.extend(_sub_agent_names(sub_agent))
+    return names
+
+
 def _search_sub_agent_tree(
     spec: AgentSpec,
     name: str,
