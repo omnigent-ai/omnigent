@@ -1597,6 +1597,7 @@ def _build_opencode_policy_evaluator(
                 "OpenCode policy evaluate POST failed for %s; failing closed",
                 conversation_id,
                 exc_info=True,
+                extra={"session_id": conversation_id},
             )
             return {"decision": "deny"}
         if resp.status_code != 200 or not resp.content:
@@ -1604,12 +1605,16 @@ def _build_opencode_policy_evaluator(
                 "OpenCode policy evaluate returned %s for %s; failing closed",
                 resp.status_code,
                 conversation_id,
+                extra={"session_id": conversation_id},
             )
             return {"decision": "deny"}
         try:
             result = resp.json()
         except ValueError:
-            _logger.warning("OpenCode policy evaluate returned non-JSON; failing closed")
+            _logger.warning(
+                "OpenCode policy evaluate returned non-JSON; failing closed",
+                extra={"session_id": conversation_id},
+            )
             return {"decision": "deny"}
         action = result.get("result") if isinstance(result, Mapping) else None
         return {"decision": _OPENCODE_POLICY_ACTION_TO_DECISION.get(str(action), "ask")}
@@ -6500,6 +6505,7 @@ async def _auto_create_claude_terminal(
             "`omnigent setup --no-internal-beta` "
             "and that the secret resolves in this process.",
             exc_info=True,
+            extra={"session_id": session_id},
         )
     # A routed session's turn-1 ``/model`` can only reach ids this launch env
     # spells, so point the family aliases at the router's frozen arms before the

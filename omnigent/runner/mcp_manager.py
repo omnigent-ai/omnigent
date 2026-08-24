@@ -269,6 +269,7 @@ class RunnerMcpManager:
             if server_client is None:
                 _logger.warning(
                     "MCP elicitation callback: no Omnigent server client available — declining",
+                    extra={"session_id": session_id},
                 )
                 return ElicitResult(action="decline")
 
@@ -296,6 +297,7 @@ class RunnerMcpManager:
                 _logger.warning(
                     "MCP elicitation callback: Omnigent server POST failed (%s) — declining",
                     exc,
+                    extra={"session_id": session_id},
                 )
                 return ElicitResult(action="decline")
 
@@ -304,6 +306,7 @@ class RunnerMcpManager:
                 _logger.warning(
                     "MCP elicitation callback: Omnigent server returned no "
                     "elicitation_id — declining",
+                    extra={"session_id": session_id},
                 )
                 return ElicitResult(action="decline")
 

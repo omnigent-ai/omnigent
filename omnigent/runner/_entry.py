@@ -1138,6 +1138,7 @@ async def _resolve_agent_spec_from_server(
         _logger.info(
             "spec_resolver: GET %s returned 404 for missing agent",
             path,
+            extra={"session_id": session_id},
         )
         return None
     if resp.status_code != 200:

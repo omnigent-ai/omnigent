@@ -558,6 +558,7 @@ async def _evaluate_policy_via_omnigent(
                 ap_resp.status_code,
                 evaluation_id,
                 _default_action,
+                extra={"session_id": conversation_id},
             )
     except Exception:  # noqa: BLE001 — fail-open (LLM phases) / fail-closed (tool phases)
         _logger.warning(
@@ -565,6 +566,7 @@ async def _evaluate_policy_via_omnigent(
             evaluation_id,
             _default_action,
             exc_info=True,
+            extra={"session_id": conversation_id},
         )
 
     # Post the verdict back to the harness as a policy_verdict event.
@@ -593,6 +595,7 @@ async def _evaluate_policy_via_omnigent(
                 evaluation_id,
                 _attempt + 1,
                 exc,
+                extra={"session_id": conversation_id},
             )
             continue
         except Exception:  # noqa: BLE001 — non-transport: no retry, but still signal
@@ -600,6 +603,7 @@ async def _evaluate_policy_via_omnigent(
                 "Failed to deliver policy verdict %s to harness (unexpected error)",
                 evaluation_id,
                 exc_info=True,
+                extra={"session_id": conversation_id},
             )
             break
         if 200 <= resp.status_code < 300:
@@ -609,6 +613,7 @@ async def _evaluate_policy_via_omnigent(
             evaluation_id,
             resp.status_code,
             _attempt + 1,
+            extra={"session_id": conversation_id},
         )
 
     _logger.error(
@@ -616,6 +621,7 @@ async def _evaluate_policy_via_omnigent(
         "non-2xx / unexpected) after retry; signaling desync for %s",
         evaluation_id,
         conversation_id,
+        extra={"session_id": conversation_id},
     )
     if on_delivery_failure is not None:
         await on_delivery_failure(conversation_id)
@@ -3808,6 +3814,7 @@ def create_runner_app(
                 "Skipping harness compaction persist for %s: no "
                 "server-side last_item_id available",
                 conv,
+                extra={"session_id": conv},
             )
             return
 
@@ -3835,6 +3842,7 @@ def create_runner_app(
                 "Failed to persist harness compaction item for %s",
                 conv,
                 exc_info=True,
+                extra={"session_id": conv},
             )
 
         if compacted_messages:
@@ -3964,6 +3972,7 @@ def create_runner_app(
                     conv_id,
                     item_type,
                     exc_info=True,
+                    extra={"session_id": conv_id},
                 )
 
     async def _recover_sub_agent_name(conv_id: str) -> str | None:
@@ -4193,6 +4202,7 @@ def create_runner_app(
                     "Codex-native plan-mode update could not fetch session snapshot for %s",
                     conv_id,
                     exc_info=True,
+                    extra={"session_id": conv_id},
                 )
 
         if model is None:
@@ -4218,6 +4228,7 @@ def create_runner_app(
             _logger.warning(
                 "Codex-native plan-mode update skipped for %s: current model is unknown",
                 conv_id,
+                extra={"session_id": conv_id},
             )
             return JSONResponse(
                 status_code=503,
@@ -4356,6 +4367,7 @@ def create_runner_app(
                     terminal_id,
                     conv_id,
                     exc_info=True,
+                    extra={"session_id": conv_id},
                 )
             _publish_terminal_deleted_event(
                 conversation_id=conv_id,
@@ -4697,7 +4709,11 @@ def create_runner_app(
                 timeout_s=1.0,
             )
         except Exception:  # noqa: BLE001 — best-effort; TUI can still answer
-            _logger.debug("claude-native plan verdict not applied", exc_info=True)
+            _logger.debug(
+                "claude-native plan verdict not applied",
+                exc_info=True,
+                extra={"session_id": conv_id},
+            )
 
     async def _handle_cursor_native_model_change(
         conv_id: str,
@@ -5277,6 +5293,7 @@ def create_runner_app(
                 conv_id,
                 owner_response_id,
                 _live_response_id.get(conv_id),
+                extra={"session_id": conv_id},
             )
             return
 
@@ -5423,6 +5440,7 @@ def create_runner_app(
                 "Interrupt forward to harness failed for %s",
                 conv_id,
                 exc_info=True,
+                extra={"session_id": conv_id},
             )
 
     async def _cancel_inprocess_turn(conv_id: str) -> None:
@@ -5483,6 +5501,7 @@ def create_runner_app(
                 conv_id,
                 owner_response_id,
                 _live_response_id.get(conv_id),
+                extra={"session_id": conv_id},
             )
             return
         _logger.warning(
@@ -5952,6 +5971,7 @@ def create_runner_app(
                 conv,
                 exc,
                 exc_info=True,
+                extra={"session_id": conv},
             )
             _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
             raise
@@ -5961,6 +5981,7 @@ def create_runner_app(
                 conv,
                 exc,
                 exc_info=True,
+                extra={"session_id": conv},
             )
             _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
         finally:
@@ -5996,6 +6017,7 @@ def create_runner_app(
                 conv,
                 _prior_agent_id,
                 _dispatched_agent_id,
+                extra={"session_id": conv},
             )
             _session_spec_cache.pop(conv, None)
             _session_harness_overrides.pop(conv, None)
@@ -6029,6 +6051,7 @@ def create_runner_app(
                         "Spec resolution failed for %s",
                         conv,
                         exc_info=True,
+                        extra={"session_id": conv},
                     )
             else:
                 try:
@@ -6039,6 +6062,7 @@ def create_runner_app(
                         "On-demand agent resolution failed for %s",
                         conv,
                         exc_info=True,
+                        extra={"session_id": conv},
                     )
 
         # The resolver branches above write straight into the cache, so the
@@ -6176,6 +6200,7 @@ def create_runner_app(
                         "ToolManager schema build failed for %s",
                         conv,
                         exc_info=True,
+                        extra={"session_id": conv},
                     )
             _session_tool_schemas[conv] = all_tools
 
@@ -6209,6 +6234,7 @@ def create_runner_app(
                         "MCP schema resolution failed for %s",
                         conv,
                         exc_info=True,
+                        extra={"session_id": conv},
                     )
 
         _spec_tools = _session_tool_schemas.get(conv) or []
@@ -6313,6 +6339,7 @@ def create_runner_app(
                 "turn bg error for %s: %s",
                 conv,
                 err_detail,
+                extra={"session_id": conv},
             )
             _on_proxy_stream_end(
                 conv,
@@ -6483,6 +6510,7 @@ def create_runner_app(
                         conv_id,
                         exc,
                         exc_info=True,
+                        extra={"session_id": conv_id},
                     )
                     _eager_spec_error = (
                         type(exc).__name__,
@@ -6500,9 +6528,16 @@ def create_runner_app(
                     _mcp_schemas = _mcp.schemas
                     _mcp_tool_names = _mcp.tool_names
                     for _srv, _err in _mcp.failures.items():
-                        _logger.warning("runner MCP %r unavailable for this turn: %s", _srv, _err)
+                        _logger.warning(
+                            "runner MCP %r unavailable for this turn: %s",
+                            _srv,
+                            _err,
+                            extra={"session_id": conv_id},
+                        )
                 except Exception:
-                    _logger.exception("runner mcp_manager.schemas_for failed")
+                    _logger.exception(
+                        "runner mcp_manager.schemas_for failed", extra={"session_id": conv_id}
+                    )
 
         async def _resolve_turn_spec_lazy() -> tuple[object | None, tuple[str, str] | None]:
             nonlocal _turn_spec, _turn_spec_entry, _turn_spec_resolved
@@ -6529,6 +6564,7 @@ def create_runner_app(
                     conv_id,
                     exc,
                     exc_info=True,
+                    extra={"session_id": conv_id},
                 )
                 return None, (
                     type(exc).__name__,
@@ -6894,6 +6930,7 @@ def create_runner_app(
                     conv_id,
                     exc,
                     exc_info=True,
+                    extra={"session_id": conv_id},
                 )
                 _error = {
                     "code": "connection_error",
@@ -7035,6 +7072,7 @@ def create_runner_app(
                                 "LLM will see message on next turn",
                                 conversation_id,
                                 exc_info=True,
+                                extra={"session_id": conversation_id},
                             )
                     return JSONResponse(
                         status_code=202,
@@ -10213,6 +10251,7 @@ def _build_spawn_env_from_spec(
             env.get(f"{prefix}_GATEWAY_BASE_URL"),
             env.get(f"{prefix}_DATABRICKS_PROFILE"),
             env.get(_HARNESS_MODEL_ENV_KEY.get(harness, f"{prefix}_MODEL")),
+            extra={"session_id": session_id},
         )
     return env
 
