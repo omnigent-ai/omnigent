@@ -173,7 +173,7 @@ describe("ProjectSettingsDialog", () => {
     fireEvent.click(screen.getByTestId("project-settings-save"));
 
     await waitFor(() =>
-      expect(updateMock).toHaveBeenCalledWith("p_1", { icon: "🔥", use_worktree: true }),
+      expect(updateMock).toHaveBeenCalledWith("p_1", "Work", { icon: "🔥", use_worktree: true }),
     );
   });
 
