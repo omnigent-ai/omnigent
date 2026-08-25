@@ -181,6 +181,9 @@ def build_opencode_mcp_block(
             entry = {"type": "remote", "url": url, "enabled": True}
             if headers:
                 entry["headers"] = headers
+        timeout = getattr(server, "timeout", None)
+        if isinstance(timeout, (int, float)) and timeout > 0:
+            entry["timeout"] = int(timeout)
         block[str(name)] = entry
     return block
 
@@ -208,7 +211,7 @@ def build_opencode_omnigent_mcp_server(
         runner interpreter (has ``omnigent`` importable).
     :returns: A one-entry ``mcp`` block ``{"omnigent": {type:"local", …}}``.
     """
-    from omnigent.claude_native_bridge import build_mcp_config
+    from omnigent.claude_native_bridge import _TOOL_CALL_TIMEOUT_S, build_mcp_config
 
     claude_cfg = build_mcp_config(bridge_dir, python_executable=python_executable)
     # build_mcp_config returns {"mcpServers": {"<name>": {command, args, env}}};
@@ -231,6 +234,7 @@ def build_opencode_omnigent_mcp_server(
         "type": "local",
         "command": [command, *args],
         "enabled": True,
+        "timeout": int(_TOOL_CALL_TIMEOUT_S),
     }
     env_value = server.get("env")
     if env_value is None:
