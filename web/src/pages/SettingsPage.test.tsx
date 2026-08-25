@@ -489,8 +489,8 @@ describe("SettingsPage", () => {
     fireEvent.change(screen.getByTestId("code-font-family-input") as HTMLInputElement, {
       target: { value: "Fira Code" },
     });
-    fireEvent.change(screen.getByTestId("code-font-weight-select") as HTMLSelectElement, {
-      target: { value: "600" },
+    fireEvent.change(screen.getByTestId("code-font-weight-slider") as HTMLInputElement, {
+      target: { value: "2" },
     });
 
     // Sanity: the non-default choices were persisted.
@@ -671,23 +671,26 @@ describe("SettingsPage", () => {
   it("shows and persists the code font weight", () => {
     localStorage.clear();
     renderPage("/settings/appearance");
-    const select = screen.getByTestId("code-font-weight-select") as HTMLSelectElement;
-    expect(select.value).toBe("400");
+    const slider = screen.getByTestId("code-font-weight-slider") as HTMLInputElement;
+    expect(slider.value).toBe("0");
+    expect(slider).toHaveAttribute("aria-valuetext", "400 Normal");
+    expect(screen.getByTestId("code-font-weight-preview-400")).toHaveTextContent("Aa code");
 
-    fireEvent.change(select, { target: { value: "500" } });
-    expect(select.value).toBe("500");
+    fireEvent.change(slider, { target: { value: "1" } });
+    expect(slider.value).toBe("1");
+    expect(slider).toHaveAttribute("aria-valuetext", "500 Medium");
     expect(localStorage.getItem("omnigent:code-font-weight")).toBe("500");
   });
 
   it("maps legacy font weights to the supported presets", () => {
     localStorage.setItem("omnigent:code-font-weight", "900");
     renderPage("/settings/appearance");
-    expect(screen.getByTestId("code-font-weight-select")).toHaveValue("600");
+    expect(screen.getByTestId("code-font-weight-slider")).toHaveValue("2");
 
     cleanup();
     localStorage.setItem("omnigent:code-font-weight", "100");
     renderPage("/settings/appearance");
-    expect(screen.getByTestId("code-font-weight-select")).toHaveValue("400");
+    expect(screen.getByTestId("code-font-weight-slider")).toHaveValue("0");
   });
 
   it("defaults bare /settings to Account when a login session exists, else Appearance", async () => {

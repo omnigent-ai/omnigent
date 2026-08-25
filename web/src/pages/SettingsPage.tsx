@@ -1433,6 +1433,14 @@ function UiCodeFontFamilyControl() {
 /** Font weight preset shared by Monaco and xterm code surfaces. */
 function UiCodeFontWeightControl() {
   const [weight, setWeight] = useState(() => readCodeFontWeight());
+  const selectedIndex = CODE_FONT_WEIGHT_OPTIONS.findIndex((option) => option.value === weight);
+
+  const update = (index: number) => {
+    const option = CODE_FONT_WEIGHT_OPTIONS[index];
+    if (!option) return;
+    setWeight(option.value);
+    writeCodeFontWeight(option.value);
+  };
 
   return (
     <div
@@ -1445,32 +1453,50 @@ function UiCodeFontWeightControl() {
           Weight used for regular code text; bold text stays three steps heavier.
         </span>
       </div>
-      <Select
-        value={String(weight)}
-        onValueChange={(next) => {
-          const option = CODE_FONT_WEIGHT_OPTIONS.find(({ value }) => String(value) === next);
-          if (!option) return;
-          setWeight(option.value);
-          writeCodeFontWeight(option.value);
-        }}
-        componentId="settings.appearance.code_font_weight"
-        valueHasNoPii
-      >
-        <SelectTrigger
-          aria-label="Code font weight"
-          data-testid="code-font-weight-select"
-          className="w-44"
-        >
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent>
-          {CODE_FONT_WEIGHT_OPTIONS.map((option) => (
-            <SelectItem key={option.value} value={String(option.value)}>
-              {option.label}
-            </SelectItem>
+      <div className="w-full max-w-sm rounded-xl bg-muted/40 p-3 sm:w-80">
+        <div className="grid grid-cols-3 gap-2">
+          {CODE_FONT_WEIGHT_OPTIONS.map((option, index) => (
+            <div
+              key={option.value}
+              data-testid={`code-font-weight-preview-${option.value}`}
+              className={cn(
+                "rounded-lg border bg-background p-2 text-center transition-[border-color,box-shadow]",
+                index === selectedIndex ? "border-primary ring-2 ring-primary/20" : "border-border",
+              )}
+            >
+              <div className="flex h-11 items-center justify-center rounded-md bg-muted/45 px-1">
+                <span
+                  className="truncate font-mono text-sm text-foreground"
+                  style={{ fontWeight: option.value }}
+                >
+                  Aa code
+                </span>
+              </div>
+              <div className="mt-1.5 text-[11px] font-medium text-muted-foreground">
+                {option.label}
+              </div>
+            </div>
           ))}
-        </SelectContent>
-      </Select>
+        </div>
+        <div className="mt-3" style={{ paddingInline: "16.666%" }}>
+          <input
+            type="range"
+            min="0"
+            max={CODE_FONT_WEIGHT_OPTIONS.length - 1}
+            step="1"
+            value={selectedIndex}
+            aria-label="Code font weight"
+            aria-valuetext={CODE_FONT_WEIGHT_OPTIONS[selectedIndex]?.label}
+            data-testid="code-font-weight-slider"
+            onChange={(event) => update(Number(event.target.value))}
+            className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-border outline-none [&::-moz-range-thumb]:size-4 [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:border-2 [&::-moz-range-thumb]:border-background [&::-moz-range-thumb]:bg-primary [&::-moz-range-thumb]:shadow-sm [&::-webkit-slider-thumb]:size-4 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-background [&::-webkit-slider-thumb]:bg-primary [&::-webkit-slider-thumb]:shadow-sm"
+          />
+        </div>
+        <div className="mt-1 flex justify-between text-[11px] text-muted-foreground">
+          <span>Lighter</span>
+          <span>Bolder</span>
+        </div>
+      </div>
     </div>
   );
 }
