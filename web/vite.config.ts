@@ -238,6 +238,11 @@ function safariLookbehindWorkarounds(): Plugin {
   };
 }
 
+// Utilities both the eager markdown renderer and Shiki's HTML serializer pull
+// in. They must not land in the Shiki chunk -- see `manualChunks` below.
+const SHARED_MARKDOWN_UTILS =
+  /\/(property-information|hast-util-to-html|hast-util-whitespace|stringify-entities|character-entities-html4|character-entities-legacy|comma-separated-tokens|space-separated-tokens|html-void-elements|zwitch|ccount)\//;
+
 export default defineConfig({
   plugins: [emitServiceWorkerTombstone(), safariLookbehindWorkarounds(), react(), tailwindcss()],
   resolve: {
@@ -284,11 +289,31 @@ export default defineConfig({
       output: {
         manualChunks(id) {
           const normalized = id.replaceAll("\\", "/");
+          // Rolldown and Vite inject transpiler helpers and the dynamic-import
+          // preload helper as virtual modules (a NUL-prefixed id). Nearly every
+          // chunk uses them, so when they get folded into the Shiki chunk below
+          // the entry chunk ends up importing Shiki *statically* and its ~2 MB of
+          // themes and regex engine load before first paint.
+          if (
+            normalized.startsWith("\0@oxc-project+runtime@") ||
+            normalized === "\0vite/preload-helper.js"
+          ) {
+            return "runtime-helpers";
+          }
           // Shiki lazily imports each language grammar (`@shikijs/langs/<lang>`)
           // via dynamic import; leave those as their own on-demand chunks
           // instead of folding ~200 grammars into the eagerly-loaded core.
           if (normalized.includes("/@shikijs/langs/")) {
             return;
+          }
+          // Small modules shared between the eagerly-loaded markdown renderer
+          // (hast-util-to-jsx-runtime, hast-util-raw) and Shiki's HTML output.
+          // Left unassigned, Rolldown folds them into the Shiki chunk below,
+          // which makes the entry chunk *statically* import Shiki and drags its
+          // ~2 MB of themes and regex engine into first paint even though every
+          // Shiki entry point (@streamdown/code, monacoSetup) is lazy.
+          if (SHARED_MARKDOWN_UTILS.test(normalized)) {
+            return "markdown-shared";
           }
           // Keep Shiki's core, engines, and bundle glue (incl. the language
           // index + alias map) in one chunk. pnpm's symlinks + Vite's default
