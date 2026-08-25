@@ -36,6 +36,10 @@ from omnigent.db.compression import CompressedText
 # BINARY(32) there — an exact fit for the digest and fully indexable.
 _CKSUM32 = LargeBinary(32).with_variant(MySQLBinary(32), "mysql")
 
+# Sentinel value for cross-harness budget tracking in user_daily_cost.harness.
+# When harness == CROSS_HARNESS_SENTINEL, the row aggregates cost across all
+# harnesses for that user+day. Per-harness rows use the actual harness name.
+CROSS_HARNESS_SENTINEL = "__all__"
 
 # Hex length of a bare uuid4 id, the canonical Python-side form.
 _UUID_HEX_LEN = 32
