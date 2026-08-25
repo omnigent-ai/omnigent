@@ -695,10 +695,11 @@ describe("TerminalSession", () => {
     const { socket, session } = makeSession();
     const { term } = session as unknown as { term: Terminal };
 
-    // Socket-down (pre-open): setFont still applies the size and must not throw
-    // or send — sendResize no-ops until the WS opens, and the reconnect re-fits.
-    session.setFont(16, "");
+    // Socket-down (pre-open): setFont still applies the options and must not
+    // throw or send — sendResize no-ops until the WS opens.
+    session.setFont({ sizePx: 16, family: "", weight: 500 });
     expect(term.options.fontSize).toBe(16);
+    expect(term.options.fontWeight).toBe(500);
     expect(socket.sent).toHaveLength(0);
 
     // Once open, setFont refits the grid (sendResize) so the new glyph cell size
@@ -707,10 +708,12 @@ describe("TerminalSession", () => {
     socket.open();
     const before = socket;
     const sendResize = vi.spyOn(session as unknown as { sendResize: () => void }, "sendResize");
-    session.setFont(18, "Fira Code");
+    session.setFont({ sizePx: 18, family: "Fira Code", weight: 600 });
     expect(sendResize).toHaveBeenCalledTimes(1);
     expect(term.options.fontSize).toBe(18);
     expect(term.options.fontFamily).toContain("Fira Code");
+    expect(term.options.fontWeight).toBe(600);
+    expect(term.options.fontWeightBold).toBe(900);
     // Same socket instance, still open — a re-font never reconnects.
     expect(socket).toBe(before);
     expect(socket.closed).toBe(false);

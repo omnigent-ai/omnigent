@@ -13,15 +13,25 @@
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
-import { type ITheme, Terminal } from "@xterm/xterm";
+import { type FontWeight, type ITheme, Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
-import { codeFontFamilyForEditor, readCodeFont } from "@/lib/codeFontPreferences";
+import { type CodeFont, codeFontFamilyForEditor, readCodeFont } from "@/lib/codeFontPreferences";
 
 // Card background colors derived from the app's CSS palette.
 // Light: --card: oklch(1.000 0 0) = pure white.
 // Dark:  --card: oklch(0.195 0.004 240) ≈ rgb(19, 21, 23) via OKLab → sRGB.
 const CARD_LIGHT = "#ffffff";
 const CARD_DARK = "#131517";
+const TERMINAL_BOLD_WEIGHT_OFFSET = 300;
+
+function terminalFontOptions({ sizePx, family, weight }: CodeFont) {
+  return {
+    fontFamily: codeFontFamilyForEditor(family),
+    fontSize: sizePx,
+    fontWeight: weight as FontWeight,
+    fontWeightBold: (weight + TERMINAL_BOLD_WEIGHT_OFFSET) as FontWeight,
+  };
+}
 
 // WebSocket close codes (RFC 6455 reserves 4xxx).
 // 4400 signals wrong-replica routing: the keyed request reached the wrong
@@ -574,10 +584,8 @@ export class TerminalSession {
     // construction; a mid-session change is applied live via setFont(). The
     // xterm.js defaults (15px, no theme) feel out of place inside the app
     // chrome, so an unset family falls back to the shared mono stack.
-    const { sizePx, family } = readCodeFont();
     this.term = new Terminal({
-      fontFamily: codeFontFamilyForEditor(family),
-      fontSize: sizePx,
+      ...terminalFontOptions(readCodeFont()),
       scrollback: 20000,
       cursorBlink: true,
       theme: terminalTheme(isDark),
@@ -790,7 +798,7 @@ export class TerminalSession {
   }
 
   /**
-   * Update the terminal's code font (size + family) without reconnecting —
+   * Update the terminal's code font without reconnecting —
    * mirrors {@link setTheme}, mutating options in place. A new glyph size
    * changes the character-cell dimensions, so this re-fits the grid to the
    * container and pushes the resulting cols×rows to tmux via {@link sendResize}
@@ -798,9 +806,8 @@ export class TerminalSession {
    * open). An empty family falls back to the shared mono stack. Safe to call at
    * any point after construction.
    */
-  setFont(sizePx: number, family: string): void {
-    this.term.options.fontFamily = codeFontFamilyForEditor(family);
-    this.term.options.fontSize = sizePx;
+  setFont(font: CodeFont): void {
+    Object.assign(this.term.options, terminalFontOptions(font));
     this.sendResize();
   }
 

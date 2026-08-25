@@ -667,7 +667,7 @@ export function TerminalView({
   // disconnected still lands on reconnect.
   useEffect(() => {
     return subscribeCodeFont((font) => {
-      sessionRef.current?.setFont(font.sizePx, font.family);
+      sessionRef.current?.setFont(font);
     });
   }, []);
 
