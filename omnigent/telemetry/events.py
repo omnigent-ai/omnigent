@@ -131,6 +131,36 @@ class TurnEndEvent:
 
 
 @dataclass
+class NativeSessionUsageEvent:
+    """Fired on each ``external_session_usage`` flush from a native harness.
+
+    Native harnesses (claude-native, codex-native) report *cumulative*
+    session totals rather than per-turn deltas, so this event carries
+    running totals at the time of the flush.  Multiple events per session
+    are expected; consumers should take the last one (or compute deltas
+    between consecutive events) to derive per-turn spend.
+
+    :param installation_id: Server-side installation ID.
+    :param session_id: Omnigent conversation/session identifier.
+    :param input_tokens: Cumulative input tokens at time of flush.
+        ``None`` when not reported in this flush.
+    :param output_tokens: Cumulative output tokens at time of flush.
+        ``None`` when not reported in this flush.
+    :param cost_usd: Cumulative cost in USD at time of flush.
+        ``None`` when the session is unpriced or not reported.
+    :param model: LLM model name forwarded by the harness, e.g.
+        ``"claude-opus-4-5"``.  ``None`` when not reported.
+    """
+
+    installation_id: str | None
+    session_id: str
+    input_tokens: int | None
+    output_tokens: int | None
+    cost_usd: float | None
+    model: str | None
+
+
+@dataclass
 class PolicyRegisteredEvent:
     """Fired when a policy is created via the API.
 

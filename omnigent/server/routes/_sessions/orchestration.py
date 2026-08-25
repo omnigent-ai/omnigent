@@ -341,6 +341,7 @@ from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.telemetry import emit as _tel_emit
+from omnigent.telemetry.events import NativeSessionUsageEvent as _TelNativeSessionUsageEvent
 from omnigent.telemetry.events import SessionCreatedEvent as _TelSessionCreatedEvent
 from omnigent.telemetry.events import TurnEndEvent as _TelTurnEndEvent
 from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
@@ -1530,6 +1531,21 @@ async def _persist_external_session_usage(
         body.data,
         conversation_store,
     )
+    _n_in = body.data.get("cumulative_input_tokens")
+    _n_out = body.data.get("cumulative_output_tokens")
+    _n_cost = body.data.get("cumulative_cost_usd")
+    _n_model: str | None = body.data.get("model") or None
+    if _n_in is not None or _n_out is not None or _n_cost is not None:
+        _tel_emit(
+            _TelNativeSessionUsageEvent(
+                installation_id=_get_installation_id(),
+                session_id=session_id,
+                input_tokens=int(_n_in) if _n_in is not None else None,
+                output_tokens=int(_n_out) if _n_out is not None else None,
+                cost_usd=(float(_n_cost) if isinstance(_n_cost, (int, float)) else None),
+                model=_n_model,
+            )
+        )
     label_updates: dict[str, str] = {}
     if raw_tokens is not None:
         label_updates[_LAST_CONTEXT_TOKENS_LABEL_KEY] = str(raw_tokens)
