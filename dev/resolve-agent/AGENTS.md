@@ -143,7 +143,9 @@ When `bug_url` is a GitHub issue, search for an open PR that fixes it:
 
 Branch on what you find:
 
-- **A candidate fix PR exists → go to Step 2A (review it).**
+- **A candidate fix PR exists → go to Step 2A (review it).** If that review finds
+  the PR's approach isn't a viable base (see 2A.5), you may fall through to Step 2B
+  and author your own.
 - **None → go to Step 2B (author the fix).**
 
 If there are *multiple* candidate PRs, pick the most recently updated open one to
@@ -162,19 +164,43 @@ reproduction test is your objective instrument.
      `reproduced` facet; all live facets must pass for the PR to fully resolve it.
    - **Fails** → the PR does **not** actually fix the reproduced behavior. This is
      the single most valuable review finding — capture the exact failure.
-3. **Review the diff** for quality, not just green: does it address the **root
+3. **Re-record the journey against the PR head when footage exists.** If the
+   recovered handoff carries `recordings` (repro-agent's before-fix footage plus
+   the drivers that produced it — the e2e_ui test for `web`/`terminal` facets, a
+   VHS tape for `cli` facets), re-run those drivers with recording on against
+   the PR head, the same commands as 2B.5's re-record step. A passing run's
+   footage is "after" evidence for your review comment; a failing run's footage
+   shows the PR author exactly what still breaks. Best-effort — skip with a note
+   when the tooling or the before-footage is missing.
+4. **Review the diff** for quality, not just green: does it address the **root
    cause** or only mask the symptom? Does it miss facets or obvious adjacent edge
    cases? Does it introduce a regression in the surrounding code (run the touched
    area's tests)?
-4. **Report on the existing PR** — do not open a competing one. Post your findings
-   as a review comment on that PR (`gh pr comment` / `gh pr review`) with the
-   fail→pass (or fail→still-fails) result and any diff concerns, and record its
-   `pr_url` in your output. The `outcome` reflects what you found (`fixed` when the
-   PR resolves every live facet and the diff is sound; `partially_fixed` /
-   `not_fixed` otherwise, with specifics).
+5. **Report on the existing PR.** Post your findings as a review comment on that
+   PR (`gh pr comment` / `gh pr review`) with the fail→pass (or fail→still-fails)
+   result and any diff concerns, and record its `pr_url` in your output. The
+   `outcome` reflects what you found (`fixed` when the PR resolves every live facet
+   and the diff is sound; `partially_fixed` / `not_fixed` otherwise, with
+   specifics). **Default to commenting, not competing** — if the PR is close and
+   its approach is sound, review it and let the author iterate; don't open a rival
+   PR over fixable nits.
 
-You do not modify the PR's code. If the PR is close but wrong, say precisely why;
-authoring a corrected fix is a separate decision a human makes.
+**When the existing PR's *approach* is wrong, open your own fix instead.** The
+default above is for a sound PR. But if reviewing shows the PR is not a viable
+base — its approach is fundamentally incorrect (masks the symptom, wrong layer,
+doesn't address the root cause), needlessly complex, or so low-quality that
+correcting it in review would be more work than a clean fix — don't force a
+comment-only outcome. Say precisely why the existing approach won't do (in a
+review comment on that PR, so the author knows), then **switch to the author path
+(Step 2B) and open your own PR** that resolves the bug correctly. In your PR,
+reference the existing one and summarize why a fresh approach was warranted.
+Record `mode: "authored_fix"` and put the reviewed PR's number in your prose so
+the two are linked. Use this escape hatch deliberately, not for style
+preferences — a working, root-cause-sound PR should be reviewed and improved in
+place, not replaced.
+
+You do not modify the existing PR's code in place — either review it (and let its
+author iterate) or open your own per the escape hatch above.
 
 ## Step 2B — Author the fix
 
@@ -202,6 +228,18 @@ the test fails that way:
   right reason before proceeding.
 - **Flag it loudly** in your handoff (`test_audit`) so a reviewer knows the
   original repro test was an existence-check and you corrected it.
+
+**If the test PASSES on the unfixed tree, the reproduction has gone stale —
+`main` has moved since repro-agent ran.** A recovered verdict is a statement
+about main AT REPRO TIME, not now. Verify the way repro-agent would: re-drive
+enough of the journey to confirm the behavior is genuinely correct on the
+current tree, and hunt for the fixing commit (`git log` on the code the
+evidence points at). When it is really fixed, do not manufacture work: stop
+with outcome `nothing_to_fix`, name the fixing commit in `root_cause`, and
+recommend closing the ticket in your prose summary. If the test passes but the
+journey still misbehaves, the test was too loose — treat it like the
+existence-check case above: rewrite it until it fails on the real, still-live
+behavior, and flag the rewrite in `test_audit`.
 
 For a **compound** bug, do this for **every facet whose verdict is `reproduced`**.
 Facets already `already_fixed` need no transition (note them skipped). Record, per
@@ -260,6 +298,43 @@ diff touches env-derived defaults; note it in the handoff (`hermetic_check`).
 
 If any live facet can't be made to pass with a real fix, say so honestly rather
 than shipping a hollow green.
+
+**Re-record the journey on the fixed tree.** The repro handoff may carry
+`recordings` — before-fix footage plus the drivers that produced it (each entry
+is `{surface, kind, path, format, caption}`; the before clip's `kind` is
+`"before"` for a `reproduced` facet or `"fixed"` for an `already_fixed` one —
+recover it whichever it is). Recover the recording files the same way you
+recovered the test (the repro session's `workspace` under `recordings/<slug>/`,
+or the CI run's artifact bundle).
+
+For a `web`/`terminal` facet, **build the SPA up front — before you run the
+recorder, not during it.** The `tests/e2e_ui/` server serves the SPA from
+`omnigent/server/static/web-ui/`, which starts empty in your checkout. The suite
+*can* build it lazily on first boot, but that build pins the machine's cores
+while the spawned runner is trying to tunnel, so on a busy CI box the runner
+misses its online deadline and the fixture reports `online: false` — a false
+"environment failure" that is really the build starving the boot. So build it
+first, then re-run the SAME drivers with recording on against the fixed tree:
+
+```bash
+pnpm --filter web install && pnpm --filter web run build   # once, up front
+pytest <test_path> --video on --screenshot on --output recordings/<slug>
+```
+
+For `cli` facets, re-render `vhs recordings/<slug>/journey.tape`. pytest-playwright
+writes the video into a per-test subdir under `--output`; **move** it to a stable
+`recordings/<slug>/after-<facet>.<ext>` and delete the leftover subdir so the same
+footage isn't collected twice. For each after clip, write a `caption` describing
+**the actions that clip performs**, ending in the *correct* behavior (a passing
+run) — the same per-clip action-caption repro-agent writes, e.g. `"open the model
+picker → select the catalog → picker now shows friendly names"`. Carry each before
+clip's `caption` through unchanged. The before/after pair is the human-visible
+half of your fail→pass proof; it goes in the PR's Demo section (Step 3) and the
+handoff (`recordings`). If the spawned runner still won't reach `online: true`
+after the SPA is built, capture the fixture's `runner.log` tail and skip with that
+note — report only what you observed, don't assert an internal cause. Best-effort,
+like repro-agent's recording step: missing tooling or missing before-footage skips
+this with a note — it never blocks the fix.
 
 ### 2B.6 — Get an independent cross-vendor review before you open the PR
 
@@ -328,7 +403,13 @@ green:
    summarize the root cause and the fix, and in the **Test Plan** give the concrete
    fail→pass proof (test paths, the pre-fix fail reason, the post-fix pass). Check
    "Bug fix" and the test-coverage boxes that apply. Generate the body from the
-   actual diff and this reproduction — do not skip template sections.
+   actual diff and this reproduction — do not skip template sections. Put the
+   before/after recordings in the **Demo** section: upload the files when your
+   environment can attach media to the PR; otherwise link where they live (the
+   CI run's artifact bundle, or the repro session) so reviewers can watch the
+   failure and the fix. When the bug is a Linear ticket and a Linear key is
+   available, also attach both recordings to the ticket (GraphQL `fileUpload` +
+   `attachmentCreate`) so the ticket carries the visual before/after.
 5. You do **not** merge. Opening the PR is not the finish line — go to Step 4 and
    drive it to a green, reviewed, ready-for-a-human state.
 
@@ -542,6 +623,12 @@ the message. Same discipline as repro-agent:
     "e2e": "tests/e2e_ui/model_catalog/test_1234.py",
     "added": ["tests/web/model/test_picker_label.py"]
   },
+  "recordings": [
+    {"surface": "web", "kind": "before", "path": "recordings/1234/before-picker.webm", "format": "webm",
+     "caption": "open the model picker → select the catalog → picker shows raw IDs"},
+    {"surface": "web", "kind": "after", "path": "recordings/1234/after-picker.webm", "format": "webm",
+     "caption": "open the model picker → select the catalog → picker now shows friendly names"}
+  ],
   "test_audit": "repro e2e was behavioral (failed on raw IDs); no rewrite needed",
   "hermetic_check": "test_picker_label re-run with ambient env vars set — still passes",
   "cross_review": "codex reviewer: no blocking findings; noted a null-guard, addressed",
@@ -561,12 +648,15 @@ Field meanings:
 
 - `bug_url` — the bug link, carried through from the recovered handoff.
 - `mode` — `reviewed_existing_pr` (Step 2A: a candidate PR existed, you reviewed
-  it) or `authored_fix` (Step 2B: you wrote the fix).
+  it) or `authored_fix` (Step 2B: you wrote the fix). Use `authored_fix` when you
+  reviewed an existing PR but its approach wasn't viable and you opened your own
+  (2A.5) — name the reviewed PR in your prose so the two stay linked.
 - `outcome` — overall: `fixed` (every live facet resolved and proven — by your fix
   or by the reviewed PR), `partially_fixed`, `not_fixed` (couldn't resolve, or the
   reviewed PR doesn't fix it), `nothing_to_fix` (recovered verdict was
-  `already_fixed`/`not_reproduced`), or `needs_more_info` (couldn't recover the
-  reproduction).
+  `already_fixed`/`not_reproduced`, or the 2B.1 audit showed `main` has since
+  fixed it — name the fixing commit and recommend closing the ticket), or
+  `needs_more_info` (couldn't recover the reproduction).
 - `root_cause` / `fix_summary` / `files_changed` — the cause and the change. In
   review mode, describe the reviewed PR's approach and leave `files_changed` empty
   (you changed nothing).
@@ -574,6 +664,15 @@ Field meanings:
   `outcome` and a `test_transition` (the fail→pass proof, or why it was skipped).
 - `tests` — `e2e` is the (possibly rewritten) repro test path; `added` is the list
   of targeted tests you wrote (empty in review mode).
+- `recordings` — the before-fix footage carried through from the repro handoff
+  plus your after-fix re-recordings (`kind: "after"`), same
+  `{surface, kind, path, format, caption}` shape as repro-agent's field. Carry
+  each before clip's `caption` through unchanged; write a `caption` for every
+  `after` clip too — the ordered actions that clip performs, ending in the
+  corrected behavior. In review mode, the "after" entries are the drivers
+  re-recorded against the reviewed PR head. Empty list when no footage exists or
+  the tooling was missing — say why in
+  prose.
 - `test_audit` — the result of the Step 2B.1 audit (author mode). In review mode,
   note whether the repro test was behavioral as-is.
 - `hermetic_check` — the result of the Step 2B.5 hostile-env re-run when the diff
