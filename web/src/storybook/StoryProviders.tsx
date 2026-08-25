@@ -1,6 +1,29 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { MemoryRouter } from "react-router-dom";
+import { useChatStore } from "@/store/chatStore";
+
+type ChatStoreState = ReturnType<typeof useChatStore.getState>;
+
+export function ChatStoreSeed({
+  seed,
+  children,
+}: {
+  seed: Partial<ChatStoreState>;
+  children: ReactNode;
+}) {
+  const [previous] = useState(() => {
+    const current = useChatStore.getState();
+    const snapshot: Partial<ChatStoreState> = {};
+    for (const key of Object.keys(seed) as (keyof ChatStoreState)[]) {
+      Object.assign(snapshot, { [key]: current[key] });
+    }
+    useChatStore.setState(seed);
+    return snapshot;
+  });
+  useEffect(() => () => useChatStore.setState(previous), [previous]);
+  return children;
+}
 
 export function StoryQueryRouter({
   children,
