@@ -1,14 +1,16 @@
 """Layered conversation history compaction for LLM context management.
 
 Compaction fires when the estimated prompt token count approaches the
-model's context window. Three layers are applied in order, from
+model's context window. Four layers are applied in order, from
 least-lossy to most-lossy:
 
+0. Headroom compression — content-aware compression of JSON, code, and
+   prose using Headroom AI (15-95% reduction, reversible via CCR).
 1. Surgical clearing — tool result bodies and binary content blocks
    outside the recent window are replaced with markers.
 2. LLM summarization — a @step LLM call summarises all messages
    outside the recent window into a single summary pair.
-3. Truncation — oldest messages are dropped when layers 1+2
+3. Truncation — oldest messages are dropped when layers 0-2
    are still insufficient (emergency fallback).
 """
 
@@ -31,6 +33,10 @@ from omnigent.llms.summarize import (
     build_summarization_input,
     build_summarization_prompt,
     extract_summary_text,
+)
+from omnigent.runtime.headroom_compression import (
+    CompressionMetrics,
+    HeadroomCompressor,
 )
 from omnigent.spec.types import CompactionConfig
 
@@ -475,6 +481,117 @@ async def _summarize_via_runner_uncached(
     return {"text": text, "token_count": token_count}
 
 
+def _apply_headroom_compression(
+    messages: list[dict[str, Any]],
+    protect_from: int,
+    compressor: HeadroomCompressor,
+    history: list[ConversationItem],
+) -> None:
+    """
+    Apply Headroom compression to messages outside the recent window.
+
+    Compresses tool results, function call outputs, and large text content
+    using content-aware methods (JSON, code, prose). Messages are modified
+    in place.
+
+    :param messages: The messages list to compress (modified in place).
+    :param protect_from: Index of the first message in the recent window.
+        Messages at indices < *protect_from* are eligible for compression.
+    :param compressor: Configured HeadroomCompressor instance.
+    :param history: The original conversation history, used to determine
+        tool names and content types.
+    """
+    # Build a mapping from message index to history item for tool name lookup
+    history_map = {}
+    msg_idx = 0
+    for _hist_idx, item in enumerate(history):
+        if item.type != "reasoning":
+            history_map[msg_idx] = item
+            msg_idx += 1
+
+    for i, msg in enumerate(messages):
+        if i >= protect_from:
+            break
+
+        msg_type = msg.get("type")
+        content = msg.get("content")
+
+        # Compress function_call_output (tool results)
+        if msg_type == "function_call_output":
+            output = msg.get("output", "")
+            if isinstance(output, str) and len(output) > compressor.json_threshold:
+                # Look up tool name from history
+                hist_item = history_map.get(i)
+                tool_name = "unknown"
+                if hist_item and hasattr(hist_item.data, "tool_name"):
+                    tool_name = hist_item.data.tool_name
+
+                estimated_tokens = compressor._estimate_tokens(output)
+                result = compressor.compress_tool_result(
+                    content=output,
+                    tool_name=tool_name,
+                    estimated_tokens=estimated_tokens,
+                )
+
+                # Only apply if compression ratio > 1.2 and we have a verified CCR key
+                if result.compression_ratio > 1.2 and result.retrieval_key:
+                    # Include retrieval key in the message so agent can recover original
+                    msg["output"] = f"{result.compressed}\n\n[Compressed content. Retrieve full version: headroom_retrieve(key=\"{result.retrieval_key}\")]"
+
+        # Compress text content in message content blocks
+        elif content and isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+
+                block_type = block.get("type")
+
+                # Compress text blocks
+                if block_type == "text":
+                    text = block.get("text", "")
+                    if isinstance(text, str) and len(text) > compressor.prose_threshold:
+                        estimated_tokens = compressor._estimate_tokens(text)
+                        result = compressor.compress_tool_result(
+                            content=text,
+                            tool_name="text_block",
+                            estimated_tokens=estimated_tokens,
+                        )
+
+                        if result.compression_ratio > 1.2 and result.retrieval_key:
+                            block["text"] = f"{result.compressed}\n\n[Compressed. Retrieve: headroom_retrieve(key=\"{result.retrieval_key}\")]"
+
+                # Compress tool_result content
+                elif block_type == "tool_result":
+                    tool_content = block.get("content", "")
+                    tool_name = block.get("tool_use_id", "unknown")
+
+                    if (
+                        isinstance(tool_content, str)
+                        and len(tool_content) > compressor.json_threshold
+                    ):
+                        estimated_tokens = compressor._estimate_tokens(tool_content)
+                        result = compressor.compress_tool_result(
+                            content=tool_content,
+                            tool_name=tool_name,
+                            estimated_tokens=estimated_tokens,
+                        )
+
+                        if result.compression_ratio > 1.2 and result.retrieval_key:
+                            block["content"] = f"{result.compressed}\n\n[Compressed. Retrieve: headroom_retrieve(key=\"{result.retrieval_key}\")]"
+
+        # Compress string content directly
+        elif isinstance(content, str) and len(content) > compressor.prose_threshold:
+            estimated_tokens = compressor._estimate_tokens(content)
+            result = compressor.compress_tool_result(
+                content=content,
+                tool_name="message_content",
+                estimated_tokens=estimated_tokens,
+            )
+
+            if result.compression_ratio > 1.2 and result.retrieval_key:
+                msg["content"] = f"{result.compressed}\n\n[Compressed. Retrieve: headroom_retrieve(key=\"{result.retrieval_key}\")]"
+
+
 def compaction_to_history_items(
     compaction_item: ConversationItem,
 ) -> list[ConversationItem]:
@@ -571,6 +688,7 @@ async def compact(
     force: bool = False,
     fail_on_summary_error: bool = False,
     conversation_id: str | None = None,
+    feature_flags: Any | None = None,  # FeatureFlags — typed as Any to avoid circular import
 ) -> CompactionResult:
     """
     Apply layered compaction to a messages list to fit within the
@@ -621,6 +739,10 @@ async def compact(
         stream so the REPL and web UI show the compaction indicator.
         ``None`` for explicit ``/compact`` — sessions.py handles those
         events directly, e.g. ``"conv_abc123"``.
+    :param feature_flags: Optional feature flags instance for checking
+        if Headroom compression is enabled. When ``None`` or when the
+        HEADROOM_COMPRESSION feature is disabled, Layer 0 is skipped
+        regardless of the config setting.
     :returns: A :class:`CompactionResult` with the compacted messages
         and optional summary metadata.
     """
@@ -635,6 +757,80 @@ async def compact(
 
     history_boundary = _find_recent_boundary(history, recent_window)
     msg_boundary = _history_idx_to_msg_idx(history, history_boundary)
+
+    # --- Layer 0: Headroom Compression ---
+    # Content-aware compression reduces tokens before expensive operations.
+    # Only compresses messages outside the recent window to preserve
+    # full context for recent interactions.
+    #
+    # Controlled by TWO settings:
+    # 1. Feature flag: OMNIGENT_FEATURES=headroom_compression (required)
+    # 2. Config setting: compaction.headroom_enabled: true (default)
+    #
+    # Resolve feature flags from environment if not provided
+    feature_gate_enabled = False
+    try:
+        from omnigent.server.feature_flags import Feature, resolve_feature_flags
+
+        # Resolve from environment when feature_flags is None (production case)
+        flags = feature_flags or resolve_feature_flags()
+        feature_gate_enabled = flags.enabled(Feature.HEADROOM_COMPRESSION)
+    except (ImportError, AttributeError):
+        # Feature flags module not available, default to disabled
+        pass
+
+    config_enabled = (
+        config.headroom_enabled if config and hasattr(config, "headroom_enabled") else True
+    )
+    headroom_enabled = feature_gate_enabled and config_enabled
+    compression_metrics: CompressionMetrics | None = None
+
+    _logger.debug(
+        "Layer 0: feature_gate=%s, config=%s, enabled=%s",
+        feature_gate_enabled,
+        config_enabled,
+        headroom_enabled,
+    )
+
+    if headroom_enabled:
+        compression_metrics = CompressionMetrics()
+        compressor = HeadroomCompressor(
+            json_threshold=getattr(config, "headroom_json_threshold", 500) if config else 500,
+            code_threshold=getattr(config, "headroom_code_threshold", 1000) if config else 1000,
+            prose_threshold=getattr(config, "headroom_prose_threshold", 2000) if config else 2000,
+            enable_ccr=getattr(config, "headroom_enable_ccr", True) if config else True,
+            conversation_id=conversation_id,
+            metrics=compression_metrics,
+        )
+
+        # Compress messages outside the recent window
+        _apply_headroom_compression(
+            working,
+            msg_boundary,
+            compressor,
+            history,
+        )
+
+        l0_tokens = count_tokens(working, model)
+        if compression_metrics.tokens_saved > 0:
+            _logger.info(
+                "Compaction Layer 0 (Headroom) complete for task %s: "
+                "%d → %d tokens (saved %d, %.1f%%), %d compressions",
+                task_id,
+                compression_metrics.total_original_tokens + l0_tokens,
+                l0_tokens,
+                compression_metrics.tokens_saved,
+                compression_metrics.percent_saved,
+                compression_metrics.total_compressions,
+            )
+
+        # Check if Layer 0 alone satisfies the budget
+        if not force and l0_tokens <= budget:
+            return CompactionResult(
+                messages=working,
+                summary_metadata=None,
+                total_tokens=l0_tokens,
+            )
 
     # --- Layer 1 ---
     _clear_tool_results(working, msg_boundary)

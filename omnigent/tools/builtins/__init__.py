@@ -122,6 +122,18 @@ __all__ = [
 _BuiltinFactory = Callable[[dict[str, str]], Tool]
 
 
+def _create_headroom_retrieve(config: dict[str, str]) -> Tool:
+    """
+    Lazy factory for HeadroomRetrieveTool.
+
+    :param config: Tool config (unused).
+    :returns: A HeadroomRetrieveTool instance.
+    """
+    from omnigent.tools.builtins.headroom_retrieve import HeadroomRetrieveTool
+
+    return HeadroomRetrieveTool()
+
+
 def _create_upload_file(config: dict[str, str]) -> Tool:
     """
     Lazy factory for UploadFileTool.
@@ -261,10 +273,12 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     # constructed by ToolManager before reaching this registry.
     # ``list_comments`` and ``update_comment`` are auto-registered by
     # ``ToolManager._register_comment_tools`` — they are reserved
-    # here so user specs cannot shadow them. (Policy ASKs are
-    # surfaced as MCP-shape elicitations on the SSE stream — not
-    # via the tool registry — see omnigent/runtime/policies/approval.py.)
+    # here so user specs cannot shadow them. ``headroom_retrieve`` is
+    # auto-registered when Headroom compression is enabled.
+    # (Policy ASKs are surfaced as MCP-shape elicitations on the SSE
+    # stream — not via the tool registry — see omnigent/runtime/policies/approval.py.)
     "web_fetch": None,
+    "headroom_retrieve": None,
     "list_comments": None,
     "update_comment": None,
     # ``sys_list_models`` is auto-registered by

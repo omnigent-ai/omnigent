@@ -634,8 +634,8 @@ class CompactionConfig:
 
     Controls when the agent compacts its conversation history to
     stay within the LLM's context window. Compaction is layered:
-    (1) clear tool result bodies, (2) LLM summarization, (3)
-    truncation as emergency fallback.
+    (0) Headroom compression, (1) clear tool result bodies,
+    (2) LLM summarization, (3) truncation as emergency fallback.
 
     :param trigger_threshold: Fraction of the model's context window
         at which proactive compaction fires (after the first overflow
@@ -645,10 +645,27 @@ class CompactionConfig:
         from compaction. Items within this window are never cleared or
         summarized — the agent always has verbatim access to its most
         recent work, e.g. ``5``.
+    :param headroom_enabled: Enable Headroom compression as Layer 0.
+        When ``True``, content-aware compression (JSON, code, prose)
+        is applied before surgical clearing. Defaults to ``True``.
+    :param headroom_json_threshold: Minimum tokens before compressing
+        JSON content (API responses, structured data). Defaults to ``500``.
+    :param headroom_code_threshold: Minimum tokens before compressing
+        code content (files, diffs). Defaults to ``1000``.
+    :param headroom_prose_threshold: Minimum tokens before compressing
+        prose content (logs, documentation). Defaults to ``2000``.
+    :param headroom_enable_ccr: Enable Content-Cache-Retrieval for reversible
+        compression. When ``True``, original content is cached locally and can
+        be retrieved via ``headroom_retrieve(key)`` tool. Defaults to ``True``.
     """
 
     trigger_threshold: float = 0.8
     recent_window: int = 5
+    headroom_enabled: bool = True
+    headroom_json_threshold: int = 500
+    headroom_code_threshold: int = 1000
+    headroom_prose_threshold: int = 2000
+    headroom_enable_ccr: bool = True
 
 
 @dataclass
