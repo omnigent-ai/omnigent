@@ -10,6 +10,35 @@ import httpx
 from playwright.sync_api import Page, expect
 
 
+def test_header_session_menu_reveals_horizontal_ellipsis_on_hover(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The desktop trigger is hidden at rest and uses a horizontal ellipsis."""
+    base_url, session_id = seeded_session
+    page.goto(f"{base_url}/c/{session_id}")
+
+    breadcrumb = page.get_by_role("navigation", name="Conversation")
+    trigger = page.get_by_test_id("header-conversation-actions")
+    expect(breadcrumb).to_be_visible(timeout=30_000)
+    expect(trigger).to_be_visible()
+
+    expect(trigger).to_have_css("opacity", "0")
+    expect(trigger.locator("svg.lucide-ellipsis")).to_have_count(1)
+    expect(trigger.locator("svg.lucide-ellipsis-vertical")).to_have_count(0)
+
+    breadcrumb.hover()
+    expect(trigger).to_have_css("opacity", "1")
+
+    trigger.click()
+    viewport = page.viewport_size
+    assert viewport is not None
+    page.mouse.move(viewport["width"] - 4, viewport["height"] - 4)
+
+    expect(page.get_by_role("menu")).to_be_visible()
+    expect(trigger).to_have_css("opacity", "1")
+
+
 def test_header_session_menu_renames_owner_and_hides_for_subagent(
     page: Page,
     seeded_session: tuple[str, str],
