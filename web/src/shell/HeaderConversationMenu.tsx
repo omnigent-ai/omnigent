@@ -53,6 +53,7 @@ import {
   useTogglePinnedConversation,
 } from "@/hooks/useConversations";
 import { markConversationUnread } from "@/hooks/useUnseenConversations";
+import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { Link, useNavigate } from "@/lib/routing";
 import { showToast } from "@/components/ui/toast";
@@ -158,6 +159,7 @@ export function HeaderConversationMenu({
 }: HeaderConversationMenuProps) {
   const navigate = useNavigate();
   const isMobile = useIsMobileViewport();
+  const { trackClick } = useOmnigentAnalytics();
   const togglePinned = useTogglePinnedConversation();
   const rename = useRenameConversation();
   const moveToProject = useMoveToProject();
@@ -174,6 +176,13 @@ export function HeaderConversationMenu({
   const label = conversationDisplayLabel(conversation);
   // Mobile taps need a bigger target than the dense desktop row.
   const itemClass = isMobile ? "gap-2.5 px-2.5 py-2" : undefined;
+  // Share and Agent info reach this menu on mobile from the header's legacy
+  // Share · Agent info menu, which reported them under these ids. Keep
+  // emitting the same ones so the metric series stays continuous, and only on
+  // mobile — the desktop kebab is a different surface.
+  const trackMobile = (componentId: string) => {
+    if (isMobile) trackClick(componentId, "button");
+  };
   const gitBranch = conversation.git_branch ?? null;
 
   useEffect(() => {
@@ -249,7 +258,14 @@ export function HeaderConversationMenu({
           className={itemClass}
           disabled={shareDisabled}
           title={shareDisabledReason}
-          onSelect={shareDisabled ? undefined : onShare}
+          onSelect={
+            shareDisabled
+              ? undefined
+              : () => {
+                  trackMobile("chat.header.mobile_share");
+                  onShare();
+                }
+          }
         >
           <ShareIcon className="size-3.5" />
           Share
@@ -259,7 +275,10 @@ export function HeaderConversationMenu({
         <DropdownMenuItem
           data-testid="header-agent-info"
           className={itemClass}
-          onSelect={onAgentInfo}
+          onSelect={() => {
+            trackMobile("chat.header.mobile_agent_info");
+            onAgentInfo();
+          }}
         >
           <InfoIcon className="size-3.5" />
           Agent info

@@ -4,6 +4,7 @@ import { MemoryRouter } from "react-router-dom";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as ConversationsModule from "@/hooks/useConversations";
 import type * as UnseenConversationsModule from "@/hooks/useUnseenConversations";
+import { setOmnigentHostConfig } from "@/lib/host";
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
 
@@ -87,6 +88,7 @@ function openMenu() {
 }
 
 beforeEach(() => {
+  setOmnigentHostConfig({});
   mocks.isMobile = false;
   mocks.projects = [{ id: "project-1", name: "Sprint 42" }];
   vi.clearAllMocks();
@@ -338,6 +340,59 @@ describe("HeaderConversationMenu", () => {
       "max-md:bg-background/70",
       "max-md:backdrop-blur-xl",
     );
+  });
+
+  it("keeps emitting the mobile Share / Agent info analytics ids", () => {
+    // These two actions moved here from the header's legacy Share · Agent info
+    // menu, which reported them under these ids. An owner-managed session no
+    // longer renders that menu, so this path has to carry the series forward.
+    const analytics = vi.fn();
+    setOmnigentHostConfig({ analytics });
+    mocks.isMobile = true;
+    const onShare = vi.fn();
+    const onAgentInfo = vi.fn();
+    renderMenu({ onShare, hasAgentInfo: true, onAgentInfo });
+
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Share" }));
+    expect(analytics).toHaveBeenCalledWith({
+      type: "click",
+      componentId: "chat.header.mobile_share",
+      componentKind: "button",
+    });
+    expect(onShare).toHaveBeenCalledOnce();
+
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Agent info" }));
+    expect(analytics).toHaveBeenCalledWith({
+      type: "click",
+      componentId: "chat.header.mobile_agent_info",
+      componentKind: "button",
+    });
+    expect(onAgentInfo).toHaveBeenCalledOnce();
+  });
+
+  it("reports nothing for the desktop kebab, a different surface", () => {
+    const analytics = vi.fn();
+    setOmnigentHostConfig({ analytics });
+    renderMenu({ onShare: () => {} });
+
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Share" }));
+    expect(analytics).not.toHaveBeenCalled();
+  });
+
+  it("emits nothing when a disabled Share is selected", () => {
+    const analytics = vi.fn();
+    setOmnigentHostConfig({ analytics });
+    mocks.isMobile = true;
+    const onShare = vi.fn();
+    renderMenu({ onShare, shareDisabled: true });
+
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Share" }));
+    expect(analytics).not.toHaveBeenCalled();
+    expect(onShare).not.toHaveBeenCalled();
   });
 
   it("reflects pinned state and preserves the disabled share reason", () => {

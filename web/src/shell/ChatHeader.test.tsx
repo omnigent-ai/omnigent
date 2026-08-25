@@ -6,6 +6,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Agent } from "@/hooks/useAgents";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as NativeBridgeModule from "@/lib/nativeBridge";
+import { setOmnigentHostConfig } from "@/lib/host";
 import { ChatHeader } from "./ChatHeader";
 import {
   TerminalFirstContextProvider,
@@ -115,6 +116,7 @@ function renderHeader(props: {
 
 afterEach(() => {
   cleanup();
+  setOmnigentHostConfig({});
   isIOSShellMock.mockReturnValue(false);
   isAndroidShellMock.mockReturnValue(false);
   isMobileMock.mockReturnValue(false);
@@ -526,6 +528,38 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     // Rightmost control in the header's action cluster.
     expect(trigger.parentElement?.lastElementChild).toBe(trigger);
     expect(screen.getByText(conversation.title as string)).toBeInTheDocument();
+  });
+
+  it("keeps the mobile Share / Agent info analytics on the owner-managed path", () => {
+    // The owner-managed session hides the legacy Share · Agent info menu that
+    // used to report these ids, so the kebab it yields to must report them.
+    const analytics = vi.fn();
+    setOmnigentHostConfig({ analytics });
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      conversationTitle: conversation.title,
+      actionConversation: conversation,
+      canShare: true,
+      hasHeaderMenu: true,
+      hasAgentInfo: true,
+    });
+
+    const openKebab = () =>
+      fireEvent.pointerDown(screen.getByRole("button", { name: "Conversation actions" }), {
+        button: 0,
+      });
+
+    openKebab();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Share" }));
+    openKebab();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Agent info" }));
+
+    expect(analytics.mock.calls.map(([event]) => event.componentId)).toEqual([
+      "chat.header.mobile_share",
+      "chat.header.mobile_agent_info",
+    ]);
   });
 
   it("renders a single kebab on mobile, not one per menu", () => {
