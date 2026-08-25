@@ -185,17 +185,19 @@ reproduction test is your objective instrument.
    its approach is sound, review it and let the author iterate; don't open a rival
    PR over fixable nits.
 6. **Trigger the automated (Polly) review on the PR.** After posting your
-   findings, comment `/review` (the command alone on its line — a write-access
-   account triggers it and Polly reacts 👀) so the repo's Polly AI Review runs on
-   the PR and its author gets those findings too:
+   findings, kick off the repo's Polly AI Review so the PR's author gets a
+   cross-vendor review too. Do **not** use the `/review` *comment* — Polly's
+   handler ignores comments from `[bot]` accounts (you are one), so it would be
+   silently dropped. Use the workflow's `workflow_dispatch` entry point instead,
+   which has no bot/association gate:
    ```
-   gh pr comment <pr> --body '/review'
+   gh workflow run polly-review.yml -R omnigent-ai/omnigent -f pr=<pr>
    ```
    Do this whenever you keep the PR as the fix (the sound-PR default). You are
    reviewing, not owning, so you don't loop on Polly's output here — that
-   push→`/review`→re-read loop is the author path's job (Step 4.3). If you instead
+   push→re-review→re-read loop is the author path's job (Step 4.3). If you instead
    take the escape hatch below and open your own PR, skip this — Polly runs on
-   *your* PR via Step 4.3.
+   *your* PR automatically (Step 4.3).
 
 **When the existing PR's *approach* is wrong, open your own fix instead.** The
 default above is for a sound PR. But if reviewing shows the PR is not a viable
