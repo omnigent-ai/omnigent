@@ -91,12 +91,15 @@ export function SidebarHeaderActions({
 }
 
 /**
- * Mobile treatment shared by the two floating icon buttons: a round chip that
- * reads as lifted off the session list, sized for a thumb. On desktop these
- * stay flat 24px ghost icons in the header row.
+ * Mobile treatment shared by the two floating icon buttons: a thumb-sized round
+ * chip in iOS liquid glass. The look lives in one CSS class
+ * (`.sidebar-glass-chip` in index.css) that both chips wear, so Search and
+ * Settings can't drift apart — they had, one landing opaque with a heavier
+ * shadow than the other. On desktop the class is inert (it is scoped to the
+ * mobile breakpoint) and these stay flat 24px ghost icons in the header row.
  */
 const SIDEBAR_FLOAT_BUTTON =
-  "size-6 text-muted-foreground hover:text-foreground max-md:size-9 max-md:rounded-full max-md:bg-muted/70 max-md:text-foreground";
+  "sidebar-glass-chip size-6 text-muted-foreground hover:text-foreground max-md:size-9 max-md:rounded-full max-md:text-foreground";
 
 const SIDEBAR_FLOAT_ICON = "ui-icon max-md:size-[18px]";
 

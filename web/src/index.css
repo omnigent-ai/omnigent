@@ -942,6 +942,49 @@ aside[aria-label="Workspace"][data-maximized] {
     transition-duration: 1ms;
   }
 }
+
+/* Liquid glass for the mobile sidebar's two floating chips (Search at the top
+ * of the header row, Settings over the bottom of the session list) — the iOS
+ * control idiom.
+ *
+ * The rim, the specular top edge, and the drop shadow do the work, not the
+ * blur: the surface behind these chips is the sidebar's own near-flat card, so
+ * blurring it alone would leave nothing to see. The blur earns its keep on the
+ * Settings chip, which floats over the scrolling session list and frosts the
+ * row titles passing under it.
+ *
+ * Scoped to `width < 48rem` so the class is inert on desktop, where the same
+ * two icons are flat ghost buttons in the header row. Both chips share it so
+ * they can't drift apart again.
+ *
+ * Backdrop sampling stops at the sidebar: the `.conversations-sidebar` carries
+ * a translate for its slide, which makes it a backdrop root, so the chips frost
+ * the drawer's own content rather than the chat behind it — which is what we
+ * want. If WebKit drops the filter (it does, once a Radix popper opens — see
+ * `max-md:bg-card-solid` on the sidebar), the fill and rim still read as a
+ * chip. */
+@media (width < 48rem) {
+  .sidebar-glass-chip {
+    /* -webkit- must come BEFORE the unprefixed property: LightningCSS (vite
+     * build) collapses the pair and keeps only the last declaration. */
+    -webkit-backdrop-filter: blur(20px) saturate(180%);
+    backdrop-filter: blur(20px) saturate(180%);
+    background-color: rgba(255, 255, 255, 0.6);
+    border: 1px solid rgba(0, 0, 0, 0.06);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.8),
+      0 1px 2px rgba(0, 0, 0, 0.05),
+      0 6px 16px rgba(0, 0, 0, 0.07);
+  }
+
+  .dark .sidebar-glass-chip {
+    background-color: rgba(255, 255, 255, 0.1);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.12),
+      0 2px 10px rgba(0, 0, 0, 0.45);
+  }
+}
 /* Share button — glassy pink effect (both modes). The vertical
  * gradient alone does the embossed work (lighter top = light catch,
  * darker bottom = shadow, simulating a convex surface lit from above);
