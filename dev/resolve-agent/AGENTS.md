@@ -164,14 +164,22 @@ reproduction test is your objective instrument.
      `reproduced` facet; all live facets must pass for the PR to fully resolve it.
    - **Fails** → the PR does **not** actually fix the reproduced behavior. This is
      the single most valuable review finding — capture the exact failure.
-3. **Re-record the journey against the PR head when footage exists.** If the
-   recovered handoff carries `recordings` (repro-agent's before-fix footage plus
-   the drivers that produced it — the e2e_ui test for `web`/`terminal` facets, a
-   VHS tape for `cli` facets), re-run those drivers with recording on against
-   the PR head, the same commands as 2B.5's re-record step. A passing run's
-   footage is "after" evidence for your review comment; a failing run's footage
-   shows the PR author exactly what still breaks. Best-effort — skip with a note
-   when the tooling or the before-footage is missing.
+3. **Re-record the journey against the PR head — always, when before-footage
+   exists.** If the recovered handoff carries `recordings` (repro-agent's
+   before-fix footage plus the drivers that produced it — the e2e_ui test for
+   `web`/`terminal` facets, a VHS tape for `cli` facets), you **must** re-run
+   those drivers with recording on against the PR head and add an `after`-kind
+   entry to your handoff `recordings` — this is not optional polish. Use the same
+   commands (and SPA-up-front sequencing) as 2B.5's re-record step, saving to
+   `recordings/<slug>/after-<facet>.<ext>` with a `caption` for what the clip
+   shows. A passing run's footage is the "after" half of your before/after pair
+   (the bug resolved); a failing run's footage shows the PR author exactly what
+   still breaks — either way you record it. The before clip alone is a
+   half-finished result: a reviewer needs to *watch* the fix work, so carry the
+   before clip through **and** produce the after. Only skip the after clip when
+   it is genuinely unobtainable (the recorder tooling is missing, or the fixture
+   can't come online after the SPA build) — and then say so explicitly in your
+   review comment and in `evidence`, naming the blocker. Never drop it silently.
 4. **Review the diff** for quality, not just green: does it address the **root
    cause** or only mask the symptom? Does it miss facets or obvious adjacent edge
    cases? Does it introduce a regression in the surrounding code (run the touched
