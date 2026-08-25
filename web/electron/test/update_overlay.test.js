@@ -60,7 +60,7 @@ class FakeWindow extends EventEmitter {
   }
 }
 
-function makeOverlay() {
+function makeOverlay({ platform = process.platform } = {}) {
   const onHandlers = new Map();
   const handleHandlers = new Map();
   const windows = [];
@@ -91,12 +91,23 @@ function makeOverlay() {
     updater,
     overlayPage: "/overlay.html",
     preloadPath: "/preload.js",
+    platform,
   });
   controller.registerIpc();
   return { controller, handleHandlers, onHandlers, windows };
 }
 
-describe("update overlay height reservation", () => {
+describe("update overlay", () => {
+  it("excludes the overlay from the macOS shown-windows menu", () => {
+    const mac = makeOverlay({ platform: "darwin" });
+    const macOverlay = mac.controller.ensureOverlay(new FakeWindow());
+    assert.equal(macOverlay.excludedFromShownWindowsMenu, true);
+
+    const linux = makeOverlay({ platform: "linux" });
+    const linuxOverlay = linux.controller.ensureOverlay(new FakeWindow());
+    assert.equal(linuxOverlay.excludedFromShownWindowsMenu, undefined);
+  });
+
   it("broadcasts visible height to the parent and supports an initial read", async () => {
     const { controller, handleHandlers, onHandlers, windows } = makeOverlay();
     const parent = new FakeWindow();

@@ -539,6 +539,38 @@ describe("auto-update main-process wiring", () => {
     assert.equal(harness.calls.appQuit, 1); // never re-issued
   });
 
+  it("force-exits if the re-issued normal quit does not terminate", async (t) => {
+    const harness = loadMainHarness({ settings: { update_mode: "manual" } });
+    t.after(harness.cleanup);
+    harness.api.setQuitTimeouts({ cleanup: 10 });
+
+    harness.appEvents.get("before-quit")({ preventDefault: () => {} });
+    await flushPromises();
+    assert.equal(harness.calls.appQuit, 1);
+    assert.equal(harness.calls.appExit, 0);
+
+    await new Promise((resolve) => {
+      setTimeout(resolve, 30);
+    });
+    assert.equal(harness.calls.appExit, 1);
+  });
+
+  it("cancels the normal quit fallback once quit is reached", async (t) => {
+    const harness = loadMainHarness({ settings: { update_mode: "manual" } });
+    t.after(harness.cleanup);
+    harness.api.setQuitTimeouts({ cleanup: 10 });
+
+    harness.appEvents.get("before-quit")({ preventDefault: () => {} });
+    await flushPromises();
+    assert.equal(harness.calls.appQuit, 1);
+
+    harness.appEvents.get("quit")();
+    await new Promise((resolve) => {
+      setTimeout(resolve, 30);
+    });
+    assert.equal(harness.calls.appExit, 0);
+  });
+
   it("force-exits if before-quit cleanup hangs past the safety cap", async (t) => {
     // A stuck shutdown (e.g. a hung `omnigent server stop`, or the known
     // Electron hazard where re-issuing app.quit() after before-quit's

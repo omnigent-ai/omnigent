@@ -26,6 +26,7 @@ const OVERLAY_INSET = 12;
  *   checkForUpdates: Function, downloadUpdate: Function, installUpdateNow: Function }} deps.updater
  * @param {string} deps.overlayPage Absolute path to the built overlay HTML.
  * @param {string} deps.preloadPath Absolute path to update_overlay_preload.js.
+ * @param {NodeJS.Platform} [deps.platform] Runtime platform (injectable for tests).
  */
 function createUpdateOverlay({
   BrowserWindow,
@@ -34,6 +35,7 @@ function createUpdateOverlay({
   updater,
   overlayPage,
   preloadPath,
+  platform = process.platform,
 }) {
   /** @type {Map<Electron.BrowserWindow, Electron.BrowserWindow>} parent -> overlay */
   const overlays = new Map();
@@ -104,6 +106,9 @@ function createUpdateOverlay({
         nodeIntegration: false,
       },
     });
+    if (platform === "darwin") {
+      overlay.excludedFromShownWindowsMenu = true;
+    }
     overlays.set(parent, overlay);
 
     // The ?theme= URL param is only a pre-paint hint to avoid a flash before

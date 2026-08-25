@@ -3057,6 +3057,13 @@ if (!gotLock) {
   // pidfile that the next launch reuses or `omnigent server stop` reclaims.
   let quitCleanupDone = false;
   let quitCleanupStarted = false;
+  let quitForceExitTimer = null;
+  const clearQuitForceExitTimer = () => {
+    if (quitForceExitTimer === null) return;
+    clearTimeout(quitForceExitTimer);
+    quitForceExitTimer = null;
+  };
+  app.on("quit", clearQuitForceExitTimer);
   app.on("before-quit", (event) => {
     if (quitCleanupDone) return;
     // A second quit (e.g. Cmd-Q again during the SIGKILL grace window) must not
@@ -3069,12 +3076,12 @@ if (!gotLock) {
     // unref'd so the cap itself can't hold the event loop open; app.exit()
     // bypasses before-quit/will-quit, so it's the guaranteed way out when
     // app.quit() proves unreliable.
-    const cap = setTimeout(() => {
-      if (quitCleanupDone) return;
+    quitForceExitTimer = setTimeout(() => {
+      quitForceExitTimer = null;
       quitCleanupDone = true;
       app.exit(0);
     }, quitCleanupTimeoutMs);
-    if (typeof cap.unref === "function") cap.unref();
+    if (typeof quitForceExitTimer.unref === "function") quitForceExitTimer.unref();
 
     // resolvedCliPath() is evaluated inside the async IIFE so a throw (a future
     // change to settings/CLI resolution) becomes a rejection caught below,
@@ -3088,7 +3095,6 @@ if (!gotLock) {
       .finally(() => {
         if (quitCleanupDone) return; // the hard cap already forced the exit
         quitCleanupDone = true;
-        clearTimeout(cap);
         // Hand off to a user-approved install if one is pending; otherwise
         // complete the deferred quit. quitAndInstall() re-issues app.quit()
         // (via setImmediate) only when it can actually install — so if the
@@ -3099,6 +3105,7 @@ if (!gotLock) {
         // the time the fallback fires the update is already underway (or was
         // never going to install) — force-exiting only ensures we quit.
         if (updater.quitAndInstallIfPending()) {
+          clearQuitForceExitTimer();
           const fallback = setTimeout(() => app.exit(0), quitInstallFallbackMs);
           if (typeof fallback.unref === "function") fallback.unref();
         } else {
