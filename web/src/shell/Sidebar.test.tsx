@@ -364,9 +364,9 @@ describe("Sidebar session list", () => {
     expect(row.className).not.toContain("focus-within");
   });
 
-  it("centers a row's state badge in a size-6 slot at the right-1 edge", () => {
-    // The row badge and the collapsed-project marker share this geometry so
-    // their dots line up vertically; keep the row side pinned here.
+  it("centers a row's dot marker in a size-6 slot at the right-1 edge", () => {
+    // The row dot and the collapsed-project dot share this geometry so they
+    // line up vertically; keep the row side pinned here.
     mockConversations([
       conv("conv_running", "Claude Code", { title: "Running row", status: "running" }),
     ]);
@@ -374,6 +374,22 @@ describe("Sidebar session list", () => {
 
     const slot = screen.getByTestId("session-state-badge").parentElement!;
     expect(slot).toHaveClass("md:right-1", "md:w-6", "md:justify-center");
+  });
+
+  it("does not constrain a row's awaiting pill to the dot slot", () => {
+    // The "Needs response" pill is wider than the dot markers; the size-6 box
+    // would clip its label, so the pill keeps its natural width.
+    mockConversations([
+      conv("conv_awaiting", "Claude Code", {
+        title: "Awaiting row",
+        pending_elicitations_count: 1,
+      }),
+    ]);
+    renderSidebar();
+
+    const slot = screen.getByTestId("session-state-badge").parentElement!;
+    expect(slot).toHaveClass("md:right-1");
+    expect(slot).not.toHaveClass("md:w-6");
   });
 
   it("offers the four display filters and defaults to My sessions", () => {
@@ -1758,11 +1774,34 @@ describe("Sidebar collapsed project marker", () => {
     expect(within(header).queryByText("Needs response")).toBeNull();
   });
 
-  // The project-folder marker must sit in the same size-6 centered slot as a
-  // row's badge (pulled to the right-1 edge, offsetting the folder button's
-  // px-2), so the dots line up vertically down the sidebar instead of the
-  // folder dot drifting right of the rows above it.
-  it("aligns the collapsed-project marker with the row badge slot", () => {
+  // A dot/spinner marker on a collapsed project must sit in the same size-6
+  // centered slot as a row's badge (pulled to the right-1 edge, offsetting the
+  // folder button's px-2), so the dots line up vertically down the sidebar
+  // instead of the folder dot drifting right of the rows above it.
+  it("aligns a collapsed-project dot marker with the row badge slot", () => {
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_running", "Claude Code", {
+        labels: { omni_project: "Customer X" },
+        status: "running",
+      }),
+    ]);
+    renderSidebar();
+
+    const slot = screen.getByTestId("session-state-badge").parentElement!;
+    // Fixed centered box so the dot centers on the same vertical line as the
+    // rows' dots.
+    expect(slot).toHaveClass("w-6", "justify-center");
+    // Folder headers use px-2, so on desktop the slot trims the trailing
+    // padding to the rows' right-1 (4px) edge. (The header also carries a
+    // kebab, so the mobile reserve is mr-14 and the -mr-1 is md-gated.)
+    expect(slot).toHaveClass("md:-mr-1");
+  });
+
+  // The "awaiting" pill is wider than the dot markers; constraining it to the
+  // size-6 box would clip its "Needs response" label, so it keeps its natural
+  // width.
+  it("does not constrain the collapsed-project awaiting pill to the dot slot", () => {
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_awaiting", "Claude Code", {
@@ -1773,13 +1812,7 @@ describe("Sidebar collapsed project marker", () => {
     renderSidebar();
 
     const slot = screen.getByTestId("session-state-badge").parentElement!;
-    // Same centered box the row slot uses (SESSION_STATE_SLOT_CLASS: md:w-6
-    // md:justify-center), so the dot centers on the same vertical line.
-    expect(slot).toHaveClass("w-6", "justify-center");
-    // Folder headers use px-2, so on desktop the slot trims the trailing
-    // padding to the rows' right-1 (4px) edge. (An awaiting marker also carries
-    // a kebab, so the mobile reserve is mr-14 and the -mr-1 is md-gated.)
-    expect(slot).toHaveClass("md:-mr-1");
+    expect(slot).not.toHaveClass("w-6");
   });
 });
 
