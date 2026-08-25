@@ -69,6 +69,13 @@ executor:
 # The full operating procedure lives in AGENTS.md, read at startup.
 instructions: AGENTS.md
 
+# Grant sys_session_share authority to grant the __public__ sentinel (anonymous
+# read-only). The agent only shares when invoked with `public: true` (the
+# `dev/resolve.py --public` flag) — useful when running against a shared
+# `--server` so the resolve session is spectatable while it works. Still gated by
+# the server's own public-sharing switch.
+agent_session_sharing: public
+
 async: true
 cancellable: true
 

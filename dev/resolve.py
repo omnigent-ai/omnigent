@@ -103,14 +103,22 @@ def parse_ci_run_url(url: str) -> dict[str, str] | None:
     return {"org": m.group(1), "repo": m.group(2), "run_id": m.group(3)}
 
 
-def build_payload(*, session: str | None, ci_link: str | None, skip_push: bool = False) -> str:
+def build_payload(
+    *,
+    session: str | None,
+    ci_link: str | None,
+    skip_push: bool = False,
+    public: bool = False,
+) -> str:
     """Normalize the two input modes into the agent's ``-p`` JSON payload.
 
     Exactly one of ``session`` / ``ci_link`` must be provided. ``session`` is
     normalized to a bare id; ``ci_link`` is passed through verbatim (the agent
     parses the run itself). ``skip_push`` is only added to the payload when true
-    (author mode then commits locally but neither pushes nor opens a PR). Raises
-    ``ValueError`` if neither or both inputs are given, or one is unparseable.
+    (author mode then commits locally but neither pushes nor opens a PR).
+    ``public`` is added when true (the agent shares the session public-read at
+    start). Raises ``ValueError`` if neither or both inputs are given, or one is
+    unparseable.
     """
     if bool(session) == bool(ci_link):
         raise ValueError("provide exactly one of a session reference or --ci-link")
@@ -124,6 +132,8 @@ def build_payload(*, session: str | None, ci_link: str | None, skip_push: bool =
         payload = {"ci_link": ci_link.strip()}
     if skip_push:
         payload["skip_push"] = True
+    if public:
+        payload["public"] = True
     return json.dumps(payload)
 
 
@@ -251,6 +261,13 @@ def _parse_args() -> argparse.Namespace:
         "PR, or comments on an existing PR, so this authorizes those outward "
         "actions up front.",
     )
+    p.add_argument(
+        "--public",
+        action="store_true",
+        help="Share the resolve session public-read (anyone who can reach the "
+        "server) right after it starts. Off by default — useful when running "
+        "against a shared --server so the session is spectatable while it works.",
+    )
     return p.parse_args()
 
 
@@ -291,7 +308,10 @@ def main() -> None:
 
     try:
         payload = build_payload(
-            session=args.session, ci_link=args.ci_link, skip_push=args.skip_push
+            session=args.session,
+            ci_link=args.ci_link,
+            skip_push=args.skip_push,
+            public=args.public,
         )
     except ValueError as exc:
         _die(str(exc))
