@@ -40,6 +40,7 @@ def test_build_omnigent_mcp_server_points_serve_mcp_at_bridge_dir() -> None:
     entry = block["omnigent"]
     assert entry["type"] == "local"
     assert entry["enabled"] is True
+    assert entry["timeout"] == 300
     cmd = entry["command"]
     # Launches the SHARED serve-mcp relay, pointed at THIS bridge dir.
     assert cmd[-3:] == ["serve-mcp", "--bridge-dir", "/tmp/bridge-xyz"]
@@ -523,3 +524,35 @@ def test_merge_user_provider_config_handles_jsonc_trailing_commas(
 
     result = maybe_merge_user_provider_config({})
     assert result["provider"]["my-openai"]["options"]["baseURL"] == "https://my-gw/v1"
+
+
+def test_build_mcp_block_preserves_custom_timeout() -> None:
+    from types import SimpleNamespace as N
+
+    from omnigent.opencode_native_provider import build_opencode_mcp_block
+
+    servers = [
+        N(
+            name="local_custom",
+            transport="stdio",
+            command="python",
+            args=["-m", "custom_server"],
+            env={},
+            url=None,
+            headers={},
+            timeout=120,
+        ),
+        N(
+            name="remote_custom",
+            transport="http",
+            url="https://remote.mcp/api",
+            headers={},
+            command=None,
+            args=[],
+            env={},
+            timeout=45.5,
+        ),
+    ]
+    block = build_opencode_mcp_block(servers)
+    assert block["local_custom"]["timeout"] == 120
+    assert block["remote_custom"]["timeout"] == 45
