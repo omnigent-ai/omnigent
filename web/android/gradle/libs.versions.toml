@@ -1,28 +1,23 @@
-# Versions are pinned to the compileSdk-35 / Gradle-8.9 / JDK-17 toolchain this
-# module builds against. AGP 9.x and the newest androidx libs require Gradle 9 /
-# compileSdk 36, so lint's "newer version available" advisories are expected
-# here and deliberately not chased — bump the whole toolchain together instead.
+# Versions are pinned to the compileSdk-36 / Gradle-9.3 / JDK-17 toolchain this
+# module builds against. AGP 9.x and the newest androidx libs are required for
+# compileSdk 36+, so these versions move together rather than one at a time.
 [versions]
-agp = "8.6.1"
-kotlin = "2.0.20"
-androidxCore = "1.13.1"
-androidxActivity = "1.9.2"
-androidxAppcompat = "1.7.0"
-androidxWebkit = "1.12.1"
+agp = "9.1.1"
+androidxCore = "1.18.0"
+androidxActivity = "1.12.4"
+androidxWebkit = "1.15.0"
+# AppCompat 1.8.x is currently in preview; stick with the latest stable 1.7.x.
+androidxAppcompat = "1.7.1"
 junit = "4.13.2"
-robolectric = "4.14.1"
-androidxTestCore = "1.6.1"
-# Instrumented (androidTest) deps. Pinned to the AGP 8.6 / compileSdk 35 toolchain;
-# androidx.test 1.6.x + espresso 3.6.x + uiautomator 2.4.0 are the last stable line
-# that doesn't force the AGP 9 / compileSdk 36 jump.
-androidxTestRunner = "1.6.2"
-androidxTestRules = "1.6.1"
-androidxTestExtJunit = "1.2.1"
-espresso = "3.6.1"
+robolectric = "4.16.1"
+androidxTestCore = "1.7.0"
+androidxTestRunner = "1.7.0"
+androidxTestRules = "1.7.0"
+androidxTestExtJunit = "1.3.0"
+espresso = "3.7.0"
 uiautomator = "2.4.0"
-# Gradle Play Publisher. 3.x tracks the AGP 8.x / Gradle 8.9 toolchain pinned
-# above; 4.x targets the newer toolchain, so bump it with the rest, not alone.
-playPublisher = "3.12.1"
+# Gradle Play Publisher 4.x supports AGP 9.x; 3.x does not.
+playPublisher = "4.0.0"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "androidxCore" }
@@ -40,5 +35,4 @@ uiautomator = { group = "androidx.test.uiautomator", name = "uiautomator", versi
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
-kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
 play-publisher = { id = "com.github.triplet.play", version.ref = "playPublisher" }

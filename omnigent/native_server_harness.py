@@ -20,7 +20,6 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
-from typing import Any
 
 from omnigent.inner.executor import (
     EnqueuedContent,
@@ -39,7 +38,7 @@ _logger = logging.getLogger(__name__)
 # Resolve the native session id from bridge state (``None`` until ready).
 SessionResolver = Callable[[], Awaitable[str | None]]
 # Build a :class:`NativePrompt` from message content.
-PromptBuilder = Callable[[Any], NativePrompt | None]
+PromptBuilder = Callable[[EnqueuedContent], NativePrompt | None]
 
 
 class NativeServerHarness(Executor):

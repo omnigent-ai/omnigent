@@ -256,12 +256,12 @@ export function CommandPalette({
                       {s.snippet && (
                         // Where the match was found in the chat body — the
                         // session is often unidentifiable from the title alone.
-                        <span className="truncate text-left text-muted-foreground text-xs">
+                        <span className="truncate text-left text-muted-foreground text-sm">
                           <HighlightedText text={s.snippet} query={debouncedQuery} />
                         </span>
                       )}
                     </div>
-                    <span className="ml-2 shrink-0 text-xs text-muted-foreground">{s.agent}</span>
+                    <span className="ml-2 shrink-0 text-sm text-muted-foreground">{s.agent}</span>
                   </CommandItem>
                 ))}
               </CommandGroup>

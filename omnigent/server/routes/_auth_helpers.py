@@ -23,6 +23,7 @@ import dataclasses
 
 from fastapi import Request
 
+from omnigent.db.utils import shared_read_scope
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import (
@@ -290,52 +291,58 @@ def _require_access_and_level_sync(
             code=ErrorCode.UNAUTHORIZED,
         )
 
-    # Single round-trip: admin flag + the user's and public grants on the
-    # conversation the caller asked about. The displayed level is the direct
-    # grant (no parent walk), matching get_permission_level exactly.
-    access = permission_store.resolve_access(user_id, conversation_id)
-    level = resolved_level(access)
+    # One read-only burst: the permission resolve, the conversation lookup,
+    # and any parent-chain walk all share a single pool checkout instead of
+    # one per store call. On the per-streamed-event path this is re-run for a
+    # session whose data is stable for the turn, so the checkout — plus
+    # ``pool_pre_ping`` — is the cost that matters.
+    with shared_read_scope():
+        # Single round-trip: admin flag + the user's and public grants on the
+        # conversation the caller asked about. The displayed level is the direct
+        # grant (no parent walk), matching get_permission_level exactly.
+        access = permission_store.resolve_access(user_id, conversation_id)
+        level = resolved_level(access)
 
-    # Admins bypass the conversation lookup entirely (mirrors
-    # check_session_access's admin short-circuit, which never reads the
-    # conversation). A missing conversation is left for the snapshot builder
-    # to 404 on, exactly as today.
-    if access.is_admin:
-        return SessionAccess(level=level, conversation=None)
+        # Admins bypass the conversation lookup entirely (mirrors
+        # check_session_access's admin short-circuit, which never reads the
+        # conversation). A missing conversation is left for the snapshot builder
+        # to 404 on, exactly as today.
+        if access.is_admin:
+            return SessionAccess(level=level, conversation=None)
 
-    conv = conversation_store.get_conversation(conversation_id)
-    if conv is None:
-        raise OmnigentError(
-            "Conversation not found",
-            code=ErrorCode.NOT_FOUND,
-        )
+        conv = conversation_store.get_conversation(conversation_id)
+        if conv is None:
+            raise OmnigentError(
+                "Conversation not found",
+                code=ErrorCode.NOT_FOUND,
+            )
 
-    if conv.parent_conversation_id is None:
-        # Top-level session: the access-governing grant lives on this same
-        # conversation, so reuse the rows already fetched — no extra reads.
-        allowed = resolved_allows(access, required_level)
-    else:
-        # Sub-agent: access delegates to the parent chain. Defer to the
-        # canonical recursive checker (its own reads); sub-agents are rare
-        # and the parent's grants are a different conversation's rows.
-        allowed = check_session_access(
-            user_id,
-            conv.parent_conversation_id,
-            required_level,
-            permission_store,
-            conversation_store,
-        )
-    if allowed:
-        return SessionAccess(level=level, conversation=conv)
+        if conv.parent_conversation_id is None:
+            # Top-level session: the access-governing grant lives on this same
+            # conversation, so reuse the rows already fetched — no extra reads.
+            allowed = resolved_allows(access, required_level)
+        else:
+            # Sub-agent: access delegates to the parent chain. Defer to the
+            # canonical recursive checker (its own reads); sub-agents are rare
+            # and the parent's grants are a different conversation's rows.
+            allowed = check_session_access(
+                user_id,
+                conv.parent_conversation_id,
+                required_level,
+                permission_store,
+                conversation_store,
+            )
+        if allowed:
+            return SessionAccess(level=level, conversation=conv)
 
-    # Denied — distinguish "has some access but not enough" (403) from
-    # "no access at all" (404, to avoid leaking session existence).
-    if conv.parent_conversation_id is None:
-        has_any = resolved_allows(access, 1)
-    else:
-        has_any = check_session_access(
-            user_id, conv.parent_conversation_id, 1, permission_store, conversation_store
-        )
+        # Denied — distinguish "has some access but not enough" (403) from
+        # "no access at all" (404, to avoid leaking session existence).
+        if conv.parent_conversation_id is None:
+            has_any = resolved_allows(access, 1)
+        else:
+            has_any = check_session_access(
+                user_id, conv.parent_conversation_id, 1, permission_store, conversation_store
+            )
     if has_any:
         level_name = _LEVEL_NAMES.get(required_level, str(required_level))
         raise OmnigentError(

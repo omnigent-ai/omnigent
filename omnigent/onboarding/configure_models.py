@@ -337,10 +337,9 @@ def credential_label(
     if kind == DATABRICKS_KIND:
         return f"Databricks ({profile})" if profile else "Databricks"
     if kind == CLI_CONFIG_KIND:
-        # The provider's own name field is the friendliest label there is
-        # ("Databricks AI Gateway"); the entry name ("codex-databricks") is
-        # the readable fallback.
-        return display_name or provider_name
+        # Use the entry name (e.g. "isaac-databricks-codex" → "Isaac-Databricks-Codex")
+        # so cli-config providers show consistently alongside other provider kinds.
+        return provider_display_name(provider_name)
     if kind == KEY_KIND:
         return f"{provider_display_name(provider_name)} API Key"
     if kind == BEDROCK_KIND:

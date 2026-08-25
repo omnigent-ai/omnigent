@@ -8,7 +8,7 @@
 // The link carries no http/https scheme — we infer it with the SAME rule the
 // setup page uses (defaultSchemeFor: http for loopback, https for remote),
 // so a deep link and a pasted URL can never disagree on scheme. The
-// workspace mount (`/ml/omnigents`) is deliberately NOT in the link: it is
+// workspace mount (`/omnigent`) is deliberately NOT in the link: it is
 // server-determined and discovered by expandDatabricksWorkspaceUrl, exactly
 // as for a pasted workspace URL.
 

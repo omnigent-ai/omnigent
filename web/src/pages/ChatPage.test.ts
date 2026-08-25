@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
-import type { RenderItem } from "@/lib/renderItems";
+import type { Bubble, RenderItem } from "@/lib/renderItems";
+import type { RoutingScope } from "@/lib/routingDecision";
 import type { ToolExecution } from "@/lib/blocks";
-import type { Bubble } from "@/lib/renderItems";
+import type { ServerInfo } from "@/lib/capabilities";
+import type { Session } from "@/lib/types";
 import {
   BUILTIN_SLASH_COMMANDS,
   isSlashCommandText,
@@ -18,6 +20,8 @@ import {
   computeShowsWorking,
   containsMarkdownTable,
   dispatchInitialPrompt,
+  isCostRoutingEligible,
+  isSubagentRoutingEligible,
   isUnboundCodingFork,
   mergePendingBubbles,
   readOnlyReasonForSessionLabels,
@@ -25,10 +29,17 @@ import {
   shouldSendInitialPrompt,
   shouldShowAuthorBadge,
   shouldShowWorkingIndicator,
+  MAX_WARM_TERMINAL_SURFACES,
+  shouldMountTerminalSurface,
   shouldShowTerminalSurface,
+  updateWarmTerminalSurfaces,
+  type WarmTerminalEntry,
+  isBackgroundTasksOnly,
   splitSlashCommand,
+  stripGatedSubagentRoutingChips,
   stripPendingElicitations,
   subAgentComposerLabel,
+  unboundSessionResumableInApp,
   WORKING_MESSAGES,
   workingIndicatorLabel,
 } from "./ChatPage";
@@ -116,6 +127,93 @@ describe("Terminal-first surface selection", () => {
     expect(
       shouldShowTerminalSurface("conv_regular", { isTerminalFirst: false, view: "terminal" }, true),
     ).toBe(false);
+  });
+
+  it("pre-warms the surface in chat view once a terminal is reachable", () => {
+    // Mounted (hidden) so the attach dials in the background and the
+    // first flip to Terminal is instant.
+    expect(
+      shouldMountTerminalSurface("conv_terminal", {
+        isTerminalFirst: true,
+        view: "chat",
+        terminalsAvailable: true,
+      }),
+    ).toBe(true);
+  });
+
+  it("keeps the surface mounted while the view is open even with no terminal", () => {
+    // The surface owns the "No terminals available" / reconnect states.
+    expect(
+      shouldMountTerminalSurface("conv_stopped", {
+        isTerminalFirst: true,
+        view: "terminal",
+        terminalsAvailable: false,
+      }),
+    ).toBe(true);
+  });
+
+  it("does not pre-warm with no reachable terminal or for non-terminal-first sessions", () => {
+    // A hidden mount here would just dial a dead runner…
+    expect(
+      shouldMountTerminalSurface("conv_stopped", {
+        isTerminalFirst: true,
+        view: "chat",
+        terminalsAvailable: false,
+      }),
+    ).toBe(false);
+    // …and non-terminal-first sessions have no main terminal surface at all.
+    expect(
+      shouldMountTerminalSurface("conv_regular", {
+        isTerminalFirst: false,
+        view: "chat",
+        terminalsAvailable: true,
+      }),
+    ).toBe(false);
+    expect(shouldMountTerminalSurface(null, null)).toBe(false);
+  });
+});
+
+describe("Warm terminal-surface LRU", () => {
+  it("moves a revisited session to the most-recent end without duplicating it", () => {
+    const warmed = updateWarmTerminalSurfaces(
+      [
+        { conversationId: "conv_a", readOnly: false },
+        { conversationId: "conv_b", readOnly: false },
+      ],
+      "conv_a",
+      false,
+    );
+    expect(warmed.map((e) => e.conversationId)).toEqual(["conv_b", "conv_a"]);
+  });
+
+  it("evicts the least-recent session past the cap", () => {
+    const ids = Array.from({ length: MAX_WARM_TERMINAL_SURFACES + 1 }, (_, i) => `conv_${i}`);
+    let warmed: WarmTerminalEntry[] = [];
+    for (const id of ids) {
+      warmed = updateWarmTerminalSurfaces(warmed, id, false);
+    }
+    // The oldest fell out: its hidden surface unmounts and its attach is
+    // disposed, keeping the cache from accumulating a tmux attach for
+    // every session ever visited.
+    expect(warmed.map((e) => e.conversationId)).toEqual(ids.slice(1));
+    expect(warmed).toHaveLength(MAX_WARM_TERMINAL_SURFACES);
+  });
+
+  it("refreshes the readOnly snapshot for the re-inserted session only", () => {
+    // Permission hydrates late for the active session; a warm background
+    // session must keep the snapshot from when IT was active.
+    const warmed = updateWarmTerminalSurfaces(
+      [
+        { conversationId: "conv_a", readOnly: true },
+        { conversationId: "conv_b", readOnly: false },
+      ],
+      "conv_b",
+      true,
+    );
+    expect(warmed).toEqual([
+      { conversationId: "conv_a", readOnly: true },
+      { conversationId: "conv_b", readOnly: true },
+    ]);
   });
 });
 
@@ -340,6 +438,30 @@ describe("buildPendingBubbles", () => {
     // p.author ("bob") wins over the viewer's selfAuthor ("alice").
     expect(bubble.createdBy).toBe("bob@example.com");
   });
+
+  it("carries the send-time stamp; replayed entries show no re-stamped time", () => {
+    // A fresh send was stamped once in the store at send time — the
+    // optimistic bubble shows THAT time, not a drifting render-time
+    // Date.now(). Snapshot-replayed entries carry no stamp (the server
+    // has none for pending inputs), so the bubble renders no timestamp
+    // rather than pretending the reload time was the send time.
+    const [stamped] = buildPendingBubbles(
+      [
+        {
+          tempId: "tmp_2",
+          content: [{ type: "input_text" as const, text: "hi" }],
+          createdAtS: 1_753_900_000,
+        },
+      ],
+      null,
+    ) as [Extract<Bubble, { kind: "user" }>];
+    expect(stamped.createdAtS).toBe(1_753_900_000);
+    const [replayed] = buildPendingBubbles(
+      [{ tempId: "tmp_3", content: [{ type: "input_text" as const, text: "hi" }] }],
+      null,
+    ) as [Extract<Bubble, { kind: "user" }>];
+    expect(replayed.createdAtS).toBeUndefined();
+  });
 });
 
 // ── mergePendingBubbles ────────────────────────────────────────────────────
@@ -358,9 +480,13 @@ const assistantText = (id: string): Bubble => ({
   error: null,
   items: [{ kind: "text", itemId: id, text: "hi", final: true }],
 });
-const elicitationBubble = (id: string, phase: string): Bubble => ({
+// A card with no turn to anchor to carries the `elicit_*` response id
+// blockStream stamps for exactly that case; pass `responseId` to model a
+// card that DOES belong to a turn (an inline approval, or a question card
+// the walker split into its own bubble).
+const elicitationBubble = (id: string, phase: string, responseId = `elicit_${id}`): Bubble => ({
   kind: "assistant",
-  responseId: id,
+  responseId,
   stableId: id,
   lifecycle: "completed",
   error: null,
@@ -379,8 +505,16 @@ const elicitationBubble = (id: string, phase: string): Bubble => ({
     },
   ],
 });
+const routingChipBubble = (id: string, scope: RoutingScope): Bubble => ({
+  kind: "routing_decision",
+  itemId: id,
+  model: "databricks-claude-sonnet-5",
+  applied: true,
+  rationale: "trivial task -> cheapest arm",
+  routing: { scope },
+});
 const bubbleIds = (bubbles: Bubble[]): string[] =>
-  bubbles.map((b) => (b.kind === "user" ? b.itemId : b.kind === "assistant" ? b.stableId : ""));
+  bubbles.map((b) => (b.kind === "assistant" ? b.stableId : b.itemId));
 
 describe("mergePendingBubbles", () => {
   it("appends pending bubbles at the end when nothing trails", () => {
@@ -424,6 +558,40 @@ describe("mergePendingBubbles", () => {
       "e1",
       "e2",
     ]);
+  });
+
+  it("splices the pending prompt ABOVE a create-time routing chip", () => {
+    // A pinned Smart Routing create routes before the pane launches, so the
+    // session-scope chip is the whole committed timeline while the landing
+    // composer's prompt is still optimistic. Appending after it would show
+    // the chip above the message — and move it below a beat later, when the
+    // server persists the message and the walker pairs them.
+    const committed = [routingChipBubble("rd_create", "session")];
+    const merged = mergePendingBubbles(committed, [userBubble("pend_1")]);
+    expect(bubbleIds(merged)).toEqual(["pend_1", "rd_create"]);
+  });
+
+  it("splices above a create whose session AND turn chip both landed first", () => {
+    const committed = [
+      routingChipBubble("rd_create", "session"),
+      routingChipBubble("rd_turn", "turn"),
+    ];
+    const merged = mergePendingBubbles(committed, [userBubble("pend_1")]);
+    expect(bubbleIds(merged)).toEqual(["pend_1", "rd_create", "rd_turn"]);
+  });
+
+  it("does NOT lift a new prompt above a chip already paired with its message", () => {
+    const committed = [userBubble("u1"), routingChipBubble("rd_1", "turn")];
+    const merged = mergePendingBubbles(committed, [userBubble("pend_1")]);
+    expect(bubbleIds(merged)).toEqual(["u1", "rd_1", "pend_1"]);
+  });
+
+  it("does NOT lift a new prompt above a trailing sub-agent chip", () => {
+    // Sub-agent chips render standalone where the spawn happened — they are
+    // not a verdict on the message being typed.
+    const committed = [routingChipBubble("rd_spawn", "native_subagent")];
+    const merged = mergePendingBubbles(committed, [userBubble("pend_1")]);
+    expect(bubbleIds(merged)).toEqual(["rd_spawn", "pend_1"]);
   });
 
   it("does NOT reorder for a tool_call-phase elicitation (message already committed)", () => {
@@ -487,6 +655,16 @@ describe("reorderCommittedRequestElicitations", () => {
     expect(result).toBe(committed);
     expect(bubbleIds(result)).toEqual(["e1", "u1"]);
   });
+
+  it("does NOT reorder a card anchored to a turn", () => {
+    // A question/plan card the walker split out of its turn keeps that
+    // turn's response id. It gated nothing — the message after it is a NEW
+    // prompt — so lifting the prompt above it would reorder history.
+    const committed = [elicitationBubble("e1", "pre_tool_use", "resp_1"), userBubble("u1")];
+    const result = reorderCommittedRequestElicitations(committed);
+    expect(result).toBe(committed);
+    expect(bubbleIds(result)).toEqual(["e1", "u1"]);
+  });
 });
 
 // ── pinned elicitations ─────────────────────────────────────────────────────
@@ -521,7 +699,7 @@ const elicitItem = (id: string, status: "pending" | "responded"): RenderItem => 
   response: status === "responded" ? { action: "accept" } : null,
 });
 const pendingIds = (items: RenderItem[]): string[] =>
-  items.map((it) => (it.kind === "elicitation" ? it.elicitationId : ""));
+  items.map((item) => (item.kind === "elicitation" ? item.elicitationId : ""));
 
 describe("collectPendingElicitations", () => {
   it("collects pending cards across bubbles in document order (newest last)", () => {
@@ -555,7 +733,7 @@ describe("stripPendingElicitations", () => {
     const bubbles = [assistantWith("a1", [elicitItem("e1", "pending"), textItem("t1")])];
     const stripped = stripPendingElicitations(bubbles);
     const a1 = stripped[0] as Extract<Bubble, { kind: "assistant" }>;
-    expect(a1.items.map((it) => it.kind)).toEqual(["text"]);
+    expect(a1.items.map((item) => item.kind)).toEqual(["text"]);
   });
 
   it("leaves answered cards inline", () => {
@@ -576,6 +754,63 @@ describe("stripPendingElicitations", () => {
     expect(stripped[0]).toBe(a1);
     expect(stripped[1]).not.toBe(a2);
     expect((stripped[1] as Extract<Bubble, { kind: "assistant" }>).items).toEqual([]);
+  });
+});
+
+// ── sub-agent routing chip gate ─────────────────────────────────────────────
+
+// Routing-decision chip bubble at some scope, e.g. an in-harness Task spawn.
+const routingChip = (id: string, scope?: RoutingScope): Bubble => ({
+  kind: "routing_decision",
+  itemId: id,
+  model: "databricks-claude-haiku-4-5",
+  applied: true,
+  rationale: "cheap lookup",
+  ...(scope !== undefined && { routing: { scope } }),
+});
+const chipIds = (bubbles: Bubble[]): string[] =>
+  bubbles.filter((b) => b.kind === "routing_decision").map((b) => b.itemId);
+
+describe("stripGatedSubagentRoutingChips", () => {
+  it("shows the spawn chips when the session turned sub-agent routing on", () => {
+    const bubbles = [userBubble("u1"), routingChip("rd_sub", "native_subagent")];
+    expect(stripGatedSubagentRoutingChips(bubbles, "on")).toBe(bubbles);
+  });
+
+  it("hides spawn chips on an unset switch but keeps the session's own decisions", () => {
+    // An unset switch means the spawns were not routed, so a per-spawn chip
+    // would describe a pick that never happened. The session's own session/turn
+    // verdicts (and legacy rows with no scope) still belong on screen.
+    const bubbles = [
+      routingChip("rd_session", "session"),
+      routingChip("rd_turn", "turn"),
+      routingChip("rd_legacy"),
+      routingChip("rd_child", "child_session"),
+      userBubble("u1"),
+      routingChip("rd_sub", "native_subagent"),
+      assistantText("a1"),
+    ];
+    const shown = stripGatedSubagentRoutingChips(bubbles, null);
+    expect(chipIds(shown)).toEqual(["rd_session", "rd_turn", "rd_legacy", "rd_child"]);
+    // Everything else keeps its place and its reference (BubbleView's memo).
+    expect(bubbleIds(shown)).toEqual([
+      "rd_session",
+      "rd_turn",
+      "rd_legacy",
+      "rd_child",
+      "u1",
+      "a1",
+    ]);
+  });
+
+  it("hides spawn chips on an explicit off", () => {
+    const bubbles = [routingChip("rd_sub", "native_subagent")];
+    expect(stripGatedSubagentRoutingChips(bubbles, "off")).toEqual([]);
+  });
+
+  it("returns the same array reference when there is nothing to hide", () => {
+    const bubbles = [userBubble("u1"), routingChip("rd_session", "session")];
+    expect(stripGatedSubagentRoutingChips(bubbles, null)).toBe(bubbles);
   });
 });
 
@@ -614,7 +849,7 @@ describe("computeShowsWorking", () => {
 
   it("parent idle stays idle in the main chat", () => {
     // Busy children are surfaced by the sidebar/Agents rail, not by the
-    // main chat's shimmer or pinned "Working…" pill.
+    // main chat's "Working…" shimmer.
     expect(computeShowsWorking("idle", opts())).toBe(false);
   });
 
@@ -670,6 +905,54 @@ describe("computeShowsWorking", () => {
     expect(computeShowsWorking("idle", opts({ runnerOnline: false, backgroundTaskCount: 2 }))).toBe(
       false,
     );
+  });
+
+  it("an in-flight local send lights the indicator before any server edge", () => {
+    // Pressing Enter sets chatStore.status = "streaming" synchronously, while
+    // `sessionStatus` stays `idle` until the server publishes `running` (for
+    // claude-native, until the status file's next poll). The sidebar row
+    // already lights up off this flag, so the chat pane must too or the two
+    // disagree for the whole dispatch round-trip.
+    expect(computeShowsWorking("idle", opts({ localSendInFlight: true }))).toBe(true);
+  });
+
+  it("an in-flight local send survives a stale offline poll", () => {
+    // Sending to an asleep runner relaunches it; `/health` reads stale-offline
+    // during that window (10s cadence). The user dispatched, so the indicator
+    // must not be suppressed — same reasoning as live running/waiting above.
+    expect(
+      computeShowsWorking("idle", opts({ localSendInFlight: true, runnerOnline: false })),
+    ).toBe(true);
+  });
+
+  it("a spin-up in flight yields the slot to the Starting-up cue", () => {
+    // ChatPage passes `localSendInFlight: status === "streaming" && !spinUpInFlight`.
+    // `RunnerStartingIndicator` renders only when the shimmer is absent, and its
+    // copy ("Starting up…" / "Cloning repository…") is strictly more informative
+    // than a generic shimmer — so during a boot the optimistic path stands down.
+    expect(computeShowsWorking("idle", opts({ localSendInFlight: false }))).toBe(false);
+  });
+
+  it("a server-confirmed running still wins during a spin-up", () => {
+    // Once the harness reports work the spin-up cue has self-gated to null, so
+    // suppressing the shimmer too would leave the turn with no indicator at all.
+    // `localSendInFlight` is the only thing the spin-up gate touches.
+    expect(computeShowsWorking("running", opts({ localSendInFlight: false }))).toBe(true);
+  });
+
+  it("a pending elicitation still outranks an in-flight local send", () => {
+    // The elicitation prompt owns the in-progress slot; the two must never
+    // stack, so the suppression applies regardless of how the work was
+    // signalled.
+    expect(
+      computeShowsWorking("idle", opts({ localSendInFlight: true, hasPendingElicitation: true })),
+    ).toBe(false);
+  });
+
+  it("no local send in flight leaves an idle session idle", () => {
+    // The flag is opt-in: a cross-client or TUI-typed turn sets no local
+    // status here, so an idle session with no send stays dark.
+    expect(computeShowsWorking("idle", opts({ localSendInFlight: false }))).toBe(false);
   });
 });
 
@@ -736,45 +1019,71 @@ describe("shouldShowWorkingIndicator", () => {
 
 // ── workingIndicatorLabel ───────────────────────────────────────────────────
 
+describe("workingIndicatorLabel — parked on a dialog", () => {
+  it("names what the agent is waiting on", () => {
+    expect(workingIndicatorLabel(0, "permission prompt")).toBe("Blocked on: permission prompt");
+  });
+
+  it("outranks the rotation", () => {
+    // Being blocked on the user is the one state that needs an action, and the
+    // dialog may exist only in the terminal tab — so it must not be buried
+    // under a rotating "Cooking…".
+    expect(workingIndicatorLabel(2, "dialog open")).toBe("Blocked on: dialog open");
+  });
+
+  it("falls back to the normal label when not parked", () => {
+    expect(workingIndicatorLabel(0, null)).toBe("Working…");
+  });
+});
+
 describe("workingIndicatorLabel", () => {
-  it("shows the plain Working label when no background tasks remain", () => {
+  it("shows the plain Working label at the first tick", () => {
     expect(workingIndicatorLabel(0)).toBe("Working…");
   });
 
-  it("treats a negative count as no background tasks", () => {
-    // Defensive: the store seeds 0, but a stale/negative tally must never
-    // produce a nonsensical "-1 background tasks" label.
-    expect(workingIndicatorLabel(-1)).toBe("Working…");
-  });
-
-  it("uses the singular noun for exactly one background task", () => {
-    expect(workingIndicatorLabel(1)).toBe("1 background task still running");
-  });
-
-  it("pluralizes the noun for more than one background task", () => {
-    expect(workingIndicatorLabel(3)).toBe("3 background tasks still running");
+  it("does not report background tasks — the pill owns that count", () => {
+    // The shimmer is the working indicator; the background-task tally lives in
+    // BackgroundTaskPill, so the label never mentions it regardless of tick.
+    expect(workingIndicatorLabel(0)).toBe("Working…");
+    expect(workingIndicatorLabel(5)).toBe(WORKING_MESSAGES[5 % WORKING_MESSAGES.length]);
   });
 
   it("pins the first rotation message to 'Working…'", () => {
     // A fresh tick and the default arg both land on index 0, so this label
-    // must stay "Working…" — the invariant the (0) / (-1) cases rely on.
+    // must stay "Working…".
     expect(WORKING_MESSAGES[0]).toBe("Working…");
-    expect(workingIndicatorLabel(0, 0)).toBe("Working…");
+    expect(workingIndicatorLabel(0)).toBe("Working…");
   });
 
   it("rotates through the message pool by tick", () => {
-    expect(workingIndicatorLabel(0, 1)).toBe(WORKING_MESSAGES[1]);
-    expect(workingIndicatorLabel(0, 2)).toBe(WORKING_MESSAGES[2]);
+    expect(workingIndicatorLabel(1)).toBe(WORKING_MESSAGES[1]);
+    expect(workingIndicatorLabel(2)).toBe(WORKING_MESSAGES[2]);
   });
 
   it("wraps the rotation modulo the pool length", () => {
-    expect(workingIndicatorLabel(0, WORKING_MESSAGES.length)).toBe("Working…");
-    expect(workingIndicatorLabel(0, WORKING_MESSAGES.length + 1)).toBe(WORKING_MESSAGES[1]);
+    expect(workingIndicatorLabel(WORKING_MESSAGES.length)).toBe("Working…");
+    expect(workingIndicatorLabel(WORKING_MESSAGES.length + 1)).toBe(WORKING_MESSAGES[1]);
+  });
+});
+
+// ── isBackgroundTasksOnly ───────────────────────────────────────────────────
+
+describe("isBackgroundTasksOnly", () => {
+  it("is true only once the turn ends with background tasks and nothing blocked", () => {
+    // Turn over (not working) + shells linger → the pill owns the state.
+    expect(isBackgroundTasksOnly(2, null, false)).toBe(true);
+    expect(isBackgroundTasksOnly(0, null, false)).toBe(false);
   });
 
-  it("ignores the tick while background tasks remain", () => {
-    // The count is information, not decoration — it must not rotate away.
-    expect(workingIndicatorLabel(2, 5)).toBe("2 background tasks still running");
+  it("yields while the turn is still active so the shimmer shows too", () => {
+    // running/waiting or a local send in flight: the agent's turn is live, so
+    // the "Working…" shimmer wins and the pill sits alongside it.
+    expect(isBackgroundTasksOnly(2, null, true)).toBe(false);
+  });
+
+  it("yields to a parked dialog so the shimmer still shouts", () => {
+    // blockedOn needs an action; it must never sit as a quiet pill.
+    expect(isBackgroundTasksOnly(2, "permission prompt", false)).toBe(false);
   });
 });
 
@@ -1323,5 +1632,161 @@ describe("isUnboundCodingFork", () => {
     // needs_workspace is workspace IS NULL, and "" never satisfies the
     // workspace-required-for-host constraint — treat it as unbound.
     expect(isUnboundCodingFork({ forkSourceId: "conv_src", workspace: "" })).toBe(true);
+  });
+});
+
+describe("unboundSessionResumableInApp", () => {
+  const owner = { unbound: true, isOwner: true, importSource: null };
+
+  it("is false unless the session is unbound", () => {
+    expect(unboundSessionResumableInApp({ ...owner, unbound: false })).toBe(false);
+  });
+
+  it("is false for a non-owner (launch_runner would 404)", () => {
+    // Regression: a shared viewer must not get a picker that always fails.
+    expect(unboundSessionResumableInApp({ ...owner, isOwner: false })).toBe(false);
+    expect(unboundSessionResumableInApp({ ...owner, isOwner: false, importSource: "claude" })).toBe(
+      false,
+    );
+  });
+
+  it("allows a non-import unbound session (e.g. an unbound fork)", () => {
+    expect(unboundSessionResumableInApp(owner)).toBe(true);
+  });
+
+  it("allows host-portable import sources", () => {
+    for (const src of ["claude", "codex", "pi", "opencode"]) {
+      expect(unboundSessionResumableInApp({ ...owner, importSource: src })).toBe(true);
+    }
+  });
+
+  it("blocks imports whose context does not carry to a chosen host", () => {
+    // kimi has no resume path; kiro/qwen resume only from a local file on the
+    // original machine — a chosen host would launch with no context.
+    for (const src of ["kimi", "kiro", "qwen"]) {
+      expect(unboundSessionResumableInApp({ ...owner, importSource: src })).toBe(false);
+    }
+  });
+});
+
+// The routing gates the ChatPage call site uses. The deployment flag is half of
+// each gate: a session-shape-eligible session on a server WITHOUT a routing
+// client must show no routing control at all, and neither must one while the
+// `/v1/info` probe is still in flight.
+describe("routing eligibility gates", () => {
+  function info(smartRouting: boolean, sources?: { external: boolean; oss: boolean }): ServerInfo {
+    return {
+      accounts_enabled: false,
+      single_user: false,
+      login_url: null,
+      needs_setup: false,
+      databricks_features: false,
+      managed_sandboxes_enabled: false,
+      sandbox_provider: null,
+      sharing_mode: "on",
+      public_sharing_enabled: true,
+      server_version: null,
+      smart_routing_enabled: smartRouting,
+      smart_routing_sources: sources ?? { external: smartRouting, oss: smartRouting },
+      features: {},
+      harness_install_enabled: false,
+      installable_harnesses: [],
+      dictation_available: false,
+    };
+  }
+
+  // Top-level agent sessions: an SDK one for the per-turn gate, a native
+  // Claude Code one for the sub-agent gate (its own model is baked at launch).
+  const sdkSession = {
+    agentName: "coder",
+    parentSessionId: null,
+    harness: "claude-sdk",
+  } as unknown as Session;
+  const nativeSession = {
+    agentName: "coder",
+    parentSessionId: null,
+    harness: "claude-native",
+    labels: { "omnigent.wrapper": "claude-code" },
+    // Routed: a native session's spawn-routing apparatus is installed at
+    // launch, so only a Smart Routing one carries the switch.
+    costControlModeOverride: "on",
+  } as unknown as Session;
+
+  it.each([true, false] as const)("cost routing follows the server flag (%s)", (flag) => {
+    expect(isCostRoutingEligible(info(flag), sdkSession)).toBe(flag);
+  });
+
+  it.each([true, false] as const)("subagent routing follows the server flag (%s)", (flag) => {
+    expect(isSubagentRoutingEligible(info(flag), nativeSession)).toBe(flag);
+  });
+
+  it("both gates are off while the info probe is loading", () => {
+    expect(isCostRoutingEligible("loading", sdkSession)).toBe(false);
+    expect(isSubagentRoutingEligible("loading", nativeSession)).toBe(false);
+  });
+
+  it("a native pane follows the per-family router sources for cost routing", () => {
+    // The judge answers for any family, gateway-backed or not.
+    expect(isCostRoutingEligible(info(true, { external: false, oss: true }), nativeSession)).toBe(
+      true,
+    );
+    // External-only: the family must be gateway-backed on the session's host.
+    const externalOnly = info(true, { external: true, oss: false });
+    expect(
+      isCostRoutingEligible(externalOnly, nativeSession, {
+        gateway_inference: { "claude-native": false },
+      }),
+    ).toBe(false);
+    expect(
+      isCostRoutingEligible(externalOnly, nativeSession, {
+        gateway_inference: { "claude-native": true },
+      }),
+    ).toBe(true);
+    // An absent host row reads as backed (older host / no row), like the
+    // landing's gate.
+    expect(isCostRoutingEligible(externalOnly, nativeSession)).toBe(true);
+    // No router at all: the option is withheld.
+    expect(isCostRoutingEligible(info(true, { external: false, oss: false }), nativeSession)).toBe(
+      false,
+    );
+    expect(isSubagentRoutingEligible(info(true), nativeSession)).toBe(true);
+  });
+
+  it("a non-native SDK session is subagent-routing eligible whatever its harness", () => {
+    // Its spawns go through the session-create path, not the native hook, so the
+    // harness allowlist doesn't apply.
+    const piSession = { ...sdkSession, harness: "pi" } as unknown as Session;
+    expect(isSubagentRoutingEligible(info(true), piSession)).toBe(true);
+  });
+
+  it("a pinned codex Smart Routing session offers the subagent-routing switch", () => {
+    // Its launch installs the generated hooks.json spawn gate and the
+    // routed-spawn pre-approvals, same as the claude arm; what it does not get
+    // is cross-family picks, which is not a knob.
+    const codex = {
+      ...nativeSession,
+      harness: "codex-native",
+      labels: { "omnigent.wrapper": "codex-cli" },
+    } as unknown as Session;
+    expect(isSubagentRoutingEligible(info(true), codex)).toBe(true);
+    const autoCodex = {
+      ...codex,
+      labels: { ...codex.labels, "omnigent.routing.auto_harness": "1" },
+    } as unknown as Session;
+    expect(isSubagentRoutingEligible(info(true), autoCodex)).toBe(true);
+    // Plain codex is the one class that never reads the switch.
+    const plainCodex = { ...codex, costControlModeOverride: null } as unknown as Session;
+    expect(isSubagentRoutingEligible(info(true), plainCodex)).toBe(false);
+  });
+
+  it("a plain native session has no subagent-routing switch to offer", () => {
+    const plain = { ...nativeSession, costControlModeOverride: null } as unknown as Session;
+    expect(isSubagentRoutingEligible(info(true), plain)).toBe(false);
+  });
+
+  it("both gates are off for a sub-agent (child) session even with the flag on", () => {
+    const child = { ...sdkSession, parentSessionId: "conv_parent" } as unknown as Session;
+    expect(isCostRoutingEligible(info(true), child)).toBe(false);
+    expect(isSubagentRoutingEligible(info(true), child)).toBe(false);
   });
 });

@@ -76,6 +76,14 @@ class AuthModel(str, Enum):
     SESSION_SCOPED_CONFIG = "session-scoped-config"  # per-session synthesized vendor config
 
 
+class ForkHistory(str, Enum):
+    """How a fork (or in-place agent switch) carries prior history into the harness."""
+
+    NONE = "none"  # fork launches fresh; no prior turns are carried
+    REBUILD = "rebuild"  # rebuild the vendor's resumable session file from copied items
+    PREAMBLE = "preamble"  # replay prior turns as a text preamble (server-backed vendors)
+
+
 @dataclass(frozen=True)
 class HarnessCapabilities:
     """The declared feature set one harness supports.
@@ -101,6 +109,16 @@ class HarnessCapabilities:
         Optional capability fields use ``None`` when the harness makes no claim;
         the bench reports those declarations as ``UNKNOWN`` rather than assuming
         the capability is unsupported.
+    :param fork_history: How a fork / in-place agent switch carries prior history
+        into the harness — ``none`` (fresh), ``rebuild`` (rebuild the vendor's
+        resumable session file from copied items), or ``preamble`` (replay prior
+        turns as a text preamble). Drives the server's fork-history gating.
+    :param shell_tool_name: The harness's shell/exec tool name the harness bench
+        provokes to verify tool-calling (e.g. ``"Bash"``, ``"shell"``). ``None``
+        skips the bench's tool/policy probe for this harness.
+    :param shell_tool_prompt: The prompt the bench sends to provoke that tool.
+        Must contain the ``omnigent-bench-ok`` placeholder the probe token-swaps.
+        ``None`` skips the probe.
     """
 
     integration_mode: IntegrationMode
@@ -116,6 +134,9 @@ class HarnessCapabilities:
     live_queue: bool | None = None
     images: bool | None = None
     compaction: bool | None = None
+    fork_history: ForkHistory = ForkHistory.NONE
+    shell_tool_name: str | None = None
+    shell_tool_prompt: str | None = None
 
     def as_dict(self) -> dict[str, str | bool | None]:
         """Return a JSON-serializable view for the ``/v1/harnesses`` catalog."""
@@ -133,4 +154,7 @@ class HarnessCapabilities:
             "live_queue": self.live_queue,
             "images": self.images,
             "compaction": self.compaction,
+            "fork_history": self.fork_history.value,
+            "shell_tool_name": self.shell_tool_name,
+            "shell_tool_prompt": self.shell_tool_prompt,
         }

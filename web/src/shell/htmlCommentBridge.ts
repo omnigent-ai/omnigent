@@ -163,8 +163,8 @@ function anchorPattern(trimmed: string): string {
  * skips these so the source's Nth match lines up with the Nth *rendered* match
  * the in-frame bridge counts (which walks only body text nodes).
  */
-function nonRenderedRanges(source: string): Array<[number, number]> {
-  const ranges: Array<[number, number]> = [];
+function nonRenderedRanges(source: string): [number, number][] {
+  const ranges: [number, number][] = [];
   const collect = (re: RegExp) => {
     for (const m of source.matchAll(re)) {
       if (m.index !== undefined) ranges.push([m.index, m.index + m[0].length]);
@@ -178,7 +178,7 @@ function nonRenderedRanges(source: string): Array<[number, number]> {
 }
 
 /** Whether `index` falls inside any (sorted) non-rendered range. */
-function inNonRendered(index: number, ranges: Array<[number, number]>): boolean {
+function inNonRendered(index: number, ranges: [number, number][]): boolean {
   for (const [start, end] of ranges) {
     if (index < start) break;
     if (index < end) return true;

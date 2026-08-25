@@ -16,7 +16,9 @@ Used by:
 
 Wire protocol (same as the original server route):
 
-- **Server → client**: every PTY read becomes a *binary* WS frame.
+- **Server → client**: every PTY read becomes a *binary* WS frame. Production
+  attaches first send a text OSC 52 capability frame so the browser can reject
+  clipboard escapes when tmux passthrough weakens the normal trust boundary.
 - **Client → server**:
     - **Text frames** are JSON control messages. Currently only
       ``{"type": "resize", "cols": N, "rows": M}`` (applied via
@@ -41,19 +43,19 @@ import time
 import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 # fcntl/pty/termios are POSIX-only. This module drives tmux PTY ``attach``
 # sessions, a feature that is disabled on Windows (see the terminal
-# entrypoints), so importing it must not crash the server there. The
-# ``sys.platform`` guard is special-cased by mypy, which type-checks on Linux
-# and therefore still sees the real modules.
+# entrypoints), so importing it must not crash the server there. Static checking
+# still analyzes the POSIX branch and sees the real modules.
 if sys.platform != "win32":
     import fcntl
     import pty
     import termios
 
-from fastapi import WebSocket, WebSocketDisconnect
+if TYPE_CHECKING:
+    from fastapi import WebSocket
 
 _logger = logging.getLogger(__name__)
 
@@ -86,6 +88,14 @@ WS_CLOSE_TERMINAL_NOT_FOUND: Final[int] = 4404
 # treat this as a terminal-gone exit: a detach misread as 4404 would
 # tear the whole session (and runner) down.
 WS_CLOSE_TERMINAL_DETACHED: Final[int] = 4405
+# 4400 is the WS analogue of the HTTP 400 ``wrong_replica`` (the 44xx band
+# mirrors HTTP 4xx, as 4500 mirrors 5xx): the runner tunnel is bound but not on
+# this replica (the ``?omnigent_slice_key=`` reached a replica that doesn't hold
+# the tunnel — the key doesn't match where it lives). Unlike 4500 (a genuine
+# failure), the request is valid and just misrouted: the client re-dials keyless
+# and reaches the replica the tunnel actually lives on. Mirrors the fetch path's
+# keyless re-address on a ``wrong_replica`` 400.
+WS_CLOSE_WRONG_REPLICA: Final[int] = 4400
 WS_CLOSE_INTERNAL_ERROR: Final[int] = 4500
 
 # A ``tmux has-session`` liveness probe is local and near-instant; cap
@@ -410,6 +420,7 @@ async def _forward_pty_to_ws(
     pty_chunks: asyncio.Queue[bytes | None],
     *,
     max_coalesce_bytes: int | Callable[[], int] = _WS_COALESCE_MAX_BYTES,
+    send_lock: asyncio.Lock | None = None,
 ) -> None:
     """
     Forward queued PTY output to *websocket*, coalescing ready chunks.
@@ -433,8 +444,13 @@ async def _forward_pty_to_ws(
         :data:`_WS_COALESCE_MAX_BYTES`; ``bridge_tmux_pty_to_websocket``
         supplies a callable so recently-typed redraws can use the smaller
         interactive cap while normal output keeps the larger flood cap.
+    :param send_lock: Optional lock shared with another server-to-browser
+        sender. Control mode uses it to serialize terminal bytes with clipboard
+        control frames; PTY mode has only this sender and leaves it unset.
     :returns: None on EOF or websocket disconnect.
     """
+    from fastapi import WebSocketDisconnect
+
     pending = bytearray()
     eof_seen = False
     while True:
@@ -461,7 +477,11 @@ async def _forward_pty_to_ws(
             frame = bytes(pending[:limit])
             del pending[:limit]
             try:
-                await websocket.send_bytes(frame)
+                if send_lock is None:
+                    await websocket.send_bytes(frame)
+                else:
+                    async with send_lock:
+                        await websocket.send_bytes(frame)
             except (RuntimeError, WebSocketDisconnect):
                 return
         if eof_seen:
@@ -510,6 +530,7 @@ async def bridge_tmux_pty_to_websocket(
     tmux_target: str,
     read_only: bool,
     on_client_interaction: Callable[[], None] | None = None,
+    allow_osc52_clipboard: bool | None = None,
 ) -> None:
     """
     Bridge a tmux attach PTY to an already-accepted *websocket*.
@@ -538,12 +559,33 @@ async def bridge_tmux_pty_to_websocket(
         mis-reading them as agent activity. ``None`` (e.g. the
         server-direct attach path, which is out-of-process from the
         watcher) disables that attribution.
+    :param allow_osc52_clipboard: Whether the browser may honor OSC 52 from this
+        PTY. Production passes ``False`` when tmux passthrough is enabled, since
+        pane output could otherwise bypass ``set-clipboard external``. ``None``
+        omits the capability frame for low-level test compatibility.
     """
+    from fastapi import WebSocketDisconnect
+
     # Attaching is itself a client interaction: tmux resizes the window to
     # the new client, which reflows the pane. Stamp it before the bridge
     # starts so that reflow is discounted.
     if on_client_interaction is not None:
         on_client_interaction()
+
+    if allow_osc52_clipboard is not None:
+        try:
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "osc52-clipboard-capability",
+                        "enabled": allow_osc52_clipboard and not read_only,
+                    },
+                    separators=(",", ":"),
+                )
+            )
+        except (RuntimeError, WebSocketDisconnect):
+            return
+
     argv = ["tmux", "-S", socket_path, "attach"]
     if read_only:
         argv.append("-r")

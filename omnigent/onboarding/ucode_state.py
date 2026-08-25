@@ -166,14 +166,16 @@ def read_ucode_state(workspace_url: str) -> UcodeWorkspaceState | None:
 
     normalized = workspace_url.rstrip("/")
     ws_key: str | None = None
-    ws_data: dict | None = None
+    ws_data: dict[str, object] | None = None
     for key, value in workspaces.items():
+        if not isinstance(key, str) or not isinstance(value, dict):
+            continue
         if key.rstrip("/") == normalized:
             ws_key = key.rstrip("/")
             ws_data = value
             break
 
-    if ws_key is None or ws_data is None or not isinstance(ws_data, dict):
+    if ws_key is None or ws_data is None:
         return None
 
     claude_models_raw = ws_data.get("claude_models", {})

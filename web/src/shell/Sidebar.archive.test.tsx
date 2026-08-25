@@ -1,14 +1,19 @@
-// Tests for the archive flow in the sidebar. Contract: archiving runs
-// stop→archive — it stops the runner first (best-effort resource hygiene,
-// NOT the user-facing Stop action, which is the kebab's own "Stop session"
-// item covered by Sidebar.stop.test.tsx) and then fires
-// `useArchiveConversation` with `archived: true` (with an onSettled that
-// clears the "Archiving…" status row). Unarchiving flips the flag back with
-// no stop and no status row. See ConversationRow.runArchive in Sidebar.tsx.
+// Tests for the archive flow in the sidebar. Contract: archiving sends ONLY
+// the archive PATCH (`archived: true`). The "Archiving…" status row stays up
+// until the row LEAVES the sidebar — on success it's held (the row unmounts
+// when the list refetch drops the archived row, taking the spinner with it),
+// and only an error clears it to restore the interactive row for retry.
+// Clearing on settle would flash the row back to its clickable form a
+// round-trip before it actually leaves. The runner stop is the server's job
+// once the flag commits — a client stop would race the server's against the
+// same runner, and it would also put the runner's stop timeouts in front of
+// the flag flip. The kebab's user-facing "Stop session" action is a separate
+// affordance covered by Sidebar.stop.test.tsx. Unarchiving flips the flag
+// back with no status row. See ConversationRow.runArchive in Sidebar.tsx.
 //
 // Archived sessions are no longer listed in the sidebar (they moved to the
 // Settings page), so unarchiving is covered by SettingsPage.test.tsx; this
-// file exercises the archive (stop→archive) path from a row's kebab.
+// file exercises the archive path from a row's kebab.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
@@ -40,9 +45,11 @@ vi.mock("@/hooks/useConversations", () => ({
   setConversationPinned: vi.fn(() => Promise.resolve({})),
   PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
   useRenameConversation: () => ({ mutate: vi.fn() }),
+  useLeaveSession: () => ({ mutate: vi.fn(), isPending: false }),
   useArchiveConversation: () => mocks.archive,
   useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useBulkMoveToProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useStopSession: () => mocks.stop,
   useProjects: () => ({ data: [] }),
@@ -59,7 +66,7 @@ vi.mock("@/hooks/useConversations", () => ({
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
-import { Toaster } from "@/components/ui/toast";
+import { Toaster } from "@/components/ui/sonner";
 import { Sidebar } from "./Sidebar";
 
 const useConvMock = vi.mocked(useConversations);
@@ -132,43 +139,37 @@ afterEach(() => {
 });
 
 describe("archive flow", () => {
-  it("archives via stop→archive: stops the runner first, then flips the flag", () => {
+  it("archives with a single PATCH and no client-side stop", () => {
     mockConversations([CONV]);
     renderSidebar();
     clickArchive();
 
-    // Stop fires first (best-effort runner teardown) with the row's id.
-    expect(mocks.stop.mutate).toHaveBeenCalledTimes(1);
-    const stopArgs = mocks.stop.mutate.mock.calls[0];
-    expect(stopArgs[0]).toBe("conv_1");
-    // Archive waits for the stop to settle — it hasn't fired yet.
-    expect(mocks.archive.mutate).not.toHaveBeenCalled();
-
-    // Settle the stop → archive fires with archived:true + an onSettled
-    // that clears the "Archiving…" flag.
-    act(() => (stopArgs[1] as { onSettled: () => void }).onSettled());
     expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
     expect(mocks.archive.mutate).toHaveBeenCalledWith(
       { id: "conv_1", archived: true },
       expect.objectContaining({
         onSuccess: expect.any(Function),
-        onSettled: expect.any(Function),
+        // Only an error restores the interactive row; success intentionally
+        // leaves the spinner up until the row unmounts (see the "keeps the
+        // 'Archiving…' row up after the archive succeeds" case below).
+        onError: expect.any(Function),
       }),
     );
+    // The server owns the stop. A client stop here would race it against
+    // the same runner and put its timeouts in front of the flag flip.
+    expect(mocks.stop.mutate).not.toHaveBeenCalled();
   });
 
-  it("toasts a pointer to Settings once the archive succeeds", () => {
+  it("toasts a pointer to Settings once the archive succeeds", async () => {
     mockConversations([CONV]);
     renderSidebar();
     clickArchive();
 
-    // Drive stop→archive to the success callback.
-    const stopArgs = mocks.stop.mutate.mock.calls[0];
-    act(() => (stopArgs[1] as { onSettled: () => void }).onSettled());
+    // Drive the archive to its success callback.
     const archiveArgs = mocks.archive.mutate.mock.calls[0];
     act(() => (archiveArgs[1] as { onSuccess: () => void }).onSuccess());
 
-    const toast = screen.getByTestId("toast");
+    const toast = await screen.findByTestId("toast");
     expect(within(toast).getByText(/View archived sessions in/)).toBeInTheDocument();
     expect(within(toast).getByRole("link", { name: "Settings" })).toHaveAttribute(
       "href",
@@ -181,9 +182,9 @@ describe("archive flow", () => {
   // covered by SettingsPage.test.tsx instead.
 
   it("shows an 'Archiving…' status row while the archive is in flight", () => {
-    // The stop mock never settles (vi.fn() stub), so the row stays in its
-    // in-flight state — the window the user sees. Without the indicator the
-    // row would look idle while the stop→archive ran.
+    // The archive mock never settles (vi.fn() stub), so the row stays in
+    // its in-flight state — the window the user sees. Without the indicator
+    // the row would look idle while the archive ran.
     mockConversations([CONV]);
     renderSidebar();
     clickArchive();
@@ -191,23 +192,44 @@ describe("archive flow", () => {
     const row = screen.getByTestId("conversation-archiving");
     expect(within(row).getByText("Archiving…")).toBeInTheDocument();
     // The interactive link is replaced by the status row, so the session
-    // can't be re-opened or re-archived mid-flight (mirrors Deleting…).
+    // can't be re-opened or re-archived mid-flight.
     expect(screen.queryByRole("link", { name: /My Session/ })).not.toBeInTheDocument();
   });
 
-  it("clears the 'Archiving…' row once stop→archive settles", () => {
+  it("keeps the 'Archiving…' row up after the archive succeeds", () => {
+    // On success the spinner must NOT be cleared: the row leaves the sidebar
+    // only when the ['conversations'] refetch drops the archived row (which
+    // unmounts this row and its spinner together). Clearing on success would
+    // flash the row back to its plain, clickable form for the round-trip until
+    // the refetch lands — the exact regression this guards. Here the mocked
+    // list still contains the row (no refetch modeled), so firing onSuccess
+    // must leave the status row in place.
     mockConversations([CONV]);
     renderSidebar();
     clickArchive();
 
     expect(screen.getByTestId("conversation-archiving")).toBeInTheDocument();
 
-    // Settle the stop → archive fires; then settle the archive → the row
-    // returns to its interactive state (onSettled runs on success or error).
-    const stopOnSettled = mocks.stop.mutate.mock.calls[0][1].onSettled as () => void;
-    act(() => stopOnSettled());
-    const archiveOnSettled = mocks.archive.mutate.mock.calls[0][1].onSettled as () => void;
-    act(() => archiveOnSettled());
+    const archiveOnSuccess = mocks.archive.mutate.mock.calls[0][1].onSuccess as () => void;
+    act(() => archiveOnSuccess());
+
+    // Still archiving, still no interactive link — the row hasn't left yet.
+    expect(screen.getByTestId("conversation-archiving")).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /My Session/ })).not.toBeInTheDocument();
+  });
+
+  it("restores the interactive row when the archive errors", () => {
+    // The only escape hatch from the status row: a failed archive clears the
+    // flag so the user gets the clickable row back to retry. Success has no
+    // such clear (see above) — the row instead leaves via the refetch.
+    mockConversations([CONV]);
+    renderSidebar();
+    clickArchive();
+
+    expect(screen.getByTestId("conversation-archiving")).toBeInTheDocument();
+
+    const archiveOnError = mocks.archive.mutate.mock.calls[0][1].onError as () => void;
+    act(() => archiveOnError());
 
     expect(screen.queryByTestId("conversation-archiving")).not.toBeInTheDocument();
     expect(screen.getByRole("link", { name: /My Session/ })).toBeInTheDocument();

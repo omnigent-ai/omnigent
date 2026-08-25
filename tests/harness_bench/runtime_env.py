@@ -77,7 +77,9 @@ def _profile_from_config() -> str | None:
     return None
 
 
-def resolve_bench_env(explicit_profile: str | None) -> BenchRuntimeEnv:
+def resolve_bench_env(
+    explicit_profile: str | None, *, require_gateway: bool = True
+) -> BenchRuntimeEnv:
     """Build the bench runtime env, mirroring ``omni run``'s credential layering.
 
     Precedence:
@@ -96,9 +98,15 @@ def resolve_bench_env(explicit_profile: str | None) -> BenchRuntimeEnv:
        a typo'd named profile — filling in only the vars not already ambient.
 
     :param explicit_profile: The ``--profile`` value, or ``None`` to derive.
+    :param require_gateway: When ``False`` — an ``own_auth`` native harness that
+        authenticates its own model (agy, cursor, …) — unresolvable creds are
+        tolerated: the server boots with no ``OPENAI_*`` rather than raising,
+        since a native-tui turn never routes through the gateway. Ambient
+        ``OPENAI_*`` or a resolvable profile is still used when present.
     :returns: A :class:`BenchRuntimeEnv`.
-    :raises OSError: When credentials cannot be resolved and no ambient
-        ``OPENAI_*`` covers auth (surfaced by the caller as a clean skip).
+    :raises OSError: When ``require_gateway`` and credentials cannot be resolved
+        and no ambient ``OPENAI_*`` covers auth (surfaced by the caller as a
+        clean skip).
     """
     base = dict(os.environ)
     have_ambient = bool(base.get("OPENAI_BASE_URL")) and bool(base.get("OPENAI_API_KEY"))
@@ -113,7 +121,16 @@ def resolve_bench_env(explicit_profile: str | None) -> BenchRuntimeEnv:
 
     from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 
-    creds = resolve_databricks_workspace(profile)
+    try:
+        creds = resolve_databricks_workspace(profile)
+    except OSError:
+        if require_gateway:
+            raise
+        # own_auth native: the vendor logs its own model in, so the server
+        # needs no gateway. Boot without OPENAI_* rather than skip the harness.
+        if profile:
+            base["DATABRICKS_CONFIG_PROFILE"] = profile
+        return BenchRuntimeEnv(base_env=base, db_profile=profile)
     base["OPENAI_BASE_URL"] = f"{creds.host}/serving-endpoints"
     base["OPENAI_API_KEY"] = creds.token
     if profile:
@@ -121,7 +138,9 @@ def resolve_bench_env(explicit_profile: str | None) -> BenchRuntimeEnv:
     return BenchRuntimeEnv(base_env=base, db_profile=profile)
 
 
-def bench_creds_skip_reason(explicit_profile: str | None) -> str | None:
+def bench_creds_skip_reason(
+    explicit_profile: str | None, *, require_gateway: bool = True
+) -> str | None:
     """Cheap gate: why the bench cannot get gateway creds, or ``None`` if it can.
 
     Mirrors :func:`resolve_bench_env`'s precedence without minting a token, so a
@@ -131,8 +150,15 @@ def bench_creds_skip_reason(explicit_profile: str | None) -> str | None:
     ``omni run``.
 
     :param explicit_profile: The ``--profile`` value, or ``None`` to derive.
-    :returns: A skip reason, or ``None`` when creds are resolvable.
+    :param require_gateway: When ``False`` — an ``own_auth`` native harness that
+        authenticates its own model — the gateway is optional, so a missing
+        credential is never a skip: the harness's own turns don't route through
+        it. Mirrors :func:`resolve_bench_env`'s ``require_gateway``.
+    :returns: A skip reason, or ``None`` when creds are resolvable (or not
+        required).
     """
+    if not require_gateway:
+        return None
     if os.environ.get("OPENAI_BASE_URL") and os.environ.get("OPENAI_API_KEY"):
         return None
     profile = explicit_profile or _profile_from_config()

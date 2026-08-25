@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { useState } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -6,25 +6,59 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   type WorkspaceChangedFile,
   type WorkspaceFile,
+  PathUnreachableError,
   useWorkspaceAllFiles,
   useWorkspaceChangedFiles,
   useWorkspaceDirectory,
   useWorkspaceEnvironment,
   useWorkspaceFileSearch,
 } from "@/hooks/useWorkspaceChangedFiles";
+import type * as WorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
+import type * as WorkspacePickerModule from "./WorkspacePicker";
+
+const { copyTextMock } = vi.hoisted(() => ({ copyTextMock: vi.fn(() => Promise.resolve()) }));
+vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
+
+import { useSession } from "@/hooks/useSession";
 import { FilesPanel } from "./FilesPanel";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import { FolderTree } from "./FolderTree";
+import { SCROLL_RESTORE_BUDGET_MS } from "./useScrollRestore";
 
-vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
+vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
+  // Keep the module's PURE path helpers real. relativizeToWorkspace decides
+  // the wire form (and therefore the authorization level) of every request the
+  // panel makes, so stubbing it would test a fiction.
+  ...(await importOriginal<typeof WorkspaceChangedFilesModule>()),
   useWorkspaceAllFiles: vi.fn(),
   useWorkspaceChangedFiles: vi.fn(),
   useWorkspaceDirectory: vi.fn(),
   useWorkspaceEnvironment: vi.fn(),
   useWorkspaceFileSearch: vi.fn(),
-  // Real export consumed by FlatFileList's `instanceof` check; the full
-  // module mock would otherwise drop it (undefined → instanceof throws).
+  // Real exports consumed by `instanceof` checks (FlatFileList's offline
+  // hint, FilesPanel's unreachable-location message); the full module mock
+  // would otherwise drop them (undefined → instanceof throws).
   RunnerOfflineError: class RunnerOfflineError extends Error {},
+  PathUnreachableError: class extends Error {
+    reachableRoots: string[] = [];
+  },
+}));
+
+// Stub only the browser component -- its own suite covers its behaviour, and
+// driving its host-filesystem fetches here would test the wrong thing. The
+// real path helpers stay, since other code under test imports them.
+vi.mock("./WorkspacePicker", async (importOriginal) => ({
+  ...(await importOriginal<typeof WorkspacePickerModule>()),
+  WorkspacePicker: ({ onNavigate }: { onNavigate?: (p: string) => void }) => (
+    <button type="button" data-testid="stub-picker-navigate" onClick={() => onNavigate?.("/etc")}>
+      pick /etc
+    </button>
+  ),
+}));
+
+// The panel reads the session's host to point the directory browser at it.
+vi.mock("@/hooks/useSession", () => ({
+  useSession: vi.fn(() => ({ session: { hostId: "host_test" } })),
 }));
 
 const useAllFilesMock = vi.mocked(useWorkspaceAllFiles);
@@ -87,9 +121,15 @@ function directoryResult(files: WorkspaceFile[] = []) {
   } as unknown as ReturnType<typeof useWorkspaceDirectory>;
 }
 
-function environmentResult(root: string | null = null) {
+function environmentResult(
+  root: string | null = null,
+  reachable: {
+    unconfined: boolean;
+    roots: { path: string; access: string; origin: string }[];
+  } | null = null,
+) {
   return {
-    data: { available: true, root },
+    data: { available: true, root, home: "/home/user", reachable },
     isLoading: false,
     isError: false,
     error: null,
@@ -116,6 +156,8 @@ function renderPanel({
   workingDir = null,
   treeSearchResults = [],
   isSearching = false,
+  reachable = null,
+  onFileSelect = vi.fn(),
 }: {
   conversationId: string;
   flatView?: boolean;
@@ -126,11 +168,16 @@ function renderPanel({
   workingDir?: string | null;
   treeSearchResults?: WorkspaceFile[] | undefined;
   isSearching?: boolean;
+  reachable?: {
+    unconfined: boolean;
+    roots: { path: string; access: string; origin: string }[];
+  } | null;
+  onFileSelect?: (path: string) => void;
 }) {
   useAllFilesMock.mockReturnValue(allFilesResult(files));
   useChangedFilesMock.mockReturnValue(changedFilesResult(changedFiles));
   useDirectoryMock.mockReturnValue(directoryResult());
-  useEnvironmentMock.mockReturnValue(environmentResult(workingDir));
+  useEnvironmentMock.mockReturnValue(environmentResult(workingDir, reachable));
   useSearchMock.mockReturnValue(searchResult(treeSearchResults, isSearching));
 
   return render(
@@ -143,8 +190,7 @@ function renderPanel({
               sort="recent"
               onSortChange={vi.fn()}
               flatView={flatView}
-              onFileSelect={vi.fn()}
-              onFlatViewChange={vi.fn()}
+              onFileSelect={onFileSelect}
               showHidden={showHidden}
               onShowHiddenChange={vi.fn()}
               onClose={onClose}
@@ -216,8 +262,8 @@ describe("FilesPanel working folder header role", () => {
     renderPanel({ conversationId: "conv_header_card", files: [] });
     expect(screen.queryByRole("button", { name: /working folder/i })).toBeNull();
     expect(screen.getByText("Working folder")).toBeInTheDocument();
-    // Content is always shown — the scope switch is part of it.
-    expect(screen.getByRole("radiogroup", { name: "File scope" })).toBeInTheDocument();
+    // Content is always shown — the tree search box is part of it.
+    expect(screen.getByRole("searchbox", { name: "Search all files" })).toBeInTheDocument();
   });
 
   it("renders the header as a static label (no toggle button) in frameless (inline rail) mode", () => {
@@ -239,7 +285,6 @@ describe("FilesPanel working folder header role", () => {
                 frameless
                 flatView={false}
                 onFileSelect={vi.fn()}
-                onFlatViewChange={vi.fn()}
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
@@ -251,7 +296,7 @@ describe("FilesPanel working folder header role", () => {
 
     expect(screen.queryByRole("button", { name: /working folder/i })).toBeNull();
     expect(screen.getByText("Working folder")).toBeInTheDocument();
-    expect(screen.getByRole("radiogroup", { name: "File scope" })).toBeInTheDocument();
+    expect(screen.getByRole("searchbox", { name: "Search all files" })).toBeInTheDocument();
   });
 
   it("renders a static label header with a Close button in the drawer", () => {
@@ -263,7 +308,24 @@ describe("FilesPanel working folder header role", () => {
   });
 });
 
-describe("FilesPanel scope switch (Changed | All) visibility", () => {
+describe("FilesPanel hidden-files toggle icon", () => {
+  // The eye reflects the current state, not the pending action: a plain eye
+  // means hidden files are visible, a slashed eye means they are filtered out.
+  it("shows a plain eye while hidden files are visible", () => {
+    renderPanel({ conversationId: "conv_eye_on", files: [], showHidden: true });
+    const toggle = screen.getByRole("button", { name: "Hide hidden files" });
+    expect(toggle.querySelector(".lucide-eye")).not.toBeNull();
+    expect(toggle.querySelector(".lucide-eye-off")).toBeNull();
+  });
+
+  it("shows a slashed eye while hidden files are filtered out", () => {
+    renderPanel({ conversationId: "conv_eye_off", files: [], showHidden: false });
+    const toggle = screen.getByRole("button", { name: "Show hidden files" });
+    expect(toggle.querySelector(".lucide-eye-off")).not.toBeNull();
+  });
+});
+
+describe("FilesPanel scope (fixed by the caller's Files/Changes tab)", () => {
   it("does not enable the root filesystem listing while showing Changed files", () => {
     renderPanel({
       conversationId: "conv_changed_only",
@@ -275,12 +337,15 @@ describe("FilesPanel scope switch (Changed | All) visibility", () => {
     expect(useChangedFilesMock).toHaveBeenCalledWith("conv_changed_only", {
       enabled: true,
     });
-    expect(useAllFilesMock).toHaveBeenCalledWith("conv_changed_only", {
-      enabled: false,
-    });
-    expect(useSearchMock).toHaveBeenCalledWith("conv_changed_only", "", "", "", {
-      enabled: false,
-    });
+    expect(useAllFilesMock).toHaveBeenCalledWith("conv_changed_only", { enabled: false }, "");
+    expect(useSearchMock).toHaveBeenCalledWith(
+      "conv_changed_only",
+      "",
+      "",
+      "",
+      { enabled: false },
+      "",
+    );
   });
 
   it("enables the root filesystem listing while showing All files", () => {
@@ -291,122 +356,29 @@ describe("FilesPanel scope switch (Changed | All) visibility", () => {
       changedFiles: [changedFile("src/App.tsx")],
     });
 
-    expect(useAllFilesMock).toHaveBeenCalledWith("conv_all_files", {
-      enabled: true,
-    });
-    expect(useSearchMock).toHaveBeenCalledWith("conv_all_files", "", "", "", {
-      enabled: false,
-    });
-  });
-
-  it("shows the scope switch in frameless (inline right-rail) mode", () => {
-    // The single Files rail tab owns its scope via this switch, so it must be
-    // present in frameless mode (where the old separate rail tabs used to live).
-    useAllFilesMock.mockReturnValue(allFilesResult([file("src/App.tsx")]));
-    useChangedFilesMock.mockReturnValue(changedFilesResult([changedFile("src/App.tsx")]));
-    useDirectoryMock.mockReturnValue(directoryResult());
-    useEnvironmentMock.mockReturnValue(environmentResult());
-    useSearchMock.mockReturnValue(searchResult());
-
-    render(
-      <MemoryRouter initialEntries={["/c/conv_frameless"]}>
-        <Routes>
-          <Route
-            path="/c/:conversationId"
-            element={
-              <FilesPanel
-                sort="recent"
-                onSortChange={vi.fn()}
-                frameless
-                flatView={false}
-                onFileSelect={vi.fn()}
-                onFlatViewChange={vi.fn()}
-                showHidden={false}
-                onShowHiddenChange={vi.fn()}
-              />
-            }
-          />
-        </Routes>
-      </MemoryRouter>,
+    expect(useAllFilesMock).toHaveBeenCalledWith("conv_all_files", { enabled: true }, "");
+    expect(useSearchMock).toHaveBeenCalledWith(
+      "conv_all_files",
+      "",
+      "",
+      "",
+      { enabled: false },
+      "",
     );
-
-    // Both segments present; All is selected (flatView=false), Changed is not.
-    const changed = screen.getByRole("radio", { name: /^changed$/i });
-    const all = screen.getByRole("radio", { name: /^all$/i });
-    expect(changed).toHaveAttribute("aria-checked", "false");
-    expect(all).toHaveAttribute("aria-checked", "true");
-    expect(changed).not.toHaveClass("bg-muted");
-    expect(all).toHaveClass("bg-muted");
   });
 
-  it("shows the scope switch in full-screen drawer mode (onClose)", () => {
+  it("does not render an in-panel scope switch (scope is the rail tab now)", () => {
+    // The Changed|All segmented control was replaced by two peer rail tabs;
+    // the panel itself no longer offers a scope toggle.
     renderPanel({
-      conversationId: "conv_drawer_tabs",
+      conversationId: "conv_no_switch",
+      flatView: false,
       files: [file("src/App.tsx")],
-      onClose: vi.fn(),
     });
 
-    expect(screen.getByRole("radio", { name: /^changed$/i })).toBeInTheDocument();
-    expect(screen.getByRole("radio", { name: /^all$/i })).toBeInTheDocument();
-  });
-
-  it("calls onFlatViewChange(true) when the Changed segment is clicked", () => {
-    const onFlatViewChange = vi.fn();
-    useAllFilesMock.mockReturnValue(allFilesResult([file("src/App.tsx")]));
-    useChangedFilesMock.mockReturnValue(changedFilesResult([changedFile("src/App.tsx")]));
-    useDirectoryMock.mockReturnValue(directoryResult());
-    useEnvironmentMock.mockReturnValue(environmentResult());
-    useSearchMock.mockReturnValue(searchResult());
-
-    render(
-      <MemoryRouter initialEntries={["/c/conv_toggle"]}>
-        <Routes>
-          <Route
-            path="/c/:conversationId"
-            element={
-              <FilesPanel
-                sort="recent"
-                onSortChange={vi.fn()}
-                frameless
-                flatView={false}
-                onFileSelect={vi.fn()}
-                onFlatViewChange={onFlatViewChange}
-                showHidden={false}
-                onShowHiddenChange={vi.fn()}
-              />
-            }
-          />
-        </Routes>
-      </MemoryRouter>,
-    );
-
-    fireEvent.click(screen.getByRole("radio", { name: /^changed$/i }));
-    // Selecting Changed switches to the changed-files-only flat list.
-    expect(onFlatViewChange).toHaveBeenCalledWith(true);
-  });
-});
-
-describe("FilesPanel Changed pill", () => {
-  // The Changed pill shows the file count only — no +/− line totals.
-  function changedPill() {
-    return screen.getByRole("radio", { name: /^changed$/i });
-  }
-
-  it("shows the file count but no +/− line totals", () => {
-    renderPanel({
-      conversationId: "conv_pill_count",
-      flatView: true,
-      files: [],
-      changedFiles: [
-        changedFile("src/a.ts", "modified", 10, 2),
-        changedFile("src/b.ts", "modified", 5, 1),
-      ],
-    });
-
-    const pill = changedPill();
-    expect(within(pill).getByText("2")).toBeInTheDocument(); // file count
-    expect(within(pill).queryByText(/^\+/)).not.toBeInTheDocument();
-    expect(within(pill).queryByText(/^−/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("radiogroup", { name: "File scope" })).toBeNull();
+    expect(screen.queryByRole("radio", { name: /^changed$/i })).toBeNull();
+    expect(screen.queryByRole("radio", { name: /^all$/i })).toBeNull();
   });
 });
 
@@ -429,7 +401,6 @@ describe("FilesPanel changed files search", () => {
                 onSortChange={vi.fn()}
                 flatView={true}
                 onFileSelect={vi.fn()}
-                onFlatViewChange={vi.fn()}
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
@@ -491,7 +462,6 @@ describe("FilesPanel changed files search", () => {
                 onSortChange={vi.fn()}
                 flatView={false}
                 onFileSelect={vi.fn()}
-                onFlatViewChange={vi.fn()}
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
@@ -513,7 +483,6 @@ describe("FilesPanel changed files search", () => {
                 onSortChange={vi.fn()}
                 flatView={true}
                 onFileSelect={vi.fn()}
-                onFlatViewChange={vi.fn()}
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
@@ -587,7 +556,6 @@ describe("FilesPanel changed files search", () => {
                     onClose={() => setDrawerOpen(false)}
                     onFileSelect={vi.fn()}
                     flatView={false}
-                    onFlatViewChange={vi.fn()}
                     showHidden={showHidden}
                     onShowHiddenChange={setShowHidden}
                   />
@@ -601,7 +569,6 @@ describe("FilesPanel changed files search", () => {
                         onSortChange={vi.fn()}
                         flatView={false}
                         onFileSelect={vi.fn()}
-                        onFlatViewChange={vi.fn()}
                         showHidden={showHidden}
                         onShowHiddenChange={setShowHidden}
                       />
@@ -656,7 +623,6 @@ describe("FilesPanel changed files search", () => {
                     onClose={() => setDrawerOpen(false)}
                     onFileSelect={vi.fn()}
                     flatView={false}
-                    onFlatViewChange={vi.fn()}
                     showHidden={showHidden}
                     onShowHiddenChange={setShowHidden}
                   />
@@ -670,7 +636,6 @@ describe("FilesPanel changed files search", () => {
                         onSortChange={vi.fn()}
                         flatView={false}
                         onFileSelect={vi.fn()}
-                        onFlatViewChange={vi.fn()}
                         showHidden={showHidden}
                         onShowHiddenChange={setShowHidden}
                       />
@@ -719,7 +684,6 @@ describe("FilesPanel changed files search", () => {
                   onSortChange={vi.fn()}
                   flatView={true}
                   onFileSelect={vi.fn()}
-                  onFlatViewChange={vi.fn()}
                   showHidden={showHidden}
                   onShowHiddenChange={setShowHidden}
                 />
@@ -772,7 +736,6 @@ describe("FilesPanel tree (Explore) search", () => {
                 onSortChange={vi.fn()}
                 flatView={true}
                 onFileSelect={vi.fn()}
-                onFlatViewChange={vi.fn()}
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
@@ -898,11 +861,15 @@ describe("FilesPanel tree (Explore) search", () => {
 
     // src/ (folder) and README.md (file) are both top-level → same depth, so
     // the chevron and the file icon start at the same x (BASE_PAD = 8px).
+    // Both row types are a wrapper div carrying the indent, with the clickable
+    // element nested inside — folders included, so the copy button can be a
+    // sibling of the toggle rather than a button inside a button.
     const folderButton = screen.getByRole("button", { name: /src\//i });
+    const folderRow = folderButton.closest("div");
     const fileRow = screen.getByText("README.md").closest("div");
-    if (!fileRow) throw new Error("file row container not found");
-    expect(folderButton.style.paddingLeft).toBe(fileRow.style.paddingLeft);
-    expect(folderButton.style.paddingLeft).toBe("8px");
+    if (!folderRow || !fileRow) throw new Error("row container not found");
+    expect(folderRow.style.paddingLeft).toBe(fileRow.style.paddingLeft);
+    expect(folderRow.style.paddingLeft).toBe("8px");
 
     // Minimal layout: folders show ONLY a chevron (no folder icon) before the
     // name. The folder row should contain exactly one svg (the chevron).
@@ -963,7 +930,6 @@ describe("FilesPanel tree (Explore) search", () => {
                 onSortChange={vi.fn()}
                 flatView={true}
                 onFileSelect={vi.fn()}
-                onFlatViewChange={vi.fn()}
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
@@ -985,7 +951,6 @@ describe("FilesPanel tree (Explore) search", () => {
                 onSortChange={vi.fn()}
                 flatView={false}
                 onFileSelect={vi.fn()}
-                onFlatViewChange={vi.fn()}
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
@@ -1193,7 +1158,6 @@ describe("FilesPanel tree (Explore) search", () => {
                 onSortChange={vi.fn()}
                 flatView={true}
                 onFileSelect={vi.fn()}
-                onFlatViewChange={vi.fn()}
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
@@ -1216,7 +1180,6 @@ describe("FilesPanel tree (Explore) search", () => {
                 onSortChange={vi.fn()}
                 flatView={false}
                 onFileSelect={vi.fn()}
-                onFlatViewChange={vi.fn()}
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
@@ -1241,5 +1204,497 @@ describe("FilesPanel sort control", () => {
       flatView: false,
     });
     expect(screen.getByRole("button", { name: /^Sort:/ })).toBeInTheDocument();
+  });
+});
+
+describe("FilesPanel scroll position persistence", () => {
+  function renderAndGetScrollSection(conversationId: string, files: WorkspaceFile[]) {
+    const result = renderPanel({ conversationId, files });
+    const section = result.container.querySelector("section");
+    if (!section) throw new Error("scroll section not found");
+    return { result, section };
+  }
+
+  it("restores the saved scroll position when returning to a conversation", () => {
+    const files = Array.from({ length: 50 }, (_, i) => file(`file-${i}.ts`));
+
+    // Scroll in conversation A, then leave it.
+    const a = renderAndGetScrollSection("conv_scroll_a", files);
+    a.section.scrollTop = 120;
+    fireEvent.scroll(a.section);
+    a.result.unmount();
+
+    // Conversation B starts at the top, unaffected by A's position.
+    const b = renderAndGetScrollSection("conv_scroll_b", files);
+    expect(b.section.scrollTop).toBe(0);
+    b.result.unmount();
+
+    // Returning to A restores its saved position.
+    const back = renderAndGetScrollSection("conv_scroll_a", files);
+    expect(back.section.scrollTop).toBe(120);
+  });
+
+  it("does not let the loading clamp overwrite the saved position", async () => {
+    const files = Array.from({ length: 50 }, (_, i) => file(`file-${i}.ts`));
+    const conversationId = "conv_scroll_clamp";
+
+    // Scroll in the conversation, then leave it.
+    const first = renderAndGetScrollSection(conversationId, files);
+    first.section.scrollTop = 120;
+    fireEvent.scroll(first.section);
+    first.result.unmount();
+
+    // Revisit while the queries are still disabled (environment pending):
+    // data is undefined — not "loading" — and the short placeholder content
+    // clamps scrollTop to 0, which fires a scroll event.
+    const pending = {
+      data: undefined,
+      error: null,
+      isError: false,
+      isLoading: false,
+    };
+    useAllFilesMock.mockReturnValue(pending as unknown as ReturnType<typeof useWorkspaceAllFiles>);
+    useChangedFilesMock.mockReturnValue(
+      pending as unknown as ReturnType<typeof useWorkspaceChangedFiles>,
+    );
+    useDirectoryMock.mockReturnValue(directoryResult());
+    useEnvironmentMock.mockReturnValue(environmentResult(null));
+    useSearchMock.mockReturnValue(searchResult());
+    // Fresh JSX per render — reusing the same element would let React bail
+    // out of the re-render without re-reading the updated hook mocks.
+    const panel = () => (
+      <MemoryRouter initialEntries={[`/c/${conversationId}`]}>
+        <Routes>
+          <Route
+            path="/c/:conversationId"
+            element={
+              <FilesPanel
+                sort="recent"
+                onSortChange={vi.fn()}
+                flatView={false}
+                onFileSelect={vi.fn()}
+                showHidden={false}
+                onShowHiddenChange={vi.fn()}
+              />
+            }
+          />
+        </Routes>
+      </MemoryRouter>
+    );
+    const view = render(panel());
+    const section = view.container.querySelector("section");
+    if (!section) throw new Error("scroll section not found");
+    section.scrollTop = 0;
+    fireEvent.scroll(section);
+
+    // Files arrive: the saved position survives the clamp and is restored.
+    useAllFilesMock.mockReturnValue(allFilesResult(files));
+    useChangedFilesMock.mockReturnValue(changedFilesResult([]));
+    view.rerender(panel());
+    expect(section.scrollTop).toBe(120);
+
+    // Let the restore's animation-frame loop settle (jsdom has no layout, so
+    // the target is never "reachable" — the loop runs until its time budget
+    // expires), then user scrolls are saved again.
+    const expired = performance.now() + SCROLL_RESTORE_BUDGET_MS + 1;
+    vi.spyOn(performance, "now").mockReturnValue(expired);
+    await act(
+      () =>
+        new Promise((resolve) => {
+          requestAnimationFrame(() => resolve(undefined));
+        }),
+    );
+    vi.mocked(performance.now).mockRestore();
+    section.scrollTop = 40;
+    fireEvent.scroll(section);
+    view.unmount();
+    const back = renderAndGetScrollSection(conversationId, files);
+    expect(back.section.scrollTop).toBe(40);
+  });
+});
+
+describe("FolderTree expanded state across conversation switches", () => {
+  function renderTree(conversationId: string, files: WorkspaceFile[]) {
+    useDirectoryMock.mockReturnValue(directoryResult());
+    const tree = (id: string) => (
+      <TooltipProvider>
+        <FolderTree
+          files={files}
+          isLoading={false}
+          isError={false}
+          error={null}
+          onFileSelect={vi.fn()}
+          conversationId={id}
+          showHidden={false}
+          changedFiles={[]}
+          sort="alpha"
+        />
+      </TooltipProvider>
+    );
+    const view = render(tree(conversationId));
+    return { view, tree };
+  }
+
+  it("re-syncs expanded folders when switching conversations without remounting", () => {
+    const files = [file("src/App.tsx"), file("README.md")];
+    const { view, tree } = renderTree("conv_tree_resync_a", files);
+
+    // Collapse src/ in conversation A (expanded by default).
+    expect(screen.getByText("App.tsx")).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: /src\// }));
+    expect(screen.queryByText("App.tsx")).toBeNull();
+
+    // Switch to conversation B in place: defaults apply, src/ is expanded.
+    view.rerender(tree("conv_tree_resync_b"));
+    expect(screen.getByText("App.tsx")).toBeDefined();
+
+    // Switch back to A in place: its collapsed state is restored.
+    view.rerender(tree("conv_tree_resync_a"));
+    expect(screen.queryByText("App.tsx")).toBeNull();
+  });
+});
+
+describe("FilesPanel browse location", () => {
+  const CONFINED = {
+    unconfined: false,
+    roots: [{ path: "/home/user/proj", access: "write", origin: "cwd" }],
+  };
+  const UNCONFINED = {
+    unconfined: true,
+    roots: [{ path: "/home/user/proj", access: "write", origin: "cwd" }],
+  };
+
+  it("stays a plain label when the session has nowhere else to go", () => {
+    // A confined agent with no declared grants can only ever see its
+    // workspace, so the navigation affordance must not appear at all --
+    // the panel looks exactly as it did before this control existed.
+    renderPanel({
+      conversationId: "conv_confined",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: CONFINED,
+    });
+
+    expect(screen.queryByTestId("browse-location-path")).toBeNull();
+    expect(screen.getByText("proj")).toBeInTheDocument();
+  });
+
+  it("shows the full path, clickable, when the session is unconfined", () => {
+    renderPanel({
+      conversationId: "conv_unconfined",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: UNCONFINED,
+    });
+
+    // The whole path, not just the basename -- the point of the control is to
+    // tell you where you are before you decide to go elsewhere.
+    const trigger = screen.getByTestId("browse-location-path");
+    expect(trigger).toHaveTextContent("/home/user/proj");
+  });
+
+  it("opens a file at an absolute browse location by its absolute path", () => {
+    // Regression: after navigating OUTSIDE the workspace (e.g. /etc), the tree
+    // lists files by bare name relative to that location. Opening one must
+    // hand the viewer the file's ABSOLUTE path (/etc/hosts) -- otherwise the
+    // viewer looks the bare name up under the workspace root and 404s.
+    const onFileSelect = vi.fn();
+    renderPanel({
+      conversationId: "conv_open_abs",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: UNCONFINED,
+      onFileSelect,
+    });
+
+    // Re-rooting to /etc swaps the listing for one whose file is bare-named.
+    useAllFilesMock.mockImplementation((_id: unknown, _opts: unknown, location?: string) =>
+      location === "/etc" ? allFilesResult([file("hosts")]) : allFilesResult([]),
+    );
+    fireEvent.click(screen.getByTestId("browse-location-path"));
+    fireEvent.click(screen.getByTestId("stub-picker-navigate"));
+
+    fireEvent.click(screen.getByText("hosts"));
+
+    expect(onFileSelect).toHaveBeenCalledWith("/etc/hosts");
+  });
+
+  it("re-roots both the tree and search when a directory is picked", () => {
+    // The bug this feature fixes is a tree showing one directory while search
+    // reports on another, so both queries must move together.
+    renderPanel({
+      conversationId: "conv_reroot",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: UNCONFINED,
+    });
+
+    fireEvent.click(screen.getByTestId("browse-location-path"));
+    fireEvent.click(screen.getByTestId("stub-picker-navigate"));
+
+    expect(useAllFilesMock).toHaveBeenLastCalledWith("conv_reroot", expect.anything(), "/etc");
+    expect(useSearchMock).toHaveBeenLastCalledWith(
+      "conv_reroot",
+      "",
+      "",
+      "",
+      expect.anything(),
+      "/etc",
+    );
+  });
+
+  it("restores the browsed location across unmount/remount (file-viewer round trip)", () => {
+    // Opening a file swaps the panel for the FileViewer, unmounting it.
+    // Closing the viewer must land back in the directory the file was opened
+    // from, not snap to the workspace root.
+    const first = renderPanel({
+      conversationId: "conv_viewer_roundtrip",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: UNCONFINED,
+    });
+    fireEvent.click(screen.getByTestId("browse-location-path"));
+    fireEvent.click(screen.getByTestId("stub-picker-navigate"));
+    expect(useAllFilesMock).toHaveBeenLastCalledWith(
+      "conv_viewer_roundtrip",
+      expect.anything(),
+      "/etc",
+    );
+
+    first.unmount();
+    renderPanel({
+      conversationId: "conv_viewer_roundtrip",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: UNCONFINED,
+    });
+
+    expect(useAllFilesMock).toHaveBeenLastCalledWith(
+      "conv_viewer_roundtrip",
+      expect.anything(),
+      "/etc",
+    );
+  });
+
+  it("keeps a remembered location scoped to its own conversation", () => {
+    // The cache must not leak one session's directory into another: a
+    // different conversation opens at ITS root, exactly as before.
+    const first = renderPanel({
+      conversationId: "conv_loc_owner",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: UNCONFINED,
+    });
+    fireEvent.click(screen.getByTestId("browse-location-path"));
+    fireEvent.click(screen.getByTestId("stub-picker-navigate"));
+    first.unmount();
+
+    renderPanel({
+      conversationId: "conv_loc_other",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: UNCONFINED,
+    });
+
+    expect(useAllFilesMock).toHaveBeenLastCalledWith("conv_loc_other", expect.anything(), "");
+  });
+
+  it("surfaces a refused location instead of an empty tree", () => {
+    // An empty tree reads as "this directory is empty", which is a different
+    // fact from "you may not look here".
+    const err = new PathUnreachableError("Path '/etc' is outside this session's reach", [
+      "/home/user/proj",
+    ]);
+    useAllFilesMock.mockReturnValue({
+      data: undefined,
+      error: err,
+      isError: true,
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceAllFiles>);
+    useChangedFilesMock.mockReturnValue(changedFilesResult([]));
+    useDirectoryMock.mockReturnValue(directoryResult());
+    useEnvironmentMock.mockReturnValue(environmentResult("/home/user/proj", CONFINED));
+    useSearchMock.mockReturnValue(searchResult(undefined, false));
+
+    render(
+      <MemoryRouter initialEntries={["/c/conv_refused"]}>
+        <Routes>
+          <Route
+            path="/c/:conversationId"
+            element={
+              <FilesPanel
+                sort="recent"
+                onSortChange={vi.fn()}
+                flatView={false}
+                onFileSelect={vi.fn()}
+                showHidden={false}
+                onShowHiddenChange={vi.fn()}
+              />
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    // Confined sessions render the plain label, so the message rides with the
+    // panel rather than the (absent) location bar.
+    expect(screen.getByText(/outside this session's reach/)).toBeInTheDocument();
+  });
+});
+
+describe("FilesPanel browse permission", () => {
+  const UNCONFINED_REACH = {
+    unconfined: true,
+    roots: [{ path: "/home/user/proj", access: "write", origin: "cwd" }],
+  };
+
+  afterEach(() => {
+    // Restore the suite default (owner) — `vi.clearAllMocks` clears calls but
+    // keeps an implementation set via mockReturnValue, which would leak.
+    vi.mocked(useSession).mockReturnValue({
+      session: { hostId: "host_test" },
+    } as unknown as ReturnType<typeof useSession>);
+  });
+
+  it("hides the control from a collaborator who is not the session owner", () => {
+    // `reachable` describes what the ENVIRONMENT can reach and is identical
+    // for every viewer, so it cannot decide this on its own. Everything past
+    // the workspace is the owner's own machine: a collaborator's browse is
+    // refused 403, and the picker itself reads the owner-scoped host
+    // filesystem endpoint — so the control would open onto an error.
+    vi.mocked(useSession).mockReturnValue({
+      session: { hostId: "host_test", permissionLevel: 2 },
+    } as unknown as ReturnType<typeof useSession>);
+
+    renderPanel({
+      conversationId: "conv_collaborator",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: UNCONFINED_REACH,
+    });
+
+    expect(screen.queryByTestId("browse-location-path")).toBeNull();
+    // Still the plain label — the collaborator keeps the workspace view.
+    expect(screen.getByText("proj")).toBeInTheDocument();
+  });
+
+  it("keeps the control for the session owner", () => {
+    vi.mocked(useSession).mockReturnValue({
+      session: { hostId: "host_test", permissionLevel: 4 },
+    } as unknown as ReturnType<typeof useSession>);
+
+    renderPanel({
+      conversationId: "conv_owner",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: UNCONFINED_REACH,
+    });
+
+    expect(screen.getByTestId("browse-location-path")).toBeInTheDocument();
+  });
+
+  it("keeps the control when the level is unknown (single-user)", () => {
+    // A single-user local server reports no level at all. Treating that as
+    // "not the owner" would remove browsing from the ONLY user.
+    vi.mocked(useSession).mockReturnValue({
+      session: { hostId: "host_test", permissionLevel: null },
+    } as unknown as ReturnType<typeof useSession>);
+
+    renderPanel({
+      conversationId: "conv_single_user",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: UNCONFINED_REACH,
+    });
+
+    expect(screen.getByTestId("browse-location-path")).toBeInTheDocument();
+  });
+});
+
+describe("FilesPanel header copy path", () => {
+  const UNCONFINED_REACH = {
+    unconfined: true,
+    roots: [{ path: "/home/user/proj", access: "write", origin: "cwd" }],
+  };
+
+  it("copies the working folder's absolute path from the header", () => {
+    renderPanel({
+      conversationId: "conv_copy_header",
+      files: [],
+      workingDir: "/home/user/proj",
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy folder path: proj" }));
+
+    // The header copies the ABSOLUTE path -- pasting a basename would be
+    // useless, and the header is the one place the full path is on screen.
+    expect(copyTextMock).toHaveBeenCalledWith("/home/user/proj");
+  });
+
+  it("copies the browsed directory after navigating away from the workspace", () => {
+    // The header tracks wherever the panel is pointed, so the copy must
+    // follow it rather than pinning to the session's workspace.
+    renderPanel({
+      conversationId: "conv_copy_browsed",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: UNCONFINED_REACH,
+    });
+
+    fireEvent.click(screen.getByTestId("browse-location-path"));
+    fireEvent.click(screen.getByTestId("stub-picker-navigate"));
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy folder path: etc" }));
+
+    expect(copyTextMock).toHaveBeenCalledWith("/etc");
+  });
+});
+
+describe("FilesPanel double-click navigation", () => {
+  it("re-roots onto a double-clicked folder and asks the server RELATIVELY", () => {
+    // The wire form is the point. A subfolder of the workspace must be
+    // requested relative, because the server authorizes an absolute location
+    // at OWNER level -- sending "/home/user/proj/src" would 403 every
+    // collaborator browsing a folder they can already list.
+    renderPanel({
+      conversationId: "conv_dblclick",
+      flatView: false,
+      files: [file("src/App.tsx")],
+      workingDir: "/home/user/proj",
+    });
+
+    useAllFilesMock.mockClear();
+    fireEvent.doubleClick(screen.getByRole("button", { name: "src/" }));
+
+    expect(useAllFilesMock).toHaveBeenCalledWith("conv_dblclick", { enabled: true }, "src");
+    // The header still names the absolute directory the user is standing in.
+    expect(screen.getByText("src")).toBeInTheDocument();
+  });
+
+  it("re-attaches the browsed folder when opening a file the tree named", () => {
+    // Tree paths are relative to where the tree is rooted, but the viewer
+    // resolves against the workspace root -- so after navigating into a
+    // folder, handing it the bare name would open the wrong file (or none).
+    const onFileSelect = vi.fn();
+    renderPanel({
+      conversationId: "conv_open_after_nav",
+      flatView: false,
+      files: [file("src/App.tsx")],
+      workingDir: "/home/user/proj",
+      onFileSelect,
+    });
+
+    // Re-rooting swaps the listing for one relative to the NEW root, which is
+    // why the bare name reaches the panel in the first place.
+    useAllFilesMock.mockImplementation((_id: unknown, _opts: unknown, location?: string) =>
+      location === "src"
+        ? allFilesResult([file("App.tsx")])
+        : allFilesResult([file("src/App.tsx")]),
+    );
+
+    fireEvent.doubleClick(screen.getByRole("button", { name: "src/" }));
+    fireEvent.click(screen.getByText("App.tsx"));
+
+    expect(onFileSelect).toHaveBeenCalledWith("src/App.tsx");
   });
 });

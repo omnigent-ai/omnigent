@@ -26,7 +26,9 @@ from collections.abc import Awaitable, Callable
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
+from omnigent.debug_logging import set_current_user_id
 from omnigent.host.frames import (
+    HostConnectionErrorFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeResultFrame,
     HostDetectCredentialsResultFrame,
@@ -45,6 +47,7 @@ from omnigent.host.frames import (
     HostStopRunnerResultFrame,
     HostStoreSecretResultFrame,
     decode_host_frame,
+    encode_host_frame,
 )
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.runner.transports.ws_tunnel.frames import (
@@ -175,19 +178,26 @@ def create_host_tunnel_router(
                 return
             tunnel_owner = managed.user_id
         elif auth_provider is not None:
-            tunnel_owner = auth_provider.get_user_id(ws)
-            if tunnel_owner is None:
+            authenticated_owner = auth_provider.get_user_id(ws)
+            if authenticated_owner is None:
                 # Auth is enabled but this peer didn't authenticate. Fail
                 # closed — never fall back to RESERVED_USER_LOCAL, which is
                 # admin-equivalent under the multi-user header scheme
                 # Closing before accept() refuses the handshake.
                 await ws.close(code=4004, reason="unauthenticated")
                 return
+            tunnel_owner = authenticated_owner
         else:
             # No auth provider configured = explicit single-user / local
             # deployment; RESERVED_USER_LOCAL is the accepted local owner
             # (consistent with get_user_id returning None on the HTTP side).
             tunnel_owner = RESERVED_USER_LOCAL
+
+        # Attribute debug-log records emitted while servicing this host's tunnel
+        # to its owner. This WebSocket handler runs in its own task, so the set
+        # is scoped to this connection (child loop tasks inherit it) and cannot
+        # bleed across concurrent host connections.
+        set_current_user_id(tunnel_owner)
 
         # Reject a cross-owner takeover before accept(). ``host_id`` is
         # UNIQUE, so a peer authenticated as one user dialing in on a
@@ -227,25 +237,30 @@ def create_host_tunnel_router(
 
         await ws.accept()
         conn: HostConnection | None = None
+        host_persisted = False
+        stage = "hello"
         try:
             raw = await ws.receive_text()
             frame = decode_host_frame(raw)
             if not isinstance(frame, HostHelloFrame):
-                await ws.close(code=4001, reason="expected host.hello frame")
+                error = "expected host.hello frame"
+                await _send_connection_error(ws, stage="hello", error=error)
+                await ws.close(code=4001, reason=error)
                 return
 
+            stage = "protocol"
             remote_major = frame.frame_protocol_version
             if remote_major != SUPPORTED_FRAME_PROTOCOL_MAJOR:
-                await ws.close(
-                    code=4002,
-                    reason=(
-                        f"frame_protocol_version mismatch: "
-                        f"server supports {SUPPORTED_FRAME_PROTOCOL_MAJOR}, "
-                        f"host sent {remote_major}"
-                    ),
+                error = (
+                    f"frame_protocol_version mismatch: "
+                    f"server supports {SUPPORTED_FRAME_PROTOCOL_MAJOR}, "
+                    f"host sent {remote_major}"
                 )
+                await _send_connection_error(ws, stage="protocol", error=error)
+                await ws.close(code=4002, reason=error)
                 return
 
+            stage = "registration"
             await asyncio.to_thread(
                 host_store.upsert_on_connect,
                 host_id=host_id,
@@ -254,13 +269,20 @@ def create_host_tunnel_router(
                 allow_host_id_reown=allow_host_id_reown,
                 configured_harnesses=frame.configured_harnesses,
             )
+            host_persisted = True
 
+            stage = "registry"
             conn = host_registry.register(
                 host_id,
                 ws,
                 frame,
                 owner=tunnel_owner,
             )
+            # Delivered on the handshake, never persisted: a replica that just
+            # started learns the host's gateway backing here, so a server
+            # restart converges as soon as each host reconnects.
+            host_registry.record_gateway_inference(host_id, frame.gateway_inference)
+            stage = "connected"
             _logger.info(
                 "Host %s connected (version=%s, name=%s, runners=%s)",
                 host_id,
@@ -283,6 +305,7 @@ def create_host_tunnel_router(
                     conn,
                     host_id,
                     host_store,
+                    host_registry,
                     runner_exit_reports,
                     on_runner_exited,
                     on_host_update,
@@ -325,8 +348,10 @@ def create_host_tunnel_router(
                     receive_task,
                     return_exceptions=True,
                 )
-                host_registry.deregister(host_id)
-                await asyncio.to_thread(host_store.set_offline, host_id)
+                # If the host already reconnected, this handler's connection
+                # was replaced; only the current one may mark it offline.
+                if host_registry.deregister(host_id, conn=conn):
+                    await asyncio.to_thread(host_store.set_offline, host_id)
                 if on_host_disconnect is not None:
                     try:
                         await on_host_disconnect(host_id, tunnel_owner)
@@ -344,8 +369,8 @@ def create_host_tunnel_router(
             # connects with another owner's host_id — must not deregister
             # or flip that owner's host offline (cross-user DoS).
             if conn is not None:
-                host_registry.deregister(host_id)
-                await asyncio.to_thread(host_store.set_offline, host_id)
+                if host_registry.deregister(host_id, conn=conn):
+                    await asyncio.to_thread(host_store.set_offline, host_id)
                 if on_host_disconnect is not None:
                     try:
                         await on_host_disconnect(host_id, tunnel_owner)
@@ -354,14 +379,45 @@ def create_host_tunnel_router(
                             "on_host_disconnect callback failed for %s",
                             host_id,
                         )
-        except Exception:
+        except Exception as exc:
             _logger.exception("Host tunnel error for %s", host_id)
-            # Same guard as above: don't touch a host we never registered.
+            retryable = stage in {"registration", "registry", "connected"}
+            await _send_connection_error(
+                ws,
+                stage=stage,
+                error=str(exc),
+                retryable=retryable,
+            )
+            with contextlib.suppress(Exception):
+                await ws.close(code=4005, reason="host connection failed")
             if conn is not None:
-                host_registry.deregister(host_id)
+                if host_registry.deregister(host_id, conn=conn):
+                    await asyncio.to_thread(host_store.set_offline, host_id)
+            elif host_persisted:
                 await asyncio.to_thread(host_store.set_offline, host_id)
 
     return router
+
+
+async def _send_connection_error(
+    ws: WebSocket,
+    *,
+    stage: str,
+    error: str,
+    retryable: bool = False,
+) -> None:
+    """Best-effort error report while the accepted WebSocket is writable."""
+    message = error or "unknown server error"
+    with contextlib.suppress(Exception):
+        await ws.send_text(
+            encode_host_frame(
+                HostConnectionErrorFrame(
+                    stage=stage,
+                    error=message,
+                    retryable=retryable,
+                )
+            )
+        )
 
 
 async def _refuse_upgrade(ws: WebSocket, *, status: int, reason: str) -> None:
@@ -403,6 +459,7 @@ async def _receive_loop(
     conn: HostConnection,
     host_id: str,
     host_store: HostStore,
+    host_registry: HostRegistry,
     runner_exit_reports: RunnerExitReports | None,
     on_runner_exited: Callable[[str, str], Awaitable[None]] | None,
     on_host_update: Callable[[str, str | None], Awaitable[None]] | None,
@@ -413,6 +470,10 @@ async def _receive_loop(
     :param conn: Host connection for resolving pending requests.
     :param host_id: Host id for logging.
     :param host_store: Persistent store receiving live readiness updates.
+    :param host_registry: Live host registry, so a frame only refreshes
+        liveness while ``conn`` is still the registered generation; it also
+        receives the reported gateway-inference map (held in memory, never
+        persisted).
     :param runner_exit_reports: Store for ``host.runner_exited``
         reports; ``None`` drops them.
     :param on_runner_exited: Callback fired with ``(runner_id, error)``
@@ -431,7 +492,10 @@ async def _receive_loop(
         if not isinstance(raw, str):
             continue
 
-        conn.last_frame_at = time.time()
+        if not host_registry.mark_frame_seen(conn):
+            # This connection was replaced or removed, so stop reading: marking
+            # it alive would keep a host that nothing can reach looking healthy.
+            return
 
         try:
             frame = decode_host_frame(raw)
@@ -474,6 +538,10 @@ async def _receive_loop(
                 frame.configured_harnesses,
             )
             conn.hello.configured_harnesses = dict(frame.configured_harnesses)
+            conn.hello.gateway_inference = (
+                dict(frame.gateway_inference) if frame.gateway_inference is not None else None
+            )
+            host_registry.record_gateway_inference(host_id, frame.gateway_inference)
             if on_host_update is not None:
                 try:
                     await on_host_update(host_id, conn.owner)
@@ -618,6 +686,7 @@ async def _receive_loop(
                     {
                         "status": frame.status,
                         "configured_harnesses": frame.configured_harnesses,
+                        "gateway_inference": frame.gateway_inference,
                         "error": frame.error,
                     }
                 )
@@ -630,6 +699,7 @@ async def _receive_loop(
                     {
                         "status": frame.status,
                         "configured_harnesses": frame.configured_harnesses,
+                        "gateway_inference": frame.gateway_inference,
                         "error": frame.error,
                     }
                 )
@@ -662,6 +732,7 @@ async def _receive_loop(
                     {
                         "status": frame.status,
                         "models": frame.models,
+                        "routable_models": frame.routable_models,
                         "error": frame.error,
                     }
                 )

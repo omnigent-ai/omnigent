@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 from abc import ABC, abstractmethod
 
 from omnigent.entities import Agent, PagedList
@@ -100,7 +101,7 @@ class AgentStore(ABC):
         ...
 
     @abstractmethod
-    def get_names(self, agent_ids: list[str]) -> dict[str, str]:
+    def get_names(self, agent_ids: builtins.list[str]) -> dict[str, str]:
         """
         Batch-fetch agent names for a list of IDs.
 

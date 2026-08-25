@@ -2,9 +2,9 @@
 // the code editor (Monaco) and the terminal (xterm), kept separate from the
 // chrome/UI font (see lib/uiFontPreferences.ts).
 //
-// The chrome font rides a CSS custom property (`--ui-font-*`) because the whole
-// rem-based UI reflows off the root font-size. Monaco and xterm can't: they're
-// fixed-pixel canvas/DOM widgets that read an absolute px size + family once, at
+// The chrome font rides CSS custom properties (`--ui-font-*`) that feed desktop
+// typography tokens. Monaco and xterm can't: they're fixed-pixel canvas/DOM
+// widgets that read an absolute px size + family once, at
 // construction, and only re-measure when told to. So instead of a CSS variable
 // this module exposes a tiny in-module pub/sub — `subscribeCodeFont` — that the
 // write helpers fire after persisting. An already-mounted editor or terminal

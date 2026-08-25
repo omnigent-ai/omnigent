@@ -93,6 +93,20 @@ def test_materialize_attachment_uses_block_filename(tmp_path: Path) -> None:
     assert path.parent == tmp_path / "uploads"
 
 
+def test_materialize_attachment_ignores_non_string_filename(tmp_path: Path) -> None:
+    block = {
+        "type": "input_image",
+        "image_url": _PNG_DATA_URI,
+        "filename": 42,
+    }
+
+    path = materialize_attachment(block, tmp_path)
+
+    assert path is not None
+    assert path.name.startswith("attachment_")
+    assert path.suffix == ".png"
+
+
 def test_materialize_attachment_returns_none_without_data_uri(tmp_path: Path) -> None:
     """
     A block whose data URI is missing yields ``None`` and writes nothing.

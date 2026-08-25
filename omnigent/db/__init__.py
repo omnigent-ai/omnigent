@@ -13,6 +13,7 @@ from omnigent.db.db_models import (
     current_workspace_id,
     workspace_scope,
 )
+from omnigent.db.query_context import current_query_name, query_name_scope
 
 __all__ = [
     "DEFAULT_WORKSPACE_ID",
@@ -24,6 +25,8 @@ __all__ = [
     "SqlFile",
     "SqlSessionPermission",
     "SqlUser",
+    "current_query_name",
     "current_workspace_id",
+    "query_name_scope",
     "workspace_scope",
 ]

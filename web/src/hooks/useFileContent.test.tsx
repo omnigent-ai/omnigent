@@ -48,13 +48,15 @@ function Probe({ id, path }: { id: string | undefined; path: string | null }) {
 }
 
 async function flushMicrotasks() {
-  await new Promise((r) => setTimeout(r, 10));
+  await new Promise((resolve) => {
+    setTimeout(resolve, 10);
+  });
 }
 
-type ChatStoreState = {
+interface ChatStoreState {
   conversationId: string | null;
   sessionStatus: "idle" | "running" | "waiting" | "failed";
-};
+}
 
 // `useChatStore` is a selector hook: state in, derived value out.
 // Our consumer reads `s.conversationId` and `s.sessionStatus`.
@@ -316,6 +318,28 @@ describe("useFileContent gating", () => {
 
     expect(fetchMock.mock.calls[0][0]).toBe(
       "/v1/sessions/conv_asleep/resources/environments/default/filesystem/src/a.txt",
+    );
+  });
+
+  it("fetches an absolute file path by its bare path plus base=host", async () => {
+    // A file opened while browsing OUTSIDE the workspace has an absolute path.
+    // It must be requested WITHOUT a leading "%2F" (which a reverse proxy such
+    // as the Databricks Apps front door would merge away) and named
+    // `base=host` -- otherwise it is looked up by its bare name under the
+    // workspace root and 404s (the regression this covers).
+    onlineMock.mockReturnValue(true);
+    hostOnlineMock.mockReturnValue(true);
+    stubChatStore();
+
+    render(
+      <Wrap>
+        <Probe id="conv_abs" path="/tmp/dbexec.log" />
+      </Wrap>,
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/v1/sessions/conv_abs/resources/environments/default/filesystem/tmp/dbexec.log?base=host",
     );
   });
 

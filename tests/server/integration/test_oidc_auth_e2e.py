@@ -96,7 +96,7 @@ def _mint_state_cookie(
 
 def _mock_httpx_client_for_github(
     token_status: int = 200,
-    token_json: dict | None = None,
+    token_json: object | None = None,
     emails_json: list | None = None,
 ) -> AsyncMock:
     """Build a mock httpx.AsyncClient context manager for GitHub endpoints.
@@ -286,6 +286,24 @@ async def test_callback_returns_400_on_token_exchange_failure() -> None:
 
     assert resp.status_code == 400
     assert "Token exchange failed" in resp.json()["error"]
+
+
+async def test_callback_returns_400_on_non_object_token_response() -> None:
+    mock_cm = _mock_httpx_client_for_github(token_json=["invalid"])
+    transport = _build_oidc_app()
+    state = "test-state"
+    state_cookie = _mint_state_cookie(state)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        with patch("omnigent.server.routes.auth.httpx.AsyncClient", return_value=mock_cm):
+            resp = await client.get(
+                "/auth/callback",
+                params={"code": "bad-response", "state": state},
+                cookies={"ap_auth_state": state_cookie},
+            )
+
+    assert resp.status_code == 400
+    assert resp.json() == {"error": "Token exchange returned an invalid response"}
 
 
 # ── 5. Logout ──────────────────────────────────────────────────────

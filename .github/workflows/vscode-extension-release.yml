@@ -9,8 +9,8 @@
 # match the input), so the tag and the packaged version can't diverge.
 #
 # This produces the ARTIFACT ONLY — it does NOT publish to the VS Code
-# Marketplace or Open VSX. That runs from the central secure-release repo
-# (databricks/secure-public-registry-releases-eng), on hardened runners, where
+# Marketplace or Open VSX. That runs from a Databricks-internal secure-release
+# repo, on hardened runners, where
 # a workflow downloads this `.vsix`, verifies its `.sha256`, scans it, and
 # publishes. Keeping the two halves separate is deliberate: this job only
 # builds and uploads; the secured half holds the marketplace tokens and scan

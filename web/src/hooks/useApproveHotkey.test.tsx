@@ -6,7 +6,7 @@ import { renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const submitApproval = vi.fn();
-let blocks: Array<Record<string, unknown>> = [];
+let blocks: Record<string, unknown>[] = [];
 vi.mock("@/store/chatStore", () => ({
   useChatStore: { getState: () => ({ blocks, submitApproval }) },
 }));

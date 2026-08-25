@@ -112,13 +112,13 @@ export function highlightRectsForPage(
   page: number,
   comments: Comment[],
   activeSelection: ActiveSelection | null,
-): Array<{ key: string; rects: PdfNormalizedRect[]; active: boolean; comment?: Comment }> {
-  const out: Array<{
+): { key: string; rects: PdfNormalizedRect[]; active: boolean; comment?: Comment }[] {
+  const out: {
     key: string;
     rects: PdfNormalizedRect[];
     active: boolean;
     comment?: Comment;
-  }> = [];
+  }[] = [];
 
   for (const c of comments) {
     const anchor = decodePdfAnchor(c.anchor_content);

@@ -477,3 +477,45 @@ def test_render_menu_compact_truncates_long_description_to_one_line() -> None:
     assert len(hint_lines) == 1
     assert "…" in hint_lines[0]
     assert len(hint_lines[0]) <= 40
+
+
+# ---------------------------------------------------------------------------
+# _count_terminal_lines
+# ---------------------------------------------------------------------------
+
+
+def test_count_terminal_lines_no_wrap() -> None:
+    """Short lines count as one row each; no wrapping."""
+    rendered = "foo\nbar\nbaz\n"
+    assert interactive._count_terminal_lines(rendered, width=80) == 3
+
+
+def test_count_terminal_lines_wraps_long_line() -> None:
+    """A line longer than *width* cells counts as two rows."""
+    # 'a' * 100 is 100 cells wide; at width=80 it wraps to 2 rows.
+    rendered = "a" * 100 + "\n"
+    assert interactive._count_terminal_lines(rendered, width=80) == 2
+
+
+def test_count_terminal_lines_exactly_full_width() -> None:
+    """A line exactly *width* cells wide does not wrap."""
+    rendered = "a" * 80 + "\n"
+    assert interactive._count_terminal_lines(rendered, width=80) == 1
+
+
+def test_count_terminal_lines_ansi_stripped() -> None:
+    """ANSI escape sequences are not counted as display cells."""
+    # Bold red 'hello' — escape sequences add bytes but no display cells.
+    rendered = "\x1b[1;31mhello\x1b[0m\n"
+    assert interactive._count_terminal_lines(rendered, width=80) == 1
+
+
+def test_count_terminal_lines_matches_naive_for_short_content() -> None:
+    """For content that never wraps, result equals the newline count."""
+    rendered = "line one\nline two\nline three\n"
+    newline_count = rendered.count("\n")
+    assert interactive._count_terminal_lines(rendered, width=80) == newline_count
+
+
+def test_count_terminal_lines_empty_string() -> None:
+    assert interactive._count_terminal_lines("", width=80) == 0

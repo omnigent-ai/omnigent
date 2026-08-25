@@ -15,9 +15,9 @@ Vertex AI), so there are no ``*_GATEWAY_*`` env vars.
 
 Env vars read at startup:
 
-- ``HARNESS_ANTIGRAVITY_MODEL``: model the executor pins for every turn, e.g.
-  ``"gemini-3.5-flash"``. Wins over per-turn ``request.model`` (which carries
-  the agent NAME, not an LLM id). ``None`` falls back to the built-in default.
+- ``HARNESS_ANTIGRAVITY_MODEL``: model the executor pins for every turn. Wins
+  over per-turn ``request.model`` (which carries the agent NAME, not an LLM
+  id). When absent, the installed SDK chooses its default.
 - ``HARNESS_ANTIGRAVITY_API_KEY``: direct Antigravity / Gemini API key. Set
   when the spec declares ``executor.auth: {type: api_key, …}`` or a global
   API-key auth resolves. Takes precedence over ambient credential lookup.

@@ -331,7 +331,7 @@ def effective_config_with_detected(
     # Explicit entries override synthesized ones of the same name.
     merged: dict[str, object] = {**synthesized, **explicit}
 
-    explicit_config = {"providers": explicit}
+    explicit_config: dict[str, object] = {"providers": explicit}
     merged_parsed = load_providers({"providers": merged})
     for family in _FAMILIES:
         # An explicit default for this family always wins — never overridden.

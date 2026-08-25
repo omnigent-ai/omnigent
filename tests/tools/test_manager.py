@@ -6,7 +6,8 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
@@ -191,6 +192,10 @@ def _make_spec(
         skills=skills or [],
         mcp_servers=mcp_servers or [],
         local_tools=local_tools or [],
+        # Without this, ``LoadSkillTool`` merges in host-scope skills from
+        # ~/.claude/skills and every .claude/skills above cwd, and these tests
+        # assert on whatever the developer happens to have installed.
+        skills_filter="none",
     )
 
 
@@ -529,12 +534,29 @@ def _spawn_spec() -> AgentSpec:
 
 
 def test_advise_models_hidden_when_routing_disabled() -> None:
-    """sys_advise_models must not appear when RuntimeCaps.routing_client is None."""
+    """sys_advise_models must not appear when no router is configured."""
     caps = _FakeRoutingCaps(routing_client=None)
     with patch("omnigent.runtime._globals._caps", new=caps):
         names = {s["function"]["name"] for s in ToolManager(_spawn_spec()).get_tool_schemas()}
     assert "sys_list_models" in names
     assert "sys_advise_models" not in names
+
+
+def test_advise_models_exposed_from_a_backends_only_deployment() -> None:
+    """The gate is "some source can answer", not "a legacy client is set".
+
+    A deployment that configures only ``routing_backends`` routes, so hiding the
+    tool there would advertise routing-off while the server routes anyway.
+    """
+    from omnigent.server.routing_backend import RoutingBackends
+
+    caps = SimpleNamespace(
+        routing_client=None,
+        routing_backends=RoutingBackends(local=cast("Any", object())),
+    )
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        names = {s["function"]["name"] for s in ToolManager(_spawn_spec()).get_tool_schemas()}
+    assert "sys_advise_models" in names
 
 
 def test_advise_models_exposed_when_routing_enabled() -> None:
@@ -643,14 +665,14 @@ def test_agent_read_tools_registered_for_every_agent() -> None:
     assert "sys_agent_download" in names
     assert "sys_agent_list" in names
     # get/download require a session_id (an agent is only inspectable
-    # while running in some session); list takes no parameters.
+    # while running in some session); list exposes optional pagination.
     for tool_name in ("sys_agent_get", "sys_agent_download"):
         schema = next(s for s in mgr.get_tool_schemas() if s["function"]["name"] == tool_name)
         assert "session_id" in schema["function"]["parameters"]["required"]
     list_schema = next(
         s for s in mgr.get_tool_schemas() if s["function"]["name"] == "sys_agent_list"
     )
-    assert list_schema["function"]["parameters"]["properties"] == {}
+    assert set(list_schema["function"]["parameters"]["properties"]) == {"limit", "cursor"}
 
 
 # ── MCP integration ──────────────────────────────────────

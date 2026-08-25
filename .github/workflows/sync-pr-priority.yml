@@ -1,0 +1,118 @@
+name: Sync PR Priority
+
+# Mirrors a linked issue's priority label (P0-P3) onto the PR that closes it.
+# Only closing links (closes/fixes/resolves #n) count -- a plain "related to
+# #n" mention is ignored. Runs on PR events and re-syncs when an issue's labels
+# change. Uses only default-branch code and never checks out or executes PR
+# files; it edits labels through the API.
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - edited
+      - synchronize
+      - reopened
+      - ready_for_review
+  issues:
+    types:
+      - labeled
+      - unlabeled
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to sync"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-pr-priority-${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pr_number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    # On issue label events, only react when the changed label is a priority
+    # (P0-P3) label; other label edits (Bug, triaged, ...) never affect sync.
+    if: >-
+      github.repository == 'omnigent-ai/omnigent' &&
+      (github.event_name != 'issues' ||
+       contains(fromJSON('["P0-critical", "P1-high", "P2-medium", "P3-low"]'), github.event.label.name))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Checkout default-branch script
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: .github/scripts/sync_pr_priority.py
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+
+      # For issue label events, find open PRs that close this issue so we can
+      # re-sync each of them. For PR / dispatch events we already know the PR.
+      - name: Resolve PR numbers to sync
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_FROM_PR: ${{ github.event.pull_request.number }}
+          PR_FROM_DISPATCH: ${{ github.event.inputs.pr_number }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${EVENT_NAME}" == "issues" ]]; then
+            # Only relevant when a priority label was (un)set on the issue.
+            # On lookup failure, warn and treat as no PRs rather than failing
+            # the whole workflow.
+            if ! prs=$(
+              gh api graphql -f query='
+                query($owner:String!,$name:String!,$number:Int!){
+                  repository(owner:$owner,name:$name){
+                    issue(number:$number){
+                      closedByPullRequestsReferences(first:50, includeClosedPrs:false){
+                        nodes { number }
+                      }
+                    }
+                  }
+                }' \
+                -f owner="${REPO%/*}" -f name="${REPO#*/}" -F number="${ISSUE_NUMBER}" \
+                --jq '.data.repository.issue.closedByPullRequestsReferences.nodes[].number'
+            ); then
+              echo "::warning::Failed to resolve PRs closing issue #${ISSUE_NUMBER}; skipping sync."
+              prs=""
+            fi
+          elif [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+            prs="${PR_FROM_DISPATCH}"
+          else
+            prs="${PR_FROM_PR}"
+          fi
+
+          echo "prs<<EOF" >> "${GITHUB_OUTPUT}"
+          echo "${prs}" >> "${GITHUB_OUTPUT}"
+          echo "EOF" >> "${GITHUB_OUTPUT}"
+
+      - name: Sync priority labels
+        if: steps.resolve.outputs.prs != ''
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PRS: ${{ steps.resolve.outputs.prs }}
+        run: |
+          set -euo pipefail
+          while read -r pr; do
+            [[ -z "${pr}" ]] && continue
+            echo "Syncing PR #${pr}"
+            PR_NUMBER="${pr}" python3 .github/scripts/sync_pr_priority.py
+          done <<< "${PRS}"

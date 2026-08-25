@@ -1,3 +1,6 @@
+import type * as ReactRouterDomModule from "react-router-dom";
+import type * as WorkspacePickerModule from "./WorkspacePicker";
+
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
@@ -6,16 +9,20 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { forkSession, launchRunner } from "@/lib/sessionsApi";
-import { useAvailableAgents } from "@/hooks/useAvailableAgents";
+import {
+  useAvailableAgents,
+  prefetchAvailableAgentDetails,
+  type AvailableAgent,
+} from "@/hooks/useAvailableAgents";
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
-import { useHostFilesystem } from "@/hooks/useHostFilesystem";
+import { checkHostDirectory, useHostFilesystem } from "@/hooks/useHostFilesystem";
 
 const navigateMock = vi.fn();
 vi.mock("react-router-dom", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("react-router-dom")>();
+  const actual = await importOriginal<typeof ReactRouterDomModule>();
   return { ...actual, useNavigate: () => navigateMock };
 });
 vi.mock("@/lib/sessionsApi", () => ({ forkSession: vi.fn(), launchRunner: vi.fn() }));
@@ -27,12 +34,15 @@ vi.mock("@/hooks/useAgents", () => ({ useSessionAgent: vi.fn() }));
 vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
 vi.mock("@/hooks/useDirectorySessions", () => ({ useDirectorySessions: vi.fn() }));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({ useRunnerHealthRegistration: vi.fn() }));
-vi.mock("@/hooks/useHostFilesystem", () => ({ useHostFilesystem: vi.fn() }));
+vi.mock("@/hooks/useHostFilesystem", () => ({
+  useHostFilesystem: vi.fn(),
+  checkHostDirectory: vi.fn(),
+}));
 // The tree browser only mounts when browsing; coding-fork tests rely on the
 // directory being prefilled from the source, so the real picker never opens —
 // stub it anyway to keep its filesystem fetch out of the test.
 vi.mock("./WorkspacePicker", async (importActual) => ({
-  ...(await importActual<typeof import("./WorkspacePicker")>()),
+  ...(await importActual<typeof WorkspacePickerModule>()),
   WorkspacePicker: ({ onSelect }: { onSelect: (p: string) => void }) => (
     <button type="button" data-testid="mock-pick-workspace" onClick={() => onSelect("/picked")}>
       pick
@@ -48,6 +58,8 @@ const useHostsMock = vi.mocked(useHosts);
 const useDirectorySessionsMock = vi.mocked(useDirectorySessions);
 const useRunnerHealthMock = vi.mocked(useRunnerHealthRegistration);
 const useHostFilesystemMock = vi.mocked(useHostFilesystem);
+const checkHostDirectoryMock = vi.mocked(checkHostDirectory);
+const prefetchAvailableAgentDetailsMock = vi.mocked(prefetchAvailableAgentDetails);
 
 function host(overrides: Partial<Host> = {}): Host {
   return {
@@ -66,13 +78,14 @@ function setHosts(hosts: Host[]): void {
 // Source session runs claude-sdk (anthropic). The picker should keep all
 // SDK targets plus same-family native (claude-native) and hide the
 // cross-family native target (codex-native).
-const AVAILABLE_AGENTS = [
+const AVAILABLE_AGENTS: AvailableAgent[] = [
   {
     id: "ag_claude_sdk",
     name: "claude",
     display_name: "Claude",
     description: null,
     harness: "claude-sdk",
+    skills: [],
   },
   {
     id: "ag_claude_native",
@@ -80,6 +93,7 @@ const AVAILABLE_AGENTS = [
     display_name: "Claude Code",
     description: null,
     harness: "claude-native",
+    skills: [],
   },
   {
     id: "ag_codex_native",
@@ -87,6 +101,7 @@ const AVAILABLE_AGENTS = [
     display_name: "Codex",
     description: null,
     harness: "codex-native",
+    skills: [],
   },
   {
     id: "ag_openai",
@@ -94,10 +109,11 @@ const AVAILABLE_AGENTS = [
     display_name: "GPT",
     description: null,
     harness: "openai-agents",
+    skills: [],
   },
 ];
 
-function setAgents(available: typeof AVAILABLE_AGENTS, sourceHarness: string | null): void {
+function setAgents(available: AvailableAgent[], sourceHarness: string | null): void {
   useAvailableAgentsMock.mockReturnValue({
     data: available,
   } as unknown as ReturnType<typeof useAvailableAgents>);
@@ -154,6 +170,11 @@ beforeEach(() => {
   forkSessionMock.mockReset();
   launchRunnerMock.mockReset();
   navigateMock.mockReset();
+  // The submit pre-flight passes by default; the nonexistent-directory
+  // test overrides it with a failure message.
+  checkHostDirectoryMock.mockReset();
+  checkHostDirectoryMock.mockResolvedValue(null);
+  prefetchAvailableAgentDetailsMock.mockReset();
   setAgents(AVAILABLE_AGENTS, "claude-sdk");
   // Defaults for the coding-fork wiring; the non-coding tests don't render
   // these fields but the hooks still run (with isCodingSource false).
@@ -208,6 +229,32 @@ describe("ForkSessionDialog", () => {
     expect(forkSessionMock).toHaveBeenCalledWith("conv_src", "My clone", undefined, undefined);
     // Session list refreshed so the fork shows in the sidebar, then navigated.
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
+    // A fork inherits the source's project, so the project-folder lists must
+    // refetch too — otherwise a filed fork stays missing from its folder.
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["project-sessions"] });
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
+  });
+
+  it("spins the submit button while the fork is in flight", async () => {
+    // The fork call can take seconds. Without the spinner the button only
+    // fades (disabled), which reads as a hang rather than work in progress.
+    type Fork = Awaited<ReturnType<typeof forkSession>>;
+    let settle: (value: Fork) => void = () => {};
+    forkSessionMock.mockReturnValue(
+      new Promise<Fork>((resolve) => {
+        settle = resolve;
+      }),
+    );
+
+    renderDialog();
+    const submit = screen.getByTestId("fork-session-submit");
+    fireEvent.click(submit);
+
+    await waitFor(() => expect(submit).toHaveAttribute("aria-busy", "true"));
+    expect(submit).toBeDisabled();
+    expect(screen.getByRole("status", { name: "Loading" })).toBeInTheDocument();
+
+    settle({ id: "conv_fork" } as Fork);
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
   });
 
@@ -330,6 +377,7 @@ describe("ForkSessionDialog", () => {
         display_name: "databricks_coding_agent",
         description: null,
         harness: "openai-agents",
+        skills: [],
       },
     ];
     setAgents(agents, "openai-agents");
@@ -413,6 +461,7 @@ describe("ForkSessionDialog", () => {
           display_name: "OpenCode",
           description: null,
           harness: "opencode-native",
+          skills: [],
         },
         {
           id: "ag_hermes",
@@ -420,6 +469,7 @@ describe("ForkSessionDialog", () => {
           display_name: "Hermes",
           description: null,
           harness: "hermes-native",
+          skills: [],
         },
       ],
       "claude-sdk",
@@ -429,6 +479,31 @@ describe("ForkSessionDialog", () => {
 
     expect(screen.getByTestId("fork-session-agent-option-ag_opencode")).toBeInTheDocument();
     expect(screen.getByTestId("fork-session-agent-option-ag_hermes")).toBeInTheDocument();
+  });
+
+  it("prefetches harness details for all agents on mount so custom agents appear", async () => {
+    // Custom agents discovered from session scans start with harness=null and
+    // a sessionId. Without eager prefetch, forkTargetCarriesHistory(null)
+    // returns false and they never appear in the fork picker.
+    const customAgent: AvailableAgent = {
+      id: "ag_custom",
+      name: "my-agent",
+      display_name: "My Agent",
+      description: null,
+      harness: null,
+      skills: [],
+      sessionId: "conv_custom",
+    };
+    setAgents([...AVAILABLE_AGENTS, customAgent], "claude-sdk");
+
+    renderDialog();
+
+    await waitFor(() =>
+      expect(prefetchAvailableAgentDetailsMock).toHaveBeenCalledWith(
+        expect.objectContaining({ id: "ag_custom" }),
+        expect.anything(),
+      ),
+    );
   });
 
   it("passes the chosen agent_id when switching agent", async () => {
@@ -579,12 +654,124 @@ describe("ForkSessionDialog", () => {
       fireEvent.click(screen.getByTestId("fork-session-submit"));
 
       await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
-      // Base ref defaults to the source's branch ("main"); the named branch
-      // makes the host create an isolated worktree.
+      // The base ref is sent automatically from the source's branch ("main");
+      // the named branch makes the host create an isolated worktree.
       expect(launchRunnerMock).toHaveBeenCalledWith("host_1", "conv_fork", "/repo", {
         branchName: "feature/x",
         baseBranch: "main",
       });
+    });
+
+    // Source session that ran in a server-created worktree: its workspace is
+    // the worktree dir and gitBranch the branch checked out there.
+    const WORKTREE_CODING = {
+      sourceTitle: "My session",
+      sourceWorkspace: "/Users/a/repo-worktrees/fix-1",
+      sourceHostId: "host_1",
+      sourceGitBranch: "fix-1",
+    };
+
+    it("prefills a worktree-backed source as original repo + source branch", () => {
+      renderDialog(WORKTREE_CODING);
+      openAdvanced();
+      // The working directory shows the repo the worktree came from, and the
+      // worktree field carries the source branch — not the worktree path as
+      // the directory with a blank branch.
+      expect(screen.getByTestId("workspace-path-input")).toHaveValue("/Users/a/repo");
+      expect(screen.getByTestId("fork-session-branch-input")).toHaveValue("fix-1");
+    });
+
+    it("binds the clone to the source's existing worktree when left untouched", async () => {
+      forkSessionMock.mockResolvedValue({
+        id: "conv_fork",
+      } as unknown as Awaited<ReturnType<typeof forkSession>>);
+      launchRunnerMock.mockResolvedValue({ runnerId: "r1" });
+      renderDialog(WORKTREE_CODING);
+
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+      await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
+      // The prefilled branch already exists, so no git options are sent —
+      // the clone binds straight to the source's worktree directory. The
+      // pre-flight probed that same directory.
+      expect(launchRunnerMock).toHaveBeenCalledWith(
+        "host_1",
+        "conv_fork",
+        "/Users/a/repo-worktrees/fix-1",
+        undefined,
+      );
+      expect(checkHostDirectoryMock).toHaveBeenCalledWith(
+        "host_1",
+        "/Users/a/repo-worktrees/fix-1",
+      );
+    });
+
+    it("creates a fresh worktree off the source branch when the branch is renamed", async () => {
+      forkSessionMock.mockResolvedValue({
+        id: "conv_fork",
+      } as unknown as Awaited<ReturnType<typeof forkSession>>);
+      launchRunnerMock.mockResolvedValue({ runnerId: "r1" });
+      renderDialog(WORKTREE_CODING);
+
+      openAdvanced();
+      fireEvent.change(screen.getByTestId("fork-session-branch-input"), {
+        target: { value: "feature/x" },
+      });
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+      await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
+      // A NEW branch name → worktree created off the original repo, based on
+      // the source's branch so the clone starts from where it left off.
+      expect(launchRunnerMock).toHaveBeenCalledWith("host_1", "conv_fork", "/Users/a/repo", {
+        branchName: "feature/x",
+        baseBranch: "fix-1",
+      });
+    });
+
+    it("recognizes a worktree source without gitBranch (fork-of-fork) via the path", async () => {
+      // A fork bound into an existing worktree carries NO git_branch (the
+      // bind sends no git options), so forking the fork must recover both
+      // the repo and the branch from the worktree path convention — the
+      // branch falls back to the worktree's directory name.
+      forkSessionMock.mockResolvedValue({
+        id: "conv_fork",
+      } as unknown as Awaited<ReturnType<typeof forkSession>>);
+      launchRunnerMock.mockResolvedValue({ runnerId: "r1" });
+      renderDialog({ ...WORKTREE_CODING, sourceGitBranch: null });
+
+      openAdvanced();
+      expect(screen.getByTestId("workspace-path-input")).toHaveValue("/Users/a/repo");
+      expect(screen.getByTestId("fork-session-branch-input")).toHaveValue("fix-1");
+
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+      await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
+      // Untouched → same aliasing as a gitBranch-carrying source: bind the
+      // exact source worktree directory with no git options.
+      expect(launchRunnerMock).toHaveBeenCalledWith(
+        "host_1",
+        "conv_fork",
+        "/Users/a/repo-worktrees/fix-1",
+        undefined,
+      );
+    });
+
+    it("refuses to create the fork when the directory doesn't exist", async () => {
+      checkHostDirectoryMock.mockResolvedValue(
+        "The working directory /repo doesn't exist on this host.",
+      );
+      renderDialog(CODING);
+
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+      await waitFor(() =>
+        expect(screen.getByTestId("fork-session-error")).toHaveTextContent("doesn't exist"),
+      );
+      // Nothing was created: no fork, no launch, no navigation — the inputs
+      // stay editable so the user can fix the path and resubmit.
+      expect(forkSessionMock).not.toHaveBeenCalled();
+      expect(launchRunnerMock).not.toHaveBeenCalled();
+      expect(navigateMock).not.toHaveBeenCalled();
     });
 
     it("disables the fork button and shows connect-host instructions when no host is online", () => {
@@ -630,7 +817,7 @@ describe("ForkSessionDialog", () => {
       expect(screen.getByTestId("fork-session-submit")).toBeDisabled();
     });
 
-    it("clears the worktree fields when the host changes (no stale base ref)", () => {
+    it("clears the worktree branch when the host changes (no stale source branch)", () => {
       // Two online hosts; source ran on host_1 with branch "main" (prefills
       // the base ref). Switching to host_2 must reset the worktree fields so a
       // base ref from the source machine can't launch a worktree on another.

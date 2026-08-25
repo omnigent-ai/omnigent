@@ -5,11 +5,12 @@ struct WebShellView: View {
   let connectToNewServer: () -> Void
   let switchToServer: (URL) -> Void
   let loadFailed: (URL, String) -> Void
-  let loadSucceeded: (URL) -> Void
+  let loadSucceeded: () -> Void
 
   @Environment(\.colorScheme) private var colorScheme
   @EnvironmentObject private var settings: SettingsStore
   @EnvironmentObject private var router: AppRouter
+  @EnvironmentObject private var managedConfiguration: ManagedConfigurationProvider
   @StateObject private var model = WebViewModel()
   /// A deep-link path that arrived while the page was still loading — emitted
   /// to the SPA once `isLoading` flips false, so a cold-start / mid-load deep
@@ -31,7 +32,8 @@ struct WebShellView: View {
 
         ServerSwitcher(
           currentURL: model.currentURL ?? initialURL,
-          recents: settings.recentServers,
+          recents: ManagedServers.merged(
+            managed: managedConfiguration.serverURLs, recents: settings.recentServers),
           isLoading: model.isLoading,
           maxWidth: ServerSwitcherMetrics.maxWidth(for: geometry.size.width),
           switchServer: switchServer,

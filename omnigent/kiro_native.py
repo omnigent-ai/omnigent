@@ -6,17 +6,18 @@ import asyncio
 import json
 import os
 import shutil
+import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any
 
 import click
 import httpx
 import yaml
 
 from omnigent._native_resume_hint import echo_native_cold_resume_hint, echo_native_resume_hint
+from omnigent._platform import resolve_cli_binary
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
 from omnigent._wrapper_labels import KIRO_NATIVE_WRAPPER_VALUE as _WRAPPER_LABEL_VALUE
 from omnigent._wrapper_labels import WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY
@@ -25,9 +26,11 @@ from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.host.daemon_launch import (
     error_text,
     launch_or_reuse_daemon_runner,
+    open_daemon_client,
     wait_for_host_online,
     wait_for_runner_online,
 )
+from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.native_coding_agents import native_shell_terminal_spec
 from omnigent.native_terminal import (
     DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
@@ -39,51 +42,14 @@ from omnigent.native_terminal import (
     DAEMON_TERMINAL_READY_TIMEOUT_S as _DAEMON_TERMINAL_READY_TIMEOUT_S,
 )
 from omnigent.native_terminal import bind_session_runner as _bind_session_runner
+from omnigent.native_terminal import (
+    normalize_extra_args as _normalize_extra_args,
+)
 from omnigent.native_terminal import url_component
 
 _DEFAULT_KIRO_COMMAND = "kiro-cli"
 _KIRO_PATH_ENV = "OMNIGENT_KIRO_PATH"
 _AGENT_NAME = "kiro-native-ui"
-
-# Curated kiro-cli base models for the Web UI picker. Static (like cursor-native,
-# the other launch-only-model vendor) rather than runner-discovered: the list is
-# global and fixed, not account-scoped. ids match what ``kiro-cli --model`` accepts
-# (and ``--list-models`` reports); ``auto`` is kiro's default and a real literal id.
-# Refresh by hand from ``kiro-cli chat --list-models --format json`` if Kiro
-# ships/renames a model.
-_KIRO_BASE_MODELS: list[dict[str, Any]] = [
-    {"id": "auto", "displayName": "Auto", "isDefault": True},
-    {"id": "claude-sonnet-4.5", "displayName": "Claude Sonnet 4.5"},
-    {"id": "claude-sonnet-4", "displayName": "Claude Sonnet 4"},
-    {"id": "claude-haiku-4.5", "displayName": "Claude Haiku 4.5"},
-    {"id": "deepseek-3.2", "displayName": "DeepSeek V3.2"},
-    {"id": "minimax-m2.5", "displayName": "MiniMax M2.5"},
-    {"id": "minimax-m2.1", "displayName": "MiniMax M2.1"},
-    {"id": "glm-5", "displayName": "GLM-5"},
-    {"id": "qwen3-coder-next", "displayName": "Qwen3 Coder Next"},
-]
-
-
-def kiro_base_model_options() -> list[dict[str, Any]]:
-    """Return the curated kiro base-model options for the Web UI picker.
-
-    Mirrors :func:`omnigent.cursor_native.cursor_base_model_options`: each option
-    carries ``id`` (the value ``kiro-cli --model`` accepts), ``displayName``, and
-    ``isDefault``/``isCurrent`` flags. kiro applies the model only at launch, so
-    the picked id is persisted as ``model_override`` and consumed by the runner.
-
-    :returns: Fresh option dicts (callers may mutate); base order preserved.
-    """
-    return [
-        {
-            "id": m["id"],
-            "displayName": m["displayName"],
-            "isDefault": bool(m.get("isDefault", False)),
-            "isCurrent": False,
-        }
-        for m in _KIRO_BASE_MODELS
-    ]
-
 
 _TERMINAL_NAME = "kiro"
 _TERMINAL_SESSION_KEY = "main"
@@ -151,13 +117,69 @@ def resolve_kiro_executable(
     env = os.environ if env is None else env
     which = shutil.which if which is None else which
     command = _configured_kiro_command(env)
-    resolved = which(command)
+    resolved = resolve_cli_binary(command, which=which)
     if resolved is None:
         raise click.ClickException(
             "Native Kiro requires the 'kiro-cli' CLI on PATH. Install and login to "
             f"Kiro, or set {_KIRO_PATH_ENV}=/path/to/kiro-cli."
         )
     return resolved
+
+
+def list_kiro_cli_model_options(
+    *,
+    env: Mapping[str, str] | None = None,
+    timeout_s: float = 10.0,
+) -> list[_JsonObject]:
+    """Discover Kiro picker options from the installed CLI."""
+    executable = resolve_kiro_executable(env=env)
+    completed = subprocess.run(
+        [executable, "chat", "--list-models", "--format", "json"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=timeout_s,
+        env=dict(env) if env is not None else None,
+    )
+    payload = json.loads(completed.stdout)
+    raw_models = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(raw_models, list):
+        raise ValueError("Kiro model list must contain a models array")
+    default_model = payload.get("default_model")
+    default_id = default_model.strip() if isinstance(default_model, str) else None
+    options: list[_JsonObject] = []
+    for raw_model in raw_models:
+        if not isinstance(raw_model, dict):
+            continue
+        raw_id = raw_model.get("model_id")
+        if not isinstance(raw_id, str) or not raw_id.strip():
+            continue
+        model_id = raw_id.strip()
+        raw_name = raw_model.get("model_name")
+        display_name = (
+            raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else model_id
+        )
+        option: _JsonObject = {
+            "id": model_id,
+            "displayName": display_name,
+            "isDefault": model_id == default_id,
+        }
+        description = raw_model.get("description")
+        if isinstance(description, str) and description.strip():
+            option["description"] = description.strip()
+        context_window = raw_model.get("context_window_tokens")
+        if isinstance(context_window, int) and context_window > 0:
+            option["contextWindow"] = context_window
+        rate_multiplier = raw_model.get("rate_multiplier")
+        if isinstance(rate_multiplier, (int, float)):
+            option["rateMultiplier"] = rate_multiplier
+        rate_unit = raw_model.get("rate_unit")
+        if isinstance(rate_unit, str) and rate_unit.strip():
+            option["rateUnit"] = rate_unit.strip()
+        options.append(option)
+    if not options:
+        raise ValueError("Kiro model list did not contain any valid models")
+    return options
 
 
 def build_kiro_launch(
@@ -186,13 +208,17 @@ def run_kiro_native(
     *,
     server: str | None,
     session_id: str | None,
-    kiro_args: tuple[str, ...],
+    extra_args: tuple[str, ...] | None = None,
+    kiro_args: tuple[str, ...] | None = None,
     resume_picker: bool = False,
     model: str | None = None,
     prompt: str | None = None,
     auto_open_conversation: bool = False,
 ) -> None:
     """Launch the Kiro TUI in an Omnigent terminal."""
+    kiro_args = _normalize_extra_args(
+        extra_args=extra_args, legacy_args=kiro_args, legacy_param="kiro_args"
+    )
     _preflight_local_tools()
     if server is None:
         raise click.ClickException(
@@ -219,7 +245,7 @@ def _materialize_kiro_agent_spec(tmpdir: Path, *, model: str | None = None) -> P
     executor: dict[str, str] = {"harness": "kiro-native"}
     if model:
         executor["model"] = model
-    raw: dict[str, Any] = {
+    raw: _JsonObject = {
         "name": _AGENT_NAME,
         "prompt": (
             "Kiro is running in the session terminal. The user drives the kiro-cli TUI directly."
@@ -255,7 +281,7 @@ def _run_with_remote_server(
     from omnigent.cli import _ensure_host_daemon
     from omnigent.host.identity import load_or_create_host_identity
 
-    headers = _remote_headers(server_url=base_url)
+    headers = _remote_headers(server_url=base_url, host_id=None)
     try:
         resolved_session_id = _resolve_session_id_for_resume(
             base_url=base_url,
@@ -330,17 +356,21 @@ async def _prepare_kiro_terminal_via_daemon(
     if prompt:
         persist_args.append(prompt)
     timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout) as client:
+    async with open_daemon_client(base_url, headers, host_id, timeout=timeout) as client:
         reattached = False
         cold_resumed = False
+        fresh_session = session_id is None
         if session_id is None:
             if session_bundle is None:
                 raise click.ClickException("Creating a Kiro session requires a session bundle.")
             _update_startup_progress(startup_progress, "Creating Kiro session...")
-            session_id = await _create_kiro_session(
-                client,
-                session_bundle,
-                terminal_launch_args=persist_args or None,
+            session_id, _ = await asyncio.gather(
+                _create_kiro_session(
+                    client,
+                    session_bundle,
+                    terminal_launch_args=persist_args or None,
+                ),
+                wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S),
             )
         else:
             _update_startup_progress(startup_progress, "Loading Kiro session...")
@@ -382,13 +412,15 @@ async def _prepare_kiro_terminal_via_daemon(
                         f"({resp.status_code}): {error_text(resp)}"
                     )
 
-        await wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S)
+        if not fresh_session:
+            await wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S)
         _update_startup_progress(startup_progress, "Starting runner...")
         runner_id = await launch_or_reuse_daemon_runner(
             client,
             host_id=host_id,
             session_id=session_id,
             workspace=workspace,
+            fresh=fresh_session,
         )
         _update_startup_progress(startup_progress, "Waiting for runner...")
         await wait_for_runner_online(client, runner_id, timeout_s=_DAEMON_RUNNER_ONLINE_TIMEOUT_S)
@@ -418,7 +450,7 @@ async def _create_kiro_session(
     terminal_launch_args: list[str] | None = None,
 ) -> str:
     """Create a bundled terminal-first kiro-native session."""
-    metadata: dict[str, Any] = {"labels": dict(_SESSION_LABELS)}
+    metadata: _JsonObject = {"labels": dict(_SESSION_LABELS)}
     if terminal_launch_args:
         metadata["terminal_launch_args"] = terminal_launch_args
     resp = await client.post(
@@ -438,7 +470,7 @@ async def _create_kiro_session(
     return new_session_id
 
 
-async def _fetch_kiro_session(client: httpx.AsyncClient, session_id: str) -> dict[str, Any]:
+async def _fetch_kiro_session(client: httpx.AsyncClient, session_id: str) -> _JsonObject:
     """Fetch an existing Omnigent session."""
     resp = await client.get(f"/v1/sessions/{url_component(session_id)}")
     if resp.status_code == 404:

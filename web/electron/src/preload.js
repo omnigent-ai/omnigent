@@ -162,6 +162,17 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
       ipcRenderer.on("omnigent:update-status", listener);
       return () => ipcRenderer.removeListener("omnigent:update-status", listener);
     },
+    /** Current shell-owned update-overlay card height in CSS pixels. */
+    getOverlayHeight: () => ipcRenderer.invoke("omnigent:get-update-overlay-height"),
+    /** Subscribe to overlay height changes; returns an unsubscribe function. */
+    onOverlayHeight: (callback) => {
+      const listener = (_event, height) => {
+        const normalized = Math.max(0, Math.round(Number(height) || 0));
+        callback(normalized);
+      };
+      ipcRenderer.on("omnigent:update-overlay-height", listener);
+      return () => ipcRenderer.removeListener("omnigent:update-overlay-height", listener);
+    },
   },
   /**
    * Report the web app's resolved color scheme so the shell can mirror it via
@@ -195,6 +206,13 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    */
   browserSetActive: (conversationId) =>
     ipcRenderer.invoke("omnigent:browser-set-active", { conversationId }),
+  /**
+   * Hide (true) or show (false) the active browser view while a DOM overlay is
+   * open, so the native layer doesn't cover dialogs/menus/tooltips/toasts.
+   * @param {boolean} suppressed
+   */
+  browserSetSuppressed: (suppressed) =>
+    ipcRenderer.invoke("omnigent:browser-set-suppressed", { suppressed }),
   /**
    * Reposition the conversation's view to freshly-measured placeholder bounds.
    * @param {string} conversationId
@@ -406,6 +424,8 @@ contextBridge.exposeInMainWorld("omnigentSetup", {
   setServerUrl: (url) => ipcRenderer.invoke("omnigent:set-server-url", url),
   /** Recently-connected server URLs, most recent first. */
   getRecentServers: () => ipcRenderer.invoke("omnigent:get-recent-servers"),
+  /** Copy text from the bundled setup page to the native clipboard. */
+  copyText: (text) => ipcRenderer.invoke("omnigent:copy-setup-text", text),
   /**
    * Whether the `omnigent` CLI is installed/runnable, e.g.
    * `{installed, path, version, source, installCommand}`.

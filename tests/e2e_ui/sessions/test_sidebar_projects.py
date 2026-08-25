@@ -28,6 +28,8 @@ import uuid
 import httpx
 from playwright.sync_api import Locator, Page, expect
 
+from tests.e2e_ui.conftest import seed_committed_turn
+
 
 def _set_title(base_url: str, session_id: str, title: str) -> None:
     """Give a session a unique title via ``PATCH /v1/sessions/{id}`` so its row
@@ -108,6 +110,72 @@ def test_move_session_into_new_project(
 
     expect(_section(page, project).locator(f'a[href="/c/{session_id}"]')).to_be_visible()
     expect(_section(page, "Sessions").locator(f'a[href="/c/{session_id}"]')).to_have_count(0)
+
+
+def test_fork_of_filed_session_joins_the_folder_without_reload(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Forking a filed session shows the clone in the same folder, live.
+
+    Two halves, both needed for the clone to land where the user is looking:
+    the server files the fork into the source's project, and the client
+    refreshes that folder's own ``["project-sessions", <name>]`` list. A folder
+    list has no poll — it converges only on an explicit invalidation — and the
+    push stream can't cover this one either (it skips the active session, which
+    the fork becomes on navigate). So a fork-time invalidation is the only thing
+    that puts the row there before a reload.
+
+    Failure modes this catches:
+
+    - The fork route drops the source's ``project_id``, so the clone is
+      unfiled and surfaces under "Sessions" instead of the folder.
+    - The fork dialog refreshes only the flat session list, leaving the folder
+      stale until the user reloads or navigates away and back.
+
+    :param page: Playwright page fixture (fresh context per test).
+    :param seeded_session: ``(base_url, session_id)`` for a pre-created
+        runner-bound ``hello_world`` session.
+    """
+    base_url, session_id = seeded_session
+    title = f"e2e-proj-fork-{uuid.uuid4().hex[:8]}"
+    _set_title(base_url, session_id, title)
+    project = f"Project {uuid.uuid4().hex[:6]}"
+
+    # "Fork from here" is the only fork entry point and it anchors on a
+    # COMMITTED assistant response. What's under test is the sidebar, not the
+    # model, so seed the exchange instead of driving a turn.
+    seed_committed_turn(session_id, prompt="ping", reply="pong")
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    assistant = page.locator('[data-testid="message-bubble"][data-role="assistant"]')
+    expect(assistant).to_have_count(1, timeout=30_000)
+
+    _move_to_new_project(page, _row(page, session_id), project)
+    expect(_section(page, project).locator(f'a[href="/c/{session_id}"]')).to_be_visible()
+
+    reply = assistant.nth(0)
+    reply.hover()
+    reply.get_by_test_id("fork-from-response").click()
+    dialog = page.get_by_test_id("fork-session-dialog")
+    expect(dialog).to_be_visible()
+    page.get_by_test_id("fork-session-submit").click()
+
+    # Land in the clone — a URL still on the source means the fork never
+    # happened, so the folder assertion below would pass vacuously.
+    expect(page).to_have_url(
+        re.compile(rf"/c/(?!{re.escape(session_id)})[0-9a-f]{{32}}"),
+        timeout=30_000,
+    )
+    fork_id = page.url.rsplit("/c/", 1)[1].split("?", 1)[0]
+
+    # The whole point: the clone's row is under the SAME folder, and no reload
+    # or re-navigation happens between the fork and this assertion.
+    expect(_section(page, project).locator(f'a[href="/c/{fork_id}"]')).to_be_visible(
+        timeout=20_000
+    )
+    expect(_section(page, "Sessions").locator(f'a[href="/c/{fork_id}"]')).to_have_count(0)
 
 
 def test_remove_session_from_project(

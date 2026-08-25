@@ -23,7 +23,6 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
 
 from omnigent._platform import stable_user_id
 
@@ -109,7 +108,7 @@ def write_tmux_target(
 ) -> None:
     """Advertise the tmux socket + target for the running Goose terminal."""
     _ensure_dir(bridge_dir)
-    payload: dict[str, Any] = {
+    payload: dict[str, object] = {
         "socket_path": str(socket_path),
         "tmux_target": tmux_target,
         "updated_at": time.time(),

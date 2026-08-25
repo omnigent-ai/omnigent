@@ -9,8 +9,8 @@
 // this output existing (see electron/package.json build.files + the
 // electron-build workflow).
 //
-// Kept separate from the main app build (vite.config.ts) so it emits no PWA
-// service worker / manifest and writes to the shell dir rather than dist/.
+// Kept separate from the main app build (vite.config.ts) so it emits no service
+// worker and writes to the shell dir rather than dist/.
 
 import path from "node:path";
 import tailwindcss from "@tailwindcss/vite";

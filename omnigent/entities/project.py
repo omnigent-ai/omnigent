@@ -20,7 +20,7 @@ class Project:
 
     :param id: UUID primary key (bare 32-char hex string, no dashes).
     :param name: Human-readable project name, unique per owner.
-    :param owner_user_id: User the project belongs to, e.g.
+    :param user_id: User the project belongs to, e.g.
         ``"alice@example.com"``. ``None`` in single-user mode. Ownership is
         stamped on the row (not derived from a permission table) because
         projects are owner-private and carry no ACL of their own.
@@ -36,7 +36,7 @@ class Project:
 
     id: str
     name: str
-    owner_user_id: str | None
+    user_id: str | None
     created_at: int
     updated_at: int | None = None
     config: dict[str, Any] = field(default_factory=dict)

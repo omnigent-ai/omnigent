@@ -26,6 +26,33 @@ def _row(page: Page, session_id: str) -> Locator:
     return page.locator("li").filter(has=page.locator(f'a[href="/c/{session_id}"]'))
 
 
+# Records the row's rendered title once per animation frame, so a title that is
+# only wrong for a frame is still observable. Reads the title span's own text
+# nodes to skip the screen-reader "(unread)" suffix, and flags whether the
+# inline edit field was mounted at that frame.
+_FRAME_SAMPLER = """
+(sessionId) => {
+  window.__renameSamples = [];
+  const tick = () => {
+    const link = document.querySelector(`a[href="/c/${sessionId}"]`);
+    const span = link && (link.querySelector('span.relative') || link.querySelector('span'));
+    window.__renameSamples.push({
+      text: span
+        ? Array.from(span.childNodes)
+            .filter((n) => n.nodeType === 3)
+            .map((n) => n.textContent)
+            .join('')
+            .trim()
+        : null,
+      editing: !!document.querySelector('[data-testid="rename-conversation-input"]'),
+    });
+    window.__renameRaf = requestAnimationFrame(tick);
+  };
+  window.__renameRaf = requestAnimationFrame(tick);
+}
+"""
+
+
 def test_rename_session_is_preserved(
     page: Page,
     seeded_session: tuple[str, str],
@@ -76,4 +103,58 @@ def test_rename_session_is_preserved(
     snap.raise_for_status()
     assert snap.json().get("title") == new_title, (
         f"server should persist the renamed title {new_title!r}, got {snap.json().get('title')!r}"
+    )
+
+
+def test_rename_row_never_repaints_the_old_title(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The row must not flash the pre-rename name as the editor closes.
+
+    The rename's cache write reaches the row as a prop from the sidebar
+    list above it, which re-renders a tick after the row's own
+    "close the editor" state change. Before the row held the committed
+    title locally, that one-frame gap repainted the old name.
+
+    Sampling per animation frame is what makes this visible at all: the
+    auto-retrying ``expect`` above re-polls until the new title lands, so
+    it passes with or without the flicker.
+
+    :param page: Playwright page fixture (fresh context per test).
+    :param seeded_session: ``(base_url, session_id)`` for a pre-created
+        runner-bound session.
+    """
+    base_url, session_id = seeded_session
+    new_title = f"e2e-noflicker-{uuid.uuid4().hex[:8]}"
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    row = _row(page, session_id)
+    expect(row).to_be_visible()
+    link = page.locator(f'a[href="/c/{session_id}"]')
+    old_title = link.inner_text().strip()
+
+    row.hover()
+    row.get_by_test_id("conversation-actions").click()
+    page.get_by_test_id("rename-conversation").click()
+    edit = page.get_by_test_id("rename-conversation-input")
+    expect(edit).to_be_visible()
+
+    page.evaluate(_FRAME_SAMPLER, session_id)
+    edit.fill(new_title)
+    edit.press("Enter")
+    expect(link).to_contain_text(new_title)
+
+    samples = page.evaluate(
+        "() => { cancelAnimationFrame(window.__renameRaf); return window.__renameSamples; }"
+    )
+    edit_frames = [i for i, s in enumerate(samples) if s["editing"]]
+    assert edit_frames, "sampler never observed the inline edit field — rename did not open"
+
+    after_commit = samples[edit_frames[-1] + 1 :]
+    stale = [s for s in after_commit if s["text"] == old_title]
+    assert not stale, (
+        f"row repainted the pre-rename title {old_title!r} for {len(stale)} frame(s) after "
+        f"the editor closed; frames after commit: {[s['text'] for s in after_commit[:5]]}"
     )

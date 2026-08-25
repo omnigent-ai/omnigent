@@ -14,8 +14,8 @@
 // images re-serialise with normalised attribute order/quoting, so the
 // guarantee is attribute preservation, not whole-tag byte identity.)
 
-import Image from "@tiptap/extension-image";
-import Link from "@tiptap/extension-link";
+import { Image } from "@tiptap/extension-image";
+import { Link } from "@tiptap/extension-link";
 import type { AnyExtension } from "@tiptap/core";
 import { fetchFileContent, fileContentToBlob } from "@/hooks/useFileContent";
 
@@ -252,6 +252,7 @@ export function createWorkspaceImageExtension(
       };
       return ({ node, HTMLAttributes }) => {
         const img = document.createElement("img");
+        let currentNode = node;
         for (const [key, value] of Object.entries(HTMLAttributes)) {
           // src is handled below: workspace paths must go through the
           // authenticated fetch, never directly onto the DOM.
@@ -296,7 +297,7 @@ export function createWorkspaceImageExtension(
           // src change returns false so the view is destroyed (revoking the
           // old URL) and recreated, refetching through the path above.
           update(newNode) {
-            if (newNode.type !== node.type || newNode.attrs.src !== src) return false;
+            if (newNode.type !== currentNode.type || newNode.attrs.src !== src) return false;
             for (const [key, value] of Object.entries(newNode.attrs)) {
               if (key === "src") continue;
               if (value == null) {
@@ -308,7 +309,7 @@ export function createWorkspaceImageExtension(
                 applyAttr(img, key, value);
               }
             }
-            node = newNode;
+            currentNode = newNode;
             return true;
           },
           destroy() {

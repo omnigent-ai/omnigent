@@ -506,7 +506,7 @@ class E2BSandboxLauncher(SandboxLauncher):
         env_vars = self._resolve_sandbox_env()
         click.echo(f"▸ Creating E2B sandbox '{name}' from template '{template}'")
         sandbox = self._create_sandbox(template, resolve_max_lifetime_s(), name, env_vars)
-        sandbox_id = sandbox.sandbox_id
+        sandbox_id = str(sandbox.sandbox_id)
         self._sandboxes[sandbox_id] = sandbox
         click.echo(f"  → created {sandbox_id}")
         return sandbox_id

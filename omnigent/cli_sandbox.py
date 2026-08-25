@@ -19,6 +19,7 @@ import click
 
 from omnigent.inner import ui
 from omnigent.onboarding.sandboxes import (
+    SandboxHostLauncher,
     SandboxLauncher,
     available_providers,
     get_launcher,
@@ -82,7 +83,7 @@ def _resolve_repo_root(repo_root: Path | None) -> Path:
     return resolved
 
 
-def _require_cli_bootstrap(launcher: SandboxLauncher) -> None:
+def _require_cli_bootstrap(launcher: SandboxHostLauncher) -> SandboxLauncher:
     """
     Reject managed-only providers up front with an actionable message.
 
@@ -92,10 +93,11 @@ def _require_cli_bootstrap(launcher: SandboxLauncher) -> None:
     opaque capability error after real work already ran.
 
     :param launcher: The resolved provider launcher.
+    :returns: The same launcher narrowed to the CLI bootstrap contract.
     :raises click.ClickException: When the provider has no CLI
         bootstrap flow.
     """
-    if not launcher.capabilities.cli_bootstrap:
+    if not launcher.capabilities.cli_bootstrap or not isinstance(launcher, SandboxLauncher):
         raise click.ClickException(
             f"The '{launcher.provider}' provider supports server-managed "
             "sessions only — create one with "
@@ -103,6 +105,7 @@ def _require_cli_bootstrap(launcher: SandboxLauncher) -> None:
             "UI's New Sandbox option) against a server configured with "
             f"`sandbox.provider: {launcher.provider}`."
         )
+    return launcher
 
 
 def _normalize_server_url(server_url: str) -> str:
@@ -269,10 +272,9 @@ def sandbox_create(
 
     app_url = _normalize_server_url(server_url)
     workspace = derive_workspace(app_url)
-    launcher = get_launcher(
-        provider, workspace_host=workspace.host if workspace is not None else None
+    launcher = _require_cli_bootstrap(
+        get_launcher(provider, workspace_host=workspace.host if workspace is not None else None)
     )
-    _require_cli_bootstrap(launcher)
     # The in-sandbox login only exists for providers that can forward
     # the browser's callback port — others skip it automatically, no
     # --no-auth acknowledgement required.
@@ -329,10 +331,9 @@ def sandbox_auth(
 
     app_url = _normalize_server_url(server_url)
     workspace = derive_workspace(app_url)
-    launcher = get_launcher(
-        provider, workspace_host=workspace.host if workspace is not None else None
+    launcher = _require_cli_bootstrap(
+        get_launcher(provider, workspace_host=workspace.host if workspace is not None else None)
     )
-    _require_cli_bootstrap(launcher)
     login_app_oauth_in_sandbox(
         launcher,
         sandbox_id,
@@ -395,10 +396,9 @@ def sandbox_connect(
     # there) — the local `lakebox ssh` transport must resolve through
     # the same workspace to find it.
     workspace = derive_workspace(app_url)
-    launcher = get_launcher(
-        provider, workspace_host=workspace.host if workspace is not None else None
+    launcher = _require_cli_bootstrap(
+        get_launcher(provider, workspace_host=workspace.host if workspace is not None else None)
     )
-    _require_cli_bootstrap(launcher)
     connect_sandbox_host(
         launcher,
         sandbox_id,

@@ -17,15 +17,19 @@ import base64
 import binascii
 import contextlib
 import logging
+import os
 import random
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import TypeAlias
 from urllib.parse import quote, urlsplit, urlunsplit
 
+from starlette.types import ASGIApp, Message, Scope
 from websockets.exceptions import ConnectionClosedOK, InvalidURI, WebSocketException
 
+from omnigent.debug_logging import runner_primary_session_id
 from omnigent.runner.identity import (
     OMNIGENT_INTERNAL_WS_ORIGIN,
+    RUNNER_SLICE_KEY_ENV_VAR,
     RUNNER_TUNNEL_TOKEN_HEADER,
 )
 from omnigent.runner.transports.ws_tunnel.frames import (
@@ -50,18 +54,12 @@ from omnigent.runner.transports.ws_tunnel.limits import (
     TUNNEL_KEEPALIVE_PING_INTERVAL_S,
     TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
 )
+from omnigent.suspend_watch import watch_for_resume
+from omnigent.tls import client_ssl_context
 
 _logger = logging.getLogger(__name__)
 
-# ASGI app type — async callable with the standard 3-arg shape.
-_ASGIApp = Callable[
-    [
-        dict[str, Any],
-        Callable[[], Awaitable[dict[str, Any]]],
-        Callable[[dict[str, Any]], Awaitable[None]],
-    ],
-    Awaitable[None],
-]
+_ASGIApp: TypeAlias = ASGIApp
 
 # Reconnect backoff: 0.5 s initial, 10 s cap, ±50% jitter. The
 # jitter spreads simultaneous reconnects from many runners across
@@ -79,8 +77,21 @@ _INITIAL_RECONNECT_DELAY_S = 0.5
 _MAX_RECONNECT_DELAY_S = 10.0
 _RECONNECT_JITTER_FRACTION = 0.5
 _FATAL_SERVER_CLOSE_CODES = {4001, 4002, 4004, 4500}
-_REFRESHABLE_HTTP_STATUSES = {401}
-_FATAL_SERVER_HTTP_STATUSES = {403}
+# Both 401 and 403 are treated as refreshable: the server may return 403
+# (not 401) when a previously-valid token expires while the machine is
+# offline or sleeping. A fresh token from the factory is obtained and the
+# connection is retried with normal backoff. After
+# _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS consecutive rejections a runner that
+# never upgraded gives up — a genuinely-forbidden runner must not
+# busy-reconnect forever.
+_REFRESHABLE_HTTP_STATUSES = {401, 403}
+# Maximum consecutive HTTP 401/403 rejections before a runner that has NEVER
+# completed an upgrade exits. A runner that HAS served this tunnel is exempt:
+# it already proved its credentials, so a later 401/403 is almost always a
+# network-path artifact (a dropped VPN whose proxy answers the upgrade before
+# it reaches the server) and exiting would kill every conversation on the
+# runner. Mirrors the host tunnel's status classification.
+_HTTP_AUTH_REJECTION_FATAL_ATTEMPTS = 3
 # Routine server-initiated recycles, NOT errors: 1012 "service restart" and
 # 1001 "going away" (and a 502 upgrade rejection) are how the Databricks Apps
 # ingress cycles long-lived WebSockets out from under a healthy app. The
@@ -112,9 +123,23 @@ RUNNER_TUNNEL_REJECTION_PREFIX = "runner tunnel rejected by server "
 # websockets library cannot follow. The common case on Databricks
 # Apps is an unauthenticated request being redirected to the OAuth
 # login page (``https://<workspace>/oidc/oauth2/v2.0/authorize?…``).
-# We detect that case and exit fatally instead of looping forever
-# against an endpoint we can never upgrade.
+# A runner that has already served this tunnel retries these with
+# refreshed credentials (an expired bearer surfaces as this redirect,
+# not a 401); a runner that never connected exits fatally after
+# ``_LOGIN_REDIRECT_FATAL_ATTEMPTS`` instead of looping forever
+# against an endpoint it can never upgrade.
 _AUTH_REDIRECT_SCHEMES = {"http", "https"}
+
+# Consecutive login-page redirects tolerated on a runner that has NEVER
+# completed a WS upgrade in this process. A single redirect can be a
+# server mid-restart (the Apps OAuth proxy answers before the app is
+# ready), so a couple of retries rule out a blip; past that, a runner
+# with no prior successful upgrade is almost certainly unauthenticated
+# and must fail loud. A runner that HAS connected keeps retrying with
+# refreshed credentials, so an expired bearer (e.g. after the machine
+# slept through a token's lifetime) never kills a live session — this
+# mirrors the host tunnel's ``_LOGIN_REDIRECT_FATAL_ATTEMPTS`` posture.
+_LOGIN_REDIRECT_FATAL_ATTEMPTS = 3
 
 
 async def dispatch_via_asgi(
@@ -132,7 +157,7 @@ async def dispatch_via_asgi(
     """
     body_bytes = decode_body(frame.body, frame.encoding) if frame.body is not None else b""
 
-    scope = {
+    scope: Scope = {
         "type": "http",
         "asgi": {"version": "3.0", "spec_version": "2.3"},
         "http_version": "1.1",
@@ -152,7 +177,7 @@ async def dispatch_via_asgi(
     response_headers_raw: list[tuple[bytes, bytes]] = []
     head_sent_to_ws: bool = False
 
-    async def receive() -> dict[str, Any]:
+    async def receive() -> Message:
         nonlocal body_sent
         if not body_sent:
             body_sent = True
@@ -168,10 +193,10 @@ async def dispatch_via_asgi(
         # can proxy harness SSE chunks. A real tunnel disconnect or
         # request.cancel frame cancels the dispatch task, which also
         # cancels this receive wait.
-        disconnect: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        disconnect: asyncio.Future[Message] = asyncio.get_running_loop().create_future()
         return await disconnect
 
-    async def send(event: dict[str, Any]) -> None:
+    async def send(event: Message) -> None:
         nonlocal head_sent_to_ws
         ev_type = event.get("type")
         if ev_type == "http.response.start":
@@ -258,6 +283,8 @@ async def serve_tunnel(
     on_activity: Callable[[], None] | None = None,
     shutdown_event: asyncio.Event | None = None,
     on_graceful_shutdown: Callable[[], None] | None = None,
+    direct_attach_port: int | None = None,
+    direct_attach_token: str | None = None,
 ) -> None:
     """Keep a runner WebSocket tunnel connected to a server.
 
@@ -312,22 +339,49 @@ async def serve_tunnel(
     """
     delay_s = _INITIAL_RECONNECT_DELAY_S
     tunnel_url = _tunnel_url(server_url, runner_id)
-    _connected_before = False
+    # Set on the first accepted WS upgrade. Distinguishes a runner that
+    # never authenticated (login redirects turn fatal after a short
+    # streak; no catch-up scan) from a live runner whose bearer expired
+    # mid-session (login redirects retry with refreshed credentials
+    # forever).
+    ever_connected = False
+    # Consecutive login-page redirects; reset by a successful upgrade.
+    login_redirect_streak = 0
+    # Consecutive HTTP 401/403 rejections; reset by a successful upgrade.
+    http_auth_rejection_streak = 0
+
+    def _mark_connected() -> None:
+        nonlocal ever_connected, login_redirect_streak, http_auth_rejection_streak
+        ever_connected = True
+        login_redirect_streak = 0
+        http_auth_rejection_streak = 0
+
+    # Set by the per-connection suspend watcher (in _serve_tunnel_once) when it
+    # aborts the live tunnel after a wake from system suspend. Read at the
+    # bottom of the loop to force a prompt reconnect (skip the backoff).
+    woke_from_suspend = False
+
+    def _note_resume_from_suspend() -> None:
+        nonlocal woke_from_suspend
+        woke_from_suspend = True
+
     while True:
         if shutdown_event is not None and shutdown_event.is_set():
             # A shutdown requested between reconnect attempts (no live
             # connection to drain): nothing to flush, just stop looping.
             return
         auth_token = await _refresh_auth_token(auth_token, auth_token_factory)
-        if _connected_before and on_reconnect is not None:
+        if ever_connected and on_reconnect is not None:
             try:
                 await on_reconnect()
             except Exception:
-                _logger.exception("on_reconnect callback failed")
+                _logger.exception(
+                    "on_reconnect callback failed",
+                    extra={"session_id": runner_primary_session_id()},
+                )
         retry_reason = "connection closed cleanly"
         recycle = False
         try:
-            _connected_before = True
             activity_kwargs = {"on_activity": on_activity} if on_activity is not None else {}
             await _serve_tunnel_once(
                 app,
@@ -339,6 +393,10 @@ async def serve_tunnel(
                 tunnel_token=tunnel_token,
                 shutdown_event=shutdown_event,
                 on_graceful_shutdown=on_graceful_shutdown,
+                on_connected=_mark_connected,
+                on_resume_note=_note_resume_from_suspend,
+                direct_attach_port=direct_attach_port,
+                direct_attach_token=direct_attach_token,
                 **activity_kwargs,
             )
             # A graceful shutdown drains and closes the connection cleanly,
@@ -351,60 +409,117 @@ async def serve_tunnel(
         except WebSocketException as exc:
             redirect_url = _websocket_auth_redirect_url(exc)
             if redirect_url is not None:
+                login_redirect_streak += 1
                 if _invalidate_auth_token_factory(auth_token_factory):
                     auth_token = await _handle_refreshable_auth_failure(
                         auth_token_factory, 302, exc
                     )
                     delay_s = _INITIAL_RECONNECT_DELAY_S
                     continue
-                # The websockets library auto-followed a redirect
-                # away from our ws:// endpoint to an http(s):// URL
-                # — typically a Databricks App login page when the
-                # caller is unauthenticated. Retrying cannot help:
-                # every reconnect will land back on the same
-                # redirect, so we fail loud with the actual URL so
-                # the user sees what the server is asking for
-                # ("go log in here").
-                raise RuntimeError(
-                    f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
-                    f"(redirect to non-WebSocket URL {redirect_url}); "
-                    "the server likely requires auth — "
-                    "run `omnigent setup` to configure credentials"
-                ) from exc
-            http_status = _websocket_http_status(exc)
-            if http_status in _REFRESHABLE_HTTP_STATUSES:
-                _invalidate_auth_token_factory(auth_token_factory)
-                auth_token = await _handle_refreshable_auth_failure(
-                    auth_token_factory, http_status, exc
+                # The websockets library auto-followed a redirect away
+                # from our ws:// endpoint to an http(s):// URL —
+                # typically the Databricks App login page. On a runner
+                # that never authenticated this is a credentials
+                # problem retrying can't fix, so after a short streak
+                # (allowing for a server mid-restart) fail loud with
+                # the actual URL. On a runner that HAS served this
+                # tunnel it usually means the bearer expired
+                # mid-session (Apps signals that as this redirect, not
+                # a 401) — keep retrying: the loop-top refresh mints a
+                # fresh token each attempt, so the session survives
+                # once credentials become valid again.
+                if not ever_connected and login_redirect_streak >= _LOGIN_REDIRECT_FATAL_ATTEMPTS:
+                    raise RuntimeError(
+                        f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
+                        f"(redirect to non-WebSocket URL {redirect_url} "
+                        f"persisted across {login_redirect_streak} attempts); "
+                        "the server likely requires auth — "
+                        f"run `omnigent login {server_url}` or "
+                        "`omnigent setup` to configure credentials"
+                    ) from exc
+                retry_reason = (
+                    f"login-page redirect during upgrade ({redirect_url}); "
+                    "retrying with refreshed credentials"
                 )
-                delay_s = _INITIAL_RECONNECT_DELAY_S
-                continue
-            if http_status in _FATAL_SERVER_HTTP_STATUSES:
-                raise RuntimeError(
-                    f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
-                    f"(HTTP {http_status}); check remote server authentication"
-                ) from exc
-            close_code = _websocket_close_code(exc)
-            if close_code in _FATAL_SERVER_CLOSE_CODES:
-                raise RuntimeError(
-                    f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
-                    f"(close code {close_code}); check frame protocol compatibility"
-                ) from exc
-            if (
-                close_code in _TUNNEL_RECYCLE_CLOSE_CODES
-                or http_status in _TUNNEL_RECYCLE_HTTP_STATUSES
-            ):
-                # Routine ingress recycle — reconnect promptly, don't escalate
-                # the backoff (which would leave the runner unregistered for
-                # seconds each recycle and drop in-flight message delivery).
-                delay_s = _INITIAL_RECONNECT_DELAY_S
-                recycle = True
-                detail = f"close {close_code}" if close_code else f"HTTP {http_status or 0}"
-                retry_reason = f"server recycled the tunnel ({detail}); reconnecting promptly"
             else:
-                retry_reason = str(exc)
+                http_status = _websocket_http_status(exc)
+                if http_status is not None and http_status in _REFRESHABLE_HTTP_STATUSES:
+                    http_auth_rejection_streak += 1
+                    if (
+                        not ever_connected
+                        and http_auth_rejection_streak >= _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
+                    ):
+                        login_hint = (
+                            f"run `databricks auth login --host {server_url}` to re-authenticate"
+                            if server_url
+                            else "check remote server authentication"
+                        )
+                        raise RuntimeError(
+                            f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
+                            f"(HTTP {http_status} persisted across "
+                            f"{http_auth_rejection_streak} attempts); "
+                            f"{login_hint}"
+                        ) from exc
+                    # Invalidate the cached token so the loop-top _refresh_auth_token
+                    # fetches a fresh one on the next attempt. The loop-top call is
+                    # already guarded against transient factory errors (OSError etc.),
+                    # so we don't call the factory directly here.
+                    _invalidate_auth_token_factory(auth_token_factory)
+                    retry_reason = f"HTTP {http_status}; retrying with refreshed token"
+                    if ever_connected:
+                        # Escalate the backoff rather than resetting it: a rejection
+                        # that outlives the token refresh is a network path answering
+                        # the upgrade, and the base delay would retry every ~0.5s for
+                        # the whole outage.
+                        _logger.warning(
+                            "HTTP %d after a successful upgrade; retrying — "
+                            "check VPN/network connectivity",
+                            http_status,
+                            extra={"session_id": runner_primary_session_id()},
+                        )
+                    else:
+                        _logger.info(
+                            "HTTP %d; invalidated auth token, retrying",
+                            http_status,
+                            extra={"session_id": runner_primary_session_id()},
+                        )
+                        delay_s = _INITIAL_RECONNECT_DELAY_S
+                else:
+                    close_code = _websocket_close_code(exc)
+                    if close_code in _FATAL_SERVER_CLOSE_CODES:
+                        raise RuntimeError(
+                            f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
+                            f"(close code {close_code}); check frame protocol compatibility"
+                        ) from exc
+                    if (
+                        close_code in _TUNNEL_RECYCLE_CLOSE_CODES
+                        or http_status in _TUNNEL_RECYCLE_HTTP_STATUSES
+                    ):
+                        # Routine ingress recycle — reconnect promptly, don't
+                        # escalate the backoff (which would leave the runner
+                        # unregistered for seconds each recycle and drop
+                        # in-flight message delivery).
+                        delay_s = _INITIAL_RECONNECT_DELAY_S
+                        recycle = True
+                        detail = (
+                            f"close {close_code}" if close_code else f"HTTP {http_status or 0}"
+                        )
+                        retry_reason = (
+                            f"server recycled the tunnel ({detail}); reconnecting promptly"
+                        )
+                    else:
+                        retry_reason = str(exc)
         except (ConnectionError, OSError, ValueError) as exc:
             retry_reason = str(exc)
+        if woke_from_suspend:
+            # A wake from system suspend already aborted the live tunnel (see
+            # _serve_tunnel_once's watcher). The abrupt close would otherwise
+            # ride the escalating backoff; force a prompt reconnect at the base
+            # delay, like a server recycle, so the session reattaches at once.
+            woke_from_suspend = False
+            delay_s = _INITIAL_RECONNECT_DELAY_S
+            recycle = True
+            retry_reason = "resumed from system suspend; reconnecting promptly"
         jittered = delay_s * (
             1.0 + random.uniform(-_RECONNECT_JITTER_FRACTION, _RECONNECT_JITTER_FRACTION)
         )
@@ -413,6 +528,7 @@ async def serve_tunnel(
             retry_reason,
             jittered,
             delay_s,
+            extra={"session_id": runner_primary_session_id()},
         )
         await asyncio.sleep(jittered)
         # Match the host tunnel (connect.py): escalate the backoff only on
@@ -462,6 +578,7 @@ async def _refresh_auth_token(
         _logger.warning(
             "auth token refresh failed; falling back to previous token",
             exc_info=True,
+            extra={"session_id": runner_primary_session_id()},
         )
     return current_token
 
@@ -472,7 +589,7 @@ async def _handle_refreshable_auth_failure(
     exc: WebSocketException,
 ) -> str | None:
     """
-    Attempt a token refresh after an HTTP 401 rejection.
+    Attempt a token refresh after an HTTP 302 login-page redirect.
 
     If the factory produces a new token, returns it so the caller
     can retry immediately. If no factory is available or the refresh
@@ -480,7 +597,7 @@ async def _handle_refreshable_auth_failure(
 
     :param factory: Sync callable returning a fresh token.
     :param http_status: The HTTP status that triggered this call,
-        e.g. ``401``.
+        e.g. ``302`` for a login-page redirect.
     :param exc: The original ``WebSocketException``.
     :returns: A refreshed token string.
     :raises RuntimeError: When no factory is available or refresh
@@ -493,6 +610,7 @@ async def _handle_refreshable_auth_failure(
                 _logger.info(
                     "auth token refreshed after HTTP %d; retrying",
                     http_status,
+                    extra={"session_id": runner_primary_session_id()},
                 )
                 return fresh
         except (ValueError, OSError, ImportError):
@@ -500,6 +618,7 @@ async def _handle_refreshable_auth_failure(
                 "auth token refresh failed after HTTP %d",
                 http_status,
                 exc_info=True,
+                extra={"session_id": runner_primary_session_id()},
             )
     raise RuntimeError(
         f"{RUNNER_TUNNEL_REJECTION_PREFIX}(HTTP {http_status}); check remote server authentication"
@@ -565,6 +684,10 @@ async def _serve_tunnel_once(
     on_activity: Callable[[], None] | None = None,
     shutdown_event: asyncio.Event | None = None,
     on_graceful_shutdown: Callable[[], None] | None = None,
+    on_connected: Callable[[], None] | None = None,
+    on_resume_note: Callable[[], None] | None = None,
+    direct_attach_port: int | None = None,
+    direct_attach_token: str | None = None,
 ) -> None:
     """Serve one WebSocket connection until it closes.
 
@@ -589,6 +712,13 @@ async def _serve_tunnel_once(
         loop and triggers the graceful drain (see ``_graceful_drain``).
     :param on_graceful_shutdown: Optional sync callback fired once, before
         the drain, to enqueue end-of-stream sentinels onto session streams.
+    :param on_connected: Optional sync callback fired once the WS
+        upgrade is accepted. ``serve_tunnel`` uses it to distinguish a
+        runner that has authenticated from one that never has.
+    :param on_resume_note: Optional sync callback fired when a wake from
+        system suspend is detected on this connection (just before the dead
+        socket is aborted). ``serve_tunnel`` uses it to force a prompt
+        reconnect instead of the escalating backoff.
     :returns: None.
     """
     import websockets
@@ -605,9 +735,19 @@ async def _serve_tunnel_once(
     from omnigent.cli_auth import databricks_request_headers
 
     headers: dict[str, str] = {"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
-    headers.update(databricks_request_headers(server_url, bearer_token=auth_token))
+    # Co-locate this runner's tunnel with its host's on one server replica: the
+    # host injects its id at launch. Absent for CLI-local runners (no host), and
+    # the builder only emits the routing header on a host-sharded deployment.
+    host_id = os.environ.get(RUNNER_SLICE_KEY_ENV_VAR)
+    headers.update(
+        databricks_request_headers(server_url, bearer_token=auth_token, host_id=host_id)
+    )
     if tunnel_token:
         headers[RUNNER_TUNNEL_TOKEN_HEADER] = tunnel_token
+    # Verifying SSL context from a real CA bundle for wss:// — a bare default
+    # context loads zero roots on uv / python-build-standalone Pythons (no
+    # OpenSSL default cert path). Local runners use ws:// and pass ssl=None.
+    ssl_ctx = client_ssl_context() if tunnel_url.startswith("wss://") else None
     # A graceful-shutdown-capable tunnel needs a close timeout sized for a
     # real remote round-trip: completing the close handshake is what confirms
     # the server read our end-of-stream frames. A tunnel without a shutdown
@@ -624,14 +764,54 @@ async def _serve_tunnel_once(
         additional_headers=headers,
         close_timeout=close_timeout,
         max_size=RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
+        ssl=ssl_ctx,
         # Protocol keepalive aligned to the server's 90 s app-level budget (not the
         # 20 s library default that drops a busy-but-healthy tunnel — issue #1116).
         # Also the runner's only liveness probe for a silently-dead server.
         ping_interval=TUNNEL_KEEPALIVE_PING_INTERVAL_S,
         ping_timeout=TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
     ) as ws:
-        await _send_hello(ws.send, runner_version)
-        _logger.info("runner %s connected to %s", runner_id, tunnel_url)
+        if on_connected is not None:
+            on_connected()
+        await _send_hello(
+            ws.send,
+            runner_version,
+            direct_attach_port=direct_attach_port,
+            direct_attach_token=direct_attach_token,
+        )
+        _logger.info(
+            "runner %s connected to %s",
+            runner_id,
+            tunnel_url,
+            extra={"session_id": runner_primary_session_id()},
+        )
+
+        def _on_resume_from_suspend(gap_s: float) -> None:
+            # Wake from system suspend: this socket is now half-open (the server
+            # already dropped it), so abort it to make the read below raise at
+            # once instead of waiting out the ~90s keepalive timeout;
+            # serve_tunnel then reconnects promptly. Skip during a graceful
+            # idle-reaper drain — aborting mid-drain would turn the clean
+            # end-of-stream close into an abrupt runner_disconnected.
+            if shutdown_event is not None and shutdown_event.is_set():
+                return
+            _logger.info(
+                "runner %s resumed from suspend (~%.0fs); dropping tunnel to reconnect",
+                runner_id,
+                gap_s,
+                extra={"session_id": runner_primary_session_id()},
+            )
+            if on_resume_note is not None:
+                on_resume_note()
+            transport = getattr(ws, "transport", None)
+            if transport is not None:
+                with contextlib.suppress(Exception):
+                    transport.abort()
+
+        suspend_task = asyncio.create_task(
+            watch_for_resume(_on_resume_from_suspend),
+            name=f"runner-suspend-watch:{runner_id}",
+        )
         try:
             if shutdown_event is None:
                 async for raw in ws:
@@ -682,6 +862,7 @@ async def _serve_tunnel_once(
                                     "during graceful shutdown of runner %s",
                                     runner_id,
                                     exc_info=True,
+                                    extra={"session_id": runner_primary_session_id()},
                                 )
                             await _graceful_drain(
                                 dispatch_tasks,
@@ -710,6 +891,9 @@ async def _serve_tunnel_once(
                     with contextlib.suppress(asyncio.CancelledError):
                         await shutdown_wait
         finally:
+            suspend_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await suspend_task
             await _cancel_dispatch_tasks(dispatch_tasks)
             await _cancel_ws_channels(ws_channels)
 
@@ -748,7 +932,10 @@ async def _graceful_drain(
             on_graceful_shutdown()
         except Exception:
             # A drain-hook error must not abort shutdown.
-            _logger.exception("on_graceful_shutdown callback failed")
+            _logger.exception(
+                "on_graceful_shutdown callback failed",
+                extra={"session_id": runner_primary_session_id()},
+            )
     if dispatch_tasks:
         # Wait for the streams to drain the sentinel and emit their end frames.
         # Bounded: a stream that never finishes must not wedge shutdown — the
@@ -762,18 +949,28 @@ async def _graceful_drain(
                 "graceful shutdown: %d dispatch task(s) did not drain in %.1fs; closing anyway",
                 len(pending),
                 _GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_S,
+                extra={"session_id": runner_primary_session_id()},
             )
 
 
 async def _send_hello(
     send_text: Callable[[str], Awaitable[None]],
     runner_version: str,
+    *,
+    direct_attach_port: int | None = None,
+    direct_attach_token: str | None = None,
 ) -> None:
     """Send the runner's opening hello frame.
 
     :param send_text: Async WebSocket text sender.
     :param runner_version: Runner version string for the hello
         frame, e.g. ``"0.1.0"``.
+    :param direct_attach_port: Loopback port of the runner's direct
+        terminal-attach listener, advertised to the server so it can
+        hand browsers a same-machine attach URL. ``None`` when the
+        listener is not running.
+    :param direct_attach_token: Bearer token guarding that listener;
+        travels only alongside *direct_attach_port*.
     :returns: None.
     """
     # Signal host-side telemetry opt-out to the server so it can honour
@@ -792,6 +989,8 @@ async def _send_hello(
                 runner_version=runner_version,
                 frame_protocol_version=1,
                 telemetry_opt_out=_tel_opt_out,
+                direct_attach_port=direct_attach_port,
+                direct_attach_token=direct_attach_token,
                 harnesses=[
                     "claude-native",
                     "claude-sdk",
@@ -834,7 +1033,11 @@ async def _handle_tunnel_frame(
         text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
         frame = decode_frame(text)
     except ValueError as exc:
-        _logger.warning("runner received malformed tunnel frame; dropping: %s", exc)
+        _logger.warning(
+            "runner received malformed tunnel frame; dropping: %s",
+            exc,
+            extra={"session_id": runner_primary_session_id()},
+        )
         return
     if isinstance(frame, PingFrame):
         await send_text(encode_frame(PongFrame(ts=frame.ts)))
@@ -850,28 +1053,32 @@ async def _handle_tunnel_frame(
     elif isinstance(frame, RequestCancelFrame):
         if on_activity is not None:
             on_activity()
-        task = dispatch_tasks.get(frame.id)
-        if task is not None:
-            task.cancel()
+        dispatch_task = dispatch_tasks.get(frame.id)
+        if dispatch_task is not None:
+            dispatch_task.cancel()
     elif isinstance(frame, WSOpenFrame):
         if on_activity is not None:
             on_activity()
-        channel = _RunnerWSChannel(ch_id=frame.ch_id, send_text=send_text)
-        ws_channels[frame.ch_id] = channel
-        channel.task = asyncio.create_task(
-            _dispatch_ws_via_asgi(app, frame, channel),
+        opened_channel = _RunnerWSChannel(ch_id=frame.ch_id, send_text=send_text)
+        ws_channels[frame.ch_id] = opened_channel
+        opened_channel.task = asyncio.create_task(
+            _dispatch_ws_via_asgi(app, frame, opened_channel),
             name=f"ws-tunnel-attach:{frame.ch_id}",
         )
-        channel.task.add_done_callback(_forget_ws_channel(ws_channels, frame.ch_id))
+        opened_channel.task.add_done_callback(_forget_ws_channel(ws_channels, frame.ch_id))
     elif isinstance(frame, WSFrame):
         if on_activity is not None:
             on_activity()
-        channel = ws_channels.get(frame.ch_id)
-        if channel is None:
-            _logger.debug("runner: dropping ws.frame for unknown ch_id %r", frame.ch_id)
+        active_channel = ws_channels.get(frame.ch_id)
+        if active_channel is None:
+            _logger.debug(
+                "runner: dropping ws.frame for unknown ch_id %r",
+                frame.ch_id,
+                extra={"session_id": runner_primary_session_id()},
+            )
             return
         if frame.encoding == "utf-8":
-            channel.inbound.put_nowait(("text", frame.data))
+            active_channel.inbound.put_nowait(("text", frame.data))
         elif frame.encoding == "base64":
             try:
                 decoded = base64.b64decode(frame.data, validate=True)
@@ -879,18 +1086,23 @@ async def _handle_tunnel_frame(
                 _logger.warning(
                     "runner: dropping ws.frame with malformed base64 on ch_id %r",
                     frame.ch_id,
+                    extra={"session_id": runner_primary_session_id()},
                 )
                 return
-            channel.inbound.put_nowait(("bytes", decoded))
+            active_channel.inbound.put_nowait(("bytes", decoded))
         else:
-            _logger.warning("runner: dropping ws.frame with unknown encoding %r", frame.encoding)
+            _logger.warning(
+                "runner: dropping ws.frame with unknown encoding %r",
+                frame.encoding,
+                extra={"session_id": runner_primary_session_id()},
+            )
     elif isinstance(frame, WSCloseFrame):
         if on_activity is not None:
             on_activity()
-        channel = ws_channels.get(frame.ch_id)
-        if channel is None:
+        closing_channel = ws_channels.get(frame.ch_id)
+        if closing_channel is None:
             return
-        channel.inbound.put_nowait(("close", (frame.code, frame.reason)))
+        closing_channel.inbound.put_nowait(("close", (frame.code, frame.reason)))
 
 
 async def _cancel_dispatch_tasks(dispatch_tasks: dict[str, asyncio.Task[None]]) -> None:
@@ -948,7 +1160,7 @@ async def _dispatch_ws_via_asgi(
     :param frame: The ``ws.open`` that triggered this dispatch.
     :param channel: Per-channel state for the receive side.
     """
-    scope: dict[str, Any] = {
+    scope: Scope = {
         "type": "websocket",
         "asgi": {"version": "3.0", "spec_version": "2.3"},
         "http_version": "1.1",
@@ -967,7 +1179,7 @@ async def _dispatch_ws_via_asgi(
     connect_event_consumed = False
     close_seen: tuple[int, str] | None = None
 
-    async def receive() -> dict[str, Any]:
+    async def receive() -> Message:
         nonlocal connect_event_consumed, close_seen
         if not connect_event_consumed:
             connect_event_consumed = True
@@ -993,7 +1205,7 @@ async def _dispatch_ws_via_asgi(
             return {"type": "websocket.receive", "bytes": bytes(bytes_payload)}
         raise RuntimeError(f"runner ws-channel {channel.ch_id!r}: unknown tag {tag!r}")
 
-    async def send(event: dict[str, Any]) -> None:
+    async def send(event: Message) -> None:
         ev_type = event.get("type")
         if ev_type == "websocket.accept":
             channel.accepted = True
@@ -1036,7 +1248,12 @@ async def _dispatch_ws_via_asgi(
             )
         raise
     except Exception as exc:  # noqa: BLE001 -- log + surface as close
-        _logger.warning("runner ws-attach dispatch %s failed: %r", channel.ch_id, exc)
+        _logger.warning(
+            "runner ws-attach dispatch %s failed: %r",
+            channel.ch_id,
+            exc,
+            extra={"session_id": runner_primary_session_id()},
+        )
         with contextlib.suppress(Exception):
             await channel.send_text(
                 encode_frame(
@@ -1070,7 +1287,12 @@ def _forget_ws_channel(
             return
         exc = task.exception()
         if exc is not None:
-            _logger.warning("runner ws-attach dispatch %s failed: %r", ch_id, exc)
+            _logger.warning(
+                "runner ws-attach dispatch %s failed: %r",
+                ch_id,
+                exc,
+                extra={"session_id": runner_primary_session_id()},
+            )
 
     return _callback
 
@@ -1099,7 +1321,12 @@ def _forget_dispatch_task(
             return
         exc = task.exception()
         if exc is not None:
-            _logger.warning("runner tunnel dispatch %s failed: %s", req_id, exc)
+            _logger.warning(
+                "runner tunnel dispatch %s failed: %s",
+                req_id,
+                exc,
+                extra={"session_id": runner_primary_session_id()},
+            )
 
     return _callback
 

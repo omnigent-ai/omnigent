@@ -10,9 +10,12 @@ Resolution: `uv pip compile` computes the exact transitive closure of
 `omnigent[<extras>]==<version>` for each target platform (macOS arm + intel by
 default — the brew tap's `brew test-bot` matrix). The per-platform closures are
 unioned; for each package we then fetch the sdist URL + sha256 from the PyPI JSON
-API and emit a `resource` stanza. Packages with no sdist (e.g. `cel-expr-python`,
-which is Bazel-built and has no PyPI sdist) are skipped — omnigent degrades
-gracefully without them, matching the hand-tuned formula.
+API and emit a `resource` stanza. Every package in the closure must publish an
+sdist: the formula builds each resource from source, so one dropped for lack of
+an sdist ships a venv missing that dependency, which surfaces as an ImportError
+(or a silently disabled feature) at runtime rather than a red build. A missing
+sdist is therefore a hard error; `--allow-no-sdist NAME` waives it for a package
+omnigent genuinely works without.
 
 Excluded from `resource` generation (provided by the brewed Python environment,
 NOT built as virtualenv resources — keep in sync with the template's
@@ -27,6 +30,7 @@ Run by `.github/workflows/homebrew-tap-pr.yml` on `release: published`.
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import re
 import subprocess
@@ -53,6 +57,13 @@ DEFAULT_PYTHON_VERSION = "3.14"
 DEFAULT_INDEX_URL = "https://pypi.org/simple"
 PYPI_JSON_API = "https://pypi.org/pypi"
 
+# The three packages that release together at one version. At release time they
+# are minutes old, so they are the only ones that legitimately need to be exempt
+# from the supply-chain cooldown re-applied below.
+LOCKSTEP_PACKAGES = ("omnigent", "omnigent-client", "omnigent-ui-sdk")
+# Fallback when `exclude-newer` can't be read out of uv.toml.
+DEFAULT_COOLDOWN_DAYS = 7
+
 # Packages provided by the brewed Python environment (system site-packages),
 # not built as virtualenv resources. `cffi`/`pycparser` are listed because cffi
 # builds against libffi (not a dep of this formula) — they come from the brewed
@@ -69,6 +80,66 @@ BREWED_EXCLUSIONS = {
 # omnigent is the stable `url` itself, so it's never a resource.
 SELF_EXCLUSIONS = {"omnigent"}
 
+# Packages pinned to an upstream platform wheel instead of the sdist, emitted as
+# an arch-conditional `resource` (the template's install block pip-installs any
+# `.whl` resource from its cached download).
+#
+# google-re2 (required by cel-python, which backs CEL policy evaluation) has an
+# sdist that cannot be built here: its setup.py shells out to `bazel` whenever
+# GITHUB_ACTIONS is set — always true under `brew test-bot` — and the non-bazel
+# path needs re2 + abseil + pybind11 headers and C++17, which it never requests.
+# The upstream macOS wheels statically link re2 and abseil, so they need no build
+# toolchain and no brewed `abseil` (whose ABI breaks on most releases, which
+# would force a formula `revision` bump every time it moved).
+WHEEL_REQUIRED = {"google-re2"}
+
+# Compiled extensions we PREFER to take as an upstream wheel, falling back to the
+# sdist when no compatible wheel exists (e.g. right after a python@X.Y bump,
+# before upstream publishes cpXY wheels). Building these is the bulk of the
+# formula's cost -- grpcio alone dwarfs everything else on a 3-core bottle
+# builder -- and every wheel here has enough Mach-O header padding for Homebrew
+# to rewrite its install name during keg relocation.
+#
+# jiter, tiktoken and watchfiles are deliberately NOT here: their wheels are
+# maturin-built with no install-name padding, so relocation dies with "Failed
+# changing dylib ID" (omnigent issue #866). They are built from source with
+# -headerpad_max_install_names instead, which is how every bottled release up to
+# 0.6.0 shipped them. Verify with:
+#   install_name_tool -id <long Cellar path> <extracted .so>
+PREFER_WHEEL = {
+    "argon2-cffi-bindings",
+    "grpcio",
+    "httptools",
+    "markupsafe",
+    "protobuf",
+    "pyyaml",
+    "regex",
+    "uvloop",
+    "zstandard",
+}
+
+# Packages pinned to the PURE-PYTHON (`py3-none-any`) wheel on purpose.
+#
+# pendulum is the awkward case: its maturin wheel cannot be relocated (see
+# above), and its sdist does not link against python 3.14 -- pyo3 leaves
+# _Py_NoneStruct/_Py_Dealloc/_Py_TrueStruct undefined and the arm64 link fails.
+# Its pure-Python wheel ships no extension module at all, so there is nothing to
+# relocate and nothing to build. Only cel-python pulls it in, for CEL timestamp
+# arithmetic, so the slower implementation is not on any hot path.
+PURE_WHEEL = {"pendulum"}
+
+# uv target platform -> (Homebrew arch block, wheel platform-tag arch suffix).
+_ARCH_BLOCKS = {
+    "aarch64-apple-darwin": ("on_arm", "arm64"),
+    "x86_64-apple-darwin": ("on_intel", "x86_64"),
+}
+
+# name-version[-build]-pytag-abitag-platformtag.whl (PEP 427).
+_WHEEL_RE = re.compile(
+    r"^(?P<name>.+?)-(?P<version>[^-]+?)(?:-(?P<build>\d[^-]*))?"
+    r"-(?P<py>[^-]+)-(?P<abi>[^-]+)-(?P<plat>[^-]+)\.whl$"
+)
+
 _PLACEHOLDERS = (
     "__OMNIGENT_URL__",
     "__OMNIGENT_SHA256__",
@@ -79,6 +150,30 @@ _PLACEHOLDERS = (
 def normalize_name(name: str) -> str:
     """PEP 503 normalized project name (lowercase, runs of [-_.] -> -)."""
     return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def cooldown_days(repo_root: Path | None = None) -> int:
+    """The repo's `exclude-newer` span in days, read from uv.toml.
+
+    Read rather than hardcoded so the formula's cooldown cannot silently drift
+    from the one the lockfile uses. Falls back to `DEFAULT_COOLDOWN_DAYS` (with a
+    warning) if uv.toml is missing or expresses the span in a form this doesn't
+    understand -- never silently to "no cooldown".
+    """
+    root = repo_root or Path(__file__).resolve().parents[3]
+    uv_toml = root / "uv.toml"
+    try:
+        m = re.search(r'^exclude-newer\s*=\s*"P(\d+)D"', uv_toml.read_text(), re.MULTILINE)
+    except OSError:
+        m = None
+    if m:
+        return int(m.group(1))
+    print(
+        f"::warning::could not read `exclude-newer` from {uv_toml}; "
+        f"falling back to {DEFAULT_COOLDOWN_DAYS}d cooldown.",
+        file=sys.stderr,
+    )
+    return DEFAULT_COOLDOWN_DAYS
 
 
 def _http_get_json(url: str, retries: int = 5, timeout: int = 30) -> dict:
@@ -124,6 +219,73 @@ def pick_sdist(files: list[dict]) -> tuple[str, str] | None:
     return f["url"], f["digests"]["sha256"]
 
 
+def _abi_compatible(py: str, abi: str, python_tag: str) -> bool:
+    """Is a wheel's (pytag, abitag) usable by CPython `python_tag` (e.g. cp314)?
+
+    Accepts the exact CPython tag, a stable-ABI (`abi3`) wheel built for that
+    version or older, and pure-Python `py3-none`. Free-threaded builds (`cp314t`)
+    are excluded: the brewed python is not free-threaded, and equality on the abi
+    tag keeps them out.
+    """
+    if abi == python_tag:
+        return True
+    if abi == "abi3" and py.startswith("cp") and py[2:].isdigit():
+        return int(py[2:]) <= int(python_tag[2:])
+    return py == "py3" and abi == "none"
+
+
+def _wheel_arches(plat: str) -> tuple[frozenset[str], tuple[int, int]] | None:
+    """Arches a macOS wheel platform tag covers, plus its deployment target."""
+    if plat == "any":
+        return frozenset({"arm64", "x86_64"}), (0, 0)
+    m = re.match(r"macosx_(\d+)_(\d+)_(arm64|x86_64|universal2|intel)$", plat)
+    if not m:
+        return None
+    arches = {
+        "arm64": {"arm64"},
+        "x86_64": {"x86_64"},
+        "intel": {"x86_64"},
+        "universal2": {"arm64", "x86_64"},
+    }[m.group(3)]
+    return frozenset(arches), (int(m.group(1)), int(m.group(2)))
+
+
+def pick_macos_wheels(
+    files: list[dict], python_tag: str, arches: list[str]
+) -> dict[str, tuple[str, str]] | None:
+    """Best macOS wheel per arch: {arch: (url, sha256)}, or None if any is missing.
+
+    Ranked by (native before pure-Python, then lowest deployment target). A wheel
+    built for an older `macosx_<major>_<minor>` minimum installs on every newer
+    macOS the tap builds for while the reverse is not true. Pure-Python
+    `py3-none-any` wheels sort last on purpose: when a package ships both (e.g.
+    protobuf, pendulum) the `any` wheel is the slow fallback implementation, and
+    it would otherwise always win by having no deployment target at all.
+
+    A `universal2` (or `any`) wheel satisfies both arches with one file, which the
+    caller renders as a single unconditional url.
+    """
+    best: dict[str, tuple[tuple[int, int, int], str, str]] = {}
+    for f in files:
+        if f.get("packagetype") != "bdist_wheel":
+            continue
+        m = _WHEEL_RE.match(f["filename"])
+        if not m or not _abi_compatible(m.group("py"), m.group("abi"), python_tag):
+            continue
+        covered = _wheel_arches(m.group("plat"))
+        if not covered:
+            continue
+        covered_arches, target = covered
+        pure = 1 if m.group("abi") == "none" else 0
+        rank = (pure, *target)
+        for arch in arches:
+            if arch in covered_arches and (arch not in best or rank < best[arch][0]):
+                best[arch] = (rank, f["url"], f["digests"]["sha256"])
+    if any(arch not in best for arch in arches):
+        return None
+    return {arch: (url, sha) for arch, (_, url, sha) in best.items()}
+
+
 def rewrite_url(url: str, rewrites: list[tuple[str, str]]) -> str:
     """Apply `from -> to` substitutions to a download URL, in order.
 
@@ -145,6 +307,25 @@ def resource_stanza(name: str, url: str, sha256: str, indent: int = 2) -> str:
     return f'{pad}resource "{name}" do\n{pad}  url "{url}"\n{pad}  sha256 "{sha256}"\n{pad}end'
 
 
+def wheel_resource_stanza(name: str, per_arch: list[tuple[str, str, str]], indent: int = 2) -> str:
+    """An arch-conditional `resource` stanza: one `on_arm`/`on_intel` block each.
+
+    `per_arch` is [(brew_block, url, sha256), ...]. `Resource` includes
+    `OnSystem::MacOSAndLinux`, so these blocks are valid inside a resource.
+    """
+    pad = " " * indent
+    lines = [f'{pad}resource "{name}" do']
+    for block, url, sha256 in per_arch:
+        lines += [
+            f"{pad}  {block} do",
+            f'{pad}    url "{url}"',
+            f'{pad}    sha256 "{sha256}"',
+            f"{pad}  end",
+        ]
+    lines.append(f"{pad}end")
+    return "\n".join(lines)
+
+
 def resolve_closure(
     version: str,
     platforms: list[str],
@@ -152,16 +333,38 @@ def resolve_closure(
     python_version: str,
     index_url: str,
     uv: str,
+    cooldown: int,
 ) -> dict[str, str]:
     """Union of `uv pip compile` resolutions per platform -> {name: version}.
 
-    Runs `uv pip compile` with `--no-config` (ignore the repo's uv.toml cooldown,
-    which would block the just-released version) against the public index. If a
-    package resolves to different versions across platforms, the highest PEP 440
-    version wins and a warning is printed (rare for sdists).
+    Runs `uv pip compile` with `--no-config` against the public index, so neither
+    the repo's uv.toml nor any user-level config decides the index or the uv
+    version floor. But `--no-config` also discards `exclude-newer`, the
+    supply-chain cooldown, so it is re-applied explicitly here: without that, every
+    resource pinned into the formula -- i.e. the code Homebrew users install -- may
+    be a distribution published minutes ago, even though the same dependency graph
+    in uv.lock has to wait out the window.
+
+    The cooldown cannot simply be left on: at release time `omnigent` and its two
+    lockstep SDKs are minutes old, and uv would filter out the very version being
+    packaged ("no version of omnigent==X.Y.Z"). So the window applies to everything
+    except those three, via `--exclude-newer-package`.
+
+    If a package resolves to different versions across platforms, the highest
+    PEP 440 version wins and a warning is printed (rare for sdists).
     """
     extras_spec = f"[{','.join(extras)}]" if extras else ""
     requirement = f"omnigent{extras_spec}=={version}"
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cutoff = (now - datetime.timedelta(days=cooldown)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # The lockstep packages are exempted up to "now" rather than skipped, so a
+    # typo'd name still gets a cooldown rather than silently getting none.
+    exempt_until = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    print(
+        f"Cooldown: ignoring distributions uploaded after {cutoff} "
+        f"({cooldown}d), except {', '.join(LOCKSTEP_PACKAGES)}.",
+        file=sys.stderr,
+    )
     closure: dict[str, str] = {}
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
@@ -173,6 +376,14 @@ def resolve_closure(
                 "pip",
                 "compile",
                 "--no-config",
+                # Re-apply the cooldown that --no-config just discarded.
+                "--exclude-newer",
+                cutoff,
+                *[
+                    arg
+                    for pkg in LOCKSTEP_PACKAGES
+                    for arg in ("--exclude-newer-package", f"{pkg}={exempt_until}")
+                ],
                 "--no-header",
                 "--no-annotate",
                 "--python-version",
@@ -253,6 +464,8 @@ def generate(
     index_url: str,
     uv: str,
     exclude: set[str],
+    cooldown: int,
+    allow_no_sdist: set[str] | None = None,
     api_base: str = PYPI_JSON_API,
     url_rewrites: list[tuple[str, str]] | None = None,
 ) -> str:
@@ -268,7 +481,7 @@ def generate(
         f"(python {python_version})…",
         file=sys.stderr,
     )
-    closure = resolve_closure(version, platforms, extras, python_version, index_url, uv)
+    closure = resolve_closure(version, platforms, extras, python_version, index_url, uv, cooldown)
     print(f"Resolved {len(closure)} packages.", file=sys.stderr)
 
     rewrites = url_rewrites or []
@@ -290,24 +503,96 @@ def generate(
     # a sdist resource stanza. `exclude` is the caller-supplied set (CLI --exclude);
     # it augments the built-in brewed set and the always-excluded self package.
     excluded = BREWED_EXCLUSIONS | exclude | SELF_EXCLUSIONS
-    resources: list[tuple[str, str, str]] = []
+    waived = allow_no_sdist or set()
+    python_tag = "cp" + python_version.replace(".", "")
+    resources: list[tuple[str, str]] = []
+    missing_sdist: list[str] = []
     for name, ver in sorted(closure.items()):
         if name in excluded:
             continue
         files = pypi_release_files(name, ver, api_base)
-        sdist = pick_sdist(files)
-        if not sdist:
-            # No sdist (e.g. cel-expr-python, Bazel-built) — skip. omnigent
-            # degrades gracefully without it, matching the hand-tuned formula.
-            print(
-                f"::warning::{name}=={ver} has no sdist on PyPI — skipping (no resource).",
-                file=sys.stderr,
+
+        # Wheel-pinned packages. One `universal2`/`abi3` wheel usually covers both
+        # arches, so emit a plain url and only fall back to on_arm/on_intel blocks
+        # when upstream ships separate per-arch wheels.
+        # Deliberate pure-Python wheel: no extension module, nothing to relocate.
+        if name in PURE_WHEEL:
+            pure = next((f for f in files if f["filename"].endswith("-py3-none-any.whl")), None)
+            if not pure:
+                raise RuntimeError(
+                    f"{name}=={ver} publishes no py3-none-any wheel, but it is in "
+                    f"PURE_WHEEL because neither its platform wheel nor its sdist "
+                    f"is usable here. Re-check the comment on PURE_WHEEL."
+                )
+            resources.append(
+                (
+                    name,
+                    resource_stanza(
+                        name, rewrite_url(pure["url"], rewrites), pure["digests"]["sha256"]
+                    ),
+                )
             )
             continue
-        resources.append((name, rewrite_url(sdist[0], rewrites), sdist[1]))
+
+        if name in WHEEL_REQUIRED or name in PREFER_WHEEL:
+            wheels = pick_macos_wheels(files, python_tag, [_ARCH_BLOCKS[p][1] for p in platforms])
+            if wheels is None:
+                if name in WHEEL_REQUIRED:
+                    raise RuntimeError(
+                        f"{name}=={ver} has no macOS wheel for {python_tag} on every "
+                        f"target arch. It is in WHEEL_REQUIRED because its sdist is "
+                        f"unbuildable here, so upstream must publish one or the "
+                        f"dependency has to go."
+                    )
+                # PREFER_WHEEL is best-effort: fall through and build the sdist.
+                print(
+                    f"::warning::{name}=={ver} has no macOS wheel for {python_tag} on "
+                    f"every target arch — falling back to a source build (slow).",
+                    file=sys.stderr,
+                )
+            elif len({url for url, _ in wheels.values()}) == 1:
+                url, sha = next(iter(wheels.values()))
+                resources.append((name, resource_stanza(name, rewrite_url(url, rewrites), sha)))
+                continue
+            else:
+                per_arch = [
+                    (
+                        _ARCH_BLOCKS[p][0],
+                        rewrite_url(wheels[_ARCH_BLOCKS[p][1]][0], rewrites),
+                        wheels[_ARCH_BLOCKS[p][1]][1],
+                    )
+                    for p in platforms
+                ]
+                resources.append((name, wheel_resource_stanza(name, per_arch)))
+                continue
+
+        sdist = pick_sdist(files)
+        if not sdist:
+            # Wheel-only dependency: Homebrew can't build it as a resource.
+            # Dropping it silently yields a formula that installs green and is
+            # missing an import, so fail unless the caller waived it.
+            if name in waived:
+                print(
+                    f"::warning::{name}=={ver} has no sdist on PyPI — waived, no resource.",
+                    file=sys.stderr,
+                )
+                continue
+            missing_sdist.append(f"{name}=={ver}")
+            continue
+        resources.append((name, resource_stanza(name, rewrite_url(sdist[0], rewrites), sdist[1])))
+
+    if missing_sdist:
+        raise RuntimeError(
+            "no sdist on PyPI for: "
+            + ", ".join(missing_sdist)
+            + "\nHomebrew builds every resource from source, so these would be "
+            "absent from the installed venv. Drop the dependency, move it to an "
+            "extra that isn't bundled (see DEFAULT_EXTRAS), or pass "
+            "--allow-no-sdist <name> if omnigent works without it."
+        )
 
     # No trailing newline: the template's blank lines frame the resource block.
-    resources_str = "\n".join(resource_stanza(n, u, s) for n, u, s in resources)
+    resources_str = "\n".join(stanza for _, stanza in resources)
 
     return render_template(template, stable_url, stable_sha, resources_str)
 
@@ -385,6 +670,21 @@ def main(argv: list[str]) -> int:
         help="Package name to exclude from resources (repeatable; "
         "added to the built-in brewed set).",
     )
+    ap.add_argument(
+        "--allow-no-sdist",
+        action="append",
+        default=None,
+        help="Package allowed to have no PyPI sdist (repeatable). Without this, a "
+        "wheel-only dependency fails the run instead of vanishing from the formula.",
+    )
+    ap.add_argument(
+        "--cooldown-days",
+        type=int,
+        default=None,
+        help="Supply-chain cooldown in days: ignore distributions uploaded more "
+        "recently than this, except the lockstep omnigent packages. Defaults to "
+        "the repo uv.toml `exclude-newer` span. 0 disables it (not recommended).",
+    )
     ap.add_argument("--uv", default="uv", help="uv binary path.")
     args = ap.parse_args(argv)
 
@@ -408,6 +708,8 @@ def main(argv: list[str]) -> int:
         index_url=index_url,
         uv=args.uv,
         exclude={normalize_name(n) for n in (args.exclude or [])},
+        cooldown=args.cooldown_days if args.cooldown_days is not None else cooldown_days(),
+        allow_no_sdist={normalize_name(n) for n in (args.allow_no_sdist or [])},
         api_base=api_base,
         url_rewrites=url_rewrites,
     )

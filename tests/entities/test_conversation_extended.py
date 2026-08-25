@@ -7,6 +7,9 @@ _validate_type_matches_data, and Conversation field defaults.
 
 from __future__ import annotations
 
+import json
+from typing import Any
+
 import pytest
 from pydantic import ValidationError
 
@@ -23,6 +26,7 @@ from omnigent.entities.conversation import (
     NewConversationItem,
     ResourceEventData,
     TerminalCommandData,
+    _binary_payload_omitted,
     _validate_type_matches_data,
     parse_item_data,
 )
@@ -91,6 +95,189 @@ def test_compaction_data_valid() -> None:
 def test_compaction_data_missing_field() -> None:
     with pytest.raises(ValidationError, match="last_item_id"):
         CompactionData(summary="s", model="m", token_count=1)  # type: ignore[call-arg]
+
+
+_IMAGE_BASE64 = "iVBORw0KGgo" + "A" * 4000
+
+
+def _compaction_event(content: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build the compaction event body a native forwarder POSTs."""
+    return {
+        "summary": "[Claude Code compaction]",
+        "last_item_id": "msg_abc123",
+        "model": "unknown",
+        "token_count": 0,
+        "compacted_messages": [{"type": "message", "role": "user", "content": content}],
+    }
+
+
+def test_compaction_snapshot_strips_anthropic_source_base64() -> None:
+    """A vendor image block is persisted without its base64 payload."""
+    event = _compaction_event(
+        [
+            {"type": "text", "text": "what is in this screenshot?"},
+            {
+                "type": "image",
+                "file_id": "file_abc123",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": _IMAGE_BASE64,
+                },
+            },
+        ]
+    )
+
+    data = parse_item_data("compaction", {"type": "compaction", **event})
+
+    assert isinstance(data, CompactionData)
+    assert data.compacted_messages is not None
+    assert _IMAGE_BASE64 not in json.dumps(data.compacted_messages)
+    block = data.compacted_messages[0]["content"][1]
+    # file_id and media_type survive so the content stays re-fetchable.
+    assert block["file_id"] == "file_abc123"
+    assert block["source"]["media_type"] == "image/png"
+    assert block["source"]["data"] == "[image/png content omitted from the compaction snapshot]"
+    assert data.compacted_messages[0]["content"][0]["text"] == "what is in this screenshot?"
+
+
+def test_compaction_snapshot_strips_nested_tool_result_image() -> None:
+    """A screenshot returned by a tool is nested inside tool_result.content."""
+    event = _compaction_event(
+        [
+            {
+                "type": "tool_result",
+                "tool_use_id": "toolu_1",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": _IMAGE_BASE64,
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+    # Every message is stripped, not just the first.
+    event["compacted_messages"].insert(
+        0, {"type": "message", "role": "user", "content": [{"type": "text", "text": "look"}]}
+    )
+
+    data = parse_item_data("compaction", {"type": "compaction", **event})
+
+    assert isinstance(data, CompactionData)
+    assert data.compacted_messages is not None
+    assert len(data.compacted_messages) == 2
+    assert _IMAGE_BASE64 not in json.dumps(data.compacted_messages)
+
+
+def test_compaction_snapshot_strips_document_block() -> None:
+    """An attached PDF uses the same source.data shape as an image."""
+    event = _compaction_event(
+        [
+            {
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": _IMAGE_BASE64,
+                },
+            }
+        ]
+    )
+
+    data = parse_item_data("compaction", {"type": "compaction", **event})
+
+    assert isinstance(data, CompactionData)
+    assert data.compacted_messages is not None
+    assert _IMAGE_BASE64 not in json.dumps(data.compacted_messages)
+
+
+def test_compaction_snapshot_strips_inline_data_uri() -> None:
+    """The Responses-shaped snapshot codex-native persists is covered too."""
+    event = _compaction_event(
+        [{"type": "input_image", "image_url": f"data:image/png;base64,{_IMAGE_BASE64}"}]
+    )
+
+    data = parse_item_data("compaction", {"type": "compaction", **event})
+
+    assert isinstance(data, CompactionData)
+    assert data.compacted_messages is not None
+    assert _IMAGE_BASE64 not in json.dumps(data.compacted_messages)
+
+
+def test_compaction_snapshot_strip_does_not_mutate_input() -> None:
+    """Pydantic shares nested dicts with the caller, so never strip in place."""
+    event = _compaction_event(
+        [{"type": "image", "source": {"type": "base64", "data": _IMAGE_BASE64}}]
+    )
+
+    parse_item_data("compaction", {"type": "compaction", **event})
+
+    source = event["compacted_messages"][0]["content"][0]["source"]
+    assert source["data"] == _IMAGE_BASE64
+
+
+def test_compaction_snapshot_strip_is_idempotent() -> None:
+    """Compaction rows are re-validated on every read; re-stripping is a no-op."""
+    event = _compaction_event(
+        [{"type": "image", "source": {"type": "base64", "data": _IMAGE_BASE64}}]
+    )
+
+    once = parse_item_data("compaction", {"type": "compaction", **event})
+    assert isinstance(once, CompactionData)
+    twice = parse_item_data(
+        "compaction",
+        {"type": "compaction", **once.model_dump()},
+    )
+
+    assert isinstance(twice, CompactionData)
+    assert twice.compacted_messages == once.compacted_messages
+
+
+def test_compaction_snapshot_without_messages_is_unchanged() -> None:
+    """The summary-only compaction item (no snapshot) still validates."""
+    data = parse_item_data(
+        "compaction",
+        {"type": "compaction", "summary": "s", "last_item_id": "i", "token_count": 3},
+    )
+
+    assert isinstance(data, CompactionData)
+    assert data.compacted_messages is None
+
+
+def test_compaction_snapshot_preserves_text_only_messages() -> None:
+    """Text snapshots (cursor/hermes forwarders) round-trip untouched."""
+    event = _compaction_event([{"type": "input_text", "text": "hello there"}])
+
+    data = parse_item_data("compaction", {"type": "compaction", **event})
+
+    assert isinstance(data, CompactionData)
+    assert data.compacted_messages == event["compacted_messages"]
+
+
+@pytest.mark.parametrize("block_type", [{}, [], 7])
+def test_compaction_snapshot_tolerates_non_string_block_type(block_type: object) -> None:
+    """An unhashable ``type`` must not 500 the event route it arrives on."""
+    event = _compaction_event([{"type": block_type, "text": "hi"}])
+
+    data = parse_item_data("compaction", {"type": "compaction", **event})
+
+    assert isinstance(data, CompactionData)
+    assert data.compacted_messages == event["compacted_messages"]
+
+
+def test_binary_payload_marker_names_the_media_type() -> None:
+    """The marker keeps the media type; the length would break idempotency."""
+    assert _binary_payload_omitted("image/png", 4011) == (
+        "[image/png content omitted from the compaction snapshot]"
+    )
+    assert _binary_payload_omitted("", 4011) == (
+        "[binary content omitted from the compaction snapshot]"
+    )
 
 
 # ── NativeToolData ────────────────────────────────────
@@ -336,6 +523,7 @@ def test_to_api_dict_function_call() -> None:
     api = item.to_api_dict()
     assert api["id"] == "item_fc"
     assert api["type"] == "function_call"
+    assert api["created_at"] == 1
     assert api["model"] == "my-agent"  # alias
     assert api["name"] == "search"
     assert api["call_id"] == "call_1"

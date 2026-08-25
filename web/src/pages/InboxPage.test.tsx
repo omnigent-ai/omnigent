@@ -47,7 +47,7 @@ vi.mock("@/components/blocks/ApprovalCard", () => ({
 }));
 
 vi.mock("@/hooks/useConversations", async (importActual) => ({
-  ...(await importActual<typeof import("@/hooks/useConversations")>()),
+  ...(await importActual<typeof conversationsHook>()),
   useConversations: vi.fn(),
 }));
 vi.mock("@/hooks/useCommentInbox", () => ({ useCommentInbox: vi.fn() }));

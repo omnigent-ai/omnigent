@@ -49,7 +49,7 @@ async function extractConfigYaml(file: File): Promise<string> {
   const tar = new Uint8Array(buf);
   // First tar entry: 512-byte header, then content.
   // File size is at offset 124, 12 bytes, octal null-terminated.
-  const sizeStr = new TextDecoder().decode(tar.slice(124, 135)).replace(/\0/g, "");
+  const sizeStr = new TextDecoder().decode(tar.slice(124, 135)).replaceAll("\0", "");
   const size = parseInt(sizeStr, 8);
   return new TextDecoder().decode(tar.slice(512, 512 + size));
 }
@@ -58,18 +58,18 @@ async function extractConfigYaml(file: File): Promise<string> {
 async function extractAgentsMd(file: File): Promise<string | null> {
   const buf = await file.arrayBuffer();
   const tar = new Uint8Array(buf);
-  const size0Str = new TextDecoder().decode(tar.slice(124, 135)).replace(/\0/g, "");
+  const size0Str = new TextDecoder().decode(tar.slice(124, 135)).replaceAll("\0", "");
   const size0 = parseInt(size0Str, 8);
   const blocks0 = Math.ceil(size0 / 512);
   const entry1Start = 512 + blocks0 * 512;
   if (entry1Start + 512 > tar.length) return null;
   const name1 = new TextDecoder()
     .decode(tar.slice(entry1Start, entry1Start + 100))
-    .replace(/\0/g, "");
+    .replaceAll("\0", "");
   if (!name1.startsWith("AGENTS.md")) return null;
   const size1Str = new TextDecoder()
     .decode(tar.slice(entry1Start + 124, entry1Start + 135))
-    .replace(/\0/g, "");
+    .replaceAll("\0", "");
   const size1 = parseInt(size1Str, 8);
   return new TextDecoder().decode(tar.slice(entry1Start + 512, entry1Start + 512 + size1));
 }

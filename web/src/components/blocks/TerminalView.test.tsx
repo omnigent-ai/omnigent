@@ -6,9 +6,13 @@
 // callback directly, while still pinning the pure URL builder contract
 // the server cares about.
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import type * as TerminalSessionModule from "./TerminalSession";
+
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { act } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { Toaster } from "@/components/ui/sonner";
+import { toast } from "sonner";
 import type { ConnectionState } from "./TerminalSession";
 import {
   TerminalView,
@@ -18,51 +22,75 @@ import {
   selectionHintText,
 } from "./TerminalView";
 
+const clipboardMock = vi.hoisted(() => ({
+  copyText: vi.fn<(text: string) => Promise<void>>(),
+}));
+
+vi.mock("@/lib/clipboard", () => ({ copyText: clipboardMock.copyText }));
+
 const terminalSessionMock = vi.hoisted(() => ({
-  instances: [] as Array<{
+  instances: [] as {
     url: string;
+    container: HTMLDivElement;
     nativeSelection: boolean;
+    clipboardEnabled: boolean;
+    onClipboardRequest?: (text: string) => void;
     onState: (state: ConnectionState) => void;
     dispose: ReturnType<typeof vi.fn>;
     setTheme: ReturnType<typeof vi.fn>;
-  }>,
+    setClipboardEnabled: ReturnType<typeof vi.fn>;
+    focus: ReturnType<typeof vi.fn>;
+  }[],
 }));
 
 vi.mock("./TerminalSession", async (importOriginal) => ({
   // Keep the real module (isUnexpectedTerminalClose and friends) —
   // only the session class itself is replaced.
-  ...(await importOriginal<typeof import("./TerminalSession")>()),
+  ...(await importOriginal<typeof TerminalSessionModule>()),
   TerminalSession: class {
     dispose = vi.fn();
     setTheme = vi.fn();
+    setClipboardEnabled = vi.fn();
+    focus = vi.fn();
 
     constructor(
-      _container: HTMLDivElement,
+      container: HTMLDivElement,
       url: string,
       onState: (state: ConnectionState) => void,
       _isDark?: boolean,
       _onActivity?: () => void,
       _onInput?: () => void,
       nativeSelection = false,
+      clipboardEnabled = true,
+      onClipboardRequest?: (text: string) => void,
     ) {
       terminalSessionMock.instances.push({
         url,
+        container,
         nativeSelection,
+        clipboardEnabled,
+        onClipboardRequest,
         onState,
         dispose: this.dispose,
         setTheme: this.setTheme,
+        setClipboardEnabled: this.setClipboardEnabled,
+        focus: this.focus,
       });
     }
   },
 }));
 
 beforeEach(() => {
+  act(() => toast.dismiss());
+  render(<Toaster visibleToasts={100} />);
   terminalSessionMock.instances = [];
+  clipboardMock.copyText.mockReset().mockResolvedValue(undefined);
 });
 
 afterEach(() => {
+  act(() => toast.dismiss());
   cleanup();
-  vi.clearAllMocks();
+  vi.restoreAllMocks();
 });
 
 describe("buildAttachPath", () => {
@@ -82,16 +110,28 @@ describe("buildAttachPath", () => {
     );
   });
 
+  it("appends ?omnigent_slice_key=host_id for host-sharded routing", () => {
+    expect(buildAttachPath("conv_abc", "terminal_bash_s1", false, "host_123")).toBe(
+      "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach?omnigent_slice_key=host_123",
+    );
+  });
+
   it("appends ?transport= when a transport override is given", () => {
-    expect(buildAttachPath("conv_abc", "terminal_bash_s1", false, "control")).toBe(
+    expect(buildAttachPath("conv_abc", "terminal_bash_s1", false, undefined, "control")).toBe(
       "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach?transport=control",
     );
   });
 
-  it("combines read_only and transport params", () => {
-    const path = buildAttachPath("conv_abc", "terminal_bash_s1", true, "control");
+  it("combines read_only, slice_key, and transport params", () => {
+    const path = buildAttachPath("conv_abc", "terminal_bash_s1", true, "host_789", "control");
     expect(path).toContain("read_only=true");
+    expect(path).toContain("omnigent_slice_key=host_789");
     expect(path).toContain("transport=control");
+  });
+
+  it("omits ?omnigent_slice_key when no hostId is provided", () => {
+    const path = buildAttachPath("conv_abc", "terminal_bash_s1", false);
+    expect(path.includes("omnigent_slice_key")).toBe(false);
   });
 
   it("omits ?transport when no override is given", () => {
@@ -132,6 +172,19 @@ describe("control-mode transport", () => {
     expect(inst.nativeSelection).toBe(true);
   });
 
+  it("disables clipboard bridging for read-only attaches", async () => {
+    render(
+      <TerminalView
+        sessionId="conv_abc"
+        terminalId="terminal_bash_s1"
+        transport="control"
+        readOnly
+      />,
+    );
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    expect(terminalSessionMock.instances[0].clipboardEnabled).toBe(false);
+  });
+
   it("hides the selection hint bar in control mode", async () => {
     render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" transport="control" />);
     await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
@@ -145,6 +198,316 @@ describe("control-mode transport", () => {
     expect(inst.url).not.toContain("transport");
     expect(inst.nativeSelection).toBe(false);
     expect(screen.getByTestId("terminal-selection-hint")).toBeInTheDocument();
+  });
+});
+
+describe("tmux clipboard", () => {
+  async function renderClipboardView() {
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    return terminalSessionMock.instances[0];
+  }
+
+  function requestClipboard(text: string): void {
+    act(() => terminalSessionMock.instances[0].onClipboardRequest?.(text));
+  }
+
+  function visibleClipboardConsent(): HTMLElement | null {
+    const active = toast
+      .getToasts()
+      .some((item) => !("dismiss" in item) && item.testId === "terminal-clipboard-consent");
+    if (!active) return null;
+    return (
+      screen
+        .queryAllByTestId("terminal-clipboard-consent")
+        .filter((element) => element.getAttribute("data-removed") !== "true")
+        .sort(
+          (left, right) =>
+            Number(left.getAttribute("data-index") ?? 999) -
+            Number(right.getAttribute("data-index") ?? 999),
+        )[0] ?? null
+    );
+  }
+
+  function clickConsentButton(name: "Allow for this session" | "Copy once" | "Block"): void {
+    const prompt = visibleClipboardConsent();
+    expect(prompt).not.toBeNull();
+    fireEvent.click(within(prompt!).getByRole("button", { name }));
+  }
+
+  async function requestClipboardConsent(text: string): Promise<HTMLElement> {
+    requestClipboard(text);
+    await waitFor(() => expect(visibleClipboardConsent()).not.toBeNull());
+    return visibleClipboardConsent()!;
+  }
+
+  it("requires consent before the first terminal clipboard write", async () => {
+    const terminal = await renderClipboardView();
+
+    const prompt = await requestClipboardConsent("copied text");
+
+    expect(clipboardMock.copyText).not.toHaveBeenCalled();
+    expect(prompt).not.toBeNull();
+    expect(
+      screen.getAllByText("Allow this terminal to copy to your clipboard?").length,
+    ).toBeGreaterThan(0);
+    expect(
+      screen.getAllByText("Terminal applications may replace clipboard contents.").length,
+    ).toBeGreaterThan(0);
+    clickConsentButton("Copy once");
+    await waitFor(() => expect(clipboardMock.copyText).toHaveBeenCalledWith("copied text"));
+    await waitFor(() => expect(visibleClipboardConsent()).toBeNull());
+    expect(terminal.focus).toHaveBeenCalled();
+
+    await requestClipboardConsent("next text");
+    expect(visibleClipboardConsent()).toBeInTheDocument();
+    expect(clipboardMock.copyText).toHaveBeenCalledTimes(1);
+  });
+
+  it("allows automatic copies for the rest of the mounted terminal session", async () => {
+    await renderClipboardView();
+    await requestClipboardConsent("first text");
+
+    clickConsentButton("Allow for this session");
+    await waitFor(() => expect(clipboardMock.copyText).toHaveBeenCalledWith("first text"));
+
+    requestClipboard("second text");
+    await waitFor(() => expect(clipboardMock.copyText).toHaveBeenLastCalledWith("second text"));
+    expect(clipboardMock.copyText).toHaveBeenCalledTimes(2);
+    await waitFor(() => expect(visibleClipboardConsent()).toBeNull());
+  });
+
+  it("resets clipboard consent when the view switches terminals", async () => {
+    const { rerender } = render(
+      <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />,
+    );
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    await requestClipboardConsent("first terminal");
+    clickConsentButton("Allow for this session");
+    await waitFor(() => expect(clipboardMock.copyText).toHaveBeenCalledTimes(1));
+
+    let rejectOldCopy: ((reason: Error) => void) | undefined;
+    clipboardMock.copyText.mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectOldCopy = reject;
+        }),
+    );
+    requestClipboard("pending old terminal");
+    await waitFor(() => expect(clipboardMock.copyText).toHaveBeenCalledTimes(2));
+    act(() => toast.dismiss());
+
+    rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s2" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
+    await act(async () => rejectOldCopy?.(new Error("old terminal closed")));
+    await waitFor(() => expect(visibleClipboardConsent()).toBeNull());
+    expect(screen.queryByText("Couldn't copy terminal selection to the clipboard.")).toBeNull();
+
+    act(() => terminalSessionMock.instances[1].onClipboardRequest?.("second terminal"));
+    await waitFor(() => expect(visibleClipboardConsent()).not.toBeNull());
+    expect(visibleClipboardConsent()).toBeInTheDocument();
+    expect(clipboardMock.copyText).toHaveBeenCalledTimes(2);
+  });
+
+  it("discards an unanswered prompt while the terminal is hidden", async () => {
+    const { rerender } = render(
+      <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />,
+    );
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    await requestClipboardConsent("stale text");
+    expect(visibleClipboardConsent()).toBeInTheDocument();
+
+    rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active={false} />);
+    rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active />);
+    await waitFor(() => expect(visibleClipboardConsent()).toBeNull());
+
+    await requestClipboardConsent("fresh text");
+    expect(visibleClipboardConsent()).toBeInTheDocument();
+  });
+
+  it("resets clipboard consent after a read-only permission transition", async () => {
+    const { rerender } = render(
+      <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />,
+    );
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    await requestClipboardConsent("initial text");
+    clickConsentButton("Allow for this session");
+    await waitFor(() => expect(clipboardMock.copyText).toHaveBeenCalledTimes(1));
+
+    rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" readOnly />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
+    rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(3));
+    act(() => terminalSessionMock.instances[2].onClipboardRequest?.("after read-only"));
+    await waitFor(() => expect(visibleClipboardConsent()).not.toBeNull());
+
+    expect(visibleClipboardConsent()).toBeInTheDocument();
+    expect(clipboardMock.copyText).toHaveBeenCalledTimes(1);
+  });
+
+  it("suppresses stale clipboard completion after the terminal unmounts", async () => {
+    const { unmount } = render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    await requestClipboardConsent("initial text");
+    clickConsentButton("Allow for this session");
+    await waitFor(() => expect(clipboardMock.copyText).toHaveBeenCalledTimes(1));
+
+    let rejectInFlight: ((reason: Error) => void) | undefined;
+    clipboardMock.copyText.mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectInFlight = reject;
+        }),
+    );
+    requestClipboard("pending text");
+    await waitFor(() => expect(clipboardMock.copyText).toHaveBeenCalledTimes(2));
+    act(() => toast.dismiss());
+    const terminal = terminalSessionMock.instances[0];
+
+    unmount();
+    await act(async () => rejectInFlight?.(new Error("unmounted")));
+
+    expect(screen.queryByText("Couldn't copy terminal selection to the clipboard.")).toBeNull();
+    expect(terminal.focus).toHaveBeenCalledTimes(1);
+  });
+
+  it("coalesces session-approved automatic copies to the newest pending text", async () => {
+    await renderClipboardView();
+    await requestClipboardConsent("initial text");
+    clickConsentButton("Allow for this session");
+    await waitFor(() => expect(clipboardMock.copyText).toHaveBeenCalledTimes(1));
+
+    let resolveInFlight: (() => void) | undefined;
+    clipboardMock.copyText.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveInFlight = resolve;
+        }),
+    );
+    requestClipboard("superseded text");
+    requestClipboard("newest text");
+    await waitFor(() => expect(clipboardMock.copyText).toHaveBeenCalledTimes(2));
+    expect(clipboardMock.copyText).toHaveBeenLastCalledWith("superseded text");
+
+    await act(async () => resolveInFlight?.());
+    await waitFor(() => expect(clipboardMock.copyText).toHaveBeenCalledTimes(3));
+    expect(clipboardMock.copyText).toHaveBeenLastCalledWith("newest text");
+  });
+
+  it("blocks clipboard requests for the rest of the mounted terminal session", async () => {
+    await renderClipboardView();
+    await requestClipboardConsent("blocked text");
+
+    clickConsentButton("Block");
+    requestClipboard("still blocked");
+
+    expect(clipboardMock.copyText).not.toHaveBeenCalled();
+    await waitFor(() => expect(visibleClipboardConsent()).toBeNull());
+  });
+
+  it("asks again when a session-approved automatic copy lacks browser permission", async () => {
+    await renderClipboardView();
+    await requestClipboardConsent("first text");
+    clickConsentButton("Allow for this session");
+    await waitFor(() => expect(clipboardMock.copyText).toHaveBeenCalledTimes(1));
+
+    clipboardMock.copyText
+      .mockRejectedValueOnce(new Error("permission denied"))
+      .mockResolvedValueOnce(undefined);
+    act(() => toast.dismiss());
+    requestClipboard("retry text");
+
+    await waitFor(() => expect(visibleClipboardConsent()).toBeInTheDocument());
+    expect(screen.queryByText("Couldn't copy terminal selection to the clipboard.")).toBeNull();
+    clickConsentButton("Copy once");
+
+    await waitFor(() => expect(clipboardMock.copyText).toHaveBeenCalledTimes(3));
+    expect(clipboardMock.copyText).toHaveBeenLastCalledWith("retry text");
+  });
+});
+
+describe("hidden pre-warmed surface", () => {
+  it("keeps one live session across an active flip and focuses on reveal", async () => {
+    // Mount hidden (a pre-warmed attach behind the chat view): the
+    // session dials immediately — that is the whole point of the
+    // pre-warm — but must not take focus away from the composer.
+    const { rerender } = render(
+      <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active={false} />,
+    );
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    const inst = terminalSessionMock.instances[0];
+    expect(inst.focus).not.toHaveBeenCalled();
+
+    // Reveal: the SAME session is kept (no re-dial — a second instance
+    // here means the flip reconnected the WebSocket) and focused, since
+    // the WS-open auto-focus was a no-op while hidden.
+    rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active />);
+    await waitFor(() => expect(inst.focus).toHaveBeenCalledTimes(1));
+    expect(terminalSessionMock.instances).toHaveLength(1);
+    expect(inst.dispose).not.toHaveBeenCalled();
+
+    // Hiding again neither disposes nor re-focuses.
+    rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active={false} />);
+    expect(inst.dispose).not.toHaveBeenCalled();
+    expect(inst.focus).toHaveBeenCalledTimes(1);
+  });
+
+  it("toggles clipboard bridging when a warm surface is revealed", async () => {
+    const { rerender } = render(
+      <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active={false} />,
+    );
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    const inst = terminalSessionMock.instances[0];
+    expect(inst.clipboardEnabled).toBe(false);
+
+    rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active />);
+    await waitFor(() => expect(inst.setClipboardEnabled).toHaveBeenCalledWith(true));
+    expect(terminalSessionMock.instances).toHaveLength(1);
+  });
+
+  it("does not focus on a plain active mount (WS-open handles it)", async () => {
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    // No reveal edge — the session's own WS-open focus owns this case;
+    // an extra explicit call would steal focus on every reconnect.
+    expect(terminalSessionMock.instances[0].focus).not.toHaveBeenCalled();
+  });
+});
+
+describe("late direct-attach advert", () => {
+  it("retires the outgoing session when the advert lands on a live terminal", async () => {
+    // The runner's loopback advert reaches the client on a terminals
+    // refetch — after the terminal has already dialed. That prop change
+    // re-runs the attach ref for the SAME mount node (React 18 hands the
+    // node back rather than remounting, and skips the ref's cleanup), so
+    // the attach itself has to retire its predecessor. Without that,
+    // xterm stacks a second instance inside one node — two helper
+    // textareas, two renderers, two live bridges.
+    const { rerender } = render(
+      <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />,
+    );
+    await act(async () => {});
+    expect(terminalSessionMock.instances).toHaveLength(1);
+    const relayed = terminalSessionMock.instances[0];
+
+    rerender(
+      <TerminalView
+        sessionId="conv_abc"
+        terminalId="terminal_bash_s1"
+        directAttachUrl={
+          "ws://127.0.0.1:54321/v1/sessions/conv_abc" +
+          "/resources/terminals/terminal_bash_s1/attach?token=t"
+        }
+      />,
+    );
+    await act(async () => {});
+
+    // Same node, so this is a re-attach rather than a remount — which is
+    // exactly why the predecessor cannot be left running.
+    const readvertised = terminalSessionMock.instances.at(-1)!;
+    expect(readvertised).not.toBe(relayed);
+    expect(readvertised.container).toBe(relayed.container);
+    expect(relayed.dispose).toHaveBeenCalled();
   });
 });
 
@@ -289,6 +652,23 @@ describe("automatic reconnect", () => {
     expect(terminalSessionMock.instances[0].dispose).toHaveBeenCalled();
   });
 
+  it("re-dials after a code-less close (1005) — the redeploy-behind-ingress case", async () => {
+    // A server redeploy behind a fronting proxy tears the attach socket
+    // down without a clean app code reaching the browser, which reports
+    // 1005 ("no status"). It must recover exactly like 1006, not dead-end
+    // on "Bridge closed: code 1005".
+    await renderAndAttach();
+
+    closeNewest(1005);
+
+    expect(screen.getByTestId("terminal-reconnecting")).toBeInTheDocument();
+    expect(screen.queryByText(/Bridge closed/)).toBeNull();
+
+    await elapse(RECONNECT_BACKOFF_MS[0]);
+    expect(terminalSessionMock.instances).toHaveLength(2);
+    expect(terminalSessionMock.instances[0].dispose).toHaveBeenCalled();
+  });
+
   it("does not re-dial after a deliberate server close (4405 terminal-detached)", async () => {
     await renderAndAttach();
 
@@ -387,6 +767,50 @@ describe("automatic reconnect", () => {
       // Restore the default prototype getter for later tests.
       delete (document as { visibilityState?: unknown }).visibilityState;
     }
+  });
+
+  it("re-dials with a fresh budget when a hidden warm surface is revealed", async () => {
+    // A warm surface parked behind another session's view: the transport
+    // flaps with nobody watching and the background reconnect loop burns
+    // its whole budget.
+    const { rerender } = render(
+      <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active={false} />,
+    );
+    await act(async () => {});
+    expect(terminalSessionMock.instances).toHaveLength(1);
+
+    for (const [, delay] of RECONNECT_BACKOFF_MS.entries()) {
+      closeNewest(1006);
+      // oxlint-disable-next-line no-await-in-loop
+      await elapse(delay);
+    }
+    closeNewest(1006);
+    await elapse(60_000);
+    const exhausted = RECONNECT_BACKOFF_MS.length + 1;
+    expect(terminalSessionMock.instances).toHaveLength(exhausted);
+
+    // Reveal: a user is now looking at the dead pane — that is the retry
+    // signal, same as a tab thaw. One fresh dial, budget restored.
+    rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active />);
+    await act(async () => {});
+    expect(terminalSessionMock.instances).toHaveLength(exhausted + 1);
+  });
+
+  it("does not resurrect a deliberately closed terminal on reveal", async () => {
+    const { rerender } = render(
+      <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active={false} />,
+    );
+    await act(async () => {});
+    closeNewest(4405);
+    await elapse(60_000);
+    expect(terminalSessionMock.instances).toHaveLength(1);
+
+    // The server ended this terminal on purpose; revealing the surface
+    // must keep the dead-end overlay, not loop on the same answer.
+    rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active />);
+    await act(async () => {});
+    expect(terminalSessionMock.instances).toHaveLength(1);
+    expect(screen.getByText("Bridge closed: code 4405")).toBeInTheDocument();
   });
 });
 

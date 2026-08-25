@@ -1,6 +1,7 @@
 // Cmd/Ctrl+↓/↑ steps next/prev with wrap; off-list ↓ enters at top, ↑ at
-// bottom; suppressed inside editable fields; ignores Alt/Shift/bare arrows; a
-// no-op step (same id) doesn't navigate.
+// bottom; fires inside editable fields (the composer is where users type, and
+// the chord carries a modifier) but yields to a widget that already claimed it;
+// ignores Alt/Shift/bare arrows; a no-op step (same id) doesn't navigate.
 
 import { renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -19,7 +20,9 @@ function press(
   },
   target: HTMLElement = document.body,
 ): void {
-  target.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, ...mods }));
+  target.dispatchEvent(
+    new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true, ...mods }),
+  );
 }
 
 beforeEach(() => {
@@ -93,19 +96,30 @@ describe("useSessionSwitchHotkey", () => {
     expect(navigate).not.toHaveBeenCalled();
   });
 
-  it("does not switch while a textarea is focused (composer editing)", () => {
+  it("switches while a textarea is focused (composer editing)", () => {
     renderHook(() => useSessionSwitchHotkey(ids, "a"));
     const ta = document.createElement("textarea");
     document.body.appendChild(ta);
     press("ArrowDown", { metaKey: true }, ta);
-    expect(navigate).not.toHaveBeenCalled();
+    expect(navigate).toHaveBeenCalledWith("/c/b");
   });
 
-  it("does not switch while an input is focused", () => {
+  it("switches while an input is focused", () => {
     renderHook(() => useSessionSwitchHotkey(ids, "a"));
     const input = document.createElement("input");
     document.body.appendChild(input);
     press("ArrowDown", { metaKey: true }, input);
+    expect(navigate).toHaveBeenCalledWith("/c/b");
+  });
+
+  it("yields when a focused widget already claimed the chord", () => {
+    renderHook(() => useSessionSwitchHotkey(ids, "a"));
+    // Stands in for the command palette / mention menu, which preventDefault
+    // on Cmd+↑/↓ to move their own selection before this listener runs.
+    const menu = document.createElement("div");
+    document.body.appendChild(menu);
+    menu.addEventListener("keydown", (e) => e.preventDefault());
+    press("ArrowDown", { metaKey: true }, menu);
     expect(navigate).not.toHaveBeenCalled();
   });
 

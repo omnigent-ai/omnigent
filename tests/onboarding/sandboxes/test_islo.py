@@ -11,7 +11,7 @@ import click
 import pytest
 
 import omnigent.onboarding.sandboxes.islo as islo_mod
-from omnigent.onboarding.sandboxes.base import DEFAULT_HOST_IMAGE
+from omnigent.onboarding.sandboxes.base import DEFAULT_HOST_IMAGE, render_host_config_write_command
 from omnigent.onboarding.sandboxes.islo import (
     API_KEY_ENV_VAR,
     HOST_IMAGE_ENV_VAR,
@@ -630,6 +630,7 @@ def test_start_host_stops_preserved_daemon_before_launch(monkeypatch: pytest.Mon
     fake = _FakeIsloAPI()
     launcher = IsloSandboxLauncher()
     monkeypatch.setattr(launcher, "_islo", lambda: fake)
+    host_config = {"providers": {"example": {"base_url": "https://gateway.example.com"}}}
 
     workspace = launcher.start_host(
         "sb-1",
@@ -637,10 +638,12 @@ def test_start_host_stops_preserved_daemon_before_launch(monkeypatch: pytest.Mon
         host_id="host_1",
         host_name="managed-1",
         server_url="https://omnigent.example.com",
+        host_config=host_config,
     )
 
     assert workspace == "/root/workspace"
     commands = [call.command[-1] for call in fake.exec_calls]
+    assert render_host_config_write_command(host_config) in commands
     cleanup_index = next(i for i, cmd in enumerate(commands) if "preserved omnigent host" in cmd)
     launch_index = next(i for i, cmd in enumerate(commands) if "OMNIGENT_HOST_TOKEN" in cmd)
     assert cleanup_index < launch_index

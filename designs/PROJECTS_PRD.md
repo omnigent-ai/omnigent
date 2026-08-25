@@ -163,7 +163,7 @@ class SqlProject(OmnigentBase):
     # permission table the way session ownership is. Correct here precisely
     # because projects have no ACL and are owner-private (§9) — see the
     # "Where ownership lives" note below. None in single-user/OSS mode.
-    owner_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[int] = mapped_column(Integer, nullable=False)
     updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # No `position` column: ordering is deferred and, when added, will be a
@@ -173,9 +173,9 @@ class SqlProject(OmnigentBase):
         # "list my projects": prefix scan on (workspace_id, owner). Server
         # returns a stable order (e.g. created_at / name); the client may
         # re-order locally.
-        Index("ix_projects_owner", "workspace_id", "owner_user_id", "id"),
-        # Per-owner name uniqueness (§7.1); app validates too.
-        Index("uq_projects_owner_name", "workspace_id", "owner_user_id", "name", unique=True),
+        Index("ix_projects_owner", "workspace_id", "user_id", "id"),
+        # Per-owner name uniqueness (§7.1) is a store-level check
+        # (`_name_taken`), not a unique index — see the table below.
     )
 ```
 
@@ -195,8 +195,8 @@ Index("ix_conversation_metadata_project_id", "workspace_id", "project_id", "id")
 |---|---|---|
 | `id` type | `String(64)`, `proj_`-prefixed | Reads as a sibling of `conv_…` ids; lives in the metadata String column. Newest tables use `Uuid16` — diverge here for readability + column symmetry. |
 | Membership location | `project_id` on `omnigent_conversation_metadata` | Metadata already holds host/workspace/runner; `list_conversations` can filter it inline. |
-| Name uniqueness | per-`(workspace, owner)` unique index | Matches §7.1; case-sensitivity still open (Q3). |
-| Ownership | `owner_user_id` **column on the row** | See "Where ownership lives" below — differs from sessions on purpose. |
+| Name uniqueness | store-level check, **no** unique index | Matches §7.1; case-sensitivity still open (Q3). The unique index shipped in Phase 1a and was dropped in `d5e6f7a8b9c0`: it never held for single-user mode (NULL owner, and SQL treats NULLs as distinct), and `name` is mutable, so it was maintained on every rename. Concurrent creates/renames to one name can now both land. |
+| Ownership | `user_id` **column on the row** | See "Where ownership lives" below — differs from sessions on purpose. |
 | Ordering | **no `position` column** | Reorder is deferred and client-only (§7.2); no server state until proven needed. |
 | Deferred columns | default host/workspace/harness/model, memory/context refs | Added in Phase 2/3, not now. |
 
@@ -209,12 +209,12 @@ shareable:
   `list_projects(owned_by=...)`). This is required *because sessions are shared*:
   ownership is just the top row among many `(user, level)` grants.
 - **`scheduled_tasks`** — a personal, non-shareable artifact with no ACL — instead
-  stamps `owner_user_id` directly on the row (`db_models.py:1298`), indexed
-  `(workspace_id, owner_user_id, id)`.
+  stamps `user_id` directly on the row (`db_models.py:1298`), indexed
+  `(workspace_id, user_id, id)`.
 
 Projects follow `scheduled_tasks`, not sessions, **because §9 gives them no
 project-level ACL** — they're owner-private, single-owner, never granted to
-anyone else. With no `project_permissions` table to derive from, `owner_user_id`
+anyone else. With no `project_permissions` table to derive from, `user_id`
 on the row is the correct and consistent choice. (The v1 label-based
 `list_projects` derives ownership from `session_permissions` only because a label
 has no row of its own to stamp — the first-class table removes that constraint.)
@@ -448,10 +448,12 @@ Tracks what has actually landed vs. what remains. Updated as work ships.
 Shipped: the project **container** — create, list, rename, and delete empty
 projects. Session→project membership landed separately in Phase 1b (below).
 - ✅ **`projects` table** — `SqlProject` (`db_models.py`): `id` (Uuid16),
-  `name`, `owner_user_id`, `created_at`, `updated_at`. Owner-scoped index; a
-  UNIQUE index on `(workspace_id, owner_user_id, name)` enforces per-owner name
+  `name`, `user_id`, `created_at`, `updated_at`. Owner-scoped index; a
+  UNIQUE index on `(workspace_id, user_id, name)` enforced per-owner name
   uniqueness at the DB layer for non-NULL owners (the store's `_name_taken`
-  check guards NULL-owner / single-user rows, which SQL treats as distinct).
+  check guarded NULL-owner / single-user rows, which SQL treats as distinct).
+  That index was later dropped in `d5e6f7a8b9c0`, leaving `_name_taken` the
+  sole guard for every owner.
   (No `config` column in Phase 1a — deferred so we didn't ship an unused
   column; added in Phase 2 via migration `b3c4d5e6f7a8`, see the TODO below.)
 - ✅ **Migration** `b1c2d3e4f5a6` — creates the `projects` table only;
@@ -459,7 +461,8 @@ projects. Session→project membership landed separately in Phase 1b (below).
 - ✅ **Entity** — `Project` (`entities/project.py`).
 - ✅ **Store** — `ProjectStore` + `SqlAlchemyProjectStore` (create/get/list/
   update/delete, owner-scoped; `IntegrityError` → `ALREADY_EXISTS` as the DB
-  backstop for the uniqueness race).
+  backstop for the uniqueness race — removed with the index in
+  `d5e6f7a8b9c0`).
 - ✅ **API** — `POST/GET/PATCH/DELETE /v1/projects` (`routes/projects.py`),
   request/response schemas, wired into `create_app` + CLI; `openapi.json`
   regenerated. Every handler is owner-scoped (projects are owner-private).

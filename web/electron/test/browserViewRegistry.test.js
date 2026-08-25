@@ -21,8 +21,12 @@ function makeRegistry() {
   const sent = []; // { channel, payload }
   const attached = [];
   const detached = [];
+  const visibility = []; // booleans passed to any view's setVisible, in order
   const makeStubView = () => ({
     setBounds() {},
+    setVisible(v) {
+      visibility.push(v);
+    },
     webContents: {
       loadURL() {},
       close() {},
@@ -39,7 +43,7 @@ function makeRegistry() {
     sendToRenderer: (channel, payload) => sent.push({ channel, payload }),
     getHostZoomFactor: () => 1,
   });
-  return { registry, sent, attached, detached };
+  return { registry, sent, attached, detached, visibility };
 }
 
 describe("browserViewRegistry — first-navigate activation signal", () => {
@@ -94,11 +98,10 @@ describe("browserViewRegistry — first-navigate activation signal", () => {
   it("full first-navigate path: create signal → setActive → attached + bounds synced", () => {
     // Mirrors what BrowserPane does: it learns of the view from the create
     // event, mounts the placeholder, then setActive attaches + syncs bounds.
-    let sawCreate = null;
     // (the pane's onBrowserViewCreated listener)
     ctx.sent.length = 0;
     ctx.registry.openOrNavigate("conv_1", "https://example.com");
-    sawCreate = ctx.sent.find((s) => s.channel === "browser-view-created");
+    const sawCreate = ctx.sent.find((s) => s.channel === "browser-view-created");
     assert.ok(sawCreate, "pane would receive the create event");
 
     // Pane reacts: setActive(conversationId) then a resize (bounds).
@@ -331,5 +334,41 @@ describe("browserViewRegistry — child window.open is denied (S3)", () => {
     registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
     assert.deepEqual(windowOpen("https://evil.example.com/popup"), { action: "deny" });
     assert.deepEqual(windowOpen("https://example.com/ok"), { action: "deny" });
+  });
+});
+
+describe("browserViewRegistry — overlay suppression (#3980)", () => {
+  let ctx;
+  beforeEach(() => {
+    ctx = makeRegistry();
+  });
+
+  it("toggles setVisible on the active view when suppressed/unsuppressed", () => {
+    ctx.registry.openOrNavigate("conv_1", "https://example.com");
+    ctx.registry.setActive("conv_1");
+    ctx.visibility.length = 0; // ignore any visibility calls during attach
+    ctx.registry.setSuppressed(true);
+    assert.deepEqual(ctx.visibility, [false], "suppress hides the active view");
+    ctx.registry.setSuppressed(false);
+    assert.deepEqual(ctx.visibility, [false, true], "unsuppress shows it again");
+    assert.equal(ctx.registry.isSuppressed(), false);
+  });
+
+  it("keeps a view hidden when it becomes active while suppression is on (sticky)", () => {
+    // Suppress with nothing active, then attach a view — it must attach hidden.
+    ctx.registry.openOrNavigate("conv_1", "https://example.com");
+    ctx.registry.setSuppressed(true);
+    ctx.visibility.length = 0;
+    ctx.registry.setActive("conv_1");
+    assert.ok(
+      ctx.visibility.includes(false) && !ctx.visibility.includes(true),
+      "a view attaching under active suppression stays hidden",
+    );
+  });
+
+  it("is a no-op (no throw) when no view is active", () => {
+    assert.deepEqual(ctx.registry.setSuppressed(true), { ok: true });
+    assert.equal(ctx.registry.isSuppressed(), true);
+    assert.equal(ctx.visibility.length, 0, "nothing to toggle with no active view");
   });
 });

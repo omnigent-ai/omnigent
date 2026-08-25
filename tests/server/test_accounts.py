@@ -969,6 +969,7 @@ def _build_accounts_app(
         admin is created and ``/v1/info`` reports ``needs_setup``.
     """
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / ".omnigent"))
     # Accounts is the default provider now, but pin it explicitly
     # so this fixture doesn't depend on the global default.
     monkeypatch.setenv("OMNIGENT_AUTH_PROVIDER", "accounts")
@@ -1550,6 +1551,52 @@ def test_admin_cannot_delete_last_admin(accounts_app: TestClient) -> None:
     assert "self" in resp.json()["error"].lower() or "last admin" in resp.json()["error"].lower()
 
 
+def test_concurrent_deletes_cannot_leave_zero_admins(tmp_path: Path) -> None:
+    """Two concurrent deletes of two *different* admins can't both apply.
+
+    Regression test for a TOCTOU race: a naive read-then-delete
+    ("are there other admins? if so, delete") checks and writes in
+    two separate transactions. If two admins are deleted at once,
+    each request's read can see the *other* as the remaining admin,
+    both checks pass, and the deploy ends up with zero admins and no
+    recovery path. ``AccountStore.delete_user`` closes this by
+    locking the admin set before counting it (``BEGIN IMMEDIATE`` on
+    SQLite), so the second writer blocks and re-observes the
+    up-to-date count instead of the stale one.
+
+    Runs the two deletes as real concurrent threads against the same
+    on-disk SQLite database — not a simulated interleave — so it
+    actually exercises the locking, not just the application logic.
+    """
+    import threading
+
+    db_url = f"sqlite:///{tmp_path}/test.db"
+    store = SqlAlchemyAccountStore(db_url)
+    store.create_user_with_password("alice", hash_password("alice-pw-1234"), is_admin=True)
+    store.create_user_with_password("bob", hash_password("bob-pw-1234"), is_admin=True)
+
+    results: dict[str, bool | None] = {}
+    barrier = threading.Barrier(2)
+
+    def delete(user_id: str) -> None:
+        barrier.wait()  # maximize the chance both threads race the same window
+        results[user_id] = store.delete_user(user_id)
+
+    threads = [threading.Thread(target=delete, args=(uid,)) for uid in ("alice", "bob")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    remaining_admins = {u.id for u in store.list_users() if u.is_admin}
+    assert remaining_admins, (
+        f"last-admin invariant violated: {remaining_admins=} results={results}"
+    )
+    # Exactly one delete should have been refused (whichever ran second
+    # relative to the DB lock); the other applied.
+    assert sorted(results.values()) == [False, True]
+
+
 def test_admin_reset_returns_new_plaintext_once(
     accounts_app: TestClient,
 ) -> None:
@@ -1761,7 +1808,10 @@ def test_cli_accounts_login_happy_path_stores_token(
         calls["n"] += 1
         assert url.endswith("/auth/login")
         body = kw["json"]
-        assert body == {"username": "alice", "password": "alice-pw-1234"}
+        assert body == {
+            "username": "alice",
+            "password": "alice-pw-1234",
+        }
         return _FakeResponse(
             200,
             {
@@ -1975,3 +2025,27 @@ def test_setup_is_single_use(accounts_app_needs_setup: TestClient) -> None:
     user_ids = {u["id"] for u in client.get("/auth/users").json()["users"]}
     assert "alice" in user_ids
     assert "bob" not in user_ids
+
+
+def test_browser_login_never_issues_refresh_token(accounts_app: TestClient) -> None:
+    """Regression test for P1 security: browser /auth/login must NEVER issue
+    a refresh_token, regardless of client input. Refresh grants are for
+    unattended flows (CLI/device); browser logins should never get long-lived
+    credentials that bypass session expiry.
+
+    This was broken when LoginRequest.issue_refresh was a client-controllable
+    bool — XSS or form-hijack could POST issue_refresh=true and obtain a
+    30-day unattended credential.
+    """
+    resp = accounts_app.post(
+        "/auth/login",
+        json={"username": "admin", "password": "admin-pw-12345"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+
+    # Browser login must NEVER include refresh_token in response.
+    assert "refresh_token" not in body, (
+        "Browser /auth/login returned refresh_token — violates the security "
+        "invariant that unattended credentials are issued only via CLI/device flows"
+    )

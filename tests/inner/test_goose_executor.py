@@ -16,7 +16,14 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from omnigent.inner.executor import ExecutorError, TextChunk, TurnComplete
+from omnigent.inner.executor import (
+    ExecutorError,
+    TextChunk,
+    ToolCallComplete,
+    ToolCallRequest,
+    ToolCallStatus,
+    TurnComplete,
+)
 from omnigent.inner.goose_executor import GooseExecutor
 
 # ---------------------------------------------------------------------------
@@ -422,6 +429,325 @@ async def test_fs_unsupported_when_delegation_off() -> None:
     )
 
     assert sent[0]["error"]["code"] == -32601
+
+
+# ---------------------------------------------------------------------------
+# fs delegation — event recording + TOOL_RESULT-phase content policy
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fs_read_records_tool_call_events() -> None:
+    """A delegated read buffers a paired ToolCallRequest + ToolCallComplete."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor._os_environment = _FakeOSEnv(  # type: ignore[assignment]
+        read_result={"content": "hello", "encoding": "utf-8"}
+    )
+    executor._send = AsyncMock()  # type: ignore[method-assign]
+
+    await executor._respond_to_agent_request(
+        {"jsonrpc": "2.0", "id": 3, "method": "fs/read_text_file", "params": {"path": "a.txt"}}
+    )
+
+    req, done = executor._fs_events
+    assert isinstance(req, ToolCallRequest)
+    assert req.name == "read_text_file"
+    assert req.args == {"path": "a.txt"}
+    assert isinstance(done, ToolCallComplete)
+    assert done.status is ToolCallStatus.SUCCESS
+    assert done.result == {"content": "hello"}
+    assert req.metadata["call_id"] == done.metadata["call_id"]
+
+
+@pytest.mark.asyncio
+async def test_fs_write_records_tool_call_events() -> None:
+    """A delegated write buffers a paired ToolCallRequest + ToolCallComplete."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    write_result = {"bytes": 3}
+    executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor._os_environment = _FakeOSEnv(write_result=write_result)  # type: ignore[assignment]
+    executor._send = AsyncMock()  # type: ignore[method-assign]
+
+    await executor._respond_to_agent_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "fs/write_text_file",
+            "params": {"path": "out.txt", "content": "abc"},
+        }
+    )
+
+    req, done = executor._fs_events
+    assert req.name == "write_text_file"
+    assert req.args == {"path": "out.txt", "content": "abc"}
+    assert done.status is ToolCallStatus.SUCCESS
+    assert done.result == write_result
+    assert req.metadata["call_id"] == done.metadata["call_id"]
+
+
+@pytest.mark.asyncio
+async def test_fs_read_blocked_by_call_policy() -> None:
+    """A TOOL_CALL-phase DENY refuses the read by path before it runs."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
+    fake = _FakeOSEnv(read_result={"content": "secret", "encoding": "utf-8"})
+    executor._os_environment = fake  # type: ignore[assignment]
+    policy = AsyncMock(return_value=MagicMock(action="POLICY_ACTION_DENY"))
+    executor._policy_evaluator = policy  # type: ignore[attr-defined]
+    sent: list[dict] = []
+    executor._send = AsyncMock(side_effect=lambda m: sent.append(m))  # type: ignore[method-assign]
+
+    await executor._respond_to_agent_request(
+        {"jsonrpc": "2.0", "id": 5, "method": "fs/read_text_file", "params": {"path": "a.txt"}}
+    )
+
+    assert policy.await_args.args == (
+        "PHASE_TOOL_CALL",
+        {"name": "read_text_file", "arguments": {"path": "a.txt"}},
+    )
+    assert fake.read_calls == []  # denied before the read ran
+    assert "error" in sent[0]
+    assert executor._fs_events[-1].status is ToolCallStatus.BLOCKED
+
+
+@pytest.mark.asyncio
+async def test_fs_read_blocked_by_result_policy() -> None:
+    """A TOOL_RESULT-phase DENY on read content refuses delivery and records BLOCKED."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor._os_environment = _FakeOSEnv(  # type: ignore[assignment]
+        read_result={"content": "secret", "encoding": "utf-8"}
+    )
+
+    async def _policy(phase: str, data: dict) -> MagicMock:  # type: ignore[type-arg]
+        # Allow the path at the call phase; deny the content at the result phase.
+        action = "POLICY_ACTION_DENY" if phase == "PHASE_TOOL_RESULT" else "POLICY_ACTION_ALLOW"
+        return MagicMock(action=action)
+
+    policy = AsyncMock(side_effect=_policy)
+    executor._policy_evaluator = policy  # type: ignore[attr-defined]
+    sent: list[dict] = []
+    executor._send = AsyncMock(side_effect=lambda m: sent.append(m))  # type: ignore[method-assign]
+
+    await executor._respond_to_agent_request(
+        {"jsonrpc": "2.0", "id": 5, "method": "fs/read_text_file", "params": {"path": "a.txt"}}
+    )
+
+    assert policy.await_args.args == ("PHASE_TOOL_RESULT", {"result": "secret"})
+    assert "error" in sent[0]
+    assert executor._fs_events[-1].status is ToolCallStatus.BLOCKED
+
+
+@pytest.mark.asyncio
+async def test_fs_write_blocked_by_result_policy() -> None:
+    """A TOOL_RESULT-phase DENY on the write result records BLOCKED."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    write_result = {"path": "out.txt", "bytes": 3, "marker": "actual"}
+    executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor._os_environment = _FakeOSEnv(write_result=write_result)  # type: ignore[attr-defined]
+
+    async def _policy(phase: str, data: dict) -> MagicMock:  # type: ignore[type-arg]
+        action = "POLICY_ACTION_DENY" if phase == "PHASE_TOOL_RESULT" else "POLICY_ACTION_ALLOW"
+        return MagicMock(action=action)
+
+    policy = AsyncMock(side_effect=_policy)
+    executor._policy_evaluator = policy  # type: ignore[attr-defined]
+    sent: list[dict] = []
+    executor._send = AsyncMock(side_effect=lambda m: sent.append(m))  # type: ignore[method-assign]
+
+    await executor._respond_to_agent_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "fs/write_text_file",
+            "params": {"path": "out.txt", "content": "abc"},
+        }
+    )
+
+    assert policy.await_args_list[-1].args == ("PHASE_TOOL_RESULT", {"result": write_result})
+    assert "error" in sent[0]
+    assert executor._fs_events[-1].status is ToolCallStatus.BLOCKED
+
+
+@pytest.mark.asyncio
+async def test_fs_write_blocked_by_call_policy_prevents_write() -> None:
+    """A TOOL_CALL-phase DENY (path + content) prevents the write."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
+    fake = _FakeOSEnv(write_result={})
+    executor._os_environment = fake  # type: ignore[assignment]
+    policy = AsyncMock(return_value=MagicMock(action="POLICY_ACTION_DENY"))
+    executor._policy_evaluator = policy  # type: ignore[attr-defined]
+    sent: list[dict] = []
+    executor._send = AsyncMock(side_effect=lambda m: sent.append(m))  # type: ignore[method-assign]
+
+    await executor._respond_to_agent_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "fs/write_text_file",
+            "params": {"path": "out.txt", "content": "secret"},
+        }
+    )
+
+    assert policy.await_args.args == (
+        "PHASE_TOOL_CALL",
+        {"name": "write_text_file", "arguments": {"path": "out.txt", "content": "secret"}},
+    )
+    assert fake.write_calls == []  # the write never happened
+    assert "error" in sent[0]
+    assert executor._fs_events[-1].status is ToolCallStatus.BLOCKED
+
+
+@pytest.mark.asyncio
+async def test_fs_write_call_policy_fails_closed() -> None:
+    """A TOOL_CALL-phase eval error prevents the write (fail closed for side effects)."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
+    fake = _FakeOSEnv(write_result={})
+    executor._os_environment = fake  # type: ignore[assignment]
+    executor._policy_evaluator = AsyncMock(  # type: ignore[attr-defined]
+        side_effect=RuntimeError("policy server unreachable")
+    )
+    sent: list[dict] = []
+    executor._send = AsyncMock(side_effect=lambda m: sent.append(m))  # type: ignore[method-assign]
+
+    await executor._respond_to_agent_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "fs/write_text_file",
+            "params": {"path": "out.txt", "content": "secret"},
+        }
+    )
+
+    assert fake.write_calls == []  # an eval failure blocks the write, it does not allow it
+    assert "error" in sent[0]
+    assert executor._fs_events[-1].status is ToolCallStatus.BLOCKED
+
+
+@pytest.mark.asyncio
+async def test_fs_write_call_policy_ask_blocks() -> None:
+    """A TOOL_CALL-phase ASK blocks the write (delegated fs has no elicitation path)."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
+    fake = _FakeOSEnv(write_result={})
+    executor._os_environment = fake  # type: ignore[assignment]
+    executor._policy_evaluator = AsyncMock(  # type: ignore[attr-defined]
+        return_value=MagicMock(action="POLICY_ACTION_ASK")
+    )
+    executor._send = AsyncMock()  # type: ignore[method-assign]
+
+    await executor._respond_to_agent_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "fs/write_text_file",
+            "params": {"path": "out.txt", "content": "secret"},
+        }
+    )
+
+    assert fake.write_calls == []  # ASK with no elicitation blocks the write
+    assert executor._fs_events[-1].status is ToolCallStatus.BLOCKED
+
+
+@pytest.mark.asyncio
+async def test_run_turn_surfaces_delegated_fs_ops() -> None:
+    """run_turn drains recorded fs ops onto the turn stream as ToolCall events."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor._initialized = True
+    executor._session_id = "s"
+    executor._proc = MagicMock()
+    executor._proc.returncode = None
+    executor._os_environment = _FakeOSEnv(  # type: ignore[assignment]
+        read_result={"content": "hi", "encoding": "utf-8"}
+    )
+    loop = asyncio.get_event_loop()
+
+    async def fake_send(msg: dict) -> None:
+        if msg.get("method") == "session/prompt":
+            req_id = msg["id"]
+            await executor._queue.put(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 77,
+                    "method": "fs/read_text_file",
+                    "params": {"path": "a.txt"},
+                }
+            )
+
+            def _resolve() -> None:
+                fut = executor._pending.get(req_id)
+                if fut and not fut.done():
+                    fut.set_result(
+                        {"jsonrpc": "2.0", "id": req_id, "result": {"stopReason": "end_turn"}}
+                    )
+
+            loop.call_soon(_resolve)
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    events = [e async for e in executor.run_turn([{"role": "user", "content": "go"}], [], "")]
+
+    assert [e.name for e in events if isinstance(e, ToolCallRequest)] == ["read_text_file"]
+    assert [e.status for e in events if isinstance(e, ToolCallComplete)] == [
+        ToolCallStatus.SUCCESS
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_turn_records_stale_fs_op_from_prior_turn() -> None:
+    """A stale server fs request answered at turn start is still audited, not dropped."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor._initialized = True
+    executor._session_id = "s"
+    executor._proc = MagicMock()
+    executor._proc.returncode = None
+    executor._os_environment = _FakeOSEnv(  # type: ignore[assignment]
+        read_result={"content": "hi", "encoding": "utf-8"}
+    )
+    loop = asyncio.get_event_loop()
+
+    # A leftover fs request from a prior turn, sitting on the queue before this
+    # turn starts. It runs real I/O when answered, so its audit events must survive.
+    await executor._queue.put(
+        {"jsonrpc": "2.0", "id": 77, "method": "fs/read_text_file", "params": {"path": "a.txt"}}
+    )
+
+    async def fake_send(msg: dict) -> None:
+        if msg.get("method") == "session/prompt":
+            req_id = msg["id"]
+
+            def _resolve() -> None:
+                fut = executor._pending.get(req_id)
+                if fut and not fut.done():
+                    fut.set_result(
+                        {"jsonrpc": "2.0", "id": req_id, "result": {"stopReason": "end_turn"}}
+                    )
+
+            loop.call_soon(_resolve)
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    events = [e async for e in executor.run_turn([{"role": "user", "content": "go"}], [], "")]
+
+    assert [e.name for e in events if isinstance(e, ToolCallRequest)] == ["read_text_file"]
+    assert [e.status for e in events if isinstance(e, ToolCallComplete)] == [
+        ToolCallStatus.SUCCESS
+    ]
 
 
 @pytest.mark.asyncio

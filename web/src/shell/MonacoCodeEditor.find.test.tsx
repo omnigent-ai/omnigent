@@ -79,6 +79,8 @@ interface FakeEditor {
   getModel: () => { setEOL: () => void };
   addCommand: () => void;
   onDidBlurEditorWidget: () => { dispose: () => void };
+  setScrollTop: (top: number) => void;
+  onDidScrollChange: () => { dispose: () => void };
   saveViewState: () => null;
   restoreViewState: () => void;
   getAction: (id: string) => { run: () => void } | undefined;
@@ -95,6 +97,8 @@ function makeFakeEditor(initial: string): FakeEditor {
     getModel: () => ({ setEOL: () => {} }),
     addCommand: () => {},
     onDidBlurEditorWidget: () => ({ dispose: () => {} }),
+    setScrollTop: () => {},
+    onDidScrollChange: () => ({ dispose: () => {} }),
     saveViewState: () => null,
     restoreViewState: () => {},
     // Only the find action is exercised here.

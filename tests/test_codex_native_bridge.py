@@ -2,30 +2,53 @@
 
 from __future__ import annotations
 
+import json
+import threading
 from pathlib import Path
 
 import pytest
 
+from omnigent import codex_native_bridge
 from omnigent.codex_native_bridge import (
     CodexNativeBridgeState,
     cancel_pending_mcp_startup,
     clear_active_turn_id_if_matches,
     clear_bridge_state,
     codex_home_for_bridge_dir,
+    codex_mcp_config_overrides,
     mcp_startup_waiting_detail,
     pending_mcp_servers,
     prepare_bridge_dir,
     read_bridge_startup_error,
     read_bridge_state,
     read_codex_config_model,
+    read_codex_home_config_model,
     read_mcp_startup,
     read_policy_hook_config,
     settle_pending_mcp_startup,
+    update_active_turn_id,
     update_mcp_server_startup,
     write_bridge_startup_error,
     write_bridge_state,
+    write_codex_config_model,
     write_policy_hook_config,
 )
+
+
+def test_codex_mcp_config_overrides_isolate_the_bridge_interpreter(tmp_path: Path) -> None:
+    """codex launches serve-mcp with ``-I`` so the workspace can't shadow omnigent.
+
+    The MCP server starts in the session workspace, and without ``-I`` python puts
+    that cwd on ``sys.path``, so a workspace that is an omnigent checkout supplies
+    the bridge's own package. Every other native bridge passes ``-I`` here.
+
+    :param tmp_path: Stands in for the per-session bridge dir.
+    """
+    overrides = codex_mcp_config_overrides(tmp_path)
+
+    prefix = "mcp_servers.omnigent.args="
+    raw = next(o[len(prefix) :] for o in overrides if o.startswith(prefix))
+    assert json.loads(raw)[:4] == ["-I", "-m", "omnigent.claude_native_bridge", "serve-mcp"]
 
 
 def _seed_active_turn(bridge_dir: Path, active_turn_id: str | None) -> None:
@@ -45,8 +68,24 @@ def _seed_active_turn(bridge_dir: Path, active_turn_id: str | None) -> None:
             thread_id="thread_test",
             codex_home=str(bridge_dir / "codex-home"),
             active_turn_id=active_turn_id,
+            cwd=str(bridge_dir),
         ),
     )
+
+
+def test_bridge_state_preserves_native_working_directory(tmp_path: Path) -> None:
+    """Bridge state retains the cwd used for web-driven Codex turns."""
+    _seed_active_turn(tmp_path, "turn_1")
+
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.cwd == str(tmp_path)
+
+    clear_active_turn_id_if_matches(tmp_path, "turn_1")
+
+    updated = read_bridge_state(tmp_path)
+    assert updated is not None
+    assert updated.cwd == str(tmp_path)
 
 
 @pytest.fixture
@@ -86,6 +125,18 @@ def test_read_codex_config_model_returns_top_level_model(bridge_dir: Path) -> No
     assert read_codex_config_model(bridge_dir) == "gpt-5.4"
 
 
+def test_read_codex_home_config_model_reads_a_codex_home_directly(bridge_dir: Path) -> None:
+    """A ``CODEX_HOME`` path yields the same model as the bridge-dir reader.
+
+    The runner's model-options endpoint holds the live bridge state's
+    ``codex_home``, not the bridge dir, and needs the session's model to
+    mark which catalog row this session actually launched on.
+    """
+    _write_config(bridge_dir, 'model = "gpt-5.6-luna"\n')
+
+    assert read_codex_home_config_model(codex_home_for_bridge_dir(bridge_dir)) == "gpt-5.6-luna"
+
+
 def test_read_codex_config_model_none_when_missing(bridge_dir: Path) -> None:
     """No ``config.toml`` → ``None`` (fail-safe), so the caller falls back."""
     assert read_codex_config_model(bridge_dir) is None
@@ -103,6 +154,42 @@ def test_read_codex_config_model_none_when_unparsable(bridge_dir: Path) -> None:
     _write_config(bridge_dir, 'model = "gpt-5.4\n[broken')
 
     assert read_codex_config_model(bridge_dir) is None
+
+
+def test_write_codex_config_model_replaces_top_level_key(bridge_dir: Path) -> None:
+    """The existing top-level ``model`` line is replaced, sections untouched.
+
+    An Omnigent-initiated switch (routing / web picker) must land on the same
+    key an in-TUI ``/model`` writes, or the forwarder's next config re-read
+    mirrors the stale launch model back and reverts the switch.
+    """
+    _write_config(
+        bridge_dir,
+        'model = "databricks-gpt-5-5"\n'
+        'model_provider = "databricks"\n'
+        "[model_providers.databricks]\n"
+        'model = "section-model-not-touched"\n',
+    )
+
+    assert write_codex_config_model(bridge_dir, "gpt-5.6-luna") is True
+    assert read_codex_config_model(bridge_dir) == "gpt-5.6-luna"
+    body = (codex_home_for_bridge_dir(bridge_dir) / "config.toml").read_text()
+    assert 'model = "section-model-not-touched"' in body
+    assert 'model_provider = "databricks"' in body
+
+
+def test_write_codex_config_model_inserts_when_absent(bridge_dir: Path) -> None:
+    """A config with no top-level ``model`` gains one at the top."""
+    _write_config(bridge_dir, 'model_provider = "databricks"\n')
+
+    assert write_codex_config_model(bridge_dir, "gpt-5.6-luna") is True
+    assert read_codex_config_model(bridge_dir) == "gpt-5.6-luna"
+
+
+def test_write_codex_config_model_creates_missing_file(bridge_dir: Path) -> None:
+    """No codex-home/config.toml yet → the writer creates it (best-effort)."""
+    assert write_codex_config_model(bridge_dir, "gpt-5.6-luna") is True
+    assert read_codex_config_model(bridge_dir) == "gpt-5.6-luna"
 
 
 def test_policy_hook_config_round_trips(bridge_dir: Path) -> None:
@@ -208,6 +295,58 @@ def test_clear_active_turn_id_if_matches_no_state_returns_true(bridge_dir: Path)
     """
     # bridge_dir exists (fixture) but no state.json was written.
     assert clear_active_turn_id_if_matches(bridge_dir, "turn_1") is True
+
+
+def test_active_turn_compare_and_clear_is_atomic_with_concurrent_update(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Clearing turn A cannot overwrite a concurrent turn-B state update."""
+    _seed_active_turn(bridge_dir, "turn_a")
+    original_write = codex_native_bridge._write_bridge_state_unlocked
+    clear_write_entered = threading.Event()
+    release_clear_write = threading.Event()
+    update_finished = threading.Event()
+    clear_result: list[bool] = []
+
+    def blocking_write(path: Path, state: CodexNativeBridgeState) -> None:
+        """Hold turn A's clear after its read while it owns the state lock."""
+        if state.active_turn_id is None:
+            clear_write_entered.set()
+            assert release_clear_write.wait(timeout=5.0)
+        original_write(path, state)
+
+    monkeypatch.setattr(codex_native_bridge, "_write_bridge_state_unlocked", blocking_write)
+
+    def clear_turn_a() -> None:
+        """Clear turn A through the compare-and-swap helper."""
+        clear_result.append(clear_active_turn_id_if_matches(bridge_dir, "turn_a"))
+
+    def publish_turn_b() -> None:
+        """Publish the newer turn B and signal when its locked update lands."""
+        update_active_turn_id(bridge_dir, "turn_b")
+        update_finished.set()
+
+    clear_thread = threading.Thread(target=clear_turn_a)
+    update_thread = threading.Thread(target=publish_turn_b)
+    clear_thread.start()
+    assert clear_write_entered.wait(timeout=5.0)
+    update_thread.start()
+    try:
+        assert not update_finished.wait(timeout=0.1), (
+            "turn B wrote while turn A's compare-and-clear still held the state lock"
+        )
+    finally:
+        release_clear_write.set()
+        clear_thread.join(timeout=5.0)
+        update_thread.join(timeout=5.0)
+
+    assert not clear_thread.is_alive()
+    assert not update_thread.is_alive()
+    assert clear_result == [True]
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.active_turn_id == "turn_b"
 
 
 def test_bridge_startup_error_round_trips_and_is_cleared(bridge_dir: Path) -> None:

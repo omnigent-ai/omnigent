@@ -17,7 +17,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Editor } from "@tiptap/core";
 import { Markdown } from "@tiptap/markdown";
-import StarterKit from "@tiptap/starter-kit";
+import { StarterKit } from "@tiptap/starter-kit";
 import { PluginKey } from "@tiptap/pm/state";
 import type { RefObject } from "react";
 import type { Comment } from "@/hooks/useComments";

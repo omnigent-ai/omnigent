@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import shutil
 import subprocess
 import sys
@@ -130,6 +131,7 @@ def test_threaded_idle_watcher_reports_terminal_exit(tmp_path: Path) -> None:
     exited = threading.Event()
 
     instance._capture_pane_for_idle_or_none = lambda: None  # type: ignore[method-assign]
+    instance._tmux_session_exists_sync = lambda: False  # type: ignore[method-assign]
 
     instance.start_idle_watcher_thread(
         on_exit=exited.set,
@@ -154,9 +156,10 @@ def test_threaded_idle_watcher_keeps_last_pane_text_on_exit(tmp_path: Path) -> N
         running=True,
     )
     exited = threading.Event()
-    snapshots = iter(["\x1b[31mstartup failed\x1b[0m\ntry config", None])
+    snapshots = iter(["\x1b[31mstartup failed\x1b[0m\ntry config", None, None, None])
 
     instance._capture_pane_for_idle_or_none = lambda: next(snapshots)  # type: ignore[method-assign]
+    instance._tmux_session_exists_sync = lambda: False  # type: ignore[method-assign]
 
     instance.start_idle_watcher_thread(
         on_exit=exited.set,
@@ -165,6 +168,193 @@ def test_threaded_idle_watcher_keeps_last_pane_text_on_exit(tmp_path: Path) -> N
 
     assert exited.wait(timeout=1.0)
     assert instance.last_pane_text() == "startup failed\ntry config"
+
+
+def test_threaded_idle_watcher_resets_transient_capture_failures(tmp_path: Path) -> None:
+    """Successful pane captures reset the consecutive-failure threshold."""
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    captures = iter([None, None, "recovered once", None, None, "recovered twice"])
+    exited = threading.Event()
+    recovered_twice = threading.Event()
+    successful_ticks = 0
+
+    def _capture() -> str | None:
+        return next(captures, "steady")
+
+    def _on_tick() -> None:
+        nonlocal successful_ticks
+        successful_ticks += 1
+        if successful_ticks >= 2:
+            recovered_twice.set()
+
+    instance._capture_pane_for_idle_or_none = _capture  # type: ignore[method-assign]
+    instance._tmux_session_exists_sync = lambda: False  # type: ignore[method-assign]
+    instance._pane_is_dead = lambda: False  # type: ignore[method-assign]
+
+    instance.start_idle_watcher_thread(
+        on_exit=exited.set,
+        on_tick=_on_tick,
+        poll_interval_s=0.01,
+    )
+
+    assert recovered_twice.wait(timeout=1.0)
+    instance._stop_idle_watcher_thread()
+    assert not exited.is_set()
+    assert instance.running is True
+
+
+def test_threaded_idle_watcher_uses_session_probe_to_confirm_capture_failure(
+    tmp_path: Path,
+) -> None:
+    """A live has-session probe prevents a failed capture from becoming exit."""
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    exited = threading.Event()
+    confirmed = threading.Event()
+    confirmations = 0
+
+    def _confirm() -> bool:
+        nonlocal confirmations
+        confirmations += 1
+        if confirmations >= 4:
+            confirmed.set()
+        return True
+
+    instance._capture_pane_for_idle_or_none = lambda: None  # type: ignore[method-assign]
+    instance._tmux_session_exists_sync = _confirm  # type: ignore[method-assign]
+
+    instance.start_idle_watcher_thread(on_exit=exited.set, poll_interval_s=0.01)
+
+    assert confirmed.wait(timeout=1.0)
+    instance._stop_idle_watcher_thread()
+    assert not exited.is_set()
+    assert instance.running is True
+
+
+@pytest.mark.asyncio
+async def test_close_kills_tmux_when_socket_exists_after_running_cleared(tmp_path: Path) -> None:
+    """Cleanup kills a surviving tmux server even after a watcher marked it dead."""
+    private_dir = tmp_path / "terminal"
+    private_dir.mkdir()
+    socket_path = private_dir / "tmux.sock"
+    socket_path.touch()
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=socket_path,
+        private_dir=private_dir,
+        running=False,
+    )
+    commands: list[tuple[str, ...]] = []
+
+    async def _tmux(*args: str) -> None:
+        commands.append(args)
+
+    instance._tmux = _tmux  # type: ignore[method-assign]
+
+    await instance.close()
+
+    assert commands == [("kill-server",)]
+    assert not private_dir.exists()
+
+
+def test_capture_probe_logs_command_return_code_and_stderr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Watcher probe errors retain the evidence needed to diagnose tmux failures."""
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+
+    monkeypatch.setattr(
+        terminal_mod.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=17,
+            stdout=b"",
+            stderr=b"fork failed: resource temporarily unavailable",
+        ),
+    )
+
+    with caplog.at_level(logging.WARNING, logger=terminal_mod.__name__):
+        snapshot = instance._capture_pane_for_idle_or_none()
+
+    assert snapshot is None
+    message = caplog.text
+    assert "rc=17" in message
+    assert str(instance.socket_path) in message
+    assert "capture-pane -t main -p -e" in message
+    assert "fork failed: resource temporarily unavailable" in message
+
+
+def test_threaded_idle_watcher_fires_on_tick_each_poll(tmp_path: Path) -> None:
+    """``on_tick`` fires every poll (not only on pane change), so the
+    claude-native status-file poller runs on the watcher cadence.
+
+    :param tmp_path: Temporary directory used for placeholder tmux paths.
+    """
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    # A steady, unchanging pane: no activity edges, but ticks still fire.
+    instance._capture_pane_for_idle_or_none = lambda: "steady frame"  # type: ignore[method-assign]
+    instance._pane_is_dead = lambda: False  # type: ignore[method-assign]
+    ticks = threading.Event()
+    count = {"n": 0}
+
+    def _on_tick() -> None:
+        count["n"] += 1
+        if count["n"] >= 3:
+            ticks.set()
+
+    instance.start_idle_watcher_thread(on_tick=_on_tick, poll_interval_s=0.01)
+    assert ticks.wait(timeout=1.0)
+    instance._stop_idle_watcher_thread()
+    assert count["n"] >= 3
+
+
+def test_pane_pid_sync_returns_pane_process_pid(tmp_path: Path) -> None:
+    """``pane_pid_sync`` parses the tmux ``#{pane_pid}`` value.
+
+    :param tmp_path: Temporary directory used for placeholder tmux paths.
+    """
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    instance._tmux_output_sync = lambda *args: "54321\n"  # type: ignore[method-assign]
+    assert instance.pane_pid_sync() == 54321
+
+    # A tmux failure (server gone) yields ``None`` rather than raising.
+    def _raise(*args: object) -> str:
+        raise RuntimeError("no server")
+
+    instance._tmux_output_sync = _raise  # type: ignore[method-assign]
+    assert instance.pane_pid_sync() is None
 
 
 @dataclass
@@ -551,6 +741,12 @@ async def test_launch_enables_csi_u_extended_keys_quietly(
     assert contains_subsequence(
         cmd,
         ["set-option", "-sq", "extended-keys-format", "csi-u"],
+    )
+    # tmux copy-mode may export selections to an attached terminal, but pane
+    # applications must not be allowed to create paste buffers through OSC 52.
+    assert contains_subsequence(
+        cmd,
+        ["set-option", "-sq", "set-clipboard", "external"],
     )
 
 

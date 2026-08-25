@@ -210,6 +210,12 @@ class SessionConnectivity:
         dot off while ``runner_id``/``host_id`` are still ``None`` so
         the UI prompts for a host + directory before the clone can run,
         rather than treating it as an in-process session.
+    :param imported: ``True`` when this session was imported from a local
+        harness transcript (the ``omnigent.import.source`` label is set).
+        Like ``needs_workspace``, forces the online dot off while unbound:
+        an imported transcript has no live executor anywhere, so it must
+        launch a runner on a host before it can run — reporting it offline
+        routes the first message into the resume picker.
     :param runner_last_seen: Epoch seconds the bound runner's tunnel was
         last observed alive, written by the replica holding the tunnel.
         ``None`` when never observed (or cleared on graceful disconnect).
@@ -221,6 +227,7 @@ class SessionConnectivity:
     runner_id: str | None
     host_id: str | None
     needs_workspace: bool
+    imported: bool = False
     runner_last_seen: int | None = None
 
 
@@ -763,19 +770,25 @@ class ConversationStore(ABC):
         _unset_model_override: bool = False,
         cost_control_mode_override: str | None = None,
         _unset_cost_control_mode_override: bool = False,
+        subagent_routing_override: str | None = None,
+        _unset_subagent_routing_override: bool = False,
         harness_override: str | None = None,
         _unset_harness_override: bool = False,
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
+        reported_model: str | None = None,
     ) -> Conversation | None:
         """
         Update mutable fields on a conversation.
 
         For ``reasoning_effort``, ``model_override``,
-        ``cost_control_mode_override``, and ``harness_override``,
+        ``cost_control_mode_override``, ``subagent_routing_override``,
+        and ``harness_override``,
         ``None`` means "leave unchanged". To explicitly clear them
         back to ``None``, pass
-        the matching ``_unset_*`` flag.
+        the matching ``_unset_*`` flag. ``reported_model`` (the model
+        the harness last reported, verbatim) has no ``_unset`` variant:
+        reports only ever move forward.
 
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
@@ -796,6 +809,12 @@ class ConversationStore(ABC):
         :param _unset_cost_control_mode_override: When ``True``, set
             ``cost_control_mode_override`` to ``None`` regardless of
             the ``cost_control_mode_override`` param value.
+        :param subagent_routing_override: Per-session subagent-routing
+            switch, ``"on"`` or ``"off"``. ``None`` leaves unchanged.
+        :param _unset_subagent_routing_override: When ``True``, set
+            ``subagent_routing_override`` to ``None`` regardless of the
+            ``subagent_routing_override`` param value. Unset reads as
+            Default (the switch is two-state; nothing is inherited).
         :param harness_override: Per-session brain-harness override,
             e.g. ``"pi"``. ``None`` leaves unchanged. No ``_unset``
             variant — the override is set once at session create and
@@ -829,6 +848,22 @@ class ConversationStore(ABC):
         :param title: Replacement title.
         :returns: The updated conversation, or ``None`` when the row is
             missing or its title changed before this call.
+        """
+        ...
+
+    @abstractmethod
+    def set_task_summary(
+        self,
+        conversation_id: str,
+        task_summary: str,
+    ) -> Conversation | None:
+        """Set a human-readable task summary on a sub-agent conversation.
+
+        :param conversation_id: Conversation to update.
+        :param task_summary: Short task-derived label, e.g.
+            ``"Investigate auth token refresh"``.
+        :returns: The updated conversation, or ``None`` when the row
+            does not exist.
         """
         ...
 
@@ -1084,6 +1119,18 @@ class ConversationStore(ABC):
             string ``"YYYY-MM-DD"``, e.g. ``"2026-06-05"``.
         :returns: The summed ``cost_usd`` across matching days, or ``0.0``
             when no rows fall in the range.
+        """
+        ...
+
+    @abstractmethod
+    def list_daily_costs(self, user_id: str, since_day_utc: str) -> list[tuple[str, float]]:
+        """
+        Return per-day cost rows for a user from ``since_day_utc`` onward.
+
+        :param user_id: The user to read, e.g. ``"alice@example.com"``.
+        :param since_day_utc: Inclusive lower-bound UTC day as ``"YYYY-MM-DD"``.
+        :returns: List of ``(day_utc, cost_usd)`` tuples, ascending by day.
+            Days with no spend are omitted.
         """
         ...
 
@@ -1460,6 +1507,7 @@ class ConversationStore(ABC):
         resume_source_native_session: bool = True,
         presentation_labels: dict[str, str] | None = None,
         up_to_response_id: str | None = None,
+        project_id: str | None = None,
     ) -> Conversation:
         """
         Deep-copy a conversation and its items into a new conversation.
@@ -1534,6 +1582,11 @@ class ConversationStore(ABC):
             transcript; when the response is the source's last one, the
             copy is equivalent to a full fork and the directive is kept.
             ``None`` (default) copies the full history.
+        :param project_id: First-class project to file the fork into
+            (``metadata.project_id``), or ``None`` (default) to leave it
+            unfiled. The caller resolves whether the fork keeps the
+            source's project — projects are owner-private, so the route
+            passes the source's id only when the forker owns it.
         :returns: The newly created :class:`Conversation`.
         :raises LookupError: If no conversation with
             *source_conversation_id* exists.

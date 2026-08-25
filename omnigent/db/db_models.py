@@ -154,14 +154,16 @@ class Uuid16(TypeDecorator[str]):
             return dialect.type_descriptor(MySQLBinary(16))
         return dialect.type_descriptor(LargeBinary(16))
 
-    def process_bind_param(self, value: str | uuid.UUID | None, _dialect: object) -> bytes | None:
+    def process_bind_param(self, value: str | uuid.UUID | None, dialect: object) -> bytes | None:
+        del dialect
         if value is None:
             return None
         return uuid_to_bytes(value)
 
     def process_result_value(
-        self, value: bytes | memoryview | str | None, _dialect: object
+        self, value: bytes | memoryview | str | None, dialect: object
     ) -> str | None:
+        del dialect
         if value is None:
             return None
         if isinstance(value, str):
@@ -622,6 +624,7 @@ class SqlConversationMetadata(OmnigentBase):
     # No FK: host records are managed outside this table.
     host_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
     sub_agent_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    task_summary: Mapped[str | None] = mapped_column(String(128), nullable=True)
     external_session_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     session_state: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     session_usage: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
@@ -671,15 +674,15 @@ class SqlProject(OmnigentBase):
     membership lives on ``omnigent_conversation_metadata.project_id``, not
     here; there is no DB foreign key (Rule R032).
 
-    Ownership is stamped on the row via ``owner_user_id`` (like
-    ``scheduled_tasks``), not derived from a permission table the way session
-    ownership is — projects have no ACL of their own and are never shared.
+    Ownership is stamped on the row via ``user_id`` (like ``scheduled_tasks``),
+    not derived from a permission table the way session ownership is — projects
+    have no ACL of their own and are never shared.
 
     :param id: Uuid16 primary key (bare 32-char hex in Python).
-    :param name: Human-readable project name; unique per owner (enforced in
-        the store, since ``owner_user_id`` is NULL in single-user mode and a DB
-        unique index treats NULLs as distinct).
-    :param owner_user_id: Owning user, or ``None`` in single-user mode.
+    :param name: Human-readable project name; unique per owner, enforced in the
+        store (``_name_taken``) rather than by a DB constraint — see
+        ``__table_args__``.
+    :param user_id: Owning user, or ``None`` in single-user mode.
     :param created_at: Unix epoch seconds at row creation.
     :param updated_at: Unix epoch seconds of the last write, or ``None``.
     """
@@ -696,7 +699,9 @@ class SqlProject(OmnigentBase):
     )
     id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
     name: Mapped[str] = mapped_column(String(256), nullable=False)
-    owner_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Owning user identity. String(128) matches session_permissions.user_id and
+    # every other user-identity column in this schema.
+    user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[int] = mapped_column(Integer, nullable=False)
     updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Default session settings as a compact JSON object (host/workspace/harness/
@@ -704,32 +709,36 @@ class SqlProject(OmnigentBase):
     # keys are an opaque, client-owned vocabulary: the value is read and written
     # whole with the row and never filtered in SQL, so new keys need no schema
     # change. Stored values are hints the new-chat dialog pre-fills and the user
-    # can always override.
-    config: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # can always override. Opaque and never SQL-filtered — stored compressed
+    # (CompressedText).
+    config: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
 
     __table_args__ = (
-        # "list my projects" — prefix scan on (workspace_id, owner_user_id) with
+        # "list my projects" — prefix scan on (workspace_id, user_id) with
         # created_at in the key so the ORDER BY created_at, id is served by the
         # index (no filesort). Server returns a stable order; reorder, if ever
         # added, is a client-only concern, so there is no ``position`` column.
+        #
+        # Also covers the two name lookups via its (workspace_id, user_id)
+        # prefix: the store's ``_name_taken`` probe and the ``?project=<name>``
+        # member join. Both then filter ``name`` over the owner's handful of
+        # rows, so neither needs a name-leading index of its own.
+        #
+        # There is deliberately NO unique index on (workspace_id, user_id, name).
+        # Per-owner name uniqueness is a store-level check (``_name_taken``), not
+        # a DB constraint: it never held for single-user mode anyway (``user_id``
+        # is NULL there and SQL treats NULLs as distinct), and ``name`` is
+        # mutable, so a unique key over it is maintained on every rename. The
+        # cost is that two concurrent creates/renames to the same name can both
+        # land; the member join already tolerates duplicate names by
+        # construction, since it unions first-class members with label-projects
+        # matched on the same string.
         Index(
-            "ix_projects_owner_user_id",
+            "ix_projects_user_id",
             "workspace_id",
-            "owner_user_id",
+            "user_id",
             "created_at",
             "id",
-        ),
-        # Enforces per-owner name uniqueness at the DB layer for NON-NULL owners
-        # (closing the store's check-then-insert race under concurrency). SQL
-        # treats NULLs as distinct, so single-user rows (owner_user_id IS NULL)
-        # can still collide on name — the store's _name_taken check covers that
-        # case. Also backs the get-by-name lookup.
-        Index(
-            "ix_projects_name",
-            "workspace_id",
-            "owner_user_id",
-            "name",
-            unique=True,
         ),
     )
 
@@ -1381,6 +1390,10 @@ class SqlScheduledTask(OmnigentBase):
         ``"claude-opus-4-7"``. ``None`` means use the agent default.
     :param reasoning_effort: Per-task reasoning-effort hint, e.g. ``"high"``.
         ``None`` means use the agent default.
+    :param permission_mode: Per-task permission mode for native coding harnesses
+        that support one (Claude Code), e.g. ``"acceptEdits"``. The fire path
+        turns it into the runner's ``--permission-mode`` launch arg. ``None``
+        means use the agent default.
     :param workspace: Absolute path on disk where a fired session's runner
         should start (the source repo / working dir). ``None`` when unset.
     :param base_branch: Git base ref a firing branches FROM when it creates a
@@ -1446,6 +1459,13 @@ class SqlScheduledTask(OmnigentBase):
     # mirror the matching conversations.* override columns.
     model_override: Mapped[str | None] = mapped_column(String(128), nullable=True)
     reasoning_effort: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Per-task permission mode for native coding harnesses that carry one
+    # (Claude Code). The fire path converts it to the runner's
+    # ``--permission-mode`` launch arg. NULL = use the agent default.
+    permission_mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Per-firing cost budget in USD. When set, the fire path attaches a
+    # cost_budget policy to each spawned session. NULL = no per-firing cap.
+    max_cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
     workspace: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     # Git base ref a firing branches from when it creates a worktree at fire
     # time (mirrors session-create's git.base_branch input). None when unset.

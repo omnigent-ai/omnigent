@@ -465,7 +465,9 @@ function renderWithSelection(
 
 /** Run pending requestAnimationFrame callbacks (the scroll effect defers via rAF). */
 function flushRaf(): Promise<void> {
-  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+  return new Promise((resolve) => {
+    requestAnimationFrame(() => resolve());
+  });
 }
 
 describe("CommentsPanel active-comment reveal", () => {

@@ -2,7 +2,7 @@
 // host, and workspace pickers where the backend can persist those fields.
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Loader2Icon, TriangleAlertIcon } from "lucide-react";
+import { TriangleAlertIcon } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -86,12 +86,15 @@ export function CreateScheduledTaskDialog({
   // below), reusing lightweight scheduled-local pickers rather than the
   // interactive dialog's 26-prop HarnessConfigModal (bound to smart-routing /
   // cost-control / per-turn model loading — disproportionate for a saved task).
-  // "" = unselected → `model_override` / `reasoning_effort` are omitted so the
-  // fire path uses the agent's configured defaults. Permission/approval/cursor
-  // mode is intentionally NOT offered here.
+  // "" = unselected → `model_override` / `reasoning_effort` / `permission_mode`
+  // are omitted so the fire path uses the agent's configured defaults. Permission
+  // mode is offered for native coding agents that support it (Claude Code); each
+  // fire launches a fresh session, so the whole launch vocabulary is valid —
+  // including the launch-only `dontAsk` / `bypassPermissions`.
   const [pickedAgentId, setPickedAgentId] = useState<string | null>(null);
   const [pickedModel, setPickedModel] = useState<string>("");
   const [pickedEffort, setPickedEffort] = useState<string>("");
+  const [pickedPermission, setPickedPermission] = useState<string>("");
 
   const agentList = useMemo(
     () => sortAgentsForDisplay((agents ?? []).filter((a) => !HIDDEN_PICKER_AGENTS.has(a.name))),
@@ -188,9 +191,10 @@ export function CreateScheduledTaskDialog({
         setName(editingTask.name);
         setPrompt(editingTask.prompt);
         setPickedAgentId(editingTask.agentId);
-        // Prefill the model/effort controls from the loaded task; null → "".
+        // Prefill the model/effort/permission controls from the loaded task; null → "".
         setPickedModel(editingTask.modelOverride ?? "");
         setPickedEffort(editingTask.reasoningEffort ?? "");
+        setPickedPermission(editingTask.permissionMode ?? "");
         setSchedule(parsedSchedule ?? DEFAULT_SCHEDULE_MODEL);
         setScheduleUnsupported(parsedSchedule === null);
         setHostId(editingTask.hostId ?? "");
@@ -201,6 +205,7 @@ export function CreateScheduledTaskDialog({
         setPickedAgentId(null);
         setPickedModel("");
         setPickedEffort("");
+        setPickedPermission("");
         setSchedule(DEFAULT_SCHEDULE_MODEL);
         setScheduleUnsupported(false);
         setHostId("");
@@ -247,6 +252,7 @@ export function CreateScheduledTaskDialog({
     setPickedAgentId(null);
     setPickedModel("");
     setPickedEffort("");
+    setPickedPermission("");
     setSchedule(DEFAULT_SCHEDULE_MODEL);
     setHostId("");
     setWorkspace("");
@@ -279,6 +285,7 @@ export function CreateScheduledTaskDialog({
           ? {
               modelOverride: pickedModel === "" ? null : pickedModel,
               reasoningEffort: pickedEffort === "" ? null : pickedEffort,
+              permissionMode: pickedPermission === "" ? null : pickedPermission,
             }
           : {};
         await updateMutation.mutateAsync({
@@ -295,6 +302,9 @@ export function CreateScheduledTaskDialog({
           // the create uses the agent's configured defaults.
           ...(showModelEffort && pickedModel !== "" ? { modelOverride: pickedModel } : {}),
           ...(showModelEffort && pickedEffort !== "" ? { reasoningEffort: pickedEffort } : {}),
+          ...(showModelEffort && pickedPermission !== ""
+            ? { permissionMode: pickedPermission }
+            : {}),
         });
       }
       handleOpenChange(false);
@@ -344,7 +354,7 @@ export function CreateScheduledTaskDialog({
               value={name}
               placeholder="daily-brief"
               data-testid="task-name-input"
-              className="text-sm"
+              className="text-ui"
               onChange={(e) => setName(e.target.value)}
             />
           </div>
@@ -357,8 +367,9 @@ export function CreateScheduledTaskDialog({
               rows={3}
               placeholder="What should the agent do each run?"
               data-testid="task-prompt-input"
+              componentId="tasks.scheduled.prompt"
               // No native resize grip — match the clean styling of the other fields.
-              className="resize-none text-sm"
+              className="resize-none text-ui"
               onChange={(e) => setPrompt(e.target.value)}
             />
           </div>
@@ -370,7 +381,7 @@ export function CreateScheduledTaskDialog({
             <Label>Runs with</Label>
             {isEdit ? (
               <div
-                className="flex h-8 w-full items-center rounded-lg border border-input bg-transparent px-2.5 text-sm text-foreground dark:bg-input/30"
+                className="flex h-8 w-full items-center rounded-lg border border-input bg-transparent px-2.5 text-ui text-foreground dark:bg-input/30"
                 data-testid="task-agent-readonly"
               >
                 {agentLabel}
@@ -416,32 +427,36 @@ export function CreateScheduledTaskDialog({
                   // width, bordered, h-8, normal foreground text — not the compact
                   // muted ghost styling the composer footer uses.
                   triggerClassName="h-8 w-full justify-between rounded-lg border border-input bg-transparent px-2.5 text-foreground hover:bg-transparent hover:text-foreground dark:bg-input/30"
-                  triggerLabelClassName="max-w-none text-sm"
+                  triggerLabelClassName="max-w-none text-ui"
                 />
               </div>
             )}
             {!showModelEffort && (
-              <p className="text-[11px] text-muted-foreground">
+              <p className="text-sm text-muted-foreground">
                 Uses this agent&apos;s default model, effort, and permission settings
               </p>
             )}
           </div>
 
-          {/* Model + reasoning effort — only for native coding agents that
-              carry the model/effort surface (Claude Code). Unselected controls
-              fall back to the agent's configured defaults. */}
+          {/* Model + reasoning effort + permission mode — only for native
+              coding agents that carry the model/effort surface (Claude Code).
+              Unselected controls fall back to the agent's configured defaults. */}
           {showModelEffort && (
             <div data-testid="task-model-effort-field">
               <ModelEffortFields
                 model={pickedModel}
                 effort={pickedEffort}
+                permissionMode={pickedPermission}
                 hostId={hostId}
                 onModelChange={setPickedModel}
                 onEffortChange={setPickedEffort}
+                onPermissionModeChange={setPickedPermission}
                 onSelectOpenChange={handleSelectOpenChange}
               />
-              <p className="mt-1.5 text-[11px] text-muted-foreground">
-                Leave on Default to use the agent&apos;s configured model and effort.
+              <p className="mt-1.5 text-sm text-muted-foreground">
+                Leave on Default to use the agent&apos;s configured model, effort, and permission
+                mode. Automations run unattended, so a prompting mode (Manual or Plan) will wait for
+                approval that never comes.
               </p>
             </div>
           )}
@@ -455,7 +470,7 @@ export function CreateScheduledTaskDialog({
             onSelectOpenChange={handleSelectOpenChange}
           />
           {scheduleUnsupported && (
-            <p className="text-xs text-destructive" role="alert">
+            <p className="text-sm text-destructive" role="alert">
               This schedule can&apos;t be edited in this form yet.
             </p>
           )}
@@ -470,6 +485,7 @@ export function CreateScheduledTaskDialog({
             <Label htmlFor="task-host">Host (optional)</Label>
             <Select
               value={hostId === "" ? UNSET_HOST : hostId}
+              componentId="tasks.scheduled.host"
               onValueChange={(v) => {
                 if (preservePinnedHost && v === UNSET_HOST) return;
                 const next = v === UNSET_HOST ? "" : v;
@@ -493,7 +509,7 @@ export function CreateScheduledTaskDialog({
                 ))}
               </SelectContent>
             </Select>
-            <p className="text-[11px] text-muted-foreground">
+            <p className="text-sm text-muted-foreground">
               Leave unset to run on your connected host when the task fires.
             </p>
           </div>
@@ -501,7 +517,7 @@ export function CreateScheduledTaskDialog({
           {hostId !== "" && (
             <div className="flex flex-col gap-1.5">
               <Label>Workspace (optional)</Label>
-              <p className="text-[11px] text-muted-foreground">
+              <p className="text-sm text-muted-foreground">
                 Defaults to the host&apos;s home directory. Pick a directory to pin it.
               </p>
               <div className="h-56 overflow-hidden rounded-md border border-border">
@@ -512,14 +528,14 @@ export function CreateScheduledTaskDialog({
                 />
               </div>
               {workspace && (
-                <p className="truncate font-mono text-[11px] text-muted-foreground">{workspace}</p>
+                <p className="truncate font-mono text-sm text-muted-foreground">{workspace}</p>
               )}
             </div>
           )}
 
           {workspaceWithoutHost && (
             <p
-              className="flex items-center gap-1.5 text-xs text-destructive"
+              className="flex items-center gap-1.5 text-sm text-destructive"
               data-testid="workspace-without-host-error"
             >
               <TriangleAlertIcon className="size-3.5 shrink-0" />
@@ -531,7 +547,7 @@ export function CreateScheduledTaskDialog({
             <div
               role="alert"
               data-testid="create-error"
-              className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive"
+              className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive"
             >
               <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
               <span>{error}</span>
@@ -540,15 +556,20 @@ export function CreateScheduledTaskDialog({
         </div>
 
         <DialogFooter className="mx-0 mb-0 shrink-0 rounded-none border-t-0 bg-transparent px-6 py-4 sm:justify-end">
-          <Button variant="outline" onClick={() => handleOpenChange(false)}>
+          <Button
+            variant="outline"
+            onClick={() => handleOpenChange(false)}
+            componentId="tasks.scheduled.cancel"
+          >
             Cancel
           </Button>
           <Button
             onClick={handleSubmit}
+            loading={mutationPending}
             disabled={!canSubmit}
             data-testid="create-scheduled-task-submit"
+            componentId="tasks.scheduled.save"
           >
-            {mutationPending && <Loader2Icon className="mr-1 size-4 animate-spin" />}
             {isEdit ? "Save changes" : "Create task"}
           </Button>
         </DialogFooter>

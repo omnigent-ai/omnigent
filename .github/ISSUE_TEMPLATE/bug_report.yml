@@ -44,3 +44,86 @@ body:
       placeholder: e.g. Ubuntu 24.04, macOS 15.1
     validations:
       required: false
+
+  - type: dropdown
+    id: harness
+    attributes:
+      label: Harness
+      description: Select the affected harnesses, if any.
+      multiple: true
+      options:
+        - Not applicable
+        - Claude
+        - Codex
+        - Cursor
+        - Antigravity
+        - Hermes
+        - OpenCode
+        - Pi
+        - Copilot
+        - Goose
+        - Kimi
+        - Kiro
+        - Qwen
+        - Other
+    validations:
+      required: false
+
+  - type: dropdown
+    id: harness-mode
+    attributes:
+      label: Harness mode
+      multiple: true
+      options:
+        - Not applicable
+        - SDK
+        - Native
+        - Other
+    validations:
+      required: false
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform or device
+      multiple: true
+      options:
+        - macOS
+        - Linux
+        - Windows
+        - Desktop app
+        - iOS
+        - Android
+        - Docker
+        - Other
+    validations:
+      required: false
+
+  - type: dropdown
+    id: impact
+    attributes:
+      label: Observed impact
+      options:
+        - All users or sessions
+        - Most users or sessions
+        - Some users or sessions
+        - One narrow or edge case
+        - Unknown
+    validations:
+      required: false
+
+  - type: dropdown
+    id: auth-type
+    attributes:
+      label: Authentication type
+      multiple: true
+      options:
+        - Not authentication-related
+        - Local
+        - Multi-user
+        - OIDC
+        - OAuth
+        - Databricks
+        - Other
+    validations:
+      required: false

@@ -34,7 +34,8 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any
+from collections.abc import Mapping
+from typing import TypedDict
 
 _logger = logging.getLogger(__name__)
 
@@ -61,6 +62,11 @@ _LEGACY_PATH_WARNED: set[str] = set()
 # Keys read from a per-harness override entry in the ``harness:`` mapping.
 _OVERRIDE_KEY_COMMAND = "command"
 _OVERRIDE_KEY_ARGS = "args"
+
+
+class _HarnessOverride(TypedDict, total=False):
+    command: str
+    args: list[str]
 
 
 def _canonicalize(harness: str) -> str:
@@ -163,8 +169,8 @@ def legacy_harness_path_env_vars_set() -> list[tuple[str, str]]:
 
 
 def resolve_harness_config(
-    cfg: dict[str, Any],  # type: ignore[explicit-any]
-) -> tuple[str | None, dict[str, dict[str, Any]]]:  # type: ignore[explicit-any]
+    cfg: Mapping[str, object],
+) -> tuple[str | None, dict[str, _HarnessOverride]]:
     """Read the ``harness:`` key from effective config.
 
     Accepts both legacy forms:
@@ -197,8 +203,16 @@ def resolve_harness_config(
         )
         return None, {}
     default: str | None = None
-    overrides: dict[str, dict[str, Any]] = {}  # type: ignore[explicit-any]
+    overrides: dict[str, _HarnessOverride] = {}
     for key, value in raw.items():
+        if not isinstance(key, str):
+            from omnigent.inner import ui
+
+            ui.warn(
+                f"config `harness:` keys must be strings, got "
+                f"{type(key).__name__} — ignoring this entry."
+            )
+            continue
         if key == "default":
             if isinstance(value, str):
                 default = value
@@ -226,8 +240,8 @@ def resolve_harness_config(
 
 def _parse_override_entry(
     key: str,
-    value: Any,  # type: ignore[explicit-any]
-) -> dict[str, Any] | None:  # type: ignore[explicit-any]
+    value: object,
+) -> _HarnessOverride | None:
     """Validate one per-harness override entry; warn+skip on malformed.
 
     :param key: The raw harness id as written in config (for messages).
@@ -244,17 +258,17 @@ def _parse_override_entry(
             f"config `harness.{key}` must be a mapping, got {type(value).__name__} — ignoring it."
         )
         return None
-    parsed: dict[str, Any] = {}  # type: ignore[explicit-any]
+    parsed: _HarnessOverride = {}
     command = value.get(_OVERRIDE_KEY_COMMAND)
     if command is not None:
         if isinstance(command, str) and command.strip():
-            parsed[_OVERRIDE_KEY_COMMAND] = command.strip()
+            parsed["command"] = command.strip()
         else:
             ui.warn(f"config `harness.{key}.command` must be a non-empty string — ignoring it.")
     args = value.get(_OVERRIDE_KEY_ARGS)
     if args is not None:
         if isinstance(args, list) and all(isinstance(a, str) for a in args):
-            parsed[_OVERRIDE_KEY_ARGS] = list(args)
+            parsed["args"] = [arg for arg in args if isinstance(arg, str)]
         else:
             ui.warn(f"config `harness.{key}.args` must be a list of strings — ignoring it.")
     return parsed
@@ -265,7 +279,7 @@ def resolve_harness_command(
     *,
     default: str,
     explicit: str | None = None,
-    cfg: dict[str, Any] | None = None,  # type: ignore[explicit-any]
+    cfg: Mapping[str, object] | None = None,
 ) -> str:
     """Resolve the executable to launch for *harness*.
 
@@ -311,7 +325,7 @@ def resolve_harness_args(
     harness: str,
     cli_args: tuple[str, ...],
     *,
-    cfg: dict[str, Any] | None = None,  # type: ignore[explicit-any]
+    cfg: Mapping[str, object] | None = None,
 ) -> list[str]:
     """Resolve the base launch args for *harness*.
 
@@ -341,7 +355,7 @@ def resolve_harness_args(
 
 def config_harness_path_override(
     harness: str,
-    cfg: dict[str, Any],  # type: ignore[explicit-any]
+    cfg: Mapping[str, object],
 ) -> str | None:
     """Return config's ``command`` override for *harness* when no env var is set.
 

@@ -39,7 +39,7 @@ type LastSeenMap = Record<string, number>;
 // The browser-durable read-state, hydrated from localStorage at module
 // load, raised (never lowered) by the server seed, and updated
 // optimistically on each mutation before the best-effort PUT lands.
-const lastSeenMap: LastSeenMap = {};
+let lastSeenMap: LastSeenMap = {};
 const explicitlyUnread = new Set<string>();
 
 // localStorage persistence. Best-effort everywhere: storage can be
@@ -198,8 +198,8 @@ export function useSeedReadState(conversations: readonly ReadStateSeed[] | undef
  * between tests (the mirror is intentionally module-scoped, not React state).
  * Not used in production.
  */
-export function __resetReadStateForTests(): void {
-  for (const id of Object.keys(lastSeenMap)) delete lastSeenMap[id];
+export function resetReadStateForTests(): void {
+  lastSeenMap = {};
   explicitlyUnread.clear();
   seeded.clear();
   hydrated = false;

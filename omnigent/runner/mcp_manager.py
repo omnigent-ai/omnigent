@@ -10,12 +10,14 @@ import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
+import httpx
 from mcp.types import ElicitRequestParams, ElicitResult
 from mcp.types import Tool as McpToolDef
 
-from omnigent.spec.types import AgentSpec, MCPServerConfig
+from omnigent.debug_logging import runner_primary_session_id
+from omnigent.json_types import JsonObject as _JsonObject
+from omnigent.spec.types import AgentSpec, MCPServerConfig, RetryPolicy
 from omnigent.tools.base import is_valid_tool_name
 from omnigent.tools.mcp import McpServerConnection
 
@@ -79,7 +81,7 @@ class _SpecEntry:
 class McpSchemasResult:
     """Output of :meth:`RunnerMcpManager.schemas_for`."""
 
-    schemas: list[dict[str, Any]]
+    schemas: list[_JsonObject]
     tool_names: set[str]
     failures: dict[str, str]  # server_name → error message
 
@@ -112,14 +114,12 @@ def compute_spec_hash(configs: list[MCPServerConfig], cwd: Path | None = None) -
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
-def _retry_payload(retry: Any | None) -> Any:
-    """Return a stable JSON payload for a retry policy-like object."""
+def _retry_payload(retry: RetryPolicy | None) -> object:
+    """Return a stable JSON payload for a retry policy."""
     if retry is None:
         return None
-    to_json = getattr(retry, "to_json", None)
-    if callable(to_json):
-        return json.loads(to_json())
-    return repr(retry)
+    payload: object = json.loads(retry.to_json())
+    return payload
 
 
 def compute_server_hash(config: MCPServerConfig, cwd: Path | None = None) -> str:
@@ -152,7 +152,7 @@ def _mcp_tool_schema(
     server_name: str,
     tool_def: McpToolDef,
     allowed: set[str] | None,
-) -> dict[str, Any] | None:
+) -> _JsonObject | None:
     """Translate an MCP tool def to an OpenAI function-tool schema with a
     namespaced name; honor *allowed*.
 
@@ -187,6 +187,7 @@ def _mcp_tool_schema(
             "(must match [a-zA-Z0-9_-]{1,256}) — skipping",
             bare_name,
             server_name,
+            extra={"session_id": runner_primary_session_id()},
         )
         return None
     # Namespace: ``{server_name}__{bare_name}`` so two servers with a tool
@@ -213,7 +214,7 @@ class RunnerMcpManager:
     def __init__(
         self,
         stdio_cwd: Path | None = None,
-        server_client: Any | None = None,
+        server_client: httpx.AsyncClient | None = None,
     ) -> None:
         """
         :param stdio_cwd: Working directory for spawned stdio MCP
@@ -270,6 +271,7 @@ class RunnerMcpManager:
             if server_client is None:
                 _logger.warning(
                     "MCP elicitation callback: no Omnigent server client available — declining",
+                    extra={"session_id": session_id},
                 )
                 return ElicitResult(action="decline")
 
@@ -277,12 +279,13 @@ class RunnerMcpManager:
 
             message = getattr(params, "message", "")
             requested_schema = getattr(params, "requestedSchema", None)
-            body: dict[str, Any] = {
+            event_data: _JsonObject = {"message": message}
+            body: _JsonObject = {
                 "type": "mcp_elicitation",
-                "data": {"message": message},
+                "data": event_data,
             }
             if requested_schema is not None:
-                body["data"]["requestedSchema"] = requested_schema
+                event_data["requestedSchema"] = requested_schema
 
             try:
                 resp = await server_client.post(
@@ -291,19 +294,21 @@ class RunnerMcpManager:
                     timeout=30.0,
                 )
                 resp.raise_for_status()
-                data = resp.json()
+                data: object = resp.json()
             except Exception as exc:  # noqa: BLE001
                 _logger.warning(
                     "MCP elicitation callback: Omnigent server POST failed (%s) — declining",
                     exc,
+                    extra={"session_id": session_id},
                 )
                 return ElicitResult(action="decline")
 
-            elicitation_id = data.get("elicitation_id", "")
-            if not elicitation_id:
+            elicitation_id = data.get("elicitation_id") if isinstance(data, dict) else None
+            if not isinstance(elicitation_id, str) or not elicitation_id:
                 _logger.warning(
                     "MCP elicitation callback: Omnigent server returned no "
                     "elicitation_id — declining",
+                    extra={"session_id": session_id},
                 )
                 return ElicitResult(action="decline")
 
@@ -367,9 +372,12 @@ class RunnerMcpManager:
                 try:
                     await asyncio.gather(*connect_tasks.values())
                 except Exception:
-                    _logger.exception("runner mcp connect task raised; surfacing partial results")
+                    _logger.exception(
+                        "runner mcp connect task raised; surfacing partial results",
+                        extra={"session_id": runner_primary_session_id()},
+                    )
 
-            schemas: list[dict[str, Any]] = []
+            schemas: list[_JsonObject] = []
             tool_names: set[str] = set()
             failures: dict[str, str] = {}
             for ref in refs:
@@ -383,7 +391,9 @@ class RunnerMcpManager:
                     if schema is None:
                         continue
                     schemas.append(schema)
-                    tool_names.add(schema["name"])
+                    schema_name = schema["name"]
+                    if isinstance(schema_name, str):
+                        tool_names.add(schema_name)
             return McpSchemasResult(schemas=schemas, tool_names=tool_names, failures=failures)
         finally:
             async with self._lock:
@@ -394,7 +404,7 @@ class RunnerMcpManager:
         self,
         spec: AgentSpec,
         tool_name: str,
-        arguments: dict[str, Any],
+        arguments: _JsonObject,
         session_id: str | None = None,
     ) -> str:
         """
@@ -445,11 +455,11 @@ class RunnerMcpManager:
             else:
                 await self.schemas_for(spec)
                 async with self._lock:
-                    entry = self._specs.get(spec_hash)
+                    existing_entry = self._specs.get(spec_hash)
                     route = (
                         None
-                        if entry is None
-                        else self._resolve_tool_route_from_entry(entry, tool_name)
+                        if existing_entry is None
+                        else self._resolve_tool_route_from_entry(existing_entry, tool_name)
                     )
                     if route is not None:
                         self._retain_server_ref(route[0])
@@ -608,6 +618,7 @@ class RunnerMcpManager:
                     "error closing MCP %r (%s) during shutdown",
                     server.config.name,
                     server.server_hash,
+                    extra={"session_id": runner_primary_session_id()},
                 )
 
         if self._evict_tasks:
@@ -655,6 +666,7 @@ class RunnerMcpManager:
                 "runner mcp pool evicting spec %s (over capacity %d)",
                 victim,
                 _POOL_SPEC_CAPACITY,
+                extra={"session_id": runner_primary_session_id()},
             )
             self._release_spec_entry(victim, entry)
 
@@ -670,7 +682,12 @@ class RunnerMcpManager:
         try:
             await conn.close()
         except Exception:
-            _logger.exception("error closing MCP %r for %s", name, owner)
+            _logger.exception(
+                "error closing MCP %r for %s",
+                name,
+                owner,
+                extra={"session_id": runner_primary_session_id()},
+            )
 
     def _schedule_close(self, conn: McpServerConnection, owner: str, name: str) -> None:
         task = asyncio.create_task(
@@ -746,6 +763,7 @@ class RunnerMcpManager:
                         server.server_hash,
                         server.config.name,
                         server.error,
+                        extra={"session_id": runner_primary_session_id()},
                     )
                     return
 
@@ -765,6 +783,7 @@ class RunnerMcpManager:
                     server.server_hash,
                     server.config.name,
                     len(tools),
+                    extra={"session_id": runner_primary_session_id()},
                 )
         finally:
             cleanup_conn: McpServerConnection | None = None
@@ -784,9 +803,9 @@ class RunnerMcpManager:
         if close_after_connect is not None:
             await self._safe_close(close_after_connect, spec_hash, server.config.name)
 
-    def status_snapshot(self) -> dict[str, Any]:
+    def status_snapshot(self) -> _JsonObject:
         """JSON-able view of pool state for introspection."""
-        out_specs: list[dict[str, Any]] = []
+        out_specs: list[_JsonObject] = []
         for spec_hash in self._lru:
             entry = self._specs.get(spec_hash)
             if entry is None:

@@ -85,3 +85,4 @@ omnigent/server/static/web-ui/
 # reason — `bundle deploy` must be able to sync it to the app source folder.
 # DAB local state directory (created by `databricks bundle deploy`).
 deploy/databricks/.databricks/
+web/package-lock.json

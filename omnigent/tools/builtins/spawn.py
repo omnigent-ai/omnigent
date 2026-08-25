@@ -228,15 +228,12 @@ def _build_sys_session_send_schema(
             "title": {
                 "type": "string",
                 "description": (
-                    "Named mode: a unique-within-this-parent "
-                    "task-based identity for the sub-agent session, "
-                    "e.g. 'auth' or 'payments'. Reusing it in a later "
-                    "sys_session_send call continues the same "
-                    "conversation. Every independent parallel call "
-                    "for the same agent must use a distinct title; "
-                    "reusing a title cannot start another concurrent "
-                    "turn. Pair with 'agent'; omit when using "
-                    "'session_id'."
+                    "Named mode: optional task-based title for the "
+                    "sub-agent session (e.g. 'auth' or 'payments'). "
+                    "Reusing the same (agent, title) pair continues "
+                    "the existing session. When omitted, a structured "
+                    "name (e.g. 'researcher-1') is auto-assigned. "
+                    "Pair with 'agent'; omit when using 'session_id'."
                 ),
             },
         }
@@ -502,7 +499,11 @@ class SysSessionListTool(Tool):
             "for orchestration (inspect via sys_agent_get / "
             "sys_session_get_info, or drive via sys_session_send by "
             "session_id). Pass agent_name to filter the global list to "
-            "sessions running that agent."
+            "sessions running that agent. Calls without pagination keep "
+            "the complete result while it fits the tool-output budget; "
+            "larger global session lists return a page with has_more "
+            "metadata and an opaque next_cursor. Pass that cursor to continue; sub_agents stays "
+            "complete."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -510,7 +511,8 @@ class SysSessionListTool(Tool):
         Return the OpenAI-format tool schema.
 
         :returns: Dict with ``"type": "function"`` and a
-            ``"function"`` sub-dict; an optional ``agent_name`` filter.
+            ``"function"`` sub-dict; an optional ``agent_name`` filter
+            and pagination parameters.
         """
         return {
             "type": "function",
@@ -527,6 +529,23 @@ class SysSessionListTool(Tool):
                                 "list to sessions whose bound agent has "
                                 "this name, e.g. 'researcher'. Does not "
                                 "affect the 'sub_agents' view."
+                            ),
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 100,
+                            "description": (
+                                "Optional maximum rows returned from 'sessions'. "
+                                "Omit it to keep the complete result while it fits."
+                            ),
+                        },
+                        "cursor": {
+                            "type": "string",
+                            "maxLength": 40000,
+                            "description": (
+                                "Opaque continuation cursor from a prior "
+                                "sys_session_list result's page.next_cursor."
                             ),
                         },
                     },
@@ -602,8 +621,11 @@ class SysSessionGetInfoTool(Tool):
     model), not just the caller's spawn subtree. Reports lifecycle
     status, title, agent binding (id + name), runner binding and live
     connectivity, host, reasoning effort, effective model, parent
-    linkage, workspace / git branch, and the count of outstanding
-    approval prompts. For the conversation transcript, use
+    linkage, workspace / git branch, persisted last-activity time, and
+    the count of outstanding approval prompts. Comparing
+    ``last_activity_at`` across polls distinguishes a running session that
+    is advancing from one whose persisted output has stalled. For the
+    conversation transcript, use
     ``sys_session_get_history`` instead.
 
     ``session_id`` is optional — when omitted, the caller's own
@@ -628,7 +650,8 @@ class SysSessionGetInfoTool(Tool):
             "Return a session's metadata: lifecycle status, title, "
             "agent binding (id/name), runner binding + connectivity, "
             "host, reasoning effort, model, parent session, workspace, "
-            "and outstanding approval prompts. Global read — any "
+            "persisted last-activity time, and outstanding approval "
+            "prompts. Global read — any "
             "session you can access. Pass session_id to target another "
             "session; omit it to describe your own. Metadata only — "
             "use sys_session_get_history for the conversation transcript."
@@ -925,11 +948,11 @@ class SysSessionCreateTool(Tool):
                         "model": {
                             "type": "string",
                             "description": (
-                                "Optional model override for the child "
-                                "session, e.g. 'system.ai.glm-5-2' or "
-                                "'databricks-claude-opus-4-8'. Sets the "
-                                "harness model at session creation; "
-                                "omit to use the agent's default."
+                                "Optional provider-configured model id for "
+                                "the child session, e.g. 'provider/model-id' "
+                                "or 'provider-local-model-id'. Sets the harness "
+                                "model at session creation; omit to use the "
+                                "agent's default."
                             ),
                         },
                     },

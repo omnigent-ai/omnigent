@@ -8,6 +8,7 @@ import logging
 import tempfile
 from pathlib import Path
 
+from omnigent.debug_logging import runner_primary_session_id
 from omnigent.runner.background_titles.service import (
     BACKGROUND_TITLE_INFERENCE_TIMEOUT_SECONDS,
     BACKGROUND_TITLE_INSTRUCTIONS,
@@ -27,11 +28,13 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
     from omnigent.inner.codex_executor import (
         _codex_home_config_source_from_env,
         _populate_codex_home_config,
+        materialize_codex_provider_config,
     )
     from omnigent.runner.native.orchestration import _codex_native_model_from_spec
 
     model = context.model_override or _codex_native_model_from_spec(context.session_spec)
-    launch = resolve_native_codex_launch(model=model)
+    # Thread the spec so a title exec honors spec-level auth too (#2744).
+    launch = resolve_native_codex_launch(model=model, spec=context.session_spec)
     with tempfile.TemporaryDirectory(prefix="omnigent-codex-title-") as temp_dir:
         temp_root = Path(temp_dir)
         codex_home = temp_root / "codex-home"
@@ -51,6 +54,10 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
             profile=launch.profile,
             bridge_dir=temp_root / "bridge",
             extra_config_overrides=launch.config_overrides,
+        )
+        native_server.config_overrides = materialize_codex_provider_config(
+            codex_home,
+            native_server.config_overrides,
         )
         output_path = temp_root / "title.txt"
         args = [
@@ -113,6 +120,7 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
                 "background native Codex title failed returncode=%s detail=%s",
                 process.returncode,
                 detail[-1000:],
+                extra={"session_id": runner_primary_session_id()},
             )
             return None
         if not output_path.is_file():

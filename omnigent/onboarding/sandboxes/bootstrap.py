@@ -379,7 +379,8 @@ def _workspace_org_id(workspace_host: str) -> str | None:
         response = httpx.get(f"{workspace_host}/login.html", timeout=10.0)
     except httpx.HTTPError:
         return None
-    return response.headers.get("x-databricks-org-id")
+    workspace_id = response.headers.get("x-databricks-org-id")
+    return str(workspace_id) if workspace_id is not None else None
 
 
 def derive_workspace(server_url: str) -> DerivedWorkspace | None:

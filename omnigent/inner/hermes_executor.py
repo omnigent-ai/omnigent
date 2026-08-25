@@ -48,6 +48,7 @@ import tempfile
 from collections.abc import AsyncIterator
 from pathlib import Path
 
+from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
     Executor,
@@ -374,13 +375,7 @@ class HermesExecutor(Executor):
             skills_filter=self._skills_filter,
         )
 
-        # Build subprocess env with per-session HERMES_HOME for policy hooks.
-        proc_env: dict[str, str] | None = None
-        if self._hermes_home is not None:
-            proc_env = {**os.environ, "HERMES_HOME": str(self._hermes_home)}
-            _logger.info("Hermes using per-session HERMES_HOME=%s", self._hermes_home)
-        else:
-            _logger.warning("Hermes running WITHOUT per-session HERMES_HOME (no policy hooks)")
+        proc_env = self._build_spawn_env()
 
         _logger.debug("Hermes subprocess: %s", " ".join(args))
 
@@ -450,6 +445,34 @@ class HermesExecutor(Executor):
             yield TextChunk(text=response_text)
 
         yield TurnComplete(response=response_text or None)
+
+    def _build_spawn_env(self) -> dict[str, str]:
+        """The env handed to the hermes subprocess.
+
+        Deny-by-default: base + hermes's own ``HERMES_`` family + the spec's
+        ``env_passthrough`` (#3445). Previously the ``hermes_home`` branch merged
+        the whole of ``os.environ``, and the else branch passed ``env=None`` —
+        which inherits everything, so the no-policy-hooks path leaked the most.
+
+        ``DATABRICKS_*`` is deliberately NOT allowlisted. ``hermes_native_bridge``
+        copies ``auth.json`` and ``.env`` under the per-session ``HERMES_HOME``,
+        so hermes's real auth is file-based; that family is exactly the one this
+        change exists to stop leaking, and a spec that genuinely needs it should
+        declare it via ``os_env.sandbox.env_passthrough``.
+
+        Kept as a named builder so the spawn-env canary can drive the real thing
+        rather than a hand-copied prefix list.
+        """
+        proc_env = clean_agent_env(
+            allow_prefixes=("HERMES_",),
+            extra_allowed=declared_passthrough(self._os_env),
+        )
+        if self._hermes_home is not None:
+            proc_env["HERMES_HOME"] = str(self._hermes_home)
+            _logger.info("Hermes using per-session HERMES_HOME=%s", self._hermes_home)
+        else:
+            _logger.warning("Hermes running WITHOUT per-session HERMES_HOME (no policy hooks)")
+        return proc_env
 
     def _session_key(self, messages: list[Message]) -> str:
         """

@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { useChatStore } from "@/store/chatStore";
 import type { Bubble } from "@/lib/renderItems";
@@ -24,18 +24,21 @@ afterEach(() => {
 });
 
 describe("SandboxFailedIndicator", () => {
-  it("renders the recorded failure reason so a dead launch explains itself", () => {
-    // WHY: a silently dead chat is the bug this band exists to prevent — the
-    // reason must reach the DOM.
+  it("surfaces the recorded failure reason in the pill so a dead launch explains itself", () => {
+    // WHY: a silently dead chat is the bug this pill exists to prevent — the
+    // reason must reach the DOM, reachable in the pill's expandable body.
     render(<SandboxFailedIndicator status={{ stage: "failed", error: "out of quota" }} />);
-    expect(screen.getByText(/Sandbox launch failed: out of quota/)).toBeInTheDocument();
+    expect(screen.getByTestId("error-headline")).toHaveTextContent("Sandbox launch failed");
+    fireEvent.click(screen.getByTestId("error-pill"));
+    expect(screen.getByTestId("error-message-content")).toHaveTextContent("out of quota");
   });
 
-  it("omits the colon suffix when no error detail is recorded", () => {
-    // WHY: a missing error must not render a dangling "failed: " — the
-    // ternary guards the suffix.
+  it("shows just the failure headline with no dangling colon when no reason is recorded", () => {
+    // WHY: a missing reason must not render a dangling "failed: " — the pill
+    // shows only the headline.
     render(<SandboxFailedIndicator status={{ stage: "failed", error: null }} />);
-    expect(screen.getByText("Sandbox launch failed")).toBeInTheDocument();
+    expect(screen.getByTestId("error-headline")).toHaveTextContent("Sandbox launch failed");
+    expect(screen.queryByText(/Sandbox launch failed:/)).not.toBeInTheDocument();
   });
 });
 
@@ -158,7 +161,9 @@ describe("RunnerStartingIndicator", () => {
 
 describe("BubbleView dispatch", () => {
   beforeEach(() => {
-    useChatStore.setState({ conversationId: "conv_test" });
+    // Explicitly settled: the fold-only cases below turn on `possiblyLive`
+    // being false, so they must not ride on the store's default status.
+    useChatStore.setState({ conversationId: "conv_test", sessionStatus: "idle" });
   });
 
   type AssistantBubble = Extract<Bubble, { kind: "assistant" }>;
@@ -188,6 +193,7 @@ describe("BubbleView dispatch", () => {
     );
     const bubble = screen.getByTestId("message-bubble");
     expect(bubble).toHaveAttribute("data-role", "user");
+    expect(bubble).toHaveClass("max-w-[640px]");
     expect(bubble).toHaveTextContent("hello there");
   });
 
@@ -197,8 +203,67 @@ describe("BubbleView dispatch", () => {
     render(<BubbleView bubble={assistantText("the answer is 42")} />);
     const bubble = screen.getByTestId("message-bubble");
     expect(bubble).toHaveAttribute("data-role", "assistant");
+    expect(bubble).toHaveClass("gap-2");
     expect(bubble).toHaveTextContent("the answer is 42");
-    expect(screen.getByRole("button", { name: "Copy" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy" })).toHaveAttribute("data-size", "icon-xxs");
+  });
+
+  it("uses full-width layout for assistant display math", () => {
+    render(<BubbleView bubble={assistantText(String.raw`$$d = \sqrt{x^2 + y^2}$$`)} />);
+
+    const bubble = screen.getByTestId("message-bubble");
+    expect(bubble).toHaveClass("max-w-full");
+    expect(bubble.firstElementChild).toHaveClass("w-full");
+  });
+
+  const errorItem = (): AssistantBubble["items"][number] => ({
+    kind: "error",
+    itemId: "err_1",
+    message: "Required terminal exited unexpectedly; the runtime is no longer available.",
+    source: "execution",
+    code: "required_terminal_exited",
+  });
+
+  const errorBubble = (items: AssistantBubble["items"]): AssistantBubble => ({
+    kind: "assistant",
+    responseId: "resp_err",
+    stableId: "resp_err",
+    lifecycle: "completed",
+    error: null,
+    items,
+    createdAtS: 1_750_000_000,
+  });
+
+  it("spans the chat column for an error-only bubble, with no hover footer", () => {
+    // WHY: an error banner is a thread-level element — its dashed rule must
+    // span the width a long-text turn takes (not shrink-wrap the 560px pill
+    // via MessageContent's w-fit), and the timestamp/actions chrome belongs
+    // to assistant prose, never to the error.
+    render(<BubbleView bubble={errorBubble([errorItem()])} />);
+
+    const bubble = screen.getByTestId("message-bubble");
+    expect(screen.getByTestId("error-pill")).toBeInTheDocument();
+    expect(bubble.firstElementChild).toHaveClass("w-full");
+    expect(screen.queryByTestId("message-timestamp")).not.toBeInTheDocument();
+  });
+
+  it("spans the chat column for a text+error turn and keeps the footer", () => {
+    // WHY: a mid-turn error shares the bubble with prose — the rule still
+    // spans the full column even when the prose is short, and the footer
+    // stays because the timestamp/actions describe the text.
+    render(
+      <BubbleView
+        bubble={errorBubble([
+          { kind: "text", itemId: "t1", text: "short answer", final: true },
+          errorItem(),
+        ])}
+      />,
+    );
+
+    const bubble = screen.getByTestId("message-bubble");
+    expect(screen.getByTestId("error-pill")).toBeInTheDocument();
+    expect(bubble.firstElementChild).toHaveClass("w-full");
+    expect(screen.getByTestId("message-timestamp")).toBeInTheDocument();
   });
 
   it("marks a cancelled assistant turn as Interrupted", () => {
@@ -208,11 +273,111 @@ describe("BubbleView dispatch", () => {
     expect(screen.getByTestId("assistant-interrupted-indicator")).toHaveTextContent("Interrupted");
   });
 
-  it("renders the error text for a failed assistant turn", () => {
-    // WHY: the failed branch must surface the error so a dead turn explains
-    // itself instead of vanishing.
+  it("surfaces a failed turn's error as a destructive pill, never raw text", () => {
+    // WHY: a failed send/stream must render through the same error pill an error
+    // block uses — never bare red "Error:" text — and the message stays
+    // reachable in the pill's expandable body so a dead turn still explains itself.
     render(<BubbleView bubble={{ ...assistantText("", "failed"), error: "rate limited" }} />);
-    expect(screen.getByText(/Error: rate limited/)).toBeInTheDocument();
+    const pill = screen.getByTestId("error-pill");
+    expect(pill).toBeInTheDocument();
+    expect(screen.queryByText(/^Error:/)).not.toBeInTheDocument();
+    fireEvent.click(pill);
+    expect(screen.getByTestId("error-message-content")).toHaveTextContent("rate limited");
+  });
+
+  it("adds no error pill for a failed turn whose message rides on its block", () => {
+    // WHY: a dropped-host turn ends "failed" but carries its explanation as an
+    // error block inside the bubble, leaving `error` null — the bubble must add
+    // no second pill (and never a bare "Error:") of its own.
+    render(<BubbleView bubble={{ ...assistantText("", "failed"), error: null }} />);
+    expect(screen.queryByTestId("error-pill")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Error:/)).not.toBeInTheDocument();
+  });
+
+  const toolItem = (callId: string): AssistantBubble["items"][number] => ({
+    kind: "tool",
+    itemId: callId,
+    execution: {
+      name: "Bash",
+      arguments: { command: "ls" },
+      argsSummary: "ls",
+      callId,
+      agentName: "coder",
+      executedBy: "server",
+      output: "ok",
+    },
+    output: "ok",
+    state: "output-available",
+    startedAt: 0,
+    duration: 1,
+  });
+
+  /** A turn that yielded mid-task: its whole trace folds, its answer lands later. */
+  const foldOnlyBubble = (items: AssistantBubble["items"]): AssistantBubble => ({
+    kind: "assistant",
+    responseId: "resp_fold",
+    stableId: "resp_fold",
+    lifecycle: "completed",
+    error: null,
+    items,
+    workedForS: 147,
+    continued: true,
+  });
+
+  it("gives fold-only turns the same chrome whether or not the hidden trace narrated", () => {
+    // WHY: the copy/fork row keys off ALL the bubble's text, including text
+    // sealed inside the fold — so an otherwise identical collapsed row grew a
+    // row of hover-only chrome purely because its hidden trace happened to
+    // narrate, and consecutive "Worked for" rows sat at two different gaps.
+    render(
+      <BubbleView
+        bubble={foldOnlyBubble([
+          { kind: "text", itemId: "t1", text: "Let me look at the code.", final: false },
+          toolItem("c1"),
+        ])}
+      />,
+    );
+    expect(screen.getByTestId("turn-worked-fold")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Copy" })).not.toBeInTheDocument();
+    // Nothing below the fold: the collapsed row is the bubble's whole height.
+    expect(screen.getByTestId("message-bubble").children).toHaveLength(1);
+    cleanup();
+
+    render(<BubbleView bubble={foldOnlyBubble([toolItem("c2"), toolItem("c3")])} />);
+    expect(screen.getByTestId("turn-worked-fold")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Copy" })).not.toBeInTheDocument();
+    expect(screen.getByTestId("message-bubble").children).toHaveLength(1);
+  });
+
+  it("spans the column for a fold-only turn so the row's hairline draws", () => {
+    // WHY: shrink-wrapped to the ~110px summary row, the trailing hairline
+    // (a flex-1 span) collapses to zero width and the click target stops
+    // short of the column. The max-w-3xl cap keeps it aligned with the rule
+    // under an answered turn.
+    render(<BubbleView bubble={foldOnlyBubble([toolItem("c4")])} />);
+    const bubble = screen.getByTestId("message-bubble");
+    expect(bubble).toHaveClass("max-w-3xl");
+    expect(bubble.firstElementChild).toHaveClass("w-full");
+    expect(bubble.firstElementChild).not.toHaveClass("w-fit");
+  });
+
+  it("keeps the copy action on a folded turn that answers for itself", () => {
+    // WHY: the suppression must stop at bubbles with a visible answer —
+    // that trailing prose is exactly what copy/fork act on.
+    render(
+      <BubbleView
+        bubble={{
+          ...foldOnlyBubble([
+            toolItem("c5"),
+            { kind: "text", itemId: "t2", text: "Done — here's the fix.", final: true },
+          ]),
+          continued: false,
+        }}
+      />,
+    );
+    expect(screen.getByTestId("turn-worked-fold")).toBeInTheDocument();
+    expect(screen.getByText("Done — here's the fix.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy" })).toBeInTheDocument();
   });
 
   it("renders the compacting shimmer for a compaction_loading bubble", () => {

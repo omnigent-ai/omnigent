@@ -24,10 +24,13 @@ Uses the shared ``client`` fixture from ``tests/server/conftest.py``
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
+import pytest_asyncio
+from fastapi import FastAPI
 
 from omnigent.runtime import get_caps, session_stream
 from omnigent.runtime.caps import RuntimeCaps
@@ -60,6 +63,25 @@ def _deny_bash_tool(event: dict[str, Any]) -> dict[str, Any]:
             "result": "DENY",
             "reason": "Bash is blocked by admin policy.",
         }
+    return {"result": "ALLOW"}
+
+
+def _deny_bash_tool_result(event: dict[str, Any]) -> dict[str, Any]:
+    """
+    Policy that denies tool RESULTS from Bash, scoped by tool name.
+
+    Reads the name from the container the engine populates, so it fires only
+    when the route resolved a tool name for this phase — which is what makes
+    the normalization of alternative wire spellings observable.
+
+    :param event: V0 event dict.
+    :returns: DENY for Bash tool results, ALLOW otherwise.
+    """
+    if event.get("type") != "tool_result":
+        return {"result": "ALLOW"}
+    # ``target`` is the resolved tool name in the V0 event dict.
+    if event.get("target") == "Bash":
+        return {"result": "DENY", "reason": "Bash results are blocked."}
     return {"result": "ALLOW"}
 
 
@@ -1162,3 +1184,354 @@ async def test_llm_response_allow_when_no_matching_policy(
     assert body["result"] in ("POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED"), (
         f"Expected ALLOW or UNSPECIFIED for no-policy session, got {body['result']}."
     )
+
+
+# The wire phases the evaluate route accepts, and whether ``event.data`` may
+# be a bare string on that phase. Both the guard and this table are derived
+# from the same rule, so a phase cannot be validated in production and left
+# out of the oracle — which is how null and empty-string survived a round.
+_EVALUATE_PHASES: tuple[tuple[str, bool], ...] = (
+    ("PHASE_TOOL_CALL", False),
+    ("PHASE_TOOL_RESULT", False),
+    ("PHASE_LLM_REQUEST", False),
+    ("PHASE_LLM_RESPONSE", False),
+    ("PHASE_REQUEST", True),
+)
+
+# Everything that is not an object, including the two that normalize to an
+# empty object rather than erroring. A non-empty list is included alongside
+# the empty one deliberately: both are non-dict and must be rejected the
+# same way, but a mutation that special-cased "falsy" values (None, False,
+# 0, "", []) while accepting any truthy non-dict would have passed with only
+# the empty list present — [] is falsy, [1] is not.
+_NON_OBJECT_DATA: tuple[tuple[object, str], ...] = (
+    (None, "null"),
+    (False, "false"),
+    (0, "zero"),
+    ("", "empty-string"),
+    ("a string", "raw-string"),
+    ([], "empty-list"),
+    ([1], "non-empty-list"),
+    (7, "int"),
+)
+
+
+def _valid_name_fields(phase: str) -> dict[str, object]:
+    """Fields that satisfy the tool-name rule for *phase*, if it has one."""
+    if phase == "PHASE_TOOL_RESULT":
+        return {"request_data": {"name": "Bash"}}
+    return {}
+
+
+def _malformed_evaluate_events() -> list[tuple[dict[str, object], str]]:
+    """Build the malformed-payload table from the rules being enforced.
+
+    Generated rather than hand-listed so neither rule can be covered for one
+    phase and missed for another — the defect this guard was written for, and
+    then repeated twice: once by validating raw ``data`` only on phases that
+    keep their tool name there, and once by accepting every falsy value that
+    normalizes to an empty object.
+    """
+    cases: list[tuple[dict[str, object], str]] = [
+        ({"type": ["not", "hashable"]}, "unhashable event.type"),
+    ]
+    for phase, allows_string in _EVALUATE_PHASES:
+        for bad, why in _NON_OBJECT_DATA:
+            if allows_string and isinstance(bad, str):
+                continue  # a legitimate wire form on this phase
+            event: dict[str, object] = {"type": phase, **_valid_name_fields(phase)}
+            if bad is not None:
+                event["data"] = bad
+            cases.append((event, f"{why} data on {phase}"))
+    cases += [
+        ({"type": "PHASE_TOOL_CALL", "data": {}}, "no name key in TOOL_CALL data"),
+        ({"type": "PHASE_TOOL_CALL", "data": {"name": ""}}, "empty TOOL_CALL name"),
+        ({"type": "PHASE_TOOL_CALL", "data": {"name": 7}}, "non-string TOOL_CALL name"),
+        ({"type": "PHASE_TOOL_RESULT", "data": {"result": "ok"}}, "no name source at all"),
+        (
+            {"type": "PHASE_TOOL_RESULT", "data": {"result": "ok"}, "request_data": {"name": ""}},
+            "empty request_data.name and no target",
+        ),
+        (
+            {"type": "PHASE_TOOL_RESULT", "data": {"result": "ok"}, "target": ""},
+            "empty target and no request_data",
+        ),
+        (
+            {"type": "PHASE_TOOL_RESULT", "data": {"result": "ok"}, "request_data": "a string"},
+            "non-object request_data with no target",
+        ),
+        (
+            {"type": "PHASE_TOOL_CALL", "data": {"name": "Bash"}, "context": 7},
+            "non-object context",
+        ),
+    ]
+    return cases
+
+
+@pytest.mark.asyncio
+async def test_policy_evaluate_rejects_malformed_event_shapes(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Malformed hook payloads must be rejected with a structured 400.
+
+    Every falsy ``data`` here used to normalize to ``{}`` before validation
+    and return 200/ALLOW — on a tool phase that means tool-name-scoped
+    policies were skipped entirely on a BLOCKING hook, which is worse than
+    the 500s the earliest guards were added for. The phase strings are the
+    wire values (``PHASE_*``); using the internal names short-circuits at the
+    unknown-type check and never reaches these guards, so the suite once
+    stayed green with the validation deleted.
+
+    One session for the whole table: each case is an independent request, so a
+    fresh session per case bought nothing but setup time. Every acceptance is
+    collected before asserting, so one run reports every case that regressed,
+    and the structured error code is checked rather than the status alone.
+    """
+    from tests.server.helpers import create_test_session
+
+    snap = await create_test_session(client, title="malformed-events")
+    accepted: list[str] = []
+    for event, why in _malformed_evaluate_events():
+        resp = await client.post(
+            f"/v1/sessions/{snap['id']}/policies/evaluate",
+            json={"event": event},
+        )
+        if resp.status_code != 400:
+            accepted.append(f"{why}: {resp.status_code} {resp.text[:120]}")
+            continue
+        body = resp.json()
+        code = (body.get("error") or {}).get("code") if isinstance(body, dict) else None
+        if code != "invalid_input":
+            accepted.append(f"{why}: 400 but code={code!r}")
+    assert not accepted, "malformed payloads accepted:\n" + "\n".join(accepted)
+
+
+@pytest.mark.asyncio
+async def test_policy_evaluate_gates_every_first_party_tool_result_shape(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Both established spellings of the tool name are accepted AND gated.
+
+    Requiring ``request_data.name`` rejected the OpenCode plugin's shape,
+    which sends the tool in ``event.target`` — and that producer converts any
+    non-2xx into ALLOW, so a stricter guard silently disabled its policies
+    instead of tightening them.
+
+    Asserting a 200 would not be enough: the guard could accept the shape
+    while the engine still saw no tool name, leaving tool-scoped policies
+    skipped exactly as before. A tool-scoped DENY is asserted instead, so the
+    resolved name has to reach the container the engine reads.
+    """
+    deny_policy = FunctionPolicySpec(
+        name="admin__deny_bash_result",
+        on=None,
+        function=FunctionRef(path=f"{__name__}._deny_bash_tool_result"),
+    )
+    original_caps = get_caps()
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_caps",
+        lambda: RuntimeCaps(
+            execution_timeout=original_caps.execution_timeout,
+            default_policies=[deny_policy],
+        ),
+    )
+
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+    shapes = {
+        "request_data.name (claude-native, tool dispatch)": {
+            "type": "PHASE_TOOL_RESULT",
+            "data": {"result": "ok"},
+            "request_data": {"name": "Bash"},
+        },
+        "target (opencode plugin)": {
+            "type": "PHASE_TOOL_RESULT",
+            "data": {"result": "ok"},
+            "target": "Bash",
+        },
+    }
+    for why, event in shapes.items():
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate",
+            json={"event": event},
+        )
+        assert resp.status_code == 200, f"{why}: {resp.status_code} {resp.text[:160]}"
+        assert resp.json()["result"] == "POLICY_ACTION_DENY", (
+            f"{why}: the tool-scoped policy did not see a tool name — {resp.text[:160]}"
+        )
+
+
+_EVALUATE_USER = "alice@example.com"
+
+
+@pytest.fixture()
+def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
+    """App with permissions + header auth, for route-level SQL budgeting."""
+    from omnigent.runtime.agent_cache import AgentCache
+    from omnigent.server.app import create_app
+    from omnigent.server.auth import UnifiedAuthProvider
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+    from omnigent.stores.artifact_store.local import LocalArtifactStore
+    from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    return create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        comment_store=SqlAlchemyCommentStore(db_uri),
+        permission_store=SqlAlchemyPermissionStore(db_uri),
+        auth_provider=UnifiedAuthProvider(source="header"),
+    )
+
+
+@pytest_asyncio.fixture()
+async def auth_client(auth_app: FastAPI, mock_llm: Any, tmp_path: Path):
+    """Async client against the auth-enabled app."""
+    from omnigent.runtime import set_harness_process_manager
+    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+
+    pm = HarnessProcessManager(tmp_parent=tmp_path / "harness_pm")
+    await pm.start()
+    set_harness_process_manager(pm)
+    transport = httpx.ASGITransport(app=auth_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        yield c
+    mock_llm.release_all()
+    set_harness_process_manager(None)
+    await pm.shutdown()
+
+
+async def _seed_authenticated_session(auth_client: httpx.AsyncClient, db_uri: str) -> str:
+    """Create a real agent-bound session and grant it to the test user.
+
+    Uses the real create path (a genuine uploaded bundle) so the agent
+    cache can load the spec — a fabricated agent row with a fake bundle
+    location cannot be loaded and the route would bail before the work
+    this budget measures.
+    """
+    import json as _json
+
+    from omnigent.server.auth import LEVEL_OWNER
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+    from tests.server.helpers import build_agent_bundle
+
+    perms = SqlAlchemyPermissionStore(db_uri)
+    perms.ensure_user(_EVALUATE_USER)
+    headers = {"X-Forwarded-Email": _EVALUATE_USER}
+    resp = await auth_client.post(
+        "/v1/sessions",
+        data={"metadata": _json.dumps({"title": "budget"})},
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                # The agent MUST declare a policy: with no policies the route
+                # short-circuits via ``any_policies_apply`` before building an
+                # engine, so a budget measured without one would not cover the
+                # preload path at all (it silently didn't, first time round).
+                build_agent_bundle(
+                    name="budget-agent",
+                    guardrails={
+                        "policies": {
+                            "allow_all": {
+                                "type": "function",
+                                "on": ["tool_call"],
+                                "function": "tests.runtime.policies.conftest._always_allow",
+                            }
+                        }
+                    },
+                ),
+                "application/gzip",
+            )
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.text
+    session_id = resp.json()["session_id"]
+    perms.grant(_EVALUATE_USER, session_id, LEVEL_OWNER)
+    return session_id
+
+
+# Measured SQL-statement budget for the AUTHENTICATED evaluate route — the
+# blocking PreToolUse hook. Counted as executed statements, not store-method
+# calls: a store-call oracle cannot see that one call fans out to three
+# statements (conversation + metadata + labels), which is exactly how an
+# earlier "6 queries" claim survived being wrong by five.
+#
+# Measured (both dialects) for the seed below: one owner grant, one agent
+# declaring one tool_call policy, one conversation, no declared labels, no
+# children. Composition: the handler's conversation load 3, session-policy
+# lookup, agent row, spawn-tree scan 3.
+#
+# ACL resolution used to add 3 more (users + the user and public grants). The
+# warm-up request below now also warms the permission store's resolve_access
+# cache, so the steady-state route serves the access decision from memory —
+# which is the production hot path, since the check re-runs on every event of a
+# turn. A cold process still pays those 3.
+#
+# This is the number the PR must quote — an earlier description claimed 6.
+# It is also the oracle for the preload optimisation: dropping the
+# ``conversation=`` argument makes the builder re-read the conversation and
+# pushes this up, which no behavioural assertion can see because both
+# variants return the same verdict.
+_EVALUATE_ROUTE_SQL_BUDGET = 8
+
+
+@pytest.mark.asyncio
+async def test_authenticated_evaluate_route_sql_budget(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    Pin the route's SQL count so the description cannot drift from the code,
+    and so removing the preload is detectable.
+
+    This is the oracle for the preload optimisation: dropping the
+    ``conversation=`` argument in ``_build_engine`` makes the builder read
+    the conversation again, which changes this count. A behavioural
+    assertion alone cannot see that, because both variants return the same
+    verdict.
+    """
+    from sqlalchemy import event as sa_event
+
+    from omnigent.db.utils import _engine_cache
+
+    session_id = await _seed_authenticated_session(auth_client, db_uri)
+    headers = {"X-Forwarded-Email": _EVALUATE_USER}
+    payload = {
+        "event": {
+            "type": "PHASE_TOOL_CALL",
+            "data": {"name": "Bash", "arguments": {"command": "ls"}},
+        }
+    }
+    # Warm the spec / policy / ACL caches so the count is the steady-state one.
+    await auth_client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate", json=payload, headers=headers
+    )
+
+    engine = _engine_cache[db_uri]
+    statements: list[str] = []
+
+    def _on_exec(conn, cursor, statement, parameters, context, executemany):
+        if not statement.lstrip().upper().startswith("PRAGMA"):
+            statements.append(statement)
+
+    sa_event.listen(engine, "before_cursor_execute", _on_exec)
+    try:
+        resp = await auth_client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate", json=payload, headers=headers
+        )
+    finally:
+        sa_event.remove(engine, "before_cursor_execute", _on_exec)
+
+    assert resp.status_code == 200, resp.text
+    assert len(statements) == _EVALUATE_ROUTE_SQL_BUDGET, [
+        s.split("\n")[0][:80] for s in statements
+    ]

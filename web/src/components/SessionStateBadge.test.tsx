@@ -43,8 +43,18 @@ describe("SessionStateBadge — per-state rendering", () => {
     expect(spinner).not.toBeNull();
     expect(spinner?.getAttribute("class")).toContain("animate-spin");
     expect(spinner?.getAttribute("class")).toContain("text-muted-foreground");
-    expect(spinner?.getAttribute("class")).toContain("size-2.5");
+    expect(spinner?.getAttribute("class")).toContain("size-3");
     expect(container.querySelector(".bg-success")).toBeNull();
+  });
+
+  it("renders starting with the same spinner as running and its own label", () => {
+    const { container } = renderBadge({ kind: "starting" });
+    const badge = screen.getByTestId("session-state-badge");
+    expect(badge).toHaveAttribute("data-state", "starting");
+    expect(badge).toHaveAttribute("aria-label", "Session starting up");
+    const spinner = container.querySelector('[data-testid="running-dot"]');
+    expect(spinner).not.toBeNull();
+    expect(spinner?.getAttribute("class")).toContain("animate-spin");
   });
 
   it("renders unseen messages as a solid (non-pulsing) brand-pink dot", () => {

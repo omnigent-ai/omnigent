@@ -395,6 +395,9 @@ async def test_serve_tunnel_on_reconnect_callback(
     async def _serve_once(app: Any, **kwargs: Any) -> None:
         nonlocal call_count
         call_count += 1
+        # A clean return models a served-then-closed connection, so the
+        # upgrade-accepted callback fires like the real _serve_tunnel_once.
+        kwargs["on_connected"]()
 
     async def _sleep(delay: float) -> None:
         if call_count >= 2:

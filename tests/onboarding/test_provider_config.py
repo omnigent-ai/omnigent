@@ -815,3 +815,77 @@ def test_default_provider_for_pi_none_when_only_bedrock_default() -> None:
         }
     }
     assert default_provider_for_harness(config, "pi") is None
+
+
+def test_provider_credential_env_vars_collects_api_key_ref() -> None:
+    """``provider_credential_env_vars`` collects ``api_key_ref: env:VAR`` names.
+
+    When a gateway provider uses ``api_key_ref: env:MY_TOKEN``, both
+    ``MY_TOKEN`` and its ``OMNIGENT_MY_TOKEN`` alias must be returned so the
+    runner-spawn layer can forward them into the runner subprocess.
+    """
+    from omnigent.onboarding.provider_config import provider_credential_env_vars
+
+    config = {
+        "providers": {
+            "my-gateway": {
+                "kind": "gateway",
+                "openai": {
+                    "api_key_ref": "env:MY_TOKEN",
+                    "base_url": "https://example.com/v1",
+                    "models": {"default": "m"},
+                },
+            }
+        }
+    }
+    result = provider_credential_env_vars(config)
+    assert "MY_TOKEN" in result
+    assert "OMNIGENT_MY_TOKEN" in result
+
+
+def test_provider_credential_env_vars_collects_inline_dollar_ref() -> None:
+    """``provider_credential_env_vars`` collects ``api_key: $VAR`` names.
+
+    An inline ``$VAR`` reference in ``api_key`` must also be returned, since
+    it is resolved lazily from the environment just like ``api_key_ref: env:VAR``.
+    """
+    from omnigent.onboarding.provider_config import provider_credential_env_vars
+
+    config = {
+        "providers": {
+            "vendor": {
+                "kind": "key",
+                "anthropic": {
+                    "api_key": "$CUSTOM_KEY",
+                    "base_url": "https://api.anthropic.com",
+                    "models": {"default": "m"},
+                },
+            }
+        }
+    }
+    result = provider_credential_env_vars(config)
+    assert "CUSTOM_KEY" in result
+    assert "OMNIGENT_CUSTOM_KEY" in result
+
+
+def test_provider_credential_env_vars_empty_for_keychain_and_auth_command() -> None:
+    """``provider_credential_env_vars`` skips ``keychain:`` refs and ``auth_command``.
+
+    Neither ``keychain:`` refs nor ``auth_command`` fields resolve from the
+    environment, so they must not appear in the returned set.
+    """
+    from omnigent.onboarding.provider_config import provider_credential_env_vars
+
+    config = {
+        "providers": {
+            "vendor": {
+                "kind": "gateway",
+                "openai": {
+                    "auth_command": "my-cli token",
+                    "base_url": "https://example.com/v1",
+                    "models": {"default": "m"},
+                },
+            }
+        }
+    }
+    assert provider_credential_env_vars(config) == frozenset()

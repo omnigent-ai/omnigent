@@ -4,6 +4,7 @@ import SwiftUI
 struct OmnigentApp: App {
   @StateObject private var settings = SettingsStore()
   @StateObject private var router = AppRouter()
+  @StateObject private var managedConfiguration = ManagedConfigurationProvider()
 
   init() {
     NativeNotificationManager.shared.start()
@@ -14,6 +15,7 @@ struct OmnigentApp: App {
       AppRootView()
         .environmentObject(settings)
         .environmentObject(router)
+        .environmentObject(managedConfiguration)
         .onAppear {
           NativeNotificationManager.shared.setActivationHandler { path in
             router.routeNotification(path)

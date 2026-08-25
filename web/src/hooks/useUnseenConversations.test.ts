@@ -1,3 +1,5 @@
+import type * as UseUnseenConversationsModule from "./useUnseenConversations";
+
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -8,7 +10,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 const { authFetch } = vi.hoisted(() => ({ authFetch: vi.fn() }));
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: authFetch }));
 
-type Mod = typeof import("./useUnseenConversations");
+type Mod = typeof UseUnseenConversationsModule;
 
 /**
  * The module keeps its read-state mirror in module-level singletons

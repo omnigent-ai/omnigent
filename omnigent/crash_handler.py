@@ -38,7 +38,8 @@ import traceback
 import urllib.parse
 import webbrowser
 from pathlib import Path
-from typing import TextIO
+from types import TracebackType
+from typing import BinaryIO, TextIO, TypedDict
 
 from omnigent.crash_ui import real_stderr, render_crash_screen
 from omnigent.process_logging import data_dir
@@ -49,13 +50,24 @@ from omnigent.process_logging import data_dir
 _ORIG_EXCEPTHOOK = sys.__excepthook__
 _ORIG_THREADING_EXCEPTHOOK = threading.excepthook
 
+
 # Runtime configuration, populated by install_crash_handler().
-_CONFIG: dict = {
+class _CrashConfig(TypedDict):
+    app_name: str
+    repo: str
+    version: str
+    crashes_dir: str | None
+    keep_reports: int
+    first_party_prefixes: tuple[str, ...]
+
+
+_CONFIG: _CrashConfig = {
     "app_name": "omnigent",
     "repo": "omnigent-ai/omnigent",
     "version": "unknown",
     "crashes_dir": None,
     "keep_reports": 10,
+    "first_party_prefixes": ("omnigent",),
 }
 
 # Reentrancy guard: if handling a crash itself raises, we must not
@@ -65,7 +77,7 @@ _HANDLING = threading.local()
 
 # File handle kept open for faulthandler so C-level segfaults dump to a
 # file (out of the terminal) instead of screaming at the user.
-_FH_FILE: object | None = None
+_FH_FILE: BinaryIO | None = None
 
 # Maximum total URL length for the pre-filled GitHub issue link. GitHub
 # and some browsers reject or silently truncate very long URLs (a deep
@@ -112,14 +124,12 @@ def install_crash_handler(
                       packages (``omnigent``, ``omnigent_client``,
                       ``omnigent_ui_sdk``) via the ``<prefix>_`` rule.
     """
-    _CONFIG.update(
-        app_name=app_name,
-        repo=repo,
-        version=version if version is not None else _read_version(),
-        crashes_dir=str(crashes_dir) if crashes_dir else None,
-        keep_reports=keep_reports,
-        first_party_prefixes=tuple(first_party_prefixes) or ("omnigent",),
-    )
+    _CONFIG["app_name"] = app_name
+    _CONFIG["repo"] = repo
+    _CONFIG["version"] = version if version is not None else _read_version()
+    _CONFIG["crashes_dir"] = str(crashes_dir) if crashes_dir else None
+    _CONFIG["keep_reports"] = keep_reports
+    _CONFIG["first_party_prefixes"] = tuple(first_party_prefixes) or ("omnigent",)
     sys.excepthook = _excepthook
     threading.excepthook = _threading_excepthook
     if enable_faulthandler:
@@ -174,7 +184,9 @@ def _enable_faulthandler() -> None:
 # --------------------------------------------------------------------------- #
 # Hooks
 # --------------------------------------------------------------------------- #
-def _excepthook(etype, value, tb) -> None:
+def _excepthook(
+    etype: type[BaseException], value: BaseException, tb: TracebackType | None
+) -> None:
     # Ctrl-C and normal exits are not crashes — defer to the originals.
     if issubclass(etype, (KeyboardInterrupt, SystemExit)):
         _ORIG_EXCEPTHOOK(etype, value, tb)
@@ -184,8 +196,11 @@ def _excepthook(etype, value, tb) -> None:
     # exits with code 1 once this hook returns — no explicit exit needed.
 
 
-def _threading_excepthook(args) -> None:
+def _threading_excepthook(args: threading.ExceptHookArgs) -> None:
     if issubclass(args.exc_type, (KeyboardInterrupt, SystemExit)):
+        _ORIG_THREADING_EXCEPTHOOK(args)
+        return
+    if args.exc_value is None:
         _ORIG_THREADING_EXCEPTHOOK(args)
         return
     # A crashed background thread shouldn't block the main thread with
@@ -206,7 +221,7 @@ def _threading_excepthook(args) -> None:
 def handle_crash(
     exc: BaseException,
     *,
-    tb=None,
+    tb: TracebackType | None = None,
     source: str = "uncaught",
     interactive: bool | None = None,
 ) -> None:

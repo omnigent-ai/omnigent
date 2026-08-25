@@ -1,3 +1,4 @@
+import org.gradle.api.tasks.Exec
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.InetSocketAddress
@@ -10,7 +11,6 @@ import java.util.concurrent.TimeUnit
 
 plugins {
     alias(libs.plugins.android.application)
-    alias(libs.plugins.kotlin.android)
     alias(libs.plugins.play.publisher)
 }
 
@@ -30,16 +30,25 @@ fun signingValue(
 
 val storeFilePath = signingValue("storeFile", "OMNIGENT_KEYSTORE_FILE")
 
+// Version is overridable at build time so release builds can be stamped without
+// editing this file: ./gradlew bundleRelease -PversionCode=10 -PversionName=0.2.0
+// The defaults below apply to local and debug builds.
+fun buildProperty(key: String): String? =
+    (project.findProperty(key) as? String)?.takeIf { it.isNotBlank() }
+
+val appVersionCode = buildProperty("versionCode")?.toIntOrNull() ?: 9
+val appVersionName = buildProperty("versionName") ?: "0.1.3"
+
 android {
     namespace = "ai.omnigent.android"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "ai.omnigent.android"
         minSdk = 28
-        targetSdk = 35
-        versionCode = (project.findProperty("versionCode") as? String)?.toIntOrNull() ?: 2
-        versionName = "0.1.0"
+        targetSdk = 36
+        versionCode = appVersionCode
+        versionName = appVersionName
 
         // Instrumented (androidTest) runner — required for UI Automator / Espresso
         // screenshot tests. Mirrors the androidx.test stable line pinned below.
@@ -77,9 +86,8 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
-    }
+    // AGP 9 has built-in Kotlin support; the jvmTarget is derived from the
+    // Java 17 sourceCompatibility/targetCompatibility settings above.
 
     testOptions {
         unitTests {
@@ -139,7 +147,14 @@ dependencies {
 // android-commandlinetools), which makes a bare `commandLine("adb", ...)` fail
 // with "A problem occurred starting process 'command 'adb''". AGP's own tasks
 // (installDebug, etc.) resolve adb from the SDK internally, so we do the same.
-val adbPath = android.sdkDirectory.resolve("platform-tools/adb").absolutePath
+val adbPath =
+    androidComponents
+        .sdkComponents
+        .sdkDirectory
+        .get()
+        .asFile
+        .resolve("platform-tools/adb")
+        .absolutePath
 
 tasks.register<Exec>("listDevices") {
     description = "List attached Android devices/emulators"
@@ -152,16 +167,14 @@ tasks.register("runDebug") {
     group = "install"
     dependsOn("installDebug")
     doLast {
-        exec {
-            commandLine(
-                adbPath,
-                "shell",
-                "am",
-                "start",
-                "-n",
-                "ai.omnigent.android/.MainActivity",
-            )
-        }
+        ProcessBuilder(
+            adbPath,
+            "shell",
+            "am",
+            "start",
+            "-n",
+            "ai.omnigent.android/.MainActivity",
+        ).inheritIO().start().waitFor()
     }
 }
 
@@ -548,21 +561,18 @@ tasks.register("recordScreenshots") {
             logger.lifecycle("recordScreenshots: capturing screen=$screen ...")
             // Per-screen device prep: pm clear so launch routes to ConnectActivity,
             // and pre-grant POST_NOTIFICATIONS to suppress the runtime dialog.
-            exec {
-                commandLine(adbPath, "shell", "pm", "clear", screenshotAppId)
-                isIgnoreExitValue = true
-            }
-            exec {
-                commandLine(
-                    adbPath,
-                    "shell",
-                    "pm",
-                    "grant",
-                    screenshotAppId,
-                    "android.permission.POST_NOTIFICATIONS",
-                )
-                isIgnoreExitValue = true
-            }
+            ProcessBuilder(adbPath, "shell", "pm", "clear", screenshotAppId)
+                .inheritIO()
+                .start()
+                .waitFor()
+            ProcessBuilder(
+                adbPath,
+                "shell",
+                "pm",
+                "grant",
+                screenshotAppId,
+                "android.permission.POST_NOTIFICATIONS",
+            ).inheritIO().start().waitFor()
             // pm clear stops the app process; give the system a moment to settle
             // before am instrument starts a fresh one, else the instrumentation
             // can race with the process shutdown and crash.
@@ -591,11 +601,11 @@ tasks.register("recordScreenshots") {
                 instrumentArgs.addAll(listOf("-e", "sessionId", sid))
             }
             instrumentArgs.add(screenshotTestComponent)
-            exec {
-                commandLine(instrumentArgs)
-                standardOutput = instrumentLog.outputStream()
-                errorOutput = instrumentLog.outputStream()
-            }
+            ProcessBuilder(instrumentArgs)
+                .redirectOutput(instrumentLog)
+                .redirectError(instrumentLog)
+                .start()
+                .waitFor()
             val log = instrumentLog.readText()
             val failures =
                 Regex("INSTRUMENTATION_RESULT: failures=(\\d+)")
@@ -612,7 +622,10 @@ tasks.register("recordScreenshots") {
             // instrument, unlike connectedDebugAndroidTest, doesn't uninstall).
             val src = "/sdcard/Android/data/$screenshotAppId/files/screenshots/$screen.png"
             val outFile = File(localScreenshotsDir, "$screen.png")
-            exec { commandLine(adbPath, "pull", src, outFile.absolutePath) }
+            ProcessBuilder(adbPath, "pull", src, outFile.absolutePath)
+                .inheritIO()
+                .start()
+                .waitFor()
             if (!outFile.exists() || outFile.length() == 0L) {
                 throw GradleException("No screenshot pulled for screen=$screen from $src.")
             }

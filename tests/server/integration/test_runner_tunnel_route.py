@@ -20,6 +20,7 @@ from omnigent.runner import create_runner_app
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.transports.ws_tunnel.frames import (
     HelloFrame,
+    PingFrame,
     RequestFrame,
     decode_frame,
     encode_frame,
@@ -735,6 +736,25 @@ async def test_ws_tunnel_route_survives_malformed_frame(
         await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
         with contextlib.suppress(asyncio.TimeoutError):
             await communicator.wait(timeout=1.0)
+
+
+async def test_ws_tunnel_rejects_non_hello_first_frame(app: FastAPI) -> None:
+    registry = app.state.tunnel_registry
+    communicator = await _connect_route(app, _TUNNEL_PATH)
+
+    await communicator.send_input(
+        {"type": "websocket.receive", "text": encode_frame(PingFrame(ts=1))}
+    )
+    close = await communicator.receive_output(timeout=1.0)
+
+    assert close == {
+        "type": "websocket.close",
+        "code": 4001,
+        "reason": "expected hello frame",
+    }
+    assert registry.get(_RUNNER_ID) is None
+    with contextlib.suppress(asyncio.TimeoutError):
+        await communicator.wait(timeout=1.0)
 
 
 async def test_ws_tunnel_route_is_not_double_prefixed(app: FastAPI) -> None:

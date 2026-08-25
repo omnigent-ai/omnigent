@@ -233,6 +233,8 @@ def create_accounts_auth_router(
     if auth_provider._source != "accounts":
         raise RuntimeError("create_accounts_auth_router called with non-accounts provider")
     config = auth_provider._accounts_config
+    if config is None:
+        raise RuntimeError("accounts auth provider has no accounts configuration")
     router = APIRouter()
 
     _secure = config.secure_cookies
@@ -304,11 +306,15 @@ def create_accounts_auth_router(
         # against a row that exists. Defensive-coding the dereference
         # would only mask a SqlAlchemy bug, which we want to surface.
         assert user is not None
-        body_payload = {
+        body_payload: dict[str, object] = {
             "token": session_jwt,
             "expires_in": _session_max_age,
             "user": {"id": user.id, "is_admin": user.is_admin},
         }
+        # Browser login must never receive refresh material — only CLI/device
+        # flows do (via /auth/cli-poll or device-grant callback). This is
+        # enforced server-side so an XSS or form-hijack cannot obtain
+        # long-lived unattended credentials.
         resp = JSONResponse(status_code=200, content=body_payload)
         _set_session_cookie(
             resp,
@@ -682,6 +688,9 @@ def create_accounts_auth_router(
           bootstrap admin's name now defaults to the OS user
           (e.g. ``dhruv.gupta``), so the check generalizes to
           "would this leave zero admins". Same invariant, name-agnostic.
+          Checked and applied atomically (see
+          ``AccountStore.delete_user``) so two concurrent deletes of
+          two different admins can't both slip past the check.
         """
         admin_id = auth_provider.get_user_id(request)
         if admin_id is None or not account_store.is_admin(admin_id):
@@ -689,23 +698,17 @@ def create_accounts_auth_router(
         if user_id == admin_id:
             return JSONResponse(status_code=400, content={"error": "cannot delete self"})
 
-        target = account_store.get_user(user_id)
-        if target is None:
+        result = account_store.delete_user(user_id)
+        if result is None:
             return JSONResponse(status_code=404, content={"error": "not found"})
-        if target.is_admin:
-            other_admins = [
-                u for u in account_store.list_users() if u.is_admin and u.id != user_id
-            ]
-            if not other_admins:
-                return JSONResponse(
-                    status_code=400,
-                    content={
-                        "error": "cannot delete the last admin — promote another "
-                        "user first or the deploy would have no recovery path"
-                    },
-                )
-
-        account_store.delete_user(user_id)
+        if result is False:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "cannot delete the last admin — promote another "
+                    "user first or the deploy would have no recovery path"
+                },
+            )
         return Response(status_code=204)
 
     @router.post("/users/{user_id}/reset")

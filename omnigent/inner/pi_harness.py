@@ -33,6 +33,8 @@ Env vars read at startup:
 - ``HARNESS_PI_GATEWAY_BASE_URLS``: JSON object of gateway base
   URLs keyed by model family, e.g.
   ``{"claude": "https://example.databricks.com/ai-gateway/anthropic"}``.
+- ``HARNESS_PI_GATEWAY_OPENAI_WIRE_API``: ``"responses"`` or ``"chat"``
+  for a configured generic OpenAI-compatible provider.
 - ``HARNESS_PI_CWD``: working directory the executor launches
   the Pi CLI in. ``None`` falls back to ``OMNIGENT_RUNNER_WORKSPACE`` if set,
   then to the subprocess's inherited cwd.
@@ -56,7 +58,7 @@ Env vars read at startup:
   bundle skill.
 - ``HARNESS_PI_BUNDLE_DIR``: Absolute path to the agent
   bundle's extracted root. When set, the executor sources
-  bundled skills from ``<bundle>/skills/<name>/`` for the
+  bundled skills from ``<bundle>/skills/<dir>/`` for the
   ``"all"`` and named-list cases. Unset for agents without a
   bundled-skill directory.
 - ``HARNESS_PI_AGENT_NAME``: Agent display name. Reserved for
@@ -98,6 +100,7 @@ _ENV_BUNDLE_DIR = "HARNESS_PI_BUNDLE_DIR"
 _ENV_AGENT_NAME = "HARNESS_PI_AGENT_NAME"
 _ENV_GATEWAY_BASE_URL = "HARNESS_PI_GATEWAY_BASE_URL"
 _ENV_GATEWAY_BASE_URLS = "HARNESS_PI_GATEWAY_BASE_URLS"
+_ENV_GATEWAY_OPENAI_WIRE_API = "HARNESS_PI_GATEWAY_OPENAI_WIRE_API"
 _ENV_GATEWAY_AUTH_COMMAND = "HARNESS_PI_GATEWAY_AUTH_COMMAND"
 _ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS = "HARNESS_PI_GATEWAY_AUTH_REFRESH_INTERVAL_MS"
 
@@ -226,6 +229,7 @@ def _build_pi_executor() -> Executor:
         gateway_host=os.environ.get(_ENV_GATEWAY_HOST) or None,
         base_url_override=os.environ.get(_ENV_GATEWAY_BASE_URL) or None,
         base_urls_override=_resolve_gateway_base_urls(),
+        openai_wire_api=os.environ.get(_ENV_GATEWAY_OPENAI_WIRE_API) or None,
         gateway_auth_command=os.environ.get(_ENV_GATEWAY_AUTH_COMMAND) or None,
         bundle_dir=bundle_dir,
         agent_name=agent_name,

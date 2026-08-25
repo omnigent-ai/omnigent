@@ -169,6 +169,28 @@ executor:
 CLI flags such as `--harness qwen` and `--model <id>` can override or supply
 missing executor values.
 
+## Custom ACP agents
+
+`harness: acp:<slug>` runs any configured Agent Client Protocol server command.
+Register commands in `~/.omnigent/config.yaml` under `acp.agents`; the slug is
+derived from the agent name.
+
+OpenClaw's Gateway ACP bridge is one such server. It rejects per-session
+`mcpServers`, so disable Omnigent's MCP relay for that entry and let OpenClaw
+use its own tools, routing, memory, and channels:
+
+```yaml
+acp:
+  agents:
+    - name: OpenClaw
+      command: openclaw acp --url <gateway-url> --token-file <token-file>
+      omnigent_mcp: false
+```
+
+Then run it with `omni run --harness acp:openclaw` or select `OpenClaw` in the
+app. See the [OpenClaw integration guide](openclaw.md) for registry import,
+Gateway setup, and compatibility details.
+
 ## Local OS access
 
 Declare `os_env` only for agents that need local file/shell tools.
@@ -198,10 +220,23 @@ Prefer the narrowest filesystem and network access that supports the task. Do
 not pass secrets through the environment unless the tool genuinely needs them.
 
 You usually don't need to choose a `sandbox.type` — omit it and Omnigent picks
-the platform default (`linux_bwrap` on Linux, `darwin_seatbelt` on macOS), so the
-same YAML works across platforms. For the full set of sandbox options, how to
-share one policy across `sys_os_*` and terminals, and how to set up network
-egress rules, see the `sandbox:` examples below and the sandbox source under `omnigent/inner/`.
+the platform default (`linux_bwrap` on Linux, `darwin_seatbelt` on macOS, or
+`windows_jobobject` on Windows), so the same YAML works across platforms. Use
+`type: auto` to explicitly request the platform-default sandbox backend:
+
+```yaml
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: auto
+```
+
+`auto` and an omitted `type` resolve identically. `type: null` and `type: none`
+both explicitly disable the sandbox. For the full set of sandbox options, how
+to share one policy across `sys_os_*` and terminals, and how to set up network
+egress rules, see the `sandbox:` examples below and the sandbox source under
+`omnigent/inner/`.
 
 ### Secretless credential proxy
 

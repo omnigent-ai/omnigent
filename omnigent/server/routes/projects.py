@@ -92,7 +92,7 @@ def create_projects_router(
         :raises OmnigentError: 401 if unauthenticated in multi-user mode.
         """
         user_id = require_user(request, auth_provider)
-        projects = await asyncio.to_thread(project_store.list, owner_user_id=user_id)
+        projects = await asyncio.to_thread(project_store.list, user_id=user_id)
         return {"object": "list", "data": [_to_response(p) for p in projects]}
 
     @router.get("/projects/{project_id}")
@@ -106,7 +106,7 @@ def create_projects_router(
             owned by the caller.
         """
         user_id = require_user(request, auth_provider)
-        project = await asyncio.to_thread(project_store.get, project_id, owner_user_id=user_id)
+        project = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
         if project is None:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
         return _to_response(project)
@@ -131,7 +131,7 @@ def create_projects_router(
         project = await asyncio.to_thread(
             project_store.update,
             project_id,
-            owner_user_id=user_id,
+            user_id=user_id,
             name=body.name,
             config=body.config,
         )
@@ -153,7 +153,7 @@ def create_projects_router(
             owned by the caller.
         """
         user_id = require_user(request, auth_provider)
-        deleted = await asyncio.to_thread(project_store.delete, project_id, owner_user_id=user_id)
+        deleted = await asyncio.to_thread(project_store.delete, project_id, user_id=user_id)
         if not deleted:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
         return {"id": project_id, "object": "project.deleted", "deleted": True}

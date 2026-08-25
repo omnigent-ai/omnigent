@@ -131,8 +131,8 @@ describe("detectNewElicitations", () => {
 
   it("treats missing count as 0", () => {
     const prev = new Map([["a", 0]]);
-    const conv = { ...convE("a", 0), pending_elicitations_count: undefined };
-    expect(detectNewElicitations(prev, [conv])).toEqual([]);
+    const conversation = { ...convE("a", 0), pending_elicitations_count: undefined };
+    expect(detectNewElicitations(prev, [conversation])).toEqual([]);
   });
 });
 
@@ -244,7 +244,7 @@ describe("computeUnreadBadgeIds", () => {
   it("passes each session's id, updated_at, and status to the predicate", () => {
     // The hook wires isConversationUnseen here; wrong arguments would make
     // the localStorage lookup miss and the badge silently read 0.
-    const calls: Array<{ id: string; updatedAt: number; status: string | undefined }> = [];
+    const calls: { id: string; updatedAt: number; status: string | undefined }[] = [];
     computeUnreadBadgeIds(
       [convB("a", { updatedAt: 42, status: "failed" })],
       undefined,

@@ -704,6 +704,9 @@ def _fast_tmux_timeouts(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(_mod, "_PASTE_SETTLE_S", 0.0)
     monkeypatch.setattr(_mod, "_PASTE_COMMIT_TIMEOUT_S", 0.3)
     monkeypatch.setattr(_mod, "_SUBMIT_VERIFY_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(_mod, "_VERIFY_PROBE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(_mod, "_VERIFY_RETRY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(_mod, "_VERIFY_RETRY_TIMEOUT_S", 5.0)
 
 
 def test_inject_user_message_via_tui_happy_path(
@@ -1047,6 +1050,231 @@ def test_inject_user_message_via_tui_rejects_empty_content(tmp_path: Path) -> No
 
 
 # ---------------------------------------------------------------------------
+# Collapsed-paste draft detection
+# ---------------------------------------------------------------------------
+
+
+def test_draft_in_input_region_detects_collapsed_paste_placeholder() -> None:
+    """
+    agy's collapsed-paste placeholder counts as a rendered draft.
+
+    Past ~13 line breaks agy replaces the pasted text with a single
+    ``[Pasted text #N +M lines]`` row instead of echoing it, so the needle is
+    never visible in the composer. Without this the render gate reads a
+    correctly pasted multi-line prompt as "never rendered".
+    """
+    baseline = "> "
+    pane = "> [Pasted text #1 +17 lines]\n? for shortcuts"
+    assert _mod._draft_in_input_region(pane, "Find the current weather", baseline)
+    # Once the placeholder leaves the composer the draft is gone (submit verified).
+    submitted = "> \n? for shortcuts"
+    assert not _mod._draft_in_input_region(submitted, "Find the current weather", baseline)
+
+
+def test_inject_user_message_via_tui_submits_a_collapsed_paste(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+) -> None:
+    """
+    A multi-line prompt agy collapses is still submitted, not reported as lost.
+
+    Reproduces the polly sub-agent dispatch: the task prompt is long enough that
+    agy shows only the placeholder, which previously failed the render gate and
+    raised "did not render the pasted message" while the draft sat in the
+    composer.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    content = "\n".join(f"Find the current weather line {i}" for i in range(1, 19))
+    tui = {"pane": "> \n? for shortcuts"}
+    enters = {"n": 0}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """agy collapses the paste, then starts a turn on Enter."""
+        del kwargs
+        if "has-session" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = "> [Pasted text #1 +18 lines]\n? for shortcuts"
+        if cmd[-1] == "Enter":
+            enters["n"] += 1
+            tui["pane"] = "> \nesc to cancel"
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message_via_tui(bridge_dir, content=content, timeout_s=0.5)
+
+    assert enters["n"] == 1, "the collapsed draft should submit on the first Enter"
+
+
+# ---------------------------------------------------------------------------
+# Account-verification re-delivery
+# ---------------------------------------------------------------------------
+
+
+_VERIFYING_PANE = (
+    "⚠ Verifying your account...\n"
+    "  ⎿  We're finishing verifying your account eligibility.\n"
+    "     This usually takes a moment. Please try again shortly.\n"
+    "> \n? for shortcuts"
+)
+
+
+def test_inject_user_message_via_tui_redelivers_while_account_verifying(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+) -> None:
+    """
+    A turn agy answers with its account-verification notice is re-delivered.
+
+    agy consumes a turn submitted before its startup eligibility check settles —
+    the draft leaves the composer, so the submit verifies — and renders the
+    notice instead of starting a cascade. Without a re-delivery the turn is lost
+    and the terminal sits idle, which is what a programmatically dispatched
+    sub-agent hits on every launch.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    content = "do the thing"
+    tui = {"pane": "> \n? for shortcuts"}
+    pastes = {"n": 0}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """Reject the first submit with the notice; start a turn on the second."""
+        del kwargs
+        if "has-session" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            pastes["n"] += 1
+            tui["pane"] = f"> {content}\n? for shortcuts"
+        if cmd[-1] == "Enter":
+            tui["pane"] = _VERIFYING_PANE if pastes["n"] == 1 else "> \nesc to cancel"
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message_via_tui(bridge_dir, content=content, timeout_s=0.5)
+
+    assert pastes["n"] == 2, "expected the rejected turn to be re-delivered once"
+
+
+def test_inject_user_message_via_tui_raises_when_account_verification_never_clears(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+) -> None:
+    """
+    Re-delivery is bounded: a never-clearing notice surfaces a clear error.
+
+    Retrying forever would hang the turn; the executor needs a failure it can
+    surface so the user learns the account is not usable yet.
+    """
+    monkeypatch.setattr(_mod, "_VERIFY_RETRY_TIMEOUT_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    content = "do the thing"
+    tui = {"pane": "> \n? for shortcuts"}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """Every submit is answered with the verification notice."""
+        del kwargs
+        if "has-session" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = f"> {content}\n? for shortcuts"
+        if cmd[-1] == "Enter":
+            tui["pane"] = _VERIFYING_PANE
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with pytest.raises(RuntimeError, match="still verifying the Antigravity account"):
+        inject_user_message_via_tui(bridge_dir, content=content, timeout_s=0.5)
+
+
+def test_inject_user_message_via_tui_does_not_redeliver_an_accepted_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+) -> None:
+    """
+    A stale notice left on screen from a prior attempt never causes a duplicate.
+
+    agy clears the notice only when a turn actually starts, so the running-turn
+    marker must win over notice text still visible in the same capture.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    content = "do the thing"
+    tui = {"pane": "> \n? for shortcuts"}
+    pastes = {"n": 0}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """Start a turn while the previous attempt's notice is still rendered."""
+        del kwargs
+        if "has-session" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            pastes["n"] += 1
+            tui["pane"] = f"> {content}\n? for shortcuts"
+        if cmd[-1] == "Enter":
+            tui["pane"] = _VERIFYING_PANE.replace("? for shortcuts", "esc to cancel")
+        return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message_via_tui(bridge_dir, content=content, timeout_s=0.5)
+
+    assert pastes["n"] == 1, "a running turn must not be re-delivered"
+
+
+def test_inject_user_message_via_tui_ignores_stale_notice_with_changed_active_footer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+) -> None:
+    """A renamed active footer still prevents a stale-notice duplicate."""
+    monkeypatch.setattr(_mod, "_VERIFY_RETRY_TIMEOUT_S", 0.2)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    content = "do the thing"
+    tui = {"pane": "> \n? for shortcuts"}
+    pastes = {"n": 0}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """Reject once, then accept while the stale notice remains visible."""
+        del kwargs
+        if "has-session" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            pastes["n"] += 1
+            tui["pane"] = f"> {content}\n? for shortcuts"
+        if cmd[-1] == "Enter":
+            tui["pane"] = (
+                _VERIFYING_PANE
+                if pastes["n"] == 1
+                else _VERIFYING_PANE.replace(
+                    "? for shortcuts", "(generating response, press the cancel key to stop)"
+                )
+            )
+        return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message_via_tui(bridge_dir, content=content, timeout_s=0.5)
+
+    assert pastes["n"] == 2, "the accepted retry must not be delivered again"
+
+
+# ---------------------------------------------------------------------------
 # Composer-region detection robustness (#1598 review follow-ups)
 # ---------------------------------------------------------------------------
 
@@ -1353,6 +1581,179 @@ def test_seed_isolated_agy_home_tolerates_missing_credential(
     # No token copied (none existed), but the isolated Gemini dir + markers still exist.
     assert not (iso_gemini / "antigravity-cli" / "antigravity-oauth-token").exists()
     assert (iso_gemini / "antigravity-cli" / "cache" / "onboarding.json").is_file()
+
+
+def test_seed_isolated_agy_home_exposes_user_plugins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The user's imported plugins (skills + hooks) are visible under --gemini_dir."""
+    fake_home = tmp_path / "real-home"
+    real_config = fake_home / ".gemini" / "config"
+    (real_config / "plugins" / "superpowers" / "skills").mkdir(parents=True)
+    (real_config / "plugins" / "superpowers" / "skills" / "brainstorming.md").write_text(
+        "# brainstorming", encoding="utf-8"
+    )
+    manifest = json.dumps(
+        {"imports": [{"name": "superpowers", "components": ["skills", "hooks"]}]}
+    )
+    (real_config / "import_manifest.json").write_text(manifest, encoding="utf-8")
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+
+    iso_config = agy_gemini_dir(bridge_dir) / "config"
+    # agy resolves plugins relative to --gemini_dir, so both the manifest and the
+    # plugin payload must be reachable there or the session lists zero skills.
+    assert json.loads((iso_config / "import_manifest.json").read_text(encoding="utf-8")) == (
+        json.loads(manifest)
+    )
+    seeded_skill = iso_config / "plugins" / "superpowers" / "skills" / "brainstorming.md"
+    assert seeded_skill.read_text(encoding="utf-8") == "# brainstorming"
+
+
+def test_seed_isolated_agy_home_does_not_copy_plugin_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plugins are linked, not copied, so plugin updates are picked up live."""
+    fake_home = tmp_path / "real-home"
+    real_plugins = fake_home / ".gemini" / "config" / "plugins"
+    (real_plugins / "superpowers").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+
+    iso_plugins = agy_gemini_dir(bridge_dir) / "config" / "plugins"
+    assert iso_plugins.is_symlink()
+    assert iso_plugins.resolve() == real_plugins.resolve()
+    # A plugin installed/updated after the session started is still visible.
+    (real_plugins / "later").mkdir()
+    assert (iso_plugins / "later").is_dir()
+
+
+def test_seed_isolated_agy_home_plugin_seed_is_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-seeding an existing bridge dir does not fail on the existing link."""
+    fake_home = tmp_path / "real-home"
+    (fake_home / ".gemini" / "config" / "plugins").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+    seed_isolated_agy_home(bridge_dir)
+
+    iso_plugins = agy_gemini_dir(bridge_dir) / "config" / "plugins"
+    assert iso_plugins.is_symlink()
+
+
+def test_seed_isolated_agy_home_tolerates_absent_plugins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A user with no imported plugins seeds cleanly — no link, no manifest."""
+    fake_home = tmp_path / "real-home"
+    (fake_home / ".gemini").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+
+    iso_config = agy_gemini_dir(bridge_dir) / "config"
+    assert not (iso_config / "plugins").exists()
+    assert not (iso_config / "import_manifest.json").exists()
+    # The rest of the seed still landed.
+    assert (iso_config / ".migrated").is_file()
+
+
+def test_seed_isolated_agy_home_exposes_user_skill_dirs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """agy's Global and Shared skill trees resolve under ``--gemini_dir``.
+
+    The ``/skills`` menu enumerates these from the REAL home, so a session that
+    cannot resolve them there would offer a skill agy then fails to expand.
+    """
+    fake_home = tmp_path / "real-home"
+    real_global = fake_home / ".gemini" / "antigravity-cli" / "skills"
+    real_shared = fake_home / ".gemini" / "skills"
+    (real_global / "global-skill").mkdir(parents=True)
+    (real_global / "global-skill" / "SKILL.md").write_text("# global", encoding="utf-8")
+    (real_shared / "shared-skill").mkdir(parents=True)
+    (real_shared / "shared-skill" / "SKILL.md").write_text("# shared", encoding="utf-8")
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+
+    iso_gemini = agy_gemini_dir(bridge_dir)
+    iso_global = iso_gemini / "antigravity-cli" / "skills"
+    iso_shared = iso_gemini / "skills"
+    # Linked, not copied: a skill authored mid-session is visible immediately.
+    assert iso_global.is_symlink() and iso_shared.is_symlink()
+    assert (iso_global / "global-skill" / "SKILL.md").read_text(encoding="utf-8") == "# global"
+    assert (iso_shared / "shared-skill" / "SKILL.md").read_text(encoding="utf-8") == "# shared"
+    (real_shared / "later").mkdir()
+    assert (iso_shared / "later").is_dir()
+
+
+def test_seed_isolated_agy_home_skill_dir_seed_is_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-seeding an existing bridge dir does not fail on the existing links."""
+    fake_home = tmp_path / "real-home"
+    (fake_home / ".gemini" / "antigravity-cli" / "skills").mkdir(parents=True)
+    (fake_home / ".gemini" / "skills").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+    seed_isolated_agy_home(bridge_dir)
+
+    iso_gemini = agy_gemini_dir(bridge_dir)
+    assert (iso_gemini / "antigravity-cli" / "skills").is_symlink()
+    assert (iso_gemini / "skills").is_symlink()
+
+
+def test_seed_isolated_agy_home_tolerates_absent_skill_dirs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A user with no Global/Shared skills seeds cleanly — no links, no failure."""
+    fake_home = tmp_path / "real-home"
+    (fake_home / ".gemini").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+
+    iso_gemini = agy_gemini_dir(bridge_dir)
+    assert not (iso_gemini / "skills").exists()
+    assert not (iso_gemini / "antigravity-cli" / "skills").exists()
+    # agy owns ``antigravity-cli`` itself; seeding must not have clobbered it.
+    assert (iso_gemini / "antigravity-cli" / "cache" / "onboarding.json").is_file()
+
+
+def test_seed_isolated_agy_home_skill_links_never_mutate_real_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Seeding links INTO the real skill trees; it never writes through them."""
+    fake_home = tmp_path / "real-home"
+    real_shared = fake_home / ".gemini" / "skills"
+    real_shared.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+
+    assert sorted(p.name for p in real_shared.iterdir()) == []
 
 
 def test_agy_home_dir_is_under_bridge_dir(tmp_path: Path) -> None:

@@ -5,12 +5,15 @@
 // ExecutionLogsPanel / FilesPanelDrawer — those open at ~50 % by default
 // while the inline panel starts at a compact sidebar width.
 
-import { useCallback, useEffect, useRef } from "react";
-import { useSyncExternalStore } from "react";
+import { useCallback, useEffect, useReducer, useRef, useState, useSyncExternalStore } from "react";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 
 const MIN_WIDTH_PX = 240;
-const MAX_WIDTH_RATIO = 0.6;
+const MAX_WIDTH_RATIO = 0.99;
+/** The center chat column never shrinks past this, whatever the rail wants. */
+const CHAT_MIN_WIDTH_PX = 480;
+/** Visual gap between the chat column and the rail. */
+const GAP_PX = 8;
 
 // ~36 % of viewport, clamped [420, 600] — ~30 % wider than the prior default so
 // the first manual open lands at a comfortable working width.
@@ -25,11 +28,28 @@ function defaultWidthPx(): number {
   return Math.max(DEFAULT_MIN_PX, Math.min(DEFAULT_MAX_PX, candidate));
 }
 
-function clamp(w: number, minPx = MIN_WIDTH_PX): number {
+// Width the panel may not eat into: the sidebar when it's open. Passed down
+// from AppShell so opening the sidebar tightens the ceiling instead of
+// squeezing the chat.
+function clamp(w: number, minPx = MIN_WIDTH_PX, reservedPx = 0): number {
   // No viewport ceiling available off the DOM (SSR / node test env) — this runs
   // during render, so guard before reading `window` to avoid a hard throw.
   if (typeof window === "undefined") return Math.max(minPx, w);
-  return Math.max(minPx, Math.min(w, window.innerWidth * MAX_WIDTH_RATIO));
+  // 99vw is the nominal ceiling, but the chat column's minimum (plus the gap
+  // between the two) is the one that actually binds on a normal desktop.
+  const ceiling = Math.max(
+    0,
+    Math.min(
+      window.innerWidth * MAX_WIDTH_RATIO,
+      window.innerWidth - reservedPx - CHAT_MIN_WIDTH_PX - GAP_PX,
+    ),
+  );
+  // The chat's 480px floor wins over the panel's own comfort minimum: when the
+  // viewport (with the sidebar open) is too small to grant both, the panel
+  // yields below `minPx` rather than let the chat break its minimum. Clamping
+  // the floor to the ceiling keeps the range valid so `Math.max` can't push the
+  // width back up past the chat-preserving cap.
+  return Math.max(Math.min(minPx, ceiling), Math.min(w, ceiling));
 }
 
 // ---------------------------------------------------------------------------
@@ -117,8 +137,17 @@ function getServerSnapshot(): number | null {
  * `sessionId` scopes the persisted width: each conversation remembers its own
  * rail width. Pass `null` when there is no active conversation (the panel then
  * uses the default width and resizes are not persisted).
+ *
+ * `reservedPx` is layout width the panel may not claim — the open sidebar. It
+ * tightens the ceiling without touching the persisted preference, so opening
+ * the sidebar temporarily shrinks the panel and collapsing it restores the
+ * user's width.
  */
-export function useResizableInlinePanel(sessionId: string | null, minWidthPx = MIN_WIDTH_PX) {
+export function useResizableInlinePanel(
+  sessionId: string | null,
+  minWidthPx = MIN_WIDTH_PX,
+  reservedPx = 0,
+) {
   const raw = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
   // On a session switch the module store still holds the previous session's
   // width until the effect below re-seeds it after commit. Derive this render's
@@ -131,11 +160,24 @@ export function useResizableInlinePanel(sessionId: string | null, minWidthPx = M
     effectiveRaw =
       sessionId !== null ? (readSessionWorkspaceState(sessionId).widthPx ?? null) : null;
   }
-  const resolvedWidth = clamp(effectiveRaw ?? defaultWidthPx(), minWidthPx);
-  const dragging = useRef(false);
+  // Clamped at render time only — the store keeps the user's preferred width, so
+  // a temporary squeeze (sidebar opening) is undone when the space returns.
+  const resolvedWidth = clamp(effectiveRaw ?? defaultWidthPx(), minWidthPx, reservedPx);
+  // Drives the drag listeners' lifecycle: they mount only while a drag is
+  // live, so there's no idle window-level mousemove handler firing during
+  // ordinary page use.
+  const [isDragging, setIsDragging] = useState(false);
+  // `resolvedWidth` reads `window.innerWidth` at render, but a viewport resize
+  // that leaves the stored (no-reserve) width unchanged wouldn't otherwise
+  // re-render — so the render-time reserve clamp would go stale and the chat
+  // could dip below its minimum on a shrink. This tick forces a recompute on
+  // every resize regardless of whether the stored width moved.
+  const [, bumpViewport] = useReducer((n: number) => n + 1, 0);
   const overlayRef = useRef<HTMLDivElement | null>(null);
   const minWidthRef = useRef(minWidthPx);
   minWidthRef.current = minWidthPx;
+  const reservedRef = useRef(reservedPx);
+  reservedRef.current = reservedPx;
 
   // While dragging, a transparent full-window overlay sits above the panel so
   // the pointer stream keeps reaching the parent document. Without it, dragging
@@ -164,13 +206,19 @@ export function useResizableInlinePanel(sessionId: string | null, minWidthPx = M
 
   // Re-clamp on viewport resize so the panel can't overflow a shrunken window.
   // Re-derive the effective width from the persisted preference so widening the
-  // window restores the user's saved choice.
+  // window restores the user's saved choice. Deliberately clamped WITHOUT
+  // `reservedPx`: the store holds the preferred width, and the reserve is
+  // applied at render time, so an open sidebar's squeeze is never written in
+  // (collapsing it restores this width).
   useEffect(() => {
     function onResize() {
       setStoredWidth((prev) => {
         const base = preferredWidth ?? prev;
         return base !== null ? clamp(base, minWidthRef.current) : defaultWidthPx();
       });
+      // Force a re-render even when the stored width is unchanged, so the
+      // render-time reserve clamp re-runs against the new viewport.
+      bumpViewport();
     }
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
@@ -182,7 +230,7 @@ export function useResizableInlinePanel(sessionId: string | null, minWidthPx = M
   const onMouseDown = useCallback(
     (e: React.MouseEvent) => {
       e.preventDefault();
-      dragging.current = true;
+      setIsDragging(true);
       addDragOverlay();
       document.body.style.cursor = "col-resize";
       document.body.style.userSelect = "none";
@@ -195,26 +243,46 @@ export function useResizableInlinePanel(sessionId: string | null, minWidthPx = M
       const step = 20;
       if (e.key === "ArrowLeft") {
         e.preventDefault();
-        setStoredWidth((prev) => clamp((prev ?? resolvedWidth) + step, minWidthRef.current), true);
+        setStoredWidth(
+          (prev) => clamp((prev ?? resolvedWidth) + step, minWidthRef.current, reservedRef.current),
+          true,
+        );
       } else if (e.key === "ArrowRight") {
         e.preventDefault();
-        setStoredWidth((prev) => clamp((prev ?? resolvedWidth) - step, minWidthRef.current), true);
+        setStoredWidth(
+          (prev) => clamp((prev ?? resolvedWidth) - step, minWidthRef.current, reservedRef.current),
+          true,
+        );
       }
     },
     [resolvedWidth],
   );
 
+  // Drag listeners live only while a drag is active — no idle window-level
+  // mousemove handler during ordinary use. Moves are coalesced through a
+  // single rAF so a burst of mousemove events yields at most one width update
+  // per frame (setStoredWidth already dedupes equal values).
   useEffect(() => {
-    function onMouseMove(e: MouseEvent) {
-      if (!dragging.current) return;
-      // Update the live width only; persist once on release to avoid a
-      // synchronous localStorage write per mousemove.
-      setStoredWidth(clamp(window.innerWidth - e.clientX, minWidthRef.current));
+    if (!isDragging) return;
+    let frame = 0;
+    let pending: number | null = null;
+
+    function flush() {
+      frame = 0;
+      if (pending === null) return;
+      setStoredWidth(clamp(pending, minWidthRef.current, reservedRef.current));
+      pending = null;
     }
 
-    function onMouseUp() {
-      if (!dragging.current) return;
-      dragging.current = false;
+    function onMouseMove(e: MouseEvent) {
+      pending = window.innerWidth - e.clientX;
+      if (frame === 0) frame = requestAnimationFrame(flush);
+    }
+
+    function stop() {
+      if (frame !== 0) cancelAnimationFrame(frame);
+      flush();
+      setIsDragging(false);
       removeDragOverlay();
       persistStoredWidth();
       document.body.style.cursor = "";
@@ -222,18 +290,18 @@ export function useResizableInlinePanel(sessionId: string | null, minWidthPx = M
     }
 
     window.addEventListener("mousemove", onMouseMove);
-    window.addEventListener("mouseup", onMouseUp);
+    window.addEventListener("mouseup", stop);
     return () => {
+      if (frame !== 0) cancelAnimationFrame(frame);
       window.removeEventListener("mousemove", onMouseMove);
-      window.removeEventListener("mouseup", onMouseUp);
-      if (dragging.current) {
-        dragging.current = false;
-        document.body.style.cursor = "";
-        document.body.style.userSelect = "";
-      }
+      window.removeEventListener("mouseup", stop);
+      // Unmounted mid-drag (panel closed via tab switch): reset the cursor and
+      // drop the overlay so it can't swallow later clicks.
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
       removeDragOverlay();
     };
-  }, [removeDragOverlay]);
+  }, [isDragging, removeDragOverlay]);
 
   return {
     panelWidth: resolvedWidth,

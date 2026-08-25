@@ -1,0 +1,19 @@
+# Keenable MCP server — live web search + full-page content fetch.
+# Auto-discovered by omnigent (omnigent/spec/parser.py:_discover_mcp_servers);
+# no need to reference it from config.yaml.
+#
+# Exposed tools: search_web_pages, fetch_page_content.
+name: keenable
+description: Live web search and page-content fetch via the Keenable MCP server.
+transport: http
+
+# Keenable's public MCP endpoint. It works WITHOUT a key (rate-limited:
+# ~10 req/s, ~100 req/hour per IP), so this example runs with zero signup.
+url: https://api.keenable.ai/mcp
+
+headers:
+  # App attribution — Keenable records this as the source of the traffic.
+  X-Keenable-Title: Omnigent Deep Research
+  # OPTIONAL — supply an API key to lift the public rate limits. Omit for
+  # keyless/public access.
+  # X-API-Key: ${KEENABLE_API_KEY}

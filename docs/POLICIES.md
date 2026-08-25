@@ -209,7 +209,28 @@ Forces a specific sandbox configuration on agent start.
 | `allow_network` | boolean | `true` | Allow network access |
 | `write_paths` | string[] | `null` | Writable paths (null inherits agent config) |
 | `read_paths` | string[] | `null` | Read-only paths (null inherits agent config) |
-| `env_passthrough` | string[] | `null` | Env vars allowed through sandbox |
+| `env_passthrough` | string[] | `null` | Env vars allowed through to the agent process (see below) |
+
+`env_passthrough` is the escape hatch for an agent that authenticates from an
+environment variable. Agent CLIs are spawned with a **deny-by-default**
+environment: the shared base (`HOME`, `PATH`, proxy/TLS, locale, `TMPDIR`, the
+Omnigent session marker) plus the harness's own variable family, and nothing
+else. A host secret belonging to some other provider is not inherited.
+
+That means an ambient key which used to reach the CLI implicitly now has to be
+declared. Two cases worth knowing:
+
+- **A generic ACP agent** (`type: acp`) gets no vendor family at all, because
+  Omnigent cannot know which vendor an arbitrary agent belongs to. Gemini via
+  ACP needs `env_passthrough: ["GEMINI_API_KEY"]`.
+- **Goose** owns `GOOSE_*` only. Goose configured through Omnigent's
+  provider/gateway routing is unaffected, but a goose set up against an ambient
+  provider key (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, ...) needs that name
+  declared here.
+
+An agent that fails during its `initialize` handshake for no obvious reason is
+worth checking against this first; the ACP executor logs a hint pointing back at
+this field.
 
 #### `deny_pii_in_llm_request`
 

@@ -41,6 +41,7 @@ function makeSession(permissionLevel: number | null): Session {
     permissionLevel,
     parentSessionId: null,
     subAgentName: null,
+    kind: "default",
   };
 }
 

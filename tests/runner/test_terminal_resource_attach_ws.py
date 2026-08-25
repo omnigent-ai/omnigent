@@ -16,12 +16,18 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from omnigent.entities.session_resources import SessionResourceView
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner import create_runner_app
+from omnigent.runner.direct_attach import (
+    allowed_origin_for_server,
+    create_direct_attach_app,
+    start_direct_attach_listener,
+)
 from omnigent.runner.resource_registry import (
     OMNIGENT_REPL_TERMINAL_ROLE,
     QWEN_NATIVE_TERMINAL_ROLE,
@@ -170,15 +176,16 @@ def test_runner_resource_attach_selects_control_bridge_on_transport_query(
 ) -> None:
     """``?transport=control`` dispatches to the control-mode bridge, not the PTY one.
 
-    Both bridges share the same signature and browser wire protocol, so the
-    route just picks one. Patch each to record which was invoked and close the
+    The route selects one bridge and gives PTY attaches the explicit OSC 52
+    trust capability. Patch each to record which was invoked and close the
     socket cleanly, then assert on the selection per query.
 
     :param tmp_path: Pytest tmp directory.
     :param monkeypatch: Pytest monkeypatch fixture.
     """
     registry = TerminalRegistry()
-    _seed_registry(registry, "conv_abc", _make_running_instance("bash", "s1", tmp_path))
+    instance = _make_running_instance("bash", "s1", tmp_path)
+    _seed_registry(registry, "conv_abc", instance)
     app = create_runner_app(
         terminal_registry=registry,
         server_client=NullServerClient(),  # type: ignore[arg-type]
@@ -190,8 +197,8 @@ def test_runner_resource_attach_selects_control_bridge_on_transport_query(
         calls.append("control")
         await websocket.close()
 
-    async def fake_pty(websocket, **_kwargs):  # type: ignore[no-untyped-def]
-        calls.append("pty")
+    async def fake_pty(websocket, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append(f"pty:{kwargs.get('allow_osc52_clipboard')}")
         await websocket.close()
 
     monkeypatch.setattr("omnigent.runner.app.bridge_tmux_control_to_websocket", fake_control)
@@ -212,8 +219,14 @@ def test_runner_resource_attach_selects_control_bridge_on_transport_query(
     with contextlib.suppress(WebSocketDisconnect):
         with client.websocket_connect(base):  # no query → control default
             pass
+    # Passthrough can carry pane-crafted OSC 52 around tmux's external-only
+    # clipboard policy, so PTY attaches must explicitly disable browser OSC 52.
+    instance.tmux_allow_passthrough = True
+    with contextlib.suppress(WebSocketDisconnect):
+        with client.websocket_connect(f"{base}?transport=pty"):
+            pass
 
-    assert calls == ["control", "pty", "control"], (
+    assert calls == ["control", "pty:True", "control", "pty:False"], (
         f"transport query did not select the expected bridge: {calls!r}"
     )
 
@@ -705,3 +718,159 @@ def test_runner_resource_attach_closes_4404_when_pty_ends(
         "Without 4404, the client's reconnect loop will spin on 'Claude "
         "session connection closed by server; reconnecting...' indefinitely."
     )
+
+
+# ── Loopback direct-attach listener (runner/direct_attach.py) ─────────
+
+
+def _make_direct_app(
+    events: list[tuple[str, str, bool, str | None]],
+) -> FastAPI:
+    """A direct-attach app whose attach handler records its arguments.
+
+    The stub stands in for the runner app's real
+    ``terminal_resource_attach_ws`` so these tests pin the listener's
+    auth gate and parameter forwarding without touching tmux.
+    """
+
+    async def stub_handler(
+        websocket: object,
+        session_id: str,
+        terminal_id: str,
+        read_only: bool = False,
+        transport: str | None = None,
+    ) -> None:
+        events.append((session_id, terminal_id, read_only, transport))
+        await websocket.accept()  # type: ignore[attr-defined]
+        await websocket.close()  # type: ignore[attr-defined]
+
+    return create_direct_attach_app(
+        stub_handler,
+        token="sekret-token",
+        allowed_origins=frozenset({"https://app.example"}),
+    )
+
+
+def test_direct_attach_probe_accepts_valid_token_without_origin() -> None:
+    """Non-browser handshakes (no Origin header) pass on the token alone."""
+    app = _make_direct_app([])
+    with TestClient(app).websocket_connect("/probe?token=sekret-token"):
+        pass
+
+
+def test_direct_attach_probe_accepts_allow_listed_origin() -> None:
+    app = _make_direct_app([])
+    with TestClient(app).websocket_connect(
+        "/probe?token=sekret-token",
+        headers={"origin": "https://app.example"},
+    ):
+        pass
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://127.8.9.10:5173",
+        "https://[::1]:5173",
+        "https://[::ffff:127.0.0.1]:5173",
+    ],
+)
+def test_direct_attach_probe_accepts_loopback_dev_origin(origin: str) -> None:
+    """A tokened same-machine dev UI may use the relay-free listener."""
+    app = _make_direct_app([])
+    with TestClient(app).websocket_connect(
+        "/probe?token=sekret-token",
+        headers={"origin": origin},
+    ):
+        pass
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/probe",
+        "/probe?token=wrong",
+        "/v1/sessions/conv1/resources/terminals/t1/attach",
+        "/v1/sessions/conv1/resources/terminals/t1/attach?token=wrong",
+    ],
+)
+def test_direct_attach_rejects_missing_or_wrong_token(path: str) -> None:
+    events: list[tuple[str, str, bool, str | None]] = []
+    app = _make_direct_app(events)
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with TestClient(app).websocket_connect(path):
+            pass
+    assert exc_info.value.code == 1008
+    assert events == []
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "https://evil.example",
+        "http://localhost.evil.example:5173",
+        "http://10.0.0.5:5173",
+        "chrome-extension://localhost",
+    ],
+)
+def test_direct_attach_rejects_foreign_origin_despite_valid_token(origin: str) -> None:
+    """A DNS-rebinding-style page presents its own origin — refused."""
+    events: list[tuple[str, str, bool, str | None]] = []
+    app = _make_direct_app(events)
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with TestClient(app).websocket_connect(
+            "/v1/sessions/conv1/resources/terminals/t1/attach?token=sekret-token",
+            headers={"origin": origin},
+        ):
+            pass
+    assert exc_info.value.code == 1008
+    assert events == []
+
+
+def test_direct_attach_forwards_attach_params_to_handler() -> None:
+    """The attach wrapper hands session/terminal/query through unchanged."""
+    events: list[tuple[str, str, bool, str | None]] = []
+    app = _make_direct_app(events)
+    with contextlib.suppress(WebSocketDisconnect):
+        with TestClient(app).websocket_connect(
+            "/v1/sessions/conv1/resources/terminals/terminal_bash_s1/attach"
+            "?token=sekret-token&read_only=true&transport=control",
+            headers={"origin": "https://app.example"},
+        ):
+            pass
+    assert events == [("conv1", "terminal_bash_s1", True, "control")]
+
+
+def test_allowed_origin_for_server_strips_path_and_keeps_port() -> None:
+    assert (
+        allowed_origin_for_server("https://omnigents.example.databricksapps.com/some/base")
+        == "https://omnigents.example.databricksapps.com"
+    )
+    assert allowed_origin_for_server("http://127.0.0.1:6767") == "http://127.0.0.1:6767"
+    assert allowed_origin_for_server("not a url") is None
+    assert allowed_origin_for_server("ftp://example.com") is None
+
+
+@pytest.mark.asyncio
+async def test_direct_attach_listener_serves_probe_on_loopback() -> None:
+    """The uvicorn listener binds 127.0.0.1:0 and answers the probe route."""
+    import websockets
+
+    events: list[tuple[str, str, bool, str | None]] = []
+    listener = await start_direct_attach_listener(_make_direct_app(events))
+    assert listener is not None, "listener failed to start on loopback"
+    try:
+        assert listener.port > 0
+        # Valid token: the handshake completes (the route accepts then
+        # closes, which is the probe contract).
+        async with websockets.connect(f"ws://127.0.0.1:{listener.port}/probe?token=sekret-token"):
+            pass
+        # Wrong token: rejected before accept — an HTTP 403 handshake
+        # denial, which the client surfaces as InvalidStatus.
+        with pytest.raises(websockets.exceptions.InvalidStatus):
+            async with websockets.connect(f"ws://127.0.0.1:{listener.port}/probe?token=wrong"):
+                pass
+    finally:
+        await listener.stop()

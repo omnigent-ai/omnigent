@@ -211,6 +211,9 @@ class _FakeAgent:
         self.closed = True
 
 
+_MODEL_NOT_PROVIDED = object()
+
+
 class _FakeLocalAgentConfig:
     """Mirror of ``LocalAgentConfig`` — accepts exactly the fields the executor sets."""
 
@@ -218,7 +221,7 @@ class _FakeLocalAgentConfig:
         self,
         *,
         system_instructions: str | None = None,
-        model: str | None = None,
+        model: str | None | object = _MODEL_NOT_PROVIDED,
         api_key: str | None = None,
         vertex: bool | None = None,
         project: str | None = None,
@@ -227,7 +230,8 @@ class _FakeLocalAgentConfig:
         hooks: Any = None,
     ) -> None:
         self.system_instructions = system_instructions
-        self.model = model
+        self.model = model if isinstance(model, str) else None
+        self.model_provided = model is not _MODEL_NOT_PROVIDED
         self.api_key = api_key
         self.vertex = vertex
         self.project = project
@@ -989,18 +993,19 @@ async def test_model_switch_rebuilds_agent(monkeypatch: pytest.MonkeyPatch) -> N
     assert len(captured["agents"]) == 2
     assert captured["configs"][0].model == "gemini-3-pro"
     assert captured["configs"][1].model == "gemini-3-flash"
+    assert all(config.model_provided for config in captured["configs"])
 
 
 @pytest.mark.asyncio
-async def test_default_model_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
-    """With no model on the executor or per-turn config, the built-in default is pinned."""
+async def test_sdk_default_model_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no explicit model, model selection remains owned by the SDK."""
     captured = _install_fake_sdk(monkeypatch, scripts=[[_text_step("ok")]])
     executor = AntigravityExecutor()  # no model anywhere
 
     await _drain(executor, [{"role": "user", "content": "hi", "session_id": "s1"}])
 
-    # Pins _ANTIGRAVITY_DEFAULT_MODEL; changing the default must update this.
-    assert captured["configs"][0].model == "gemini-3.5-flash"
+    assert captured["configs"][0].model is None
+    assert captured["configs"][0].model_provided is False
 
 
 @pytest.mark.asyncio
@@ -1030,6 +1035,8 @@ async def test_api_key_and_vertex_threaded_to_config(monkeypatch: pytest.MonkeyP
     await _drain(key_exec, [{"role": "user", "content": "hi", "session_id": "s1"}])
     cfg = captured["configs"][0]
     assert cfg.api_key == "gem-key"
+    assert cfg.model is None
+    assert cfg.model_provided is False
     # Vertex left unset on the API-key path.
     assert cfg.vertex is None
 
@@ -1039,6 +1046,8 @@ async def test_api_key_and_vertex_threaded_to_config(monkeypatch: pytest.MonkeyP
     assert vcfg.vertex is True
     assert vcfg.project == "my-proj"
     assert vcfg.location == "us-central1"
+    assert vcfg.model is None
+    assert vcfg.model_provided is False
     # The SDK config has no base_url field — the executor must never set one.
     assert not hasattr(vcfg, "base_url")
 

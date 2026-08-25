@@ -14,7 +14,7 @@ from typing import Any
 import pytest
 
 from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
-from omnigent.spec.types import LocalToolInfo, SandboxConfig
+from omnigent.spec.types import LocalToolInfo, SandboxConfig, ToolRuntime
 from omnigent.tools.base import ToolContext
 from omnigent.tools.local import (
     LocalPythonTool,
@@ -330,6 +330,29 @@ def test_load_skips_typescript(tmp_path: Path) -> None:
     info = LocalToolInfo(name="ts_tool", path="tools/typescript/ts_tool.ts", language="typescript")
     tools = load_local_python_tools([info], tmp_path)
     assert tools == []
+
+
+def test_load_skips_client_runtime_tool(tmp_path: Path) -> None:
+    info = LocalToolInfo(
+        name="client_tool",
+        path=None,
+        language="python",
+        runtime=ToolRuntime.CLIENT,
+    )
+
+    assert load_local_python_tools([info], tmp_path) == []
+
+
+def test_load_server_tool_without_path_fails_loud(tmp_path: Path) -> None:
+    info = LocalToolInfo(
+        name="pathless",
+        path=None,
+        language="python",
+        runtime=ToolRuntime.SERVER,
+    )
+
+    with pytest.raises(LocalToolLoadError, match="no source path"):
+        load_local_python_tools([info], tmp_path, agent_name="testagent")
 
 
 def test_load_missing_file_fails_loud(tmp_path: Path) -> None:

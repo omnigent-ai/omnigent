@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.spec._omnigent_compat import OMNIGENT_HARNESSES
 from tests.e2e._harness_probes import (
@@ -30,7 +31,7 @@ from tests.e2e.omnigent._pexpect_harness import (
     spawn_omnigent_run,
     strip_ansi,
 )
-from tests.e2e.omnigent.conftest import configure_mock_llm
+from tests.e2e.omnigent.conftest import configure_mock_llm, set_fallback_mock_llm
 
 _PROMPT_TEMPLATE = (
     "Reply with exactly the identifier between <answer> tags, but omit the tags: "
@@ -75,14 +76,15 @@ def test_run_harness_without_agent_live_repl_round_trip(
     marker = f"{probe.marker}_RUN_HARNESS_WITHOUT_AGENT"
     prompt = _PROMPT_TEMPLATE.format(marker=marker)
 
-    # claude-code issues a warmup/title call before the turn that consumes one
-    # queued response, so the turn call needs another; queue a few markers.
-    responses = [{"text": marker}] * (4 if probe.harness == "claude-sdk" else 1)
+    # A background session-title generator races the user turn for this same
+    # keyed queue, so the call count per run is not fixed. The fallback answers
+    # every call with the marker, so whichever wins, the turn still renders it.
     configure_mock_llm(
         mock_llm_server_url,
-        responses,
+        [{"text": marker}],
         key=model,
     )
+    set_fallback_mock_llm(mock_llm_server_url, model, marker)
 
     # claude-sdk speaks the Anthropic wire, not OPENAI_*. Point it at the mock
     # and pass a static gateway token via ANTHROPIC_AUTH_TOKEN (Authorization:
@@ -225,6 +227,12 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     ``omnigent run --harness hermes-native``, AND it wraps the ``hermes`` CLI
     binary. Its coverage is the dedicated hermes-native bridge/executor/forwarder/
     approval-mirror unit tests.
+
+    Builtin ACP CLI harnesses (every row of ``ACP_CLI_HARNESSES``) are excluded
+    for the same reason as ``goose``: each wraps an own-auth vendor CLI, so its
+    spawn env carries no gateway/profile probe vars for this matrix to drive.
+    Their shared wiring is covered by ``tests/test_acp_cli_harnesses.py`` and
+    the ``tests/inner/test_acp_executor.py`` suite.
     """
     expected_live_harnesses = set(OMNIGENT_HARNESSES).intersection(_HARNESS_MODULES) - {
         "acp",
@@ -246,5 +254,6 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "kimi-native",
         "hermes",
         "hermes-native",
+        *ACP_CLI_HARNESSES,
     }
     assert {probe.harness for probe in HARNESS_PROBES} == expected_live_harnesses

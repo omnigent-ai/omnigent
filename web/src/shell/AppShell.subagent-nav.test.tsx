@@ -19,6 +19,11 @@
 // mock used by AppShell.test.tsx) so we can drive a real ``<Link>``
 // click through the router and observe the resulting rail-tab state.
 
+import type * as UseTerminalsModule from "@/hooks/useTerminals";
+import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
+import type * as UseSessionModule from "@/hooks/useSession";
+import type * as UseConversationsModule from "@/hooks/useConversations";
+
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
@@ -27,14 +32,15 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 
 // Match the AppShell.test.tsx mocks except DO NOT mock SubagentsPanel —
 // we want the real one so its <Link> renders.
-vi.mock("@/hooks/useConversations", () => ({
+vi.mock("@/hooks/useConversations", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseConversationsModule>()),
   useConversations: vi.fn(),
   useStopSession: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
 }));
 vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   // Keep the real module (inventoryTerminals etc.) — only the
   // network-backed hook is replaced.
-  ...(await importOriginal<typeof import("@/hooks/useTerminals")>()),
+  ...(await importOriginal<typeof UseTerminalsModule>()),
   useTerminals: vi.fn(() => ({ terminals: [], isLoading: false, error: null })),
 }));
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
@@ -52,7 +58,7 @@ vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   // Keep the real module — childSessionsQueryKey, MAX_TREE_DEPTH, and
   // cachedTreeContains (which reads the query cache seeded below) stay
   // genuine; only the hook is replaced.
-  ...(await importOriginal<typeof import("@/hooks/useChildSessions")>()),
+  ...(await importOriginal<typeof UseChildSessionsModule>()),
   useChildSessions: vi.fn(() => ({ children: [], isLoading: false, error: null })),
 }));
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
@@ -60,7 +66,7 @@ vi.mock("@/hooks/useSession", async (importOriginal) => ({
   // top-level session it resolves without fetching, and during the
   // navigation race (parentSessionId undefined) it stays null, which
   // is exactly the production behavior the sticky root rides out.
-  ...(await importOriginal<typeof import("@/hooks/useSession")>()),
+  ...(await importOriginal<typeof UseSessionModule>()),
   useSession: vi.fn(() => ({ session: null, isLoading: false, error: null })),
 }));
 vi.mock("@/hooks/useAgents", () => ({
@@ -85,7 +91,6 @@ vi.mock("./FileViewer", () => ({
 vi.mock("./InlineTerminalsSection", () => ({
   InlineTerminalsSection: () => <div data-testid="inline-terminals-section" />,
 }));
-vi.mock("./TodoPanel", () => ({ TodoPanel: () => <div data-testid="todo-panel" /> }));
 vi.mock("./FilesPanelDrawer", () => ({
   FilesPanelDrawer: () => <div data-testid="files-panel-drawer" />,
 }));
@@ -160,6 +165,7 @@ describe("click sub-agent in rail (real SubagentsPanel)", () => {
             {
               id: "conv_child",
               title: null,
+              task_summary: null,
               tool: "researcher",
               session_name: null,
               current_task_status: null,
@@ -217,6 +223,7 @@ describe("click sub-agent in rail (real SubagentsPanel)", () => {
       {
         id: "conv_child",
         title: null,
+        task_summary: null,
         tool: "researcher",
         session_name: null,
         current_task_status: null,

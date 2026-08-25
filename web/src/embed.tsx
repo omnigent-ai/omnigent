@@ -31,6 +31,7 @@ import { TooltipProvider } from "./components/ui/tooltip";
 import { ImageLightboxProvider } from "./components/ImageLightbox";
 import { RunnerHealthProvider } from "./hooks/RunnerHealthProvider";
 import { CapabilitiesContext } from "./lib/CapabilitiesContext";
+import { createBootServerInfo } from "./lib/bootCapabilities";
 import { resolveServerInfo, type ServerInfo } from "./lib/capabilities";
 import { EmbeddedProvider } from "./lib/embedded";
 import { type OmnigentHostConfig, setEmbedRoot, setOmnigentHostConfig } from "./lib/host";
@@ -42,6 +43,8 @@ import {
   reactRouterRouting,
 } from "./lib/routing";
 import { initChatStore } from "./store/chatStore";
+import "katex/dist/katex.min.css";
+import "streamdown/styles.css";
 import "./index.css";
 import { QueueFlushProvider } from "./hooks/QueueFlushProvider";
 import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
@@ -98,25 +101,6 @@ export interface OmnigentAppProps extends OmnigentHostConfig {
  * as the Radix portal root, so the host only renders this — no class/portal
  * wiring needed.
  */
-// Sentinel used when the `/v1/info` probe is slow or missing — matches
-// `main.tsx`'s fallback (accounts off, no login).
-const SERVER_INFO_OFFLINE_FALLBACK: ServerInfo = {
-  accounts_enabled: false,
-  single_user: false,
-  login_url: null,
-  needs_setup: false,
-  databricks_features: false,
-  managed_sandboxes_enabled: false,
-  sandbox_provider: null,
-  sharing_mode: "on",
-  public_sharing_enabled: true,
-  server_version: null,
-  smart_routing_enabled: false,
-  harness_install_enabled: false,
-  installable_harnesses: [],
-  dictation_available: false,
-};
-
 /**
  * Runs `main.tsx`'s boot-time `/v1/info` probe inside the embed tree.
  *
@@ -133,14 +117,11 @@ function EmbedCapabilitiesProvider({ children }: { children: ReactNode }) {
   const [info, setInfo] = useState<ServerInfo | "loading">("loading");
   useEffect(() => {
     let alive = true;
-    // Fail open to "accounts off" on a slow/missing probe (same 1.5s budget as
-    // main.tsx) so the chat UI still paints instead of hanging on "loading".
-    void Promise.race([
-      resolveServerInfo(),
-      new Promise<ServerInfo>((resolve) =>
-        setTimeout(() => resolve(SERVER_INFO_OFFLINE_FALLBACK), 1500),
-      ),
-    ]).then((resolved) => {
+    const boot = createBootServerInfo(resolveServerInfo());
+    void boot.initial.then((resolved) => {
+      if (alive) setInfo(resolved);
+    });
+    void boot.settled.then((resolved) => {
       if (alive) setInfo(resolved);
     });
     return () => {
@@ -163,9 +144,9 @@ function OmnigentProviders({
   // one-time side effects (wire the chat store to that client + resolve
   // identity). `initChatStore` only stashes the client for later cache
   // invalidation, so doing this in a mount-once initializer is fine.
-  const queryClient = useQueryClient();
+  const hostQueryClient = useQueryClient();
   useState(() => {
-    initChatStore(queryClient);
+    initChatStore(hostQueryClient);
     void resolveIdentity();
     return null;
   });

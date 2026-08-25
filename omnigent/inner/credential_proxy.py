@@ -413,7 +413,7 @@ def _databricks_authenticate(config: object) -> str:
             code=ErrorCode.INVALID_INPUT,
         ) from exc
     auth = (headers or {}).get("Authorization", "")
-    if not auth.startswith("Bearer "):
+    if not isinstance(auth, str) or not auth.startswith("Bearer "):
         raise OmnigentError(
             "Databricks authentication returned a non-Bearer scheme; only "
             "Bearer tokens (PAT / OAuth) are supported by the credential proxy.",

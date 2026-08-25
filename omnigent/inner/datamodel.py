@@ -511,11 +511,12 @@ class OSEnvSandboxSpec:
     """Sandbox configuration for an OS environment."""
 
     # Backend identifier, e.g. ``"linux_bwrap"``,
-    # ``"darwin_seatbelt"``, or ``"none"``. The dataclass default of
-    # ``"linux_bwrap"`` is a safe sentinel for in-process construction
-    # (``OSEnvSandboxSpec(type=self.type_name)`` is the idiomatic call
-    # site); YAML parsers map a missing ``type:`` field to the platform
-    # default at parse time via
+    # ``"darwin_seatbelt"``, or ``"none"``. YAML also accepts ``"auto"``
+    # and resolves it to the platform default before constructing this value.
+    # The dataclass default of ``"linux_bwrap"`` is a safe sentinel for
+    # in-process construction (``OSEnvSandboxSpec(type=self.type_name)`` is
+    # the idiomatic call site); YAML parsers map a missing ``type:`` field to
+    # the platform default at parse time via
     # :func:`omnigent.inner.sandbox._default_sandbox_for_platform`,
     # which picks ``linux_bwrap`` on Linux (with ``bwrap`` on PATH)
     # and ``darwin_seatbelt`` on macOS.
@@ -636,6 +637,36 @@ class OSEnvSandboxSpec:
     # (untrusted source trees, supervisor-spawned forks) where an
     # unmasked dotfile past the cap would be an unacceptable leak.
     cwd_hidden_scan_overflow: str = "warn"
+    # Whether the dotfile / escaping-symlink masker recurses into
+    # subdirectories. ``False`` (default) scans only the immediate
+    # children of cwd and each ``read_paths`` / ``write_paths`` root —
+    # the top-level dotfiles (``.git``, ``.env``, ``.aws``, ``.ssh``,
+    # ...) that carry the overwhelming majority of secrets are still
+    # masked, but the walker no longer pays to descend the whole tree.
+    # This is the scalable default: a recursive walk of a medium/large
+    # project (or ``read_paths: ["~/"]``) visits enormous numbers of
+    # entries and routinely trips :attr:`cwd_hidden_scan_max_entries`.
+    #
+    # L6 (security trade-off): with the top-level-only default, a
+    # dotfile nested below the first level (e.g.
+    # ``cwd/services/api/.env`` or ``~/projects/foo/.netrc``) is NOT
+    # masked and stays readable by the sandboxed helper. Set this to
+    # ``True`` for untrusted source trees where a deeply-nested
+    # credential file would be an unacceptable leak; the cap /
+    # overflow knobs then bound the cost of the full walk.
+    cwd_hidden_scan_recursive: bool = False
+    # Explicit files/directories to hide from the sandboxed helper,
+    # regardless of whether their basename starts with ``.``. Each
+    # entry is a path string resolved like ``read_paths`` (``~`` is
+    # expanded; relative paths are taken against cwd; ``$VAR`` is NOT
+    # expanded). Directories are masked as an empty view, files as an
+    # empty file — the same masking the dotfile walker emits. Use this
+    # to hide a specific secret the name-based masker wouldn't catch
+    # (e.g. ``config/production.key``) or a deeply-nested dotfile
+    # without turning on full recursion. Applied on top of the
+    # dotfile mask in every mode. ``None`` and ``[]`` both mean "no
+    # explicit masks".
+    mask_paths: list[str] | None = None
     # Environment-variable allowlist for the helper subprocess, beyond
     # the always-passed minimal default (PATH/HOME/USER/LANG/LC_*/etc.;
     # see :data:`omnigent.inner.os_env._DEFAULT_ENV_PASSTHROUGH`).
@@ -855,7 +886,7 @@ class AgentDef:
     terminals: dict[str, TerminalEnvSpec] = field(default_factory=dict)
     skills: SkillRegistry = field(default_factory=dict)
     # Materialized agent-bundle root on disk, when known. Used by
-    # the Claude SDK harness to expose ``<bundle>/skills/<name>/
+    # the Claude SDK harness to expose ``<bundle>/skills/<dir>/
     # SKILL.md`` files as plugin skills via the SDK's
     # ``--plugin-dir`` mechanism. Set by the AgentSpec → AgentDef
     # bridge from the spec's parsed ``skill_dir`` paths; left

@@ -13,7 +13,8 @@ const DAYS_TO_CONSIDER = 14;
 const DUPLICATE_LABEL = "duplicate";
 
 const duplicateMessage = (author, issueNumber, keeperPR) =>
-  `@${author} This PR appears to reference the same issue (#${issueNumber}) as #${keeperPR} (opened earlier). Closing as a duplicate.`;
+  `@${author} This PR appears to reference the same issue (#${issueNumber}) as #${keeperPR} (opened earlier). Closing as a duplicate. ` +
+  `If that's wrong, comment \`/reopen\` and this PR will be reopened.`;
 
 // Maintainer duplicates are flagged but not auto-closed -- a softer, no-action
 // heads-up so the maintainer can decide what to do.

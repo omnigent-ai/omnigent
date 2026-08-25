@@ -1,0 +1,50 @@
+{
+  "impact_weights": {
+    "critical": 100,
+    "high": 60,
+    "medium": 30,
+    "low": 10
+  },
+  "priority_thresholds": {
+    "P0-critical": 100,
+    "P1-high": 60,
+    "P2-medium": 25,
+    "P3-low": 0
+  },
+  "module_order": [
+    "component",
+    "duplicates",
+    "demand",
+    "readiness",
+    "age"
+  ],
+  "modules": {
+    "component": {
+      "enabled": true,
+      "default_weight": 1.0
+    },
+    "duplicates": {
+      "enabled": false,
+      "increment": 0.15,
+      "max_bonus": 0.5
+    },
+    "demand": {
+      "enabled": true,
+      "upvote_cap": 12,
+      "max_points": 15
+    },
+    "readiness": {
+      "enabled": false,
+      "ready_multiplier": 1.1,
+      "needs_info_multiplier": 0.85
+    },
+    "age": {
+      "enabled": false,
+      "fresh_days": 5,
+      "visibility_days": 21,
+      "fresh_multiplier": 1.0,
+      "visibility_multiplier": 1.2,
+      "stale_multiplier": 0.8
+    }
+  }
+}

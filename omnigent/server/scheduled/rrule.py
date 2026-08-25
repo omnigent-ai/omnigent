@@ -16,11 +16,13 @@ fire spawns a real agent session, so a runaway cadence is expensive.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import Protocol, cast
 from zoneinfo import ZoneInfo
 
-from dateutil.rrule import rrulestr
+from dateutil.rrule import rrulestr  # type: ignore[import-untyped]
 
 # Reject anything more frequent than this. Each fire spawns a real agent
 # session, so a tight cadence gets expensive fast. One hour is the tightest
@@ -51,6 +53,14 @@ _MAX_SAMPLE_OCCURRENCES = 2000
 
 class RRuleValidationError(ValueError):
     """Raised when an RRULE string is malformed or violates a scheduler rule."""
+
+
+class _ParsedRRule(Protocol):
+    def after(self, dt: datetime, inc: bool = False) -> datetime | None:
+        raise NotImplementedError
+
+    def __iter__(self) -> Iterator[datetime]:
+        raise NotImplementedError
 
 
 def _anchor_dtstart(after: datetime, tz: ZoneInfo) -> datetime:
@@ -118,13 +128,13 @@ class RRuleTrigger:
         return get_next_fire_time(self.rule, after, tz)
 
 
-def _parse(rule_str: str, dtstart: datetime):
+def _parse(rule_str: str, dtstart: datetime) -> _ParsedRRule:
     """Parse an RRULE string anchored at ``dtstart``, normalizing errors.
 
     :raises RRuleValidationError: On any malformed input ``dateutil`` rejects.
     """
     try:
-        return rrulestr(rule_str, dtstart=dtstart)
+        return cast(_ParsedRRule, rrulestr(rule_str, dtstart=dtstart))
     except (ValueError, TypeError) as exc:
         raise RRuleValidationError(f"Invalid RRULE {rule_str!r}: {exc}") from exc
 
@@ -165,6 +175,7 @@ def validate_rrule(rule_str: str, tz: ZoneInfo | None = None) -> RRuleTrigger:  
             continue
         min_gap = min(min_gap, (occ - prev).total_seconds())
         prev = occ
+        assert window_end is not None
         if occ >= window_end or count >= _MAX_SAMPLE_OCCURRENCES:
             break
 

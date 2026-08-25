@@ -17,7 +17,6 @@ import json
 import os
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
 
 from omnigent.native_server_harness import NativeServerHarness
 from omnigent.native_server_transport import NativePrompt
@@ -54,7 +53,7 @@ class OpenCodeNativeExecutor(NativeServerHarness):
             build_prompt=self._build_prompt_with_model_override,
         )
 
-    def _build_prompt_with_model_override(self, content: Any) -> NativePrompt | None:
+    def _build_prompt_with_model_override(self, content: object) -> NativePrompt | None:
         """
         Build a prompt, pinning the resolved model so it governs from turn one.
 
@@ -131,7 +130,7 @@ def _session_is_active(session_id: str, request_session_id: str | None) -> bool:
     return request_session_id is None or request_session_id == session_id
 
 
-def _content_to_native_prompt(content: Any) -> NativePrompt | None:
+def _content_to_native_prompt(content: object) -> NativePrompt | None:
     """
     Normalize executor message content into a :class:`NativePrompt`.
 
@@ -148,7 +147,7 @@ def _content_to_native_prompt(content: Any) -> NativePrompt | None:
         return NativePrompt(text=content) if content else None
     if isinstance(content, list):
         texts: list[str] = []
-        attachments: list[Mapping[str, Any]] = []
+        attachments: list[Mapping[str, object]] = []
         for block in content:
             if not isinstance(block, dict):
                 continue

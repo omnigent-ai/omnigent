@@ -55,6 +55,7 @@ class ImportSessionRequest(BaseModel):
     source: ImportSource
     external_session_id: str = Field(min_length=1, max_length=128)
     workspace: str | None = Field(default=None, max_length=2048)
+    force: bool = False
     items: list[ImportItemInput] = Field(min_length=1, max_length=100_000)
 
     @field_validator("external_session_id")
@@ -132,7 +133,7 @@ def create_imports_router(
         request: Request,
         response: Response,
     ) -> ImportSessionResponse:
-        """Import one normalized transcript, rejecting duplicate sources."""
+        """Import one normalized transcript, optionally replacing its prior import."""
         user_id = require_user(request, auth_provider)
         items = [item.to_item() for item in body.items]
         existing = await asyncio.to_thread(
@@ -148,10 +149,11 @@ def create_imports_router(
                 permission_store,
                 conversation_store,
             )
-            raise OmnigentError(
-                f"This {body.source} session has already been imported as {existing.id}",
-                code=ErrorCode.CONFLICT,
-            )
+            if not body.force:
+                raise OmnigentError(
+                    f"This {body.source} session has already been imported as {existing.id}",
+                    code=ErrorCode.CONFLICT,
+                )
 
         native_agent = native_coding_agent_for_harness(f"{body.source}-native")
         if native_agent is None:
@@ -165,6 +167,9 @@ def create_imports_router(
                 f"The {native_agent.display_name} built-in agent is unavailable",
                 code=ErrorCode.INTERNAL_ERROR,
             )
+
+        if existing is not None:
+            await conversation_store.delete_conversation(existing.id)
 
         try:
             conversation = await asyncio.to_thread(

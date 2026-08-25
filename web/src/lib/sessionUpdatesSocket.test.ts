@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { HEARTBEAT_WATCHDOG_MS, sessionUpdatesSocket } from "./sessionUpdatesSocket";
+import {
+  HEARTBEAT_WATCHDOG_MS,
+  nextPushedSession,
+  sessionUpdatesSocket,
+} from "./sessionUpdatesSocket";
 
 // Minimal stand-in for the browser WebSocket: records sends/closes and lets
 // the test drive the lifecycle (open, message) by hand. A real socket can't be
@@ -121,3 +125,47 @@ describe("sessionUpdatesSocket heartbeat watchdog", () => {
 // Reconnect backoff is capped at 5 s + jitter; advancing past 5 s guarantees
 // the scheduled reconnect timer has fired regardless of the random jitter.
 const RECONNECT_CEILING_MS = 5_001;
+
+describe("nextPushedSession", () => {
+  beforeEach(() => {
+    FakeWebSocket.instances = [];
+    vi.stubGlobal("WebSocket", FakeWebSocket as unknown as typeof WebSocket);
+  });
+
+  afterEach(() => {
+    sessionUpdatesSocket.stop();
+    vi.unstubAllGlobals();
+  });
+
+  it("waits for the row the caller is expecting, not merely the next new one", async () => {
+    sessionUpdatesSocket.start();
+    const ws = latestWs();
+    ws.open();
+    const abort = new AbortController();
+    const mine = nextPushedSession((item) => item.id === "conv_mine", abort.signal);
+
+    // A session the caller didn't create lands first — another tab, a
+    // scheduled task, one just shared with them. The stream announces those
+    // identically, so settling on "something new arrived" would hand back the
+    // wrong conversation (and the caller's first message with it).
+    ws.emit({ type: "changed", items: [{ id: "conv_theirs" }] });
+    ws.emit({ type: "changed", items: [{ id: "conv_mine", agent_id: "ag_1" }] });
+
+    await expect(mine).resolves.toMatchObject({ id: "conv_mine", agent_id: "ag_1" });
+  });
+
+  it("resolves null once aborted so the caller falls back to its own result", async () => {
+    sessionUpdatesSocket.start();
+    latestWs().open();
+    const abort = new AbortController();
+    const mine = nextPushedSession(() => true, abort.signal);
+
+    abort.abort();
+    await expect(mine).resolves.toBeNull();
+
+    // Settled for good: a late frame must not revive it, or a caller that
+    // already committed to the authoritative id would be handed a second one.
+    latestWs().emit({ type: "changed", items: [{ id: "conv_late" }] });
+    await expect(mine).resolves.toBeNull();
+  });
+});

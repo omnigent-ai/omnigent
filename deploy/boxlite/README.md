@@ -83,6 +83,7 @@ sandbox:
   boxlite:
     image: docker.io/me/omnigent-host:latest     # optional, shared; default: official
     env: [OPENAI_API_KEY, GIT_TOKEN]             # optional, shared; SERVER env var NAMES
+    disk_size_gb: 100                            # optional, shared; default: SDK default
     cloud:
       endpoint: https://boxlite.example.com:8100 # selects CLOUD mode
 ```

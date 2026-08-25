@@ -268,13 +268,13 @@ def _compute_actions(existing: dict[str, str]) -> _Actions:
     """
     # Lazy import: the internal-beta workspace list is excluded from the OSS
     # build. This function is only reached via ``setup --internal-beta``.
-    from omnigent.onboarding.internal_beta import DEFAULT_PROFILES
+    import omnigent.onboarding.internal_beta as internal_beta  # type: ignore[import-not-found]
 
     ready: list[ProfileSpec] = []
     aliasable: list[tuple[str, ProfileSpec]] = []
     oauth: list[ProfileSpec] = []
     wrong_host: list[tuple[ProfileSpec, str]] = []
-    for spec in DEFAULT_PROFILES:
+    for spec in internal_beta.DEFAULT_PROFILES:
         host = existing.get(spec.name)
         if host is not None and _host_matches(host, spec.host):
             ready.append(spec)
@@ -509,7 +509,9 @@ def _derive_workspace_profile_name(workspace_url: str, existing: dict[str, str])
 
     for spec in DEFAULT_PROFILES:
         if _host_matches(spec.host, workspace_url):
-            return spec.name
+            name = spec.name
+            if isinstance(name, str):
+                return name
     netloc = urlparse(workspace_url).netloc
     # The first DNS label is the most human-recognizable handle; fall back
     # to the full netloc, then a constant, so we never return an empty name.

@@ -1,0 +1,2 @@
+# Load-test result directories are generated per run; do not commit them.
+results/

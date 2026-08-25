@@ -4,25 +4,34 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
 import re
 import shlex
+import socket
 import sys
 import tempfile
 import uuid
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, TypeAlias, cast
 
 import tomlkit
 import websockets
+from cachetools import TTLCache
+from websockets.asyncio.client import ClientConnection
+
+from omnigent import model_catalog
+from omnigent.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
     from omnigent.onboarding.provider_config import ProviderEntry
+    from omnigent.spec.types import AgentSpec
 
+from omnigent.codex_model_vocabulary import codex_spawn_model
 from omnigent.codex_native_bridge import write_policy_hook_config
 from omnigent.codex_native_process_registry import (
     CodexNativeProcessOwnerLock,
@@ -34,6 +43,7 @@ from omnigent.codex_native_process_registry import (
 )
 from omnigent.inner import _proc
 from omnigent.inner.codex_executor import (
+    _CODEX_ROUTER_HOOK_MODULE,
     _clean_codex_env,
     _codex_cli_version,
     _codex_home_config_source_from_env,
@@ -41,21 +51,31 @@ from omnigent.inner.codex_executor import (
     _databricks_codex_base_url,
     _databricks_codex_config_overrides,
     _find_codex_cli,
-    _merge_codex_hook_trust_back,
     _populate_codex_home_config,
     _provider_codex_config_overrides,
+    codex_extended_catalog_requested,
+    codex_router_bridge_dir,
+    codex_router_hooks_settings,
+    codex_router_session_id,
+    codex_routing_hook_skip_reason,
+    materialize_codex_provider_config,
+    read_codex_model_catalog,
+    write_codex_hooks_file,
 )
 from omnigent.inner.databricks_executor import _databricks_gateway_host
 
 _logger = logging.getLogger(__name__)
 
-CodexMessage = dict[str, Any]
-CodexParams = dict[str, Any]
+CodexMessage: TypeAlias = _JsonObject
+CodexParams: TypeAlias = _JsonObject
+# A bound app-server JSON-RPC request coroutine (``client.request`` or the
+# SDK executor's ``_request``), so the trust helpers work over either transport.
+CodexRequestFn = Callable[[str, CodexParams], Awaitable[CodexMessage]]
 
 _CONNECT_RETRY_DELAY_SECONDS = 0.05
 _CONNECT_TIMEOUT_SECONDS = 10.0
+_MODEL_DISCOVERY_CACHE_SECONDS = 300.0
 _STDERR_CHUNK_LIMIT = 65536
-_DATABRICKS_CODEX_DEFAULT_MODEL = "databricks-gpt-5-5"
 _UDS_WEBSOCKET_HANDSHAKE_URI = "ws://localhost/rpc"
 _MAX_WEBSOCKET_MESSAGE_SIZE_BYTES = 128 << 20
 # hooks.json filename written into the private CODEX_HOME registering the
@@ -88,6 +108,26 @@ _TRUSTED_HOOK_STATUSES = frozenset({"trusted", "managed"})
 # — we detect the old version up front and skip registration with a loud
 # warning rather than crash startup on an un-trustable hook.
 _MIN_POLICY_HOOK_CODEX_VERSION = (0, 129, 0)
+# Minimum codex CLI version that accepts ``--dangerously-bypass-hook-trust``.
+# Older binaries exit immediately on the unknown flag, so below this floor
+# (including a version we could not parse) the flag is omitted and the
+# interactive trust prompt may appear instead.
+_MIN_BYPASS_HOOK_TRUST_CODEX_VERSION = (0, 131, 0)
+_MODEL_MIGRATION_CATALOG_TIMEOUT_SECONDS = 3.0
+
+
+def _string_object_dict(value: object) -> _JsonObject | None:
+    """Return *value* as a string-keyed object mapping when valid."""
+    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+        return None
+    return cast("_JsonObject", value)
+
+
+def _object_list(value: object) -> list[object] | None:
+    """Return *value* as an object list when valid."""
+    if not isinstance(value, list):
+        return None
+    return cast("list[object]", value)
 
 
 def _format_codex_version(version: tuple[int, int, int] | None) -> str:
@@ -155,9 +195,45 @@ def _remove_toml_table(text: str, table_name: str) -> str:
     return "".join(kept).rstrip()
 
 
+#: Omnigent tools the framework calls on every session's behalf, pre-approved
+#: so codex never raises an interactive prompt for them. The rename keeps a
+#: session's title current, which the framework does unprompted on any session.
+_FRAMEWORK_APPROVED_TOOLS: tuple[str, ...] = ("sys_session_rename",)
+
+#: Additionally pre-approved for an auto-harness Smart Routing session, whose
+#: spawns the router may move onto the counterpart harness family: these four
+#: carry out that cross-harness redirect end to end — discover the agent, start
+#: the routed child, deliver the task, collect its result. Without the last one
+#: the redirect stalls on an approval prompt nobody is watching. A plain or
+#: pinned session can never receive a redirect, so it gets none of them and its
+#: approval surface stays a plain codex session's. Mirrors the claude-native
+#: ``_ROUTED_SPAWN_ALLOWED_TOOLS`` gate.
+_ROUTED_SPAWN_APPROVED_TOOLS: tuple[str, ...] = (
+    "sys_session_create",
+    "sys_agent_list",
+    "sys_session_send",
+    "sys_read_inbox",
+)
+
+
+def framework_approved_tools(*, routed_spawns: bool) -> tuple[str, ...]:
+    """
+    Name the Omnigent tools this session pre-approves in codex.
+
+    :param routed_spawns: ``True`` for an auto-harness Smart Routing session,
+        which also needs the cross-harness redirect toolkit.
+    :returns: Tool names, in the order their approval tables are written.
+    """
+    if not routed_spawns:
+        return _FRAMEWORK_APPROVED_TOOLS
+    return (*_FRAMEWORK_APPROVED_TOOLS, *_ROUTED_SPAWN_APPROVED_TOOLS)
+
+
 def _codex_mcp_server_config_section(
     bridge_dir: Path,
     python_executable: str | None = None,
+    *,
+    routed_spawns: bool = False,
 ) -> str:
     """
     Build the generated Codex MCP server TOML section.
@@ -167,8 +243,10 @@ def _codex_mcp_server_config_section(
     :param python_executable: Python executable for serve-mcp, e.g.
         ``"/path/to/.venv/bin/python"``. ``None`` uses
         :data:`sys.executable`.
+    :param routed_spawns: ``True`` for an auto-harness Smart Routing session,
+        which pre-approves the cross-harness redirect tools too.
     :returns: TOML text for ``[mcp_servers.omnigent]`` and its
-        framework-managed rename-tool approval.
+        framework-managed tool approvals.
     """
     python = python_executable or sys.executable
     args = [
@@ -180,13 +258,21 @@ def _codex_mcp_server_config_section(
         str(bridge_dir),
     ]
     args_toml = ", ".join(json.dumps(a) for a in args)
+    approvals = "\n".join(
+        f'[mcp_servers.omnigent.tools.{tool}]\napproval_mode = "approve"\n'
+        for tool in framework_approved_tools(routed_spawns=routed_spawns)
+    )
     return (
         f"[mcp_servers.omnigent]\n"
         f"command = {json.dumps(python)}\n"
         f"args = [{args_toml}]\n\n"
-        "[mcp_servers.omnigent.tools.sys_session_rename]\n"
-        'approval_mode = "approve"\n'
+        f"{approvals}"
     )
+
+
+# Top-level ``model_reasoning_effort = "<value>"`` line, capturing the value so
+# it can be clamped to one the pinned model accepts. Tolerates a trailing comment.
+_EFFORT_KEY_RE = re.compile(r'^(\s*model_reasoning_effort\s*=\s*")([^"]*)("\s*(?:#.*)?)$')
 
 
 def _pin_codex_config_model(codex_home: Path, model: str) -> None:
@@ -205,6 +291,8 @@ def _pin_codex_config_model(codex_home: Path, model: str) -> None:
     :param codex_home: Private per-session ``CODEX_HOME`` directory.
     :param model: Validated model id to pin.
     """
+    from omnigent.reasoning_effort import clamp_effort_for_model
+
     config_path = codex_home / "config.toml"
     # Same symlink-materialization dance as the MCP injection: never edit
     # the user's real config.toml through the link.
@@ -225,7 +313,15 @@ def _pin_codex_config_model(codex_home: Path, model: str) -> None:
         if re.match(r"^model\s*=", line):
             lines[i] = pin_line
             replaced = True
-            break
+            continue
+        # The config copies the user's default effort (e.g. xhigh), which the
+        # pinned model may reject (GLM has no xhigh). Clamp it to a value the
+        # model accepts rather than 400 the turn.
+        effort_match = _EFFORT_KEY_RE.match(line)
+        if effort_match:
+            clamped = clamp_effort_for_model(effort_match.group(2), model)
+            if clamped and clamped != effort_match.group(2):
+                lines[i] = f"{effort_match.group(1)}{clamped}{effort_match.group(3)}"
     if not replaced:
         lines.insert(0, pin_line)
     config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -294,10 +390,49 @@ def _sync_codex_developer_instructions(
     config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
 
 
+def _codex_model_upgrade_target(catalog: object, model: str) -> str | None:
+    """Return Codex's replacement for *model*, when the catalog declares one."""
+    if not isinstance(catalog, dict):
+        return None
+    models = catalog.get("models")
+    if not isinstance(models, list):
+        return None
+    for entry in models:
+        if not isinstance(entry, dict) or entry.get("slug") != model:
+            continue
+        upgrade = entry.get("upgrade")
+        if not isinstance(upgrade, dict):
+            return None
+        target = upgrade.get("model") or upgrade.get("id")
+        if isinstance(target, str) and target and target != model:
+            return target
+        return None
+    return None
+
+
+def _acknowledge_codex_model_migration(codex_home: Path, model: str, target: str) -> None:
+    """Suppress one model-migration prompt in a private runner-owned config."""
+    config_path = codex_home / "config.toml"
+    existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    document = tomlkit.parse(existing) if existing else tomlkit.document()
+    notice = document.get("notice")
+    if notice is None:
+        notice = tomlkit.table()
+        document["notice"] = notice
+    migrations = notice.get("model_migrations")
+    if migrations is None:
+        migrations = tomlkit.table()
+        notice["model_migrations"] = migrations
+    migrations[model] = target
+    config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
+
+
 def _inject_mcp_server_config(
     codex_home: Path,
     bridge_dir: Path,
     python_executable: str | None = None,
+    *,
+    routed_spawns: bool = False,
 ) -> None:
     """
     Upsert Omnigent MCP server config into ``config.toml``.
@@ -313,6 +448,8 @@ def _inject_mcp_server_config(
         and ``tool_relay.json``.
     :param python_executable: Python executable for serve-mcp.
         ``None`` uses :data:`sys.executable`.
+    :param routed_spawns: ``True`` for an auto-harness Smart Routing session,
+        which pre-approves the cross-harness redirect tools too.
     :returns: None.
     """
     config_path = codex_home / "config.toml"
@@ -330,9 +467,27 @@ def _inject_mcp_server_config(
     else:
         existing = ""
     updated = _remove_toml_table(existing, "mcp_servers.omnigent")
-    section = _codex_mcp_server_config_section(bridge_dir, python_executable)
+    section = _codex_mcp_server_config_section(
+        bridge_dir, python_executable, routed_spawns=routed_spawns
+    )
     rendered = f"{updated}\n\n{section}" if updated else section
     config_path.write_text(rendered, encoding="utf-8")
+
+
+class CodexAppServerResponseError(RuntimeError):
+    """Structured JSON-RPC error returned by the Codex app-server."""
+
+    def __init__(self, error: object) -> None:
+        """Preserve the JSON-RPC code and message while remaining a RuntimeError."""
+        self.error = error
+        self.code: int | None = None
+        self.message: str | None = None
+        if isinstance(error, dict):
+            code = error.get("code")
+            message = error.get("message")
+            self.code = code if isinstance(code, int) else None
+            self.message = message if isinstance(message, str) else None
+        super().__init__(str(error))
 
 
 class CodexAppServerClient:
@@ -361,7 +516,7 @@ class CodexAppServerClient:
         self._socket_path = socket_path
         self._ws_url = ws_url
         self._client_name = client_name
-        self._ws: Any | None = None
+        self._ws: ClientConnection | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._pending_requests: dict[int, asyncio.Future[CodexMessage]] = {}
         self._events: asyncio.Queue[CodexMessage] = asyncio.Queue()
@@ -430,7 +585,7 @@ class CodexAppServerClient:
         :param method: App-server method, e.g. ``"thread/start"``.
         :param params: JSON-serializable method parameters.
         :returns: Decoded response envelope.
-        :raises RuntimeError: If the app-server returns an error.
+        :raises CodexAppServerResponseError: If the app-server returns an error.
         """
         if self._ws is None:
             raise RuntimeError("Codex app-server client is not connected")
@@ -451,7 +606,7 @@ class CodexAppServerClient:
         response = await future
         error = response.get("error")
         if error:
-            raise RuntimeError(str(error))
+            raise CodexAppServerResponseError(error)
         return response
 
     async def notify(self, method: str, params: CodexParams | None = None) -> None:
@@ -510,17 +665,402 @@ class CodexAppServerClient:
         async for raw in self._ws:
             if not isinstance(raw, str):
                 continue
-            message = json.loads(raw)
+            decoded: object = json.loads(raw)
+            message = _string_object_dict(decoded)
+            if message is None:
+                _logger.warning("Ignoring non-object Codex app-server message")
+                continue
             if (
                 "id" in message
                 and "method" not in message
                 and ("result" in message or "error" in message)
             ):
-                future = self._pending_requests.pop(int(message["id"]), None)
+                raw_id = message["id"]
+                request_id: int | None = None
+                if isinstance(raw_id, int):
+                    request_id = raw_id
+                elif isinstance(raw_id, str):
+                    with contextlib.suppress(ValueError):
+                        request_id = int(raw_id)
+                future = (
+                    self._pending_requests.pop(request_id, None)
+                    if request_id is not None
+                    else None
+                )
                 if future is not None and not future.done():
                     future.set_result(message)
                 continue
             await self._events.put(message)
+
+
+async def list_codex_model_options(client: CodexAppServerClient) -> list[_JsonObject]:
+    """Read every visible model from an initialized Codex app-server client.
+
+    :param client: Connected Codex app-server client.
+    :returns: Raw ``model/list`` rows in Codex preference order.
+    :raises ValueError: When Codex returns a malformed response.
+    """
+    options: list[_JsonObject] = []
+    cursor: str | None = None
+    while True:
+        params: CodexParams = {"includeHidden": False}
+        if cursor is not None:
+            params["cursor"] = cursor
+        response = await client.request("model/list", params)
+        result = response.get("result")
+        if not isinstance(result, dict):
+            raise ValueError("Codex model/list result must be an object")
+        data = result.get("data")
+        if not isinstance(data, list):
+            raise ValueError("Codex model/list data must be a list")
+        for raw_model in data:
+            if not isinstance(raw_model, dict):
+                raise ValueError("Codex model/list item must be an object")
+            options.append(raw_model)
+        next_cursor = result.get("nextCursor")
+        if next_cursor is None:
+            return options
+        if not isinstance(next_cursor, str) or not next_cursor:
+            raise ValueError("Codex model/list nextCursor must be a string or null")
+        cursor = next_cursor
+
+
+_model_discovery_cache: TTLCache[str, tuple[_JsonObject, ...]] = TTLCache(
+    maxsize=8,
+    ttl=_MODEL_DISCOVERY_CACHE_SECONDS,
+)
+
+
+async def discover_codex_model_options(*, codex_path: str | None = None) -> list[_JsonObject]:
+    """Query the installed Codex CLI's credential-free compatibility catalog.
+
+    Starts a short-lived app-server with an empty private ``CODEX_HOME`` and
+    no provider overrides. The resulting ``model/list`` is Codex's own curated
+    compatibility set; callers can intersect it with a provider's live
+    availability without exposing provider credentials to the subprocess.
+
+    :param codex_path: Optional Codex executable override.
+    :returns: Raw visible ``model/list`` rows in Codex preference order.
+    :raises ImportError: When the Codex CLI is unavailable.
+    :raises RuntimeError: When the discovery app-server exits before connecting.
+    :raises TimeoutError: When the discovery app-server does not become ready.
+    """
+    resolved_codex = codex_path or _find_codex_cli()
+    if not resolved_codex:
+        raise ImportError("Native Codex model discovery requires the 'codex' CLI on PATH.")
+    cached = _model_discovery_cache.get(resolved_codex)
+    if cached is not None:
+        return [dict(option) for option in cached]
+
+    with tempfile.TemporaryDirectory(prefix="omnigent-codex-model-discovery-") as raw_dir:
+        root = Path(raw_dir)
+        codex_home = root / "codex-home"
+        codex_home.mkdir(mode=0o700)
+        port = _allocate_loopback_port()
+        listen_url = f"ws://127.0.0.1:{port}"
+        env = _clean_codex_env()
+        for name in tuple(env):
+            if name.startswith("OPENAI_") or name in {
+                "DATABRICKS_BEARER",
+                "DATABRICKS_CODEX_TOKEN",
+            }:
+                env.pop(name)
+        env["CODEX_HOME"] = str(codex_home)
+        process = await _start_codex_model_discovery_process(
+            codex_path=resolved_codex,
+            listen_url=listen_url,
+            env=env,
+            cwd=root,
+        )
+        client: CodexAppServerClient | None = None
+        try:
+            await _wait_for_discovery_listener(process, port)
+            client = CodexAppServerClient(
+                ws_url=listen_url,
+                client_name="omnigent-codex-model-discovery",
+            )
+            await client.connect()
+            options = await list_codex_model_options(client)
+        finally:
+            if client is not None:
+                with contextlib.suppress(Exception):
+                    await client.close()
+            _proc.terminate_tree(process)
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5.0)
+            except TimeoutError:
+                _proc.kill_tree(process)
+                await process.wait()
+
+    _model_discovery_cache[resolved_codex] = tuple(dict(option) for option in options)
+    return options
+
+
+async def _start_codex_model_discovery_process(
+    *,
+    codex_path: str,
+    listen_url: str,
+    env: dict[str, str],
+    cwd: Path,
+    config_overrides: Sequence[str] = (),
+) -> asyncio.subprocess.Process:
+    """Start the isolated Codex process used only for model discovery."""
+    override_args: list[str] = []
+    for override in config_overrides:
+        override_args.extend(("-c", override))
+    return await asyncio.create_subprocess_exec(
+        codex_path,
+        "app-server",
+        "--listen",
+        listen_url,
+        *override_args,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+        env=env,
+        cwd=str(cwd),
+        **_proc.spawn_kwargs(),
+    )
+
+
+def _allocate_loopback_port() -> int:
+    """Return an ephemeral TCP port on loopback for model discovery."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return int(listener.getsockname()[1])
+
+
+async def _wait_for_discovery_listener(
+    process: asyncio.subprocess.Process,
+    port: int,
+) -> None:
+    """Wait until a discovery app-server accepts loopback connections."""
+    deadline = asyncio.get_running_loop().time() + _CONNECT_TIMEOUT_SECONDS
+    while asyncio.get_running_loop().time() < deadline:
+        if process.returncode is not None:
+            raise RuntimeError(f"Codex model discovery exited early ({process.returncode})")
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        except OSError:
+            await asyncio.sleep(_CONNECT_RETRY_DELAY_SECONDS)
+            continue
+        writer.close()
+        await writer.wait_closed()
+        del reader
+        return
+    raise TimeoutError("Timed out waiting for Codex model discovery app-server")
+
+
+def _probe_codex_home(config_overrides: Sequence[str]) -> Path:
+    """
+    Persistent probe ``CODEX_HOME`` for one provider configuration.
+
+    Persistent (unlike the hermetic discovery's temp dir) so Codex's own
+    ``models_cache.json`` ETag handling makes repeat probes cheap; keyed by
+    the override set so a provider change never replays another provider's
+    cache. The account's real ``auth.json`` is symlinked in, the same way
+    a session launch links it: the credential decides which models the
+    account's catalog lists (login-gated entries, the account default), so
+    a credential-less probe answers for a catalog no session will see.
+
+    :param config_overrides: The probe's ``-c`` overrides.
+    :returns: The created ``CODEX_HOME`` directory.
+    """
+    key = hashlib.sha256("\n".join(config_overrides).encode("utf-8")).hexdigest()[:12]
+    home = Path.home() / ".omnigent" / "cache" / "codex-model-probe" / key
+    home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    real_auth = _codex_home_config_source_from_env() / "auth.json"
+    probe_auth = home / "auth.json"
+    if real_auth.exists():
+        with contextlib.suppress(OSError):
+            if probe_auth.is_symlink() or probe_auth.exists():
+                probe_auth.unlink()
+            probe_auth.symlink_to(real_auth)
+    return home
+
+
+def mark_launch_default(rows: list[_JsonObject], pinned_model: str | None) -> list[_JsonObject]:
+    """
+    Reduce ``model/list`` rows to exactly one ``isDefault`` marker.
+
+    The launch-pinned model wins when a row names it (either spelling);
+    otherwise Codex's own first default stands. Rows are otherwise verbatim.
+
+    Codex's own ``isDefault`` is its built-in preference, which says nothing
+    about the model this session launched on, so a picker that trusted it
+    would name a model the pane is not running.
+
+    :param rows: Raw ``model/list`` rows.
+    :param pinned_model: The model the session runs, or ``None``.
+    :returns: The rows with a single default marked.
+    """
+    from omnigent.codex_model_vocabulary import comparable_model_id
+
+    codex_default_index: int | None = None
+    pinned_index: int | None = None
+    pinned_key = comparable_model_id(pinned_model) if pinned_model else None
+    marked: list[_JsonObject] = []
+    for index, row in enumerate(rows):
+        cleaned = {key: value for key, value in row.items() if key != "isDefault"}
+        marked.append(cleaned)
+        if codex_default_index is None and row.get("isDefault") is True:
+            codex_default_index = index
+        if pinned_index is None and pinned_key is not None:
+            for spelling in (row.get("id"), row.get("model")):
+                if isinstance(spelling, str) and comparable_model_id(spelling) == pinned_key:
+                    pinned_index = index
+                    break
+    default_index = pinned_index if pinned_index is not None else codex_default_index
+    if default_index is not None:
+        marked[default_index]["isDefault"] = True
+    return marked
+
+
+async def probe_codex_model_options(*, codex_path: str | None = None) -> list[_JsonObject]:
+    """
+    Ask a session-configured Codex app-server for its own model list.
+
+    The harness is the source of truth for what a session's ``/model``
+    picker would offer, so the probe boots ``codex app-server`` with the
+    SAME materialization a session launch gets — for every launch shape.
+    A Databricks profile contributes its provider overrides (gateway base
+    URL + minted auth + model pin) and ``DATABRICKS_HOST``; other provider
+    shapes carry their resolved ``-c`` overrides verbatim; the plain
+    Codex-login shape probes bare, which yields the ACCOUNT's visible
+    catalog: the probe home is isolated (never the user's real
+    ``~/.codex``) but links the real ``auth.json`` in the way a session
+    launch does, so login-gated entries and the account default match what
+    a live session will offer.
+
+    :param codex_path: Optional Codex executable override.
+    :returns: The probe rows with a single default marked.
+    :raises ImportError: When the Codex CLI is unavailable.
+    :raises OSError: When a Databricks profile resolves no workspace host.
+    :raises RuntimeError: When the probe app-server exits before connecting.
+    :raises TimeoutError: When the probe app-server does not become ready.
+    """
+    launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
+    resolved_codex = codex_path or _find_codex_cli()
+    if not resolved_codex:
+        raise ImportError("Native Codex model probing requires the 'codex' CLI on PATH.")
+    config_overrides = list(launch.config_overrides)
+    pinned_model = launch.model
+    env = _clean_codex_env()
+    if launch.profile is not None:
+        databricks = await asyncio.to_thread(
+            _databricks_launch_materialization, model=launch.model, profile=launch.profile
+        )
+        config_overrides.extend(databricks.config_overrides)
+        env["DATABRICKS_HOST"] = databricks.host
+        pinned_model = databricks.model
+    codex_home = await asyncio.to_thread(_probe_codex_home, config_overrides)
+    env["CODEX_HOME"] = str(codex_home)
+    port = _allocate_loopback_port()
+    listen_url = f"ws://127.0.0.1:{port}"
+    process = await _start_codex_model_discovery_process(
+        codex_path=resolved_codex,
+        listen_url=listen_url,
+        env=env,
+        cwd=codex_home,
+        config_overrides=config_overrides,
+    )
+    client: CodexAppServerClient | None = None
+    try:
+        await _wait_for_discovery_listener(process, port)
+        client = CodexAppServerClient(
+            ws_url=listen_url,
+            client_name="omnigent-codex-model-probe",
+        )
+        await client.connect()
+        rows = await list_codex_model_options(client)
+    finally:
+        if client is not None:
+            with contextlib.suppress(Exception):
+                await client.close()
+        _proc.terminate_tree(process)
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5.0)
+        except TimeoutError:
+            _proc.kill_tree(process)
+            await process.wait()
+    return mark_launch_default(rows, pinned_model)
+
+
+def codex_catalog_fingerprint(launch: NativeCodexLaunch) -> str:
+    """The launch-config fingerprint keying codex's shared model catalog.
+
+    One formula for every consumer (host boot probe, runner launch, live
+    write-back), so they read and write the same catalog file. Callers
+    fingerprint the SHAPE — a ``model=None`` resolution — so per-session
+    picks never fragment the catalog.
+
+    :param launch: The resolved launch (``resolve_native_codex_launch``).
+    :returns: A stable fingerprint string.
+    """
+    from omnigent.model_catalog_store import fingerprint_of
+
+    return fingerprint_of(
+        "codex-native", launch.profile, launch.model, tuple(launch.config_overrides)
+    )
+
+
+async def codex_launch_catalog(*, codex_path: str | None = None) -> list[_JsonObject] | None:
+    """
+    The shared codex catalog for this host's default shape: store, then probe.
+
+    Reads the on-disk catalog for the ``model=None`` launch shape; a miss
+    pays one session-shaped probe (real auth linked in) and persists the
+    answer for every later consumer.
+
+    :param codex_path: Optional Codex executable override.
+    :returns: Catalog rows, or ``None`` when no catalog could be obtained.
+    """
+    from omnigent import model_catalog_store
+
+    try:
+        launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
+    except Exception:  # noqa: BLE001 — a broken provider config means no catalog
+        _logger.warning("codex catalog: launch shape resolution failed", exc_info=True)
+        return None
+    fingerprint = codex_catalog_fingerprint(launch)
+
+    async def _probe() -> list[_JsonObject] | None:
+        try:
+            return await probe_codex_model_options(codex_path=codex_path)
+        except Exception:  # noqa: BLE001 — probe failure means "no catalog", never a crash
+            _logger.warning("codex catalog probe failed", exc_info=True)
+            return None
+
+    return await model_catalog_store.ensure_catalog("codex-native", fingerprint, _probe)
+
+
+async def codex_launch_catalog_is_stale() -> bool:
+    """
+    Whether the default launch shape's stored catalog is past the TTL.
+
+    :returns: ``True`` when the store holds only a stale entry; ``False``
+        when it is fresh, absent, or the launch shape cannot resolve.
+    """
+    from omnigent import model_catalog_store
+
+    try:
+        launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
+    except Exception:  # noqa: BLE001 — a broken provider config means no catalog
+        return False
+    return model_catalog_store.catalog_is_stale("codex-native", codex_catalog_fingerprint(launch))
+
+
+def _build_native_codex_app_server_argv(
+    *,
+    tagged_argv0: str,
+    listen_url: str,
+    config_overrides: Sequence[str],
+) -> list[str]:
+    """Build argv for the native Codex app-server subprocess."""
+    argv = [tagged_argv0, "app-server", "--listen", listen_url]
+    for override in config_overrides:
+        argv.extend(["-c", override])
+    return argv
 
 
 @dataclass
@@ -562,6 +1102,10 @@ class CodexNativeAppServer:
         per-session ``config.toml`` at start, or ``None``. Keeps the
         forwarder's config.toml model mirror (and the cost gate's hook
         read) consistent with what the session was launched to run.
+    :param trust_project: Whether to trust :attr:`cwd` in the private
+        session config before startup. Runner-owned headless sessions set
+        this because nobody can answer Codex's project-trust TUI prompt.
+        Interactive CLI sessions leave it disabled.
     :param policy_notice_pending: One-shot flag: ``True`` once a degrade
         reason is recorded, until the runner's terminal-ensure handler
         surfaces it to Omnigent (which posts a single durable banner). Prevents
@@ -589,6 +1133,9 @@ class CodexNativeAppServer:
     pinned_model: str | None = None
     process_registry_tag: str | None = None
     process_owner_lock: CodexNativeProcessOwnerLock | None = None
+    codex_cli_version: tuple[int, int, int] | None = None
+    trust_project: bool = False
+    router_hooks_registered: bool = False
 
     async def start(self) -> None:
         """
@@ -601,31 +1148,87 @@ class CodexNativeAppServer:
         if self.listen_url is None or self.listen_url.startswith("unix://"):
             with contextlib.suppress(FileNotFoundError):
                 self.socket_path.unlink()
-        _populate_codex_home_config(
-            self.codex_home,
-            _codex_home_config_source_from_env(),
+        # Native policy enforcement needs codex's hook-trust protocol
+        # (``currentHash`` / ``trustStatus`` in ``hooks/list``), added in
+        # codex 0.129. Below that the hook can never be trusted, so
+        # registering it would only fail at the trust gate. Probed before
+        # the home is populated: on an unsupported codex no hooks file is
+        # generated at all, so the user's hooks.json must still be
+        # symlinked in rather than left missing. A version we cannot parse
+        # (``None``) is treated as supported so a flaky probe never
+        # silently disables enforcement — a genuine trust failure is then
+        # caught below.
+        codex_version = await _codex_cli_version(self.codex_path)
+        self.codex_cli_version = codex_version
+        policy_hooks_supported = (
+            codex_version is None or codex_version >= _MIN_POLICY_HOOK_CODEX_VERSION
         )
+        # When the runner advertises a route-subagent endpoint, the generated
+        # hooks file owns hooks.json, so the user's copy is merged in rather
+        # than symlinked over. The runner advertises it for auto-harness Smart
+        # Routing sessions only, so its presence is also this session class's
+        # signature — see ``ensure_session_router_quietly``.
+        router_bridge_dir = codex_router_bridge_dir(self.env)
+        if router_bridge_dir is not None:
+            # A CLI too old for the spawn gate gets no routing hooks at all, so
+            # routing no-ops instead of blocking the launch. Everything keyed
+            # off the advertisement below (generated hooks.json, the routed-spawn
+            # tool pre-approvals) then falls back to the plain shape.
+            skip_reason = codex_routing_hook_skip_reason(codex_version)
+            if skip_reason is not None:
+                _logger.warning("%s", skip_reason)
+                router_bridge_dir = None
+        self.router_hooks_registered = router_bridge_dir is not None and policy_hooks_supported
+        routed_spawns = router_bridge_dir is not None
+        config_source = _codex_home_config_source_from_env()
+        model_migration_target: str | None = None
+        if self.trust_project and self.pinned_model:
+            catalog = await asyncio.to_thread(
+                read_codex_model_catalog,
+                self.codex_path,
+                config_source,
+                timeout=_MODEL_MIGRATION_CATALOG_TIMEOUT_SECONDS,
+            )
+            model_migration_target = _codex_model_upgrade_target(catalog, self.pinned_model)
+        # Off the loop: this copies/symlinks a home AND (on a Smart Routing
+        # session) shells out to ``codex debug models`` with a 10s timeout. Run
+        # inline it stalled every other session sharing this event loop for that
+        # long — which is also why a plain session must never reach the probe.
+        await asyncio.to_thread(
+            _populate_codex_home_config,
+            self.codex_home,
+            config_source,
+            inject_hooks=self.router_hooks_registered,
+            extend_model_catalog=codex_extended_catalog_requested(self.env),
+        )
+        if self.trust_project:
+            _trust_codex_project(self.codex_home, self.cwd)
         # Write the MCP server config into config.toml so the app-server
         # discovers it at config load. The -c overrides may not be honored
         # by `codex app-server`, so we write directly to the file.
-        _inject_mcp_server_config(self.codex_home, self.bridge_dir, self.python_executable)
+        _inject_mcp_server_config(
+            self.codex_home,
+            self.bridge_dir,
+            self.python_executable,
+            routed_spawns=routed_spawns,
+        )
         if self.pinned_model:
             _pin_codex_config_model(self.codex_home, self.pinned_model)
+            if model_migration_target is not None:
+                _acknowledge_codex_model_migration(
+                    self.codex_home,
+                    self.pinned_model,
+                    model_migration_target,
+                )
         _sync_codex_developer_instructions(
             self.codex_home,
             self.developer_instructions,
         )
-        # Native policy enforcement needs codex's hook-trust protocol
-        # (``currentHash`` / ``trustStatus`` in ``hooks/list``), added in
-        # codex 0.129. Below that the hook can never be trusted, so
-        # registering it would only fail at the trust gate. Detect the
-        # version up front; below the minimum we skip registration and
-        # degrade to "no enforcement" with a surfaced reason. A version we
-        # cannot parse (``None``) is treated as supported so a flaky probe
-        # never silently disables enforcement — a genuine trust failure is
-        # then caught below.
-        codex_version = await _codex_cli_version(self.codex_path)
-        if codex_version is not None and codex_version < _MIN_POLICY_HOOK_CODEX_VERSION:
+        self.config_overrides = materialize_codex_provider_config(
+            self.codex_home,
+            self.config_overrides,
+        )
+        if codex_version is not None and not policy_hooks_supported:
             self._disable_policy_hook(
                 f"Codex CLI {_format_codex_version(codex_version)} is older than "
                 f"{_format_codex_version(_MIN_POLICY_HOOK_CODEX_VERSION)}; upgrade "
@@ -639,7 +1242,17 @@ class CodexNativeAppServer:
             # ap_server_url the hook is still registered + trusted but
             # no-ops.
             _write_codex_policy_hooks_file(
-                self.codex_home, self.bridge_dir, self.python_executable
+                self.codex_home,
+                self.bridge_dir,
+                self.python_executable,
+                router_bridge_dir=router_bridge_dir,
+                router_session_id=codex_router_session_id(self.env),
+                user_hooks_source=config_source / _CODEX_HOOKS_FILE,
+                # The runner only advertises a route-turn endpoint for a
+                # session that launched with Smart Routing on, so its presence
+                # is the switch for the first-message routing hook. Same
+                # rendezvous-as-switch shape as the subagent router above.
+                turn_routing=_turn_router_advertised(self.bridge_dir),
             )
             if self.ap_server_url:
                 write_policy_hook_config(
@@ -654,14 +1267,11 @@ class CodexNativeAppServer:
             f"{Path(self.codex_path).name} "
             f"{codex_native_session_tag_cmdline_arg(self.process_registry_tag)}"
         )
-        argv = [
-            tagged_argv0,
-            "app-server",
-            "--listen",
-            resolved_listen,
-        ]
-        for override in self.config_overrides:
-            argv.extend(["-c", override])
+        argv = _build_native_codex_app_server_argv(
+            tagged_argv0=tagged_argv0,
+            listen_url=resolved_listen,
+            config_overrides=self.config_overrides,
+        )
         proc_env = {**self.env, "CODEX_HOME": str(self.codex_home)}
         self.process_owner_lock = acquire_codex_native_process_owner_lock()
         try:
@@ -692,6 +1302,13 @@ class CodexNativeAppServer:
             self._stderr_loop(),
             name="codex-native-app-server-stderr",
         )
+        # Ordering invariant: hooks.json is written before the spawn above,
+        # and the trust handshake must complete before the first turn — codex
+        # resolves trust when it dispatches a hook, so trust landing after the
+        # spawn is fine, but a turn started before it runs unhooked. The
+        # handshake cannot precede the spawn (``hooks/list`` is an app-server
+        # RPC), so callers must not launch the TUI or dispatch a turn until
+        # ``start()`` returns.
         # Readiness failure (the app-server never came up) is fatal and
         # tears down the subprocess so it is not orphaned. Policy-hook
         # trust, by contrast, is best-effort: a trust failure degrades the
@@ -741,6 +1358,18 @@ class CodexNativeAppServer:
         await client.connect()
         try:
             await trust_native_policy_hooks(client, cwd=str(self.cwd))
+            # Routing hooks live in the same generated file but under a
+            # different module, so they need their own trust pass. Best
+            # effort: a routing-trust failure must not disable the policy
+            # gate, so it is logged instead of raised.
+            if self.router_hooks_registered:
+                try:
+                    await trust_codex_router_hooks(client.request, cwd=str(self.cwd))
+                except Exception:  # noqa: BLE001 - routing trust never blocks startup
+                    _logger.warning(
+                        "codex subagent-routing hook trust failed; routing will not be enforced",
+                        exc_info=True,
+                    )
         except RuntimeError as exc:
             raise RuntimeError(f"{exc}{self._codex_config_error_hint()}") from exc
         finally:
@@ -823,14 +1452,6 @@ class CodexNativeAppServer:
             except asyncio.TimeoutError:
                 _kill_process_tree(self.proc)
                 await self.proc.wait()
-        # Flush any hook-trust the user accepted this session back into the
-        # global config so the next session's copy inherits it and
-        # _retarget_codex_hook_trust_keys can carry it forward without prompting.
-        _merge_codex_hook_trust_back(
-            self.codex_home / "config.toml",
-            _codex_home_config_source_from_env(),
-            self.codex_home,
-        )
         if self.process_registry_tag is not None:
             unregister_codex_native_process(self.process_registry_tag)
         if self.process_owner_lock is not None:
@@ -907,23 +1528,56 @@ def _codex_policy_hook_command(bridge_dir: Path, python_executable: str | None) 
     """
     Build the shell command codex runs for the policy hook.
 
+    Runs python in isolated mode (``-I``): codex executes hooks with the
+    session's workspace as cwd, and ``-m`` would otherwise put that
+    workspace first on ``sys.path``. A workspace holding a directory named
+    like one of our packages (the omnigent checkout itself, most obviously)
+    then shadows the installed one and the hook dies on an import error
+    that codex discards — a silent fail-open. Mirrors the ``-I`` the
+    bridge's MCP server command already uses.
+
     :param bridge_dir: Native Codex bridge directory passed to the hook
         via ``--bridge-dir``.
     :param python_executable: Python executable to run, e.g.
         ``"/path/to/python"``. ``None`` uses :data:`sys.executable`.
     :returns: A shell-escaped command string, e.g.
-        ``"/path/python -m omnigent.codex_native_hook evaluate-policy
+        ``"/path/python -I -m omnigent.codex_native_hook evaluate-policy
         --bridge-dir /home/u/.omnigent/codex-native/abc"``.
     """
     python = python_executable or sys.executable
     return shlex.join(
-        [python, "-m", _POLICY_HOOK_MODULE, "evaluate-policy", "--bridge-dir", str(bridge_dir)]
+        [
+            python,
+            "-I",
+            "-m",
+            _POLICY_HOOK_MODULE,
+            "evaluate-policy",
+            "--bridge-dir",
+            str(bridge_dir),
+        ]
     )
 
 
+def _turn_router_advertised(bridge_dir: Path) -> bool:
+    """
+    Report whether the runner advertised a ``route-turn`` endpoint here.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: ``True`` when a usable ``turn_router.json`` is present, i.e. the
+        session launched with Smart Routing on.
+    """
+    from omnigent.inner.hook_scripts.subagent_router import read_router_endpoint
+    from omnigent.runner.turn_routing import ADVERTISEMENT_FILE
+
+    return read_router_endpoint(bridge_dir, filename=ADVERTISEMENT_FILE) is not None
+
+
 def _codex_policy_hooks_settings(
-    bridge_dir: Path, python_executable: str | None
-) -> dict[str, Any]:
+    bridge_dir: Path,
+    python_executable: str | None,
+    *,
+    turn_routing: bool = False,
+) -> _JsonObject:
     """
     Build the ``hooks.json`` payload registering the policy hook.
 
@@ -938,76 +1592,162 @@ def _codex_policy_hooks_settings(
 
     :param bridge_dir: Native Codex bridge directory.
     :param python_executable: Python executable for the hook command.
+    :param turn_routing: ``True`` when the runner advertised a ``route-turn``
+        endpoint for this session, i.e. it launched with Smart Routing on.
+        ``False`` leaves the first-message routing hook unregistered, so a
+        session that will never route pays no per-prompt round trip.
     :returns: A ``hooks.json``-shaped dict.
     """
-    hook = {
+    hook: _JsonObject = {
         "type": "command",
         "command": _codex_policy_hook_command(bridge_dir, python_executable),
         "timeout": _POLICY_HOOK_TIMEOUT_SECONDS,
     }
+    prompt_submit: list[_JsonObject] = [hook]
+    if turn_routing:
+        prompt_submit.append(_codex_route_turn_hook(bridge_dir, python_executable))
     return {
         "hooks": {
             "PreToolUse": [{"hooks": [hook]}],
             "PostToolUse": [{"hooks": [hook]}],
-            "UserPromptSubmit": [{"hooks": [hook]}],
+            "UserPromptSubmit": [{"hooks": prompt_submit}],
         }
     }
 
 
+def _codex_route_turn_hook(bridge_dir: Path, python_executable: str | None) -> _JsonObject:
+    """
+    Build the ``UserPromptSubmit`` entry for first-message model routing.
+
+    A second command alongside the policy gate rather than a module of its
+    own: codex trusts hooks by command, and the trust pass filters on
+    :data:`_POLICY_HOOK_MODULE`, so keeping the subcommand there rides the
+    existing handshake. It no-ops (exit 0, no output) unless the runner has
+    advertised a ``route-turn`` endpoint and nothing has pinned the
+    session's model yet; when it does route, it blocks the prompt and the
+    runner replays it on the routed model. See
+    :mod:`omnigent.runner.turn_routing`.
+
+    :param bridge_dir: Native Codex bridge directory, holding both the
+        endpoint advertisement and the marker file.
+    :param python_executable: Python executable for the hook command.
+    :returns: One ``hooks.json`` command-hook entry.
+    """
+    from omnigent.runner.turn_routing import HARNESS_HOOK_TIMEOUT_S
+
+    return {
+        "type": "command",
+        "command": shlex.join(
+            [
+                python_executable or sys.executable,
+                "-I",
+                "-m",
+                _POLICY_HOOK_MODULE,
+                "route-turn",
+                "--bridge-dir",
+                str(bridge_dir),
+                "--harness",
+                "codex-native",
+            ]
+        ),
+        "timeout": HARNESS_HOOK_TIMEOUT_S,
+    }
+
+
 def _write_codex_policy_hooks_file(
-    codex_home: Path, bridge_dir: Path, python_executable: str | None
+    codex_home: Path,
+    bridge_dir: Path,
+    python_executable: str | None,
+    *,
+    router_bridge_dir: Path | None = None,
+    router_session_id: str | None = None,
+    user_hooks_source: Path | None = None,
+    turn_routing: bool = False,
 ) -> None:
     """
     Write ``hooks.json`` into the private CODEX_HOME (atomically).
 
+    This file is the only ``hooks.json`` codex loads, so the policy hooks,
+    the subagent-routing hooks and the user's own hooks all go through the
+    shared :func:`write_codex_hooks_file` into one payload — written
+    separately, whichever ran last would erase the other.
+
     :param codex_home: Private per-session ``CODEX_HOME`` directory.
     :param bridge_dir: Native Codex bridge directory for the hook command.
     :param python_executable: Python executable for the hook command.
+    :param router_bridge_dir: Directory advertising the route-subagent
+        endpoint. ``None`` leaves native subagent spawns unrouted.
+    :param router_session_id: Session id baked into the routing hook
+        commands.
+    :param user_hooks_source: The user's real ``hooks.json`` to merge when
+        the private home holds no symlink to it (the routing path unlinks
+        it before this runs).
+    :param turn_routing: ``True`` when the session launched with Smart Routing
+        on, which registers the ``UserPromptSubmit`` first-message routing
+        hook.
     :returns: None.
     """
-    codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path = codex_home / _CODEX_HOOKS_FILE
-    payload = _codex_policy_hooks_settings(bridge_dir, python_executable)
-    fd, tmp_name = tempfile.mkstemp(prefix=f"{_CODEX_HOOKS_FILE}.", dir=str(codex_home))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, sort_keys=True)
-            handle.write("\n")
-        os.replace(tmp_name, path)
-    finally:
-        if os.path.exists(tmp_name):
-            os.unlink(tmp_name)
+    payloads: list[Mapping[str, object]] = [
+        _codex_policy_hooks_settings(bridge_dir, python_executable, turn_routing=turn_routing)
+    ]
+    if router_bridge_dir is not None:
+        payloads.append(
+            codex_router_hooks_settings(
+                router_bridge_dir,
+                session_id=router_session_id,
+                harness="codex-native",
+                python_executable=python_executable,
+            )
+        )
+    _ = write_codex_hooks_file(codex_home, payloads, user_hooks_source=user_hooks_source)
 
 
-def _our_policy_hooks_from_list(listed: dict[str, Any], cwd: str) -> list[dict[str, Any]]:
+def _our_hooks_from_list(listed: _JsonObject, cwd: str, module: str) -> list[_JsonObject]:
     """
-    Extract *our* policy hooks for *cwd* from a ``hooks/list`` response.
+    Extract the hooks for *cwd* whose command runs *module*.
 
-    Filters to hooks whose command references :data:`_POLICY_HOOK_MODULE`
-    so the trust step never touches hooks the user's symlinked
-    ``config.toml`` might declare.
+    Filtering by module keeps the trust step from ever touching hooks the
+    user's own ``hooks.json`` contributed to the merged file.
 
     :param listed: Parsed ``hooks/list`` response envelope, with
         ``result.data`` a list of ``{cwd, hooks: [...]}`` entries.
     :param cwd: The cwd whose hook set to read, e.g.
         ``"/home/user/repo"``.
-    :returns: The matching Omnigent hook metadata dicts (possibly
-        empty), each with ``key``, ``currentHash``, ``trustStatus``.
+    :param module: Hook-script module marker, e.g.
+        ``"omnigent.codex_native_hook"``.
+    :returns: The matching hook metadata dicts (possibly empty), each
+        with ``key``, ``currentHash``, ``trustStatus``.
     """
-    result = listed.get("result", listed)
-    data = result.get("data", []) if isinstance(result, dict) else []
-    for entry in data:
-        if isinstance(entry, dict) and entry.get("cwd") == cwd:
-            hooks = entry.get("hooks", [])
+    result = _string_object_dict(listed.get("result"))
+    if result is None:
+        result = listed
+    data = _object_list(result.get("data")) or []
+    for raw_entry in data:
+        entry = _string_object_dict(raw_entry)
+        if entry is not None and entry.get("cwd") == cwd:
+            hooks = _object_list(entry.get("hooks")) or []
             return [
-                h
-                for h in hooks
-                if isinstance(h, dict) and _POLICY_HOOK_MODULE in str(h.get("command", ""))
+                hook
+                for raw_hook in hooks
+                if (hook := _string_object_dict(raw_hook)) is not None
+                and module in str(hook.get("command", ""))
             ]
     return []
 
 
-def _hooks_list_diagnostics(listed: dict[str, Any], cwd: str) -> str:
+def _our_policy_hooks_from_list(listed: _JsonObject, cwd: str) -> list[_JsonObject]:
+    """
+    Extract *our* policy hooks for *cwd* from a ``hooks/list`` response.
+
+    :param listed: Parsed ``hooks/list`` response envelope.
+    :param cwd: The cwd whose hook set to read, e.g.
+        ``"/home/user/repo"``.
+    :returns: The matching Omnigent policy-hook metadata dicts.
+    """
+    return _our_hooks_from_list(listed, cwd, _POLICY_HOOK_MODULE)
+
+
+def _hooks_list_diagnostics(listed: _JsonObject, cwd: str) -> str:
     """
     Summarize a ``hooks/list`` response for a discovery-failure error.
 
@@ -1030,10 +1770,12 @@ def _hooks_list_diagnostics(listed: dict[str, Any], cwd: str) -> str:
         ``"hooks/list returned no hooks (codex loaded none — likely an "
         "invalid per-session config.toml)"``.
     """
-    result = listed.get("result", listed)
-    data = result.get("data", []) if isinstance(result, dict) else []
-    entries = [e for e in data if isinstance(e, dict)]
-    if not entries or all(not e.get("hooks") for e in entries):
+    result = _string_object_dict(listed.get("result"))
+    if result is None:
+        result = listed
+    data = _object_list(result.get("data")) or []
+    entries = [entry for raw in data if (entry := _string_object_dict(raw)) is not None]
+    if not entries or all(not (_object_list(entry.get("hooks")) or []) for entry in entries):
         return (
             "hooks/list returned no hooks (codex loaded none — likely an "
             "invalid per-session config.toml, so codex fell back to defaults)"
@@ -1041,18 +1783,19 @@ def _hooks_list_diagnostics(listed: dict[str, Any], cwd: str) -> str:
     matched_cwd = any(e.get("cwd") == cwd for e in entries)
     parts: list[str] = []
     for entry in entries:
-        hooks = entry.get("hooks", []) or []
+        hooks = _object_list(entry.get("hooks")) or []
         ours = sum(
             1
-            for h in hooks
-            if isinstance(h, dict) and _POLICY_HOOK_MODULE in str(h.get("command", ""))
+            for raw_hook in hooks
+            if (hook := _string_object_dict(raw_hook)) is not None
+            and _POLICY_HOOK_MODULE in str(hook.get("command", ""))
         )
         parts.append(f"cwd={entry.get('cwd')!r}: {len(hooks)} hook(s), {ours} ours")
     prefix = "" if matched_cwd else f"no entry matched queried cwd {cwd!r}; "
     return f"hooks/list returned [{prefix}{'; '.join(parts)}]"
 
 
-def _untrusted_hook_detail(hooks: list[dict[str, Any]]) -> str:
+def _untrusted_hook_detail(hooks: Sequence[_JsonObject]) -> str:
     """
     Render untrusted hook metadata for a trust-failure error.
 
@@ -1071,6 +1814,104 @@ def _untrusted_hook_detail(hooks: list[dict[str, Any]]) -> str:
         f"isManaged={h.get('isManaged')!r} statusMessage={h.get('statusMessage')!r}"
         for h in hooks
     )
+
+
+async def _persist_hook_trust(request: CodexRequestFn, untrusted: Sequence[_JsonObject]) -> None:
+    """
+    Write ``hooks.state.<key>.trusted_hash`` for each untrusted hook.
+
+    Persisted trust is the *only* mechanism that makes a hook run under
+    ``codex app-server``: the ``--dangerously-bypass-hook-trust`` CLI flag
+    is honored by the interactive/exec paths only, so app-server threads
+    silently skip anything left ``untrusted``.
+
+    :param request: Bound app-server JSON-RPC request coroutine, e.g.
+        ``client.request``.
+    :param untrusted: Hook metadata dicts from ``hooks/list`` carrying
+        ``key`` and ``currentHash``.
+    :returns: None.
+    """
+    trust_value = {
+        str(h["key"]): {"trusted_hash": h["currentHash"]}
+        for h in untrusted
+        if h.get("key") and h.get("currentHash")
+    }
+    if not trust_value:
+        return
+    await request(
+        "config/batchWrite",
+        {
+            "edits": [
+                {
+                    "keyPath": "hooks.state",
+                    "mergeStrategy": "upsert",
+                    "value": trust_value,
+                }
+            ],
+            "reloadUserConfig": True,
+        },
+    )
+
+
+async def trust_codex_router_hooks(request: CodexRequestFn, *, cwd: str) -> list[str]:
+    """
+    Trust the generated subagent-routing hooks so codex runs them.
+
+    Codex skips untrusted hooks without a word, which for the routing gate
+    is a fail-open, and app-server threads honor persisted trust only (the
+    ``--dangerously-bypass-hook-trust`` flag covers the interactive /
+    ``exec`` paths, not this one), so the handshake is the only way in.
+
+    The routing gate (``PreToolUse`` on the spawn tool) lives in the same
+    generated ``hooks.json`` as the policy hook but under a different
+    module, so the policy trust pass leaves it ``untrusted``. Same
+    ``hooks/list`` → ``config/batchWrite`` flow, but best-effort: a
+    routing-trust failure must not disable policy enforcement, so it is
+    reported instead of raised.
+
+    :param request: Bound app-server JSON-RPC request coroutine, e.g.
+        ``client.request`` (or the SDK executor's ``_request``).
+    :param cwd: The session cwd the hooks are scoped to, e.g.
+        ``"/home/user/repo"``.
+    :returns: Keys of routing hooks still untrusted afterwards; empty when
+        every routing hook is trusted (or none are registered).
+    """
+    listed = await request("hooks/list", {"cwds": [cwd]})
+    ours = _our_hooks_from_list(listed, cwd, _CODEX_ROUTER_HOOK_MODULE)
+    if not ours:
+        _logger.info(
+            "codex subagent-routing hooks: none discovered for cwd %s (%s)",
+            cwd,
+            _hooks_list_diagnostics(listed, cwd),
+        )
+        return []
+    untrusted = [h for h in ours if h.get("trustStatus") not in _TRUSTED_HOOK_STATUSES]
+    if not untrusted:
+        _logger.info(
+            "codex subagent-routing hooks: all %d already trusted for cwd %s", len(ours), cwd
+        )
+        return []
+    await _persist_hook_trust(request, untrusted)
+    relisted = await request("hooks/list", {"cwds": [cwd]})
+    still_untrusted = [
+        h
+        for h in _our_hooks_from_list(relisted, cwd, _CODEX_ROUTER_HOOK_MODULE)
+        if h.get("trustStatus") not in _TRUSTED_HOOK_STATUSES
+    ]
+    if still_untrusted:
+        _logger.warning(
+            "codex subagent-routing hooks still untrusted after config/batchWrite; "
+            "native subagent routing will NOT be enforced: %s",
+            _untrusted_hook_detail(still_untrusted),
+        )
+        return [str(h.get("key")) for h in still_untrusted]
+    _logger.info(
+        "codex subagent-routing hooks trusted (%d of %d newly): %s",
+        len(untrusted),
+        len(ours),
+        ", ".join(sorted(str(h.get("eventName")) for h in ours)),
+    )
+    return []
 
 
 async def trust_native_policy_hooks(client: CodexAppServerClient, *, cwd: str) -> None:
@@ -1103,24 +1944,7 @@ async def trust_native_policy_hooks(client: CodexAppServerClient, *, cwd: str) -
     untrusted = [h for h in ours if h.get("trustStatus") not in _TRUSTED_HOOK_STATUSES]
     if not untrusted:
         return
-    trust_value = {
-        str(h["key"]): {"trusted_hash": h["currentHash"]}
-        for h in untrusted
-        if h.get("key") and h.get("currentHash")
-    }
-    await client.request(
-        "config/batchWrite",
-        {
-            "edits": [
-                {
-                    "keyPath": "hooks.state",
-                    "mergeStrategy": "upsert",
-                    "value": trust_value,
-                }
-            ],
-            "reloadUserConfig": True,
-        },
-    )
+    await _persist_hook_trust(client.request, untrusted)
     relisted = await client.request("hooks/list", {"cwds": [cwd]})
     still_untrusted = [
         h
@@ -1145,6 +1969,159 @@ async def trust_native_policy_hooks(client: CodexAppServerClient, *, cwd: str) -
         )
 
 
+def _trust_codex_project(codex_home: Path, cwd: Path) -> None:
+    """
+    Trust a runner-selected workspace in the private Codex config.
+
+    Codex 0.146 introduced a project-trust screen before the remote TUI
+    creates its thread. Headless sessions cannot answer it, so startup waits
+    until Omnigent reports a timeout. The config is already a private copy;
+    this never modifies the user's shared ``~/.codex/config.toml``.
+
+    :param codex_home: Private per-session ``CODEX_HOME`` directory.
+    :param cwd: Workspace selected for this runner-owned session.
+    :returns: None.
+    """
+    config_path = codex_home / "config.toml"
+    existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    document = tomlkit.parse(existing) if existing else tomlkit.document()
+    projects = document.get("projects")
+    if projects is None:
+        projects = tomlkit.table()
+        document["projects"] = projects
+    project_key = str(cwd.resolve())
+    project = projects.get(project_key)
+    if project is None:
+        project = tomlkit.table()
+        projects[project_key] = project
+    project["trust_level"] = "trusted"
+    config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
+
+
+@dataclass(frozen=True)
+class _DatabricksLaunchMaterialization:
+    """
+    The Databricks-profile pieces of a Codex launch, shared by the real
+    app-server build and the model-options probe so the two cannot drift.
+
+    :param config_overrides: ``-c`` overrides routing Codex through the
+        profile's AI Gateway (provider block + auth command + model pin).
+    :param model: The model the overrides pin, e.g. ``"databricks-gpt-5-4"``
+        — the explicit *model* when given, else the catalog default.
+    :param host: The profile's workspace origin for ``DATABRICKS_HOST``.
+    """
+
+    config_overrides: list[str]
+    model: str
+    host: str
+
+
+def _databricks_launch_materialization(
+    *, model: str | None, profile: str
+) -> _DatabricksLaunchMaterialization:
+    """
+    Resolve the Databricks-profile routing pieces of a Codex launch.
+
+    Uses the profile's own host so the gateway base URL matches the token
+    the profile-pinned auth command mints; a ``DATABRICKS_HOST`` override in
+    the runner env must not point the base URL at another workspace.
+
+    :param model: Optional explicit model pin; ``None`` resolves the
+        catalog default.
+    :param profile: ``~/.databrickscfg`` profile name, e.g. ``"oss"``.
+    :returns: The materialized overrides, pinned model, and host.
+    :raises OSError: When the profile resolves no workspace host.
+    """
+    host = _databricks_gateway_host(profile)
+    if not host:
+        raise OSError(
+            f"Native Codex with Databricks profile {profile!r} (from your "
+            "provider config) requires a matching ~/.databrickscfg section "
+            "with a host visible to the runner process."
+        )
+    host = host.rstrip("/")
+    # Resolve against what the workspace actually serves (live UC listing →
+    # ucode state → bundled catalog), never the bundled catalog alone — its
+    # legacy ``databricks-`` spellings can 501 on today's gateway.
+    resolved_model = _resolve_databricks_codex_model(host, profile, model)
+    return _DatabricksLaunchMaterialization(
+        config_overrides=_databricks_codex_config_overrides(
+            model=resolved_model,
+            base_url=_databricks_codex_base_url(host),
+            auth_command=_databricks_codex_auth_command(host, profile),
+        ),
+        model=resolved_model,
+        host=host,
+    )
+
+
+# DATABRICKS-PATCH(codex-live-model-discovery)
+def _resolve_databricks_codex_model(host: str, profile: str, requested: str | None) -> str:
+    """Resolve the codex launch model against what the workspace serves.
+
+    Codex used to take its model from the bundled MLflow catalog — a
+    third-party listing whose Databricks ids carry the legacy
+    ``databricks-`` spelling the gateway now answers with ``501
+    NOT_IMPLEMENTED ... Use Unity Catalog model services (v3)`` — so a launch
+    could pin a model the workspace will not serve. Resolve from the workspace
+    instead, as claude-native already does: the live Unity Catalog listing,
+    then ucode's cached copy of it, then the bundled catalog as the documented
+    last resort.
+
+    An explicit model is matched against the servable ids, so a legacy
+    ``model_override`` persisted before this change still launches; one the
+    workspace does not serve passes through untouched, because the gateway's
+    error beats a silent substitution.
+
+    :param host: Workspace origin, e.g. ``"https://example.com"``.
+    :param profile: Databricks CLI profile backing the launch.
+    :param requested: Explicit model id, or ``None`` to take the newest
+        servable one.
+    :returns: The model id to pin on the codex launch.
+    """
+    from omnigent.databricks_model_discovery import (
+        discover_databricks_codex_models,
+        select_servable_model,
+    )
+
+    servable: tuple[str, ...] = ()
+    try:
+        from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
+
+        creds = resolve_databricks_workspace(profile)
+        # Discover against the host the launch actually posts to. This resolver
+        # honors ``DATABRICKS_HOST`` while the launch host comes from the
+        # profile section alone (``_databricks_gateway_host``), so using
+        # ``creds.host`` here can pin a model discovered on workspace A onto a
+        # launch targeting workspace B. A token that does not match ``host``
+        # simply fails the listing and drops to the ucode-state fallback below,
+        # which is already keyed by ``host``.
+        servable = discover_databricks_codex_models(host, creds.token)
+    except Exception:  # noqa: BLE001 — cached ucode state is the launch fallback
+        _logger.warning(
+            "native-codex: live Databricks model discovery failed for profile %r; "
+            "falling back to ucode state",
+            profile,
+            exc_info=True,
+        )
+        try:
+            from omnigent.onboarding.ucode_state import read_ucode_state
+
+            workspace_state = read_ucode_state(host)
+            if workspace_state is not None:
+                servable = tuple(workspace_state.codex_models)
+        except Exception:  # noqa: BLE001 — the bundled catalog is the last resort
+            _logger.warning(
+                "native-codex: could not read ucode state for %r", profile, exc_info=True
+            )
+
+    if requested:
+        return select_servable_model(requested, servable) or requested
+    if servable:
+        return servable[0]
+    return model_catalog.resolve_catalog_model("databricks", family="openai").model_id
+
+
 def build_codex_native_server(
     *,
     socket_path: Path,
@@ -1160,6 +2137,7 @@ def build_codex_native_server(
     extra_config_overrides: list[str] | None = None,
     developer_instructions: str | None = None,
     bypass_sandbox: bool = False,
+    trust_project: bool = False,
 ) -> CodexNativeAppServer:
     """
     Build a configured native Codex app-server process wrapper.
@@ -1194,6 +2172,9 @@ def build_codex_native_server(
         disables both approval prompts and the command sandbox; gated
         behind an explicit, typed-confirmation opt-in in the web UI.
         Default ``False``. See issue #657.
+    :param trust_project: Whether to trust ``cwd`` in the private session
+        config before app-server startup. Intended for runner-owned headless
+        sessions whose hidden TUI cannot answer Codex's project-trust prompt.
     :returns: Configured app-server process wrapper.
     :raises ImportError: If no Codex CLI is available.
     :raises OSError: If Databricks routing was requested but no
@@ -1208,26 +2189,18 @@ def build_codex_native_server(
         )
     env = _clean_codex_env()
     config_overrides: list[str] = []
+    pinned_model = model
     if profile is not None:
-        # Use the profile's own host so the gateway base URL matches the token
-        # the profile-pinned auth command mints; a DATABRICKS_HOST override in
-        # the runner env must not point the base URL at another workspace.
-        host = _databricks_gateway_host(profile)
-        if not host:
-            raise OSError(
-                f"Native Codex with Databricks profile {profile!r} (from your "
-                "provider config) requires a matching ~/.databrickscfg section "
-                "with a host visible to the runner process."
-            )
-        host = host.rstrip("/")
-        config_overrides.extend(
-            _databricks_codex_config_overrides(
-                model=model or _DATABRICKS_CODEX_DEFAULT_MODEL,
-                base_url=_databricks_codex_base_url(host),
-                auth_command=_databricks_codex_auth_command(host, profile),
-            )
-        )
-        env["DATABRICKS_HOST"] = host
+        databricks = _databricks_launch_materialization(model=model, profile=profile)
+        config_overrides.extend(databricks.config_overrides)
+        env["DATABRICKS_HOST"] = databricks.host
+        # A launch that names no model still routes through the profile's
+        # resolved model via ``-c model=``, which outranks the config.toml
+        # copied from the user's shared home. Pin that model in codex's own
+        # spelling — the vocabulary config.toml and its readers use — so the
+        # forwarder mirror and cost gate report the model this session runs
+        # instead of whatever the shared file was last left on.
+        pinned_model = codex_spawn_model(databricks.model) or databricks.model
     if extra_config_overrides:
         config_overrides.extend(extra_config_overrides)
     if bypass_sandbox:
@@ -1241,6 +2214,15 @@ def build_codex_native_server(
                 'sandbox_mode="danger-full-access"',
             ]
         )
+    # Every launch is explicit: the resolved model rides argv (``-c model=``)
+    # AND the private config copy's ``model =`` line (pinned in ``start``),
+    # both written from this one value — so a stale line copied from the
+    # user's shared config can never govern a session, and the two artifacts
+    # cannot drift.
+    if pinned_model and not any(
+        override.split("=", 1)[0] == "model" for override in config_overrides
+    ):
+        config_overrides.append(f"model={json.dumps(pinned_model)}")
     return CodexNativeAppServer(
         codex_path=resolved_codex,
         socket_path=socket_path,
@@ -1253,7 +2235,8 @@ def build_codex_native_server(
         ap_server_url=ap_server_url,
         ap_auth_headers=ap_auth_headers,
         python_executable=python_executable,
-        pinned_model=model,
+        pinned_model=pinned_model,
+        trust_project=trust_project,
     )
 
 
@@ -1283,6 +2266,23 @@ class NativeCodexLaunch:
     summary: str = ""
 
 
+_MODEL_PROVIDER_OVERRIDE_PREFIX = "model_provider="
+
+
+def native_codex_launch_pins_model_provider(launch: NativeCodexLaunch) -> bool:
+    """Whether a launch overrides Codex's config-file provider choice.
+
+    Profiles route through generated provider config. Explicit
+    ``model_provider=`` overrides cover CLI-config, configured-provider, and
+    literal built-in OpenAI paths. An empty-override, profile-free launch alone
+    defers to the user's top-level ``config.toml`` provider.
+    """
+    return launch.profile is not None or any(
+        override.startswith(_MODEL_PROVIDER_OVERRIDE_PREFIX)
+        for override in launch.config_overrides
+    )
+
+
 def codex_session_meta_model_provider(launch: NativeCodexLaunch) -> str:
     """Return the provider id a launch routes through, for rollout synthesis.
 
@@ -1308,13 +2308,130 @@ def codex_session_meta_model_provider(launch: NativeCodexLaunch) -> str:
     :returns: Provider id for ``session_meta.model_provider``, e.g.
         ``"omnigent_databricks"``.
     """
-    prefix = "model_provider="
     for override in launch.config_overrides:
-        if override.startswith(prefix):
-            return json.loads(override.removeprefix(prefix))
+        if override.startswith(_MODEL_PROVIDER_OVERRIDE_PREFIX):
+            decoded: object = json.loads(override.removeprefix(_MODEL_PROVIDER_OVERRIDE_PREFIX))
+            if not isinstance(decoded, str):
+                raise ValueError("model_provider override must decode to a string")
+            return decoded
     if launch.profile is not None:
         return "omnigent_databricks"
     return "openai"
+
+
+def native_codex_launch_base_url(launch: NativeCodexLaunch) -> str | None:
+    """Inference base URL a resolved launch pins, or None when it defers to Codex's own login.
+
+    Mirrors how the launch is actually applied: the Databricks-profile branch of
+    :func:`build_native_codex_app` derives the base URL from the profile host,
+    while a generic provider carries it inside the generated
+    ``model_providers.…`` config override.
+
+    :param launch: Resolved native-Codex launch, e.g. one returned by
+        :func:`resolve_native_codex_launch`.
+    :returns: The base URL the launch routes through, or ``None`` when the
+        launch pins none.
+    """
+    # Profiles are pins too, but must resolve through their Databricks host
+    # before the generic provider-name path below.
+    if launch.profile is not None:
+        host = _databricks_gateway_host(launch.profile)
+        if not host:
+            return None
+        return _databricks_codex_base_url(host.rstrip("/"))
+    for override in launch.config_overrides:
+        _, sep, table = override.partition("=")
+        if not sep or not override.startswith("model_providers."):
+            continue
+        marker = "base_url="
+        index = table.find(marker)
+        if index < 0:
+            continue
+        decoder = json.JSONDecoder()
+        try:
+            base_url, _ = decoder.raw_decode(table[index + len(marker) :])
+        except ValueError:
+            continue
+        if isinstance(base_url, str):
+            return base_url
+    # A cli-config entry pins only a provider *name*; its table (with the
+    # base_url) lives in the user's shared ~/.codex/config.toml. Read that
+    # file to resolve the base URL a cli-config launch actually routes through.
+    if native_codex_launch_pins_model_provider(launch):
+        return _cli_config_provider_base_url(codex_session_meta_model_provider(launch))
+    # No provider pinned at all: the deliberate config-default path leaves
+    # overrides empty so Codex uses its own config.toml top-level
+    # ``model_provider`` default (a Databricks-wide setup). Resolve that.
+    return _config_default_provider_base_url()
+
+
+def _config_default_provider_base_url() -> str | None:
+    """Base URL Codex's config.toml top-level ``model_provider`` default routes to.
+
+    When omnigent pins no provider, Codex falls back to the top-level
+    ``model_provider`` in the user's shared ``config.toml`` — unless the user
+    dismissed that default, which pins Codex's built-in ``openai`` instead.
+
+    :returns: The default provider table's ``base_url``, or ``None`` when the
+        default is dismissed, absent, or unreadable.
+    """
+    import tomllib
+
+    from omnigent.inner.codex_executor import _codex_home_config_source_from_env
+    from omnigent.onboarding.detected import codex_config_provider_dismissed
+    from omnigent.onboarding.provider_config import load_config
+
+    if codex_config_provider_dismissed(load_config()):
+        return None
+    config_path = _codex_home_config_source_from_env() / "config.toml"
+    try:
+        data = tomllib.loads(config_path.read_text(encoding="utf-8"))
+        provider_name = data["model_provider"]
+    except (OSError, tomllib.TOMLDecodeError, KeyError, TypeError):
+        return None
+    if not isinstance(provider_name, str):
+        return None
+    return _config_toml_provider_base_url(provider_name)
+
+
+def _cli_config_provider_base_url(provider_name: str) -> str | None:
+    """Base URL a cli-config provider name resolves to in the user's codex config.
+
+    A ``cli-config`` launch pins only a ``model_provider`` name; the provider
+    table lives in the user's shared ``config.toml``, which the launch never
+    inlines. Read it here so the gateway-inference probe can see the URL.
+
+    Only genuine cli-config provider names are looked up: ``"openai"`` is
+    Codex's own login (no pinned AIGW) and ``"omnigent_databricks"`` is the
+    profile branch's generated id, so both return ``None``.
+
+    :param provider_name: Provider id from
+        :func:`codex_session_meta_model_provider`.
+    :returns: The provider table's ``base_url``, or ``None`` when it cannot be
+        read.
+    """
+    if provider_name in ("openai", "omnigent_databricks"):
+        return None
+    return _config_toml_provider_base_url(provider_name)
+
+
+def _config_toml_provider_base_url(provider_name: str) -> str | None:
+    """Read ``[model_providers.<provider_name>].base_url`` from the shared config.toml.
+
+    :param provider_name: A provider table key in the user's ``config.toml``.
+    :returns: That table's ``base_url``, or ``None`` when it cannot be read.
+    """
+    import tomllib
+
+    from omnigent.inner.codex_executor import _codex_home_config_source_from_env
+
+    config_path = _codex_home_config_source_from_env() / "config.toml"
+    try:
+        data = tomllib.loads(config_path.read_text(encoding="utf-8"))
+        base_url = data["model_providers"][provider_name]["base_url"]
+    except (OSError, tomllib.TOMLDecodeError, KeyError, TypeError):
+        return None
+    return base_url if isinstance(base_url, str) else None
 
 
 def _codex_provider_launch(entry: ProviderEntry, model: str | None) -> NativeCodexLaunch | None:
@@ -1528,13 +2645,26 @@ def _resolve_subscription_launch(
     )
 
 
-def resolve_native_codex_launch(*, model: str | None) -> NativeCodexLaunch:
+def resolve_native_codex_launch(
+    *, model: str | None, spec: AgentSpec | None = None
+) -> NativeCodexLaunch:
     """Resolve the native Codex launch config across all offerings.
 
     Mirrors the in-process codex harness routing precedence
     (:func:`omnigent.runtime.workflow._resolve_provider_for_build`) for the
     ``openai`` surface, so ``omnigent codex`` and a host-spawned native
     Codex session route through ``omnigent setup``:
+
+    0. (with *spec*) a spec-level credential — ``executor.auth`` naming a
+       provider (:class:`~omnigent.spec.types.ProviderAuth`, fails loud when
+       undeclared), a spec :class:`~omnigent.spec.types.DatabricksAuth`, or a
+       legacy ``executor.profile`` / ``executor.config.profile`` — resolved
+       through :func:`~omnigent.runtime.workflow._resolve_provider_for_build`
+       itself, the same resolver the in-process harness uses, so a spec that
+       routes in-process routes natively too (a spec ``ApiKeyAuth`` resolves
+       to ``None`` for every harness — the resolver leaves bare keys to the
+       claude-sdk / openai-agents builders — so codex-native falls through
+       exactly as in-process codex does);
 
     1. an explicit per-family default provider →
        - ``key`` / ``gateway`` / ``local`` → provider ``-c`` overrides
@@ -1549,16 +2679,21 @@ def resolve_native_codex_launch(*, model: str | None) -> NativeCodexLaunch:
     3. else an ambient-detected provider (first run without configure);
     4. else the codex CLI's own login.
 
-    Credentials are controlled exclusively by ``omnigent setup``
-    provider config (or the legacy global ``auth:`` block) — there is
-    no CLI/env profile override.
+    Without a *spec* (or when the spec carries no spec-level credential),
+    credentials are controlled by ``omnigent setup`` provider config (or the
+    legacy global ``auth:`` block) exactly as before — there is no CLI/env
+    profile override, and machine-level flows are unchanged.
 
     :param model: An explicit/session model override that wins over the
         provider's default model, or ``None``.
+    :param spec: The custom agent spec launching this session, when there is
+        one, so its ``executor.auth`` / legacy profile win over machine-level
+        config (issue #2744 — parity with the in-process codex harness).
     :returns: The resolved :class:`NativeCodexLaunch`.
     """
+    from omnigent.onboarding.ambient import codex_config_detection
     from omnigent.onboarding.detected import (
-        codex_config_provider_dismissed,
+        dismissed_detection_names,
         effective_config_with_detected,
     )
     from omnigent.onboarding.provider_config import (
@@ -1566,18 +2701,80 @@ def resolve_native_codex_launch(*, model: str | None) -> NativeCodexLaunch:
         default_provider_for_harness,
         load_config,
     )
-    from omnigent.runtime.workflow import _load_global_auth
+    from omnigent.runtime.workflow import _load_global_auth, _resolve_provider_for_build
     from omnigent.spec.types import DatabricksAuth
 
     explicit = load_config()
+    config_detection = codex_config_detection()
+    config_provider_dismissed = (
+        config_detection is not None
+        and config_detection.name in dismissed_detection_names(explicit)
+    )
     # When the launch ends up on codex's own login with NO provider routing,
     # the bridged config.toml's custom default model_provider would still
     # apply — including one the user explicitly Removed (dismissed). Pin
     # codex's built-in provider in that case so the dismissal holds at run
     # time. An undetectable/undismissed custom provider keeps its routing.
-    no_provider_overrides = (
-        ['model_provider="openai"'] if codex_config_provider_dismissed(explicit) else []
-    )
+    no_provider_overrides = ['model_provider="openai"'] if config_provider_dismissed else []
+    if spec is not None and (
+        spec.executor.auth is not None
+        or spec.executor.profile
+        or spec.executor.config.get("profile")
+    ):
+        # Spec-level credential (issue #2744): resolve it through the same
+        # resolver the in-process codex harness uses, so switching a working
+        # spec from ``harness: codex`` to ``codex-native`` keeps its auth
+        # working. A named provider that is undeclared raises loud here
+        # instead of parking the TUI on the sign-in screen for a 30s timeout.
+        # A spec ``ApiKeyAuth`` resolves to ``None`` for every harness (the
+        # shared resolver leaves bare keys to the claude-sdk / openai-agents
+        # builders; the in-process codex builder has no ApiKeyAuth branch
+        # either), so codex-native falls through to the machine-level chain
+        # below exactly as in-process codex does — as does a spec credential
+        # that cannot route openai.
+        spec_entry = _resolve_provider_for_build(spec, harness_type="codex", for_launch=True)
+        if spec_entry is not None:
+            if spec_entry.kind == SUBSCRIPTION_KIND:
+                # A spec-named subscription defers to Codex's own login,
+                # logged in or not. The machine-default path would substitute
+                # the first OTHER routable provider on a logged-out Codex
+                # (:func:`_resolve_subscription_launch`) — never do that for
+                # an explicit spec declaration: silently running a credential
+                # the spec did not name is worse than the login screen.
+                from omnigent.onboarding.ambient import codex_auth_has_credential
+
+                if codex_auth_has_credential(_codex_home_config_source_from_env() / "auth.json"):
+                    state = "Codex is logged in"
+                else:
+                    state = (
+                        "Codex is not logged in — the TUI likely renders the "
+                        "sign-in screen and never starts a thread"
+                    )
+                return NativeCodexLaunch(
+                    config_overrides=['model_provider="openai"'],
+                    model=model,
+                    profile=None,
+                    summary=f"Codex CLI login (spec provider {spec_entry.name!r}; {state})",
+                )
+            launch = _codex_provider_launch(spec_entry, model)
+            if launch is not None:
+                if launch.profile is not None:
+                    _logger.info(
+                        "native-codex routing: Databricks ucode profile %r (spec auth)",
+                        launch.profile,
+                    )
+                else:
+                    _logger.info(
+                        "native-codex routing: provider %r (spec auth, model=%s)",
+                        spec_entry.name,
+                        launch.model,
+                    )
+                return launch
+            _logger.warning(
+                "native-codex: spec-level provider %r has no usable openai credential — "
+                "falling back to machine-level resolution.",
+                spec_entry.name,
+            )
     entry = default_provider_for_harness(explicit, "codex")
     if entry is None:
         # No explicit provider default: global auth wins over ambient
@@ -1598,6 +2795,31 @@ def resolve_native_codex_launch(*, model: str | None) -> NativeCodexLaunch:
                 summary="Codex CLI login (global auth block, non-Databricks; no provider routing)",
             )
         entry = default_provider_for_harness(effective_config_with_detected(explicit), "codex")
+
+    if (
+        entry is None
+        and config_detection is not None
+        and config_detection.model_provider is not None
+        and not config_provider_dismissed
+    ):
+        # An adopted cli-config entry can explicitly shadow the same ambient
+        # detection without being marked the Omnigent default. Codex still
+        # selects that provider from config.toml, so pin the already-resolved
+        # detection instead of describing this as an OpenAI-login launch.
+        # This keeps rollout metadata, app-server, and remote TUI routing on
+        # one immutable provider selection during cold resume.
+        provider_id = config_detection.model_provider
+        _logger.info(
+            "native-codex routing: config.toml provider %r (ambient fallback, model=%s)",
+            provider_id,
+            model,
+        )
+        return NativeCodexLaunch(
+            config_overrides=[f"model_provider={json.dumps(provider_id)}"],
+            model=model,
+            profile=None,
+            summary=f"Codex config.toml provider {provider_id!r} (ambient fallback)",
+        )
 
     if entry is None:
         _logger.info(
@@ -1829,6 +3051,7 @@ def codex_terminal_env(app_server: CodexNativeAppServer) -> dict[str, str]:
 # flag because it MUST go, the sandbox flag for hygiene so the launched arg
 # list reflects a single coherent stance.
 _CODEX_BYPASS_SANDBOX_FLAG = "--dangerously-bypass-approvals-and-sandbox"
+_CODEX_BYPASS_HOOK_TRUST_FLAG = "--dangerously-bypass-hook-trust"
 # Granular approval/sandbox flags to drop when bypass is on. The "Full
 # access" / "Read only" approval presets emit the long ``--flag value`` form
 # (see web CODEX_NATIVE_APPROVAL_MODES), but ``terminal_launch_args`` is
@@ -1905,6 +3128,7 @@ def build_codex_remote_args(
     remote_url: str,
     config_overrides: tuple[str, ...] = (),
     bypass_sandbox: bool = False,
+    bypass_hook_trust: bool = False,
 ) -> list[str]:
     """
     Build Codex CLI args for an app-server-backed TUI session.
@@ -1954,10 +3178,22 @@ def build_codex_remote_args(
         prompts and the command sandbox; it is gated behind an explicit,
         typed-confirmation opt-in in the web UI. Default ``False`` keeps
         the granular flags untouched. See issue #657.
+    :param bypass_hook_trust: When ``True``, emit
+        ``--dangerously-bypass-hook-trust`` so the TUI runs all enabled
+        hooks without the interactive "Hooks need review" trust prompt.
+        Intended for runner-owned headless sessions where the private
+        ``CODEX_HOME`` is provisioned by Omnigent and there is no terminal
+        user to answer the prompt. Default ``False`` for interactive
+        ``omnigent codex`` sessions where the user faces the terminal and
+        can accept hooks normally.
     :returns: Codex argv tail after the executable.
     """
     override_args: list[str] = []
     for override in config_overrides:
+        if override.lstrip().startswith("model_providers."):
+            raise ValueError(
+                "Codex remote provider definitions must be materialized in CODEX_HOME"
+            )
         override_args.extend(["-c", override])
     if bypass_sandbox:
         # Strip the conflicting granular flags, then prepend one canonical
@@ -1965,6 +3201,8 @@ def build_codex_remote_args(
         passthrough = [_CODEX_BYPASS_SANDBOX_FLAG, *_strip_approval_sandbox_flags(codex_args)]
     else:
         passthrough = normalize_codex_permission_launch_args(codex_args)
+    if bypass_hook_trust:
+        passthrough = [_CODEX_BYPASS_HOOK_TRUST_FLAG, *passthrough]
     if thread_id is None:
         return [*override_args, *passthrough, "--remote", remote_url]
     return [*override_args, *passthrough, "resume", "--remote", remote_url, thread_id]

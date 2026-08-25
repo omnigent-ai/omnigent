@@ -204,23 +204,15 @@ def _capath_ca_bytes(capath: str | None) -> bytes:
 def _system_ca_bundle() -> bytes:
     """Return the system CA bundle as PEM bytes.
 
-    Combines the OS trust store from ``ssl.get_default_verify_paths``
-    so that CAs added by corporate MDM, IT policy, or the user are
-    included: both the consolidated ``cafile`` bundle AND the loose
-    certs under ``capath`` (where MDM roots often live). Falls back to
-    the certifi (Mozilla) bundle only when neither yields any certs.
+    Delegates cafile resolution to :func:`omnigent.tls.resolve_ca_file` (single
+    source of truth: OS trust store first, certifi fallback). Also includes loose
+    certs under ``capath`` where corporate MDM roots often live.
     """
+    from omnigent.tls import resolve_ca_file
+
+    cafile_bytes = Path(resolve_ca_file()).read_bytes()
+
     paths = ssl.get_default_verify_paths()
-
-    cafile_bytes = b""
-    for candidate in (paths.cafile, paths.openssl_cafile):
-        if candidate:
-            p = Path(candidate)
-            if p.is_file() and p.stat().st_size > 0:
-                logger.debug("Using system CA bundle: %s", p)
-                cafile_bytes = p.read_bytes()
-                break
-
     capath_bytes = b""
     for candidate in (paths.capath, paths.openssl_capath):
         capath_bytes = _capath_ca_bytes(candidate)
@@ -228,11 +220,4 @@ def _system_ca_bundle() -> bytes:
             logger.debug("Including loose CA certs from capath: %s", candidate)
             break
 
-    combined = b"\n".join(part for part in (cafile_bytes, capath_bytes) if part)
-    if combined:
-        return combined
-
-    import certifi
-
-    logger.debug("System CA bundle not found, falling back to certifi")
-    return Path(certifi.where()).read_bytes()
+    return b"\n".join(part for part in (cafile_bytes, capath_bytes) if part)

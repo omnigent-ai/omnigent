@@ -5,7 +5,8 @@
 # spliced into this file via three placeholders that live ONLY in the class body
 # below — keep them out of this comment or the splicer will mangle it:
 #   * the stable `url` / `sha256` lines  -> the released omnigent sdist on PyPI
-#   * the per-dependency `resource` stanzas (one per PyPI sdist in the closure)
+#   * the per-dependency `resource` stanzas (one per package in the closure: the
+#     PyPI sdist, or a pinned wheel for WHEEL_REQUIRED / PREFER_WHEEL)
 #
 # Edit the hand-tuned STRUCTURAL parts here (desc, depends_on, install, test).
 # Edit the dependency set in omnigent-ai/omnigent's `pyproject.toml`
@@ -27,7 +28,10 @@ class Omnigent < Formula
   sha256 "__OMNIGENT_SHA256__"
   license "Apache-2.0"
 
-  # The Rust toolchain builds jiter and watchfiles from source.
+  # Most compiled extensions come from upstream wheels (see PREFER_WHEEL in
+  # generate_formula.py). jiter, tiktoken and watchfiles still build here, because
+  # their maturin wheels have no Mach-O install-name padding and Homebrew cannot
+  # relocate them -- hence the Rust toolchain and the RUSTFLAGS below.
   depends_on "pkgconf" => :build
   depends_on "rust" => :build
   # certifi, cryptography, pydantic (which bundles pydantic-core), and rpds-py
@@ -49,18 +53,25 @@ __RESOURCES__
   def install
     venv = virtualenv_create(libexec, "python3.14")
 
-    # The Rust extensions (jiter, watchfiles) must leave Mach-O header padding so
-    # Homebrew can rewrite their install names to the Cellar path during
-    # relocation (macOS only; the flag breaks Linux ld).
+    # jiter, tiktoken and watchfiles are the only Rust builds left. Their
+    # extensions must leave Mach-O header padding so Homebrew can rewrite install
+    # names to the Cellar path during relocation (macOS only; the flag breaks
+    # Linux ld). Everything else compiled is a prebuilt wheel.
     ENV.append_to_rustflags "-C link-args=-Wl,-headerpad_max_install_names" if OS.mac?
 
-    # argon2-cffi-bindings' sdist ships an unprocessed .git_archival.txt that the
-    # (build-isolated, latest) setuptools-scm parses instead of falling back to
-    # PKG-INFO, so version detection fails. Pin the version it should report.
-    ENV["SETUPTOOLS_SCM_PRETEND_VERSION_FOR_ARGON2_CFFI_BINDINGS"] =
-      resource("argon2-cffi-bindings").version.to_s
-
-    venv.pip_install resources
+    # Pure-Python resources are sdists Homebrew builds in place. Every other
+    # compiled extension is pinned to an upstream wheel (WHEEL_REQUIRED /
+    # PREFER_WHEEL in generate_formula.py), which is what keeps this formula out of
+    # cc/rustc on a 3-core bottle builder. Homebrew only auto-installs
+    # `py3-none-any` wheels, so copy each platform wheel's cached download back to
+    # its real filename and pip-install the file directly.
+    wheels, sdists = resources.partition { |r| r.url.end_with?(".whl") }
+    venv.pip_install sdists
+    wheels.each do |r|
+      whl = buildpath/r.url.split("/").last
+      cp r.cached_download, whl
+      venv.pip_install whl
+    end
 
     venv.pip_install_and_link buildpath
 
@@ -79,5 +90,10 @@ __RESOURCES__
     # provided by Homebrew formulae and imported from the brewed python through
     # the virtualenv's system site-packages; confirm they resolve in the venv.
     system libexec/"bin/python", "-c", "import certifi, cryptography, pydantic, rpds"
+
+    # celpy imports re2 at module scope and omnigent imports celpy behind a
+    # try/except, so a google-re2 that failed to build disables inline policies
+    # silently instead of failing. Import both so the gap is caught at build time.
+    system libexec/"bin/python", "-c", "import re2, celpy"
   end
 end

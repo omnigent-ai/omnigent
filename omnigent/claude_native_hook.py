@@ -11,9 +11,7 @@ import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
-
-import httpx
+from typing import TYPE_CHECKING
 
 from omnigent.claude_native_bridge import (
     BRIDGE_ID_LABEL_KEY,
@@ -29,15 +27,13 @@ from omnigent.claude_native_bridge import (
     url_component,
     write_active_session_id,
 )
-from omnigent.entities.session_resources import terminal_resource_id
-from omnigent.native_policy_hook import (
-    _is_login_redirect_or_unauthorized,
-    evaluation_response_to_hook_output,
-    fail_closed_hook_output,
-    hook_payload_to_evaluation_request,
-    policy_hook_reauth,
-    post_evaluate_with_retry,
-)
+
+# The observer path (the default, most frequent invocation — Claude blocks
+# on it per Stop/UserPromptSubmit/TaskCreated/...) must not pay the
+# httpx/policy import cost; those are imported inside the subcommands and
+# helpers that actually speak HTTP.
+if TYPE_CHECKING:
+    import httpx
 
 # Client-side budget for the permission-request long-poll to AP. Held
 # at one day so the hook subprocess waits ~indefinitely for a verdict
@@ -127,17 +123,23 @@ def _env_float(name: str, default: float) -> float:
 # down server can no longer re-POST for a day. Overridable for operators who
 # want more slack against a flaky upstream.
 _PERMISSION_MAX_CONSECUTIVE_FAILURES = max(1, _env_int("OMNIGENT_HOOK_MAX_RETRIES", 8))
-# httpx errors that mean the request never reached a live server (no response
-# was ever begun). These are unambiguous hard failures — the server is down /
-# unreachable, not holding a poll. Everything else under ``httpx.HTTPError``
-# that is not a 4xx/5xx status (RemoteProtocolError, ReadError, ReadTimeout, …)
-# means the connection was established and then severed mid-poll.
-_NEVER_CONNECTED_ERRORS = (
-    httpx.ConnectError,
-    httpx.ConnectTimeout,
-    httpx.PoolTimeout,
-    httpx.ProxyError,
-)
+
+
+def _never_connected_errors() -> tuple[type[Exception], ...]:
+    """httpx errors meaning the request never reached a live server.
+
+    No response was ever begun — unambiguous hard failures (the server is
+    down / unreachable), not a held poll. Everything else under
+    ``httpx.HTTPError`` that is not a 4xx/5xx status (RemoteProtocolError,
+    ReadError, ReadTimeout, …) means the connection was established and
+    then severed mid-poll. A function, not a module constant, so the
+    hook's hot observer path never imports httpx.
+    """
+    import httpx
+
+    return (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout, httpx.ProxyError)
+
+
 # An established connection that drops in under this many seconds is treated as
 # a flapping/crash-looping server (a hard failure), NOT a genuinely-parked poll
 # a proxy severed. Comfortably below any real idle-proxy timeout (typically
@@ -185,6 +187,8 @@ def main(argv: list[str] | None = None) -> int:
         return _main_ask_user_question(raw_argv[1:])
     if raw_argv and raw_argv[0] == "evaluate-policy":
         return _main_evaluate_policy(raw_argv[1:])
+    if raw_argv and raw_argv[0] == "route-turn":
+        return _main_route_turn(raw_argv[1:])
     # Backwards compat: older bridge dirs may still reference the
     # pre-tool-use subcommand before the terminal is restarted.
     if raw_argv and raw_argv[0] == "pre-tool-use":
@@ -362,6 +366,18 @@ def _rotate_session_on_clear(bridge_dir: Path) -> str | None:
         if isinstance(raw_headers, dict)
         else {}
     )
+    import httpx
+
+    # Route the whole rotation sequence (GET old, POST /v1/sessions or /fork,
+    # PATCH new, DELETE old) to the replica holding this host's tunnel: a managed
+    # create/fork notifies the host inline over its pod-local tunnel, so an
+    # off-replica request can't reach it. This hook client carries no
+    # _RunnerDatabricksAuth, so key the reused headers dict from the runner-env
+    # host_id (databricks_request_headers reads OMNIGENT_RUNNER_SLICE_KEY when no
+    # explicit host_id; emitted only on the workspace mount).
+    from omnigent.cli_auth import databricks_request_headers
+
+    headers.update(databricks_request_headers(ap_server_url))
     try:
         with httpx.Client(
             headers=headers, timeout=httpx.Timeout(_SESSION_ROTATION_TIMEOUT_S)
@@ -408,6 +424,18 @@ def _rotate_session_on_fork(bridge_dir: Path) -> str | None:
         if isinstance(raw_headers, dict)
         else {}
     )
+    import httpx
+
+    # Route the whole rotation sequence (GET old, POST /v1/sessions or /fork,
+    # PATCH new, DELETE old) to the replica holding this host's tunnel: a managed
+    # create/fork notifies the host inline over its pod-local tunnel, so an
+    # off-replica request can't reach it. This hook client carries no
+    # _RunnerDatabricksAuth, so key the reused headers dict from the runner-env
+    # host_id (databricks_request_headers reads OMNIGENT_RUNNER_SLICE_KEY when no
+    # explicit host_id; emitted only on the workspace mount).
+    from omnigent.cli_auth import databricks_request_headers
+
+    headers.update(databricks_request_headers(ap_server_url))
     try:
         with httpx.Client(
             headers=headers, timeout=httpx.Timeout(_SESSION_ROTATION_TIMEOUT_S)
@@ -456,8 +484,12 @@ def _create_clear_replacement_session(
     if not isinstance(agent_id, str) or not agent_id:
         raise RuntimeError(f"session {old_session_id!r} has no agent_id")
     runner_id = old.get("runner_id")
-    labels = old.get("labels") if isinstance(old.get("labels"), dict) else {}
-    labels = {str(key): str(value) for key, value in labels.items()}
+    raw_labels = old.get("labels")
+    labels = (
+        {str(key): str(value) for key, value in raw_labels.items()}
+        if isinstance(raw_labels, dict)
+        else {}
+    )
     labels.setdefault(BRIDGE_ID_LABEL_KEY, read_bridge_id(bridge_dir) or old_session_id)
 
     create_resp = client.post(
@@ -481,6 +513,8 @@ def _create_clear_replacement_session(
             json={"runner_id": runner_id},
         )
         bind_resp.raise_for_status()
+
+    from omnigent.entities.session_resources import terminal_resource_id
 
     terminal_id = terminal_resource_id("claude", "main")
     transfer_resp = client.post(
@@ -562,6 +596,8 @@ def _create_fork_replacement_session(
         )
         bind_resp.raise_for_status()
 
+    from omnigent.entities.session_resources import terminal_resource_id
+
     terminal_id = terminal_resource_id("claude", "main")
     transfer_resp = client.post(
         (
@@ -618,7 +654,7 @@ def _conversation_url_for_active_session(
 def _post_hook_with_reattach(
     url: str,
     headers: dict[str, str],
-    payload: dict[str, Any],
+    payload: dict[str, object],
     hook_label: str,
     reauth: Callable[[], dict[str, str] | None] | None = None,
 ) -> httpx.Response | None:
@@ -641,7 +677,7 @@ def _post_hook_with_reattach(
     Failure classification:
 
     * **Hard failure → count toward the cap.** A 5xx, or a connection that
-      never established (:data:`_NEVER_CONNECTED_ERRORS`), or an established
+      never established (:func:`_never_connected_errors`), or an established
       connection that dropped in under :data:`_PERMISSION_HELD_POLL_FLOOR_S`
       (a flapping/crash-looping server). This is the spin.
     * **Held-poll sever → reset the counter.** An established connection that
@@ -694,6 +730,10 @@ def _post_hook_with_reattach(
         "_omnigent_elicitation_id": f"elicit_claude_{secrets.token_hex(16)}",
     }
     backoff_s = _PERMISSION_RETRY_INITIAL_BACKOFF_S
+    import httpx
+
+    from omnigent.native_policy_hook import _is_login_redirect_or_unauthorized
+
     timeout = httpx.Timeout(_PERMISSION_TIMEOUT_S, connect=_PERMISSION_CONNECT_TIMEOUT_S)
     # Absolute backstop: even a run of held-poll severs (which don't count
     # toward the hard-failure cap) can't loop past the day-long human-answer
@@ -744,7 +784,7 @@ def _post_hook_with_reattach(
             # Classify by HOW it failed, not by elapsed time (a proxy severs a
             # legitimately-held poll in seconds-to-minutes, so wall-clock can't
             # tell it from a down server — #1782 Polly review).
-            never_connected = isinstance(exc, _NEVER_CONNECTED_ERRORS)
+            never_connected = isinstance(exc, _never_connected_errors())
             held_s = time.monotonic() - attempt_started
             # Hard failure iff the server was never reached, OR an established
             # connection dropped so fast it's a flap rather than a parked poll.
@@ -794,6 +834,8 @@ def _main_permission_request(argv: list[str]) -> int:
     :returns: Process exit code. Returns ``0`` on transport failures so
         Claude Code falls back to its terminal prompt.
     """
+    from omnigent.native_policy_hook import policy_hook_reauth
+
     args = _parse_permission_args(argv)
     raw = sys.stdin.read()
     try:
@@ -819,6 +861,13 @@ def _main_permission_request(argv: list[str]) -> int:
         raw_headers = config.get("ap_auth_headers")
         if isinstance(raw_headers, dict):
             headers = {str(key): str(value) for key, value in raw_headers.items()}
+    # A permission request raises a web elicitation that parks in the pod-local
+    # registry on the replica holding this session's runner tunnel; an unkeyed
+    # POST lands elsewhere and the approval is silently lost. Key from the
+    # runner-env host_id (reads OMNIGENT_RUNNER_SLICE_KEY; workspace mount only).
+    from omnigent.cli_auth import databricks_request_headers
+
+    headers.update(databricks_request_headers(ap_server_url))
     url = (
         f"{ap_server_url.rstrip('/')}/v1/sessions/"
         f"{url_component(session_id)}/hooks/permission-request"
@@ -860,6 +909,8 @@ def _main_ask_user_question(argv: list[str]) -> int:
     :returns: Process exit code. Returns ``0`` on any failure so Claude Code
         falls back to its terminal TUI prompt rather than blocking.
     """
+    from omnigent.native_policy_hook import policy_hook_reauth
+
     args = _parse_permission_args(argv)
     raw = sys.stdin.read()
     try:
@@ -891,6 +942,12 @@ def _main_ask_user_question(argv: list[str]) -> int:
         raw_headers = config.get("ap_auth_headers")
         if isinstance(raw_headers, dict):
             headers = {str(key): str(value) for key, value in raw_headers.items()}
+    # Same as the permission-request hook: the elicitation parks in the pod-local
+    # registry on the session's tunnel replica, so key the POST from the
+    # runner-env host_id or an off-replica landing silently drops the prompt.
+    from omnigent.cli_auth import databricks_request_headers
+
+    headers.update(databricks_request_headers(ap_server_url))
     url = (
         f"{ap_server_url.rstrip('/')}/v1/sessions/"
         f"{url_component(session_id)}/hooks/permission-request"
@@ -988,6 +1045,16 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     :returns: Process exit code. Always ``0`` — blocking verdicts
         are expressed via the JSON output, not exit codes.
     """
+    from omnigent.native_policy_hook import (
+        evaluation_response_to_hook_output,
+        fail_closed_hook_output,
+        hook_payload_to_evaluation_request,
+        policy_hook_reauth,
+        post_evaluate_with_retry,
+        read_relay_policy_config,
+        relay_policy_evaluate_url,
+    )
+
     args = _parse_evaluate_policy_args(argv)
     raw = sys.stdin.read()
     try:
@@ -1002,14 +1069,6 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     session_id = read_active_session_id(bridge_dir)
     if not session_id:
         return 0
-    config = read_permission_hook_config(bridge_dir)
-    ap_server_url = config.get("ap_server_url")
-    if not isinstance(ap_server_url, str) or not ap_server_url:
-        return 0
-    headers: dict[str, str] = {}
-    raw_headers = config.get("ap_auth_headers")
-    if isinstance(raw_headers, dict):
-        headers = {str(key): str(value) for key, value in raw_headers.items()}
 
     hook_event = payload.get("hook_event_name", "")
     eval_request = hook_payload_to_evaluation_request(hook_event, payload)
@@ -1017,29 +1076,12 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         # Unrecognized hook event — no policy to evaluate.
         return 0
 
-    # Stamp the live model from this session's statusLine capture (the
-    # statusLine wrapper writes the active model id into ``context.json`` on
-    # every render — including right after an in-pane ``/model`` switch). This
-    # is the cost gate's source of truth at hook time, race-free, unlike the
-    # forwarder's async ``model_override`` mirror which lags a poll behind.
-    # Without it the cost-budget gate can see an unresolved model (None) and
-    # fail closed — blocking a cheap-model (sonnet/haiku) session over budget,
-    # even though only expensive tiers should be gated (the server prefers a
-    # stamped model over its own resolution; see ``PolicyEngine._inject_model``).
-    # hook_payload_to_evaluation_request always returns an event with a
-    # "context" dict, so index it directly (fail loud if that contract changes).
+    # Stamp the live model from this session's statusLine capture.
     context = eval_request["event"]["context"]
-    # Stamp the harness so the over-budget message names claude-native's
-    # model-switch surface (the in-pane ``/model`` picker).
     context["harness"] = "claude-native"
     status_model = read_claude_status_model(bridge_dir)
     if status_model:
         context["model"] = status_model
-
-    # The session is governed (active id + ap_server_url) and we have a
-    # policy-relevant event: from here a failure to obtain a usable verdict
-    # fails CLOSED for the tool-call gate (see ``fail_closed_hook_output``).
-    reauth = policy_hook_reauth(ap_server_url, headers)
 
     def _fail_closed(detail: str | None = None) -> int:
         out = fail_closed_hook_output(hook_event, detail)
@@ -1047,7 +1089,35 @@ def _main_evaluate_policy(argv: list[str]) -> int:
             sys.stdout.write(json.dumps(out))
         return 0
 
-    url = f"{ap_server_url.rstrip('/')}/v1/sessions/{url_component(session_id)}/policies/evaluate"
+    # Prefer the relay; fall back to direct server call when relay not yet up.
+    relay = read_relay_policy_config(bridge_dir)
+    if relay:
+        relay_url, relay_token, _sid = relay
+        url = relay_policy_evaluate_url(relay_url)
+        headers: dict[str, str] = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {relay_token}",
+        }
+        reauth = None
+    else:
+        config = read_permission_hook_config(bridge_dir)
+        ap_server_url = config.get("ap_server_url")
+        if not isinstance(ap_server_url, str) or not ap_server_url:
+            return 0
+        headers = {}
+        raw_headers = config.get("ap_auth_headers")
+        if isinstance(raw_headers, dict):
+            headers = {str(k): str(v) for k, v in raw_headers.items()}
+        # This posts to the session's policy registry on the replica holding its
+        # tunnel; key from the runner-env host_id so it isn't misrouted. (The
+        # relay branch above targets a relay token URL, so it needs no key.)
+        from omnigent.cli_auth import databricks_request_headers
+
+        headers.update(databricks_request_headers(ap_server_url))
+        session_component = url_component(session_id)
+        url = f"{ap_server_url.rstrip('/')}/v1/sessions/{session_component}/policies/evaluate"
+        reauth = policy_hook_reauth(ap_server_url, headers)
+
     resp, api_error = post_evaluate_with_retry(
         url,
         headers,
@@ -1057,7 +1127,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         reauth=reauth,
     )
     if resp is None:
-        return _fail_closed(api_error or reauth.failure_reason)
+        return _fail_closed(api_error or (reauth.failure_reason if reauth else None))
     if not resp.content:
         print("omnigent evaluate-policy hook: empty Omnigent response", file=sys.stderr)
         return _fail_closed()
@@ -1135,6 +1205,187 @@ def _parse_headers(raw: str | None) -> dict[str, str]:
     if not isinstance(parsed, dict):
         return {}
     return {str(key): str(value) for key, value in parsed.items()}
+
+
+def _main_route_turn(argv: list[str]) -> int:
+    """
+    Route the model this session runs on, from its first real prompt.
+
+    The in-harness half of first-message routing (see
+    :mod:`omnigent.runner.turn_routing`), registered as an extra
+    ``UserPromptSubmit`` command alongside the forwarder's status hook and
+    the policy gate. On every prompt submit, in order:
+
+    1. Fast skip on ``<bridge_dir>/turn_routing_done`` **when it names this
+       session** — no output, no network. The authoritative gate is the
+       endpoint's routing-decision check; this file only saves the round
+       trip, and a ``/clear`` rotation hands the same bridge dir to a new
+       conversation whose first message must still be able to route.
+    2. POST ``{session_id, prompt, harness, model}`` to the advertised
+       loopback ``route-turn`` endpoint. Claude's hook payload carries no
+       model, so ``model`` is the live one from ``context.json`` (the
+       statusLine snapshot) — never a config file, which reports the
+       launch model.
+    3. On a routed verdict: write the marker and BLOCK the prompt. The
+       hook does **not** touch the model itself — the pane is frozen
+       waiting on this very subprocess, so keystrokes sent from here would
+       queue behind the block. The runner replays the prompt through the
+       normal turn path, which applies the routed model under the pane's
+       inject lock and then delivers the text.
+
+    Fails open everywhere: an absent advertisement, an unreachable
+    endpoint or an unroutable verdict all exit ``0`` with no output, and
+    the prompt runs untouched on the current model.
+
+    :param argv: CLI argv after the ``route-turn`` subcommand, e.g.
+        ``["--bridge-dir", "/tmp/x", "--harness", "claude-native"]``.
+    :returns: Process exit code. Always ``0`` — the block is expressed via
+        the JSON on stdout, never via the exit code.
+    """
+    from omnigent.runner.turn_routing import (
+        ADVERTISEMENT_FILE,
+        HOOK_REQUEST_TIMEOUT_S,
+        ROUTE_PATH_TEMPLATE,
+        turn_routing_marker_present,
+    )
+
+    parser = argparse.ArgumentParser(prog="python -m omnigent.claude_native_hook route-turn")
+    parser.add_argument("--bridge-dir", required=True)
+    parser.add_argument("--harness", default="claude-native")
+    args = parser.parse_args(argv)
+    bridge_dir = Path(args.bridge_dir)
+
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except json.JSONDecodeError:
+        return 0
+    if not isinstance(payload, dict):
+        return 0
+    prompt = payload.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return 0
+
+    from omnigent.inner.hook_scripts.subagent_router import read_router_endpoint
+
+    endpoint = read_router_endpoint(bridge_dir, filename=ADVERTISEMENT_FILE)
+    if endpoint is None:
+        return 0
+    # The bridge's ACTIVE session wins over the advertisement's, which is
+    # written once at launch and goes stale the moment ``/clear`` re-keys this
+    # pane onto a new conversation. Same source the permission hook reads for
+    # the same reason — approvals and routing both have to follow rotations.
+    # Reading the stale id instead made the new conversation ask (and skip) as
+    # the superseded one.
+    session_id = read_active_session_id(bridge_dir) or endpoint.session_id
+    if not session_id:
+        return 0
+
+    # The marker is checked here, after the session id is known, because it is
+    # scoped to a session: a ``/clear`` rotation hands this same bridge dir to
+    # a NEW conversation, whose first message must still be able to route.
+    # Still zero network on the fast path.
+    if turn_routing_marker_present(bridge_dir, session_id):
+        return 0
+
+    body = {
+        "harness": args.harness,
+        "prompt": prompt,
+        # Claude's payload has no turn id the runner could match a replay
+        # against, and a blocked prompt starts no turn at all.
+        "turn_id": None,
+        "model": read_claude_status_model(bridge_dir),
+    }
+    url = endpoint.url + ROUTE_PATH_TEMPLATE.format(session_id=url_component(session_id))
+    decision = _route_turn_post(url, endpoint.token, body, HOOK_REQUEST_TIMEOUT_S)
+    if decision is None:
+        return 0
+    model = decision.get("model")
+    if decision.get("action") != "route" or not isinstance(model, str) or not model:
+        if decision.get("terminal"):
+            # Nothing will route this session again, so stop asking. Covers the
+            # no-op verdict too (the pick equals the live model): terminal and
+            # unblocking, so the prompt runs where it already was.
+            _write_turn_routing_marker(bridge_dir, session_id, decision)
+        return 0
+    # The marker is what tells the runner "this prompt was dropped, you owe
+    # it a replay", so a marker we could not write means we must not block.
+    if not _write_turn_routing_marker(bridge_dir, session_id, decision):
+        return 0
+    sys.stdout.write(
+        json.dumps(
+            {
+                "decision": "block",
+                "reason": f"Smart Routing selected {model}; rerunning your message on it.",
+            }
+        )
+    )
+    sys.stdout.flush()
+    return 0
+
+
+def _write_turn_routing_marker(
+    bridge_dir: Path, session_id: str, decision: dict[str, object]
+) -> bool:
+    """
+    Write the session-scoped turn-routing marker file.
+
+    :param bridge_dir: Native Claude bridge directory.
+    :param session_id: Session the verdict belongs to — the conversation a
+        later ``/clear`` rotation creates must not fast-skip on it.
+    :param decision: The verdict, for its ``decision_id``.
+    :returns: ``True`` when the marker is on disk.
+    """
+    from omnigent.runner.turn_routing import write_turn_routing_marker
+
+    decision_id = decision.get("decision_id")
+    if write_turn_routing_marker(
+        bridge_dir,
+        session_id=session_id,
+        decision_id=decision_id if isinstance(decision_id, str) else None,
+    ):
+        return True
+    print(
+        "omnigent claude route-turn hook: could not write the turn marker",
+        file=sys.stderr,
+    )
+    return False
+
+
+def _route_turn_post(
+    url: str,
+    token: str,
+    body: dict[str, object],
+    timeout: float,
+) -> dict[str, object] | None:
+    """
+    POST one JSON body to the loopback ``route-turn`` endpoint.
+
+    Uses :mod:`urllib` rather than the module's ``httpx`` import so the
+    call stays available to a ``python -I`` hook whose interpreter may not
+    resolve site packages the same way the CLI's does.
+
+    :param url: Fully-qualified loopback URL.
+    :param token: Bearer token from the advertisement.
+    :param body: Request body.
+    :param timeout: Socket timeout in seconds.
+    :returns: The decoded response object, or ``None`` on any transport or
+        decode failure (callers treat that as "allow unrouted").
+    """
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            decoded = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+        return None
+    return decoded if isinstance(decoded, dict) else None
 
 
 if __name__ == "__main__":

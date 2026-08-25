@@ -252,6 +252,30 @@ def configure_mock_llm(
     resp.raise_for_status()
 
 
+def set_fallback_mock_llm(
+    mock_llm_server_url: str,
+    key: str,
+    text: str,
+) -> None:
+    """Set a non-resettable fallback response for a queue key.
+
+    Returned once the regular queue for *key* is exhausted, so a test
+    stays deterministic when the harness makes more model calls than it
+    queued responses for — e.g. a background session-title call racing
+    the user turn for the same keyed queue.
+
+    :param mock_llm_server_url: Mock server base URL.
+    :param key: Queue key (typically the model name).
+    :param text: Fallback response text.
+    """
+    resp = httpx.post(
+        f"{mock_llm_server_url}/mock/set_fallback",
+        json={"key": key, "text": text},
+        timeout=5.0,
+    )
+    resp.raise_for_status()
+
+
 def reset_mock_llm(mock_llm_server_url: str) -> None:
     """Clear all keyed queues, captured requests, and gates."""
     resp = httpx.post(f"{mock_llm_server_url}/mock/reset", timeout=5.0)

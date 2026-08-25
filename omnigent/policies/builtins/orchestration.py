@@ -9,11 +9,13 @@ The evaluators run runner-side at tool dispatch
 
 from __future__ import annotations
 
-import os
+import posixpath
 import re
 import shlex
 from collections.abc import Callable, Collection
 from typing import Any, TypeAlias
+
+from omnigent.policies.builtins._shell import SHELL_TOOLS
 
 # Heterogeneous JSON-shaped maps — the V0 policy event + decision payloads.
 _Json: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
@@ -129,9 +131,7 @@ _GIT_GLOBAL_VALUE_OPTS: frozenset[str] = frozenset(
 )
 _PUSH_SHORT_VALUE_OPTS: frozenset[str] = frozenset({"o"})
 _ENV_ASSIGNMENT_RE: re.Pattern[str] = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
-_SHELL_TOOLS: frozenset[str] = frozenset(
-    {"sys_os_shell", "Bash", "bash", "Shell", "terminal", "developer__shell"}
-)
+_SHELL_TOOLS: frozenset[str] = SHELL_TOOLS
 
 
 def _shell_statements(command: str) -> list[list[str]]:
@@ -580,11 +580,25 @@ def worktree_guard(
         # ``..\\`` past the split-on-'/' traversal check.
         if "\\" in path:
             return _decision("DENY", f"{deny_reason} (outside {allowed_root}/: {path!r})")
+        # posixpath, NOT os.path: the tool contract is POSIX-shaped, and
+        # ntpath.normpath rewrites "/" to "\", which makes the leading-"/" test
+        # below inert on a Windows runner (absolute paths would ALLOW there).
         # normpath collapses ``..``/``.``/repeated slashes and pushes every
         # upward traversal to the front, so a single startswith catches every
         # escape form (e.g. "a/../../escape" → "../../escape").
-        normalized = os.path.normpath(path)
+        normalized = posixpath.normpath(path)
         if normalized.startswith(("/", "~", "..")):
+            return _decision("DENY", f"{deny_reason} (outside {allowed_root}/: {path!r})")
+        # A drive-qualified path ("C:/Windows/x") is absolute on Windows but
+        # reads as an ordinary relative dir named "C:" to posixpath, so the test
+        # above misses it. Checked on the NORMALIZED path, not the raw one:
+        # normpath strips a leading "./" (and collapses "a/../C:/..."), which
+        # would otherwise hide the drive letter from a raw-string check. UNC
+        # ("//server/share") keeps its leading slashes and is caught above.
+        # ASCII-only: Windows drives are [A-Za-z], but str.isalpha() is
+        # Unicode-aware and would also reject a relative dir named e.g. "Ω:".
+        drive = normalized[:1]
+        if drive.isascii() and drive.isalpha() and normalized[1:2] == ":":
             return _decision("DENY", f"{deny_reason} (outside {allowed_root}/: {path!r})")
         return _ALLOW
 
@@ -644,7 +658,7 @@ def read_only_os(
 
 # ── Registry ─────────────────────────────────────────────────────────────────
 
-POLICY_REGISTRY: list[dict[str, Any]] = [
+POLICY_REGISTRY: list[dict[str, object]] = [
     {
         "handler": "omnigent.policies.builtins.orchestration.blast_radius",
         "kind": "factory",

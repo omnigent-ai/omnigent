@@ -245,6 +245,7 @@ jobs:
           stderr-file: /tmp/draft-stderr.log
           gateway-base-url: ${{ secrets.GATEWAY_BASE_URL }}
           llm-api-key: ${{ secrets.LLM_API_KEY }}
+          model: ${{ vars.OMNIGENT_CI_ANTHROPIC_MODEL }}
 
       - name: Extract synthesized notes (fall back to mechanical)
         if: steps.guard.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'

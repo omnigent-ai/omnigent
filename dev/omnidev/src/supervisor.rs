@@ -156,10 +156,12 @@ impl Supervisor {
 
     async fn start_backend(&mut self) {
         self.spawn(ProcId::Server);
-        if self.wait_healthy().await {
+        if self.pod.host_enabled() && self.wait_healthy().await {
             self.spawn(ProcId::Host);
-        } else {
+        } else if self.pod.host_enabled() {
             self.event("server did not become healthy; host not started");
+        } else {
+            self.set_status(ProcId::Host, ProcStatus::Stopped);
         }
     }
 
@@ -171,7 +173,9 @@ impl Supervisor {
         self.set_status(ProcId::Server, ProcStatus::Restarting);
         self.set_status(ProcId::Host, ProcStatus::Restarting);
         self.spawn(ProcId::Server);
-        if self.wait_healthy().await {
+        if !self.pod.host_enabled() {
+            self.set_status(ProcId::Host, ProcStatus::Stopped);
+        } else if self.wait_healthy().await {
             self.spawn(ProcId::Host);
         } else {
             self.event("server did not become healthy after restart");
@@ -272,23 +276,28 @@ impl Supervisor {
         });
     }
 
-    /// Run `pnpm install` to completion before Vite starts, but only when deps
-    /// are missing or stale — otherwise Vite's dependency scan fails on an
-    /// unresolved import (e.g. a dep added to package.json but not installed).
+    /// Prepare web dependencies before Vite starts, but only when they are
+    /// missing or stale. OSS uses `pnpm install`; profiles choose the command.
     /// Output streams into the Vite pane. A failed/absent install is logged but
     /// non-fatal: we still let Vite try, so a transient pnpm hiccup doesn't block
     /// the whole session.
     async fn prepare_vite(&self) {
-        if !self.pod.needs_pnpm_install() {
+        if self
+            .pod
+            .profile
+            .as_ref()
+            .is_some_and(|profile| profile.prepare.is_none())
+            || !self.pod.needs_web_prepare()
+        {
             return;
         }
         self.set_status(ProcId::Vite, ProcStatus::Starting);
         self.shared.lock().unwrap().log_proc(
             ProcId::Vite,
-            "web deps missing or stale — running pnpm install".into(),
+            "web deps missing or stale — preparing dependencies".into(),
         );
 
-        let spec = ProcSpec::pnpm_install(&self.pod);
+        let spec = ProcSpec::web_prepare(&self.pod);
         let mut cmd = Command::new(&spec.program);
         cmd.args(&spec.args)
             .current_dir(&spec.cwd)
@@ -301,10 +310,10 @@ impl Supervisor {
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
-                self.shared
-                    .lock()
-                    .unwrap()
-                    .log_proc(ProcId::Vite, format!("failed to run pnpm install: {e}"));
+                self.shared.lock().unwrap().log_proc(
+                    ProcId::Vite,
+                    format!("failed to prepare web dependencies: {e}"),
+                );
                 return;
             }
         };
@@ -327,17 +336,19 @@ impl Supervisor {
                     self.shared
                         .lock()
                         .unwrap()
-                        .log_proc(ProcId::Vite, format!("… pnpm install running ({secs}s)"));
+                        .log_proc(ProcId::Vite, format!("… dependency preparation running ({secs}s)"));
                 }
             }
         };
         match status {
             Ok(s) if s.success() => self.event(format!(
-                "pnpm install complete ({}s)",
+                "web dependency preparation complete ({}s)",
                 started.elapsed().as_secs()
             )),
-            Ok(s) => self.event(format!("pnpm install exited {s} — starting Vite anyway")),
-            Err(e) => self.event(format!("pnpm install wait error: {e}")),
+            Ok(s) => self.event(format!(
+                "web dependency preparation exited {s} — starting Vite anyway"
+            )),
+            Err(e) => self.event(format!("web dependency preparation wait error: {e}")),
         }
     }
 
@@ -427,6 +438,9 @@ impl Supervisor {
         match exit.id {
             ProcId::Server => self.start_backend_restart().await,
             ProcId::Host => {
+                if !self.pod.host_enabled() {
+                    return;
+                }
                 if self.wait_healthy().await {
                     self.spawn(ProcId::Host);
                 } else {

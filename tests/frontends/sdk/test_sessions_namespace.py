@@ -113,6 +113,7 @@ def _session_response_body(
         "agent_id": agent_id,
         "status": status,
         "created_at": 1700000000,
+        "updated_at": 1700000042,
         "items": items if items is not None else [],
     }
 
@@ -242,6 +243,26 @@ async def test_get_returns_typed_session() -> None:
     # items round-trip as raw dicts (heterogeneous, intentionally
     # un-modeled per the namespace docstring).
     assert session.items == [{"id": "msg_1", "type": "message"}]
+    assert session.updated_at == 1700000042
+
+
+@pytest.mark.asyncio
+async def test_get_updated_at_defaults_to_none_when_omitted() -> None:
+    """Older session responses without ``updated_at`` remain parseable."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        payload = _session_response_body()
+        payload.pop("updated_at")
+        return httpx.Response(200, json=payload)
+
+    ns, client = _make_namespace(handler)
+    try:
+        session = await ns.get("conv_abc")
+    finally:
+        await client.aclose()
+
+    assert session.updated_at is None
 
 
 @pytest.mark.asyncio

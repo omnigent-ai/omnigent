@@ -104,6 +104,7 @@ export async function fetchLastAssistantText(
 ): Promise<string | undefined> {
   try {
     const params = new URLSearchParams({ limit: String(SCAN_ITEMS), order: "desc" });
+    // oxlint-disable-next-line eslint/no-restricted-globals -- This lookup uses the page origin.
     const res = await fetch(`/v1/sessions/${encodeURIComponent(sessionId)}/items?${params}`);
     if (!res.ok) return undefined;
     const json = (await res.json()) as { data?: unknown };

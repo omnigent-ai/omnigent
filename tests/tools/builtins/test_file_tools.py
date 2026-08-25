@@ -331,6 +331,15 @@ def test_list_files_rejects_non_string_after(tool_ctx: ToolContext) -> None:
     assert result == {"error": "'after' must be a string"}
 
 
+def test_list_files_requires_conversation_id() -> None:
+    tool = ListFilesTool()
+    ctx = ToolContext(task_id="task_test", agent_id="agent_test")
+
+    result = json.loads(tool.invoke("{}", ctx))
+
+    assert result == {"error": "list_files requires a conversation_id"}
+
+
 def test_list_files_excludes_other_sessions(
     monkeypatch: pytest.MonkeyPatch,
     tool_ctx: ToolContext,

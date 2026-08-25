@@ -8,18 +8,19 @@
 //!   keep a git-based omnigent up to date. These need no checkout and run
 //!   anywhere.
 //! - **omnigent passthrough** (`omnidev omnigent …`): run any omnigent command
-//!   against the current checkout's pod via `uv run omnigent …`, with the pod's
+//!   against the current checkout's pod via pinned `uv run --python …`, with the pod's
 //!   isolated env applied. Requires a checkout, like the supervisor.
 
 mod install;
 mod lan;
 mod lock;
 mod logs;
+mod omnigent_cmd;
 mod paths;
 mod pod;
-mod omnigent_cmd;
 mod ports;
 mod process;
+mod profile;
 mod shellhook;
 mod state;
 mod supervisor;
@@ -81,7 +82,7 @@ enum Command {
     Refresh,
     /// Print a shell snippet to eval from .zshrc/.bashrc for daily checks.
     ShellHook,
-    /// Run an omnigent command against this checkout's pod (`uv run omnigent …`).
+    /// Run an omnigent command against this checkout's pod (pinned `uv run --python …`).
     ///
     /// Everything after the subcommand is forwarded verbatim to omnigent. The
     /// pod's isolated env (data dir, database, config, server URL) is applied,
@@ -97,6 +98,10 @@ enum Command {
 /// Flags for the default (no-subcommand) pod-supervisor run.
 #[derive(clap::Args, Debug)]
 struct RunArgs {
+    /// Process profile for an Omnigent integration with a different repository layout.
+    #[arg(long)]
+    profile: Option<PathBuf>,
+
     /// Force the backend server port (default: probe from 6767).
     #[arg(long)]
     server_port: Option<u16>,
@@ -172,7 +177,7 @@ fn main() -> Result<()> {
 }
 
 /// `omnidev omnigent …` — run an arbitrary omnigent command against this
-/// checkout's pod via `uv run omnigent …`, with the pod's isolated env (data
+/// checkout's pod via pinned `uv run --python …`, with the pod's isolated env (data
 /// dir, database URI, config home, server URL) applied on top of the inherited
 /// parent env. Resolves the repo root and pod dir (same as the supervisor),
 /// ensures the pod tree exists, then spawns in the foreground inheriting stdio.
@@ -180,7 +185,7 @@ fn main() -> Result<()> {
 /// running supervisor (the common case: server up, you run a command).
 fn run_omnigent(args: RunArgs, passthrough: Vec<String>) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let repo_root = paths::find_repo_root(&cwd)?;
+    let repo_root = paths::find_repo_root(&cwd, false)?;
     let pod_dir = match &args.pod_dir {
         Some(p) => p.clone(),
         None => paths::default_pod_dir(&repo_root)?,
@@ -208,7 +213,19 @@ fn run_omnigent(args: RunArgs, passthrough: Vec<String>) -> Result<()> {
 #[tokio::main]
 async fn run_supervisor(args: RunArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let repo_root = paths::find_repo_root(&cwd)?;
+    let repo_root = paths::find_repo_root(&cwd, args.profile.is_some())?;
+    let profile = args
+        .profile
+        .as_deref()
+        .map(|path| {
+            let path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                repo_root.join(path)
+            };
+            profile::Profile::load(&path)
+        })
+        .transpose()?;
     let pod_dir = match &args.pod_dir {
         Some(p) => p.clone(),
         None => paths::default_pod_dir(&repo_root)?,
@@ -231,12 +248,13 @@ async fn run_supervisor(args: RunArgs) -> Result<()> {
     } else {
         Vec::new()
     };
-    let pod = Arc::new(Pod::create(
+    let pod = Arc::new(Pod::create_with_profile(
         repo_root,
         pod_dir,
         ports,
         args.vite_host,
         trusted_origins,
+        profile,
     )?);
 
     let shared = Shared::new(&pod);
@@ -246,7 +264,7 @@ async fn run_supervisor(args: RunArgs) -> Result<()> {
     // for the whole session.
     let _watcher = watcher::spawn(
         &pod.repo_root,
-        &pod.omnigent_dir(),
+        &pod.backend_dir(),
         shared.clone(),
         args.debug,
         cmd_tx.clone(),

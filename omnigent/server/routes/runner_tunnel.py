@@ -26,6 +26,7 @@ from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.transports.ws_tunnel.frames import (
+    HelloFrame,
     PingFrame,
     PongFrame,
     WSCloseFrame,
@@ -34,7 +35,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     encode_frame,
 )
 from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
-from omnigent.server import session_live_state
+from omnigent.server import session_live_state, shutdown_state
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.host_registry import RunnerExitReports
 from omnigent.server.routes._auth_helpers import require_user
@@ -266,7 +267,7 @@ def create_runner_tunnel_router(
         online = session is not None
         # Hide runners owned by other users.
         if (
-            online
+            session is not None
             and user_id is not None
             and session.owner is not None
             and session.owner != user_id
@@ -443,7 +444,7 @@ def create_runner_tunnel_router(
             # 3. Receive hello frame.
             raw = await ws.receive_text()
             frame = decode_frame(raw)
-            if not hasattr(frame, "frame_protocol_version"):
+            if not isinstance(frame, HelloFrame):
                 await ws.close(code=4001, reason="expected hello frame")
                 return
 
@@ -528,31 +529,36 @@ def create_runner_tunnel_router(
                             task_name,
                         )
                         continue
-                    exc = task.exception()
-                    if exc is None:
+                    task_error = task.exception()
+                    if task_error is None:
                         _logger.warning(
                             "Tunnel helper task ended for runner %s: %s",
                             runner_id,
                             task_name,
                         )
                         continue
-                    if isinstance(exc, WebSocketDisconnect):
+                    if isinstance(task_error, WebSocketDisconnect):
+                        shutdown_state.note_tunnel_close_code(getattr(task_error, "code", None))
                         _logger.warning(
                             "Tunnel helper task disconnected for runner %s: %s "
                             "(code=%s, reason=%r)",
                             runner_id,
                             task_name,
-                            getattr(exc, "code", None),
-                            getattr(exc, "reason", None),
+                            getattr(task_error, "code", None),
+                            getattr(task_error, "reason", None),
                         )
                     else:
                         _logger.warning(
                             "Tunnel helper task failed for runner %s: %s",
                             runner_id,
                             task_name,
-                            exc_info=(type(exc), exc, exc.__traceback__),
+                            exc_info=(
+                                type(task_error),
+                                task_error,
+                                task_error.__traceback__,
+                            ),
                         )
-                    raise exc
+                    raise task_error
             finally:
                 for task in (sender_task, ping_task, receive_task):
                     task.cancel()
@@ -573,6 +579,7 @@ def create_runner_tunnel_router(
                         )
 
         except WebSocketDisconnect as exc:
+            shutdown_state.note_tunnel_close_code(getattr(exc, "code", None))
             _logger.warning(
                 "Runner %s websocket disconnected (code=%s, reason=%r)",
                 runner_id,

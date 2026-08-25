@@ -40,8 +40,9 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from fastapi import FastAPI
     from opentelemetry.context import Context
-    from opentelemetry.sdk._logs.export import LogExporter
+    from opentelemetry.sdk._logs.export import LogRecordExporter
     from opentelemetry.sdk.metrics.export import MetricExporter
+    from opentelemetry.sdk.trace.export import SpanExporter
     from opentelemetry.trace import Span
 
 _logger = logging.getLogger(__name__)
@@ -858,7 +859,7 @@ def _otlp_protocol() -> str:
     raise ValueError(f"Unsupported OTLP protocol for metrics export: {protocol!r}")
 
 
-def _create_otlp_span_exporter() -> Any:
+def _create_otlp_span_exporter() -> SpanExporter:
     """
     Create an OTLP span exporter using standard OTel environment vars.
 
@@ -867,12 +868,16 @@ def _create_otlp_span_exporter() -> Any:
     """
     protocol = _otlp_protocol()
     if protocol == "http/protobuf":
-        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+            OTLPSpanExporter as HttpOTLPSpanExporter,
+        )
 
-        return OTLPSpanExporter()
-    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+        return HttpOTLPSpanExporter()
+    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
+        OTLPSpanExporter as GrpcOTLPSpanExporter,
+    )
 
-    return OTLPSpanExporter()
+    return GrpcOTLPSpanExporter()
 
 
 def _create_otlp_metric_exporter() -> MetricExporter:
@@ -887,15 +892,15 @@ def _create_otlp_metric_exporter() -> MetricExporter:
     protocol = _otlp_protocol()
     if protocol == "http/protobuf":
         from opentelemetry.exporter.otlp.proto.http.metric_exporter import (
-            OTLPMetricExporter,
+            OTLPMetricExporter as HttpOTLPMetricExporter,
         )
 
-        return OTLPMetricExporter()
+        return HttpOTLPMetricExporter()
     from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import (
-        OTLPMetricExporter,
+        OTLPMetricExporter as GrpcOTLPMetricExporter,
     )
 
-    return OTLPMetricExporter()
+    return GrpcOTLPMetricExporter()
 
 
 def _init_otel_traces(endpoint: str) -> None:
@@ -994,7 +999,7 @@ def _logs_exporter_name() -> str:
     return "none"
 
 
-def _create_otlp_log_exporter() -> LogExporter:
+def _create_otlp_log_exporter() -> LogRecordExporter:
     """
     Create an OTLP log exporter using standard OTel environment vars.
 
@@ -1006,15 +1011,15 @@ def _create_otlp_log_exporter() -> LogExporter:
     protocol = _otlp_protocol()
     if protocol == "http/protobuf":
         from opentelemetry.exporter.otlp.proto.http._log_exporter import (
-            OTLPLogExporter,
+            OTLPLogExporter as HttpOTLPLogExporter,
         )
 
-        return OTLPLogExporter()
+        return HttpOTLPLogExporter()
     from opentelemetry.exporter.otlp.proto.grpc._log_exporter import (
-        OTLPLogExporter,
+        OTLPLogExporter as GrpcOTLPLogExporter,
     )
 
-    return OTLPLogExporter()
+    return GrpcOTLPLogExporter()
 
 
 def _init_otel_logs() -> None:

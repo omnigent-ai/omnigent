@@ -169,7 +169,7 @@ def _drive_foreground_pty(pty: PtyHandle, sandbox_id: str, command: str) -> int:
             f"The PTY session on sandbox '{sandbox_id}' ended without "
             f"an exit code{f': {result.error}' if result.error else ''}."
         )
-    return result.exit_code
+    return int(result.exit_code)
 
 
 class DaytonaSandboxLauncher(SandboxLauncher):
@@ -366,9 +366,10 @@ class DaytonaSandboxLauncher(SandboxLauncher):
             # 502 — and a waiting message POST — carries it verbatim
             # instead of a generic "internal error".
             raise click.ClickException(f"Daytona sandbox creation failed: {exc}") from exc
-        self._sandboxes[handle.id] = handle
-        click.echo(f"  → created {handle.id}")
-        return handle.id
+        sandbox_id = str(handle.id)
+        self._sandboxes[sandbox_id] = handle
+        click.echo(f"  → created {sandbox_id}")
+        return sandbox_id
 
     def attach(self, sandbox_id: str) -> None:
         """

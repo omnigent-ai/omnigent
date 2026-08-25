@@ -962,8 +962,10 @@ async def test_output_deny_replaces_text():
 def test_build_evaluation_context_request_accepts_string_data() -> None:
     """REQUEST-phase ``data`` may be a bare string and must NOT raise.
 
-    opencode's policy plugin sends the prompt text directly as ``data`` for
-    PHASE_REQUEST (``{"event": {"type": "PHASE_REQUEST", "data": "<prompt>"}}``).
+    A bare string is accepted for compatibility with older or third-party
+    callers that send the prompt text directly rather than wrapped in an
+    object — OpenCode's own plugin used to be one of these, but now sends
+    ``{"text": ...}`` like the native hooks (see the dict-data test below).
     The old code did ``data.get("text")`` unconditionally and ``AttributeError``ed
     on a string, 500ing the evaluate endpoint — which silently failed the
     request-phase gate OPEN (cost-over-budget terminal prompts sailed through).

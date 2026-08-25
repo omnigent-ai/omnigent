@@ -111,7 +111,7 @@ def _resolve_databricks_token(profile: str) -> str:
         result = client.config.authenticate()
         # SDK returns either a dict (newer versions) or a callable
         # that produces headers (older versions).
-        headers: dict[str, str] = result if isinstance(result, dict) else result(None)  # type: ignore[assignment]
+        headers: dict[str, str] = result if isinstance(result, dict) else result(None)
         auth_header = headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             return auth_header[len("Bearer ") :]

@@ -29,10 +29,29 @@ and :class:`PolicyResult` from here (or from the
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Protocol, cast
 
 from omnigent.spec.types import Phase, PolicyAction, StateUpdate
+
+if TYPE_CHECKING:
+    from omnigent.llms.client import Client
+    from omnigent.llms.types import Response, ResponseStreamEvent
+
+
+class _CreateResponse(Protocol):
+    async def __call__(
+        self,
+        *,
+        input: list[dict[str, object]],
+        model: str,
+        connection_params: dict[str, str] | None,
+        timeout: int | None,
+        instructions: str | None,
+        **kwargs: object,
+    ) -> Response | AsyncIterator[ResponseStreamEvent]: ...
+
 
 _log = logging.getLogger(__name__)
 
@@ -185,18 +204,18 @@ class EvaluationContext:
     """
 
     phase: Phase
-    content: Any
+    content: object
     tool_name: str | None = None
     actor: dict[str, str] | None = None
-    request_data: Any = None
-    session_state: dict[str, Any] | None = None
+    request_data: object | None = None
+    session_state: dict[str, object] | None = None
     usage: dict[str, float] | None = None
     subtree_usage: dict[str, float] | None = None
     user_daily_cost: dict[str, float | str] | None = None
     model: str | None = None
     harness: str | None = None
     labels: dict[str, str] | None = None
-    llm_client: Any = None  # PolicyLLMClient | None — Any to avoid import cycle
+    llm_client: PolicyLLMClient | None = None
 
 
 @dataclass(frozen=True)
@@ -259,7 +278,7 @@ class PolicyResult:
     reason: str | None = None
     set_labels: dict[str, str] | None = None
     deciding_policies: list[str] | None = None
-    data: Any = None
+    data: object | None = None
     state_updates: list[StateUpdate] | None = None
 
     @property
@@ -315,7 +334,7 @@ class ElicitationRequest:
     phase: str
     policy_names: list[str]
     content_preview: str
-    requested_schema: dict[str, Any] = field(default_factory=dict)
+    requested_schema: dict[str, object] = field(default_factory=dict)
 
     @property
     def policy_name(self) -> str:
@@ -362,7 +381,7 @@ class PolicyLLMClient:
         ``_connection`` is ``None``).
     """
 
-    _client: Any  # omnigent.llms.client.Client — Any to avoid import cycle
+    _client: Client
     _model: str
     _connection: dict[str, str] | None
     _request_timeout: int
@@ -371,10 +390,10 @@ class PolicyLLMClient:
     async def create(
         self,
         *,
-        input: list[dict[str, Any]],
+        input: list[dict[str, object]],
         instructions: str | None = None,
-        **kwargs: Any,
-    ) -> Any:
+        **kwargs: object,
+    ) -> Response | AsyncIterator[ResponseStreamEvent]:
         """
         Call the server-level LLM with pre-bound model and credentials.
 
@@ -406,15 +425,19 @@ class PolicyLLMClient:
             candidate model fails. Propagates the primary model's
             exception when no fallbacks are configured.
         """
-        connection_params = kwargs.pop("connection_params", self._connection)
-        timeout = kwargs.pop("timeout", self._request_timeout)
+        create_response = cast(_CreateResponse, self._client.responses.create)
+        connection_params = cast(
+            "dict[str, str] | None",
+            kwargs.pop("connection_params", self._connection),
+        )
+        timeout = cast(int | None, kwargs.pop("timeout", self._request_timeout))
 
         # An explicit model override opts out of the fallback chain —
         # honour exactly what the caller asked for.
         if "model" in kwargs:
-            return await self._client.responses.create(
+            return await create_response(
                 input=input,
-                model=kwargs.pop("model"),
+                model=cast(str, kwargs.pop("model")),
                 connection_params=connection_params,
                 timeout=timeout,
                 instructions=instructions,
@@ -425,7 +448,7 @@ class PolicyLLMClient:
         last_exc: Exception | None = None
         for index, model in enumerate(candidates):
             try:
-                response = await self._client.responses.create(
+                response = await create_response(
                     input=input,
                     model=model,
                     connection_params=connection_params,

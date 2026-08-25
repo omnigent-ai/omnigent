@@ -690,11 +690,10 @@ async def test_smart_routing_overrides_orchestrator_model_for_child_session(
 ) -> None:
     """Smart routing wins over the orchestrator's model choice for child sessions.
 
-    When the parent session has the routing toggle on, a sub-agent created via
-    sys_session_send is forced to ``harness_override="auto"`` at create time
-    (ignoring the orchestrator's harness/model). The first-message auto-harness
-    path then routes both harness and model via ``route_session_harness`` and
-    the verdict replaces the orchestrator's choice in the runner body.
+    When the parent session has the routing toggle on, the child's first
+    message routes both harness and model via ``route_session_harness``
+    (within the parent's harness family) and the verdict replaces the
+    orchestrator's ``model``/``harness`` choice in the runner body.
     """
     captured = _stub_runner_client(monkeypatch)
 

@@ -3,9 +3,9 @@
 // Covers the Appearance theme picker, the auth-gated Account section, and the
 // Archived sessions list (which moved here out of the sidebar).
 
-import { type ReactNode } from "react";
+import type { ReactNode } from "react";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
@@ -93,7 +93,16 @@ vi.mock("@/hooks/useConversations", async () => {
     // Picker options are sourced from this dedicated scan, decoupled from the
     // loaded rows so archived-only projects on later pages still appear.
     useArchivedProjectNames: () => ({ data: mocks.projectNames }),
-    useArchiveConversation: () => ({ mutate: mocks.archiveMutate, isPending: false }),
+    useLeaveSession: () => ({ mutate: vi.fn(), isPending: false }),
+    // Mirrors react-query's mutate: per-call `onSuccess` runs once the
+    // mutation settles, which is what drives the post-unarchive navigation.
+    useArchiveConversation: () => ({
+      mutate: (vars: { id: string; archived: boolean }, opts?: { onSuccess?: () => void }) => {
+        mocks.archiveMutate(vars, opts);
+        opts?.onSuccess?.();
+      },
+      isPending: false,
+    }),
     useStopAndDeleteConversation: () => ({ mutate: mocks.deleteMutate, isPending: false }),
   };
 });
@@ -103,7 +112,7 @@ vi.mock("@/hooks/useConversations", async () => {
 // so the stub lifts it from the trigger child onto the native <select>.
 vi.mock("@/components/ui/select", async () => {
   const { Children, isValidElement } = await import("react");
-  const SelectTrigger = ({ children }: { children?: ReactNode }) => <>{children}</>;
+  const SelectTrigger = ({ children }: { children?: ReactNode }) => children;
   const Select = ({
     value,
     onValueChange,
@@ -133,7 +142,7 @@ vi.mock("@/components/ui/select", async () => {
     Select,
     SelectTrigger,
     SelectValue: () => null,
-    SelectContent: ({ children }: { children: ReactNode }) => <>{children}</>,
+    SelectContent: ({ children }: { children: ReactNode }) => children,
     SelectItem: ({ value, children }: { value: string; children: ReactNode }) => (
       <option value={value}>{children}</option>
     ),
@@ -164,11 +173,17 @@ function conv(id: string, partial: Partial<Conversation> = {}): Conversation {
   };
 }
 
+/** Exposes the router location so navigation assertions read the real URL. */
+function LocationProbe() {
+  return <span data-testid="location">{useLocation().pathname}</span>;
+}
+
 function renderPage(path = "/settings") {
   return render(
     <TooltipProvider>
       <MemoryRouter initialEntries={[path]}>
         <SettingsPage />
+        <LocationProbe />
       </MemoryRouter>
     </TooltipProvider>,
   );
@@ -191,11 +206,10 @@ beforeEach(() => {
 });
 afterEach(() => {
   cleanup();
-  // Reset the font-size preference + applied scale so the Appearance tests
-  // don't leak persisted state or the --ui-font-scale variable into each other.
+  // Reset the font-size preference + applied desktop size so the Appearance
+  // tests don't leak state into each other.
   localStorage.clear();
-  document.documentElement.style.removeProperty("--ui-font-scale");
-  document.documentElement.style.removeProperty("--sidebar-font-size");
+  document.documentElement.style.removeProperty("--desktop-ui-font-size");
   // The palette picker sets data-theme on <html>; clear it so a palette
   // selected in one test doesn't leak into the next.
   document.documentElement.removeAttribute("data-theme");
@@ -292,6 +306,24 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("terminal-theme-auto")).toHaveAttribute("aria-checked", "false");
   });
 
+  it("defaults transcripts to Chat and persists a Terminal default", () => {
+    renderPage("/settings/appearance");
+
+    expect(screen.getByRole("radiogroup", { name: "Default transcript view" })).toBeInTheDocument();
+    expect(screen.getByTestId("transcript-view-default-chat")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(localStorage.getItem("omnigent:default-transcript-view")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("transcript-view-default-terminal"));
+    expect(screen.getByTestId("transcript-view-default-terminal")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(localStorage.getItem("omnigent:default-transcript-view")).toBe("terminal");
+  });
+
   it("renders the color theme dropdown, defaults to Omnigent, and applies a palette on change", () => {
     localStorage.clear();
     renderPage("/settings/appearance");
@@ -368,28 +400,29 @@ describe("SettingsPage", () => {
     localStorage.clear();
     renderPage("/settings/appearance");
     const input = screen.getByTestId("ui-font-size-input") as HTMLInputElement;
-    // No stored preference → 16px default.
-    expect(input.value).toBe("16");
+    // No stored preference → 13px default.
+    expect(input.value).toBe("13");
+    expect(screen.getByTestId("ui-font-size-inc").querySelector("svg")).toHaveClass("ui-icon");
 
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
-    expect(input.value).toBe("17");
+    expect(input.value).toBe("14");
     // The choice is persisted so it survives a refresh.
-    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("17");
-    // The scale is applied live to the document root (17 / 16).
-    expect(document.documentElement.style.getPropertyValue("--ui-font-scale")).toBe("1.0625");
+    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("14");
+    // The discrete desktop size is applied live to the document root.
+    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("14px");
   });
 
   it("disables the steppers at the min and max bounds", () => {
-    localStorage.setItem("omnigent:ui-font-size", "20");
+    localStorage.setItem("omnigent:ui-font-size", "18");
     renderPage("/settings/appearance");
-    // At the 20px max, only the increase button is disabled.
+    // At the 18px max, only the increase button is disabled.
     expect(screen.getByTestId("ui-font-size-inc")).toBeDisabled();
     expect(screen.getByTestId("ui-font-size-dec")).not.toBeDisabled();
 
     cleanup();
-    localStorage.setItem("omnigent:ui-font-size", "12");
+    localStorage.setItem("omnigent:ui-font-size", "11");
     renderPage("/settings/appearance");
-    // At the 12px min, only the decrease button is disabled.
+    // At the 11px min, only the decrease button is disabled.
     expect(screen.getByTestId("ui-font-size-dec")).toBeDisabled();
     expect(screen.getByTestId("ui-font-size-inc")).not.toBeDisabled();
   });
@@ -443,6 +476,7 @@ describe("SettingsPage", () => {
     fireEvent.change(screen.getByTestId("color-theme-select") as HTMLSelectElement, {
       target: { value: "github" },
     });
+    fireEvent.click(screen.getByTestId("transcript-view-default-terminal"));
     fireEvent.click(screen.getByTestId("workspace-panel-default-collapsed"));
     fireEvent.click(screen.getByTestId("hide-unconfigured-harnesses-toggle"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
@@ -458,8 +492,9 @@ describe("SettingsPage", () => {
 
     // Sanity: the non-default choices were persisted.
     expect(localStorage.getItem("omnigent:terminal-theme")).toBe("dark");
+    expect(localStorage.getItem("omnigent:default-transcript-view")).toBe("terminal");
     expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("github"));
-    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("18");
+    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("15");
     expect(localStorage.getItem("omnigent:code-font-size")).toBe("15");
 
     // Open the confirmation dialog and confirm the reset.
@@ -470,11 +505,11 @@ describe("SettingsPage", () => {
     expect(mocks.setTheme).toHaveBeenCalledWith("system");
 
     // Fonts are back to their defaults.
-    expect((screen.getByTestId("ui-font-size-input") as HTMLInputElement).value).toBe("16");
+    expect((screen.getByTestId("ui-font-size-input") as HTMLInputElement).value).toBe("13");
     expect((screen.getByTestId("ui-font-family-input") as HTMLInputElement).value).toBe("");
     expect((screen.getByTestId("code-font-size-input") as HTMLInputElement).value).toBe("13");
     expect((screen.getByTestId("code-font-family-input") as HTMLInputElement).value).toBe("");
-    expect(document.documentElement.style.getPropertyValue("--ui-font-scale")).toBe("1");
+    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("13px");
     expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe("");
     expect(localStorage.getItem("omnigent:ui-font-size")).toBeNull();
     expect(localStorage.getItem("omnigent:code-font-size")).toBeNull();
@@ -483,8 +518,12 @@ describe("SettingsPage", () => {
     expect((screen.getByTestId("color-theme-select") as HTMLSelectElement).value).toBe("omni");
     expect(document.documentElement.getAttribute("data-theme")).toBeNull();
 
-    // Terminal theme, workspace panel, and harness visibility are restored.
+    // Terminal theme, transcript view, workspace panel, and harness visibility are restored.
     expect(screen.getByTestId("terminal-theme-auto")).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("transcript-view-default-chat")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
     expect(screen.getByTestId("workspace-panel-default-open")).toHaveAttribute(
       "aria-checked",
       "true",
@@ -501,19 +540,18 @@ describe("SettingsPage", () => {
     const input = screen.getByTestId("ui-font-size-input") as HTMLInputElement;
     expect(input.value).toBe("13");
 
-    // Deleting a digit leaves "1" — below the 12px min. The box must SHOW "1"
-    // (free editing) without snapping to 12 or persisting the transient value.
+    // Deleting a digit leaves "1" — below the 11px min. The box must SHOW "1"
+    // (free editing) without snapping to 11 or persisting the transient value.
     fireEvent.change(input, { target: { value: "1" } });
     expect(input.value).toBe("1");
     expect(localStorage.getItem("omnigent:ui-font-size")).toBe("13");
-    expect(document.documentElement.style.getPropertyValue("--ui-font-scale")).toBe("");
+    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("");
 
     // Finishing the number to a valid size applies it live and persists it.
     fireEvent.change(input, { target: { value: "18" } });
     expect(input.value).toBe("18");
     expect(localStorage.getItem("omnigent:ui-font-size")).toBe("18");
-    // 18 / 16 base = 1.125.
-    expect(document.documentElement.style.getPropertyValue("--ui-font-scale")).toBe("1.125");
+    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("18px");
   });
 
   it("clamps a below-min entry to the minimum on blur", () => {
@@ -524,8 +562,8 @@ describe("SettingsPage", () => {
     fireEvent.change(input, { target: { value: "1" } });
     fireEvent.blur(input);
     // On blur the draft settles to the clamped minimum.
-    expect(input.value).toBe("12");
-    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("12");
+    expect(input.value).toBe("11");
+    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("11");
   });
 
   it("reverts an empty entry to the committed size on blur", () => {
@@ -545,15 +583,14 @@ describe("SettingsPage", () => {
     localStorage.clear();
     renderPage("/settings/appearance");
     const input = screen.getByTestId("code-font-size-input") as HTMLInputElement;
-    // No stored preference → 13px default (code widgets read a touch smaller
-    // than the 16px chrome default).
+    // No stored preference → 13px default, matching the interface default.
     expect(input.value).toBe("13");
 
     fireEvent.click(screen.getByTestId("code-font-size-inc"));
     expect(input.value).toBe("14");
     // Persisted under the code-font key (distinct from the chrome font's) so it
-    // survives a refresh. There's no --ui-font-scale here — the pref reaches the
-    // editor/terminal imperatively, not via a CSS variable.
+    // survives a refresh. It doesn't use --desktop-ui-font-size — the pref
+    // reaches the editor/terminal imperatively, not via a CSS variable.
     expect(localStorage.getItem("omnigent:code-font-size")).toBe("14");
   });
 
@@ -794,7 +831,12 @@ describe("SettingsPage", () => {
     expect(within(rows[0]).getByText("Old chat")).toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("unarchive-conversation"));
-    expect(mocks.archiveMutate).toHaveBeenCalledWith({ id: "conv_archived", archived: false });
+    expect(mocks.archiveMutate.mock.calls[0][0]).toEqual({
+      id: "conv_archived",
+      archived: false,
+    });
+    // Unarchiving opens the restored session (the mock mutate runs onSuccess).
+    expect(screen.getByTestId("location").textContent).toBe("/c/conv_archived");
   });
 
   it("deletes an archived session after confirming, with no row-click navigation", () => {
@@ -928,5 +970,47 @@ describe("SettingsPage", () => {
     expect(mocks.fetchNextPage).toHaveBeenCalled();
     expect(screen.getByTestId("archived-row")).toBeInTheDocument();
     expect(screen.getByText("Deep archive")).toBeInTheDocument();
+  });
+
+  it("groups archived sessions under date headers", () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    // Use local-time construction so bucket boundaries align with the
+    // local-time arithmetic in dateGroupLabel regardless of the test runner's
+    // timezone.
+    vi.setSystemTime(new Date(2026, 6, 15, 12, 0, 0));
+
+    try {
+      const todaySec = new Date(2026, 6, 15, 10, 0, 0).getTime() / 1000;
+      const yesterdaySec = new Date(2026, 6, 14, 8, 0, 0).getTime() / 1000;
+      const fiveDaysAgoSec = new Date(2026, 6, 10, 8, 0, 0).getTime() / 1000;
+      const twentyDaysAgoSec = new Date(2026, 5, 25, 8, 0, 0).getTime() / 1000;
+      const oldDate = new Date(2026, 2, 1, 8, 0, 0);
+      const oldSec = oldDate.getTime() / 1000;
+
+      mocks.conversations = [
+        conv("c_today", { archived: true, title: "Today chat", updated_at: todaySec }),
+        conv("c_yesterday", { archived: true, title: "Yesterday chat", updated_at: yesterdaySec }),
+        conv("c_week", { archived: true, title: "This week chat", updated_at: fiveDaysAgoSec }),
+        conv("c_month", { archived: true, title: "This month chat", updated_at: twentyDaysAgoSec }),
+        conv("c_old", { archived: true, title: "Old chat", updated_at: oldSec }),
+      ];
+      renderPage("/settings/archived");
+
+      expect(screen.getByText("Today")).toBeInTheDocument();
+      expect(screen.getByText("Yesterday")).toBeInTheDocument();
+      expect(screen.getByText("Previous 7 days")).toBeInTheDocument();
+      expect(screen.getByText("Previous 30 days")).toBeInTheDocument();
+      // Derive the expected label the same way the component does so the
+      // assertion is locale-independent.
+      const expectedOldLabel = oldDate.toLocaleDateString(undefined, {
+        month: "long",
+        year: "numeric",
+      });
+      expect(screen.getByText(expectedOldLabel)).toBeInTheDocument();
+
+      expect(screen.getAllByTestId("archived-row")).toHaveLength(5);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

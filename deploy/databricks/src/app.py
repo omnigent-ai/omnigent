@@ -129,7 +129,7 @@ try:
     from omnigent.runtime.agent_cache import AgentCache
     from omnigent.runtime.caps import RuntimeCaps
     from omnigent.server.app import create_app
-    from omnigent.server.auth import create_auth_provider
+    from omnigent.server.auth import create_auth_provider, warn_if_single_user_exposed
 
     # OTel: the Databricks Apps platform auto-injects
     # OTEL_EXPORTER_OTLP_ENDPOINT when `telemetry_export_destinations`
@@ -153,6 +153,9 @@ try:
         SqlAlchemyPermissionStore,
     )
     from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
+    from omnigent.stores.project_store.sqlalchemy_store import (
+        SqlAlchemyProjectStore,
+    )
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
         SqlAlchemyScheduledTaskStore,
     )
@@ -182,6 +185,7 @@ try:
     file_comment_store = SqlAlchemyCommentStore(DB_URI)
     permission_store = SqlAlchemyPermissionStore(DB_URI)
     policy_store = SqlAlchemyPolicyStore(DB_URI)
+    project_store = SqlAlchemyProjectStore(DB_URI)
     host_store = HostStore(DB_URI)
     scheduled_task_store = SqlAlchemyScheduledTaskStore(DB_URI)
 
@@ -205,6 +209,12 @@ try:
     # OMNIGENT_AUTH_ENABLED in the deploy env (an explicit
     # provider always wins over the enable switch).
     os.environ.setdefault("OMNIGENT_AUTH_PROVIDER", "header")
+
+    # A single-user marker here would serve un-proxied requests as "local".
+    _exposure = warn_if_single_user_exposed("0.0.0.0")
+    if _exposure:
+        logger.warning("%s", _exposure)
+
     auth_provider = create_auth_provider()
     app = create_app(
         agent_store=agent_store,
@@ -215,6 +225,7 @@ try:
         comment_store=file_comment_store,
         permission_store=permission_store,
         policy_store=policy_store,
+        project_store=project_store,
         host_store=host_store,
         scheduled_task_store=scheduled_task_store,
         auth_provider=auth_provider,

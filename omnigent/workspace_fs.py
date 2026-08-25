@@ -37,12 +37,14 @@ import mimetypes
 import os
 import re
 from pathlib import Path
-from typing import Any
+from typing import TypeAlias, cast
 
 from omnigent.entities.environment_filesystem import InvalidPath
 from omnigent.entities.pagination import paginate_in_memory
+from omnigent.inner._cwd_scan import _DEFAULT_DEPRIORITIZED_DIRS
 from omnigent.inner.os_env import _DEFAULT_READ_LIMIT
 from omnigent.runner.environment_filesystem import (
+    _SEARCH_SCAN_BUDGET,
     _glob_to_regex,
     _validate_path,
     split_glob_list,
@@ -54,6 +56,8 @@ from omnigent.runtime.filesystem_registry import (
 
 # Match the runner's caps so a host-served read is truncated identically.
 _MAX_READ_BYTES = 10 * 1024 * 1024  # 10 MiB
+
+_WorkspacePayload: TypeAlias = dict[str, object]
 
 
 class WorkspaceReaderError(Exception):
@@ -125,7 +129,7 @@ class WorkspaceReader:
         after: str | None = None,
         before: str | None = None,
         order: str = "desc",
-    ) -> dict[str, Any]:
+    ) -> _WorkspacePayload:
         """List a directory or read a file, mirroring ``_fs_list_or_read``.
 
         :param path: Relative path (``""`` for the workspace root).
@@ -149,7 +153,7 @@ class WorkspaceReader:
         after: str | None,
         before: str | None,
         order: str,
-    ) -> dict[str, Any]:
+    ) -> _WorkspacePayload:
         """Build the directory-listing payload for a resolved directory.
 
         Classifies entries by target type (follows symlinks) and skips
@@ -157,7 +161,7 @@ class WorkspaceReader:
         does not fail the listing — matching the runner's ``list_dir``.
         """
         validated = _validate_path(rel) if rel else ""
-        entries: list[dict[str, Any]] = []
+        entries: list[_WorkspacePayload] = []
         try:
             names = sorted(os.listdir(resolved))
         except OSError as exc:
@@ -197,7 +201,7 @@ class WorkspaceReader:
             )
         page = paginate_in_memory(
             entries,
-            id_fn=lambda e: e["id"],
+            id_fn=lambda entry: cast(str, entry["id"]),
             limit=limit,
             after=after,
             before=before,
@@ -217,7 +221,7 @@ class WorkspaceReader:
         resolved: Path,
         *,
         limit: int | None = _DEFAULT_READ_LIMIT,
-    ) -> dict[str, Any]:
+    ) -> _WorkspacePayload:
         """Build the file-content payload for a resolved file.
 
         Text files are UTF-8 decoded and line-capped at ``limit``; binary
@@ -245,7 +249,7 @@ class WorkspaceReader:
         raw: bytes,
         *,
         limit: int | None,
-    ) -> dict[str, Any]:
+    ) -> _WorkspacePayload:
         """Assemble the file-content dict from raw bytes."""
         content_type_guess, _ = mimetypes.guess_type(rel)
         truncated = False
@@ -254,9 +258,9 @@ class WorkspaceReader:
             capped = capped[:_MAX_READ_BYTES]
             truncated = True
 
+        text: str | None = None
         try:
             text = capped.decode("utf-8")
-            is_text = True
         except UnicodeDecodeError as exc:
             # A byte-cap truncation can split a multi-byte codepoint at the very
             # end, which would otherwise flip an oversize *text* file to base64.
@@ -269,16 +273,13 @@ class WorkspaceReader:
             if truncated and exc.start >= len(capped) - 3:
                 capped = capped[: exc.start]
                 text = capped.decode("utf-8")
-                is_text = True
-            else:
-                is_text = False
 
-        payload: dict[str, Any] = {
+        payload: _WorkspacePayload = {
             "object": "session.environment.filesystem.file_content",
             "path": rel,
             "content_type": content_type_guess,
         }
-        if is_text:
+        if text is not None:
             if limit is not None:
                 lines = text.splitlines(keepends=True)
                 if len(lines) > limit:
@@ -305,7 +306,7 @@ class WorkspaceReader:
         include: str | None = None,
         exclude: str | None = None,
         limit: int = 500,
-    ) -> dict[str, Any]:
+    ) -> _WorkspacePayload:
         """Search files by substring + glob filters, like the runner.
 
         :param query: Case-insensitive substring matched against name and
@@ -323,7 +324,9 @@ class WorkspaceReader:
         inc = [re.compile(_glob_to_regex(p), re.IGNORECASE) for p in split_glob_list(include)]
         exc = [re.compile(_glob_to_regex(p), re.IGNORECASE) for p in split_glob_list(exclude)]
 
-        results: list[dict[str, Any]] = []
+        results: list[_WorkspacePayload] = []
+        scanned = 0
+        truncated = False
         for dirpath, dirnames, filenames in os.walk(self._root):
             rel_dir = os.path.relpath(dirpath, self._root)
             # Prune excluded subtrees so a "**/node_modules" pattern
@@ -334,8 +337,17 @@ class WorkspaceReader:
                 if any(r.match(dp) for r in exc):
                     continue
                 kept.append(d)
+            # Spend the scan budget on the real tree first, as the runner does.
+            kept.sort(key=lambda d: d in _DEFAULT_DEPRIORITIZED_DIRS)
             dirnames[:] = kept
+            scanned += len(kept)
             for fname in sorted(filenames):
+                # Counted per entry: a per-directory check lets one huge
+                # directory overshoot the budget before `truncated` trips.
+                scanned += 1
+                if scanned >= _SEARCH_SCAN_BUDGET:
+                    truncated = True
+                    break
                 p = os.path.normpath(os.path.join("" if rel_dir == "." else rel_dir, fname))
                 if exc and any(r.match(p) for r in exc):
                     continue
@@ -363,14 +375,22 @@ class WorkspaceReader:
                 )
                 if len(results) >= limit:
                     break
-            if len(results) >= limit:
+            # A query matching little or nothing never fills the result cap,
+            # so the walk needs its own bound -- the same one the runner
+            # applies, so search behaves identically whether the agent is awake.
+            if truncated or len(results) >= limit:
                 break
-        results.sort(key=lambda e: e["path"])
-        return {"object": "list", "data": results, "has_more": len(results) >= limit}
+        results.sort(key=lambda entry: cast(str, entry["path"]))
+        return {
+            "object": "list",
+            "data": results,
+            "has_more": len(results) >= limit,
+            "truncated": truncated,
+        }
 
     # ── Changed files / diff ───────────────────────────────────────
 
-    def changes(self, session_id: str) -> dict[str, Any]:
+    def changes(self, session_id: str) -> _WorkspacePayload:
         """List changed files, mirroring ``list_filesystem_changes``.
 
         Git workspaces report the working-tree diff (``git status``);
@@ -401,7 +421,7 @@ class WorkspaceReader:
         ]
         return {"object": "list", "data": data, "has_more": False}
 
-    def diff(self, session_id: str, relative_path: str) -> dict[str, Any]:
+    def diff(self, session_id: str, relative_path: str) -> _WorkspacePayload:
         """Return before/after content, mirroring the runner diff endpoint.
 
         :param session_id: Session id (git mode ignores it).

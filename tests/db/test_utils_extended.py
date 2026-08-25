@@ -19,9 +19,10 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import event, text
 
 from omnigent.db.db_models import SqlUser
+from omnigent.db.query_context import current_query_name, query_name_scope
 from omnigent.db.utils import (
     _ITEM_TYPES,
     clear_engine_cache,
@@ -34,6 +35,7 @@ from omnigent.db.utils import (
     get_or_create_engine,
     insert_fts,
     make_managed_session_maker,
+    make_named_managed_session_maker,
     normalize_database_url,
     now_epoch,
     now_epoch_us,
@@ -151,6 +153,64 @@ class TestManagedSessionMaker:
         with managed() as session:
             loaded = session.get(SqlUser, (0, "immediate_test"))
             assert loaded is not None
+
+    def test_named_session_covers_implicit_flush_and_commit(self, db_uri: str) -> None:
+        engine = get_or_create_engine(db_uri)
+        managed = make_named_managed_session_maker(
+            engine,
+            query_name_prefix="omnigent.test_store",
+        )
+        observed_names: list[str | None] = []
+
+        def capture_name(
+            _connection: object,
+            _cursor: object,
+            statement: str,
+            _parameters: object,
+            _context: object,
+            _executemany: bool,
+        ) -> None:
+            if statement.lstrip().upper().startswith("INSERT"):
+                observed_names.append(current_query_name())
+
+        event.listen(engine, "before_cursor_execute", capture_name)
+        try:
+            with managed("insert_user") as session:
+                session.add(SqlUser(id="named_session_test", is_admin=False))
+        finally:
+            event.remove(engine, "before_cursor_execute", capture_name)
+
+        assert observed_names == ["omnigent.test_store.insert_user"]
+        assert current_query_name() is None
+
+    def test_nested_query_name_overrides_and_restores_session_name(self, db_uri: str) -> None:
+        engine = get_or_create_engine(db_uri)
+        managed = make_named_managed_session_maker(
+            engine,
+            query_name_prefix="omnigent.test_store",
+        )
+
+        with managed("outer_operation") as session:
+            assert current_query_name() == "omnigent.test_store.outer_operation"
+            with query_name_scope("omnigent.test_store.inner_query"):
+                session.execute(text("SELECT 1"))
+                assert current_query_name() == "omnigent.test_store.inner_query"
+            assert current_query_name() == "omnigent.test_store.outer_operation"
+
+        assert current_query_name() is None
+
+    def test_named_session_rejects_empty_names(self, db_uri: str) -> None:
+        engine = get_or_create_engine(db_uri)
+        with pytest.raises(ValueError, match="query_name_prefix must not be empty"):
+            make_named_managed_session_maker(engine, query_name_prefix=" ")
+
+        managed = make_named_managed_session_maker(
+            engine,
+            query_name_prefix="omnigent.test_store",
+        )
+        with pytest.raises(ValueError, match="query_name must not be empty"):
+            with managed(" "):
+                raise AssertionError("empty query name entered its session")
 
 
 # ── ID generators ─────────────────────────────────────

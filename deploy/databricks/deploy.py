@@ -212,7 +212,7 @@ class _ClassifiedWheels:
     """Result of sorting built wheels by size for upload routing.
 
     :param main: The top-level ``omnigent`` wheel — always uploaded
-        with the ``[databricks]`` extra.
+        with the ``[databricks,tracing]`` extras.
     :param small: Wheels ≤ 10 MB. Uploaded into the bundle's
         ``source_code_path`` and referenced by relative path.
     :param oversize: Wheels > 10 MB. These cannot be used by the
@@ -369,7 +369,7 @@ def build_uv_pyproject(
     """
     source_lines = _uv_source_lines(main_wheel, small_wheels, oversize_wheels)
     dependencies = [
-        f'"omnigent[databricks]=={deploy_version}"',
+        f'"omnigent[databricks,tracing]=={deploy_version}"',
         f'"omnigent-client=={deploy_version}"',
         f'"omnigent-ui-sdk=={deploy_version}"',
     ]
@@ -568,6 +568,14 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--features",
+        default="",
+        help=(
+            "Comma-separated deployment-wide release features, e.g. "
+            "'usage_page'. Empty keeps every release feature off."
+        ),
+    )
+    parser.add_argument(
         "--target",
         default="prod",
         help=(
@@ -735,6 +743,10 @@ def _ensure_compute_size(
 
 def _bundle_vars(args: argparse.Namespace) -> list[str]:
     """CLI args to pass to `databricks bundle` as --var pairs."""
+    # The Apps API rejects an environment entry with an empty source. A single
+    # space is trimmed by the feature parser and therefore preserves the
+    # documented "no features" behavior while providing a valid value source.
+    features = args.features if args.features.strip() else " "
     return [
         "--var",
         f"app_name={args.app_name}",
@@ -746,6 +758,8 @@ def _bundle_vars(args: argparse.Namespace) -> list[str]:
         f"volume_name={args.volume_name}",
         "--var",
         f"otel_table_schema={args.otel_table_schema}",
+        "--var",
+        f"features={features}",
     ]
 
 

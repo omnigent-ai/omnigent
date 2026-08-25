@@ -38,11 +38,12 @@ import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import cast
 
 import httpx
 
 from omnigent.host.daemon_launch import error_text
+from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.native_terminal import url_component
 
 # Pi session ids are UUIDv7 hex with dashes (e.g.
@@ -99,7 +100,7 @@ def _synthetic_pi_entry_id(
     *,
     session_id: str,
     external_session_id: str,
-    item: dict[str, Any],
+    item: _JsonObject,
     index: int,
     suffix: str = "",
 ) -> str:
@@ -125,7 +126,7 @@ def _synthetic_pi_entry_id(
     return digest[:_ENTRY_ID_LEN]
 
 
-def _pi_text_blocks_from_api_content(content: object, *, api_type: str) -> list[dict[str, Any]]:
+def _pi_text_blocks_from_api_content(content: object, *, api_type: str) -> list[_JsonObject]:
     """Extract Pi text content blocks from an Omnigent content array.
 
     :param content: Omnigent content array, e.g.
@@ -136,7 +137,7 @@ def _pi_text_blocks_from_api_content(content: object, *, api_type: str) -> list[
     """
     if not isinstance(content, list):
         return []
-    blocks: list[dict[str, Any]] = []
+    blocks: list[_JsonObject] = []
     for block in content:
         if not isinstance(block, dict) or block.get("type") != api_type:
             continue
@@ -146,7 +147,7 @@ def _pi_text_blocks_from_api_content(content: object, *, api_type: str) -> list[
     return blocks
 
 
-def _pi_tool_arguments(value: object) -> dict[str, Any]:
+def _pi_tool_arguments(value: object) -> _JsonObject:
     """Parse an Omnigent function-call ``arguments`` string into a Pi object.
 
     Pi's ``toolCall.arguments`` is a structured object, whereas Omnigent stores
@@ -165,7 +166,7 @@ def _pi_tool_arguments(value: object) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _is_interrupted_assistant_item(item: dict[str, Any]) -> bool:
+def _is_interrupted_assistant_item(item: _JsonObject) -> bool:
     """Return whether an Omnigent item is an interrupted assistant partial.
 
     Omnigent persists these so the web transcript can show the partial text and
@@ -182,7 +183,7 @@ def _is_interrupted_assistant_item(item: dict[str, Any]) -> bool:
     )
 
 
-def _interrupted_response_ids(items: list[dict[str, Any]]) -> set[str]:
+def _interrupted_response_ids(items: list[_JsonObject]) -> set[str]:
     """Return response ids for Omnigent turns that ended interrupted.
 
     :param items: Flat Omnigent item dicts in chronological order.
@@ -199,14 +200,14 @@ def _interrupted_response_ids(items: list[dict[str, Any]]) -> set[str]:
 
 
 def pi_session_records_from_session_items(
-    items: list[dict[str, Any]],
+    items: list[_JsonObject],
     *,
     session_id: str,
     external_session_id: str,
     cwd: Path,
     provider: str = "omnigent",
     model: str = "",
-) -> list[dict[str, Any]]:
+) -> list[_JsonObject]:
     """Convert Omnigent session items into Pi session JSONL records.
 
     The generated records follow Pi's v3 session format: one ``session``
@@ -237,14 +238,14 @@ def pi_session_records_from_session_items(
     :returns: Pi session record dictionaries (header first).
     """
     timestamp = _pi_entry_timestamp()
-    header: dict[str, Any] = {
+    header: _JsonObject = {
         "type": "session",
         "version": _PI_SESSION_VERSION,
         "id": external_session_id,
         "timestamp": timestamp,
         "cwd": str(cwd),
     }
-    records: list[dict[str, Any]] = [header]
+    records: list[_JsonObject] = [header]
     parent_id: str | None = None
     skip_response_ids = _interrupted_response_ids(items)
 
@@ -264,12 +265,12 @@ def pi_session_records_from_session_items(
         for entry in entries:
             entry["parentId"] = parent_id
             records.append(entry)
-            parent_id = entry["id"]
+            parent_id = cast(str, entry["id"])
     return records
 
 
 def _pi_entries_from_session_item(
-    item: dict[str, Any],
+    item: _JsonObject,
     *,
     session_id: str,
     external_session_id: str,
@@ -277,7 +278,7 @@ def _pi_entries_from_session_item(
     timestamp: str,
     provider: str,
     model: str,
-) -> list[dict[str, Any]]:
+) -> list[_JsonObject]:
     """Convert one Omnigent item into zero or more Pi session entries.
 
     :param item: Flat Omnigent item dict.
@@ -341,7 +342,7 @@ def _pi_entries_from_session_item(
             return []
         if not isinstance(call_id, str) or not call_id:
             return []
-        tool_call_block = {
+        tool_call_block: _JsonObject = {
             "type": "toolCall",
             "id": call_id,
             "name": name,
@@ -385,11 +386,11 @@ def _pi_entries_from_session_item(
 
 
 def _pi_assistant_message(
-    content: list[dict[str, Any]],
+    content: list[_JsonObject],
     *,
     provider: str,
     model: str,
-) -> dict[str, Any]:
+) -> _JsonObject:
     """Build a Pi assistant ``message`` body with the required metadata.
 
     Pi's ``AssistantMessage`` requires ``provider`` / ``model`` / ``usage`` /
@@ -466,7 +467,7 @@ def _find_pi_session_file(session_dir: Path, external_session_id: str) -> Path |
 async def fetch_all_session_items_for_pi_resume(
     client: httpx.AsyncClient,
     session_id: str,
-) -> list[dict[str, Any]]:
+) -> list[_JsonObject]:
     """Fetch committed Omnigent session items in chronological order.
 
     :param client: HTTP client pointed at the Omnigent server.
@@ -474,7 +475,7 @@ async def fetch_all_session_items_for_pi_resume(
     :returns: Flat API item dicts from ``GET /v1/sessions/{id}/items``.
     :raises RuntimeError: If an item page cannot be fetched or parsed.
     """
-    items: list[dict[str, Any]] = []
+    items: list[_JsonObject] = []
     after: str | None = None
     while True:
         params: dict[str, str | int] = {"limit": 1000, "order": "asc"}
@@ -509,7 +510,7 @@ async def fetch_all_session_items_for_pi_resume(
         after = last_id
 
 
-def write_pi_session_records(target: Path, records: list[dict[str, Any]]) -> None:
+def write_pi_session_records(target: Path, records: list[_JsonObject]) -> None:
     """Atomically write Pi session JSONL *records* to *target*.
 
     :param target: Session JSONL path to write.

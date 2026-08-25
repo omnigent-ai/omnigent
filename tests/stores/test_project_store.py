@@ -41,7 +41,7 @@ def test_create_returns_project(store: SqlAlchemyProjectStore) -> None:
     project = store.create(_uid("p1"), "My Project", "alice@example.com")
     assert project.id == _uid("p1")
     assert project.name == "My Project"
-    assert project.owner_user_id == "alice@example.com"
+    assert project.user_id == "alice@example.com"
     assert project.created_at > 0
     assert project.updated_at is None
 
@@ -49,20 +49,20 @@ def test_create_returns_project(store: SqlAlchemyProjectStore) -> None:
 def test_get_returns_created_project(store: SqlAlchemyProjectStore) -> None:
     """``get`` reads back a created project for its owner."""
     store.create(_uid("p1"), "My Project", "alice@example.com")
-    got = store.get(_uid("p1"), owner_user_id="alice@example.com")
+    got = store.get(_uid("p1"), user_id="alice@example.com")
     assert got is not None
     assert got.name == "My Project"
 
 
 def test_get_missing_returns_none(store: SqlAlchemyProjectStore) -> None:
     """``get`` returns ``None`` for an unknown id."""
-    assert store.get(_uid("nope"), owner_user_id="alice@example.com") is None
+    assert store.get(_uid("nope"), user_id="alice@example.com") is None
 
 
 def test_get_scoped_to_owner(store: SqlAlchemyProjectStore) -> None:
     """A project owned by someone else reads back as not found."""
     store.create(_uid("p1"), "Alice Project", "alice@example.com")
-    assert store.get(_uid("p1"), owner_user_id="bob@example.com") is None
+    assert store.get(_uid("p1"), user_id="bob@example.com") is None
 
 
 # ── list ──────────────────────────────────────────────────────────────────
@@ -76,7 +76,7 @@ def test_list_orders_by_created_at_then_id(store: SqlAlchemyProjectStore) -> Non
     """
     store.create(_uid("p1"), "First", "alice@example.com")
     store.create(_uid("p2"), "Second", "alice@example.com")
-    listed = store.list(owner_user_id="alice@example.com")
+    listed = store.list(user_id="alice@example.com")
     assert {p.name for p in listed} == {"First", "Second"}
     # Whatever the tie order, it is ascending by (created_at, id).
     keys = [(p.created_at, p.id) for p in listed]
@@ -87,13 +87,13 @@ def test_list_scoped_to_owner(store: SqlAlchemyProjectStore) -> None:
     """``list`` only returns the requesting owner's projects."""
     store.create(_uid("p1"), "Alice Project", "alice@example.com")
     store.create(_uid("p2"), "Bob Project", "bob@example.com")
-    alice = store.list(owner_user_id="alice@example.com")
+    alice = store.list(user_id="alice@example.com")
     assert [p.name for p in alice] == ["Alice Project"]
 
 
 def test_list_empty(store: SqlAlchemyProjectStore) -> None:
     """``list`` returns an empty list when the owner has no projects."""
-    assert store.list(owner_user_id="alice@example.com") == []
+    assert store.list(user_id="alice@example.com") == []
 
 
 # ── single-user (None owner) vs multi-user isolation ────────────────────────
@@ -102,7 +102,7 @@ def test_list_empty(store: SqlAlchemyProjectStore) -> None:
 def test_none_owner_and_named_owner_are_isolated(store: SqlAlchemyProjectStore) -> None:
     """The single-user ``None`` owner is a distinct scope from any named user.
 
-    A project created in single-user mode (``owner_user_id=None``) must not be
+    A project created in single-user mode (``user_id=None``) must not be
     visible to a named multi-user identity, and vice versa — the same DB can
     hold both without cross-leaking.
     """
@@ -110,26 +110,26 @@ def test_none_owner_and_named_owner_are_isolated(store: SqlAlchemyProjectStore) 
     store.create(_uid("alice"), "Alice Project", "alice@example.com")
 
     # Each scope lists only its own.
-    assert [p.name for p in store.list(owner_user_id=None)] == ["Solo Project"]
-    assert [p.name for p in store.list(owner_user_id="alice@example.com")] == ["Alice Project"]
+    assert [p.name for p in store.list(user_id=None)] == ["Solo Project"]
+    assert [p.name for p in store.list(user_id="alice@example.com")] == ["Alice Project"]
 
 
 def test_named_owner_cannot_get_none_owner_project(store: SqlAlchemyProjectStore) -> None:
     """A ``None``-owner project is not found for a named user (and vice versa)."""
     store.create(_uid("solo"), "Solo", None)
-    assert store.get(_uid("solo"), owner_user_id="alice@example.com") is None
-    assert store.get(_uid("solo"), owner_user_id=None) is not None
+    assert store.get(_uid("solo"), user_id="alice@example.com") is None
+    assert store.get(_uid("solo"), user_id=None) is not None
 
 
 def test_named_owner_cannot_mutate_none_owner_project(store: SqlAlchemyProjectStore) -> None:
     """update / delete on a ``None``-owner project are no-ops for a named user."""
     store.create(_uid("solo"), "Solo", None)
-    updated = store.update(_uid("solo"), owner_user_id="alice@example.com", name="Hacked")
+    updated = store.update(_uid("solo"), user_id="alice@example.com", name="Hacked")
     assert updated is None
-    deleted = store.delete(_uid("solo"), owner_user_id="alice@example.com")
+    deleted = store.delete(_uid("solo"), user_id="alice@example.com")
     assert deleted is False
     # Untouched for the real (None) owner.
-    assert store.get(_uid("solo"), owner_user_id=None).name == "Solo"
+    assert store.get(_uid("solo"), user_id=None).name == "Solo"
 
 
 # ── name uniqueness ────────────────────────────────────────────────────────
@@ -151,10 +151,10 @@ def test_same_name_allowed_across_owners(store: SqlAlchemyProjectStore) -> None:
 
 
 def test_duplicate_name_rejected_for_null_owner(store: SqlAlchemyProjectStore) -> None:
-    """Single-user mode (NULL owner) still enforces name uniqueness.
+    """Single-user mode (NULL owner) enforces name uniqueness in the store.
 
-    The DB UNIQUE index can't do this (SQL treats NULLs as distinct), so the
-    store's ``_name_taken`` check is the sole guard for NULL owners.
+    ``_name_taken`` is the sole guard for every owner, NULL included — no unique
+    index backs it.
     """
     store.create(_uid("p1"), "Solo", None)
     with pytest.raises(OmnigentError) as exc:
@@ -162,29 +162,32 @@ def test_duplicate_name_rejected_for_null_owner(store: SqlAlchemyProjectStore) -
     assert exc.value.code == ErrorCode.ALREADY_EXISTS
 
 
-def test_duplicate_name_rejected_at_db_layer_for_named_owner(
+def test_duplicate_name_lands_when_precheck_is_bypassed(
     store: SqlAlchemyProjectStore,
 ) -> None:
-    """The UNIQUE index enforces per-owner uniqueness even if the store's
-    ``_name_taken`` pre-check is bypassed — the DB is the race backstop.
+    """A duplicate name is accepted once ``_name_taken`` is bypassed.
+
+    No unique index covers (workspace_id, user_id, name), so the pre-check is
+    the only guard and a concurrent create racing past it lands. Pins that
+    accepted cost: both rows exist, each addressable by its own id.
 
     Monkeypatching ``_name_taken`` to always-miss simulates two concurrent
-    creates both passing the check; the second must still fail via the index's
-    ``IntegrityError``, mapped to ``ALREADY_EXISTS``.
+    creates both passing the check.
     """
     store.create(_uid("p1"), "Dup", "alice@example.com")
     store._name_taken = lambda *a, **k: False  # type: ignore[method-assign]
-    with pytest.raises(OmnigentError) as exc:
-        store.create(_uid("p2"), "Dup", "alice@example.com")
-    assert exc.value.code == ErrorCode.ALREADY_EXISTS
+    store.create(_uid("p2"), "Dup", "alice@example.com")
+
+    assert [p.name for p in store.list(user_id="alice@example.com")] == ["Dup", "Dup"]
+    assert store.get(_uid("p1"), user_id="alice@example.com") is not None
+    assert store.get(_uid("p2"), user_id="alice@example.com") is not None
 
 
-def test_non_name_integrity_error_is_not_masked(store: SqlAlchemyProjectStore) -> None:
-    """An integrity failure that isn't the name index re-raises untranslated.
+def test_primary_key_collision_is_not_masked(store: SqlAlchemyProjectStore) -> None:
+    """Reusing an id surfaces as ``IntegrityError``, not ``ALREADY_EXISTS``.
 
-    Reusing an existing id hits the primary-key constraint, not
-    ``ix_projects_name``; that must surface as ``IntegrityError`` rather than a
-    misleading ``ALREADY_EXISTS`` name collision.
+    The PK is the only remaining constraint on this table, and the store must
+    not dress its violation up as a name collision.
     """
     store.create(_uid("p1"), "Original", "alice@example.com")
     store._name_taken = lambda *a, **k: False  # type: ignore[method-assign]
@@ -199,22 +202,22 @@ def test_create_defaults_to_empty_config(store: SqlAlchemyProjectStore) -> None:
     """A project created without config reads back an empty dict (SQL NULL)."""
     project = store.create(_uid("p1"), "No Config", "alice@example.com")
     assert project.config == {}
-    assert store.get(_uid("p1"), owner_user_id="alice@example.com").config == {}
+    assert store.get(_uid("p1"), user_id="alice@example.com").config == {}
 
 
 def test_create_persists_config(store: SqlAlchemyProjectStore) -> None:
     """A config passed to ``create`` round-trips through ``get``/``list``."""
     cfg = {"host_id": "host_abc", "workspace": "/work/repo", "model": "claude-opus-4-8"}
     store.create(_uid("p1"), "Configured", "alice@example.com", cfg)
-    assert store.get(_uid("p1"), owner_user_id="alice@example.com").config == cfg
-    assert store.list(owner_user_id="alice@example.com")[0].config == cfg
+    assert store.get(_uid("p1"), user_id="alice@example.com").config == cfg
+    assert store.list(user_id="alice@example.com")[0].config == cfg
 
 
 def test_update_replaces_config_and_stamps_updated_at(store: SqlAlchemyProjectStore) -> None:
     """Passing a new ``config`` replaces the stored one and stamps updated_at."""
     store.create(_uid("p1"), "P", "alice@example.com", {"host_id": "old"})
     updated = store.update(
-        _uid("p1"), owner_user_id="alice@example.com", config={"host_id": "new", "model": "m"}
+        _uid("p1"), user_id="alice@example.com", config={"host_id": "new", "model": "m"}
     )
     assert updated is not None
     assert updated.config == {"host_id": "new", "model": "m"}
@@ -225,7 +228,7 @@ def test_update_config_none_leaves_it_unchanged(store: SqlAlchemyProjectStore) -
     """``config=None`` (the default) leaves the stored config untouched."""
     store.create(_uid("p1"), "P", "alice@example.com", {"host_id": "keep"})
     # Rename only — config omitted — must not wipe the stored defaults.
-    updated = store.update(_uid("p1"), owner_user_id="alice@example.com", name="Renamed")
+    updated = store.update(_uid("p1"), user_id="alice@example.com", name="Renamed")
     assert updated is not None
     assert updated.config == {"host_id": "keep"}
 
@@ -233,7 +236,7 @@ def test_update_config_none_leaves_it_unchanged(store: SqlAlchemyProjectStore) -
 def test_update_empty_config_clears_defaults(store: SqlAlchemyProjectStore) -> None:
     """An explicit ``config={}`` clears the stored defaults (distinct from None)."""
     store.create(_uid("p1"), "P", "alice@example.com", {"host_id": "drop"})
-    updated = store.update(_uid("p1"), owner_user_id="alice@example.com", config={})
+    updated = store.update(_uid("p1"), user_id="alice@example.com", config={})
     assert updated is not None
     assert updated.config == {}
     assert updated.updated_at is not None
@@ -242,7 +245,7 @@ def test_update_empty_config_clears_defaults(store: SqlAlchemyProjectStore) -> N
 def test_update_same_config_is_noop(store: SqlAlchemyProjectStore) -> None:
     """Re-setting the identical config changes nothing, leaving updated_at None."""
     store.create(_uid("p1"), "P", "alice@example.com", {"host_id": "x"})
-    updated = store.update(_uid("p1"), owner_user_id="alice@example.com", config={"host_id": "x"})
+    updated = store.update(_uid("p1"), user_id="alice@example.com", config={"host_id": "x"})
     assert updated is not None
     assert updated.updated_at is None
 
@@ -264,10 +267,10 @@ def test_update_rejects_oversized_config(store: SqlAlchemyProjectStore) -> None:
     store.create(_uid("p1"), "P", "alice@example.com", {"host_id": "keep"})
     huge = {"blob": "x" * (64 * 1024 + 1)}
     with pytest.raises(OmnigentError) as exc:
-        store.update(_uid("p1"), owner_user_id="alice@example.com", config=huge)
+        store.update(_uid("p1"), user_id="alice@example.com", config=huge)
     assert exc.value.code == ErrorCode.INVALID_INPUT
     # The prior config is untouched (the encode guard fires before any write).
-    assert store.get(_uid("p1"), owner_user_id="alice@example.com").config == {"host_id": "keep"}
+    assert store.get(_uid("p1"), user_id="alice@example.com").config == {"host_id": "keep"}
 
 
 def test_decode_coerces_non_object_blob_to_empty(store: SqlAlchemyProjectStore) -> None:
@@ -285,7 +288,7 @@ def test_decode_coerces_non_object_blob_to_empty(store: SqlAlchemyProjectStore) 
             sa_text("UPDATE projects SET config = :c WHERE id = :i"),
             {"c": '"just a string"', "i": _uid("p1")},
         )
-    got = store.get(_uid("p1"), owner_user_id="alice@example.com")
+    got = store.get(_uid("p1"), user_id="alice@example.com")
     assert got is not None
     assert got.config == {}
 
@@ -296,7 +299,7 @@ def test_decode_coerces_non_object_blob_to_empty(store: SqlAlchemyProjectStore) 
 def test_update_renames_and_stamps_updated_at(store: SqlAlchemyProjectStore) -> None:
     """Renaming changes ``name`` and sets ``updated_at``."""
     store.create(_uid("p1"), "Old", "alice@example.com")
-    updated = store.update(_uid("p1"), owner_user_id="alice@example.com", name="New")
+    updated = store.update(_uid("p1"), user_id="alice@example.com", name="New")
     assert updated is not None
     assert updated.name == "New"
     assert updated.updated_at is not None
@@ -305,24 +308,24 @@ def test_update_renames_and_stamps_updated_at(store: SqlAlchemyProjectStore) -> 
 def test_update_noop_leaves_updated_at_none(store: SqlAlchemyProjectStore) -> None:
     """An update that changes nothing leaves ``updated_at`` untouched."""
     store.create(_uid("p1"), "Same", "alice@example.com")
-    updated = store.update(_uid("p1"), owner_user_id="alice@example.com", name="Same")
+    updated = store.update(_uid("p1"), user_id="alice@example.com", name="Same")
     assert updated is not None
     assert updated.updated_at is None
 
 
 def test_update_missing_returns_none(store: SqlAlchemyProjectStore) -> None:
     """Updating an unknown project returns ``None``."""
-    updated = store.update(_uid("nope"), owner_user_id="alice@example.com", name="X")
+    updated = store.update(_uid("nope"), user_id="alice@example.com", name="X")
     assert updated is None
 
 
 def test_update_scoped_to_owner(store: SqlAlchemyProjectStore) -> None:
     """A non-owner cannot rename another user's project."""
     store.create(_uid("p1"), "Alice Project", "alice@example.com")
-    updated = store.update(_uid("p1"), owner_user_id="bob@example.com", name="Hacked")
+    updated = store.update(_uid("p1"), user_id="bob@example.com", name="Hacked")
     assert updated is None
     # Unchanged for the real owner.
-    assert store.get(_uid("p1"), owner_user_id="alice@example.com").name == "Alice Project"
+    assert store.get(_uid("p1"), user_id="alice@example.com").name == "Alice Project"
 
 
 def test_update_rejects_duplicate_name(store: SqlAlchemyProjectStore) -> None:
@@ -330,7 +333,7 @@ def test_update_rejects_duplicate_name(store: SqlAlchemyProjectStore) -> None:
     store.create(_uid("p1"), "First", "alice@example.com")
     store.create(_uid("p2"), "Second", "alice@example.com")
     with pytest.raises(OmnigentError) as exc:
-        store.update(_uid("p2"), owner_user_id="alice@example.com", name="First")
+        store.update(_uid("p2"), user_id="alice@example.com", name="First")
     assert exc.value.code == ErrorCode.ALREADY_EXISTS
 
 
@@ -340,16 +343,16 @@ def test_update_rejects_duplicate_name(store: SqlAlchemyProjectStore) -> None:
 def test_delete_removes_project(store: SqlAlchemyProjectStore) -> None:
     """``delete`` removes the project and is idempotent."""
     store.create(_uid("p1"), "Doomed", "alice@example.com")
-    deleted = store.delete(_uid("p1"), owner_user_id="alice@example.com")
+    deleted = store.delete(_uid("p1"), user_id="alice@example.com")
     assert deleted is True
-    assert store.get(_uid("p1"), owner_user_id="alice@example.com") is None
-    deleted_again = store.delete(_uid("p1"), owner_user_id="alice@example.com")
+    assert store.get(_uid("p1"), user_id="alice@example.com") is None
+    deleted_again = store.delete(_uid("p1"), user_id="alice@example.com")
     assert deleted_again is False
 
 
 def test_delete_scoped_to_owner(store: SqlAlchemyProjectStore) -> None:
     """A non-owner cannot delete another user's project."""
     store.create(_uid("p1"), "Alice Project", "alice@example.com")
-    deleted = store.delete(_uid("p1"), owner_user_id="bob@example.com")
+    deleted = store.delete(_uid("p1"), user_id="bob@example.com")
     assert deleted is False
-    assert store.get(_uid("p1"), owner_user_id="alice@example.com") is not None
+    assert store.get(_uid("p1"), user_id="alice@example.com") is not None

@@ -3,10 +3,13 @@
 import asyncio
 import json
 import sys
+import threading
 import unittest
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 import databricks.sdk.config as _sdk_config_mod
 
@@ -574,17 +577,27 @@ class TestDatabricksExecutorConfig(unittest.TestCase):
         _run(_t())
 
     def test_default_model(self):
-        """When no model is specified, falls back to databricks-claude-sonnet-4-6."""
+        """Catalog default resolution does not block the event-loop thread."""
 
         async def _t():
             chunks = _make_text_stream("ok")
             client = FakeClient(chunks)
             executor = DatabricksExecutor(client=client)
+            event_loop_thread = threading.get_ident()
 
-            [e async for e in executor.run_turn([], [], "", config=ExecutorConfig())]
+            def _resolve_model(provider_name: str, *, family: str) -> SimpleNamespace:
+                self.assertNotEqual(threading.get_ident(), event_loop_thread)
+                self.assertEqual((provider_name, family), ("databricks", "claude"))
+                return SimpleNamespace(model_id="catalog-databricks-claude-default")
+
+            with patch(
+                "omnigent.model_catalog.resolve_catalog_model",
+                side_effect=_resolve_model,
+            ):
+                [e async for e in executor.run_turn([], [], "", config=ExecutorConfig())]
             self.assertEqual(
                 client.chat.completions.last_kwargs["model"],
-                "databricks-claude-sonnet-4-6",
+                "catalog-databricks-claude-default",
             )
 
         _run(_t())

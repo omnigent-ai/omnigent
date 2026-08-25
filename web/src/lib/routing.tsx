@@ -23,7 +23,10 @@
 
 import {
   type ComponentPropsWithoutRef,
+  type ComponentType,
+  type MouseEvent,
   type ReactNode,
+  type RefAttributes,
   createContext,
   forwardRef,
   useContext,
@@ -38,18 +41,27 @@ import {
   useParams as useRRParams,
   useSearchParams as useRRSearchParams,
 } from "react-router-dom";
+import { useOmnigentAnalytics } from "@/lib/analyticsEmit";
 
 /**
  * The routing contract web depends on. Types are taken verbatim from
  * react-router-dom so call sites are identical and any host implementation
  * must conform to the same shapes (the adapter's job).
  */
+/**
+ * Link props: react-router-dom's `LinkProps` plus an optional `componentId` an
+ * embedding host can use for per-link analytics. Standalone ignores it; the
+ * Databricks host maps it to a namespaced analytics id (see the routing IoC
+ * override). Optional so existing call sites are unchanged.
+ */
+export type OmnigentLinkProps = ComponentPropsWithoutRef<typeof RRLink> & { componentId?: string };
+
 export interface RoutingApi {
   useNavigate: typeof useRRNavigate;
   useParams: typeof useRRParams;
   useSearchParams: typeof useRRSearchParams;
   useLocation: typeof useRRLocation;
-  Link: typeof RRLink;
+  Link: ComponentType<OmnigentLinkProps & RefAttributes<HTMLAnchorElement>>;
   Outlet: typeof RROutlet;
   /**
    * Rebase an app-absolute path (`/c/:id`) the same way `navigate()`/`<Link>`
@@ -60,13 +72,31 @@ export interface RoutingApi {
   rebasePath: (path: string) => string;
 }
 
+// Standalone Link: react-router-dom's Link that reports a click to the host
+// analytics sink when a `componentId` is given (see `lib/analytics.ts`). The id
+// is consumed here and never spread onto the real <a>, so it can't warn as an
+// unknown DOM attribute. When no host sink is configured the emit is a no-op.
+const StandaloneLink = forwardRef<HTMLAnchorElement, OmnigentLinkProps>(function StandaloneLink(
+  { componentId, onClick, ...props },
+  ref,
+) {
+  const { trackClick } = useOmnigentAnalytics();
+  const handleClick = componentId
+    ? (e: MouseEvent<HTMLAnchorElement>) => {
+        trackClick(componentId, "link");
+        onClick?.(e);
+      }
+    : onClick;
+  return <RRLink ref={ref} {...props} onClick={handleClick} />;
+});
+
 /** Default implementation: plain react-router-dom. */
 export const reactRouterRouting: RoutingApi = {
   useNavigate: useRRNavigate,
   useParams: useRRParams,
   useSearchParams: useRRSearchParams,
   useLocation: useRRLocation,
-  Link: RRLink,
+  Link: StandaloneLink,
   Outlet: RROutlet,
   rebasePath: (path) => path,
 };
@@ -82,7 +112,7 @@ function rebasePath(path: string, basename: string): string {
   // and `/mount?o=1` are all "already under `/mount`", but a distinct segment
   // like `/mounting` is not. Checking only `=== basename` / `${basename}/`
   // missed the query/hash forms: a mount-absolute path carrying a search (e.g.
-  // the settings "Back to Omnigent" target `/mount?o=123`, captured from
+  // the settings Back target `/mount?o=123`, captured from
   // `useLocation()` which already includes the basename) fell through and got
   // prefixed again → `/mount/mount?o=123`, a 404.
   if (path === basename) return path;
@@ -129,7 +159,7 @@ export function basenamedRouting(
         return navigate(rebaseTo(to, basename), options);
       }) as ReturnType<typeof useRRNavigate>;
     },
-    Link: forwardRef<HTMLAnchorElement, ComponentPropsWithoutRef<typeof RRLink>>((props, ref) => {
+    Link: forwardRef<HTMLAnchorElement, OmnigentLinkProps>((props, ref) => {
       const Impl = base.Link;
       return <Impl ref={ref} {...props} to={rebaseTo(props.to, basename)} />;
     }),
@@ -172,12 +202,10 @@ export const useLocation: typeof useRRLocation = () => useRouting().useLocation(
  */
 export const useRebasePath = (): ((path: string) => string) => useRouting().rebasePath;
 
-export const Link = forwardRef<HTMLAnchorElement, ComponentPropsWithoutRef<typeof RRLink>>(
-  (props, ref) => {
-    const { Link: Impl } = useRouting();
-    return <Impl ref={ref} {...props} />;
-  },
-);
+export const Link = forwardRef<HTMLAnchorElement, OmnigentLinkProps>((props, ref) => {
+  const { Link: Impl } = useRouting();
+  return <Impl ref={ref} {...props} />;
+});
 Link.displayName = "Link";
 
 export const Outlet: typeof RROutlet = (props) => {

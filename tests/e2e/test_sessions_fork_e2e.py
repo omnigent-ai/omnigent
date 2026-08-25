@@ -201,6 +201,7 @@ def _fork_session(
     return fork
 
 
+@pytest.mark.compat_smoke
 def test_full_fork_replays_whole_history(
     http_client: httpx.Client,
     live_runner_id: str,
@@ -262,6 +263,64 @@ def test_full_fork_replays_whole_history(
     assert _CODEWORD_1 in text and _CODEWORD_2 in text, (
         f"fork's agent should recall both codewords from replayed history, got: {text!r}"
     )
+
+
+# Compaction-cursor remapping is server-side behavior introduced after v0.11.
+# A new runner paired with an old server must skip this new-server contract.
+@pytest.mark.compat_smoke
+@pytest.mark.min_server_version("0.12.0")
+def test_fork_preserves_compacted_context_boundary(
+    http_client: httpx.Client,
+    live_runner_id: str,
+    mock_llm_server_url: str,
+) -> None:
+    """Forking a compacted session remaps its cursor and remains executable."""
+    reset_mock_llm(mock_llm_server_url)
+    agent_name, model = _register_mock_fork_agent(
+        http_client, mock_llm_server_url, prefix="compacted"
+    )
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": "OK"}, {"text": "OK"}, {"text": "context preserved"}],
+        key=model,
+    )
+    source_id = _seed_two_codeword_turns(
+        http_client, agent_name=agent_name, runner_id=live_runner_id
+    )
+    source = http_client.get(f"/v1/sessions/{source_id}").json()
+    boundary = next(
+        item
+        for item in source["items"]
+        if item.get("type") == "message" and (item.get("data") or {}).get("role") == "assistant"
+    )
+    compact = http_client.post(
+        f"/v1/sessions/{source_id}/events",
+        json={
+            "type": "compaction",
+            "data": {
+                "summary": f"The user mentioned {_CODEWORD_1}.",
+                "last_item_id": boundary["id"],
+                "token_count": 12,
+            },
+        },
+    )
+    assert compact.status_code == 202, compact.text
+
+    fork = _fork_session(http_client, source_id, runner_id=live_runner_id)
+    fork_items = fork["items"]
+    fork_compaction = next(item for item in fork_items if item.get("type") == "compaction")
+    fork_ids = {item["id"] for item in fork_items}
+    fork_boundary_id = fork_compaction["data"]["last_item_id"]
+    assert fork_boundary_id in fork_ids
+    assert fork_boundary_id != boundary["id"]
+
+    response_id = send_user_message_to_session(
+        http_client,
+        session_id=fork["id"],
+        content="Confirm that the compacted fork can continue.",
+    )
+    body = poll_session_until_terminal(http_client, session_id=fork["id"], response_id=response_id)
+    assert body["status"] == "completed", body.get("error")
 
 
 # Truncating a fork at a mid-conversation cutoff (dropping the post-cutoff turn)

@@ -21,9 +21,41 @@ const { readFileSync } = require("node:fs");
 const path = require("node:path");
 
 const mainSource = readFileSync(path.join(__dirname, "../src/main.js"), "utf8");
+const preloadSource = readFileSync(path.join(__dirname, "../src/preload.js"), "utf8");
 
 // Strip block comments, then line comments (leaving `://` in URLs intact).
 const liveCode = mainSource.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
+
+describe("setup clipboard IPC wiring", () => {
+  it("exposes a narrow copy action through the setup bridge", () => {
+    assert.match(
+      preloadSource,
+      /copyText:\s*\(text\)\s*=>\s*ipcRenderer\.invoke\("omnigent:copy-setup-text",\s*text\)/,
+    );
+  });
+
+  it("checks the setup-page sender before writing to the clipboard", () => {
+    assert.match(
+      liveCode,
+      /ipcMain\.handle\("omnigent:copy-setup-text",[\s\S]{0,200}!isSetupPageSender\(event\)[\s\S]{0,300}clipboard\.writeText\(text\)/,
+    );
+  });
+});
+
+describe("production developer-mode wiring (src/main.js)", () => {
+  it("uses the same opt-in to enable the shell window's DevTools capability", () => {
+    assert.match(liveCode, /webPreferences:\s*\{[\s\S]{0,400}devTools:\s*developerModeEnabled\(\)/);
+  });
+});
+
+describe("workspace root bounce wiring (src/main.js)", () => {
+  it("registers the bounce against the window's current pinned origin", () => {
+    assert.match(
+      liveCode,
+      /registerWorkspaceRootBounce\(\s*win\.webContents,\s*\(\)\s*=>\s*pinnedOrigin\(win\)\s*\)/,
+    );
+  });
+});
 
 describe("workspace chrome injection wiring (src/main.js)", () => {
   it("invokes registerWorkspaceChromeHide(win.webContents) as live code", () => {
@@ -157,8 +189,31 @@ describe("OAuth popup COOP-strip wiring (src/main.js)", () => {
   });
 });
 
+describe("recent-server startup wiring (src/main.js)", () => {
+  it("backfills a saved server only after its cold load succeeds", () => {
+    assert.match(
+      liveCode,
+      /loadURL\(destination\)\s*\.then\(\(\)\s*=>\s*\{\s*if\s*\(!ephemeral\s*&&\s*!explicit\s*&&\s*serverUrl\)[\s\S]{0,200}rememberRecentServer\(settings,\s*serverUrl\)/,
+      [
+        "createWindow no longer backfills a successfully loaded saved server into",
+        "recent_servers. Existing installs can have server_url without recent_servers,",
+        "so the setup page would show no recents after leaving that server. Keep the",
+        "backfill in loadURL(destination).then, gated away from ephemeral windows and",
+        "explicit target URLs (which may include a conversation path).",
+      ].join(" "),
+    );
+  });
+
+  it("normalizes persisted targets before returning setup-page recents", () => {
+    assert.match(
+      liveCode,
+      /ipcMain\.handle\("omnigent:get-recent-servers"[\s\S]{0,300}return normalizeRecentServers\(loadSettings\(\)\.recent_servers\)/,
+    );
+  });
+});
+
 // Guard for the deep-link path join in createWindow. A basename-less SPA path
-// (/c/<id>) lives UNDER the server's workspace mount (/ml/omnigents), so it
+// (/c/<id>) lives UNDER the server's workspace mount (/omnigent), so it
 // must be string-concatenated (resolveServerPath) — NOT resolved with
 // `new URL(path, serverUrl)`, which would anchor against the ORIGIN and drop
 // the mount, opening the wrong URL for every workspace deep link. This catches
@@ -170,7 +225,7 @@ describe("deep-link path join wiring (src/main.js)", () => {
       /resolveServerPath\(serverUrl, opts\.path\)/,
       [
         "createWindow no longer joins opts.path onto opts.serverUrl via",
-        "resolveServerPath. A deep link to a workspace server (origin + /ml/omnigents",
+        "resolveServerPath. A deep link to a workspace server (origin + /omnigent",
         "mount) would lose the mount and 404. Restore the mount-aware join (see",
         "resolveServerPath); do not replace it with `new URL(path, serverUrl)`.",
       ].join(" "),
@@ -323,6 +378,39 @@ describe("deep-link ingestion wiring (src/main.js)", () => {
         "expandDatabricksWorkspaceUrl reappeared in the pre-decision section of",
         "handleDeepLink, reopening the pre-consent SSRF. The probe must run only after",
         "confirmOpenDeepLink (in the consent-unknown branch), not before chooseDeepLinkStrategy.",
+      ].join(" "),
+    );
+  });
+});
+
+// pinWindow is the one chokepoint every "leave this server" path routes through
+// (Connect to new server, Change Server…, switch-server, did-fail-load fallback).
+// Those navigations tear down the renderer WITHOUT running BrowserPane's unmount
+// detach, so pinWindow must close the window's browser registry when the origin
+// changes — else the native WebContentsView dangles over the setup/welcome page.
+describe("browser-view teardown on server change (src/main.js)", () => {
+  it("closes the window's browserRegistry when pinWindow changes origin", () => {
+    assert.match(
+      liveCode,
+      /function pinWindow\(win,\s*origin\)\s*\{[\s\S]{0,600}browserRegistry\?\.closeAll\(/,
+      [
+        "pinWindow no longer closes the window's embedded-browser views when the",
+        "origin changes. Leaving a server (Connect to new server / Change Server / switch)",
+        "navigates the window away and tears down the renderer WITHOUT running",
+        "BrowserPane's unmount detach, so the native WebContentsView keeps painting over",
+        "the setup/welcome page. Restore the closeAll call in pinWindow.",
+      ].join(" "),
+    );
+  });
+
+  it("guards the teardown so the initial cold-connect pin doesn't fire it", () => {
+    assert.match(
+      liveCode,
+      /function pinWindow\(win,\s*origin\)\s*\{[\s\S]{0,600}state\.origin\s*!=\s*null[\s\S]{0,120}browserRegistry\?\.closeAll\(/,
+      [
+        "The closeAll in pinWindow is no longer guarded on a prior origin. Without the",
+        "state.origin != null guard the initial pin (setup→first connect) would try to",
+        "close a registry with nothing open. Keep the guard.",
       ].join(" "),
     );
   });

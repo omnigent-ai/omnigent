@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import TypedDict
 
 from fastapi import (
     APIRouter,
@@ -43,13 +44,14 @@ from omnigent.server.routes._auth_helpers import (
 from omnigent.server.routes._auth_helpers import (
     require_user as _require_user,
 )
-from omnigent.server.routes._sessions.common import *
 from omnigent.server.routes._sessions.common import (
+    _logger,
     get_server_runner_router,
     set_server_runner_router,
 )
-from omnigent.server.routes._sessions.helpers import *
-from omnigent.server.routes._sessions.orchestration import *
+from omnigent.server.routes._sessions.helpers import (
+    _announce_session_added,
+)
 from omnigent.server.schemas import (
     AgentObject,
     GrantPermissionRequest,
@@ -64,6 +66,11 @@ from omnigent.spec.types import (
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
+
+
+class _PermissionListResponse(TypedDict):
+    permissions: list[PermissionObject]
+    next_cursor: str | None
 
 
 def register_permissions_routes(
@@ -189,42 +196,84 @@ def register_permissions_routes(
         session_id: str,
         target_user_id: str,
     ) -> Response:
-        """Revoke a user's permission on a session.
+        """Revoke a permission on a session — someone else's, or your own.
 
-        Requires manage-level access. Cannot revoke your own
-        manage grant (prevents orphaned sessions). Returns 204
-        whether or not the grant existed (idempotent).
+        Two shapes, one endpoint:
+
+        * *Revoke* — removing **another** user's grant is a management
+          action and needs manage access.
+        * *Leave* — removing **your own** grant ("unshare myself", so a
+          shared session stops cluttering your sidebar) needs only read
+          access, since giving up access requires no privilege.
+
+        Either way the owner grant is protected: it is what keeps the
+        session reachable, so revoking it would orphan the session. That
+        guard covers the self case too — an owner cannot leave, and
+        archives or deletes instead. A manage-level *grantee* is still a
+        guest and may leave. Leaving records no lasting refusal, so the
+        owner re-granting brings the session back.
+
+        Idempotent: 204 whether or not a grant existed.
 
         :param request: The incoming FastAPI request (for auth).
         :param session_id: Session to revoke access from,
             e.g. ``"conv_abc123"``.
-        :param target_user_id: User whose grant to revoke,
-            e.g. ``"alice@example.com"``.
+        :param target_user_id: User whose grant to revoke, or the caller's
+            own id to leave, e.g. ``"alice@example.com"``.
         :returns: 204 No Content.
-        :raises OmnigentError: 404 if no session or no access,
-            403 if attempting to revoke own manage grant.
+        :raises OmnigentError: 404 if no session or no access, 403 when the
+            target holds the owner grant, 400 when leaving a sub-agent
+            session, 401 if unauthenticated.
         """
         user_id = _require_user(request, auth_provider)
+        # Leaving is self-service; revoking someone else is management. Read
+        # access is the floor for the self case — enough to prove the session
+        # exists and is visible to the caller without leaking others' via
+        # 403/404.
+        leaving_self = target_user_id == user_id
         await _require_access(
-            user_id, session_id, LEVEL_MANAGE, permission_store, conversation_store
+            user_id,
+            session_id,
+            LEVEL_READ if leaving_self else LEVEL_MANAGE,
+            permission_store,
+            conversation_store,
         )
         if permission_store is None:
             raise OmnigentError(
                 "Permissions not enabled",
                 code=ErrorCode.INTERNAL_ERROR,
             )
-        if target_user_id == user_id:
+        # Single-user mode has one identity that owns everything, so a
+        # self-revoke there could only strand the local user's own sessions.
+        if leaving_self and user_id is None:
             raise OmnigentError(
-                "Cannot modify your own permissions",
+                "Cannot leave a session on a single-user server.",
                 code=ErrorCode.FORBIDDEN,
             )
+        # A sub-agent holds no grant of its own — access delegates to its
+        # parent — so revoking here would delete nothing and still report
+        # success, leaving the row in place. Scoped to the self case: the
+        # manager path is unchanged.
+        if leaving_self:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is not None and conv.parent_conversation_id is not None:
+                raise OmnigentError(
+                    "This is a sub-agent session; its access comes from its parent. "
+                    f"Leave the parent session {conv.parent_conversation_id!r} instead.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
         existing = await asyncio.to_thread(permission_store.get, target_user_id, session_id)
         if existing is not None and existing.level == LEVEL_OWNER:
             raise OmnigentError(
-                "Cannot revoke owner permissions",
+                "Cannot leave a session you own. Delete or archive it instead."
+                if leaving_self
+                else "Cannot revoke owner permissions",
                 code=ErrorCode.FORBIDDEN,
             )
         await asyncio.to_thread(permission_store.revoke, target_user_id, session_id)
+        # The leaver's own tab drops the row via the client mutation's success
+        # handler; their other tabs converge on the next watch-set diff, which
+        # reports the now-inaccessible id as removed. No extra push needed.
         return Response(status_code=204)
 
     @router.get(
@@ -260,7 +309,7 @@ def register_permissions_routes(
         session_id: str,
         limit: int = Query(default=100, ge=1, le=1000),
         after: str | None = Query(default=None, description="Cursor: user_id to start after"),
-    ) -> dict:
+    ) -> _PermissionListResponse:
         """List permission grants on a session with cursor pagination.
 
         Requires manage-level access.
@@ -296,8 +345,6 @@ def register_permissions_routes(
             ],
             "next_cursor": next_cursor,
         }
-
-    return router
 
 
 def _policy_type(spec: PolicySpec) -> str:

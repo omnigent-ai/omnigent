@@ -24,7 +24,7 @@ vi.mock("qrcode.react", () => ({
 // Host config is read-once at render to decide plain-input vs combobox and to
 // transform the share link. Mock both getters so we can drive each branch.
 vi.mock("@/lib/host", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/lib/host")>();
+  const actual = await importOriginal<typeof host>();
   return {
     ...actual,
     getOmnigentUserSearch: vi.fn(() => undefined),
@@ -34,6 +34,7 @@ vi.mock("@/lib/host", async (importOriginal) => {
 
 import * as api from "@/lib/permissionsApi";
 import * as host from "@/lib/host";
+
 const listMock = vi.mocked(api.listPermissions);
 const grantMock = vi.mocked(api.grantPermission);
 const revokeMock = vi.mocked(api.revokePermission);
@@ -67,6 +68,8 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
     public_sharing_enabled: true,
     server_version: null,
     smart_routing_enabled: false,
+    smart_routing_sources: { external: false, oss: false },
+    features: {},
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
@@ -278,6 +281,8 @@ describe("PermissionsModal", () => {
     // The manage grant's level is still visible to the viewer as static text.
     expect(screen.getByText("Manage")).toBeInTheDocument();
 
+    // Only one listbox can be open, so each interaction must finish first.
+    /* oxlint-disable no-await-in-loop */
     for (const trigger of triggers) {
       trigger.focus();
       fireEvent.keyDown(trigger, { key: "Enter" });
@@ -290,6 +295,7 @@ describe("PermissionsModal", () => {
       fireEvent.keyDown(listbox, { key: "Escape" });
       await waitFor(() => expect(screen.queryByRole("listbox")).not.toBeInTheDocument());
     }
+    /* oxlint-enable no-await-in-loop */
   });
 
   it("does not fetch permissions when closed", () => {

@@ -29,6 +29,7 @@ from tests.runner.conftest import (
     _FakeProcessManager,
     _runner_client,
     _ScriptedHarnessClient,
+    _sse,
 )
 
 # Reuse the proven runner-turn stubs from the sessions-native suite.
@@ -348,3 +349,78 @@ async def test_top_level_session_idle_is_noop(
 
     assert http == 204
     assert items == []
+
+
+@pytest.mark.asyncio
+async def test_routed_child_off_its_native_spec_still_delivers(
+    _clean_subagent_registry: None,
+) -> None:
+    """A child routed onto an SDK harness delivers, though its spec says native.
+
+    The Smart Routing shape: polly's ``claude_code`` worker declares
+    ``claude-native``, but a routed child is forwarded ``harness_override`` and
+    actually runs ``claude-sdk``. The runner read the harness off the cached
+    SPEC, so the turn looked native and its completion was left to a native
+    path that never runs — the parent waited forever while the pi sibling
+    (whose spec harness is already non-native) was the only one to report.
+    """
+    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+    runner_app.register_subagent_work(
+        parent_session_id=PARENT_SESSION_ID,
+        child_session_id=CHILD_SESSION_ID,
+        agent="claude_code",
+        title="joke-claude",
+    )
+    harness_client = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+            _sse({"type": "response.output_text.delta", "delta": "knock knock"}),
+            _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+        ]
+    )
+    pm = _FakeProcessManager(harness_client)
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="claude_code",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+        )
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    inbox = runner_app._session_inboxes_ref[PARENT_SESSION_ID]
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{CHILD_SESSION_ID}/events",
+            json={
+                "type": "message",
+                "agent_id": "ag_reviewer",
+                "harness_override": "claude-sdk",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "tell me a joke"}],
+                },
+            },
+        )
+        assert resp.status_code in (200, 202), resp.text
+        for _ in range(200):
+            if not inbox.empty():
+                break
+            await asyncio.sleep(0.01)
+
+    items: list[dict[str, Any]] = []
+    while not inbox.empty():
+        items.append(inbox.get_nowait())
+    assert items, (
+        "a routed child finished its turn but nothing reached the parent inbox: "
+        "the runner read the harness off the spec (claude-native) instead of the "
+        "forwarded harness_override (claude-sdk)"
+    )
+    assert items[0]["status"] == "completed"
+    assert items[0]["conversation_id"] == CHILD_SESSION_ID
