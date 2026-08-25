@@ -570,6 +570,32 @@ class ZerobusLogHandler(logging.Handler):
 _active_sink: ZerobusLogHandler | None = None
 _sink_lock = threading.Lock()
 
+# Dedicated logger for the server's outgoing SSE-event stream. It gets the sink
+# as its sole handler with ``propagate=False`` (wired in attach_debug_log_sink),
+# so its high-volume, table-only records — one per emitted event, names + safe
+# ids, never content — never reach the on-disk/stderr logs.
+SSE_LOGGER_NAME = "omnigent.sse_events"
+
+
+def debug_sink_enabled() -> bool:
+    """Whether the debug-log sink is active in this process.
+
+    A cheap gate for opt-in, table-only logging (e.g. the SSE-event stream):
+    callers skip building records entirely when the sink is off, so the feature
+    adds no cost for OSS / non-internal users who never enabled it.
+    """
+    return _active_sink is not None and not _active_sink.closed
+
+
+def sse_event_logger() -> logging.Logger:
+    """Return the table-only logger for SSE events (see :data:`SSE_LOGGER_NAME`).
+
+    Records go only to the debug sink (attached with ``propagate=False`` in
+    :func:`attach_debug_log_sink`); when the sink is disabled the logger has no
+    handlers and records are dropped -- so gate on :func:`debug_sink_enabled`.
+    """
+    return logging.getLogger(SSE_LOGGER_NAME)
+
 
 def attach_debug_log_sink(loggers: list[logging.Logger], *, source: str, level: int) -> None:
     """Attach the shared debug-log sink to *loggers* when configured.
@@ -601,3 +627,10 @@ def attach_debug_log_sink(loggers: list[logging.Logger], *, source: str, level: 
         _active_sink.setLevel(level)
         for target in loggers:
             target.addHandler(_active_sink)
+        # Table-only SSE-event logger: the sink is its sole handler and it does
+        # not propagate to root, so per-token delta events populate the table
+        # without flooding the on-disk/stderr logs.
+        sse_logger = logging.getLogger(SSE_LOGGER_NAME)
+        sse_logger.setLevel(level)
+        sse_logger.propagate = False
+        sse_logger.addHandler(_active_sink)
