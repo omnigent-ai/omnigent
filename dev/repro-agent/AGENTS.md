@@ -330,46 +330,38 @@ empty recordings list on a `web`/`terminal`/`cli` facet must always come with a
 concrete reason, never a silent skip. Do not fabricate a hollow journey that
 doesn't actually reach the failure just to produce a video.
 
-**The recorder needs its own server — spawn one with a scrubbed env.** A `web`
-recording runs the `tests/e2e_ui/` suite, which drives a live server. Do **not**
-point it at the app you were launched against: that app is typically auth-gated
-(a Databricks Apps deployment bounces an unauthenticated Playwright to SSO), so
-the recorder can't drive it. Let the `tests/e2e_ui/` fixtures **spawn their own
-local server + runner** instead (the default when no `--ui-base-url` is passed).
+**The recorder needs its own server.** A `web` recording runs the
+`tests/e2e_ui/` suite, which drives a live server. Do **not** point it at the app
+you were launched against: that app is typically auth-gated (a Databricks Apps
+deployment bounces an unauthenticated Playwright to SSO), so the recorder can't
+drive it. Let the `tests/e2e_ui/` fixtures **spawn their own local server +
+runner** instead (the default when no `--ui-base-url` is passed).
 
-But when you are yourself running inside a server-spawned runner (the `--server`
-CI path), that fixture's runner **inherits your runner's environment and never
-tunnels** — it silently hangs with an empty `runner.log` and stays
-`online: false`. The conflict is the ambient runner/host vars leaking into the
-child. Launch the recorder with them **stripped** so the fixture starts clean:
+**Build the SPA up front — before you run the recorder, not during it.** The
+`tests/e2e_ui/` server serves the SPA from `omnigent/server/static/web-ui/`,
+which starts empty in your worktree (the deploy's pre-built bundle lives in the
+serving layer, not the source tree). The suite *can* build it lazily on first
+boot, but that build pins the machine's cores for a few minutes **while** the
+spawned runner is trying to tunnel and go online — on a busy CI box the runner
+can miss its online deadline and the fixture reports `online: false`, which looks
+like an environment failure but is really just the build starving the boot. So
+**always build the SPA first as its own step**, then run the (now fast-booting)
+recorder:
 
 ```bash
-env -u OMNIGENT_RUNNER_ID -u OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN \
-    -u OMNIGENT_RUNNER_TUNNEL_TOKEN -u OMNIGENT_RUNNER_PARENT_PID \
-    -u OMNIGENT_RUNNER_ISOLATE_SESSION -u OMNIGENT_RUNNER_WORKSPACE \
-    -u OMNIGENT_HOST_ID -u OMNIGENT_HOST_TOKEN -u OMNIGENT_HOST_NAME \
-    -u RUNNER_SERVER_URL -u OMNIGENT_REMOTE_AUTH_TOKEN \
-    $(env | grep -oE '^OMNIGENT_RUNNER_ZYGOTE[A-Z_]*' | sed 's/^/-u /' | tr '\n' ' ') \
-    pytest <test_path> --video on --screenshot on --output recordings/<slug>
+pnpm --filter web install && pnpm --filter web run build   # once, up front
+pytest <test_path> --video on --screenshot on --output recordings/<slug>
 ```
 
-The `OMNIGENT_RUNNER_ZYGOTE*` FDs are the usual culprit — they make the child
-runner take the fork path and block on control FDs it doesn't have. If the
-spawned runner still won't go `online: true` within the fixture's timeout, that
-lane is genuinely unreachable here: keep `recordings: []` for it and say so in
-`evidence` (a real environment limit, not a bug verdict).
-
-**A missing SPA build is not a reason to skip recording.** The `tests/e2e_ui/`
-server serves the SPA from `omnigent/server/static/web-ui/`, which starts empty
-in your worktree (the deploy's pre-built bundle lives in the serving layer, not
-the source tree). That is expected and cheap to resolve — the `tests/e2e_ui/`
-harness **builds the SPA itself** as part of its normal boot (a `pnpm install
---filter web && pnpm --filter web run build`, a few minutes, well within your
-turn budget), so you do **not** need to pre-check for the directory. Just run the
-recorder and let the suite build it. If you prefer to build it explicitly first
-for determinism, run `pnpm --filter web install && pnpm --filter web run build`
-from your checkout — but never skip recording merely because the dir is empty on
-first look; that is the normal starting state, not a blocker.
+If the spawned runner still doesn't reach `online: true` within the fixture's
+timeout *after* the SPA is already built, capture the tail of the fixture's
+`runner.log` and treat that lane as genuinely unreachable here: keep
+`recordings: []` for it and, in `evidence`, say plainly **"recorder's test server
+did not come online in time"** with the `runner.log` tail. Do **not** assert a
+specific internal cause you did not confirm (e.g. do not claim leaked runner env
+vars or zygote FDs blocked a fork — the fixture spawns a plain
+`omnigent.runner._entry`, not a zygote fork, so that is not the mechanism). Name
+only what you observed.
 
 - **`web` facets** — run the authored Playwright test with recording on:
   `pytest <test_path> --video on --screenshot on --output recordings/<slug>`
@@ -403,6 +395,14 @@ state, bad output, error) for a `before` recording, or the correct end state for
 `fixed` one. Convert to `.mp4` with `ffmpeg` when available; `.webm`/`.gif` are
 fine otherwise. Recordings are workspace artifacts exactly like the test — leave
 them uncommitted; in CI the artifact bundle collects them.
+
+For each recording, write a short **`caption`** in its handoff entry describing
+**the actions that clip performs** — the ordered steps a viewer watches, ending
+in what the clip shows (see the `recordings` field in Output). You just drove
+those steps, so capture them while they're fresh: e.g. `"start a session → open
+the model picker → select the catalog → picker shows raw IDs"`. This is what a
+reader sees under the video on the ticket, so make it read like a journey, not a
+restatement of the bug title.
 
 ## Output — the reproduction artifacts
 
@@ -444,7 +444,8 @@ choice:
   ],
   "test_path": "tests/e2e_ui/model_catalog/test_1234.py",
   "recordings": [
-    {"surface": "web", "kind": "before", "path": "recordings/1234/before-picker.webm", "format": "webm"}
+    {"surface": "web", "kind": "before", "path": "recordings/1234/before-picker.webm", "format": "webm",
+     "caption": "open the model picker → select the catalog → picker shows raw IDs instead of names"}
   ],
   "session_id": "dc59e331-...",
   "journey": "open model picker → select catalog → picker shows raw IDs",
@@ -483,13 +484,20 @@ Field meanings:
   excerpt), plus any root-cause leads you noticed while reproducing (hypotheses
   only — you do not fix).
 - `recordings` — the Step 4 captures: a list of
-  `{"surface", "kind", "path", "format"}` objects. `kind` is `"before"` for a
-  `reproduced` facet's failing run or `"fixed"` for an `already_fixed` facet's
-  passing run (the fix step later re-records the same drivers post-fix as
-  `"after"`); `path` workspace-relative. Include an entry for the
-  authored-but-unrendered VHS tape too (`"format": "tape"`) when rendering was
-  skipped. Empty list when nothing was recorded — then say what was missing in
-  `evidence`.
+  `{"surface", "kind", "path", "format", "caption"}` objects. `kind` is
+  `"before"` for a `reproduced` facet's failing run or `"fixed"` for an
+  `already_fixed` facet's passing run (the fix step later re-records the same
+  drivers post-fix as `"after"`); `path` workspace-relative. `caption` is a
+  short, human-readable description of **the actions this specific clip
+  performs**, written as the ordered steps a viewer will watch and ending in
+  what the clip shows — e.g. `"start a session → open the model picker → select
+  the catalog → picker shows raw IDs"`. Phrase it for *this* clip's outcome: a
+  `before` caption ends in the failure, a `fixed` caption ends in the correct
+  behavior (the journey completing). This is per-recording (each clip drives its
+  own steps), distinct from the bug-level `journey` field. Include an entry for
+  the authored-but-unrendered VHS tape too (`"format": "tape"`) when rendering
+  was skipped. Empty list when nothing was recorded — then say what was missing
+  in `evidence`.
 
 Keep the prose before the block terse — the one exception is the full test
 source, which you paste in full. You produce the live-confirmed reproduction +

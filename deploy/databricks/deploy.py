@@ -39,7 +39,12 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from databricks.sdk import WorkspaceClient
 
-_WORKSPACE_WHEEL_LIMIT_BYTES = 10 * 1024 * 1024
+# Databricks Apps rejects any single source file over 10 MB. Keep wheels and
+# the externalized SPA archive under the same limit.
+_WORKSPACE_FILE_LIMIT_BYTES = 10 * 1024 * 1024
+_WORKSPACE_WHEEL_LIMIT_BYTES = _WORKSPACE_FILE_LIMIT_BYTES
+_WEB_UI_DIR_NAME = "web-ui"
+_WEB_UI_ARCHIVE_NAME = "web-ui.tar.gz"
 _APP_REQUIRES_PYTHON = ">=3.12,<3.13"
 # Public PyPI by default. Set UV_INDEX_URL to lock against a private mirror or
 # proxy instead (see run_uv_lock).
@@ -192,6 +197,11 @@ def _clean_build_artifacts() -> None:
             shutil.rmtree(target)
 
 
+def _dist_web_ui_archive() -> Path:
+    """Return the SPA archive produced outside the Python wheel."""
+    return _repo_root() / "dist" / _WEB_UI_ARCHIVE_NAME
+
+
 def _build_wheels(skip_web_ui: bool) -> list[Path]:
     """Invoke build.sh and return the resulting wheel paths."""
     root = _repo_root()
@@ -199,7 +209,15 @@ def _build_wheels(skip_web_ui: bool) -> list[Path]:
     env = os.environ.copy()
     if skip_web_ui:
         env["SKIP_WEB_UI"] = "1"
-    _log(f"$ {build_sh}" + (" (SKIP_WEB_UI=1)" if skip_web_ui else ""))
+        env.pop("EXTERNALIZE_WEB_UI", None)
+    else:
+        # Keep the SPA out of the wheel: bundled it takes the main wheel over
+        # the 10 MB Workspace per-file cap. build.sh writes a fixed archive,
+        # so no caller-controlled path reaches rm or mv.
+        env["EXTERNALIZE_WEB_UI"] = "1"
+        env.pop("SKIP_WEB_UI", None)
+        env.pop("OMNIGENT_SKIP_WEB_UI", None)
+    _log(f"$ {build_sh}" + (" (SKIP_WEB_UI=1)" if skip_web_ui else " (EXTERNALIZE_WEB_UI=1)"))
     subprocess.run([str(build_sh)], cwd=root, env=env, check=True)
     wheels = sorted((root / "dist").glob("*.whl"))
     if not wheels:
@@ -295,6 +313,61 @@ def _sweep_local_src_wheels(keep: set[str]) -> None:
             continue
         _log(f"removing stale local wheel {entry.relative_to(_repo_root())}")
         entry.unlink()
+
+
+def _stage_web_ui(skip_web_ui: bool) -> Path | None:
+    """Copy the externalized SPA archive into the app source directory.
+
+    A previous version staged the SPA as hundreds of loose files. The archive
+    keeps the same source-code sync path while reducing the Workspace upload
+    round-trips to one file. ``src/app.py`` extracts it before importing the
+    server and points ``OMNIGENT_WEB_UI_DIST`` at the extracted directory.
+    """
+    src = _src_dir()
+    stale_dir = src / _WEB_UI_DIR_NAME
+    if stale_dir.exists():
+        shutil.rmtree(stale_dir)
+        _log(f"removed stale {stale_dir.relative_to(_repo_root())}")
+
+    destination = src / _WEB_UI_ARCHIVE_NAME
+    if destination.exists():
+        if destination.is_dir():
+            shutil.rmtree(destination)
+        else:
+            destination.unlink()
+
+    if skip_web_ui:
+        _log("--skip-web-ui: deploying without the SPA (API-only)")
+        return None
+
+    source = _dist_web_ui_archive()
+    if not source.is_file():
+        _log(f"no externalized SPA at {source.relative_to(_repo_root())}; skipping web UI staging")
+        return None
+
+    shutil.copy2(source, destination)
+    _log(
+        f"copy SPA archive {source.relative_to(_repo_root())} → "
+        f"{destination.relative_to(_repo_root())}"
+    )
+    return destination
+
+
+def _assert_app_files_under_limit() -> None:
+    """Fail before upload if any app source file exceeds the Workspace cap."""
+    src = _src_dir()
+    offenders = [
+        (path, path.stat().st_size)
+        for path in src.rglob("*")
+        if path.is_file() and path.stat().st_size > _WORKSPACE_FILE_LIMIT_BYTES
+    ]
+    if offenders:
+        listing = ", ".join(
+            f"{path.relative_to(src)} ({size / 1024 / 1024:.2f} MB)" for path, size in offenders
+        )
+        raise SystemExit(
+            f"app source files exceed the Databricks Apps 10 MB per-file cap: {listing}"
+        )
 
 
 def _toml_string(value: str) -> str:
@@ -851,10 +924,9 @@ def main() -> int:
         _log(f"  {wheel.name}  {size_mb:.2f} MB")
     if classified.oversize:
         raise SystemExit(
-            "uv-based Databricks Apps deploys require all Omnigent wheels "
-            "to fit in the app source snapshot. Rebuild with --skip-web-ui "
-            "or reduce wheel size; UC Volume wheel paths are not used "
-            "because uv lock validates path sources locally."
+            "uv-based Databricks Apps deploys require every Omnigent wheel to "
+            "fit under the 10 MB Workspace file cap. Reduce the Python payload "
+            "or pass --skip-web-ui; the SPA ships outside the wheel."
         )
 
     # Late-import the SDK so `--help` works without it installed.
@@ -872,6 +944,10 @@ def main() -> int:
         _log(f"copy {wheel.name} → {dest.relative_to(_repo_root())}")
         shutil.copy2(wheel, dest)
 
+    # 1a) Ship the SPA as one archive beside app.py so no wheel exceeds the
+    # cap and Databricks does not sync hundreds of individual UI files.
+    _stage_web_ui(args.skip_web_ui)
+
     # 2) Generate pyproject.toml + uv.lock. Remove requirements.txt
     # first because Databricks Apps gives it precedence over uv.
     write_uv_dependency_files(
@@ -881,6 +957,9 @@ def main() -> int:
         classified.oversize,
         deploy_version,
     )
+
+    # 3) Guard every uploaded source file before touching the workspace.
+    _assert_app_files_under_limit()
 
     # 4) Bind the bundle to the existing app (if any).
     _ensure_bound(args)

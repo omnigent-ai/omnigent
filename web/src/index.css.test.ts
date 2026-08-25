@@ -625,3 +625,64 @@ describe("index.css native conversation breadcrumb", () => {
     );
   });
 });
+
+describe("index.css native safe-area insets for mobile overlays", () => {
+  // The `fixed inset-0` overlays cover the whole screen on a phone, status bar
+  // and home indicator included, so each one needs the safe-area padding. The
+  // Shells drawer once missed it (the rule listed drawers by `data-testid` and
+  // its id was never added), putting the title and Close button under the
+  // dynamic island with no way to dismiss the panel. Selecting the shared
+  // `.mobile-panel-drawer` class covers every drawer built from
+  // `MobilePanelDrawer`, present and future.
+  // Balance-aware slice instead of `[^)]*`: a selector in this list may well
+  // grow a functional pseudo-class (`:not(...)`), which a naive capture would
+  // truncate at its first `)` — silently dropping selectors from the assertions
+  // below.
+  const rule = extractInsetRule(cssSource);
+
+  it("has the inset rule this test exists to protect", () => {
+    expect(rule).not.toBeNull();
+    expect(rule?.body).toContain("padding-top: var(--omnigent-safe-top)");
+    expect(rule?.body).toContain("padding-bottom: var(--omnigent-safe-bottom)");
+  });
+
+  it.each([
+    ".conversations-sidebar",
+    '[data-testid="file-viewer"]',
+    '[data-testid="files-panel-drawer"]',
+    '[data-testid="terminals-panel"]',
+    ".mobile-panel-drawer",
+  ])("insets %s", (selector) => {
+    expect(rule?.selectors).toContain(selector);
+  });
+});
+
+/**
+ * Slice the native safe-area inset rule out of the CSS source.
+ *
+ * Walks parens/braces so a selector containing `)` (e.g. `:not(...)`) can't
+ * truncate the selector list, and returns the selector text and declaration
+ * body separately. `null` when the rule is gone (a real failure, not a silent
+ * pass).
+ */
+function extractInsetRule(css: string): { selectors: string; body: string } | null {
+  // The native prefix appears on several rules; the inset rule is the one whose
+  // subject is an `:is(...)` selector list.
+  const match = /:is\(\[data-ios-native\], \[data-android-native\]\)\s*:is\(/.exec(css);
+  if (match === null) return null;
+  let depth = 1; // the `:is(` the match ends on
+  let i = match.index + match[0].length;
+  for (; i < css.length; i += 1) {
+    if (css[i] === "(") depth += 1;
+    else if (css[i] === ")") {
+      depth -= 1;
+      if (depth === 0) break;
+    }
+  }
+  if (depth !== 0) return null;
+  const selectors = css.slice(match.index + match[0].length, i);
+  const bodyStart = css.indexOf("{", i);
+  const bodyEnd = css.indexOf("}", bodyStart);
+  if (bodyStart === -1 || bodyEnd === -1) return null;
+  return { selectors, body: css.slice(bodyStart + 1, bodyEnd) };
+}
