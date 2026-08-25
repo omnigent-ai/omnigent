@@ -355,30 +355,17 @@ def _load_user_period_cost(
 
     if period == "day":
         start = dt.date()
-        end = dt.date()
     elif period == "week":
         # ISO week starts on Monday
         start = dt.date() - timedelta(days=dt.weekday())
-        end = start + timedelta(days=6)
     elif period == "month":
         start = dt.date().replace(day=1)
-        # Last day of month: next month's first day minus one day
-        if dt.month == 12:
-            end = dt.date().replace(year=dt.year + 1, month=1, day=1) - timedelta(days=1)
-        else:
-            end = dt.date().replace(month=dt.month + 1, day=1) - timedelta(days=1)
     elif period == "quarter":
         quarter = (dt.month - 1) // 3 + 1
         start_month = (quarter - 1) * 3 + 1
         start = dt.date().replace(month=start_month, day=1)
-        # Last day of quarter: start of next quarter minus one day
-        if quarter == 4:
-            end = dt.date().replace(year=dt.year + 1, month=1, day=1) - timedelta(days=1)
-        else:
-            end = dt.date().replace(month=start_month + 3, day=1) - timedelta(days=1)
     elif period == "year":
         start = dt.date().replace(month=1, day=1)
-        end = dt.date().replace(month=12, day=31)
     else:
         # Fallback: treat as single day
         start = dt.date()
