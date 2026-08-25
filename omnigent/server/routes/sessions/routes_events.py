@@ -213,6 +213,7 @@ from omnigent.stores.permission_store import PermissionStore
 from omnigent.telemetry import emit as _tel_emit
 from omnigent.telemetry.events import SessionDeletedEvent as _TelSessionDeletedEvent
 from omnigent.telemetry.events import SessionStoppedEvent as _TelSessionStoppedEvent
+from omnigent.telemetry.events import TurnEndEvent as _TelTurnEndEvent
 from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
 from omnigent.tools.client_specified import parse_client_side_tool_specs
 
@@ -1068,6 +1069,22 @@ def register_events_routes(
                 background_task_count=bg_count,
                 blocked_on=blocked_on,
             )
+            # Emit a turn-end telemetry event for native harnesses. "idle"
+            # means the turn completed normally; "failed" means it errored.
+            # No latency or token deltas are available on this path.
+            if status in {"idle", "failed"}:
+                _tel_emit(
+                    _TelTurnEndEvent(
+                        installation_id=_get_installation_id(),
+                        session_id=session_id,
+                        status="completed" if status == "idle" else "failed",
+                        latency_ms=None,
+                        model=None,
+                        input_tokens=None,
+                        output_tokens=None,
+                        cost_usd=None,
+                    )
+                )
             forward_body = body.model_dump()
             forward_body["data"] = await _enrich_idle_status_with_subagent_output(
                 forward_body["data"], status, session_id, conversation_store

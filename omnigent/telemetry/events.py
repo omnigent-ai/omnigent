@@ -87,15 +87,21 @@ class SessionDeletedEvent:
 
 @dataclass
 class TurnEndEvent:
-    """Fired at the end of each LLM turn (relay path only).
+    """Fired at the end of each LLM turn.
 
-    Emitted once per terminal ``response.*`` event (``completed``,
-    ``failed``, ``cancelled``, ``incomplete``) so per-turn latency,
-    status, and token spend can be tracked without waiting for session
-    deletion.
+    Emitted on two paths:
 
-    Token fields are only present on ``status="completed"`` turns; they
-    are ``None`` for ``failed`` / ``cancelled`` / ``incomplete``.
+    - **Relay / SDK harnesses**: once per terminal ``response.*`` event
+      (``completed``, ``failed``, ``cancelled``, ``incomplete``).
+      ``latency_ms`` and token fields are populated when available.
+    - **Native harnesses** (claude-native, codex-native): once per
+      ``external_session_status`` event with ``status`` in
+      ``{"idle", "failed"}``.  ``latency_ms`` and token fields are
+      always ``None`` on this path (native harnesses report cumulative
+      totals separately via ``SessionDeletedEvent``).
+
+    Token fields are only present on ``status="completed"`` relay turns;
+    they are ``None`` for all other statuses and for the native path.
 
     :param installation_id: Server-side installation ID.
     :param session_id: Omnigent conversation/session identifier.
