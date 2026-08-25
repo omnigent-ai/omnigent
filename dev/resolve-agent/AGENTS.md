@@ -461,7 +461,15 @@ green:
    failure and the fix. When the bug is a Linear ticket and a Linear key is
    available, also attach both recordings to the ticket (GraphQL `fileUpload` +
    `attachmentCreate`) so the ticket carries the visual before/after.
-5. You do **not** merge. Opening the PR is not the finish line — go to Step 4 and
+5. **Emit an interim handoff now — the moment the PR is open.** As soon as
+   `gh pr create` succeeds, print the full handoff json block (the Output schema)
+   with `pr_url` set and `outcome` at its current best assessment, *before* you
+   start Step 4. This is what lets the workflow post the PR link to the Linear
+   ticket promptly, rather than waiting the ~hour Step 4 can take. Leave the
+   not-yet-known Step-4 fields empty (`ci_status`, `polly_review`,
+   `maintainer_review`) — you refill them in the final handoff. Emit it as a
+   normal intermediate message (json block last in *that* message), then carry on.
+6. You do **not** merge. Opening the PR is not the finish line — go to Step 4 and
    drive it to a green, reviewed, ready-for-a-human state.
 
 ## Step 4 — Land the PR: preview, green CI, clean review, hand it to the maintainer (author path only)
@@ -649,6 +657,11 @@ the message. Same discipline as repro-agent:
 - Write whatever prose summary you like above it, but the ```json block is the
   **last chunk** of the message, with nothing after its closing fence. Do not
   split the handoff across multiple sections or emit a second data block.
+- **One exception (author path):** you also emit an *interim* handoff right after
+  opening the PR (Step 3.5) so the workflow can post the PR link to Linear before
+  Step 4 finishes. That is fine — the caller reads the **last** valid handoff in
+  the session, so this final one supersedes the interim block. The interim block
+  carries `pr_url` + a provisional `outcome`; this final block is authoritative.
 - Emit it as **JSON**, never YAML. Include **every** key below, always, even when
   a value is empty (`""`, `[]`).
 - `mode` must be exactly `"reviewed_existing_pr"` or `"authored_fix"` — which path
