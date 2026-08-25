@@ -187,11 +187,12 @@ import {
 import { SidebarServerPicker } from "./SidebarServerPicker";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 
-// Positioning for a row's trailing session-state badge. Anchored at the
-// controls' right-1 edge and fades on hover so the pin + kebab take its place;
-// on mobile it sits left of the always-visible controls.
+// Positioning for a row's trailing session-state badge. Anchored at the row's
+// right-1 edge in every viewport: on desktop it fades on hover so the pin +
+// kebab take its place; on mobile those controls are gone, so the badge simply
+// holds the right edge.
 const SESSION_STATE_SLOT_CLASS =
-  "-translate-y-1/2 pointer-events-none absolute top-1/2 right-[4.5rem] flex h-5 items-center transition-opacity md:right-1 md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0";
+  "-translate-y-1/2 pointer-events-none absolute top-1/2 right-1 flex h-5 items-center transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0";
 
 // Small markers (running/starting/unseen dot, or the draft pencil when there's
 // no session state) get a fixed size-6 centered box so they line up vertically
@@ -3524,12 +3525,11 @@ function ConversationRow({
         // Full width (not 100%+1rem) so the highlight stays inset from the
         // right edge, aligning with the project/folder rows above.
         "w-full",
+        // Mobile drops the pin + kebab (see the trailing controls below), so it
+        // reserves only what the badge needs — the same width desktop uses at
+        // rest, before hover reveals the controls.
         !selectionMode &&
-          (sessionState?.kind === "awaiting"
-            ? "pr-48 md:pr-29"
-            : hasTrailingIndicator
-              ? "pr-28 md:pr-8"
-              : "pr-28 md:pr-2"),
+          (sessionState?.kind === "awaiting" ? "pr-29" : hasTrailingIndicator ? "pr-8" : "pr-2"),
         // The narrowed reserve must track exactly when the trailing controls
         // appear and the state marker fades — both keyed on `:focus-visible`.
         // `focus-within` also fires for a plain click, which shrank the reserve
