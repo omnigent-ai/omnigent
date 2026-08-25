@@ -33,12 +33,14 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from urllib.parse import quote
 
 import jwt
 import uvicorn
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
+from markupsafe import escape
 
 from tests.e2e_ui.conftest import _find_free_port
 
@@ -101,13 +103,20 @@ def _build_app(issuer: str, client_id: str, email: str, private_pem: bytes) -> F
     async def authorize(redirect_uri: str, state: str) -> HTMLResponse:
         # The user-facing sign-in page. One click continues the OAuth flow by
         # bouncing back to the server's callback with a fixed code + the state.
-        continue_url = f"{redirect_uri}?code=fake-auth-code&state={state}"
+        # redirect_uri/state are request query params, so escape them before
+        # reflecting into HTML: URL-encode into the href, HTML-escape for text.
+        continue_url = (
+            f"{quote(redirect_uri, safe=':/?#[]@!$&()*+,;=')}"
+            f"?code=fake-auth-code&state={quote(state, safe='')}"
+        )
+        safe_href = escape(continue_url)
+        safe_email = escape(email)
         return HTMLResponse(
             "<!doctype html><html><head><title>Fake IdP Sign-in</title></head>"
             "<body style='font-family:sans-serif;padding:2rem'>"
             "<h1>Fake IdP</h1>"
-            f"<p>Sign in as <b>{email}</b> to continue.</p>"
-            f"<a id='fake-idp-continue' href='{continue_url}'>Continue as {email}</a>"
+            f"<p>Sign in as <b>{safe_email}</b> to continue.</p>"
+            f"<a id='fake-idp-continue' href='{safe_href}'>Continue as {safe_email}</a>"
             "</body></html>"
         )
 
