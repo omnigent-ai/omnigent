@@ -11,6 +11,7 @@ from issue_prioritization.areas import AreaCatalog
 from issue_prioritization.artifacts import RankedIssue, rank_issues
 from issue_prioritization.bronze import BronzeIssue
 from issue_prioritization.classification import Classification, Classifier
+from issue_prioritization.comments import build_triage_comment
 from issue_prioritization.config import ScoringConfig
 from issue_prioritization.github import GitHubClient, GitHubMutationSink
 from issue_prioritization.labels import LabelManifest
@@ -56,8 +57,6 @@ def prioritize_issue(
             classification,
             scored_at,
             issue.labels,
-            planner,
-            None,
             ScoreEngine(config, areas),
         ),
     )
@@ -82,16 +81,10 @@ def _rank_issue(
     classification: Classification,
     scored_at: datetime,
     labels: tuple[str, ...],
-    planner: MutationPlanner,
-    state: BotState | None,
     engine: ScoreEngine,
 ) -> RankedIssue:
     live_issue = replace(issue, labels=labels)
-    normalized = live_issue.to_issue(classification, scored_at)
-    severity = planner.severity_override(labels, state)
-    if severity is not None:
-        normalized = replace(normalized, severity=severity)
-    return rank_issues([normalized], engine)[0]
+    return rank_issues([live_issue.to_issue(classification, scored_at)], engine)[0]
 
 
 def target_for_labels(
@@ -99,13 +92,9 @@ def target_for_labels(
     classification: Classification,
     scored_at: datetime,
     labels: tuple[str, ...],
-    planner: MutationPlanner,
-    state: BotState | None,
     engine: ScoreEngine,
 ) -> MutationTarget:
-    return target_from_ranked(
-        _rank_issue(issue, classification, scored_at, labels, planner, state, engine)
-    )
+    return target_from_ranked(_rank_issue(issue, classification, scored_at, labels, engine))
 
 
 def write_event_artifacts(
@@ -147,7 +136,7 @@ def write_event_status(
     plan = plan or run.mutations[0]
     decision = decision or run.ranked[0]
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "source": "github_actions",
         "run_id": run.run_id,
         "mode": run.mode.value,
@@ -159,13 +148,20 @@ def write_event_status(
         "content_hash": classification.content_hash,
         "classification": {
             "type": classification.issue_type.label,
-            "severity": classification.severity.value,
+            "impact": classification.impact.value,
             "area_keys": list(classification.area_keys),
             "component_labels": list(classification.component_labels),
             "reasoning": classification.reasoning,
         },
         "score": _score_payload(decision),
         "mutation": _mutation_payload(plan),
+        "comment": {
+            "body": build_triage_comment(
+                decision,
+                plan,
+                labels_after if labels_after is not None else _planned_labels_after(decision, plan),
+            )
+        },
         "applied_bot_state": (
             _bot_state_payload(applied_bot_state) if applied_bot_state is not None else None
         ),
@@ -185,7 +181,7 @@ def _score_payload(item: RankedIssue) -> dict[str, object]:
         "title": issue.title,
         "url": issue.url,
         "type": issue.issue_type.label,
-        "severity": issue.severity.value,
+        "impact": issue.impact.value,
         "score": float(result.score),
         "current_priority": issue.current_priority.value if issue.current_priority else None,
         "proposed_priority": result.priority.value,
@@ -211,7 +207,6 @@ def _mutation_payload(plan: MutationPlan) -> dict[str, object]:
         "issue_number": plan.target.issue_number,
         "target": {
             "priority": plan.target.priority,
-            "severity": plan.target.severity,
             "components": list(plan.target.components),
         },
         "labels_add": list(plan.labels_add),
@@ -224,7 +219,6 @@ def _mutation_payload(plan: MutationPlan) -> dict[str, object]:
 def _bot_state_payload(state: BotState) -> dict[str, object]:
     return {
         "priority": state.priority,
-        "severity": state.severity,
         "components": list(state.components),
     }
 
@@ -302,8 +296,6 @@ def main() -> None:
                 classification,
                 run.scored_at,
                 current_labels,
-                planner,
-                state,
                 engine,
             )
 
@@ -337,8 +329,6 @@ def main() -> None:
             classification,
             run.scored_at,
             labels_after,
-            planner,
-            states.load().get(issue.number),
             engine,
         )
         write_event_status(
@@ -355,10 +345,17 @@ def main() -> None:
             applied_bot_state=states.load().get(issue.number),
         )
     print(
-        f"Issue #{issue.number}: severity={decision.issue.severity.value}, "
+        f"Issue #{issue.number}: impact={decision.issue.impact.value}, "
         f"score={decision.result.score}, priority={decision.result.priority.value}, "
         f"mode={mode.value}"
     )
+
+
+def _planned_labels_after(item: RankedIssue, plan: MutationPlan) -> tuple[str, ...]:
+    current_priority = item.issue.current_priority
+    labels = {current_priority.value} if current_priority else set()
+    labels = (labels - set(plan.labels_remove)) | set(plan.labels_add)
+    return tuple(sorted(labels))
 
 
 if __name__ == "__main__":

@@ -32,8 +32,7 @@ Runs from a **repo checkout** (it imports `dev.benchmarks` + `tests`), with the
 harness + bench deps:
 
 ```bash
-pip install -e '.[loadtest,dev,agents-sdk]'
-# or: uv sync --extra loadtest --extra dev --extra agents-sdk
+uv sync --extra loadtest --extra agents-sdk
 ```
 
 ## Run

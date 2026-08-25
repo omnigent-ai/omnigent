@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Protocol
@@ -129,13 +129,6 @@ class IssuePrioritizationPipeline:
         normalized = []
         for issue in issues:
             normalized_issue = issue.to_issue(resolved[issue.number], now)
-            if self.mutation_planner:
-                severity = self.mutation_planner.severity_override(
-                    issue.labels,
-                    bot_states.get(issue.number),
-                )
-                if severity is not None:
-                    normalized_issue = replace(normalized_issue, severity=severity)
             normalized.append(normalized_issue)
         ranked = tuple(rank_issues(normalized, self.engine))
         current_labels = {issue.number: issue.labels for issue in issues}

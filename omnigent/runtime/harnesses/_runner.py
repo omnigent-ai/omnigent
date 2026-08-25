@@ -28,9 +28,14 @@ with four required arguments (plus one optional):
   It sends ``SIGTERM`` to this process when the parent disappears
   or the OS reparents the runner.
 
-The runner is intentionally minimal — import, factory call, state
-stash, uvicorn launch. All harness-specific behavior lives in the
-per-harness ``create_app()`` factory.
+The runner is intentionally minimal — configure logging, import,
+factory call, state stash, uvicorn launch. All harness-specific
+behavior lives in the per-harness ``create_app()`` factory.
+
+Logging is configured here rather than per harness so every harness
+child's logs land in a file an operator can read (see
+:func:`_configure_logging`); a child with no handler falls back to
+``logging.lastResort``, which drops everything below WARNING.
 
 See ``designs/SERVER_HARNESS_CONTRACT.md`` §Required harness
 package shape and §Process management.
@@ -387,6 +392,39 @@ def _create_uvicorn_config(
     sys.exit("runner: exactly one of --socket or --bind is required")
 
 
+def _configure_logging(harness: str, conversation_id: str) -> None:
+    """Point this harness child's logs at a file an operator can read.
+
+    Writes to ``OMNIGENT_PROCESS_LOG_FILE`` when the parent published one (the
+    runner's own log, so harness lines interleave with the spawn that caused
+    them), else a per-conversation file under ``logs/harness/``.
+
+    Best-effort: logging is diagnostics, so a read-only log dir must not stop a
+    harness from serving turns.
+    """
+    try:
+        from omnigent.process_logging import (
+            PROCESS_LOG_FILE_ENV_VAR,
+            configure_process_logging,
+            create_process_log_path,
+        )
+
+        # configure_process_logging picks up PROCESS_LOG_FILE itself; only when
+        # the parent published none do we allocate a per-conversation file.
+        log_path = None
+        if not os.environ.get(PROCESS_LOG_FILE_ENV_VAR):
+            log_path = create_process_log_path("harness", prefix=f"{harness}-{conversation_id}-")
+        configure_process_logging(
+            "harness",
+            log_path=log_path,
+            logger_names=("omnigent", "uvicorn"),
+        )
+    except Exception as exc:
+        # Never fatal, but never silent either: without this line a failure here
+        # looks exactly like the bug it fixes (no harness logs anywhere).
+        print(f"runner: could not configure harness logging: {exc!r}", file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> None:
     """
     Runner entrypoint.
@@ -395,6 +433,13 @@ def main(argv: list[str] | None = None) -> None:
         the live process arguments. Tests pass an explicit list.
     """
     args = _parse_args(argv if argv is not None else sys.argv[1:])
+
+    # Attach a log handler before anything harness-specific runs. Without this
+    # the child has no handler at all, so logging falls back to lastResort:
+    # WARNING+ goes to the inherited stderr and every logger.debug/info/
+    # exception below WARNING is dropped. An agent CLI's own stderr (drained at
+    # debug) and an executor traceback then reach no file an operator can read.
+    _configure_logging(args.harness, args.conversation_id)
 
     # Initialize OTel tracing in the harness subprocess so ExecutorAdapter
     # can emit spans for agent turns, tool calls, and LLM interactions.

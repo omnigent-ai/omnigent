@@ -32,10 +32,12 @@ to resolving the terminal in the local registry.
 Wire protocol on the WebSocket
 ------------------------------
 
-- **Server → client**: every PTY read is forwarded as a *binary*
-  WebSocket frame. xterm.js's ``term.write()`` accepts ``Uint8Array``
-  directly and runs it through its ANSI parser, so colors, cursor
-  motion, alternate screen, mouse modes all work transparently.
+- **Server → client**: terminal output is forwarded as *binary* WebSocket
+  frames. xterm.js's ``term.write()`` accepts ``Uint8Array`` directly and runs
+  it through its ANSI parser, so colors, cursor motion, alternate screen, and
+  mouse modes work transparently. Control-mode attaches may also send a text
+  ``clipboard-write`` JSON frame after tmux reports a copy-mode selection; PTY
+  attaches advertise whether OSC 52 is safe before terminal output begins.
 - **Client → server**:
     - **Text frames** are JSON control messages:
       ``{"type": "resize", "cols": N, "rows": M}``. Parsed and applied
@@ -84,6 +86,7 @@ from omnigent.runtime import (
     get_runner_ws_factory,
     get_terminal_registry,
 )
+from omnigent.server._runner_ws_tunnel import WrongReplicaWSError
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, AuthProvider
 from omnigent.server.routes._auth_helpers import require_access
 from omnigent.stores import ConversationStore
@@ -92,6 +95,7 @@ from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
 from omnigent.terminals.ws_bridge import (
     WS_CLOSE_INTERNAL_ERROR,
     WS_CLOSE_TERMINAL_NOT_FOUND,
+    WS_CLOSE_WRONG_REPLICA,
     bridge_tmux_pty_to_websocket,
 )
 
@@ -99,6 +103,7 @@ _logger = logging.getLogger(__name__)
 
 _WS_CLOSE_TERMINAL_NOT_FOUND: Final[int] = WS_CLOSE_TERMINAL_NOT_FOUND
 _WS_CLOSE_INTERNAL_ERROR: Final[int] = WS_CLOSE_INTERNAL_ERROR
+_WS_CLOSE_WRONG_REPLICA: Final[int] = WS_CLOSE_WRONG_REPLICA
 
 
 def create_terminal_attach_router(
@@ -180,6 +185,17 @@ def create_terminal_attach_router(
             )
             try:
                 runner_cm = ws_factory(runner_path)
+            except WrongReplicaWSError:
+                # Wrong-replica routing miss: the runner tunnel is bound but not
+                # on this replica (the key routed here, but the host homed its
+                # tunnel elsewhere). Signal 4400 so the client re-dials WITHOUT
+                # the key and reaches the replica that holds the tunnel — the WS
+                # analogue of the fetch path's keyless re-address on a 400.
+                await websocket.close(
+                    code=_WS_CLOSE_WRONG_REPLICA,
+                    reason="host on another replica; retry without slice key",
+                )
+                return
             except Exception:  # noqa: BLE001
                 await websocket.close(
                     code=_WS_CLOSE_INTERNAL_ERROR,
@@ -260,17 +276,21 @@ def create_terminal_attach_router(
                 "terminal.transport": resolved_transport,
             },
         ):
-            bridge = (
-                bridge_tmux_control_to_websocket
-                if resolved_transport == TERMINAL_TRANSPORT_CONTROL
-                else bridge_tmux_pty_to_websocket
-            )
-            await bridge(
-                websocket,
-                socket_path=str(entry.instance.socket_path),
-                tmux_target=entry.instance.tmux_target,
-                read_only=read_only,
-            )
+            if resolved_transport == TERMINAL_TRANSPORT_CONTROL:
+                await bridge_tmux_control_to_websocket(
+                    websocket,
+                    socket_path=str(entry.instance.socket_path),
+                    tmux_target=entry.instance.tmux_target,
+                    read_only=read_only,
+                )
+            else:
+                await bridge_tmux_pty_to_websocket(
+                    websocket,
+                    socket_path=str(entry.instance.socket_path),
+                    tmux_target=entry.instance.tmux_target,
+                    read_only=read_only,
+                    allow_osc52_clipboard=not entry.instance.tmux_allow_passthrough,
+                )
 
     return router
 

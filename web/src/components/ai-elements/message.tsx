@@ -22,8 +22,11 @@ import {
 } from "react";
 import { Streamdown, type StreamdownProps } from "streamdown";
 
+import { MarkdownErrorBoundary } from "./MarkdownErrorBoundary";
+
 import {
   CHAT_LINK_SAFETY,
+  FILE_LINK_STREAMDOWN_REHYPE_PLUGINS,
   SECURE_STREAMDOWN_REHYPE_PLUGINS,
   STREAMDOWN_PLUGINS,
 } from "./streamdown-security";
@@ -35,7 +38,8 @@ export type MessageProps = HTMLAttributes<HTMLDivElement> & {
 export const Message = ({ className, from, ...props }: MessageProps) => (
   <div
     className={cn(
-      "group flex w-full max-w-[95%] flex-col gap-2",
+      // min-w-0 lets this flex item shrink below its content's intrinsic width instead of widening the column.
+      "group flex w-full min-w-0 max-w-[95%] flex-col gap-2",
       from === "user" ? "is-user ml-auto justify-end" : "is-assistant",
       className,
     )}
@@ -66,7 +70,7 @@ export const MessageContent = ({ children, className, ...props }: MessageContent
 export type MessageActionsProps = ComponentProps<"div">;
 
 export const MessageActions = ({ className, children, ...props }: MessageActionsProps) => (
-  <div className={cn("flex items-center gap-1", className)} {...props}>
+  <div className={cn("flex items-center gap-3", className)} {...props}>
     {children}
   </div>
 );
@@ -80,12 +84,19 @@ export const MessageAction = ({
   tooltip,
   children,
   label,
+  className,
   variant = "ghost",
   size = "icon-sm",
   ...props
 }: MessageActionProps) => {
   const button = (
-    <Button size={size} type="button" variant={variant} {...props}>
+    <Button
+      size={size}
+      type="button"
+      variant={variant}
+      className={cn("text-muted-foreground hover:text-foreground", className)}
+      {...props}
+    >
       {children}
       <span className="sr-only">{label || tooltip}</span>
     </Button>
@@ -286,7 +297,14 @@ export const MessageBranchPage = ({ className, ...props }: MessageBranchPageProp
   );
 };
 
-export type MessageResponseProps = Omit<StreamdownProps, "rehypePlugins">;
+export type MessageResponseProps = Omit<StreamdownProps, "rehypePlugins"> & {
+  /**
+   * Hand file-path links to the `a` component override instead of letting the
+   * harden pass turn them into app-origin navigations or " [blocked]" text.
+   * Opt-in: only callers that supply that override may set it.
+   */
+  markFileLinks?: boolean;
+};
 
 function getChatCodeControls(controls: StreamdownProps["controls"]): StreamdownProps["controls"] {
   if (typeof controls === "object" && controls !== null) {
@@ -423,7 +441,7 @@ function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
 }
 
 export const MessageResponse = memo(
-  ({ className, components, controls, ...props }: MessageResponseProps) => {
+  ({ className, components, controls, markFileLinks = false, ...props }: MessageResponseProps) => {
     const messageComponents = useMemo(
       () => ({ ...components, pre: ChatCodeBlockPre }),
       [components],
@@ -432,18 +450,26 @@ export const MessageResponse = memo(
     const messageControls = useMemo(() => getChatCodeControls(controls), [controls]);
 
     return (
-      <Streamdown
-        className={cn("size-full [&>*:first-child]:mt-0 [&>*:last-child]:mb-0", className)}
-        plugins={STREAMDOWN_PLUGINS}
-        // Let links open on a plain click (and cmd/ctrl-click in a new tab)
-        // instead of Streamdown's default "Open external link?" modal.
-        linkSafety={CHAT_LINK_SAFETY}
-        {...props}
-        components={messageComponents}
-        controls={messageControls}
-        // Block remote image fetches that can exfiltrate data through URLs.
-        rehypePlugins={SECURE_STREAMDOWN_REHYPE_PLUGINS}
-      />
+      <MarkdownErrorBoundary source={props.children}>
+        <Streamdown
+          // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.
+          className={cn(
+            "size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
+            className,
+          )}
+          plugins={STREAMDOWN_PLUGINS}
+          // Let links open on a plain click (and cmd/ctrl-click in a new tab)
+          // instead of Streamdown's default "Open external link?" modal.
+          linkSafety={CHAT_LINK_SAFETY}
+          {...props}
+          components={messageComponents}
+          controls={messageControls}
+          // Block remote image fetches that can exfiltrate data through URLs.
+          rehypePlugins={
+            markFileLinks ? FILE_LINK_STREAMDOWN_REHYPE_PLUGINS : SECURE_STREAMDOWN_REHYPE_PLUGINS
+          }
+        />
+      </MarkdownErrorBoundary>
     );
   },
 );

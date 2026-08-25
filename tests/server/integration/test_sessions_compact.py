@@ -439,6 +439,55 @@ async def test_compact_errors_when_runner_injection_fails(
     )
 
 
+async def test_compact_native_session_no_runner_returns_reconnect_error(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A native-terminal /compact with no reachable runner surfaces a clear
+    "reconnect first" error, not the confusing no-LLM-model message.
+
+    A native session compacts only in its vendor TUI, so when no runner is
+    bound (disconnected session) the compact branch must NOT fall through to
+    server-side ``_run_compact_locked`` — which would 400 with the opaque
+    "does not declare an LLM model" text. Instead it should try to wake the
+    runner; an un-host-bound native session can't be woken, so it returns a
+    503 RUNNER_UNAVAILABLE the user can act on.
+    """
+
+    async def _must_not_run(**_: Any) -> CompactionResult:
+        """Fail loudly if AP-side compaction is reached on the native path."""
+        raise AssertionError(
+            "compact_conversation_now must not run for a native-terminal "
+            "session with no runner — the compact branch fell through to "
+            "in-process compaction instead of the reconnect error."
+        )
+
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow.compact_conversation_now",
+        _must_not_run,
+    )
+
+    # No runner bound (no set_runner_client) and no host_id → unwakeable.
+    agent = await create_test_agent(
+        client,
+        name="claude-native-compact",
+        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+    )
+    sid = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{sid}/events",
+        json={"type": "compact", "data": {}},
+    )
+
+    # 503 = RUNNER_UNAVAILABLE (reconnect-first). A 400 would mean it fell
+    # through to the no-LLM-model check (the original confusing bug).
+    assert resp.status_code == 503, resp.text
+    assert "Reconnect the session" in resp.text
+    assert "llm.model" not in resp.text
+
+
 # ── external_compaction_status: terminal-observed compaction edge ────────
 #
 # The claude-native forwarder posts external_compaction_status when Claude
@@ -526,3 +575,89 @@ async def test_external_compaction_status_rejects_unknown_status(
     )
     assert resp.status_code == 400, resp.text
     assert "external_compaction_status" in resp.text
+
+
+async def test_compaction_snapshot_persists_without_base64_payloads(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A compaction snapshot reaches storage with no inline base64 payload.
+
+    The strip is unit-tested at ``parse_item_data``; this walks the whole
+    user-visible path instead — the event a native forwarder POSTs, through
+    the store, back out of ``GET /items`` — because that round trip is what
+    the reported multi-MB rows were actually made of.
+    """
+    payload = "iVBORw0KGgoAAAANSUhEUgAAAAE" + "A" * 20_000
+    agent = await create_test_agent(client)
+    sid = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{sid}/events",
+        json={
+            "type": "compaction",
+            "data": {
+                "summary": "[Claude Code compaction — context was compacted in the terminal]",
+                "last_item_id": "msg_boundary_abc123",
+                "model": "unknown",
+                "token_count": 0,
+                "compacted_messages": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_screenshot_01",
+                                "content": [
+                                    {
+                                        "type": "image",
+                                        "source": {
+                                            "type": "base64",
+                                            "media_type": "image/png",
+                                            "data": payload,
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "I can see the screenshot."}],
+                    },
+                ],
+            },
+        },
+    )
+    assert resp.status_code == 202, resp.text
+
+    items_resp = await client.get(f"/v1/sessions/{sid}/items")
+    assert items_resp.status_code == 200, items_resp.text
+    compaction_items = [i for i in items_resp.json()["data"] if i.get("type") == "compaction"]
+    assert len(compaction_items) == 1, (
+        f"Expected exactly one compaction item; got {len(compaction_items)}."
+    )
+
+    item = compaction_items[0]
+    # to_api_dict spreads CompactionData onto the top level, so serialising the
+    # whole item leaves nowhere for a stray copy of the payload to hide.
+    item_json = json.dumps(item)
+    assert payload[:200] not in item_json, (
+        "Compaction snapshot persisted the full base64 image payload verbatim."
+    )
+    assert len(item_json) < len(payload) // 2, (
+        f"Stored compaction item is {len(item_json):,} bytes — close to the "
+        f"{len(payload):,}-byte payload, so it was not stripped."
+    )
+
+    # Still a usable snapshot: summary intact, message shape preserved, and
+    # only the payload swapped for a marker that names what was dropped.
+    assert item["summary"].startswith("[Claude Code compaction")
+    messages = item["compacted_messages"]
+    assert [m["role"] for m in messages] == ["user", "assistant"]
+    source = messages[0]["content"][0]["content"][0]["source"]
+    assert source["media_type"] == "image/png"
+    assert source["data"] == "[image/png content omitted from the compaction snapshot]"
+    assert messages[1]["content"][0]["text"] == "I can see the screenshot."

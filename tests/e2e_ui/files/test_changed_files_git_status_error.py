@@ -67,12 +67,10 @@ def test_git_status_failure_surfaces_in_files_panel(
     open_right_rail(page)
     rail = page.get_by_role("complementary", name="Workspace")
 
-    # Files is the default rail tab; click it explicitly so the assertion does
-    # not depend on the remembered tab from a prior session. The Changed scope
-    # (the flat changed-files list, where the error renders) is the default, but
-    # select it explicitly for the same reason.
-    rail.get_by_role("tab", name=re.compile("^Files")).click()
-    rail.get_by_role("radio", name="Changed").click()
+    # The changed-files list — where the git-status error renders — is now the
+    # Changes rail tab (a peer of Files). Select it explicitly so the assertion
+    # does not depend on the remembered tab from a prior session.
+    rail.get_by_role("tab", name=re.compile("^Changes")).click()
 
     # The panel surfaces the server's reason verbatim, in the destructive style —
     # not a bare status code and not the misleading empty state.

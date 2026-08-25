@@ -554,6 +554,7 @@ export function ForkSessionForm({
               <>
                 <Select
                   value={selectedHostId ?? ""}
+                  componentId="fork_session.host"
                   onValueChange={(v) => {
                     setSelectedHostId(v);
                     // Workspace and the worktree branch are host-specific:
@@ -614,7 +615,11 @@ export function ForkSessionForm({
           <label htmlFor="fork-session-agent" className="text-sm font-medium text-muted-foreground">
             Agent
           </label>
-          <Select value={agentChoice} onValueChange={setAgentChoice}>
+          <Select
+            value={agentChoice}
+            onValueChange={setAgentChoice}
+            componentId="fork_session.agent"
+          >
             <SelectTrigger
               id="fork-session-agent"
               data-testid="fork-session-agent-select"
@@ -857,15 +862,10 @@ export function ForkSessionForm({
         <Button
           data-testid="fork-session-submit"
           onClick={handleFork}
-          disabled={submitting || !canSubmit}
+          loading={submitting}
+          disabled={!canSubmit}
         >
-          {submitting
-            ? isCodingSource
-              ? "Starting…"
-              : "Cloning…"
-            : isCodingSource
-              ? "Clone & start"
-              : "Clone"}
+          {isCodingSource ? "Clone & start" : "Clone"}
         </Button>
       </DialogFooter>
     </>

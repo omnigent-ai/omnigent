@@ -154,6 +154,29 @@ def test_key_provider_resolves_to_inline_family() -> None:
     assert provider.model == "claude-sonnet-4-6"
 
 
+def test_managed_picker_prefix_is_not_part_of_provider_model() -> None:
+    """A managed picker value resolves its provider-local model id."""
+    config = {
+        "providers": {
+            "anthropic": {
+                "kind": "key",
+                "default": True,
+                "anthropic": {
+                    "base_url": "https://api.anthropic.com",
+                    "api_key": "sk-test-literal",
+                },
+            }
+        }
+    }
+
+    provider = creds.resolve_pi_native_provider(
+        model="omnigent/claude-opus-4-7", config_loader=lambda: config
+    )
+
+    assert provider is not None
+    assert provider.model == "claude-opus-4-7"
+
+
 def test_subscription_default_returns_none() -> None:
     """A subscription (CLI-login) default isn't reusable by Pi → None."""
     config = {"providers": {"claude": {"kind": "subscription", "default": True, "cli": "claude"}}}
@@ -281,6 +304,99 @@ def test_pi_native_provider_launch_namespaced_model_uses_qualified_arg(
     _env, args = creds.pi_native_provider_launch(agent_dir, provider)
 
     assert args == ["--provider", "omnigent", "--model", "omnigent/moonshotai/kimi-k2.5"]
+
+
+def test_provider_launch_accepts_provider_qualified_selection(tmp_path: Path) -> None:
+    """A start-picker selection chooses its generated Pi provider and model."""
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://api.anthropic.com",
+        api="anthropic-messages",
+        model="claude-sonnet-4-6",
+        api_key="sk-secret",
+        auth_header=False,
+        additional_providers={
+            "omnigent-openai": {
+                "baseUrl": "https://api.openai.com/v1",
+                "api": "openai-responses",
+                "apiKey": "sk-openai",
+                "models": [{"id": "gpt-5.6-sol"}],
+            }
+        },
+    )
+
+    _, args = creds.pi_native_provider_launch(
+        tmp_path / "pi-agent",
+        provider,
+        selection="omnigent-openai/gpt-5.6-sol",
+    )
+
+    assert args == [
+        "--provider",
+        "omnigent-openai",
+        "--model",
+        "gpt-5.6-sol",
+        "--thinking",
+        "off",
+    ]
+
+
+def test_provider_launch_rejects_unavailable_qualified_selection(tmp_path: Path) -> None:
+    """A stale picker value must not silently launch the provider default."""
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://api.anthropic.com",
+        api="anthropic-messages",
+        model="claude-sonnet-4-6",
+        api_key="sk-secret",
+        auth_header=False,
+    )
+    agent_dir = tmp_path / "pi-agent"
+
+    with pytest.raises(ValueError, match="not available"):
+        creds.pi_native_provider_launch(
+            agent_dir,
+            provider,
+            selection="omnigent-openai/gpt-missing",
+        )
+
+    assert not agent_dir.exists()
+
+
+def test_pi_native_model_options_lists_only_managed_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pre-launch choices come only from the provider built by ``omni setup``."""
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://api.anthropic.com",
+        api="anthropic-messages",
+        model="claude-sonnet-4-6",
+        api_key="sk-secret",
+        auth_header=False,
+        additional_providers={
+            "omnigent-openai": {
+                "baseUrl": "https://api.openai.com/v1",
+                "api": "openai-responses",
+                "apiKey": "sk-openai",
+                "models": [{"id": "gpt-5.6-sol", "name": "GPT 5.6 Sol"}],
+            }
+        },
+    )
+    monkeypatch.setattr(creds, "resolve_pi_native_provider", lambda: provider)
+
+    assert creds.pi_native_model_options() == [
+        {
+            "id": "omnigent-openai/gpt-5.6-sol",
+            "model": "omnigent-openai/gpt-5.6-sol",
+            "displayName": "GPT 5.6 Sol",
+        },
+        {
+            "id": "omnigent/claude-sonnet-4-6",
+            "model": "omnigent/claude-sonnet-4-6",
+            "displayName": "claude-sonnet-4-6",
+        },
+    ]
 
 
 def test_openai_chat_wire_api_resolves_to_completions(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1153,3 +1269,494 @@ def test_fetch_pi_model_lists_falls_back_on_http_error() -> None:
     assert gpt == []
     assert completions == []
     assert gemini == []
+
+
+def test_fetch_pi_model_lists_carries_catalog_token_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The interactive path advertises the catalog's context and output limits.
+
+    Pi defaults an entry with no ``contextWindow``/``maxTokens`` to 128000 /
+    16384, so a 1M-context gateway model registered bare is silently capped —
+    the harness path already carries the real limits, and both surfaces must
+    agree. Regression guard for the two fields going missing again.
+    """
+    import json
+    import unittest.mock
+
+    import httpx
+
+    from omnigent import model_catalog
+    from omnigent.model_metadata import ModelMetadata
+
+    payload = {
+        "model_services": [
+            {
+                "name": "model-services/system.ai.claude-opus-4-8",
+                "supported_api_types": ["mlflow/v1/chat/completions"],
+            }
+        ]
+    }
+
+    def _catalog(provider_name: str) -> tuple[model_catalog.ModelEntry, ...]:
+        """Stand in for the MLflow catalog, which reports the limits.
+
+        :param provider_name: The catalog provider being queried.
+        :returns: One entry, keyed by the ``databricks-`` alias spelling so the
+            alias match is exercised too.
+        """
+        assert provider_name == "databricks"
+        return (
+            model_catalog.ModelEntry(
+                id="databricks-claude-opus-4-8",
+                family="claude",
+                metadata=ModelMetadata(context_window=1000000, max_output_tokens=128000),
+            ),
+        )
+
+    monkeypatch.setattr(model_catalog, "catalog_model_entries", _catalog)
+
+    class _MockTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            """Serve the model-services page.
+
+            :param request: The outgoing request.
+            :returns: The canned response.
+            """
+            return httpx.Response(200, content=json.dumps(payload).encode())
+
+    _real_client = httpx.Client
+    with unittest.mock.patch(
+        "httpx.Client",
+        lambda **kw: _real_client(transport=_MockTransport()),
+    ):
+        claude, _gpt, _completions, _gemini = creds._fetch_pi_model_lists(
+            "https://wkspc.example.com", "tok"
+        )
+
+    assert [m["id"] for m in claude] == ["system.ai.claude-opus-4-8"]
+    assert claude[0]["contextWindow"] == 1000000
+    assert claude[0]["maxTokens"] == 128000
+
+
+def test_fetch_pi_model_lists_survives_catalog_outage(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An MLflow catalog outage drops the limits, never the models.
+
+    Live availability is authoritative: losing the metadata lookup must leave
+    the picker fully populated (Pi then applies its own defaults) rather than
+    failing the launch.
+    """
+    import json
+    import unittest.mock
+
+    import httpx
+
+    from omnigent import model_catalog
+
+    payload = {
+        "model_services": [
+            {
+                "name": "model-services/system.ai.claude-opus-4-8",
+                "supported_api_types": ["mlflow/v1/chat/completions"],
+            }
+        ]
+    }
+
+    def _boom(provider_name: str) -> tuple[model_catalog.ModelEntry, ...]:
+        """Fail the metadata lookup.
+
+        :param provider_name: The catalog provider being queried.
+        :returns: Never returns.
+        """
+        raise RuntimeError("catalog unavailable")
+
+    monkeypatch.setattr(model_catalog, "catalog_model_entries", _boom)
+
+    class _MockTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            """Serve the model-services page.
+
+            :param request: The outgoing request.
+            :returns: The canned response.
+            """
+            return httpx.Response(200, content=json.dumps(payload).encode())
+
+    _real_client = httpx.Client
+    with unittest.mock.patch(
+        "httpx.Client",
+        lambda **kw: _real_client(transport=_MockTransport()),
+    ):
+        claude, _gpt, _completions, _gemini = creds._fetch_pi_model_lists(
+            "https://wkspc.example.com", "tok"
+        )
+
+    assert [m["id"] for m in claude] == ["system.ai.claude-opus-4-8"]
+    assert "contextWindow" not in claude[0]
+
+
+def _mock_databricks_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point the Databricks profile path at a fake workspace with fake creds."""
+    from omnigent.inner import databricks_executor
+    from omnigent.runtime.credentials import databricks as db_creds_mod
+
+    monkeypatch.setattr(
+        databricks_executor,
+        "_read_databrickscfg_host",
+        lambda profile: "https://wkspc.example.com/",
+    )
+    monkeypatch.setattr(
+        creds,
+        "resolve_databricks_workspace",
+        lambda profile: db_creds_mod.WorkspaceCreds(host="https://wkspc.example.com", token="tok"),
+    )
+
+
+def _databricks_provider_without_catalog(
+    monkeypatch: pytest.MonkeyPatch, model: str
+) -> creds.PiProviderConfig:
+    """Resolve a Databricks provider whose live model-catalog fetch failed."""
+    _mock_databricks_profile(monkeypatch)
+
+    def _boom(*_args: object) -> None:
+        raise RuntimeError("network blip")
+
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", _boom)
+    provider = creds.resolve_pi_native_provider(model=model, config_loader=_databricks_config)
+    assert provider is not None
+    return provider
+
+
+@pytest.mark.parametrize(
+    ("model", "expected_provider", "expected_api"),
+    [
+        # Probed: the gateway serves Responses passthrough for the system.ai.*
+        # id but rejects it for the databricks-* alias of the same model.
+        ("databricks-glm-5-2", "omnigent-completions", "openai-completions"),
+        ("system.ai.glm-5-2", "omnigent-openai", "openai-responses"),
+        ("databricks-kimi-k3", "omnigent-completions", "openai-completions"),
+        ("databricks-gpt-5-5", "omnigent-openai", "openai-responses"),
+        ("system.ai.gemini-3-5-flash", "omnigent-mlflow", "openai-completions"),
+        ("databricks-gemini-3-5-flash", "omnigent-completions", "openai-completions"),
+        ("databricks-llama-4-maverick", "omnigent-completions", "openai-completions"),
+        ("databricks-deepseek-v3", "omnigent-completions", "openai-completions"),
+    ],
+)
+def test_uncataloged_non_claude_model_routed_by_family(
+    monkeypatch: pytest.MonkeyPatch, model: str, expected_provider: str, expected_api: str
+) -> None:
+    """A non-Claude model the catalog didn't list routes by family, not Anthropic.
+
+    The live model-services fetch is best-effort (expired token, network blip, a
+    workspace listing nothing). Registering the selected model on the primary
+    regardless put GLM/Gemini/Llama on ``anthropic-messages``, where the gateway
+    answers "API type 'anthropic/v1/messages' is not supported" and the turn
+    hangs with no reply.
+    """
+    provider = _databricks_provider_without_catalog(monkeypatch, model)
+
+    cfg = provider.to_models_config()
+    assert [m["id"] for m in cfg["providers"][expected_provider]["models"]] == [model]
+    assert cfg["providers"][expected_provider]["api"] == expected_api
+    # The Claude-only primary must not also offer it.
+    assert cfg["providers"]["omnigent"]["models"] == []
+    assert provider.unroutable_model_warning() is None
+
+
+def test_uncataloged_deepseek_declares_reasoning(monkeypatch: pytest.MonkeyPatch) -> None:
+    """DeepSeek streams on reasoning_content; Pi needs ``reasoning: true``.
+
+    Without the flag Pi sees empty content and the turn never completes.
+    """
+    provider = _databricks_provider_without_catalog(monkeypatch, "databricks-deepseek-v3")
+
+    entry = provider.to_models_config()["providers"]["omnigent-completions"]["models"][0]
+    assert entry.get("reasoning") is True
+
+
+def test_uncataloged_claude_model_stays_on_primary(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A Claude model still self-registers: the primary surface serves it."""
+    provider = _databricks_provider_without_catalog(monkeypatch, "databricks-claude-sonnet-4-6")
+
+    cfg = provider.to_models_config()
+    assert [m["id"] for m in cfg["providers"]["omnigent"]["models"]] == [
+        "databricks-claude-sonnet-4-6"
+    ]
+    assert provider.unroutable_model_warning() is None
+
+
+def test_uncataloged_custom_claude_endpoint_stays_on_primary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A provisioned-throughput Claude endpoint keeps working.
+
+    Custom endpoint names aren't enumerated by the model-services API, so the
+    family fallback is all that places them — classifying on "claude" keeps a
+    ``prod-claude-sonnet-pt`` endpoint on the Anthropic surface that serves it.
+    """
+    provider = _databricks_provider_without_catalog(monkeypatch, "prod-claude-sonnet-pt")
+
+    cfg = provider.to_models_config()
+    assert [m["id"] for m in cfg["providers"]["omnigent"]["models"]] == ["prod-claude-sonnet-pt"]
+    assert provider.unroutable_model_warning() is None
+
+
+def test_unparseable_model_is_refused_with_user_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A model Pi cannot parse is left unregistered and the user is told why.
+
+    Gemini 2.5 returns typed-array content Pi renders as ``[object Object]`` on
+    every available wire, so no surface can serve it. Registering it anywhere
+    would hang; the warning turns that into an explanation.
+    """
+    provider = _databricks_provider_without_catalog(monkeypatch, "databricks-gemini-2-5-pro")
+
+    cfg = provider.to_models_config()
+    assert cfg["providers"]["omnigent"]["models"] == []
+    assert list(cfg["providers"]) == ["omnigent"]
+    warning = provider.unroutable_model_warning()
+    assert warning is not None
+    assert "databricks-gemini-2-5-pro" in warning
+
+
+def test_unreachable_surface_is_refused_with_user_warning() -> None:
+    """A model whose surface this credential can't reach is refused, not guessed.
+
+    The cli-config path can resolve the gateway's Responses surface but not the
+    workspace ``/serving-endpoints`` URL. A completions-only model then has
+    nowhere to go, so it must not fall back to the Anthropic primary.
+    """
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://wkspc.example.com/ai-gateway/anthropic",
+        api="anthropic-messages",
+        model="databricks-llama-4-maverick",
+        api_key="!auth",
+        auth_header=True,
+        databricks_surfaces={
+            creds.DatabricksPiSurface.RESPONSES: "https://wkspc.example.com/ai-gateway/codex/v1",
+        },
+    )
+
+    cfg = provider.to_models_config()
+    assert cfg["providers"]["omnigent"]["models"] == []
+    assert provider.unroutable_model_warning() is not None
+
+
+def test_cataloged_model_is_not_touched_by_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The fallback only fires when nothing claimed the model.
+
+    A catalog that placed the model under a secondary provider keeps working —
+    the model is served there once, and the primary must not offer it as well.
+    """
+    _mock_databricks_profile(monkeypatch)
+    live_claude = [{"id": "databricks-claude-sonnet-4-6", "input": ["text", "image"]}]
+    live_completions = [{"id": "databricks-llama-4", "input": ["text", "image"]}]
+    monkeypatch.setattr(
+        creds, "_fetch_pi_model_lists", lambda *_: (live_claude, [], live_completions, [])
+    )
+
+    provider = creds.resolve_pi_native_provider(
+        model="databricks-llama-4", config_loader=_databricks_config
+    )
+    assert provider is not None
+
+    cfg = provider.to_models_config()
+    assert [m["id"] for m in cfg["providers"]["omnigent-completions"]["models"]] == [
+        "databricks-llama-4"
+    ]
+    assert [m["id"] for m in cfg["providers"]["omnigent"]["models"]] == [
+        "databricks-claude-sonnet-4-6"
+    ]
+
+
+def test_uncataloged_model_launch_arg_matches_rendered_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``--provider`` must name the provider models.json registered the model on.
+
+    The launch resolves the provider from the rendered config, so a model placed
+    by the family fallback is selectable — and gets ``--thinking off``, without
+    which the gateway 400s on ``reasoning_effort``.
+    """
+    provider = _databricks_provider_without_catalog(monkeypatch, "databricks-glm-5-2")
+    monkeypatch.setattr(
+        "omnigent.inner.pi_settings.prepare_managed_pi_agent_dir",
+        lambda *_args, **_kwargs: None,
+    )
+
+    _env, args = creds.pi_native_provider_launch(tmp_path / "pi-agent", provider)
+
+    assert args == [
+        "--provider",
+        "omnigent-completions",
+        "--model",
+        "databricks-glm-5-2",
+        "--thinking",
+        "off",
+    ]
+    cfg = json.loads((tmp_path / "pi-agent" / "models.json").read_text())
+    registered = cfg["providers"]["omnigent-completions"]["models"]
+    assert [m["id"] for m in registered] == ["databricks-glm-5-2"]
+
+
+def test_anthropic_protocol_proxy_serves_non_claude_model() -> None:
+    """An Anthropic-protocol proxy may serve non-Claude ids — don't reroute it.
+
+    ``anthropic-messages`` alone does NOT imply "Claude only": a gateway or
+    LiteLLM-style proxy speaks that protocol for arbitrary models. Only the
+    Databricks gateway's ``/ai-gateway/anthropic`` surface is Claude-only, and
+    its builders say so by carrying ``databricks_surfaces``.
+    """
+    config = {
+        "providers": {
+            "proxy": {
+                "kind": "gateway",
+                "default": True,
+                "anthropic": {
+                    "base_url": "https://litellm.internal.example.com/anthropic",
+                    "api_key": "sk-proxy",
+                },
+            }
+        }
+    }
+
+    provider = creds.resolve_pi_native_provider(
+        model="zai-org/GLM-4.7", config_loader=lambda: config
+    )
+    assert provider is not None
+    assert provider.api == "anthropic-messages"
+    assert provider.databricks_surfaces == {}
+
+    cfg = provider.to_models_config()
+    assert [m["id"] for m in cfg["providers"]["omnigent"]["models"]] == ["zai-org/GLM-4.7"]
+    assert provider.unroutable_model_warning() is None
+
+
+def _dual_family_config(anthropic: bool = True, openai: bool = True) -> dict[str, object]:
+    """A proxy entry exposing an Anthropic surface, an OpenAI surface, or both."""
+    proxy: dict[str, object] = {"kind": "gateway", "default": True}
+    if anthropic:
+        proxy["anthropic"] = {
+            "base_url": "https://litellm.internal.example.com/anthropic",
+            "api_key": "sk-a",
+        }
+    if openai:
+        proxy["openai"] = {
+            "base_url": "https://litellm.internal.example.com/v1",
+            "api_key": "sk-o",
+        }
+    return {"providers": {"proxy": proxy}}
+
+
+@pytest.mark.parametrize(
+    ("model", "expected_api", "expected_base_url"),
+    [
+        (
+            "claude-sonnet-4-6",
+            "anthropic-messages",
+            "https://litellm.internal.example.com/anthropic",
+        ),
+        ("gpt-5-5", "openai-responses", "https://litellm.internal.example.com/v1"),
+        ("glm-5-2", "openai-responses", "https://litellm.internal.example.com/v1"),
+        # Tokens as "other", but no gateway serves it over Anthropic Messages.
+        ("gemini-3-5-flash", "openai-responses", "https://litellm.internal.example.com/v1"),
+        ("llama-4-maverick", "openai-responses", "https://litellm.internal.example.com/v1"),
+    ],
+)
+def test_dual_family_provider_matches_model_family(
+    model: str, expected_api: str, expected_base_url: str
+) -> None:
+    """A provider offering both surfaces serves each model from its own family.
+
+    The family loop used to return on the first configured family, so a proxy
+    with both surfaces sent every model to Anthropic Messages. A non-translating
+    proxy rejects that and the turn hangs with no reply.
+    """
+    config = _dual_family_config()
+
+    provider = creds.resolve_pi_native_provider(model=model, config_loader=lambda: config)
+
+    assert provider is not None
+    assert provider.api == expected_api
+    assert provider.base_url == expected_base_url
+
+
+@pytest.mark.parametrize(
+    ("model", "anthropic", "openai", "expected_api"),
+    [
+        ("gpt-5-5", True, False, "anthropic-messages"),
+        ("claude-sonnet-4-6", False, True, "openai-responses"),
+    ],
+)
+def test_single_family_provider_serves_any_model(
+    model: str, anthropic: bool, openai: bool, expected_api: str
+) -> None:
+    """One configured family serves every model — it may be protocol-translating.
+
+    Preferring the model's family must not become a requirement: a LiteLLM
+    ``/anthropic`` passthrough serves GPT ids, and an OpenAI-compatible proxy
+    serves Claude ids. Excluding them would strand both.
+    """
+    config = _dual_family_config(anthropic=anthropic, openai=openai)
+
+    provider = creds.resolve_pi_native_provider(model=model, config_loader=lambda: config)
+
+    assert provider is not None
+    assert provider.api == expected_api
+
+
+def test_databricks_builders_carry_reachable_surfaces(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The Databricks profile path records every surface its credential reaches."""
+    _mock_databricks_profile(monkeypatch)
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", lambda *_: ([], [], [], []))
+
+    provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
+
+    assert provider is not None
+    assert provider.databricks_surfaces == {
+        creds.DatabricksPiSurface.RESPONSES: "https://wkspc.example.com/ai-gateway/codex/v1",
+        creds.DatabricksPiSurface.COMPLETIONS: "https://wkspc.example.com/serving-endpoints",
+        creds.DatabricksPiSurface.MLFLOW: "https://wkspc.example.com/ai-gateway/mlflow/v1",
+    }
+
+
+def test_launch_renders_config_once(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Rendering is not repeated per launch, so routing is logged once.
+
+    ``pi_native_provider_launch`` both writes ``models.json`` and reads it back
+    to resolve ``--provider``; rendering twice duplicated the routing log line.
+    """
+    provider = _databricks_provider_without_catalog(monkeypatch, "databricks-glm-5-2")
+    monkeypatch.setattr(
+        "omnigent.inner.pi_settings.prepare_managed_pi_agent_dir",
+        lambda *_args, **_kwargs: None,
+    )
+    renders = 0
+    original = creds.PiProviderConfig.to_models_config
+
+    def _counting(self: creds.PiProviderConfig) -> object:
+        nonlocal renders
+        renders += 1
+        return original(self)
+
+    monkeypatch.setattr(creds.PiProviderConfig, "to_models_config", _counting)
+
+    creds.pi_native_provider_launch(tmp_path / "pi-agent", provider)
+
+    assert renders == 1
+
+
+def test_default_claude_model_from_picks_by_tier_then_newest() -> None:
+    """Pi's launch default follows the ``opus > sonnet > …`` precedence, newest first."""
+    from omnigent.pi_native_credentials import _default_claude_model_from
+
+    entries = [
+        {"id": "system.ai.claude-sonnet-5"},
+        {"id": "system.ai.claude-opus-4-8"},
+        {"id": "system.ai.claude-opus-5"},
+    ]
+    # opus outranks sonnet, and opus-5 is the newest opus.
+    assert _default_claude_model_from(entries) == "system.ai.claude-opus-5"
+    # An empty live listing lets the caller fall through to the bundled catalog.
+    assert _default_claude_model_from([]) is None

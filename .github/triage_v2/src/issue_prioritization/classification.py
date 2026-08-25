@@ -9,7 +9,7 @@ from string import Template
 from typing import Protocol
 
 from issue_prioritization.areas import AreaCatalog
-from issue_prioritization.domain import IssueType, Priority, Severity
+from issue_prioritization.domain import Impact, IssueType, Priority
 
 _PRIORITY_LABELS = {priority.value for priority in Priority}
 _TYPE_LABELS = {
@@ -50,7 +50,7 @@ class IssueContent:
 class Classification:
     issue_number: int
     issue_type: IssueType
-    severity: Severity
+    impact: Impact
     area_keys: tuple[str, ...]
     component_labels: tuple[str, ...]
     reasoning: str
@@ -82,7 +82,7 @@ class PromptClassifier:
         return Classification(
             issue_number=issue.number,
             issue_type=_labeled_issue_type(issue.labels) or _issue_type(value.get("type")),
-            severity=Severity(str(value["severity"])),
+            impact=Impact.parse(value.get("impact", value.get("severity"))),
             area_keys=area_keys,
             component_labels=component_labels,
             reasoning=str(value.get("reasoning", "")),

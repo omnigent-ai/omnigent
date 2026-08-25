@@ -10,6 +10,7 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
   basename,
   joinPath,
@@ -571,5 +572,108 @@ describe("WorkspacePicker new folder", () => {
 
     await Promise.resolve();
     expect(mutateAsync).toHaveBeenCalledWith({ hostId: "host_1", path: "~/fresh" });
+  });
+});
+
+describe("WorkspacePicker back-to-workspace", () => {
+  it("is absent when no workspace is supplied", () => {
+    // The new-session / fork / project dialogs are *choosing* a workspace, so
+    // there is nothing to go back to and Home (~) is the only anchor. This is
+    // why the button is its own control rather than a repurposed Home.
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: { entries: [dir("app", "/Users/corey/projects/app")], truncated: false },
+        isLoading: false,
+        isPlaceholderData: false,
+      }),
+    );
+
+    render(<WorkspacePicker hostId="host_1" />);
+
+    expect(screen.queryByTestId("workspace-picker-workspace")).toBeNull();
+    expect(screen.getByTestId("workspace-picker-home")).toBeInTheDocument();
+  });
+
+  it("returns to the workspace in one click after wandering off", () => {
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: { entries: [dir("Music", "/Users/corey/Music")], truncated: false },
+        isLoading: false,
+        isPlaceholderData: false,
+      }),
+    );
+    const onNavigate = vi.fn();
+
+    render(
+      <WorkspacePicker
+        hostId="host_1"
+        initialPath="/Users/corey"
+        workspacePath="/Users/corey/repo"
+        onNavigate={onNavigate}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("workspace-picker-workspace"));
+
+    expect(onNavigate).toHaveBeenCalledWith("/Users/corey/repo");
+  });
+
+  it("is disabled once the workspace is already showing", () => {
+    // Same treatment as Up at the filesystem root: kept in place but inert,
+    // so the header does not reflow as the user navigates.
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: { entries: [dir("src", "/Users/corey/repo/src")], truncated: false },
+        isLoading: false,
+        isPlaceholderData: false,
+      }),
+    );
+
+    render(
+      <WorkspacePicker
+        hostId="host_1"
+        initialPath="/Users/corey/repo"
+        workspacePath="/Users/corey/repo"
+      />,
+    );
+
+    expect(screen.getByTestId("workspace-picker-workspace")).toBeDisabled();
+  });
+});
+
+// The picker opens inside popovers and dialogs, which focus their first
+// tabbable child — the header's Up button. That focus must not reveal its
+// tooltip, or merely opening the picker throws a black label over the listing.
+describe("WorkspacePicker header tooltips", () => {
+  beforeEach(() => {
+    useHostFilesystemMock.mockReset();
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: { entries: [dir("src", "/Users/corey/repo/src")], truncated: false },
+        isLoading: false,
+        isPlaceholderData: false,
+      }),
+    );
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("stays hidden when opening the picker focuses the Up button", async () => {
+    render(
+      <Popover>
+        <PopoverTrigger data-testid="open-picker">Working folder</PopoverTrigger>
+        <PopoverContent>
+          <WorkspacePicker hostId="host_1" initialPath="/Users/corey/repo" />
+        </PopoverContent>
+      </Popover>,
+    );
+
+    fireEvent.click(screen.getByTestId("open-picker"));
+    const up = await screen.findByTestId("workspace-picker-up");
+    // Radix's own autofocus is what used to trip the tooltip; assert it landed
+    // so the test would notice if the focus behaviour changed instead.
+    expect(up).toHaveFocus();
+    expect(screen.queryByRole("tooltip")).toBeNull();
   });
 });

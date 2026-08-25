@@ -50,7 +50,7 @@ export function TurnRail({
   const tickRefs = useRef(new Map<string, HTMLButtonElement>());
   // True while the pointer is over the rail, i.e. the user is browsing ticks.
   // Suppresses the thumb-tracking auto-scroll so a history fetch (or any other
-  // `turns` change) can't yank the rail back to the transcript's visible run
+  // `turns` change) can't yank the rail back to the transcript's active tick
   // while the user is scrolling it.
   const interactingRef = useRef(false);
   // Cursor position at which we last accepted a hover. Scrolling drags ticks
@@ -62,53 +62,57 @@ export function TurnRail({
   // Last pointer position over the rail, used to pick the settle tick. Starts
   // off-screen so a settle before any pointermove resolves to no element.
   const pointerRef = useRef({ x: -1, y: -1 });
-  // itemIds of the turns whose messages are currently on screen. Their ticks
-  // read as active (black) when the user isn't hovering the rail.
-  const [visibleIds, setVisibleIds] = useState<ReadonlySet<string>>(() => new Set());
+  // The turn whose content region contains the viewport's vertical midpoint.
+  // Exactly one tick reads as active (black) when the user isn't hovering.
+  const [activeId, setActiveId] = useState<string | null>(null);
   const [hoveredId, setHoveredId] = useState<string | null>(null);
   // Vertical center of the hovered tick within the rail's own coordinate
   // space, so the (rail-relative) preview box tracks it as the rail scrolls.
   const [previewTop, setPreviewTop] = useState(0);
   const scrollEl = scroller?.el ?? null;
 
-  // Track which turns' messages are on screen, so their ticks read as active.
-  // A turn spans from its own user-message anchor down to the next turn's
-  // anchor (its reply); a turn is visible when that span overlaps the
-  // viewport. rAF-throttled — scroll fires far faster than we need to
-  // recompute, and reading anchor rects forces layout.
+  // Track the single turn at the viewport's reading position. A turn spans
+  // from its user-message anchor to the next turn's anchor, so the latest
+  // anchor at or above the viewport midpoint owns the center line. This keeps
+  // a long reply associated with its initiating prompt instead of switching
+  // early to whichever user-message anchor happens to be nearest. Clamps to
+  // the first loaded turn when the midpoint is above every available anchor.
+  // At the absolute start of the conversation, the first tick stays active
+  // while its user message remains visible, even if the viewport midpoint has
+  // already crossed into the second turn.
+  // rAF-throttled — scroll fires far faster than we need to recompute, and
+  // reading anchor rects forces layout.
   useEffect(() => {
     if (!scrollEl) return;
     let frame = 0;
     const recompute = () => {
       frame = 0;
       const view = scrollEl.getBoundingClientRect();
-      // Anchor top for each turn (skip turns whose message isn't in the DOM).
-      const tops = turns.map((turn) => {
+      const midpoint = (view.top + view.bottom) / 2;
+      let firstAvailableId: string | null = null;
+      let nextActiveId: string | null = null;
+      for (const turn of turns) {
         const anchor = document.querySelector(
           `[data-user-message-id="${CSS.escape(turn.itemId)}"]`,
         );
-        return anchor ? anchor.getBoundingClientRect().top : null;
-      });
-      const next = new Set<string>();
-      for (let i = 0; i < turns.length; i++) {
-        const start = tops[i];
-        if (start == null) continue;
-        // The turn's region ends where the next visible turn begins (or the
-        // viewport bottom for the last turn).
-        let end = view.bottom;
-        for (let j = i + 1; j < tops.length; j++) {
-          if (tops[j] != null) {
-            end = tops[j] as number;
+        if (!anchor) continue;
+        const rect = anchor.getBoundingClientRect();
+        if (firstAvailableId === null) {
+          firstAvailableId = turn.itemId;
+          const firstMessageIsVisible =
+            !hasMoreHistory && rect.bottom > view.top && rect.top < view.bottom;
+          if (firstMessageIsVisible) {
+            nextActiveId = turn.itemId;
             break;
           }
         }
-        // Overlaps the viewport?
-        if (start < view.bottom && end > view.top) next.add(turns[i].itemId);
+        if (rect.top <= midpoint) {
+          nextActiveId = turn.itemId;
+        } else {
+          break;
+        }
       }
-      setVisibleIds((prev) => {
-        if (prev.size === next.size && [...next].every((id) => prev.has(id))) return prev;
-        return next;
-      });
+      setActiveId(nextActiveId ?? firstAvailableId);
     };
     const schedule = () => {
       if (frame === 0) frame = requestAnimationFrame(recompute);
@@ -124,11 +128,11 @@ export function TurnRail({
       if (frame !== 0) cancelAnimationFrame(frame);
       scrollEl.removeEventListener("scroll", schedule);
     };
-  }, [scrollEl, turns]);
+  }, [scrollEl, turns, hasMoreHistory]);
 
-  // Keep the visible run of ticks reachable in the rail's own viewport as the
-  // transcript scrolls, so the highlight tracks your position like a scrollbar
-  // thumb. Only scrolls when that run has drifted out of (or past) the rail
+  // Keep the active tick reachable in the rail's own viewport as the transcript
+  // scrolls, so the highlight tracks your position like a scrollbar thumb.
+  // Only scrolls when that tick has drifted out of (or past) the rail
   // viewport, and only far enough to bring it back to the edge — never
   // re-centering. This is what lets a tick-click leave the rail alone: after
   // you scroll the rail to a tick and click it, that tick is already in view,
@@ -137,20 +141,15 @@ export function TurnRail({
   // hides under them.
   useEffect(() => {
     const rail = railRef.current;
-    if (!rail || visibleIds.size === 0) return;
+    if (!rail || !activeId) return;
     // Don't fight the user: while they're browsing the rail (pointer over it),
     // a `turns` change from history loading must not snap the
-    // rail back to the transcript's visible run.
+    // rail back to the transcript's active tick.
     if (interactingRef.current) return;
-    let top = Infinity;
-    let bottom = -Infinity;
-    for (const id of visibleIds) {
-      const tick = tickRefs.current.get(id);
-      if (!tick) continue;
-      top = Math.min(top, tick.offsetTop);
-      bottom = Math.max(bottom, tick.offsetTop + tick.offsetHeight);
-    }
-    if (!Number.isFinite(top)) return;
+    const tick = tickRefs.current.get(activeId);
+    if (!tick) return;
+    const top = tick.offsetTop;
+    const bottom = tick.offsetTop + tick.offsetHeight;
     const viewTop = rail.scrollTop + FADE;
     const viewBottom = rail.scrollTop + rail.clientHeight - FADE;
     const max = rail.scrollHeight - rail.clientHeight;
@@ -168,12 +167,12 @@ export function TurnRail({
     const clamped = Math.max(0, Math.min(next, max));
     if (Math.abs(clamped - rail.scrollTop) < 1) return;
     rail.scrollTo({ top: clamped, behavior: "smooth" });
-    // Re-run on `turns` too, not just `visibleIds`: loading older history
+    // Re-run on `turns` too, not just `activeId`: loading older history
     // prepends ticks without changing which transcript turns are on screen, so
-    // `visibleIds` stays put. Without this, a fresh load (pinned to the bottom)
-    // leaves the rail stuck at the top with the active run stranded off-screen
+    // `activeId` stays put. Without this, a fresh load (pinned to the bottom)
+    // leaves the rail stuck at the top with the active tick stranded off-screen
     // below the fade — the reported "should start at the bottom" bug.
-  }, [visibleIds, turns]);
+  }, [activeId, turns]);
 
   // Page in older history when the rail nears its own top. Two triggers:
   //  - scroll: fires when the ticks overflow the box and the user scrolls up.
@@ -323,7 +322,7 @@ export function TurnRail({
         style={{ "--turn-rail-fade": `${FADE}px` } as CSSProperties}
         // max-h-72 (not a fixed height): the box shrinks to its ticks when a
         // session is short — so no confusing empty scroll track — and caps at
-        // 288px once the ticks (~16px pitch) exceed ~18, at which point it
+        // 288px once the ticks (~10px pitch) exceed ~29, at which point it
         // overflows and scrolls. Top+bottom fades (mask) show the ticks scroll
         // past both ends. items-start (not center) so a hover-widened tick
         // extends rightward from a fixed left edge instead of re-centering the
@@ -334,8 +333,8 @@ export function TurnRail({
         {turns.map((turn) => {
           const isHovered = turn.itemId === hoveredId;
           // Black when it's the tick you're hovering, or — with no hover — when
-          // its message is on screen. Hovering isolates black to that one tick.
-          const black = hoveredId ? isHovered : visibleIds.has(turn.itemId);
+          // it owns the viewport midpoint. Hovering isolates black to one tick.
+          const black = hoveredId ? isHovered : activeId === turn.itemId;
           return (
             <button
               key={turn.itemId}
@@ -349,12 +348,12 @@ export function TurnRail({
               onBlur={() => setHoveredId((cur) => (cur === turn.itemId ? null : cur))}
               onClick={() => scrollToUserMessage(turn.itemId, flashUserMessage)}
               aria-label={`Jump to: ${turn.userText.slice(0, 80) || "message"}`}
-              // Full-pitch hit area (h-4, no gap between ticks) so clicking
+              // Full-pitch hit area (h-2.5, no gap between ticks) so clicking
               // anywhere in a tick's band — not just the 2px dash — registers.
               // Matches the hover zone, so any spot that shows the preview also
               // navigates on click. Dash anchored left (justify-start) so the
               // hover-widen grows rightward without nudging the button box.
-              className="group flex h-4 w-4 shrink-0 items-center justify-start"
+              className="group flex h-2.5 w-4 shrink-0 items-center justify-start"
             >
               {/* Dash: subtle by default; black for on-screen turns (or the
                   hovered one); wider only on hover. Transitions keep the color
@@ -362,7 +361,7 @@ export function TurnRail({
               <span
                 className={cn(
                   "h-0.5 rounded-full transition-all duration-150",
-                  isHovered ? "w-4" : "w-2.5",
+                  isHovered ? "w-4" : "w-[7px]",
                   black
                     ? "bg-foreground"
                     : "bg-muted-foreground/40 group-hover:bg-muted-foreground/70",

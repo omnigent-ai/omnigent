@@ -649,11 +649,11 @@ def test_route_turn_blocks_and_switches_on_a_routed_verdict(
             "terminal": True,
         }
 
-    def _switch(bdir: Path, model: str) -> bool:
+    def _switch(bdir: Path, model: str) -> str | None:
         # The marker is only written after the switch is accepted.
         assert not (bdir / MARKER_FILE).exists()
         switched.append(model)
-        return True
+        return None
 
     monkeypatch.setattr(codex_native_hook, "_post_json", _post)
     monkeypatch.setattr(codex_native_hook, "_apply_thread_model", _switch)
@@ -765,7 +765,11 @@ def test_route_turn_allows_the_prompt_when_the_switch_fails(
             "terminal": True,
         },
     )
-    monkeypatch.setattr(codex_native_hook, "_apply_thread_model", lambda *args: False)
+    monkeypatch.setattr(
+        codex_native_hook,
+        "_apply_thread_model",
+        lambda *args: "could not switch to gpt-5.6-luna",
+    )
 
     exit_code = _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch)
 
@@ -774,6 +778,47 @@ def test_route_turn_allows_the_prompt_when_the_switch_fails(
     assert captured.out == ""
     assert "could not switch" in captured.err
     # No marker: it is the replay handshake, and this prompt is running.
+    assert not (bridge_dir / MARKER_FILE).exists()
+
+
+def test_route_turn_declines_visibly_when_the_pane_cannot_serve_the_pick(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    An unreachable pick is a recorded decline, not a silent drop.
+
+    The reason reaches both the routing trace and stderr, so "the pane never
+    moved" is answerable without reproducing the stale gateway map.
+    """
+    from omnigent.runner.turn_routing import MARKER_FILE, TRACE_FILE
+
+    _advertise_turn_router(bridge_dir)
+    monkeypatch.setattr(
+        codex_native_hook,
+        "_post_json",
+        lambda *args, **kwargs: {
+            "action": "route",
+            "model": "databricks-claude-opus-5",
+            "rationale": "deep refactor",
+            "terminal": True,
+        },
+    )
+    monkeypatch.setattr(
+        codex_native_hook,
+        "_apply_thread_model",
+        lambda *args: "routed model not in this pane's catalog (databricks-claude-opus-5)",
+    )
+
+    exit_code = _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch)
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    # The prompt runs, unblocked, on the pane's own model.
+    assert captured.out == ""
+    assert "not in this pane's catalog" in captured.err
+    assert "not in this pane's catalog" in (bridge_dir / TRACE_FILE).read_text()
     assert not (bridge_dir / MARKER_FILE).exists()
 
 
@@ -843,7 +888,9 @@ def test_route_turn_falls_open_on_the_ladders_own_request_budget(
 
     assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
     assert seen == [HOOK_REQUEST_TIMEOUT_S]
-    assert HOOK_REQUEST_TIMEOUT_S < 10.0
+    # Must outlast a healthy route (catalog prep + router call), capped at the
+    # owner's 15s ceiling.
+    assert HOOK_REQUEST_TIMEOUT_S <= 15.0
     assert capsys.readouterr().out == ""
     assert not (bridge_dir / MARKER_FILE).exists()
 
@@ -919,7 +966,7 @@ def test_route_turn_traces_the_route_it_applied(
             "terminal": True,
         },
     )
-    monkeypatch.setattr(codex_native_hook, "_apply_thread_model", lambda *args: True)
+    monkeypatch.setattr(codex_native_hook, "_apply_thread_model", lambda *args: None)
 
     assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
     assert json.loads(capsys.readouterr().out)["decision"] == "block"
@@ -1019,9 +1066,6 @@ _LIVE_CATALOG: list[dict[str, object]] = [
         # Extended-catalog rows are listed under the catalog spelling, which
         # IS codex's id for them — translating must not mangle it.
         ("system.ai.glm-5-2", "system.ai.glm-5-2"),
-        # Nothing in the catalog names it: send it anyway (the gateway may
-        # still serve it) rather than skipping the switch.
-        ("databricks-claude-opus-5", "databricks-claude-opus-5"),
     ],
 )
 def test_apply_thread_model_switches_in_codex_spelling(
@@ -1036,7 +1080,7 @@ def test_apply_thread_model_switches_in_codex_spelling(
     codex_home_for_bridge_dir(bridge_dir).mkdir(parents=True, exist_ok=True)
     client = _install_fake_client(monkeypatch, _FakeAppServerClient(_LIVE_CATALOG))
 
-    assert codex_native_hook._apply_thread_model(bridge_dir, routed) is True
+    assert codex_native_hook._apply_thread_model(bridge_dir, routed) is None
 
     assert client.requests == [
         ("model/list", {"includeHidden": True}),
@@ -1046,23 +1090,50 @@ def test_apply_thread_model_switches_in_codex_spelling(
     assert read_codex_config_model(bridge_dir) == applied
 
 
-def test_apply_thread_model_falls_back_to_the_routed_id_without_a_catalog(
+def test_apply_thread_model_declines_a_model_this_pane_cannot_serve(
     bridge_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An unreadable catalog must not cost the switch — send the id verbatim."""
+    """
+    A stale gateway map can route a pane onto a model its gateway will not run.
+
+    Switching anyway is a silent drop at the next turn, so the live catalog is
+    the authority: no row names the pick, no switch, and the reason is said out
+    loud rather than being swallowed.
+    """
+    from omnigent.codex_native_bridge import read_codex_config_model
+
+    codex_home_for_bridge_dir(bridge_dir).mkdir(parents=True, exist_ok=True)
+    client = _install_fake_client(monkeypatch, _FakeAppServerClient(_LIVE_CATALOG))
+
+    declined = codex_native_hook._apply_thread_model(bridge_dir, "databricks-claude-opus-5")
+
+    assert declined is not None
+    assert "not in this pane's catalog" in declined
+    assert "databricks-claude-opus-5" in declined
+    # The catalog was read, and nothing was switched or mirrored.
+    assert client.requests == [("model/list", {"includeHidden": True})]
+    assert client.closed is True
+    assert read_codex_config_model(bridge_dir) is None
+
+
+def test_apply_thread_model_declines_when_the_catalog_cannot_be_read(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreadable catalog proves nothing, so it is not proof of reachability."""
     from omnigent.codex_native_bridge import read_codex_config_model
 
     codex_home_for_bridge_dir(bridge_dir).mkdir(parents=True, exist_ok=True)
     client = _install_fake_client(monkeypatch, _FakeAppServerClient(None))
 
-    assert codex_native_hook._apply_thread_model(bridge_dir, "databricks-gpt-5-6-luna") is True
+    declined = codex_native_hook._apply_thread_model(bridge_dir, "databricks-gpt-5-6-luna")
 
-    assert client.requests[-1] == (
-        "thread/settings/update",
-        {"threadId": "thread_abc", "model": "databricks-gpt-5-6-luna"},
-    )
-    assert read_codex_config_model(bridge_dir) == "databricks-gpt-5-6-luna"
+    assert declined is not None
+    assert "could not read this pane's model catalog" in declined
+    # Fail open: no switch, no crash, and the pane keeps its own model.
+    assert [method for method, _params in client.requests] == ["model/list"]
+    assert read_codex_config_model(bridge_dir) is None
 
 
 def test_apply_thread_model_pages_the_catalog(
@@ -1090,7 +1161,7 @@ def test_apply_thread_model_pages_the_catalog(
     codex_home_for_bridge_dir(bridge_dir).mkdir(parents=True, exist_ok=True)
     client = _install_fake_client(monkeypatch, _PagedClient(None))
 
-    assert codex_native_hook._apply_thread_model(bridge_dir, "databricks-gpt-5-6-luna") is True
+    assert codex_native_hook._apply_thread_model(bridge_dir, "databricks-gpt-5-6-luna") is None
 
     assert client.requests[-1] == (
         "thread/settings/update",

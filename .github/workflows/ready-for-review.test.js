@@ -62,11 +62,20 @@ async function run(
   };
   const github = {
     graphql: async (query, vars) => {
-      if (query.includes("pullRequest(number:")) {
+      if (query.includes("closingIssuesReferences")) {
         if (linkError) throw new Error("boom");
         return {
           repository: {
             pullRequest: { closingIssuesReferences: { totalCount: linked[vars.number] ?? 0 } },
+          },
+        };
+      }
+      // Single-PR fetch (the instant path).
+      if (query.includes("createdAt")) {
+        const found = nodes.find((n) => n.number === vars.number) ?? null;
+        return {
+          repository: {
+            pullRequest: found ? { createdAt: "2026-08-06T00:00:00Z", ...found } : null,
           },
         };
       }
@@ -302,6 +311,38 @@ const verdictOf = (rows, n) => (rows.find((r) => r[0] === `#${n}`) || [])[1];
       "the sweep continues past a write failure"
     );
     assert.ok(warnings.some((w) => /Could not label #191/.test(w)));
+  }
+
+  // ---- the instant path: PR_NUMBER names one PR ----
+  {
+    const nodes = [pr({ number: 70 }), pr({ number: 71 })];
+    const { labeled } = await run(nodes, {
+      linked: { 70: 1, 71: 1 },
+      env: { ...ENFORCE, PR_NUMBER: "70" },
+    });
+    assert.deepStrictEqual(
+      labeled.map((l) => l.issue_number),
+      [70],
+      "only the named PR is labelled"
+    );
+  }
+  // Exclusions still hold on the instant path.
+  {
+    const { labeled } = await run([pr({ number: 72, assoc: "MEMBER" })], {
+      linked: { 72: 1 },
+      env: { ...ENFORCE, PR_NUMBER: "72" },
+    });
+    assert.strictEqual(labeled.length, 0, "maintainer PRs stay skipped");
+  }
+  // The effective-date floor applies to events too.
+  {
+    const old = pr({ number: 73 });
+    old.createdAt = "2026-07-01T00:00:00Z";
+    const { labeled } = await run([old], {
+      linked: { 73: 1 },
+      env: { ...ENFORCE, PR_NUMBER: "73" },
+    });
+    assert.strictEqual(labeled.length, 0, "a pre-cutoff PR is skipped");
   }
 
   // Dry run touches nothing but still reports.

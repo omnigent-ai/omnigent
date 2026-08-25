@@ -17,6 +17,10 @@ task_v1 behaviour the CUJ matrix in this directory is scored against:
 * Picks come only from ``route_options``, and the rationale is the same rule
   trace the live router emits (captured verbatim from staging logs), so the
   chips and decision cards under test carry production-shaped text.
+* :attr:`MockRouter.disabled` reproduces a workspace whose account never had
+  the routing API turned on: every ``routes:select`` answers the 404 that
+  deployment gets (:data:`NOT_ENABLED_MESSAGE`), which is a permanent
+  condition rather than an outage.
 
 The rule table is :func:`decide`; it is the whole routing policy and is unit
 tested by ``test_mock_router.py``.
@@ -63,6 +67,10 @@ ROUTES_SELECT_PATH = "/routes:select"
 #: Base path the mock serves under, so the configured ``base_url`` looks like
 #: the gateway's (``.../ai-gateway/routing/v1``) rather than a bare host.
 BASE_PATH = "/ai-gateway/routing/v1"
+
+#: What a workspace without the routing API answers, verbatim. The condition is
+#: account-level, so it never clears on retry.
+NOT_ENABLED_MESSAGE = "routing/v1/routes:select is not enabled for this account."
 
 # Deterministic stand-ins for task_v1's "errors or code refs" regex family:
 # stack traces, file paths, backticked symbols, code fences, CLI flags.
@@ -293,6 +301,8 @@ class MockRouter:
 
     base_url: str
     calls: list[RecordedCall] = field(default_factory=list)
+    #: Serve the account-level "not enabled" 404 instead of routing.
+    disabled: bool = False
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def record(self, call: RecordedCall) -> None:
@@ -382,6 +392,19 @@ def _handler_class(router: MockRouter) -> type[BaseHTTPRequestHandler]:
             )
             prompt = str((body.get("task") or {}).get("prompt") or "")
             router_name = (body.get("route_selector") or {}).get("router_name")
+            if router.disabled:
+                router.record(
+                    RecordedCall(
+                        prompt=prompt,
+                        offered=offered,
+                        router_name=router_name,
+                        status=404,
+                        model=None,
+                        rationale=None,
+                    )
+                )
+                self._reply(404, {"error_code": "NOT_FOUND", "message": NOT_ENABLED_MESSAGE})
+                return
             try:
                 payload = select_route(body)
             except MenuRejected as exc:

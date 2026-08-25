@@ -27,7 +27,6 @@ from omnigent.server._elicitation_registry import (
     _PreResolvedHarnessElicitation,
 )
 from omnigent.server.auth import (
-    LEVEL_EDIT,
     LEVEL_MANAGE,
     LEVEL_OWNER,
     LEVEL_READ,
@@ -135,8 +134,9 @@ def register_permissions_routes(
                     "cannot be shared on this Omnigent server.",
                     code=ErrorCode.FORBIDDEN,
                 )
-        if _sharing_mode in (SharingMode.READ_ONLY, SharingMode.RESTRICTED_READ_ONLY) and (
-            body.level > LEVEL_READ or body.can_approve is True
+        if (
+            _sharing_mode in (SharingMode.READ_ONLY, SharingMode.RESTRICTED_READ_ONLY)
+            and body.level > LEVEL_READ
         ):
             raise OmnigentError(
                 "Sharing is limited to read-only access on this Omnigent server.",
@@ -173,35 +173,9 @@ def register_permissions_routes(
                 "Cannot modify owner permissions",
                 code=ErrorCode.FORBIDDEN,
             )
-        can_approve = (
-            existing.can_approve
-            if body.can_approve is None and existing is not None
-            else bool(body.can_approve)
-        )
-        if can_approve and body.level < LEVEL_EDIT:
-            raise OmnigentError(
-                "Approval delegation requires edit access",
-                code=ErrorCode.INVALID_INPUT,
-            )
-        if body.user_id == RESERVED_USER_PUBLIC and can_approve:
-            raise OmnigentError(
-                "Public access cannot approve privileged actions",
-                code=ErrorCode.INVALID_INPUT,
-            )
-        approval_capability_changed = (
-            existing.can_approve if existing is not None else False
-        ) != can_approve
-        if approval_capability_changed:
-            await _require_access(
-                user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
-            )
         await asyncio.to_thread(permission_store.ensure_user, body.user_id)
         perm = await asyncio.to_thread(
-            permission_store.grant,
-            body.user_id,
-            session_id,
-            body.level,
-            can_approve=can_approve,
+            permission_store.grant, body.user_id, session_id, body.level
         )
         # Push the now-shared session to the GRANTEE's open tabs so it
         # appears in their sidebar without a list poll.
@@ -210,7 +184,6 @@ def register_permissions_routes(
             user_id=perm.user_id,
             conversation_id=perm.conversation_id,
             level=perm.level,
-            can_approve=perm.can_approve,
         )
 
     @router.delete(
@@ -223,42 +196,84 @@ def register_permissions_routes(
         session_id: str,
         target_user_id: str,
     ) -> Response:
-        """Revoke a user's permission on a session.
+        """Revoke a permission on a session — someone else's, or your own.
 
-        Requires manage-level access. Cannot revoke your own
-        manage grant (prevents orphaned sessions). Returns 204
-        whether or not the grant existed (idempotent).
+        Two shapes, one endpoint:
+
+        * *Revoke* — removing **another** user's grant is a management
+          action and needs manage access.
+        * *Leave* — removing **your own** grant ("unshare myself", so a
+          shared session stops cluttering your sidebar) needs only read
+          access, since giving up access requires no privilege.
+
+        Either way the owner grant is protected: it is what keeps the
+        session reachable, so revoking it would orphan the session. That
+        guard covers the self case too — an owner cannot leave, and
+        archives or deletes instead. A manage-level *grantee* is still a
+        guest and may leave. Leaving records no lasting refusal, so the
+        owner re-granting brings the session back.
+
+        Idempotent: 204 whether or not a grant existed.
 
         :param request: The incoming FastAPI request (for auth).
         :param session_id: Session to revoke access from,
             e.g. ``"conv_abc123"``.
-        :param target_user_id: User whose grant to revoke,
-            e.g. ``"alice@example.com"``.
+        :param target_user_id: User whose grant to revoke, or the caller's
+            own id to leave, e.g. ``"alice@example.com"``.
         :returns: 204 No Content.
-        :raises OmnigentError: 404 if no session or no access,
-            403 if attempting to revoke own manage grant.
+        :raises OmnigentError: 404 if no session or no access, 403 when the
+            target holds the owner grant, 400 when leaving a sub-agent
+            session, 401 if unauthenticated.
         """
         user_id = _require_user(request, auth_provider)
+        # Leaving is self-service; revoking someone else is management. Read
+        # access is the floor for the self case — enough to prove the session
+        # exists and is visible to the caller without leaking others' via
+        # 403/404.
+        leaving_self = target_user_id == user_id
         await _require_access(
-            user_id, session_id, LEVEL_MANAGE, permission_store, conversation_store
+            user_id,
+            session_id,
+            LEVEL_READ if leaving_self else LEVEL_MANAGE,
+            permission_store,
+            conversation_store,
         )
         if permission_store is None:
             raise OmnigentError(
                 "Permissions not enabled",
                 code=ErrorCode.INTERNAL_ERROR,
             )
-        if target_user_id == user_id:
+        # Single-user mode has one identity that owns everything, so a
+        # self-revoke there could only strand the local user's own sessions.
+        if leaving_self and user_id is None:
             raise OmnigentError(
-                "Cannot modify your own permissions",
+                "Cannot leave a session on a single-user server.",
                 code=ErrorCode.FORBIDDEN,
             )
+        # A sub-agent holds no grant of its own — access delegates to its
+        # parent — so revoking here would delete nothing and still report
+        # success, leaving the row in place. Scoped to the self case: the
+        # manager path is unchanged.
+        if leaving_self:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is not None and conv.parent_conversation_id is not None:
+                raise OmnigentError(
+                    "This is a sub-agent session; its access comes from its parent. "
+                    f"Leave the parent session {conv.parent_conversation_id!r} instead.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
         existing = await asyncio.to_thread(permission_store.get, target_user_id, session_id)
         if existing is not None and existing.level == LEVEL_OWNER:
             raise OmnigentError(
-                "Cannot revoke owner permissions",
+                "Cannot leave a session you own. Delete or archive it instead."
+                if leaving_self
+                else "Cannot revoke owner permissions",
                 code=ErrorCode.FORBIDDEN,
             )
         await asyncio.to_thread(permission_store.revoke, target_user_id, session_id)
+        # The leaver's own tab drops the row via the client mutation's success
+        # handler; their other tabs converge on the next watch-set diff, which
+        # reports the now-inaccessible id as removed. No extra push needed.
         return Response(status_code=204)
 
     @router.get(
@@ -325,7 +340,6 @@ def register_permissions_routes(
                     user_id=g.user_id,
                     conversation_id=g.conversation_id,
                     level=g.level,
-                    can_approve=g.can_approve,
                 )
                 for g in grants
             ],

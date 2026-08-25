@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useSessionAgent } from "@/hooks/useAgents";
@@ -19,16 +19,14 @@ vi.mock("./FileViewer", () => ({
   FileViewer: ({ path }: { path: string }) => <div data-testid="file-viewer-stub">{path}</div>,
 }));
 vi.mock("./FilesPanel", () => ({
-  FilesPanel: () => <div data-testid="files-panel-stub" />,
-}));
-vi.mock("./InlineTerminalsSection", () => ({
-  InlineTerminalsSection: () => <div data-testid="terminals-stub" />,
+  // Echo the fixed scope so tests can prove the Files tab renders the tree
+  // (flatView=false) and the Changes tab the changed-only list (flatView=true).
+  FilesPanel: ({ flatView }: { flatView: boolean }) => (
+    <div data-testid="files-panel-stub" data-flat-view={String(flatView)} />
+  ),
 }));
 vi.mock("./SubagentsPanel", () => ({
   SubagentsPanel: () => <div data-testid="subagents-stub" />,
-}));
-vi.mock("./TodoPanel", () => ({
-  TodoPanel: () => <div data-testid="todos-stub" />,
 }));
 vi.mock("@/components/BrowserPane/BrowserPane", () => ({
   BrowserPane: ({ conversationId }: { conversationId: string }) => (
@@ -81,8 +79,8 @@ function renderWorkspace(
     rightRailTab?: RightRailTab;
     selectedFilePath?: string | null;
     openFiles?: string[];
+    changedCount?: number;
     showBrowserTab?: boolean;
-    showShellsTab?: boolean;
     openTerminals?: string[];
     selectedTerminalKey?: string | null;
     maximized?: boolean;
@@ -105,14 +103,9 @@ function renderWorkspace(
         onRightRailTabChange={onRightRailTabChange}
         showFilesPanel
         showBrowserTab={overrides.showBrowserTab ?? false}
-        changedCount={0}
-        showShellsTab={overrides.showShellsTab ?? false}
-        terminalsLength={0}
+        changedCount={overrides.changedCount ?? 0}
         subagentsWorking={0}
         agentCount={1}
-        todosSupported={false}
-        todosCompleted={0}
-        todosTotal={0}
         rootSessionId={null}
         selectedFilePath={overrides.selectedFilePath ?? null}
         openFiles={overrides.openFiles ?? []}
@@ -129,8 +122,6 @@ function renderWorkspace(
         permissionLevel={null}
         filesPanelSort={"recent" as ChangedSort}
         onSortChange={vi.fn()}
-        filesPanelFlatView={false}
-        onFlatViewChange={vi.fn()}
         filesPanelShowHidden={false}
         onShowHiddenChange={vi.fn()}
         liveness={overrides.liveness}
@@ -160,15 +151,33 @@ describe("WorkspacePanel surface presentation", () => {
     renderWorkspace();
 
     const filesTab = screen.getByRole("tab", { name: "Files" });
+    const changesTab = screen.getByRole("tab", { name: "Changes" });
     const agentsTab = screen.getByRole("tab", { name: "Agents 1" });
-    expect(filesTab).toHaveClass("size-8", "p-0");
+    // Icon-only tabs carry their accessible name (queried above) plus a hover
+    // tooltip, never a native title attribute. Exact size/padding classes are
+    // intentionally not asserted — brittle styling detail, not behaviour.
     expect(filesTab).not.toHaveAttribute("title");
-    expect(agentsTab).toHaveClass("size-8", "p-0");
+    expect(changesTab).not.toHaveAttribute("title");
     expect(agentsTab).not.toHaveAttribute("title");
+  });
+
+  it("has no static Shells nav tab — shells open only as closable soft tabs", () => {
+    renderWorkspace({ openTerminals: [] });
+    expect(screen.queryByRole("tab", { name: /shells/i })).toBeNull();
+  });
+
+  it("badges the Changes tab (not Files) with the changed-file count", () => {
+    renderWorkspace({ changedCount: 3 });
+
+    // The changed-file count moved from the old single Files tab to Changes;
+    // Files carries no count.
+    expect(screen.getByRole("tab", { name: "Changes 3 changed" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Files" })).toBeInTheDocument();
   });
 
   it.each([
     { tabName: "Files", tooltip: "Files" },
+    { tabName: "Changes", tooltip: "Changes" },
     { tabName: "Agents 1", tooltip: "Agents" },
   ])("explains the $tabName pane icon with a hover tooltip", async ({ tabName, tooltip }) => {
     renderWorkspace();
@@ -268,12 +277,21 @@ describe("WorkspacePanel content area", () => {
     expect(screen.queryByTestId("files-panel-stub")).toBeNull();
   });
 
-  it("renders the FilesPanel scope view when no file is active on the Files tab", () => {
+  it("renders the FilesPanel tree scope when no file is active on the Files tab", () => {
     renderWorkspace({ rightRailTab: "files", selectedFilePath: null });
 
-    // No active file → the scope view (Changed/All list/tree) owns the content
-    // slot and the viewer is unmounted.
-    expect(screen.getByTestId("files-panel-stub")).toBeInTheDocument();
+    // No active file → the scope view owns the content slot and the viewer is
+    // unmounted. The Files tab pins the panel to the full folder tree.
+    const panel = screen.getByTestId("files-panel-stub");
+    expect(panel).toHaveAttribute("data-flat-view", "false");
+    expect(screen.queryByTestId("file-viewer-stub")).toBeNull();
+  });
+
+  it("renders the FilesPanel changed-only scope on the Changes tab", () => {
+    renderWorkspace({ rightRailTab: "changes", selectedFilePath: null });
+
+    // The Changes tab pins the same panel to the changed-files-only flat list.
+    expect(screen.getByTestId("files-panel-stub")).toHaveAttribute("data-flat-view", "true");
     expect(screen.queryByTestId("file-viewer-stub")).toBeNull();
   });
 });
@@ -289,7 +307,7 @@ describe("WorkspacePanel shell tabs", () => {
 
   it("renders a tab per open shell labeled by name · session", () => {
     useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
-    renderWorkspace({ showShellsTab: true, openTerminals: [termKey] });
+    renderWorkspace({ openTerminals: [termKey] });
 
     // The label resolves through the terminals cache (name · session), not the
     // raw tab key. A failure means the strip didn't render or didn't resolve
@@ -297,10 +315,23 @@ describe("WorkspacePanel shell tabs", () => {
     expect(screen.getByText("zsh · u-g9qopr")).toBeInTheDocument();
   });
 
+  it("sizes shell tab pills to the same 24px height as file tabs", () => {
+    useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
+    renderWorkspace({
+      openFiles: ["src/App.tsx"],
+      openTerminals: [termKey],
+    });
+
+    const fileTab = screen.getByText("App.tsx").closest("[role='button']");
+    const shellTab = screen.getByText("zsh · u-g9qopr").closest("[role='button']");
+    expect(fileTab).toHaveClass("h-[24px]");
+    expect(shellTab).toHaveClass("h-[24px]");
+    expect(shellTab).not.toHaveClass("h-[32px]");
+  });
+
   it("surfaces the active shell's xterm in the content slot", () => {
     useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
     renderWorkspace({
-      showShellsTab: true,
       openTerminals: [termKey],
       selectedTerminalKey: termKey,
     });
@@ -315,7 +346,6 @@ describe("WorkspacePanel shell tabs", () => {
   it("activates a shell via openTerminalTab when its tab body is clicked", () => {
     useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
     const { openTerminalTab } = renderWorkspace({
-      showShellsTab: true,
       openTerminals: [termKey],
     });
 
@@ -327,7 +357,6 @@ describe("WorkspacePanel shell tabs", () => {
   it("closes a shell via onCloseTerminal (and does not also open it) when the x is clicked", () => {
     useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
     const { openTerminalTab, onCloseTerminal } = renderWorkspace({
-      showShellsTab: true,
       openTerminals: [termKey],
     });
 
@@ -340,7 +369,6 @@ describe("WorkspacePanel shell tabs", () => {
   it("keeps the static nav tabs inactive while a shell tab is active", () => {
     useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
     renderWorkspace({
-      showShellsTab: true,
       openTerminals: [termKey],
       selectedTerminalKey: termKey,
     });
@@ -410,6 +438,9 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     // Launches the first declared shell and opens the created terminal's tab.
     expect(mutate).toHaveBeenCalledWith("zsh", expect.any(Object));
     expect(openTerminalTab).toHaveBeenCalledWith("terminal:terminal_zsh_s1");
+
+    // The menu closes on its own after the launch.
+    await waitFor(() => expect(screen.queryByRole("menuitem", { name: /shell/i })).toBeNull());
   });
 
   it("launches the default shell directly when several are declared (type selection is optional)", async () => {
@@ -438,6 +469,14 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     // Launches the default (first-declared) shell without a further pick.
     expect(mutate).toHaveBeenCalledWith("zsh", expect.any(Object));
     expect(openTerminalTab).toHaveBeenCalledWith("terminal:terminal_zsh_s1");
+
+    // The menu closes on its own — the submenu trigger's preventDefault would
+    // otherwise leave it stuck open, needing a second click to dismiss.
+    await waitFor(() => expect(screen.queryByRole("menuitem", { name: /shell/i })).toBeNull());
+
+    // Focus is not restored to the "+" trigger on close — that focus return is
+    // what re-opened its tooltip for a frame (the visible flash after launch).
+    expect(screen.getByRole("button", { name: "Open new" })).not.toHaveFocus();
   });
 
   it("remembers the picked shell type as the new default (persisted + check-marked)", async () => {

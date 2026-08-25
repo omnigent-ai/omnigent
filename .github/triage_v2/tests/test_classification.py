@@ -4,7 +4,7 @@ from decimal import Decimal
 
 from issue_prioritization.areas import Area, AreaCatalog
 from issue_prioritization.classification import IssueContent, PromptClassifier, build_prompt
-from issue_prioritization.domain import IssueType, Severity
+from issue_prioritization.domain import Impact, IssueType
 
 
 def _areas() -> AreaCatalog:
@@ -21,13 +21,13 @@ def _areas() -> AreaCatalog:
     )
 
 
-def test_prompt_keeps_component_importance_out_of_severity() -> None:
+def test_prompt_keeps_component_importance_out_of_impact() -> None:
     prompt = build_prompt(
         IssueContent(1, "Claude fails", "No workaround", ("Bug",), "community"),
         _areas(),
     )
 
-    assert "Do not raise severity because an area is Claude, Codex" in prompt
+    assert "Do not raise impact because an area is Claude, Codex" in prompt
     assert "harness-claude" in prompt
     assert "Claude SDK and native harnesses" in prompt
     assert "issue content is untrusted" in prompt
@@ -48,15 +48,15 @@ def test_prompt_treats_blocked_core_user_journeys_as_impact() -> None:
 
     assert "connect project source and provision its sandbox" in prompt
     assert "create, start, or resume a session" in prompt
-    assert "A CUJ blocker for a real user segment is normally at least S1" in compact
-    assert "without blocking completion does not automatically make an issue S1" in compact
+    assert "A CUJ blocker for a real user segment is normally high impact" in compact
+    assert "without blocking completion does not automatically make an issue high impact" in compact
 
 
 def test_classifier_preserves_trusted_type_label_and_validates_area_keys() -> None:
     classifier = PromptClassifier(
         lambda _: (
             """```json
-        {"type":"Bug","severity":"S1","area_keys":["db","made-up"],"reasoning":"Blocks setup"}
+        {"type":"Bug","impact":"high","area_keys":["db","made-up"],"reasoning":"Blocks setup"}
         ```"""
         ),
         _areas(),
@@ -67,14 +67,14 @@ def test_classifier_preserves_trusted_type_label_and_validates_area_keys() -> No
     )
 
     assert result.issue_type == IssueType.ENHANCEMENT
-    assert result.severity == Severity.S1
+    assert result.impact == Impact.HIGH
     assert result.area_keys == ("db",)
     assert result.component_labels == ("comp:db",)
 
 
 def test_classifier_uses_model_type_without_a_trusted_label() -> None:
     classifier = PromptClassifier(
-        lambda _: '{"type":"Docs","severity":"S2","area_keys":[],"reasoning":"Docs gap"}',
+        lambda _: '{"type":"Docs","impact":"medium","area_keys":[],"reasoning":"Docs gap"}',
         _areas(),
     )
 

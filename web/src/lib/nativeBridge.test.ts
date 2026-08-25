@@ -8,6 +8,9 @@ import {
   nativeNotify,
   onNativeNotificationActivated,
   onNativeSidebarDrag,
+  PRE_MANIFEST_BASELINE,
+  type ServerManifest,
+  serverManifestOf,
   setBadgeCount as bridgeSetBadge,
   setNativeServerSwitcherHidden,
   setThemeSource,
@@ -199,6 +202,66 @@ describe("supportsBrowser", () => {
   it("is false under a non-Electron native shell (iOS)", () => {
     setIOS(true);
     expect(supportsBrowser()).toBe(false);
+  });
+});
+
+describe("serverManifestOf", () => {
+  it("returns the baseline off-shell (no picker payload at all)", () => {
+    expect(serverManifestOf(null)).toEqual(PRE_MANIFEST_BASELINE);
+  });
+
+  it("returns the baseline when an older shell omits the manifest", () => {
+    // A shell that predates the manifest still sends currentOrigin/recents —
+    // it just has no serverManifest field. That must read as "pre-manifest",
+    // not crash or yield undefined, so a new SPA runs on an old shell.
+    const info = {
+      currentOrigin: "http://localhost:6767",
+      recentServers: ["http://localhost:6767/"],
+    };
+    expect(serverManifestOf(info)).toEqual(PRE_MANIFEST_BASELINE);
+    expect(serverManifestOf(info).manifestVersion >= 1).toBe(false);
+  });
+
+  it("passes through a manifest the shell forwarded", () => {
+    const manifest = {
+      manifestVersion: 1,
+      serverVersion: "0.6.0",
+      minDesktopVersion: null,
+      ui: { server_picker: "sidebar" },
+    };
+    expect(
+      serverManifestOf({
+        currentOrigin: "http://localhost:6767",
+        recentServers: [],
+        serverManifest: manifest,
+      }),
+    ).toBe(manifest);
+  });
+
+  it("keeps a newer envelope usable (gates are >=, never ===)", () => {
+    const result = serverManifestOf({
+      currentOrigin: "http://localhost:6767",
+      recentServers: [],
+      serverManifest: {
+        manifestVersion: 99,
+        serverVersion: "9.9.9",
+        minDesktopVersion: null,
+        ui: { server_picker: "some-future-shape" },
+      },
+    });
+    expect(result.manifestVersion >= 1).toBe(true);
+    expect(result.ui.server_picker).toBe("some-future-shape");
+  });
+
+  it("falls back to the baseline on a malformed manifest", () => {
+    // Crosses an IPC boundary from a shell of unknown vintage, so a bad
+    // manifestVersion degrades instead of producing NaN comparisons.
+    const result = serverManifestOf({
+      currentOrigin: "http://localhost:6767",
+      recentServers: [],
+      serverManifest: { manifestVersion: "1" } as unknown as ServerManifest,
+    });
+    expect(result).toEqual(PRE_MANIFEST_BASELINE);
   });
 });
 

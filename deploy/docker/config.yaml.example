@@ -47,3 +47,16 @@ allowed_domains:
 # the built-in defaults (20 files / 256 MiB total).
 # copy_max_files: 20
 # copy_max_total_bytes: 268435456
+
+# Branding / white-labeling. Customize the app name, landing heading, and
+# logos shown in the web UI. Logo files must live under branding-assets/ beside
+# this config file; served pre-auth so the login screen is branded too. Any unset
+# field keeps its built-in default. See deploy/README.md#branding-white-labeling.
+# branding:
+#   app_name: "Acme Agent"      # tab title, sidebar wordmark, login screen
+#   heading: "How can I help?"   # landing hero; "" hides it, omit for the default
+#   logo:                        # a bare string sets `main`; or per-variant:
+#     main: logo.png             # hero / primary mark
+#     loading: loading.webp      # working indicator (falls back to main)
+#     favicon: favicon.png       # browser-tab icon
+#   powered_by: true             # "Powered by Omnigent" credit (only when branded); false to hide

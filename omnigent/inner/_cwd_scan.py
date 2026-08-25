@@ -302,11 +302,11 @@ def scan_cwd_mask_entries(
                     continue
                 seen.add(key)
                 # ``is_dir`` follows symlinks by default — matches what
-                # the agent would observe through the bind. For broken
-                # symlinks it returns False; the backend's "file"
-                # emitter handles both (``--bind /dev/null`` works on
-                # a broken symlink; SBPL ``(literal ...)`` denies the
-                # path regardless of what it points at).
+                # the agent would observe through the bind. Backends decide
+                # how to act on a symlink entry: SBPL ``(literal ...)``
+                # denies the path itself, while bwrap cannot mount onto a
+                # symlink at all and skips it (the mount namespace already
+                # confines where the link resolves).
                 kind: MaskKind = "dir" if child.is_dir() else "file"
                 entries.append(MaskedEntry(path=child_path, kind=kind))
                 # Prune: don't descend into a masked dir.

@@ -904,7 +904,82 @@ def test_shell_gh_non_delete_write_unaffected() -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Layer 1 — force-push protection
+# Layer 1 — tag push protection
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def test_tag_push_with_tags_flag_denied() -> None:
+    """git push --tags is denied by default."""
+    policy = github_policy(write_repos=["octo/hello"])
+    result = policy(_sh("git push https://github.com/octo/hello --tags"))
+    assert result is not None and result["result"] == "DENY"
+    assert "tag" in result.get("reason", "").lower()
+
+
+def test_tag_push_follow_tags_denied() -> None:
+    """git push --follow-tags is denied by default."""
+    policy = github_policy(write_repos=["octo/hello"])
+    result = policy(_sh("git push https://github.com/octo/hello --follow-tags main"))
+    assert result is not None and result["result"] == "DENY"
+
+
+def test_tag_push_explicit_ref_denied() -> None:
+    """git push origin refs/tags/v1.0 is denied by default."""
+    policy = github_policy(write_repos=["octo/hello"])
+    result = policy(_sh("git push https://github.com/octo/hello refs/tags/v1.0"))
+    assert result is not None and result["result"] == "DENY"
+
+
+def test_tag_push_full_refspec_denied() -> None:
+    """git push origin refs/tags/v1.0:refs/tags/v1.0 is denied by default."""
+    policy = github_policy(write_repos=["octo/hello"])
+    result = policy(_sh("git push https://github.com/octo/hello refs/tags/v1.0:refs/tags/v1.0"))
+    assert result is not None and result["result"] == "DENY"
+
+
+def test_tag_push_force_prefixed_refspec_denied() -> None:
+    """``+refs/tags/v1.0`` (force-prefixed) is still detected as a tag push."""
+    policy = github_policy(write_repos=["octo/hello"])
+    result = policy(_sh("git push https://github.com/octo/hello +refs/tags/v1.0"))
+    assert result is not None and result["result"] == "DENY"
+
+
+def test_tag_push_allowed_when_opt_out() -> None:
+    """deny_tag_push=False lets tag pushes through normal write gating."""
+    policy = github_policy(write_repos=["octo/hello"], deny_tag_push=False)
+    assert policy(_sh("git push https://github.com/octo/hello --tags")) is None
+
+
+def test_tag_push_alias_denied() -> None:
+    """Tag push to an alias is still DENY (not ASK) when deny_tag_push is on."""
+    policy = github_policy(write_repos=["octo/hello"])
+    result = policy(_sh("git push origin --tags"))
+    assert result is not None and result["result"] == "DENY"
+
+
+def test_normal_branch_push_unaffected_by_tag_protection() -> None:
+    """A normal branch push is not blocked by tag push protection."""
+    policy = github_policy(write_repos=["octo/hello"])
+    assert policy(_sh("git push https://github.com/octo/hello main")) is None
+
+
+def test_tag_push_wrapped_in_bash_denied() -> None:
+    """bash -c wrapper does not bypass tag push detection."""
+    policy = github_policy(write_repos=["octo/hello"])
+    result = policy(_sh('bash -c "git push https://github.com/octo/hello --tags"'))
+    assert result is not None and result["result"] == "DENY"
+
+
+def test_tag_refspec_not_added_to_branches() -> None:
+    """refs/tags/v1.0 refspec should not pollute the branch set."""
+    policy = github_policy(write_repos=["octo/hello"], write_branches=["main"])
+    result = policy(_sh("git push https://github.com/octo/hello main refs/tags/v1.0"))
+    assert result is not None and result["result"] == "DENY"
+    assert "tag" in result.get("reason", "").lower()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Layer 1b — force-push protection
 # ══════════════════════════════════════════════════════════════════════════════
 
 

@@ -82,7 +82,7 @@ final class SettingsStore: ObservableObject {
 
 #if DEBUG
   extension ProcessInfo {
-    fileprivate func omnigentArgumentValue(after argumentName: String) -> String? {
+    func omnigentArgumentValue(after argumentName: String) -> String? {
       guard let index = arguments.firstIndex(of: argumentName) else { return nil }
       let valueIndex = arguments.index(after: index)
       guard arguments.indices.contains(valueIndex) else { return nil }

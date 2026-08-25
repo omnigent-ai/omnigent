@@ -563,8 +563,6 @@ class SqlSessionPermission(OmnigentBase):
     :param level: Numeric permission level: ``1`` = read,
         ``2`` = edit, ``3`` = manage. Each level subsumes the
         ones below it (comparison is ``>=``).
-    :param can_approve: Owner-controlled authority to resolve privileged
-        action approvals for this session.
     """
 
     __tablename__ = "session_permissions"
@@ -586,12 +584,6 @@ class SqlSessionPermission(OmnigentBase):
         primary_key=True,
     )
     level: Mapped[int] = mapped_column(Integer, nullable=False)
-    can_approve: Mapped[bool] = mapped_column(
-        Boolean,
-        nullable=False,
-        server_default=false(),
-        default=False,
-    )
 
     __table_args__ = (
         CheckConstraint("level IN (1, 2, 3, 4)", name="ck_session_permissions_level"),
@@ -632,6 +624,7 @@ class SqlConversationMetadata(OmnigentBase):
     # No FK: host records are managed outside this table.
     host_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
     sub_agent_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    task_summary: Mapped[str | None] = mapped_column(String(128), nullable=True)
     external_session_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     session_state: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     session_usage: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
@@ -1397,6 +1390,10 @@ class SqlScheduledTask(OmnigentBase):
         ``"claude-opus-4-7"``. ``None`` means use the agent default.
     :param reasoning_effort: Per-task reasoning-effort hint, e.g. ``"high"``.
         ``None`` means use the agent default.
+    :param permission_mode: Per-task permission mode for native coding harnesses
+        that support one (Claude Code), e.g. ``"acceptEdits"``. The fire path
+        turns it into the runner's ``--permission-mode`` launch arg. ``None``
+        means use the agent default.
     :param workspace: Absolute path on disk where a fired session's runner
         should start (the source repo / working dir). ``None`` when unset.
     :param base_branch: Git base ref a firing branches FROM when it creates a
@@ -1462,6 +1459,13 @@ class SqlScheduledTask(OmnigentBase):
     # mirror the matching conversations.* override columns.
     model_override: Mapped[str | None] = mapped_column(String(128), nullable=True)
     reasoning_effort: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Per-task permission mode for native coding harnesses that carry one
+    # (Claude Code). The fire path converts it to the runner's
+    # ``--permission-mode`` launch arg. NULL = use the agent default.
+    permission_mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Per-firing cost budget in USD. When set, the fire path attaches a
+    # cost_budget policy to each spawned session. NULL = no per-firing cap.
+    max_cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
     workspace: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     # Git base ref a firing branches from when it creates a worktree at fire
     # time (mirrors session-create's git.base_branch input). None when unset.

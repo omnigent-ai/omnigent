@@ -28,9 +28,11 @@ demand counts GitHub `+1` reactions only, not all reaction types.
 
 When `ISSUE_PRIORITIZATION_V2_ENABLED=true`, the existing Issue Triage workflow
 runs v2 after intake for each new non-bot issue, including maintainer-authored
-issues. It calls the configured model
-serving endpoint, applies severity, component, and priority labels, and uploads
-a 30-day decision artifact. The periodic Databricks job remains responsible for
+issues. It calls the configured model serving endpoint, applies component and
+priority labels, posts one bot-owned triage comment with its assessment of impact,
+and uploads a 30-day decision artifact.
+Legacy `severity:S*` labels are removed instead of replaced with another label.
+The periodic Databricks job remains responsible for
 the complete ranking and dashboard; the issue-open path does not wait for it.
 
 Configure these repository settings before enabling the switch:
@@ -73,8 +75,8 @@ uv run --frozen --project .github/triage_v2 issue-priority-event \
 ```
 
 The output includes the classification, score breakdown, proposed mutations,
-prompt input hash, and model endpoint, so a later Databricks importer can
-consume it without changing the event path.
+proposed bot comment, prompt input hash, and model endpoint, so a later
+Databricks importer can consume it without changing the event path.
 
 ## Databricks dry-run
 
@@ -103,21 +105,29 @@ databricks bundle run issue_prioritization --target dev --profile <profile> \
   --params regrade=true
 ```
 
-For the one-time backfill, preview regrading only priorities whose latest label
-event came from a known legacy bot. This needs read credentials but keeps the
-GitHub write gate off:
+Impact replaces severity as the model's base judgment. Existing cached S0-S3
+classifications are mapped to critical/high/medium/low Impact values, so this
+migration does not require a full LLM regrade. Legacy S-code and classification
+schema compatibility remains for the 0.2.x wheel and is expected to be removed
+in 0.3.0 after the label backfill and table migration are complete.
+
+For the one-time migration backfill, first preview comment creation, legacy
+severity-label removal, and priority changes whose latest label event came from
+a known legacy bot. This needs read credentials but keeps the GitHub write gate
+off:
 
 ```bash
 databricks bundle deploy --target dev --profile <profile> \
   --var="github_secret_scope=<scope>" \
   --var="model_endpoint=<endpoint>"
 databricks bundle run issue_prioritization --target dev --profile <profile> \
-  --params regrade=true,adopt_legacy_bot_priorities=true
+  --params mode=dry_run,regrade=false,adopt_legacy_bot_priorities=true
 ```
 
 `run.json` records whether regrade/adoption was enabled and how many historical
 priorities were adopted. Human-authored priority events remain blocked in
-`mutations.json`.
+`mutations.json`. Each mutation also contains the comment body that apply mode
+will create or update.
 
 ## Dashboard draft
 
@@ -140,8 +150,10 @@ dashboard.
 The table-update trigger is paused. GitHub writes additionally require
 `mode=apply`, the deploy variable `allow_github_writes=true`, and a configured
 secret scope. The job re-reads every issue's live labels before writing and
-preserves maintainer priority and severity overrides. Removing a bot-owned label
-is also a durable override; human-added component labels are never removed.
+preserves maintainer priority overrides. Removing a bot-owned priority is also a
+durable override; human-added component labels are never removed. Retired
+`severity:S*` labels are always removed because they no longer participate in
+scoring.
 
 For scheduled runs, prefer a GitHub App installation token over a personal PAT.
 Install the App on `omnigent-ai/omnigent` with metadata read and issues read/write,
@@ -198,6 +210,13 @@ databricks bundle deploy --target dev --profile <profile> \
 databricks bundle run issue_prioritization --target dev --profile <profile> \
   --params mode=apply,adopt_legacy_bot_priorities=true
 ```
+
+That apply run is also the comment backfill. The bot finds comments by the
+`omnigent-issue-prioritization-v2` marker and updates the existing comment rather
+than posting another one. The base score is embedded in HTML metadata for audit
+and is not rendered by GitHub; it is hidden, not secret. Visible text contains
+the bot assessment, effective priority, the automated recommendation when a
+human override is retained, and a concise rationale.
 
 Keep the write variable false until a dry-run's `ranking.*` and
 `mutations.json` artifacts have been reviewed. Apply mode also creates any

@@ -26,14 +26,17 @@ sending a value the CLI drops.
 
 **Turns** (``thread/setModel`` on a live thread). Here codex is its own
 vocabulary authority: the live ``model/list`` response IS the mapping, so
-:func:`codex_model_slug` hardcodes no model id. The gateway serves either
-spelling, so a thread switched onto a catalog id still RUNS; codex just warns
-"Model metadata for databricks-gpt-5-6-luna not found. Defaulting to fallback
-metadata" and leaves ``/model`` pointing at the launch slug, which reads as
-"routing did nothing". Extended-catalog rows (``system.ai.glm-5-2``) are
-listed under the catalog spelling, so they translate to themselves. An id no
-row matches is returned verbatim — the turn still runs, which beats skipping
-the switch.
+:func:`codex_reachable_model_slug` hardcodes no model id. Extended-catalog
+rows (``system.ai.glm-5-2``) are listed under the catalog spelling, so they
+translate to themselves.
+
+An id no row matches is not reachable from this pane, and the function returns
+``None`` rather than the id: the routing decision comes from a server-side
+gateway map that can name a model this pane's gateway does not actually serve,
+and switching onto one of those is a silent drop at the next turn. Declining
+the switch keeps the pane on a model it can run and puts the reason where
+someone can read it — the same posture the claude side takes when a routed
+model has no spelling its picker accepts.
 
 Stdlib-only so hook subprocesses can import it on the spawn/routing paths.
 """
@@ -151,21 +154,25 @@ def clamp_spawn_effort(effort: str | None, model: str | None) -> str | None:
     return EXTENDED_MODEL_DEFAULT_EFFORT.get(bare, effort)
 
 
-def codex_model_slug(
+def codex_reachable_model_slug(
     model: str,
     options: Iterable[Mapping[str, Any]],  # type: ignore[explicit-any]  # raw model/list rows
-) -> str:
-    """Translate a routed model id into codex's own spelling.
+) -> str | None:
+    """Translate a routed model id into codex's own spelling, if it serves it.
+
+    Doubles as the reachability check for a routed switch: the live catalog is
+    the only authority on what this pane can be moved onto, so "no row names
+    it" is the answer, not a reason to send the id anyway.
 
     :param model: Model id from a routing decision, e.g.
         ``"databricks-gpt-5-6-luna"``.
     :param options: Raw ``model/list`` rows, e.g.
         ``[{"id": "gpt-5.6-luna", "model": "gpt-5.6-luna"}]``.
-    :returns: The matching row's ``id``, or *model* verbatim when no row
-        names the same model (an empty catalog included).
+    :returns: The matching row's ``id``, or ``None`` when no row names the
+        same model (an empty catalog included).
     """
     if not isinstance(model, str) or not model.strip():
-        return model
+        return None
     target = comparable_model_id(model)
     for option in options:
         if not isinstance(option, Mapping):
@@ -179,4 +186,4 @@ def codex_model_slug(
         for spelling in (slug, option.get("model")):
             if isinstance(spelling, str) and comparable_model_id(spelling) == target:
                 return slug.strip()
-    return model
+    return None

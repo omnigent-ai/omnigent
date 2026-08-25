@@ -30,7 +30,19 @@ export interface UserSuggestion {
  * telemetry taxonomy uses. Omitted when the element doesn't fit any of these.
  */
 export type OmnigentComponentKind =
-  "button" | "link" | "input" | "textarea" | "checkbox" | "toggle" | "select";
+  "button" | "link" | "input" | "textarea" | "checkbox" | "toggle" | "select" | "tabs";
+
+/**
+ * A multi-phase interaction whose *outcome* matters — not just that a control was
+ * clicked. Host-agnostic; the host maps each onto its own taxonomy.
+ *   - `agent_run`  — one user prompt → model run.
+ *   - `tool_call`  — a single tool / skill / MCP invocation within a run.
+ *   - `approval`   — a human-in-the-loop permission decision.
+ */
+export type OmnigentInteractionKind = "agent_run" | "tool_call" | "approval";
+
+/** Terminal outcome of an interaction, set on the `complete` phase. */
+export type OmnigentInteractionStatus = "success" | "failure" | "cancelled" | "timed_out";
 
 /**
  * A product-analytics event forwarded to the host. Each carries a stable,
@@ -38,7 +50,9 @@ export type OmnigentComponentKind =
  *
  * PII: `value` on a value-change is only ever set when the emitting call site
  * explicitly declares the value PII-free (see `useOmnigentAnalytics` in
- * `lib/analytics.ts`). Free-form field text is never forwarded.
+ * `lib/analytics.ts`). Free-form field text is never forwarded. Likewise
+ * `interaction_phase.name` must be a bounded, non-PII label (e.g. a tool name
+ * from a fixed set), never user content.
  */
 export type OmnigentAnalyticsEvent =
   | { type: "click"; componentId: string; componentKind?: OmnigentComponentKind }
@@ -48,7 +62,21 @@ export type OmnigentAnalyticsEvent =
       componentKind?: OmnigentComponentKind;
       value?: string | number | boolean;
     }
-  | { type: "page_view"; pageId: string };
+  | { type: "page_view"; pageId: string }
+  | {
+      /**
+       * Start or end of an interaction whose outcome matters (agent run, tool
+       * call, approval). `interactionId` correlates the `start` and `complete`
+       * of one interaction; `status` and `durationMs` are set on `complete`.
+       */
+      type: "interaction_phase";
+      interactionId: string;
+      interactionKind: OmnigentInteractionKind;
+      phase: "start" | "complete";
+      status?: OmnigentInteractionStatus;
+      name?: string;
+      durationMs?: number;
+    };
 
 export interface OmnigentHostConfig {
   /**
@@ -118,6 +146,7 @@ export interface OmnigentHostConfig {
 }
 
 let hostConfig: OmnigentHostConfig = {};
+let hostConfigGeneration = 0;
 let embedRoot: HTMLElement | null = null;
 
 export function setOmnigentHostConfig(config: OmnigentHostConfig): void {
@@ -128,10 +157,27 @@ export function setOmnigentHostConfig(config: OmnigentHostConfig): void {
   // to bare same-origin paths.
   if (!config?.fetcher && hostConfig.fetcher) return;
   hostConfig = config ?? {};
+  hostConfigGeneration += 1;
 }
 
 export function getOmnigentHostConfig(): OmnigentHostConfig {
   return hostConfig;
+}
+
+export function getOmnigentHostGeneration(): number {
+  return hostConfigGeneration;
+}
+
+/**
+ * True when host-scoped traffic must carry the host_id slice key: either the
+ * embed host fetcher is installed (managed UI) or the standalone dev bundle
+ * was pointed at a Databricks workspace via `npm run dev` (vite.config.ts sets
+ * `VITE_DATABRICKS_WORKSPACE=true`). No fetcher is installed in the dev case,
+ * so the flag is the signal. False for a bare local / self-hosted server
+ * (single replica, no sharding), where emitting the key would just dirty the log.
+ */
+export function isDatabricksWorkspace(): boolean {
+  return hostConfig.fetcher != null || import.meta.env.VITE_DATABRICKS_WORKSPACE === "true";
 }
 
 /**

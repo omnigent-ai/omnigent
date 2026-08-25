@@ -16,12 +16,13 @@
 //      revises toward it.
 //
 // The plan markdown renders through the same secure Streamdown stack
-// as assistant chat bubbles (`MessageResponse`).
+// as assistant chat bubbles, so file paths and file links a plan names
+// open in the FileViewer just as they do in a message.
 
 import { CheckIcon, XIcon, ZapIcon } from "lucide-react";
 import { useState } from "react";
-import { MessageResponse } from "@/components/ai-elements/message";
 import { Button } from "@/components/ui/button";
+import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 import { Textarea } from "@/components/ui/textarea";
 
 interface ExitPlanModeReviewProps {
@@ -33,8 +34,6 @@ interface ExitPlanModeReviewProps {
   onAccept: () => void;
   /** Reject; `feedback` is the user's typed revision guidance (`""` when none). */
   onReject: (feedback: string) => void;
-  /** Whether this viewer may approve the plan. */
-  canApprove?: boolean;
 }
 
 export function ExitPlanModeReview({
@@ -42,7 +41,6 @@ export function ExitPlanModeReview({
   onAcceptAuto,
   onAccept,
   onReject,
-  canApprove = true,
 }: ExitPlanModeReviewProps) {
   const [rejecting, setRejecting] = useState(false);
   const [feedback, setFeedback] = useState("");
@@ -55,7 +53,7 @@ export function ExitPlanModeReview({
           the whole plan out). The short lead-in caption above stays muted
           for hierarchy, matching the Codex command card. */}
       <div className="text-ui text-foreground">
-        <MessageResponse>{plan}</MessageResponse>
+        <FilePathAwareMessageResponse>{plan}</FilePathAwareMessageResponse>
       </div>
       {rejecting ? (
         <div className="flex flex-col gap-2 pt-1" data-testid="exit-plan-mode-feedback">
@@ -65,9 +63,10 @@ export function ExitPlanModeReview({
             value={feedback}
             onChange={(e) => setFeedback(e.target.value)}
             className="min-h-20 text-ui"
+            componentId="plan.feedback"
           />
           <div className="flex flex-wrap gap-2">
-            <Button size="sm" onClick={() => onReject(feedback)}>
+            <Button size="sm" onClick={() => onReject(feedback)} componentId="plan.reject">
               <XIcon className="mr-1 size-3.5" />
               Reject plan
             </Button>
@@ -78,11 +77,11 @@ export function ExitPlanModeReview({
         </div>
       ) : (
         <div className="flex flex-wrap gap-2 pt-1">
-          <Button size="sm" onClick={onAcceptAuto} disabled={!canApprove}>
+          <Button size="sm" onClick={onAcceptAuto} componentId="plan.accept_auto">
             <ZapIcon className="mr-1 size-3.5" />
             Yes, and use auto mode
           </Button>
-          <Button size="sm" variant="outline" onClick={onAccept} disabled={!canApprove}>
+          <Button size="sm" variant="outline" onClick={onAccept} componentId="plan.accept_manual">
             <CheckIcon className="mr-1 size-3.5" />
             Yes, manually approve edits
           </Button>

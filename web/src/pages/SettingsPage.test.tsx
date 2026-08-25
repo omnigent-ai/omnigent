@@ -93,6 +93,7 @@ vi.mock("@/hooks/useConversations", async () => {
     // Picker options are sourced from this dedicated scan, decoupled from the
     // loaded rows so archived-only projects on later pages still appear.
     useArchivedProjectNames: () => ({ data: mocks.projectNames }),
+    useLeaveSession: () => ({ mutate: vi.fn(), isPending: false }),
     // Mirrors react-query's mutate: per-call `onSuccess` runs once the
     // mutation settles, which is what drives the post-unarchive navigation.
     useArchiveConversation: () => ({
@@ -305,6 +306,24 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("terminal-theme-auto")).toHaveAttribute("aria-checked", "false");
   });
 
+  it("defaults transcripts to Chat and persists a Terminal default", () => {
+    renderPage("/settings/appearance");
+
+    expect(screen.getByRole("radiogroup", { name: "Default transcript view" })).toBeInTheDocument();
+    expect(screen.getByTestId("transcript-view-default-chat")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(localStorage.getItem("omnigent:default-transcript-view")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("transcript-view-default-terminal"));
+    expect(screen.getByTestId("transcript-view-default-terminal")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(localStorage.getItem("omnigent:default-transcript-view")).toBe("terminal");
+  });
+
   it("renders the color theme dropdown, defaults to Omnigent, and applies a palette on change", () => {
     localStorage.clear();
     renderPage("/settings/appearance");
@@ -457,6 +476,7 @@ describe("SettingsPage", () => {
     fireEvent.change(screen.getByTestId("color-theme-select") as HTMLSelectElement, {
       target: { value: "github" },
     });
+    fireEvent.click(screen.getByTestId("transcript-view-default-terminal"));
     fireEvent.click(screen.getByTestId("workspace-panel-default-collapsed"));
     fireEvent.click(screen.getByTestId("hide-unconfigured-harnesses-toggle"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
@@ -469,12 +489,15 @@ describe("SettingsPage", () => {
     fireEvent.change(screen.getByTestId("code-font-family-input") as HTMLInputElement, {
       target: { value: "Fira Code" },
     });
+    fireEvent.click(screen.getByTestId("heavier-code-text-toggle"));
 
     // Sanity: the non-default choices were persisted.
     expect(localStorage.getItem("omnigent:terminal-theme")).toBe("dark");
+    expect(localStorage.getItem("omnigent:default-transcript-view")).toBe("terminal");
     expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("github"));
     expect(localStorage.getItem("omnigent:ui-font-size")).toBe("15");
     expect(localStorage.getItem("omnigent:code-font-size")).toBe("15");
+    expect(localStorage.getItem("omnigent:code-font-weight")).toBe("500");
 
     // Open the confirmation dialog and confirm the reset.
     fireEvent.click(screen.getByTestId("reset-appearance-button"));
@@ -492,13 +515,18 @@ describe("SettingsPage", () => {
     expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe("");
     expect(localStorage.getItem("omnigent:ui-font-size")).toBeNull();
     expect(localStorage.getItem("omnigent:code-font-size")).toBeNull();
+    expect(localStorage.getItem("omnigent:code-font-weight")).toBeNull();
 
     // Color theme is back to Omnigent.
     expect((screen.getByTestId("color-theme-select") as HTMLSelectElement).value).toBe("omni");
     expect(document.documentElement.getAttribute("data-theme")).toBeNull();
 
-    // Terminal theme, workspace panel, and harness visibility are restored.
+    // Terminal theme, transcript view, workspace panel, and harness visibility are restored.
     expect(screen.getByTestId("terminal-theme-auto")).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("transcript-view-default-chat")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
     expect(screen.getByTestId("workspace-panel-default-open")).toHaveAttribute(
       "aria-checked",
       "true",
@@ -636,6 +664,28 @@ describe("SettingsPage", () => {
     // Reset clears the field and the stored key.
     expect(input.value).toBe("");
     expect(localStorage.getItem("omnigent:code-font-family")).toBeNull();
+  });
+
+  it("shows and persists the code font weight", () => {
+    localStorage.clear();
+    renderPage("/settings/appearance");
+    const toggle = screen.getByTestId("heavier-code-text-toggle");
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+    expect(localStorage.getItem("omnigent:code-font-weight")).toBe("500");
+  });
+
+  it("maps legacy font weights to the supported presets", () => {
+    localStorage.setItem("omnigent:code-font-weight", "900");
+    renderPage("/settings/appearance");
+    expect(screen.getByTestId("heavier-code-text-toggle")).toHaveAttribute("aria-checked", "true");
+
+    cleanup();
+    localStorage.setItem("omnigent:code-font-weight", "100");
+    renderPage("/settings/appearance");
+    expect(screen.getByTestId("heavier-code-text-toggle")).toHaveAttribute("aria-checked", "false");
   });
 
   it("defaults bare /settings to Account when a login session exists, else Appearance", async () => {

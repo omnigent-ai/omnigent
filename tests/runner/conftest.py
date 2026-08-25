@@ -5,17 +5,73 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 from fastapi import FastAPI
 
+from omnigent import claude_native, codex_native_app_server
+from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from omnigent.runner import create_runner_app
 from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.spec.types import AgentSpec, ExecutorSpec, MCPServerConfig
 from tests.runner.helpers import NullServerClient
+
+# The real store-backed catalog resolver, captured before the autouse fixture
+# below stubs it: a test that exercises the catalog path re-patches the module
+# attribute back to this. (An assignment, not an alias import, so lint
+# autofixes can't strip it as unused.)
+REAL_CLAUDE_LAUNCH_CATALOG = claude_native.claude_launch_catalog
+REAL_CODEX_LAUNCH_CATALOG = codex_native_app_server.codex_launch_catalog
+
+# Project root: two parents up from this conftest (tests/runner/ → repo root).
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.fixture(autouse=True)
+def _isolated_model_catalog_store(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """Keep launch-path catalog consults off the developer's machine.
+
+    The native launch paths consult the shared model-catalog store and, on
+    a miss, probe the REAL harness CLIs — which a unit test must never do
+    (a real ``claude`` boot takes ~6 s and writes the developer's real
+    ``~/.omnigent`` store). Redirect the store's directory seam per test
+    and stub both launch-catalog resolvers to "no catalog" (the
+    pre-catalog behavior); a test exercising catalogs re-patches them
+    explicitly.
+    """
+    store_dir = tmp_path_factory.mktemp("model_catalog_store")
+    monkeypatch.setattr("omnigent.model_catalog_store._data_dir", lambda: store_dir)
+
+    async def _no_catalog(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", _no_catalog)
+    monkeypatch.setattr("omnigent.codex_native_app_server.codex_launch_catalog", _no_catalog)
+
+
+@pytest.fixture(autouse=True)
+def _ensure_subprocess_pythonpath(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Put the project root on ``PYTHONPATH`` for spawned harness children.
+
+    Harnesses are spawned with ``-P``, so the child's cwd is deliberately kept
+    off ``sys.path`` (a workspace that is an omnigent checkout must not shadow
+    the installed package). Tests that register a fixture harness module such as
+    ``tests._fixtures.runner_test_harness`` therefore have to hand the child that
+    path through the environment, exactly as ``tests/runtime/harnesses/conftest``
+    already does. Prepend rather than overwrite so a developer-set value stays.
+
+    :param monkeypatch: Pytest monkeypatch fixture, scoping this to one test.
+    """
+    existing = os.environ.get("PYTHONPATH", "")
+    new_path = f"{_PROJECT_ROOT}{os.pathsep}{existing}" if existing else str(_PROJECT_ROOT)
+    monkeypatch.setenv("PYTHONPATH", new_path)
 
 
 def _drain_session_event_queue(queue: asyncio.Queue[Any] | None) -> list[dict[str, Any]]:
@@ -194,6 +250,7 @@ class _FakeProcessManager:
         # idle reaper's guard is actually populated for a live turn.
         self.marked_in_flight: list[tuple[str, str]] = []
         self.cleared_in_flight: list[str] = []
+        self.activity_noted: list[str] = []
 
     async def get_client(
         self, conversation_id: str, harness: str, env: Any = None
@@ -210,6 +267,10 @@ class _FakeProcessManager:
     def has_active_turn(self, conversation_id: str) -> bool:
         """Check if a turn is marked active for this conversation."""
         return conversation_id in self._active_turns
+
+    def note_activity(self, conversation_id: str) -> None:
+        """Record an activity lease refresh for a conversation."""
+        self.activity_noted.append(conversation_id)
 
     def mark_turn_active(self, conversation_id: str) -> None:
         """Mark a conversation as having an active turn (test helper)."""
@@ -717,3 +778,24 @@ def _no_wake_backoff(monkeypatch: pytest.MonkeyPatch) -> list[float]:
 
     monkeypatch.setattr("omnigent.runner.app._wake_retry_sleep", _record)
     return recorded
+
+
+@pytest.fixture
+def pinned_runner_log(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """
+    Pin the log path the runner names in its client-safe error messages.
+
+    ``process_log_reference`` reports whatever ``configure_process_logging``
+    published for this process, falling back to ``OMNIGENT_PROCESS_LOG_FILE``.
+    Any test in the session that runs the real ``configure_process_logging``
+    (``test_runner_entry``'s ``main()`` cases do) leaves its own allocated path
+    behind, so pin both sources here instead of depending on test order.
+
+    :param monkeypatch: pytest monkeypatch fixture.
+    :param tmp_path: pytest temp dir holding the stand-in log file.
+    :returns: The path the runner's error messages must name.
+    """
+    log_path = tmp_path / "runner-pinned.log"
+    monkeypatch.setattr("omnigent.process_logging._current_process_log_path", log_path)
+    monkeypatch.setenv(PROCESS_LOG_FILE_ENV_VAR, str(log_path))
+    return log_path

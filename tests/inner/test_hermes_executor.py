@@ -184,7 +184,12 @@ class TestSetupHermesHome:
         key: a headless Hermes agent had zero Omnigent tools."""
         home, bridge_dir = setup
         omnigent_mcp = json.loads((home / "config.yaml").read_text())["mcp_servers"]["omnigent"]
-        assert omnigent_mcp["args"][:2] == ["-m", "omnigent.claude_native_bridge"]
+        assert omnigent_mcp["args"][:4] == [
+            "-I",
+            "-m",
+            "omnigent.claude_native_bridge",
+            "serve-mcp",
+        ]
         assert "serve-mcp" in omnigent_mcp["args"]
         assert str(bridge_dir) in omnigent_mcp["args"]  # serve-mcp --bridge-dir <bridge_dir>
 

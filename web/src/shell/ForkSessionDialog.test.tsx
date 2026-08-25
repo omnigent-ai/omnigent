@@ -235,6 +235,29 @@ describe("ForkSessionDialog", () => {
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
   });
 
+  it("spins the submit button while the fork is in flight", async () => {
+    // The fork call can take seconds. Without the spinner the button only
+    // fades (disabled), which reads as a hang rather than work in progress.
+    type Fork = Awaited<ReturnType<typeof forkSession>>;
+    let settle: (value: Fork) => void = () => {};
+    forkSessionMock.mockReturnValue(
+      new Promise<Fork>((resolve) => {
+        settle = resolve;
+      }),
+    );
+
+    renderDialog();
+    const submit = screen.getByTestId("fork-session-submit");
+    fireEvent.click(submit);
+
+    await waitFor(() => expect(submit).toHaveAttribute("aria-busy", "true"));
+    expect(submit).toBeDisabled();
+    expect(screen.getByRole("status", { name: "Loading" })).toBeInTheDocument();
+
+    settle({ id: "conv_fork" } as Fork);
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
+  });
+
   it("passes the truncation point through on a 'fork from here' and retitles the dialog", async () => {
     forkSessionMock.mockResolvedValue({
       id: "conv_fork",

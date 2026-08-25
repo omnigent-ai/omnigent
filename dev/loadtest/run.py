@@ -26,7 +26,7 @@ Writes a timestamped result set:
       summary.md              human-readable latency write-up (this tool)
 
 Runs from a repo checkout only (imports ``dev.benchmarks`` + ``tests``), with
-the ``[loadtest,dev,agents-sdk]`` extras. Knobs: ``--users`` (N hosts),
+the ``loadtest`` and ``agents-sdk`` extras. Knobs: ``--users`` (N hosts),
 ``--spawn-rate``, ``--run-time``, ``--sessions-per-user``, ``--turns-per-session``,
 ``--reply-words``, ``--out-dir``.
 """
@@ -96,7 +96,7 @@ def _resolve_out_dir(out_dir: str | None) -> Path:
     if out_dir:
         out = Path(out_dir)
     else:
-        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        stamp = datetime.datetime.now(datetime.timezone.utc).astimezone().strftime("%Y%m%d-%H%M%S")
         out = _RESULTS_ROOT / f"omnigent_load_test-{stamp}"
     out.mkdir(parents=True, exist_ok=True)
     return out
@@ -363,7 +363,7 @@ def main() -> int:
         if importlib.util.find_spec(mod) is None:
             sys.exit(
                 f"{pkg} not importable under {sys.executable} — install the extras: "
-                "pip install -e '.[loadtest,dev,agents-sdk]' (run from a repo checkout)."
+                "uv sync --extra loadtest --extra agents-sdk (run from a repo checkout)."
             )
     out_dir = _resolve_out_dir(args.out_dir)
     return asyncio.run(_boot_and_run(args, out_dir))

@@ -9,6 +9,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from omnigent.inner.native_attachments import UNRESOLVED_ATTACHMENT_MARKER_PATTERN
+from omnigent.llms.adapters._content import redact_binary_payloads
 
 # Attachment markers the native executors prepend to prompt text
 # ("[Attached: /tmp/.../x.png]" from claude-native's _content_to_text,
@@ -102,9 +103,15 @@ class Conversation:
         (alongside the runner-binding primitive of the Alpha
         runner-state design). Both paths validate the value against
         the supported set; invalid values fail with ``invalid_input``.
-    :param model_override: Per-session LLM model override,
-        e.g. ``"claude-opus-4-7"``. ``None`` means use the agent
-        default from the spec's ``llm.model``. Mutable via
+    :param reported_model: The model the harness last REPORTED the
+        session is actually on, verbatim in the harness's own
+        spelling, e.g. ``"claude-opus-4-8[1m]"``. Written only by
+        harness reports (``external_model_change``); never by user
+        picks. The only model value UI surfaces display. ``None``
+        means no report has arrived yet.
+    :param model_override: Per-session LLM model override — the user's
+        REQUEST, e.g. ``"claude-opus-4-7"``. ``None`` means use the
+        agent default from the spec's ``llm.model``. Mutable via
         ``PATCH /v1/sessions/{id}`` and the REPL's ``/model``
         command. Mirrors the persistence shape of
         ``reasoning_effort`` so the web UI and the TUI stay
@@ -220,10 +227,12 @@ class Conversation:
     session_usage: dict[str, Any] = field(default_factory=dict)
     reasoning_effort: str | None = None
     model_override: str | None = None
+    reported_model: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
     harness_override: str | None = None
     sub_agent_name: str | None = None
+    task_summary: str | None = None
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
     workspace: str | None = None
@@ -413,6 +422,21 @@ class ReasoningData(BaseModel):
     encrypted_content: str | None = None
 
 
+def _binary_payload_omitted(media_type: str, _payload_length: int) -> str:
+    """
+    Build the marker written over a dropped compaction-snapshot payload.
+
+    The payload length is deliberately unused: a compaction row is
+    re-validated on every read, so a length would describe the previous
+    marker on the second pass and the strip would stop being idempotent.
+
+    :param media_type: The block's declared media type, if any.
+    :param _payload_length: Unused.
+    :returns: The replacement text.
+    """
+    return f"[{media_type or 'binary'} content omitted from the compaction snapshot]"
+
+
 class CompactionData(BaseModel):
     """
     Data payload for a compaction summary item.
@@ -443,6 +467,29 @@ class CompactionData(BaseModel):
     token_count: int
     compacted_messages: list[dict[str, Any]] | None = None
     window_id: int | None = None
+
+    @field_validator("compacted_messages")
+    @classmethod
+    def strip_binary_payloads(
+        cls,
+        value: list[dict[str, Any]] | None,
+    ) -> list[dict[str, Any]] | None:
+        """
+        Drop base64 payloads from the compaction snapshot.
+
+        Every harness builds the snapshot by copying its vendor transcript
+        verbatim, so a single screenshot turns one compaction item into
+        megabytes of base64 that is stored forever and re-read on every
+        session load. Stripping here rather than in each forwarder covers
+        every producer through one seam. Only newly written rows shrink —
+        a row already on disk keeps its size, and validation runs on the
+        way out, not back into the store.
+
+        :param value: The compacted message list, or ``None``.
+        :returns: The list with binary payloads replaced by a marker,
+            or ``None`` unchanged.
+        """
+        return redact_binary_payloads(value, _binary_payload_omitted)
 
 
 class NativeToolData(BaseModel):

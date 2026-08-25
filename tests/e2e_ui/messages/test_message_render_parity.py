@@ -66,37 +66,19 @@ def _send(page: Page, text: str) -> None:
     page.get_by_role("button", name="Send", exact=True).click()
 
 
-# The header Chat/Terminal switcher is a Radix dropdown whose trigger *toggles*
-# on pointer-down. On a busy page (a live terminal stream plus the trigger's own
-# hover-driven tooltip re-rendering onto the same node) a lone click can net back
-# to closed, leaving the menu shut. Reopen until the target item is on screen
-# instead of asserting a single click landed.
-_VIEW_MENU_OPEN_ATTEMPTS = 5
-_VIEW_MENU_OPEN_TIMEOUT_MS = 5_000
-
-
 def _select_view_mode(page: Page, option: str) -> None:
-    """Open the header Chat/Terminal switcher and select *option*.
+    """Click the header Chat/Terminal switcher's *option* segment.
 
-    Clicks the ``view-mode-toggle`` trigger and waits for the ``option`` radio
-    item; a Radix toggle-trigger click can be swallowed on a busy page, so retry
-    the open before selecting rather than trusting one click.
+    Both destinations are always on screen (a segmented control, not a menu),
+    so this is a single click with no menu to open first.
 
     :param page: The Playwright page, on the session's chat surface.
-    :param option: The menu item label, e.g. ``"Chat"`` or ``"Terminal"``.
+    :param option: The segment to activate, ``"Chat"`` or ``"Terminal"``.
     """
-    toggle = page.get_by_test_id("view-mode-toggle")
-    expect(toggle).to_be_visible(timeout=30_000)
-    item = page.get_by_role("menuitemradio", name=option)
-    for attempt in range(_VIEW_MENU_OPEN_ATTEMPTS):
-        toggle.click()
-        try:
-            expect(item).to_be_visible(timeout=_VIEW_MENU_OPEN_TIMEOUT_MS)
-            break
-        except AssertionError:
-            if attempt == _VIEW_MENU_OPEN_ATTEMPTS - 1:
-                raise
-    item.click()
+    expect(page.get_by_test_id("view-mode-toggle")).to_be_visible(timeout=30_000)
+    segment = page.get_by_test_id(f"view-mode-{option.lower()}")
+    expect(segment).to_be_enabled(timeout=30_000)
+    segment.click()
 
 
 def _ensure_chat_view(page: Page) -> None:

@@ -10,6 +10,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -397,18 +398,27 @@ def _run_migrations(engine: Engine, db_uri: str) -> None:
     :param db_uri: Database connection string forwarded to
         Alembic's ``sqlalchemy.url`` config option, e.g.
         ``"sqlite:///mydb.db"``.
+    :raises RuntimeError: If the database revision is newer than
+        the revisions known to this build.
     """
     from alembic import command
 
     from omnigent.db.db_models import ConversationBase, OmnigentBase
 
+    current = _get_current_db_revision(engine)
+    head = _get_head_db_revision(db_uri)
+    _verify_db_revision_is_supported(db_uri, current, head)
+
     _logger.info("Running database migrations...")
     config = _build_alembic_config(db_uri)
     # Pass a shared connection so Alembic operates within the same
     # engine (required for SQLite in-memory databases, and avoids
-    # creating a second connection pool).
+    # creating a second connection pool). The connection is handed over
+    # outside any transaction so Alembic owns transaction demarcation:
+    # a migration with an autocommit_block (CREATE INDEX CONCURRENTLY)
+    # cannot suspend an externally-begun transaction.
     with query_name_scope("omnigent.database.run_migrations"):
-        with engine.begin() as connection:
+        with engine.connect() as connection:
             config.attributes["connection"] = connection
             command.upgrade(config, "head")
         # Belt-and-suspenders: if a future migration is added but a
@@ -472,11 +482,34 @@ def _get_head_db_revision(db_uri: str) -> str:
     return head
 
 
+def _verify_db_revision_is_supported(
+    db_uri: str,
+    current: str | None,
+    head: str,
+) -> None:
+    """Reject a database revision that is unknown to this build."""
+    if current is None or current == head:
+        return
+
+    from alembic.script import ScriptDirectory
+    from alembic.util import CommandError
+
+    script = ScriptDirectory.from_config(_build_alembic_config(db_uri))
+    try:
+        script.get_revision(current)
+    except CommandError as exc:
+        raise RuntimeError(
+            "Omnigent database schema is newer than this version of Omnigent "
+            f"(found revision {current!r}, latest supported revision {head!r}). "
+            "Upgrade Omnigent before using this database."
+        ) from exc
+
+
 def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
     """
     Bring a fresh or stale database to head before the server starts.
 
-    Three cases:
+    Four cases:
 
     - **Fresh DB** (no ``alembic_version`` table) — run migrations to
       head. This covers brand-new SQLite files and freshly created
@@ -487,6 +520,8 @@ def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
       If the migration fails, re-raise with context so the server
       still terminates with an actionable error instead of continuing
       against an incompatible schema.
+    - **Newer than this build** — stop without attempting a migration
+      and tell the operator to upgrade Omnigent.
 
     :param engine: SQLAlchemy engine bound to the target database.
     :param db_uri: Database URL, used both for Alembic config and in
@@ -496,6 +531,7 @@ def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
     """
     head = _get_head_db_revision(db_uri)
     current = _get_current_db_revision(engine)
+    _verify_db_revision_is_supported(db_uri, current, head)
 
     if current is None:
         _run_migrations(engine, db_uri)
@@ -550,6 +586,54 @@ def clear_engine_cache() -> None:
 # ── Managed session ────────────────────────────────────
 
 
+# Ambient per-engine sessions for a read-only "share one checkout" scope. When
+# active (see :func:`shared_read_scope`), ``managed_session()`` reuses the
+# scope's session for its engine instead of opening a fresh pool checkout,
+# collapsing several back-to-back reads (e.g. the access-control check's
+# permission + conversation lookups) into a single connection round-trip.
+# Keyed by ``id(engine)`` so distinct engines (split-DB) still get independent
+# checkouts. Unset outside a scope, so it is a strict no-op for every ordinary
+# caller.
+_shared_read_sessions: ContextVar[dict[int, Session] | None] = ContextVar(
+    "omnigent_shared_read_sessions", default=None
+)
+
+
+@contextmanager
+def shared_read_scope() -> Iterator[None]:
+    """Collapse back-to-back reads into one pool checkout per engine.
+
+    Within this scope, ``managed_session()`` reuses a single session per
+    engine rather than checking out a fresh pooled connection (plus a
+    ``pool_pre_ping`` round-trip) on every store call. Intended for a short,
+    strictly READ-ONLY burst — an access-control check, a snapshot assembly —
+    where the per-call checkout dominates the actual query time.
+
+    Nesting reuses the outer scope. Write makers (``immediate=True``) never
+    participate, so they keep their own ``BEGIN IMMEDIATE`` isolation even
+    when nested here. Never hold this open across network I/O: it pins a
+    pooled connection for the scope's whole duration.
+    """
+    if _shared_read_sessions.get() is not None:
+        # Already inside a scope — the outer one owns the sessions.
+        yield
+        return
+    sessions: dict[int, Session] = {}
+    token = _shared_read_sessions.set(sessions)
+    try:
+        yield
+        for session in sessions.values():
+            session.commit()
+    except BaseException:
+        for session in sessions.values():
+            session.rollback()
+        raise
+    finally:
+        for session in sessions.values():
+            session.close()
+        _shared_read_sessions.reset(token)
+
+
 def make_managed_session_maker(
     engine: Engine,
     *,
@@ -589,7 +673,27 @@ def make_managed_session_maker(
         Commits on clean exit, rolls back on exception. For SQLite
         backends, enables foreign key enforcement and sets a
         busy timeout before yielding.
+
+        Inside a :func:`shared_read_scope` (and only for read makers), the
+        scope's per-engine session is reused instead of a fresh checkout;
+        the scope — not this block — owns its commit/close.
         """
+        if not immediate:
+            shared = _shared_read_sessions.get()
+            if shared is not None:
+                key = id(engine)
+                session = shared.get(key)
+                if session is None:
+                    session = factory()
+                    # Register before the PRAGMAs: those executes force the pool
+                    # checkout, so if one raises the scope must already track the
+                    # session to close it (otherwise the connection would leak).
+                    shared[key] = session
+                    if is_sqlite:
+                        session.execute(text("PRAGMA foreign_keys = ON"))
+                        session.execute(text("PRAGMA busy_timeout = 20000"))  # 20s
+                yield session
+                return
         with factory() as session:
             try:
                 if is_sqlite:

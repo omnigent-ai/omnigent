@@ -83,16 +83,17 @@ _SDK_HARNESSES: frozenset[str] = frozenset(
 # than a CLI login-status command. For these, ``harness_is_configured`` checks
 # BOTH the binary (via ``harness_cli_installed``) AND the credential (via the
 # callable here). ``agy`` writes an OAuth token on its first interactive run;
-# ``kimi login`` writes ``~/.kimi-code/credentials/kimi-code.json`` (kimi has no
-# login-status probe). The ``anthropic`` / ``openai`` families authenticate via
-# subscription provider config and do not appear here. Each lambda resolves
-# through its module at call time so a test can monkeypatch
-# ``…gemini_auth.gemini_login_detected`` / ``…kimi_auth.kimi_login_detected``
-# and have the patch take effect without this dict caching the old function
-# object.
+# ``kimi login`` writes ``~/.kimi-code/credentials/kimi-code.json``, and
+# pay-per-use users instead set an API key in ``~/.kimi-code/config.toml`` (kimi
+# has no login-status probe) — ``kimi_auth_configured`` accepts either. The
+# ``anthropic`` / ``openai`` families authenticate via subscription provider
+# config and do not appear here. Each lambda resolves through its module at call
+# time so a test can monkeypatch ``…gemini_auth.gemini_login_detected`` /
+# ``…kimi_auth.kimi_auth_configured`` and have the patch take effect without
+# this dict caching the old function object.
 _FAMILY_CREDENTIAL_CHECK: dict[str, Callable[[], bool]] = {
     GEMINI_FAMILY: lambda: _gemini_auth.gemini_login_detected(),
-    KIMI_KEY: lambda: _kimi_auth.kimi_login_detected(),
+    KIMI_KEY: lambda: _kimi_auth.kimi_auth_configured(),
 }
 
 # CLI-wrapping pi harnesses. Both the bare ``pi`` surface and the native
@@ -256,12 +257,18 @@ def _harness_availability_core(harness: str) -> HarnessAvailability:
         # the environment. A bad / Copilot-less token surfaces at run time.
         from omnigent.onboarding.copilot_auth import (
             COPILOT_TOKEN_ENV_VARS,
+            copilot_github_host,
             copilot_github_token_configured,
+            gh_cli_github_token,
         )
 
-        return copilot_github_token_configured() or any(
+        if copilot_github_token_configured() or any(
             os.environ.get(var) for var in COPILOT_TOKEN_ENV_VARS
-        )
+        ):
+            return True
+        # A ``gh auth login`` session is a usable Copilot credential, so a
+        # logged-in user is ready without pasting a token into setup.
+        return gh_cli_github_token(copilot_github_host()) is not None
     if (
         canonical not in _HARNESS_FAMILY
         and canonical not in _PI_HARNESSES

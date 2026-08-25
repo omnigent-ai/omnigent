@@ -18,6 +18,12 @@ never-to-A — once for a plain-text follow-up, and once for a follow-up carryin
 an image (upload → ``input_image`` post, both addressed to B). (The FIFO/idle
 unit behavior is covered by the ``chatStore`` tests.)
 
+A third test pins the other side of that isolation: a send whose POST never
+settles must not wedge a DIFFERENT session. POSTs are serialized through a
+client-side ordering chain, and while that chain was one per tab a single
+stalled POST blocked every later send in every conversation — silently, with
+a page reload as the only recovery.
+
 Why async Playwright (not the sync ``page`` fixture): the test inspects the
 body of every ``/events`` POST via a route handler and asserts on which
 session each was addressed to, across interleaved UI actions (send, switch
@@ -46,6 +52,7 @@ _COMPOSER_PLACEHOLDER = "Ask the agent anything…"
 # Unique sentinels so each POST body is unambiguously identifiable.
 _MSG1 = "sentinel-xsess-msg1-3a7f first message into B"
 _MSG2 = "sentinel-xsess-msg2-9c2e second message into B"
+_MSG3 = "sentinel-xsess-msg3-5d1b message into A while B is stalled"
 
 _EVENTS_RE = re.compile(r"/v1/sessions/([^/]+)/events$")
 
@@ -125,6 +132,100 @@ def test_queued_message_with_image_flushes_to_origin(
     """
     base_url, session_a, session_b = seeded_session_pair
     _run_in_fresh_loop(_drive_cross_session_image_flush(base_url, session_a, session_b))
+
+
+def test_stalled_send_does_not_block_another_session(
+    seeded_session_pair: tuple[str, str, str],
+) -> None:
+    """A send whose POST never settles must not wedge a different session.
+
+    POSTs are serialized through a client-side chain so they reach the
+    server in submission order. That chain used to be one per tab, and a
+    POST whose connection dies mid-flight never settles — so its link was
+    never released and EVERY later send, in every conversation, parked on
+    it forever. The composer just kept queueing with no error, and only a
+    page reload cleared it.
+
+    Failure mode this catches: B's stalled POST blocks the send in A, so
+    ``_MSG3`` never reaches the server at all.
+    """
+    base_url, session_a, session_b = seeded_session_pair
+    _run_in_fresh_loop(_drive_stalled_send_isolation(base_url, session_a, session_b))
+
+
+async def _drive_stalled_send_isolation(base_url: str, session_a: str, session_b: str) -> None:
+    """Async body of the stalled-send isolation test.
+
+    :param base_url: Spawned server base URL.
+    :param session_a: The healthy session, sent to while B is stalled.
+    :param session_b: The session whose POST is held open for good.
+    """
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        # Never set during the test body: B's POST models a connection that
+        # died in flight, so it stays pending until teardown releases the
+        # handler (leaving it awaiting a browser close would strand the task).
+        release_b = asyncio.Event()
+        try:
+            event_posts: list[tuple[str, str]] = []
+            b_post_held = False
+
+            async def handle_events(route: Route) -> None:
+                nonlocal b_post_held
+                request = route.request
+                match = _EVENTS_RE.search(request.url)
+                assert match is not None, f"unexpected /events url: {request.url}"
+                session_id = match.group(1)
+                text = request.post_data_json["data"]["content"][0]["text"]
+                event_posts.append((session_id, text))
+                if session_id == session_b and not b_post_held:
+                    b_post_held = True
+                    await release_b.wait()
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"queued": True, "item_id": "ci_e2e"}),
+                )
+
+            await page.route("**/v1/sessions/*/events", handle_events)
+
+            await page.goto(f"{base_url}/c/{session_b}")
+            composer = page.get_by_label("Message the agent")
+            await page.get_by_placeholder(_COMPOSER_PLACEHOLDER).wait_for(
+                state="visible", timeout=15_000
+            )
+            send_button = page.get_by_role("button", name="Send", exact=True)
+
+            # B's POST goes out and is never answered — the stalled send.
+            await composer.fill(_MSG1)
+            await send_button.click()
+            await _wait_until(lambda: b_post_held)
+
+            # Switch to A via the sidebar (client-side nav — a reload would
+            # reset the JS module state holding the chain, dissolving the bug).
+            await page.locator(f'a[href="/c/{session_a}"]').click()
+            await page.wait_for_url(re.compile(rf"/c/{re.escape(session_a)}"))
+            # A is its own session and idle, so this send dispatches rather
+            # than queueing — the placeholder proves it before we type.
+            await page.get_by_placeholder(_COMPOSER_PLACEHOLDER).wait_for(
+                state="visible", timeout=15_000
+            )
+
+            # The assertion: A's send reaches the server while B is still
+            # stalled. Before the fix it never POSTed at all.
+            await page.get_by_label("Message the agent").fill(_MSG3)
+            await page.get_by_role("button", name="Send", exact=True).click()
+            await _wait_until(lambda: any(text == _MSG3 for _, text in event_posts))
+            assert [sid for sid, text in event_posts if text == _MSG3] == [session_a], (
+                f"msg3 must be delivered to the active session A, got {event_posts}"
+            )
+            # B's POST is still in flight — the isolation is what let A through,
+            # not B's send having quietly resolved.
+            assert not release_b.is_set()
+        finally:
+            release_b.set()
+            await browser.close()
 
 
 async def _drive_cross_session_image_flush(base_url: str, session_a: str, session_b: str) -> None:

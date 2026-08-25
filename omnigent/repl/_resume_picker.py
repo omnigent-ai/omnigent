@@ -28,7 +28,7 @@ import sys
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, TextIO
 
@@ -970,13 +970,27 @@ async def pick_conversation_by_wrapper_label_from_sdk(
 async def pick_conversation_cross_agent_from_sdk(
     client: OmnigentClient,
     *,
+    owner_user_id: str | None = None,
     out: TextIO | None = None,
     in_: TextIO | None = None,
 ) -> str | None:
     """Cross-agent variant: lists every session the caller can see
     via ``/v1/sessions`` and renders runtime metadata for
-    ``omnigent resume``'s runtime-dispatch UX."""
+    ``omnigent resume``'s runtime-dispatch UX.
+
+    ``/v1/sessions`` returns every session the caller can *access*,
+    which includes ones merely shared with them. Resume is an
+    owner-only action — the server rejects binding a runner to a
+    session you don't own (``PATCH /v1/sessions/{id}`` → 403) — so a
+    shared row in this picker is a dead end. When ``owner_user_id`` is
+    set, drop the rows this caller does not own so ``omnigent resume``
+    lists only their own sessions. ``None`` leaves the list unfiltered:
+    the caller's identity could not be resolved, or the server runs
+    without permissions (``owner`` unset, no sharing to filter).
+    """
     convos = await client.sessions.list(limit=200, agent_id=None, order="desc")
+    if owner_user_id is not None:
+        convos = [c for c in convos if c.owner == owner_user_id]
     previews = await _collect_previews_async(client, convos)
     # Header label is intentionally generic — "resume" describes the
     # action, not a single agent. Without overriding the legacy
@@ -1659,7 +1673,7 @@ def _format_when(created_at: int) -> str:
         return f"{delta // 3600}h ago"
     if delta < 7 * 86400:
         return f"{delta // 86400}d ago"
-    return datetime.fromtimestamp(created_at).strftime("%b %d %H:%M")
+    return datetime.fromtimestamp(created_at, tz=timezone.utc).astimezone().strftime("%b %d %H:%M")
 
 
 def _read_line_choice(in_: TextIO) -> str | None:

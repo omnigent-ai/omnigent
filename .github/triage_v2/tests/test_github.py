@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from decimal import Decimal
 
 import pytest
 
+from issue_prioritization.artifacts import RankedIssue
+from issue_prioritization.domain import Impact, Issue, IssueType, Priority, ScoreResult, ScoreStep
 from issue_prioritization.github import (
     GitHubClient,
     GitHubLegacyPriorityOwnership,
@@ -36,6 +39,7 @@ class FakeClient:
         self.synced = False
         self.labels = ("P2-medium", "severity:S2", "comp:server")
         self.applied = []
+        self.comments = []
 
     def sync_missing_labels(self, manifest):
         self.synced = True
@@ -46,13 +50,14 @@ class FakeClient:
     def apply_labels(self, issue_number, labels_add, labels_remove):
         self.applied.append((issue_number, labels_add, labels_remove))
 
+    def upsert_issue_comment(self, issue_number, body):
+        self.comments.append((issue_number, body))
+        return 42
+
 
 def _manifest() -> LabelManifest:
     return LabelManifest(
         labels=(
-            LabelDefinition("severity:S1", "000000", ""),
-            LabelDefinition("severity:S2", "000000", ""),
-            LabelDefinition("severity:S3", "000000", ""),
             LabelDefinition("comp:db", "000000", ""),
             LabelDefinition("comp:server", "000000", ""),
         )
@@ -60,11 +65,11 @@ def _manifest() -> LabelManifest:
 
 
 def test_apply_rechecks_live_labels_before_writing() -> None:
-    state = BotState(1, "P2-medium", "severity:S2", ("comp:server",))
+    state = BotState(1, "P2-medium", ("comp:server",))
     states = FakeStates({1: state})
     manifest = _manifest()
     planner = MutationPlanner(manifest, states)
-    target = MutationTarget(1, "P1-high", "severity:S1", ("comp:db",))
+    target = MutationTarget(1, "P1-high", ("comp:db",))
     proposed = MutationPlan(target, (), (), (), state)
     run = PipelineRun("run", PipelineMode.APPLY, datetime.now(UTC), (), 0, (proposed,))
     client = FakeClient()
@@ -75,19 +80,61 @@ def test_apply_rechecks_live_labels_before_writing() -> None:
     assert client.applied == [
         (
             1,
-            ("P1-high", "comp:db", "severity:S1"),
+            ("P1-high", "comp:db"),
             ("P2-medium", "comp:server", "severity:S2"),
         )
     ]
     assert states.updated[0].priority == "P1-high"
 
 
+def test_apply_posts_the_ranked_bot_judgment() -> None:
+    states = FakeStates({})
+    manifest = _manifest()
+    planner = MutationPlanner(manifest, states)
+    target = MutationTarget(1, "P1-high", ("comp:db",))
+    proposed = MutationPlan(target, (), (), (), BotState(1, None, ()))
+    issue = Issue(
+        1,
+        "Session fails",
+        "https://github.com/org/repo/issues/1",
+        IssueType.BUG,
+        Impact.HIGH,
+        classification_reasoning="Blocks session startup.",
+    )
+    ranked = RankedIssue(
+        1,
+        1,
+        issue,
+        ScoreResult(
+            Decimal("60"),
+            Priority.P1,
+            (ScoreStep("impact", "set", Decimal("60"), Decimal(0), Decimal("60")),),
+        ),
+    )
+    run = PipelineRun(
+        "run",
+        PipelineMode.APPLY,
+        datetime.now(UTC),
+        (ranked,),
+        0,
+        (proposed,),
+    )
+    client = FakeClient()
+    client.labels = ("severity:S2",)
+
+    GitHubMutationSink(client, manifest, planner, states).apply(run)
+
+    assert client.applied == [(1, ("P1-high", "comp:db"), ("severity:S2",))]
+    assert len(client.comments) == 1
+    assert "**Bot assessment:** High impact" in client.comments[0][1]
+
+
 def test_apply_preserves_human_priority_changed_after_dry_run() -> None:
-    state = BotState(1, "P2-medium", "severity:S2", ("comp:server",))
+    state = BotState(1, "P2-medium", ("comp:server",))
     states = FakeStates({1: state})
     manifest = _manifest()
     planner = MutationPlanner(manifest, states)
-    target = MutationTarget(1, "P1-high", "severity:S2", ("comp:server",))
+    target = MutationTarget(1, "P1-high", ("comp:server",))
     proposed = MutationPlan(target, (), (), (), state)
     run = PipelineRun("run", PipelineMode.APPLY, datetime.now(UTC), (), 0, (proposed,))
     client = FakeClient()
@@ -95,7 +142,7 @@ def test_apply_preserves_human_priority_changed_after_dry_run() -> None:
 
     GitHubMutationSink(client, manifest, planner, states).apply(run)
 
-    assert client.applied == []
+    assert client.applied == [(1, (), ("severity:S2",))]
     assert states.updated == []
 
 
@@ -104,11 +151,11 @@ def test_apply_can_recompute_target_from_live_labels() -> None:
     manifest = _manifest()
     planner = MutationPlanner(manifest, states)
     proposed = MutationPlan(
-        MutationTarget(1, "P1-high", "severity:S1", ("comp:db",)),
+        MutationTarget(1, "P1-high", ("comp:db",)),
         (),
         (),
         (),
-        BotState(1, None, None, ()),
+        BotState(1, None, ()),
     )
     run = PipelineRun("run", PipelineMode.APPLY, datetime.now(UTC), (), 0, (proposed,))
     client = FakeClient()
@@ -122,21 +169,20 @@ def test_apply_can_recompute_target_from_live_labels() -> None:
         target_resolver=lambda target, labels, state: MutationTarget(
             target.issue_number,
             "P3-low",
-            "severity:S3",
             target.components,
         ),
     ).apply_with_plans(run)
 
     assert plans[0].target.priority == "P3-low"
-    assert client.applied == [(1, ("P3-low", "comp:db"), ())]
+    assert client.applied == [(1, ("P3-low", "comp:db"), ("severity:S3",))]
 
 
 def test_apply_preserves_human_label_removals_after_dry_run() -> None:
-    state = BotState(1, "P2-medium", "severity:S2", ("comp:server",))
+    state = BotState(1, "P2-medium", ("comp:server",))
     states = FakeStates({1: state})
     manifest = _manifest()
     planner = MutationPlanner(manifest, states)
-    target = MutationTarget(1, "P2-medium", "severity:S2", ("comp:server",))
+    target = MutationTarget(1, "P2-medium", ("comp:server",))
     proposed = MutationPlan(target, (), (), (), state)
     run = PipelineRun("run", PipelineMode.APPLY, datetime.now(UTC), (), 0, (proposed,))
     client = FakeClient()
@@ -149,21 +195,21 @@ def test_apply_preserves_human_label_removals_after_dry_run() -> None:
 
 
 def test_apply_checkpoints_successful_writes_after_a_later_failure() -> None:
-    first = BotState(1, "P2-medium", "severity:S2", ("comp:server",))
-    second = BotState(2, "P2-medium", "severity:S2", ("comp:server",))
+    first = BotState(1, "P2-medium", ("comp:server",))
+    second = BotState(2, "P2-medium", ("comp:server",))
     states = FakeStates({1: first, 2: second})
     manifest = _manifest()
     planner = MutationPlanner(manifest, states)
     targets = (
         MutationPlan(
-            MutationTarget(1, "P1-high", "severity:S1", ("comp:db",)),
+            MutationTarget(1, "P1-high", ("comp:db",)),
             (),
             (),
             (),
             first,
         ),
         MutationPlan(
-            MutationTarget(2, "P1-high", "severity:S1", ("comp:db",)),
+            MutationTarget(2, "P1-high", ("comp:db",)),
             (),
             (),
             (),
@@ -252,3 +298,33 @@ def test_client_strips_token_whitespace() -> None:
     client = GitHubClient(" token\n", "org/repo", lambda method, path, body: None)
 
     assert client.token == "token"
+
+
+@pytest.mark.parametrize("author_type", ("Bot", "User"))
+def test_client_creates_and_updates_one_marker_comment(author_type: str) -> None:
+    calls = []
+    comments = []
+
+    def transport(method, path, payload):
+        calls.append((method, path, payload))
+        if method == "GET":
+            return comments
+        if method == "POST":
+            comments.append({"id": 42, "body": payload["body"], "user": {"type": author_type}})
+            return comments[0]
+        if method == "PATCH":
+            comments[0]["body"] = payload["body"]
+            return comments[0]
+        raise AssertionError(method)
+
+    client = GitHubClient("token", "org/repo", transport)
+    first = "<!-- omnigent-issue-prioritization-v2 {} -->\nFirst"
+    second = "<!-- omnigent-issue-prioritization-v2 {} -->\nSecond"
+
+    assert client.upsert_issue_comment(7, first) == 42
+    assert client.upsert_issue_comment(7, first) == 42
+    assert client.upsert_issue_comment(7, second) == 42
+
+    assert [method for method, _, _ in calls].count("POST") == 1
+    assert [method for method, _, _ in calls].count("PATCH") == 1
+    assert comments == [{"id": 42, "body": second, "user": {"type": author_type}}]

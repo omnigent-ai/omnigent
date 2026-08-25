@@ -62,6 +62,12 @@ export interface ErrorItem extends BaseItem {
   source: string;
   code: string;
   message: string;
+  /** Friendly headline for a classified failure. Present when the runner classified it. */
+  title?: string;
+  /** One/two-sentence explanation of why it failed. Paired with `title`. */
+  cause?: string;
+  /** Concrete next step to fix it, e.g. a command to run. */
+  remediation?: string;
 }
 
 export interface ReasoningItem extends BaseItem {

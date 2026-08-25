@@ -27,11 +27,13 @@ Consumer (SSE endpoint, async):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import threading
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from typing import Any
 
+from omnigent.debug_logging import debug_event, debug_sink_enabled, sse_event_logger
 from omnigent.runtime import inflight_text, pending_elicitations
 
 _logger = logging.getLogger(__name__)
@@ -78,6 +80,91 @@ def _enqueue_or_overflow(
     queue.put_nowait(_OVERFLOW)
 
 
+# ── SSE-event debug logging (table-only; see omnigent.debug_logging) ──────────
+# Frequent, low-signal events not worth a debug-log row.
+_SSE_SKIP_TYPES = frozenset(
+    {"session.terminal.activity", "session.heartbeat", "response.heartbeat"}
+)
+# Failure events logged at WARNING so the table's level column flags them.
+_SSE_WARN_TYPES = frozenset(
+    {"response.failed", "response.error", "turn.failed", "response.policy_denied"}
+)
+# Top-level event fields safe to log — stable identifiers, closed enums, and
+# pure numerics only. Deliberately excludes human/LLM-authored free text
+# (``reason`` — PolicyDeniedEvent's deny reason is LLM-generated and can quote
+# the content it evaluated — and ``blocked_on``, a free-form "human phrase") and
+# ``tool_name`` (author-defined for custom/MCP tools; ``call_id`` still
+# correlates a call to its result without naming the tool), alongside the
+# content fields dropped in _sse_safe_attributes.
+_SSE_SAFE_KEYS = (
+    "status",
+    "call_id",
+    "message_id",
+    "phase",
+    "attempt",
+    "max_attempts",
+    "sequence_number",
+    "index",
+    "final",
+    "model",
+    "context_tokens",
+    "context_window",
+    "total_cost_usd",
+)
+
+
+def _sse_safe_attributes(event: dict[str, Any]) -> dict[str, object]:
+    """Extract only safe identifiers/dimensions from an SSE event.
+
+    A strict whitelist: content and free-text fields (``delta`` text, tool
+    ``arguments`` / outputs, message/reasoning ``data``, ``error.message``,
+    human/LLM-authored ``reason`` / ``blocked_on``, and ``tool_name``) are never
+    read, so no model response or user content reaches the debug table.
+    """
+    attrs: dict[str, object] = {}
+    for key in _SSE_SAFE_KEYS:
+        value = event.get(key)
+        if value is not None and not isinstance(value, (dict, list)):
+            attrs[key] = value
+    response = event.get("response")
+    if isinstance(response, dict) and isinstance(response.get("id"), str):
+        attrs["response_id"] = response["id"]
+    elif isinstance(event.get("response_id"), str):
+        attrs["response_id"] = event["response_id"]
+    item = event.get("item")
+    if isinstance(item, dict):
+        if isinstance(item.get("id"), str):
+            attrs["item_id"] = item["id"]
+        if isinstance(item.get("type"), str):
+            attrs["item_type"] = item["type"]
+    error = event.get("error")
+    if isinstance(error, dict):
+        if error.get("code") is not None:
+            attrs["error_code"] = error["code"]
+        if error.get("source") is not None:
+            attrs["error_source"] = error["source"]
+    return attrs
+
+
+def _log_sse_event(conversation_id: str, event: dict[str, Any]) -> None:
+    """Mirror one emitted SSE event to the debug-log table (best-effort).
+
+    No-op unless the debug-log sink is enabled. Logs the event name and safe
+    ids only (never content); heartbeats / terminal-activity are skipped, and
+    failure events go at WARNING. Never raises into :func:`publish`.
+    """
+    with contextlib.suppress(Exception):
+        if not debug_sink_enabled():
+            return
+        event_type = event.get("type")
+        if not isinstance(event_type, str) or event_type in _SSE_SKIP_TYPES:
+            return
+        level = logging.WARNING if event_type in _SSE_WARN_TYPES else logging.INFO
+        extra = debug_event(event_type, session_id=conversation_id)
+        extra["attributes"] = _sse_safe_attributes(event)
+        sse_event_logger().log(level, "sse %s", event_type, extra=extra)
+
+
 def publish(conversation_id: str, event: dict[str, Any]) -> None:
     """
     Broadcast an event to every active subscriber of the given
@@ -102,39 +189,25 @@ def publish(conversation_id: str, event: dict[str, Any]) -> None:
         the union before serializing, so an unmodelled event
         fails loud at the SSE boundary.
     """
-    # Track the current turn's streamed assistant text so a client
-    # (re)connecting mid-turn can replay it, AND get the verdict
-    # on whether this event must be WITHHELD from the live fan-out. The
-    # only suppressed events are claude-native ``output_text.delta`` chunks
-    # whose message has already committed (a duplicate trailing chunk): the
-    # forwarder tails the deltas file separately from the transcript, so a
-    # message's last chunk can be POSTed just AFTER its committed item.
-    # Computed BEFORE fan-out so we can actually drop it — the old order
-    # (fan-out first, record after) could only scrub the reconnect-replay
-    # snapshot, never un-send a delta already on a live subscriber's queue.
-    # Safe to reorder: ``record_publish`` and the fan-out below run with no
-    # ``await`` between them, so within a single ``publish`` call nothing
-    # interleaves — the verdict and the enqueue are one atomic step. (This
-    # holds for both callers: native deltas, the only suppressible events,
-    # arrive on the AP loop via the ``POST /events`` handler; the in-process
-    # relay calls ``publish`` from a workflow thread, where ``record_publish``
-    # never returns a suppress verdict so the reorder is a no-op there.) The
-    # snapshot/live-tail partition is unaffected: a
-    # reconnecting client's prefix is still captured by ``subscribe``'s
-    # ``pre_ready_snapshot`` at slot registration, independent of this order.
-    suppress_live = inflight_text.record_publish(conversation_id, event)
+    # Mirror the emitted event to the debug-log table (best-effort, table-only,
+    # no-op unless the sink is enabled). Done first so it captures every event
+    # the server produces — including ones with no live subscriber.
+    _log_sse_event(conversation_id, event)
+    # Track reconnect state and centrally suppress or rewrite native deltas
+    # before they reach subscribers.
+    live_event = inflight_text.record_publish(conversation_id, event)
     # Side-channel: keep the cross-session pending-elicitations
     # index in step with the SSE stream. Only acts on
     # ``response.elicitation_request`` events; every other event
     # type is a single dict lookup and a return. A suppressed event is
     # always a text delta, never an elicitation, so this still runs.
     pending_elicitations.record_publish(conversation_id, event)
-    if suppress_live:
+    if live_event is None:
         return
     with _lock:
         subs = list(_subscribers.get(conversation_id, ()))
     for queue, loop in subs:
-        loop.call_soon_threadsafe(_enqueue_or_overflow, queue, event)
+        loop.call_soon_threadsafe(_enqueue_or_overflow, queue, live_event)
 
 
 def close(conversation_id: str) -> None:

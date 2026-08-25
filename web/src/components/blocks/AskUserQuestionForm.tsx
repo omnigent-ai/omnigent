@@ -44,7 +44,6 @@ interface AskUserQuestionFormProps {
   questions: ClaudeQuestion[];
   onSubmit: (answers: AskUserQuestionAnswers) => void;
   onReject: () => void;
-  canSubmit?: boolean;
 }
 
 /**
@@ -83,12 +82,7 @@ function questionKey(question: ClaudeQuestion): string {
   return question.id && question.id.length > 0 ? question.id : question.question;
 }
 
-export function AskUserQuestionForm({
-  questions,
-  onSubmit,
-  onReject,
-  canSubmit = true,
-}: AskUserQuestionFormProps) {
+export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQuestionFormProps) {
   // Currently-visible question (carousel index).
   const [currentIndex, setCurrentIndex] = useState(0);
 
@@ -354,6 +348,7 @@ export function AskUserQuestionForm({
           onClick={() => setCurrentIndex((i) => i - 1)}
           disabled={isFirst}
           data-testid="ask-user-question-prev"
+          componentId="question.prev"
         >
           <ChevronLeftIcon className="mr-1 size-3.5" />
           Prev
@@ -364,6 +359,7 @@ export function AskUserQuestionForm({
             variant="outline"
             onClick={() => setCurrentIndex((i) => i + 1)}
             data-testid="ask-user-question-next"
+            componentId="question.next"
           >
             Next
             <ChevronRightIcon className="ml-1 size-3.5" />
@@ -373,14 +369,21 @@ export function AskUserQuestionForm({
           <Button
             size="sm"
             onClick={handleSubmit}
-            disabled={!allAnswered || !canSubmit}
+            disabled={!allAnswered}
             data-testid="ask-user-question-submit"
+            componentId="question.submit"
           >
             <CheckIcon className="mr-1 size-3.5" />
             Submit
           </Button>
         )}
-        <Button size="sm" variant="outline" onClick={onReject} className="ml-auto">
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={onReject}
+          className="ml-auto"
+          componentId="question.cancel"
+        >
           <XIcon className="mr-1 size-3.5" />
           Cancel
         </Button>

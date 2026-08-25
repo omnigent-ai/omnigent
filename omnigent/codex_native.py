@@ -42,6 +42,8 @@ from omnigent.codex_native_app_server import (
     client_for_transport,
     codex_session_meta_model_provider,
     codex_terminal_env,
+    native_codex_launch_base_url,
+    native_codex_launch_pins_model_provider,
     normalize_codex_permission_launch_args,
     preload_codex_thread_for_resume,
     resolve_native_codex_launch,
@@ -70,6 +72,7 @@ from omnigent.harness_availability import (
 from omnigent.host.daemon_launch import (
     error_text,
     launch_or_reuse_daemon_runner,
+    open_daemon_client,
     wait_for_host_online,
     wait_for_runner_online,
 )
@@ -122,9 +125,16 @@ _CODEX_THREAD_ID_RE = re.compile(r"^[0-9a-fA-F-]+$")
 
 @dataclass(frozen=True)
 class _CodexAuthSource:
-    """Resolved source for Codex authentication material."""
+    """Resolved source for Codex authentication material.
+
+    :param auth_path: Codex's ``auth.json``, the credential for a launch that
+        defers to Codex's own login.
+    :param config_path: Codex's ``config.toml``, whose effective
+        ``model_provider`` can carry a credential of its own instead.
+    """
 
     auth_path: Path
+    config_path: Path
 
 
 def _resolve_codex_auth_source() -> _CodexAuthSource:
@@ -141,7 +151,11 @@ def _resolve_codex_auth_source() -> _CodexAuthSource:
     """
     from omnigent.inner.codex_executor import _codex_home_config_source_from_env
 
-    return _CodexAuthSource(auth_path=_codex_home_config_source_from_env() / "auth.json")
+    codex_home = _codex_home_config_source_from_env()
+    return _CodexAuthSource(
+        auth_path=codex_home / "auth.json",
+        config_path=codex_home / "config.toml",
+    )
 
 
 def _codex_auth_json_has_available_credential(auth_path: Path) -> bool:
@@ -222,6 +236,19 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
     fail-open the ``claude-sdk`` / ``openai-agents`` gateway harnesses already
     rely on: their gateway token is a runtime mint the daemon can't observe.
 
+    "Defers to Codex" is not the same as "uses ``auth.json``", though: when the
+    launch leaves Codex's provider selection alone, Codex resolves its own
+    effective ``model_provider`` from ``config.toml``, and a custom provider
+    there authenticates from that table (an auth command, an inline bearer, or
+    an ``env_key``) without ever reading ``auth.json``. That config is checked
+    before ``auth.json`` (see
+    :func:`omnigent.onboarding.codex_auth_readiness.codex_config_effective_auth`), so
+    a self-authenticating provider is not reported as needing a ``codex login``
+    that would add a second, competing credential. A launch that pins
+    ``model_provider`` itself — the dismissed-custom-provider case, which pins
+    the built-in ``openai`` — overrides that selection, so Codex's config cannot
+    authenticate and ``auth.json`` decides.
+
     The check stays synchronous and local: it resolves the launch (local config
     reads) and, only on the defer-to-login path, inspects the local auth source.
     It never runs ``codex login`` or a status command; the CLI ``--version``
@@ -230,9 +257,10 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
     onto the ``auth.json`` check.
 
     :returns: ``"binary-missing"`` when the CLI is absent, ``"needs-auth"``
-        when the launch would defer to Codex's own login but ``auth.json`` is
-        missing, malformed, or carries no credential, and ``None`` when a
-        provider will route the launch or a login credential is configured.
+        when a config-selected provider's declared env credential is missing
+        or the launch uses Codex login without a usable ``auth.json``, and
+        ``None`` when a provider will route the launch, Codex's own config is
+        provider-ready, or a login credential is configured.
         Token *validity* (revoked/expired refresh, an unreachable gateway) is
         not judged locally — it surfaces at the first turn via the executor.
     """
@@ -248,20 +276,37 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
         return HARNESS_VERSION_TOO_LOW
     # On a host with no configured provider this may run ambient detection.
     # configured_harness_map shares one probe across all Codex aliases.
+    defers_to_codex_config = False
     try:
         launch = resolve_native_codex_launch(model=None)
         routes_through_provider = (
-            launch.profile is not None or codex_session_meta_model_provider(launch) != "openai"
+            launch.profile is not None
+            or codex_session_meta_model_provider(launch) != "openai"
+            or native_codex_launch_base_url(launch) is not None
         )
+        defers_to_codex_config = not native_codex_launch_pins_model_provider(launch)
     except Exception:  # noqa: BLE001 - readiness must never raise; fail onto auth.json.
         _logger.debug("codex readiness: launch resolve failed; using auth.json", exc_info=True)
         routes_through_provider = False
-    if routes_through_provider:
+    if routes_through_provider and not defers_to_codex_config:
         return None
-    source = _resolve_codex_auth_source()
-    if not _codex_auth_json_has_available_credential(source.auth_path):
+    try:
+        source = _resolve_codex_auth_source()
+        if defers_to_codex_config:
+            from omnigent.inner.codex_executor import _clean_codex_env
+            from omnigent.onboarding.codex_auth_readiness import codex_config_effective_auth
+
+            config_auth = codex_config_effective_auth(source.config_path, env=_clean_codex_env())
+            if config_auth == "provider-ready":
+                return None
+            if config_auth == "provider-auth-missing":
+                return HARNESS_NEEDS_AUTH
+        if not _codex_auth_json_has_available_credential(source.auth_path):
+            return HARNESS_NEEDS_AUTH
+        return None
+    except Exception:  # noqa: BLE001 - readiness must never raise.
+        _logger.debug("codex readiness: local auth check failed", exc_info=True)
         return HARNESS_NEEDS_AUTH
-    return None
 
 
 def _update_startup_progress(
@@ -709,8 +754,12 @@ def _run_with_remote_server(
     from omnigent.cli import _ensure_host_daemon
     from omnigent.host.identity import load_or_create_host_identity
 
-    headers = _remote_headers(server_url=base_url)
-    attach_auth = _server_auth(server_url=base_url)
+    # This machine's host id keys the WebSocket attach handshake (and its
+    # reconnects) to the replica holding the runner's tunnel; the CLI can set WS
+    # headers, so it rides the header (emitted only on a host-sharded deployment).
+    host_id = load_or_create_host_identity().host_id
+    headers = _remote_headers(server_url=base_url, host_id=host_id)
+    attach_auth = _server_auth(server_url=base_url, session_id=None)
     try:
         resolved_session_id = _resolve_session_id_for_resume(
             base_url=base_url,
@@ -732,7 +781,6 @@ def _run_with_remote_server(
             with runner_startup_progress(initial_message="Preparing Codex...") as progress:
                 _update_startup_progress(progress, "Connecting to local daemon...")
                 _ensure_host_daemon(base_url)
-                host_id = load_or_create_host_identity().host_id
                 bundle = None if resolved_session_id is not None else _bundle_agent(spec_path)
                 prepared = await _prepare_codex_terminal_via_daemon(
                     base_url=base_url,
@@ -761,7 +809,7 @@ def _run_with_remote_server(
 
                 :returns: None.
                 """
-                new_headers = _remote_headers(server_url=base_url)
+                new_headers = _remote_headers(server_url=base_url, host_id=host_id)
                 headers.clear()
                 headers.update(new_headers)
 
@@ -839,17 +887,21 @@ async def _prepare_codex_terminal_via_daemon(
     """
     persist_args = list(codex_args)
     timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout) as client:
+    async with open_daemon_client(base_url, headers, host_id, timeout=timeout) as client:
         reattached = session_id is not None
+        fresh_session = session_id is None
         if session_id is None:
             if session_bundle is None:
                 raise click.ClickException("Creating a Codex session requires a session bundle.")
             _update_startup_progress(startup_progress, "Creating Codex session...")
-            session_id = await _create_codex_session(
-                client,
-                session_bundle,
-                bridge_id=None,
-                terminal_launch_args=persist_args or None,
+            session_id, _ = await asyncio.gather(
+                _create_codex_session(
+                    client,
+                    session_bundle,
+                    bridge_id=None,
+                    terminal_launch_args=persist_args or None,
+                ),
+                wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S),
             )
         else:
             _update_startup_progress(startup_progress, "Loading Codex session...")
@@ -902,13 +954,15 @@ async def _prepare_codex_terminal_via_daemon(
                         f"({resp.status_code}): {error_text(resp)}"
                     )
 
-        await wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S)
+        if not fresh_session:
+            await wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S)
         _update_startup_progress(startup_progress, "Starting runner...")
         runner_id = await launch_or_reuse_daemon_runner(
             client,
             host_id=host_id,
             session_id=session_id,
             workspace=workspace,
+            fresh=fresh_session,
         )
         _update_startup_progress(startup_progress, "Waiting for runner...")
         await wait_for_runner_online(client, runner_id, timeout_s=_DAEMON_RUNNER_ONLINE_TIMEOUT_S)
@@ -1010,8 +1064,10 @@ async def _post_initial_prompt(
     :returns: None.
     :raises click.ClickException: If Omnigent rejects the prompt.
     """
-    async with httpx.AsyncClient(
-        base_url=base_url,
+    from omnigent.cli_auth import open_server_client
+
+    async with open_server_client(
+        base_url,
         headers=headers,
         auth=auth,
         timeout=httpx.Timeout(30.0),
@@ -1060,7 +1116,9 @@ async def _prepare_codex_terminal(
     :returns: Prepared terminal details.
     """
     timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout) as client:
+    from omnigent.cli_auth import open_server_client
+
+    async with open_server_client(base_url, headers=headers, timeout=timeout) as client:
         bridge_id: str
         thread_id: str | None = None
         if session_id is None:
@@ -1183,6 +1241,7 @@ async def _prepare_codex_terminal(
                         socket_path=codex_ws_url,
                         thread_id=thread_id,
                         codex_home=str(codex_home),
+                        cwd=str(Path.cwd()),
                     ),
                 )
             if runner_id is not None:
@@ -1389,8 +1448,10 @@ async def _initialize_fresh_terminal_thread(
         raise click.ClickException("Codex event listener was not initialized.")
     app_server_url = _require_codex_app_server_url(prepared)
     thread_id = await _wait_for_thread_started(prepared.event_client)
-    async with httpx.AsyncClient(
-        base_url=base_url,
+    from omnigent.cli_auth import open_server_client
+
+    async with open_server_client(
+        base_url,
         headers=headers,
         timeout=httpx.Timeout(30.0),
     ) as client:
@@ -1402,6 +1463,7 @@ async def _initialize_fresh_terminal_thread(
             socket_path=app_server_url,
             thread_id=thread_id,
             codex_home=str(codex_home_for_bridge_dir(prepared.bridge_dir)),
+            cwd=str(Path.cwd()),
         ),
     )
     return thread_id
@@ -2696,9 +2758,11 @@ async def _close_codex_terminal(
     :param terminal_id: Terminal resource id.
     :returns: None.
     """
+    from omnigent.cli_auth import open_server_client
+
     with contextlib.suppress(Exception):
-        async with httpx.AsyncClient(
-            base_url=base_url,
+        async with open_server_client(
+            base_url,
             headers=headers,
             timeout=httpx.Timeout(10.0),
         ) as client:

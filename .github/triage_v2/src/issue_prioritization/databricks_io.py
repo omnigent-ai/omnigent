@@ -5,28 +5,28 @@ import re
 from dataclasses import asdict
 from pathlib import Path
 
-from issue_prioritization.artifacts import write_artifacts
+from issue_prioritization.artifacts import RankedIssue, write_artifacts
 from issue_prioritization.bronze import BronzeIssue
 from issue_prioritization.classification import Classification
+from issue_prioritization.comments import build_triage_comment
 from issue_prioritization.config import ScoringConfig
-from issue_prioritization.domain import IssueType, Severity
-from issue_prioritization.mutations import BotState
+from issue_prioritization.domain import Impact, IssueType
+from issue_prioritization.mutations import BotState, MutationPlan
 from issue_prioritization.pipeline import PipelineRun
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+){2}$")
-_CLASSIFICATION_SCHEMA = """issue_number BIGINT, issue_type STRING, severity STRING,
+_CLASSIFICATION_SCHEMA = """issue_number BIGINT, issue_type STRING, impact STRING,
 area_keys ARRAY<STRING>, component_labels ARRAY<STRING>, reasoning STRING,
 content_hash STRING"""
 _SCORE_SCHEMA = """run_id STRING, mode STRING, regrade BOOLEAN,
 adopt_legacy_bot_priorities BOOLEAN, legacy_priorities_adopted BIGINT,
 scored_at TIMESTAMP, rank BIGINT, previous_rank BIGINT, rank_delta BIGINT,
-issue_number BIGINT, title STRING, url STRING, issue_type STRING, severity STRING,
+issue_number BIGINT, title STRING, url STRING, issue_type STRING, impact STRING,
 classification_reasoning STRING, score DOUBLE, upvote_count BIGINT, duplicate_count BIGINT,
 current_priority STRING, proposed_priority STRING,
 area_keys ARRAY<STRING>, component_labels ARRAY<STRING>, breakdown_json STRING,
 labels_add ARRAY<STRING>, labels_remove ARRAY<STRING>, mutation_blocked ARRAY<STRING>"""
-_BOT_STATE_SCHEMA = """issue_number BIGINT, priority STRING, severity STRING,
-components ARRAY<STRING>"""
+_BOT_STATE_SCHEMA = """issue_number BIGINT, priority STRING, components ARRAY<STRING>"""
 
 
 class SparkIssueSource:
@@ -62,7 +62,7 @@ class SparkClassificationRepository:
             int(row.issue_number): Classification(
                 issue_number=int(row.issue_number),
                 issue_type=IssueType.parse(row.issue_type),
-                severity=Severity(str(row.severity)),
+                impact=Impact.parse(_row_value(row, "impact", "severity")),
                 area_keys=tuple(row.area_keys or ()),
                 component_labels=tuple(row.component_labels or ()),
                 reasoning=str(row.reasoning or ""),
@@ -76,7 +76,7 @@ class SparkClassificationRepository:
             {
                 "issue_number": item.issue_number,
                 "issue_type": item.issue_type.label,
-                "severity": item.severity.value,
+                "impact": item.impact.value,
                 "area_keys": list(item.area_keys),
                 "component_labels": list(item.component_labels),
                 "reasoning": item.reasoning,
@@ -88,7 +88,16 @@ class SparkClassificationRepository:
             frame = self.spark.createDataFrame(rows, schema=_CLASSIFICATION_SCHEMA)
             frame.write.format("delta").mode("overwrite").saveAsTable(self.table)
             return
-        frame = self.spark.createDataFrame(rows, schema=self.spark.table(self.table).schema)
+        schema = self.spark.table(self.table).schema
+        if "impact" not in _field_names(schema) and "severity" in _field_names(schema):
+            rows = [
+                {
+                    **{key: value for key, value in row.items() if key != "impact"},
+                    "severity": Impact.parse(row["impact"]).legacy_code,
+                }
+                for row in rows
+            ]
+        frame = self.spark.createDataFrame(rows, schema=schema)
         view = "issue_priority_classification_updates"
         frame.createOrReplaceTempView(view)
         self.spark.sql(
@@ -128,7 +137,7 @@ class SparkScoreSink:
                     "title": issue.title,
                     "url": issue.url,
                     "issue_type": issue.issue_type.label,
-                    "severity": issue.severity.value,
+                    "impact": issue.impact.value,
                     "classification_reasoning": issue.classification_reasoning,
                     "score": float(result.score),
                     "upvote_count": issue.upvote_count,
@@ -166,6 +175,7 @@ class VolumeArtifactSink:
     def write(self, run: PipelineRun) -> None:
         destination = self.root / run.run_id
         write_artifacts(destination, list(run.ranked), self.config)
+        ranked = {item.issue.number: item for item in run.ranked}
         metadata = {
             "run_id": run.run_id,
             "mode": run.mode.value,
@@ -180,7 +190,6 @@ class VolumeArtifactSink:
                 "issue_number": plan.target.issue_number,
                 "target": {
                     "priority": plan.target.priority,
-                    "severity": plan.target.severity,
                     "components": list(plan.target.components),
                 },
                 "labels_add": list(plan.labels_add),
@@ -188,9 +197,13 @@ class VolumeArtifactSink:
                 "blocked": list(plan.blocked),
                 "next_bot_state": {
                     "priority": plan.next_state.priority,
-                    "severity": plan.next_state.severity,
                     "components": list(plan.next_state.components),
                 },
+                "comment": build_triage_comment(
+                    ranked[plan.target.issue_number],
+                    plan,
+                    _planned_labels_after(ranked[plan.target.issue_number], plan),
+                ),
             }
             for plan in run.mutations
         ]
@@ -212,7 +225,6 @@ class SparkBotStateRepository:
             int(row.issue_number): BotState(
                 issue_number=int(row.issue_number),
                 priority=str(row.priority) if row.priority else None,
-                severity=str(row.severity) if row.severity else None,
                 components=tuple(row.components or ()),
             )
             for row in self.spark.table(self.table).collect()
@@ -223,7 +235,6 @@ class SparkBotStateRepository:
             {
                 "issue_number": state.issue_number,
                 "priority": state.priority,
-                "severity": state.severity,
                 "components": list(state.components),
             }
             for state in states
@@ -259,3 +270,25 @@ def latest_scores_view_sql(scores_table: str, latest_view: str) -> str:
     SELECT *
     FROM {scores_table}
     WHERE run_id = (SELECT max_by(run_id, scored_at) FROM {scores_table})"""
+
+
+def _row_value(row: object, *names: str) -> object:
+    for name in names:
+        value = getattr(row, name, None)
+        if value is not None:
+            return value
+    raise ValueError(f"row does not contain any of {names}")
+
+
+def _field_names(schema: object) -> set[str]:
+    field_names = getattr(schema, "fieldNames", None)
+    if callable(field_names):
+        return set(field_names())
+    return {str(field.name) for field in getattr(schema, "fields", ())}
+
+
+def _planned_labels_after(item: RankedIssue, plan: MutationPlan) -> tuple[str, ...]:
+    current_priority = item.issue.current_priority
+    labels = {current_priority.value} if current_priority else set()
+    labels = (labels - set(plan.labels_remove)) | set(plan.labels_add)
+    return tuple(sorted(labels))

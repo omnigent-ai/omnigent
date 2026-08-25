@@ -176,6 +176,32 @@ def test_catalog_rows_include_capabilities() -> None:
                 assert value is None or isinstance(value, (str, bool))
 
 
+def test_catalog_includes_hermes() -> None:
+    """Hermes must appear in the web picker catalog (regression: it was a
+    valid harness with capabilities but had no ``harness_labels`` entry, so
+    ``harness_catalog`` — which iterates labels — dropped it)."""
+    rows = harness_catalog()
+    hermes = next((row for row in rows if row["id"] == "hermes"), None)
+    assert hermes is not None, "hermes missing from harness_catalog()"
+    assert hermes["label"] == "Hermes"
+    # The catalog only lists valid harnesses and hermes declares capabilities,
+    # so the row must carry the feature matrix like its subprocess peers.
+    assert "capabilities" in hermes
+
+
+def test_hermes_picker_row_has_spawn_env_plumbing() -> None:
+    """A picker row is only honest if the session's choices reach the harness.
+
+    Hermes' model env key is what both threads ``/model`` into the spawn env and
+    (via ``_SDK_MODEL_OVERRIDE_HARNESSES``) makes the server accept the override
+    instead of rejecting it up front."""
+    from omnigent.harness_plugins import model_env_keys
+    from omnigent.model_override import harness_supports_model_override
+
+    assert model_env_keys()["hermes"] == "HARNESS_HERMES_MODEL"
+    assert harness_supports_model_override("hermes")
+
+
 def test_catalog_rows_carry_setup_steps() -> None:
     """Every row exposes an ordered, JSON-serializable setup checklist."""
     rows = {row["id"]: row for row in harness_catalog()}

@@ -12,6 +12,7 @@ a run / setup readout falls back rather than crashing. Mirrors
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -131,10 +132,107 @@ def test_dangling_keychain_reference_is_soft_none(tmp_path: Path) -> None:
     assert copilot_github_token_configured() is False
 
 
-def test_settings_shape() -> None:
+def test_settings_shape(tmp_path: Path) -> None:
     assert copilot_github_token_settings("keychain:copilot") == {
         "copilot": {"github_token_ref": "keychain:copilot"}
     }
+
+
+# ---------------------------------------------------------------------------
+# GitHub Enterprise host + gh-CLI login fallback
+# ---------------------------------------------------------------------------
+
+
+def test_github_host_none_when_unset(tmp_path: Path) -> None:
+    assert copilot_auth.copilot_github_host() is None
+    _write_config(tmp_path, {"copilot": {"github_token_ref": "keychain:copilot"}})
+    assert copilot_auth.copilot_github_host() is None
+
+
+@pytest.mark.parametrize(
+    "stored",
+    ["acme.ghe.com", "https://acme.ghe.com", "http://acme.ghe.com/", "  acme.ghe.com  "],
+)
+def test_github_host_normalized_to_bare_hostname(tmp_path: Path, stored: str) -> None:
+    """A pasted URL is reduced to the bare hostname the Copilot CLI expects."""
+    _write_config(tmp_path, {"copilot": {"github_host": stored}})
+    assert copilot_auth.copilot_github_host() == "acme.ghe.com"
+
+
+def test_host_and_token_settings_preserve_each_other(tmp_path: Path) -> None:
+    """Each saver replaces the whole ``copilot:`` block, so neither may drop the other."""
+    _write_config(tmp_path, {"copilot": {"github_token_ref": "keychain:copilot"}})
+    assert copilot_auth.copilot_github_host_settings("acme.ghe.com") == {
+        "copilot": {"github_token_ref": "keychain:copilot", "github_host": "acme.ghe.com"}
+    }
+
+    _write_config(tmp_path, {"copilot": {"github_host": "acme.ghe.com"}})
+    assert copilot_github_token_settings("env:GH_TOKEN") == {
+        "copilot": {"github_token_ref": "env:GH_TOKEN", "github_host": "acme.ghe.com"}
+    }
+
+
+def test_host_settings_clears_field_when_none(tmp_path: Path) -> None:
+    _write_config(
+        tmp_path, {"copilot": {"github_token_ref": "keychain:copilot", "github_host": "a.ghe.com"}}
+    )
+    assert copilot_auth.copilot_github_host_settings(None) == {
+        "copilot": {"github_token_ref": "keychain:copilot"}
+    }
+
+
+def test_token_removal_keeps_configured_host(tmp_path: Path) -> None:
+    """Removing the token must not take a configured GHE host with it."""
+    _write_config(
+        tmp_path, {"copilot": {"github_token_ref": "keychain:copilot", "github_host": "a.ghe.com"}}
+    )
+    assert copilot_auth.copilot_token_removal_settings() == {
+        "copilot": {"github_host": "a.ghe.com"}
+    }
+
+
+def test_token_removal_none_when_no_host(tmp_path: Path) -> None:
+    """With no host to keep, the caller unsets the whole block."""
+    _write_config(tmp_path, {"copilot": {"github_token_ref": "keychain:copilot"}})
+    assert copilot_auth.copilot_token_removal_settings() is None
+
+
+def test_gh_cli_github_token_returns_stdout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A ``gh auth login`` session is a usable Copilot credential."""
+    calls: list[list[str]] = []
+
+    def _fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="gho_abc\n", stderr="")
+
+    monkeypatch.setattr(copilot_auth.subprocess, "run", _fake_run)
+    assert copilot_auth.gh_cli_github_token() == "gho_abc"
+    assert calls == [["gh", "auth", "token"]]
+
+    calls.clear()
+    assert copilot_auth.gh_cli_github_token("acme.ghe.com") == "gho_abc"
+    assert calls == [["gh", "auth", "token", "--hostname", "acme.ghe.com"]]
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        subprocess.CompletedProcess(["gh"], 1, stdout="", stderr="not logged in"),
+        subprocess.CompletedProcess(["gh"], 0, stdout="   \n", stderr=""),
+        FileNotFoundError("gh"),
+        subprocess.TimeoutExpired("gh", 10),
+    ],
+)
+def test_gh_cli_github_token_soft_none(monkeypatch: pytest.MonkeyPatch, outcome: object) -> None:
+    """Logged out, gh absent, or hung — never raise into a run or setup readout."""
+
+    def _fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome  # type: ignore[return-value]
+
+    monkeypatch.setattr(copilot_auth.subprocess, "run", _fake_run)
+    assert copilot_auth.gh_cli_github_token() is None
 
 
 # ---------------------------------------------------------------------------

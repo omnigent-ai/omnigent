@@ -57,6 +57,7 @@ const { projectsMock, conversationsRef, projectSessionsMock, bulkArchiveMock } =
 
 vi.mock("@/hooks/useConversations", () => ({
   useConversations: vi.fn(),
+  useLeaveSession: () => ({ mutate: vi.fn(), isPending: false }),
   useArchiveConversation: () => ({ mutate: vi.fn() }),
   useBulkArchiveConversations: () => ({
     mutate: bulkArchiveMock.mutate,
@@ -64,6 +65,7 @@ vi.mock("@/hooks/useConversations", () => ({
     isError: false,
   }),
   useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useBulkMoveToProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useConnectedConversations: () => [],
   useStopAndDeleteConversation: () => ({ mutate: vi.fn() }),
@@ -337,6 +339,15 @@ describe("Sidebar shift-click selection", () => {
     const theirs = conv("theirs", { owner: "someone_else" });
     mockConversations([mine, theirs]);
     renderSidebar();
+
+    // Mixed ownership only shows on "All sessions"; the default "My sessions"
+    // filter hides the shared row, so switch to All before selecting.
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByTestId("session-filter-all"));
 
     fireEvent.click(screen.getByRole("button", { name: /select/i }));
 

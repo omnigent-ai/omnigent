@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -385,11 +386,10 @@ async def test_teardown_codex_native_app_server_cancels_forwarder_and_closes_ser
     """
     Codex pane teardown cancels the forwarder and closes the app-server.
 
-    The idle pane reaper and an unexpected TUI exit both close only the tmux
-    pane; without this helper the per-session ``codex app-server`` (and its
-    forwarder) survives with no TUI, orphaning a ``codex`` process for the
-    runner's lifetime. Teardown must both cancel the registered forwarder and
-    close the registered app-server so neither leaks.
+    The idle pane reaper closes only the tmux pane; without this helper the
+    per-session ``codex app-server`` (and its forwarder) survives with no TUI,
+    orphaning a ``codex`` process for the runner's lifetime. Teardown must both
+    cancel the registered forwarder and close the registered app-server.
     """
     session_id = "c0d3f00d0000000000000000deadbeef"
     run = _ForwarderRun()
@@ -432,10 +432,9 @@ async def test_teardown_codex_native_app_server_noop_without_registered_server()
     """
     Teardown is a no-op for a session with no registered codex app-server.
 
-    The shared pane-teardown paths (reaper, terminal-exit publisher) fire for
-    every native harness, so calling this for a non-codex session — or a codex
-    session whose server is already gone — must not touch that session's
-    forwarder or raise.
+    Shared required-session and idle-reaper cleanup can fire for every native
+    harness, so calling this for a non-codex session — or a codex session whose
+    server is already gone — must not touch that session's forwarder or raise.
     """
     session_id = "1111111122222222aaaaaaaabbbbbbbb"
     run = _ForwarderRun()
@@ -966,3 +965,227 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
         runner_app_mod._AUTO_FORWARDER_TASKS.pop(session_id, None)
         runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
         await _drain_forwarder_runs(runs)
+
+
+async def test_forwarder_task_exit_paths_are_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    Every forwarder-task exit path leaves an obituary log line.
+
+    A forwarder that stops takes mirroring, status events and the pane
+    busy signal with it, and a silent exit once presented as an hour-long
+    session blackout with nothing to grep for. Cancellation is routine
+    (INFO), an escaped exception is fatal to mirroring (ERROR, carrying
+    the traceback), and an unexpected clean return still warns.
+    """
+    cancelled_id = "0b17aa000000000000000000000000c1"
+    died_id = "0b17aa000000000000000000000000d2"
+    returned_id = "0b17aa000000000000000000000000e3"
+
+    async def _parked() -> None:
+        await asyncio.Event().wait()
+
+    async def _raises() -> None:
+        raise RuntimeError("client construction failed")
+
+    async def _returns() -> None:
+        return None
+
+    try:
+        with caplog.at_level(logging.INFO, logger="omnigent.runner.app"):
+            parked_task = asyncio.create_task(_parked(), name="claude-forwarder-cancelled")
+            runner_app_mod._register_auto_forwarder_task(cancelled_id, parked_task)
+            await asyncio.sleep(0)
+            parked_task.cancel()
+            await asyncio.wait([parked_task])
+
+            raising_task = asyncio.create_task(_raises(), name="claude-forwarder-died")
+            runner_app_mod._register_auto_forwarder_task(died_id, raising_task)
+            await asyncio.wait([raising_task])
+
+            returning_task = asyncio.create_task(_returns(), name="claude-forwarder-returned")
+            runner_app_mod._register_auto_forwarder_task(returned_id, returning_task)
+            await asyncio.wait([returning_task])
+            # Done callbacks run via call_soon after task completion.
+            await asyncio.sleep(0)
+
+        def _obits(level: int, needle: str) -> list[logging.LogRecord]:
+            return [
+                record
+                for record in caplog.records
+                if record.name == "omnigent.runner.app"
+                and record.levelno == level
+                and needle in record.getMessage()
+            ]
+
+        assert _obits(logging.INFO, "cancelled; session=" + cancelled_id)
+        died = _obits(logging.ERROR, "died; session mirroring is down")
+        assert died and died[0].exc_info is not None, (
+            "a forwarder killed by an escaped exception must log an ERROR "
+            "obituary carrying the traceback"
+        )
+        assert _obits(logging.WARNING, "returned; session mirroring has stopped")
+    finally:
+        for sid in (cancelled_id, died_id, returned_id):
+            runner_app_mod._AUTO_FORWARDER_TASKS.pop(sid, None)
+
+
+async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A refused ``thread/resume`` must not leak the app-server it started.
+
+    The stale-writer incident shape: a leftover process holds the codex
+    thread's writer lock, ``thread/resume`` fails, and each retry stacked
+    another live app-server — only the newest stayed tracked for teardown.
+    The failure path must close the app-server and drop the session's
+    tracking entry so a retry starts clean.
+
+    :param tmp_path: Temporary directory for isolated bridge state.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    import omnigent.codex_native_app_server as codex_app_mod
+
+    session_id = "b7d2c1e0aa114b52b7c2f1d3e4a5b6c7"
+    thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936c"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+
+    class _SnapshotServerClient:
+        """Server client whose snapshot carries a persisted resume thread."""
+
+        async def get(self, url: str, **kwargs: Any) -> httpx.Response:
+            """
+            Return the session snapshot / items consumed by the helper.
+
+            :param url: Request path, e.g. ``"/v1/sessions/conv_..."``.
+            :param kwargs: Request keyword arguments (ignored).
+            :returns: HTTP 200 response carrying launch config or items.
+            """
+            del kwargs
+            if url == f"/v1/sessions/{session_id}/items":
+                return httpx.Response(
+                    200,
+                    json={"data": [], "has_more": False},
+                    request=httpx.Request("GET", url),
+                )
+            return httpx.Response(
+                200,
+                json={"external_session_id": thread_id},
+                request=httpx.Request("GET", url),
+            )
+
+    closed: list[str] = []
+
+    class _FakeCodexAppServer:
+        """Minimal app-server recording whether it was closed."""
+
+        codex_path = "/opt/codex/bin/codex"
+        codex_cli_version: tuple[int, int, int] | None = None
+
+        def __init__(self) -> None:
+            """:returns: None."""
+            self.env = {"OPENAI_API_KEY": "sk-test"}
+            self.codex_home = tmp_path / "unconfigured-codex-home"
+            self.listen_url: str | None = None
+            self.config_overrides: list[str] = []
+
+        async def start(self) -> None:
+            """:returns: None."""
+
+        async def close(self) -> None:
+            """Record the teardown the failure path owes."""
+            closed.append("closed")
+
+    def _fake_build_codex_native_server(**kwargs: Any) -> _FakeCodexAppServer:
+        """
+        Build a fake app-server bound to the requested CODEX_HOME.
+
+        :param kwargs: Keyword arguments passed by the runner helper.
+        :returns: Fresh fake app-server.
+        """
+        app_server = _FakeCodexAppServer()
+        app_server.codex_home = kwargs["codex_home"]
+        return app_server
+
+    class _IdleClient:
+        """Event client that must never connect before the resume succeeds."""
+
+        def __init__(self, *, ws_url: str, client_name: str) -> None:
+            """
+            :param ws_url: App-server WebSocket URL.
+            :param client_name: JSON-RPC client name.
+            """
+            self.ws_url = ws_url
+            self.client_name = client_name
+
+        async def connect(self) -> None:
+            """Fail if the refused resume still wires the listener."""
+            raise AssertionError("refused resume must not connect the event client")
+
+        async def close(self) -> None:
+            """:returns: None."""
+
+    async def _refusing_preload(
+        transport: str,
+        loaded_thread_id: str,
+        *,
+        terminal_launch_args: list[str] | None = None,
+    ) -> None:
+        """
+        Refuse the resume the way a stale writer-lock holder does.
+
+        :param transport: App-server transport URL (ignored).
+        :param loaded_thread_id: Thread id passed to ``thread/resume``.
+        :raises RuntimeError: Always, mirroring the app-server error.
+        """
+        del transport, terminal_launch_args
+        raise RuntimeError(f"thread {loaded_thread_id} already has an active writer")
+
+    class _UnreachableResourceRegistry:
+        """Terminal launcher the failing path must never reach."""
+
+        async def launch_auxiliary_terminal(self, **kwargs: Any) -> SessionResourceView:
+            """Fail if a terminal is launched despite the refused resume."""
+            del kwargs
+            raise AssertionError("refused resume must not launch the TUI")
+
+    monkeypatch.setattr(
+        codex_app_mod,
+        "build_codex_native_server",
+        _fake_build_codex_native_server,
+    )
+    monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _IdleClient)
+    monkeypatch.setattr(codex_app_mod, "preload_codex_thread_for_resume", _refusing_preload)
+
+    agent_spec = AgentSpec(
+        spec_version=1,
+        name="codex",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "codex-native", "model": "gpt-5-default"},
+        ),
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="active writer"):
+            await runner_app_mod._auto_create_codex_terminal(
+                session_id,
+                _UnreachableResourceRegistry(),  # type: ignore[arg-type]
+                lambda _sid, _evt: None,
+                agent_spec=agent_spec,
+                server_client=_SnapshotServerClient(),  # type: ignore[arg-type]
+            )
+        assert closed == ["closed"], "refused resume left the app-server running"
+        assert session_id not in runner_app_mod._AUTO_CODEX_APP_SERVERS, (
+            "failed create left its app-server tracked; the next attempt would "
+            "overwrite (and leak) it"
+        )
+    finally:
+        runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)

@@ -34,8 +34,10 @@ import {
   type ToolGroup,
   type ToolResultBlock,
   type UserMessageBlock,
+  ELICITATION_RESPONSE_PREFIX,
   slashCommandEchoItemId,
   slashCommandEchoText,
+  structuredErrorFields,
 } from "./blocks";
 import type { StreamEvent } from "./events";
 import { routingExtras } from "./routingDecision";
@@ -205,6 +207,9 @@ function ctx(
     // under the item's true id without moving the reducer's active id.
     responseId: responseId || state.responseId,
     itemId,
+    // Live blocks carry no server stamp yet — record the client clock
+    // separately so same-clock duration guards never mix epochs.
+    clientCreatedAtS: Math.floor(Date.now() / 1000),
   };
 }
 
@@ -778,6 +783,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         message: event.error.message,
         source: event.source,
         code: event.error.code,
+        ...structuredErrorFields(event.error),
       } satisfies ErrorBlock;
       return;
     }
@@ -810,6 +816,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
           message: event.response.error.message ?? "",
           source: "",
           code: event.response.error.code ?? "response_failed",
+          ...structuredErrorFields(event.response.error),
         } satisfies ErrorBlock;
       }
       yield {
@@ -847,7 +854,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         // inline with the turn that triggered it.
         ctx:
           event.phase === "request" || state.responseId === ""
-            ? ctx(state, null, `elicit_${event.elicitationId}`)
+            ? ctx(state, null, `${ELICITATION_RESPONSE_PREFIX}${event.elicitationId}`)
             : ctx(state),
         elicitationId: event.elicitationId,
         targetSessionId: event.targetSessionId,

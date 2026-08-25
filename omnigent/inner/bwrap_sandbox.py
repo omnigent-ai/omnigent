@@ -1268,6 +1268,15 @@ def _dotfile_and_symlink_mask_args(
         # still masked.
         if not _path_exists_lstat(entry.path):
             continue
+        # Symlinks are skipped: bwrap resolves a mount destination through
+        # the final symlink, so both mask shapes abort the whole namespace
+        # ("Can't create file at <link>" / "Can't mount tmpfs on <link>")
+        # and kill the launcher at spawn. Skipping is safe because the mount
+        # namespace already confines symlink resolution — the link is
+        # followed inside the sandbox view, where an escaping target is
+        # either unmounted or independently masked.
+        if entry.path.is_symlink():
+            continue
         if entry.kind == "dir":
             args.extend(["--tmpfs", str(entry.path)])
         else:

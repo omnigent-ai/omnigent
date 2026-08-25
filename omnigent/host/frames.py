@@ -43,6 +43,7 @@ class HostFrameKind(str, Enum):
     """All host frame kinds; the value is the JSON wire string."""
 
     HELLO = "host.hello"
+    CONNECTION_ERROR = "host.connection_error"
     HARNESS_READINESS = "host.harness_readiness"
     LAUNCH_RUNNER = "host.launch_runner"
     LAUNCH_RUNNER_RESULT = "host.launch_runner_result"
@@ -94,7 +95,7 @@ class HostHelloFrame:
         machine, e.g. ``{"claude-sdk": True, "codex": False}``
         (see ``omnigent.onboarding.harness_readiness``). Keys
         cover every accepted harness spelling. ``None`` means
-        unknown (an older host that doesn't report it) — never
+        unknown (an older host, or a startup probe that failed) — never
         treat ``None`` as "nothing is configured". Changes arrive in
         :class:`HostHarnessReadinessFrame`; launch-time checks remain
         authoritative.
@@ -102,8 +103,8 @@ class HostHelloFrame:
         launch on this host resolves AI-Gateway-backed inference, e.g.
         ``{"claude-native": True, "codex": False}`` (see
         ``omnigent.gateway_inference``). A family that could not be evaluated
-        is omitted. ``None`` means unknown (an older host that doesn't report
-        it) — never treat it as "nothing is gateway-backed".
+        is omitted. ``None`` means unknown (an older host, or a startup probe
+        that failed) — never treat it as "nothing is gateway-backed".
     """
 
     version: str
@@ -114,6 +115,20 @@ class HostHelloFrame:
     gateway_inference: dict[str, bool] | None = None
     telemetry_opt_out: bool = False
     installation_id: str | None = None
+
+
+@dataclass
+class HostConnectionErrorFrame:
+    """Server-side channel failure sent before the WebSocket closes.
+
+    :param stage: Connection stage that failed, e.g. ``"registration"``.
+    :param error: Exception message from the server.
+    :param retryable: Whether reconnecting may recover.
+    """
+
+    stage: str
+    error: str
+    retryable: bool
 
 
 @dataclass
@@ -851,6 +866,7 @@ class HostModelOptionsResultFrame:
 
 HostFrame = (
     HostHelloFrame
+    | HostConnectionErrorFrame
     | HostHarnessReadinessFrame
     | HostLaunchRunnerFrame
     | HostLaunchRunnerResultFrame
@@ -932,6 +948,15 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "gateway_inference": frame.gateway_inference,
                 "telemetry_opt_out": frame.telemetry_opt_out,
                 "installation_id": frame.installation_id,
+            }
+        )
+    if isinstance(frame, HostConnectionErrorFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.CONNECTION_ERROR.value,
+                "stage": frame.stage,
+                "error": frame.error,
+                "retryable": frame.retryable,
             }
         )
     if isinstance(frame, HostHarnessReadinessFrame):
@@ -1295,6 +1320,12 @@ def _decode_known_host_frame(
     match kind:
         case HostFrameKind.HELLO:
             return _decode_host_hello(msg)
+        case HostFrameKind.CONNECTION_ERROR:
+            return HostConnectionErrorFrame(
+                stage=_required_str(msg, "stage"),
+                error=_required_str(msg, "error"),
+                retryable=_required_bool(msg, "retryable"),
+            )
         case HostFrameKind.HARNESS_READINESS:
             return _decode_harness_readiness(msg)
         case HostFrameKind.LAUNCH_RUNNER:

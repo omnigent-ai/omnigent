@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import time
 import uuid
@@ -265,6 +266,103 @@ def test_host_connect_and_list(
         assert resp.json()["status"] == "offline", "Host should be offline after daemon is killed"
 
 
+def _wait_for_host_online_by_name(
+    client: httpx.Client,
+    host_name: str,
+    timeout: float = 30.0,
+) -> dict[str, object]:
+    """Poll GET /v1/hosts until a host with *host_name* is online.
+
+    Used when the host_id isn't known in advance (the daemon generates it),
+    so the test matches on the seeded name instead.
+
+    :param client: HTTP client pointed at the server.
+    :param host_name: Host name to wait for.
+    :param timeout: Max seconds to wait.
+    :returns: The matching host dict from the list response.
+    :raises AssertionError: If no such host appears online.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            resp = client.get("/v1/hosts")
+            if resp.status_code == 200:
+                for host in resp.json().get("hosts", []):
+                    if host["name"] == host_name and host["status"] == "online":
+                        return host
+        except httpx.ConnectError:
+            # The API may be temporarily unreachable during startup; retry until timeout.
+            pass
+        time.sleep(POLL_INTERVAL_S)
+    raise AssertionError(f"Host named {host_name!r} did not appear online within {timeout}s")
+
+
+def test_host_name_only_config_generates_host_id(
+    live_server: str,
+    http_client: httpx.Client,
+    tmp_path: Path,
+    mock_llm_server_url: str,
+) -> None:
+    """
+    A config.yaml that names the host but omits host_id must register
+    end-to-end under the provided name with a freshly generated id.
+
+    Regression for the name-only path: the daemon used to overwrite the
+    chosen name with the machine hostname and mint a fresh id, so the
+    host showed up under the wrong name. It should now keep the name and
+    generate + persist only the missing host_id.
+    """
+    omni_dir = tmp_path / ".omnigent"
+    omni_dir.mkdir(parents=True, exist_ok=True)
+    config_path = omni_dir / "config.yaml"
+    # Unique name so the (owner, name) host row doesn't collide with the
+    # session-scoped server's other host rows.
+    host_name = f"e2e-nameonly-{uuid.uuid4().hex[:12]}"
+    config_path.write_text(
+        yaml.safe_dump({"host": {"name": host_name}}, default_flow_style=False, sort_keys=True)
+    )
+
+    daemon_log = tmp_path / "host-daemon.log"
+    env = {
+        **os.environ,
+        "HOME": str(tmp_path),
+        "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
+        "OPENAI_API_KEY": "mock-key",
+        PROCESS_LOG_FILE_ENV_VAR: str(daemon_log),
+    }
+    with open(daemon_log, "w") as log_fh:
+        proc = subprocess.Popen(
+            [runner_executable(), "-m", "omnigent.host._daemon_entry", "--server", live_server],
+            env=apply_runner_env(env),
+            cwd=compat_runner_cwd(),
+            stdout=subprocess.DEVNULL,
+            stderr=log_fh,
+        )
+    try:
+        host = _wait_for_host_online_by_name(http_client, host_name, timeout=30.0)
+        # The provided name survived — not replaced by the machine hostname.
+        assert host["name"] == host_name
+        assert host["name"] != socket.gethostname()
+
+        # The daemon generated + persisted a bare 32-char hex host_id.
+        cfg = yaml.safe_load(config_path.read_text())
+        persisted_id = cfg["host"]["host_id"]
+        assert isinstance(persisted_id, str) and len(persisted_id) == 32
+        int(persisted_id, 16)  # raises ValueError if not valid hex
+        # The name is kept in the persisted config too.
+        assert cfg["host"]["name"] == host_name
+
+        # The registered host_id is exactly what was written to config.yaml.
+        assert host["host_id"] == persisted_id
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+
 def test_host_launch_runner_and_session_round_trip(
     live_server: str,
     http_client: httpx.Client,
@@ -363,6 +461,103 @@ def test_host_launch_runner_and_session_round_trip(
         assert body["status"] == "completed", f"Session failed: {body.get('error')}"
         text = final_assistant_text(body)
         assert marker in text, f"Marker {marker!r} missing from response: {text!r}"
+
+    finally:
+        host_proc.send_signal(signal.SIGTERM)
+        try:
+            host_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            host_proc.kill()
+            host_proc.wait()
+
+
+@pytest.mark.skipif(
+    shutil.which("goose") is not None,
+    reason="needs the goose CLI ABSENT so the native terminal start fails",
+)
+def test_native_terminal_start_failure_names_the_readable_runner_log(
+    live_server: str,
+    http_client: httpx.Client,
+    tmp_path: Path,
+    mock_llm_server_url: str,
+) -> None:
+    """
+    A failed native terminal start tells the user which log holds the cause.
+
+    ``omnigent codex`` (and its siblings) surface the runner's message
+    verbatim, so "see runner logs for details" left the user hunting for a
+    file whose name they could not know. The runner names its own log file
+    instead. This asserts the path is not just present but *real*: the file
+    it names exists and carries the raw cause that the client-safe message
+    deliberately withholds.
+
+    Goose stands in for any native harness whose CLI is missing — the same
+    ``ImportError``/``ClickException`` path the reported codex failure took.
+    """
+    daemon = _spawn_host_daemon(
+        tmp_path=tmp_path,
+        live_server=live_server,
+        mock_llm_server_url=mock_llm_server_url,
+    )
+    host_proc = daemon.proc
+    host_id = daemon.host_id
+
+    try:
+        _wait_for_host_online(http_client, host_id, timeout=30.0)
+
+        agent_id = lookup_agent_id(
+            http_client,
+            upload_agent(http_client, _write_smoke_agent_yaml(tmp_path)),
+        )
+        resp = http_client.post("/v1/sessions", json={"agent_id": agent_id})
+        resp.raise_for_status()
+        session_id = resp.json()["id"]
+
+        launch_resp = http_client.post(
+            f"/v1/hosts/{host_id}/runners",
+            json={"session_id": session_id, "workspace": str(tmp_path)},
+            timeout=60.0,
+        )
+        launch_resp.raise_for_status()
+        runner_id = launch_resp.json()["runner_id"]
+
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            status_resp = http_client.get(f"/v1/runners/{runner_id}/status")
+            if status_resp.status_code == 200 and status_resp.json().get("online") is True:
+                break
+            time.sleep(POLL_INTERVAL_S)
+        else:
+            raise AssertionError(f"Runner {runner_id} never came online after launch")
+
+        http_client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"runner_id": runner_id},
+        ).raise_for_status()
+
+        ensure_resp = http_client.post(
+            f"/v1/sessions/{session_id}/resources/terminals",
+            json={"terminal": "goose", "session_key": "main", "ensure_native_terminal": True},
+            timeout=90.0,
+        )
+        assert ensure_resp.status_code >= 400, (
+            f"expected the goose terminal start to fail, got {ensure_resp.status_code}: "
+            f"{ensure_resp.text}"
+        )
+        message = ensure_resp.json()["error"]["message"]
+        assert "Native Goose terminal failed to start" in message, message
+
+        # The daemon runs with HOME=tmp_path, so the runner's home-relative
+        # path resolves back under the test's temp dir.
+        named_path = message.rsplit(": ", 1)[-1]
+        assert named_path.endswith(".log"), f"message names no log file: {message!r}"
+        runner_log = tmp_path / named_path[2:] if named_path.startswith("~/") else Path(named_path)
+        assert runner_log.exists(), (
+            f"message named {named_path!r} but no such log exists (resolved {runner_log})"
+        )
+        # The message stays free of the raw cause; the named log carries it.
+        assert "requires the 'goose' CLI" not in message
+        assert "requires the 'goose' CLI" in runner_log.read_text()
 
     finally:
         host_proc.send_signal(signal.SIGTERM)

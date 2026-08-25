@@ -61,15 +61,9 @@ interface PermissionsModalProps {
   sessionId: string;
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  canDelegateApprovals?: boolean;
 }
 
-export function PermissionsModal({
-  sessionId,
-  open,
-  onOpenChange,
-  canDelegateApprovals = false,
-}: PermissionsModalProps) {
+export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsModalProps) {
   // Server sharing policy. While the boot probe is in flight we treat the
   // server as "on" (fail open) so the modal renders its full controls; the
   // server-side gate is the real enforcement point regardless.
@@ -105,9 +99,8 @@ export function PermissionsModal({
     const trimmed = newUserId.trim();
     if (!trimmed) return;
     setError(null);
-    const canApprove = newLevel === "2-approve";
     grant.mutate(
-      { userId: trimmed, level: canApprove ? 2 : parseInt(newLevel, 10), canApprove },
+      { userId: trimmed, level: parseInt(newLevel, 10) },
       {
         onSuccess: () => {
           setNewUserId("");
@@ -125,9 +118,9 @@ export function PermissionsModal({
     });
   }
 
-  function handleChangeLevel(userId: string, level: number, canApprove: boolean) {
+  function handleChangeLevel(userId: string, level: number) {
     setError(null);
-    grant.mutate({ userId, level, canApprove }, { onError: (err) => setError(err.message) });
+    grant.mutate({ userId, level }, { onError: (err) => setError(err.message) });
   }
 
   function handlePublicToggle(checked: boolean) {
@@ -186,6 +179,7 @@ export function PermissionsModal({
               checked={isPublic}
               onCheckedChange={handlePublicToggle}
               disabled={grant.isPending || revoke.isPending}
+              componentId="diagnostics.permissions.public_toggle"
             />
           </div>
         )}
@@ -219,7 +213,6 @@ export function PermissionsModal({
                     onChangeLevel={handleChangeLevel}
                     busy={grant.isPending || revoke.isPending}
                     readOnly={sharingReadOnly}
-                    canDelegateApprovals={canDelegateApprovals}
                   />
                 ))}
               </div>
@@ -239,7 +232,12 @@ export function PermissionsModal({
             <label htmlFor="perm-level" className="text-sm font-medium text-muted-foreground">
               Level
             </label>
-            <Select value={newLevel} onValueChange={setNewLevel}>
+            <Select
+              value={newLevel}
+              onValueChange={setNewLevel}
+              componentId="diagnostics.permissions.grant_level"
+              valueHasNoPii
+            >
               <SelectTrigger className="mt-1 w-24">
                 <SelectValue />
               </SelectTrigger>
@@ -247,23 +245,20 @@ export function PermissionsModal({
                 <SelectItem value="1">Read</SelectItem>
                 {/* Read-only sharing caps new grants at view; hide Edit. */}
                 {!sharingReadOnly && <SelectItem value="2">Edit</SelectItem>}
-                {!sharingReadOnly && canDelegateApprovals && (
-                  <SelectItem value="2-approve">Edit + approve</SelectItem>
-                )}
               </SelectContent>
             </Select>
           </div>
-          <Button type="submit" size="sm" disabled={!newUserId.trim() || grant.isPending}>
+          <Button
+            type="submit"
+            size="sm"
+            loading={grant.isPending}
+            disabled={!newUserId.trim()}
+            componentId="diagnostics.permissions.grant"
+          >
             <UserPlusIcon className="mr-1 size-3.5" />
             Grant
           </Button>
         </form>
-
-        {canDelegateApprovals && !sharingReadOnly && (
-          <p className="text-sm text-muted-foreground">
-            Approvers can authorize actions that use your session credentials.
-          </p>
-        )}
 
         {error && <p className="text-sm text-destructive">{error}</p>}
 
@@ -516,7 +511,13 @@ function CopyLinkButton({ sessionId }: { sessionId: string }) {
   }, [sessionId, rebasePath]);
 
   return (
-    <Button variant="ghost" size="sm" onClick={handleCopy} className="gap-1.5 text-primary">
+    <Button
+      variant="ghost"
+      size="sm"
+      onClick={handleCopy}
+      className="gap-1.5 text-primary"
+      componentId="diagnostics.permissions.copy_link"
+    >
       {copied ? <CheckIcon className="size-3.5" /> : <LinkIcon className="size-3.5" />}
       {copied ? "Copied!" : "Copy link"}
     </Button>
@@ -585,14 +586,12 @@ function GrantRow({
   onChangeLevel,
   busy,
   readOnly,
-  canDelegateApprovals,
 }: {
   permission: Permission;
   onRevoke: (userId: string) => void;
-  onChangeLevel: (userId: string, level: number, canApprove: boolean) => void;
+  onChangeLevel: (userId: string, level: number) => void;
   busy: boolean;
   readOnly: boolean;
-  canDelegateApprovals: boolean;
 }) {
   const isOwner = permission.level === 4;
   // Manage is not grantable from the UI, so a pre-existing manage grant
@@ -601,10 +600,7 @@ function GrantRow({
   const isManage = permission.level === 3;
   // Read-only sharing mode: existing grants can't be re-leveled, so the level
   // shows as a fixed label (like owner/manage) — but the row stays revocable.
-  const fixedLevel =
-    isOwner || isManage || readOnly || (permission.can_approve && !canDelegateApprovals);
-  const baseLevelLabel = LEVEL_LABELS[permission.level] ?? "Read";
-  const levelLabel = permission.can_approve ? `${baseLevelLabel} + approve` : baseLevelLabel;
+  const fixedLevel = isOwner || isManage || readOnly;
 
   return (
     <div className="flex items-center gap-2 rounded-md px-2 py-0.5 hover:bg-muted/50">
@@ -616,15 +612,12 @@ function GrantRow({
       </span>
       {fixedLevel ? (
         <span className="flex h-8 w-28 items-center px-3 text-ui text-muted-foreground">
-          {levelLabel}
+          {LEVEL_LABELS[permission.level] ?? "Read"}
         </span>
       ) : (
         <Select
-          value={permission.can_approve ? "2-approve" : String(permission.level)}
-          onValueChange={(value) => {
-            const canApprove = value === "2-approve";
-            onChangeLevel(permission.user_id, canApprove ? 2 : parseInt(value, 10), canApprove);
-          }}
+          value={String(permission.level)}
+          onValueChange={(v) => onChangeLevel(permission.user_id, parseInt(v, 10))}
           disabled={busy}
         >
           <SelectTrigger
@@ -636,7 +629,6 @@ function GrantRow({
           <SelectContent>
             <SelectItem value="1">Read</SelectItem>
             <SelectItem value="2">Edit</SelectItem>
-            {canDelegateApprovals && <SelectItem value="2-approve">Edit + approve</SelectItem>}
           </SelectContent>
         </Select>
       )}
@@ -649,6 +641,7 @@ function GrantRow({
           onClick={() => onRevoke(permission.user_id)}
           disabled={busy}
           className="shrink-0 text-muted-foreground hover:text-destructive"
+          componentId="diagnostics.permissions.revoke"
         >
           <Trash2Icon className="size-3.5" />
           <span className="sr-only">Revoke</span>

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
+import tempfile
 import time
 from collections.abc import Generator
 from pathlib import Path
@@ -14,6 +16,11 @@ try:
     import resource as _resource  # POSIX-only; absent on Windows.
 except ImportError:
     _resource = None  # type: ignore[assignment]
+
+# Establish test data isolation before importing any Omnigent modules. This
+# deliberately replaces ambient state; subprocesses inherit the safe override.
+_TEST_OMNIGENT_DATA_DIR = Path(tempfile.mkdtemp(prefix="omnigent-pytest-")).resolve()
+os.environ["OMNIGENT_DATA_DIR"] = str(_TEST_OMNIGENT_DATA_DIR)
 
 # Skip the synchronous api.litellm.ai/model_catalog HTTP fallback during
 # tests. Hardened CI runners can't reach the public internet, so every
@@ -54,9 +61,9 @@ os.environ.setdefault("OMNIGENT_AUTH_PROVIDER", "header")
 # monkeypatch.delenv-ing this var.
 os.environ.setdefault("OMNIGENT_LOCAL_SINGLE_USER", "1")
 
-from omnigent.db.utils import _engine_cache, _engine_lock, get_or_create_engine
-from omnigent.runtime.filesystem_registry import GitFilesystemRegistry
-from tests import _model_pools
+from omnigent.db.utils import _engine_cache, _engine_lock, get_or_create_engine  # noqa: E402
+from omnigent.runtime.filesystem_registry import GitFilesystemRegistry  # noqa: E402
+from tests import _model_pools  # noqa: E402
 
 pytest_plugins = ["tests._token_usage"]
 
@@ -122,6 +129,7 @@ def _run_test_environment_guardrails(config: pytest.Config) -> None:
 
 def pytest_unconfigure(config: pytest.Config) -> None:
     """Clean up per-session resources."""
+    shutil.rmtree(_TEST_OMNIGENT_DATA_DIR, ignore_errors=True)
 
 
 # Per-worker progress logger: fsync'd START/END lines so a
@@ -270,6 +278,27 @@ def pytest_addoption(parser):
             "configured with the credentials/profile the test needs."
         ),
     )
+
+
+@pytest.fixture(autouse=True)
+def _reset_runner_catalog_cache() -> Generator[None, None, None]:
+    """
+    Clear smart routing's per-session runner-catalog cache after every test.
+
+    The cache is process-global and keyed by session id, and the suite reuses
+    a handful of fixed ids (``conv_123`` and friends) across unrelated tests —
+    so one test's catalog would answer another test's fetch and its counting
+    stub would never be called.
+
+    :returns: None.
+    """
+    yield
+    # sys.modules lookup, not an import: the spec lane blocks omnigent imports
+    # inside some tests, and a lane that never touched smart_routing should not
+    # pay for loading it in every teardown.
+    module = sys.modules.get("omnigent.server.smart_routing")
+    if module is not None:
+        module._runner_catalog_cache.clear()
 
 
 @pytest.fixture(autouse=True)

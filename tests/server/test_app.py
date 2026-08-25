@@ -7,13 +7,16 @@ they live here following the source ↔ test directory mirroring rule.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 
 import httpx
 import pytest
 from fastapi import FastAPI
+from PIL import Image
 
 from omnigent.native_coding_agents import (
     ANTIGRAVITY_NATIVE_AGENT_NAME,
@@ -68,6 +71,65 @@ def test_server_version_reads_version_constant() -> None:
     from omnigent.version import VERSION
 
     assert server_app._server_version() == VERSION
+
+
+@pytest.mark.asyncio
+async def test_well_known_manifest_shape(client: httpx.AsyncClient) -> None:
+    """GET /.well-known/omnigent.json returns the version manifest.
+
+    The desktop shell reads this BEFORE loading the SPA to decide how to open a
+    window, so the envelope keys are a contract: every one asserted here is a
+    key a shipped shell may branch on.
+    """
+    from omnigent.version import VERSION
+
+    resp = await client.get("/.well-known/omnigent.json")
+    assert resp.status_code == 200
+    # JSON, not the SPA's index.html — see the not-swallowed test below.
+    assert resp.headers["content-type"].startswith("application/json")
+    body = resp.json()
+
+    assert body["manifest_version"] == server_app.WELL_KNOWN_MANIFEST_VERSION
+    # An int, so clients can compare with >= rather than parsing a string.
+    assert isinstance(body["manifest_version"], int)
+    # Same source of truth as /api/version and /v1/info.server_version, so a
+    # client never sees three different answers for one server.
+    assert body["server_version"] == VERSION
+    # Present-but-null: clients rely on the key existing, and null is the
+    # "no floor" path every shipped shell must accept.
+    assert "min_desktop_version" in body
+    assert body["min_desktop_version"] is None
+    # Tells the shell where server-driven chrome lives, so it need not infer
+    # placement from the version number.
+    assert body["ui"]["server_picker"] == "sidebar"
+
+
+@pytest.mark.asyncio
+async def test_well_known_manifest_is_unauthed(client: httpx.AsyncClient) -> None:
+    """The manifest is readable without a session cookie.
+
+    The shell consults it before the app loads — i.e. before any login could
+    have happened — so an auth gate here would defeat its purpose entirely.
+    """
+    resp = await client.get("/.well-known/omnigent.json", headers={"Cookie": ""})
+    assert resp.status_code == 200
+    assert resp.json()["manifest_version"] >= 1
+
+
+def test_well_known_prefix_is_not_spa_fallback() -> None:
+    """An unmatched /.well-known/* path must 404, never fall back to the SPA.
+
+    The web UI is mounted at "/" and serves ``index.html`` for unmatched paths
+    so client routes survive a refresh. Without ``.well-known`` on the API
+    allowlist, a shell probing an OLDER server (which has no manifest route)
+    would receive ``200 text/html`` and could parse the SPA shell as a
+    manifest. The 404 is what makes "no manifest" detectable, and therefore
+    what makes the pre-manifest fallback path work at all.
+    """
+    assert server_app._is_web_ui_api_fallback_path(".well-known/omnigent.json")
+    assert server_app._is_web_ui_api_fallback_path(".well-known/anything-else")
+    # Sanity: a real client route still falls through to index.html.
+    assert not server_app._is_web_ui_api_fallback_path("c/conv_abc123")
 
 
 class _StubWebSocket:
@@ -395,6 +457,270 @@ async def test_info_includes_server_version(
     assert body["server_version"] == VERSION
 
 
+def _branding_png(color: tuple[int, int, int, int]) -> bytes:
+    output = BytesIO()
+    Image.new("RGBA", (2, 2), color).save(output, format="PNG")
+    return output.getvalue()
+
+
+def _build_branding_app(db_uri: str, tmp_path: Path, label: str) -> FastAPI:
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+    artifact_store = LocalArtifactStore(str(tmp_path / f"artifacts-{label}"))
+    return server_app.create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(
+            artifact_store=artifact_store,
+            cache_dir=tmp_path / f"cache-{label}",
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_branding_logo_route_serves_only_validated_asset_pre_auth(
+    db_uri: str,
+    runtime_init: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text("branding:\n  logo: logo.png\n")
+    assets = tmp_path / "branding-assets"
+    assets.mkdir()
+    payload = _branding_png((25, 100, 200, 255))
+    (assets / "logo.png").write_bytes(payload)
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config))
+
+    app = _build_branding_app(db_uri, tmp_path, "pre-auth")
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/v1/branding/logo/main", headers={"Cookie": ""})
+
+    assert response.status_code == 200
+    assert response.content == payload
+    assert response.headers["content-type"].startswith("image/png")
+    assert response.headers["x-content-type-options"] == "nosniff"
+
+
+@pytest.mark.asyncio
+async def test_branding_snapshot_performs_no_request_time_io_or_decode(
+    db_uri: str,
+    runtime_init: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from omnigent.server import server_config as server_config_module
+
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "branding:\n"
+        "  app_name: Acme\n"
+        "  logo:\n"
+        "    main: logo.png\n"
+        "    loading: ./logo.png\n"
+        "    favicon: logo.png\n"
+    )
+    assets = tmp_path / "branding-assets"
+    assets.mkdir()
+    logo = assets / "logo.png"
+    payload = _branding_png((25, 100, 200, 255))
+    logo.write_bytes(payload)
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config))
+
+    config_loads = 0
+    logo_reads = 0
+    validations = 0
+    pillow_opens = 0
+    original_load = server_config_module.load_server_config
+    original_read_bytes = Path.read_bytes
+    original_validation = server_config_module._validated_image
+    original_image_open = server_config_module.Image.open
+    resolved_logo = logo.resolve()
+
+    def _counted_load() -> dict[str, object]:
+        nonlocal config_loads
+        config_loads += 1
+        return original_load()
+
+    def _counted_read_bytes(path: Path) -> bytes:
+        nonlocal logo_reads
+        if path == resolved_logo:
+            logo_reads += 1
+        return original_read_bytes(path)
+
+    def _counted_validation(
+        path: Path,
+    ) -> server_config_module.BrandingAsset | None:
+        nonlocal validations
+        validations += 1
+        return original_validation(path)
+
+    def _counted_image_open(*args: object, **kwargs: object) -> object:
+        nonlocal pillow_opens
+        pillow_opens += 1
+        return original_image_open(*args, **kwargs)
+
+    monkeypatch.setattr(server_config_module, "load_server_config", _counted_load)
+    monkeypatch.setattr(Path, "read_bytes", _counted_read_bytes)
+    monkeypatch.setattr(server_config_module, "_validated_image", _counted_validation)
+    monkeypatch.setattr(server_config_module.Image, "open", _counted_image_open)
+
+    app = _build_branding_app(db_uri, tmp_path, "no-request-io")
+    startup_counts = (config_loads, logo_reads, validations, pillow_opens)
+    assert startup_counts == (1, 1, 1, 2)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        responses = await asyncio.gather(
+            *(
+                client.get(path, headers={"Cookie": ""})
+                for _ in range(8)
+                for path in (
+                    "/v1/info",
+                    "/v1/branding/logo/main",
+                    "/v1/branding/logo/loading",
+                    "/v1/branding/logo/favicon",
+                )
+            )
+        )
+
+    assert all(response.status_code == 200 for response in responses)
+    assert all(
+        response.content == payload
+        for response in responses
+        if response.request.url.path.startswith("/v1/branding/logo/")
+    )
+    assert (config_loads, logo_reads, validations, pillow_opens) == startup_counts
+
+
+@pytest.mark.asyncio
+async def test_branding_snapshot_is_immutable_and_isolated_per_app(
+    db_uri: str,
+    runtime_init: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    first_dir = tmp_path / "first"
+    first_dir.mkdir()
+    first_config = first_dir / "config.yaml"
+    first_config.write_text("branding:\n  app_name: First\n  logo: logo.png\n")
+    first_assets = first_dir / "branding-assets"
+    first_assets.mkdir()
+    first_logo = first_assets / "logo.png"
+    first_payload = _branding_png((25, 100, 200, 255))
+    first_logo.write_bytes(first_payload)
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(first_config))
+    first_app = _build_branding_app(db_uri, tmp_path, "first")
+
+    updated_payload = _branding_png((200, 100, 25, 255))
+    first_config.write_text("branding:\n  app_name: Updated\n  logo: logo.png\n")
+    first_logo.write_bytes(updated_payload)
+
+    second_dir = tmp_path / "second"
+    second_dir.mkdir()
+    second_config = second_dir / "config.yaml"
+    second_config.write_text("branding:\n  app_name: Second\n  logo: logo.png\n")
+    second_assets = second_dir / "branding-assets"
+    second_assets.mkdir()
+    second_payload = _branding_png((100, 25, 200, 255))
+    (second_assets / "logo.png").write_bytes(second_payload)
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(second_config))
+    second_app = _build_branding_app(db_uri, tmp_path, "second")
+
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(first_config))
+    recreated_app = _build_branding_app(db_uri, tmp_path, "recreated")
+
+    async def _branding(app: FastAPI) -> tuple[dict[str, object], bytes]:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            info = (await client.get("/v1/info")).json()["branding"]
+            logo_response = await client.get("/v1/branding/logo/main")
+        assert logo_response.status_code == 200
+        return info, logo_response.content
+
+    first, second, recreated = await asyncio.gather(
+        _branding(first_app),
+        _branding(second_app),
+        _branding(recreated_app),
+    )
+
+    assert first[0]["app_name"] == "First"
+    assert first[1] == first_payload
+    assert second[0]["app_name"] == "Second"
+    assert second[1] == second_payload
+    assert recreated[0]["app_name"] == "Updated"
+    assert recreated[1] == updated_payload
+
+
+@pytest.mark.asyncio
+async def test_branding_missing_at_startup_remains_missing_until_app_recreation(
+    db_uri: str,
+    runtime_init: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text("branding:\n  logo: logo.png\n")
+    assets = tmp_path / "branding-assets"
+    assets.mkdir()
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config))
+    missing_app = _build_branding_app(db_uri, tmp_path, "missing")
+
+    payload = _branding_png((25, 100, 200, 255))
+    (assets / "logo.png").write_bytes(payload)
+    recreated_app = _build_branding_app(db_uri, tmp_path, "now-present")
+
+    missing_transport = httpx.ASGITransport(app=missing_app)
+    async with httpx.AsyncClient(
+        transport=missing_transport, base_url="http://test"
+    ) as missing_client:
+        missing_info = (await missing_client.get("/v1/info")).json()["branding"]
+        missing_logo = await missing_client.get("/v1/branding/logo/main")
+
+    recreated_transport = httpx.ASGITransport(app=recreated_app)
+    async with httpx.AsyncClient(
+        transport=recreated_transport, base_url="http://test"
+    ) as recreated_client:
+        recreated_info = (await recreated_client.get("/v1/info")).json()["branding"]
+        recreated_logo = await recreated_client.get("/v1/branding/logo/main")
+
+    assert missing_info["logos"]["main"] is None
+    assert missing_logo.status_code == 404
+    assert recreated_info["logos"]["main"] == "/v1/branding/logo/main"
+    assert recreated_logo.status_code == 200
+    assert recreated_logo.content == payload
+
+
+@pytest.mark.asyncio
+async def test_branding_openapi_declares_binary_images_and_typed_info(
+    client: httpx.AsyncClient,
+) -> None:
+    schema = (await client.get("/openapi.json")).json()
+    logo_response = schema["paths"]["/v1/branding/logo/{variant}"]["get"]["responses"]["200"]
+    assert set(logo_response["content"]) == {
+        "image/gif",
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+        "image/x-icon",
+    }
+    assert logo_response["content"]["image/png"]["schema"] == {
+        "type": "string",
+        "format": "binary",
+    }
+
+    info_schema = schema["paths"]["/v1/info"]["get"]["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"]
+    assert info_schema["$ref"].endswith("/ServerInfoResponse")
+    properties = schema["components"]["schemas"]["ServerInfoResponse"]["properties"]
+    assert properties["branding"]["$ref"].endswith("/BrandingInfo")
+    assert properties["accounts_enabled"]["type"] == "boolean"
+
+
 @pytest.mark.asyncio
 async def test_health_bare_returns_status_ok(db_uri: str, tmp_path: Path) -> None:
     """
@@ -475,6 +801,61 @@ async def test_health_unbound_fork_of_coding_session_reads_offline(
     assert sessions[coding_fork.id]["runner_online"] is False
     # Chat-only fork → still reachable in-process.
     assert sessions[chat_fork.id]["runner_online"] is True
+
+
+@pytest.mark.asyncio
+async def test_health_unbound_imported_session_reads_offline(
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """
+    An unbound imported transcript reads offline; a plain session online.
+
+    Both are unbound (no runner, no host). The ``omnigent.import.source``
+    label is the difference: an import has no live executor anywhere, so it
+    must launch a runner on a host first and reads ``runner_online: false``
+    (routing the open view to the resume picker). A plain unbound session
+    resumes in-process and stays online. Regression guard for the
+    ``imported`` branch of ``_bulk_session_liveness``.
+    """
+    from omnigent.server.app import create_app
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.host_store import HostStore
+
+    conversation_store = SqlAlchemyConversationStore(db_uri)
+    host_store = HostStore(db_uri)
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+
+    imported = conversation_store.create_conversation()
+    conversation_store.set_labels(imported.id, {"omnigent.import.source": "claude"})
+    plain = conversation_store.create_conversation()
+
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=conversation_store,
+        artifact_store=artifact_store,
+        host_store=host_store,
+        agent_cache=AgentCache(
+            artifact_store=artifact_store,
+            cache_dir=tmp_path / "cache",
+        ),
+    )
+    ids = f"{imported.id},{plain.id}"
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.get(f"/health?session_ids={ids}")
+
+    assert resp.status_code == 200
+    sessions = resp.json()["sessions"]
+    # Imported → offline (needs a host). A True here means the unbound branch
+    # ignored the import marker (the pre-fix behavior).
+    assert sessions[imported.id]["runner_online"] is False
+    # Plain unbound session → reachable in-process.
+    assert sessions[plain.id]["runner_online"] is True
 
 
 @dataclass(frozen=True)
@@ -656,6 +1037,175 @@ def test_ensure_default_native_agents_seeds_every_native_agent(
         assert seeded.id == builtin_agent_id(agent.agent_name)
         assert seeded.session_id is None, "built-ins must be session-scope NULL"
         assert seed_stores.artifact_store.get(seeded.bundle_location) is not None
+
+
+def test_ensure_default_acp_agents_seeds_configured_agent(
+    seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A configured ``acp:<slug>`` agent becomes a picker-renderable built-in.
+
+    This is the ACP analogue of the native seeding: the New-Session picker reads
+    built-ins from ``GET /v1/agents``, so a configured ACP agent must seed to
+    appear — the same way ``opencode-native-ui`` etc. do.
+
+    **What breaks if this fails**: a user with Devin (or any ``acp:`` agent) set
+    up on their machine never sees it in the web picker.
+    """
+    from omnigent.db.utils import builtin_agent_id
+    from omnigent.onboarding.acp_auth import AcpAgentEntry
+
+    # A display label with a space ("Gemini CLI") must not become the agent name
+    # (spec names are [a-zA-Z0-9_-]+); the slug is used instead.
+    entry = AcpAgentEntry(
+        slug="gemini-cli", name="Gemini CLI", command="gemini --experimental-acp"
+    )
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda *a, **k: [entry])
+    # No builtin ACP CLI installed, so only the configured agent seeds.
+    monkeypatch.setattr("omnigent._platform.resolve_cli_binary", lambda _b, **k: None)
+
+    server_app._ensure_default_acp_agents(
+        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+    )
+
+    # Keyed by the slug, not the label.
+    seeded = seed_stores.agent_store.get_by_name("gemini-cli")
+    assert seeded is not None, "configured acp:<slug> agent was not seeded into the picker"
+    assert seed_stores.agent_store.get_by_name("Gemini CLI") is None, (
+        "the invalid space-bearing label must not be used as the agent name"
+    )
+    assert seeded.id == builtin_agent_id("gemini-cli")
+    assert seeded.session_id is None, "built-ins must be session-scope NULL"
+    assert seed_stores.artifact_store.get(seeded.bundle_location) is not None
+
+
+def test_ensure_default_acp_agents_seeds_installed_builtin_cli(
+    seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A builtin ACP CLI harness whose binary is on PATH seeds a picker built-in."""
+    from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda *a, **k: [])
+    # Every builtin ACP CLI resolves on PATH in this test.
+    monkeypatch.setattr(
+        "omnigent._platform.resolve_cli_binary", lambda _b, **k: "/usr/local/bin/x"
+    )
+
+    server_app._ensure_default_acp_agents(
+        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+    )
+    # Keyed by the catalog id (a valid slug), not the display label.
+    for key in ACP_CLI_HARNESSES:
+        assert seed_stores.agent_store.get_by_name(key) is not None, (
+            f"installed builtin ACP CLI {key!r} was not seeded"
+        )
+
+
+def test_ensure_default_acp_agents_configured_agent_beats_same_slug_builtin(
+    seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A configured agent whose slug is a builtin row id keeps its own command.
+
+    ``AcpAgentEntry(name="Devin")`` slugifies to ``devin``, which is also a
+    catalog row id, so both sources seed the same :func:`builtin_agent_id`. The
+    row must be skipped rather than seeded second and overwriting the user's
+    entry — while an unrelated row (``grok``) still seeds alongside.
+
+    **What breaks if this fails**: picking "Devin" in the web picker silently
+    runs the fixed row argv (account-default model) instead of the command the
+    user configured, e.g. ``devin acp --model swe-1-7-medium``.
+    """
+    import io
+    import tarfile
+
+    from omnigent.db.utils import builtin_agent_id
+    from omnigent.onboarding.acp_auth import AcpAgentEntry
+    from omnigent.spec import load
+
+    entry = AcpAgentEntry(slug="devin", name="Devin", command="devin acp --model swe-1-7-medium")
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda *a, **k: [entry])
+    # Both vendor CLIs are installed, so the devin row would otherwise seed too.
+    monkeypatch.setattr(
+        "omnigent._platform.resolve_cli_binary", lambda _b, **k: "/usr/local/bin/x"
+    )
+
+    server_app._ensure_default_acp_agents(
+        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+    )
+
+    seeded = seed_stores.agent_store.get_by_name("devin")
+    assert seeded is not None
+    assert seeded.id == builtin_agent_id("devin"), "both sources key the same id"
+    assert seed_stores.agent_store.get_by_name("grok") is not None, (
+        "a non-colliding builtin row must still seed"
+    )
+
+    # Presence is not enough — assert the surviving row launches the *configured*
+    # harness, since the bug was an overwrite that kept the name and lost the spec.
+    bundle = seed_stores.artifact_store.get(seeded.bundle_location)
+    assert bundle is not None
+    dest = tmp_path / "seeded"
+    with tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz") as tf:
+        tf.extractall(dest, filter="data")
+    assert load(dest).executor.config["harness"] == "acp:devin"
+
+
+def test_ensure_default_acp_agents_noop_when_nothing_set_up(
+    seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No configured agents + no installed builtin CLI → nothing seeded.
+
+    **What breaks if this fails**: a remote server (no ``acp:`` config, ACP CLIs
+    absent) shows phantom ACP picker rows that can't launch there.
+    """
+    from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda *a, **k: [])
+    monkeypatch.setattr("omnigent._platform.resolve_cli_binary", lambda _b, **k: None)
+
+    server_app._ensure_default_acp_agents(
+        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+    )
+    assert seed_stores.agent_store.get_by_name("devin") is None
+    for key in ACP_CLI_HARNESSES:
+        assert seed_stores.agent_store.get_by_name(key) is None
+
+
+def test_ensure_default_acp_agents_survives_unreadable_config(
+    seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A malformed ``acp:`` block is skipped, never fatal to server startup."""
+
+    def _boom(*_a: object, **_k: object) -> list[object]:
+        raise ValueError("bad acp: block")
+
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", _boom)
+    monkeypatch.setattr("omnigent._platform.resolve_cli_binary", lambda _b, **k: None)
+
+    # Must not raise — startup calls this and a bad user config can't take the
+    # whole server down.
+    server_app._ensure_default_acp_agents(
+        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+    )
+
+
+def test_build_acp_bundle_carries_the_harness_id(tmp_path: Path) -> None:
+    """The seeded bundle's spec runs on ``acp:<slug>`` — resolved at spawn.
+
+    **What breaks if this fails**: the picker row exists but launches the wrong
+    (or no) ACP agent because the harness id didn't reach the bundle.
+    """
+    import io
+    import tarfile
+
+    from omnigent.spec import load
+
+    data = server_app._build_acp_bundle(harness="acp:devin", name="devin")
+    dest = tmp_path / "bundle"
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
+        tf.extractall(dest, filter="data")
+    spec = load(dest)
+    assert spec.name == "devin"
+    assert spec.executor.config["harness"] == "acp:devin"
 
 
 def test_ensure_default_native_agents_raises_when_provider_missing(

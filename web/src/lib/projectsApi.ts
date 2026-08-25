@@ -25,6 +25,8 @@ export interface ProjectConfig {
   workspace?: string;
   /** Default agent id for new sessions. */
   agent_id?: string;
+  /** Chosen emoji icon (a unicode grapheme, e.g. "🔥"). Unset → default folder. */
+  icon?: string;
   /**
    * Opt-in worktree default: only `true` is meaningful. When `true`, a new
    * session in a git workspace starts in a fresh randomly-named worktree; unset
