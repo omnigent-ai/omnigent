@@ -24,8 +24,20 @@ Enumeration is deterministic per provider kind:
 - ``cli-config`` → the codex curated static list (source ``"static"``,
   ``verified: false`` — the credential lives in the CLI's own config
   file and is resolved by the CLI at launch).
-- anything unresolvable → source ``"none"`` with an explanatory note,
-  which doubles as a dead-worker preflight signal.
+
+Everything else splits three ways, because "Omnigent enumerated nothing"
+is three different facts with three different consequences for a caller:
+
+- ``self-managed`` → the harness authenticates itself (goose, hermes,
+  opencode, generic ACP agents), so Omnigent wires no credential and can
+  enumerate no models. Dispatch is UNAFFECTED — the harness picks the
+  model from its own config.
+- ``unconfigured`` → no USABLE Omnigent provider resolved for a harness
+  that needs one — nothing configured, or a configured provider whose
+  credential could not be resolved. A dispatch is at risk.
+- ``unavailable`` → a provider resolved but its listing could not be
+  fetched. Only the sub-case this module can prove launch-blocking (the
+  backing CLI is not installed) says a dispatch cannot run.
 """
 
 from __future__ import annotations
@@ -64,6 +76,7 @@ from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
     CLI_CONFIG_KIND,
     DATABRICKS_KIND,
+    GEMINI_FAMILY,
     KEY_KIND,
     OPENAI_FAMILY,
     SUBSCRIPTION_KIND,
@@ -80,6 +93,19 @@ _logger = logging.getLogger(__name__)
 
 # Sentinel kind for "no usable provider resolved" rows.
 NONE_KIND = "none"
+
+# Sentinel kind for a harness that authenticates itself: there is no Omnigent
+# provider to resolve (or to fail resolving), so the readout must not imply one
+# was missing. Mirrors how _CURSOR_HARNESSES short-circuits to a subscription
+# readout instead of reporting cursor as unresolvable.
+SELF_MANAGED_KIND = "self-managed"
+
+# ``ModelListing.source`` values for the empty-list rows. The single legacy
+# ``"none"`` conflated all three, so a caller could not tell a working
+# self-authenticating worker from a dead one.
+SELF_MANAGED_SOURCE = "self-managed"
+UNCONFIGURED_SOURCE = "unconfigured"
+UNAVAILABLE_SOURCE = "unavailable"
 
 # ~5 min: provider listings change rarely; a turn that fans out many
 # dispatches should never re-fetch per call.
@@ -163,7 +189,9 @@ _KEY_AUTH_FAMILY: dict[str, str] = {
     "claude-sdk": ANTHROPIC_FAMILY,
     "codex": OPENAI_FAMILY,
     "openai-agents-sdk": OPENAI_FAMILY,
-    "antigravity": OPENAI_FAMILY,
+    # Antigravity's SDK is Gemini-native.  Treating it as OpenAI here made
+    # an unrelated Codex subscription fallback appear as its vendor identity.
+    "antigravity": GEMINI_FAMILY,
     "qwen": OPENAI_FAMILY,
 }
 
@@ -198,8 +226,9 @@ class ModelListing:
     """A worker's enumerated model list plus its provenance.
 
     :param source: Where the list came from — ``"gateway"``,
-        ``"openai-compatible"``, ``"anthropic-api"``, ``"cli"``,
-        ``"static"``, or ``"none"``.
+        ``"openai-compatible"``, ``"anthropic-api"``, ``"cli"``, or
+        ``"static"``; else why it is empty — :data:`SELF_MANAGED_SOURCE`,
+        :data:`UNCONFIGURED_SOURCE`, or :data:`UNAVAILABLE_SOURCE`.
     :param verified: ``True`` when the list was fetched live from the
         provider; ``False`` for static/curated or empty listings.
     :param models: The enumerated models, e.g.
@@ -219,8 +248,9 @@ class ResolvedModelProvider:
 
     :param kind: Provider kind — ``"key"`` / ``"gateway"`` / ``"local"``
         / ``"subscription"`` / ``"databricks"`` / ``"cli-config"`` from
-        the provider config layer, or ``"none"`` when no usable provider
-        resolved.
+        the provider config layer, :data:`SELF_MANAGED_KIND` when the
+        harness supplies its own credential, or ``"none"`` when a
+        provider was needed and none resolved.
     :param family: ``"anthropic"`` / ``"openai"`` for inline-family
         kinds, else ``None``.
     :param profile: Databricks profile for ``kind="databricks"``, e.g.
@@ -547,16 +577,42 @@ def _resolve_model_provider_unsafe(spec: object, harness: str | None) -> Resolve
 
     harness_type = _PROVIDER_RESOLUTION_HARNESS.get(harness or "")
     if harness_type is None:
-        return ResolvedModelProvider(
-            kind=NONE_KIND,
-            detail=f"harness {harness or 'unknown'!r} has no model-provider resolution",
-        )
+        return _unresolved_provider(harness)
 
     agent_spec = cast("AgentSpec", spec)
     entry = _resolve_provider_for_build(agent_spec, harness_type=harness_type)
     if entry is not None:
         return _provider_from_entry(entry, harness_type)
     return _provider_from_legacy_auth(agent_spec, harness_type)
+
+
+def _unresolved_provider(harness: str | None) -> ResolvedModelProvider:
+    """Classify a harness absent from :data:`_PROVIDER_RESOLUTION_HARNESS`.
+
+    A missing entry is not one fact but two. For a self-authenticating
+    harness (goose, hermes, opencode, a generic ACP agent) the absence is
+    CORRECT: its spawn builder deliberately wires no credential — see
+    :func:`omnigent.runtime.workflow._build_goose_spawn_env`, "Goose owns its
+    own auth via ``goose configure``" — so there is nothing to resolve and
+    dispatch works fine. Reporting that as ``kind="none"`` made the readout
+    claim a live worker was dead. For anything else the absence really does
+    mean no provider was determined.
+
+    :param harness: The worker's harness id, e.g. ``"goose"``.
+    :returns: A :data:`SELF_MANAGED_KIND` provider for a self-authenticating
+        harness, else a ``kind="none"`` provider.
+    """
+    from omnigent.onboarding.provider_config import harness_declares_own_auth
+
+    if harness and harness_declares_own_auth(harness):
+        return ResolvedModelProvider(
+            kind=SELF_MANAGED_KIND,
+            detail=f"the {harness} harness authenticates itself; Omnigent wires no credential",
+        )
+    return ResolvedModelProvider(
+        kind=NONE_KIND,
+        detail=f"harness {harness or 'unknown'!r} has no model-provider resolution",
+    )
 
 
 def _provider_from_legacy_auth(
@@ -844,8 +900,9 @@ def catalog_for_spec(
 
     One row per declared sub-agent, keyed by sub-agent name, plus a
     ``"self"`` row for the calling agent's own (brain) harness. Failures
-    are isolated per worker: one broken provider yields a ``"none"`` row
-    with the failure in its note and never hides the other workers.
+    are isolated per worker: one broken provider yields an
+    :data:`UNAVAILABLE_SOURCE` row with the failure in its note and never
+    hides the other workers.
 
     :param spec: The calling agent's spec (sub-agents enumerated from
         ``spec.sub_agents``).
@@ -881,7 +938,7 @@ def _worker_row(
     except Exception as exc:  # noqa: BLE001 — per-worker isolation: fail informative, never crash the tool
         _logger.debug("worker model enumeration failed", exc_info=True)
         listing = ModelListing(
-            source=NONE_KIND,
+            source=UNAVAILABLE_SOURCE,
             verified=False,
             models=(),
             note=f"model enumeration failed: {_redacted_failure_reason(exc)}",
@@ -980,14 +1037,17 @@ def _listing_for_provider(
     :param transport: Optional httpx transport override for tests.
     :returns: The provider's :class:`ModelListing`.
     """
+    if provider.kind == SELF_MANAGED_KIND:
+        return _self_managed_listing(provider)
     if provider.kind == NONE_KIND:
         return ModelListing(
-            source=NONE_KIND,
+            source=UNCONFIGURED_SOURCE,
             verified=False,
             models=(),
             note=(
-                f"no usable model provider ({provider.detail}) — dispatches to "
-                "this worker cannot run here"
+                f"no usable Omnigent model provider resolved for this worker "
+                f"({provider.detail}), so no models can be enumerated; a dispatch "
+                "will fail unless the harness supplies its own credentials"
             ),
         )
     if provider.kind == SUBSCRIPTION_KIND and provider.cli != "cursor-agent":
@@ -1019,18 +1079,60 @@ def _listing_for_provider(
         _logger.debug(
             "model enumeration failed for %s", provider.detail or provider.kind, exc_info=True
         )
-        return ModelListing(
-            source=NONE_KIND,
-            verified=False,
-            models=(),
-            note=(
-                f"model enumeration failed for {provider.detail or provider.kind}: "
-                f"{_redacted_failure_reason(exc)}"
-            ),
-        )
+        return _unavailable_listing(provider, exc)
     with _listing_cache_lock:
         _listing_cache[cache_key] = listing
     return listing
+
+
+def _self_managed_listing(provider: ResolvedModelProvider) -> ModelListing:
+    """Build the empty-but-healthy listing for a self-authenticating harness.
+
+    ``verified`` stays ``False`` and ``models`` stays empty — nothing was
+    fetched, and fabricating a curated list here would advertise ids the
+    user's own vendor config may not serve. The note carries the one fact a
+    supervisor needs: the emptiness is not a failure, so dispatch to this
+    worker without an ``args.model``.
+
+    :param provider: A :data:`SELF_MANAGED_KIND` provider descriptor.
+    :returns: A :data:`SELF_MANAGED_SOURCE` listing.
+    """
+    return ModelListing(
+        source=SELF_MANAGED_SOURCE,
+        verified=False,
+        models=(),
+        note=(
+            f"{provider.detail}, so its models cannot be enumerated from here — "
+            "this is not a failure: dispatches to this worker run normally and the "
+            "harness picks the model from its own configuration (omit 'args.model')"
+        ),
+    )
+
+
+def _unavailable_listing(provider: ResolvedModelProvider, exc: Exception) -> ModelListing:
+    """Build the listing for a resolved provider whose enumeration failed.
+
+    A failed fetch is usually transient (endpoint 503, expired token) and says
+    nothing about whether a dispatch would launch, so the note must not claim
+    the worker is dead. The one exception this module can actually prove is a
+    missing CLI binary: ``FileNotFoundError`` out of a CLI-backed provider's
+    subprocess means the executable is absent, which IS launch-blocking.
+
+    :param provider: The resolved provider whose listing failed.
+    :param exc: The caught enumeration failure.
+    :returns: An :data:`UNAVAILABLE_SOURCE` listing.
+    """
+    if isinstance(exc, FileNotFoundError) and provider.cli:
+        note = (
+            f"the {provider.cli} CLI is not installed — dispatches to this worker cannot run here"
+        )
+    else:
+        note = (
+            f"model enumeration failed for {provider.detail or provider.kind}: "
+            f"{_redacted_failure_reason(exc)}; the provider is configured, so a "
+            "dispatch may still run"
+        )
+    return ModelListing(source=UNAVAILABLE_SOURCE, verified=False, models=(), note=note)
 
 
 def _fetch_cursor_cli_listing(provider: ResolvedModelProvider) -> ModelListing:

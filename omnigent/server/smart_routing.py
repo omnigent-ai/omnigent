@@ -445,9 +445,13 @@ async def _load_runner_catalog(
                 item[0],
             ),
         )
-        models = [model for _, model in ordered_models]
-        if models:
-            result[worker_name] = models
+        # Preserve declared workers even when discovery has no model ids.  A
+        # self-managed harness deliberately reports an empty list: Omnigent
+        # cannot enumerate its vendor-managed models, but the worker is still
+        # a viable dispatch target.  Dropping that row made it invisible to
+        # callers of ``fetch_runner_models`` and, consequently,
+        # ``sys_advise_models``.
+        result[worker_name] = [model for _, model in ordered_models]
     return result or None
 
 

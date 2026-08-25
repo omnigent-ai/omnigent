@@ -48,6 +48,7 @@ from omnigent.onboarding.provider_config import (
     BEDROCK_KIND,
     CLI_CONFIG_KIND,
     DATABRICKS_KIND,
+    GEMINI_FAMILY,
     OPENAI_FAMILY,
     RESPONSES_WIRE_API,
     SUBSCRIPTION_KIND,
@@ -394,10 +395,9 @@ _PROVIDER_HARNESS_FAMILY: dict[AgentHarnessType, str] = {
     "claude-sdk": ANTHROPIC_FAMILY,
     "codex": OPENAI_FAMILY,
     "openai-agents-sdk": OPENAI_FAMILY,
-    # Antigravity is Gemini-native but routes generic-provider traffic over
-    # the OpenAI-compatible wire (OpenRouter / LiteLLM / Databricks gateway),
-    # so it consumes the ``openai`` family like openai-agents-sdk.
-    "antigravity": OPENAI_FAMILY,
+    # Antigravity's SDK consumes Gemini credentials directly; it has no
+    # OpenAI-compatible provider path.
+    "antigravity": GEMINI_FAMILY,
     # Qwen Code routes through OpenAI-compatible providers (like Kimi v1).
     "qwen": OPENAI_FAMILY,
 }

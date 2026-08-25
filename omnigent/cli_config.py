@@ -1017,10 +1017,7 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         entry = build_databricks_provider_entry(profile)
 
     from omnigent.onboarding.configure_models import family_label
-    from omnigent.onboarding.provider_config import (
-        provider_families,
-        surface_default_provider,
-    )
+    from omnigent.onboarding.provider_config import provider_families
 
     # Persist the entry (deep-merge — doesn't disturb sibling entries).
     _save_global_config(
@@ -1048,7 +1045,7 @@ def _configure_harness_add(family: str | None = None) -> str | None:
     became_default: list[str] = []
     for fam in default_families:
         cfg = _load_global_config()
-        if surface_default_provider(cfg, fam) is not None:
+        if _surface_already_driven(cfg, fam, name, claimed=bool(became_default)):
             continue
         block = cfg.get("providers")
         if isinstance(block, dict):
@@ -1058,6 +1055,39 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         labels = " · ".join(family_label(f) for f in became_default)
         return f"✓ Added {name} — default for {labels}"
     return f"✓ Added {name}"
+
+
+def _surface_already_driven(
+    config: dict[str, object], surface: str, name: str, *, claimed: bool
+) -> bool:
+    """Whether *surface* is already driven, so entry *name* must not claim it.
+
+    The "don't re-route what the user configured" guard, asked of the config
+    as it stands AFTER the new entry was persisted — which is why the
+    self-match needs handling. Two self-match cases, opposite answers:
+
+    - *claimed* is ``False``: the entry has taken no default yet, and it only
+      resolves for *surface* because pi's effective default is a fallback scan
+      over every pi-capable provider, which now includes it. Treating that as
+      "already driven" would drop the explicit scope the user picked (the
+      ``+Add`` → Databricks-under-Pi path claims ``pi`` and nothing else).
+    - *claimed* is ``True``: the entry took a family default a moment ago, and
+      that claim is what drives *surface*. A second explicit scope would only
+      restate it — the whole-served-set spelling (``default: true``) is the
+      one the config should keep.
+
+    :param config: The parsed global config, including the new entry.
+    :param surface: ``"anthropic"`` / ``"openai"`` / ``"gemini"`` / ``"pi"``.
+    :param name: The provider entry being decided about.
+    :param claimed: Whether *name* already took a default in this pass.
+    :returns: ``True`` when *surface* must be left alone.
+    """
+    from omnigent.onboarding.provider_config import surface_default_provider
+
+    current = surface_default_provider(config, surface)
+    if current is None:
+        return False
+    return claimed or current.name != name
 
 
 def _adopt_detected_providers() -> list[str]:
@@ -1115,7 +1145,6 @@ def _promote_global_auth_to_provider() -> str | None:
         provider_entry_settings,
         provider_families,
         set_default_provider,
-        surface_default_provider,
     )
 
     config = _load_global_config()
@@ -1135,16 +1164,18 @@ def _promote_global_auth_to_provider() -> str | None:
         deep_merge_keys=("providers",),
     )
     parsed = load_providers({"providers": {name: entry}})[name]
+    claimed = False
     for fam in sorted(provider_families(parsed)):
         cfg = _load_global_config()
         # Effective check (matters for the pi surface): a default that
         # already drives the surface — explicitly or via pi's fallback —
         # outranks the legacy auth: block, exactly like routing does.
-        if surface_default_provider(cfg, fam) is not None:
+        if _surface_already_driven(cfg, fam, name, claimed=claimed):
             continue  # respect an existing provider default (it outranks auth:)
         block = cfg.get("providers")
         if isinstance(block, dict):
             _save_global_config({"providers": set_default_provider(block, name, fam)})
+            claimed = True
     return name
 
 
