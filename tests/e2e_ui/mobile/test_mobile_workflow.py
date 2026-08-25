@@ -7,10 +7,10 @@ tests run a real browser at a 390×844 (phone) viewport and assert the
 behaviors only real CSS can produce:
 
   - the desktop workspace rail (``md:flex``) is collapsed off-screen;
-  - the session-menu FAB (``md:hidden``) is the navigation entry point;
+  - the header's session kebab is the one navigation entry point;
   - the desktop right-panel toggle (``hidden md:inline-flex``) is gone;
   - each rail surface (Changes/Files/Agents) is reachable through the
-    FAB and opens a full-screen drawer;
+    kebab and opens a full-screen drawer;
   - the chat composer is usable and streams a response on a phone.
 
 Files are seeded via the filesystem PUT endpoint so the navigation
@@ -66,17 +66,18 @@ def mobile_session_with_file(
         shutil.rmtree(_REPO_ROOT / session_id, ignore_errors=True)
 
 
-def test_mobile_collapses_rail_and_surfaces_fab(
+def test_mobile_collapses_rail_and_surfaces_kebab(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """At a phone width the rail is hidden and the FAB replaces it.
+    """At a phone width the rail is hidden and the header kebab replaces it.
 
     Proves the responsive layout swap that jsdom can't: the desktop
     workspace ``aside`` (``hidden md:flex``) must not be visible, the
-    session-menu FAB (``md:hidden``) must be, and the desktop-only
-    right-panel collapse toggle (``hidden md:inline-flex``) must be
-    absent from the viewport.
+    header's session kebab must be — as the *only* trigger, carrying both
+    the session actions and the rail entries — and the desktop-only
+    right-panel collapse toggle (``hidden md:inline-flex``) must be absent
+    from the viewport.
     """
     base_url, session_id = seeded_session
     page.set_viewport_size(_MOBILE_VIEWPORT)
@@ -91,8 +92,11 @@ def test_mobile_collapses_rail_and_surfaces_fab(
     # display:none rather than passing on a 0-match accessibility locator.
     expect(page.locator('aside[aria-label="Workspace"]')).not_to_be_visible()
 
-    # FAB present; desktop right-panel toggle present-but-hidden.
-    expect(page.get_by_role("button", name="Open session menu")).to_be_visible()
+    # Kebab present; desktop right-panel toggle present-but-hidden.
+    expect(page.get_by_role("button", name="Conversation actions")).to_be_visible()
+    # Exactly one trigger on a phone — the rail entries were folded into the
+    # kebab, so the old PanelRight FAB must be gone.
+    expect(page.get_by_role("button", name="Open session menu")).to_have_count(0)
     expect(
         page.locator(
             'button[aria-label="Collapse right panel"], button[aria-label="Expand right panel"]'
@@ -147,11 +151,11 @@ def mobile_session_with_child_agent(
         )
 
 
-def test_mobile_fab_lists_file_surfaces_and_omits_absent_ones(
+def test_mobile_kebab_lists_file_surfaces_and_omits_absent_ones(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """The FAB menu degrades gracefully to only the available surfaces.
+    """The kebab menu degrades gracefully to only the available surfaces.
 
     A plain ``hello_world`` session has a workspace (os_env), no child
     agents, and is not claude-native — so the menu must list Files and
@@ -161,13 +165,13 @@ def test_mobile_fab_lists_file_surfaces_and_omits_absent_ones(
     only terminal is the auto-created embedded Omnigent REPL, which is
     plumbing for the Chat/Terminal pill, not inventory — listing it
     read as a phantom "main" terminal on agents that don't run a TUI,
-    so ``inventoryTerminals`` excludes it from the FAB/rail.
+    so ``inventoryTerminals`` excludes it from the kebab/rail.
     """
     base_url, session_id = seeded_session
     page.set_viewport_size(_MOBILE_VIEWPORT)
     page.goto(f"{base_url}/c/{session_id}")
 
-    page.get_by_role("button", name="Open session menu").click()
+    page.get_by_role("button", name="Conversation actions").click()
 
     expect(page.get_by_role("menuitem", name="Files", exact=True)).to_be_visible()
     # Changes is a peer files surface (the changed-files list), listed
@@ -178,7 +182,7 @@ def test_mobile_fab_lists_file_surfaces_and_omits_absent_ones(
     expect(page.get_by_role("menuitem", name=re.compile(r"Agents\s*1"))).to_be_visible()
     # No Shells entry: the embedded REPL terminal is excluded from
     # the inventory (reachable via the Chat/Terminal pill instead). An
-    # entry here means the REPL leaked back into the FAB gating.
+    # entry here means the REPL leaked back into the kebab gating.
     expect(page.get_by_role("menuitem", name="Shells")).to_have_count(0)
     # No todos on a plain hello_world session.
     expect(page.get_by_role("menuitem", name="Tasks")).to_have_count(0)
@@ -191,7 +195,7 @@ def test_mobile_shells_drawer_exposes_new_shell_before_shells_exist(
     """Shell-capable agents expose the mobile Shells drawer at zero shells.
 
     Mobile has no tab-strip "+" menu, so the Shells drawer is the create entry
-    point: when the session agent declares a ``terminals:`` block, the FAB lists
+    point: when the session agent declares a ``terminals:`` block, the kebab lists
     Shells before any user shell exists, and selecting it opens the full-screen
     drawer carrying a "+ New shell" row. (On desktop the create affordance lives
     in the tab strip's "+" menu and the rail's Shells tab only lists existing
@@ -201,7 +205,7 @@ def test_mobile_shells_drawer_exposes_new_shell_before_shells_exist(
     page.set_viewport_size(_MOBILE_VIEWPORT)
     page.goto(f"{base_url}/c/{session_id}")
 
-    page.get_by_role("button", name="Open session menu").click()
+    page.get_by_role("button", name="Conversation actions").click()
 
     shells_entry = page.get_by_role("menuitem", name="Shells", exact=True)
     expect(shells_entry).to_be_visible(timeout=10_000)
@@ -212,7 +216,7 @@ def test_mobile_shells_drawer_exposes_new_shell_before_shells_exist(
     expect(drawer.get_by_role("button", name="New shell")).to_be_visible()
 
 
-def test_mobile_fab_shows_agents_entry_when_child_agents_exist(
+def test_mobile_kebab_shows_agents_entry_when_child_agents_exist(
     page: Page,
     mobile_session_with_child_agent: tuple[str, str],
 ) -> None:
@@ -220,14 +224,14 @@ def test_mobile_fab_shows_agents_entry_when_child_agents_exist(
 
     Counterpart to the omits-absent-ones test: with one sub-agent
     seeded under the parent, the multi-agent gate
-    (``childSessions.length > 0``) is satisfied, so the FAB now lists
+    (``childSessions.length > 0``) is satisfied, so the kebab now lists
     Agents alongside Files. Selecting it opens the agents drawer.
     """
     base_url, session_id = mobile_session_with_child_agent
     page.set_viewport_size(_MOBILE_VIEWPORT)
     page.goto(f"{base_url}/c/{session_id}")
 
-    page.get_by_role("button", name="Open session menu").click()
+    page.get_by_role("button", name="Conversation actions").click()
 
     agents_entry = page.get_by_role("menuitem", name="Agents")
     # 10s budget: the rail fetches child_sessions on load, so the entry
@@ -245,9 +249,9 @@ def test_mobile_files_drawer_opens_seeded_file(
     page: Page,
     mobile_session_with_file: tuple[str, str],
 ) -> None:
-    """Open the Files drawer from the FAB and view the seeded file.
+    """Open the Files drawer from the header kebab and view the seeded file.
 
-    The full chain a phone user hits: FAB → Files → full-screen files
+    The full chain a phone user hits: kebab → Files → full-screen files
     drawer → tap a file → full-screen file viewer with real content.
     Uses the Files (folder-tree) surface rather than Changes: the
     session workspace isn't a git repo, so the changed-files diff is
@@ -259,7 +263,7 @@ def test_mobile_files_drawer_opens_seeded_file(
     page.set_viewport_size(_MOBILE_VIEWPORT)
     page.goto(f"{base_url}/c/{session_id}")
 
-    page.get_by_role("button", name="Open session menu").click()
+    page.get_by_role("button", name="Conversation actions").click()
     page.get_by_role("menuitem", name="Files", exact=True).click()
 
     drawer = page.get_by_test_id("files-panel-drawer")

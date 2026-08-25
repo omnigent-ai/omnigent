@@ -175,7 +175,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _best_effort_stop,
     _child_session_summaries_from_conversations,
     _dispatch_session_event_to_runner,
-    _enrich_idle_status_with_subagent_output,
+    _enrich_terminal_status_with_subagent_output,
     _ensure_native_terminal_ready,
     _ensure_runner_relay_ready,
     _ensure_runner_session_initialized,
@@ -1173,26 +1173,6 @@ def register_events_routes(
                     "external_session_status data.response_id must be a string",
                     code=ErrorCode.INVALID_INPUT,
                 )
-            # Surface the failure reason a native forwarder carries so a
-            # top-level session sees it on its own status edge and persisted
-            # last_task_error, not only the sub-agent parent-inbox path.
-            output = body.data.get("output")
-            status_error: ErrorDetail | None = None
-            if status == "failed" and isinstance(output, str) and output.strip():
-                status_error = ErrorDetail(
-                    code=(
-                        "codex_reauth_required"
-                        if body.data.get("reauth_required") is True
-                        else "codex_turn_error"
-                    ),
-                    message=output.strip(),
-                )
-            if status_error is not None:
-                await _persist_session_status_error_labels(
-                    session_id, status_error, conversation_store
-                )
-            elif status == "running":
-                await _persist_session_status_error_labels(session_id, None, conversation_store)
             # ``None`` (field absent) = no information; leave the sticky
             # tally untouched (the PTY-activity ``idle`` carries none). An
             # explicit ``0`` from a ``Stop`` hook is authoritative and clears
@@ -1227,6 +1207,39 @@ def register_events_routes(
             if effective_status != status:
                 status = effective_status
                 body.data["status"] = status
+            # Terminal edges carry the harness's own persisted text: the
+            # child's result on ``idle``, and on ``failed`` — when the
+            # forwarder attached no detail — its error report (claude-native's
+            # StopFailure edge posts none). Enriched before the reason is
+            # derived so the pill, ``last_task_error``, and the parent inbox
+            # all see the same detail.
+            data = await _enrich_terminal_status_with_subagent_output(
+                body.data, status, session_id, conversation_store
+            )
+            # Surface the failure reason a native forwarder carries so a
+            # top-level session sees it on its own status edge and persisted
+            # last_task_error, not only the sub-agent parent-inbox path.
+            output = data.get("output")
+            status_error: ErrorDetail | None = None
+            if status == "failed" and isinstance(output, str) and output.strip():
+                status_error = ErrorDetail(
+                    code=(
+                        "codex_reauth_required"
+                        if data.get("reauth_required") is True
+                        # The store-enriched detail keeps a harness-neutral
+                        # code; a forwarder-sent detail keeps codex's.
+                        else (
+                            "codex_turn_error" if body.data.get("output") else "native_turn_error"
+                        )
+                    ),
+                    message=output.strip(),
+                )
+            if status_error is not None:
+                await _persist_session_status_error_labels(
+                    session_id, status_error, conversation_store
+                )
+            elif status == "running":
+                await _persist_session_status_error_labels(session_id, None, conversation_store)
             _publish_status(
                 session_id,
                 status,
@@ -1237,9 +1250,7 @@ def register_events_routes(
                 blocked_on=blocked_on,
             )
             forward_body = body.model_dump()
-            forward_body["data"] = await _enrich_idle_status_with_subagent_output(
-                forward_body["data"], status, session_id, conversation_store
-            )
+            forward_body["data"] = data
             runner_result = await _forward_session_change_to_runner(
                 session_id,
                 runner_router,

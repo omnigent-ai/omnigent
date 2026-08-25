@@ -16,6 +16,8 @@ Rows are numbered after the design's §10.1 table.
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import time
 from collections.abc import Callable, Iterator
@@ -25,6 +27,7 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.claude_native import claude_catalog_fingerprint
 from omnigent.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME, CODEX_NATIVE_AGENT_NAME
 from tests.e2e.omnigent._model_flows_rig import (
     ModelFlowsRig,
@@ -723,3 +726,89 @@ def test_row18_cold_resume_honors_the_persisted_model_override(
             f"the resumed pane footer {footer!r} does not name the {family} family "
             f"of {override!r} (session {session_id})"
         )
+
+
+# ---------------------------------------------------------------------------
+# Stale catalog: a Default launch must not run yesterday's default
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.timeout(600)
+def test_row19_stale_catalog_default_launch_defers_to_the_cli_default(
+    rig: ModelFlowsRig,
+    shaped_host: Callable[[str], str],
+    tmp_path: Path,
+) -> None:
+    """
+    A month-old catalog default must not govern a Default launch.
+
+    The store never re-probes on its own, so its ``isDefault`` row can
+    outlive the model it names (a retirement or an entitlement change).
+    Pinning it as ``--model`` then hard-fails every Default session on the
+    host with a provider ``model_not_found`` — sticky, because nothing
+    invalidates the entry. The launch must instead defer to the CLI's own
+    always-servable default and let the background re-probe converge the
+    store. Seeded with Claude Code's real 2024 default, retired upstream
+    today — exactly what a catalog written back then would hold.
+    """
+    require_clis("claude")
+    host_id = shaped_host("claude-subscription")
+    # Let the boot probe finish first, so it cannot overwrite the seed.
+    wait_for(
+        lambda: host_model_options(rig.base_url, host_id, "claude-native").get("models") or None,
+        timeout=180.0,
+        what="the boot-warmed claude catalog",
+    )
+    retired = "claude-3-5-sonnet-20241022"
+    fingerprint = claude_catalog_fingerprint(None)
+    path = rig.data_dir / "cache" / "model-catalogs" / f"claude-native-{fingerprint}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    month_ago = time.time() - 30 * 86400
+    path.write_text(
+        json.dumps(
+            {
+                "harness": "claude-native",
+                "fingerprint": fingerprint,
+                "written_at": month_ago,
+                "models": [
+                    {"id": "opus", "model": "claude-opus-5", "displayName": "Opus 5"},
+                    {
+                        "id": retired,
+                        "model": retired,
+                        "displayName": "Claude 3.5 Sonnet",
+                        "isDefault": True,
+                    },
+                ],
+            }
+        )
+    )
+    os.utime(path, (month_ago, month_ago))
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "README.md").write_text("# stale catalog workspace\n")
+    pane = PaneWatcher()
+    pane.arm()
+    session_id = rest_create_session(
+        rig.base_url,
+        agent_name=CLAUDE_NATIVE_AGENT_NAME,
+        host_id=host_id,
+        workspace=workspace,
+        terminal_launch_args=bypass_args("claude-native"),
+    )
+    rest_post_user_message(rig.base_url, session_id, "Reply with exactly: ok. Nothing else.")
+
+    def _settled() -> dict[str, Any] | None:
+        snapshot = session_snapshot(rig.base_url, session_id)
+        assert snapshot.get("status") != "failed", (
+            f"the stale catalog default still governed the launch: "
+            f"{snapshot.get('last_task_error') or snapshot.get('error')} "
+            f"(session {session_id})"
+        )
+        return snapshot if assistant_message_count(snapshot) >= 1 else None
+
+    snapshot = wait_for(_settled, timeout=240.0, what="the Default session's first reply")
+    reported = str(snapshot.get("llm_model") or "")
+    assert not reported.startswith(retired), (
+        f"the launch still ran the stale pin {retired!r} (session {session_id})"
+    )

@@ -4,6 +4,8 @@ import { MemoryRouter } from "react-router-dom";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as ConversationsModule from "@/hooks/useConversations";
 import type * as UnseenConversationsModule from "@/hooks/useUnseenConversations";
+import { setOmnigentHostConfig } from "@/lib/host";
+import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
 
 const mocks = vi.hoisted(() => ({
@@ -86,6 +88,7 @@ function openMenu() {
 }
 
 beforeEach(() => {
+  setOmnigentHostConfig({});
   mocks.isMobile = false;
   mocks.projects = [{ id: "project-1", name: "Sprint 42" }];
   vi.clearAllMocks();
@@ -233,6 +236,163 @@ describe("HeaderConversationMenu", () => {
       id: "conv-2",
       deleteBranch: false,
     });
+  });
+
+  it("heads the mobile menu with the session title and drops it in the picker", () => {
+    // The mobile chat header shows no title of its own (the native shells hide
+    // the breadcrumb), so the menu itself has to name the session.
+    mocks.isMobile = true;
+    renderMenu();
+    openMenu();
+    const label = screen.getByText("Quarterly planning");
+    expect(label).toHaveAttribute("data-slot", "dropdown-menu-label");
+
+    fireEvent.click(screen.getByTestId("header-move-to-project"));
+    expect(screen.queryByText("Quarterly planning")).toBeNull();
+  });
+
+  it("omits the title header on desktop, where the breadcrumb already shows it", () => {
+    renderMenu();
+    openMenu();
+
+    expect(screen.queryByText("Quarterly planning")).toBeNull();
+  });
+
+  it("sizes the trigger and rows for touch on mobile only", () => {
+    const view = renderMenu();
+    const desktopTrigger = screen.getByRole("button", { name: "Conversation actions" });
+    expect(desktopTrigger.querySelector("svg")).toHaveClass("size-3.5");
+    openMenu();
+    expect(screen.getByRole("menuitem", { name: "Pin" })).not.toHaveClass("py-2");
+
+    view.unmount();
+    mocks.isMobile = true;
+    renderMenu();
+    const mobileTrigger = screen.getByRole("button", { name: "Conversation actions" });
+    expect(mobileTrigger.querySelector("svg")).toHaveClass("size-4");
+    openMenu();
+    expect(screen.getByRole("menuitem", { name: "Pin" })).toHaveClass("gap-2.5", "px-2.5", "py-2");
+  });
+
+  it("keeps every session action reachable on mobile", () => {
+    // Regression guard for the native mobile shells, where this menu is the
+    // only entry point to the session operations.
+    mocks.isMobile = true;
+    renderMenu();
+    openMenu();
+
+    expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
+      "Pin",
+      "Share",
+      "Rename",
+      "Mark as unread",
+      "Add to project",
+      "Archive",
+      "Delete",
+    ]);
+  });
+
+  it("slots workspace entries between the session actions and the destructive block", () => {
+    // On mobile these are the rail drawers folded into this same menu; Archive
+    // and Delete must stay last so a mis-tap doesn't land on them.
+    mocks.isMobile = true;
+    renderMenu({
+      workspaceItems: <DropdownMenuItem data-testid="rail-files">Files</DropdownMenuItem>,
+    });
+    openMenu();
+
+    expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
+      "Pin",
+      "Share",
+      "Rename",
+      "Mark as unread",
+      "Add to project",
+      "Files",
+      "Archive",
+      "Delete",
+    ]);
+  });
+
+  it("renders no workspace section when there are no entries", () => {
+    const view = renderMenu();
+    openMenu();
+    const baseSeparators = screen.getAllByRole("separator").length;
+
+    view.unmount();
+    renderMenu({
+      workspaceItems: <DropdownMenuItem data-testid="rail-files">Files</DropdownMenuItem>,
+    });
+    openMenu();
+    // The entries bring exactly one separator of their own.
+    expect(screen.getAllByRole("separator")).toHaveLength(baseSeparators + 1);
+  });
+
+  it("wears the mobile glass surface and a round trigger", () => {
+    // The trigger sits inside the header's round floating pill; a rounded-lg
+    // open-state background showed through it as a square.
+    mocks.isMobile = true;
+    renderMenu();
+    const trigger = screen.getByRole("button", { name: "Conversation actions" });
+    expect(trigger).toHaveClass("max-md:rounded-full");
+
+    openMenu();
+    expect(screen.getByRole("menu")).toHaveClass(
+      "max-md:bg-background/70",
+      "max-md:backdrop-blur-xl",
+    );
+  });
+
+  it("keeps emitting the mobile Share / Agent info analytics ids", () => {
+    // These two actions moved here from the header's legacy Share · Agent info
+    // menu, which reported them under these ids. An owner-managed session no
+    // longer renders that menu, so this path has to carry the series forward.
+    const analytics = vi.fn();
+    setOmnigentHostConfig({ analytics });
+    mocks.isMobile = true;
+    const onShare = vi.fn();
+    const onAgentInfo = vi.fn();
+    renderMenu({ onShare, hasAgentInfo: true, onAgentInfo });
+
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Share" }));
+    expect(analytics).toHaveBeenCalledWith({
+      type: "click",
+      componentId: "chat.header.mobile_share",
+      componentKind: "button",
+    });
+    expect(onShare).toHaveBeenCalledOnce();
+
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Agent info" }));
+    expect(analytics).toHaveBeenCalledWith({
+      type: "click",
+      componentId: "chat.header.mobile_agent_info",
+      componentKind: "button",
+    });
+    expect(onAgentInfo).toHaveBeenCalledOnce();
+  });
+
+  it("reports nothing for the desktop kebab, a different surface", () => {
+    const analytics = vi.fn();
+    setOmnigentHostConfig({ analytics });
+    renderMenu({ onShare: () => {} });
+
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Share" }));
+    expect(analytics).not.toHaveBeenCalled();
+  });
+
+  it("emits nothing when a disabled Share is selected", () => {
+    const analytics = vi.fn();
+    setOmnigentHostConfig({ analytics });
+    mocks.isMobile = true;
+    const onShare = vi.fn();
+    renderMenu({ onShare, shareDisabled: true });
+
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Share" }));
+    expect(analytics).not.toHaveBeenCalled();
+    expect(onShare).not.toHaveBeenCalled();
   });
 
   it("reflects pinned state and preserves the disabled share reason", () => {

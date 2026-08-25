@@ -10,7 +10,7 @@
  * Sections:
  *
  * - **Appearance** — theme mode (System / Light / Dark), terminal theme,
- *   Workspace panel default for new chats, and UI/code font controls.
+ *   default transcript view, Workspace panel default, and UI/code font controls.
  * - **Git** — Git behavior, e.g. the default base branch pre-filled when
  *   naming a new worktree branch in the composer.
  * - **Keyboard shortcuts** — the full shortcuts reference, shown inline.
@@ -45,6 +45,7 @@ import {
   KeyRoundIcon,
   LaptopMinimalIcon,
   LogOutIcon,
+  MessagesSquareIcon,
   MinusIcon,
   MonitorIcon,
   MoonIcon,
@@ -52,6 +53,7 @@ import {
   PanelRightIcon,
   PlusIcon,
   SunIcon,
+  TerminalIcon,
   Trash2Icon,
   UserCogIcon,
 } from "lucide-react";
@@ -137,6 +139,12 @@ import {
   writeWorkspacePanelDefault,
   type WorkspacePanelDefault,
 } from "@/lib/workspacePanelPreferences";
+import {
+  readTranscriptViewDefault,
+  TRANSCRIPT_VIEW_DEFAULT,
+  writeTranscriptViewDefault,
+  type TranscriptViewDefault,
+} from "@/lib/transcriptViewPreferences";
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import {
   DEFAULT_HIDE_UNCONFIGURED_HARNESSES,
@@ -274,6 +282,15 @@ const terminalThemeCards: { mode: TerminalThemeMode; label: string; icon: typeof
   { mode: "auto", label: "Match app", icon: MonitorIcon },
   { mode: "light", label: "Light", icon: SunIcon },
   { mode: "dark", label: "Dark", icon: MoonIcon },
+];
+
+const transcriptViewCards: {
+  value: TranscriptViewDefault;
+  label: string;
+  icon: typeof MessagesSquareIcon;
+}[] = [
+  { value: "chat", label: "Chat", icon: MessagesSquareIcon },
+  { value: "terminal", label: "Terminal", icon: TerminalIcon },
 ];
 
 const workspacePanelCards: {
@@ -545,6 +562,37 @@ function TerminalThemeControl() {
         items={terminalThemeCards.map((card) => ({
           value: card.mode,
           testId: `terminal-theme-${card.mode}`,
+          body: iconCardBody(card.icon, card.label),
+        }))}
+      />
+    </ThemeSubsection>
+  );
+}
+
+/** Default surface for terminal-first transcripts without a per-tab choice. */
+function TranscriptViewDefaultControl() {
+  const [value, setValue] = useState(() => readTranscriptViewDefault());
+  const labelId = useId();
+  const choose = useCallback((next: TranscriptViewDefault) => {
+    setValue(next);
+    writeTranscriptViewDefault(next);
+  }, []);
+  return (
+    <ThemeSubsection
+      labelId={labelId}
+      title="Default transcript view"
+      helper="Choose whether terminal-backed chats open in Chat or Terminal view. A view selected in a chat is remembered for the current tab."
+    >
+      <CardRadioGroup<TranscriptViewDefault>
+        labelledBy={labelId}
+        value={value}
+        onSelect={choose}
+        componentId="settings.appearance.transcript_view"
+        className="grid grid-cols-2 gap-3"
+        cardClassName="items-center gap-2 p-4"
+        items={transcriptViewCards.map((card) => ({
+          value: card.value,
+          testId: `transcript-view-default-${card.value}`,
           body: iconCardBody(card.icon, card.label),
         }))}
       />
@@ -863,6 +911,8 @@ function AppearanceSection() {
     writeCustomTheme(DEFAULT_CUSTOM_THEME);
     applyCustomTheme(DEFAULT_CUSTOM_THEME);
 
+    writeTranscriptViewDefault(TRANSCRIPT_VIEW_DEFAULT);
+
     writeWorkspacePanelDefault(WORKSPACE_PANEL_DEFAULT);
 
     writeHideUnconfiguredHarnesses(DEFAULT_HIDE_UNCONFIGURED_HARNESSES);
@@ -887,6 +937,7 @@ function AppearanceSection() {
           "omnigent:terminal-theme",
           "omnigent:ui-theme-palette",
           "omnigent:custom-theme",
+          "omnigent:default-transcript-view",
           "omnigent:default-workspace-panel",
           "omnigent:hide-unconfigured-harnesses",
         ]) {
@@ -928,6 +979,8 @@ function AppearanceSection() {
         <TerminalThemeControl />
 
         {!isEmbedded && <ColorThemeControl />}
+
+        <TranscriptViewDefaultControl />
 
         <WorkspacePanelDefaultControl />
 

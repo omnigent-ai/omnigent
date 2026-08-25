@@ -1003,3 +1003,93 @@ def test_start_hosts_on_explicit_server(
             "https://example.databricksapps.com",
         ]
     ]
+
+
+@pytest.mark.parametrize(
+    ("is_tty", "extra_args", "config_content", "expected_opened"),
+    [
+        pytest.param(True, [], None, ["http://127.0.0.1:8123"], id="interactive-opens"),
+        pytest.param(True, ["--non-interactive"], None, [], id="non-interactive-skips"),
+        pytest.param(False, [], None, [], id="no-tty-skips"),
+        pytest.param(
+            True, [], "auto_open_conversation: false\n", [], id="auto-open-disabled-skips"
+        ),
+    ],
+)
+def test_host_web_ui_open_gates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    is_tty: bool,
+    extra_args: list[str],
+    config_content: str | None,
+    expected_opened: list[str],
+) -> None:
+    """Open the host web UI only when interactive and enabled."""
+    if config_content is not None:
+        (tmp_path / "config.yaml").write_text(config_content)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr("omnigent.cli._stdin_is_tty", lambda: is_tty)
+    opened: list[str] = []
+
+    with (
+        patch(
+            "omnigent.cli.ensure_local_omnigent_server",
+            lambda: LocalServerStartup(url="http://127.0.0.1:8123", spawned=False),
+        ),
+        patch("omnigent.host.connect.run_host_process", lambda server_url, **kwargs: None),
+        patch(
+            "omnigent.conversation_browser.open_conversation_url",
+            lambda url: opened.append(url) or True,
+        ),
+    ):
+        result = CliRunner().invoke(cli, ["host", *extra_args])
+
+    assert result.exit_code == 0, result.output
+    assert opened == expected_opened
+
+
+def test_host_opens_remote_web_ui_when_interactive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Open the browser-facing URL for a remote workspace host."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr("omnigent.cli._stdin_is_tty", lambda: True)
+    opened: list[str] = []
+
+    with (
+        patch("omnigent.cli._ensure_databricks_server_auth"),
+        patch("omnigent.host.connect.run_host_process", lambda server_url, **kwargs: None),
+        patch(
+            "omnigent.conversation_browser.open_conversation_url",
+            lambda url: opened.append(url) or True,
+        ),
+    ):
+        result = CliRunner().invoke(
+            cli,
+            ["host", "--server", "https://example.databricks.com/api/2.0/omnigent"],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert opened == ["https://example.databricks.com/omnigent"]
+
+
+def test_start_opens_web_ui_when_interactive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Open the web UI after the background host registers."""
+    _patch_background_host_spawn(monkeypatch, tmp_path)
+    monkeypatch.setattr("omnigent.cli._stdin_is_tty", lambda: True)
+    opened: list[str] = []
+
+    with patch(
+        "omnigent.conversation_browser.open_conversation_url",
+        lambda url: opened.append(url) or True,
+    ):
+        result = CliRunner().invoke(cli, ["start"])
+
+    assert result.exit_code == 0, result.output
+    assert opened == ["http://127.0.0.1:6767"]

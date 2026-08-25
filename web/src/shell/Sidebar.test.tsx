@@ -6,13 +6,14 @@
 // are no longer listed here — they live on the Settings page.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useEffect } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
+import { clearSessionDrafts, setSessionDraft } from "@/lib/sessionDrafts";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 
 // Project mocks are declared via vi.hoisted so they exist before the hoisted
@@ -267,6 +268,7 @@ beforeEach(() => {
   useHostsMock.mockReset();
   useHostsMock.mockReturnValue({ data: [] });
   localStorage.clear();
+  clearSessionDrafts();
   projectsMock.length = 0;
   moveToProjectSpy.mockReset();
   deleteProjectSpy.mockReset();
@@ -320,6 +322,25 @@ describe("Sidebar session list", () => {
     expect(scroller.className).not.toContain("scrollbar-gutter");
   });
 
+  it("shows a draft icon only beside sessions with unfinished composer content", () => {
+    mockConversations([
+      conv("conv_draft", "Codex", { title: "Draft session" }),
+      conv("conv_empty", "Codex", { title: "Empty session" }),
+    ]);
+    renderSidebar();
+
+    const draftRow = screen.getByText("Draft session").closest("li")!;
+    const emptyRow = screen.getByText("Empty session").closest("li")!;
+    expect(within(draftRow).queryByTestId("conversation-draft-indicator")).toBeNull();
+
+    act(() => setSessionDraft("conv_draft", { text: "unfinished message", files: [] }));
+
+    const indicator = within(draftRow).getByTestId("conversation-draft-indicator");
+    expect(indicator).toHaveAccessibleName("Draft");
+    expect(indicator.parentElement).toHaveClass("absolute", "right-[4.5rem]", "md:right-1");
+    expect(within(emptyRow).queryByTestId("conversation-draft-indicator")).toBeNull();
+  });
+
   it("uses balanced title padding until row actions are revealed", () => {
     mockConversations([conv("conv_balanced", "Codex", { title: "Balanced row title" })]);
     renderSidebar();
@@ -362,6 +383,34 @@ describe("Sidebar session list", () => {
     // not react to — the mismatch that put the title under the selected row's
     // tag.
     expect(row.className).not.toContain("focus-within");
+  });
+
+  it("centers a row's dot marker in a size-6 slot at the right-1 edge", () => {
+    // The row dot and the collapsed-project dot share this geometry so they
+    // line up vertically; keep the row side pinned here.
+    mockConversations([
+      conv("conv_running", "Claude Code", { title: "Running row", status: "running" }),
+    ]);
+    renderSidebar();
+
+    const slot = screen.getByTestId("session-state-badge").parentElement!;
+    expect(slot).toHaveClass("md:right-1", "md:w-6", "md:justify-center");
+  });
+
+  it("does not constrain a row's awaiting pill to the dot slot", () => {
+    // The "Needs response" pill is wider than the dot markers; the size-6 box
+    // would clip its label, so the pill keeps its natural width.
+    mockConversations([
+      conv("conv_awaiting", "Claude Code", {
+        title: "Awaiting row",
+        pending_elicitations_count: 1,
+      }),
+    ]);
+    renderSidebar();
+
+    const slot = screen.getByTestId("session-state-badge").parentElement!;
+    expect(slot).toHaveClass("md:right-1");
+    expect(slot).not.toHaveClass("md:w-6");
   });
 
   it("offers the four display filters and defaults to My sessions", () => {
@@ -1745,6 +1794,47 @@ describe("Sidebar collapsed project marker", () => {
     const header = screen.getByRole("button", { name: /^Customer X/ });
     expect(within(header).queryByText("Needs response")).toBeNull();
   });
+
+  // A dot/spinner marker on a collapsed project must sit in the same size-6
+  // centered slot as a row's badge (pulled to the right-1 edge, offsetting the
+  // folder button's px-2), so the dots line up vertically down the sidebar
+  // instead of the folder dot drifting right of the rows above it.
+  it("aligns a collapsed-project dot marker with the row badge slot", () => {
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_running", "Claude Code", {
+        labels: { omni_project: "Customer X" },
+        status: "running",
+      }),
+    ]);
+    renderSidebar();
+
+    const slot = screen.getByTestId("session-state-badge").parentElement!;
+    // Fixed centered box so the dot centers on the same vertical line as the
+    // rows' dots.
+    expect(slot).toHaveClass("w-6", "justify-center");
+    // Folder headers use px-2, so on desktop the slot trims the trailing
+    // padding to the rows' right-1 (4px) edge. (The header also carries a
+    // kebab, so the mobile reserve is mr-14 and the -mr-1 is md-gated.)
+    expect(slot).toHaveClass("md:-mr-1");
+  });
+
+  // The "awaiting" pill is wider than the dot markers; constraining it to the
+  // size-6 box would clip its "Needs response" label, so it keeps its natural
+  // width.
+  it("does not constrain the collapsed-project awaiting pill to the dot slot", () => {
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_awaiting", "Claude Code", {
+        labels: { omni_project: "Customer X" },
+        pending_elicitations_count: 1,
+      }),
+    ]);
+    renderSidebar();
+
+    const slot = screen.getByTestId("session-state-badge").parentElement!;
+    expect(slot).not.toHaveClass("w-6");
+  });
 });
 
 // Every section is expanded by default, but a collapse the user makes
@@ -1953,6 +2043,18 @@ describe("Sidebar active-row auto-scroll", () => {
     expect(scrollIntoView).toHaveBeenCalledTimes(1);
     expect(scrollIntoView).toHaveBeenCalledWith({ behavior: "smooth", block: "center" });
 
+    vi.restoreAllMocks();
+  });
+
+  it("hides the draft indicator for the active conversation", () => {
+    vi.spyOn(Element.prototype, "scrollIntoView").mockImplementation(() => {});
+    mockConversations([conv("conv_active", "Claude Code", { title: "Active draft" })]);
+    setSessionDraft("conv_active", { text: "visible in the open composer", files: [] });
+
+    renderAtRoute("/c/conv_active");
+
+    const row = screen.getByText("Active draft").closest("li")!;
+    expect(within(row).queryByTestId("conversation-draft-indicator")).toBeNull();
     vi.restoreAllMocks();
   });
 

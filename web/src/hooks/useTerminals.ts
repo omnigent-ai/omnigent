@@ -73,6 +73,18 @@ export function isAgentTerminalKey(terminalKey: string): boolean {
 }
 
 /**
+ * Find the session's agent terminal, excluding user-created shells.
+ *
+ * The Chat/Terminal view toggle must use this selector instead of the first
+ * terminal in the resource list. A user shell can be the only cached row
+ * briefly while the agent terminal is starting or reconciling; treating that
+ * shell as a fallback duplicates it in the main viewport.
+ */
+export function findAgentTerminal(terminals: TerminalInfo[]): TerminalInfo | null {
+  return terminals.find((terminal) => AGENT_TERMINAL_IDS.has(terminal.id)) ?? null;
+}
+
+/**
  * Project the terminal list down to the session's *inventory* — the
  * shells shown as the rail's soft tabs and in the mobile Shells menu
  * entry / drawer.
@@ -100,7 +112,7 @@ interface UseTerminalsResult {
 
 /**
  * How often (ms) to re-poll the authoritative terminals endpoint while
- * the runner reports a terminal is spinning up but none is visible yet.
+ * the runner reports the agent terminal is spinning up but it is not visible.
  * Short enough that the Terminal-pill spinner clears within a couple
  * seconds of the terminal landing; only active during that window, so it
  * adds no steady-state polling.
@@ -111,37 +123,37 @@ export const PENDING_RECONCILE_INTERVAL_MS = 2500;
  * Decide the React Query ``refetchInterval`` for the terminals query.
  *
  * Returns :data:`PENDING_RECONCILE_INTERVAL_MS` only while the runner
- * reports a terminal is spinning up (*reconcileWhilePending*) and none is
- * visible yet; ``false`` (no polling) the instant a terminal lands or
- * pending clears. Reading *terminalCount* keeps the poll self-limiting to
- * the Terminal-pill spinner window — no steady-state polling.
+ * reports the agent terminal is spinning up (*reconcileWhilePending*) and it
+ * is not visible; ``false`` (no polling) the instant the agent terminal lands or
+ * pending clears. A user shell does not satisfy the pending agent-terminal
+ * launch and must not stop reconciliation.
  *
  * :param reconcileWhilePending: Whether the runner reports a terminal
  *     spinning up (``terminalPending``).
- * :param terminalCount: Terminals currently in the query cache.
+ * :param agentTerminalAvailable: Whether the agent terminal is in the cache.
  * :returns: Poll interval in ms, or ``false`` to disable polling.
  */
 export function terminalsReconcileInterval(
   reconcileWhilePending: boolean,
-  terminalCount: number,
+  agentTerminalAvailable: boolean,
 ): number | false {
-  return reconcileWhilePending && terminalCount === 0 ? PENDING_RECONCILE_INTERVAL_MS : false;
+  return reconcileWhilePending && !agentTerminalAvailable ? PENDING_RECONCILE_INTERVAL_MS : false;
 }
 
 interface UseTerminalsOptions {
   /**
-   * When ``true`` (the runner is auto-creating a terminal — see
+   * When ``true`` (the runner is auto-creating the agent terminal — see
    * ``terminalPending``), poll :func:`fetchTerminals` every
-   * :data:`PENDING_RECONCILE_INTERVAL_MS` until a terminal appears.
+   * :data:`PENDING_RECONCILE_INTERVAL_MS` until the agent terminal appears.
    *
    * The query is otherwise fetch-once + live-SSE-delta driven. A single
    * missed ``session.resource.created`` delta (e.g. dropped through the
    * dbx-apps proxy before the SSE subscription opened, with the server's
    * best-effort snapshot-on-connect reconcile also timing out) would
-   * otherwise leave ``terminals`` empty — stranding the Terminal-pill
+   * otherwise leave the agent terminal absent — stranding the Terminal-pill
    * spinner on ``terminalPending && !terminalsAvailable`` until a manual
    * page refresh. This bounded reconcile poll self-heals that exact
-   * window: it stops the instant a terminal lands (or pending clears).
+   * window: it stops the instant the agent terminal lands (or pending clears).
    */
   reconcileWhilePending?: boolean;
 }
@@ -393,11 +405,13 @@ export function useTerminals(
     // initial load without hammering an unreachable runner.
     retry: 1,
     // Self-heal a missed ``session.resource.created`` while a terminal is
-    // spinning up: poll the authoritative endpoint until one appears, then
-    // stop. Reads the query's own cached data for the stop condition so it
-    // never feeds back through the caller.
+    // spinning up: poll the authoritative endpoint until the agent pane
+    // appears, then stop. User shells are unrelated and do not satisfy it.
     refetchInterval: (query) =>
-      terminalsReconcileInterval(reconcileWhilePending, query.state.data?.length ?? 0),
+      terminalsReconcileInterval(
+        reconcileWhilePending,
+        findAgentTerminal(query.state.data ?? []) !== null,
+      ),
   });
   // The poll corrects the SSE-driven list ONLY on runner-liveness edges — it
   // never masks continuously. Two corrections, both keyed off the edge so a

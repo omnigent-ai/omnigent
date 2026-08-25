@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -9,6 +10,7 @@ import re
 import secrets
 import sys
 import tempfile
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,6 +21,7 @@ CODEX_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_CODEX_NATIVE_BRIDGE_DIR"
 CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR = "HARNESS_CODEX_NATIVE_REQUEST_SESSION_ID"
 
 _STATE_FILE = "state.json"
+_STATE_LOCK_FILE = "state.lock"
 _STARTUP_ERROR_FILE = "startup_error.json"
 # Per-MCP-server startup state mirrored from Codex's
 # ``mcpServer/startupStatus/updated`` notifications. Written by the
@@ -422,9 +425,37 @@ def write_codex_config_model(bridge_dir: Path, model: str) -> bool:
     return True
 
 
-def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
+@contextlib.contextmanager
+def _bridge_state_lock(bridge_dir: Path) -> Iterator[None]:
     """
-    Persist shared native Codex state atomically.
+    Serialize bridge-state read/modify/write cycles across local processes.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: Context manager holding the bridge's process lock.
+    """
+    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - native Codex is POSIX-only today.
+        yield
+        return
+    fd = os.open(
+        bridge_dir / _STATE_LOCK_FILE,
+        os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0),
+        0o600,
+    )
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _write_bridge_state_unlocked(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
+    """
+    Atomically replace bridge state while the caller holds its state lock.
 
     :param bridge_dir: Native Codex bridge directory.
     :param state: State payload to persist.
@@ -454,6 +485,18 @@ def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
             os.unlink(tmp_name)
 
 
+def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
+    """
+    Persist shared native Codex state atomically under a process lock.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :param state: State payload to persist.
+    :returns: None.
+    """
+    with _bridge_state_lock(bridge_dir):
+        _write_bridge_state_unlocked(bridge_dir, state)
+
+
 def clear_bridge_state(bridge_dir: Path) -> None:
     """
     Remove stale native Codex runtime state for a bridge directory.
@@ -468,15 +511,16 @@ def clear_bridge_state(bridge_dir: Path) -> None:
     :param bridge_dir: Native Codex bridge directory.
     :returns: None.
     """
-    for name in (
-        _STATE_FILE,
-        _STARTUP_ERROR_FILE,
-        _MCP_STARTUP_FILE,
-    ):
-        try:
-            (bridge_dir / name).unlink()
-        except FileNotFoundError:
-            continue
+    with _bridge_state_lock(bridge_dir):
+        for name in (
+            _STATE_FILE,
+            _STARTUP_ERROR_FILE,
+            _MCP_STARTUP_FILE,
+        ):
+            try:
+                (bridge_dir / name).unlink()
+            except FileNotFoundError:
+                continue
 
 
 def write_bridge_startup_error(bridge_dir: Path, message: str) -> None:
@@ -738,20 +782,21 @@ def update_active_turn_id(bridge_dir: Path, active_turn_id: str | None) -> None:
         or ``None`` when no turn is running.
     :returns: None.
     """
-    state = read_bridge_state(bridge_dir)
-    if state is None:
-        return
-    write_bridge_state(
-        bridge_dir,
-        CodexNativeBridgeState(
-            session_id=state.session_id,
-            socket_path=state.socket_path,
-            thread_id=state.thread_id,
-            codex_home=state.codex_home,
-            active_turn_id=active_turn_id,
-            cwd=state.cwd,
-        ),
-    )
+    with _bridge_state_lock(bridge_dir):
+        state = read_bridge_state(bridge_dir)
+        if state is None:
+            return
+        _write_bridge_state_unlocked(
+            bridge_dir,
+            CodexNativeBridgeState(
+                session_id=state.session_id,
+                socket_path=state.socket_path,
+                thread_id=state.thread_id,
+                codex_home=state.codex_home,
+                active_turn_id=active_turn_id,
+                cwd=state.cwd,
+            ),
+        )
 
 
 def update_thread_id(bridge_dir: Path, thread_id: str, active_turn_id: str | None = None) -> None:
@@ -767,20 +812,21 @@ def update_thread_id(bridge_dir: Path, thread_id: str, active_turn_id: str | Non
         ``"turn_abc123"``, or ``None`` when no turn is running yet.
     :returns: None.
     """
-    state = read_bridge_state(bridge_dir)
-    if state is None:
-        return
-    write_bridge_state(
-        bridge_dir,
-        CodexNativeBridgeState(
-            session_id=state.session_id,
-            socket_path=state.socket_path,
-            thread_id=thread_id,
-            codex_home=state.codex_home,
-            active_turn_id=active_turn_id,
-            cwd=state.cwd,
-        ),
-    )
+    with _bridge_state_lock(bridge_dir):
+        state = read_bridge_state(bridge_dir)
+        if state is None:
+            return
+        _write_bridge_state_unlocked(
+            bridge_dir,
+            CodexNativeBridgeState(
+                session_id=state.session_id,
+                socket_path=state.socket_path,
+                thread_id=thread_id,
+                codex_home=state.codex_home,
+                active_turn_id=active_turn_id,
+                cwd=state.cwd,
+            ),
+        )
 
 
 def clear_active_turn_id_if_matches(bridge_dir: Path, completed_turn_id: str | None) -> bool:
@@ -807,24 +853,25 @@ def clear_active_turn_id_if_matches(bridge_dir: Path, completed_turn_id: str | N
     :returns: ``True`` when bridge state was cleared or did not exist,
         ``False`` when a stale or ambiguous terminal event was ignored.
     """
-    state = read_bridge_state(bridge_dir)
-    if state is None:
-        return True
-    if completed_turn_id is None:
-        # No-id terminal mid-turn is ambiguous — ignore (clearing posts a premature idle).
-        if state.active_turn_id is not None:
+    with _bridge_state_lock(bridge_dir):
+        state = read_bridge_state(bridge_dir)
+        if state is None:
+            return True
+        if completed_turn_id is None:
+            # No-id terminal mid-turn is ambiguous — ignore (clearing posts a premature idle).
+            if state.active_turn_id is not None:
+                return False
+        elif state.active_turn_id != completed_turn_id:
             return False
-    elif state.active_turn_id != completed_turn_id:
-        return False
-    write_bridge_state(
-        bridge_dir,
-        CodexNativeBridgeState(
-            session_id=state.session_id,
-            socket_path=state.socket_path,
-            thread_id=state.thread_id,
-            codex_home=state.codex_home,
-            active_turn_id=None,
-            cwd=state.cwd,
-        ),
-    )
-    return True
+        _write_bridge_state_unlocked(
+            bridge_dir,
+            CodexNativeBridgeState(
+                session_id=state.session_id,
+                socket_path=state.socket_path,
+                thread_id=state.thread_id,
+                codex_home=state.codex_home,
+                active_turn_id=None,
+                cwd=state.cwd,
+            ),
+        )
+        return True

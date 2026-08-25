@@ -17,11 +17,10 @@ Security model
 - Every handshake must present the per-process bearer token
   (``?token=``, high-entropy, held only in runner memory, the tunnel
   hello, and the owner-gated terminals API response).
-- Browser handshakes must carry an allow-listed ``Origin`` (the
-  server origin the runner is tunneled to); requests without an
-  ``Origin`` header (curl, native tools) pass on the token alone.
-  This blocks DNS-rebinding-style pages, which present a foreign
-  origin, from driving the port even if a token ever leaked.
+- Browser handshakes must carry the server origin or an HTTP(S)
+  loopback origin used by a same-machine development UI; requests
+  without an ``Origin`` header (curl, native tools) pass on the token
+  alone. Foreign origins stay blocked even if a token ever leaked.
 - Authorization-wise the token equals owner-level write attach: the
   server discloses it only to callers who hold ``LEVEL_OWNER`` on the
   session, mirroring the relay's write-attach gate.
@@ -38,6 +37,7 @@ import asyncio
 import logging
 import secrets
 from collections.abc import Awaitable, Callable
+from ipaddress import ip_address
 from typing import Final
 from urllib.parse import urlsplit
 
@@ -93,6 +93,24 @@ def allowed_origin_for_server(server_url: str) -> str | None:
     return f"{parts.scheme}://{host}"
 
 
+def _origin_hostname_is_loopback(origin: str) -> bool:
+    """Return whether *origin* is an HTTP(S) loopback page origin."""
+    try:
+        parts = urlsplit(origin)
+    except ValueError:
+        return False
+    if parts.scheme not in ("http", "https") or parts.hostname is None:
+        return False
+    if parts.hostname == "localhost":
+        return True
+    try:
+        address = ip_address(parts.hostname)
+    except ValueError:
+        return False
+    mapped_ipv4 = getattr(address, "ipv4_mapped", None)
+    return address.is_loopback or (mapped_ipv4 is not None and mapped_ipv4.is_loopback)
+
+
 def _handshake_authorized(
     websocket: WebSocket,
     *,
@@ -118,7 +136,7 @@ def _handshake_authorized(
     if origin is None:
         # Non-browser client (no Origin header); the token is the gate.
         return True
-    return origin in allowed_origins
+    return origin in allowed_origins or _origin_hostname_is_loopback(origin)
 
 
 def create_direct_attach_app(

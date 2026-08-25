@@ -338,6 +338,7 @@ from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
     ConversationNotFoundError,
+    NameAlreadyExistsError,
     pinned_label_key,
 )
 from omnigent.stores.file_store import FileStore
@@ -2201,30 +2202,41 @@ async def _persist_skipped_kiro_pending_input(
     _publish_external_conversation_item(session_id, persisted_items[1])
 
 
-async def _enrich_idle_status_with_subagent_output(
+async def _enrich_terminal_status_with_subagent_output(
     data: dict[str, Any],
     status: str,
     session_id: str,
     conversation_store: ConversationStore,
 ) -> dict[str, Any]:
     """
-    Attach a native sub-agent's durable assistant text to an idle status edge.
+    Attach a native session's durable assistant text to a terminal status edge.
 
-    Shared by both native sub-agent delivery paths (the codex
-    ``external_session_status`` POST handler and the claude-native relay
-    forward) so the parent inbox result carries the child's output. Native
-    harnesses mirror transcript items to the store, not runner memory, so the
-    text is read here and forwarded with the idle edge.
+    Shared by both native delivery paths (the codex ``external_session_status``
+    POST handler and the claude-native relay forward) so the parent inbox
+    result carries the child's output. Native harnesses mirror transcript items
+    to the store, not runner memory, so the text is read here and forwarded
+    with the terminal edge.
+
+    A ``failed`` edge is filled only when the forwarder attached no detail of
+    its own. On a failed turn the latest assistant message is the harness's own
+    error report (e.g. Claude's "There's an issue with the selected model
+    (…)"), which otherwise reaches only the child's transcript while the
+    parent inbox falls back to the generic "Error: native sub-agent turn
+    failed" and the session's ``last_task_error`` stays empty.
 
     :param data: The ``external_session_status`` ``data`` to enrich, e.g.
         ``{"status": "idle"}``.
-    :param status: Status edge; only ``"idle"`` is enriched.
+    :param status: Status edge; only the terminal ``"idle"`` / ``"failed"``
+        edges are enriched.
     :param session_id: Sub-agent session id, e.g. ``"conv_child123"``.
     :param conversation_store: Store read for the child's assistant text.
-    :returns: ``data`` with ``"output"`` added when an idle edge has a
+    :returns: ``data`` with ``"output"`` added when a terminal edge has a
         persisted assistant message; otherwise unchanged.
     """
-    if status != "idle":
+    if status not in ("idle", "failed"):
+        return data
+    existing = data.get("output")
+    if status == "failed" and isinstance(existing, str) and existing.strip():
         return data
     output = await asyncio.to_thread(
         _latest_assistant_text_from_store,
@@ -8135,6 +8147,21 @@ async def _create_session_from_existing_agent(
             git_branch=git_branch,
             terminal_launch_args=validated_launch_args,
         )
+    except NameAlreadyExistsError as exc:
+        if (
+            created_worktree_path is not None
+            and body.host_id is not None
+            and git_branch is not None
+        ):
+            await _remove_session_worktree_best_effort(
+                host_id=body.host_id,
+                worktree_path=created_worktree_path,
+                branch=git_branch,
+                delete_branch=True,
+                request=request,
+                reason="create-rollback",
+            )
+        raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
     except Exception:
         # Broad catch is intentional: ANY create_conversation failure
         # (integrity error, name clash, ...) must trigger orphan-worktree
@@ -9437,7 +9464,7 @@ __all__ = [
     "_detached_stop_tasks",
     "_dispatch_session_event_to_runner",
     "_drive_terminal_resolved_elicitation",
-    "_enrich_idle_status_with_subagent_output",
+    "_enrich_terminal_status_with_subagent_output",
     "_ensure_native_terminal_ready",
     "_ensure_runner_relay",
     "_ensure_runner_relay_ready",
