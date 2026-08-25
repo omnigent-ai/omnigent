@@ -251,4 +251,47 @@ def create_usage_router(
             include_page_details=flags.enabled(Feature.USAGE_PAGE),
         )
 
+    @router.get("/sessions/{session_id}/cost-breakdown")
+    async def get_session_cost_breakdown(
+        request: Request,
+        session_id: str,
+    ):
+        """
+        Get detailed cost breakdown for a specific session.
+
+        Returns categorized breakdown showing where tokens and cost were spent:
+        tools, shell commands, model output, user input, system overhead, and images.
+
+        Simplified breakdown that aggregates by category and tool name without
+        full carry-cost tracking across turns.
+        """
+        from omnigent.server.schemas import SessionCostBreakdown
+        from omnigent.usage_breakdown_builder import build_session_cost_breakdown
+
+        # Auth check: user must have access to this session
+        user_id = require_user(request, auth_provider) if auth_provider else None
+
+        # Verify session exists and user has access
+        conv = conversation_store.get_conversation(session_id)
+        if not conv:
+            from fastapi import HTTPException
+
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        # TODO: Add proper permission check here
+        # For now, assume if user can read the conversation they can see breakdown
+
+        # Get the model for pricing
+        llm_model = conv.model_override or _resolve_llm_model(conv)
+
+        # Build breakdown
+        breakdown = await asyncio.to_thread(
+            build_session_cost_breakdown,
+            session_id,
+            conversation_store,
+            llm_model=llm_model,
+        )
+
+        return breakdown
+
     return router

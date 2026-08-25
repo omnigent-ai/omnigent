@@ -2605,6 +2605,65 @@ class DailyCost(BaseModel):
     cost_usd: float = 0.0
 
 
+class UsageEntry(BaseModel):
+    """Token and cost counters for a breakdown entry."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    cache_read_input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    total_cost_usd: float | None = None  # only present when priced
+
+
+class CategoryBreakdownItem(BaseModel):
+    """One item within a category (e.g., a specific tool, command, etc.)."""
+
+    name: str
+    usage: UsageEntry
+
+
+class CategoryBreakdown(BaseModel):
+    """Breakdown for one category with per-item details."""
+
+    total: UsageEntry
+    items: list[CategoryBreakdownItem] = Field(default_factory=list)
+
+
+class SessionCostBreakdown(BaseModel):
+    """
+    Detailed cost breakdown for a session showing where tokens/cost were spent.
+
+    Simplified breakdown aggregating by category (tools, shell, model, system, user)
+    and individual items within each category. Does not implement full "carry cost"
+    tracking across turns, but provides clear attribution.
+
+    :param session_id: Session identifier, e.g. ``"conv_abc123"``.
+    :param total_cost_usd: Total session cost (matches session_usage.total_cost_usd).
+    :param total_tokens: Total tokens consumed.
+    :param tools: Breakdown for tool calls (Read, Edit, Bash, etc.).
+    :param shell: Breakdown for shell/bash commands.
+    :param model: Breakdown for model output (assistant messages).
+    :param system: Breakdown for system prompts, schemas, harness overhead.
+    :param user: Breakdown for user input messages.
+    :param images: Breakdown for images and attachments.
+    """
+
+    session_id: str
+    total_cost_usd: float = 0.0
+    total_tokens: int = 0
+    tools: CategoryBreakdown = Field(default_factory=lambda: CategoryBreakdown(total=UsageEntry()))
+    shell: CategoryBreakdown = Field(default_factory=lambda: CategoryBreakdown(total=UsageEntry()))
+    model: CategoryBreakdown = Field(default_factory=lambda: CategoryBreakdown(total=UsageEntry()))
+    system: CategoryBreakdown = Field(
+        default_factory=lambda: CategoryBreakdown(total=UsageEntry())
+    )
+    user: CategoryBreakdown = Field(default_factory=lambda: CategoryBreakdown(total=UsageEntry()))
+    images: CategoryBreakdown = Field(
+        default_factory=lambda: CategoryBreakdown(total=UsageEntry())
+    )
+
+
 class UsageReport(BaseModel):
     """
     Aggregated LLM usage for the calling user, powering ``omni usage``.
