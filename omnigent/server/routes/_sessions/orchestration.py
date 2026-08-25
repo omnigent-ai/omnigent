@@ -6190,47 +6190,50 @@ async def _relay_runner_stream_once(
                                 ),
                             )
                         )
-                        # Push the server-computed cost AND token breakdown
-                        # to the web client's session indicator, rolled up
-                        # over the spawn subtree. The session's own event
-                        # carries its SUBTREE total (this conversation + its
-                        # sub-agents), and each ancestor gets its own subtree
-                        # total on its own stream — so a supervisor's badge
-                        # includes its sub-agents and a parent updates live
-                        # when a relay sub-agent spends. Mirrors the native
-                        # path (_persist_external_session_usage); the roll-up
-                        # was wired for native only, but relay agents (e.g.
-                        # claude-sdk) need it too. Cost is included only when
-                        # priced; the token breakdown rides along whenever any
-                        # bucket is recorded (so an unpriced session still
-                        # surfaces tokens). context_tokens/window already ride
-                        # on the response.completed event. Threaded: store
-                        # reads + SSE fan-out.
-                        _subtree_usage = await asyncio.to_thread(
-                            load_session_usage,
-                            session_id,
-                            conversation_store,
-                        )
-                        _subtree_cost = _priced_cost_for_display(_subtree_usage)
-                        _usage_by_model = _usage_by_model_for_display(_subtree_usage)
-                        if _subtree_cost is not None or _usage_by_model is not None:
-                            _usage_payload: dict[str, Any] = {
-                                "type": "session.usage",
-                                "conversation_id": session_id,
-                            }
-                            if _subtree_cost is not None:
-                                _usage_payload["total_cost_usd"] = _subtree_cost
-                            if _usage_by_model is not None:
-                                _usage_payload["usage_by_model"] = _usage_by_model
-                            session_stream.publish(
+                        if evt_type == "response.completed":
+                            # Push the server-computed cost AND token breakdown
+                            # to the web client's session indicator, rolled up
+                            # over the spawn subtree. The session's own event
+                            # carries its SUBTREE total (this conversation + its
+                            # sub-agents), and each ancestor gets its own subtree
+                            # total on its own stream — so a supervisor's badge
+                            # includes its sub-agents and a parent updates live
+                            # when a relay sub-agent spends. Mirrors the native
+                            # path (_persist_external_session_usage); the roll-up
+                            # was wired for native only, but relay agents (e.g.
+                            # claude-sdk) need it too. Cost is included only when
+                            # priced; the token breakdown rides along whenever any
+                            # bucket is recorded (so an unpriced session still
+                            # surfaces tokens). context_tokens/window already ride
+                            # on the response.completed event. Threaded: store
+                            # reads + SSE fan-out.
+                            _subtree_usage = await asyncio.to_thread(
+                                load_session_usage,
                                 session_id,
-                                SessionUsageEvent(**_usage_payload).model_dump(exclude_none=True),
-                            )
-                            await asyncio.to_thread(
-                                _publish_subtree_cost_to_ancestors,
                                 conversation_store,
-                                session_id,
                             )
+                            _subtree_cost = _priced_cost_for_display(_subtree_usage)
+                            _usage_by_model = _usage_by_model_for_display(_subtree_usage)
+                            if _subtree_cost is not None or _usage_by_model is not None:
+                                _usage_payload: dict[str, Any] = {
+                                    "type": "session.usage",
+                                    "conversation_id": session_id,
+                                }
+                                if _subtree_cost is not None:
+                                    _usage_payload["total_cost_usd"] = _subtree_cost
+                                if _usage_by_model is not None:
+                                    _usage_payload["usage_by_model"] = _usage_by_model
+                                session_stream.publish(
+                                    session_id,
+                                    SessionUsageEvent(**_usage_payload).model_dump(
+                                        exclude_none=True
+                                    ),
+                                )
+                                await asyncio.to_thread(
+                                    _publish_subtree_cost_to_ancestors,
+                                    conversation_store,
+                                    session_id,
+                                )
 
                     # Reset the turn-scoped response_id on any
                     # terminal event so it doesn't leak to the
