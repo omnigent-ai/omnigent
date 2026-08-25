@@ -7850,6 +7850,89 @@ async def test_spawn_async_tool_phase_tool_call_policy_allow(
     assert item["output"] == "ok"
 
 
+@pytest.mark.asyncio
+async def test_web_fetch_dispatch_admits_researcher_without_harness_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """web_fetch's synthesized ``__web_researcher`` passes the dispatch gate,
+    and the child create carries no ``harness_override`` / ``model_override``
+    (#2426).
+
+    The runner never persists ``__web_researcher``, so before the gate/lookup
+    reconciliation the dispatch aborted with "sub-agent '__web_researcher' not
+    found in agent spec". After it, the gate admits the researcher AND the
+    create body is unchanged: ``harness_override`` stays absent (it comes only
+    from an explicit ``args.harness``, never set on the web_fetch path), so the
+    server-side reconstruction that resolves the researcher spec remains
+    authoritative. This locks down that the fix reconciled the local resolvers
+    without altering what is POSTed to ``/v1/sessions``.
+    """
+    import shutil
+
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+    from omnigent.spec.types import BuiltinToolConfig, LLMConfig, ToolsConfig
+    from omnigent.tools.builtins.web_fetch import RESEARCHER_NAME
+
+    # Hermetic bwrap probe: ``build_researcher_spec`` probes PATH for a
+    # no-``os_env`` parent; don't depend on bubblewrap on the test host.
+    monkeypatch.setattr(shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+
+    parent = AgentSpec(
+        spec_version=1,
+        name="coordinator",
+        llm=LLMConfig(model="openai/gpt-5.4"),
+        executor=ExecutorSpec(max_iterations=40, config={"harness": "claude-sdk"}),
+        tools=ToolsConfig(builtins=[BuiltinToolConfig(name="web_fetch")]),
+    )
+    # Precondition: the re-parsed bundle does not carry the researcher.
+    assert RESEARCHER_NAME not in [s.name for s in parent.sub_agents]
+
+    create_bodies: list[dict[str, Any]] = []
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_wf_parent/child_sessions"
+        ):
+            return httpx.Response(200, json={"data": []})
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_bodies.append(json.loads(request.content))
+            return httpx.Response(201, json={"id": "conv_wf_child"})
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_wf_child/events":
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="web_fetch",
+                arguments=json.dumps({"query": "latest score"}),
+                server_client=server_client,
+                conversation_id="conv_wf_parent",
+                agent_spec=parent,
+                task_id="t1",
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_wf_child")
+            runner_app._session_inboxes_ref.pop("conv_wf_parent", None)
+
+    # The gate admitted the researcher -- no "not found in agent spec" error.
+    assert "not found in agent spec" not in output
+    assert len(create_bodies) == 1, "web_fetch must create exactly one researcher child"
+    body = create_bodies[0]
+    assert body["sub_agent_name"] == RESEARCHER_NAME
+    # Acceptance C: server-side reconstruction stays authoritative.
+    assert "harness_override" not in body
+    assert "model_override" not in body
+
+
 # ── cross-process lifecycle desync recovery ── ──────────────────────────
 
 

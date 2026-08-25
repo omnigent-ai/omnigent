@@ -177,6 +177,7 @@ async def post_external_session_status(
     status: str,
     output: str | None = None,
     background_task_count: int | None = None,
+    background_tasks: list[dict[str, object]] | None = None,
     response_id: str | None = None,
 ) -> None:
     """Post one ``external_session_status`` event to the Sessions API.
@@ -195,6 +196,11 @@ async def post_external_session_status(
         edge, forwarded so the UI can show "N background tasks still running".
         ``None`` omits the field (server leaves its sticky tally untouched) — the
         default for edges that know nothing about background shells.
+    :param background_tasks: Per-shell detail backing that count (each a dict of
+        ``id``/``type``/``status``/``description``/``command``), forwarded so the
+        UI can name the individual shells. ``None`` omits the field — the default
+        for edges with no detail; sent alongside a positive count by the
+        claude-native ``Stop`` hook.
     :param response_id: Optional id of the assistant turn this status edge
         belongs to. When set, the server attaches it to the ``session.status``
         SSE event so ap-web can drive the bubble's streaming lifecycle — that's
@@ -209,6 +215,8 @@ async def post_external_session_status(
         data["output"] = output
     if background_task_count is not None:
         data["background_task_count"] = background_task_count
+    if background_tasks is not None:
+        data["background_tasks"] = background_tasks
     if response_id is not None:
         data["response_id"] = response_id
     resp = await client.post(

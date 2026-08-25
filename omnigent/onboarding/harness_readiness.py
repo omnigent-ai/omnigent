@@ -57,6 +57,7 @@ from omnigent.onboarding.harness_install import (
 from omnigent.onboarding.provider_config import (
     _EXECUTOR_TYPE_HARNESS_ALIASES,
     _HARNESS_FAMILY,
+    ANTHROPIC_FAMILY,
     GEMINI_FAMILY,
     OPENAI_FAMILY,
     PI_SURFACE,
@@ -83,16 +84,17 @@ _SDK_HARNESSES: frozenset[str] = frozenset(
 # than a CLI login-status command. For these, ``harness_is_configured`` checks
 # BOTH the binary (via ``harness_cli_installed``) AND the credential (via the
 # callable here). ``agy`` writes an OAuth token on its first interactive run;
-# ``kimi login`` writes ``~/.kimi-code/credentials/kimi-code.json`` (kimi has no
-# login-status probe). The ``anthropic`` / ``openai`` families authenticate via
-# subscription provider config and do not appear here. Each lambda resolves
-# through its module at call time so a test can monkeypatch
-# ``…gemini_auth.gemini_login_detected`` / ``…kimi_auth.kimi_login_detected``
-# and have the patch take effect without this dict caching the old function
-# object.
+# ``kimi login`` writes ``~/.kimi-code/credentials/kimi-code.json``, and
+# pay-per-use users instead set an API key in ``~/.kimi-code/config.toml`` (kimi
+# has no login-status probe) — ``kimi_auth_configured`` accepts either. The
+# ``anthropic`` / ``openai`` families authenticate via subscription provider
+# config and do not appear here. Each lambda resolves through its module at call
+# time so a test can monkeypatch ``…gemini_auth.gemini_login_detected`` /
+# ``…kimi_auth.kimi_auth_configured`` and have the patch take effect without
+# this dict caching the old function object.
 _FAMILY_CREDENTIAL_CHECK: dict[str, Callable[[], bool]] = {
     GEMINI_FAMILY: lambda: _gemini_auth.gemini_login_detected(),
-    KIMI_KEY: lambda: _kimi_auth.kimi_login_detected(),
+    KIMI_KEY: lambda: _kimi_auth.kimi_auth_configured(),
 }
 
 # CLI-wrapping pi harnesses. Both the bare ``pi`` surface and the native
@@ -358,6 +360,32 @@ def _family_provider_configured(harness: str) -> bool:
     return provider is not None and provider.kind != SUBSCRIPTION_KIND
 
 
+def _claude_managed_gateway_configured() -> bool:
+    """Whether Claude Code's own settings chain carries a usable credential.
+
+    The structural companion to :func:`_family_provider_configured` (which sees
+    only omnigent's ``providers:`` config). An enterprise install configures
+    Claude Code directly — a gateway ``ANTHROPIC_BASE_URL`` + ``apiKeyHelper`` in
+    its managed settings — and Claude Code applies that at its own launch, so
+    the harness is genuinely usable with nothing in ``config.yaml`` and no CLI
+    subscription login. Crediting it here is what stops an enterprise host from
+    reading "needs-auth" (the "Claude Code isn't configured on <host>" banner).
+
+    Local, synchronous, side-effect free (one JSON file read) and never raises:
+    any error fails to ``False`` so readiness falls through to the CLI status
+    probe rather than crashing the refresh.
+
+    :returns: ``True`` when Claude Code's managed settings deliver a credential.
+    """
+    try:
+        from omnigent.onboarding.ambient import claude_managed_gateway
+
+        return claude_managed_gateway()[1]
+    except Exception:
+        _logger.debug("readiness: claude managed-settings check failed", exc_info=True)
+        return False
+
+
 def _installer_only_availability(install_key: str) -> HarnessAvailability:
     """Return availability for a binary-gated harness without login commands.
 
@@ -412,6 +440,14 @@ def _cli_family_availability(canonical: str, install_key: str) -> HarnessAvailab
     from omnigent.onboarding.harness_install import harness_cli_logged_in
 
     if _family_provider_configured(canonical):
+        return True
+    # Claude Code's own managed settings can carry a complete gateway credential
+    # (enterprise ``ANTHROPIC_BASE_URL`` + ``apiKeyHelper``) that omnigent's
+    # config knows nothing about, and that is what a claude-native launch
+    # actually routes through. Credit it structurally (one local file read, no
+    # subprocess) before the status probe, so an enterprise host reads ready
+    # without depending on the probe resolving the CLI on PATH.
+    if install_key == ANTHROPIC_FAMILY and _claude_managed_gateway_configured():
         return True
     return (
         True

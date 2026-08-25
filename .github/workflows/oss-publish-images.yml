@@ -1,6 +1,8 @@
-# Builds + pushes two images to GHCR via GITHUB_TOKEN: the server image
-# (ghcr.io/omnigent-ai/omnigent-server, referenced by every deploy template)
-# and the host image (the `host` target of the same Dockerfile,
+# Builds + pushes server image variants and the host image to GHCR via
+# GITHUB_TOKEN. The base server image
+# (ghcr.io/omnigent-ai/omnigent-server) is referenced by every deploy template,
+# while provider variants include their optional SDK. The host image (the
+# `host` target of the same Dockerfile,
 # ghcr.io/omnigent-ai/omnigent-host — default for `sandbox create --provider
 # modal` and server-launched managed hosts). Dockerfile ARGs default to public
 # registries, so no build-args needed.
@@ -69,9 +71,9 @@ jobs:
     runs-on: ubuntu-latest
     # Multi-arch: the linux/arm64 leg cross-builds under QEMU emulation on this
     # amd64 runner, which roughly doubles the host-image build time (emulated
-    # npm/pip native steps). A cold-cache four-variant (server+host × amd64+
-    # arm64) build can exceed 60m, and hitting the timeout loses the release's
-    # images silently — give it real headroom.
+    # npm/pip native steps). Cold-cache server, host, and provider image builds
+    # can exceed 60m, and hitting the timeout loses the release's images
+    # silently — give them real headroom.
     timeout-minutes: 120
     steps:
       - name: Checkout
@@ -115,6 +117,7 @@ jobs:
           HOST_IMAGE="ghcr.io/omnigent-ai/omnigent-host"
           OPENSHELL_IMAGE="ghcr.io/omnigent-ai/omnigent-server-openshell"
           KUBERNETES_IMAGE="ghcr.io/omnigent-ai/omnigent-server-kubernetes"
+          MODAL_IMAGE="ghcr.io/omnigent-ai/omnigent-server-modal"
           SHORT_SHA=$(git rev-parse --short HEAD)
 
           # Immutable per-commit pin, always.
@@ -122,6 +125,7 @@ jobs:
           HOST_TAGS="${HOST_IMAGE}:sha-${SHORT_SHA}"
           OPENSHELL_TAGS="${OPENSHELL_IMAGE}:sha-${SHORT_SHA}"
           KUBERNETES_TAGS="${KUBERNETES_IMAGE}:sha-${SHORT_SHA}"
+          MODAL_TAGS="${MODAL_IMAGE}:sha-${SHORT_SHA}"
 
           # Append a floating/version tag to all images.
           add_tag() {
@@ -129,6 +133,7 @@ jobs:
             HOST_TAGS="${HOST_TAGS},${HOST_IMAGE}:$1"
             OPENSHELL_TAGS="${OPENSHELL_TAGS},${OPENSHELL_IMAGE}:$1"
             KUBERNETES_TAGS="${KUBERNETES_TAGS},${KUBERNETES_IMAGE}:$1"
+            MODAL_TAGS="${MODAL_TAGS},${MODAL_IMAGE}:$1"
           }
 
           # The nightly rebuild of main moves :latest-nightly (bleeding edge).
@@ -169,6 +174,7 @@ jobs:
           echo "host_tags=${HOST_TAGS}" >> "$GITHUB_OUTPUT"
           echo "openshell_tags=${OPENSHELL_TAGS}" >> "$GITHUB_OUTPUT"
           echo "kubernetes_tags=${KUBERNETES_TAGS}" >> "$GITHUB_OUTPUT"
+          echo "modal_tags=${MODAL_TAGS}" >> "$GITHUB_OUTPUT"
 
       # No build-args: the Dockerfile ARGs default to public registries.
       # Multi-arch: each tag publishes as a manifest list spanning amd64 + arm64,
@@ -249,11 +255,32 @@ jobs:
           cache-to: type=gha,mode=max
           provenance: false
           sbom: true
+
+      # Modal server variant: the default server image plus the modal SDK
+      # extra (OMNIGENT_EXTRAS=modal), so a server running outside Modal can
+      # provision managed Modal sandboxes. Reuses the shared builder-stage
+      # layers from the gha cache.
+      - name: Build and push modal server image
+        id: build-modal
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.tags.outputs.modal_tags }}
+          build-args: |
+            OMNIGENT_EXTRAS=modal
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          sbom: true
     outputs:
       server-digest: ${{ steps.build-server.outputs.digest }}
       host-digest: ${{ steps.build-host.outputs.digest }}
       openshell-digest: ${{ steps.build-openshell.outputs.digest }}
       kubernetes-digest: ${{ steps.build-kubernetes.outputs.digest }}
+      modal-digest: ${{ steps.build-modal.outputs.digest }}
 
   generate-sbom:
     # Runs in a separate job with read-only permissions so the Syft
@@ -304,6 +331,13 @@ jobs:
             -o cyclonedx-json=kubernetes-sbom.cdx.json \
             -o spdx-json=kubernetes-sbom.spdx.json
 
+      - name: Generate modal server SBOM
+        run: |
+          set -euo pipefail
+          syft "ghcr.io/omnigent-ai/omnigent-server-modal@${{ needs.build-and-push.outputs.modal-digest }}" \
+            -o cyclonedx-json=modal-sbom.cdx.json \
+            -o spdx-json=modal-sbom.spdx.json
+
       - name: Upload SBOMs
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
@@ -317,6 +351,8 @@ jobs:
             openshell-sbom.spdx.json
             kubernetes-sbom.cdx.json
             kubernetes-sbom.spdx.json
+            modal-sbom.cdx.json
+            modal-sbom.spdx.json
           retention-days: 90
 
   reconcile-floating:
@@ -381,7 +417,7 @@ jobs:
             fi
           }
 
-          for img in ghcr.io/omnigent-ai/omnigent-server ghcr.io/omnigent-ai/omnigent-host ghcr.io/omnigent-ai/omnigent-server-openshell ghcr.io/omnigent-ai/omnigent-server-kubernetes; do
+          for img in ghcr.io/omnigent-ai/omnigent-server ghcr.io/omnigent-ai/omnigent-host ghcr.io/omnigent-ai/omnigent-server-openshell ghcr.io/omnigent-ai/omnigent-server-kubernetes ghcr.io/omnigent-ai/omnigent-server-modal; do
             retag "${img}" "latest-rc" "${RC_TAG}"
             retag "${img}" "latest" "${LATEST_TAG}"
           done

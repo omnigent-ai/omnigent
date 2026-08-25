@@ -789,7 +789,7 @@ def test_foreground_connect_registers_status_record(
     monkeypatch.setattr(cli, "_ensure_databricks_server_auth", lambda server, **kw: None)
     observed: list[cli._HostDaemonRecord] = []
 
-    def _fake_run_host_process(server_url: str) -> None:
+    def _fake_run_host_process(server_url: str, **_kw: object) -> None:
         """Capture the foreground registry record during connect execution."""
         observed.extend(cli._list_daemon_records(include_legacy=False))
         assert server_url == "https://server.example.com"
@@ -825,7 +825,7 @@ def test_foreground_connect_refuses_duplicate_live_daemon(
         server_url="https://server.example.com",
     )
 
-    def _unexpected_run_host_process(server_url: str) -> None:
+    def _unexpected_run_host_process(server_url: str, **_kw: object) -> None:
         """Fail if duplicate detection lets the foreground daemon start."""
         raise AssertionError(f"unexpected foreground connect: {server_url}")
 
@@ -877,7 +877,9 @@ def test_foreground_connect_local_prompts_and_stops_server_on_yes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Answering yes at the exit prompt stops the detached local server."""
-    _patch_foreground_host_local(monkeypatch, tmp_path, run_host_process=lambda server_url: None)
+    _patch_foreground_host_local(
+        monkeypatch, tmp_path, run_host_process=lambda server_url, **_kw: None
+    )
     monkeypatch.setattr(cli, "local_server_url_if_healthy", lambda: "http://127.0.0.1:8000")
     stopped: list[bool] = []
     monkeypatch.setattr(cli, "stop_local_omnigent_server", lambda: stopped.append(True))
@@ -894,7 +896,9 @@ def test_foreground_connect_local_prompt_declined_leaves_server(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Answering no at the exit prompt leaves the server running."""
-    _patch_foreground_host_local(monkeypatch, tmp_path, run_host_process=lambda server_url: None)
+    _patch_foreground_host_local(
+        monkeypatch, tmp_path, run_host_process=lambda server_url, **_kw: None
+    )
     monkeypatch.setattr(cli, "local_server_url_if_healthy", lambda: "http://127.0.0.1:8000")
     monkeypatch.setattr(
         cli,
@@ -917,7 +921,9 @@ def test_foreground_connect_local_prompt_aborted_leaves_server(
     or a second Ctrl-C. The prompt must treat that as "no" — never stop the
     server and still exit 0 rather than dying with an ``Aborted!`` trace.
     """
-    _patch_foreground_host_local(monkeypatch, tmp_path, run_host_process=lambda server_url: None)
+    _patch_foreground_host_local(
+        monkeypatch, tmp_path, run_host_process=lambda server_url, **_kw: None
+    )
     monkeypatch.setattr(cli, "local_server_url_if_healthy", lambda: "http://127.0.0.1:8000")
     monkeypatch.setattr(
         cli,
@@ -946,7 +952,7 @@ def test_foreground_connect_local_prompts_after_keyboard_interrupt(
 ) -> None:
     """A Ctrl-C stop (KeyboardInterrupt) still reaches the exit prompt."""
 
-    def _interrupt(server_url: str) -> None:
+    def _interrupt(server_url: str, **_kw: object) -> None:
         """Simulate Ctrl-C stopping the foreground daemon."""
         raise KeyboardInterrupt
 
@@ -968,7 +974,9 @@ def test_foreground_connect_local_no_prompt_when_server_absent(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """No prompt fires when no healthy local server is found at exit."""
-    _patch_foreground_host_local(monkeypatch, tmp_path, run_host_process=lambda server_url: None)
+    _patch_foreground_host_local(
+        monkeypatch, tmp_path, run_host_process=lambda server_url, **_kw: None
+    )
     monkeypatch.setattr(cli, "local_server_url_if_healthy", lambda: None)
     monkeypatch.setattr(
         cli,
@@ -994,7 +1002,7 @@ def test_foreground_connect_reused_server_omits_prompt(
     _patch_foreground_host_local(
         monkeypatch,
         tmp_path,
-        run_host_process=lambda server_url: None,
+        run_host_process=lambda server_url, **_kw: None,
         spawned=False,
     )
     # A healthy server exists, but since we reused it the prompt must not even
@@ -1021,7 +1029,7 @@ def test_foreground_connect_connection_failure_skips_prompt(
 ) -> None:
     """A connection failure (SystemExit) does not prompt over the error."""
 
-    def _fail(server_url: str) -> None:
+    def _fail(server_url: str, **_kw: object) -> None:
         """Simulate a permanent connection failure exiting non-zero."""
         raise SystemExit(1)
 
@@ -1052,7 +1060,7 @@ def test_foreground_connect_remote_omits_local_server_prompt(
     )
     monkeypatch.setattr(
         "omnigent.host.connect.run_host_process",
-        lambda server_url: None,
+        lambda server_url, **_kw: None,
     )
 
     result = CliRunner().invoke(cli_group, ["host", "--server", "https://server.example.com"])
@@ -1924,7 +1932,7 @@ def _patch_foreground_host(
     connected: list[str] = []
     monkeypatch.setattr(
         "omnigent.host.connect.run_host_process",
-        lambda server_url: connected.append(server_url),
+        lambda server_url, **_kw: connected.append(server_url),
     )
     return connected
 
@@ -2252,7 +2260,7 @@ def test_host_command_defaults_scheme_and_accepts_omnigent_web_url(
     observed: list[str] = []
     monkeypatch.setattr(
         "omnigent.host.connect.run_host_process",
-        lambda server_url: observed.append(server_url),
+        lambda server_url, **_kw: observed.append(server_url),
     )
 
     result = CliRunner().invoke(

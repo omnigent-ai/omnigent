@@ -108,7 +108,7 @@ from omnigent.claude_native_state import (
 from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.host.daemon_launch import (
-    DAEMON_POLL_INTERVAL_S,
+    daemon_poll_intervals,
     error_text,
     launch_or_reuse_daemon_runner,
     open_daemon_client,
@@ -254,11 +254,24 @@ _SESSION_LABELS = {
     _WRAPPER_LABEL_KEY: _WRAPPER_LABEL_VALUE,
 }
 _CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
-_CLAUDE_CODE_MANAGED_SETTINGS_PATHS: tuple[Path, ...] = (
-    Path("/Library/Application Support/ClaudeCode/managed-settings.json"),
-    Path("/etc/claude-code/managed-settings.json"),
-    Path(os.environ.get("PROGRAMDATA", "C:/ProgramData")) / "ClaudeCode" / "managed-settings.json",
-)
+# Test override for the managed-settings chain. ``None`` means "use the ambient
+# detector's chain" — the single canonical definition (``ambient`` owns both the
+# path list and the parser). Binding a *copy* here would create a second source
+# of host state that a test fixture could neutralize independently of the other,
+# so both readers below resolve through ``_managed_settings_paths`` at call time.
+_CLAUDE_CODE_MANAGED_SETTINGS_PATHS: tuple[Path, ...] | None = None
+
+
+def _managed_settings_paths() -> tuple[Path, ...]:
+    """The Claude Code managed-settings chain to read (ambient's, or a test override)."""
+    override = _CLAUDE_CODE_MANAGED_SETTINGS_PATHS
+    if override is not None:
+        return override
+    from omnigent.onboarding.ambient import CLAUDE_CODE_MANAGED_SETTINGS_PATHS
+
+    return CLAUDE_CODE_MANAGED_SETTINGS_PATHS
+
+
 _CLAUDE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _RESUME_ACTION_SWITCH = "switch"
 _RESUME_ACTION_MOVE = "move"
@@ -633,7 +646,7 @@ def _managed_claude_model_config() -> ClaudeNativeUcodeConfig | None:
         _ANTHROPIC_CUSTOM_MODEL_OPTION_ENV,
         _ANTHROPIC_CUSTOM_MODEL_OPTION_NAME_ENV,
     }
-    for path in _CLAUDE_CODE_MANAGED_SETTINGS_PATHS:
+    for path in _managed_settings_paths():
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -666,25 +679,9 @@ def managed_claude_gateway_signal() -> tuple[str | None, bool]:
     :returns: ``(base_url, has_credential)`` from the first readable managed
         settings file, or ``(None, False)`` when none is present or parseable.
     """
-    for path in _CLAUDE_CODE_MANAGED_SETTINGS_PATHS:
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if not isinstance(payload, dict):
-            continue
-        raw_env = payload.get("env")
-        env = raw_env if isinstance(raw_env, dict) else {}
-        raw_base_url = env.get("ANTHROPIC_BASE_URL")
-        base_url = raw_base_url.strip() if isinstance(raw_base_url, str) else None
-        has_helper = bool(payload.get("apiKeyHelper"))
-        use_gateway = str(env.get("CLAUDE_CODE_USE_GATEWAY", "")).strip().lower() not in (
-            "",
-            "0",
-            "false",
-        )
-        return base_url or None, has_helper or use_gateway
-    return None, False
+    from omnigent.onboarding.ambient import claude_managed_gateway
+
+    return claude_managed_gateway(_managed_settings_paths())
 
 
 def claude_native_model_options(
@@ -1203,6 +1200,20 @@ async def claude_launch_catalog(
     fingerprint = claude_catalog_fingerprint(claude_config)
     return await model_catalog_store.ensure_catalog(
         "claude-native", fingerprint, lambda: claude_model_catalog(claude_config)
+    )
+
+
+def claude_launch_catalog_is_stale(claude_config: ClaudeNativeUcodeConfig | None) -> bool:
+    """
+    Whether this config's stored catalog is past the freshness TTL.
+
+    :param claude_config: The resolved launch config, or ``None``.
+    :returns: ``True`` when the store holds only a stale entry.
+    """
+    from omnigent import model_catalog_store
+
+    return model_catalog_store.catalog_is_stale(
+        "claude-native", claude_catalog_fingerprint(claude_config)
     )
 
 
@@ -2038,6 +2049,7 @@ def _fetch_external_session_id_for_redirect(
             "failed to fetch external Claude session id for redirect; session=%s",
             session_id,
             exc_info=True,
+            extra={"session_id": session_id},
         )
         return None
     external_session_id = payload.get("external_session_id") if isinstance(payload, dict) else None
@@ -3824,11 +3836,12 @@ async def _wait_for_claude_terminal_ready(
     :raises click.ClickException: If no terminal appears in time.
     """
     deadline = asyncio.get_event_loop().time() + timeout_s
+    intervals = daemon_poll_intervals()
     while asyncio.get_event_loop().time() < deadline:
         terminal_id = await _find_running_claude_terminal(client, session_id)
         if terminal_id is not None:
             return terminal_id
-        await asyncio.sleep(DAEMON_POLL_INTERVAL_S)
+        await asyncio.sleep(next(intervals))
     raise click.ClickException(
         f"The runner did not create the Claude terminal for {session_id!r} "
         f"within {timeout_s:.0f}s."

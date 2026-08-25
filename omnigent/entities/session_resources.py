@@ -160,10 +160,8 @@ def terminal_resource_view(session_id: str, entry: TerminalListEntry) -> Session
             "tmux_socket": str(entry.instance.socket_path),
             "tmux_target": entry.instance.tmux_target,
             # Effective web-attach transport (``"pty"`` / ``"control"``) absent
-            # a per-attach ``?transport=`` override, so the browser can pick
-            # the matching mouse/selection behavior. Control mode lets xterm
-            # own scrollback + selection; PTY mode still needs the modifier
-            # workarounds + hint bar.
+            # a per-attach ``?transport=`` override, so the browser can select
+            # the matching bridge and clipboard behavior.
             "terminal_transport": _resolve_transport_for_view(entry),
         },
     )

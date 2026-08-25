@@ -207,6 +207,17 @@ function SearchFilterInput({
 // ---------------------------------------------------------------------------
 
 /**
+ * Browse location per conversation, surviving unmount/remount within a JS
+ * session. Opening a file swaps this panel for the FileViewer (see
+ * WorkspacePanel's content slot), which unmounts it — with plain state,
+ * closing the viewer snapped the tree back to the workspace root instead of
+ * the directory the file was opened from. Same pattern as FolderTree's
+ * expandedPathsCache. Keyed by conversation, so a session switch still lands
+ * on that session's own last location (or its root), never another's.
+ */
+const browseLocationCache = new Map<string, string>();
+
+/**
  * Right-side Files card. Always visible on desktop.
  *
  * - Flat view: changed files only (registry-backed, any depth).
@@ -272,13 +283,21 @@ export function FilesPanel({
   // The picker browses the host's filesystem, the same source the new-session
   // workspace chip uses.
   const { session } = useSession(conversationId);
-  // Absolute path currently browsed. Null tracks the workspace root, so the
-  // panel keeps opening there and a session switch never strands the user in
-  // a directory belonging to the session they just left.
-  const [browseLocation, setBrowseLocation] = useState<string | null>(null);
+  // Absolute path currently browsed. Null tracks the workspace root. Seeded
+  // from the per-conversation cache so the location survives the panel
+  // unmounting while a file is open in the viewer.
+  const [browseLocation, setBrowseLocation] = useState<string | null>(
+    () => (conversationId && browseLocationCache.get(conversationId)) || null,
+  );
   const [browseError, setBrowseError] = useState<string | null>(null);
+  // On an in-place conversation switch (no remount), land on the NEW
+  // session's own cached location or its root — never the previous
+  // session's directory. The ref keeps mount itself from wiping the seed.
+  const browseForRef = useRef(conversationId);
   useEffect(() => {
-    setBrowseLocation(null);
+    if (browseForRef.current === conversationId) return;
+    browseForRef.current = conversationId;
+    setBrowseLocation((conversationId && browseLocationCache.get(conversationId)) || null);
     setBrowseError(null);
   }, [conversationId]);
   const workingDir = browseLocation ?? workspaceRoot;
@@ -292,7 +311,12 @@ export function FilesPanel({
 
   function navigateTo(absolutePath: string) {
     setBrowseError(null);
-    setBrowseLocation(absolutePath === workspaceRoot ? null : absolutePath);
+    const next = absolutePath === workspaceRoot ? null : absolutePath;
+    if (conversationId) {
+      if (next === null) browseLocationCache.delete(conversationId);
+      else browseLocationCache.set(conversationId, next);
+    }
+    setBrowseLocation(next);
   }
 
   /** Re-root onto a directory of the current tree (double-click to open). */
@@ -303,14 +327,16 @@ export function FilesPanel({
 
   /**
    * Open a file the TREE named. Tree paths are relative to the browsed
-   * location while the viewer resolves against the workspace root, so an
-   * in-workspace location has to be re-attached — otherwise a file opened
-   * after navigating into a folder is looked for in the wrong place. An
-   * absolute location has no workspace-relative form to hand over, so it is
-   * passed through as before.
+   * location, so the location is re-attached before handing the file to the
+   * viewer. For an in-workspace location that yields a workspace-relative
+   * path; for a location OUTSIDE the workspace it yields the file's absolute
+   * path, which the viewer fetches host-absolutely (see `fetchFileContent`).
+   * Without this a file opened while browsing an absolute location like
+   * `/tmp` would be looked up by its bare name under the workspace root and
+   * 404.
    */
   function openTreeFile(path: string) {
-    onFileSelect(locationParam.startsWith("/") ? path : joinBrowseLocation(locationParam, path));
+    onFileSelect(joinBrowseLocation(locationParam, path));
   }
 
   const allFilesQuery = useWorkspaceAllFiles(conversationId, { enabled: !flatView }, locationParam);

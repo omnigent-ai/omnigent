@@ -27,11 +27,13 @@ import websockets.asyncio.client
 from websockets.exceptions import ConnectionClosed, InvalidStatus, InvalidURI
 
 from omnigent._platform import IS_POSIX, WINDOWS_ENV_PASSTHROUGH
+from omnigent.debug_logging import PRIMARY_SESSION_ID_ENV_VAR, USER_ID_ENV_VAR
 from omnigent.env_credentials import env_names_with_omnigent_prefix
 from omnigent.gateway_inference import gateway_inference_map
 from omnigent.harness_aliases import canonicalize_harness, is_claude_sdk_harness_name
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
 from omnigent.host import HOST_FATAL_EXIT_CODE
+from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
@@ -185,8 +187,8 @@ _LOG_TAIL_MAX_BYTES = 4096
 # the error summary above it remains visible.
 _LOG_TAIL_MAX_LINES = 15
 
-# Poll cadence for the per-runner exit watcher. 0.5s matches the
-# client's online-poll cadence (daemon_launch.DAEMON_POLL_INTERVAL_S),
+# Poll cadence for the per-runner exit watcher. 0.5s matches the client's
+# steady-state online-poll cadence (daemon_launch.DAEMON_POLL_INTERVAL_S),
 # so a crashed runner is reported within about one client poll.
 _RUNNER_WATCH_INTERVAL_S = 0.5
 
@@ -329,6 +331,15 @@ def _connection_refused(exc: BaseException) -> bool:
 _RECONNECT_BASE_S = 0.5
 _RECONNECT_CAP_S = 3.0
 _RECONNECT_JITTER = 0.5
+# How often the lifecycle monitor re-checks that this daemon still owns its
+# registry record. Cheap local-file read; a stale daemon retiring within a
+# minute is prompt enough, and 60s keeps polling churn negligible.
+# ``OMNIGENT_HOST_LIFECYCLE_POLL_S`` overrides it (e2e tests set it low so the
+# self-terminate path is observable without a minute-long wait).
+try:
+    _LIFECYCLE_POLL_INTERVAL_S = float(os.environ.get("OMNIGENT_HOST_LIFECYCLE_POLL_S", "60"))
+except ValueError:
+    _LIFECYCLE_POLL_INTERVAL_S = 60.0
 # Keep first startup tolerant of a cold server, but do not spend the library's
 # full default timeout on each reconnect after an established tunnel drops.
 _INITIAL_CONNECT_OPEN_TIMEOUT_S = 10.0
@@ -447,6 +458,16 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "OMNIGENT_LOG_LEVEL",
         "OMNIGENT_LOG_TO_STDERR",
         LOG_TTY_FD_ENV_VAR,
+        # Debug-log sink config + creds (OMNI-4198). The runner uploads its OWN
+        # process logs to the debug-logs table, so it needs these — including the
+        # service-principal secret. That is the one deliberate exception to the
+        # "no secrets" rule: it is the app's SP creds for log upload (not a user
+        # secret), and the runner is a trusted child. Without them the runner's
+        # sink never arms and runner logs never reach the table.
+        "OMNIGENT_DEBUG_LOG_CLIENT_ID",
+        "OMNIGENT_DEBUG_LOG_CLIENT_SECRET",
+        "OMNIGENT_DEBUG_LOG_WORKSPACE_URL",
+        "OMNIGENT_DEBUG_LOG_ENDPOINT",
         # Secret-store backend selector. The CLI's `configure harnesses` stores
         # pasted API keys via the file backend when this is set (headless /
         # locked-keyring hosts), writing `keychain:<name>` refs. The runner
@@ -830,11 +851,15 @@ class HostProcess:
         self,
         identity: HostIdentity,
         server_url: str,
+        lifecycle_lock: DaemonLifecycleLock | None = None,
     ) -> None:
         """Initialize the host process.
 
         :param identity: Host identity from ``config.yaml``.
         :param server_url: Server URL to connect to.
+        :param lifecycle_lock: Optional guard binding this daemon's lifetime
+            to its registry record. When present, the daemon holds the lock
+            and self-terminates once the record is deleted or reassigned.
         """
         self._identity = identity
         self._server_url = server_url.rstrip("/")
@@ -845,6 +870,11 @@ class HostProcess:
         # to retry credential discovery.
         self._auth_token_factory: Callable[[], str | None] | None = None
         self._auth_token_factory_resolved = False
+        # This host's owning user, resolved once after the first accepted tunnel
+        # upgrade (GET /v1/me). Injected into every runner it spawns and published
+        # to OMNIGENT_USER_ID so host/runner debug-log rows carry it. None until
+        # resolved, or on a single-user server / managed host where it is absent.
+        self._owner_user_id: str | None = None
         # Set on the first accepted WS upgrade. Distinguishes a host that
         # never authenticated (login redirects / 401 / 403 turn fatal) from a
         # live host hit by a transient failure — a server restart or a dropped
@@ -930,6 +960,13 @@ class HostProcess:
         # detected resume; read+cleared in run()'s reconnect handler to force a
         # prompt reconnect (skip the backoff).
         self._woke_from_suspend = False
+        # Lifecycle guard: hold the target's flock and watch its registry
+        # record. When the record is deleted/reassigned the monitor sets
+        # _lifecycle_lost and aborts the live tunnel so run() breaks out of its
+        # serve and tears down cleanly instead of lingering as a stale daemon.
+        self._lifecycle_lock = lifecycle_lock
+        self._lifecycle_task: asyncio.Task[None] | None = None
+        self._lifecycle_lost = asyncio.Event()
 
     def _tracked_runner_pids(self) -> set[int]:
         """PIDs of runners this host spawned and still tracks directly.
@@ -1414,6 +1451,15 @@ class HostProcess:
             host_id=self._identity.host_id,
             harness=frame.harness,
         )
+        # The runner serves one primary session (plus any co-located subagents);
+        # pass it so runner-level log records can be attributed to that session.
+        if frame.session_id:
+            env[PRIMARY_SESSION_ID_ENV_VAR] = frame.session_id
+        # The runner is 1:1 with this host's owner (cross-owner co-location is
+        # rejected server-side), so hand it our resolved owner for user_id
+        # attribution of runner-level log records.
+        if self._owner_user_id:
+            env[USER_ID_ENV_VAR] = self._owner_user_id
 
         # Embed the session id so operators can find all logs for a session
         # with `omnigent debug logs --session <id>`. Cap at 32 chars to keep
@@ -2686,6 +2732,61 @@ class HostProcess:
         self._gateway_inference = gateway
         self._capabilities_initialized = True
 
+    async def _lifecycle_monitor_loop(self) -> None:
+        """Self-terminate once this daemon no longer owns its registry record.
+
+        Polls the record; a delete (``omnigent host stop``) or pid change (a
+        newer daemon claimed the target) after we have owned it at least once
+        means this process is stale. It then sets ``_lifecycle_lost`` and aborts
+        the live tunnel (same mechanism as the suspend watcher) so an in-flight
+        :meth:`_connect_and_serve` returns now; :meth:`run` sees the flag and
+        breaks, and its ``finally`` reaps runners and releases the lock.
+
+        The "owned at least once" latch tolerates the startup window where the
+        launching CLI has not written the record yet, so a fresh daemon is not
+        killed before it is registered.
+
+        :returns: None.
+        """
+        lock = self._lifecycle_lock
+        if lock is None:
+            return
+        confirmed = False
+        while True:
+            await asyncio.sleep(_LIFECYCLE_POLL_INTERVAL_S)
+            if await asyncio.to_thread(lock.still_owner):
+                confirmed = True
+                continue
+            if not confirmed:
+                continue
+            _logger.warning(
+                "Host daemon record for %s is gone or reassigned; self-terminating.",
+                lock.target,
+            )
+            self._lifecycle_lost.set()
+            self._abort_live_tunnel()
+            return
+
+    def _abort_live_tunnel(self) -> None:
+        """Abort the live tunnel transport, if any, to break the serve loop.
+
+        Reads ``self._ws`` and aborts synchronously on the event loop, so it is
+        atomic w.r.t. ``_serve_frames``. A no-op when nothing is connected — the
+        top-of-loop / backoff checks in :meth:`run` handle that case.
+
+        :returns: None.
+        """
+        ws = self._ws
+        transport = getattr(ws, "transport", None) if ws is not None else None
+        if transport is not None:
+            # Best-effort: aborting an already-closing/dead transport can raise
+            # a socket-level error. It's harmless here (run() still exits via
+            # _lifecycle_lost), but log it rather than swallow it silently.
+            try:
+                transport.abort()
+            except OSError:
+                _logger.debug("lifecycle tunnel abort raised", exc_info=True)
+
     async def run(self) -> None:
         """Run the host process with reconnection.
 
@@ -2718,6 +2819,13 @@ class HostProcess:
         self._suspend_task = asyncio.create_task(
             watch_for_resume(self._on_resume_from_suspend), name="host-suspend-watch"
         )
+        # Bind this daemon's lifetime to its registry record: hold the target's
+        # flock and watch the record so a stale daemon retires itself.
+        if self._lifecycle_lock is not None:
+            self._lifecycle_lock.acquire()
+            self._lifecycle_task = asyncio.create_task(
+                self._lifecycle_monitor_loop(), name="host-lifecycle-monitor"
+            )
         # Warm the runner zygote now: start() blocks on its one-time import
         # of the runner graph (~1-2s), which otherwise lands inside the first
         # session launch of the daemon's life. Best-effort — a failure
@@ -2730,6 +2838,8 @@ class HostProcess:
         backoff = _RECONNECT_BASE_S
         try:
             while True:
+                if self._lifecycle_lost.is_set():
+                    break
                 try:
                     await self._connect_and_serve()
                     backoff = _RECONNECT_BASE_S
@@ -2741,6 +2851,11 @@ class HostProcess:
                     # ``run_host_process`` can fail loud.
                     raise
                 except Exception as exc:
+                    if self._lifecycle_lost.is_set():
+                        # The lifecycle monitor aborted the tunnel to retire this
+                        # stale daemon; the resulting disconnect is expected, so
+                        # exit cleanly rather than logging a spurious reconnect.
+                        break
                     if not isinstance(exc, InvalidURI):
                         # Any non-redirect failure (5xx bounce, network
                         # blip, mid-serve drop) breaks a login-redirect
@@ -2857,7 +2972,11 @@ class HostProcess:
                         if woke
                         else (" (recycle — prompt reconnect)" if recycle else ""),
                     )
-                    await asyncio.sleep(wait_s)
+                    # Interruptible backoff: wake early if the lifecycle
+                    # monitor loses ownership mid-backoff so the top-of-loop
+                    # check breaks instead of reconnecting one more time.
+                    with contextlib.suppress(asyncio.TimeoutError):
+                        await asyncio.wait_for(self._lifecycle_lost.wait(), timeout=wait_s)
                     import random
 
                     if recycle:
@@ -2882,6 +3001,15 @@ class HostProcess:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await self._suspend_task
                 self._suspend_task = None
+            if self._lifecycle_task is not None:
+                self._lifecycle_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._lifecycle_task
+                self._lifecycle_task = None
+            # Release the flock but leave the record deletion to the CLI stop /
+            # takeover paths that own it (this daemon may have been superseded).
+            if self._lifecycle_lock is not None:
+                self._lifecycle_lock.release()
             if self._zygote_prestart_task is not None:
                 self._zygote_prestart_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -3009,6 +3137,7 @@ class HostProcess:
         self._auth_retry_streak = 0
         self._refused_streak = 0
         self._conn_upgrade_accepted = True
+        await self._ensure_owner_user_id()
         try:
             await self._serve_frames(ws)
         finally:
@@ -3021,6 +3150,32 @@ class HostProcess:
             # ``async with`` this replaced; the manual enter is only so the
             # upgrade-time exception can be classified above.
             await ws_cm.__aexit__(*sys.exc_info())
+
+    async def _ensure_owner_user_id(self) -> None:
+        """Resolve this host's owning user once and publish it for attribution.
+
+        Best-effort ``GET /v1/me`` (the same call the CLI resume picker uses),
+        run after the tunnel upgrade is accepted so credentials are known to
+        work. On success, store it on the handler (injected into every runner
+        this host spawns) and in ``OMNIGENT_USER_ID`` (so the host's own
+        debug-log rows carry it). A single-user server / managed host answers no
+        owner, and any failure is swallowed -- attribution must never disrupt the
+        host, and those rows simply ship ``user_id = NULL``.
+        """
+        if self._owner_user_id is not None:
+            return
+        try:
+            from omnigent.resume_dispatch import _resolve_current_user_id
+
+            headers = self._build_connect_headers()
+            owner = await asyncio.to_thread(
+                _resolve_current_user_id, base_url=self._server_url, headers=headers
+            )
+        except Exception:  # noqa: BLE001 — attribution is best-effort
+            return
+        if owner:
+            self._owner_user_id = owner
+            os.environ[USER_ID_ENV_VAR] = owner
 
     def _build_connect_headers(self) -> dict[str, str]:
         """Build the WebSocket upgrade headers for the tunnel connection.
@@ -3408,6 +3563,8 @@ class HostProcess:
 def run_host_process(
     server_url: str,
     config_path: Path | None = None,
+    *,
+    daemon_target: str | None = None,
 ) -> None:
     """Entry point for ``omnigent host``.
 
@@ -3418,6 +3575,10 @@ def run_host_process(
         ``"https://omnigent-app.databricksapps.com"``.
     :param config_path: Optional path to ``config.yaml``.
         Defaults to ``~/.omnigent/config.yaml``.
+    :param daemon_target: Normalized registry target this process owns, e.g.
+        ``"local"`` or a server URL. When given, the daemon binds its lifetime
+        to that record (flock + self-terminate on delete/reassign). ``None``
+        (the historical default) runs without the lifecycle guard.
     :raises SystemExit: With :data:`HOST_FATAL_EXIT_CODE` when the tunnel
         fails permanently (auth / authorization / outdated server, or a
         loopback server that is gone). The actionable cause is printed
@@ -3452,7 +3613,10 @@ def run_host_process(
     if _cli_log is not None and _cli_log != host_log_path:
         print(f"CLI diagnostics: {display_log_path(_cli_log)}")
 
-    host = HostProcess(identity, server_url)
+    lifecycle_lock = (
+        DaemonLifecycleLock.for_target(daemon_target) if daemon_target is not None else None
+    )
+    host = HostProcess(identity, server_url, lifecycle_lock=lifecycle_lock)
     try:
         asyncio.run(host.run())
     except HostConnectError as exc:

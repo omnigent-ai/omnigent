@@ -24,6 +24,7 @@ from fastapi.responses import Response
 from pydantic import ValidationError
 
 from omnigent.db.utils import generate_agent_id, generate_task_id
+from omnigent.debug_logging import debug_event
 from omnigent.entities import (
     Agent,
     CommentsFingerprint,
@@ -90,7 +91,7 @@ from omnigent.runtime.policies.builder import (
 )
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.workflow import _find_spec_by_name
-from omnigent.server import session_live_state
+from omnigent.server import session_live_state, shutdown_state
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -179,6 +180,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _runner_skills_inflight,
     _session_active_response_cache,
     _session_background_task_count_cache,
+    _session_background_tasks_cache,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
@@ -304,6 +306,7 @@ from omnigent.server.routes._sessions.helpers import (
 )
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.schemas import (
+    BackgroundTaskInfo,
     ChildSessionSummary,
     CreatedSessionResponse,
     ElicitationRequestEvent,
@@ -335,6 +338,7 @@ from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
     ConversationNotFoundError,
+    NameAlreadyExistsError,
     pinned_label_key,
 )
 from omnigent.stores.file_store import FileStore
@@ -941,6 +945,7 @@ def _build_session_response(
     status: Literal["idle", "running", "waiting", "failed"],
     permission_level: int | None = None,
     background_task_count: int | None = None,
+    background_tasks: list[BackgroundTaskInfo] | None = None,
     llm_model: str | None = None,
     context_window: int | None = None,
     last_total_tokens: int | None = None,
@@ -973,6 +978,8 @@ def _build_session_response(
         last status edge (claude-native), so a reload re-shows "N shells
         still running" even after the session settles to ``"idle"``. ``None``
         when none are tracked.
+    :param background_tasks: Per-shell detail for that tally, so a reload can
+        restore it. ``None`` when none are tracked.
     :param permission_level: The requesting user's numeric level
         on this session (1=read, 2=edit, 3=manage), or ``None``
         when permissions are disabled.
@@ -1054,6 +1061,7 @@ def _build_session_response(
         agent_name=agent_name,
         status=status,
         background_task_count=background_task_count,
+        background_tasks=background_tasks,
         created_at=conv.created_at,
         updated_at=conv.updated_at,
         title=title_without_closed_marker(conv.title),
@@ -2194,30 +2202,41 @@ async def _persist_skipped_kiro_pending_input(
     _publish_external_conversation_item(session_id, persisted_items[1])
 
 
-async def _enrich_idle_status_with_subagent_output(
+async def _enrich_terminal_status_with_subagent_output(
     data: dict[str, Any],
     status: str,
     session_id: str,
     conversation_store: ConversationStore,
 ) -> dict[str, Any]:
     """
-    Attach a native sub-agent's durable assistant text to an idle status edge.
+    Attach a native session's durable assistant text to a terminal status edge.
 
-    Shared by both native sub-agent delivery paths (the codex
-    ``external_session_status`` POST handler and the claude-native relay
-    forward) so the parent inbox result carries the child's output. Native
-    harnesses mirror transcript items to the store, not runner memory, so the
-    text is read here and forwarded with the idle edge.
+    Shared by both native delivery paths (the codex ``external_session_status``
+    POST handler and the claude-native relay forward) so the parent inbox
+    result carries the child's output. Native harnesses mirror transcript items
+    to the store, not runner memory, so the text is read here and forwarded
+    with the terminal edge.
+
+    A ``failed`` edge is filled only when the forwarder attached no detail of
+    its own. On a failed turn the latest assistant message is the harness's own
+    error report (e.g. Claude's "There's an issue with the selected model
+    (…)"), which otherwise reaches only the child's transcript while the
+    parent inbox falls back to the generic "Error: native sub-agent turn
+    failed" and the session's ``last_task_error`` stays empty.
 
     :param data: The ``external_session_status`` ``data`` to enrich, e.g.
         ``{"status": "idle"}``.
-    :param status: Status edge; only ``"idle"`` is enriched.
+    :param status: Status edge; only the terminal ``"idle"`` / ``"failed"``
+        edges are enriched.
     :param session_id: Sub-agent session id, e.g. ``"conv_child123"``.
     :param conversation_store: Store read for the child's assistant text.
-    :returns: ``data`` with ``"output"`` added when an idle edge has a
+    :returns: ``data`` with ``"output"`` added when a terminal edge has a
         persisted assistant message; otherwise unchanged.
     """
-    if status != "idle":
+    if status not in ("idle", "failed"):
+        return data
+    existing = data.get("output")
+    if status == "failed" and isinstance(existing, str) and existing.strip():
         return data
     output = await asyncio.to_thread(
         _latest_assistant_text_from_store,
@@ -3562,7 +3581,11 @@ async def _run_managed_wake(
         # Fire-and-forget task — settle the tracker (else a waiting message
         # POST hangs to its timeout) and never escape as an unhandled-task
         # traceback. A failed wake leaves the sandbox intact for a retry.
-        _logger.exception("Managed host wake crashed for session %s", session_id)
+        _logger.exception(
+            "Managed host wake crashed for session %s",
+            session_id,
+            extra={"session_id": session_id},
+        )
         tracker.fail(session_id, "internal error during managed host wake")
         _publish_sandbox_status(session_id, "failed", "internal error during managed host wake")
 
@@ -3767,6 +3790,7 @@ async def _ensure_native_terminal_ready(
             display_name,
             session_id,
             exc_info=True,
+            extra={"session_id": session_id},
         )
         return _NativeTerminalEnsureOutcome(
             error=_native_terminal_ensure_transport_error(exc, display_name=display_name),
@@ -3782,6 +3806,7 @@ async def _ensure_native_terminal_ready(
         session_id,
         resp.status_code,
         resp.text[:500],
+        extra={"session_id": session_id},
     )
     return _NativeTerminalEnsureOutcome(
         error=_native_terminal_failure_from_runner_response(resp, display_name=display_name),
@@ -4091,7 +4116,7 @@ async def _forward_native_terminal_message(
     :raises HTTPException: 502 when the runner or harness rejects
         the injection request.
     """
-    display_name, _, _ = _native_terminal_runtime(conv)
+    display_name, _, harness = _native_terminal_runtime(conv)
     event = _build_native_terminal_message_event(conv, body, model_override=model_override)
     _logger.info(
         "%s terminal message forward starting: session=%s block_types=%s model_override=%s",
@@ -4101,6 +4126,7 @@ async def _forward_native_terminal_message(
         if isinstance(event.get("content"), list)
         else type(event.get("content")).__name__,
         event.get("model_override"),
+        extra={"session_id": session_id},
     )
     if (
         file_store is not None
@@ -4123,6 +4149,7 @@ async def _forward_native_terminal_message(
                 "File reference resolution failed for native session=%s",
                 session_id,
                 exc_info=True,
+                extra={"session_id": session_id},
             )
     try:
         resp = await runner_client.post(
@@ -4136,6 +4163,7 @@ async def _forward_native_terminal_message(
             session_id,
             resp.status_code,
             resp.text[:500],
+            extra={"session_id": session_id},
         )
     except (httpx.HTTPError, ConnectionError) as exc:
         # WSTunnelTransport raises bare ConnectionError on tunnel close;
@@ -4146,6 +4174,7 @@ async def _forward_native_terminal_message(
             display_name,
             session_id,
             exc_info=True,
+            extra={"session_id": session_id},
         )
         raise HTTPException(
             status_code=502,
@@ -4158,6 +4187,7 @@ async def _forward_native_terminal_message(
             session_id,
             resp.status_code,
             resp.text,
+            extra={"session_id": session_id},
         )
         raise HTTPException(
             status_code=502,
@@ -4170,11 +4200,26 @@ async def _forward_native_terminal_message(
             display_name,
             session_id,
             failure,
+            extra={"session_id": session_id},
         )
         raise HTTPException(
             status_code=502,
             detail=f"{display_name} terminal message delivery failed: {failure}",
         )
+    # Native-terminal counterpart to the SDK path's turn_dispatched (same event
+    # name so a session reads uniformly across harnesses); the message was
+    # injected into the live terminal rather than dispatched as a discrete turn.
+    _logger.info(
+        "%s terminal message dispatched for session=%s",
+        display_name,
+        session_id,
+        extra=debug_event(
+            "turn_dispatched",
+            session_id=session_id,
+            agent=conv.agent_id or "",
+            harness=harness,
+        ),
+    )
 
 
 async def _persist_session_event(
@@ -4276,6 +4321,7 @@ async def _refresh_stale_native_model_options(
         session_id,
         time.monotonic() - started,
         session_id in _model_options_stale,
+        extra={"session_id": session_id},
     )
 
 
@@ -4380,6 +4426,7 @@ def _routed_turn_model_spelling(
             model,
             session_id,
             sorted(env.values()),
+            extra={"session_id": session_id},
         )
     return spelling
 
@@ -4689,6 +4736,7 @@ async def _forward_event_to_runner(
                     "Resolved %d file_id block(s) for session=%s before forwarding",
                     len(_unresolved),
                     session_id,
+                    extra={"session_id": session_id},
                 )
             except (ValueError, KeyError):
                 _logger.warning(
@@ -4697,6 +4745,7 @@ async def _forward_event_to_runner(
                     "runner will attempt fallback resolution)",
                     session_id,
                     exc_info=True,
+                    extra={"session_id": session_id},
                 )
 
     # Flatten SessionEventInput {type, data} into the runner's
@@ -4824,6 +4873,7 @@ async def _forward_event_to_runner(
                     "auto-harness: failed to persist resolved harness for session=%s",
                     session_id,
                     exc_info=True,
+                    extra={"session_id": session_id},
                 )
             # Defer card emission until after input.consumed (see below).
             if _auto_model is not None and _auto_verdict is not None:
@@ -4972,6 +5022,7 @@ async def _forward_event_to_runner(
                         "smart_routing: failed to persist harness/model for child session=%s",
                         session_id,
                         exc_info=True,
+                        extra={"session_id": session_id},
                     )
                 if _routed_model is None and _route_err is not None:
                     # ``route_session_harness`` already fails open, so the spawn
@@ -5035,6 +5086,7 @@ async def _forward_event_to_runner(
                                 "for session=%s; turn still uses routed model",
                                 session_id,
                                 exc_info=True,
+                                extra={"session_id": session_id},
                             )
     # ────────────────────────────────────────────────────────────────
     if effective_runner_override is not None:
@@ -5077,6 +5129,12 @@ async def _forward_event_to_runner(
                 session_id,
                 _forward_resp.status_code,
                 _reject_detail,
+                extra=debug_event(
+                    "turn_dispatch_rejected",
+                    session_id=session_id,
+                    status=_forward_resp.status_code,
+                    detail=_reject_detail,
+                ),
             )
             _reject_error = ErrorDetail(code="runner_rejected_event", message=_reject_detail)
             # Persist before publishing: a client that reloads on the ``failed``
@@ -5092,6 +5150,16 @@ async def _forward_event_to_runner(
         # Publish input.consumed AFTER the forward succeeds —
         # the runner has the message and will start the turn.
         _publish_input_consumed(session_id, persisted_items[0])
+        _logger.info(
+            "turn dispatched to runner for session=%s",
+            session_id,
+            extra=debug_event(
+                "turn_dispatched",
+                session_id=session_id,
+                agent=agent_name or conv.agent_id or "",
+                harness=_effective_harness or "",
+            ),
+        )
         # Emit the routing_decision chip AFTER input.consumed so the
         # live SSE stream delivers the user bubble before the chip —
         # matching the store order (user message was persisted first).
@@ -5183,6 +5251,7 @@ async def _forward_event_to_runner(
         _logger.exception(
             "Forward to runner failed for session=%s",
             session_id,
+            extra={"session_id": session_id},
         )
         _publish_status(session_id, "idle")
         raise OmnigentError(
@@ -5221,6 +5290,7 @@ async def _stamp_routing_decision_label(
             "smart_routing: failed to label routing decision for session=%s",
             session_id,
             exc_info=True,
+            extra={"session_id": session_id},
         )
 
 
@@ -5261,6 +5331,7 @@ async def _record_create_route_prompt(
             "smart_routing: failed to record the create-time prompt for session=%s",
             conv.id,
             exc_info=True,
+            extra={"session_id": conv.id},
         )
         return conv
     conv.labels[CREATE_ROUTE_PROMPT_LABEL_KEY] = fingerprint
@@ -5514,6 +5585,7 @@ async def _dispatch_session_event_to_runner_impl(
                             "smart_routing: persist failed for native session=%s",
                             session_id,
                             exc_info=True,
+                            extra={"session_id": session_id},
                         )
         # ────────────────────────────────────────────────────────────
         # Forward the message, carrying any routed model in-band. The
@@ -5656,6 +5728,7 @@ async def _runner_drop_interrupted_turn(
             "Relay: live-status read failed for session=%s; reporting the drop",
             session_id,
             exc_info=True,
+            extra={"session_id": session_id},
         )
         return True
     if conv is None:
@@ -5677,8 +5750,11 @@ async def _relay_runner_stream(
     lost stream retries inside that window instead of failing the
     session. An intentional Stop exits quietly at once.
 
-    Past the grace the runner is genuinely gone, and only a session it
-    caught mid-turn (:func:`_runner_drop_interrupted_turn`) gets the
+    Past the grace the runner is genuinely gone — unless this server is the
+    one shutting down (:func:`omnigent.server.shutdown_state.server_shutting_down`):
+    it closed the tunnel itself, so the loss says nothing about the runner
+    and no session is failed. Otherwise only a session it caught mid-turn
+    (:func:`_runner_drop_interrupted_turn`) gets the
     ``failed`` status and durable ``runner_disconnected`` labels — the same
     rule :func:`_mark_runner_sessions_offline_impl` applies to the runner's
     other sessions. An idle session had no work to interrupt, so it stays
@@ -5715,6 +5791,7 @@ async def _relay_runner_stream(
                     "Relay: runner transport lost for session=%s; retrying for %.1fs",
                     session_id,
                     deadline - now,
+                    extra={"session_id": session_id},
                 )
                 await asyncio.sleep(_RELAY_RETRY_INTERVAL_S)
                 continue
@@ -5722,6 +5799,7 @@ async def _relay_runner_stream(
                 "Relay: runner transport lost for session=%s",
                 session_id,
                 exc_info=True,
+                extra={"session_id": session_id},
             )
             if lost.intentional:
                 # User clicked Stop: the Stop handler brought this runner's
@@ -5738,6 +5816,15 @@ async def _relay_runner_stream(
                     None,
                     conversation_store,
                 )
+            elif shutdown_state.server_shutting_down():
+                # This server closed the tunnel on its way down; the runner is
+                # reachable, just not by a process that stopped listening. The
+                # replacement server re-adopts it on reconnect.
+                _logger.info(
+                    "Relay: transport lost during server shutdown for session=%s; "
+                    "not failing the turn",
+                    session_id,
+                )
             elif not await _runner_drop_interrupted_turn(session_id, conversation_store):
                 # The runner went away while this session sat idle (host
                 # asleep, host restart, `omnigent host` stopped). Nothing was
@@ -5751,6 +5838,7 @@ async def _relay_runner_stream(
                 _logger.info(
                     "Relay: runner gone for idle session=%s; no failure to report",
                     session_id,
+                    extra={"session_id": session_id},
                 )
             else:
                 # Publish a failed status so the client's SSE stream sees a
@@ -5820,7 +5908,11 @@ async def _relay_runner_stream_once(
     # web UI's block stream clears its pending-tool state on the
     # response_id transition and the tool card spinner never resolves.
     tool_call_response_ids: dict[str, str] = {}
-    _logger.info("Relay: connecting to runner GET /stream for session=%s", session_id)
+    _logger.info(
+        "Relay: connecting to runner GET /stream for session=%s",
+        session_id,
+        extra={"session_id": session_id},
+    )
 
     # Read timeout: 3x the runner's session-stream heartbeat interval
     # (15s). Between turns the runner emits ``session.heartbeat`` every
@@ -5836,7 +5928,11 @@ async def _relay_runner_stream_once(
             f"/v1/sessions/{session_id}/stream",
             timeout=_relay_timeout,
         ) as resp:
-            _logger.info("Relay: connected to runner GET /stream for session=%s", session_id)
+            _logger.info(
+                "Relay: connected to runner GET /stream for session=%s",
+                session_id,
+                extra=debug_event("runner_stream_connected", session_id=session_id),
+            )
             buffer = ""
             async for chunk in resp.aiter_text():
                 buffer += chunk
@@ -6131,6 +6227,7 @@ async def _relay_runner_stream_once(
                                 "Relay: routing_decision persist failed for session=%s; "
                                 "publishing the live chip without a durable id",
                                 session_id,
+                                extra={"session_id": session_id},
                             )
                             _persisted_id = None
                         session_stream.publish(
@@ -6253,7 +6350,11 @@ async def _relay_runner_stream_once(
     except asyncio.CancelledError:
         raise
     finally:
-        _logger.info("Relay: task exiting for session=%s", session_id)
+        _logger.info(
+            "Relay: task exiting for session=%s",
+            session_id,
+            extra={"session_id": session_id},
+        )
         # Drop any in-flight assistant-text entry so a relay that exits
         # WITHOUT a terminal turn event (runner death / tunnel drop
         # mid-turn, or a rebind cancellation) can't strand it forever.
@@ -6306,23 +6407,35 @@ def _ensure_runner_relay(
             session_id,
             runner_client is not None,
             runner_id,
+            extra={"session_id": session_id},
         )
         return None
     existing = _runner_relay_tasks.get(session_id)
     if existing is not None:
         if existing.runner_id == runner_id and not existing.task.done():
-            _logger.info("Relay: reusing existing for session=%s runner=%s", session_id, runner_id)
+            _logger.info(
+                "Relay: reusing existing for session=%s runner=%s",
+                session_id,
+                runner_id,
+                extra={"session_id": session_id},
+            )
             return existing  # same runner, healthy task
         _logger.info(
             "Relay: replacing stale for session=%s (old_runner=%s done=%s)",
             session_id,
             existing.runner_id,
             existing.task.done(),
+            extra={"session_id": session_id},
         )
         if not existing.task.done():
             existing.task.cancel()  # stale binding; replace
     else:
-        _logger.info("Relay: creating new for session=%s runner=%s", session_id, runner_id)
+        _logger.info(
+            "Relay: creating new for session=%s runner=%s",
+            session_id,
+            runner_id,
+            extra={"session_id": session_id},
+        )
     ready = asyncio.Event()
     # Runtime callers always supply a store. ``None`` is retained for
     # heartbeat-only relay readiness tests that never emit persistable frames.
@@ -7050,7 +7163,11 @@ async def _session_routing_host(
         return await asyncio.to_thread(host_store.get_host, conv.host_id)
     except Exception:  # noqa: BLE001 — an unreadable host row is just unknown
         _logger.debug(
-            "routing: could not read host %r for session=%s", conv.host_id, conv.id, exc_info=True
+            "routing: could not read host %r for session=%s",
+            conv.host_id,
+            conv.id,
+            exc_info=True,
+            extra={"session_id": conv.id},
         )
         return None
 
@@ -8030,6 +8147,21 @@ async def _create_session_from_existing_agent(
             git_branch=git_branch,
             terminal_launch_args=validated_launch_args,
         )
+    except NameAlreadyExistsError as exc:
+        if (
+            created_worktree_path is not None
+            and body.host_id is not None
+            and git_branch is not None
+        ):
+            await _remove_session_worktree_best_effort(
+                host_id=body.host_id,
+                worktree_path=created_worktree_path,
+                branch=git_branch,
+                delete_branch=True,
+                request=request,
+                reason="create-rollback",
+            )
+        raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
     except Exception:
         # Broad catch is intentional: ANY create_conversation failure
         # (integrity error, name clash, ...) must trigger orphan-worktree
@@ -8508,6 +8640,7 @@ async def _handle_mcp_tools_call(
         session_id,
         namespaced_name,
         is_retry,
+        extra={"session_id": session_id},
     )
 
     if not namespaced_name:
@@ -8568,6 +8701,7 @@ async def _handle_mcp_tools_call(
             namespaced_name,
             retry_result.action,
             retry_result.reason,
+            extra={"session_id": session_id},
         )
 
         if retry_result.action == PolicyAction.DENY:
@@ -8637,6 +8771,7 @@ async def _handle_mcp_tools_call(
             namespaced_name,
             call_result.action,
             call_result.reason,
+            extra={"session_id": session_id},
         )
 
         if call_result.action == PolicyAction.DENY:
@@ -8831,6 +8966,7 @@ async def _handle_mcp_tools_call(
         session_id,
         namespaced_name,
         len(output),
+        extra={"session_id": session_id},
     )
 
     # ── TOOL_RESULT policy ───────────────────────────────────────────
@@ -8852,6 +8988,7 @@ async def _handle_mcp_tools_call(
         namespaced_name,
         result_policy.action,
         result_policy.reason,
+        extra={"session_id": session_id},
     )
 
     if result_policy.action == PolicyAction.DENY:
@@ -9104,6 +9241,7 @@ async def _get_session_snapshot(
             _logger.debug(
                 "No runner bound for session=%s on snapshot build",
                 session_id,
+                extra={"session_id": session_id},
             )
     if runner_client is None:
         runner_client = get_runner_client()
@@ -9289,6 +9427,7 @@ async def _get_session_snapshot(
         status,
         permission_level,
         background_task_count=_session_background_task_count_cache.get(session_id),
+        background_tasks=_session_background_tasks_cache.get(session_id),
         llm_model=llm_model,
         context_window=context_window,
         last_total_tokens=last_total_tokens,
@@ -9325,7 +9464,7 @@ __all__ = [
     "_detached_stop_tasks",
     "_dispatch_session_event_to_runner",
     "_drive_terminal_resolved_elicitation",
-    "_enrich_idle_status_with_subagent_output",
+    "_enrich_terminal_status_with_subagent_output",
     "_ensure_native_terminal_ready",
     "_ensure_runner_relay",
     "_ensure_runner_relay_ready",

@@ -8,6 +8,7 @@ import logging
 import os
 import signal
 import subprocess
+import time
 import uuid
 from collections.abc import Generator
 from dataclasses import asdict, dataclass
@@ -419,3 +420,80 @@ def _kill_tmux_session(tmux_session_name: str) -> None:
             stderr=subprocess.DEVNULL,
             timeout=2.0,
         )
+
+
+def reap_codex_native_processes_for_state_dir(
+    state_dir: Path,
+    *,
+    grace_s: float = 1.5,
+) -> int:
+    """
+    Kill any live Codex app-server still bound to *state_dir*'s session.
+
+    A runner that dies without finishing graceful shutdown (host restart,
+    hard exit) strands its app-server: the process runs in its own
+    session, survives, and keeps holding the codex thread's writer lock —
+    so every later ``thread/resume`` for the session is refused with
+    "already has an active writer". Launch time is when that matters, so
+    the launch path calls this first. Identity is the session state dir
+    baked into the app-server command line (its ``-c`` config overrides
+    name the bridge dir), which — unlike the argv0 crash tag — survives
+    the npm shim's ``exec``. Matches are killed by process group, taking
+    their bridge/hook children with them.
+
+    :param state_dir: The session's codex-native state dir, e.g.
+        ``~/.omnigent/codex-native/<sha256(session)[:32]>``.
+    :param grace_s: Seconds to wait after SIGTERM before escalating the
+        survivors to SIGKILL, e.g. ``1.5``.
+    :returns: Number of matched processes signalled.
+    """
+    if os.name != "posix":
+        return 0
+    needle = str(state_dir)
+    try:
+        listing = subprocess.run(
+            ["ps", "-axww", "-o", "pid=,pgid=,command="],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        ).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return 0
+    own_pgid = os.getpgid(0)
+    victims: dict[int, int] = {}
+    for line in listing.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) != 3:
+            continue
+        pid_text, pgid_text, command = parts
+        try:
+            pid, pgid = int(pid_text), int(pgid_text)
+        except ValueError:
+            continue
+        # "app-server" scopes the match to the codex app-server itself (the
+        # session's bridge MCP child also carries the state dir, but it is a
+        # member of the app-server's process group and dies with it).
+        if needle not in command or "app-server" not in command:
+            continue
+        if pid == os.getpid() or pgid <= 0 or pgid == own_pgid:
+            continue
+        victims[pid] = pgid
+    if not victims:
+        return 0
+    for pgid in sorted(set(victims.values())):
+        with contextlib.suppress(OSError):
+            os.killpg(pgid, signal.SIGTERM)
+    deadline = time.monotonic() + grace_s
+    while time.monotonic() < deadline and any(_pid_alive(pid) for pid in victims):
+        time.sleep(0.05)
+    for pid, pgid in victims.items():
+        if _pid_alive(pid):
+            with contextlib.suppress(OSError):
+                os.killpg(pgid, signal.SIGKILL)
+    _logger.warning(
+        "reaped %d stale codex app-server process(es) for state dir %s",
+        len(victims),
+        state_dir.name,
+    )
+    return len(victims)

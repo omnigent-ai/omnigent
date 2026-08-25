@@ -2921,6 +2921,58 @@ async def test_required_terminal_exit_while_idle_does_not_fail_session(tmp_path:
     assert pm.released == [conv_id]
 
 
+@pytest.mark.asyncio
+async def test_auxiliary_codex_tui_exit_preserves_app_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Losing the streamable TUI does not cancel Codex's active control plane."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.runner.resource_registry import TerminalExitEvent, TerminalLifecycle
+
+    conv_id = uuid.uuid4().hex
+    teardown_calls: list[str] = []
+
+    async def _record_teardown(session_id: str) -> None:
+        teardown_calls.append(session_id)
+
+    monkeypatch.setattr(
+        runner_app._native_runtime,
+        "teardown_codex_native_app_server",
+        _record_teardown,
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    publish_exit = app.state.session_resource_registry._terminal_exit_publisher
+    assert callable(publish_exit)
+
+    try:
+        publish_exit(
+            TerminalExitEvent(
+                session_id=conv_id,
+                terminal_id="terminal_codex_main",
+                terminal_name="codex",
+                session_key="main",
+                lifecycle=TerminalLifecycle.AUXILIARY,
+            )
+        )
+        await asyncio.sleep(0)
+        events = _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+    finally:
+        _session_event_queues_ref.pop(conv_id, None)
+
+    assert teardown_calls == []
+    assert {
+        "type": "session.resource.deleted",
+        "resource_id": "terminal_codex_main",
+        "resource_type": "terminal",
+        "session_id": conv_id,
+    } in events
+    assert not [event for event in events if event.get("type") == "session.status"]
+
+
 @pytest.mark.parametrize("terminal_name", ["qwen", "antigravity"])
 @pytest.mark.asyncio
 async def test_required_terminal_clean_quit_publishes_idle_not_failed(

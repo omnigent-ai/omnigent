@@ -195,6 +195,8 @@ export function ScheduleFields({
           <Label htmlFor="schedule-preset">Frequency</Label>
           <Select
             value={model.preset}
+            componentId="tasks.scheduled.schedule_frequency"
+            valueHasNoPii
             onValueChange={(value) => onChange({ ...model, preset: value as SchedulePreset })}
             onOpenChange={onSelectOpenChange}
           >

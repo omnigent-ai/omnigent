@@ -38,6 +38,19 @@ def _patch_session_as_codex_native(page: Page, session_id: str) -> list[dict]:
             response = route.fetch()
             payload = response.json()
             headers = {**response.headers, **headers}
+            # A real server persists the collaboration_mode a prior PATCH set, so
+            # a session rebind/refetch after toggling Plan mode still reports it.
+            # The seeded hello_world session carries no such label, so carry the
+            # last mode this mock recorded forward — otherwise a rebind (e.g. a
+            # stream re-bind) re-derives Plan mode as off and the toggle snaps
+            # back to "Enter Plan mode" mid-test.
+            prior_labels = (latest_payload or {}).get("labels", {})
+            prior_mode = prior_labels.get("omnigent.codex_native.collaboration_mode")
+            if prior_mode is not None:
+                payload["labels"] = {
+                    **payload.get("labels", {}),
+                    "omnigent.codex_native.collaboration_mode": prior_mode,
+                }
         elif request.method == "PATCH":
             request_body = json.loads(request.post_data or "{}")
             patch_bodies.append(request_body)

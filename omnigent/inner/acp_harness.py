@@ -37,6 +37,11 @@ Env vars read at startup:
 - ``HARNESS_ACP_PERMISSION_MODE``: Omnigent permission stance, ``auto`` (default) or
   ``bypassPermissions`` — the latter skips the approval card for a tool call no
   policy had an opinion on, so a headless agent runs without parking on prompts.
+- ``HARNESS_ACP_INJECT_SYSTEM_PROMPT``: ``"0"`` to skip folding the Omnigent system
+  prompt into the first ACP turn. Recommended for Pi-fork agents (e.g. ``omp``) that
+  fully own their own system prompt — prepending Omnigent's text can cause the agent's
+  internal Claude model to emit XML tool-call fragments when no MCP relay is backing the
+  described tools (see ``omnigent_mcp``). Defaults to ``"1"`` (inject).
 """
 
 from __future__ import annotations
@@ -60,6 +65,7 @@ _ENV_MODEL = "HARNESS_ACP_MODEL"
 _ENV_SESSION_ID_MODE = "HARNESS_ACP_SESSION_ID_MODE"
 _ENV_SEND_MODEL = "HARNESS_ACP_SEND_MODEL"
 _ENV_OMNIGENT_MCP = "HARNESS_ACP_OMNIGENT_MCP"
+_ENV_INJECT_SYSTEM_PROMPT = "HARNESS_ACP_INJECT_SYSTEM_PROMPT"
 _ENV_CWD = "HARNESS_ACP_CWD"
 _ENV_OS_ENV = "HARNESS_ACP_OS_ENV"
 _ENV_ENV_PASSTHROUGH = "HARNESS_ACP_ENV_PASSTHROUGH"
@@ -131,6 +137,7 @@ def _build_acp_executor() -> Executor:
     session_id_mode = os.environ.get(_ENV_SESSION_ID_MODE, "").strip() or "server"
     send_model = _env_enabled(_ENV_SEND_MODEL, default=False)
     omnigent_mcp = _env_enabled(_ENV_OMNIGENT_MCP, default=True)
+    inject_system_prompt = _env_enabled(_ENV_INJECT_SYSTEM_PROMPT, default=True)
     cwd = os.environ.get(_ENV_CWD) or os.environ.get("OMNIGENT_RUNNER_WORKSPACE") or None
     permission_mode = os.environ.get(_ENV_PERMISSION_MODE, "").strip() or _DEFAULT_PERMISSION_MODE
 
@@ -143,6 +150,7 @@ def _build_acp_executor() -> Executor:
         omnigent_mcp=omnigent_mcp,
         env_passthrough=_env_passthrough_names(),
         permission_mode=permission_mode,
+        inject_system_prompt=inject_system_prompt,
     )
     return AcpExecutor(config=config, cwd=cwd, os_env=_resolve_os_env())
 

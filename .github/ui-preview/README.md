@@ -23,7 +23,7 @@ on teardown.
 
 There is **no LLM or runner baked into the preview** -- Omnigent runs agent
 turns on a runner the user connects from their own machine or sandbox
-(`omnigent run … --server <preview-url>`), where the model credentials live. So
+(`omnigent host --server <preview-url>`), where the model credentials live. So
 the preview is for reviewing the UI's look-and-feel and navigation; to drive a
 real session, connect your own host to the preview URL.
 

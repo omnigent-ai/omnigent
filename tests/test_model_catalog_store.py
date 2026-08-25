@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import time
 from pathlib import Path
 
 import pytest
@@ -60,3 +62,73 @@ def test_catalog_age_reports_and_misses() -> None:
     store.write_catalog("claude-native", "abc123", _ROWS)
     age = store.catalog_age_s("claude-native", "abc123")
     assert age is not None and age >= 0.0
+
+
+def _age_entry(harness: str, fingerprint: str, age_s: float) -> None:
+    """
+    Backdate a stored catalog file's mtime by *age_s* seconds.
+    """
+    path = store.catalog_path(harness, fingerprint)
+    old = time.time() - age_s
+    os.utime(path, (old, old))
+
+
+def test_catalog_is_stale_truth_table() -> None:
+    assert store.catalog_is_stale("claude-native", "abc123") is False
+    store.write_catalog("claude-native", "abc123", _ROWS)
+    assert store.catalog_is_stale("claude-native", "abc123") is False
+    _age_entry("claude-native", "abc123", store.CATALOG_STALE_AFTER_S + 60)
+    assert store.catalog_is_stale("claude-native", "abc123") is True
+
+
+async def test_ensure_catalog_fresh_hit_never_probes() -> None:
+    store.write_catalog("claude-native", "abc123", _ROWS)
+    probes: list[int] = []
+
+    async def _probe() -> list[dict[str, object]]:
+        probes.append(1)
+        return [{"id": "new"}]
+
+    assert await store.ensure_catalog("claude-native", "abc123", _probe) == _ROWS
+    assert probes == []
+
+
+async def test_ensure_catalog_stale_hit_serves_now_and_refreshes_in_background() -> None:
+    """
+    A stale entry still answers instantly; the re-probe converges the store.
+    """
+    store.write_catalog("claude-native", "abc123", _ROWS)
+    _age_entry("claude-native", "abc123", store.CATALOG_STALE_AFTER_S + 60)
+    refreshed = [{"id": "sonnet", "model": "claude-sonnet-6", "isDefault": True}]
+    probes: list[int] = []
+
+    async def _probe() -> list[dict[str, object]]:
+        probes.append(1)
+        return refreshed
+
+    assert await store.ensure_catalog("claude-native", "abc123", _probe) == _ROWS
+    task = store._inflight.get(("claude-native", "abc123"))
+    assert task is not None, "a stale hit must kick a background refresh"
+    await task
+    assert probes == [1]
+    assert store.read_catalog("claude-native", "abc123") == refreshed
+    assert store.catalog_is_stale("claude-native", "abc123") is False
+    # The refreshed entry is fresh again: the next read is a plain hit.
+    assert await store.ensure_catalog("claude-native", "abc123", _probe) == refreshed
+    assert probes == [1]
+
+
+async def test_ensure_catalog_stale_refresh_failure_keeps_serving() -> None:
+    store.write_catalog("claude-native", "abc123", _ROWS)
+    _age_entry("claude-native", "abc123", store.CATALOG_STALE_AFTER_S + 60)
+
+    async def _probe() -> list[dict[str, object]]:
+        raise OSError("provider unreachable")
+
+    assert await store.ensure_catalog("claude-native", "abc123", _probe) == _ROWS
+    task = store._inflight.get(("claude-native", "abc123"))
+    assert task is not None
+    await task
+    # The stale rows keep serving; nothing crashed and nothing was clobbered.
+    assert store.read_catalog("claude-native", "abc123") == _ROWS
+    assert await store.ensure_catalog("claude-native", "abc123", _probe) == _ROWS

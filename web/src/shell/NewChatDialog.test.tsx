@@ -982,11 +982,18 @@ describe("NewChatLandingScreen", () => {
     renderLanding();
 
     expect(screen.getByTestId("new-chat-landing-input")).toHaveClass(
+      "block",
       "min-h-[60px]",
       "max-h-[200px]",
+      "overflow-y-auto",
       "px-4",
       "pt-3",
       "pb-2",
+      "[scrollbar-width:none]",
+      "[&::-webkit-scrollbar]:hidden",
+    );
+    expect(screen.getByTestId("new-chat-landing-input").parentElement).toHaveClass(
+      "overflow-hidden",
     );
     expect(screen.getByTestId("new-chat-landing-actions")).toHaveClass("px-2", "pb-2");
     const footer = screen.getByTestId("new-chat-landing-footer");
@@ -2745,6 +2752,17 @@ describe("NewChatLandingScreen skill pills", () => {
     // fed from GET /v1/agents bundled skills.
     expect(screen.getByTestId("skill-pill-debate").textContent).toBe("/debate");
     expect(screen.getByTestId("skill-pill-compare").textContent).toBe("/compare");
+  });
+
+  it("lets the textarea and skill prompt inherit the app font family", () => {
+    mockAgents([debbyAgent()]);
+    renderLanding();
+
+    const localFontFamily = /(^|\s)font-(sans|serif|mono|\[)/;
+    for (const element of [input(), screen.getByText("Describe a task, or try a skill")]) {
+      expect(element.className).not.toMatch(localFontFamily);
+      expect(element.style.fontFamily).toBe("");
+    }
   });
 
   it("hides pills for agents outside the allowlist even when they carry skills", () => {
