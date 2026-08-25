@@ -382,6 +382,23 @@ export function isNativeTerminalSession(
   return nativeCodingAgentForHarness(session.harness) !== undefined;
 }
 
+/**
+ * Resolve the native coding agent a session runs, from its wrapper label
+ * (authoritative) or its harness field.
+ *
+ * @param session - Session-shaped object with `harness` and `labels`.
+ * @returns The agent spec, or undefined for non-native sessions.
+ */
+export function nativeCodingAgentForSession(
+  session: { harness?: string | null; labels?: Record<string, string> } | null | undefined,
+): NativeCodingAgentSpec | undefined {
+  if (session == null) return undefined;
+  return (
+    nativeCodingAgentForWrapper(session.labels?.[WRAPPER_LABEL_KEY]) ??
+    nativeCodingAgentForHarness(session.harness)
+  );
+}
+
 export function nativeWrapperLabelsForAgent(
   agent: Pick<AvailableAgent, "name" | "harness"> | null | undefined,
 ): Record<string, string> | undefined {

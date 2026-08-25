@@ -694,8 +694,8 @@ def set_fallback_mock_llm(
     resp.raise_for_status()
 
 
-def _codex_cli_supports_goal_mode(codex_path: str) -> bool:
-    """Return whether the installed Codex CLI has app-server goal APIs."""
+def _codex_cli_supports_mocked_app_server(codex_path: str) -> bool:
+    """Return whether the Codex CLI supports the mocked app-server tests."""
     version = subprocess.run(
         [codex_path, "--version"],
         text=True,
@@ -708,6 +708,23 @@ def _codex_cli_supports_goal_mode(codex_path: str) -> bool:
     if not match:
         return False
     return tuple(int(part) for part in match.groups()) >= _CODEX_GOAL_MIN_VERSION
+
+
+def _write_codex_unknown_version_shim(directory: Path, codex_path: str) -> Path:
+    """Write a Codex shim whose version probe fails without blocking launches."""
+    shim = directory / "codex-unknown-version"
+    shim.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os\n"
+        "import sys\n"
+        "if sys.argv[1:] == ['--version']:\n"
+        "    print('codex-cli version unavailable')\n"
+        "    raise SystemExit(0)\n"
+        f"os.execv({codex_path!r}, [{codex_path!r}, *sys.argv[1:]])\n",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    return shim
 
 
 def _assert_service_worker_tombstone(build_output: Path) -> None:
@@ -2509,7 +2526,12 @@ def native_claude_plan_session(
                 respawned.wait(timeout=5)
 
 
-def _create_native_codex_session(base_url: str, runner_id: str) -> str:
+def _create_native_codex_session(
+    base_url: str,
+    runner_id: str,
+    *,
+    model: str | None = None,
+) -> str:
     """Register the ``codex-native`` wrapper agent and bind its session.
 
     Reuses the exact terminal-first spec ``omnigent codex`` ships
@@ -2526,10 +2548,12 @@ def _create_native_codex_session(base_url: str, runner_id: str) -> str:
     gateway auth from its own credentials, and pre-accepts the first-run
     trust/onboarding prompts — no CLI client required. ``model=None`` lets the
     configured provider's default model win (matching the seeded codex bundle
-    built via ``_build_native_bundle``).
+    built via ``_build_native_bundle``); tests can pin a specific catalog model
+    to exercise model-specific startup behavior.
 
     :param base_url: Spawned server base URL.
     :param runner_id: The token-bound runner id to bind.
+    :param model: Optional Codex model to pin in the wrapper spec.
     :returns: The new session/conversation id.
     """
     import json as _json
@@ -2544,7 +2568,7 @@ def _create_native_codex_session(base_url: str, runner_id: str) -> str:
     from omnigent.codex_native import _materialize_codex_agent_spec
 
     with tempfile.TemporaryDirectory() as _tmp:
-        spec_path = _materialize_codex_agent_spec(Path(_tmp), model=None)
+        spec_path = _materialize_codex_agent_spec(Path(_tmp), model=model)
         yaml_text = spec_path.read_text()
 
     buf = io.BytesIO()
@@ -2760,7 +2784,12 @@ class MockedCodexNativeSession:
     sidecar: CodexResponsesSidecar
 
 
-def _write_mock_codex_provider_config(config_home: Path, base_url: str) -> None:
+def _write_mock_codex_provider_config(
+    config_home: Path,
+    base_url: str,
+    *,
+    model: str = "mock-model",
+) -> None:
     """Write provider config that routes native Codex to the sidecar."""
     config_home.mkdir(parents=True, exist_ok=True)
     (config_home / "config.yaml").write_text(
@@ -2774,14 +2803,14 @@ providers:
       api_key: "sk-e2e-mock"
       wire_api: responses
       models:
-        default: mock-model
+        default: {model}
 """,
         encoding="utf-8",
     )
 
 
 @pytest.fixture
-def mocked_native_codex_goal_session(
+def mocked_native_codex_session(
     built_spa: None,
     tmp_path_factory: pytest.TempPathFactory,
     request: pytest.FixtureRequest,
@@ -2796,30 +2825,38 @@ def mocked_native_codex_goal_session(
     in the same shard.
     """
     if request.config.getoption("--ui-base-url"):
-        pytest.skip("mocked native Codex goal e2e requires an isolated spawned server")
+        pytest.skip("mocked native Codex e2e requires an isolated spawned server")
 
     codex_path = shutil.which("codex")
     if codex_path is None:
-        pytest.skip("codex CLI is required for mocked native Codex goal e2e")
-    if not _codex_cli_supports_goal_mode(codex_path):
-        pytest.skip("codex CLI >= 0.139.0 is required for app-server goal APIs")
+        pytest.skip("codex CLI is required for mocked native Codex e2e")
+    if not _codex_cli_supports_mocked_app_server(codex_path):
+        pytest.skip("codex CLI >= 0.139.0 is required for mocked app-server e2e")
+
+    fixture_param = getattr(request, "param", None)
+    model = fixture_param if isinstance(fixture_param, str) else "mock-model"
 
     try:
         sidecar_bin = build_sidecar_bin()
     except RuntimeError:
         pytest.skip("cargo is required for Codex parity sidecar")
 
-    server_tmp = tmp_path_factory.mktemp("e2e_ui_codex_goal_server")
-    sidecar = start_codex_responses_sidecar(
-        sidecar_bin,
-        server_tmp / "responses.json",
-        [
+    server_tmp = tmp_path_factory.mktemp("e2e_ui_mocked_codex_server")
+    responses = (
+        fixture_param
+        if isinstance(fixture_param, list)
+        else [
             [
                 ev_response_created("resp-goal-ui-bootstrap"),
                 ev_assistant_message("msg-goal-ui-bootstrap", "E2E_GOAL_BOOTSTRAP"),
                 ev_completed("resp-goal-ui-bootstrap"),
             ]
-        ],
+        ]
+    )
+    sidecar = start_codex_responses_sidecar(
+        sidecar_bin,
+        server_tmp / "responses.json",
+        responses,
     )
 
     config_home = server_tmp / "config-home"
@@ -2829,7 +2866,23 @@ def mocked_native_codex_goal_session(
     artifact_dir = server_tmp / "artifacts"
     for path in (source_codex_home, home_dir, state_dir, artifact_dir):
         path.mkdir(parents=True, exist_ok=True)
-    _write_mock_codex_provider_config(config_home, sidecar.base_url)
+    # Reproduce the intermittent production path deterministically: a user
+    # hook needs review while the runner's version probe is unparseable. The
+    # real Codex binary still handles every non-version invocation.
+    (source_codex_home / "hooks.json").write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "UserPromptSubmit": [
+                        {"hooks": [{"type": "command", "command": "/usr/bin/true"}]}
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    codex_shim = _write_codex_unknown_version_shim(server_tmp, codex_path)
+    _write_mock_codex_provider_config(config_home, sidecar.base_url, model=model)
 
     port = _find_free_port()
     log_path = server_tmp / "server.log"
@@ -2852,6 +2905,7 @@ def mocked_native_codex_goal_session(
         "OMNIGENT_CODEX_NATIVE_STATE_DIR": str(state_dir),
         "CODEX_HOME": str(source_codex_home),
         "HOME": str(home_dir),
+        "OMNIGENT_CODEX_PATH": str(codex_shim),
     }
     server_env = {
         **shared_env,
@@ -2940,7 +2994,7 @@ def mocked_native_codex_goal_session(
                 f"{runner_log_path.read_text()[-3000:] if runner_log_path.exists() else ''}"
             )
 
-        session_id = _create_native_codex_session(base_url, runner_id)
+        session_id = _create_native_codex_session(base_url, runner_id, model=model)
         yield MockedCodexNativeSession(base_url=base_url, session_id=session_id, sidecar=sidecar)
     finally:
         if session_id is not None:

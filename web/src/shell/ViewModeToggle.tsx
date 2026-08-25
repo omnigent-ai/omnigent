@@ -22,7 +22,7 @@ export function ViewModeToggle() {
   const ctx = useTerminalFirst();
   if (!ctx || !ctx.isTerminalFirst || ctx.isShellView || isIOSShell()) return null;
 
-  const { view, setView, terminalsAvailable, terminalStartingUp } = ctx;
+  const { view, setView, terminalStartingUp } = ctx;
   const terminalLabel = terminalStartingUp ? "Terminal is starting up…" : "Terminal view";
 
   return (
@@ -42,12 +42,9 @@ export function ViewModeToggle() {
       >
         <MessagesSquareIcon className="size-3.5" />
       </ViewModeSegment>
-      {/* Terminal stays disabled until a PTY is reachable; the spinner while
-          it's coming up reads as "loading" rather than a dead segment. */}
       <ViewModeSegment
         label={terminalLabel}
         active={view === "terminal"}
-        disabled={!terminalsAvailable}
         onClick={() => setView("terminal")}
         testId="view-mode-terminal"
       >
@@ -70,23 +67,18 @@ export function ViewModeToggle() {
 function ViewModeSegment({
   label,
   active,
-  disabled = false,
   onClick,
   testId,
   children,
 }: {
   label: string;
   active: boolean;
-  disabled?: boolean;
   onClick: () => void;
   testId: string;
   children: React.ReactNode;
 }) {
   return (
     <Tooltip>
-      {/* Wrapper span owns hover/focus: a disabled button gets no pointer
-          events, so the tooltip explaining *why* it's disabled would never
-          open if it anchored to the button itself. */}
       <TooltipTrigger asChild>
         <span className="inline-flex">
           <Button
@@ -95,7 +87,6 @@ function ViewModeSegment({
             size="icon-xs"
             aria-label={label}
             aria-pressed={active}
-            disabled={disabled}
             onClick={onClick}
             data-testid={testId}
             className={cn(

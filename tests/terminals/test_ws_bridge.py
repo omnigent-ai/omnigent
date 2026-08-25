@@ -22,6 +22,7 @@ import signal
 import stat
 import struct
 import subprocess
+import sys
 import termios
 import tty
 from pathlib import Path
@@ -40,6 +41,36 @@ from omnigent.terminals.ws_bridge import (
 )
 
 _HAS_TMUX = shutil.which("tmux") is not None
+
+
+def test_importing_claude_native_does_not_pull_in_fastapi() -> None:
+    """Importing the CLI module keeps the FastAPI server stack lazy.
+
+    ``claude_native`` imports terminal constants from ``ws_bridge`` on every
+    launch. The bridge must therefore avoid loading FastAPI until it is used
+    to serve a WebSocket.
+
+    :returns: None.
+    """
+    probe = (
+        "import sys\n"
+        "import omnigent.claude_native\n"
+        "assert 'fastapi' not in sys.modules, "
+        "'fastapi loaded via claude_native import'\n"
+    )
+    child_env = {**os.environ, "PYTHONPATH": os.pathsep.join(p for p in sys.path if p)}
+
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        env=child_env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, (
+        f"claude_native import pulled in the FastAPI stack. stderr:\n{result.stderr}"
+    )
 
 
 @pytest.mark.asyncio
@@ -438,6 +469,11 @@ class _ParkingFakeWebSocket:
         self._parked = asyncio.Event()  # never set: parks ``receive``
         self.close_code: int | None = None
         self.close_reason: str | None = None
+        self.sent_text: list[str] = []
+
+    async def send_text(self, data: str) -> None:
+        """Capture server-to-browser capability frames."""
+        self.sent_text.append(data)
 
     async def send_bytes(self, data: bytes) -> None:
         """Record that the PTY produced output (tmux attached, drawing)."""
@@ -452,6 +488,36 @@ class _ParkingFakeWebSocket:
         """Capture the bridge's chosen close code and reason."""
         self.close_code = code
         self.close_reason = reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("read_only", "allow", "expected"),
+    [(False, True, True), (False, False, False), (True, True, False)],
+)
+async def test_bridge_advertises_safe_osc52_capability(
+    monkeypatch: pytest.MonkeyPatch,
+    read_only: bool,
+    allow: bool,
+    expected: bool,
+) -> None:
+    """PTY OSC 52 is explicitly enabled only for trusted writable attaches."""
+    monkeypatch.setattr(ws_bridge.shutil, "which", lambda _command: None)
+    websocket = _ParkingFakeWebSocket()
+
+    await bridge_tmux_pty_to_websocket(
+        websocket,  # type: ignore[arg-type]
+        socket_path="unused",
+        tmux_target="main",
+        read_only=read_only,
+        allow_osc52_clipboard=allow,
+    )
+
+    assert len(websocket.sent_text) == 1
+    assert json.loads(websocket.sent_text[0]) == {
+        "type": "osc52-clipboard-capability",
+        "enabled": expected,
+    }
 
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux required")

@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from omnigent import _native_forwarder_health as native_forwarder_health
 from omnigent.codex_model_vocabulary import codex_spawn_model
 from omnigent.inner.codex_executor import (
     _TURN_EVENT_WARN_SECONDS,
@@ -24,6 +25,7 @@ from omnigent.inner.codex_executor import (
     _databricks_codex_config_overrides,
     _dynamic_tool_result_payload,
     _goal_objective_from_content,
+    _parse_codex_gateway_error,
     _prompt_for_turn,
     _provider_codex_config_overrides,
     _to_codex_input_items,
@@ -3475,5 +3477,190 @@ def test_run_turn_defaults_to_a_codex_model_on_codexs_own_login():
         model = fake_session.calls[0]["model"]
         assert model == CODEX_DEFAULT_MODEL
         assert codex_spawn_model(model) == model, "not codex's own spelling"
+
+    _run(_t())
+
+
+# ── Gateway-auth error surfacing (issue: codex SDK head swallows 401s) ──────
+
+
+def test_parse_codex_gateway_error_extracts_status_and_url():
+    """The real ``unexpected status 401 … url: …`` stderr line is classified."""
+    line = (
+        'ERROR: unexpected status 401 Unauthorized: {"error_code":401,"message":'
+        '"Credential was not sent or was of an unsupported type for this API."}, '
+        "url: https://host/ai-gateway/codex/v1/responses"
+    )
+    error = _parse_codex_gateway_error(line)
+    assert error is not None
+    assert error.code == 401
+    assert error.reason == "Unauthorized"
+    assert error.url == "https://host/ai-gateway/codex/v1/responses"
+    assert error.fatal is True
+    detail = error.detail(model="databricks-gpt-5")
+    assert "401" in detail
+    assert "databricks-gpt-5" in detail
+    assert "ai-gateway/codex/v1/responses" in detail
+
+
+def test_parse_codex_gateway_error_ignores_ordinary_stderr():
+    """Ordinary stderr (including the retry lines) is not misclassified."""
+    assert _parse_codex_gateway_error("Reconnecting... 3/5") is None
+    assert _parse_codex_gateway_error("some unrelated log line") is None
+    assert _parse_codex_gateway_error("") is None
+
+
+def test_parse_codex_gateway_error_5xx_not_fatal():
+    """A 5xx is attributed but not treated as fast-fail (a retry might fix it)."""
+    error = _parse_codex_gateway_error(
+        "unexpected status 503 Service Unavailable: {}, url: https://h/x"
+    )
+    assert error is not None
+    assert error.code == 503
+    assert error.fatal is False
+    assert "auth likely" not in error.detail()
+
+
+def test_note_stderr_gateway_error_records_into_health_slot():
+    """A parsed gateway rejection is recorded where the idle watchdog reads it."""
+    native_forwarder_health.clear()
+    try:
+        session = _CodexAppServerSession(
+            codex_path="/bin/echo", cwd="/tmp/w", env={}, tool_executor=None
+        )
+        session._note_stderr_gateway_error(
+            "unexpected status 401 Unauthorized: {}, url: https://h/ai-gateway/codex/v1/responses"
+        )
+        detail = native_forwarder_health.recent_post_failure(60.0)
+        assert detail is not None
+        assert "gateway returned 401" in detail
+        assert "ai-gateway/codex/v1/responses" in detail
+    finally:
+        native_forwarder_health.clear()
+
+
+def test_fatal_gateway_arms_only_after_retries_exhausted():
+    """Fast-fail arms only when BOTH a 401 and a final ``Reconnecting N/N`` are seen."""
+    native_forwarder_health.clear()
+    try:
+        session = _CodexAppServerSession(
+            codex_path="/bin/echo", cwd="/tmp/w", env={}, tool_executor=None
+        )
+        # A 401 alone (retries not yet exhausted) must not arm fast-fail.
+        session._note_stderr_gateway_error("Reconnecting... 3/5")
+        session._note_stderr_gateway_error(
+            "unexpected status 401 Unauthorized: {}, url: https://h/x"
+        )
+        assert session._fatal_gateway_error is None
+        # The final retry line arms it.
+        session._note_stderr_gateway_error("Reconnecting... 5/5")
+        assert session._fatal_gateway_error is not None
+        assert session._fatal_gateway_error.code == 401
+    finally:
+        native_forwarder_health.clear()
+
+
+def test_app_server_run_turn_fails_fast_on_gateway_auth_error():
+    """An auth-class gateway rejection surfaces the real cause promptly as an
+    ExecutorError, instead of stalling to the generic idle-watchdog message."""
+
+    async def _t():
+        native_forwarder_health.clear()
+        session = _CodexAppServerSession(
+            codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
+        )
+        session.start = AsyncMock()
+        session._proc = _FakeProcess()
+        session._request = AsyncMock(
+            side_effect=[
+                {"result": {"thread": {"id": "thread-1"}}},
+                {"result": {"turn": {"id": "turn-1"}}},
+                {"result": {}},
+            ]
+        )
+
+        # The stderr loop would set this once the CLI exhausts its retries on a
+        # 401; simulate that arriving mid-wait (no turn events ever emitted).
+        async def _inject_gateway_error() -> None:
+            await asyncio.sleep(0.01)
+            session._note_stderr_gateway_error("Reconnecting... 5/5")
+            session._note_stderr_gateway_error(
+                "unexpected status 401 Unauthorized: {}, "
+                "url: https://h/ai-gateway/codex/v1/responses"
+            )
+
+        inject_task = asyncio.create_task(_inject_gateway_error())
+        events = [
+            event
+            async for event in session.run_turn(
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[],
+                system_prompt="Be helpful.",
+                model="databricks-gpt-5",
+                cwd=".",
+                sandbox="workspace-write",
+            )
+        ]
+        await inject_task
+
+        errors = [e for e in events if isinstance(e, ExecutorError)]
+        assert errors, f"expected an ExecutorError, got {events}"
+        message = errors[-1].message
+        assert "401" in message
+        assert "databricks-gpt-5" in message
+        assert "wedged LLM" not in message
+        assert errors[-1].retryable is False
+        session._request.assert_any_await(
+            "turn/interrupt",
+            {"threadId": "thread-1", "turnId": "turn-1"},
+        )
+        native_forwarder_health.clear()
+
+    _run(_t())
+
+
+def test_run_turn_clears_stale_gateway_error_at_turn_start():
+    """A new turn forgets a prior turn's fatal signal so it can't misfire."""
+
+    async def _t():
+        session = _CodexAppServerSession(
+            codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
+        )
+        session.start = AsyncMock()
+        session._proc = _FakeProcess()
+        session._request = AsyncMock(
+            side_effect=[
+                {"result": {"thread": {"id": "thread-1"}}},
+                {"result": {"turn": {"id": "turn-1"}}},
+            ]
+        )
+        # Pretend a prior turn left a fatal signal set.
+        session._fatal_gateway_error = _parse_codex_gateway_error(
+            "unexpected status 401 Unauthorized: {}, url: https://h/x"
+        )
+
+        async def _inject_turn_completed() -> None:
+            await asyncio.sleep(0.01)
+            session._events.put_nowait(
+                {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}}
+            )
+
+        inject_task = asyncio.create_task(_inject_turn_completed())
+        events = [
+            event
+            async for event in session.run_turn(
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[],
+                system_prompt="Be helpful.",
+                model="databricks-gpt-5",
+                cwd=".",
+                sandbox="workspace-write",
+            )
+        ]
+        await inject_task
+        # The stale signal was cleared at turn start, so the turn completes
+        # normally rather than fast-failing on it.
+        assert any(isinstance(e, TurnComplete) for e in events), events
+        assert not any(isinstance(e, ExecutorError) for e in events), events
 
     _run(_t())

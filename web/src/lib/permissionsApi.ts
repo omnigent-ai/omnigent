@@ -32,6 +32,22 @@ export function isOwnerLevel(level: number | null): boolean {
 }
 
 /**
+ * Numeric permission level required to mutate the session's shared
+ * workspace. Mirrors ``LEVEL_EDIT`` in ``omnigent/server/auth.py``.
+ */
+export const LEVEL_EDIT = 2;
+
+/**
+ * Return whether a permission level grants edit access — mutating the
+ * session's shared workspace, e.g. opening or closing a shell tab (both
+ * server-gated on ``LEVEL_EDIT``). ``null`` is treated permissively
+ * (single-user / still loading), matching ``isOwnerLevel`` / ``useCanEdit``.
+ */
+export function isEditorLevel(level: number | null): boolean {
+  return level == null || level >= LEVEL_EDIT;
+}
+
+/**
  * Derive the effective permission level for the active conversation.
  *
  * Resolution order:

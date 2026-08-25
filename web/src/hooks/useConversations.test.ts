@@ -21,6 +21,7 @@ import {
   useProjects,
   useProjectConfig,
   useProjectSessions,
+  useRenameProject,
   useUpdateProjectConfig,
   useMoveToProject,
   useRenameConversation,
@@ -340,6 +341,46 @@ describe("fetchAllArchivedProjectNames", () => {
 
     expect(names).toEqual([]);
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("useRenameProject", () => {
+  function renderRenameHook() {
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    return renderHook(() => useRenameProject(), { wrapper });
+  }
+
+  // Regression: promoting a label-only folder must return the created id so a
+  // follow-up icon write targets that row instead of re-creating it (409).
+  it("creates and returns the new id when promoting a label-only folder", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ id: "proj_new", name: "Renamed" })); // POST create
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ data: [], first_id: null, last_id: null, has_more: false }), // members page
+    );
+
+    const { result } = renderRenameHook();
+    const id = await result.current.mutateAsync({ id: null, oldName: "old", newName: "Renamed" });
+
+    expect(id).toBe("proj_new");
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/projects");
+  });
+
+  it("returns the existing id for a first-class rename", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ id: "proj_1", name: "Renamed" })); // PATCH rename
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
+    );
+
+    const { result } = renderRenameHook();
+    const id = await result.current.mutateAsync({
+      id: "proj_1",
+      oldName: "old",
+      newName: "Renamed",
+    });
+
+    expect(id).toBe("proj_1");
   });
 });
 

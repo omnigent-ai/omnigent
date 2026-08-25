@@ -27,6 +27,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from omnigent._platform import resolve_repo_symlink
 from omnigent.db.db_models import InvalidUuidError
+from omnigent.debug_logging import set_current_user_id
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_plugins import (
     NativeHarnessProvider,
@@ -43,7 +44,7 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-from omnigent.server import session_live_state
+from omnigent.server import session_live_state, shutdown_state
 from omnigent.server.auth import AuthProvider, SharingMode
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
@@ -1268,6 +1269,7 @@ def create_app(
                 agent_store=agent_store,
                 conversation_store=conversation_store,
                 permission_store=permission_store,
+                policy_store=policy_store,
                 host_store=host_store,
                 host_registry=host_registry,
                 agent_cache=agent_cache,
@@ -1485,6 +1487,18 @@ def create_app(
         set_request_session_id_for_access_log(
             session_match.group(1) if session_match else None,
         )
+        # Bind the request's authenticated user so debug-log records emitted
+        # while handling it are attributed. Request-scoped: each request runs in
+        # its own task/context, so concurrent users never see each other's id.
+        # Best-effort — attribution must never fail a request. The raw identity
+        # (incl. the "local" single-user sentinel) is kept; it is a meaningful
+        # queryable value in the debug table.
+        try:
+            set_current_user_id(
+                auth_provider.get_user_id(request) if auth_provider is not None else None
+            )
+        except Exception:  # noqa: BLE001 — attribution is best-effort
+            set_current_user_id(None)
 
         failed = False
         status_code: int | None = None
@@ -1785,12 +1799,13 @@ def create_app(
                 host_version = host_versions.get(conn.host_id)
             if conn.runner_id is None:
                 # No runner binding: an in-process executor (or a session
-                # not yet dispatched) is reachable — EXCEPT an unbound fork
-                # of a session that had a working directory, which must
-                # rebind a host + directory first. Reporting it offline
-                # routes the first message into the directory picker instead
-                # of dropping it against a runner that can't start.
-                runner_online = not conn.needs_workspace
+                # not yet dispatched) is reachable — EXCEPT sessions that have
+                # no executor to reach and must launch a runner on a host
+                # first: an unbound fork (needs a workspace) or an imported
+                # transcript (no live executor anywhere). Reporting those
+                # offline routes the first message into the resume picker
+                # instead of dropping it against a runner that can't start.
+                runner_online = not (conn.needs_workspace or conn.imported)
             else:
                 # Strict: reachable only if the runner tunnel is up. No
                 # host-relaunch optimism — host state lives in host_online.
@@ -2381,6 +2396,11 @@ def create_app(
         :func:`_mark_runner_sessions_offline`, which fails only the
         interrupted turns and stamps the disconnect cause.
 
+        A server that is itself shutting down skips the marking too: it
+        closed the tunnel, and the runner cannot re-register with a
+        process that stopped listening — the replacement server re-adopts
+        it on reconnect (:mod:`omnigent.server.shutdown_state`).
+
         :param runner_id: The disconnected runner's id.
         """
         from omnigent.server.routes.sessions import (
@@ -2390,6 +2410,12 @@ def create_app(
         from omnigent.server.schemas import ErrorDetail
 
         await asyncio.sleep(RUNNER_DISCONNECT_GRACE_S)
+        if shutdown_state.server_shutting_down():
+            _logger.info(
+                "Runner %s dropped because this server is shutting down; skipping offline-marking",
+                runner_id,
+            )
+            return
         if tunnel_registry.get(runner_id) is not None:
             _logger.info(
                 "Runner %s reconnected within the disconnect grace; skipping offline-marking",
@@ -2719,6 +2745,22 @@ def create_app(
         # auth routes and ``/v1/me`` share one roster. Consulted on each login
         # to promote listed identities — the only admin path for OIDC, and an
         # additive convenience for accounts.
+        # Login-issued refresh grants: both server-mintable providers
+        # (accounts, oidc) get a grant store so `omnigent login` can hand
+        # the CLI refresh material — without it, an unattended host dies
+        # permanently at session-JWT expiry (default 8 h). The store also
+        # backs the opt-in RFC 8628 device flow below.
+        device_grant_store = None
+        if (
+            isinstance(auth_provider, UnifiedAuthProvider)
+            and auth_provider._source in ("accounts", "oidc")
+            and permission_store is not None
+        ):
+            from omnigent.server.device_grant_store import DeviceGrantStore
+
+            device_grant_store = DeviceGrantStore(permission_store.storage_location)
+            auth_provider.set_grant_revocation_check(device_grant_store.is_revoked)
+
         if (
             isinstance(auth_provider, UnifiedAuthProvider)
             and auth_provider._source == "accounts"
@@ -2730,7 +2772,10 @@ def create_app(
 
             app.include_router(
                 create_accounts_auth_router(
-                    auth_provider, account_store, admin_list, permission_store
+                    auth_provider,
+                    account_store,
+                    admin_list,
+                    permission_store,
                 ),
                 prefix="/auth",
                 tags=["auth"],
@@ -2761,6 +2806,7 @@ def create_app(
                     admin_list,
                     oidc_account_store,
                     allowed_domains=frozenset(allowed_domains or ()) or None,
+                    device_grant_store=device_grant_store,
                 ),
                 prefix="/auth",
                 tags=["auth"],
@@ -2772,24 +2818,20 @@ def create_app(
             )
 
         # Device Authorization Grant (RFC 8628): opt-in, default-off via
-        # OMNIGENT_DEVICE_GRANT_ENABLED, and accounts-mode only. OIDC delegates
-        # login to the IdP (cli-ticket flow), so it neither needs nor mounts
-        # these routes. Wires the revocation lookup into the auth provider so
-        # revoking a grant immediately rejects its delegated access tokens.
-        # See designs/DEVICE_AUTH.md.
+        # OMNIGENT_DEVICE_GRANT_ENABLED, and accounts-mode only (the
+        # in-browser consent flow needs the accounts login page). Wires
+        # the full /oauth/* surface including the token endpoint. See
+        # designs/DEVICE_AUTH.md.
         from omnigent.server.auth import env_var_is_truthy
 
         if (
             env_var_is_truthy("OMNIGENT_DEVICE_GRANT_ENABLED", default=False)
             and isinstance(auth_provider, UnifiedAuthProvider)
             and auth_provider._source == "accounts"
-            and permission_store is not None
+            and device_grant_store is not None
         ):
-            from omnigent.server.device_grant_store import DeviceGrantStore
             from omnigent.server.routes.device_auth import create_device_auth_router
 
-            device_grant_store = DeviceGrantStore(permission_store.storage_location)
-            auth_provider.set_grant_revocation_check(device_grant_store.is_revoked)
             app.include_router(
                 create_device_auth_router(auth_provider, device_grant_store),
                 tags=["oauth"],
@@ -2810,6 +2852,17 @@ def create_app(
                     "the server and its trusted client(s) to restrict initiation "
                     "to authorized clients. See designs/DEVICE_AUTH.md.",
                 )
+        elif isinstance(auth_provider, UnifiedAuthProvider) and device_grant_store is not None:
+            # No device flow, but login-issued refresh grants still need
+            # their token/revoke endpoints — in OIDC mode and in accounts
+            # mode without the flag alike.
+            from omnigent.server.routes.device_auth import create_oauth_token_router
+
+            app.include_router(
+                create_oauth_token_router(auth_provider, device_grant_store),
+                tags=["oauth"],
+            )
+            _logger.info("login-grant: /oauth/token + /oauth/revoke enabled")
 
     # Mount the built web SPA at "/" if a build is present. The SPA is
     # built into ``omnigent/server/static/web-ui/`` by ``web/``'s Vite

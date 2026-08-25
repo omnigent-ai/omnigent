@@ -57,6 +57,35 @@ class FakeAgentStore:
         return self.agents.get(agent_id)
 
 
+class _FakeExecutor:
+    def __init__(self, harness: str) -> None:
+        # Mirrors AgentSpec.executor: a canonical harness in ``config['harness']``
+        # (falls back to ``type``). The permission-mode injection reads this to
+        # confirm a claude-native agent before adding ``--permission-mode``.
+        self.type = harness
+        self.config = {"harness": harness}
+
+
+class _FakeSpec:
+    def __init__(self, harness: str) -> None:
+        self.executor = _FakeExecutor(harness)
+
+
+class _FakeLoadedAgent:
+    def __init__(self, harness: str) -> None:
+        self.spec = _FakeSpec(harness)
+
+
+class FakeAgentCache:
+    """Resolves an agent id to a spec with a fixed harness (for launch gating)."""
+
+    def __init__(self, harness: str = "claude-native") -> None:
+        self._harness = harness
+
+    def load(self, agent_id: str, bundle_location: str, **_: Any) -> _FakeLoadedAgent:
+        return _FakeLoadedAgent(self._harness)
+
+
 class FakeScheduledTaskStore:
     """Records update/create_run calls and serves get() from a dict."""
 
@@ -183,12 +212,46 @@ class FakeHostRegistry:
         return None
 
 
+class FakePolicyStore:
+    """Records policy create calls."""
+
+    def __init__(self, *, fail_create: bool = False) -> None:
+        self.created: list[dict[str, Any]] = []
+        self.fail_create = fail_create
+
+    def create(
+        self,
+        policy_id: str,
+        session_id: str,
+        name: str,
+        type: str,
+        handler: str,
+        factory_params: dict[str, Any] | None = None,
+        enabled: bool = True,
+    ) -> Any:
+        if self.fail_create:
+            raise RuntimeError("policy create failed")
+        self.created.append(
+            {
+                "policy_id": policy_id,
+                "session_id": session_id,
+                "name": name,
+                "type": type,
+                "handler": handler,
+                "factory_params": factory_params,
+                "enabled": enabled,
+            }
+        )
+        return None
+
+
 def _deps(sched_store: FakeScheduledTaskStore, **overrides: Any) -> FireDeps:
     return FireDeps(
         scheduled_task_store=sched_store,
         agent_store=overrides.get("agent_store", FakeAgentStore()),
         conversation_store=overrides.get("conversation_store", FakeConversationStore()),
         permission_store=overrides.get("permission_store", FakePermissionStore()),
+        policy_store=overrides.get("policy_store"),
         host_store=overrides.get("host_store", FakeHostStore()),
         host_registry=overrides.get("host_registry", FakeHostRegistry()),
         agent_cache=overrides.get("agent_cache"),
@@ -334,6 +397,84 @@ async def test_active_creates_session_grant_and_run() -> None:
     assert len(store.runs) == 1
     assert any("last_run_at" in u for u in store.updates)
     assert any("last_run_conversation_id" in u for u in store.updates)
+
+
+def _claude_agent_deps(
+    store: FakeScheduledTaskStore, conv_store: FakeConversationStore, *, harness: str
+) -> FireDeps:
+    """Deps whose agent ``ag_1`` resolves to *harness* (for launch-arg gating)."""
+    return _deps(
+        store,
+        permission_store=FakePermissionStore(),
+        conversation_store=conv_store,
+        agent_store=FakeAgentStore({"ag_1": _FakeAgent("ag_1", bundle_location="ag_1/hash")}),
+        agent_cache=FakeAgentCache(harness=harness),
+    )
+
+
+@pytest.mark.asyncio
+async def test_permission_mode_becomes_terminal_launch_args() -> None:
+    """A Claude task's permission_mode fires as the runner's --permission-mode args."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(permission_mode="acceptEdits")})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _claude_agent_deps(store, conv_store, harness="claude-native"),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert len(conv_store.created) == 1
+    assert conv_store.created[0]["terminal_launch_args"] == ["--permission-mode", "acceptEdits"]
+
+
+@pytest.mark.asyncio
+async def test_unset_permission_mode_sends_no_launch_args() -> None:
+    """No permission_mode → no terminal_launch_args (agent default applies)."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _claude_agent_deps(store, conv_store, harness="claude-native"),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert len(conv_store.created) == 1
+    assert conv_store.created[0]["terminal_launch_args"] is None
+
+
+@pytest.mark.asyncio
+async def test_permission_mode_omitted_for_non_claude_agent() -> None:
+    """A mis-stamped non-Claude row degrades to no --permission-mode flag.
+
+    The injection is harness-gated fail-safe: even if a permission_mode somehow
+    persisted on a codex/cursor task, the fire must NOT inject the unknown flag
+    (which would break the launch) — it launches with the agent's own default.
+    """
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(permission_mode="bypassPermissions")})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _claude_agent_deps(store, conv_store, harness="codex-native"),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert len(conv_store.created) == 1
+    assert conv_store.created[0]["terminal_launch_args"] is None
 
 
 @pytest.mark.asyncio
@@ -1082,3 +1223,99 @@ async def test_run_now_skips_when_already_in_flight() -> None:
     release.set()
     await _drain()
     assert len(store.runs) == 1
+
+
+# ── Cost budget policy attachment ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_max_cost_usd_attaches_cost_budget_policy() -> None:
+    """When a task has max_cost_usd set, a cost_budget policy is attached to the
+    spawned session."""
+    policy_store = FakePolicyStore()
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(max_cost_usd=5.0)})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _deps(store, conversation_store=conv_store, policy_store=policy_store),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert len(conv_store.created) == 1
+    assert len(policy_store.created) == 1
+    pol = policy_store.created[0]
+    assert pol["session_id"] == "conv_1"
+    assert pol["handler"] == "omnigent.policies.builtins.cost.cost_budget"
+    assert pol["factory_params"] == {"max_cost_usd": 5.0}
+    assert pol["enabled"] is True
+    assert store.runs[0]["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_no_max_cost_usd_skips_policy_attachment() -> None:
+    """When max_cost_usd is None, no policy is attached."""
+    policy_store = FakePolicyStore()
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(max_cost_usd=None)})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _deps(store, conversation_store=conv_store, policy_store=policy_store),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert len(conv_store.created) == 1
+    assert policy_store.created == []
+    assert store.runs[0]["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_no_policy_store_skips_attachment() -> None:
+    """When policy_store is None, cost budget attachment is silently skipped."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(max_cost_usd=5.0)})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _deps(store, conversation_store=conv_store, policy_store=None),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert len(conv_store.created) == 1
+    assert store.runs[0]["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_policy_create_failure_does_not_fail_fire() -> None:
+    """A policy store failure is non-fatal: the session proceeds without a cap."""
+    policy_store = FakePolicyStore(fail_create=True)
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(max_cost_usd=5.0)})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    on_fire = build_on_fire(
+        _deps(store, conversation_store=conv_store, policy_store=policy_store),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert len(conv_store.created) == 1
+    assert len(launched) == 1
+    assert store.runs[0]["status"] == "running"

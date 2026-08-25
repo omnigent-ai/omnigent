@@ -192,9 +192,14 @@ def _detect_terminal_background() -> Literal["dark", "light"] | None:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         return None
 
-    import select
-    import termios
-    import tty
+    try:
+        import select
+        import termios
+        import tty
+    except ModuleNotFoundError:
+        # Windows has no termios or tty support, even when its terminal
+        # streams report that they are TTYs.
+        return None
 
     fd = sys.stdin.fileno()
     try:
@@ -312,8 +317,15 @@ def startup_theme_picker(
         update_user_config(theme=theme.name)
         return theme
 
-    import termios
-    import tty
+    try:
+        import termios
+        import tty
+    except ModuleNotFoundError:
+        # Raw terminal mode is unavailable on Windows. Use the same
+        # persisted fallback as other non-interactive terminals.
+        theme = DARK_THEME if detected == "dark" else LIGHT_THEME
+        update_user_config(theme=theme.name)
+        return theme
 
     fd = sys.stdin.fileno()
     try:

@@ -1,7 +1,8 @@
-import { render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter, type To } from "react-router-dom";
-import { describe, expect, it } from "vitest";
-import { basenamedRouting, reactRouterRouting } from "./routing";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { basenamedRouting, Link as RoutingLink, reactRouterRouting } from "./routing";
+import { setOmnigentHostConfig } from "@/lib/host";
 
 // `basenamedRouting` is the embed seam: it rebases web's absolute
 // navigation targets under the host mount path so links land under
@@ -90,5 +91,51 @@ describe("rebasePath primitive", () => {
     // `/mounting` merely shares the `/mount` text prefix; it's a different path
     // and must be rebased under the mount, not treated as already-under.
     expect(basenamedRouting("/mount").rebasePath("/mounting")).toBe("/mount/mounting");
+  });
+});
+
+describe("Link analytics (componentId)", () => {
+  afterEach(() => {
+    cleanup();
+    setOmnigentHostConfig({});
+  });
+
+  function renderLink(props: { componentId?: string; onClick?: () => void }) {
+    return render(
+      <MemoryRouter>
+        <RoutingLink to="/tasks" {...props}>
+          Tasks
+        </RoutingLink>
+      </MemoryRouter>,
+    );
+  }
+
+  it("reports a click to the host sink and still calls the caller's onClick", () => {
+    const analytics = vi.fn();
+    setOmnigentHostConfig({ analytics });
+    const onClick = vi.fn();
+    renderLink({ componentId: "sidebar.tasks", onClick });
+    fireEvent.click(screen.getByRole("link", { name: "Tasks" }));
+    expect(analytics).toHaveBeenCalledExactlyOnceWith({
+      type: "click",
+      componentId: "sidebar.tasks",
+      componentKind: "link",
+    });
+    expect(onClick).toHaveBeenCalledOnce();
+  });
+
+  it("does not leak componentId onto the rendered <a>", () => {
+    setOmnigentHostConfig({ analytics: vi.fn() });
+    renderLink({ componentId: "sidebar.tasks" });
+    // React would warn on an unknown DOM attribute; also assert it isn't present.
+    expect(screen.getByRole("link", { name: "Tasks" })).not.toHaveAttribute("componentId");
+  });
+
+  it("emits nothing when componentId is absent", () => {
+    const analytics = vi.fn();
+    setOmnigentHostConfig({ analytics });
+    renderLink({});
+    fireEvent.click(screen.getByRole("link", { name: "Tasks" }));
+    expect(analytics).not.toHaveBeenCalled();
   });
 });

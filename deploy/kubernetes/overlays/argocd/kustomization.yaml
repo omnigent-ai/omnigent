@@ -32,10 +32,12 @@ patches:
 
   # The Ingress depends on an ingress controller (nginx by default) and
   # cert-manager. ArgoCD scores an Ingress without status.loadBalancer as
-  # Progressing, so on a cluster with no controller the sync stalls forever.
-  # Putting it in wave 1 (everything else is implicit wave 0) means nothing
-  # gates on its health. ArgoCD's kind ordering already applies it last within
-  # a wave, so this only affects the health gate.
+  # Progressing. Wave 1 (everything else is implicit wave 0) means no later
+  # sync wave gates on its health, so the *sync* completes. The Application
+  # itself may still report Progressing indefinitely on a cluster without a
+  # controller — with automated + selfHeal, that keeps the Application in a
+  # perpetual reconcile loop (harmless but noisy). Install the controller or
+  # add a custom health check that treats the Ingress as healthy.
   - target:
       kind: Ingress
     patch: |

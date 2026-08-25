@@ -1,7 +1,7 @@
-"""E2E: right rail Shells tab and file viewer.
+"""E2E: right rail shell soft tab and file viewer.
 
 Execution-logs coverage was dropped: that surface used to be a
-``SessionRail`` card but the rail is now tabbed (Agents/Files/Shells)
+``SessionRail`` card but the rail is now tabbed (Files/Changes/Agents)
 and the only entry point left is the ``md:hidden`` mobile session menu —
 unreachable on the desktop viewport these tests run at.
 """
@@ -56,14 +56,14 @@ def test_right_panel_terminals_and_file_viewer(
     page: Page,
     terminal_session: tuple[str, str],
 ) -> None:
-    """Launch a terminal and exercise the Terminals tab + file viewer.
+    """Launch a terminal and exercise the shell soft tab + file viewer.
 
     The terminal session fixture registers the test agent and creates a
     session bound to it. We send ``spin up zsh``, then verify:
 
-    - the right rail's Terminals tab lists the launched terminal, its
-      xterm connects inline, and the maximize button opens the full
-      terminals push panel;
+    - the agent-launched shell appears as a closable soft tab in the rail,
+      its xterm connects inline when the tab is opened, and closing the tab
+      (after the confirm) kills the terminal;
     - the Files tab can open a workspace file and the file viewer renders
       its contents.
 
@@ -96,7 +96,7 @@ def test_right_panel_terminals_and_file_viewer(
     try:
         page.goto(f"{base_url}/c/{session_id}")
         # The rail defaults open but is remembered per session; ensure it is
-        # open so the Shells tab and Files panel below are reachable.
+        # open so the shell tab and Files panel below are reachable.
         open_right_rail(page)
 
         composer = page.get_by_placeholder("Ask the agent anything…")
@@ -104,34 +104,32 @@ def test_right_panel_terminals_and_file_viewer(
         composer.fill("spin up zsh")
         page.get_by_role("button", name="Send", exact=True).click()
 
-        # Open the Shells tab (present by default — the agent declares
-        # terminals). The launched shell's row shows once the agent's
-        # sys_terminal_launch completes (LLM turn → up to 60s); keep
-        # main's generous click timeout for slow CI turns.
-        rail.get_by_role("tab", name=re.compile("Shells")).click(timeout=60_000)
-        terminal_row = rail.get_by_role("button").filter(has_text="zsh").filter(has_text="main")
-        expect(terminal_row.first).to_be_visible(timeout=60_000)
+        # The agent's sys_terminal_launch creates a shell that appears directly
+        # as a closable soft tab in the rail's strip (shells are 1:1 with the
+        # session's terminals — there is no separate Shells tab or list). The
+        # launch rides an LLM turn, so allow main's generous 60s. The tab's
+        # accessible name starts with its label "zsh · main"; the "Close …" x is
+        # a separate button, so anchor the regex to disambiguate.
+        shell_tab = rail.get_by_role("button", name=re.compile(r"^zsh · main"))
+        expect(shell_tab).to_be_visible(timeout=60_000)
 
-        # Clicking a shell row opens it as a tab in the rail's top strip;
-        # its xterm renders inside the rail's content slot and the chat
-        # page is left undisturbed (no main-column takeover). The shell tab
-        # is labeled "zsh · main" and carries a "Close zsh · main" x.
-        terminal_row.first.click()
-        close_tab = rail.get_by_role("button", name="Close zsh · main", exact=True)
-        expect(close_tab).to_be_visible(timeout=20_000)
-        # The shell's xterm mounts in the rail and connects; the chat main
-        # column is not replaced. Assert no VISIBLE main terminal surface:
-        # terminal-first sessions keep a hidden pre-warmed surface mounted
-        # (data-visible="false"), which is not a takeover.
+        # Agent-spawned shells don't steal focus, so click the tab to open it;
+        # its xterm renders inside the rail's content slot and the chat page is
+        # left undisturbed (no main-column takeover). Assert no VISIBLE main
+        # terminal surface: terminal-first sessions keep a hidden pre-warmed
+        # surface mounted (data-visible="false"), which is not a takeover.
+        shell_tab.click()
         terminal_view = rail.get_by_test_id("terminal-view")
         expect(terminal_view.last).to_be_visible(timeout=20_000)
         expect(terminal_view.last).to_have_attribute("data-state", "connected", timeout=20_000)
         expect(
             page.locator('[data-testid="main-terminal-view"][data-visible="true"]')
         ).to_have_count(0)
-        # The tab's x closes the shell — its xterm unmounts and the rail
-        # falls back to the Shells list for the Files steps below.
-        close_tab.click()
+        # Closing the tab kills the terminal, so its "x" confirms first; after
+        # confirming the xterm unmounts and the rail returns to its default
+        # (files) view for the Files steps below.
+        rail.get_by_role("button", name="Close zsh · main", exact=True).click()
+        page.get_by_role("button", name="Close shell").click()
         expect(terminal_view).to_have_count(0)
 
         # Switch to the Files tab and open the seeded file. The

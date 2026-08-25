@@ -133,6 +133,18 @@ describe("index.css bg-card glass rule selector", () => {
   });
 });
 
+describe("index.css app-shell viewport lock", () => {
+  const rule = (cssSource.match(/[^{}]+\{[^{}]*\}/g) ?? []).find(
+    (block) => block.includes("body:has(.app-shell)") && /overflow\s*:\s*hidden/.test(block),
+  );
+
+  it("locks both document roots while the fixed app shell is mounted", () => {
+    expect(rule, "the app-shell viewport lock is gone from index.css").toBeDefined();
+    expect(rule).toContain("html:has(.app-shell)");
+    expect(rule).toContain("body:has(.app-shell)");
+  });
+});
+
 /* Regression test for the "table link column collapses to ~2ch" bug.
  *
  * Streamdown styles links with `wrap-anywhere`, which also drops the
