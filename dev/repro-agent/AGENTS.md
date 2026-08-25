@@ -396,6 +396,14 @@ state, bad output, error) for a `before` recording, or the correct end state for
 fine otherwise. Recordings are workspace artifacts exactly like the test — leave
 them uncommitted; in CI the artifact bundle collects them.
 
+For each recording, write a short **`caption`** in its handoff entry describing
+**the actions that clip performs** — the ordered steps a viewer watches, ending
+in what the clip shows (see the `recordings` field in Output). You just drove
+those steps, so capture them while they're fresh: e.g. `"start a session → open
+the model picker → select the catalog → picker shows raw IDs"`. This is what a
+reader sees under the video on the ticket, so make it read like a journey, not a
+restatement of the bug title.
+
 ## Output — the reproduction artifacts
 
 The **last thing in your final message** must be exactly one fenced ```json code
@@ -436,7 +444,8 @@ choice:
   ],
   "test_path": "tests/e2e_ui/model_catalog/test_1234.py",
   "recordings": [
-    {"surface": "web", "kind": "before", "path": "recordings/1234/before-picker.webm", "format": "webm"}
+    {"surface": "web", "kind": "before", "path": "recordings/1234/before-picker.webm", "format": "webm",
+     "caption": "open the model picker → select the catalog → picker shows raw IDs instead of names"}
   ],
   "session_id": "dc59e331-...",
   "journey": "open model picker → select catalog → picker shows raw IDs",
@@ -475,13 +484,20 @@ Field meanings:
   excerpt), plus any root-cause leads you noticed while reproducing (hypotheses
   only — you do not fix).
 - `recordings` — the Step 4 captures: a list of
-  `{"surface", "kind", "path", "format"}` objects. `kind` is `"before"` for a
-  `reproduced` facet's failing run or `"fixed"` for an `already_fixed` facet's
-  passing run (the fix step later re-records the same drivers post-fix as
-  `"after"`); `path` workspace-relative. Include an entry for the
-  authored-but-unrendered VHS tape too (`"format": "tape"`) when rendering was
-  skipped. Empty list when nothing was recorded — then say what was missing in
-  `evidence`.
+  `{"surface", "kind", "path", "format", "caption"}` objects. `kind` is
+  `"before"` for a `reproduced` facet's failing run or `"fixed"` for an
+  `already_fixed` facet's passing run (the fix step later re-records the same
+  drivers post-fix as `"after"`); `path` workspace-relative. `caption` is a
+  short, human-readable description of **the actions this specific clip
+  performs**, written as the ordered steps a viewer will watch and ending in
+  what the clip shows — e.g. `"start a session → open the model picker → select
+  the catalog → picker shows raw IDs"`. Phrase it for *this* clip's outcome: a
+  `before` caption ends in the failure, a `fixed` caption ends in the correct
+  behavior (the journey completing). This is per-recording (each clip drives its
+  own steps), distinct from the bug-level `journey` field. Include an entry for
+  the authored-but-unrendered VHS tape too (`"format": "tape"`) when rendering
+  was skipped. Empty list when nothing was recorded — then say what was missing
+  in `evidence`.
 
 Keep the prose before the block terse — the one exception is the full test
 source, which you paste in full. You produce the live-confirmed reproduction +
