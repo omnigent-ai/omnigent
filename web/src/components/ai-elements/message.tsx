@@ -39,8 +39,8 @@ export const Message = ({ className, from, ...props }: MessageProps) => (
   <div
     className={cn(
       // min-w-0 lets this flex item shrink below its content's intrinsic width instead of widening the column.
-      "group flex w-full min-w-0 max-w-[95%] flex-col gap-2",
-      from === "user" ? "is-user ml-auto justify-end" : "is-assistant",
+      "group flex w-full min-w-0 flex-col gap-2",
+      from === "user" ? "is-user ml-auto max-w-[95%] justify-end" : "is-assistant max-w-full",
       className,
     )}
     {...props}
@@ -54,11 +54,11 @@ export const MessageContent = ({ children, className, ...props }: MessageContent
     className={cn(
       // User and assistant prose share the settings-driven interface text
       // token, so their size and line-height stay in lockstep.
-      "is-user:dark flex w-fit min-w-0 max-w-full flex-col gap-2 text-ui",
-      "group-[.is-user]:ml-auto group-[.is-user]:overflow-hidden group-[.is-user]:rounded-2xl group-[.is-user]:bg-muted group-[.is-user]:px-3 group-[.is-user]:py-2 group-[.is-user]:text-foreground group-[.is-user]:ring-1 group-[.is-user]:ring-border/60",
+      "is-user:dark flex min-w-0 max-w-full flex-col gap-2 text-ui",
+      "group-[.is-user]:ml-auto group-[.is-user]:w-fit group-[.is-user]:overflow-hidden group-[.is-user]:rounded-2xl group-[.is-user]:bg-muted group-[.is-user]:px-3 group-[.is-user]:py-2 group-[.is-user]:text-foreground group-[.is-user]:ring-1 group-[.is-user]:ring-border/60",
       // Tighter than the user bubble's gap-2 so muted single-line tool
       // ("See N steps") / reasoning rows don't look orphaned between prose.
-      "group-[.is-assistant]:gap-1.5 group-[.is-assistant]:text-foreground",
+      "group-[.is-assistant]:w-full group-[.is-assistant]:gap-1.5 group-[.is-assistant]:text-foreground",
       className,
     )}
     {...props}
@@ -427,7 +427,14 @@ function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
     : children;
 
   return (
-    <div className={cn("relative", wrap && "chat-code-wrap")}>
+    <div
+      className={cn(
+        // Keep short fenced blocks compact inside the structural assistant column.
+        // Long blocks still stop at the column edge and wrap within it.
+        "relative w-fit max-w-full",
+        wrap && "chat-code-wrap",
+      )}
+    >
       {block}
       {/* Overlay actions, anchored left of Streamdown's own download button
           (which sits at the header's right edge). A flex row lets the buttons

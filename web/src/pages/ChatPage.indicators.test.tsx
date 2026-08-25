@@ -203,17 +203,18 @@ describe("BubbleView dispatch", () => {
     render(<BubbleView bubble={assistantText("the answer is 42")} />);
     const bubble = screen.getByTestId("message-bubble");
     expect(bubble).toHaveAttribute("data-role", "assistant");
-    expect(bubble).toHaveClass("gap-2");
+    expect(bubble).toHaveClass("gap-2", "max-w-full");
+    expect(bubble.firstElementChild).toHaveClass("group-[.is-assistant]:w-full");
     expect(bubble).toHaveTextContent("the answer is 42");
     expect(screen.getByRole("button", { name: "Copy" })).toHaveAttribute("data-size", "icon-xxs");
   });
 
-  it("uses full-width layout for assistant display math", () => {
+  it("inherits the full-width assistant layout for display math", () => {
     render(<BubbleView bubble={assistantText(String.raw`$$d = \sqrt{x^2 + y^2}$$`)} />);
 
     const bubble = screen.getByTestId("message-bubble");
     expect(bubble).toHaveClass("max-w-full");
-    expect(bubble.firstElementChild).toHaveClass("w-full");
+    expect(bubble.firstElementChild).toHaveClass("group-[.is-assistant]:w-full");
   });
 
   const errorItem = (): AssistantBubble["items"][number] => ({
@@ -236,14 +237,14 @@ describe("BubbleView dispatch", () => {
 
   it("spans the chat column for an error-only bubble, with no hover footer", () => {
     // WHY: an error banner is a thread-level element — its dashed rule must
-    // span the width a long-text turn takes (not shrink-wrap the 560px pill
-    // via MessageContent's w-fit), and the timestamp/actions chrome belongs
-    // to assistant prose, never to the error.
+    // inherit the assistant column width, and the timestamp/actions chrome
+    // belongs to assistant prose, never to the error.
     render(<BubbleView bubble={errorBubble([errorItem()])} />);
 
     const bubble = screen.getByTestId("message-bubble");
     expect(screen.getByTestId("error-pill")).toBeInTheDocument();
-    expect(bubble.firstElementChild).toHaveClass("w-full");
+    expect(bubble).toHaveClass("max-w-full");
+    expect(bubble.firstElementChild).toHaveClass("group-[.is-assistant]:w-full");
     expect(screen.queryByTestId("message-timestamp")).not.toBeInTheDocument();
   });
 
@@ -262,7 +263,8 @@ describe("BubbleView dispatch", () => {
 
     const bubble = screen.getByTestId("message-bubble");
     expect(screen.getByTestId("error-pill")).toBeInTheDocument();
-    expect(bubble.firstElementChild).toHaveClass("w-full");
+    expect(bubble).toHaveClass("max-w-full");
+    expect(bubble.firstElementChild).toHaveClass("group-[.is-assistant]:w-full");
     expect(screen.getByTestId("message-timestamp")).toBeInTheDocument();
   });
 
@@ -349,16 +351,13 @@ describe("BubbleView dispatch", () => {
     expect(screen.getByTestId("message-bubble").children).toHaveLength(1);
   });
 
-  it("spans the column for a fold-only turn so the row's hairline draws", () => {
-    // WHY: shrink-wrapped to the ~110px summary row, the trailing hairline
-    // (a flex-1 span) collapses to zero width and the click target stops
-    // short of the column. The max-w-3xl cap keeps it aligned with the rule
-    // under an answered turn.
+  it("inherits the assistant column for a fold-only turn so the row's hairline draws", () => {
+    // WHY: the trailing hairline and click target should span the same
+    // structural column as every other assistant block.
     render(<BubbleView bubble={foldOnlyBubble([toolItem("c4")])} />);
     const bubble = screen.getByTestId("message-bubble");
-    expect(bubble).toHaveClass("max-w-3xl");
-    expect(bubble.firstElementChild).toHaveClass("w-full");
-    expect(bubble.firstElementChild).not.toHaveClass("w-fit");
+    expect(bubble).toHaveClass("max-w-full");
+    expect(bubble.firstElementChild).toHaveClass("group-[.is-assistant]:w-full");
   });
 
   it("keeps the copy action on a folded turn that answers for itself", () => {
