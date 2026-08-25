@@ -25,14 +25,16 @@
 //
 // Submit is gated on EVERY question having an answer (a predefined
 // option selected, or the custom row selected with non-empty text).
+// ⌘/Ctrl+Enter is the keyboard equivalent of the primary button.
 // Selections are gathered into a flat ``{[question id or text]:
 // answer}`` map matching MCP's ``ElicitResult.content`` shape and
 // passed to ``onSubmit``.
 
 import { CheckIcon, ChevronLeftIcon, ChevronRightIcon, XIcon } from "lucide-react";
-import { type ChangeEvent, useState } from "react";
+import { type ChangeEvent, type KeyboardEvent, useState } from "react";
 import { Button } from "@/components/ui/button";
 import type { ClaudeQuestion } from "@/lib/askUserQuestion";
+import { isImeCompositionKeyEvent } from "@/lib/ime";
 
 /**
  * Map from question id/text → either a single selected label
@@ -197,6 +199,19 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
   const isFirst = currentIndex === 0;
   const isLast = currentIndex === questions.length - 1;
 
+  // ⌘/Ctrl+Enter mirrors the primary button: advance the carousel, or
+  // submit on the last question. Plain Enter stays a newline.
+  const handleKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
+    if (e.key !== "Enter" || !(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;
+    if (isImeCompositionKeyEvent(e)) return;
+    e.preventDefault();
+    if (!isLast) {
+      setCurrentIndex((i) => i + 1);
+    } else if (allAnswered) {
+      handleSubmit();
+    }
+  };
+
   // Selected labels drive the preview render. Only PREDEFINED
   // options contribute previews — the custom row has no preview
   // to show. Single-select: 0 or 1 selected option (custom doesn't
@@ -219,7 +234,11 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
   const customRowValue = customInputs[currentKey] ?? "";
 
   return (
-    <div className="flex flex-col gap-2 text-foreground" data-testid="ask-user-question-form">
+    <div
+      className="flex flex-col gap-2 text-foreground"
+      data-testid="ask-user-question-form"
+      onKeyDown={handleKeyDown}
+    >
       <div className="flex items-center gap-2 text-sm text-muted-foreground">
         <span data-testid="ask-user-question-progress">
           Question {currentIndex + 1} of {questions.length}:
