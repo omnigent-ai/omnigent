@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import os
 import secrets
-import signal
 import subprocess
 import sys
 import time
@@ -27,7 +26,7 @@ from dataclasses import dataclass
 
 import httpx
 
-from tests.e2e_ui.auth._accounts_server import public_loopback_url
+from tests.e2e_ui.auth._accounts_server import _terminate, public_loopback_url
 from tests.e2e_ui.auth._fake_idp import FakeIdP, fake_idp
 from tests.e2e_ui.conftest import (
     _HEALTH_POLL_INTERVAL_S,
@@ -51,17 +50,6 @@ class OIDCServer:
     base_url: str
     public_url: str
     idp: FakeIdP
-
-
-def _terminate(proc: subprocess.Popen[bytes]) -> None:
-    """SIGTERM with a short grace period, escalating to SIGKILL."""
-    if proc.poll() is None:
-        proc.send_signal(signal.SIGTERM)
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5)
 
 
 def spawn_oidc_server(mock_llm_server_url: str, server_tmp) -> Iterator[OIDCServer]:

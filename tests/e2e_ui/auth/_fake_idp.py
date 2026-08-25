@@ -122,9 +122,11 @@ def _build_app(issuer: str, client_id: str, email: str, private_pem: bytes) -> F
 
     @app.post("/token")
     async def token() -> JSONResponse:
-        # Any code is accepted; return an RS256-signed id_token the server
-        # verifies against /jwks. iss/aud/email must match what the callback
-        # checks (issuer, client_id, verified email).
+        # Any code is accepted (PKCE code_verifier/challenge is intentionally
+        # NOT validated — the goal is filming the journey, so this lane does not
+        # exercise/guard the server's PKCE handling). Return an RS256-signed
+        # id_token the server verifies against /jwks. iss/aud/email must match
+        # what the callback checks (issuer, client_id, verified email).
         now = int(time.time())
         id_token = jwt.encode(
             {
