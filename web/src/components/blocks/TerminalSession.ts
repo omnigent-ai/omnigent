@@ -265,13 +265,10 @@ export function loadWebglRenderer(term: Terminal): WebglAddon | null {
  * Populate the clipboard from a terminal text selection on a browser
  * ``copy`` event.
  *
- * The attached tmux session runs with ``mouse on``, so a plain click-drag
- * is captured by tmux for its own copy-mode and never becomes a browser
- * selection; the user makes a selection with Shift-drag (non-Mac) or
- * ⌥-drag (Mac, via ``macOptionClickForcesSelection``). xterm renders that
- * selection in its own layer rather than a DOM range, so the browser's
- * default copy of it is unreliable — we feed ``term.getSelection()`` into
- * the event's ``clipboardData`` ourselves. ``getSelection()`` already
+ * xterm renders terminal selections in its own layer rather than a DOM range,
+ * so the browser's default copy is unreliable — we feed
+ * ``term.getSelection()`` into the event's ``clipboardData`` ourselves.
+ * ``getSelection()`` already
  * rejoins soft-wrapped rows, so a paragraph the terminal wrapped across
  * several rows copies back as one logical line.
  *
@@ -434,8 +431,8 @@ export function sgrWheelReports(lines: number, col: number, row: number): string
  * xterm's built-in wheel→report conversion is unusable with macOS
  * trackpads: it damps sub-50px pixel deltas by ×0.3 and emits at most one
  * report per DOM event regardless of magnitude, so two-finger scrolling
- * over a mouse-tracking TUI (Claude Code, tmux with ``mouse on``) barely
- * moves. This helper replaces that path: deltas convert to lines at face
+ * over a mouse-tracking TUI (such as Claude Code) barely moves. This helper
+ * replaces that path: deltas convert to lines at face
  * value, the fractional remainder accumulates in *partial* so a run of
  * small trackpad deltas still adds up, and one report is emitted per whole
  * line (capped at {@link WHEEL_REPORTS_MAX_PER_EVENT}; the excess is
@@ -443,10 +440,9 @@ export function sgrWheelReports(lines: number, col: number, row: number): string
  * after the gesture).
  *
  * The event is only consumed when the pane program is tracking the mouse
- * with SGR encoding — both tmux ``mouse on`` (PTY transport) and Claude
- * Code's own tracking (control transport) request SGR. Otherwise the
- * caller must let xterm handle the wheel natively so, e.g., a plain shell
- * on the control transport scrolls xterm's own scrollback. Shift-wheel is
+ * with SGR encoding, such as Claude Code on the control transport. Otherwise
+ * the caller must let xterm handle the wheel natively so, e.g., a plain shell
+ * scrolls xterm's own scrollback. Shift-wheel is
  * also left to xterm, mirroring its built-in escape hatch.
  *
  * Pure helper — exported for direct unit testing; production code calls it
@@ -558,12 +554,8 @@ export class TerminalSession {
    *     server. This is a best-effort UI activity signal, not a shell
    *     job-state oracle.
    * :param onInput: Called when user input is sent to the terminal.
-   * :param nativeSelection: When ``true`` (control-mode transport), xterm
-   *     owns the character buffer and mouse, so plain click-drag selects and
-   *     the browser's own copy works — the ``macOptionClickForcesSelection``
-   *     workaround and the custom ``copy`` listener are skipped. When
-   *     ``false`` (PTY transport, the default), tmux runs with ``mouse on``
-   *     and captures drags, so both workarounds stay wired.
+   * :param controlMode: Whether this is the control transport. Control mode
+   *     forwards raw pane output, so pane OSC 52 must not be accepted directly.
    * :param clipboardEnabled: Whether tmux copies may write the local clipboard.
    * :param onClipboardRequest: Receives validated tmux copy-mode text.
    */
@@ -574,7 +566,7 @@ export class TerminalSession {
     isDark = false,
     onActivity?: TerminalActivityListener,
     onInput?: TerminalInputListener,
-    nativeSelection = false,
+    controlMode = false,
     clipboardEnabled = true,
     onClipboardRequest?: TerminalClipboardListener,
   ) {
@@ -595,14 +587,6 @@ export class TerminalSession {
       // cell's foreground luminance only when it lacks contrast against
       // its actual background.
       minimumContrastRatio: 4.5,
-      // PTY transport only: the attached tmux session runs with `mouse on`
-      // (terminal.py) so the wheel pages through scrollback, but tmux then
-      // captures every mouse drag for its own copy-mode, so a plain
-      // click-drag never produces a browser text selection. xterm's escape
-      // hatch `macOptionClickForcesSelection` lets Mac users ⌥-drag to select,
-      // then ⌘-C copies. In control mode xterm owns the mouse and plain drag
-      // selects natively, so the forced-selection workaround is unnecessary.
-      macOptionClickForcesSelection: !nativeSelection,
       // Opt into xterm's proposed APIs, matching openui's terminal setup.
       allowProposedApi: true,
     });
@@ -612,7 +596,7 @@ export class TerminalSession {
       // Control mode forwards raw pane output, so accepting pane OSC 52 there
       // would bypass tmux's `set-clipboard external` trust boundary. Its copy
       // path is the typed websocket message emitted from tmux notifications.
-      if (!nativeSelection && this.osc52ClipboardEnabled) {
+      if (!controlMode && this.osc52ClipboardEnabled) {
         const text = parseOsc52Clipboard(data);
         if (text !== null) this.requestClipboardWrite(text);
       }
@@ -648,7 +632,7 @@ export class TerminalSession {
 
     // Make the browser copy gesture (right-click → Copy and Edit → Copy on
     // every platform, ⌘C on macOS) yield the terminal selection as text.
-    // Without this, a Shift/⌥-drag selection has no working copy path on
+    // Without this, an xterm selection has no working copy path on
     // Linux/Windows — Ctrl+C is SIGINT, and xterm's selection layer isn't a
     // DOM range the browser copies on its own. Capture phase + the shared
     // abort signal so `dispose()` removes it for free. Ctrl+C is never
@@ -852,11 +836,9 @@ export class TerminalSession {
    * Whether the pane program requested SGR mouse encoding (``?1006h``).
    *
    * The public ``IModes`` exposes the tracking mode but not the encoding,
-   * so this feature-detects xterm's core mouse service. Both tmux with
-   * ``mouse on`` (PTY transport) and Claude Code (control transport) request
-   * SGR; when the private shape is missing or the encoding is anything else,
-   * the wheel handler defers to xterm rather than synthesizing reports the
-   * program could not parse.
+   * so this feature-detects xterm's core mouse service. When a pane program
+   * requests SGR tracking (for example Claude Code on the control transport),
+   * reports are synthesized; otherwise the wheel handler defers to xterm.
    */
   private sgrMouseEncodingActive(): boolean {
     // eslint-disable-next-line no-underscore-dangle

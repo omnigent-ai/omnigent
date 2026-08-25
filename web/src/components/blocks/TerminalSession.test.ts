@@ -512,7 +512,7 @@ describe("TerminalSession", () => {
     onInput?: () => void,
     clipboardEnabled = true,
     onClipboardRequest?: (text: string) => void,
-    nativeSelection = false,
+    controlMode = false,
   ) {
     const states: ConnectionState[] = [];
     const container = document.createElement("div");
@@ -524,7 +524,7 @@ describe("TerminalSession", () => {
       false,
       onActivity,
       onInput,
-      nativeSelection,
+      controlMode,
       clipboardEnabled,
       onClipboardRequest,
     );

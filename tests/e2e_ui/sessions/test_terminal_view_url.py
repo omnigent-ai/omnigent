@@ -61,6 +61,8 @@ def test_transcript_views_survive_cold_reload(
 
     expect(page).to_have_url(re.compile(r"[?&]view=terminal(?:&|$)"))
     expect(terminal_button).to_have_attribute("aria-pressed", "true")
+    # PTY terminals use native selection now that managed tmux mouse mode is off.
+    expect(page.get_by_test_id("terminal-selection-hint")).to_have_count(0)
 
     # Remove the same-tab fallback so the reload must restore from the URL.
     page.evaluate("window.sessionStorage.clear()")

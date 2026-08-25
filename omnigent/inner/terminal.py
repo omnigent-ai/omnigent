@@ -212,7 +212,7 @@ def _tmux_command_sequence(commands: list[list[str]]) -> list[str]:
     file.
 
     :param commands: Tmux commands without the leading ``tmux`` argv,
-        e.g. ``[["set-option", "-g", "mouse", "on"], ["new-session"]]``.
+        e.g. ``[["set-option", "-g", "mouse", "off"], ["new-session"]]``.
     :returns: Flattened argv suffix with command separators.
     """
     sequence: list[str] = []
@@ -295,9 +295,10 @@ def _tmux_input_option_commands(scrollback: int) -> list[list[str]]:
 
     ``history-limit`` is generated per terminal because it comes from
     ``TerminalEnvSpec.scrollback``. ``set-clipboard external`` exports tmux
-    copy-mode selections without trusting pane OSC 52 requests. ``mouse on``
-    makes the attached web terminal scrollable. ``focus-events on`` lets interactive programs
-    observe pane focus changes. ``extended-keys`` with CSI-u formatting
+    copy-mode selections without trusting pane OSC 52 requests. ``mouse off``
+    leaves scrolling and text selection to the attached terminal instead of
+    tmux copy mode. ``focus-events on`` lets interactive programs observe pane
+    focus changes. ``extended-keys`` with CSI-u formatting
     lets programs inside tmux receive Kitty Keyboard Protocol keys such
     as Shift+Enter when the attached terminal supports them. Terminals
     without that protocol ignore tmux's request, and the quiet tmux
@@ -315,7 +316,7 @@ def _tmux_input_option_commands(scrollback: int) -> list[list[str]]:
         # Export tmux copy-mode selections to attached terminals without letting
         # pane applications create tmux buffers through OSC 52.
         ["set-option", "-sq", "set-clipboard", "external"],
-        ["set-option", "-g", "mouse", "on"],
+        ["set-option", "-g", "mouse", "off"],
         ["set-option", "-g", "focus-events", "on"],
         ["set-option", "-g", "escape-time", "0"],
     ]

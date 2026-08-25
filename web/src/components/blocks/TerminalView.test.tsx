@@ -19,7 +19,6 @@ import {
   RECONNECT_BACKOFF_MS,
   RECONNECT_STABLE_MS,
   buildAttachPath,
-  selectionHintText,
 } from "./TerminalView";
 
 const clipboardMock = vi.hoisted(() => ({
@@ -32,7 +31,7 @@ const terminalSessionMock = vi.hoisted(() => ({
   instances: [] as {
     url: string;
     container: HTMLDivElement;
-    nativeSelection: boolean;
+    controlMode: boolean;
     clipboardEnabled: boolean;
     onClipboardRequest?: (text: string) => void;
     onState: (state: ConnectionState) => void;
@@ -60,14 +59,14 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
       _isDark?: boolean,
       _onActivity?: () => void,
       _onInput?: () => void,
-      nativeSelection = false,
+      controlMode = false,
       clipboardEnabled = true,
       onClipboardRequest?: (text: string) => void,
     ) {
       terminalSessionMock.instances.push({
         url,
         container,
-        nativeSelection,
+        controlMode,
         clipboardEnabled,
         onClipboardRequest,
         onState,
@@ -164,12 +163,12 @@ describe("buildAttachPath", () => {
 });
 
 describe("control-mode transport", () => {
-  it("forwards ?transport=control and enables native selection when transport=control", async () => {
+  it("forwards ?transport=control and marks the session as control mode", async () => {
     render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" transport="control" />);
     await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
     const inst = terminalSessionMock.instances[0];
     expect(inst.url).toContain("transport=control");
-    expect(inst.nativeSelection).toBe(true);
+    expect(inst.controlMode).toBe(true);
   });
 
   it("disables clipboard bridging for read-only attaches", async () => {
@@ -185,19 +184,13 @@ describe("control-mode transport", () => {
     expect(terminalSessionMock.instances[0].clipboardEnabled).toBe(false);
   });
 
-  it("hides the selection hint bar in control mode", async () => {
-    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" transport="control" />);
-    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
-    expect(screen.queryByTestId("terminal-selection-hint")).toBeNull();
-  });
-
-  it("keeps the hint bar and PTY behavior by default (no transport prop)", async () => {
+  it("keeps PTY clipboard behavior without rendering a selection hint", async () => {
     render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
     await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
     const inst = terminalSessionMock.instances[0];
     expect(inst.url).not.toContain("transport");
-    expect(inst.nativeSelection).toBe(false);
-    expect(screen.getByTestId("terminal-selection-hint")).toBeInTheDocument();
+    expect(inst.controlMode).toBe(false);
+    expect(screen.queryByTestId("terminal-selection-hint")).toBeNull();
   });
 });
 
@@ -811,27 +804,5 @@ describe("automatic reconnect", () => {
     await act(async () => {});
     expect(terminalSessionMock.instances).toHaveLength(1);
     expect(screen.getByText("Bridge closed: code 4405")).toBeInTheDocument();
-  });
-});
-
-describe("selectionHintText", () => {
-  it("tells macOS users to hold Option and copy with Command", () => {
-    // On macOS the force-selection modifier is Option and Cmd+C copies
-    // (Cmd isn't forwarded to the shell). Both must appear; a regression
-    // to Shift/Ctrl here would print the wrong keys for Mac users.
-    const hint = selectionHintText(true);
-    expect(hint).toContain("⌥");
-    expect(hint).toContain("⌘C");
-  });
-
-  it("tells non-macOS users to hold Shift and copy via right-click", () => {
-    // Elsewhere the modifier is Shift, and Ctrl+C is SIGINT (not copy),
-    // so the hint must say Shift and must point at right-click → Copy
-    // rather than a Ctrl+C shortcut that would kill the user's process.
-    const hint = selectionHintText(false);
-    expect(hint).toContain("Shift");
-    expect(hint).toContain("right-click");
-    expect(hint).not.toContain("⌘");
-    expect(hint.toLowerCase()).not.toContain("ctrl");
   });
 });

@@ -676,6 +676,17 @@ async def test_launch_omits_keep_alive_options_by_default(
 
 
 @pytest.mark.asyncio
+async def test_launch_disables_tmux_mouse_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Managed terminals leave scrolling and text selection to the client."""
+    cmd = await _capture_launch_argv(tmp_path, monkeypatch, keep_alive_after_exit=False)
+    assert contains_subsequence(cmd, ["set-option", "-g", "mouse", "off"])
+    assert not contains_subsequence(cmd, ["set-option", "-g", "mouse", "on"])
+
+
+@pytest.mark.asyncio
 async def test_launch_enables_csi_u_extended_keys_quietly(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
