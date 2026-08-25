@@ -21,6 +21,9 @@ end-to-end publish pipeline.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import logging
+from collections.abc import Iterator
 from typing import Any
 
 import pytest
@@ -742,3 +745,122 @@ async def test_inflight_replay_via_pre_ready_snapshot_does_not_duplicate_window_
     assert deltas.count("Hello world") == 1, (
         f"joined prefix should be replayed exactly once, got deltas={deltas!r}"
     )
+
+
+# ── SSE-event debug logging ───────────────────────────────────────────────────
+
+
+def test_sse_safe_attributes_whitelists_ids_and_excludes_content() -> None:
+    # The whitelist captures identifiers/dimensions and NEVER content — no model
+    # text, tool arguments/outputs, message data, error messages, or the
+    # human/LLM-authored free text carried in reason / blocked_on.
+    event = {
+        "type": "response.output_item.done",
+        "response": {"id": "resp_123", "output": [{"secret": "assistant text"}]},
+        "item": {
+            "id": "item_1",
+            "type": "function_call",
+            "arguments": '{"query": "pii"}',
+            "data": "PII payload",
+        },
+        "call_id": "call_9",
+        "message_id": "msg_5",
+        "index": 3,
+        "final": True,
+        "tool_name": "search.web",
+        "status": "completed",
+        "delta": "streamed model tokens",
+        # Free-text fields that must NOT be captured (e.g. an LLM-generated
+        # policy deny reason quoting the content it evaluated).
+        "reason": "blocked because the prompt asked to exfiltrate secret_pii_value",
+        "blocked_on": "waiting on user secret_pii_value confirmation",
+        "error": {"code": "timeout", "source": "llm", "message": "raw provider detail"},
+    }
+    attrs = session_stream._sse_safe_attributes(event)
+    assert attrs["response_id"] == "resp_123"
+    assert attrs["item_id"] == "item_1"
+    assert attrs["item_type"] == "function_call"
+    assert attrs["call_id"] == "call_9"
+    assert attrs["message_id"] == "msg_5"
+    assert attrs["index"] == 3
+    assert attrs["final"] is True
+    assert attrs["status"] == "completed"
+    assert attrs["error_code"] == "timeout"
+    assert attrs["error_source"] == "llm"
+    # Free-text / author-defined dimensions are excluded outright.
+    assert "reason" not in attrs
+    assert "blocked_on" not in attrs
+    assert "tool_name" not in attrs
+    # No content leaks, in any key or value.
+    flat = repr(attrs).lower()
+    for forbidden in (
+        "delta",
+        "arguments",
+        "data",
+        "message",
+        "output",
+        "reason",
+        "blocked_on",
+        "tool_name",
+    ):
+        assert forbidden not in attrs
+    for leaked in (
+        "streamed model tokens",
+        "pii",
+        "assistant text",
+        "raw provider detail",
+        "secret_pii_value",
+    ):
+        assert leaked.lower() not in flat
+
+
+@contextlib.contextmanager
+def _capturing_sse_logger() -> Iterator[list[logging.LogRecord]]:
+    """Attach a capturing handler to the SSE logger for the duration of the block."""
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    logger = session_stream.sse_event_logger()
+    old_level = logger.level
+    logger.setLevel(logging.INFO)
+    handler = _Capture()
+    logger.addHandler(handler)
+    try:
+        yield records
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(old_level)
+
+
+def test_log_sse_event_logs_kept_and_skips_noise(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(session_stream, "debug_sink_enabled", lambda: True)
+    with _capturing_sse_logger() as records:
+        session_stream._log_sse_event(
+            "conv_1", {"type": "response.completed", "response": {"id": "resp_1"}, "delta": "text"}
+        )
+        session_stream._log_sse_event("conv_1", {"type": "response.heartbeat"})
+        session_stream._log_sse_event("conv_1", {"type": "session.terminal.activity"})
+        session_stream._log_sse_event(
+            "conv_1", {"type": "response.failed", "error": {"code": "timeout", "message": "x"}}
+        )
+
+    # Heartbeat + terminal-activity skipped; the two meaningful events logged.
+    assert [r.event_name for r in records] == ["response.completed", "response.failed"]
+    completed = records[0]
+    assert completed.session_id == "conv_1"
+    assert completed.levelno == logging.INFO
+    assert completed.attributes == {"response_id": "resp_1"}  # no delta text
+    failed = records[1]
+    assert failed.levelno == logging.WARNING  # failures flagged in the level column
+    assert failed.attributes.get("error_code") == "timeout"
+    assert "message" not in failed.attributes
+
+
+def test_log_sse_event_noop_when_sink_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(session_stream, "debug_sink_enabled", lambda: False)
+    with _capturing_sse_logger() as records:
+        session_stream._log_sse_event("conv_1", {"type": "response.completed"})
+    assert records == []

@@ -9,7 +9,12 @@ name: Polly AI Review
 # Triggers:
 #   - pull_request opened/reopened/ready_for_review (automatic, once per PR)
 #   - `/review` comment on a PR (manual retrigger by write-access users)
-#   - workflow_dispatch with a PR number (manual retrigger from Actions tab)
+#   - workflow_dispatch with a PR number (manual retrigger from Actions tab,
+#     also used by the maintainer-approval relay)
+#
+# A head SHA is reviewed at most once: a trigger that lands on an
+# already-reviewed commit posts a short "skipped" note instead of a second
+# review. `/review force` overrides that.
 
 on:
   pull_request:
@@ -97,8 +102,61 @@ jobs:
             -f content=eyes --silent || true
           echo "skip=false" >> "$GITHUB_OUTPUT"
 
-      - name: Check LLM credentials available
+      # A commit needs reviewing once. Several triggers can fire for the same
+      # head SHA (open then `/review`, or `/review` then maintainer approval),
+      # which used to post two reviews of identical code. Skip the repeat and
+      # say so in one comment; `/review force` re-reviews anyway.
+      - name: Skip if this commit already has a review
+        id: dupe
         if: steps.trigger.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          set -euo pipefail
+
+          head_sha="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.head.sha')"
+          echo "head_sha=${head_sha}" >> "$GITHUB_OUTPUT"
+
+          if grep -qE '^[[:space:]]*/review[[:space:]]+force([[:space:]]|$)' <<<"${COMMENT_BODY:-}"; then
+            echo "::notice::'/review force': re-reviewing ${head_sha}."
+            exit 0
+          fi
+
+          # One page-walk gives both markers and the prior comment's URL. Only
+          # bot comments count: a human quoting a marker must not suppress a review.
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
+            --jq '.[] | select(.user.type == "Bot")
+                  | [.html_url, (.body | gsub("\n"; " "))] | @tsv' > /tmp/pr_comments.tsv
+
+          if grep -qF "<!-- polly-skipped-sha: ${head_sha} -->" /tmp/pr_comments.tsv; then
+            echo "::notice::Already posted a skip notice for ${head_sha}."
+            echo "duplicate=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          prior="$(grep -F "<!-- polly-reviewed-sha: ${head_sha} -->" /tmp/pr_comments.tsv \
+            | tail -1 | cut -f1)" || true
+          if [ -z "$prior" ]; then
+            exit 0
+          fi
+
+          echo "duplicate=true" >> "$GITHUB_OUTPUT"
+          {
+            echo "<!-- polly-skipped-sha: ${head_sha} -->"
+            echo "## <img src=\"https://raw.githubusercontent.com/omnigent-ai/omnigent/main/docs/images/omnigent-logo.svg\" alt=\"\" height=\"20\" valign=\"middle\" /> Polly AI Review skipped"
+            echo ""
+            echo "\`${head_sha:0:7}\` already has a [review](${prior}), so there is nothing new to look at."
+            echo ""
+            echo "Push a commit or comment \`/review force\` to review it again."
+          } > /tmp/skip_comment.md
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/skip_comment.md \
+            || echo "::notice::Could not post the skip note (read-only token); skipping anyway."
+
+      - name: Check LLM credentials available
+        if: steps.trigger.outputs.skip != 'true' && steps.dupe.outputs.duplicate != 'true'
         id: creds
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
@@ -504,6 +562,7 @@ jobs:
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
           REVIEW_TEXT: ${{ steps.polly.outputs.review_text }}
+          HEAD_SHA: ${{ steps.dupe.outputs.head_sha }}
           RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
         run: |
           set -euo pipefail
@@ -512,6 +571,7 @@ jobs:
           # (not expression interpolation) to avoid expression injection.
           {
             echo "<!-- polly-review-bot -->"
+            echo "<!-- polly-reviewed-sha: ${HEAD_SHA} -->"
             echo "## <img src=\"https://raw.githubusercontent.com/omnigent-ai/omnigent/main/docs/images/omnigent-logo.svg\" alt=\"\" height=\"20\" valign=\"middle\" /> Polly AI Review"
             echo ""
             echo "$REVIEW_TEXT"

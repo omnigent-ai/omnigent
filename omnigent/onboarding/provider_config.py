@@ -169,6 +169,7 @@ _HARNESS_FAMILY: dict[str, str] = {
     # Antigravity is Gemini-native but routes generic-provider traffic over
     # the OpenAI-compatible wire, so it consumes the ``openai`` family.
     "antigravity": OPENAI_FAMILY,
+    "agy": OPENAI_FAMILY,
     # NB: ``kimi`` is intentionally absent. Upstream Kimi Code CLI has no
     # per-spawn provider override flag, so Omnigent cannot thread a generic
     # provider through. Provider routing for kimi lives in ``~/.kimi/config.toml``
@@ -182,9 +183,11 @@ _HARNESS_FAMILY: dict[str, str] = {
     # (file-based, checked in :mod:`omnigent.onboarding.gemini_auth`) and the
     # detected GEMINI_API_KEY is adopted as a ``gemini``-family key, so the
     # native harness consumes the ``gemini`` family for onboarding / readiness.
-    # Both spellings are accepted, mirroring claude-native / native-claude.
+    # All spellings and aliases are accepted, mirroring claude-native / native-claude.
     "antigravity-native": GEMINI_FAMILY,
     "native-antigravity": GEMINI_FAMILY,
+    "agy-native": GEMINI_FAMILY,
+    "native-agy": GEMINI_FAMILY,
 }
 
 # Executor-type spellings that ``AgentSpec.harness_kind`` returns for SDK

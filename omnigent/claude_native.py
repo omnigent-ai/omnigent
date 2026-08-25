@@ -1206,6 +1206,20 @@ async def claude_launch_catalog(
     )
 
 
+def claude_launch_catalog_is_stale(claude_config: ClaudeNativeUcodeConfig | None) -> bool:
+    """
+    Whether this config's stored catalog is past the freshness TTL.
+
+    :param claude_config: The resolved launch config, or ``None``.
+    :returns: ``True`` when the store holds only a stale entry.
+    """
+    from omnigent import model_catalog_store
+
+    return model_catalog_store.catalog_is_stale(
+        "claude-native", claude_catalog_fingerprint(claude_config)
+    )
+
+
 def build_native_claude_terminal_env(
     claude_config: ClaudeNativeUcodeConfig | None,
 ) -> dict[str, str]:
@@ -2038,6 +2052,7 @@ def _fetch_external_session_id_for_redirect(
             "failed to fetch external Claude session id for redirect; session=%s",
             session_id,
             exc_info=True,
+            extra={"session_id": session_id},
         )
         return None
     external_session_id = payload.get("external_session_id") if isinstance(payload, dict) else None

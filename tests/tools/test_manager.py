@@ -192,6 +192,10 @@ def _make_spec(
         skills=skills or [],
         mcp_servers=mcp_servers or [],
         local_tools=local_tools or [],
+        # Without this, ``LoadSkillTool`` merges in host-scope skills from
+        # ~/.claude/skills and every .claude/skills above cwd, and these tests
+        # assert on whatever the developer happens to have installed.
+        skills_filter="none",
     )
 
 

@@ -44,6 +44,14 @@ from omnigent.onboarding.provider_config import (
         ("qwen", OPENAI_FAMILY),
         ("qwen-native", OPENAI_FAMILY),
         ("native-qwen", OPENAI_FAMILY),
+        # Antigravity SDK harness and aliases consume OpenAI family.
+        ("antigravity", OPENAI_FAMILY),
+        ("agy", OPENAI_FAMILY),
+        # Antigravity native CLI harness and aliases consume Gemini family.
+        ("antigravity-native", GEMINI_FAMILY),
+        ("native-antigravity", GEMINI_FAMILY),
+        ("agy-native", GEMINI_FAMILY),
+        ("native-agy", GEMINI_FAMILY),
         # An unknown harness has no family (caller falls back / shows nothing).
         ("some-unknown-harness", None),
     ],

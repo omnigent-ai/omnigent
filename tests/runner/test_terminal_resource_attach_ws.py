@@ -768,6 +768,26 @@ def test_direct_attach_probe_accepts_allow_listed_origin() -> None:
 
 
 @pytest.mark.parametrize(
+    "origin",
+    [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://127.8.9.10:5173",
+        "https://[::1]:5173",
+        "https://[::ffff:127.0.0.1]:5173",
+    ],
+)
+def test_direct_attach_probe_accepts_loopback_dev_origin(origin: str) -> None:
+    """A tokened same-machine dev UI may use the relay-free listener."""
+    app = _make_direct_app([])
+    with TestClient(app).websocket_connect(
+        "/probe?token=sekret-token",
+        headers={"origin": origin},
+    ):
+        pass
+
+
+@pytest.mark.parametrize(
     "path",
     [
         "/probe",
@@ -786,14 +806,23 @@ def test_direct_attach_rejects_missing_or_wrong_token(path: str) -> None:
     assert events == []
 
 
-def test_direct_attach_rejects_foreign_origin_despite_valid_token() -> None:
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "https://evil.example",
+        "http://localhost.evil.example:5173",
+        "http://10.0.0.5:5173",
+        "chrome-extension://localhost",
+    ],
+)
+def test_direct_attach_rejects_foreign_origin_despite_valid_token(origin: str) -> None:
     """A DNS-rebinding-style page presents its own origin — refused."""
     events: list[tuple[str, str, bool, str | None]] = []
     app = _make_direct_app(events)
     with pytest.raises(WebSocketDisconnect) as exc_info:
         with TestClient(app).websocket_connect(
             "/v1/sessions/conv1/resources/terminals/t1/attach?token=sekret-token",
-            headers={"origin": "https://evil.example"},
+            headers={"origin": origin},
         ):
             pass
     assert exc_info.value.code == 1008

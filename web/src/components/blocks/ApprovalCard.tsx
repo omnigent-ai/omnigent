@@ -297,12 +297,17 @@ export function ApprovalCard({
     : undefined;
   const binaryButtons = (
     <div className="flex flex-wrap gap-2 pt-1">
-      <Button size="sm" onClick={() => submitBinary("accept")}>
+      <Button size="sm" onClick={() => submitBinary("accept")} componentId="approval.approve">
         <CheckIcon className="mr-1 size-3.5" />
         Approve
       </Button>
       {allowAllEdits && (
-        <Button size="sm" variant="outline" onClick={submitAllowAllEdits}>
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={submitAllowAllEdits}
+          componentId="approval.approve_allow_edits"
+        >
           <CheckIcon className="mr-1 size-3.5" />
           Accept & allow all edits
         </Button>
@@ -314,12 +319,18 @@ export function ApprovalCard({
           onClick={submitRemember}
           title={rememberTitle}
           data-testid="approval-card-remember"
+          componentId="approval.approve_remember"
         >
           <CheckIcon className="mr-1 size-3.5" />
           Approve &amp; don't ask again for {rememberTarget}
         </Button>
       )}
-      <Button size="sm" variant="outline" onClick={() => submitBinary("decline")}>
+      <Button
+        size="sm"
+        variant="outline"
+        onClick={() => submitBinary("decline")}
+        componentId="approval.reject"
+      >
         <XIcon className="mr-1 size-3.5" />
         Reject
       </Button>
@@ -327,7 +338,11 @@ export function ApprovalCard({
   );
   const codexCommandButtons = (
     <div className="flex flex-wrap items-center gap-2 pt-1" data-testid="codex-command-actions">
-      <Button size="sm" onClick={() => submitBinary("accept")}>
+      <Button
+        size="sm"
+        onClick={() => submitBinary("accept")}
+        componentId="approval.approve_command"
+      >
         <CheckIcon className="mr-1 size-3.5" />
         Approve
       </Button>
@@ -336,6 +351,7 @@ export function ApprovalCard({
           size="sm"
           variant="outline"
           onClick={() => submitExecPolicyAmendment(execPolicyAmendment)}
+          componentId="approval.approve_command_remember"
         >
           <CheckIcon className="mr-1 size-3.5" />
           Approve and remember

@@ -278,6 +278,10 @@ export interface ElectronUpdateBridge {
   installNow: () => Promise<void>;
   setConfig: (patch: Partial<UpdateConfig>) => Promise<UpdateConfig>;
   onStatus: (callback: (status: UpdateStatus) => void) => () => void;
+  /** Shell-owned update card height; optional on older desktop builds. */
+  getOverlayHeight?: () => Promise<number>;
+  /** Subscribe to shell-owned update card height changes. */
+  onOverlayHeight?: (callback: (height: number) => void) => () => void;
 }
 
 /** Data backing the title-bar server picker, from the Electron shell. */

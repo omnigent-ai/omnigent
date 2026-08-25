@@ -281,6 +281,38 @@ function installContentWidth(width: number): void {
 }
 
 /**
+ * Force the header's inline toolbar into its collapsed "⋯" overflow state.
+ *
+ * useToolbarOverflow bails in jsdom (no ResizeObserver, zero clientWidth, and
+ * empty computed padding → NaN reserve), so the toolbar never collapses on its
+ * own. This stubs a ResizeObserver so the measure effect runs, numeric header
+ * padding so the reserve math resolves, and a tiny-but-positive header width
+ * that sits below the minimum required width (the title reserve alone is 48px),
+ * which flips `collapsed` to true. getComputedStyle is proxied (not replaced)
+ * so Radix's own positioning reads still see real values.
+ */
+function installCollapsedToolbar(): void {
+  class StubResizeObserver {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  }
+  vi.stubGlobal("ResizeObserver", StubResizeObserver);
+  const originalGetComputedStyle = window.getComputedStyle.bind(window);
+  vi.spyOn(window, "getComputedStyle").mockImplementation((el, pseudo) => {
+    const real = originalGetComputedStyle(el, pseudo ?? undefined);
+    return new Proxy(real, {
+      get(target, prop) {
+        if (prop === "paddingLeft" || prop === "paddingRight") return "0px";
+        const val = Reflect.get(target, prop);
+        return typeof val === "function" ? val.bind(target) : val;
+      },
+    });
+  });
+  vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(10);
+}
+
+/**
  * Simulate the iOS native shell and its live visual viewport. The keyboard
  * "opens" by shrinking the visual viewport below the layout viewport
  * (window.innerHeight); useIOSNativeKeyboardInset reads the delta. Pass
@@ -1302,6 +1334,62 @@ describe("FileViewer view-settings menu", () => {
     first.unmount();
     render(viewerTree({ open: true, initialSearch: "diff=1" }));
     expect(await screen.findByTestId("diff-viewer")).toHaveAttribute("data-wrap-lines", "true");
+  });
+});
+
+// ── Collapsed toolbar overflow "⋯" menu ─────────────────────────────────────
+//
+// When the header is too narrow for the inline action buttons, they all fold
+// into one "⋯" ("More actions") overflow menu. The settings menu's items
+// (Find, Download, and the diff-only wrap/whitespace toggles) are already
+// independent, so they flatten straight into this overflow rather than nesting
+// a second "⋯" submenu inside it. The mutually-exclusive view-mode picker still
+// collapses to a submenu (its "one selected choice" semantics need it).
+
+describe("FileViewer collapsed-toolbar overflow menu", () => {
+  beforeEach(() => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    installCollapsedToolbar();
+  });
+
+  const openOverflowMenu = () =>
+    fireEvent.pointerDown(screen.getByRole("button", { name: "More actions" }), { button: 0 });
+
+  it("collapses the inline actions into a single '⋯' overflow menu", () => {
+    render(viewerTree({ open: true }));
+    // The inline buttons are gone; only the single overflow trigger remains.
+    expect(screen.getByRole("button", { name: "More actions" })).toBeInTheDocument();
+  });
+
+  it("flattens the settings items into the overflow menu (no '⋯'-in-'⋯' submenu)", () => {
+    render(viewerTree({ open: true }));
+    openOverflowMenu();
+    // The settings items appear as flat rows in the overflow menu…
+    expect(screen.getByRole("menuitem", { name: "Find in file" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Download file" })).toBeInTheDocument();
+    // …and there is no nested "View settings" submenu trigger wrapping them.
+    expect(screen.queryByRole("menuitem", { name: "View settings" })).toBeNull();
+  });
+
+  it("flattens the diff-only wrap/whitespace toggles too, and they still work", async () => {
+    render(viewerTree({ open: true, initialSearch: "diff=1" }));
+    const diff = await screen.findByTestId("diff-viewer");
+    expect(diff).toHaveAttribute("data-wrap-lines", "false");
+    openOverflowMenu();
+    // Diff toggles are flat rows here, not behind a "View settings" submenu.
+    expect(screen.queryByRole("menuitem", { name: "View settings" })).toBeNull();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Wrap lines" }));
+    expect(screen.getByTestId("diff-viewer")).toHaveAttribute("data-wrap-lines", "true");
+  });
+
+  it("keeps the mutually-exclusive view-mode picker as a submenu", () => {
+    render(viewerTree({ open: true, path: "notes.md" }));
+    openOverflowMenu();
+    // Markdown's Preview/Edit/Source picker still nests (a submenu trigger),
+    // since it carries a single highlighted "selected choice".
+    expect(screen.getByRole("menuitem", { name: "View mode" })).toBeInTheDocument();
+    // Its choices are not surfaced at the top level of the overflow menu.
+    expect(screen.queryByRole("menuitem", { name: "Preview" })).toBeNull();
   });
 });
 
