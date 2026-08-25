@@ -771,7 +771,7 @@ async def test_session_snapshot_includes_model_options_from_runner(
             self.get_calls.append(url)
             if url.endswith("/skills"):
                 return _FakeResponse({"skills": []})
-            if url.endswith("/codex-model-options"):
+            if url.endswith("/model-options"):
                 return _FakeResponse(
                     {
                         "models": [
@@ -823,7 +823,7 @@ async def test_session_snapshot_includes_model_options_from_runner(
         session_id,
     )
 
-    assert f"/v1/sessions/{session_id}/codex-model-options" in fake_client.get_calls
+    assert f"/v1/sessions/{session_id}/model-options" in fake_client.get_calls
     assert [m.id for m in snapshot.model_options] == ["gpt-5.5"]
     assert snapshot.model_options[0].displayName == "GPT-5.5"
     assert [
@@ -841,6 +841,12 @@ async def test_session_snapshot_includes_model_options_from_runner(
 async def test_kiro_session_snapshot_loads_runner_model_catalog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """An older runner without the unified route still fills the picker.
+
+    The fake runner 404s ``/model-options`` (it predates the unified
+    route), so the server's loader must drop to the legacy harness-named
+    route and serve its rows — the compat lane until 0.11.0.
+    """
     from omnigent.server.routes import sessions as _mod
 
     _mod._runner_skills_cache.clear()
@@ -849,9 +855,8 @@ async def test_kiro_session_snapshot_loads_runner_model_catalog(
     _mod._model_options_inflight.clear()
 
     class _FakeResponse:
-        status_code = 200
-
-        def __init__(self, payload: dict[str, object]) -> None:
+        def __init__(self, payload: dict[str, object], status_code: int = 200) -> None:
+            self.status_code = status_code
             self._payload = payload
 
         def json(self) -> dict[str, object]:
@@ -866,6 +871,8 @@ async def test_kiro_session_snapshot_loads_runner_model_catalog(
             self.get_calls.append(url)
             if url.endswith("/skills"):
                 return _FakeResponse({"skills": []})
+            if url.endswith("/model-options"):
+                return _FakeResponse({"detail": "Not Found"}, status_code=404)
             if url.endswith("/kiro-model-options"):
                 return _FakeResponse(
                     {
@@ -908,6 +915,8 @@ async def test_kiro_session_snapshot_loads_runner_model_catalog(
     await _drain_model_options(session_id)
     snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
 
+    # The unified route was tried first, then the legacy alias filled in.
+    assert f"/v1/sessions/{session_id}/model-options" in fake_client.get_calls
     assert f"/v1/sessions/{session_id}/kiro-model-options" in fake_client.get_calls
     assert [model.id for model in snapshot.model_options] == ["provider-latest"]
     assert snapshot.model_options[0].model_dump()["description"] == (
@@ -948,7 +957,7 @@ async def test_claude_session_snapshot_loads_launch_time_model_aliases(
             self.get_calls.append(url)
             if url.endswith("/skills"):
                 return _FakeResponse({"skills": []})
-            if url.endswith("/claude-model-options"):
+            if url.endswith("/model-options"):
                 return _FakeResponse(
                     {
                         "models": [
@@ -993,7 +1002,7 @@ async def test_claude_session_snapshot_loads_launch_time_model_aliases(
     await _drain_model_options(session_id)
     snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
 
-    assert f"/v1/sessions/{session_id}/claude-model-options" in fake_client.get_calls
+    assert f"/v1/sessions/{session_id}/model-options" in fake_client.get_calls
     assert [(m.id, m.displayName) for m in snapshot.model_options] == [
         ("opus", "Opus 4.10"),
         ("haiku", "Haiku 4.5"),
@@ -1127,7 +1136,7 @@ async def test_session_snapshot_fetches_live_cursor_model_options(
             self.get_calls.append(url)
             if url.endswith("/skills"):
                 return _FakeResponse({"skills": []})
-            if url.endswith("/cursor-model-options"):
+            if url.endswith("/model-options"):
                 return _FakeResponse(
                     {
                         "models": [
@@ -1174,10 +1183,7 @@ async def test_session_snapshot_fetches_live_cursor_model_options(
 
     assert [m.id for m in snapshot.model_options] == ["provider-latest"]
     assert snapshot.model_options[0].displayName == "Provider Latest"
-    assert (
-        "/v1/sessions/4747fb03a3b45bb1f96bf130f4d704e5/cursor-model-options"
-        in fake_client.get_calls
-    )
+    assert "/v1/sessions/4747fb03a3b45bb1f96bf130f4d704e5/model-options" in fake_client.get_calls
     assert "4747fb03a3b45bb1f96bf130f4d704e5" in _mod._model_options_cache
 
 
@@ -1229,7 +1235,7 @@ async def test_snapshot_refresh_scopes_cached_options_to_cursor(
             self.get_calls.append(url)
             if url.endswith("/skills"):
                 return _FakeResponse({"skills": []})
-            if url.endswith(f"/{wrapper_name}-model-options"):
+            if url.endswith("/model-options"):
                 return _FakeResponse(
                     {
                         "models": [
@@ -1278,10 +1284,7 @@ async def test_snapshot_refresh_scopes_cached_options_to_cursor(
         "3626053dfa9668a8604cc06e0b590ae0",
     )
 
-    assert (
-        f"/v1/sessions/3626053dfa9668a8604cc06e0b590ae0/{wrapper_name}-model-options"
-        in fake_client.get_calls
-    )
+    assert "/v1/sessions/3626053dfa9668a8604cc06e0b590ae0/model-options" in fake_client.get_calls
     assert [m.id for m in snapshot.model_options] == ["fresh-model"]
     assert snapshot.model_options[0].displayName == "Fresh Model"
 
@@ -1321,7 +1324,7 @@ async def test_session_snapshot_serves_cached_model_options_while_runner_offline
         async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
             if url.endswith("/skills"):
                 return _FakeResponse({"skills": []})
-            if url.endswith("/codex-model-options"):
+            if url.endswith("/model-options"):
                 return _FakeResponse({"models": [{"id": "gpt-5.5", "displayName": "GPT-5.5"}]})
             return _FakeResponse({"status": "idle"})
 
@@ -1403,7 +1406,7 @@ async def test_session_snapshot_refetches_stale_model_options_after_relaunch(
         async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
             if url.endswith("/skills"):
                 return _FakeResponse({"skills": []})
-            if url.endswith("/codex-model-options"):
+            if url.endswith("/model-options"):
                 return _FakeResponse({"models": [{"id": self.model_id}]})
             return _FakeResponse({"status": "idle"})
 
@@ -1577,7 +1580,7 @@ async def test_session_snapshot_retries_empty_model_options(
             self.get_calls.append(url)
             if url.endswith("/skills"):
                 return _FakeResponse({"skills": []})
-            if url.endswith("/codex-model-options"):
+            if url.endswith("/model-options"):
                 return _FakeResponse(self._codex_payloads.pop(0))
             return _FakeResponse({"status": "idle"})
 
@@ -1614,9 +1617,7 @@ async def test_session_snapshot_retries_empty_model_options(
     # Two codex-model-options calls means the empty catalog was not cached;
     # one call would recreate the missing-picker regression.
     assert (
-        fake_client.get_calls.count(
-            "/v1/sessions/a17f935755fe66e4a0f42878eee28820/codex-model-options"
-        )
+        fake_client.get_calls.count("/v1/sessions/a17f935755fe66e4a0f42878eee28820/model-options")
         == 2
     )
     assert [m.id for m in snapshot.model_options] == ["gpt-5.5"]
@@ -1691,7 +1692,7 @@ async def test_session_snapshot_retries_503_model_options(
             self.get_calls.append(url)
             if url.endswith("/skills"):
                 return _FakeResponse({"skills": []})
-            if url.endswith("/codex-model-options"):
+            if url.endswith("/model-options"):
                 return self._codex_responses.pop(0)
             return _FakeResponse({"status": "idle"})
 
@@ -1728,9 +1729,7 @@ async def test_session_snapshot_retries_503_model_options(
     # Two calls proves the transient 503 did not terminate discovery; one
     # call would leave the cache cold forever until another snapshot request.
     assert (
-        fake_client.get_calls.count(
-            "/v1/sessions/a5cf1ddab988dcc43e643401b70c56d0/codex-model-options"
-        )
+        fake_client.get_calls.count("/v1/sessions/a5cf1ddab988dcc43e643401b70c56d0/model-options")
         == 2
     )
     assert [m.id for m in snapshot.model_options] == ["gpt-5.4"]

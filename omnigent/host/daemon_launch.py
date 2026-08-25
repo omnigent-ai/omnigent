@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Iterator
 
 import click
 import httpx
@@ -22,9 +23,31 @@ import httpx
 from omnigent.claude_native_bridge import url_component
 from omnigent.process_logging import display_log_path, process_log_dir
 
-# Poll cadence while waiting for a daemon-spawned runner to connect its
-# tunnel or for a resource to appear.
+# Steady-state poll cadence while waiting for a daemon-spawned runner to
+# connect its tunnel or for a resource to appear.
 DAEMON_POLL_INTERVAL_S = 0.5
+
+# Readiness usually lands on the first probe or two, so open tight and ease
+# off to the steady cadence for the long tail.
+DAEMON_POLL_INITIAL_INTERVAL_S = 0.1
+DAEMON_POLL_BACKOFF_FACTOR = 1.5
+
+
+def daemon_poll_intervals() -> Iterator[float]:
+    """
+    Yield successive sleeps between daemon readiness probes.
+
+    Starts at :data:`DAEMON_POLL_INITIAL_INTERVAL_S` and grows
+    geometrically to :data:`DAEMON_POLL_INTERVAL_S`, then holds there.
+    Infinite: callers stop on their own deadline.
+
+    :returns: Iterator of sleep durations in seconds, e.g.
+        ``0.1, 0.15, 0.225, ... 0.5, 0.5``.
+    """
+    interval = DAEMON_POLL_INITIAL_INTERVAL_S
+    while True:
+        yield interval
+        interval = min(interval * DAEMON_POLL_BACKOFF_FACTOR, DAEMON_POLL_INTERVAL_S)
 
 
 def _json_body(resp: httpx.Response) -> dict[str, object]:
@@ -120,6 +143,7 @@ async def wait_for_host_online(
     :raises click.ClickException: If the host is not online in time.
     """
     deadline = asyncio.get_event_loop().time() + timeout_s
+    intervals = daemon_poll_intervals()
     last_error: httpx.TransportError | None = None
     while asyncio.get_event_loop().time() < deadline:
         try:
@@ -129,7 +153,7 @@ async def wait_for_host_online(
         else:
             if resp.status_code == 200 and _json_body(resp).get("status") == "online":
                 return
-        await asyncio.sleep(DAEMON_POLL_INTERVAL_S)
+        await asyncio.sleep(next(intervals))
     message = (
         f"The connect daemon for host {host_id!r} did not come online within {timeout_s:.0f}s."
     )
@@ -180,6 +204,7 @@ async def wait_for_runner_online(
         does not connect in time.
     """
     deadline = asyncio.get_event_loop().time() + timeout_s
+    intervals = daemon_poll_intervals()
     last_error: httpx.TransportError | None = None
     while asyncio.get_event_loop().time() < deadline:
         try:
@@ -199,7 +224,7 @@ async def wait_for_runner_online(
                     raise click.ClickException(
                         f"Runner {runner_id!r} failed to start: {exit_error}"
                     )
-        await asyncio.sleep(DAEMON_POLL_INTERVAL_S)
+        await asyncio.sleep(next(intervals))
     message = f"Runner {runner_id!r} did not connect within {timeout_s:.0f}s."
     if last_error is not None:
         message += f" Last connection error: {last_error!r}."

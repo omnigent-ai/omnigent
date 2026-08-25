@@ -1,10 +1,15 @@
 ---
-# Namespaced Role granting the server EXACTLY what the entrypoint-as-host
-# launcher calls — nothing more (no watch, no pods/exec). Lives in the DEDICATED
-# runner namespace `omnigent-sandboxes` and is bound to the omnigent-server SA
-# (in `omnigent`) via the cross-namespace rolebinding.yaml. Because the grant is
-# a namespaced Role here, it can ONLY ever touch objects in `omnigent-sandboxes`,
-# never the server/DB Pods or Secrets in `omnigent`.
+# Namespaced Role granting what the entrypoint-as-host launcher needs (no watch,
+# no pods/exec). Lives in the DEDICATED runner namespace `omnigent-sandboxes`
+# and is bound to the omnigent-server SA (in `omnigent`) via the cross-namespace
+# rolebinding.yaml. Because the grant is a namespaced Role here, it can ONLY
+# ever touch objects in `omnigent-sandboxes`, never the server/DB Pods or
+# Secrets in `omnigent`.
+#
+# pods:create is retained temporarily for the bare-Pod → Job migration (see
+# TODO below). secrets:get is deliberately withheld — the launcher never reads
+# Secrets back, and the harness-credentials Secret is operator-managed.
+# pods/exec is withheld — the host is an entrypoint, not exec'd into.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -14,34 +19,31 @@ metadata:
     app.kubernetes.io/name: omnigent
     app.kubernetes.io/component: server
 rules:
-  # Manage the lifecycle of runner Pods, scoped to exactly what the launcher
-  # calls: provision_managed_host() creates them, the pod-start wait reads them
-  # (read_namespaced_pod is a `get`), and terminate() deletes them. The launcher
-  # never watches Pods, so `watch` is omitted. NOTE: there is deliberately NO
-  # `pods/exec` grant — the host runs as the Pod's OWN entrypoint
-  # (`omnigent host` under a PID-1 reaper), so the server never execs into a
-  # running container. Dropping exec removes the most powerful grant a
-  # compromised server could abuse (arbitrary in-Pod command execution).
+  # Manage the lifecycle of runner Jobs.  The launcher creates a batch/v1 Job
+  # (which spawns a child Pod), reads the Job's child Pod to poll start
+  # readiness, and deletes the Job (cascading to its Pods) at terminate.
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "delete"]
+  # The launcher lists Pods by job-name label to find the Job's child Pod,
+  # then reads it to poll for Running phase. create/delete are retained so
+  # old-server (bare Pod) + new-Role doesn't break, and so terminate() can
+  # fall back to deleting a bare Pod created before the Job migration.
+  # TODO(v0.29): remove create/delete once all runners have rolled past v0.28.
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["create", "get", "delete"]
-  # Start-failure diagnostics ONLY: when a Pod won't start, the launcher tails
-  # the failed container's log (e.g. the init container's `git clone` error) so
-  # the launch error names WHAT failed instead of a generic timeout. Read-only.
+    verbs: ["create", "list", "get", "delete"]
+  # Start-failure diagnostics ONLY: tails the failed container's log.
   - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get"]
-  # The per-launch token rides a per-Pod Secret (referenced by the Pod's
-  # `secretKeyRef`), so the launch token never enters the Pod spec or any
-  # audit-logged surface. The launcher creates that Secret at provision and
-  # deletes it alongside the Pod at terminate — hence create + delete (no get:
-  # the launcher never reads Secrets back, and the harness-credentials Secret is
-  # operator-managed, not touched here).
+  # The per-launch token rides a per-Job Secret (referenced by the Pod's
+  # `secretKeyRef`).  The launcher creates that Secret before the Job and
+  # deletes it alongside the Job at terminate.
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["create", "delete"]
-  # Surface scheduler/kubelet events (FailedScheduling, Failed pull, …) in the
-  # provider's error messages when a Pod won't become ready.
+  # Surface scheduler/kubelet events in the provider's error messages.
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["list"]

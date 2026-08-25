@@ -5,7 +5,6 @@ from __future__ import annotations
 import concurrent.futures
 import contextlib
 import copy
-import hashlib
 import json
 import logging
 import os
@@ -56,6 +55,18 @@ from omnigent.config import (
     load_local_config,
 )
 from omnigent.harness_aliases import canonicalize_harness
+from omnigent.host.daemon_lifecycle import (
+    daemon_record_path as _daemon_record_path_for,
+)
+from omnigent.host.daemon_lifecycle import (
+    daemon_registry_dir as _daemon_registry_dir_for,
+)
+from omnigent.host.daemon_lifecycle import (
+    normalize_daemon_target as _normalize_daemon_target_impl,
+)
+from omnigent.host.daemon_lifecycle import (
+    record_flock_is_held as _record_flock_is_held,
+)
 from omnigent.host.local_server import (
     _DEFAULT_LOCAL_PORT,
     _pid_alive,
@@ -70,7 +81,7 @@ from omnigent.inner import _proc, ui
 from omnigent.integration_daemon import IntegrationDaemon
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.onboarding.sandboxes import available_providers as _sandbox_providers
-from omnigent.process_logging import LOG_LEVEL_ENV_VAR, LOG_TO_STDERR_ENV_VAR, data_dir
+from omnigent.process_logging import LOG_LEVEL_ENV_VAR, LOG_TO_STDERR_ENV_VAR, data_dir, env_truthy
 
 if TYPE_CHECKING:
     import socket
@@ -1597,6 +1608,7 @@ def _print_version_callback(ctx: click.Context, _param: click.Parameter, value: 
 # decorated below.
 _HARNESS_COMMANDS: frozenset[str] = frozenset(
     {
+        "agy",
         "antigravity",
         "claude",
         "codex",
@@ -1624,7 +1636,7 @@ _ACCENT_RGB = (244, 59, 166)
 # object registered under a second name, e.g. ``update`` -> ``upgrade``).
 # Kept runnable/registered but omitted from the ``--help`` listing so the
 # alias isn't shown as a duplicate line.
-_ALIAS_COMMANDS: frozenset[str] = frozenset({"update"})
+_ALIAS_COMMANDS: frozenset[str] = frozenset({"update", "antigravity"})
 
 
 def _harness_extra_checks() -> dict[str, Callable[[], bool]]:
@@ -1636,12 +1648,10 @@ def _harness_extra_checks() -> dict[str, Callable[[], bool]]:
     The predicates use ``importlib.util.find_spec`` (no heavy import).
     Commands absent from this map are always listed.
     """
-    from omnigent.onboarding.antigravity_auth import antigravity_sdk_installed
     from omnigent.onboarding.cursor_auth import cursor_sdk_installed
 
     return {
         "cursor": cursor_sdk_installed,
-        "antigravity": antigravity_sdk_installed,
     }
 
 
@@ -1781,6 +1791,98 @@ def _set_log_to_stderr(
     return value
 
 
+def _finish_cli_profile(profiler: Any, output_path: Path) -> None:  # type: ignore[explicit-any]
+    """Stop a requested cProfile run and render a focused bottleneck summary."""
+    import pstats
+
+    profiler.disable()
+    profiler.dump_stats(output_path)
+    stats = pstats.Stats(profiler)
+    stats_state = vars(stats)
+    raw_stats = cast(
+        dict[tuple[str, int, str], tuple[int, int, float, float, object]],
+        stats_state["stats"],
+    )
+    total_time = float(stats_state["total_tt"])
+    total_calls = int(stats_state["total_calls"])
+    primitive_calls = int(stats_state["prim_calls"])
+    package_root = Path(__file__).resolve().parent
+    source_root = package_root.parent
+
+    # (filename, line, function, primitive calls, total calls, self, cumulative)
+    rows = [(*key, cc, nc, tt, ct) for key, (cc, nc, tt, ct, _) in raw_stats.items()]
+
+    def _location(filename: str, line: int, function: str) -> str:
+        path = Path(filename).resolve()
+        try:
+            display = str(path.relative_to(source_root))
+        except ValueError:
+            display = path.name
+        return f"{display}:{line}({function})"
+
+    def _duration(seconds: float) -> str:
+        if seconds < 0.01:
+            return f"{seconds * 1_000:.2f} ms"
+        if seconds < 1:
+            return f"{seconds * 1_000:.1f} ms"
+        return f"{seconds:.3f} s"
+
+    def _print_rows(
+        title: str,
+        selected: list[tuple[str, int, str, int, int, float, float]],
+    ) -> None:
+        click.echo(f"\n{title}", err=True)
+        click.echo(f"  {'self':>9}  {'cumulative':>10}  {'calls':>9}  function", err=True)
+        for filename, line, function, primitive, calls, self_time, cumulative in selected[:10]:
+            call_count = str(calls) if calls == primitive else f"{calls}/{primitive}"
+            click.echo(
+                f"  {_duration(self_time):>9}  {_duration(cumulative):>10}  "
+                f"{call_count:>9}  {_location(filename, line, function)}",
+                err=True,
+            )
+
+    omnigent_rows = [
+        row for row in rows if Path(row[0]).resolve().is_relative_to(package_root) and row[6] > 0
+    ]
+    omnigent_rows.sort(key=lambda row: row[6], reverse=True)
+    self_time_rows = [row for row in omnigent_rows if row[5] > 0]
+    self_time_rows.sort(key=lambda row: row[5], reverse=True)
+
+    click.echo(
+        f"\nCLI profile: {_duration(total_time)}, "
+        f"{total_calls:,} calls ({primitive_calls:,} primitive)",
+        err=True,
+    )
+    _print_rows("Top Omnigent call paths", omnigent_rows)
+    _print_rows("Top Omnigent functions by self time", self_time_rows)
+    click.echo(f"\nFull profile data: {output_path}", err=True)
+
+
+def _start_cli_profile(
+    ctx: click.Context,
+    _param: click.Parameter,
+    value: bool,
+) -> bool:
+    """Start cProfile early and finish it after the selected command exits."""
+    if not value:
+        return value
+
+    import cProfile
+
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    microseconds = time.time_ns() // 1_000 % 1_000_000
+    profile_dir = data_dir() / "profiles"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    output_path = profile_dir / (f"omnigent-cli-{timestamp}-{microseconds:06d}-{os.getpid()}.prof")
+    profiler = cProfile.Profile()
+    profiler.enable()
+    ctx.call_on_close(lambda: _finish_cli_profile(profiler, output_path))
+    # Click closes callbacks last-in-first-out, so measurement stops before
+    # rendering the summary above.
+    ctx.call_on_close(profiler.disable)
+    return value
+
+
 def _extract_global_logging_flags(argv: list[str]) -> tuple[list[str], bool, bool]:
     """Remove global logging flags before run-shorthand rewriting."""
     debug_logging = False
@@ -1801,6 +1903,17 @@ def _extract_global_logging_flags(argv: list[str]) -> tuple[list[str], bool, boo
 
 
 @click.group(cls=_OmnigentCLI)
+@click.option(
+    "--profiling",
+    is_flag=True,
+    is_eager=True,
+    expose_value=False,
+    callback=_start_cli_profile,
+    help=(
+        "Profile CLI execution, print a summary, and write a timestamped .prof file. "
+        "Place before COMMAND."
+    ),
+)
 @click.option(
     "--debug",
     "debug_logging",
@@ -1836,6 +1949,7 @@ def cli() -> None:
 # Keep in sync with ``@cli.command()`` decorations below.
 _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
     {
+        "agy",
         "antigravity",
         "attach",
         "claude",
@@ -1930,6 +2044,44 @@ def _warn_deprecated_harness_path_env_vars() -> None:
         )
 
 
+REQUIRE_WRAPPER_ENV = "OMNIGENT_REQUIRE_WRAPPER"
+WRAPPER_COMMAND_ENV = "OMNIGENT_WRAPPER_COMMAND"
+WRAPPER_BYPASS_ENV = "OMNIGENT_WRAPPER_BYPASS"
+
+
+def _wrapper_guard_error(env: Mapping[str, str], prog: str) -> str | None:
+    """Return the block message when a naked ``omni`` call is refused, else ``None``.
+
+    A deployment that wraps the CLI (e.g. ``isaac omni``) sets
+    ``OMNIGENT_REQUIRE_WRAPPER`` so direct calls are refused; the wrapper sets
+    ``OMNIGENT_WRAPPER_BYPASS`` around its own invocation to pass through, and
+    ``OMNIGENT_WRAPPER_COMMAND`` names the command to suggest instead.
+    """
+    if not env_truthy(env.get(REQUIRE_WRAPPER_ENV)):
+        return None
+    if env_truthy(env.get(WRAPPER_BYPASS_ENV)):
+        return None
+    redirect = (env.get(WRAPPER_COMMAND_ENV) or "").strip()
+    if redirect:
+        detail = f"Use `{redirect}` instead, or set {WRAPPER_BYPASS_ENV}=1 to run it directly."
+    else:
+        detail = f"Set {WRAPPER_BYPASS_ENV}=1 to run it directly."
+    return f"Error: running `{prog}` directly is disabled in this environment.\n{detail}"
+
+
+def _enforce_wrapper_guard() -> None:
+    """Exit early when a naked ``omni``/``omnigent`` call is blocked by an operator."""
+    # argv[0] is the console-script name (``omni``/``omnigent``); ``python -m
+    # omnigent`` reports ``__main__.py``, so fall back to the canonical name.
+    prog = os.path.basename(sys.argv[0])
+    if not prog or prog == "__main__.py":
+        prog = "omnigent"
+    message = _wrapper_guard_error(os.environ, prog)
+    if message is not None:
+        click.echo(message, err=True)
+        raise SystemExit(2)
+
+
 def main() -> None:
     """
     Console-script entry point for ``omnigent``.
@@ -1961,6 +2113,11 @@ def main() -> None:
 
     install_crash_handler(app_name="omnigent", repo="omnigent-ai/omnigent")
 
+    # Operators can force all use through a wrapper (e.g. `isaac omni`) by
+    # setting OMNIGENT_REQUIRE_WRAPPER; the wrapper sets OMNIGENT_WRAPPER_BYPASS
+    # to pass through. Refuse naked calls before any work happens.
+    _enforce_wrapper_guard()
+
     cwd = os.getcwd()
     if cwd not in sys.path:
         sys.path.insert(0, cwd)
@@ -1988,7 +2145,17 @@ def main() -> None:
     # intentionally tiny (currently only help/version); runner flags live on
     # ``run``. Treat a leading non-top-level flag as bare-run shorthand so
     # users can type the natural no-AGENT launcher form.
-    if argv and argv[0].startswith("-") and argv[0] not in {"--help", "-h", "--version"}:
+    if (
+        argv
+        and argv[0].startswith("-")
+        and argv[0]
+        not in {
+            "--help",
+            "-h",
+            "--version",
+            "--profiling",
+        }
+    ):
         argv = ["run", *argv]
 
     # Shorthand: ``omnigent myagent.yaml [opts]`` → ``run myagent.yaml [opts]``.
@@ -2157,6 +2324,10 @@ def _is_removed_ad_hoc_invocation(argv: list[str]) -> bool:
     # should go through click so the user sees the click group's
     # help listing subcommands, not the legacy argparse help.
     if argv[0] in {"--help", "-h", "--version"}:
+        return False
+    # A root profiling flag may precede an eager help/version flag or stand
+    # alone. These are valid Click invocations, not removed ad-hoc chat.
+    if all(token in {"--profiling", "--help", "-h", "--version"} for token in argv):
         return False
     # Skip leading flags to find the first positional. If all
     # tokens are flags (e.g. ``omnigent --system-prompt "..."``),
@@ -2360,7 +2531,7 @@ def _normalize_daemon_target(server_url: str | None) -> str:
     :returns: ``"local"`` for local mode, otherwise the URL without a
         trailing slash.
     """
-    return _LOCAL_DAEMON_MARKER if not server_url else server_url.rstrip("/")
+    return _normalize_daemon_target_impl(server_url)
 
 
 def _daemon_host_online(record: _HostDaemonRecord, *, timeout_s: float = 2.0) -> bool:
@@ -2411,7 +2582,7 @@ def _daemon_registry_dir() -> Path:
     :returns: Registry directory path, e.g.
         ``Path("~/.omnigent/daemons")``.
     """
-    return _HOST_PID_PATH.parent / "daemons"
+    return _daemon_registry_dir_for(_HOST_PID_PATH.parent)
 
 
 def _daemon_record_path(target: str) -> Path:
@@ -2422,8 +2593,7 @@ def _daemon_record_path(target: str) -> Path:
         ``"https://example.databricksapps.com"`` or ``"local"``.
     :returns: JSON registry path for the target.
     """
-    digest = hashlib.sha256(target.encode("utf-8")).hexdigest()[:16]
-    return _daemon_registry_dir() / f"{digest}.json"
+    return _daemon_record_path_for(target, base_dir=_HOST_PID_PATH.parent)
 
 
 def _record_from_json(raw: _HostJsonObject) -> _HostDaemonRecord | None:
@@ -2710,11 +2880,32 @@ class _DaemonReuseDecision:
     config_changed: bool
 
 
+def _daemon_owner_is_live(record: _HostDaemonRecord, target: str) -> bool:
+    """Whether the daemon that wrote *record* is still alive.
+
+    A held record flock is a definitive live owner (the kernel drops it on
+    death), so it is the fast positive signal. When the lock is free or can't
+    be probed (no ``fcntl``, unreadable), fall back to whether the PID is
+    alive — so a daemon still mid-startup (hasn't grabbed the lock yet) is not
+    reaped. Reaping therefore requires both signals dead: a free lock and a
+    dead PID.
+
+    :param record: Existing daemon record for *target*.
+    :param target: Normalized daemon target, e.g. ``"local"``.
+    :returns: ``True`` if the daemon should be treated as alive.
+    """
+    if _record_flock_is_held(_daemon_record_path(target)) is True:
+        return True
+    return _pid_alive(record.pid)
+
+
 def _reuse_existing_daemon_record(target: str) -> _DaemonReuseDecision:
     """
     Decide whether an existing daemon for *target* can be reused.
 
-    Reuse requires more than a live PID: a daemon whose process is alive
+    Liveness is judged by the record's flock, falling back to a PID check (see
+    :func:`_daemon_owner_is_live`). Reuse requires more than a live owner: a
+    daemon whose process is alive
     but whose server tunnel is down (server restart, ungraceful death,
     flapping tunnel) is a zombie — the host reads ``offline`` and the
     caller would poll until timeout. And a daemon spawned under a
@@ -2737,7 +2928,7 @@ def _reuse_existing_daemon_record(target: str) -> _DaemonReuseDecision:
     existing = _find_daemon_record(target)
     if existing is None:
         return _DaemonReuseDecision(reuse=False, config_changed=False)
-    if not _pid_alive(existing.pid):
+    if not _daemon_owner_is_live(existing, target):
         _delete_daemon_record(existing)
         return _DaemonReuseDecision(reuse=False, config_changed=False)
 
@@ -2820,6 +3011,7 @@ def _spawn_host_daemon_process(
             proc = subprocess.Popen(
                 args,
                 env=env,
+                stdin=subprocess.DEVNULL,
                 stdout=log_fh,
                 stderr=log_fh,
                 **_proc.spawn_kwargs(),
@@ -2896,18 +3088,25 @@ def _live_daemon_conflict(record: _HostDaemonRecord) -> _HostDaemonRecord | None
     """
     Find a live daemon that already serves a foreground record target.
 
+    Liveness uses the record flock, falling back to a PID check (see
+    :func:`_daemon_owner_is_live`).
+
     :param record: Foreground daemon record this process wants to claim.
     :returns: Conflicting live record, or ``None``.
     """
     existing = _find_daemon_record(record.target)
-    if existing is not None and existing.pid != record.pid and _pid_alive(existing.pid):
+    if (
+        existing is not None
+        and existing.pid != record.pid
+        and _daemon_owner_is_live(existing, record.target)
+    ):
         return existing
     if record.mode == "server" and record.server_url is not None:
         local_record = _find_daemon_record(_LOCAL_DAEMON_MARKER)
         if (
             local_record is not None
             and local_record.pid != record.pid
-            and _pid_alive(local_record.pid)
+            and _daemon_owner_is_live(local_record, _LOCAL_DAEMON_MARKER)
             and local_record.resolved_server_url == record.server_url.rstrip("/")
         ):
             return local_record
@@ -2928,11 +3127,13 @@ def _claim_foreground_daemon_record(
     """
     conflict = _live_daemon_conflict(record)
     if conflict is not None:
+        # server_url is None in local mode; "" makes the hint say --server "".
+        stop_command = _host_stop_command(conflict.server_url or "")
         raise click.ClickException(
             "A host daemon is already running for this server "
             f"(pid={conflict.pid}, target={conflict.target}). "
-            "Run `omnigent host status` to inspect it or "
-            "`omnigent host stop --server ...` to stop it first."
+            f"Run `omnigent host status` to inspect it or `{stop_command}` "
+            "to stop it first."
         )
     previous = _find_daemon_record(record.target)
     if previous is not None and not _pid_alive(previous.pid):
@@ -3008,7 +3209,8 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
     mode_args = ["--local"] if not server_url else ["--server", server_url]
     args = [sys.executable, "-m", "omnigent.host._daemon_entry", *mode_args]
     spawned = _spawn_host_daemon_process(
-        args=args, env=_build_host_daemon_env(server_url=server_url)
+        args=args,
+        env=_build_host_daemon_env(server_url=server_url),
     )
     if spawned is None:
         return False
@@ -3115,9 +3317,10 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
     today. A non-200 answer that carries the Databricks edge signature
     (302 to the workspace OAuth page, or a DatabricksRealm 401) means
     the run would otherwise die much later with an opaque "non-JSON
-    response (status=302)" traceback from the session-create call. On a
-    TTY we run the same flow ``omnigent login`` would and continue;
-    headless invocations get the exact command to run instead.
+    response (status=302)" traceback from the session-create call. First,
+    it asks the SDK for a fresh workspace token; only then does a TTY run
+    the same flow ``omnigent login`` would, while headless invocations get
+    the exact command to run instead.
 
     Non-Databricks postures are deliberately left alone: local accounts
     servers auto-authenticate downstream (magic-link redeem), and
@@ -3137,6 +3340,7 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
     import httpx as _httpx
 
     from omnigent.chat import _remote_headers
+    from omnigent.cli_auth import load_databricks_org_id, store_databricks_auth
 
     try:
         probe = _httpx.get(
@@ -3153,6 +3357,13 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
     workspace_host = _databricks_workspace_login_target(server, probe)
     if workspace_host is None:
         return
+    org_id = load_databricks_org_id(server)
+    token = _databricks_workspace_token(workspace_host)
+    if token is not None:
+        refreshed_probe = _verify_databricks_server_token(server, token, org_id)
+        if refreshed_probe.status_code == 200:
+            store_databricks_auth(server, workspace_host, org_id=org_id)
+            return
     login_cmd = f"omnigent login {server}"
     if non_interactive or not sys.stdin.isatty():
         raise click.ClickException(
@@ -3160,11 +3371,7 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
             f"HTTP {probe.status_code}). Run `{login_cmd}` and retry."
         )
     click.echo(f"Not signed in to {server} — running `{login_cmd}` first.")
-    # Recover the ``?o=`` selector from a prior login record so a re-login
-    # still targets the right workspace.
-    from omnigent.cli_auth import load_databricks_org_id
-
-    _databricks_login(server, workspace_host, org_id=load_databricks_org_id(server))
+    _databricks_login(server, workspace_host, org_id=org_id)
 
 
 def _ensure_backend(server: str | None) -> str:
@@ -3789,6 +3996,10 @@ def server(
 
     cfg = _load_config(config_path)
 
+    # Let the server-config reader (branding) see the same ``-c`` file.
+    if config_path:
+        os.environ["OMNIGENT_CONFIG"] = str(Path(config_path).resolve())
+
     # CLI args take precedence over config file, which takes precedence
     # over defaults.
     db_uri = database_uri or cfg.get("database_uri", _default_db_uri())
@@ -4030,7 +4241,11 @@ def server(
             import asyncio as _asyncio
 
             from omnigent.runtime import session_stream as _session_stream
+            from omnigent.server import shutdown_state as _shutdown_state
 
+            # The runner tunnels close next; their disconnect handlers must
+            # read that loss as ours, not as the runners dying.
+            _shutdown_state.mark_server_shutting_down()
             _session_stream.shutdown_all()
             # Yield to the event loop so generators can consume _DONE,
             # flush their final "data: [DONE]\n\n" chunk, and exit before
@@ -4697,6 +4912,7 @@ def _upgrade_vcs_install(
         _probe_installed_distribution,
         _remote_git_head,
         _run_upgrade_command,
+        _upgrade_failure_message,
     )
 
     current_sha = info.commit_sha or ""
@@ -4751,7 +4967,7 @@ def _upgrade_vcs_install(
     code = _run_upgrade_command(suggestion.command, console)
     if code != 0:
         raise click.ClickException(
-            f"Upgrade command exited with status {code}; your previous install is intact."
+            _upgrade_failure_message(code, set(info.extras) | set(extra_overrides))
         )
 
     # Verify by commit, not exit code: a re-pull of a ref that hasn't moved (or
@@ -4820,6 +5036,7 @@ def _upgrade_to_nightly(
         _latest_nightly_version,
         _probe_installed_distribution,
         _run_upgrade_command,
+        _upgrade_failure_message,
         _uv_tool_receipt_path,
     )
 
@@ -4896,7 +5113,7 @@ def _upgrade_to_nightly(
     code = _run_upgrade_command(suggestion.command, console)
     if code != 0:
         raise click.ClickException(
-            f"Upgrade command exited with status {code}; your previous install is intact."
+            _upgrade_failure_message(code, set(info.extras) | set(extra_overrides))
         )
 
     # Same trust-the-disk verification as the release path: re-read the
@@ -5018,6 +5235,7 @@ def upgrade(
         _probe_installed_distribution,
         _read_installed_wheel_info,
         _run_upgrade_command,
+        _upgrade_failure_message,
         _uv_tool_receipt_path,
         fetch_latest_version,
     )
@@ -5164,7 +5382,7 @@ def upgrade(
     code = _run_upgrade_command(suggestion.command, console)
     if code != 0:
         raise click.ClickException(
-            f"Upgrade command exited with status {code}; your previous install is intact."
+            _upgrade_failure_message(code, set(info.extras) | set(extra_overrides))
         )
 
     # Trust the installed version, not the installer's exit code. The running
@@ -5621,6 +5839,25 @@ def resume(
     )
 
 
+_IMPORT_BATCH_MAX_WORKERS = 8
+
+
+@dataclass
+class _SessionImportResult:
+    """Outcome of importing one source session.
+
+    Shared by the single-session path and the parallel batch path so both
+    interpret the same statuses.
+    """
+
+    session_id: str
+    status: Literal["imported", "already", "unreachable", "failed", "load_error"]
+    item_count: int = 0
+    link: str | None = None
+    message: str | None = None
+    raw_exc: BaseException | None = None
+
+
 @cli.command("import")
 @click.option(
     "--harness",
@@ -5687,6 +5924,7 @@ def import_session_command(
     import httpx
 
     from omnigent.chat import _remote_headers
+    from omnigent.conversation_browser import conversation_url
     from omnigent.session_import import (
         ImportSource,
         SessionImportNotFoundError,
@@ -5718,24 +5956,14 @@ def import_session_command(
     if base_url is None:
         base_url = ensure_local_omnigent_server().url
     base_url = base_url.rstrip("/")
-    imported_count = 0
-    already_imported_count = 0
-    failed_count = 0
-    for current_source_session_id in source_session_ids:
+
+    def _import_one(sid: str) -> _SessionImportResult:
         try:
-            imported = load_local_session(source, current_source_session_id)
+            imported = load_local_session(source, sid)
         except SessionImportNotFoundError as exc:
-            if not is_batch:
-                raise click.ClickException(str(exc)) from exc
-            failed_count += 1
-            click.echo(f"Failed {current_source_session_id}: {exc}", err=True)
-            continue
+            return _SessionImportResult(sid, "load_error", message=str(exc), raw_exc=exc)
         except (OSError, TypeError, ValueError) as exc:
-            if not is_batch:
-                raise
-            failed_count += 1
-            click.echo(f"Failed {current_source_session_id}: {exc}", err=True)
-            continue
+            return _SessionImportResult(sid, "load_error", message=str(exc), raw_exc=exc)
 
         payload = {
             "source": imported.source,
@@ -5759,12 +5987,13 @@ def import_session_command(
                 timeout=120.0,
             )
         except httpx.RequestError as exc:
-            raise click.ClickException(f"Could not reach the Omnigent server: {exc}") from exc
+            return _SessionImportResult(
+                sid,
+                "unreachable",
+                message=f"Could not reach the Omnigent server: {exc}",
+                raw_exc=exc,
+            )
 
-        if response.status_code == 409 and is_batch:
-            already_imported_count += 1
-            click.echo(f"Already imported {current_source_session_id}; skipped.")
-            continue
         if response.is_error:
             try:
                 body = response.json()
@@ -5772,40 +6001,84 @@ def import_session_command(
             except (ValueError, AttributeError):
                 detail = None
             message = f"Import failed ({response.status_code}): {detail or response.text}"
-            if not is_batch:
-                raise click.ClickException(message)
-            failed_count += 1
-            click.echo(f"Failed {current_source_session_id}: {message}", err=True)
-            continue
+            status = "already" if response.status_code == 409 else "failed"
+            return _SessionImportResult(sid, status, message=message)
 
         try:
             result = response.json()
             session_id = result["session_id"]
             item_count = result["item_count"]
         except (AttributeError, KeyError, TypeError, ValueError) as exc:
-            if not is_batch:
-                raise click.ClickException("Import returned an invalid server response") from exc
-            failed_count += 1
-            click.echo(
-                f"Failed {current_source_session_id}: import returned an invalid server response",
-                err=True,
+            return _SessionImportResult(
+                sid,
+                "failed",
+                message="Import returned an invalid server response",
+                raw_exc=exc,
             )
-            continue
-        imported_count += 1
-        if is_batch:
-            click.echo(
-                f"Imported {item_count} item(s) from {current_source_session_id} "
-                f"into {session_id}."
-            )
-        else:
-            click.echo(f"Imported {item_count} item(s) into {session_id}.")
+        # Surface the browser URL, not the bare id, so the user can open the
+        # imported session straight into the web (where it offers the resume
+        # picker). Maps a Databricks API base to its workspace SPA link.
+        return _SessionImportResult(
+            sid,
+            "imported",
+            item_count=item_count,
+            link=conversation_url(base_url, session_id),
+        )
 
-    if is_batch:
-        click.echo(f"\nImported: {imported_count}")
-        click.echo(f"Already imported: {already_imported_count}")
-        click.echo(f"Failed: {failed_count}")
-        if failed_count:
-            raise click.ClickException(f"{failed_count} session(s) failed to import")
+    if not is_batch:
+        result = _import_one(source_session_ids[0])
+        if result.status == "imported":
+            click.echo(f"Imported {result.item_count} item(s) into {result.link}")
+            return
+        if result.status == "load_error":
+            # A missing session is a clean CLI error; a corrupt transcript keeps
+            # its original exception so the traceback points at the parse fault.
+            if isinstance(result.raw_exc, SessionImportNotFoundError):
+                raise click.ClickException(str(result.raw_exc)) from result.raw_exc
+            assert result.raw_exc is not None
+            raise result.raw_exc
+        raise click.ClickException(result.message or "Import failed")
+
+    # Distinct sessions are independent conversations on the server (their own
+    # ids, row locks, and position counters), so importing them concurrently
+    # never contends. Resolve the remote auth token once up front to populate
+    # the per-URL SDK cache before the workers fan out, rather than have each
+    # worker cold-mint it in parallel.
+    _remote_headers(server_url=base_url, host_id=None)
+    results: dict[str, _SessionImportResult] = {}
+    max_workers = min(len(source_session_ids), _IMPORT_BATCH_MAX_WORKERS)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_import_one, sid): sid for sid in source_session_ids}
+        for future in concurrent.futures.as_completed(futures):
+            outcome = future.result()
+            results[outcome.session_id] = outcome
+
+    # A network failure is fatal for the whole batch, matching the serial import.
+    unreachable = next((r for r in results.values() if r.status == "unreachable"), None)
+    if unreachable is not None:
+        raise click.ClickException(unreachable.message or "Could not reach the Omnigent server")
+
+    imported_count = 0
+    already_imported_count = 0
+    failed_count = 0
+    # Report in the caller's requested order, not worker completion order.
+    for sid in source_session_ids:
+        outcome = results[sid]
+        if outcome.status == "imported":
+            imported_count += 1
+            click.echo(f"Imported {outcome.item_count} item(s) from {sid} into {outcome.link}")
+        elif outcome.status == "already":
+            already_imported_count += 1
+            click.echo(f"Already imported {sid}; skipped.")
+        else:
+            failed_count += 1
+            click.echo(f"Failed {sid}: {outcome.message}", err=True)
+
+    click.echo(f"\nImported: {imported_count}")
+    click.echo(f"Already imported: {already_imported_count}")
+    click.echo(f"Failed: {failed_count}")
+    if failed_count:
+        raise click.ClickException(f"{failed_count} session(s) failed to import")
 
 
 def _render_usage(report: dict[str, Any], limit: int) -> None:  # type: ignore[explicit-any]
@@ -7824,6 +8097,9 @@ def _prompt_stop_local_server() -> None:
 # server URL, missing credentials) leaves nothing on the terminal, so we wait
 # this long and surface its log instead of falsely reporting success.
 _BACKGROUND_HOST_GRACE_S = 2.0
+# A detached process isn't ready merely because its PID survived. Wait until
+# the server confirms the host row and live tunnel are online.
+_BACKGROUND_HOST_REGISTRATION_GRACE_S = 30.0
 
 
 def _confirm_background_host_alive(record: _HostDaemonRecord) -> None:
@@ -7836,16 +8112,77 @@ def _confirm_background_host_alive(record: _HostDaemonRecord) -> None:
     deadline = time.time() + _BACKGROUND_HOST_GRACE_S
     while True:
         if not _pid_alive(record.pid):
-            from omnigent._runner_startup import format_runner_log_tail
-
-            log_path = Path(record.log_path) if record.log_path else None
             raise click.ClickException(
                 "The host daemon exited immediately after starting."
-                f"{format_runner_log_tail(log_path)}"
+                f"{_background_host_log_detail(record.log_path)}"
             )
         if time.time() >= deadline:
             return
         time.sleep(0.1)
+
+
+def _background_host_log_detail(log_path: str | None) -> str:
+    """Return the host log path and a short failure tail."""
+    if log_path is None:
+        return ""
+    path = Path(log_path)
+    detail = f"\nHost log: {path}"
+    try:
+        tail = path.read_bytes()[-4096:].decode("utf-8", errors="replace").strip()
+    except OSError:
+        return detail
+    if tail:
+        detail += "\n--- host log tail ---\n" + "\n".join(tail.splitlines()[-12:])
+    return detail
+
+
+def _confirm_background_host_registered(record: _HostDaemonRecord) -> None:
+    """Wait until the detached daemon completes server registration."""
+    deadline = time.monotonic() + _BACKGROUND_HOST_REGISTRATION_GRACE_S
+    while True:
+        if not _pid_alive(record.pid):
+            raise click.ClickException(
+                "The host daemon exited before registering with the server."
+                f"{_background_host_log_detail(record.log_path)}"
+            )
+        if _daemon_host_online(record, timeout_s=1.0):
+            return
+        if time.monotonic() >= deadline:
+            raise click.ClickException(
+                "The host daemon started but did not register with the server "
+                f"within {_BACKGROUND_HOST_REGISTRATION_GRACE_S:.0f}s."
+                f"{_background_host_log_detail(record.log_path)}"
+            )
+        time.sleep(0.2)
+
+
+def _stdin_is_tty() -> bool:
+    """Return whether stdin is an interactive terminal."""
+    return sys.stdin.isatty()
+
+
+def _maybe_open_host_web_ui(
+    server_url: str,
+    *,
+    non_interactive: bool,
+    cfg: dict[str, Any] | None = None,  # type: ignore[explicit-any]
+) -> None:
+    """Open the host web UI when interactive and enabled."""
+    if non_interactive or not _stdin_is_tty():
+        return
+    if cfg is None:
+        cfg = _load_effective_config()
+    if _resolve_auto_open_conversation_setting(cfg) is False:
+        return
+    from omnigent.conversation_browser import display_server_url, open_conversation_url
+
+    web_url = display_server_url(server_url)
+    try:
+        opened = open_conversation_url(web_url)
+    except OSError:
+        opened = False
+    if not opened:
+        click.echo(f"Open the Omnigent web UI: {web_url}", err=True)
 
 
 def _run_background_host(
@@ -7875,7 +8212,7 @@ def _run_background_host(
     :param non_interactive: When ``True``, never launch the browser login —
         fail with the ``omnigent login`` hint instead.
     :raises click.ClickException: If the daemon cannot be spawned, exits
-        immediately after starting, or (local mode) never serves its local
+        immediately, fails to register, or (local mode) never serves its local
         Omnigent server.
     """
     if server:
@@ -7885,36 +8222,47 @@ def _run_background_host(
     _ensure_host_daemon(server or None)
     record = _find_daemon_record(target)
     if record is None:
-        # No record for this target: either the live local-mode daemon already
-        # serves the requested URL, or the spawn itself failed.
+        # A local daemon may already own the requested URL under its local
+        # registry key. It is reusable only after its host is online too.
         if _local_daemon_serves_target(target, server or None):
-            click.echo(f"The local host daemon already serves {target}.")
-            return
+            local_record = _find_daemon_record(_LOCAL_DAEMON_MARKER)
+            if local_record is not None:
+                _confirm_background_host_registered(local_record)
+                click.echo(f"The local host daemon already serves {target}.")
+                return
         raise click.ClickException(
             "Could not spawn the background host daemon. See ~/.omnigent/logs/host/ for details."
         )
-    if previous is not None and previous.pid == record.pid:
-        headline = _cli_style("Host daemon already running", fg="yellow", bold=True)
-    else:
-        _confirm_background_host_alive(record)
-        headline = _cli_style("Started the host daemon in the background", fg="green", bold=True)
+    reused = previous is not None and previous.pid == record.pid
+    try:
+        if not reused:
+            _confirm_background_host_alive(record)
+        if record.mode == "local":
+            # The status probe needs the daemon-owned server's loopback URL.
+            server_url = _discover_local_server_url()
+            _update_daemon_resolved_server_url(target, server_url)
+            record = _find_daemon_record(target) or record
+        else:
+            server_url = target
+        _confirm_background_host_registered(record)
+    except click.ClickException:
+        if not reused:
+            with contextlib.suppress(click.ClickException):
+                _terminate_daemon(record, force=True)
+        raise
+    headline = _cli_style(
+        "Host daemon already running" if reused else "Started the host daemon in the background",
+        fg="yellow" if reused else "green",
+        bold=True,
+    )
     click.echo(f"{headline} (pid {record.pid}).")
-    if record.mode == "local":
-        # A local-mode daemon owns the local Omnigent server, so this command is
-        # the whole "start everything" step — wait for that server and report
-        # its URL, otherwise the Web UI is unreachable without a follow-up
-        # `omnigent server status`. Resolved after the headline above so a cold
-        # start isn't a silent terminal.
-        server_url = _discover_local_server_url()
-        _update_daemon_resolved_server_url(target, server_url)
-    else:
-        server_url = target
     _echo_host_field("server", _cli_style(server_url, fg="cyan"))
     if record.log_path is not None:
         _echo_host_field("log", _display_path(Path(record.log_path)))
     click.echo()
     click.echo(_cli_style("Stop it with:", dim=True))
     click.echo(f"  {_cli_style(stop_command, bold=True)}")
+    _maybe_open_host_web_ui(server_url, non_interactive=non_interactive)
 
 
 def _echo_host_field(label: str, value: str) -> None:
@@ -8070,7 +8418,8 @@ def host(
         # (or a headless invocation) fails loud with the command to run.
         if remote_mode:
             _ensure_databricks_server_auth(server, non_interactive=non_interactive)
-        run_host_process(server_url=server)
+        _maybe_open_host_web_ui(server, non_interactive=non_interactive, cfg=cfg)
+        run_host_process(server_url=server, daemon_target=target)
         stopped_cleanly = True
     except KeyboardInterrupt:
         # Ctrl-C is the normal way to stop the foreground daemon — swallow it
@@ -9095,6 +9444,50 @@ def _stop_daemon_sessions(
     return stopped
 
 
+def _signal_daemon_pid(record: _HostDaemonRecord, sig: int) -> bool:
+    """
+    Signal a daemon's recorded PID, tolerating a stale foreign entry.
+
+    A daemon registry record can outlive the process it names. The recorded
+    PID may since have been reused by an unrelated process — often owned by
+    another user — or the real daemon may have been started under a different
+    account (e.g. ``sudo``). In both cases the PID is no longer this user's
+    daemon and must not be killed.
+
+    ``os.kill`` raises ``PermissionError`` (EPERM) when the caller lacks
+    permission to signal the target — which, since we only ever signal our
+    own daemons, means the record is stale and points at someone else's
+    process. ``_pid_alive`` reports such a PID as alive (``psutil`` maps the
+    same permission failure to ``AccessDenied``), so without this guard
+    ``_terminate_daemon`` would fall through to ``os.kill`` and crash on the
+    unsuppressed EPERM — ``--force`` included, since it dies before the
+    SIGKILL path. Log a warning and treat the record as stale instead.
+
+    :param record: Daemon record whose PID should be signalled.
+    :param sig: Signal number to send, e.g. ``signal.SIGTERM``.
+    :returns: ``True`` if the record is stale and the caller should drop it
+        and stop (either the PID is not ours, or it already exited); ``False``
+        if the signal was delivered and termination should proceed as usual.
+    """
+    try:
+        os.kill(record.pid, sig)
+    except ProcessLookupError:
+        # The process exited between the liveness check and the signal —
+        # nothing left to kill, so the record is stale.
+        return True
+    except PermissionError:
+        # Not our daemon: the record points at another user's process (PID
+        # reuse, or a daemon started under a different account). Drop the
+        # stale record and warn rather than crashing the CLI on the EPERM.
+        click.echo(
+            f"Skipping stale daemon record for {record.target!r}: pid "
+            f"{record.pid} is owned by another user and is not this daemon.",
+            err=True,
+        )
+        return True
+    return False
+
+
 def _terminate_daemon(record: _HostDaemonRecord, *, force: bool) -> None:
     """
     Terminate one local daemon process.
@@ -9106,8 +9499,9 @@ def _terminate_daemon(record: _HostDaemonRecord, *, force: bool) -> None:
     if not _pid_alive(record.pid):
         _delete_daemon_record(record)
         return
-    with contextlib.suppress(ProcessLookupError):
-        os.kill(record.pid, signal.SIGTERM)
+    if _signal_daemon_pid(record, signal.SIGTERM):
+        _delete_daemon_record(record)
+        return
     deadline = time.monotonic() + _HOST_DAEMON_STOP_GRACE_S
     while time.monotonic() < deadline:
         if not _pid_alive(record.pid):
@@ -9115,8 +9509,9 @@ def _terminate_daemon(record: _HostDaemonRecord, *, force: bool) -> None:
             return
         time.sleep(0.1)
     if force:
-        with contextlib.suppress(ProcessLookupError):
-            os.kill(record.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+        if _signal_daemon_pid(record, getattr(signal, "SIGKILL", signal.SIGTERM)):
+            _delete_daemon_record(record)
+            return
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
             if not _pid_alive(record.pid):
@@ -10799,6 +11194,12 @@ def _run_databricks_browser_login(workspace_host: str, org_id: str | None = None
         the workspace rejects it).
     :raises click.ClickException: When the Databricks CLI binary is
         missing or the login exits non-zero.
+
+    The login writes to a ``.databrickscfg`` profile named after the
+    workspace's first DNS label (e.g. ``acme`` for
+    ``acme.cloud.databricks.com``), keeping distinct workspaces off the
+    shared ``DEFAULT`` profile. The OAuth grant itself stays host-keyed,
+    so :func:`_databricks_workspace_token` still resolves it by host.
     """
     databricks_bin = shutil.which("databricks")
     if databricks_bin is None:
@@ -10807,14 +11208,21 @@ def _run_databricks_browser_login(workspace_host: str, org_id: str | None = None
             "Install it first: https://docs.databricks.com/dev-tools/cli/install.html"
         )
     login_host = _host_with_org(workspace_host, org_id)
-    click.echo(f"Opening browser to log in to {login_host} ...")
+    # Pin the grant to a profile named for the workspace's first DNS label so
+    # distinct workspaces don't clobber each other under the CLI's ``DEFAULT``.
+    from urllib.parse import urlsplit
+
+    split = urlsplit(workspace_host.rstrip("/"))
+    host = split.hostname or split.netloc or split.path
+    profile = host.split(".")[0]
+    click.echo(f"Opening browser to log in to {login_host} (profile {profile}) ...")
     result = subprocess.run(
-        [databricks_bin, "auth", "login", "--host", login_host],
+        [databricks_bin, "auth", "login", "--host", login_host, "--profile", profile],
         check=False,
     )
     if result.returncode != 0:
         raise click.ClickException(
-            f"`databricks auth login --host {login_host}` failed "
+            f"`databricks auth login --host {login_host} --profile {profile}` failed "
             f"(exit {result.returncode}). If the workspace is unreachable from "
             "this machine (VPN / IP access lists), resolve that and retry."
         )
@@ -10867,7 +11275,7 @@ def _databricks_workspace_token(workspace_host: str) -> str | None:
     try:
         auth, _host = _resolve_databricks_auth(host=workspace_host)
         return auth.current_token()
-    except (DatabricksAuthError, ValueError):
+    except (DatabricksAuthError, ImportError, ValueError):
         return None
 
 
@@ -11037,6 +11445,9 @@ def login(server_url: str) -> None:
                 token=token,
                 user_id=user_id,
                 expires_at=_time.time() + expires_in,
+                # Login-issued refresh grant (newer servers) — lets the
+                # host/CLI renew past session expiry unattended.
+                refresh_token=result.get("refresh_token"),
             )
             click.echo(f"Logged in as {user_id}")
             _remember_default_server(server)
@@ -11088,7 +11499,7 @@ def _accounts_login(server: str) -> None:
     try:
         resp = _httpx.post(
             f"{server}/auth/login",
-            json={"username": username, "password": password},
+            json={"username": username, "password": password, "issue_refresh": True},
             timeout=10.0,
         )
     except _httpx.HTTPError as exc:
@@ -11116,6 +11527,7 @@ def _accounts_login(server: str) -> None:
         token=token,
         user_id=user_id,
         expires_at=_time.time() + expires_in,
+        refresh_token=body.get("refresh_token"),
     )
     click.echo(f"Logged in as {user_id}.")
 

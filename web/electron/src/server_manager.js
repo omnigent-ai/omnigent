@@ -131,7 +131,13 @@ function spawnHostChild(cliPath, serverUrl) {
     const holder = { text: "" };
     let child;
     try {
-      child = spawn(cliPath, ["host", "--server", serverUrl], {
+      // `--non-interactive`: the desktop owns the sign-in step (ensureServerAuth
+      // runs `omnigent login` first), so the host daemon must never try its own
+      // interactive login. Without the flag, an unauthed connect relies on the
+      // spawned child's stdin not being a TTY to bail — with it, the CLI raises a
+      // deterministic "run `omnigent login`" error that `isAuthError` classifies,
+      // so any residual auth gap becomes a fast, surfaced authError, not a hang.
+      child = spawn(cliPath, ["host", "--server", serverUrl, "--non-interactive"], {
         stdio: ["ignore", "pipe", "pipe"],
       });
     } catch (err) {
@@ -295,23 +301,41 @@ async function disconnectHost(cliPath, serverUrl) {
 
 /**
  * Ensure the CLI is authenticated for a server before connecting a host to it.
- * Local (loopback) servers need no auth. For a remote server with no valid
- * stored credentials, runs `omnigent login <url>` (browser/OIDC/Databricks; a
- * no-op when the server needs no auth). Returns ok when already authed, after a
- * successful login, or for a no-auth server; an error (pointing at `omnigent
- * login`) when login fails — e.g. a password/TTY mode that can't run headless.
+ * Local (loopback) servers need no auth. For a remote server, this asks the
+ * server itself (a `GET /v1/me` probe via {@link module:omnigent_cli.probeServerAuth})
+ * rather than trusting the on-disk token file — a Databricks pointer record has
+ * no readable expiry, so a stale file would otherwise falsely report "authed"
+ * and skip the login that should open the browser. When not authed it runs
+ * `omnigent login <url>` (browser/OIDC/Databricks), which is idempotent: a
+ * live-but-expired Databricks access token refreshes silently with no browser,
+ * and only a dead grant opens the sign-in browser.
+ *
+ * Returns ok when already authed, when the server is unreachable (so the connect
+ * attempt can raise its own, clearer error), or after a successful login. On
+ * login failure returns `{ ok:false, authError:true, error }` so the UI can
+ * offer a sign-in/retry affordance instead of a generic failure.
  *
  * @param {string} cliPath
  * @param {string} serverUrl
- * @returns {Promise<{ ok: boolean, error?: string }>}
+ * @returns {Promise<{ ok: boolean, authError?: boolean, error?: string }>}
  */
 async function ensureServerAuth(cliPath, serverUrl) {
-  if (cli.isLoopbackServer(serverUrl) || cli.serverAuthed(serverUrl)) return { ok: true };
+  if (cli.isLoopbackServer(serverUrl)) return { ok: true };
+  const probe = await cli.probeServerAuth(serverUrl);
+  // Already authed, or unreachable — in the unreachable case skip a doomed login
+  // and let the connect attempt surface the real (connectivity) error.
+  if (probe.authed || !probe.reachable) return { ok: true };
   const res = await cli.loginServer(cliPath, serverUrl);
   if (res.ok) return { ok: true };
+  // Deliberately a fixed, generic message — NOT `res.output`. `omnigent login`
+  // stdout on the OIDC path contains the login-ticket URL
+  // (`…/auth/login?ticket=…`), which is auth material; threading it to the
+  // renderer would leak it. The server URL alone is safe (the renderer already
+  // knows it).
   return {
     ok: false,
-    error: `Sign-in required — run \`omnigent login ${serverUrl}\` in a terminal, then try again.`,
+    authError: true,
+    error: `Sign-in to ${serverUrl} didn't complete. A browser window should have opened — finish signing in and try again (or run \`omnigent login ${serverUrl}\` in a terminal).`,
   };
 }
 

@@ -1902,12 +1902,14 @@ class PiExecutor(Executor):
         cfg = config or ExecutorConfig()
         model = cfg.model or self._model_override
         if model is None and self._gateway_uses_databricks_profile:
-            resolution = await run_sync_on_thread(
-                model_catalog.resolve_catalog_model,
-                "databricks",
-                family="claude",
+            # DATABRICKS-PATCH(pi-live-model-discovery): resolve from the
+            # workspace, not the bundled catalog whose legacy `databricks-` ids
+            # the gateway answers with `501 … Use Unity Catalog model services`.
+            from omnigent.inner.claude_sdk_executor import _resolve_databricks_claude_model
+
+            model_id = await run_sync_on_thread(
+                _resolve_databricks_claude_model, self._databricks_profile
             )
-            model_id = resolution.model_id
             if not isinstance(model_id, str):
                 raise TypeError("Databricks model resolution returned a non-string model id")
             return model_id

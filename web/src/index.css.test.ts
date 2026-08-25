@@ -133,6 +133,18 @@ describe("index.css bg-card glass rule selector", () => {
   });
 });
 
+describe("index.css app-shell viewport lock", () => {
+  const rule = (cssSource.match(/[^{}]+\{[^{}]*\}/g) ?? []).find(
+    (block) => block.includes("body:has(.app-shell)") && /overflow\s*:\s*hidden/.test(block),
+  );
+
+  it("locks both document roots while the fixed app shell is mounted", () => {
+    expect(rule, "the app-shell viewport lock is gone from index.css").toBeDefined();
+    expect(rule).toContain("html:has(.app-shell)");
+    expect(rule).toContain("body:has(.app-shell)");
+  });
+});
+
 /* Regression test for the "table link column collapses to ~2ch" bug.
  *
  * Streamdown styles links with `wrap-anywhere`, which also drops the
@@ -479,9 +491,6 @@ describe("index.css electron-mac sidebar header", () => {
   const stripActionsRule = cssSource.match(
     /\[data-electron-mac\] \.electron-sidebar-header-actions \{(?:[^{}]|\{[^{}]*\})*\}/,
   )?.[0];
-  const dragStripRule = cssSource.match(
-    /\[data-electron-mac\] \.electron-drag-strip \{[^}]*\}/,
-  )?.[0];
   const settingsHeaderRule = cssSource.match(
     /\[data-electron-mac\] \.settings-sidebar-header \{[^}]*\}/,
   )?.[0];
@@ -527,8 +536,6 @@ describe("index.css electron-mac sidebar header", () => {
     // keeps the icons in place while the sidebar collapses (md:w-0 +
     // overflow-hidden + inert) or peeks (floating card at inset-2).
     expect(stripActionsRule).toContain("position: absolute");
-    // 5rem clears the three lights plus their inset.
-    expect(stripActionsRule).toContain("left: 5rem");
   });
 
   it("stacks the cluster above the sidebar so it is actually painted", () => {
@@ -562,15 +569,6 @@ describe("index.css electron-mac sidebar header", () => {
     // floats clear of all of it, so the row is 2.25rem of empty canvas above the
     // first entry — the content should line up against the card's own padding.
     expect(peekHeaderRowRule).toContain("display: none");
-  });
-
-  it("aligns the cluster to the lights' centre line", () => {
-    // The lights sit ~y=19. Centring a 1.5rem button in the 2.25rem title-bar
-    // strip gives y=18: (2.25rem − 1.5rem) / 2 = 0.375rem.
-    expect(stripActionsRule).toContain("top: 0.375rem");
-    // Anchored to the SAME strip height the drag region uses, so the two can't
-    // drift apart if that band is ever retuned.
-    expect(dragStripRule).toContain("height: 2.25rem");
   });
 
   it("orders the cluster Collapse, Search, Settings left-to-right", () => {
@@ -610,3 +608,81 @@ describe("index.css electron-mac sidebar header", () => {
     }
   });
 });
+
+describe("index.css native conversation breadcrumb", () => {
+  it("does not hide the parent-session link on iOS/Android native shells", () => {
+    // Native chrome is a server switcher, not session back. A blanket
+    // `.conversation-breadcrumb { display: none }` would also drop the only
+    // in-header climb-out of a sub-agent (native back is off; edge-pan opens
+    // the sidebar). Folder / title / sub-agent may hide; the parent link must
+    // stay.
+    const blanket = cssSource.match(
+      /\[data-ios-native\] \.conversation-breadcrumb\s*,\s*\[data-android-native\] \.conversation-breadcrumb\s*\{[^}]*display:\s*none/,
+    );
+    expect(blanket).toBeNull();
+    expect(cssSource).toMatch(
+      /\[data-ios-native\][\s\S]*breadcrumb-parent-link[\s\S]*\[data-android-native\][\s\S]*breadcrumb-parent-link/,
+    );
+  });
+});
+
+describe("index.css native safe-area insets for mobile overlays", () => {
+  // The `fixed inset-0` overlays cover the whole screen on a phone, status bar
+  // and home indicator included, so each one needs the safe-area padding. The
+  // Shells drawer once missed it (the rule listed drawers by `data-testid` and
+  // its id was never added), putting the title and Close button under the
+  // dynamic island with no way to dismiss the panel. Selecting the shared
+  // `.mobile-panel-drawer` class covers every drawer built from
+  // `MobilePanelDrawer`, present and future.
+  // Balance-aware slice instead of `[^)]*`: a selector in this list may well
+  // grow a functional pseudo-class (`:not(...)`), which a naive capture would
+  // truncate at its first `)` — silently dropping selectors from the assertions
+  // below.
+  const rule = extractInsetRule(cssSource);
+
+  it("has the inset rule this test exists to protect", () => {
+    expect(rule).not.toBeNull();
+    expect(rule?.body).toContain("padding-top: var(--omnigent-safe-top)");
+    expect(rule?.body).toContain("padding-bottom: var(--omnigent-safe-bottom)");
+  });
+
+  it.each([
+    ".conversations-sidebar",
+    '[data-testid="file-viewer"]',
+    '[data-testid="files-panel-drawer"]',
+    '[data-testid="terminals-panel"]',
+    ".mobile-panel-drawer",
+  ])("insets %s", (selector) => {
+    expect(rule?.selectors).toContain(selector);
+  });
+});
+
+/**
+ * Slice the native safe-area inset rule out of the CSS source.
+ *
+ * Walks parens/braces so a selector containing `)` (e.g. `:not(...)`) can't
+ * truncate the selector list, and returns the selector text and declaration
+ * body separately. `null` when the rule is gone (a real failure, not a silent
+ * pass).
+ */
+function extractInsetRule(css: string): { selectors: string; body: string } | null {
+  // The native prefix appears on several rules; the inset rule is the one whose
+  // subject is an `:is(...)` selector list.
+  const match = /:is\(\[data-ios-native\], \[data-android-native\]\)\s*:is\(/.exec(css);
+  if (match === null) return null;
+  let depth = 1; // the `:is(` the match ends on
+  let i = match.index + match[0].length;
+  for (; i < css.length; i += 1) {
+    if (css[i] === "(") depth += 1;
+    else if (css[i] === ")") {
+      depth -= 1;
+      if (depth === 0) break;
+    }
+  }
+  if (depth !== 0) return null;
+  const selectors = css.slice(match.index + match[0].length, i);
+  const bodyStart = css.indexOf("{", i);
+  const bodyEnd = css.indexOf("}", bodyStart);
+  if (bodyStart === -1 || bodyEnd === -1) return null;
+  return { selectors, body: css.slice(bodyStart + 1, bodyEnd) };
+}

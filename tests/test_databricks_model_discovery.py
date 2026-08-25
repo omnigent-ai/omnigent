@@ -310,3 +310,64 @@ def test_family_shim_warns_and_delegates_to_the_catalog() -> None:
             transport=httpx.MockTransport(_handler),
         )
     assert families == {"opus": "system.ai.claude-opus-5"}
+
+
+def _discover_codex(model_services: list[dict[str, str]]) -> tuple[str, ...]:
+    """Run codex discovery against a canned ``system.ai`` model-services page."""
+    from omnigent.databricks_model_discovery import discover_databricks_codex_models
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params["parent"] == "schemas/system.ai"
+        return httpx.Response(200, json={"model_services": model_services}, request=request)
+
+    return discover_databricks_codex_models(
+        "https://workspace.example.com",
+        "token",
+        transport=httpx.MockTransport(_handler),
+    )
+
+
+def test_discover_codex_models_filters_non_codex_and_ranks_curated_first() -> None:
+    """Codex discovery keeps only codex-servable ids, curated catalog first.
+
+    The listing says what a workspace *can* serve, not which to launch on:
+    the owned curated codex catalog leads (in its declared order), then
+    versioned GPT ids newest-first, then the rest — and non-codex families
+    (Claude) are dropped entirely.
+    """
+    servable = _discover_codex(
+        [
+            {"name": "model-services/system.ai.gpt-5-5"},
+            {"name": "model-services/system.ai.gpt-5-6-luna"},
+            {"name": "model-services/system.ai.gpt-5-6-sol"},
+            {"name": "model-services/system.ai.gpt-6-1"},
+            {"name": "model-services/system.ai.kimi-k2"},
+            {"name": "model-services/system.ai.claude-opus-5"},
+        ]
+    )
+
+    assert servable == (
+        # Curated (cheapest-safe-first) beats a newer non-curated generation.
+        "system.ai.gpt-5-6-sol",
+        "system.ai.gpt-5-6-luna",
+        "system.ai.gpt-5-5",
+        # Non-curated GPT, newest generation next.
+        "system.ai.gpt-6-1",
+        # Codex-compatible but unversioned, last.
+        "system.ai.kimi-k2",
+    )
+
+
+def test_discover_codex_models_empty_listing_is_authoritative() -> None:
+    """A listing that serves no codex model returns an empty tuple, not an error."""
+    assert _discover_codex([{"name": "model-services/system.ai.claude-opus-5"}]) == ()
+
+
+def test_select_servable_model_matches_legacy_spelling() -> None:
+    """A legacy ``databricks-`` request resolves to the served ``system.ai.`` id."""
+    from omnigent.databricks_model_discovery import select_servable_model
+
+    servable = ("system.ai.gpt-5-6-luna", "system.ai.gpt-5-5")
+    assert select_servable_model("databricks-gpt-5-6-luna", servable) == "system.ai.gpt-5-6-luna"
+    # A model the workspace does not serve is left for the caller to pass through.
+    assert select_servable_model("databricks-gpt-9-9", servable) is None

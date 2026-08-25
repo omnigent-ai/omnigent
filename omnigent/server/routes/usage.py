@@ -10,7 +10,7 @@ from fastapi import APIRouter, Request
 
 from omnigent._wrapper_labels import WRAPPER_LABEL_KEY
 from omnigent.entities import Conversation
-from omnigent.runtime.policies.builder import load_session_usage
+from omnigent.runtime.policies.builder import load_session_tree, load_session_usage
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.routes._auth_helpers import require_user
@@ -63,6 +63,22 @@ def _session_models(usage: dict[str, Any]) -> dict[str, float]:
         except (TypeError, ValueError):
             continue
     return models
+
+
+def _collect_other_harnesses(
+    primary: str | None,
+    tree: list[Conversation],
+    root_id: str,
+) -> list[str] | None:
+    """Distinct harnesses used by sub-agents, excluding the primary."""
+    seen: set[str] = set()
+    for conv in tree:
+        if conv.id == root_id:
+            continue
+        h = _resolve_session_harness(conv)
+        if h and h != primary:
+            seen.add(h)
+    return sorted(seen) if seen else None
 
 
 def _resolve_session_harness(conv: Conversation) -> str | None:
@@ -152,6 +168,11 @@ def _build_usage_report(
             if conv.agent_id is None:
                 continue
             usage = load_session_usage(conv.id, conversation_store)
+            primary_harness = _resolve_session_harness(conv) if include_page_details else None
+            other_harnesses = None
+            if include_page_details:
+                tree = load_session_tree(conv.id, conversation_store)
+                other_harnesses = _collect_other_harnesses(primary_harness, tree, conv.id)
             sessions.append(
                 SessionUsage(
                     id=conv.id,
@@ -160,7 +181,8 @@ def _build_usage_report(
                     title=conv.title,
                     cost_usd=_session_cost(usage),
                     models=_session_models(usage),
-                    harness=_resolve_session_harness(conv) if include_page_details else None,
+                    harness=primary_harness,
+                    other_harnesses=other_harnesses,
                     llm_model=(
                         conv.model_override or _resolve_llm_model(conv)
                         if include_page_details

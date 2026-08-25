@@ -80,8 +80,12 @@ function isUpdateSecurityError(message) {
  * @param {(win: Electron.BrowserWindow | null | undefined) => string | null} deps.pinnedOrigin
  *   The origin a window is pinned to (used for the consent dialog copy).
  * @param {string} deps.iconPath Absolute path to the app icon PNG.
- * @param {boolean} [deps.forceDevUpdateConfig] Force the dev feed on in an
- *   unpackaged build (main.js sets this from !app.isPackaged).
+ * @param {boolean} [deps.forceDevUpdateConfig] Enable the development update
+ *   config in an unpackaged build (main.js sets this from !app.isPackaged).
+ * @param {() => string} [deps.getCurrentVersion] Version shown in update UI.
+ *   Defaults to Electron's real app version.
+ * @param {(installReady: boolean) => void} [deps.onInstallReadyChange]
+ *   Called when a downloaded update becomes ready or stops being ready.
  * @returns {{
  *   getConfig: () => { mode: string, autoInstall: boolean, skippedVersion: string | null },
  *   setConfig: (patch?: object) => { mode: string, autoInstall: boolean, skippedVersion: string | null },
@@ -107,6 +111,8 @@ function createDesktopUpdater({
   pinnedOrigin,
   iconPath,
   forceDevUpdateConfig = false,
+  getCurrentVersion = () => app.getVersion(),
+  onInstallReadyChange = () => {},
 }) {
   let updateCheckTimer = null;
   let currentUpdateStatus = { state: "idle" };
@@ -141,7 +147,10 @@ function createDesktopUpdater({
   }
 
   function broadcast(status) {
+    const wasInstallReady = currentUpdateStatus.state === "downloaded";
     currentUpdateStatus = status;
+    const installReady = status.state === "downloaded";
+    if (installReady !== wasInstallReady) onInstallReadyChange(installReady);
     for (const win of BrowserWindow.getAllWindows()) {
       if (win.isDestroyed()) continue;
       try {
@@ -195,7 +204,7 @@ function createDesktopUpdater({
     autoUpdater.on("checking-for-update", () => broadcast({ state: "checking" }));
     autoUpdater.on("update-available", (info) => {
       manualCheckInFlight = false;
-      broadcast({ state: "available", info });
+      broadcast({ state: "available", currentVersion: getCurrentVersion(), info });
     });
     autoUpdater.on("update-not-available", () => {
       manualCheckInFlight = false;
@@ -204,7 +213,9 @@ function createDesktopUpdater({
     autoUpdater.on("download-progress", (progress) =>
       broadcast({ state: "downloading", progress }),
     );
-    autoUpdater.on("update-downloaded", (info) => broadcast({ state: "downloaded", info }));
+    autoUpdater.on("update-downloaded", (info) =>
+      broadcast({ state: "downloaded", currentVersion: getCurrentVersion(), info }),
+    );
     autoUpdater.on("error", (err) => {
       const msg = String(err?.message ?? err);
       const isSecurity = isUpdateSecurityError(msg);
