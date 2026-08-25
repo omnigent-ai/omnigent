@@ -649,3 +649,62 @@ def test_antigravity_native_requires_credential(
     monkeypatch.setattr(_ga, "gemini_login_detected", lambda: True)
     assert harness_is_configured("antigravity-native") is True
     assert harness_is_configured("native-antigravity") is True
+
+
+def test_claude_ready_via_managed_gateway_without_provider_or_cli_login(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Claude reads ready from its own managed-settings gateway alone.
+
+    The enterprise state (`isaac configure claude`): nothing in omnigent's
+    config, no subscription login the probe can see, but Claude Code's managed
+    settings pin an AI Gateway + apiKeyHelper and the CLI applies them itself.
+    This is the exact "Claude Code isn't configured on <host>" dead end — the
+    structural check must go green WITHOUT the `claude auth status` subprocess.
+    """
+    import json
+
+    from omnigent.onboarding import ambient
+
+    _all_clis_installed(monkeypatch)
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_readiness._family_provider_configured", lambda _h: False
+    )
+    # The subprocess probe stays broken; readiness must not depend on it.
+    monkeypatch.setattr(hi, "harness_cli_logged_in", lambda key, **_kw: False)
+    settings = tmp_path / "managed-settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://dbc.cloud.databricks.com/ai-gateway/anthropic"
+                },
+                "apiKeyHelper": "print-token",
+            }
+        )
+    )
+    monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (settings,))
+
+    result = configured_harness_map()
+    assert result["claude-native"] is True
+    assert result["native-claude"] is True
+
+
+def test_claude_needs_auth_without_gateway_provider_or_login(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No managed gateway + no provider + no login → still `needs-auth`.
+
+    Guards the structural check from going green on nothing: an absent settings
+    file must not credit a credential that isn't there.
+    """
+    from omnigent.onboarding import ambient
+
+    _all_clis_installed(monkeypatch)
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_readiness._family_provider_configured", lambda _h: False
+    )
+    monkeypatch.setattr(hi, "harness_cli_logged_in", lambda key, **_kw: False)
+    monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (tmp_path / "absent.json",))
+
+    assert configured_harness_map()["claude-native"] == "needs-auth"

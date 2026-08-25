@@ -1148,6 +1148,22 @@ def _promote_global_auth_to_provider() -> str | None:
     return name
 
 
+def _claude_managed_gateway_label() -> str | None:
+    """Display label for a Claude credential backed by Claude Code's managed gateway.
+
+    When Claude Code's own settings deliver a gateway credential (enterprise
+    ``ANTHROPIC_BASE_URL`` + ``apiKeyHelper``), the Claude "subscription" the
+    machine really carries is that gateway, so setup names it as such (e.g.
+    ``"Databricks AI Gateway"``) instead of the generic ``"Subscription"``.
+    Purely a display derivation from live managed settings — nothing persisted.
+
+    :returns: The gateway label, or ``None`` when no managed credential is present.
+    """
+    from omnigent.onboarding.ambient import claude_managed_gateway_display_name
+
+    return claude_managed_gateway_display_name()
+
+
 def _compact_credential_label(det: DetectedProvider) -> str:
     """A short, brand-qualified label for an auto-configured credential.
 
@@ -1168,6 +1184,12 @@ def _compact_credential_label(det: DetectedProvider) -> str:
     from omnigent.onboarding.configure_models import credential_label
 
     if det.kind == SUBSCRIPTION_KIND:
+        # A Claude login whose real backing is Claude Code's managed-settings
+        # gateway names that gateway, so the callout matches Codex-Databricks.
+        if det.name == "claude":
+            gateway = _claude_managed_gateway_label()
+            if gateway is not None:
+                return gateway
         # Fallback to the raw CLI name is unreachable for today's detections
         # (see _CLI_LOGIN_BRAND) but keeps an added CLI readable, not crashing.
         brand = _CLI_LOGIN_BRAND.get(det.name, det.name)
@@ -1284,7 +1306,17 @@ def _credential_label(name: str, entry: ProviderEntry) -> str:
     :returns: A human label, e.g. ``"Anthropic API Key"`` or ``"Databricks (oss)"``.
     """
     from omnigent.onboarding.configure_models import credential_label
+    from omnigent.onboarding.provider_config import SUBSCRIPTION_KIND
 
+    # A Claude subscription whose real backing is Claude Code's managed-settings
+    # gateway reads as that gateway (e.g. "Databricks AI Gateway") rather than
+    # the generic "Subscription", so the credential the user recognizes is named
+    # — the Claude analogue of the "Codex-Databricks" row. Display only; the
+    # persisted entry stays a plain subscription (no new shape on disk).
+    if entry.kind == SUBSCRIPTION_KIND and entry.cli == "claude":
+        gateway = _claude_managed_gateway_label()
+        if gateway is not None:
+            return gateway
     return credential_label(
         entry.kind, name, profile=entry.profile, display_name=entry.display_name
     )
