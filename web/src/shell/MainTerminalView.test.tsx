@@ -361,6 +361,23 @@ describe("MainTerminalView — persistent hidden mount", () => {
     expect(screen.getByTestId("terminal-view").getAttribute("data-instance")).toBe(instance);
   });
 
+  it("falls back to the agent pane when the restored target no longer exists", () => {
+    // `?view=terminal` resolves against the per-session stored panel key, which
+    // can name a shell that has since been closed. The stale key must degrade to
+    // the agent terminal, not leave the pane empty.
+    renderView({
+      terminals: [REPL_TERMINAL],
+      initialTerminalKey: "terminal:terminal_bash_gone",
+    });
+
+    expect(screen.getByTestId("terminal-view")).toHaveAttribute(
+      "data-terminal-id",
+      "terminal_tui_main",
+    );
+    // No shell header: the pane is the agent's, not a phantom shell.
+    expect(screen.queryByRole("button", { name: "Close shell" })).toBeNull();
+  });
+
   it("resets a shell selection to the agent terminal while hidden", () => {
     // Open on a rail shell, then close the view (AppShell nulls the
     // target key when the view closes). The old unmount-on-close forgot
