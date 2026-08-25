@@ -33,6 +33,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from html import escape
 from urllib.parse import quote
 
 import jwt
@@ -40,7 +41,6 @@ import uvicorn
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
-from markupsafe import escape
 
 from tests.e2e_ui.conftest import _find_free_port
 
