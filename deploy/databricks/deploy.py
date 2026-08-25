@@ -933,6 +933,8 @@ def _ensure_app_sp_uc_traversal(
     on a shared catalog cannot add it. Aborting the deploy there fails a
     workspace that would have booted fine, and the app-boot smoke check later
     in :func:`main` is the real gate on whether traversal actually works.
+    With ``--no-smoke-check``, this warning is the only post-grant signal that
+    traversal may still be unavailable.
     """
     if not app_sp:
         _log("app SP not resolved yet; skipping UC traversal grants")
