@@ -113,6 +113,20 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    */
   controlHost: (action) => ipcRenderer.invoke("omnigent:host-control", action),
   /**
+   * Desktop feature gates the server can't know about — currently
+   * `{ databricksInternalFeatures }` from macOS Managed Preferences, scoped
+   * to the window's server (true only on Databricks-managed servers).
+   * Resolves null off a connected server.
+   */
+  getDesktopFeatures: () => ipcRenderer.invoke("omnigent:get-desktop-features"),
+  /**
+   * Connect the user's Arca instance (Databricks-internal) to the window's
+   * server as a host, via `arca ssh`. Native consent is asked in the main
+   * process. Resolves a `{ ok, error?, authError? }` result.
+   */
+  connectArcaHost: () => ipcRenderer.invoke("omnigent:arca-connect"),
+
+  /**
    * Subscribe to host status-change pings. Fired only on real events (a host
    * child connecting/exiting, or a control action) — never on a timer — so the
    * renderer re-reads what it needs on demand. The callback takes no argument.
