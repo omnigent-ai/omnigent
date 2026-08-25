@@ -18,6 +18,7 @@ from omnigent.process_logging import (
     LOG_TTY_FD_ENV_VAR,
     PROCESS_LOG_FILE_ENV_VAR,
     TerminalLogFormatter,
+    _debug_sink_target_loggers,
     _unlink_if_empty,
     child_logging_popen_kwargs,
     configure_process_logging,
@@ -301,3 +302,25 @@ def test_configure_registers_the_empty_log_sweep_for_self_allocated_paths(
         for handler in list(logger.handlers):
             logger.removeHandler(handler)
             handler.close()
+
+
+def test_debug_sink_targets_follow_non_propagating_package_logger() -> None:
+    # cli_diagnostics sets our package loggers to propagate=False with their own
+    # handlers, so records logged under them never reach root. The debug-log
+    # sink (attached to root) must therefore also attach to such loggers, or it
+    # sees nothing — the bug that left server/host rows undelivered.
+    name = "omnigent.test.sink_target_propagation"
+    logger = logging.getLogger(name)
+    original = logger.propagate
+    try:
+        logger.propagate = False
+        targets = _debug_sink_target_loggers((name,), root=True)
+        assert logging.getLogger() in targets  # root, for propagating loggers
+        assert logger in targets  # and the non-propagating package logger itself
+
+        logger.propagate = True
+        targets = _debug_sink_target_loggers((name,), root=True)
+        # A propagating logger reaches root already; root-only avoids double-ship.
+        assert targets == [logging.getLogger()]
+    finally:
+        logger.propagate = original

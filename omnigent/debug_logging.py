@@ -472,14 +472,32 @@ class ZerobusLogHandler(logging.Handler):
                 pass
 
     def _run(self) -> None:
-        while not self._stop.is_set():
-            batch = self._collect_batch(self._FLUSH_WAIT)
-            if batch:
-                self._post(batch)
-        # Drain whatever is left on shutdown.
-        remaining = self._collect_batch(0.0)
-        if remaining:
-            self._post(remaining)
+        # This worker owns the client captured at start and closes it on exit,
+        # so close() never shuts the client down from another thread while a
+        # post/token-mint is in flight (which raises inside httpx and would
+        # otherwise kill this thread with an uncaught exception).
+        client = self._client
+        try:
+            while not self._stop.is_set():
+                try:
+                    batch = self._collect_batch(self._FLUSH_WAIT)
+                    if batch:
+                        self._post(batch)
+                except Exception:  # noqa: BLE001 — the uploader thread must never die
+                    # A transient error (or a closed client during a shutdown
+                    # race) must not kill the worker: emit()'s self-heal only
+                    # revives a *stopped* thread, so a crash would silently end
+                    # delivery for the process. Drop and keep going.
+                    time.sleep(0.1)
+            # Best-effort drain of whatever is left on shutdown.
+            remaining = self._collect_batch(0.0)
+            if remaining:
+                self._post(remaining)
+        except Exception:  # noqa: BLE001 — shutdown drain is best-effort
+            pass
+        finally:
+            with contextlib.suppress(Exception):
+                client.close()
 
     _FLUSH_WAIT = _FLUSH_INTERVAL_S
 
@@ -551,18 +569,17 @@ class ZerobusLogHandler(logging.Handler):
     def close(self) -> None:
         if self._closed:
             return
-        # Capture the worker we are tearing down first. A concurrent emit()
-        # (which runs under the handler lock) can revive the sink during the
-        # join below — reassigning self._stop/_thread/_client to fresh ones — so
-        # stop and close the captured locals, never the revived worker.
-        stop, thread, client = self._stop, self._thread, self._client
+        # Signal the worker and let it finish and close its own client. Capture
+        # the worker we are tearing down first: a concurrent emit() (under the
+        # handler lock) can revive the sink during the join below, reassigning
+        # self._stop/_thread to fresh ones. Do NOT close the client here — the
+        # worker's shutdown drain may still be minting a token / posting, and
+        # closing it underneath raises inside httpx and kills the thread.
+        stop, thread = self._stop, self._thread
         self._closed = True
         stop.set()
         thread.join(timeout=5.0)
-        try:
-            client.close()
-        finally:
-            super().close()
+        super().close()
 
 
 # Process-wide sink; recreated only if a prior instance was closed (e.g. a
