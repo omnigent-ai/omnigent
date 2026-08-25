@@ -27,6 +27,7 @@ export function SidebarHeaderActions({
   onOpenSearch,
   onSettingsClick,
   onTogglePointerEnter,
+  onTogglePointerDown,
   onTogglePointerLeave,
 }: {
   /**
@@ -50,6 +51,7 @@ export function SidebarHeaderActions({
    * so the behaviour has to ride along with it or dwell-to-peek disappears.
    */
   onTogglePointerEnter?: () => void;
+  onTogglePointerDown?: () => void;
   onTogglePointerLeave?: () => void;
 }) {
   return (
@@ -65,6 +67,7 @@ export function SidebarHeaderActions({
             aria-label={expanded ? "Close sidebar" : "Open sidebar"}
             onClick={onToggle}
             onPointerEnter={onTogglePointerEnter}
+            onPointerDown={onTogglePointerDown}
             onPointerLeave={onTogglePointerLeave}
             // Mobile drops the toggle entirely: there the sidebar is a drawer
             // that leaves a strip of the chat visible, and tapping that strip

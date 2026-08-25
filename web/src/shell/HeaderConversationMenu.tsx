@@ -10,7 +10,7 @@ import {
   ArchiveIcon,
   CheckIcon,
   ChevronLeftIcon,
-  EllipsisVerticalIcon,
+  EllipsisIcon,
   FolderInputIcon,
   GitBranchIcon,
   InfoIcon,
@@ -369,9 +369,9 @@ export function HeaderConversationMenu({
             size={isMobile ? "icon" : "icon-xs"}
             aria-label="Conversation actions"
             data-testid="header-conversation-actions"
-            className="shrink-0 border-none text-muted-foreground hover:text-foreground max-md:rounded-full"
+            className="shrink-0 border-none text-muted-foreground transition-opacity hover:text-foreground max-md:rounded-full md:opacity-0 md:group-hover/breadcrumb:opacity-100 md:group-focus-within/breadcrumb:opacity-100 data-[state=open]:opacity-100"
           >
-            <EllipsisVerticalIcon className={isMobile ? "size-4" : "size-3.5"} />
+            <EllipsisIcon className={isMobile ? "size-4" : "size-3.5"} />
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent
