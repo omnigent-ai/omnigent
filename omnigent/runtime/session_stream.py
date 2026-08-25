@@ -89,22 +89,19 @@ _SSE_SKIP_TYPES = frozenset(
 _SSE_WARN_TYPES = frozenset(
     {"response.failed", "response.error", "turn.failed", "response.policy_denied"}
 )
-# Top-level event fields safe to log — identifiers/dimensions, never content.
+# Top-level event fields safe to log — stable identifiers, closed enums, and
+# pure numerics only. Deliberately excludes human/LLM-authored free text such
+# as ``reason`` (PolicyDeniedEvent's deny reason is LLM-generated and can quote
+# the content it evaluated) and ``blocked_on`` (a free-form "human phrase"),
+# alongside the content fields dropped in _sse_safe_attributes.
 _SSE_SAFE_KEYS = (
     "status",
-    "source",
     "call_id",
-    "message_id",
     "tool_name",
     "phase",
     "attempt",
     "max_attempts",
-    "delay_seconds",
     "sequence_number",
-    "reason",
-    "blocked_on",
-    "index",
-    "final",
     "model",
     "context_tokens",
     "context_window",
@@ -115,8 +112,9 @@ _SSE_SAFE_KEYS = (
 def _sse_safe_attributes(event: dict[str, Any]) -> dict[str, object]:
     """Extract only safe identifiers/dimensions from an SSE event.
 
-    A strict whitelist: content fields (``delta`` text, tool ``arguments`` /
-    outputs, message/reasoning ``data``, error messages) are never read, so no
+    A strict whitelist: content and free-text fields (``delta`` text, tool
+    ``arguments`` / outputs, message/reasoning ``data``, ``error.message``,
+    and human/LLM-authored ``reason`` / ``blocked_on``) are never read, so no
     model response or user content reaches the debug table.
     """
     attrs: dict[str, object] = {}

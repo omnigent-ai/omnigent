@@ -752,7 +752,8 @@ async def test_inflight_replay_via_pre_ready_snapshot_does_not_duplicate_window_
 
 def test_sse_safe_attributes_whitelists_ids_and_excludes_content() -> None:
     # The whitelist captures identifiers/dimensions and NEVER content — no model
-    # text, tool arguments/outputs, message data, or error messages.
+    # text, tool arguments/outputs, message data, error messages, or the
+    # human/LLM-authored free text carried in reason / blocked_on.
     event = {
         "type": "response.output_item.done",
         "response": {"id": "resp_123", "output": [{"secret": "assistant text"}]},
@@ -766,6 +767,10 @@ def test_sse_safe_attributes_whitelists_ids_and_excludes_content() -> None:
         "tool_name": "search.web",
         "status": "completed",
         "delta": "streamed model tokens",
+        # Free-text fields that must NOT be captured (e.g. an LLM-generated
+        # policy deny reason quoting the content it evaluated).
+        "reason": "blocked because the prompt asked to exfiltrate secret_pii_value",
+        "blocked_on": "waiting on user secret_pii_value confirmation",
         "error": {"code": "timeout", "source": "llm", "message": "raw provider detail"},
     }
     attrs = session_stream._sse_safe_attributes(event)
@@ -777,11 +782,20 @@ def test_sse_safe_attributes_whitelists_ids_and_excludes_content() -> None:
     assert attrs["status"] == "completed"
     assert attrs["error_code"] == "timeout"
     assert attrs["error_source"] == "llm"
+    # Free-text dimensions are excluded outright.
+    assert "reason" not in attrs
+    assert "blocked_on" not in attrs
     # No content leaks, in any key or value.
     flat = repr(attrs).lower()
-    for forbidden in ("delta", "arguments", "data", "message", "output"):
+    for forbidden in ("delta", "arguments", "data", "message", "output", "reason", "blocked_on"):
         assert forbidden not in attrs
-    for leaked in ("streamed model tokens", "pii", "assistant text", "raw provider detail"):
+    for leaked in (
+        "streamed model tokens",
+        "pii",
+        "assistant text",
+        "raw provider detail",
+        "secret_pii_value",
+    ):
         assert leaked.lower() not in flat
 
 

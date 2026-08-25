@@ -601,6 +601,9 @@ def debug_sink_enabled() -> bool:
     callers skip building records entirely when the sink is off, so the feature
     adds no cost for OSS / non-internal users who never enabled it.
     """
+    # Intentionally lock-free: a single global-object read is atomic under the
+    # GIL, and this is a best-effort gate — a stale read only mis-times one
+    # record around enable/close, never corrupts state.
     return _active_sink is not None and not _active_sink.closed
 
 
