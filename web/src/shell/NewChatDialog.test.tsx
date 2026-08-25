@@ -2,6 +2,7 @@ import type * as IdentityModule from "@/lib/identity";
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as ChatStoreModule from "@/store/chatStore";
+import type * as NativeBridgeModule from "@/lib/nativeBridge";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -43,6 +44,12 @@ import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import type { Conversation } from "@/hooks/useConversations";
 import { setOmnigentHostConfig } from "@/lib/host";
+import {
+  controlHost,
+  getHostIdentity,
+  isElectronShell,
+  onHostStatusChanged,
+} from "@/lib/nativeBridge";
 import { writeHideUnconfiguredHarnesses } from "@/lib/harnessVisibilityPreferences";
 import { setPendingInitialPrompt } from "@/store/chatStore";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -52,6 +59,16 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 vi.mock("@/lib/identity", async (importOriginal) => ({
   ...(await importOriginal<typeof IdentityModule>()),
   authenticatedFetch: vi.fn(),
+}));
+// Desktop bridge: default to the browser/jsdom world (isElectronShell → false),
+// so existing tests are unaffected; the "Run on this machine" suite opts into
+// the desktop shell by overriding these per-test.
+vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
+  ...(await importOriginal<typeof NativeBridgeModule>()),
+  isElectronShell: vi.fn(() => false),
+  getHostIdentity: vi.fn(async () => null),
+  onHostStatusChanged: vi.fn(() => () => {}),
+  controlHost: vi.fn(async () => ({ ok: false })),
 }));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
@@ -760,6 +777,7 @@ function renderLanding(infoOverrides: Partial<ServerInfo> = {}, route = "/") {
     // routing). Cases that exercise the built-in judge pass the field
     // explicitly.
     smart_routing_sources: { external: infoOverrides.smart_routing_enabled === true, oss: false },
+    features: { harness_install: infoOverrides.harness_install_enabled === true },
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
@@ -868,6 +886,71 @@ function saveConfig(): void {
   fireEvent.click(screen.getByTestId("new-chat-landing-config-save"));
 }
 
+describe("Run on this machine (desktop host enrollment)", () => {
+  beforeEach(() => {
+    setupLandingMocks();
+    // No hosts connected yet → the picker offers the one-click connect.
+    mockHosts([]);
+    // Pretend we're in the desktop shell with the CLI installed, so
+    // `showConnectThisMachine` is true and the affordance renders.
+    vi.mocked(isElectronShell).mockReturnValue(true);
+    vi.mocked(getHostIdentity).mockResolvedValue({ cliInstalled: true, hostId: "this-machine" });
+    vi.mocked(onHostStatusChanged).mockReturnValue(() => {});
+    // Call history persists across tests in this file (no global clearMocks), so
+    // reset controlHost so per-test call-count assertions start from zero.
+    vi.mocked(controlHost).mockClear();
+  });
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+    // Restore the browser default so these overrides don't leak into the other
+    // describe blocks (which assume no desktop shell).
+    vi.mocked(isElectronShell).mockReturnValue(false);
+  });
+
+  // Open the host chip menu and click "Run on this machine". Selecting the item
+  // arms `pendingConnectRef`; the menu closing then runs `connectThisMachine`.
+  async function clickRunOnThisMachine() {
+    const chip = await screen.findByTestId("new-chat-landing-host-chip");
+    fireEvent.pointerDown(chip, { button: 0 });
+    fireEvent.click(chip);
+    const item = await screen.findByTestId("new-chat-landing-run-on-this-machine");
+    fireEvent.click(item);
+  }
+
+  it("surfaces an auth failure (with a retry) instead of silently returning to No hosts", async () => {
+    vi.mocked(controlHost).mockResolvedValue({
+      ok: false,
+      authError: true,
+      error:
+        "Sign-in required — run `omnigent login https://app.example.com` in a terminal, then try again.",
+    });
+    renderLanding();
+    await clickRunOnThisMachine();
+
+    const err = await screen.findByTestId("new-chat-landing-connect-error");
+    expect(err.textContent).toContain("Sign-in required");
+    expect(screen.getByTestId("new-chat-landing-connect-error-retry")).toBeTruthy();
+    expect(vi.mocked(controlHost)).toHaveBeenCalledWith("start");
+  });
+
+  it("re-invokes the connect when Try again is clicked", async () => {
+    vi.mocked(controlHost).mockResolvedValue({
+      ok: false,
+      authError: true,
+      error: "Sign-in required.",
+    });
+    renderLanding();
+    await clickRunOnThisMachine();
+    await screen.findByTestId("new-chat-landing-connect-error");
+
+    // Clear the initial connect's call, then assert the retry re-invokes it.
+    vi.mocked(controlHost).mockClear();
+    fireEvent.click(screen.getByTestId("new-chat-landing-connect-error-retry"));
+    await waitFor(() => expect(vi.mocked(controlHost)).toHaveBeenCalledWith("start"));
+  });
+});
+
 describe("NewChatLandingScreen", () => {
   beforeEach(setupLandingMocks);
   afterEach(() => {
@@ -899,11 +982,18 @@ describe("NewChatLandingScreen", () => {
     renderLanding();
 
     expect(screen.getByTestId("new-chat-landing-input")).toHaveClass(
+      "block",
       "min-h-[60px]",
       "max-h-[200px]",
+      "overflow-y-auto",
       "px-4",
       "pt-3",
       "pb-2",
+      "[scrollbar-width:none]",
+      "[&::-webkit-scrollbar]:hidden",
+    );
+    expect(screen.getByTestId("new-chat-landing-input").parentElement).toHaveClass(
+      "overflow-hidden",
     );
     expect(screen.getByTestId("new-chat-landing-actions")).toHaveClass("px-2", "pb-2");
     const footer = screen.getByTestId("new-chat-landing-footer");
@@ -1358,14 +1448,24 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
-  it("opens the connect-host instructions from the host dropdown", () => {
-    renderLanding();
+  it("quotes server URLs in host and Lakebox connect commands", () => {
+    setOmnigentHostConfig({ cliServerUrlSuffix: "/api?profile=dev&glob=*" });
+    renderLanding({ databricks_features: true });
     // Radix dropdowns open on pointerdown (a bare click doesn't in jsdom).
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-connect-host"));
-    // The modal mounts the connect instructions with the runnable command.
+
     expect(screen.getByTestId("connect-host-dialog")).toBeTruthy();
-    expect(screen.getByTestId("connect-host-command")).toBeTruthy();
+    expect(screen.getByTestId("connect-host-command")).toHaveTextContent(
+      `omni host --server '${window.location.origin}/api?profile=dev&glob=*'`,
+    );
+
+    const lakeboxTab = screen.getByRole("tab", { name: "Databricks Lakebox" });
+    fireEvent.mouseDown(lakeboxTab);
+    fireEvent.click(lakeboxTab);
+    expect(screen.getByTestId("connect-lakebox-connect-command")).toHaveTextContent(
+      `omni sandbox connect --provider lakebox --sandbox-id <id> --server '${window.location.origin}/api?profile=dev&glob=*'`,
+    );
   });
 
   it("offers connect-host even when no hosts are online (no dead end)", () => {
@@ -1425,9 +1525,9 @@ describe("NewChatLandingScreen", () => {
 
     openAgentConfig("a2");
     openSelect("new-chat-landing-config-model");
-    expect(screen.getAllByText("Default (databricks-gpt-5-5)").length).toBeGreaterThan(0);
-    expect(screen.getByText("databricks-gpt-5-6")).toBeTruthy();
-    fireEvent.click(screen.getByText("databricks-gpt-5-6"));
+    expect(screen.getAllByText("Default (GPT-5.5)").length).toBeGreaterThan(0);
+    expect(screen.getByText("GPT-5.6")).toBeTruthy();
+    fireEvent.click(screen.getByText("GPT-5.6"));
     saveConfig();
 
     // The Codex model is remembered under codex-native only; Claude Code's
@@ -1435,14 +1535,12 @@ describe("NewChatLandingScreen", () => {
     openAgentConfig("a1");
     expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain("Default");
     expect(screen.getByTestId("new-chat-landing-config-model").textContent).not.toContain(
-      "databricks-gpt-5-6",
+      "GPT-5.6",
     );
     saveConfig();
 
     openAgentConfig("a2");
-    expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain(
-      "databricks-gpt-5-6",
-    );
+    expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain("GPT-5.6");
     saveConfig();
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
       target: { value: "run the build" },
@@ -2656,6 +2754,17 @@ describe("NewChatLandingScreen skill pills", () => {
     expect(screen.getByTestId("skill-pill-compare").textContent).toBe("/compare");
   });
 
+  it("lets the textarea and skill prompt inherit the app font family", () => {
+    mockAgents([debbyAgent()]);
+    renderLanding();
+
+    const localFontFamily = /(^|\s)font-(sans|serif|mono|\[)/;
+    for (const element of [input(), screen.getByText("Describe a task, or try a skill")]) {
+      expect(element.className).not.toMatch(localFontFamily);
+      expect(element.style.fontFamily).toBe("");
+    }
+  });
+
   it("hides pills for agents outside the allowlist even when they carry skills", () => {
     // Same skills, non-allowlisted name: no pill row. Fails if the gate
     // ever degrades to "any agent with skills", which would spam the
@@ -3119,9 +3228,10 @@ describe("NewChatLandingScreen agent picker + config gear", () => {
     fireEvent.click(screen.getByTestId("new-chat-landing-config-cancel"));
     expect(screen.queryByTestId("new-chat-landing-config-modal")).toBeNull();
     fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
-    // Reopened: Plan was discarded, the permission select is back at Default.
+    // Reopened: Plan was discarded, the permission select is back at Manual
+    // (Claude's label for the prompting `default` mode).
     expect(screen.getByTestId("new-chat-landing-config-permission").textContent).toContain(
-      "Default",
+      "Manual",
     );
   });
 
@@ -3381,7 +3491,7 @@ describe("NewChatLandingScreen smart routing", () => {
   it.each([
     ["Claude Code", "a1", true, "Smart Routing", "Opus 4.8"],
     ["Claude Code", "a1", false, null, "Default"],
-    ["Codex", "a2", true, "Smart Routing", "Default (databricks-gpt-5-5)"],
+    ["Codex", "a2", true, "Smart Routing", "Default (GPT-5.5)"],
   ] as const)(
     "%s Model dropdown with the flag %s offers %s alongside %s",
     (_label, agentId, flag, routingOption, siblingOption) => {
@@ -3448,7 +3558,7 @@ describe("NewChatLandingScreen smart routing", () => {
         expect(screen.queryByRole("option", { name: "Smart Routing" })).toBeNull();
         expect(
           screen.getByRole("option", {
-            name: agentId === "a2" ? "databricks-gpt-5-6" : "Opus 4.8",
+            name: agentId === "a2" ? "GPT-5.6" : "Opus 4.8",
           }),
         ).toBeTruthy();
       }
@@ -4178,7 +4288,7 @@ describe("NewChatLandingScreen Smart Routing harness row", () => {
     selectAgent("a1");
     fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
     expect(screen.getByTestId("new-chat-landing-config-permission").textContent).toContain(
-      "Default",
+      "Manual",
     );
   });
 

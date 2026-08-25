@@ -10,17 +10,17 @@ from the default ``pytest`` run via ``--ignore=tests/e2e_ui`` in
 Local usage::
 
     # one-time setup
-    uv sync --extra e2e-ui
-    uv run playwright install --with-deps chromium
+    uv sync --extra all --group test
+    uv run --no-sync playwright install --with-deps chromium
 
     # run against a freshly built SPA + spawned server
-    uv run pytest tests/e2e_ui -v
+    uv run --no-sync pytest tests/e2e_ui -v
 
     # iterate against an already-running server (dev hosts/ports need opt-in)
     cd web && npm run dev &
     omnigent server --agent examples/hello_world.yaml &
     OMNIGENT_E2E_ALLOW_DEV_BASE_URL=1 \
-      uv run pytest tests/e2e_ui --ui-base-url http://127.0.0.1:5173
+      uv run --no-sync pytest tests/e2e_ui --ui-base-url http://127.0.0.1:5173
 
 ``omnigent server`` is documented at ``omnigent/cli.py:server``:
 it spins up uvicorn with the Omnigent app and spawns an out-of-process
@@ -542,7 +542,10 @@ def configure_mock_llm(
     :param mock_url: Mock server base URL.
     :param responses: List of response configs. Keys:
         ``text``, ``tool_calls``, ``block``, ``stream``,
-        ``error``, ``status_code``.
+        ``error``, ``status_code``, ``delay``, ``truncate_after``
+        (emit only N SSE events then end the stream, dropping the
+        completion event — a mid-stream fault for exercising the SPA's
+        stream error/recovery UI).
     :param key: Queue key — typically the model name baked into the
         agent spec. Defaults to ``"default"`` (matches any model
         not assigned to a more specific queue).
@@ -571,6 +574,36 @@ def reset_mock_llm(mock_url: str) -> None:
     resp.raise_for_status()
 
 
+def seed_committed_items(session_id: str, items: list[Any]) -> None:
+    """Append committed ``NewConversationItem``s straight into the store.
+
+    For tests that need a settled transcript to act on but not the model's
+    behaviour. Skips the runner and the LLM entirely, so the test neither
+    waits on a turn nor inherits the mock-LLM harness's flakiness. Seed
+    BEFORE navigating — the chat hydrates its history on load.
+
+    Items go through the same store the server writes with, so they are
+    indistinguishable from a real turn's (same shape, ids, FTS rows).
+
+    :param session_id: Session to append to, e.g. ``"conv_abc123"``.
+    :param items: ``omnigent.entities.NewConversationItem`` values, in
+        transcript order.
+    :raises RuntimeError: If the server under test isn't one we spawned
+        (``--ui-base-url``), so its database isn't reachable from here.
+    """
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+
+    database_uri = _server_state.get("database_uri")
+    if not database_uri:
+        raise RuntimeError(
+            "seeding needs the spawned server's database; it is "
+            "unavailable when running against --ui-base-url."
+        )
+    SqlAlchemyConversationStore(str(database_uri)).append(session_id, items)
+
+
 def seed_committed_turn(
     session_id: str,
     *,
@@ -580,35 +613,19 @@ def seed_committed_turn(
 ) -> None:
     """Write one committed user+assistant exchange straight into the store.
 
-    For tests that need a settled transcript to act on (per-message actions
-    anchor on a committed assistant response) but not the model's behaviour.
-    Skips the runner and the LLM entirely, so the test neither waits on a turn
-    nor inherits the mock-LLM harness's flakiness. Seed BEFORE navigating —
-    the chat hydrates its history on load.
-
-    Items are appended through the same store the server writes with, so they
-    are indistinguishable from a real turn's (same shape, ids, FTS rows).
+    Thin wrapper over :func:`seed_committed_items` for the common case: a
+    settled exchange per-message actions can anchor on (a fork's truncation
+    point, say).
 
     :param session_id: Session to append to, e.g. ``"conv_abc123"``.
     :param prompt: User message text, e.g. ``"ping"``.
     :param reply: Assistant message text, e.g. ``"pong"``.
     :param response_id: Response id shared by both items — per-message
         actions pass it as the turn anchor (e.g. a fork's truncation point).
-    :raises RuntimeError: If the server under test isn't one we spawned
-        (``--ui-base-url``), so its database isn't reachable from here.
     """
     from omnigent.entities import MessageData, NewConversationItem
-    from omnigent.stores.conversation_store.sqlalchemy_store import (
-        SqlAlchemyConversationStore,
-    )
 
-    database_uri = _server_state.get("database_uri")
-    if not database_uri:
-        raise RuntimeError(
-            "seed_committed_turn needs the spawned server's database; it is "
-            "unavailable when running against --ui-base-url."
-        )
-    SqlAlchemyConversationStore(str(database_uri)).append(
+    seed_committed_items(
         session_id,
         [
             NewConversationItem(
@@ -627,6 +644,32 @@ def seed_committed_turn(
             ),
         ],
     )
+
+
+def set_session_task_summary(session_id: str, task_summary: str) -> None:
+    """Write a session's ``task_summary`` straight into the store.
+
+    The background title coordinator is the only writer of this column —
+    there is no REST path for it — so a UI test that needs a settled label
+    seeds it here rather than waiting on LLM-backed generation. Seed BEFORE
+    navigating; the sub-agents rail reads the label when it hydrates.
+
+    :param session_id: Session to label, e.g. ``"conv_abc123"``.
+    :param task_summary: Human-readable label, e.g. ``"Investigate auth flow"``.
+    :raises RuntimeError: If the server under test isn't one we spawned
+        (``--ui-base-url``), so its database isn't reachable from here.
+    """
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+
+    database_uri = _server_state.get("database_uri")
+    if not database_uri:
+        raise RuntimeError(
+            "set_session_task_summary needs the spawned server's database; it "
+            "is unavailable when running against --ui-base-url."
+        )
+    SqlAlchemyConversationStore(str(database_uri)).set_task_summary(session_id, task_summary)
 
 
 def set_fallback_mock_llm(
@@ -654,8 +697,8 @@ def set_fallback_mock_llm(
     resp.raise_for_status()
 
 
-def _codex_cli_supports_goal_mode(codex_path: str) -> bool:
-    """Return whether the installed Codex CLI has app-server goal APIs."""
+def _codex_cli_supports_mocked_app_server(codex_path: str) -> bool:
+    """Return whether the Codex CLI supports the mocked app-server tests."""
     version = subprocess.run(
         [codex_path, "--version"],
         text=True,
@@ -668,6 +711,23 @@ def _codex_cli_supports_goal_mode(codex_path: str) -> bool:
     if not match:
         return False
     return tuple(int(part) for part in match.groups()) >= _CODEX_GOAL_MIN_VERSION
+
+
+def _write_codex_unknown_version_shim(directory: Path, codex_path: str) -> Path:
+    """Write a Codex shim whose version probe fails without blocking launches."""
+    shim = directory / "codex-unknown-version"
+    shim.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os\n"
+        "import sys\n"
+        "if sys.argv[1:] == ['--version']:\n"
+        "    print('codex-cli version unavailable')\n"
+        "    raise SystemExit(0)\n"
+        f"os.execv({codex_path!r}, [{codex_path!r}, *sys.argv[1:]])\n",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    return shim
 
 
 def _assert_service_worker_tombstone(build_output: Path) -> None:
@@ -2062,6 +2122,77 @@ def tool_fold_session(
             respawned.wait(timeout=5)
 
 
+@pytest.fixture
+def paused_mid_turn_session(
+    live_server: str,
+    mock_llm_server_url: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str, str]]:
+    """A runner-bound session whose turn PAUSES between two tool calls.
+
+    Same agent and bind contract as :func:`tool_fold_session`, except the
+    second LLM call blocks on the mock server's gate. That holds the turn
+    open — running, with its first tool already rendered — for as long as
+    the test needs, so a test can inject a mid-turn event (an elicitation,
+    say), act on it, then release the gate and let the same turn finish
+    with a second tool call and its wrap-up text. Without the gate the
+    ordering is a race against a turn that takes well under a second.
+
+    :param live_server: Spawned server fixture.
+    :param mock_llm_server_url: Session-scoped mock LLM server URL.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: ``(base_url, session_id, mock_llm_url)``. Send any turn, wait
+        for ``GET {mock_llm_url}/gate/pending``, then ``POST
+        {mock_llm_url}/gate/release`` to resume it.
+    """
+    import json as _json
+    import uuid as _uuid
+
+    model = f"paused-turn-probe-{_uuid.uuid4().hex[:8]}"
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_ls",
+                        "name": "sys_os_shell",
+                        "arguments": _json.dumps({"command": "ls"}),
+                    }
+                ]
+            },
+            {
+                "block": True,
+                "tool_calls": [
+                    {
+                        "call_id": "call_read",
+                        "name": "sys_os_read",
+                        "arguments": _json.dumps({"path": "README.md"}),
+                    }
+                ],
+            },
+        ],
+        key=model,
+    )
+    set_fallback_mock_llm(mock_llm_server_url, model, "Workspace inspected.")
+
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    yaml_text = _TOOL_FOLD_AGENT_YAML.format(name=_TOOL_FOLD_AGENT_NAME, model=model)
+    session_id = _create_bundled_session(live_server, runner_id, yaml_text)
+    try:
+        yield (live_server, session_id, mock_llm_server_url)
+    finally:
+        # Never leave a runner blocked on the gate — a stuck turn outlives
+        # the test and wedges the shared runner for the next one.
+        with contextlib.suppress(httpx.HTTPError):
+            httpx.post(f"{mock_llm_server_url}/gate/release", timeout=5.0)
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned is not None:
+            respawned.terminate()
+            respawned.wait(timeout=5)
+
+
 @pytest.fixture(autouse=True)
 def _ui_defaults() -> None:
     """
@@ -2398,7 +2529,12 @@ def native_claude_plan_session(
                 respawned.wait(timeout=5)
 
 
-def _create_native_codex_session(base_url: str, runner_id: str) -> str:
+def _create_native_codex_session(
+    base_url: str,
+    runner_id: str,
+    *,
+    model: str | None = None,
+) -> str:
     """Register the ``codex-native`` wrapper agent and bind its session.
 
     Reuses the exact terminal-first spec ``omnigent codex`` ships
@@ -2415,10 +2551,12 @@ def _create_native_codex_session(base_url: str, runner_id: str) -> str:
     gateway auth from its own credentials, and pre-accepts the first-run
     trust/onboarding prompts — no CLI client required. ``model=None`` lets the
     configured provider's default model win (matching the seeded codex bundle
-    built via ``_build_native_bundle``).
+    built via ``_build_native_bundle``); tests can pin a specific catalog model
+    to exercise model-specific startup behavior.
 
     :param base_url: Spawned server base URL.
     :param runner_id: The token-bound runner id to bind.
+    :param model: Optional Codex model to pin in the wrapper spec.
     :returns: The new session/conversation id.
     """
     import json as _json
@@ -2433,7 +2571,7 @@ def _create_native_codex_session(base_url: str, runner_id: str) -> str:
     from omnigent.codex_native import _materialize_codex_agent_spec
 
     with tempfile.TemporaryDirectory() as _tmp:
-        spec_path = _materialize_codex_agent_spec(Path(_tmp), model=None)
+        spec_path = _materialize_codex_agent_spec(Path(_tmp), model=model)
         yaml_text = spec_path.read_text()
 
     buf = io.BytesIO()
@@ -2649,7 +2787,12 @@ class MockedCodexNativeSession:
     sidecar: CodexResponsesSidecar
 
 
-def _write_mock_codex_provider_config(config_home: Path, base_url: str) -> None:
+def _write_mock_codex_provider_config(
+    config_home: Path,
+    base_url: str,
+    *,
+    model: str = "mock-model",
+) -> None:
     """Write provider config that routes native Codex to the sidecar."""
     config_home.mkdir(parents=True, exist_ok=True)
     (config_home / "config.yaml").write_text(
@@ -2663,14 +2806,14 @@ providers:
       api_key: "sk-e2e-mock"
       wire_api: responses
       models:
-        default: mock-model
+        default: {model}
 """,
         encoding="utf-8",
     )
 
 
 @pytest.fixture
-def mocked_native_codex_goal_session(
+def mocked_native_codex_session(
     built_spa: None,
     tmp_path_factory: pytest.TempPathFactory,
     request: pytest.FixtureRequest,
@@ -2685,30 +2828,38 @@ def mocked_native_codex_goal_session(
     in the same shard.
     """
     if request.config.getoption("--ui-base-url"):
-        pytest.skip("mocked native Codex goal e2e requires an isolated spawned server")
+        pytest.skip("mocked native Codex e2e requires an isolated spawned server")
 
     codex_path = shutil.which("codex")
     if codex_path is None:
-        pytest.skip("codex CLI is required for mocked native Codex goal e2e")
-    if not _codex_cli_supports_goal_mode(codex_path):
-        pytest.skip("codex CLI >= 0.139.0 is required for app-server goal APIs")
+        pytest.skip("codex CLI is required for mocked native Codex e2e")
+    if not _codex_cli_supports_mocked_app_server(codex_path):
+        pytest.skip("codex CLI >= 0.139.0 is required for mocked app-server e2e")
+
+    fixture_param = getattr(request, "param", None)
+    model = fixture_param if isinstance(fixture_param, str) else "mock-model"
 
     try:
         sidecar_bin = build_sidecar_bin()
     except RuntimeError:
         pytest.skip("cargo is required for Codex parity sidecar")
 
-    server_tmp = tmp_path_factory.mktemp("e2e_ui_codex_goal_server")
-    sidecar = start_codex_responses_sidecar(
-        sidecar_bin,
-        server_tmp / "responses.json",
-        [
+    server_tmp = tmp_path_factory.mktemp("e2e_ui_mocked_codex_server")
+    responses = (
+        fixture_param
+        if isinstance(fixture_param, list)
+        else [
             [
                 ev_response_created("resp-goal-ui-bootstrap"),
                 ev_assistant_message("msg-goal-ui-bootstrap", "E2E_GOAL_BOOTSTRAP"),
                 ev_completed("resp-goal-ui-bootstrap"),
             ]
-        ],
+        ]
+    )
+    sidecar = start_codex_responses_sidecar(
+        sidecar_bin,
+        server_tmp / "responses.json",
+        responses,
     )
 
     config_home = server_tmp / "config-home"
@@ -2718,7 +2869,23 @@ def mocked_native_codex_goal_session(
     artifact_dir = server_tmp / "artifacts"
     for path in (source_codex_home, home_dir, state_dir, artifact_dir):
         path.mkdir(parents=True, exist_ok=True)
-    _write_mock_codex_provider_config(config_home, sidecar.base_url)
+    # Reproduce the intermittent production path deterministically: a user
+    # hook needs review while the runner's version probe is unparseable. The
+    # real Codex binary still handles every non-version invocation.
+    (source_codex_home / "hooks.json").write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "UserPromptSubmit": [
+                        {"hooks": [{"type": "command", "command": "/usr/bin/true"}]}
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    codex_shim = _write_codex_unknown_version_shim(server_tmp, codex_path)
+    _write_mock_codex_provider_config(config_home, sidecar.base_url, model=model)
 
     port = _find_free_port()
     log_path = server_tmp / "server.log"
@@ -2741,6 +2908,7 @@ def mocked_native_codex_goal_session(
         "OMNIGENT_CODEX_NATIVE_STATE_DIR": str(state_dir),
         "CODEX_HOME": str(source_codex_home),
         "HOME": str(home_dir),
+        "OMNIGENT_CODEX_PATH": str(codex_shim),
     }
     server_env = {
         **shared_env,
@@ -2829,7 +2997,7 @@ def mocked_native_codex_goal_session(
                 f"{runner_log_path.read_text()[-3000:] if runner_log_path.exists() else ''}"
             )
 
-        session_id = _create_native_codex_session(base_url, runner_id)
+        session_id = _create_native_codex_session(base_url, runner_id, model=model)
         yield MockedCodexNativeSession(base_url=base_url, session_id=session_id, sidecar=sidecar)
     finally:
         if session_id is not None:

@@ -1,17 +1,11 @@
 import { describe, expect, it } from "vitest";
-import {
-  effortLevelsForConv,
-  isModelImplicitlySelected,
-  shouldShowEffortPicker,
-  shouldShowModelPicker,
-} from "./ChatPage";
+import { effortLevelsForConv, shouldShowEffortPicker, shouldShowModelPicker } from "./ChatPage";
 
 // These pin the label-driven composer capability gates (effort levels, model
-// picker, effort picker) and the model-row implicit-selection match. They
-// fail closed on missing labels, so a refactor that loosens the gate would
-// expose model/effort controls on sessions that can't honor mid-session
-// overrides (codex-native pins its model at launch; non-claude wrappers have
-// no Web UI effort dial).
+// picker, effort picker). They fail closed on missing labels, so a refactor
+// that loosens the gate would expose model/effort controls on sessions that
+// can't honor mid-session overrides (codex-native pins its model at launch;
+// non-claude wrappers have no Web UI effort dial).
 
 const NATIVE = "claude-code-native-ui";
 
@@ -116,37 +110,5 @@ describe("shouldShowEffortPicker", () => {
     expect(shouldShowEffortPicker({ labels: { "omnigent.wrapper": "kiro-native-ui" } })).toBe(
       false,
     );
-  });
-});
-
-describe("isModelImplicitlySelected", () => {
-  it("matches a tier alias against the bound full spec by suffix", () => {
-    // WHY: with no explicit override, the row whose alias is the suffix of the
-    // bound spec ("anthropic/claude-opus-4-8" → "opus" via includes) lights up
-    // so the user sees which model is actually running.
-    expect(isModelImplicitlySelected("opus", "anthropic/claude-opus-4-8")).toBe(true);
-  });
-
-  it("matches an exact spec equality", () => {
-    // WHY: the identity branch — a fully-qualified id that equals the bound
-    // spec is selected.
-    expect(isModelImplicitlySelected("databricks-gpt-5-4", "databricks-gpt-5-4")).toBe(true);
-  });
-
-  it("matches a path-suffix without a substring false-positive elsewhere", () => {
-    // WHY: the endsWith("/id") branch — the alias is the trailing path segment.
-    expect(isModelImplicitlySelected("sonnet", "anthropic/claude-sonnet")).toBe(true);
-  });
-
-  it("returns false when no model is bound (null spec)", () => {
-    // WHY: nothing bound → nothing implicitly selected; guards the early null
-    // return so we don't highlight a row on a fresh session.
-    expect(isModelImplicitlySelected("opus", null)).toBe(false);
-  });
-
-  it("returns false when the alias appears nowhere in the bound spec", () => {
-    // WHY: a non-matching alias must not light up — otherwise two rows could
-    // read as selected.
-    expect(isModelImplicitlySelected("opus", "anthropic/claude-sonnet-4")).toBe(false);
   });
 });

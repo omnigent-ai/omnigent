@@ -162,6 +162,17 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
       ipcRenderer.on("omnigent:update-status", listener);
       return () => ipcRenderer.removeListener("omnigent:update-status", listener);
     },
+    /** Current shell-owned update-overlay card height in CSS pixels. */
+    getOverlayHeight: () => ipcRenderer.invoke("omnigent:get-update-overlay-height"),
+    /** Subscribe to overlay height changes; returns an unsubscribe function. */
+    onOverlayHeight: (callback) => {
+      const listener = (_event, height) => {
+        const normalized = Math.max(0, Math.round(Number(height) || 0));
+        callback(normalized);
+      };
+      ipcRenderer.on("omnigent:update-overlay-height", listener);
+      return () => ipcRenderer.removeListener("omnigent:update-overlay-height", listener);
+    },
   },
   /**
    * Report the web app's resolved color scheme so the shell can mirror it via

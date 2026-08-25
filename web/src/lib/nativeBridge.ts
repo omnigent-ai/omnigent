@@ -223,6 +223,13 @@ export interface HostIdentity {
 export interface HostActionResult {
   ok: boolean;
   error?: string;
+  /**
+   * True when the failure was an authentication/sign-in problem — e.g. the
+   * server needs a Databricks/OIDC login the desktop couldn't complete
+   * headlessly — so the UI can offer a sign-in/retry affordance rather than a
+   * generic error. Set by the desktop's `omnigent:host-control` handler.
+   */
+  authError?: boolean;
 }
 
 export type UpdateMode = "none" | "manual" | "start" | "default";
@@ -233,7 +240,10 @@ export interface UpdateConfig {
   skippedVersion: string | null;
 }
 
-export type UpdateStatus =
+export type UpdateStatus = {
+  /** Installed Electron app version; absent on older desktop shells. */
+  currentVersion?: string;
+} & (
   | {
       state: "idle" | "checking" | "none";
       info?: undefined;
@@ -257,7 +267,8 @@ export type UpdateStatus =
       info?: { version: string; releaseNotes?: string };
       progress?: undefined;
       lastError?: string;
-    };
+    }
+);
 
 export interface ElectronUpdateBridge {
   getConfig: () => Promise<UpdateConfig>;
@@ -267,6 +278,10 @@ export interface ElectronUpdateBridge {
   installNow: () => Promise<void>;
   setConfig: (patch: Partial<UpdateConfig>) => Promise<UpdateConfig>;
   onStatus: (callback: (status: UpdateStatus) => void) => () => void;
+  /** Shell-owned update card height; optional on older desktop builds. */
+  getOverlayHeight?: () => Promise<number>;
+  /** Subscribe to shell-owned update card height changes. */
+  onOverlayHeight?: (callback: (height: number) => void) => () => void;
 }
 
 /** Data backing the title-bar server picker, from the Electron shell. */

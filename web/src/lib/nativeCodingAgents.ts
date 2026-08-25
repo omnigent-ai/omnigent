@@ -17,7 +17,7 @@ export type NativeCodingAgentIconKind =
   | "kimi"
   | "hermes";
 export type NativeCodingAgentCapability =
-  "permissionMode" | "approvalMode" | "cursorMode" | "skipPermissions";
+  "permissionMode" | "approvalMode" | "cursorMode" | "skipPermissions" | "modelPicker";
 
 export interface NativeCodingAgentSpec {
   key: NativeCodingAgentIconKind;
@@ -53,7 +53,7 @@ export const NATIVE_CODING_AGENTS = [
     displayName: "Claude Code",
     iconKind: "claude",
     sortRank: 10,
-    capabilities: ["permissionMode"],
+    capabilities: ["permissionMode", "modelPicker"],
     fullySupported: true,
   },
   {
@@ -106,6 +106,7 @@ export const NATIVE_CODING_AGENTS = [
     displayName: "Pi",
     iconKind: "pi",
     sortRank: 40,
+    capabilities: ["modelPicker"],
   },
   {
     key: "kiro",
@@ -276,6 +277,24 @@ export function nativeCodingAgentForAgentName(
   return name == null ? undefined : BY_AGENT_NAME.get(name);
 }
 
+/**
+ * The synthetic ``policy_name`` a native agent's permission prompts carry.
+ *
+ * History hydration rebuilds answered question / plan cards from persisted
+ * tool calls, which name the agent rather than the elicitation provenance
+ * the live card came with. Minting the id from the same prefix table
+ * :func:`nativeCodingAgentForPolicyName` reads keeps both directions on
+ * one source of truth, so the rebuilt card names the same vendor.
+ *
+ * @param name - Agent name from the item, e.g. ``"claude-native-ui"``.
+ * @returns The provenance id, or ``""`` for a non-native agent.
+ */
+export function nativePolicyNameForAgentName(name: string | null | undefined): string {
+  const spec = nativeCodingAgentForAgentName(name);
+  if (spec === undefined) return "";
+  return `${POLICY_NAME_VENDORS[spec.key] ?? spec.key}_native_permission`;
+}
+
 export function nativeCodingAgentForHarness(
   harness: string | null | undefined,
 ): NativeCodingAgentSpec | undefined {
@@ -361,6 +380,23 @@ export function isNativeTerminalSession(
   const wrapper = session.labels?.[WRAPPER_LABEL_KEY];
   if (isNativeWrapper(wrapper)) return true;
   return nativeCodingAgentForHarness(session.harness) !== undefined;
+}
+
+/**
+ * Resolve the native coding agent a session runs, from its wrapper label
+ * (authoritative) or its harness field.
+ *
+ * @param session - Session-shaped object with `harness` and `labels`.
+ * @returns The agent spec, or undefined for non-native sessions.
+ */
+export function nativeCodingAgentForSession(
+  session: { harness?: string | null; labels?: Record<string, string> } | null | undefined,
+): NativeCodingAgentSpec | undefined {
+  if (session == null) return undefined;
+  return (
+    nativeCodingAgentForWrapper(session.labels?.[WRAPPER_LABEL_KEY]) ??
+    nativeCodingAgentForHarness(session.harness)
+  );
 }
 
 export function nativeWrapperLabelsForAgent(

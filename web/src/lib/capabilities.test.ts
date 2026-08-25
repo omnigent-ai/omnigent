@@ -26,6 +26,7 @@ function info(overrides: Partial<ServerInfo>): ServerInfo {
     server_version: null,
     smart_routing_enabled: false,
     smart_routing_sources: { external: false, oss: false },
+    features: {},
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
@@ -119,6 +120,36 @@ describe("resolveServerInfo sandbox_providers", () => {
   });
 });
 
+describe("resolveServerInfo release features", () => {
+  it("keeps boolean feature values and drops malformed entries", async () => {
+    const parsed = await probe({
+      features: { usage_page: true, harness_install: false, malformed: "yes" },
+    });
+    expect(parsed.features).toEqual({ usage_page: true, harness_install: false });
+  });
+
+  it("defaults missing features off", async () => {
+    const { isFeatureEnabled } = await import("./capabilities");
+    const parsed = await probe({});
+    expect(isFeatureEnabled(parsed, "usage_page")).toBe(false);
+    expect(isFeatureEnabled(parsed, "harness_install")).toBe(false);
+  });
+
+  it("falls back to the legacy harness field from an older server", async () => {
+    const { isFeatureEnabled } = await import("./capabilities");
+    const parsed = await probe({ harness_install_enabled: true });
+    expect(isFeatureEnabled(parsed, "harness_install")).toBe(true);
+  });
+
+  it("fails all release features closed when the probe fails", async () => {
+    fetchMock.mockRejectedValueOnce(new Error("offline"));
+    const { isFeatureEnabled, resolveServerInfo } = await import("./capabilities");
+    const parsed = await resolveServerInfo();
+    expect(isFeatureEnabled(parsed, "usage_page")).toBe(false);
+    expect(isFeatureEnabled(parsed, "harness_install")).toBe(false);
+  });
+});
+
 describe("resolveServerInfo smart_routing_sources", () => {
   it("reads an explicit field verbatim", async () => {
     const parsed = await probe({
@@ -159,5 +190,34 @@ describe("resolveServerInfo smart_routing_sources", () => {
     const parsed = await resolveServerInfo();
     expect(parsed.smart_routing_enabled).toBe(false);
     expect(parsed.smart_routing_sources).toEqual({ external: false, oss: false });
+  });
+});
+
+describe("resolveServerInfo branding", () => {
+  it("preserves an explicit empty heading and disabled attribution", async () => {
+    const brandingInfo = await probe({
+      branding: {
+        app_name: "Acme Agent",
+        heading: "",
+        logos: { main: "/logo/main", loading: "/logo/loading", favicon: "/logo/favicon" },
+        powered_by: false,
+      },
+    });
+
+    expect(brandingInfo.branding).toEqual({
+      app_name: "Acme Agent",
+      heading: "",
+      logos: { main: "/logo/main", loading: "/logo/loading", favicon: "/logo/favicon" },
+      powered_by: false,
+    });
+  });
+
+  it("normalizes an empty or malformed branding payload to null", async () => {
+    const empty = await probe({ branding: { logos: { main: 123 }, powered_by: true } });
+    expect(empty.branding).toBeNull();
+
+    vi.resetModules();
+    const malformed = await probe({ branding: "Acme" });
+    expect(malformed.branding).toBeNull();
   });
 });

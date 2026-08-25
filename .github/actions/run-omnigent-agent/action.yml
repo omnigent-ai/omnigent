@@ -58,7 +58,8 @@ runs:
     - name: Install dependencies
       shell: bash
       working-directory: ${{ inputs.workdir }}
-      run: uv sync --extra all --extra dev
+      # Current callers are tools-less prose/JSON agents; repository checks never run.
+      run: uv sync --extra all
 
     - name: Install Claude Code CLI
       shell: bash

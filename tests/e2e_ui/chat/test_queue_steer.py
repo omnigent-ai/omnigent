@@ -32,7 +32,7 @@ import threading
 from collections.abc import Coroutine
 from typing import Any
 
-from playwright.async_api import Route, async_playwright
+from playwright.async_api import Route, async_playwright, expect
 
 _COMPOSER_PLACEHOLDER = "Ask the agent anything…"
 _MSG1 = "sentinel-steer-msg1-2b8d first message, holds the turn open"
@@ -154,10 +154,22 @@ async def _drive_steer(base_url: str, session_id: str) -> None:
                 f"msg2 was POSTed before steer (should be held client-side): {event_posts}"
             )
 
+            # The icon-only action explains itself on hover, with the tooltip
+            # placed above the control rather than covering the queued row.
+            steer_button = page.get_by_role("button", name="Send queued message now")
+            await steer_button.hover()
+            tooltip = page.locator("[data-slot=tooltip-content]", has_text="Send now")
+            await expect(tooltip).to_be_visible(timeout=5_000)
+            button_box = await steer_button.bounding_box()
+            tooltip_box = await tooltip.bounding_box()
+            assert button_box is not None
+            assert tooltip_box is not None
+            assert tooltip_box["y"] + tooltip_box["height"] <= button_box["y"]
+
             # Steer msg2 → it must POST now, even though the session never went
             # idle. This is what distinguishes steer from the idle auto-flush:
             # the only reason msg2 could POST here is the explicit steer.
-            await page.get_by_role("button", name="Send queued message now").click()
+            await steer_button.click()
             await _wait_until(lambda: any(text == _MSG2 for _, text in event_posts))
 
             # The steered message left the queue (strip empties).

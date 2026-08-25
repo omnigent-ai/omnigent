@@ -64,6 +64,13 @@ class HelloFrame:
         ``DISABLE_TELEMETRY=true``, or ``telemetry: false`` in
         config.yaml).  The server honours this on a best-effort basis
         by skipping telemetry events for sessions on this runner.
+    :param direct_attach_port: Loopback TCP port of the runner's
+        direct terminal-attach listener, or ``None`` when the runner
+        does not run one. Lets a browser on the same machine attach
+        without the server relay.
+    :param direct_attach_token: Per-process bearer token guarding the
+        direct-attach listener. Only meaningful alongside
+        *direct_attach_port*; both travel together or not at all.
     """
 
     runner_version: str
@@ -71,6 +78,8 @@ class HelloFrame:
     harnesses: list[str] = field(default_factory=list)
     envs: list[str] = field(default_factory=list)
     telemetry_opt_out: bool = False
+    direct_attach_port: int | None = None
+    direct_attach_token: str | None = None
 
 
 @dataclass
@@ -201,16 +210,21 @@ def encode_frame(frame: Frame) -> str:
     The output is what goes onto the WebSocket as a text message.
     """
     if isinstance(frame, HelloFrame):
-        return json.dumps(
-            {
-                "kind": FrameKind.HELLO.value,
-                "runner_version": frame.runner_version,
-                "frame_protocol_version": frame.frame_protocol_version,
-                "harnesses": list(frame.harnesses),
-                "envs": list(frame.envs),
-                "telemetry_opt_out": frame.telemetry_opt_out,
-            }
-        )
+        payload: dict[str, object] = {
+            "kind": FrameKind.HELLO.value,
+            "runner_version": frame.runner_version,
+            "frame_protocol_version": frame.frame_protocol_version,
+            "harnesses": list(frame.harnesses),
+            "envs": list(frame.envs),
+            "telemetry_opt_out": frame.telemetry_opt_out,
+        }
+        # Emitted only when the listener is actually up, so old servers
+        # (which ignore unknown keys) and advert-less runners share one
+        # wire shape.
+        if frame.direct_attach_port is not None and frame.direct_attach_token:
+            payload["direct_attach_port"] = frame.direct_attach_port
+            payload["direct_attach_token"] = frame.direct_attach_token
+        return json.dumps(payload)
     if isinstance(frame, RequestFrame):
         return json.dumps(
             {
@@ -373,12 +387,25 @@ def _decode_hello(msg: _JsonObject) -> HelloFrame:
     :param msg: Decoded frame object.
     :returns: Typed hello frame.
     """
+    # The direct-attach advert is optional and its two fields only mean
+    # anything together — a half-present pair decodes as absent.
+    raw_port = msg.get("direct_attach_port")
+    raw_token = msg.get("direct_attach_token")
+    direct_port = (
+        raw_port if isinstance(raw_port, int) and not isinstance(raw_port, bool) else None
+    )
+    direct_token = raw_token if isinstance(raw_token, str) and raw_token else None
+    if direct_port is None or direct_token is None:
+        direct_port = None
+        direct_token = None
     return HelloFrame(
         runner_version=_required_str(msg, "runner_version"),
         frame_protocol_version=_required_int(msg, "frame_protocol_version"),
         harnesses=_optional_str_list(msg, "harnesses"),
         envs=_optional_str_list(msg, "envs"),
         telemetry_opt_out=_optional_bool(msg, "telemetry_opt_out", False),
+        direct_attach_port=direct_port,
+        direct_attach_token=direct_token,
     )
 
 

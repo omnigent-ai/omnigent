@@ -498,6 +498,40 @@ to set and sanitize the identity header, and read
 [`docker/README.md#header-proxy-mode-for-deploys-behind-an-existing-sso-proxy`](docker/README.md#header-proxy-mode-for-deploys-behind-an-existing-sso-proxy)
 first.
 
+## Branding (white-labeling)
+
+Customize the app name, landing heading, and logos with a `branding:` block in
+the server config (`omnigent server -c config.yaml`, or `<data_dir>/config.yaml`
+— `/data/config.yaml` in the Docker stack). Takes effect on the next server
+start.
+
+```yaml
+branding:
+  app_name: "Acme Agent"        # tab title, sidebar wordmark, login screen
+  heading: "How can I help?"     # landing hero; "" hides it, omit to keep the default
+  logo:                          # a bare string sets `main`; or per-variant:
+    main: logo.png               # branding-assets/logo.png
+    loading: loading.webp        # working indicator (falls back to main)
+    favicon: favicon.png         # browser-tab icon
+  powered_by: true               # "Powered by Omnigent" credit; false to hide
+```
+
+Logo files must live under a dedicated `branding-assets/` directory beside the
+config file (for example, `/data/branding-assets/logo.png`). PNG, JPEG, GIF,
+WebP, and ICO files up to 5 MiB are accepted only after full decoder validation.
+ICO files must contain only PNG-backed entries; every directory entry is bounded
+and decoded independently, while DIB/BMP-backed entries are rejected. Malformed,
+truncated, oversized, overlapping, trailing-payload, SVG, symlinked, escaped, and
+non-image files are ignored. Images are also bounded to 4096 pixels per side,
+128 frames, 16 megapixels per frame, and 64 megapixels across all decoded frames.
+The values are served over the unauthenticated `GET /v1/info` and
+`GET /v1/branding/logo/<variant>` endpoints so the login screen is branded before
+sign-in. Any unset field keeps its built-in default, so a partial block is fine.
+
+The small "Powered by Omnigent" credit under the landing composer appears only
+once you set custom branding; `powered_by: false` hides it even then. It always
+shows the Omnigent mascot, never your logo.
+
 ## Adding a new deploy target
 
 Drop a new subdirectory under `deploy/<target>/` with a `README.md`

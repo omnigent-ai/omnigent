@@ -95,6 +95,7 @@ describe("createSession", () => {
       permissionLevel: null,
       parentSessionId: null,
       subAgentName: null,
+      terminalLaunchArgs: null,
       kind: "default",
       backgroundTaskCount: undefined,
       todos: [],

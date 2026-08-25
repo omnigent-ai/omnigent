@@ -200,7 +200,7 @@ def test_routed_session_config_modal_names_the_routed_model(
     :returns: None.
     """
     base_url, session_id = seeded_session
-    _patch_session_as_claude_native(page, session_id, model_override=_ROUTED_MODEL)
+    _patch_session_as_claude_native(page, session_id, llm_model=_ROUTED_MODEL)
 
     page.goto(f"{base_url}/c/{session_id}")
 

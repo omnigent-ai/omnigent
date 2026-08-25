@@ -206,6 +206,7 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
     server_version: null,
     smart_routing_enabled: false,
     smart_routing_sources: { external: false, oss: false },
+    features: {},
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
@@ -343,6 +344,29 @@ describe("quick pin/unpin hover button", () => {
       expect(button).toHaveClass("size-6", "text-muted-foreground", "hover:text-foreground");
       expect(button).not.toHaveClass("size-7");
     }
+  });
+
+  it("keeps the Projects group-header actions visible on mobile, hover-revealed on desktop", () => {
+    // The "New project" (+) button is the only way to create a project, so its
+    // group-header wrapper must stay visible on mobile (no hover there) rather
+    // than fade out like the desktop-only session-header controls. jsdom
+    // doesn't evaluate media queries, so assert the responsive classes: base
+    // `flex` (shown at every breakpoint) with `md:opacity-0` + hover/focus
+    // reveals (so desktop keeps the fade-until-hover behavior unchanged).
+    mocks.projects = ["Sprint 42"];
+    renderSidebar();
+
+    const wrapper = screen.getByTestId("new-project").closest(".transition-opacity");
+    expect(wrapper).not.toBeNull();
+    // Visible on mobile: base display is `flex`, never `hidden`.
+    expect(wrapper).toHaveClass("flex");
+    expect(wrapper).not.toHaveClass("hidden");
+    // Desktop: fades out until the header is hovered / focused / a menu opens.
+    expect(wrapper).toHaveClass(
+      "md:opacity-0",
+      "md:group-hover/header:opacity-100",
+      "md:has-[:focus-visible]:opacity-100",
+    );
   });
 
   it("hides the Projects list-actions kebab when there are no projects", () => {
@@ -687,6 +711,16 @@ describe("leave a shared session", () => {
     // row must not offer Leave — it falls back to Delete.
     mockConversations([{ ...CONV, owner: "other@example.com" }]);
     renderSidebar(undefined, serverInfo({ single_user: true }));
+
+    // The default filter is "My sessions", which scopes out this owner:other
+    // row; the single-user menu still offers "All sessions", so switch to it to
+    // surface the row this test is about.
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByTestId("session-filter-all"));
 
     fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
 

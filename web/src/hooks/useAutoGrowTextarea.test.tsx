@@ -110,19 +110,23 @@ describe("useAutoGrowTextarea", () => {
     // scrollHeight is read while the textarea is collapsed, so it's the one
     // moment that sees the layout the rest of the page would have seen.
     let wrapperHeightWhileCollapsed: string | null = null;
+    let wrapperOverflowWhileCollapsed: string | null = null;
     Object.defineProperty(ta, "scrollHeight", {
       configurable: true,
       get: () => {
         wrapperHeightWhileCollapsed = wrapper.style.height;
+        wrapperOverflowWhileCollapsed = wrapper.style.overflow;
         return 40;
       },
     });
     roCallback?.([], {} as ResizeObserver);
 
     expect(wrapperHeightWhileCollapsed).toBe("100px");
+    expect(wrapperOverflowWhileCollapsed).toBe("hidden");
     // Released again once the real height is on, so the wrapper goes back to
     // tracking its content instead of freezing at the pinned value.
     expect(wrapper.style.height).toBe("");
+    expect(wrapper.style.overflow).toBe("");
     expect(ta.style.height).toBe("40px");
   });
 
@@ -136,9 +140,8 @@ describe("useAutoGrowTextarea", () => {
   });
 
   it("reports how far past one row the box has grown", () => {
-    // The in-session composer subtracts this from its own top margin, keeping
-    // the extra rows out of the flex column so the transcript's scroll
-    // viewport — and the scrollbar and turn rail drawn from it — hold still.
+    // Callers use this to react to the textarea's capped growth without
+    // remeasuring its content independently.
     const growth: number[] = [];
     const { getByTestId } = render(<Harness value="x" onGrowth={(px) => growth.push(px)} />);
     const ta = getByTestId("ta") as HTMLTextAreaElement;

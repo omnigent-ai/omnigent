@@ -46,10 +46,13 @@
   }
 
   /**
-   * Normalize a user-entered server URL into something navigable. Accepts a
-   * bare `host[:port][/path]` and defaults the scheme (https://, or http:// for
-   * loopback hosts), trims whitespace, and rejects anything that isn't an
-   * http(s) URL — fail loud rather than navigate to garbage.
+   * Normalize a user-entered server URL to its origin. Accepts a bare
+   * `host[:port][/path]`, defaults the scheme (https://, or http:// for loopback
+   * hosts), trims whitespace, and discards paths, fragments, and query
+   * parameters. For Databricks workspace hosts only, it preserves `o` (the
+   * workspace organization selector). A server connection always starts at the
+   * canonical root; workspace mounts
+   * are discovered separately by expandDatabricksWorkspaceUrl.
    *
    * @param {string} raw
    * @returns {string} A normalized absolute http(s) URL.
@@ -69,7 +72,65 @@
     if (url.protocol !== "http:" && url.protocol !== "https:") {
       throw new Error(`unsupported scheme '${url.protocol}' (use http/https)`);
     }
-    return url.toString();
+    const normalized = new URL(`${url.origin}/`);
+    if (isDatabricksWorkspaceHost(url.hostname)) {
+      for (const organization of url.searchParams.getAll("o")) {
+        normalized.searchParams.append("o", organization);
+      }
+    }
+    return normalized.toString();
+  }
+
+  /**
+   * Normalize persisted recent-server targets for the setup-page picker. The
+   * stored target may include an internal mount such as `/omnigent`; the picker
+   * shows and reconnects through the user-facing root URL instead. Invalid and
+   * duplicate entries are omitted.
+   *
+   * @param {unknown} rawRecents
+   * @returns {string[]}
+   */
+  function normalizeRecentServers(rawRecents) {
+    if (!Array.isArray(rawRecents)) return [];
+    const normalized = [];
+    const seen = new Set();
+    for (const candidate of rawRecents) {
+      if (typeof candidate !== "string") continue;
+      let url;
+      try {
+        url = normalizeUrl(candidate);
+      } catch {
+        continue;
+      }
+      if (seen.has(url)) continue;
+      seen.add(url);
+      normalized.push(url);
+    }
+    return normalized;
+  }
+
+  /**
+   * Compact label for a server in the setup-page recent list: host (including
+   * a non-default port), plus `/?o=…` for a Databricks organization selector.
+   *
+   * @param {string} rawUrl
+   * @returns {string}
+   */
+  function serverDisplayLabel(rawUrl) {
+    let url;
+    try {
+      url = new URL(rawUrl);
+    } catch {
+      return String(rawUrl ?? "");
+    }
+    const query = new URLSearchParams();
+    if (isDatabricksWorkspaceHost(url.hostname)) {
+      for (const organization of url.searchParams.getAll("o")) {
+        query.append("o", organization);
+      }
+    }
+    const serialized = query.toString();
+    return `${url.host}${serialized ? `/?${serialized}` : ""}`;
   }
 
   /**
@@ -98,30 +159,46 @@
     return url.protocol === "http:" && !LOCAL_HOSTS.has(url.hostname);
   }
 
-  /**
-   * Path under a Databricks workspace where the Omnigent web UI is mounted. A
-   * bare workspace URL serves the workspace's own web app at the root, so a
-   * user who pastes just the workspace host (e.g.
-   * ``https://<ws>.azuredatabricks.net``) lands on a 404 unless this suffix is
-   * appended.
-   *
-   * NOTE: the Python CLI records the UI mount as ``/omnigent`` in
-   * ``omnigent/conversation_browser.py`` (WORKSPACE_UI_PATH), whereas the
-   * desktop deliberately keeps ``/ml/omnigents`` for now — that is the path the
-   * live workspace serves the embedded SPA on. The two are intentionally
-   * divergent pending reconciliation; do not "fix" this to ``/omnigent``
-   * without verifying what the workspace actually serves to the desktop shell.
-   */
-  const WORKSPACE_UI_PATH = "/ml/omnigents";
+  /** Path where the Omnigent SPA is mounted in a Databricks workspace. */
+  const WORKSPACE_UI_PATH = "/omnigent";
 
   /**
-   * Databricks Apps are served from ``*.databricksapps.com`` and answer with the
-   * same ``server: databricks`` header as a workspace, but they are NOT
-   * workspaces and have no ``/ml/omnigents`` mount. Skip expansion for these
-   * hosts so a user who points the shell at a Databricks App is left on the URL
-   * they entered.
+   * Domains that serve Databricks workspaces. Databricks Apps are deliberately
+   * absent: ``*.databricksapps.com`` serves the app itself at the root and must
+   * not be redirected to a workspace mount.
    */
+  const WORKSPACE_DOMAINS = ["databricks.com", "azuredatabricks.net"];
   const DATABRICKS_APPS_HOST_SUFFIX = "databricksapps.com";
+
+  /** True when a host is, or sits under, a Databricks workspace domain. */
+  function isDatabricksWorkspaceHost(host) {
+    const normalized = (host ?? "").toLowerCase();
+    return WORKSPACE_DOMAINS.some(
+      (domain) => normalized === domain || normalized.endsWith(`.${domain}`),
+    );
+  }
+
+  /**
+   * Return the workspace UI URL for a bare Databricks workspace root.
+   * Deliberate deep links are left untouched, while query and fragment survive
+   * because e.g. ``?o=<org>`` can select the workspace.
+   *
+   * @param {string | null | undefined} rawUrl
+   * @returns {string | null}
+   */
+  function databricksWorkspaceUiUrl(rawUrl) {
+    let url;
+    try {
+      url = new URL(rawUrl);
+    } catch {
+      return null;
+    }
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+    if (!isDatabricksWorkspaceHost(url.hostname)) return null;
+    if (url.pathname !== "/" && url.pathname !== "") return null;
+    url.pathname = WORKSPACE_UI_PATH;
+    return url.toString();
+  }
 
   /**
    * Probe timeout for Databricks workspace detection. Deliberately short: a
@@ -138,7 +215,7 @@
    * hostnames, probe the URL and adopt the mount only when the host answers
    * like a Databricks workspace — a response carrying the ``server: databricks``
    * header. URLs that already carry a path, or aren't https, are returned
-   * untouched WITHOUT a probe, so a user who pastes the full ``…/ml/omnigents``
+   * untouched WITHOUT a probe, so a user who pastes the full ``…/omnigent``
    * URL (or connects to any non-workspace server) is never second-guessed.
    *
    * The CLI appends the API mount because it's an API client; the desktop shell
@@ -162,7 +239,7 @@
       return normalized;
     }
     // Databricks Apps share the workspace ``server: databricks`` header but have
-    // no ``/ml/omnigents`` mount, so never expand them.
+    // no workspace UI mount, so never expand them.
     const host = url.hostname.toLowerCase();
     if (host === DATABRICKS_APPS_HOST_SUFFIX || host.endsWith(`.${DATABRICKS_APPS_HOST_SUFFIX}`)) {
       return normalized;
@@ -182,7 +259,8 @@
     if ((probe.headers.get("server") ?? "").toLowerCase() !== "databricks") {
       return normalized;
     }
-    return `${url.origin}${WORKSPACE_UI_PATH}`;
+    url.pathname = WORKSPACE_UI_PATH;
+    return url.toString();
   }
 
   /**
@@ -282,9 +360,12 @@
     LOCAL_HOSTS,
     defaultSchemeFor,
     normalizeUrl,
+    normalizeRecentServers,
+    serverDisplayLabel,
     isPlainHttpRemote,
     WORKSPACE_UI_PATH,
     WORKSPACE_PROBE_TIMEOUT_MS,
+    databricksWorkspaceUiUrl,
     expandDatabricksWorkspaceUrl,
     WELL_KNOWN_MANIFEST_PATH,
     MANIFEST_FETCH_TIMEOUT_MS,
