@@ -331,7 +331,7 @@ def create_accounts_auth_router(
                     user_id=username,
                     cookie_secret=config.cookie_secret,
                 )
-            except Exception:  # noqa: BLE001 — grant failure must never break login
+            except Exception:  # grant failure must never break login
                 _logger.exception(
                     "auth/login: refresh grant issuance failed for %s",
                     _redact_for_log(username),
