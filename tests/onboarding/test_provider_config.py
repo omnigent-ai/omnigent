@@ -671,14 +671,13 @@ def test_parse_cli_config_entry() -> None:
 @pytest.mark.parametrize(
     "body,message_fragment",
     [
-        # Only codex and claude carry a config-file credential; any other CLI
-        # is a typo, not a silently-accepted value.
+        # Only codex has config-file model providers; a claude analog would
+        # be a deliberate extension, not a silently-accepted value.
         (
-            {"kind": "cli-config", "cli": "gemini", "model_provider": "X"},
-            "requires cli: 'codex' or 'claude'",
+            {"kind": "cli-config", "cli": "claude", "model_provider": "X"},
+            "requires cli: 'codex'",
         ),
-        # For codex the pin target is the entry's whole point — fail loud
-        # without it. (Claude has no id to pin, so it is optional there.)
+        # The pin target is the entry's whole point — fail loud without it.
         ({"kind": "cli-config", "cli": "codex"}, "'model_provider'"),
     ],
 )
@@ -890,84 +889,3 @@ def test_provider_credential_env_vars_empty_for_keychain_and_auth_command() -> N
         }
     }
     assert provider_credential_env_vars(config) == frozenset()
-
-
-def test_parse_claude_cli_config_entry_without_model_provider() -> None:
-    """A claude cli-config entry parses with no ``model_provider``.
-
-    Claude Code's settings pin the endpoint directly, so there is no
-    ``[model_providers.X]`` id. Requiring one (as codex does) would reject the
-    enterprise Claude credential outright — the parse-level half of the bug.
-    """
-    from omnigent.onboarding.provider_config import load_providers
-
-    entries = load_providers(
-        {
-            "providers": {
-                "claude-databricks": {
-                    "kind": "cli-config",
-                    "cli": "claude",
-                    "display_name": "Databricks AI Gateway",
-                }
-            }
-        }
-    )
-    entry = entries["claude-databricks"]
-    assert (entry.kind, entry.cli, entry.model_provider) == ("cli-config", "claude", None)
-    assert entry.display_name == "Databricks AI Gateway"
-
-
-def test_claude_cli_config_serves_only_anthropic() -> None:
-    """A claude cli-config serves the anthropic surface and NOT pi.
-
-    Pi reuses a pinned *codex* ``[model_providers.X]`` table; Claude Code's
-    managed credential is not readable outside its own CLI, so claiming the pi
-    scope would strand a pi launch. Failure means pi could auto-default to a
-    credential it cannot use.
-    """
-    from omnigent.onboarding.provider_config import (
-        ANTHROPIC_FAMILY,
-        load_providers,
-        provider_families,
-    )
-
-    entry = load_providers({"providers": {"c": {"kind": "cli-config", "cli": "claude"}}})["c"]
-    assert provider_families(entry) == frozenset({ANTHROPIC_FAMILY})
-
-
-def test_claude_cli_config_rejects_pi_default_scope() -> None:
-    """``default: pi`` on a claude cli-config is a loud config error.
-
-    Same guard the codex *subscription* has: a scope the credential cannot serve
-    must fail at parse rather than at launch.
-    """
-    from omnigent.errors import OmnigentError
-    from omnigent.onboarding.provider_config import load_providers
-
-    with pytest.raises(OmnigentError):
-        load_providers(
-            {"providers": {"c": {"kind": "cli-config", "cli": "claude", "default": "pi"}}}
-        )
-
-
-def test_claude_cli_config_resolves_for_claude_harness() -> None:
-    """A default claude cli-config resolves as the claude harness's provider.
-
-    The routing half: ``default_provider_for_harness`` must hand the native /
-    SDK Claude launch this entry so the harness counts as configured.
-    """
-    from omnigent.onboarding.provider_config import (
-        default_provider_for_harness,
-        load_providers,
-    )
-
-    config = {
-        "providers": {
-            "claude-databricks": {"kind": "cli-config", "cli": "claude", "default": True}
-        }
-    }
-    # Sanity: the entry itself parses and claims the anthropic default.
-    assert load_providers(config)["claude-databricks"].default is True
-    for harness in ("claude-sdk", "claude-native"):
-        entry = default_provider_for_harness(config, harness)
-        assert entry is not None and entry.name == "claude-databricks", harness

@@ -21,7 +21,7 @@ Enumeration is deterministic per provider kind:
   ``"openai-compatible"``).
 - ``subscription`` → live CLI discovery for Cursor; curated static aliases for
   CLIs without a listing API (source ``"static"``, ``verified: false``).
-- ``cli-config`` → a curated static list (source ``"static"``,
+- ``cli-config`` → the codex curated static list (source ``"static"``,
   ``verified: false`` — the credential lives in the CLI's own config
   file and is resolved by the CLI at launch).
 - anything unresolvable → source ``"none"`` with an explanatory note,
@@ -232,8 +232,7 @@ class ResolvedModelProvider:
     :param auth_command: Shell command printing a bearer token, for
         providers configured with a dynamic credential.
     :param cli: ``"claude"`` / ``"codex"`` / ``"cursor-agent"`` for
-        ``kind="subscription"``; ``"codex"`` / ``"claude"`` for
-        ``kind="cli-config"``.
+        ``kind="subscription"``; ``"codex"`` for ``kind="cli-config"``.
     :param detail: Non-secret descriptor of how the provider resolved,
         e.g. ``"provider 'openrouter'"`` — used in listing notes.
     """
@@ -754,8 +753,6 @@ def _provider_from_entry(entry: ProviderEntry, harness_type: str) -> ResolvedMod
             detail=(
                 f"provider {entry.name!r} (codex config.toml model provider "
                 f"{entry.model_provider!r})"
-                if entry.cli == "codex"
-                else f"provider {entry.name!r} (Claude Code managed settings gateway)"
             ),
         )
     # Inline-family kinds: single-family harnesses get exactly their family;
@@ -1077,12 +1074,11 @@ def _static_subscription_listing(provider: ResolvedModelProvider) -> ModelListin
 def _static_cli_config_listing(provider: ResolvedModelProvider) -> ModelListing:
     """Build the curated static listing for a ``cli-config`` provider.
 
-    A ``cli-config`` provider names a credential the harness CLI's own config
-    already carries — a custom ``[model_providers.X]`` table in codex's
-    ``config.toml``, or a gateway pinned by Claude Code's managed settings. The
-    CLI resolves it at launch, so the listing carries a note saying the
-    credential is the CLI's to resolve — not a "no credentials" preflight
-    failure.
+    A ``cli-config`` provider pins a custom ``[model_providers.X]`` table in
+    the codex CLI's own ``config.toml``; its credential (an auth command /
+    env key in that file) is resolved by codex at launch, so the listing is
+    the codex curated ids with a note saying the credential is the CLI's to
+    resolve — not a "no credentials" preflight failure.
 
     :param provider: A ``kind="cli-config"`` provider descriptor.
     :returns: A ``source="static"`` listing with no models.

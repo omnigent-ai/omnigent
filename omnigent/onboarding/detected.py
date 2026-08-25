@@ -129,16 +129,13 @@ def _synthesize_entry(det: DetectedProvider) -> dict[str, object] | None:
         return build_subscription_provider_entry(det.name)
 
     if det.kind == "cli-config":
-        # A provider the harness CLI's own config file defines AND
-        # authenticates — record which CLI (and, for codex, which provider id)
-        # the launch selects; the credential stays in that file.
-        if det.cli is None:
+        # A custom model provider defined (and authenticated) by the codex
+        # CLI's own config.toml — pin it by name; the credential stays in
+        # that file. ``model_provider`` is always set on this kind (the
+        # detector constructs it from the provider id it just matched).
+        if det.model_provider is None:
             return None
-        # codex pins a named ``[model_providers.X]``, so a detection missing it
-        # is unusable; claude has no id to pin (its settings name the endpoint).
-        if det.cli == "codex" and det.model_provider is None:
-            return None
-        return build_cli_config_provider_entry(det.cli, det.model_provider, det.display_name)
+        return build_cli_config_provider_entry("codex", det.model_provider, det.display_name)
 
     if det.name == "vertex-claude":
         # Claude Code on Vertex AI — the CLI authenticates via its own env

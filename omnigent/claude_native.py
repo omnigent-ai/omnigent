@@ -24,10 +24,6 @@ import uuid
 
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.llms.adapters._content import redact_binary_payloads
-from omnigent.onboarding.ambient import (
-    CLAUDE_CODE_MANAGED_SETTINGS_PATHS,
-    claude_managed_gateway,
-)
 from omnigent.runtime.tool_result_replay import (
     blocks_from_parsed_list,
     image_payloads_in_blocks,
@@ -258,11 +254,11 @@ _SESSION_LABELS = {
     _WRAPPER_LABEL_KEY: _WRAPPER_LABEL_VALUE,
 }
 _CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
-# Test override for the managed-settings chain. ``None`` means "use the ambient
-# detector's chain", which is the single canonical definition — binding a *copy*
-# here would leave two independently-isolatable sources of the same host state,
-# so a fixture that neutralized one would silently miss this reader.
-_CLAUDE_CODE_MANAGED_SETTINGS_PATHS: tuple[Path, ...] | None = None
+_CLAUDE_CODE_MANAGED_SETTINGS_PATHS: tuple[Path, ...] = (
+    Path("/Library/Application Support/ClaudeCode/managed-settings.json"),
+    Path("/etc/claude-code/managed-settings.json"),
+    Path(os.environ.get("PROGRAMDATA", "C:/ProgramData")) / "ClaudeCode" / "managed-settings.json",
+)
 _CLAUDE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _RESUME_ACTION_SWITCH = "switch"
 _RESUME_ACTION_MOVE = "move"
@@ -630,20 +626,6 @@ def _claude_model_display_name(tier: str, model_id: str) -> str:
     return f"{family} {'.'.join(version_parts)}" if version_parts else family
 
 
-def _managed_settings_paths() -> tuple[Path, ...]:
-    """The Claude Code managed-settings chain to read.
-
-    Resolved at call time so the ambient detector stays the single definition of
-    the chain (and the single place tests neutralize it), while a test that needs
-    to point *this* module somewhere specific can still set
-    :data:`_CLAUDE_CODE_MANAGED_SETTINGS_PATHS`.
-
-    :returns: The override when one is set, else the canonical ambient chain.
-    """
-    override = _CLAUDE_CODE_MANAGED_SETTINGS_PATHS
-    return CLAUDE_CODE_MANAGED_SETTINGS_PATHS if override is None else override
-
-
 def _managed_claude_model_config() -> ClaudeNativeUcodeConfig | None:
     """Read the model overrides Claude Code applies from managed settings."""
     allowed_env = {
@@ -651,7 +633,7 @@ def _managed_claude_model_config() -> ClaudeNativeUcodeConfig | None:
         _ANTHROPIC_CUSTOM_MODEL_OPTION_ENV,
         _ANTHROPIC_CUSTOM_MODEL_OPTION_NAME_ENV,
     }
-    for path in _managed_settings_paths():
+    for path in _CLAUDE_CODE_MANAGED_SETTINGS_PATHS:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -684,7 +666,25 @@ def managed_claude_gateway_signal() -> tuple[str | None, bool]:
     :returns: ``(base_url, has_credential)`` from the first readable managed
         settings file, or ``(None, False)`` when none is present or parseable.
     """
-    return claude_managed_gateway(_managed_settings_paths())
+    for path in _CLAUDE_CODE_MANAGED_SETTINGS_PATHS:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        raw_env = payload.get("env")
+        env = raw_env if isinstance(raw_env, dict) else {}
+        raw_base_url = env.get("ANTHROPIC_BASE_URL")
+        base_url = raw_base_url.strip() if isinstance(raw_base_url, str) else None
+        has_helper = bool(payload.get("apiKeyHelper"))
+        use_gateway = str(env.get("CLAUDE_CODE_USE_GATEWAY", "")).strip().lower() not in (
+            "",
+            "0",
+            "false",
+        )
+        return base_url or None, has_helper or use_gateway
+    return None, False
 
 
 def claude_native_model_options(
@@ -2908,7 +2908,6 @@ def _native_claude_config_from_entry(
     """
     from omnigent.onboarding.provider_config import (
         BEDROCK_KIND,
-        CLI_CONFIG_KIND,
         DATABRICKS_KIND,
         GATEWAY_KIND,
         KEY_KIND,
@@ -2922,15 +2921,6 @@ def _native_claude_config_from_entry(
     if entry.kind == DATABRICKS_KIND:
         _logger.info("native-claude routing: Databricks ucode profile %r", entry.profile)
         return _ucode_config_for_profile(entry.profile, refresh_models=refresh_models)
-    if entry.kind == CLI_CONFIG_KIND:
-        # The endpoint AND its credential live in Claude Code's own settings
-        # chain, which the CLI applies at its own launch — returning None is
-        # what routes through them, so omnigent must not override anything.
-        _logger.info(
-            "native-claude routing: Claude Code's own settings (cli-config provider %r)",
-            entry.name,
-        )
-        return None
     _logger.info("native-claude routing: Claude CLI login (subscription provider %r)", entry.name)
     return None
 
