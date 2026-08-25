@@ -707,15 +707,31 @@ export function Sidebar({
       {/* Mobile: the drawer stops short of the right edge, leaving a strip of
       the chat visible; this scrim covers that strip so tapping it dismisses the
       drawer — the gesture that replaced the collapse icon. Full-bleed and
-      behind the drawer (z-40 vs z-50), so only the strip is actually reachable.
-      Tracks the finger during an edge-swipe drag. */}
+      behind the drawer (z-45 vs z-50), so only the strip is actually reachable.
+      Tracks the finger during an edge-swipe drag.
+
+      A labeled <button>, not a bare div: with the collapse toggle gone on
+      mobile this is the drawer's only non-navigational way out, so it has to be
+      reachable by keyboard and announced by a screen reader, not just findable
+      by sighted users with a pointer. Parked, it leaves the tab order and the
+      a11y tree via tabIndex/aria-hidden rather than the `inert` the drawer
+      uses: React 18 doesn't know `inert` as a boolean attribute and drops it,
+      so a focusable control relying on it would stay tabbable while closed.
+
+      z-45, not z-40: chat chrome also sits at z-40 (ChatPage's jump-to-top
+      pill) and renders after the sidebar, so a same-z peer that ever takes
+      pointer events would win the tie inside the exposed strip and swallow the
+      dismiss. Strictly between chat chrome and the drawer's z-50. */}
       {!inSettings && (
-        <div
+        <button
+          type="button"
           data-testid="sidebar-scrim"
-          aria-hidden="true"
+          aria-label="Close sidebar"
           onClick={onClose}
+          tabIndex={effectiveOpen ? 0 : -1}
+          aria-hidden={!effectiveOpen}
           className={cn(
-            "fixed inset-0 z-40 bg-black/25 transition-opacity duration-200 ease-out md:hidden",
+            "fixed inset-0 z-[45] bg-black/25 transition-opacity duration-200 ease-out md:hidden",
             effectiveOpen ? "opacity-100" : "pointer-events-none opacity-0",
           )}
           style={dragging ? { opacity: dragProgress, transition: "none" } : undefined}
@@ -1011,7 +1027,11 @@ export function Sidebar({
                 ref={scrollContainerRef}
                 // Keep wheel/touch scrolling without letting classic-scrollbar
                 // platforms reserve a wide, permanently visible Sidebar gutter.
-                className="relative flex-1 overflow-y-auto px-2 pt-4 pb-3 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+                // max-md:pb-14 is the floating Settings chip's clearance: the
+                // chip is a non-scrolling sibling pinned bottom-right, so
+                // without a gutter the last row's always-visible kebab parks
+                // underneath it and can't be tapped.
+                className="relative flex-1 overflow-y-auto px-2 pt-4 pb-3 [scrollbar-width:none] max-md:pb-14 [&::-webkit-scrollbar]:hidden"
               >
                 <ConversationList
                   conversationsQuery={conversationsQuery}

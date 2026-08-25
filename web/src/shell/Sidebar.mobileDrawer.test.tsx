@@ -134,7 +134,35 @@ describe("mobile sidebar drawer", () => {
   it("keeps the scrim inert while the drawer is closed", () => {
     renderSidebar({ open: false });
 
-    expect(screen.getByTestId("sidebar-scrim")).toHaveClass("pointer-events-none", "opacity-0");
+    const scrim = screen.getByTestId("sidebar-scrim");
+    expect(scrim).toHaveClass("pointer-events-none", "opacity-0");
+    // Untappable is not enough for a focusable control: parked, it must also
+    // leave the tab order and the a11y tree. (Not `inert` — React 18 drops the
+    // boolean form, so this would silently stay reachable.)
+    expect(scrim).toHaveAttribute("tabindex", "-1");
+    expect(scrim).toHaveAttribute("aria-hidden", "true");
+  });
+
+  it("exposes the dismiss as a labeled control, not a bare click target", () => {
+    // With the collapse toggle gone on mobile, the scrim is the only
+    // non-navigational way out — so it has to be reachable and announced,
+    // not just tappable.
+    renderSidebar();
+
+    const scrim = screen.getByTestId("sidebar-scrim");
+    expect(scrim.tagName).toBe("BUTTON");
+    expect(scrim).toHaveAttribute("aria-label", "Close sidebar");
+    expect(scrim).toHaveAttribute("tabindex", "0");
+    expect(scrim).toHaveAttribute("aria-hidden", "false");
+  });
+
+  it("stacks the scrim above chat chrome but below the drawer", () => {
+    // Chat chrome (ChatPage's jump-to-top pill) also sits at z-40 and renders
+    // after the sidebar, so a same-z scrim would lose the tie inside the strip.
+    renderSidebar();
+
+    expect(screen.getByTestId("sidebar-scrim")).toHaveClass("z-[45]");
+    expect(screen.getByRole("complementary", { name: "Conversations" })).toHaveClass("z-50");
   });
 
   it("stops the drawer short of the right edge so the chat stays reachable", () => {
@@ -171,5 +199,13 @@ describe("mobile sidebar drawer", () => {
     expect(within(headerActions).getByRole("button", { name: "Close sidebar" })).toHaveClass(
       "max-md:hidden",
     );
+  });
+
+  it("gives the session list a gutter so the last row clears the floating chip", () => {
+    // The chip doesn't scroll, so without this the bottom row's always-visible
+    // kebab sits underneath it and can't be tapped.
+    renderSidebar();
+
+    expect(screen.getByRole("navigation")).toHaveClass("max-md:pb-14");
   });
 });
