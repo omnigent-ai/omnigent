@@ -764,6 +764,9 @@ def test_sse_safe_attributes_whitelists_ids_and_excludes_content() -> None:
             "data": "PII payload",
         },
         "call_id": "call_9",
+        "message_id": "msg_5",
+        "index": 3,
+        "final": True,
         "tool_name": "search.web",
         "status": "completed",
         "delta": "streamed model tokens",
@@ -778,16 +781,28 @@ def test_sse_safe_attributes_whitelists_ids_and_excludes_content() -> None:
     assert attrs["item_id"] == "item_1"
     assert attrs["item_type"] == "function_call"
     assert attrs["call_id"] == "call_9"
-    assert attrs["tool_name"] == "search.web"
+    assert attrs["message_id"] == "msg_5"
+    assert attrs["index"] == 3
+    assert attrs["final"] is True
     assert attrs["status"] == "completed"
     assert attrs["error_code"] == "timeout"
     assert attrs["error_source"] == "llm"
-    # Free-text dimensions are excluded outright.
+    # Free-text / author-defined dimensions are excluded outright.
     assert "reason" not in attrs
     assert "blocked_on" not in attrs
+    assert "tool_name" not in attrs
     # No content leaks, in any key or value.
     flat = repr(attrs).lower()
-    for forbidden in ("delta", "arguments", "data", "message", "output", "reason", "blocked_on"):
+    for forbidden in (
+        "delta",
+        "arguments",
+        "data",
+        "message",
+        "output",
+        "reason",
+        "blocked_on",
+        "tool_name",
+    ):
         assert forbidden not in attrs
     for leaked in (
         "streamed model tokens",

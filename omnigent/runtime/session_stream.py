@@ -90,18 +90,22 @@ _SSE_WARN_TYPES = frozenset(
     {"response.failed", "response.error", "turn.failed", "response.policy_denied"}
 )
 # Top-level event fields safe to log — stable identifiers, closed enums, and
-# pure numerics only. Deliberately excludes human/LLM-authored free text such
-# as ``reason`` (PolicyDeniedEvent's deny reason is LLM-generated and can quote
-# the content it evaluated) and ``blocked_on`` (a free-form "human phrase"),
-# alongside the content fields dropped in _sse_safe_attributes.
+# pure numerics only. Deliberately excludes human/LLM-authored free text
+# (``reason`` — PolicyDeniedEvent's deny reason is LLM-generated and can quote
+# the content it evaluated — and ``blocked_on``, a free-form "human phrase") and
+# ``tool_name`` (author-defined for custom/MCP tools; ``call_id`` still
+# correlates a call to its result without naming the tool), alongside the
+# content fields dropped in _sse_safe_attributes.
 _SSE_SAFE_KEYS = (
     "status",
     "call_id",
-    "tool_name",
+    "message_id",
     "phase",
     "attempt",
     "max_attempts",
     "sequence_number",
+    "index",
+    "final",
     "model",
     "context_tokens",
     "context_window",
@@ -114,8 +118,8 @@ def _sse_safe_attributes(event: dict[str, Any]) -> dict[str, object]:
 
     A strict whitelist: content and free-text fields (``delta`` text, tool
     ``arguments`` / outputs, message/reasoning ``data``, ``error.message``,
-    and human/LLM-authored ``reason`` / ``blocked_on``) are never read, so no
-    model response or user content reaches the debug table.
+    human/LLM-authored ``reason`` / ``blocked_on``, and ``tool_name``) are never
+    read, so no model response or user content reaches the debug table.
     """
     attrs: dict[str, object] = {}
     for key in _SSE_SAFE_KEYS:
