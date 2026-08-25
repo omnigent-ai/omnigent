@@ -364,23 +364,33 @@ boot, but that build pins the machine's cores for a few minutes **while** the
 spawned runner is trying to tunnel and go online — on a busy CI box the runner
 can miss its online deadline and the fixture reports `online: false`, which looks
 like an environment failure but is really just the build starving the boot. So
-**always build the SPA first as its own step**, then run the (now fast-booting)
-recorder:
+**always build the SPA first as its own step**, then run the recorder — and,
+when you are yourself running inside a server-spawned runner (the `--server`
+path), **strip the ambient runner/host env vars** so the fixture's own runner
+starts clean. Those vars (`OMNIGENT_RUNNER_ZYGOTE*` FDs, `OMNIGENT_RUNNER_ID`,
+tunnel/host tokens) leak into the spawned child, make it take the zygote-fork
+path and block on control FDs it doesn't have, so it hangs with an empty
+`runner.log` and stays `online: false`. Strip them with `env -u` on the
+recorder invocation:
 
 ```bash
 pnpm --filter web install && pnpm --filter web run build   # once, up front
-pytest <test_path> --video on --screenshot on --output recordings/<slug>
+env -u OMNIGENT_RUNNER_ID -u OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN \
+    -u OMNIGENT_RUNNER_TUNNEL_TOKEN -u OMNIGENT_RUNNER_PARENT_PID \
+    -u OMNIGENT_RUNNER_ISOLATE_SESSION -u OMNIGENT_RUNNER_WORKSPACE \
+    -u OMNIGENT_HOST_ID -u OMNIGENT_HOST_TOKEN -u OMNIGENT_HOST_NAME \
+    -u RUNNER_SERVER_URL -u OMNIGENT_REMOTE_AUTH_TOKEN \
+    $(env | grep -oE '^OMNIGENT_RUNNER_ZYGOTE[A-Z_]*' | sed 's/^/-u /' | tr '\n' ' ') \
+    pytest <test_path> --video on --screenshot on --output recordings/<slug>
 ```
 
 If the spawned runner still doesn't reach `online: true` within the fixture's
-timeout *after* the SPA is already built, capture the tail of the fixture's
-`runner.log` and treat that lane as genuinely unreachable here: keep
+timeout *after* the SPA is built and the env is stripped, capture the tail of the
+fixture's `runner.log` and treat that lane as genuinely unreachable here: keep
 `recordings: []` for it and, in `evidence`, say plainly **"recorder's test server
-did not come online in time"** with the `runner.log` tail. Do **not** assert a
-specific internal cause you did not confirm (e.g. do not claim leaked runner env
-vars or zygote FDs blocked a fork — the fixture spawns a plain
-`omnigent.runner._entry`, not a zygote fork, so that is not the mechanism). Name
-only what you observed.
+did not come online in time"** with the `runner.log` tail — and note whether the
+log was empty (the leaked-env/zygote hang) or showed a later failure, so the
+cause is named from what you observed rather than guessed.
 
 - **`web` facets** — run the authored Playwright test with recording on:
   `pytest <test_path> --video on --screenshot on --output recordings/<slug>`
