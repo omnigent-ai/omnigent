@@ -288,7 +288,7 @@ describe("MonacoCodeEditor read-only / truncated gating", () => {
     renderEditor();
 
     await waitFor(() => expect(h.editorProps).not.toBeNull());
-    expect(h.editorProps?.options?.fontWeight).toBe("600");
+    expect(h.editorProps?.options?.fontWeight).toBe("500");
   });
 });
 

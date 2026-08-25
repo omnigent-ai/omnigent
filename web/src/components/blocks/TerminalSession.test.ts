@@ -708,12 +708,12 @@ describe("TerminalSession", () => {
     socket.open();
     const before = socket;
     const sendResize = vi.spyOn(session as unknown as { sendResize: () => void }, "sendResize");
-    session.setFont({ sizePx: 18, family: "Fira Code", weight: 600 });
+    session.setFont({ sizePx: 18, family: "Fira Code", weight: 500 });
     expect(sendResize).toHaveBeenCalledTimes(1);
     expect(term.options.fontSize).toBe(18);
     expect(term.options.fontFamily).toContain("Fira Code");
-    expect(term.options.fontWeight).toBe(600);
-    expect(term.options.fontWeightBold).toBe(900);
+    expect(term.options.fontWeight).toBe(500);
+    expect(term.options.fontWeightBold).toBe(800);
     // Same socket instance, still open — a re-font never reconnects.
     expect(socket).toBe(before);
     expect(socket.closed).toBe(false);

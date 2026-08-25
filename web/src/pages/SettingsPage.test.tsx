@@ -489,9 +489,7 @@ describe("SettingsPage", () => {
     fireEvent.change(screen.getByTestId("code-font-family-input") as HTMLInputElement, {
       target: { value: "Fira Code" },
     });
-    fireEvent.change(screen.getByTestId("code-font-weight-slider") as HTMLInputElement, {
-      target: { value: "2" },
-    });
+    fireEvent.click(screen.getByTestId("heavier-code-text-toggle"));
 
     // Sanity: the non-default choices were persisted.
     expect(localStorage.getItem("omnigent:terminal-theme")).toBe("dark");
@@ -499,7 +497,7 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("github"));
     expect(localStorage.getItem("omnigent:ui-font-size")).toBe("15");
     expect(localStorage.getItem("omnigent:code-font-size")).toBe("15");
-    expect(localStorage.getItem("omnigent:code-font-weight")).toBe("600");
+    expect(localStorage.getItem("omnigent:code-font-weight")).toBe("500");
 
     // Open the confirmation dialog and confirm the reset.
     fireEvent.click(screen.getByTestId("reset-appearance-button"));
@@ -671,26 +669,23 @@ describe("SettingsPage", () => {
   it("shows and persists the code font weight", () => {
     localStorage.clear();
     renderPage("/settings/appearance");
-    const slider = screen.getByTestId("code-font-weight-slider") as HTMLInputElement;
-    expect(slider.value).toBe("0");
-    expect(slider).toHaveAttribute("aria-valuetext", "400 Normal");
-    expect(screen.getByTestId("code-font-weight-preview-400")).toHaveTextContent("Aa");
+    const toggle = screen.getByTestId("heavier-code-text-toggle");
+    expect(toggle).toHaveAttribute("aria-checked", "false");
 
-    fireEvent.change(slider, { target: { value: "1" } });
-    expect(slider.value).toBe("1");
-    expect(slider).toHaveAttribute("aria-valuetext", "500 Medium");
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-checked", "true");
     expect(localStorage.getItem("omnigent:code-font-weight")).toBe("500");
   });
 
   it("maps legacy font weights to the supported presets", () => {
     localStorage.setItem("omnigent:code-font-weight", "900");
     renderPage("/settings/appearance");
-    expect(screen.getByTestId("code-font-weight-slider")).toHaveValue("2");
+    expect(screen.getByTestId("heavier-code-text-toggle")).toHaveAttribute("aria-checked", "true");
 
     cleanup();
     localStorage.setItem("omnigent:code-font-weight", "100");
     renderPage("/settings/appearance");
-    expect(screen.getByTestId("code-font-weight-slider")).toHaveValue("0");
+    expect(screen.getByTestId("heavier-code-text-toggle")).toHaveAttribute("aria-checked", "false");
   });
 
   it("defaults bare /settings to Account when a login session exists, else Appearance", async () => {

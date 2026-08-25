@@ -24,13 +24,10 @@ export const CODE_FONT_SIZE_MIN = 10;
 export const CODE_FONT_SIZE_MAX = 24;
 export const CODE_FONT_SIZE_STEP = 1;
 
-export const CODE_FONT_WEIGHT_OPTIONS = [
-  { value: 400, label: "400 Normal" },
-  { value: 500, label: "500 Medium" },
-  { value: 600, label: "600 Semi-bold" },
-] as const;
-export type CodeFontWeight = (typeof CODE_FONT_WEIGHT_OPTIONS)[number]["value"];
-export const CODE_FONT_WEIGHT_DEFAULT = CODE_FONT_WEIGHT_OPTIONS[0].value;
+export const CODE_FONT_WEIGHT_NORMAL = 400;
+export const CODE_FONT_WEIGHT_HEAVIER = 500;
+export const CODE_FONT_WEIGHT_DEFAULT = CODE_FONT_WEIGHT_NORMAL;
+export type CodeFontWeight = typeof CODE_FONT_WEIGHT_NORMAL | typeof CODE_FONT_WEIGHT_HEAVIER;
 
 /** Empty string = "editor default": no override, falls back to the mono stack. */
 export const CODE_FONT_FAMILY_DEFAULT = "";
@@ -53,9 +50,7 @@ export function clampCodeFontSizePx(px: number): number {
 
 /** Resolve arbitrary or legacy values to one of the supported presets. */
 function normalizeCodeFontWeight(weight: number): CodeFontWeight {
-  return CODE_FONT_WEIGHT_OPTIONS.reduce((closest, option) =>
-    Math.abs(option.value - weight) < Math.abs(closest.value - weight) ? option : closest,
-  ).value;
+  return weight >= CODE_FONT_WEIGHT_HEAVIER ? CODE_FONT_WEIGHT_HEAVIER : CODE_FONT_WEIGHT_NORMAL;
 }
 
 function isFiniteNumber(value: unknown): value is number {

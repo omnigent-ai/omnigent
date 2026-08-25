@@ -6,7 +6,8 @@ import {
   CODE_FONT_SIZE_MAX,
   CODE_FONT_SIZE_MIN,
   CODE_FONT_WEIGHT_DEFAULT,
-  CODE_FONT_WEIGHT_OPTIONS,
+  CODE_FONT_WEIGHT_HEAVIER,
+  CODE_FONT_WEIGHT_NORMAL,
   codeFontFamilyForEditor,
   readCodeFont,
   readCodeFontFamily,
@@ -247,19 +248,20 @@ describe("codeFontPreferences — weight", () => {
   });
 
   it("round-trips the supported presets", () => {
-    for (const option of CODE_FONT_WEIGHT_OPTIONS) {
-      writeCodeFontWeight(option.value);
-      expect(readCodeFontWeight()).toBe(option.value);
-      expect(localStorage.getItem(WEIGHT_STORAGE_KEY)).toBe(JSON.stringify(option.value));
-    }
+    writeCodeFontWeight(CODE_FONT_WEIGHT_HEAVIER);
+    expect(readCodeFontWeight()).toBe(CODE_FONT_WEIGHT_HEAVIER);
+    expect(localStorage.getItem(WEIGHT_STORAGE_KEY)).toBe(JSON.stringify(500));
+
+    writeCodeFontWeight(CODE_FONT_WEIGHT_NORMAL);
+    expect(readCodeFontWeight()).toBe(CODE_FONT_WEIGHT_NORMAL);
   });
 
   it("maps legacy stored weights to the supported presets", () => {
     localStorage.setItem(WEIGHT_STORAGE_KEY, JSON.stringify(1500));
-    expect(readCodeFontWeight()).toBe(600);
+    expect(readCodeFontWeight()).toBe(CODE_FONT_WEIGHT_HEAVIER);
 
     localStorage.setItem(WEIGHT_STORAGE_KEY, JSON.stringify(10));
-    expect(readCodeFontWeight()).toBe(400);
+    expect(readCodeFontWeight()).toBe(CODE_FONT_WEIGHT_NORMAL);
   });
 
   it("falls back to the default for malformed values", () => {
@@ -274,11 +276,11 @@ describe("codeFontPreferences — weight", () => {
     const cb = vi.fn();
     const unsubscribe = subscribeCodeFont(cb);
 
-    writeCodeFontWeight(600);
+    writeCodeFontWeight(CODE_FONT_WEIGHT_HEAVIER);
     expect(cb).toHaveBeenCalledWith({
       sizePx: CODE_FONT_SIZE_DEFAULT,
       family: "",
-      weight: 600,
+      weight: CODE_FONT_WEIGHT_HEAVIER,
     });
 
     unsubscribe();
@@ -308,11 +310,11 @@ describe("readCodeFont", () => {
   it("reads size, family, and weight together", () => {
     writeCodeFontSizePx(15);
     writeCodeFontFamily("Menlo");
-    writeCodeFontWeight(600);
+    writeCodeFontWeight(CODE_FONT_WEIGHT_HEAVIER);
     expect(readCodeFont()).toEqual({
       sizePx: 15,
       family: "Menlo",
-      weight: 600,
+      weight: CODE_FONT_WEIGHT_HEAVIER,
     });
   });
 });
