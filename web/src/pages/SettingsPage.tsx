@@ -1443,7 +1443,7 @@ function UiCodeFontWeightControl() {
   return (
     <div className="flex items-center justify-between gap-6" data-testid="code-font-weight-control">
       <div className="min-w-0 flex-1">
-        <span className="text-ui font-medium">Heavier code text</span>
+        <span className="text-ui font-medium">Heavier code font</span>
         <span className="block text-sm text-muted-foreground">
           Use a slightly heavier font weight in the code editor and terminal.
         </span>
