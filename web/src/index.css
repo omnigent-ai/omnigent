@@ -308,6 +308,13 @@
 
 .dark {
   /* Dark mode tokens — semi-transparent for glassmorphism backdrop-filter */
+  /* Selection tokens: the sidebar's 7%-foreground active tint — fine for a
+   * sidebar row — is near-invisible as a text-selection background on dark
+   * palettes (white text on ~#1f2024 over an already-dark surface; selected
+   * and unselected text become indistinguishable, #5068). Selection gets its
+   * own stronger mix; the sidebar's active treatment is unchanged. */
+  --selection-background: color-mix(in srgb, var(--sidebar-foreground) 30%, var(--sidebar));
+  --selection-foreground: var(--sidebar-foreground);
   --ui-shadow-neutral-rgb: 0 0 0;
   --ui-shadow-warm-rgb: 0 0 0;
   --composer-shadow: 0 0 12px -6px rgb(0 0 0 / 80%);
@@ -394,6 +401,10 @@
 .dark:not([data-theme]) {
   --sidebar-active: rgba(240, 1, 150, 0.15);
   --sidebar-active-foreground: #f472b6;
+  /* The brand pink pair is already high-contrast on dark — selection keeps
+   * it instead of the generic 30% mix. */
+  --selection-background: rgba(240, 1, 150, 0.15);
+  --selection-foreground: #f472b6;
 }
 
 /* Main-sidebar item labels use the same text-ui semantic step as Appearance
@@ -1061,8 +1072,8 @@ aside[aria-label="Workspace"][data-maximized] {
   /* Text selection mirrors the sidebar's active-item treatment in every
    * palette and color mode. */
   ::selection {
-    background: var(--sidebar-active);
-    color: var(--sidebar-active-foreground);
+    background: var(--selection-background, var(--sidebar-active));
+    color: var(--selection-foreground, var(--sidebar-active-foreground));
   }
 }
 
