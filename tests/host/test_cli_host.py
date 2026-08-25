@@ -1005,23 +1005,12 @@ def test_start_hosts_on_explicit_server(
     ]
 
 
-# ── auto-open web UI ──────────────────────────────────────────────
-
-
 @pytest.mark.parametrize(
     ("is_tty", "extra_args", "config_content", "expected_opened"),
     [
-        # Interactive TTY, default (unconfigured) auto_open: the local
-        # server's URL is opened once, before the blocking loop starts —
-        # the daemon otherwise occupies the terminal.
         pytest.param(True, [], None, ["http://127.0.0.1:8123"], id="interactive-opens"),
-        # ``--non-interactive`` never opens a browser, even on a TTY (scripts/CI).
         pytest.param(True, ["--non-interactive"], None, [], id="non-interactive-skips"),
-        # A non-terminal context (pipe / nohup / systemd) never opens: else
-        # ``webbrowser.open`` shells out to ``xdg-open`` with no display, so
-        # "no TTY" is treated like ``--non-interactive``.
         pytest.param(False, [], None, [], id="no-tty-skips"),
-        # An explicit ``auto_open_conversation: false`` suppresses it on a TTY.
         pytest.param(
             True, [], "auto_open_conversation: false\n", [], id="auto-open-disabled-skips"
         ),
@@ -1035,14 +1024,7 @@ def test_host_web_ui_open_gates(
     config_content: str | None,
     expected_opened: list[str],
 ) -> None:
-    """
-    Foreground ``omnigent host`` opens the web UI only when appropriate.
-
-    It opens the local server's URL before the daemon blocks so the user
-    lands in the web app without a second command — but stays quiet on
-    ``--non-interactive``, without a TTY, or when ``auto_open_conversation``
-    is explicitly ``false``. Each parametrization exercises one gate.
-    """
+    """Open the host web UI only when interactive and enabled."""
     if config_content is not None:
         (tmp_path / "config.yaml").write_text(config_content)
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
@@ -1071,12 +1053,7 @@ def test_start_opens_web_ui_when_interactive(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    ``omnigent start`` opens the web UI after the background daemon registers.
-
-    ``start`` brings up the local server (which serves the web UI) and
-    returns; on a TTY it also opens that server's URL in the browser.
-    """
+    """Open the web UI after the background host registers."""
     _patch_background_host_spawn(monkeypatch, tmp_path)
     monkeypatch.setattr("omnigent.cli._stdin_is_tty", lambda: True)
     opened: list[str] = []
@@ -1088,5 +1065,4 @@ def test_start_opens_web_ui_when_interactive(
         result = CliRunner().invoke(cli, ["start"])
 
     assert result.exit_code == 0, result.output
-    # The daemon-owned local server URL (see _patch_background_host_spawn).
     assert opened == ["http://127.0.0.1:6767"]

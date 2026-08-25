@@ -8157,13 +8157,7 @@ def _confirm_background_host_registered(record: _HostDaemonRecord) -> None:
 
 
 def _stdin_is_tty() -> bool:
-    """Whether stdin is an interactive terminal.
-
-    A one-line seam over ``sys.stdin.isatty()`` so callers gating an
-    interactive-only action stay readable and tests can force the answer.
-
-    :returns: ``True`` when stdin is a TTY.
-    """
+    """Return whether stdin is an interactive terminal."""
     return sys.stdin.isatty()
 
 
@@ -8173,24 +8167,7 @@ def _maybe_open_host_web_ui(
     non_interactive: bool,
     cfg: dict[str, Any] | None = None,  # type: ignore[explicit-any]
 ) -> None:
-    """Open the Omnigent web UI in the browser when a host comes up.
-
-    Honors the shared ``auto_open_conversation`` setting — the same switch
-    ``omnigent run`` reads — defaulting ON when the user has not configured
-    it, so ``host``/``start`` open the web page without extra setup while
-    still respecting an explicit ``auto_open_conversation: false``. Skips in
-    ``--non-interactive`` (scripts/CI). A failed open (headless box, no
-    browser) falls back to printing the URL instead of raising.
-
-    :param server_url: Resolved server URL the host serves/connects to, e.g.
-        ``"http://127.0.0.1:6767"`` or ``"https://ws/api/2.0/omnigent"``.
-    :param non_interactive: When ``True``, never open a browser.
-    :param cfg: Effective config the caller already loaded, reused to resolve
-        ``auto_open_conversation``; loaded lazily when ``None`` (only after
-        the interactive gate passes, so a skipped open reads no config).
-    """
-    # Mirror the adjacent sign-in flow: a pipe/CI/systemd context has no one
-    # watching a browser, so treat "no TTY" like --non-interactive.
+    """Open the host web UI when interactive and enabled."""
     if non_interactive or not _stdin_is_tty():
         return
     if cfg is None:
@@ -8441,8 +8418,6 @@ def host(
         # (or a headless invocation) fails loud with the command to run.
         if remote_mode:
             _ensure_databricks_server_auth(server, non_interactive=non_interactive)
-        # Open the web UI before the daemon blocks in the foreground, so the
-        # user lands in Omnigent web without a second command.
         _maybe_open_host_web_ui(server, non_interactive=non_interactive, cfg=cfg)
         run_host_process(server_url=server, daemon_target=target)
         stopped_cleanly = True
