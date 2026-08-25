@@ -26,6 +26,7 @@ const OVERLAY_INSET = 12;
  *   checkForUpdates: Function, downloadUpdate: Function, installUpdateNow: Function }} deps.updater
  * @param {string} deps.overlayPage Absolute path to the built overlay HTML.
  * @param {string} deps.preloadPath Absolute path to update_overlay_preload.js.
+ * @param {NodeJS.Platform} [deps.platform] Runtime platform (injectable for tests).
  */
 function createUpdateOverlay({
   BrowserWindow,
@@ -34,6 +35,7 @@ function createUpdateOverlay({
   updater,
   overlayPage,
   preloadPath,
+  platform = process.platform,
 }) {
   /** @type {Map<Electron.BrowserWindow, Electron.BrowserWindow>} parent -> overlay */
   const overlays = new Map();
@@ -52,6 +54,20 @@ function createUpdateOverlay({
       if (ov === overlay) return parent;
     }
     return null;
+  }
+
+  function overlayHeightForSender(event) {
+    for (const [parent, overlay] of overlays) {
+      if (!parent.isDestroyed() && parent.webContents === event.sender) {
+        return heights.get(overlay) ?? 0;
+      }
+    }
+    return 0;
+  }
+
+  function notifyParentHeight(parent, height) {
+    if (!parent || parent.isDestroyed()) return;
+    parent.webContents.send("omnigent:update-overlay-height", height);
   }
 
   function position(parent, overlay, height) {
@@ -90,6 +106,9 @@ function createUpdateOverlay({
         nodeIntegration: false,
       },
     });
+    if (platform === "darwin") {
+      overlay.excludedFromShownWindowsMenu = true;
+    }
     overlays.set(parent, overlay);
 
     // The ?theme= URL param is only a pre-paint hint to avoid a flash before
@@ -118,6 +137,7 @@ function createUpdateOverlay({
     };
     parent.on("closed", onParentClosed);
     overlay.on("closed", () => {
+      notifyParentHeight(parent, 0);
       overlays.delete(parent);
       if (!parent.isDestroyed()) {
         parent.removeListener("resize", reposition);
@@ -143,6 +163,7 @@ function createUpdateOverlay({
       const h = Math.max(0, Math.round(Number(height) || 0));
       heights.set(overlay, h);
       const parent = parentOf(overlay);
+      notifyParentHeight(parent, h);
       if (h > 0) {
         position(parent, overlay, h);
         overlay.setIgnoreMouseEvents(false);
@@ -152,6 +173,10 @@ function createUpdateOverlay({
       }
       if (!overlay.isVisible()) overlay.showInactive();
     });
+
+    // The parent SPA reads the current value on mount so an overlay that became
+    // visible before its listener attached still reserves the correct space.
+    ipcMain.handle("omnigent:get-update-overlay-height", (event) => overlayHeightForSender(event));
 
     // Trusted updater controls for the overlay page only.
     const guard = (event) => {

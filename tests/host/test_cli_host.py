@@ -596,6 +596,65 @@ def test_host_stop_treats_zombie_daemon_as_dead(
     )
 
 
+def test_host_stop_drops_stale_foreign_daemon_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Verify ``host stop`` drops a daemon record whose pid it cannot signal.
+
+    A registry record can outlive its daemon: the pid may be reused by
+    another user's process, or the daemon was started under a different
+    account. ``_pid_alive`` reports such a pid as alive (psutil maps the
+    EPERM to ``AccessDenied``), so stop falls through to ``os.kill``, which
+    raises ``PermissionError``. Stop must treat the record as stale — warn
+    and delete it — instead of crashing on the EPERM, even with ``--force``.
+    """
+    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+
+    daemons_dir = tmp_path / "daemons"
+    daemons_dir.mkdir()
+    # The file name must match _daemon_record_path's derivation (sha256 of
+    # the target, truncated) or stop's record cleanup would unlink a
+    # different path than the one written here.
+    record_path = daemons_dir / (hashlib.sha256(b"local").hexdigest()[:16] + ".json")
+    record_path.write_text(
+        json.dumps(
+            {
+                "pid": 4242,
+                "target": "local",
+                "mode": "local",
+                "server_url": None,
+                "log_path": None,
+                "started_at": 1781200000,
+                "host_id": "host_foreign_test",
+                "resolved_server_url": None,
+                "config_sig": None,
+            }
+        )
+    )
+
+    def _eperm_kill(pid: int, sig: int) -> None:
+        """Simulate signalling a pid owned by another user (EPERM)."""
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr("omnigent.cli._pid_alive", lambda pid: True)
+    monkeypatch.setattr("omnigent.cli.os.kill", _eperm_kill)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["host", "stop", "--all", "--daemon-only", "--force"])
+
+    # Exit code 0 proves the EPERM was treated as a stale record. A nonzero
+    # exit means the PermissionError propagated out of os.kill and crashed
+    # the CLI before the SIGKILL path --force is supposed to reach.
+    assert result.exit_code == 0, f"host stop crashed on a foreign daemon pid: {result.output}"
+    assert "owned by another user" in result.output
+    assert not record_path.exists(), (
+        "stale foreign daemon record survived stop — a subsequent host start "
+        "would be blocked by an 'already running' conflict"
+    )
+
+
 def test_add_daemon_host_status_skips_http_for_dead_process() -> None:
     """Dead processes must not trigger a network round-trip.
 
@@ -944,3 +1003,93 @@ def test_start_hosts_on_explicit_server(
             "https://example.databricksapps.com",
         ]
     ]
+
+
+@pytest.mark.parametrize(
+    ("is_tty", "extra_args", "config_content", "expected_opened"),
+    [
+        pytest.param(True, [], None, ["http://127.0.0.1:8123"], id="interactive-opens"),
+        pytest.param(True, ["--non-interactive"], None, [], id="non-interactive-skips"),
+        pytest.param(False, [], None, [], id="no-tty-skips"),
+        pytest.param(
+            True, [], "auto_open_conversation: false\n", [], id="auto-open-disabled-skips"
+        ),
+    ],
+)
+def test_host_web_ui_open_gates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    is_tty: bool,
+    extra_args: list[str],
+    config_content: str | None,
+    expected_opened: list[str],
+) -> None:
+    """Open the host web UI only when interactive and enabled."""
+    if config_content is not None:
+        (tmp_path / "config.yaml").write_text(config_content)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr("omnigent.cli._stdin_is_tty", lambda: is_tty)
+    opened: list[str] = []
+
+    with (
+        patch(
+            "omnigent.cli.ensure_local_omnigent_server",
+            lambda: LocalServerStartup(url="http://127.0.0.1:8123", spawned=False),
+        ),
+        patch("omnigent.host.connect.run_host_process", lambda server_url, **kwargs: None),
+        patch(
+            "omnigent.conversation_browser.open_conversation_url",
+            lambda url: opened.append(url) or True,
+        ),
+    ):
+        result = CliRunner().invoke(cli, ["host", *extra_args])
+
+    assert result.exit_code == 0, result.output
+    assert opened == expected_opened
+
+
+def test_host_opens_remote_web_ui_when_interactive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Open the browser-facing URL for a remote workspace host."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr("omnigent.cli._stdin_is_tty", lambda: True)
+    opened: list[str] = []
+
+    with (
+        patch("omnigent.cli._ensure_databricks_server_auth"),
+        patch("omnigent.host.connect.run_host_process", lambda server_url, **kwargs: None),
+        patch(
+            "omnigent.conversation_browser.open_conversation_url",
+            lambda url: opened.append(url) or True,
+        ),
+    ):
+        result = CliRunner().invoke(
+            cli,
+            ["host", "--server", "https://example.databricks.com/api/2.0/omnigent"],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert opened == ["https://example.databricks.com/omnigent"]
+
+
+def test_start_opens_web_ui_when_interactive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Open the web UI after the background host registers."""
+    _patch_background_host_spawn(monkeypatch, tmp_path)
+    monkeypatch.setattr("omnigent.cli._stdin_is_tty", lambda: True)
+    opened: list[str] = []
+
+    with patch(
+        "omnigent.conversation_browser.open_conversation_url",
+        lambda url: opened.append(url) or True,
+    ):
+        result = CliRunner().invoke(cli, ["start"])
+
+    assert result.exit_code == 0, result.output
+    assert opened == ["http://127.0.0.1:6767"]

@@ -1026,6 +1026,163 @@ def test_terminal_error_from_turn_prefers_turn_error_over_item() -> None:
     assert error.message == "from turn.error"
 
 
+def test_terminal_error_from_notification_reads_usage_limit() -> None:
+    """The standalone Codex ``error`` notification carries the visible reason."""
+    error = fwd._terminal_error_from_notification(
+        {
+            "threadId": "thread_123",
+            "turnId": "turn_123",
+            "willRetry": False,
+            "error": {
+                "message": "You've hit your usage limit.",
+                "codexErrorInfo": "usageLimitExceeded",
+            },
+        }
+    )
+
+    assert error is not None
+    assert error.message == "You've hit your usage limit."
+    assert error.kind == fwd._CODEX_ERROR_KIND_GENERIC
+
+
+@pytest.mark.asyncio
+async def test_handle_event_surfaces_non_retrying_error_notification(tmp_path: Path) -> None:
+    """A terminal standalone ``error`` notification reaches the session UI."""
+    client = _RecordingClient()
+
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event={
+            "method": "error",
+            "params": {
+                "threadId": "thread_123",
+                "turnId": "turn_123",
+                "willRetry": False,
+                "error": {
+                    "message": "You've hit your usage limit.",
+                    "codexErrorInfo": "usageLimitExceeded",
+                },
+            },
+        },
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_123",
+    )
+
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {
+                "type": "external_session_status",
+                "data": {
+                    "status": "failed",
+                    "response_id": "codex_turn_123",
+                    "output": "You've hit your usage limit.",
+                },
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_event_ignores_retrying_error_notification(tmp_path: Path) -> None:
+    """Retryable Codex errors remain internal while Codex retries the turn."""
+    client = _RecordingClient()
+
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event={
+            "method": "error",
+            "params": {
+                "threadId": "thread_123",
+                "turnId": "turn_123",
+                "willRetry": True,
+                "error": {"message": "connection dropped"},
+            },
+        },
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_123",
+    )
+
+    assert client.posts == []
+
+
+@pytest.mark.asyncio
+async def test_handle_event_deduplicates_error_then_terminal_boundary(tmp_path: Path) -> None:
+    """A standalone error owns the terminal status for its turn."""
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_x",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_123",
+        ),
+    )
+    client = _RecordingClient()
+    usage_coalescer = fwd._SessionUsageCoalescer(client, "conv_x")  # type: ignore[arg-type]
+    elicitation_tracker = fwd._CodexElicitationTaskTracker()
+    forwarder_state = fwd._CodexForwarderState()
+    error_event = {
+        "method": "error",
+        "params": {
+            "threadId": "thread_123",
+            "turnId": "turn_123",
+            "willRetry": False,
+            "error": {"message": "You've hit your usage limit."},
+        },
+    }
+
+    for event in (
+        error_event,
+        error_event,
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread_123",
+                "turn": {
+                    "id": "turn_123",
+                    "status": "completed",
+                    "items": [{"type": "agentMessage", "text": ""}],
+                },
+            },
+        },
+    ):
+        await fwd._handle_event(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            event=event,
+            usage_coalescer=usage_coalescer,
+            elicitation_tracker=elicitation_tracker,
+            expected_thread_id="thread_123",
+            forwarder_state=forwarder_state,
+        )
+
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {
+                "type": "external_session_status",
+                "data": {
+                    "status": "failed",
+                    "response_id": "codex_turn_123",
+                    "output": "You've hit your usage limit.",
+                },
+            },
+        )
+    ]
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id is None
+
+
 def test_terminal_error_from_turn_none_for_clean_turn() -> None:
     """A turn with no ``error`` object or item yields ``None`` (no false positives)."""
     params = {

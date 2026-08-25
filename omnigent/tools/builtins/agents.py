@@ -188,8 +188,8 @@ class SysAgentListTool(Tool):
     """
     List launchable agents across three sources.
 
-    A **global read** that surfaces, in one call, every agent the caller
-    could launch a session from:
+    A **global read** that pages agents the caller could launch a session
+    from across three sources:
 
     - **built-ins**: template agents registered on the server
       (``GET /v1/agents``);
@@ -230,7 +230,10 @@ class SysAgentListTool(Tool):
             "agent never needs its bundle downloaded or re-uploaded. "
             "Use sys_agent_get / sys_agent_download (with a "
             "session_agents row's session_id) only to inspect or fork "
-            "an agent's config. Global read — no parameters."
+            "an agent's config. Calls without pagination keep the complete "
+            "result while it fits the tool-output budget; larger results "
+            "return a page with has_more metadata and an opaque "
+            "next_cursor. Pass that cursor to continue."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -238,7 +241,7 @@ class SysAgentListTool(Tool):
         Return the OpenAI-format tool schema.
 
         :returns: Dict with ``"type": "function"`` and a
-            ``"function"`` sub-dict; no parameters.
+            ``"function"`` sub-dict; optional pagination parameters.
         """
         return {
             "type": "function",
@@ -247,7 +250,25 @@ class SysAgentListTool(Tool):
                 "description": SysAgentListTool.description(),
                 "parameters": {
                     "type": "object",
-                    "properties": {},
+                    "properties": {
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 100,
+                            "description": (
+                                "Optional maximum rows returned from each source. "
+                                "Omit it to keep the complete result while it fits."
+                            ),
+                        },
+                        "cursor": {
+                            "type": "string",
+                            "maxLength": 40000,
+                            "description": (
+                                "Opaque continuation cursor from a prior "
+                                "sys_agent_list result's page.next_cursor."
+                            ),
+                        },
+                    },
                     "additionalProperties": False,
                 },
             },

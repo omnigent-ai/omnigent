@@ -57,7 +57,11 @@ import {
   FilePathAwareMessageResponse,
   rendersOnlyWorkedFold,
 } from "@/components/blocks/BlockRenderer";
-import { CompactionMarker, RoutingDecisionCard } from "@/components/blocks/StatusBlocks";
+import {
+  CompactionMarker,
+  ErrorBanner,
+  RoutingDecisionCard,
+} from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
 import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
@@ -109,7 +113,6 @@ import {
 } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { retrySession } from "@/lib/sessionsApi";
-import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
 import {
   composerAttachmentKey,
@@ -121,6 +124,7 @@ import {
 } from "@/store/chatStore";
 import {
   isNativeTerminalSession,
+  nativeCodingAgentForSession,
   nativeCodingAgentForHarness,
   nativeCodingAgentForSubagentWrapper,
   WRAPPER_LABEL_KEY,
@@ -136,6 +140,7 @@ import {
   rankMentionEntries,
 } from "@/lib/composerMentions";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
+import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 // Re-exported so existing tests importing these from "./ChatPage" keep working
 // after the pure helpers moved to the shared lib.
 export { detectMentionAt, mentionMarkerFor };
@@ -169,6 +174,12 @@ import {
 } from "@/hooks/useWorkspaceChangedFiles";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import { isCostRoutingSession, isSubagentRoutingSession } from "@/components/CostRoutingControl";
+import {
+  SMART_ROUTING_ARMS,
+  hostBacksHarnessWithGateway,
+  smartRoutingSourceFor,
+} from "@/lib/smartRoutingAvailability";
+import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import { isSessionScopedDecision, showsRoutingDecisionChip } from "@/lib/routingDecision";
 import {
   Dialog,
@@ -192,6 +203,8 @@ import {
   MODEL_SELECT_DEFAULT,
   MODEL_SELECT_SMART,
   RoutingModelSelect,
+  defaultModelLabel,
+  nativeModelLabel,
 } from "@/components/HarnessConfigControls";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
@@ -204,6 +217,11 @@ import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { useForkDialog } from "@/shell/ForkDialogContext";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
+import {
+  CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES,
+  claudePermissionModeLabel,
+  isClaudeNativeSession,
+} from "@/lib/claudePermissionMode";
 import { isCodexNativeSession } from "@/lib/codexPlanMode";
 import { getCliServerUrl } from "@/lib/host";
 import { SessionImage } from "@/components/SessionImage";
@@ -232,18 +250,35 @@ function smartRoutingEnabled(serverInfo: ServerInfoValue): boolean {
 }
 
 /**
- * Whether the session's own model can be routed per turn: the deployment flag,
- * plus a top-level agent session that is not a native terminal (their CLI bakes
- * the model at launch and can't per-turn route).
+ * Whether the session's own model can be routed per turn.
+ *
+ * SDK/bundle agent sessions need only the deployment flag. Native Claude
+ * Code / Codex panes ARE routable per turn — the server injects the routed
+ * pick via ``/model`` when ``cost_control_mode_override`` is on, the same
+ * apparatus the create-time gear arms — but only when a router can answer
+ * for their family (the server rejects a routing-on create otherwise): the
+ * external AI-Gateway router needs the family's inference gateway-backed on
+ * the session's host, and the built-in judge covers the rest. An absent
+ * host row reads as backed, mirroring {@link hostBacksHarnessWithGateway}.
  */
 export function isCostRoutingEligible(
   serverInfo: ServerInfoValue,
   session: Session | null | undefined,
+  host?: { gateway_inference?: Record<string, boolean> | null } | null,
 ): boolean {
+  if (serverInfo === "loading" || !serverInfo.smart_routing_enabled) return false;
+  if (!isCostRoutingSession(session)) return false;
+  if (!isNativeTerminalSession(session)) return true;
+  const native = nativeCodingAgentForSession(session);
+  if (native === undefined || !SMART_ROUTING_ARMS.some((arm) => arm === native.harness)) {
+    return false;
+  }
   return (
-    smartRoutingEnabled(serverInfo) &&
-    isCostRoutingSession(session) &&
-    !isNativeTerminalSession(session)
+    smartRoutingSourceFor({
+      externalConfigured: serverInfo.smart_routing_sources.external,
+      ossConfigured: serverInfo.smart_routing_sources.oss,
+      gatewayBacked: hostBacksHarnessWithGateway(host, native.harness),
+    }) !== null
   );
 }
 
@@ -642,47 +677,6 @@ function truncateTitle(raw: string, max = 60): string {
   return slice.slice(0, cut).join("").trimEnd() + "…";
 }
 
-// Per-session draft storage — module-level so it survives the Composer
-// unmount/remount that happens during the loading gate between session
-// switches (ChatPage returns <HydratingPlaceholder /> while
-// loadingConversation is true, which unmounts the entire chat surface).
-// Text drafts are also persisted to sessionStorage so they survive page
-// refreshes; File objects can't be serialized, so only text round-trips.
-const SESSION_DRAFTS_KEY = "omnigent.sessionDrafts";
-
-function loadDraftsFromStorage(): Map<string, { text: string; files: File[] }> {
-  try {
-    const raw = window.sessionStorage.getItem(SESSION_DRAFTS_KEY);
-    if (!raw) return new Map();
-    const entries = JSON.parse(raw) as Record<string, string>;
-    const map = new Map<string, { text: string; files: File[] }>();
-    for (const [id, text] of Object.entries(entries)) {
-      if (text) map.set(id, { text, files: [] });
-    }
-    return map;
-  } catch {
-    return new Map();
-  }
-}
-
-function saveDraftsToStorage(drafts: Map<string, { text: string; files: File[] }>): void {
-  try {
-    const obj: Record<string, string> = {};
-    for (const [id, draft] of drafts) {
-      if (draft.text) obj[id] = draft.text;
-    }
-    if (Object.keys(obj).length === 0) {
-      window.sessionStorage.removeItem(SESSION_DRAFTS_KEY);
-    } else {
-      window.sessionStorage.setItem(SESSION_DRAFTS_KEY, JSON.stringify(obj));
-    }
-  } catch {
-    // Storage full or unavailable — drafts still work in-memory.
-  }
-}
-
-const sessionDrafts = loadDraftsFromStorage();
-
 /**
  * Single component that drives the chat surface. Streaming + history
  * state lives in `useChatStore` (a Zustand store at module scope), so
@@ -1005,13 +999,16 @@ export function ChatPage() {
 
   // Orchestrator-only: polly's children inherit its agentName, so the gate
   // needs the session predicate (parent linkage), not a bare name check. An
-  // eligible session's Smart Routing toggle lives in the gear modal — Claude
-  // folds it into the Model dropdown; other routable agents get a standalone
-  // Switch row. Native terminal sessions (Claude Code / Codex / Pi / …) are
-  // excluded: their CLI bakes the model at launch and can't per-turn route, so
-  // Smart Routing is meaningless there.
+  // eligible session's Smart Routing option lives in the gear modal — Claude
+  // Code / Codex fold it into the Model dropdown (the server routes native
+  // panes per turn via /model injection); other routable agents get a
+  // standalone Switch row. The session's host row feeds the per-family
+  // gateway check the external router requires.
   const serverInfo = useServerInfo();
-  const costRoutingEligible = isCostRoutingEligible(serverInfo, activeSession);
+  const { data: hostRows } = useHosts();
+  const sessionHost =
+    hostRows?.find((row) => row.host_id === (activeSession?.hostId ?? null)) ?? null;
+  const costRoutingEligible = isCostRoutingEligible(serverInfo, activeSession, sessionHost);
   // Sub-agent routing is a separate knob with a different gate: a native CLI
   // can't per-turn route itself, but the sub-agents it spawns are routed per
   // spawn — where the launch actually installed that apparatus. See
@@ -1172,9 +1169,39 @@ export function ChatPage() {
     document.title = showsWorking ? `● ${base}` : base;
   }, [activeConv?.title, subAgentTabTitle, showsWorking, urlConvId, appName]);
 
-  const codexModelOptions = useChatStore((s) => s.codexModelOptions);
+  const sessionModelOptions = useChatStore((s) => s.codexModelOptions);
   const selectedModel = useChatStore((s) => s.selectedModel);
   const llmModel = useChatStore((s) => s.llmModel);
+  // Pre-catalog fallback: a fresh native session's own catalog only arrives
+  // once its CLI is up (codex answers model/list after app-server boot,
+  // ~15s cold), which left the gear's Model list sparse and its Effort row
+  // hidden until then. The session's host already probed the same harness
+  // for the new-chat picker — ride those cached rows (same ids the launch
+  // accepts, ~90ms warm) until the runner's per-session catalog lands;
+  // the runner truth replaces them the moment it arrives. Must stay above
+  // the hydration early-returns below (hook order).
+  const fallbackPickerKind = modelPickerKindForConv({
+    labels: activeSession ? (activeSession.labels ?? {}) : (activeConv?.labels ?? {}),
+  });
+  const hostProbeHarness =
+    fallbackPickerKind === "codex"
+      ? "codex-native"
+      : fallbackPickerKind === "claude"
+        ? "claude-native"
+        : null;
+  const { data: hostProbeOptions } = useHostModelOptions(
+    activeSession?.hostId ?? null,
+    hostProbeHarness ?? "",
+    hostProbeHarness !== null && sessionModelOptions.length === 0,
+  );
+  // Identity-stable on purpose: substitute only when the host rows actually
+  // exist, else keep the store's own array reference — a fresh [] here would
+  // re-render every options consumer (composer, gear, agent-info popover) on
+  // each streaming/liveness tick.
+  const codexModelOptions =
+    sessionModelOptions.length === 0 && hostProbeOptions != null && hostProbeOptions.length > 0
+      ? hostProbeOptions
+      : sessionModelOptions;
 
   // Loading + error gates for `/c/:id` hydration.
   if (urlConvId) {
@@ -1275,10 +1302,13 @@ export function ChatPage() {
     labels: activeSession ? (activeSession.labels ?? {}) : (activeConv?.labels ?? {}),
   };
   const modelPickerKind = modelPickerKindForConv(capabilitySource);
+  // Effort ladders key on the model the session is actually on — the
+  // reported `llmModel` — falling back to the sticky preference only
+  // before the first report lands.
   const effortLevels = effortLevelsForConv(
     capabilitySource,
     codexModelOptions,
-    selectedModel ?? llmModel,
+    llmModel ?? selectedModel,
   );
   const showEffort = shouldShowEffortPicker(capabilitySource) && effortLevels.length > 0;
 
@@ -1331,6 +1361,7 @@ export function ChatPage() {
       modelPickerKind={modelPickerKind}
       codexModelOptions={codexModelOptions}
       showCodexPlanMode={shouldShowCodexPlanModeControl(capabilitySource)}
+      showClaudePermissionMode={shouldShowClaudePermissionModeControl(capabilitySource)}
       showGoalControl={shouldShowGoalControl(capabilitySource)}
       showClaudeGoalControl={shouldShowPollyClaudeGoalControl(activeSession)}
       showPollyCodexGoalControl={shouldShowPollyCodexGoalControl(activeSession)}
@@ -1536,9 +1567,8 @@ interface MainAgentSurfaceProps {
    *  Never includes child-session activity and never gates Stop/Interrupt. */
   showsWorking: boolean;
   /**
-   * Strict runner-tunnel liveness, used only to gate the inline terminal
-   * view (the PTY dies the moment the runner tunnel drops). The reconnect
-   * affordances key off `liveness` instead.
+   * Strict runner-tunnel liveness. The terminal view remains selectable when
+   * this is false and uses it to show the stopped-harness resume state.
    */
   runnerOnline: boolean | undefined;
   /** Derived open-session liveness — drives the reconnect hint/banner. */
@@ -1575,6 +1605,7 @@ interface MainAgentSurfaceProps {
   codexModelOptions: readonly NativeModelOption[];
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
+  showClaudePermissionMode?: boolean;
   /** Show the session Goal control. */
   showGoalControl?: boolean;
   /** Show Polly's Claude SDK command-backed Goal control. */
@@ -1719,6 +1750,7 @@ function MainAgentSurface({
   modelPickerKind,
   codexModelOptions,
   showCodexPlanMode,
+  showClaudePermissionMode = false,
   showGoalControl = false,
   showClaudeGoalControl = false,
   showPollyCodexGoalControl = false,
@@ -1832,20 +1864,16 @@ function MainAgentSurface({
     [streamBubbles],
   );
 
-  // Cmd+Alt+↑/↓ (Ctrl+Alt on win/linux) — guarded so the composer's
-  // own unmodified ArrowUp/Down history-recall still works.
+  // Cmd+Alt+↑/↓ (Ctrl+Alt on win/linux) — the composer's own unmodified
+  // ArrowUp/Down history-recall skips modified arrows, so this fires there too.
   useEffect(() => {
     // globalThis prefix because React's KeyboardEvent is imported above.
     const handler = (e: globalThis.KeyboardEvent) => {
       if (!(e.metaKey || e.ctrlKey) || !e.altKey) return;
       if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
-      const target = e.target;
-      if (
-        target instanceof HTMLElement &&
-        target.closest('textarea, input, [contenteditable="true"]')
-      ) {
-        return;
-      }
+      // Yield to a focused widget that already claimed the chord for its own
+      // list navigation (command palette, mention / slash menus).
+      if (e.defaultPrevented) return;
       e.preventDefault();
       if (e.key === "ArrowUp") nav.goPrev();
       else nav.goNext();
@@ -1995,6 +2023,17 @@ function MainAgentSurface({
     mountTerminal && conversationId
       ? updateWarmTerminalSurfaces(warmTerminals, conversationId, terminalReadOnly)
       : warmTerminals;
+  const handleTerminalResume = useCallback(async () => {
+    if (!conversationId) throw new Error("Session is not available");
+    if (liveness.kind === "host_offline" || liveness.kind === "local_stranded") {
+      onShowReconnectHelp();
+      return;
+    }
+    const result = await retrySession(conversationId);
+    if (!result.recovered) {
+      throw new Error("The session is already connected; no recovery was performed");
+    }
+  }, [conversationId, liveness.kind, onShowReconnectHelp]);
   const terminalSurfaces = renderedTerminals.map((entry) => {
     const isActive = mountTerminal && entry.conversationId === conversationId;
     const isShown = isActive && showTerminal;
@@ -2008,6 +2047,8 @@ function MainAgentSurface({
           conversationId={entry.conversationId}
           initialTerminalKey={isActive ? terminalFirst?.terminalViewKey : null}
           visible={isShown}
+          runnerOnline={isActive ? runnerOnline : undefined}
+          onResume={isActive ? handleTerminalResume : undefined}
           onSurfaceElement={isActive ? setTerminalSurfaceEl : undefined}
           readOnly={entry.readOnly}
         />
@@ -2248,6 +2289,7 @@ function MainAgentSurface({
             modelPickerKind={modelPickerKind}
             codexModelOptions={codexModelOptions}
             showCodexPlanMode={showCodexPlanMode}
+            showClaudePermissionMode={showClaudePermissionMode}
             showGoalControl={showGoalControl}
             showClaudeGoalControl={showClaudeGoalControl}
             showPollyCodexGoalControl={showPollyCodexGoalControl}
@@ -2920,6 +2962,7 @@ export function JumpToTopButton({
         disabled={jumping}
         onClick={() => void jumpToTop()}
         aria-label="Jump to the first message"
+        componentId="chat.nav.jump_to_top"
         // When hidden (opacity-0 / pointer-events-none) keep the button out of
         // the tab order and the accessibility tree so it can't take focus or be
         // announced while invisible.
@@ -3105,13 +3148,9 @@ export function SandboxFailedIndicator({ status }: { status: SandboxStatus }) {
     <div
       data-testid="sandbox-failed-indicator"
       role="status"
-      className={cn(
-        "mx-auto mb-4 flex w-full items-center justify-center gap-2 px-6 py-1.5 text-destructive text-sm",
-        CHAT_COLUMN_WIDTH,
-      )}
+      className={cn("mx-auto w-full", CHAT_COLUMN_WIDTH)}
     >
-      <AlertTriangleIcon className="size-3.5 shrink-0" aria-hidden />
-      <span>Sandbox launch failed{status.error ? `: ${status.error}` : ""}</span>
+      <ErrorBanner message={status.error ?? ""} source="" code="" title="Sandbox launch failed" />
     </div>
   );
 }
@@ -3150,7 +3189,6 @@ export function ConnectionIndicator({
     terminalFirst?.isTerminalFirst === true &&
     !terminalFirst.isShellView &&
     sandboxStatus?.stage !== "failed" &&
-    !unreachable &&
     !keyboardVisible &&
     surfaceFrontmost;
   useNativeChatTerminalBar(terminalFirst, nativeBarVisible);
@@ -3175,25 +3213,51 @@ export function ConnectionIndicator({
     // `local_stranded` keeps the banner everywhere (no host, hence no badge).
     const composerOnScreen = !(terminalFirst?.isTerminalFirst && terminalFirst.view === "terminal");
     if (liveness.kind === "host_offline" && composerOnScreen) {
-      return null;
+      return nativeBarVisible ? (
+        <div
+          aria-hidden
+          className={cn(
+            "omnigent-native-bottom-spacer",
+            terminalFirst?.view === "chat" && "omnigent-native-bottom-spacer--chat",
+          )}
+        />
+      ) : null;
     }
     return (
-      <button
-        type="button"
-        data-testid="disconnected-indicator"
-        onClick={onShowReconnectHelp}
-        className={cn(
-          "mx-auto mb-4 flex w-full items-center justify-center gap-2 px-6 py-1.5 text-sm text-destructive underline-offset-2 hover:underline",
-          CHAT_COLUMN_WIDTH,
+      <>
+        <div className={cn("mx-auto mb-4 flex w-full justify-center px-6", CHAT_COLUMN_WIDTH)}>
+          {/* Reconnect affordance styled as the destructive error pill (never
+              raw red text). Keeps its own click → reconnect dialog rather than
+              the ErrorBanner's async Retry, since some states need the picker. */}
+          <button
+            type="button"
+            data-testid="disconnected-indicator"
+            onClick={onShowReconnectHelp}
+            className="flex items-center gap-2 rounded-[12px] px-4 py-2 text-sm text-destructive transition-[filter] hover:brightness-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+            style={{
+              background:
+                "color-mix(in srgb, var(--destructive) 4%, var(--app-shell-bg, var(--background)))",
+              border: "1px solid color-mix(in srgb, var(--destructive) 32%, transparent)",
+            }}
+          >
+            <WifiOffIcon className="size-3.5 shrink-0" />
+            <span>
+              {liveness.kind === "host_offline"
+                ? "Host is offline — click to reconnect"
+                : "Agent disconnected — click to reconnect"}
+            </span>
+          </button>
+        </div>
+        {nativeBarVisible && (
+          <div
+            aria-hidden
+            className={cn(
+              "omnigent-native-bottom-spacer",
+              terminalFirst?.view === "chat" && "omnigent-native-bottom-spacer--chat",
+            )}
+          />
         )}
-      >
-        <WifiOffIcon className="size-3.5 shrink-0" />
-        <span>
-          {liveness.kind === "host_offline"
-            ? "Host is offline — click to reconnect"
-            : "Agent disconnected — click to reconnect"}
-        </span>
-      </button>
+      </>
     );
   }
 
@@ -3422,7 +3486,7 @@ function useNativeChatTerminalBar(
 ): void {
   const native = isIOSShell();
   const view = ctx?.view ?? "chat";
-  const terminalsAvailable = ctx?.terminalsAvailable ?? false;
+  const terminalEnabled = ctx?.isTerminalFirst === true;
   const terminalStartingUp = ctx?.terminalStartingUp ?? false;
 
   // Keep `setView` reachable from the subscribe-once effect without
@@ -3435,11 +3499,11 @@ function useNativeChatTerminalBar(
     if (!native) return;
     setNativeViewMode({
       mode: view,
-      terminalEnabled: terminalsAvailable,
+      terminalEnabled,
       terminalStartingUp,
       visible,
     });
-  }, [native, view, terminalsAvailable, terminalStartingUp, visible]);
+  }, [native, view, terminalEnabled, terminalStartingUp, visible]);
 
   // Belt-and-suspenders: hide the bar if the host component ever unmounts.
   useEffect(() => {
@@ -3793,7 +3857,12 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             )}
             {text && (
               <MessageActions>
-                <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
+                <MessageAction
+                  tooltip="Copy"
+                  size="icon-xxs"
+                  onClick={handleCopy}
+                  componentId="chat.message.copy_user"
+                >
                   {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
                 </MessageAction>
               </MessageActions>
@@ -3862,6 +3931,14 @@ function AssistantBubble({
   const hasElicitation = bubble.items.some((it) => it.kind === "elicitation");
   const isWide =
     hasElicitation || containsMarkdownTable(bubble.items) || containsDisplayMath(bubble.items);
+  // An error banner's dashed rule spans the full chat column: MessageContent
+  // is w-fit, so without w-full an error-only bubble shrink-wraps the 560px
+  // pill and the rule clips to it instead of reaching the column edges.
+  const hasError = bubble.items.some((it) => it.kind === "error");
+  // A bubble carrying an error but no prose stands alone as a thread-level
+  // element — the hover footer's timestamp/actions belong to assistant text,
+  // not to the error.
+  const errorOnly = hasError && !markdownText;
 
   return (
     <>
@@ -3876,7 +3953,7 @@ function AssistantBubble({
             collapsed the row's trailing hairline (a flex-1 span) to zero
             and stopped its click target short of the column. Keeping the
             cap lands the hairline where an answered turn's does. */}
-        <MessageContent className={isWide || foldOnly ? "w-full" : undefined}>
+        <MessageContent className={isWide || foldOnly || hasError ? "w-full" : undefined}>
           <BlockRenderer
             items={bubble.items}
             sessionStatus={sessionStatus}
@@ -3903,13 +3980,20 @@ function AssistantBubble({
             the user can see, and hanging them off a collapsed row spaced
             consecutive rows unevenly depending on hidden narration. Also
             skipped when there is neither a timestamp nor actions to show.
+            Also skipped on an error-only bubble: the banner stands alone as
+            a thread-level element, so no timestamp/actions hang off it.
             40%-visible on touch (no hover), hover/focus-reveal on desktop.
             Order matches the design target: actions, then timestamp. */}
-        {!foldOnly && (ts || markdownText) && (
+        {!foldOnly && !errorOnly && (ts || markdownText) && (
           <div className="flex items-center gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
             {markdownText && (
               <MessageActions>
-                <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
+                <MessageAction
+                  tooltip="Copy"
+                  size="icon-xxs"
+                  onClick={handleCopy}
+                  componentId="chat.message.copy_assistant"
+                >
                   {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
                 </MessageAction>
                 {/* Fork from this response: clone the session with history
@@ -3922,6 +4006,7 @@ function AssistantBubble({
                     size="icon-xxs"
                     data-testid="fork-from-response"
                     onClick={() => forkDialog.openForkDialog({ upToResponseId: bubble.responseId })}
+                    componentId="chat.message.fork"
                   >
                     <GitForkIcon size={14} />
                   </MessageAction>
@@ -3940,8 +4025,12 @@ function AssistantBubble({
         )}
       </Message>
 
-      {bubble.lifecycle === "failed" && (
-        <p className="text-destructive text-sm">Error: {bubble.error}</p>
+      {/* Surface a turn-level failure (a failed send or stream) as the same
+          destructive pill an error block renders — never raw red text. A
+          dropped host connection already carries its own error pill inside the
+          bubble and leaves `bubble.error` null, so this stays hidden there. */}
+      {bubble.lifecycle === "failed" && bubble.error && (
+        <ErrorBanner message={bubble.error} source="" code="" />
       )}
     </>
   );
@@ -3999,6 +4088,7 @@ interface ComposerProps {
   codexModelOptions: readonly NativeModelOption[];
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
+  showClaudePermissionMode?: boolean;
   /** Show the session Goal control. */
   showGoalControl?: boolean;
   /** Show Polly's Claude SDK command-backed Goal control. */
@@ -4186,9 +4276,10 @@ function ContextRing({ contextWindow, tokensUsed }: { contextWindow: number; tok
  *
  * @param model - Model override or bound agent model id.
  * @param codexModelOptions - Native model metadata, when available.
- * @returns The advertised display label for known native models, a local Claude alias
- *   label for Claude native tiers, the raw model id otherwise, or ``null``
- *   when no model is known.
+ * @returns The advertised display label for known native models, a
+ *   version-agnostic friendly form for an alias-shaped id the catalog
+ *   doesn't list, the raw model id otherwise, or ``null`` when no model
+ *   is known.
  */
 export function formatStatusModelLabel(
   model: string | null,
@@ -4199,8 +4290,19 @@ export function formatStatusModelLabel(
   const lower = raw.toLowerCase();
   const codexOption = findNativeModelOption(codexModelOptions, raw);
   if (codexOption) return codexOption.displayName ?? codexOption.id;
-  const known = CLAUDE_NATIVE_MODELS.find((m) => m.id === lower);
-  if (known) return known.label;
+  // An alias-shaped id the session's catalog doesn't list (e.g. during
+  // the pre-catalog window): render it friendly mechanically — "sonnet"
+  // → "Sonnet", "sonnet_5" → "Sonnet 5", "sonnet[1m]" → "Sonnet
+  // (1M context)" — without claiming a version the client can't know.
+  // Which model an alias lands on is the harness's answer; the catalog's
+  // display name supersedes this wherever one has arrived.
+  const alias = /^([a-z]+)(?:_(\d+))?(\[1m\])?$/.exec(lower);
+  if (alias) {
+    let label = `${alias[1]!.charAt(0).toUpperCase()}${alias[1]!.slice(1)}`;
+    if (alias[2]) label += ` ${alias[2]}`;
+    if (alias[3]) label += " (1M context)";
+    return label;
+  }
   return raw;
 }
 
@@ -4437,27 +4539,133 @@ function SubagentComposerTray({ label }: { label: string }) {
 }
 
 /**
- * Pill above the composer tallying background tasks that are running (a dev
- * server, a background shell, a sub-agent). Independent of the "Working…"
- * shimmer: while the turn is active both show — the shimmer for the turn, the
- * pill for the tally — and once the turn ends the pill carries on alone.
- * Label-only: the count spans shells, sub-agents, and tools, so there's no
- * single terminal to open.
+ * Pill above the composer tallying running background tasks (a dev server, a
+ * background shell, a sub-agent), shown independently of the "Working…" shimmer.
+ *
+ * The tally expands into a card listing each running shell by name: on hover
+ * for a mouse, on tap for touch (which focuses it, so a tap outside closes it
+ * via blur), and on focus for the keyboard. It morphs in place — the same
+ * element tweens width and height to the measured content size at a constant
+ * corner radius (CSS can't animate to an `auto` size), growing upward out of an
+ * absolute layer over a hidden spacer so the composer below never shifts. A
+ * count-only edge (older runner, no per-shell detail) stays a plain tally.
  */
 function BackgroundTaskPill() {
   const bgCount = useChatStore((s) => s.backgroundTaskCount);
+  const bgTasks = useChatStore((s) => s.backgroundTasks);
+  const [open, setOpen] = useState(false);
+  const contentRef = useRef<HTMLDivElement>(null);
+  const [box, setBox] = useState<{ width: number; height: number } | null>(null);
+  const canExpand = bgTasks.length > 0;
+
+  useEffect(() => {
+    if (bgCount <= 0 || !canExpand) setOpen(false);
+  }, [bgCount, canExpand]);
+
+  // Measure the current content so the container tweens to a concrete size in
+  // both dimensions. Re-measured whenever the state or the task list changes.
+  useLayoutEffect(() => {
+    const el = contentRef.current;
+    if (el) setBox({ width: el.offsetWidth, height: el.offsetHeight });
+  }, [open, canExpand, bgCount, bgTasks]);
+
   if (bgCount <= 0) return null;
+
+  const showCard = open && canExpand;
+
   return (
     <div className={cn("mx-auto flex w-full px-1 pb-1.5", CHAT_COLUMN_WIDTH)}>
-      <div
-        role="status"
-        data-testid="background-task-pill"
-        className="flex items-center gap-1.5 rounded-full border border-border bg-card px-3 py-1 text-sm text-muted-foreground shadow-sm"
-      >
-        <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
-        <span>
-          {bgCount} background task{bgCount === 1 ? "" : "s"}
-        </span>
+      <div className="relative">
+        {/* Reserves the collapsed footprint so the absolute, upward-growing
+            card never shoves the composer. */}
+        <div aria-hidden className="invisible px-3 py-1.5 text-sm">
+          <div className="flex items-center gap-1.5 whitespace-nowrap">
+            <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
+            <span>
+              {bgCount} background task{bgCount === 1 ? "" : "s"}
+            </span>
+          </div>
+        </div>
+        <div
+          role="status"
+          data-testid="background-task-pill"
+          aria-label={`${bgCount} background task${bgCount === 1 ? "" : "s"} still running`}
+          tabIndex={canExpand ? 0 : undefined}
+          // Hover opens ONLY for a real mouse. On touch, opening on emulated
+          // hover triggers iOS's "first tap reveals hover, second tap clicks"
+          // heuristic — which swallows the first tap inconsistently. Touch opens
+          // via onClick instead, so the first tap always lands.
+          onPointerEnter={(e) => {
+            if (e.pointerType === "mouse" && canExpand) setOpen(true);
+          }}
+          onPointerLeave={(e) => {
+            if (e.pointerType === "mouse") setOpen(false);
+          }}
+          // Tap/click: open and focus the pill so onBlur can close it on
+          // tap-out (a gesture-driven focus() works even on iOS, where tapping a
+          // non-button element otherwise won't focus it).
+          onClick={(e) => {
+            if (!canExpand) return;
+            setOpen(true);
+            e.currentTarget.focus({ preventScroll: true });
+          }}
+          onFocus={() => canExpand && setOpen(true)}
+          onBlur={(e) => {
+            // Close when focus leaves the pill entirely (tap/click outside,
+            // Tab away); staying open if it moves to a child.
+            if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setOpen(false);
+          }}
+          style={box ? { width: box.width, height: box.height } : undefined}
+          className={cn(
+            "absolute bottom-0 left-0 overflow-hidden rounded-2xl bg-card text-sm shadow-sm ring-1 ring-border transition-[width,height,box-shadow] duration-200 ease-out",
+            showCard && "z-10 shadow-menu",
+          )}
+        >
+          <div
+            ref={contentRef}
+            // Cap at Tailwind's `md` container (28rem/448px), but never wider
+            // than the viewport minus a margin so it can't overflow on a narrow
+            // screen. The margin exceeds the composer's own px-4/px-6 inset (this
+            // pill sits at px-1) so the card's right edge, ring included, stays
+            // inside the composer rather than overhanging it.
+            style={
+              showCard ? { maxWidth: "min(var(--container-md, 28rem), 100vw - 3rem)" } : undefined
+            }
+            className={cn("w-max text-left", showCard ? "px-3 py-2" : "px-3 py-1.5")}
+          >
+            {showCard ? (
+              <ul className="flex animate-in flex-col gap-1.5 fade-in-0 duration-200">
+                {bgTasks.map((task, i) => {
+                  const label = task.description || task.command || "Background shell";
+                  const cmd = task.command && task.command !== label ? task.command : null;
+                  return (
+                    <li key={task.id ?? i} className="flex items-start gap-2">
+                      <SquareTerminalIcon
+                        className="mt-0.5 size-3.5 shrink-0 text-muted-foreground"
+                        aria-hidden="true"
+                      />
+                      <div className="min-w-0">
+                        <div className="truncate text-foreground">{label}</div>
+                        {cmd ? (
+                          <div className="truncate font-mono text-xs text-muted-foreground">
+                            {cmd}
+                          </div>
+                        ) : null}
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            ) : (
+              <div className="flex items-center gap-1.5 whitespace-nowrap text-muted-foreground">
+                <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
+                <span>
+                  {bgCount} background task{bgCount === 1 ? "" : "s"}
+                </span>
+              </div>
+            )}
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -4488,6 +4696,7 @@ export function Composer({
   modelPickerKind,
   codexModelOptions,
   showCodexPlanMode,
+  showClaudePermissionMode = false,
   showGoalControl = false,
   showClaudeGoalControl = false,
   showPollyCodexGoalControl = false,
@@ -4590,9 +4799,8 @@ export function Composer({
   );
 
   // Preserve unsent text + file attachments per session so switching
-  // tabs and coming back restores the draft. The drafts map lives at
-  // module scope (not useRef) because Composer unmounts during the
-  // loading gate between session switches.
+  // tabs and coming back restores the draft. The shared draft store also lets
+  // the sidebar surface which sessions have unfinished composer content.
   const conversationId = useChatStore((s) => s.conversationId);
   const queuedMessages = useChatStore((s) => s.queuedMessages);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
@@ -4665,7 +4873,7 @@ export function Composer({
   }, []);
 
   useEffect(() => {
-    const restored = conversationId ? sessionDrafts.get(conversationId) : undefined;
+    const restored = conversationId ? getSessionDraft(conversationId) : undefined;
     setValue(restored?.text ?? "");
     setFiles(restored?.files ?? []);
     dirtyRef.current = false;
@@ -4678,16 +4886,19 @@ export function Composer({
 
     return () => {
       if (!conversationId || !dirtyRef.current) return;
-      const text = valueRef.current;
-      const draftFiles = filesRef.current;
-      if (text || draftFiles.length > 0) {
-        sessionDrafts.set(conversationId, { text, files: draftFiles });
-      } else {
-        sessionDrafts.delete(conversationId);
-      }
-      saveDraftsToStorage(sessionDrafts);
+      setSessionDraft(conversationId, {
+        text: valueRef.current,
+        files: filesRef.current,
+      });
     };
   }, [conversationId]);
+
+  // Publish edits as they happen so the open sidebar updates immediately,
+  // rather than only learning about a draft when this composer unmounts.
+  useEffect(() => {
+    if (!conversationId || settledConversationId !== conversationId || !dirtyRef.current) return;
+    setSessionDraft(conversationId, { text: value, files });
+  }, [conversationId, settledConversationId, value, files]);
 
   // Adding a reply quote (via the floating "Reply" button) should drop the
   // caret straight into the composer so the user can type immediately. Only
@@ -4959,9 +5170,14 @@ export function Composer({
         // Confirmation is a durable `[System: model changed to X]` note the
         // server appends to the transcript (see _persist_model_change_note) —
         // not a transient composer hint. Surface only failures inline here.
+        // Native reported-model sessions additionally show the pending
+        // indicator until the harness's own report settles the ask.
+        const harness = useChatStore.getState().sessionHarness;
         void useChatStore
           .getState()
-          .setModel(clear ? null : target)
+          .setModel(clear ? null : target, {
+            expectConfirmation: harness === "claude-native" || harness === "codex-native",
+          })
           .catch((err: unknown) => {
             setCommandError(err instanceof Error ? err.message : "Failed to set model");
           });
@@ -5341,6 +5557,11 @@ export function Composer({
           }
         }}
       />
+      {/* Background tasks that outlive the turn show as a pill, not the
+          "Working…" shimmer. Sits above the queued/sub-agent trays: those dock
+          onto the composer card with a negative margin, so nothing may come
+          between them and the card. Self-gates to null otherwise. */}
+      <BackgroundTaskPill />
       {/* Queued messages — peeks above the card like the sub-agent tray.
           Lists follow-ups held while the agent is busy; drains FIFO on idle.
           Scope to this conversation so a queue held elsewhere never leaks in. */}
@@ -5368,9 +5589,6 @@ export function Composer({
           Truthy (not just non-null) so an empty label never peeks a
           nameless tray. */}
       {subAgentLabel ? <SubagentComposerTray label={subAgentLabel} /> : null}
-      {/* Background tasks that outlive the turn show as a pill here, not the
-          "Working…" shimmer. Self-gates to null otherwise. */}
-      <BackgroundTaskPill />
       {/* Single rounded container — textarea + action row. No focus-within
           ring; drag-over still lifts an inset ring. dark:bg-card-solid so
           upper trays (queued / sub-agent) don't ghost through glass --card. */}
@@ -5441,7 +5659,7 @@ export function Composer({
             (text-transparent, caret kept visible) and render an aligned mirror
             behind it. Same box/typography so wrapping matches the textarea
             exactly. Only mounted while the draft is a command. */}
-        <div className="relative">
+        <div className="relative overflow-hidden">
           {composerIsCommand && (
             <div
               ref={backdropRef}
@@ -5538,7 +5756,7 @@ export function Composer({
             disabled={disabled || isReadOnly || unreachable || hasPendingElicitation}
             data-slash-command={composerIsCommand ? "true" : undefined}
             className={cn(
-              "relative w-full resize-none bg-transparent px-4 pt-3 pb-2 text-ui outline-none placeholder:text-muted-foreground disabled:opacity-60",
+              "relative w-full resize-none overflow-y-auto bg-transparent px-4 pt-3 pb-2 text-ui outline-none [scrollbar-width:none] placeholder:text-muted-foreground disabled:opacity-60 [&::-webkit-scrollbar]:hidden",
               // Hand glyph painting to the overlay while a command is drafted;
               // the caret stays visible via caret-foreground.
               composerIsCommand && "text-transparent caret-foreground",
@@ -5629,6 +5847,7 @@ export function Composer({
               disabled={disabled || isReadOnly || hasPendingElicitation}
               onClick={() => fileInputRef.current?.click()}
               title="Attach files"
+              componentId="chat.composer.attach_files"
             >
               <PaperclipIcon className="size-4" data-icon-size="16" />
               <span className="sr-only">Attach files</span>
@@ -5679,6 +5898,7 @@ export function Composer({
                     data-testid="codex-plan-mode-toggle"
                     data-active={codexPlanMode ? "true" : undefined}
                     onClick={() => void toggleCodexPlanMode()}
+                    componentId="chat.composer.toggle_plan_mode"
                   >
                     {planModeBusy ? (
                       <Loader2Icon className="size-3.5 animate-spin" />
@@ -5733,6 +5953,7 @@ export function Composer({
                 harnessLabel={harnessLabel}
                 showModels={showModels}
                 showEffort={showEffort}
+                showClaudePermissionMode={showClaudePermissionMode}
                 effortLevels={effortLevels}
                 modelPickerKind={modelPickerKind}
                 codexModelOptions={codexModelOptions}
@@ -6117,6 +6338,22 @@ export function shouldShowCodexPlanModeControl(
 }
 
 /**
+ * True when the claude-native permission-mode picker should be visible.
+ *
+ * Claude-native sessions only: the switch drives Claude Code's own
+ * shift+tab cycle, which no other harness has.
+ *
+ * :param conv: Session-like object carrying `labels`; a missing session
+ *     or missing labels fails closed.
+ * :returns: True only for sessions running the claude-native wrapper.
+ */
+export function shouldShowClaudePermissionModeControl(
+  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+): boolean {
+  return isClaudeNativeSession(conv);
+}
+
+/**
  * True when the session Goal control should be visible.
  *
  * @param conv - Session or sidebar row carrying labels. ``null`` or missing
@@ -6152,25 +6389,6 @@ export function shouldShowPollyCodexGoalControl(
   );
 }
 
-/**
- * Highlight a model row when ``selectedModel`` is null by matching the
- * bound spec ``llmModel`` to its tier alias (e.g.
- * ``"anthropic/claude-opus-4-8"`` matches ``"opus"``).
- *
- * Sonnet 5 is special-cased both ways: its concrete id ("...-sonnet-5")
- * would otherwise substring-match the generic "sonnet" row (since "sonnet"
- * is itself a substring), and its own opt-in row id ("sonnet_5") never
- * literally appears in a hyphenated concrete id. The default "sonnet" row
- * stays bound to the older Sonnet (4.6), which collapses to it normally.
- */
-export function isModelImplicitlySelected(modelId: string, llmModel: string | null): boolean {
-  if (!llmModel) return false;
-  const isSonnet5 = llmModel.includes("sonnet-5") || llmModel.includes("sonnet_5");
-  if (modelId === "sonnet_5") return isSonnet5;
-  if (modelId === "sonnet" && isSonnet5) return false;
-  return llmModel === modelId || llmModel.endsWith(`/${modelId}`) || llmModel.includes(modelId);
-}
-
 /** Title-case an effort level for the status label (``"high"`` → ``"High"``). */
 function formatEffortLabel(effort: string): string {
   return effort.charAt(0).toUpperCase() + effort.slice(1);
@@ -6200,6 +6418,7 @@ function SessionConfigModal({
   harnessLabel,
   showModels,
   showEffort,
+  showClaudePermissionMode = false,
   effortLevels,
   modelPickerKind,
   codexModelOptions,
@@ -6211,6 +6430,7 @@ function SessionConfigModal({
   harnessLabel: string | null;
   showModels: boolean;
   showEffort: boolean;
+  showClaudePermissionMode?: boolean;
   effortLevels: readonly string[];
   modelPickerKind: NativeModelPickerKind | null;
   codexModelOptions: readonly NativeModelOption[];
@@ -6218,6 +6438,7 @@ function SessionConfigModal({
   subagentRoutingEligible: boolean;
 }) {
   const selectedEffort = useSessionEffort();
+  const claudePermissionMode = useChatStore((s) => s.claudePermissionMode);
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const subagentRoutingOverride = useChatStore((s) => s.subagentRoutingOverride);
   const conversationId = useChatStore((s) => s.conversationId);
@@ -6233,11 +6454,10 @@ function SessionConfigModal({
   // model shows without an explicit pick), else the catalog default. Falls back
   // to the "Default" sentinel when nothing resolves.
   const implicitModelId =
-    pickerSelectedModel === null
-      ? ((usesServerModelOptions
-          ? (findNativeModelOption(codexModelOptions, llmModel)?.id ??
-            codexModelOptions.find((option) => option.isDefault)?.id)
-          : modelOptions.find((m) => isModelImplicitlySelected(m.id, llmModel))?.id) ?? null)
+    pickerSelectedModel === null && usesServerModelOptions
+      ? (findNativeModelOption(codexModelOptions, llmModel)?.id ??
+        codexModelOptions.find((option) => option.isDefault)?.id ??
+        null)
       : null;
   const resolvedModelId = pickerSelectedModel ?? implicitModelId;
 
@@ -6248,6 +6468,7 @@ function SessionConfigModal({
   const [draftModelId, setDraftModelId] = useState<string | null>(resolvedModelId);
   const [draftEffort, setDraftEffort] = useState<string | null>(selectedEffort);
   const [draftRoutingOn, setDraftRoutingOn] = useState(liveRoutingOn);
+  const [draftPermissionMode, setDraftPermissionMode] = useState(claudePermissionMode);
   // The sub-agent row is stored as a PICK, not a pre-seeded draft:
   // `undefined` means "untouched", so the row mirrors the live stored value for
   // as long as the user hasn't chosen anything. A draft seeded once per open
@@ -6262,6 +6483,7 @@ function SessionConfigModal({
     setDraftModelId(resolvedModelId);
     setDraftEffort(selectedEffort);
     setDraftRoutingOn(liveRoutingOn);
+    setDraftPermissionMode(claudePermissionMode);
     setPickedSubagentRouting(undefined);
     // Nothing pushes a routing-switch change to the client (no SSE event, and
     // the session query never goes stale), so re-read them here — otherwise the
@@ -6276,6 +6498,33 @@ function SessionConfigModal({
   // drafted model, else the "Default" sentinel (no override).
   const modelValue = draftRoutingOn ? MODEL_SELECT_SMART : (draftModelId ?? MODEL_SELECT_DEFAULT);
 
+  // Codex advertises a per-model effort ladder, so the dropdown must follow the
+  // DRAFTED model, not the committed one the parent computed — else picking
+  // Luna still lists Sol's "ultra". "Default" (null) resolves to the catalog
+  // default; non-codex harnesses use a model-independent ladder, so keep the
+  // parent's list.
+  const draftEffortLevels = useMemo(() => {
+    if (modelPickerKind !== "codex") return effortLevels;
+    const modelForEffort =
+      draftModelId ?? codexModelOptions.find((o) => o.isDefault)?.id ?? llmModel;
+    const levels = codexEffortLevelsForModel(codexModelOptions, modelForEffort);
+    return levels.length > 0 ? levels : effortLevels;
+  }, [modelPickerKind, codexModelOptions, draftModelId, llmModel, effortLevels]);
+
+  // Drop a picked level the newly-drafted model doesn't offer (Sol's "ultra"
+  // when switching to Luna) so no stale rung shows and Save never submits a
+  // level the model rejects.
+  const clampDraftEffortToModel = (modelId: string | null) => {
+    if (modelPickerKind !== "codex") return;
+    setDraftEffort((prev) => {
+      if (prev === null) return null;
+      const modelForEffort = modelId ?? codexModelOptions.find((o) => o.isDefault)?.id ?? llmModel;
+      return codexEffortLevelsForModel(codexModelOptions, modelForEffort).includes(prev)
+        ? prev
+        : null;
+    });
+  };
+
   const onModelChange = (value: string) => {
     if (value === MODEL_SELECT_SMART) {
       setDraftRoutingOn(true);
@@ -6286,10 +6535,12 @@ function SessionConfigModal({
     } else if (value === MODEL_SELECT_DEFAULT) {
       setDraftModelId(null);
       setDraftRoutingOn(false);
+      clampDraftEffortToModel(null);
     } else {
       // Pinning a model turns routing off (mutually exclusive).
       setDraftModelId(value);
       setDraftRoutingOn(false);
+      clampDraftEffortToModel(value);
     }
   };
 
@@ -6326,13 +6577,23 @@ function SessionConfigModal({
           // routing off just clears via setModel(null) below.
           const modelChanged = draftModelId !== resolvedModelId;
           const rePinAfterRouting = liveRoutingOn && showModels;
-          if (rePinAfterRouting || modelChanged) await store.setModel(draftModelId);
+          if (rePinAfterRouting || modelChanged)
+            await store.setModel(draftModelId, {
+              // Reported-model sessions confirm through the harness's own
+              // report — mark the ask pending until it (or the not-applied
+              // error) settles.
+              expectConfirmation: modelPickerKind === "claude" || modelPickerKind === "codex",
+            });
           if (costRoutingEligible && liveRoutingOn) await store.setCostControlMode("off");
         }
         // Skip effort while routing is on: the router picks it per turn, and a
         // stray ``/effort`` injection would just be noise.
         if (showEffort && !draftRoutingOn && draftEffort !== selectedEffort)
           await store.setEffort(draftEffort);
+        // Same pane as /model + /effort, so this must stay in the awaited
+        // sequence rather than firing concurrently.
+        if (showClaudePermissionMode && draftPermissionMode !== claudePermissionMode)
+          await store.setClaudePermissionMode(draftPermissionMode);
         // Sub-agent routing is independent of this session's own model — a
         // plain PATCH with no slash-command injection, so ordering is free.
         // Only an explicit pick is written, and only when it still differs from
@@ -6355,7 +6616,7 @@ function SessionConfigModal({
 
   const modelSelectOptions = useMemo(() => {
     const catalog = usesServerModelOptions
-      ? modelOptions.map((m) => ({ id: m.id, label: m.displayName ?? m.id }))
+      ? modelOptions.map((m) => ({ id: m.id, label: nativeModelLabel(m) }))
       : modelOptions.map((m) => ({ id: m.id, label: m.label ?? m.id }));
     // Smart Routing pins the router's fully-qualified pick
     // (``databricks-claude-opus-4-8``), which the harness catalog carries only
@@ -6390,7 +6651,16 @@ function SessionConfigModal({
                 offerSmartRouting={costRoutingEligible}
                 testId="composer-config-model"
                 models={modelSelectOptions}
+                // Claude's and Codex's Default resolves to a model the
+                // spellings don't make obvious, so name it here exactly as
+                // the landing dialog does — one shared labeling.
+                defaultLabel={
+                  modelPickerKind === "codex" || modelPickerKind === "claude"
+                    ? defaultModelLabel(modelOptions)
+                    : undefined
+                }
                 activeModelId={draftModelId}
+                componentId="chat.composer.model"
               />
             </ConfigRow>
           )}
@@ -6403,6 +6673,8 @@ function SessionConfigModal({
                 value={draftRoutingOn ? "" : (draftEffort ?? EFFORT_SELECT_NONE)}
                 onValueChange={(v) => setDraftEffort(v === EFFORT_SELECT_NONE ? null : v)}
                 disabled={draftRoutingOn}
+                componentId="chat.composer.effort"
+                valueHasNoPii
               >
                 <SelectTrigger
                   className="w-full"
@@ -6417,7 +6689,7 @@ function SessionConfigModal({
                   className="w-(--radix-select-trigger-width)"
                 >
                   <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
-                  {effortLevels.map((level) => (
+                  {draftEffortLevels.map((level) => (
                     <SelectItem
                       key={level}
                       value={level}
@@ -6427,6 +6699,40 @@ function SessionConfigModal({
                       className={modelPickerKind === "codex" ? undefined : "capitalize"}
                     >
                       {formatStatusEffortLabel(level, modelPickerKind === "codex") ?? level}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </ConfigRow>
+          )}
+          {/* Hidden when the mode is unknown — Claude only renders its mode
+              footer in some pane states, and a guess would misreport it. */}
+          {showClaudePermissionMode && claudePermissionMode !== "" && (
+            <ConfigRow label="Permissions" description="How much Claude asks before acting">
+              <Select
+                value={draftPermissionMode}
+                onValueChange={setDraftPermissionMode}
+                componentId="chat.composer.permission_mode"
+                valueHasNoPii
+              >
+                <SelectTrigger
+                  className="w-full"
+                  data-testid="composer-config-permission-mode"
+                  aria-label="Permission mode"
+                >
+                  <SelectValue>{claudePermissionModeLabel(draftPermissionMode)}</SelectValue>
+                </SelectTrigger>
+                <SelectContent position="popper" align="start">
+                  {CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES.map((mode) => (
+                    <SelectItem
+                      key={mode.value}
+                      value={mode.value}
+                      data-permission-mode={mode.value}
+                    >
+                      <span className="flex flex-col items-start">
+                        <span>{mode.label}</span>
+                        <span className="text-muted-foreground text-xs">{mode.description}</span>
+                      </span>
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -6446,6 +6752,8 @@ function SessionConfigModal({
               <Select
                 value={subagentRoutingValue}
                 onValueChange={(v) => setPickedSubagentRouting(v === "on" ? "on" : "off")}
+                componentId="chat.composer.subagent_routing"
+                valueHasNoPii
               >
                 <SelectTrigger
                   className="w-full"
@@ -6499,6 +6807,7 @@ function ComposerConfigGear({
   harnessLabel,
   showModels,
   showEffort,
+  showClaudePermissionMode = false,
   effortLevels,
   modelPickerKind,
   codexModelOptions,
@@ -6510,6 +6819,7 @@ function ComposerConfigGear({
   harnessLabel: string | null;
   showModels: boolean;
   showEffort: boolean;
+  showClaudePermissionMode?: boolean;
   effortLevels: readonly string[];
   modelPickerKind: NativeModelPickerKind | null;
   codexModelOptions: readonly NativeModelOption[];
@@ -6538,7 +6848,14 @@ function ComposerConfigGear({
     costRoutingEligible,
   });
 
-  if (!showModels && !showEffort && !costRoutingEligible && !subagentRoutingEligible) return null;
+  if (
+    !showModels &&
+    !showEffort &&
+    !costRoutingEligible &&
+    !subagentRoutingEligible &&
+    !showClaudePermissionMode
+  )
+    return null;
 
   return (
     <>
@@ -6594,6 +6911,7 @@ function ComposerConfigGear({
         harnessLabel={harnessLabel}
         showModels={showModels}
         showEffort={showEffort}
+        showClaudePermissionMode={showClaudePermissionMode}
         effortLevels={effortLevels}
         modelPickerKind={modelPickerKind}
         codexModelOptions={codexModelOptions}
@@ -6607,7 +6925,7 @@ function ComposerConfigGear({
 /**
  * Label/value rows summarizing the session's live run-config, for the gear
  * icon's hover tooltip. Mirrors the new-session summary but with in-session
- * values and no Permissions row (permission mode is launch-time only).
+ * values. The Permissions row lives in the modal itself, not this summary.
  */
 function useSessionConfigSummary({
   harnessLabel,
@@ -6674,7 +6992,6 @@ function useResolvedComposerModel(
   modelPickerKind: NativeModelPickerKind | null,
   codexModelOptions: readonly NativeModelOption[],
 ) {
-  const selectedModel = useChatStore((s) => s.selectedModel);
   const sessionModelOverride = useChatStore((s) => s.sessionModelOverride);
   const llmModel = useChatStore((s) => s.llmModel);
   const nativeVendorOwnsModel = useChatStore((s) => s.nativeVendorOwnsModel);
@@ -6689,74 +7006,58 @@ function useResolvedComposerModel(
     modelPickerKind === "kiro" ||
     modelPickerKind === "pi" ||
     modelPickerKind === "opencode";
-  const modelOptions: readonly { id: string; label?: string; displayName?: string }[] =
-    usesServerModelOptions ? codexModelOptions : [];
+  const modelOptions: readonly {
+    id: string;
+    label?: string;
+    displayName?: string;
+    isDefault?: boolean;
+  }[] = usesServerModelOptions ? codexModelOptions : [];
   const isNativeModelPicker = modelPickerKind !== null;
 
-  // qwen/goose/cursor/pi/opencode native wrappers pick their model inside
-  // the vendor TUI, so the bound `llmModel` is an unused default — don't
-  // surface it as if it were live; claude-/codex-native and SDK agents
-  // resolve to a real model.
-  // cursor-native is a vendor-owns-model wrapper, but unlike qwen/goose/pi/
-  // opencode it mirrors its live TUI model into the session override
-  // (`sessionModelOverride` / `model_override`), kept current both by the
-  // forwarder's terminal→web mirror and by web-side picks. Surface *that* as
-  // the live model — never the cross-session sticky `selectedModel` (a pick
-  // carried over from some other session) nor the meaningless `llmModel`
-  // default. The other vendor-owns wrappers have no Omnigent-visible model and
-  // stay null.
-  // kiro persists the pick as ``model_override`` (applied via ``--model`` at
-  // launch) and, mid-session, the runner types ``/model <id>`` into the live TUI.
-  // There is no terminal→web mirror, so the picker reflects the web-side
-  // ``sessionModelOverride`` (which stays correct since a web pick sets it), like
-  // cursor/opencode surface theirs.
-  // pi mirrors both ways into ``model_override`` (a web pick persists it before
-  // the live ``setModel``; a TUI ``/model`` pick posts external_model_change),
-  // so like cursor/kiro/opencode the live model is the session override, never
-  // the cross-session sticky ``selectedModel``.
-  // The sticky is this session's model only when the session itself advertises
-  // it. `switchTo` clears the session-scoped fields but deliberately keeps
-  // `selectedModel`, so until the incoming snapshot lands the catalog is empty
-  // and the sticky still holds the OUTGOING session's pick — surfacing it paints
-  // e.g. a Codex gpt-5.5 on a Claude session for the whole bind round trip.
-  // Gating on the session's own catalog mirrors the compatibility rule bindStream
-  // applies a moment later, so the label never advertises a model this session
-  // would reject. Post-bind this is a no-op: the store only ever leaves a
-  // catalog-compatible sticky (or the override) in `selectedModel`.
-  const sessionStickyModel =
-    findNativeModelOption(codexModelOptions, selectedModel) !== null ? selectedModel : null;
-  const pickerSelectedModel =
-    modelPickerKind === "cursor" ||
-    modelPickerKind === "kiro" ||
-    modelPickerKind === "opencode" ||
-    modelPickerKind === "pi"
-      ? sessionModelOverride
-      : (sessionModelOverride ?? sessionStickyModel);
-  // SDK/bundle agents (no native picker) never have the cross-session sticky
-  // applied to them, so their live model is the session's own — the applied
-  // override or the bound default — never `selectedModel` (a pick carried over
-  // from an unrelated session, e.g. a gpt-5.5 left from a Codex session showing
-  // on a Claude-SDK agent like Polly). claude-/codex-native keep the sticky —
-  // there it IS the applied model — but only once this session's catalog vouches
-  // for it (see `sessionStickyModel`).
-  const nonNativeModel =
-    modelPickerKind === null
-      ? (sessionModelOverride ?? llmModel)
-      : (sessionModelOverride ?? sessionStickyModel ?? llmModel);
+  // The harness's own report is the display authority for claude-/codex-
+  // native sessions: `llmModel` carries the verbatim reported model (the
+  // launch's own report, or an in-pane switch), and the chip, the gear
+  // highlight, and the hover summary all resolve from it alone. The user's
+  // request (`sessionModelOverride`) and the cross-session sticky
+  // (`selectedModel`) are inputs, never display state — rendering a request
+  // as if it were truth is exactly how a record/pane divergence hides.
+  const isReportedModelPicker = modelPickerKind === "claude" || modelPickerKind === "codex";
+  // The row the reported model maps to: its catalog row when one matches
+  // exactly (by id or wire model), else the raw reported value itself — the
+  // modal appends that as its own honest row rather than relabeling it onto
+  // a same-family row of a different generation.
+  const reportedRowId =
+    isReportedModelPicker && llmModel
+      ? (findNativeModelOption(codexModelOptions, llmModel)?.id ?? llmModel)
+      : null;
+  // Before the harness has reported anything (a routed session whose pane
+  // has not started, a reload of one), the gear seeds from the session's
+  // own REQUEST so the pick the user (or the router) made is what the row
+  // offers to edit — a request is never display truth, but it is the draft.
+  // The moment a report exists it wins, so a request the pane never took
+  // can't masquerade as the active model.
+  const requestedRowId =
+    isReportedModelPicker && sessionModelOverride
+      ? (findNativeModelOption(codexModelOptions, sessionModelOverride)?.id ?? sessionModelOverride)
+      : null;
+  // cursor mirrors its live TUI model into ``model_override``; kiro sets it
+  // on a web pick (which also drives a live ``/model`` switch); opencode/pi
+  // mirror both ways into ``model_override``. Those wrappers keep their
+  // override-derived surface until they adopt reported-model semantics.
+  // SDK/bundle agents (no native picker) resolve the session override or the
+  // bound default — never the cross-session sticky.
+  const pickerSelectedModel = isReportedModelPicker
+    ? (reportedRowId ?? requestedRowId)
+    : sessionModelOverride;
   const effectiveModel = nativeVendorOwnsModel
     ? modelPickerKind === "cursor" || modelPickerKind === "kiro"
-      ? // cursor mirrors its live TUI model into ``model_override``; kiro sets it
-        // on a web pick (which also drives a live ``/model`` switch). Either way
-        // the Omnigent-visible model is ``model_override``.
-        sessionModelOverride
+      ? sessionModelOverride
       : modelPickerKind === "opencode" || modelPickerKind === "pi"
-        ? // opencode/pi mirror their live TUI model into ``model_override``
-          // (set on a web pick, updated by the extension's model_select
-          // handler on a TUI switch); show that, falling back to the
-          // launch-resolved model before any switch.
-          (sessionModelOverride ?? llmModel)
+        ? (sessionModelOverride ?? llmModel)
         : null
-    : nonNativeModel;
+    : isReportedModelPicker
+      ? llmModel
+      : (sessionModelOverride ?? llmModel);
   const modelLabel = formatStatusModelLabel(effectiveModel, codexModelOptions);
   return {
     llmModel,
@@ -6801,8 +7102,20 @@ function ComposerModelEffortLabel({
 }) {
   const selectedEffort = useSessionEffort();
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
+  const pendingModelChange = useChatStore((s) => s.pendingModelChange);
   const { modelLabel } = useResolvedComposerModel(modelPickerKind, codexModelOptions);
   const routingOn = costRoutingEligible && costControlModeOverride === "on";
+  // An asked-but-unconfirmed switch on a reported-model session: the chip
+  // keeps the harness's model; this spinner is the honest "asked, not yet
+  // true" marker until the report (or the not-applied error) settles it.
+  const modelPending =
+    pendingModelChange !== null && (modelPickerKind === "claude" || modelPickerKind === "codex") ? (
+      <Loader2Icon
+        data-testid="composer-model-pending"
+        aria-label="Model change pending"
+        className="ml-1 inline size-3 shrink-0 animate-spin text-muted-foreground"
+      />
+    ) : null;
   // Routing picks the model + effort per turn, so the label reads
   // "Smart Routing" with no pinned model/effort — matching the tooltip.
   if (routingOn) {
@@ -6848,6 +7161,7 @@ function ComposerModelEffortLabel({
       {model && <span className="text-foreground">{model}</span>}
       {model && effortLabel && " "}
       {effortLabel && <span className="text-muted-foreground">{effortLabel}</span>}
+      {modelPending}
     </span>
   );
 }

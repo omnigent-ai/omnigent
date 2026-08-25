@@ -21,17 +21,31 @@ export const SERVER_INFO_OFFLINE_FALLBACK: ServerInfo = {
   branding: null,
 };
 
-export function createBootServerInfo(
-  settled: Promise<ServerInfo>,
-  timeoutMs = 1500,
-): { initial: Promise<ServerInfo>; settled: Promise<ServerInfo> } {
+/**
+ * Race a boot probe against a timeout so first paint never waits on a
+ * stalled server: whichever settles first wins, and `fallback` stands in
+ * when the probe is too slow. The timer is cleared once the probe settles
+ * so a fast boot doesn't leave a pending handle behind (which would hold
+ * the event loop open in tests).
+ */
+export function withBootTimeout<T>(settled: Promise<T>, fallback: T, timeoutMs = 1500): Promise<T> {
   let timeout: ReturnType<typeof setTimeout>;
-  const fallback = new Promise<ServerInfo>((resolve) => {
-    timeout = setTimeout(() => resolve(SERVER_INFO_OFFLINE_FALLBACK), timeoutMs);
+  const timer = new Promise<T>((resolve) => {
+    timeout = setTimeout(() => resolve(fallback), timeoutMs);
   });
   void settled.then(
     () => clearTimeout(timeout),
     () => clearTimeout(timeout),
   );
-  return { initial: Promise.race([settled, fallback]), settled };
+  return Promise.race([settled, timer]);
+}
+
+export function createBootServerInfo(
+  settled: Promise<ServerInfo>,
+  timeoutMs = 1500,
+): { initial: Promise<ServerInfo>; settled: Promise<ServerInfo> } {
+  return {
+    initial: withBootTimeout(settled, SERVER_INFO_OFFLINE_FALLBACK, timeoutMs),
+    settled,
+  };
 }

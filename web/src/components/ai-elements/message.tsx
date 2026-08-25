@@ -22,6 +22,8 @@ import {
 } from "react";
 import { Streamdown, type StreamdownProps } from "streamdown";
 
+import { MarkdownErrorBoundary } from "./MarkdownErrorBoundary";
+
 import {
   CHAT_LINK_SAFETY,
   FILE_LINK_STREAMDOWN_REHYPE_PLUGINS,
@@ -448,24 +450,26 @@ export const MessageResponse = memo(
     const messageControls = useMemo(() => getChatCodeControls(controls), [controls]);
 
     return (
-      <Streamdown
-        // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.
-        className={cn(
-          "size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
-          className,
-        )}
-        plugins={STREAMDOWN_PLUGINS}
-        // Let links open on a plain click (and cmd/ctrl-click in a new tab)
-        // instead of Streamdown's default "Open external link?" modal.
-        linkSafety={CHAT_LINK_SAFETY}
-        {...props}
-        components={messageComponents}
-        controls={messageControls}
-        // Block remote image fetches that can exfiltrate data through URLs.
-        rehypePlugins={
-          markFileLinks ? FILE_LINK_STREAMDOWN_REHYPE_PLUGINS : SECURE_STREAMDOWN_REHYPE_PLUGINS
-        }
-      />
+      <MarkdownErrorBoundary source={props.children}>
+        <Streamdown
+          // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.
+          className={cn(
+            "size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
+            className,
+          )}
+          plugins={STREAMDOWN_PLUGINS}
+          // Let links open on a plain click (and cmd/ctrl-click in a new tab)
+          // instead of Streamdown's default "Open external link?" modal.
+          linkSafety={CHAT_LINK_SAFETY}
+          {...props}
+          components={messageComponents}
+          controls={messageControls}
+          // Block remote image fetches that can exfiltrate data through URLs.
+          rehypePlugins={
+            markFileLinks ? FILE_LINK_STREAMDOWN_REHYPE_PLUGINS : SECURE_STREAMDOWN_REHYPE_PLUGINS
+          }
+        />
+      </MarkdownErrorBoundary>
     );
   },
 );

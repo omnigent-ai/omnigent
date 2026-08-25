@@ -110,10 +110,10 @@ def test_shared_viewer_leaves_session_and_row_disappears(
         page = ctx.new_page()
         page.goto(f"{server.public_url}/c/{sid}")
 
-        # The shared session is visible before leaving, under both the default
-        # filter and the shared one.
+        # The shared session is hidden under the default "My sessions" filter
+        # (it isn't the viewer's own); it shows under the "Shared sessions"
+        # filter, where the viewer leaves it from.
         expect(page.locator(_FILTER)).to_be_visible(timeout=30_000)
-        expect(_row(page, sid)).to_be_visible(timeout=30_000)
         page.locator(_FILTER).click()
         page.locator(_FILTER_SHARED).click()
         expect(_row(page, sid)).to_be_visible(timeout=30_000)

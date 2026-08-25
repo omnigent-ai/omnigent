@@ -39,6 +39,7 @@ from omnigent.runner.resource_registry import (
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalListEntry, TerminalRegistry
+from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient
 from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 
 
@@ -280,6 +281,21 @@ class _CapturingResourceRegistry:
                 instance=instance,
             ),
         )
+
+
+def test_terminal_activity_refreshes_harness_idle_lease(tmp_path: Path) -> None:
+    """Runner terminal activity refreshes the owning harness subprocess."""
+    resource_registry = _CapturingResourceRegistry(tmp_path)
+    process_manager = _FakeProcessManager(_ScriptedHarnessClient([]))
+
+    create_runner_app(
+        process_manager=process_manager,  # type: ignore[arg-type]
+        resource_registry=resource_registry,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    resource_registry._terminal_activity_publisher("conv_native", "terminal:codex:main")
+
+    assert process_manager.activity_noted == ["conv_native"]
 
 
 @pytest.fixture

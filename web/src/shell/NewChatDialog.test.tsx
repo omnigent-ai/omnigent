@@ -982,11 +982,18 @@ describe("NewChatLandingScreen", () => {
     renderLanding();
 
     expect(screen.getByTestId("new-chat-landing-input")).toHaveClass(
+      "block",
       "min-h-[60px]",
       "max-h-[200px]",
+      "overflow-y-auto",
       "px-4",
       "pt-3",
       "pb-2",
+      "[scrollbar-width:none]",
+      "[&::-webkit-scrollbar]:hidden",
+    );
+    expect(screen.getByTestId("new-chat-landing-input").parentElement).toHaveClass(
+      "overflow-hidden",
     );
     expect(screen.getByTestId("new-chat-landing-actions")).toHaveClass("px-2", "pb-2");
     const footer = screen.getByTestId("new-chat-landing-footer");
@@ -1518,9 +1525,9 @@ describe("NewChatLandingScreen", () => {
 
     openAgentConfig("a2");
     openSelect("new-chat-landing-config-model");
-    expect(screen.getAllByText("Default (databricks-gpt-5-5)").length).toBeGreaterThan(0);
-    expect(screen.getByText("databricks-gpt-5-6")).toBeTruthy();
-    fireEvent.click(screen.getByText("databricks-gpt-5-6"));
+    expect(screen.getAllByText("Default (GPT-5.5)").length).toBeGreaterThan(0);
+    expect(screen.getByText("GPT-5.6")).toBeTruthy();
+    fireEvent.click(screen.getByText("GPT-5.6"));
     saveConfig();
 
     // The Codex model is remembered under codex-native only; Claude Code's
@@ -1528,14 +1535,12 @@ describe("NewChatLandingScreen", () => {
     openAgentConfig("a1");
     expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain("Default");
     expect(screen.getByTestId("new-chat-landing-config-model").textContent).not.toContain(
-      "databricks-gpt-5-6",
+      "GPT-5.6",
     );
     saveConfig();
 
     openAgentConfig("a2");
-    expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain(
-      "databricks-gpt-5-6",
-    );
+    expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain("GPT-5.6");
     saveConfig();
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
       target: { value: "run the build" },
@@ -2749,6 +2754,17 @@ describe("NewChatLandingScreen skill pills", () => {
     expect(screen.getByTestId("skill-pill-compare").textContent).toBe("/compare");
   });
 
+  it("lets the textarea and skill prompt inherit the app font family", () => {
+    mockAgents([debbyAgent()]);
+    renderLanding();
+
+    const localFontFamily = /(^|\s)font-(sans|serif|mono|\[)/;
+    for (const element of [input(), screen.getByText("Describe a task, or try a skill")]) {
+      expect(element.className).not.toMatch(localFontFamily);
+      expect(element.style.fontFamily).toBe("");
+    }
+  });
+
   it("hides pills for agents outside the allowlist even when they carry skills", () => {
     // Same skills, non-allowlisted name: no pill row. Fails if the gate
     // ever degrades to "any agent with skills", which would spam the
@@ -3212,9 +3228,10 @@ describe("NewChatLandingScreen agent picker + config gear", () => {
     fireEvent.click(screen.getByTestId("new-chat-landing-config-cancel"));
     expect(screen.queryByTestId("new-chat-landing-config-modal")).toBeNull();
     fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
-    // Reopened: Plan was discarded, the permission select is back at Default.
+    // Reopened: Plan was discarded, the permission select is back at Manual
+    // (Claude's label for the prompting `default` mode).
     expect(screen.getByTestId("new-chat-landing-config-permission").textContent).toContain(
-      "Default",
+      "Manual",
     );
   });
 
@@ -3474,7 +3491,7 @@ describe("NewChatLandingScreen smart routing", () => {
   it.each([
     ["Claude Code", "a1", true, "Smart Routing", "Opus 4.8"],
     ["Claude Code", "a1", false, null, "Default"],
-    ["Codex", "a2", true, "Smart Routing", "Default (databricks-gpt-5-5)"],
+    ["Codex", "a2", true, "Smart Routing", "Default (GPT-5.5)"],
   ] as const)(
     "%s Model dropdown with the flag %s offers %s alongside %s",
     (_label, agentId, flag, routingOption, siblingOption) => {
@@ -3541,7 +3558,7 @@ describe("NewChatLandingScreen smart routing", () => {
         expect(screen.queryByRole("option", { name: "Smart Routing" })).toBeNull();
         expect(
           screen.getByRole("option", {
-            name: agentId === "a2" ? "databricks-gpt-5-6" : "Opus 4.8",
+            name: agentId === "a2" ? "GPT-5.6" : "Opus 4.8",
           }),
         ).toBeTruthy();
       }
@@ -4271,7 +4288,7 @@ describe("NewChatLandingScreen Smart Routing harness row", () => {
     selectAgent("a1");
     fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
     expect(screen.getByTestId("new-chat-landing-config-permission").textContent).toContain(
-      "Default",
+      "Manual",
     );
   });
 

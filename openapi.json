@@ -223,6 +223,73 @@
         "title": "AutomaticSessionRenameResponse",
         "type": "object"
       },
+      "BackgroundTaskInfo": {
+        "description": "One still-running background shell from the claude-native `Stop` hook.\n\nClaude Code leaves finished shells in the hook's `background_tasks`\narray, so the list surfaced here is filtered to the non-terminal ones \u2014\nits length matches the `background_task_count` tally. Every field is\nbest-effort: the hook shape is external, so an entry missing one field\nstill yields a usable row (e.g. a `description` with no `command`).",
+        "properties": {
+          "command": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Command the shell is running, e.g. `\"sleep 120\"`.",
+            "title": "Command"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Human-readable label, e.g. `\"Wait for CI\"`.",
+            "title": "Description"
+          },
+          "id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Opaque per-shell identifier, e.g. `\"abc123\"`.",
+            "title": "Id"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Per-task status, e.g. `\"running\"`.",
+            "title": "Status"
+          },
+          "type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Task kind, e.g. `\"shell\"`.",
+            "title": "Type"
+          }
+        },
+        "title": "BackgroundTaskInfo",
+        "type": "object"
+      },
       "Body_update_session_agent_v1_sessions__session_id__agent_put": {
         "properties": {
           "bundle": {
@@ -1736,11 +1803,19 @@
         "type": "object"
       },
       "FailedEvent": {
-        "description": "Terminal event for a turn that ended with an error.\n\nCarries the final\n`omnigent.server.schemas.ResponseObject` whose\n`error` field describes the failure.",
+        "description": "Terminal event for a turn that ended with an error.\n\nCarries a `omnigent.server.schemas.FailedResponseObject`\nwhose `error` field describes the failure. Response metadata may\nbe absent when the failure occurs before response allocation.",
         "properties": {
           "response": {
-            "$ref": "#/components/schemas/ResponseObject",
-            "description": "The final response object with `status=\"failed\"` and `error` populated."
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ResponseObject"
+              },
+              {
+                "$ref": "#/components/schemas/FailedResponseObject"
+              }
+            ],
+            "description": "The failure response object with `status=\"failed\"` and `error` populated.",
+            "title": "Response"
           },
           "sequence_number": {
             "anyOf": [
@@ -1766,6 +1841,190 @@
           "response"
         ],
         "title": "FailedEvent",
+        "type": "object"
+      },
+      "FailedResponseObject": {
+        "description": "Response payload for failures raised before response allocation.\n\nTransport and setup failures can terminate a turn before the harness has\nassigned the metadata required by `ResponseObject`. The remaining\nfields mirror that model so fully allocated failures retain their complete\nwire representation.",
+        "properties": {
+          "background": {
+            "default": false,
+            "description": "Whether the response was created as a background task.",
+            "title": "Background",
+            "type": "boolean"
+          },
+          "completed_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Unix epoch timestamp of completion, or `None`.",
+            "title": "Completed At"
+          },
+          "conversation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ConversationRef"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Reference to the owning conversation, or `None`."
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Unix epoch timestamp of creation, or `None` when the response failed before creation.",
+            "title": "Created At"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ErrorDetail"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Error details describing the failure, or `None`."
+          },
+          "id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Unique response identifier, e.g. `\"resp_abc123\"`, or `None` when allocation did not complete.",
+            "title": "Id"
+          },
+          "incomplete_details": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/IncompleteDetails"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Incomplete-response details, or `None`."
+          },
+          "instructions": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Per-request instructions override, or `None`.",
+            "title": "Instructions"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Agent name that produced the response, e.g. `\"research-agent\"`, or `None` when resolution did not complete.",
+            "title": "Model"
+          },
+          "object": {
+            "default": "response",
+            "description": "Fixed resource type, always `\"response\"`.",
+            "title": "Object",
+            "type": "string"
+          },
+          "output": {
+            "description": "Heterogeneous serialized output items accumulated before failure.",
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Output",
+            "type": "array"
+          },
+          "previous_response_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "ID of the prior response, or `None`.",
+            "title": "Previous Response Id"
+          },
+          "reasoning": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Reasoning configuration, or `None`.",
+            "title": "Reasoning"
+          },
+          "status": {
+            "description": "Lifecycle status, normally `\"failed\"`.",
+            "title": "Status",
+            "type": "string"
+          },
+          "store": {
+            "default": true,
+            "description": "Whether the response is persisted.",
+            "title": "Store",
+            "type": "boolean"
+          },
+          "usage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Usage"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Token usage statistics, or `None` when unavailable."
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "FailedResponseObject",
         "type": "object"
       },
       "FunctionCallData": {
@@ -3695,6 +3954,7 @@
             "session.mcp_startup": "#/components/schemas/SessionMcpStartupEvent",
             "session.model": "#/components/schemas/SessionModelEvent",
             "session.model_options": "#/components/schemas/SessionModelOptionsEvent",
+            "session.permission_mode": "#/components/schemas/SessionPermissionModeEvent",
             "session.presence": "#/components/schemas/SessionPresenceEvent",
             "session.reasoning_effort": "#/components/schemas/SessionReasoningEffortEvent",
             "session.resource.created": "#/components/schemas/SessionResourceCreatedEvent",
@@ -3705,6 +3965,7 @@
             "session.superseded": "#/components/schemas/SessionSupersededEvent",
             "session.terminal.activity": "#/components/schemas/SessionTerminalActivityEvent",
             "session.terminal_pending": "#/components/schemas/SessionTerminalPendingEvent",
+            "session.title": "#/components/schemas/SessionTitleEvent",
             "session.todos": "#/components/schemas/SessionTodosEvent",
             "session.usage": "#/components/schemas/SessionUsageEvent",
             "turn.cancelled": "#/components/schemas/TurnCancelledEvent",
@@ -3725,10 +3986,16 @@
             "$ref": "#/components/schemas/SessionModelEvent"
           },
           {
+            "$ref": "#/components/schemas/SessionTitleEvent"
+          },
+          {
             "$ref": "#/components/schemas/SessionReasoningEffortEvent"
           },
           {
             "$ref": "#/components/schemas/SessionCollaborationModeEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionPermissionModeEvent"
           },
           {
             "$ref": "#/components/schemas/SessionAgentChangedEvent"
@@ -4771,7 +5038,7 @@
         "type": "object"
       },
       "SessionModelEvent": {
-        "description": "Active-model update from a terminal-backed integration.\n\nEmitted after an `external_model_change` POST from the\n`omnigent claude` transcript forwarder when the model is\nswitched inside the Claude Code terminal (a `/model` command or\nthe in-TUI picker). Lets the web model picker reflect a TUI-side\nswitch without a reload.",
+        "description": "Active-model report from a terminal-backed integration.\n\nEmitted after an `external_model_change` POST from a native\nforwarder \u2014 the launch's own model report, or a switch made inside\nthe pane (a `/model` command or the in-TUI picker). Every surface\nre-renders its model display from this.",
         "properties": {
           "conversation_id": {
             "description": "Session identifier, e.g. `\"conv_abc123\"`.",
@@ -4779,7 +5046,7 @@
             "type": "string"
           },
           "model": {
-            "description": "Tier alias the session is now on, e.g. `\"opus\"` \u2014 Claude Code's version-agnostic alias, matching the picker's vocabulary (not a pinned `\"claude-opus-4-8\"` id). Category: **transient** (SSE-only). The server also writes `model_override` on the conversation, so on reconnect clients restore the selection from the snapshot's `model_override` rather than from a replayed event.",
+            "description": "The model the harness reports the session is on, VERBATIM in the harness's own spelling, e.g. `\"claude-opus-4-8[1m]\"` or `\"gpt-5.6-luna\"` \u2014 never collapsed to a picker alias. Category: **transient** (SSE-only). The server also writes `reported_model` on the conversation (served on the snapshot's `llm_model`), so on reconnect clients restore the display from the snapshot rather than from a replayed event.",
             "title": "Model",
             "type": "string"
           },
@@ -4844,6 +5111,46 @@
         "title": "SessionModelOptionsEvent",
         "type": "object"
       },
+      "SessionPermissionModeEvent": {
+        "description": "Active permission-mode update from a claude-native session.\n\nEmitted after the web UI switches the mode, and after the Claude forwarder\nobserves a different mode in the pane footer \u2014 a shift+tab pressed inside\nthe TUI, which Omnigent has no other way to see. Lets the composer's mode\npicker track the pane without a reload.",
+        "properties": {
+          "conversation_id": {
+            "description": "Session identifier, e.g. `\"conv_abc123\"`.",
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "permission_mode": {
+            "description": "The active mode, e.g. `\"auto\"` or `\"plan\"`. Category: **transient** (SSE-only). The server also writes `omnigent.claude_native.permission_mode` on the conversation labels, so reconnecting clients restore the same state from the session snapshot.",
+            "title": "Permission Mode",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.permission_mode",
+            "description": "Always `\"session.permission_mode\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id",
+          "permission_mode"
+        ],
+        "title": "SessionPermissionModeEvent",
+        "type": "object"
+      },
       "SessionPresenceEvent": {
         "description": "The session's viewer list changed \u2014 full state, not a delta.\n\nEmitted on `GET /v1/sessions/{id}/stream` whenever a user\njoins, leaves (after the server-side grace window absorbs\nreconnect churn), or flips their idle aggregate, and once to\neach newly-connected stream as a snapshot-on-connect. Every\nevent carries the COMPLETE viewer list so clients replace their\nstate wholesale \u2014 missed events self-heal on the next event or\nreconnect. Viewers are scoped to the session *tree* (the root\nconversation and every sub-agent conversation under it), so a\nuser on a sub-agent page and a user on the root page appear in\neach other's lists. See `omnigent/server/presence.py` and\n`designs/UI/PRESENCE.md`.",
         "properties": {
@@ -4890,6 +5197,18 @@
       "SessionProjectSummary": {
         "description": "One entry of `GET /v1/sessions/projects` \u2014 a sidebar project folder.\n\nDual-read union of first-class projects and legacy `omni_project`\nlabel-projects, keyed by name.",
         "properties": {
+          "icon": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The project's chosen emoji icon (a unicode grapheme), read from its `config`; `None` when unset or for a label-only folder, so the sidebar falls back to the default folder glyph.",
+            "title": "Icon"
+          },
           "id": {
             "anyOf": [
               {
@@ -5203,6 +5522,21 @@
             "description": "Background shells (claude-native) still running as of the last status edge, so a reload re-shows \"N shells still running\" even though the session has settled to `\"idle\"`. `None` (the default / omitted) when no shells are tracked.",
             "title": "Background Task Count"
           },
+          "background_tasks": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/BackgroundTaskInfo"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Per-shell detail for the running tally above, so a reload can restore each shell's description/command. `None` when none are tracked (or when an older runner reported only the count).",
+            "title": "Background Tasks"
+          },
           "context_window": {
             "anyOf": [
               {
@@ -5360,7 +5694,7 @@
                 "type": "null"
               }
             ],
-            "description": "The LLM model identifier from the bound agent's spec, e.g. `\"anthropic/claude-sonnet-4-6\"`. `None` when the agent has no explicit `llm:` block or the agent cannot be looked up.",
+            "description": "The model this session is actually on. When the harness has reported one (`reported_model`, written by `external_model_change`), that verbatim value serves here and is the only model value clients display; otherwise the bound agent spec's model, e.g. `\"anthropic/claude-sonnet-4-6\"`. `None` when neither exists.",
             "title": "Llm Model"
           },
           "mcp_startup": {
@@ -5763,7 +6097,24 @@
               }
             ],
             "default": null,
+            "description": "Background shells still running at this edge (claude-native `Stop` hook). `None` when the edge carries no information (leave the sticky tally untouched); `0` clears it.",
             "title": "Background Task Count"
+          },
+          "background_tasks": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/BackgroundTaskInfo"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Per-shell detail backing that tally, so the UI can name each running shell. `None` when the edge reports no detail (an older runner may send only the count).",
+            "title": "Background Tasks"
           },
           "blocked_on": {
             "anyOf": [
@@ -5988,6 +6339,46 @@
           "pending"
         ],
         "title": "SessionTerminalPendingEvent",
+        "type": "object"
+      },
+      "SessionTitleEvent": {
+        "description": "Session-title update from a terminal-backed integration.\n\nEmitted after an `external_session_title` POST from the\n`omnigent claude` transcript forwarder when the operator renames\nthe session inside the Claude Code pane (`/rename`). Lets the web\nsession list show the new name without a reload.",
+        "properties": {
+          "conversation_id": {
+            "description": "Session identifier, e.g. `\"conv_abc123\"`.",
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "title": {
+            "description": "Title the session is now on, e.g. `\"auth-refactor\"`. Category: **transient** (SSE-only). The server also writes `title` on the conversation, so on reconnect clients restore the name from the session snapshot rather than from a replayed event.",
+            "title": "Title",
+            "type": "string"
+          },
+          "type": {
+            "const": "session.title",
+            "description": "Always `\"session.title\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id",
+          "title"
+        ],
+        "title": "SessionTitleEvent",
         "type": "object"
       },
       "SessionTodosEvent": {
@@ -6948,6 +7339,18 @@
             ],
             "description": "Per-session LLM model override, e.g. `\"claude-opus-4-7\"`. The value is forwarded as-is to the executor at turn start; the server does not enumerate valid models. Clear aliases such as `\"default\"`, `\"off\"`, or `\"reset\"` remove the override (matching the REPL's `/model` semantics). `None` leaves unchanged.",
             "title": "Model Override"
+          },
+          "permission_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Claude-native permission mode to switch a running session to, e.g. `\"auto\"`. Only the modes Claude Code's shift+tab cycle can reach are accepted (`default`, `acceptEdits`, `plan`, `auto`) \u2014 `dontAsk` and `bypassPermissions` are launch-only. Only valid for sessions stamped with the claude-native wrapper label. Unlike the other fields here the switch is applied by the live TUI, so a failure to reach the mode is surfaced as an error rather than persisted. Omitted leaves unchanged.",
+            "title": "Permission Mode"
           },
           "project_id": {
             "anyOf": [
@@ -8151,10 +8554,7 @@
               "application/json": {
                 "schema": {
                   "additionalProperties": {
-                    "items": {
-                      "additionalProperties": true,
-                      "type": "object"
-                    },
+                    "items": {},
                     "type": "array"
                   },
                   "title": "Response Get Host Model Options V1 Hosts  Host Id  Harnesses  Harness  Model Options Get",

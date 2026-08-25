@@ -8,6 +8,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
+import { clearSessionDrafts, hasSessionDraft } from "@/lib/sessionDrafts";
 
 // Composer reads workspace files via a TanStack query hook (for "@"-file
 // mentions). These slash-command tests don't exercise that, so stub the hook
@@ -112,6 +113,28 @@ function renderWithTooltips(ui: ReactElement) {
   return render(<TooltipProvider>{ui}</TooltipProvider>);
 }
 
+describe("Composer session drafts", () => {
+  beforeEach(() => {
+    clearSessionDrafts();
+    useChatStore.setState({ conversationId: "conv_draft" });
+  });
+
+  afterEach(() => {
+    cleanup();
+    clearSessionDrafts();
+  });
+
+  it("publishes unfinished text for the sidebar and clears it after send", async () => {
+    render(<Composer {...composerProps()} />);
+
+    fireEvent.change(textarea(), { target: { value: "unfinished message" } });
+    await waitFor(() => expect(hasSessionDraft("conv_draft")).toBe(true));
+
+    fireEvent.submit(textarea().closest("form")!);
+    await waitFor(() => expect(hasSessionDraft("conv_draft")).toBe(false));
+  });
+});
+
 describe("Composer growth layout", () => {
   afterEach(() => {
     cleanup();
@@ -145,6 +168,18 @@ describe("Composer growth layout", () => {
 
     expect(ta.style.height).toBe("200px");
     expect(form?.style.marginTop).toBe("");
+  });
+
+  it("keeps long drafts scrollable without showing a native scrollbar", () => {
+    render(<Composer {...composerProps()} />);
+
+    const ta = textarea();
+    expect(ta).toHaveClass(
+      "overflow-y-auto",
+      "[scrollbar-width:none]",
+      "[&::-webkit-scrollbar]:hidden",
+    );
+    expect(ta.parentElement).toHaveClass("overflow-hidden");
   });
 });
 
@@ -347,7 +382,7 @@ describe("Composer slash-command submit routing", () => {
   afterEach(() => {
     cleanup();
     vi.restoreAllMocks();
-    useChatStore.setState({ setModel: realSetModel });
+    useChatStore.setState({ setModel: realSetModel, sessionHarness: null });
   });
 
   it("routes a known skill through onSendSlashCommand with parsed args", () => {
@@ -464,7 +499,9 @@ describe("Composer slash-command submit routing", () => {
     fireEvent.change(ta, { target: { value: "/model databricks-gpt-5-4" } });
     fireEvent.keyDown(ta, { key: "Enter" });
 
-    expect(setModel).toHaveBeenCalledWith("databricks-gpt-5-4");
+    expect(setModel).toHaveBeenCalledWith("databricks-gpt-5-4", {
+      expectConfirmation: false,
+    });
     expect(onSend).not.toHaveBeenCalled();
   });
 
@@ -479,7 +516,7 @@ describe("Composer slash-command submit routing", () => {
     fireEvent.change(ta, { target: { value: "/model default" } });
     fireEvent.keyDown(ta, { key: "Enter" });
 
-    expect(setModel).toHaveBeenCalledWith(null);
+    expect(setModel).toHaveBeenCalledWith(null, { expectConfirmation: false });
   });
 
   it("treats /model as plaintext on native-wrapper sessions without a model picker", () => {
@@ -608,7 +645,9 @@ describe("Composer slash-command submit routing", () => {
     fireEvent.change(ta, { target: { value: "/model openrouter/llama-3.3-70b" } });
     fireEvent.keyDown(ta, { key: "Enter" });
 
-    expect(setModel).toHaveBeenCalledWith("openrouter/llama-3.3-70b");
+    expect(setModel).toHaveBeenCalledWith("openrouter/llama-3.3-70b", {
+      expectConfirmation: false,
+    });
     expect(onSend).not.toHaveBeenCalled();
   });
 
@@ -619,7 +658,7 @@ describe("Composer slash-command submit routing", () => {
     // instead: setModel persists the override and the runner injects
     // "/model <name>" into the pane with auto-confirm.
     const setModel = vi.fn().mockResolvedValue(undefined);
-    useChatStore.setState({ setModel });
+    useChatStore.setState({ setModel, sessionHarness: "claude-native" });
     const onSend = vi.fn();
     render(
       <Composer
@@ -637,7 +676,9 @@ describe("Composer slash-command submit routing", () => {
     fireEvent.change(ta, { target: { value: "/model fable" } });
     fireEvent.keyDown(ta, { key: "Enter" });
 
-    expect(setModel).toHaveBeenCalledWith("fable");
+    // Reported-model session: the ask is marked pending until the
+    // harness's own report (or the not-applied error) settles it.
+    expect(setModel).toHaveBeenCalledWith("fable", { expectConfirmation: true });
     expect(onSend).not.toHaveBeenCalled();
     // The config modal only opens for the bare command, not the argument form.
     expect(screen.queryByTestId("composer-config-modal")).toBeNull();
@@ -648,7 +689,7 @@ describe("Composer slash-command submit routing", () => {
     // `thread/settings/update`, so it follows the same picker-backed route
     // as claude-native instead of sending plaintext into the terminal.
     const setModel = vi.fn().mockResolvedValue(undefined);
-    useChatStore.setState({ setModel });
+    useChatStore.setState({ setModel, sessionHarness: "codex-native" });
     const onSend = vi.fn();
     render(
       <Composer
@@ -665,7 +706,7 @@ describe("Composer slash-command submit routing", () => {
     fireEvent.change(ta, { target: { value: "/model gpt-5.4" } });
     fireEvent.keyDown(ta, { key: "Enter" });
 
-    expect(setModel).toHaveBeenCalledWith("gpt-5.4");
+    expect(setModel).toHaveBeenCalledWith("gpt-5.4", { expectConfirmation: true });
     expect(onSend).not.toHaveBeenCalled();
   });
 });
@@ -697,7 +738,9 @@ describe("Composer model/effort label", () => {
   const label = () => screen.getByTestId("composer-model-effort-label");
 
   it("shows the model in the foreground and effort muted", () => {
-    useChatStore.setState({ selectedModel: "opus", selectedEffort: "high" });
+    // The chip renders the harness's reported model (`llmModel`), never the
+    // sticky preference or the request.
+    useChatStore.setState({ llmModel: "opus", selectedEffort: "high" });
     renderWithTooltips(
       <Composer
         {...composerProps({
@@ -742,7 +785,7 @@ describe("Composer model/effort label", () => {
     expect(label()).not.toHaveTextContent("High");
   });
 
-  it("prefers a claude session override over the cross-session sticky model", () => {
+  it("renders the reported model, never the request or the sticky", () => {
     useChatStore.setState({
       selectedModel: "opus",
       sessionModelOverride: "sonnet",
@@ -761,9 +804,12 @@ describe("Composer model/effort label", () => {
         })}
       />,
     );
-    // The applied session override ("sonnet") wins over the cross-session sticky ("opus").
-    expect(label()).toHaveTextContent("Sonnet 4.6");
+    // The harness's report ("haiku") is the display authority: neither the
+    // pending request ("sonnet") nor the cross-session sticky ("opus") may
+    // render as if it were the session's model.
+    expect(label()).toHaveTextContent("Haiku");
     expect(label()).not.toHaveTextContent("Opus");
+    expect(label()).not.toHaveTextContent("Sonnet");
   });
 
   const CLAUDE_LIVE_OPTIONS = [
@@ -1133,6 +1179,58 @@ describe("Composer Codex Plan-mode control", () => {
   it("hides the control when the session is not Codex-native", () => {
     render(<Composer {...composerProps({ showCodexPlanMode: false })} />);
     expect(screen.queryByTestId("codex-plan-mode-toggle")).toBeNull();
+  });
+});
+
+describe("Composer claude-native permission mode", () => {
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+    useChatStore.setState({ claudePermissionMode: "" });
+  });
+
+  it("shows the Permissions row inside the gear modal", async () => {
+    useChatStore.setState({ conversationId: "conv_test", claudePermissionMode: "auto" });
+
+    renderWithTooltips(<Composer {...composerProps({ showClaudePermissionMode: true })} />);
+    fireEvent.click(screen.getByTestId("composer-config-gear"));
+
+    expect(await screen.findByTestId("composer-config-modal")).toBeTruthy();
+    const row = screen.getByTestId("composer-config-permission-mode");
+    // Trigger shows the label only — the description belongs to the open list.
+    expect(row).toHaveTextContent("Auto");
+    expect(row).not.toHaveTextContent("classifier");
+  });
+
+  it("omits the Permissions row when the mode could not be determined", async () => {
+    // Claude only renders its mode footer in some pane states (a todo list
+    // displaces it), so an unknown mode must not be shown as a guess.
+    useChatStore.setState({ conversationId: "conv_test", claudePermissionMode: "" });
+
+    renderWithTooltips(<Composer {...composerProps({ showClaudePermissionMode: true })} />);
+    fireEvent.click(screen.getByTestId("composer-config-gear"));
+
+    expect(await screen.findByTestId("composer-config-modal")).toBeTruthy();
+    expect(screen.queryByTestId("composer-config-permission-mode")).toBeNull();
+  });
+
+  it("keeps the gear reachable when the mode is the only config row", () => {
+    // A Claude session with no model/effort/routing knobs must still open the
+    // gear, since the permission mode lives behind it.
+    useChatStore.setState({ conversationId: "conv_test", claudePermissionMode: "auto" });
+
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showClaudePermissionMode: true,
+          showModels: false,
+          showEffort: false,
+          costRoutingEligible: false,
+        })}
+      />,
+    );
+
+    expect(screen.getByTestId("composer-config-gear")).toBeInTheDocument();
   });
 });
 
@@ -1645,12 +1743,18 @@ describe("Composer — queued-message flush gating", () => {
     });
 
     // Idle + a waiting head, but unreachable → the effect must not flush.
-    const { rerender } = render(<Composer {...composerProps({ unreachable: true })} />);
+    // Wrapped in TooltipProvider since the queued-message strip renders the
+    // steer button's tooltip.
+    const { rerender } = renderWithTooltips(<Composer {...composerProps({ unreachable: true })} />);
     await waitFor(() => expect(sendSpy).not.toHaveBeenCalled());
     expect(useChatStore.getState().queuedMessages).toHaveLength(1);
 
     // Becomes reachable → the effect re-fires and drains the head.
-    rerender(<Composer {...composerProps({ unreachable: false })} />);
+    rerender(
+      <TooltipProvider>
+        <Composer {...composerProps({ unreachable: false })} />
+      </TooltipProvider>,
+    );
     await waitFor(() => expect(sendSpy).toHaveBeenCalledTimes(1));
     expect(sendSpy.mock.calls[0]!.slice(0, 2)).toEqual(["held", "agent_xyz"]);
     expect(useChatStore.getState().queuedMessages).toHaveLength(0);
@@ -1834,6 +1938,61 @@ describe("Composer config gear", () => {
     expect(screen.getByTestId("composer-config-model")).toHaveTextContent("Default");
   });
 
+  it("names the model Codex's Default resolves to, like the new-session gear", async () => {
+    const options = [
+      { id: "gpt-5.6-sol", displayName: "GPT-5.6-Sol" },
+      { id: "gpt-5.6-luna", displayName: "GPT-5.6-Luna", isDefault: true },
+    ];
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showEffort: false,
+          showModels: true,
+          modelPickerKind: "codex",
+          codexModelOptions: options,
+        })}
+      />,
+    );
+
+    fireEvent.click(gear()!);
+    await screen.findByTestId("composer-config-modal");
+    fireEvent.click(screen.getByTestId("composer-config-model"));
+    // A bare "Default" was the bug: this gear and the new-session gear named
+    // the same unpinned session's model differently, so neither told the user
+    // which model Codex would actually run.
+    expect(screen.getByRole("option", { name: "Default (GPT-5.6-Luna)" })).toBeTruthy();
+  });
+
+  it("names the model Claude's Default resolves to, like Codex", async () => {
+    // The claude branch used to discard the catalog's isDefault marker, so
+    // its gear read a bare "Default" while codex named the model — the same
+    // shared labeling now serves both harnesses.
+    const options = [
+      { id: "sonnet", model: "claude-sonnet-5", displayName: "Sonnet 5" },
+      {
+        id: "opus[1m]",
+        model: "claude-opus-4-8[1m]",
+        displayName: "Opus 4.8 (1M context)",
+        isDefault: true,
+      },
+    ];
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showEffort: false,
+          showModels: true,
+          modelPickerKind: "claude",
+          codexModelOptions: options,
+        })}
+      />,
+    );
+
+    fireEvent.click(gear()!);
+    await screen.findByTestId("composer-config-modal");
+    fireEvent.click(screen.getByTestId("composer-config-model"));
+    expect(screen.getByRole("option", { name: "Default (Opus 4.8 (1M context))" })).toBeTruthy();
+  });
+
   it("does not open the modal via bare /model when the gear is disabled (unreachable)", async () => {
     // Bare /model bumps the open nonce; on an unreachable session the gear is
     // inert, so the nonce must NOT open a modal that can't apply a change.
@@ -1944,11 +2103,83 @@ describe("Composer config gear", () => {
 
     fireEvent.click(screen.getByTestId("composer-config-save"));
     // Model fires first and effort waits for its promise to resolve.
-    await waitFor(() => expect(setModel).toHaveBeenCalledWith("sonnet"));
+    await waitFor(() =>
+      expect(setModel).toHaveBeenCalledWith("sonnet", { expectConfirmation: true }),
+    );
     expect(setEffort).not.toHaveBeenCalled();
     resolveModel();
     await waitFor(() => expect(setEffort).toHaveBeenCalledWith("low"));
     expect(calls).toEqual(["model", "effort"]);
+  });
+
+  it("recomputes the Codex effort ladder for the drafted model and drops an unsupported level", async () => {
+    // Codex advertises a per-model effort ladder. Drafting a lower-ceiling
+    // model (Luna, no "ultra") must refresh the dropdown to that model's levels
+    // and drop a picked level it can't run — else Save would send Sol's "ultra"
+    // to Luna, and the dropdown would show a rung Luna rejects.
+    const codexOptions = [
+      {
+        id: "gpt-5.6-sol",
+        model: "gpt-5.6-sol",
+        displayName: "GPT-5.6-Sol",
+        isDefault: true,
+        supportedReasoningEfforts: [
+          { reasoningEffort: "low" },
+          { reasoningEffort: "medium" },
+          { reasoningEffort: "high" },
+          { reasoningEffort: "xhigh" },
+          { reasoningEffort: "max" },
+          { reasoningEffort: "ultra" },
+        ],
+      },
+      {
+        id: "gpt-5.6-luna",
+        model: "gpt-5.6-luna",
+        displayName: "GPT-5.6-Luna",
+        supportedReasoningEfforts: [
+          { reasoningEffort: "low" },
+          { reasoningEffort: "medium" },
+          { reasoningEffort: "high" },
+          { reasoningEffort: "xhigh" },
+          { reasoningEffort: "max" },
+        ],
+      },
+    ] as never;
+    useChatStore.setState({
+      setModel: vi.fn().mockResolvedValue(undefined),
+      setEffort: vi.fn().mockResolvedValue(undefined),
+      selectedEffort: "ultra",
+      llmModel: "gpt-5.6-sol",
+      codexModelOptions: codexOptions,
+      refreshSessionOverrides: vi.fn().mockResolvedValue(undefined),
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showModels: true,
+          showEffort: true,
+          modelPickerKind: "codex",
+          effortLevels: ["low", "medium", "high", "xhigh", "max", "ultra"],
+          codexModelOptions: codexOptions,
+        })}
+      />,
+    );
+    fireEvent.click(gear()!);
+    await screen.findByTestId("composer-config-modal");
+
+    // Sol starts on ultra.
+    expect(screen.getByTestId("composer-config-effort")).toHaveTextContent("ultra");
+
+    // Draft a switch to Luna, whose ceiling is "max".
+    fireEvent.click(document.querySelector('[data-testid="composer-config-model"]') as Element);
+    fireEvent.click(document.querySelector('[data-model-id="gpt-5.6-luna"]') as Element);
+
+    // The picked ultra is dropped (back to Default) and no longer offered,
+    // while Luna's own max stays.
+    expect(screen.getByTestId("composer-config-effort")).toHaveTextContent("Default");
+    fireEvent.click(document.querySelector('[data-testid="composer-config-effort"]') as Element);
+    expect(document.querySelector('[data-effort-level="ultra"]')).toBeNull();
+    expect(document.querySelector('[data-effort-level="max"]')).not.toBeNull();
   });
 
   it("skips unchanged knobs on Save (no spurious slash-command injection)", async () => {
@@ -2007,7 +2238,9 @@ describe("Composer config gear", () => {
     fireEvent.click(document.querySelector('[data-model-id="opus"]') as Element);
     fireEvent.click(screen.getByTestId("composer-config-save"));
     // The pin must be re-applied AND routing cleared.
-    await waitFor(() => expect(setModel).toHaveBeenCalledWith("opus"));
+    await waitFor(() =>
+      expect(setModel).toHaveBeenCalledWith("opus", { expectConfirmation: true }),
+    );
     expect(setCostControlMode).toHaveBeenCalledWith("off");
   });
 
@@ -2071,6 +2304,8 @@ describe("Composer config gear", () => {
         setModel,
         codexModelOptions: options,
         sessionModelOverride: ROUTED,
+        // The forwarder reported the routed model — the display authority.
+        llmModel: ROUTED,
         // Routing pinned the model; the session's own routing switch is unset.
         costControlModeOverride: null,
       });
@@ -2105,7 +2340,9 @@ describe("Composer config gear", () => {
       fireEvent.click(screen.getByTestId("composer-config-model"));
       fireEvent.click(screen.getByRole("option", { name: "Sonnet" }));
       fireEvent.click(screen.getByTestId("composer-config-save"));
-      await waitFor(() => expect(setModel).toHaveBeenCalledWith("sonnet"));
+      await waitFor(() =>
+        expect(setModel).toHaveBeenCalledWith("sonnet", { expectConfirmation: true }),
+      );
     });
   });
 });

@@ -192,7 +192,12 @@ export function LoginPage() {
             </div>
           )}
 
-          <Button type="submit" className="w-full" disabled={submitting || password.length === 0}>
+          <Button
+            type="submit"
+            className="w-full"
+            disabled={submitting || password.length === 0}
+            componentId="login.sign_in"
+          >
             {submitting ? "Signing in…" : "Sign in"}
           </Button>
         </form>

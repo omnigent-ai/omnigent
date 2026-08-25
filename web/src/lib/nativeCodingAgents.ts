@@ -209,6 +209,8 @@ const HARNESS_ALIASES: Record<string, string> = {
   "native-cursor": "cursor-native",
   "native-kiro": "kiro-native",
   "native-antigravity": "antigravity-native",
+  "agy-native": "antigravity-native",
+  "native-agy": "antigravity-native",
   "native-goose": "goose-native",
   "native-qwen": "qwen-native",
   "native-kimi": "kimi-native",
@@ -380,6 +382,23 @@ export function isNativeTerminalSession(
   const wrapper = session.labels?.[WRAPPER_LABEL_KEY];
   if (isNativeWrapper(wrapper)) return true;
   return nativeCodingAgentForHarness(session.harness) !== undefined;
+}
+
+/**
+ * Resolve the native coding agent a session runs, from its wrapper label
+ * (authoritative) or its harness field.
+ *
+ * @param session - Session-shaped object with `harness` and `labels`.
+ * @returns The agent spec, or undefined for non-native sessions.
+ */
+export function nativeCodingAgentForSession(
+  session: { harness?: string | null; labels?: Record<string, string> } | null | undefined,
+): NativeCodingAgentSpec | undefined {
+  if (session == null) return undefined;
+  return (
+    nativeCodingAgentForWrapper(session.labels?.[WRAPPER_LABEL_KEY]) ??
+    nativeCodingAgentForHarness(session.harness)
+  );
 }
 
 export function nativeWrapperLabelsForAgent(

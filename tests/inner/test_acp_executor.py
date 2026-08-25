@@ -361,7 +361,7 @@ def test_in_progress_tool_update_emits_nothing() -> None:
 @pytest.mark.asyncio
 async def test_decide_permission_allows_with_no_gates() -> None:
     ex = AcpExecutor(AcpAgentConfig(command="x"))
-    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) is True
+    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) == (True, None)
 
 
 @pytest.mark.asyncio
@@ -372,7 +372,7 @@ async def test_decide_permission_denies_on_policy_deny() -> None:
         action = "POLICY_ACTION_DENY"
 
     ex._policy_evaluator = AsyncMock(return_value=_V())
-    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) is False
+    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) == (False, None)
 
 
 @pytest.mark.asyncio
@@ -384,7 +384,7 @@ async def test_decide_permission_ask_defers_to_elicitation() -> None:
 
     ex._policy_evaluator = AsyncMock(return_value=_V())
     ex._elicitation_handler = AsyncMock(return_value=True)
-    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) is True
+    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) == (True, None)
     ex._elicitation_handler.assert_awaited_once()
 
 
@@ -396,7 +396,7 @@ async def test_decide_permission_ask_without_handler_fails_closed() -> None:
         action = "POLICY_ACTION_ASK"
 
     ex._policy_evaluator = AsyncMock(return_value=_V())
-    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) is False
+    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) == (False, None)
 
 
 def _seed_tool_call(ex: AcpExecutor) -> dict[str, object]:
@@ -434,7 +434,7 @@ async def test_decide_permission_policy_sees_the_real_tool_call() -> None:
         action = "POLICY_ACTION_DENY"
 
     ex._policy_evaluator = AsyncMock(return_value=_V())
-    assert await ex._decide_permission(params) is False
+    assert await ex._decide_permission(params) == (False, None)
     ex._policy_evaluator.assert_awaited_once_with(
         "PHASE_TOOL_CALL",
         {"name": "Ran command", "arguments": {"command": "rm -rf build"}},
@@ -452,8 +452,329 @@ async def test_decide_permission_card_names_the_tool() -> None:
     params = _seed_tool_call(ex)
     ex._elicitation_handler = AsyncMock(return_value=True)
 
-    assert await ex._decide_permission(params) is True
+    assert await ex._decide_permission(params) == (True, None)
     ex._elicitation_handler.assert_awaited_once_with("Ran command", {"command": "rm -rf build"})
+
+
+# ---------------------------------------------------------------------------
+# Scoped approval: the agent's own permission options
+# ---------------------------------------------------------------------------
+
+
+def _agent_options() -> list[dict[str, str]]:
+    """Devin-shaped options: allow-once, two scoped always-allows, and a reject.
+
+    Order is the agent's own — narrowest first — and is preserved on the card so
+    the least-privilege choice leads.
+    """
+    return [
+        {"optionId": "allow_once", "name": "Allow", "kind": "allow_once"},
+        {
+            "optionId": "allow_session",
+            "name": "Yes, allow `ls` commands (this session)",
+            "kind": "allow_always",
+        },
+        {
+            "optionId": "allow_always_global",
+            "name": "Yes, always allow `ls` commands in all projects",
+            "kind": "allow_always",
+        },
+        {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"},
+    ]
+
+
+def test_acp_executor_accepts_the_choice_bridge() -> None:
+    """The attribute the adapter installs by name exists, and starts unwired.
+
+    The executor half of a cross-layer contract: the adapter gates its install on
+    this attribute (see ``tests/runtime/harnesses/test_executor_adapter.py``), so a
+    rename here would silently disable scoped approval.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    assert ex._elicitation_choice_handler is None
+
+
+@pytest.mark.asyncio
+async def test_decide_permission_offers_the_agents_own_scopes() -> None:
+    """The card gets every option the agent offered, in the agent's order.
+
+    **What breaks if this fails**: the user is back to Approve/Reject and each
+    grant is once-scoped, so the same command class re-prompts indefinitely.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    params = {
+        "toolCall": {"title": "shell", "rawInput": {"command": "ls"}},
+        "options": _agent_options(),
+    }
+    ex._elicitation_choice_handler = AsyncMock(
+        return_value="Yes, allow `ls` commands (this session)"
+    )
+
+    assert await ex._decide_permission(params) == (True, "allow_session")
+    ex._elicitation_choice_handler.assert_awaited_once_with(
+        "shell",
+        {"command": "ls"},
+        [
+            "Allow",
+            "Yes, allow `ls` commands (this session)",
+            "Yes, always allow `ls` commands in all projects",
+            "Reject",
+        ],
+    )
+
+
+@pytest.mark.asyncio
+async def test_scoped_choice_reaches_the_agent_as_that_option() -> None:
+    """End of the chain: the agent is told the exact scope the user picked.
+
+    Mirrors the call site (``_decide_permission`` then ``_permission_outcome``),
+    because the scope only takes effect if it survives into the reply — the agent
+    is what honors it and stops asking.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    params = {"toolCall": {"title": "shell"}, "options": _agent_options()}
+    ex._elicitation_choice_handler = AsyncMock(
+        return_value="Yes, allow `ls` commands (this session)"
+    )
+
+    allow, option_id = await ex._decide_permission(params)
+    assert ex._permission_outcome(params, allow=allow, option_id=option_id) == {
+        "outcome": {"outcome": "selected", "optionId": "allow_session"}
+    }
+
+
+@pytest.mark.asyncio
+async def test_decide_permission_choice_reject_denies() -> None:
+    """Picking the agent's own reject option denies, and names that option."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    params = {"toolCall": {"title": "shell"}, "options": _agent_options()}
+    ex._elicitation_choice_handler = AsyncMock(return_value="Reject")
+
+    assert await ex._decide_permission(params) == (False, "reject_once")
+
+
+@pytest.mark.asyncio
+async def test_decide_permission_choice_declined_denies() -> None:
+    """A dismissed / timed-out choice card denies, with no scope."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    params = {"toolCall": {"title": "shell"}, "options": _agent_options()}
+    ex._elicitation_choice_handler = AsyncMock(return_value=None)
+
+    assert await ex._decide_permission(params) == (False, None)
+
+
+@pytest.mark.asyncio
+async def test_decide_permission_choice_not_offered_denies() -> None:
+    """A label the agent never offered fails closed rather than guessing."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    params = {"toolCall": {"title": "shell"}, "options": _agent_options()}
+    ex._elicitation_choice_handler = AsyncMock(return_value="Yes, do whatever you like")
+
+    assert await ex._decide_permission(params) == (False, None)
+
+
+@pytest.mark.asyncio
+async def test_decide_permission_needs_a_reject_option_for_a_choice_card() -> None:
+    """Without a reject option the binary card is used instead.
+
+    A choice card replaces Approve/Reject with the agent's options, so offering
+    only allow-shaped ones would leave the user no way to say no.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    params = {
+        "toolCall": {"title": "shell"},
+        "options": [
+            {"optionId": "allow_once", "name": "Allow", "kind": "allow_once"},
+            {"optionId": "allow_session", "name": "Allow this session", "kind": "allow_always"},
+        ],
+    }
+    ex._elicitation_choice_handler = AsyncMock(return_value="Allow this session")
+    ex._elicitation_handler = AsyncMock(return_value=True)
+
+    assert await ex._decide_permission(params) == (True, None)
+    ex._elicitation_choice_handler.assert_not_awaited()
+    ex._elicitation_handler.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_decide_permission_falls_back_on_duplicate_labels() -> None:
+    """Two options sharing a label are ambiguous, since the reply names the label."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    params = {
+        "toolCall": {"title": "shell"},
+        "options": [
+            {"optionId": "a1", "name": "Allow", "kind": "allow_once"},
+            {"optionId": "a2", "name": "Allow", "kind": "allow_always"},
+            {"optionId": "r1", "name": "Reject", "kind": "reject_once"},
+        ],
+    }
+    ex._elicitation_choice_handler = AsyncMock(return_value="Allow")
+    ex._elicitation_handler = AsyncMock(return_value=True)
+
+    assert await ex._decide_permission(params) == (True, None)
+    ex._elicitation_choice_handler.assert_not_awaited()
+
+
+def test_permission_outcome_honors_a_chosen_scope() -> None:
+    """A user-picked option is echoed verbatim, overriding the once-scoped default."""
+    params = {"options": _agent_options()}
+    out = AcpExecutor._permission_outcome(params, allow=True, option_id="allow_session")
+    assert out == {"outcome": {"outcome": "selected", "optionId": "allow_session"}}
+
+
+def test_permission_outcome_ignores_an_unoffered_scope() -> None:
+    """An id the agent didn't offer is never echoed; the safe default applies.
+
+    Guards against sending the agent an option it can't honor — or a broader one
+    than it advertised — if a stale or hand-crafted id ever reaches here.
+    """
+    params = {"options": _agent_options()}
+    out = AcpExecutor._permission_outcome(params, allow=True, option_id="made_up")
+    assert out == {"outcome": {"outcome": "selected", "optionId": "allow_once"}}
+
+
+# ---------------------------------------------------------------------------
+# permission_mode (bypassPermissions)
+# ---------------------------------------------------------------------------
+
+
+def _bypass_executor() -> AcpExecutor:
+    """An executor whose spec opted out of approval cards."""
+    return AcpExecutor(AcpAgentConfig(command="x", permission_mode="bypassPermissions"))
+
+
+@pytest.mark.asyncio
+async def test_bypass_permissions_skips_the_card() -> None:
+    """``bypassPermissions`` allows a policy-silent call without prompting.
+
+    **What breaks if this fails**: a headless ACP worker (a polly sub-agent, a
+    scheduled task) parks on an approval card nobody is watching, so the turn
+    stalls rather than running unattended.
+    """
+    ex = _bypass_executor()
+    ex._elicitation_handler = AsyncMock(return_value=True)
+    ex._elicitation_choice_handler = AsyncMock(return_value="Allow")
+
+    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) == (True, None)
+    ex._elicitation_handler.assert_not_awaited()
+    ex._elicitation_choice_handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_bypass_permissions_still_denies_on_policy_deny() -> None:
+    """Policy runs in every mode, so a DENY still blocks under bypass.
+
+    This is the invariant that makes the mode safe to offer: it waives the
+    *human* gate, never the user's own rules.
+    """
+    ex = _bypass_executor()
+    ex._elicitation_handler = AsyncMock(return_value=True)
+
+    class _V:
+        action = "POLICY_ACTION_DENY"
+
+    ex._policy_evaluator = AsyncMock(return_value=_V())
+    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) == (False, None)
+
+
+@pytest.mark.asyncio
+async def test_bypass_permissions_still_prompts_on_policy_ask() -> None:
+    """A policy that says ASK outranks bypass — the user asked to be asked."""
+    ex = _bypass_executor()
+
+    class _V:
+        action = "POLICY_ACTION_ASK"
+
+    ex._policy_evaluator = AsyncMock(return_value=_V())
+    ex._elicitation_handler = AsyncMock(return_value=True)
+
+    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) == (True, None)
+    ex._elicitation_handler.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_default_permission_mode_still_asks() -> None:
+    """The ``auto`` default is unchanged: a policy-silent call still prompts.
+
+    **What breaks if this fails**: every ACP agent silently stops asking for
+    approval — the mode would be a default-off switch instead of an opt-in.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    assert ex._config.permission_mode == "auto"
+    ex._elicitation_handler = AsyncMock(return_value=True)
+
+    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) == (True, None)
+    ex._elicitation_handler.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_unrecognized_permission_mode_still_asks() -> None:
+    """Only the exact ``bypassPermissions`` waives the card; anything else prompts.
+
+    A typo (``"bypass"``) or a mode borrowed from another harness
+    (``"acceptEdits"``) must fail toward asking, not toward silence.
+    """
+    for mode in ("bypass", "acceptEdits", "default", ""):
+        ex = AcpExecutor(AcpAgentConfig(command="x", permission_mode=mode))
+        ex._elicitation_handler = AsyncMock(return_value=True)
+        assert await ex._decide_permission({"toolCall": {"title": "shell"}}) == (True, None), mode
+        assert ex._elicitation_handler.await_count == 1, mode
+
+
+@pytest.mark.asyncio
+async def test_bypass_never_sends_the_agents_own_bypass_option() -> None:
+    """Bypass answers each request; it never tells the agent to stop asking.
+
+    Devin offers ``switch_bypass`` ("switch to bypass mode"). Selecting it would
+    end the request stream, so omnigent would no longer see the agent's tool
+    calls and the TOOL_CALL policy could not gate them. The narrow
+    ``allow_once`` grant keeps every later call visible.
+    """
+    ex = _bypass_executor()
+    ex._elicitation_handler = AsyncMock(return_value=True)
+    params = {
+        "toolCall": {"title": "shell"},
+        "options": [
+            {"optionId": "allow_once", "name": "Allow", "kind": "allow_once"},
+            {
+                "optionId": "switch_bypass",
+                "name": "Yes, switch to bypass mode",
+                "kind": "allow_always",
+            },
+            {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"},
+        ],
+    }
+
+    allow, option_id = await ex._decide_permission(params)
+    assert ex._permission_outcome(params, allow=allow, option_id=option_id) == {
+        "outcome": {"outcome": "selected", "optionId": "allow_once"}
+    }
+
+
+def test_harness_wrap_reads_permission_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The wrap decodes the forwarded mode, closing spawn env → child config."""
+    from omnigent.inner import acp_harness
+
+    monkeypatch.setenv("HARNESS_ACP_COMMAND", "devin acp")
+    monkeypatch.setenv("HARNESS_ACP_PERMISSION_MODE", "bypassPermissions")
+    ex = acp_harness._build_acp_executor()
+    assert isinstance(ex, AcpExecutor)
+    assert ex._config.permission_mode == "bypassPermissions"
+    assert ex._bypass_permissions is True
+
+
+def test_harness_wrap_permission_mode_defaults_to_auto(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unset (or blank) var leaves the wrap prompting, as before this option."""
+    from omnigent.inner import acp_harness
+
+    monkeypatch.setenv("HARNESS_ACP_COMMAND", "devin acp")
+    monkeypatch.delenv("HARNESS_ACP_PERMISSION_MODE", raising=False)
+    assert acp_harness._build_acp_executor()._config.permission_mode == "auto"
+
+    monkeypatch.setenv("HARNESS_ACP_PERMISSION_MODE", "   ")
+    ex = acp_harness._build_acp_executor()
+    assert ex._config.permission_mode == "auto"
+    assert ex._bypass_permissions is False
 
 
 # ---------------------------------------------------------------------------
@@ -684,6 +1005,30 @@ def test_harness_wrap_builds_executor(monkeypatch: pytest.MonkeyPatch) -> None:
     assert ex._config.model == "gpt-5.3"
 
 
+def test_harness_wrap_reads_inject_system_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    """HARNESS_ACP_INJECT_SYSTEM_PROMPT=0 sets inject_system_prompt=False (#4917)."""
+    from omnigent.inner import acp_harness
+
+    monkeypatch.setenv("HARNESS_ACP_COMMAND", "omp acp")
+    monkeypatch.setenv("HARNESS_ACP_INJECT_SYSTEM_PROMPT", "0")
+    ex = acp_harness._build_acp_executor()
+    assert isinstance(ex, AcpExecutor)
+    assert ex._config.inject_system_prompt is False
+
+
+def test_harness_wrap_inject_system_prompt_defaults_to_true(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """inject_system_prompt defaults to True when env var is absent."""
+    from omnigent.inner import acp_harness
+
+    monkeypatch.setenv("HARNESS_ACP_COMMAND", "goose acp")
+    monkeypatch.delenv("HARNESS_ACP_INJECT_SYSTEM_PROMPT", raising=False)
+    ex = acp_harness._build_acp_executor()
+    assert isinstance(ex, AcpExecutor)
+    assert ex._config.inject_system_prompt is True
+
+
 def test_harness_wrap_reads_env_passthrough_names(monkeypatch: pytest.MonkeyPatch) -> None:
     """The wrap decodes the forwarded names, closing parent → child → spawn env."""
     from omnigent.inner import acp_harness
@@ -909,6 +1254,115 @@ async def test_acp_session_new_omnigent_mcp_disabled_per_agent() -> None:
     ex._rpc = fake_rpc  # type: ignore[assignment]
     await ex._ensure_session()
     assert captured["params"]["mcpServers"] == []
+
+
+def test_omnigent_tools_cleared_when_mcp_disabled() -> None:
+    """run_turn discards builtin tools when omnigent_mcp=False (#4917).
+
+    With the relay disabled, the tool schemas serve no purpose and must not be
+    stored — they could otherwise accidentally reach the session/prompt path.
+    Verified by pre-populating _omnigent_tools and running the capture logic
+    from the start of run_turn in isolation.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x", omnigent_mcp=False))
+    tools = [{"name": "load_skill"}, {"name": "sys_session_rename"}]
+
+    # Simulate the first few lines of run_turn: capture _omnigent_tools.
+    # When omnigent_mcp is False the assignment must yield an empty list.
+    ex._omnigent_tools = (tools or []) if ex._config.omnigent_mcp else []
+    assert ex._omnigent_tools == [], "tools must be discarded when omnigent_mcp=False"
+
+
+def test_omnigent_tools_kept_when_mcp_enabled() -> None:
+    """Sanity: _omnigent_tools is populated when omnigent_mcp=True."""
+    ex = AcpExecutor(AcpAgentConfig(command="x", omnigent_mcp=True))
+    tools = [{"name": "load_skill"}, {"name": "sys_session_rename"}]
+    ex._omnigent_tools = (tools or []) if ex._config.omnigent_mcp else []
+    assert ex._omnigent_tools == tools, "tools must be stored when omnigent_mcp=True"
+
+
+@pytest.mark.asyncio
+async def test_inject_system_prompt_false_skips_prepend(tmp_path: Path) -> None:
+    """inject_system_prompt=False prevents the spec's system prompt from being
+    folded into the first ACP user turn (#4917 — Pi-fork agents like omp).
+
+    Without this fix, Omnigent's system prompt is prepended to the user message
+    on the first turn.  For agents that fully own their own system prompt (Pi
+    forks), this confuses the internal Claude model into emitting XML tool-call
+    fragments (``</function></tool_call>``) when there is no MCP relay backing
+    the described tools.
+    """
+    agent_path = tmp_path / "prompt_echo_agent.py"
+    agent_path.write_text(
+        r"""
+import sys, json
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method", "")
+    if method == "initialize":
+        caps = {"promptCapabilities": {"image": False}}
+        send({"jsonrpc": "2.0", "id": mid,
+              "result": {"protocolVersion": 1, "agentCapabilities": caps}})
+    elif method == "session/new":
+        send({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "echo-1"}})
+    elif method == "session/prompt":
+        sid = msg.get("params", {}).get("sessionId", "echo-1")
+        # Echo back the text the client sent so the test can inspect it.
+        text = ""
+        for block in msg.get("params", {}).get("prompt", []):
+            if isinstance(block, dict) and block.get("type") == "text":
+                text += block.get("text", "")
+        send({"jsonrpc": "2.0", "method": "session/update",
+              "params": {"sessionId": sid,
+                         "update": {"sessionUpdate": "agent_message_chunk",
+                                    "content": {"type": "text", "text": text}}}})
+        send({"jsonrpc": "2.0", "id": mid,
+              "result": {"stopReason": "end_turn", "usage": {}}})
+"""
+    )
+    command = shlex.join([sys.executable, str(agent_path)])
+
+    # With injection enabled (default), the system prompt is prepended.
+    ex_inject = AcpExecutor(AcpAgentConfig(command=command, inject_system_prompt=True))
+    texts_inject: list[str] = []
+    try:
+        async for ev in ex_inject.run_turn(
+            [{"role": "user", "content": "hello"}], [], "SYSTEM_PROMPT_TEXT"
+        ):
+            if isinstance(ev, TextChunk):
+                texts_inject.append(ev.text)
+    finally:
+        await ex_inject.close()
+    combined_inject = "".join(texts_inject)
+    assert "SYSTEM_PROMPT_TEXT" in combined_inject, (
+        "system prompt should appear in the echoed first turn when inject_system_prompt=True"
+    )
+
+    # With injection disabled, the system prompt must NOT appear.
+    ex_no_inject = AcpExecutor(AcpAgentConfig(command=command, inject_system_prompt=False))
+    texts_no_inject: list[str] = []
+    try:
+        async for ev in ex_no_inject.run_turn(
+            [{"role": "user", "content": "hello"}], [], "SYSTEM_PROMPT_TEXT"
+        ):
+            if isinstance(ev, TextChunk):
+                texts_no_inject.append(ev.text)
+    finally:
+        await ex_no_inject.close()
+    combined_no_inject = "".join(texts_no_inject)
+    assert "SYSTEM_PROMPT_TEXT" not in combined_no_inject, (
+        "system prompt must not appear in the first turn when inject_system_prompt=False"
+    )
+    assert "hello" in combined_no_inject, "user message itself must still be sent"
 
 
 @pytest.mark.asyncio

@@ -2001,3 +2001,162 @@ async def test_policy_evaluator_no_active_turn_context_is_phase_aware() -> None:
         verdict = await adapter._stable_policy_evaluator(advisory_phase, {})
         assert verdict.action == "POLICY_ACTION_ALLOW", advisory_phase
         assert verdict.reason is None, advisory_phase
+
+
+class _CancelFlag:
+    """Records whether the adapter signalled cancellation.
+
+    A real class rather than MagicMock so an unexpected attribute access on the
+    flag fails loud, per the project's testing rules.
+    """
+
+    def __init__(self) -> None:
+        self.was_set = False
+
+    def set(self) -> None:
+        """Mark the turn cancelled."""
+        self.was_set = True
+
+
+class _ElicitingTurnContext:
+    """Stand-in for :class:`TurnContext` that captures one elicitation.
+
+    Only the surface the elicitation bridges touch is implemented: ``elicit`` and
+    ``cancelled``.
+    """
+
+    def __init__(self, reply: Any) -> None:  # type: ignore[explicit-any]
+        """:param reply: The :class:`ElicitationResult` to answer with."""
+        self.reply = reply
+        self.cancelled = _CancelFlag()
+        self.seen: list[Any] = []  # type: ignore[explicit-any]
+
+    async def elicit(self, elicitation_id: str, params: Any) -> Any:  # type: ignore[explicit-any]
+        """Record the request and return the canned reply."""
+        self.seen.append((elicitation_id, params))
+        return self.reply
+
+
+@pytest.mark.asyncio
+async def test_elicitation_choice_handler_asks_for_one_button_per_option() -> None:
+    """The card is asked for buttons, and the chosen label comes back.
+
+    The ``answer`` enum shape is a contract with the web approval card, which
+    renders one button per enum value and replies ``content={"answer": <label>}``
+    (see ``web/src/components/blocks/ApprovalCard.test.tsx``). A change to either
+    half silently collapses the card back to Approve/Reject, so it is asserted
+    exactly here.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import ElicitationResult
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _ElicitingTurnContext(
+        ElicitationResult(action="accept", content={"answer": "Allow this session"})
+    )
+    adapter._current_ctx = ctx  # type: ignore[assignment]
+
+    chosen = await adapter._stable_elicitation_choice_handler(
+        "Ran command",
+        {"command": "ls"},
+        ["Allow", "Allow this session", "Reject"],
+    )
+
+    assert chosen == "Allow this session"
+    (_elicitation_id, params) = ctx.seen[0]
+    assert params.requestedSchema == {
+        "type": "object",
+        "properties": {
+            "answer": {"type": "string", "enum": ["Allow", "Allow this session", "Reject"]}
+        },
+        "required": ["answer"],
+    }
+    # The card still names the tool and previews its arguments, as the binary one does.
+    assert "Ran command" in params.message
+    assert params.content_preview == 'Ran command({"command": "ls"})'
+    assert params.phase == "tool_call"
+    assert not ctx.cancelled.was_set
+
+
+@pytest.mark.asyncio
+async def test_elicitation_choice_handler_declines_on_a_dismissed_card() -> None:
+    """A declined card returns no choice and signals cancellation, as before."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import ElicitationResult
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _ElicitingTurnContext(ElicitationResult(action="decline"))
+    adapter._current_ctx = ctx  # type: ignore[assignment]
+
+    assert (
+        await adapter._stable_elicitation_choice_handler("shell", {}, ["Allow", "Reject"]) is None
+    )
+    assert ctx.cancelled.was_set
+
+
+@pytest.mark.asyncio
+async def test_elicitation_choice_handler_declines_without_a_turn() -> None:
+    """An orphaned callback declines rather than granting a scope unreviewed."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    assert adapter._current_ctx is None
+
+    assert (
+        await adapter._stable_elicitation_choice_handler("shell", {}, ["Allow", "Reject"]) is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_turn_installs_the_choice_bridge_only_where_supported() -> None:
+    """The choice bridge reaches executors that accept it, and only those.
+
+    Bridges are installed by attribute, so a rename on either side would leave the
+    feature silently inert — the card would quietly stay Approve/Reject. Executors
+    that don't offer the agent's own options must not grow the attribute.
+    """
+    import asyncio
+
+    from omnigent.inner.executor import Executor, ExecutorConfig, Message, ToolSpec, TurnComplete
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    class _ChoiceCapableExecutor(Executor):
+        """Declares the attribute, as :class:`AcpExecutor` does."""
+
+        def __init__(self) -> None:
+            self._elicitation_choice_handler = None
+
+        async def run_turn(
+            self,
+            messages: list[Message],
+            tools: list[ToolSpec],
+            system_prompt: str,
+            config: ExecutorConfig | None = None,
+        ):
+            yield TurnComplete(response="ok")
+
+    class _BinaryOnlyExecutor(Executor):
+        """Declares no choice attribute — e.g. the SDK harnesses."""
+
+        async def run_turn(
+            self,
+            messages: list[Message],
+            tools: list[ToolSpec],
+            system_prompt: str,
+            config: ExecutorConfig | None = None,
+        ):
+            yield TurnComplete(response="ok")
+
+    for executor, expected in ((_ChoiceCapableExecutor(), True), (_BinaryOnlyExecutor(), False)):
+        adapter = ExecutorAdapter(executor_factory=lambda e=executor: e)  # type: ignore[misc]
+        ctx = TurnContext(
+            response_id="resp_bridge", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+        )
+        await adapter.run_turn(CreateResponseRequest(model="agent", input="hi"), ctx)
+
+        installed = getattr(executor, "_elicitation_choice_handler", None) is not None
+        assert installed is expected, type(executor).__name__
+        # The yes/no bridge is installed on both — the choice bridge is additive.
+        assert getattr(executor, "_elicitation_handler", None) is not None

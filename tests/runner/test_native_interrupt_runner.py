@@ -233,6 +233,33 @@ async def test_codex_interrupt_noop_when_no_bridge_state() -> None:
 
 
 @pytest.mark.asyncio
+async def test_claude_stop_is_idempotent_without_advertised_tmux(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An already-absent Claude pane still completes stop teardown."""
+    import omnigent.claude_native_bridge as claude_bridge
+    from omnigent.runner.native import interrupt as interrupt_mod
+
+    async def _fake_bridge_id(*, server_client: Any, session_id: str) -> str:
+        del server_client, session_id
+        return "bridge123"
+
+    def _absent(bridge_dir: Any, *, timeout_s: float) -> None:
+        del bridge_dir, timeout_s
+        raise claude_bridge.TmuxSessionNotAdvertised("not advertised")
+
+    monkeypatch.setattr(interrupt_mod, "_claude_native_bridge_id_for_session", _fake_bridge_id)
+    monkeypatch.setattr(claude_bridge, "bridge_dir_for_bridge_id", lambda bridge_id: bridge_id)
+    monkeypatch.setattr(claude_bridge, "kill_session", _absent)
+
+    runner, captured = _make_runner()
+    resp = await runner.stop("claude-native", "conv_cn")
+
+    assert isinstance(resp, Response) and resp.status_code == 204
+    assert captured["wakes"] == [("conv_cn", "cancelled", "[System: sub-agent stopped]")]
+
+
+@pytest.mark.asyncio
 async def test_claude_interrupt_resolves_bridge_id_and_injects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
