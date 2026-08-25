@@ -142,6 +142,8 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, _ProviderHarness] = {
     # mirroring the claude-native -> claude-sdk rule above.
     "antigravity-native": "antigravity",
     "native-antigravity": "antigravity",
+    "agy-native": "antigravity",
+    "native-agy": "antigravity",
 }
 
 # cursor-agent always routes through its own stored login — there is no

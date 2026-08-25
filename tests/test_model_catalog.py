@@ -166,6 +166,21 @@ def test_resolve_provider_databricks_default(
         assert provider.profile == "prof-a"
 
 
+@pytest.mark.parametrize(
+    "harness",
+    ["antigravity-native", "native-antigravity", "agy-native", "native-agy"],
+)
+def test_resolve_provider_antigravity_native_aliases(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, harness: str
+) -> None:
+    """Every native agy spelling reaches the same provider resolver."""
+    _isolate_config(monkeypatch, tmp_path, "")
+    spec = _worker_spec(harness, auth=ApiKeyAuth(api_key="gemini-test-key"))
+    provider = resolve_model_provider(spec, harness)
+    assert provider.kind == "key"
+    assert provider.api_key == "gemini-test-key"
+
+
 def test_resolve_provider_key_kind_resolves_family_credential(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
