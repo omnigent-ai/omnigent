@@ -478,14 +478,6 @@ function FileViewerBody({
     [isEditorDirty],
   );
 
-  const handleSetActiveSelection = (sel: ActiveSelection | null) => {
-    setActiveSelection(sel);
-    if (sel !== null) {
-      commentsInitializedRef.current = true;
-      setCommentsOpen(true);
-    }
-  };
-
   useEffect(
     () => () => {
       window.clearTimeout(linkCopiedTimerRef.current);
@@ -545,9 +537,24 @@ function FileViewerBody({
     [allComments, fileContent],
   );
 
+  const handleSetActiveSelection = (selection: ActiveSelection | null) => {
+    let nextSelection = selection;
+    if (selection && selection.comment_id == null) {
+      const comment = openComments.find(
+        (c) => c.start_index === selection.start_index && c.end_index === selection.end_index,
+      );
+      if (comment) nextSelection = { ...selection, comment_id: comment.id };
+    }
+    setActiveSelection(nextSelection);
+    if (selection !== null) {
+      commentsInitializedRef.current = true;
+      setCommentsOpen(true);
+    }
+  };
+
   // Apply the linked comment (from ?comment= URL param) once per lifecycle.
   // Waits for fileQuery.data so classifyAndRemapComments has run with real content,
-  // ensuring activeSelection uses remapped indices that match openComments.
+  // ensuring activeSelection uses remapped indices that match open comments.
   useEffect(() => {
     if (linkedCommentAppliedRef.current) return;
     const commentId = initialCommentIdRef.current;
@@ -561,6 +568,7 @@ function FileViewerBody({
       start_index: comment.start_index,
       end_index: comment.end_index,
       anchor_content: comment.anchor_content ?? "",
+      comment_id: comment.id,
     });
   }, [openComments]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -1435,6 +1443,7 @@ function FileViewerBody({
               onDirtyChange={setIsEditorDirty}
               onSaveStatusChange={setSaveStatus}
               comments={openComments}
+              addressedComments={addressedComments}
               activeSelection={activeSelection}
               onSetActiveSelection={handleSetActiveSelection}
               pendingBodyRef={pendingBodyRef}
@@ -1471,20 +1480,21 @@ function FileViewerBody({
               if (!sender) return;
               const ids = openComments.map((c) => c.id);
               sender.mutate({ comment_ids: ids });
-              setActiveSelection(null);
             }}
             onClickComment={(comment) => {
               setActiveSelection({
                 start_index: comment.start_index,
                 end_index: comment.end_index,
                 anchor_content: comment.anchor_content ?? "",
+                comment_id: comment.id,
               });
               // Sync the selected comment into the URL so the address bar is
               // always shareable. AppShell clears this param when the viewer closes.
               setSearchParams(
                 (prev) => {
                   const next = new URLSearchParams(prev);
-                  next.set("comment", comment.id);
+                  if (comment.status === "draft") next.set("comment", comment.id);
+                  else next.delete("comment");
                   return next;
                 },
                 { replace: true },
@@ -1496,8 +1506,10 @@ function FileViewerBody({
               const deleted = [...openComments, ...addressedComments].find((c) => c.id === id);
               if (
                 deleted &&
-                activeSelection?.start_index === deleted.start_index &&
-                activeSelection?.end_index === deleted.end_index
+                (activeSelection?.comment_id === deleted.id ||
+                  (activeSelection?.comment_id == null &&
+                    activeSelection?.start_index === deleted.start_index &&
+                    activeSelection?.end_index === deleted.end_index))
               )
                 setActiveSelection(null);
             }}

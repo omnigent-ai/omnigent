@@ -180,6 +180,7 @@ export function PdfViewer({
       start_index: comment.start_index,
       end_index: comment.end_index,
       anchor_content: comment.anchor_content ?? "",
+      comment_id: comment.id,
     });
     setFloating(null);
   }, []);
@@ -235,12 +236,15 @@ export function PdfViewer({
       const page = getPageNumber(pageEl);
       const selection = encodePdfAnchor(page, rects, text);
 
-      const existing = commentsRef.current.find((c) => commentsMatchOffsets(selection, c));
+      const existing = commentsRef.current.find(
+        (c) => c.status === "draft" && commentsMatchOffsets(selection, c),
+      );
       if (existing) {
         onSetActiveSelectionRef.current?.({
           start_index: existing.start_index,
           end_index: existing.end_index,
           anchor_content: existing.anchor_content ?? "",
+          comment_id: existing.id,
         });
         setFloating(null);
         return;

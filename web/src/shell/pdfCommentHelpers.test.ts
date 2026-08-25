@@ -91,8 +91,23 @@ describe("highlightRectsForPage", () => {
       end_index: anchor.end_index,
       anchor_content: anchor.anchor_content,
     });
-    const active = highlightRectsForPage(2, [comment], anchor);
+    const active = highlightRectsForPage(2, [comment], { ...anchor, comment_id: "c1" });
     expect(active[0]!.active).toBe(true);
+  });
+
+  it("keeps an addressed anchor clickable while a same-range draft stays pending", () => {
+    const anchor = encodePdfAnchor(1, [{ x: 0.1, y: 0.2, w: 0.3, h: 0.04 }], "Hello");
+    const addressed = makeComment({
+      status: "addressed",
+      start_index: anchor.start_index,
+      end_index: anchor.end_index,
+      anchor_content: anchor.anchor_content,
+    });
+
+    const highlights = highlightRectsForPage(1, [addressed], anchor);
+
+    expect(highlights.find((h) => h.key === "c1")?.active).toBe(false);
+    expect(highlights.find((h) => h.key === "pending")?.active).toBe(true);
   });
 });
 
