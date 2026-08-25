@@ -1049,6 +1049,33 @@ def test_host_web_ui_open_gates(
     assert opened == expected_opened
 
 
+def test_host_opens_remote_web_ui_when_interactive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Open the browser-facing URL for a remote workspace host."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr("omnigent.cli._stdin_is_tty", lambda: True)
+    opened: list[str] = []
+
+    with (
+        patch("omnigent.cli._ensure_databricks_server_auth"),
+        patch("omnigent.host.connect.run_host_process", lambda server_url, **kwargs: None),
+        patch(
+            "omnigent.conversation_browser.open_conversation_url",
+            lambda url: opened.append(url) or True,
+        ),
+    ):
+        result = CliRunner().invoke(
+            cli,
+            ["host", "--server", "https://example.databricks.com/api/2.0/omnigent"],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert opened == ["https://example.databricks.com/omnigent"]
+
+
 def test_start_opens_web_ui_when_interactive(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
