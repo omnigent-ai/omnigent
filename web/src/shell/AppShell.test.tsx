@@ -3589,3 +3589,76 @@ describe("Mobile header actions menu", () => {
     expect(screen.queryByRole("menuitem", { name: /^resume$/i })).toBeNull();
   });
 });
+
+describe("Terminal-first shells — opening a shell from the mobile drawer", () => {
+  function openSessionMenu() {
+    const trigger = screen.getByTestId("session-actions-menu");
+    fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
+    return trigger;
+  }
+
+  it("keeps the tapped shell as the terminal-view target", () => {
+    // Terminal-first sessions render the terminal inline in main, and opening a
+    // shell also writes `?view=terminal`. That param names only the surface, so
+    // re-deriving the target from it sent the user to the agent's pane — the
+    // chat's Terminal view — instead of the shell they tapped.
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([
+      { id: "conv_native", permission_level: null, labels: { "omnigent.ui": "terminal" } },
+    ]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [
+        { id: "terminal_tui_main", name: "tui", session: "main", running: true },
+        { id: "terminal_main", name: "zsh", session: "main", running: true },
+      ],
+      isLoading: false,
+      error: null,
+    });
+    useSessionAgentMock.mockReturnValue({
+      data: { id: "ag_x", name: "polly", terminals: ["zsh"] },
+    } as ReturnType<typeof useSessionAgent>);
+
+    renderShell("/c/conv_native");
+    openSessionMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: /^Shells/i }));
+
+    const drawer = screen.getByTestId("shells-panel-drawer");
+    expect(drawer).toHaveAttribute("data-state", "open");
+    fireEvent.click(within(drawer).getByRole("button", { name: /rail: open terminal/i }));
+
+    // Drawer dismissed, terminal surface showing the tapped shell — not
+    // `terminal:terminal_tui_main`, the agent pane.
+    expect(screen.getByTestId("shells-panel-drawer")).toHaveAttribute("data-state", "closed");
+    const probe = screen.getByTestId("view-probe");
+    expect(probe).toHaveAttribute("data-view", "terminal");
+    expect(probe).toHaveAttribute("data-terminal-view-key", "terminal:terminal_main");
+  });
+
+  it("still opens the agent pane for a bare ?view=terminal deep link", () => {
+    // No stored target: the param alone must land on the agent's terminal.
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([
+      { id: "conv_native", permission_level: null, labels: { "omnigent.ui": "terminal" } },
+    ]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [
+        { id: "terminal_tui_main", name: "tui", session: "main", running: true },
+        { id: "terminal_main", name: "zsh", session: "main", running: true },
+      ],
+      isLoading: false,
+      error: null,
+    });
+
+    renderShell("/c/conv_native?view=terminal");
+
+    const probe = screen.getByTestId("view-probe");
+    expect(probe).toHaveAttribute("data-view", "terminal");
+    expect(probe).toHaveAttribute("data-terminal-view-key", "terminal:terminal_tui_main");
+  });
+});

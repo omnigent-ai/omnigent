@@ -159,6 +159,23 @@ import type { RightRailTab } from "./railTabs";
 // can override a Terminal default when the user returns to that conversation.
 const CHAT_VIEW_STORAGE_VALUE = "__chat__";
 
+/**
+ * Resolve the terminal-view target for `?view=terminal`.
+ *
+ * The URL param names only the SURFACE (chat vs terminal), never which
+ * terminal, so restoring straight from it would rewrite a rail-opened shell
+ * to the agent pane. The precise target lives in the per-session store, which
+ * the panel setter writes alongside the param — prefer it, and fall back to
+ * the agent terminal for a deep link that carries no stored target.
+ *
+ * :param stored: Per-session stored panel key (null when absent).
+ * :param agentKey: The session's agent-terminal key (or the no-target sentinel).
+ * :returns: The terminal key the view should open on.
+ */
+function resolveTerminalViewKey(stored: string | null, agentKey: string): string {
+  return stored !== null && stored !== CHAT_VIEW_STORAGE_VALUE ? stored : agentKey;
+}
+
 export function AppShell() {
   // Cmd/Ctrl+Enter accepts the pending harness approval prompt. Bound once
   // here so it works on every chat route, regardless of where focus sits.
@@ -936,7 +953,7 @@ export function AppShell() {
       requestedView === "chat"
         ? null
         : requestedView === "terminal"
-          ? terminalKey
+          ? resolveTerminalViewKey(stored, terminalKey)
           : stored === CHAT_VIEW_STORAGE_VALUE
             ? null
             : (stored ?? (defaultToTerminal ? terminalKey : null)),
@@ -1006,7 +1023,7 @@ export function AppShell() {
     if (requestedView === "chat") {
       setPanelInitialKeyState(null);
     } else if (requestedView === "terminal") {
-      setPanelInitialKeyState(terminalKey);
+      setPanelInitialKeyState(resolveTerminalViewKey(stored, terminalKey));
     } else if (stored === CHAT_VIEW_STORAGE_VALUE) {
       setPanelInitialKeyState(null);
     } else if (stored !== null) {
