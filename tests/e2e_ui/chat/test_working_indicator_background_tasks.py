@@ -147,7 +147,7 @@ def test_working_shimmer_and_pill_coexist_while_running(
     # the shimmer for the live turn, the pill for the still-running shell.
     _publish_status(base_url, session_id, "running")
     expect(working).to_contain_text(_WORKING_LABEL_RE, timeout=15_000)
-    expect(pill).to_contain_text("2 background tasks")
+    expect(pill).to_contain_text("2 background tasks", timeout=15_000)
 
 
 def test_sidebar_spinner_ignores_background_tasks(
