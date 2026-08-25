@@ -192,6 +192,7 @@ def test_send_schema_advertises_plain_string_and_purpose_object_args() -> None:
         "input",
         "purpose",
         "model",
+        "workspace",
         "file_ids",
         "cost_budget",
     }
@@ -202,6 +203,12 @@ def test_send_schema_advertises_plain_string_and_purpose_object_args() -> None:
     assert object_schema["properties"]["model"]["type"] == "string"
     assert "CREATES" in model_desc
     assert "harness default" in model_desc
+    workspace_schema = object_schema["properties"]["workspace"]
+    assert "workspace" not in object_schema["required"]
+    assert workspace_schema["type"] == "string"
+    assert workspace_schema["minLength"] == 1
+    assert "absolute" in workspace_schema["description"]
+    assert "CREATES" in workspace_schema["description"]
 
 
 def _object_branch_props(tool: SysSessionSendTool) -> set[str]:
@@ -220,8 +227,9 @@ def test_send_schema_gates_harness_field_behind_allowlist_opt_in() -> None:
     Per design D.4 the runtime harness override is allowlist-gated: the
     schema exposes ``harness`` only when at least one declared sub-agent
     declares a non-empty ``executor.config.allowed_harnesses``. A sub-agent
-    without that opt-in keeps the base ``{input, purpose, model, file_ids}``
-    args object, so the orchestrator never sees a harness knob it cannot use.
+    without that opt-in keeps the base
+    ``{input, purpose, model, workspace, file_ids, cost_budget}`` args object,
+    so the orchestrator never sees a harness knob it cannot use.
     This mirrors the per-child dispatch guard in tool_dispatch.py — the two
     gates must agree on what "opted in" means.
     """
@@ -233,6 +241,7 @@ def test_send_schema_gates_harness_field_behind_allowlist_opt_in() -> None:
         "input",
         "purpose",
         "model",
+        "workspace",
         "file_ids",
         "cost_budget",
     }
@@ -257,6 +266,7 @@ def test_send_schema_gates_harness_field_behind_allowlist_opt_in() -> None:
         "input",
         "purpose",
         "model",
+        "workspace",
         "file_ids",
         "harness",
         "cost_budget",
@@ -283,6 +293,7 @@ def test_send_schema_gates_harness_field_behind_allowlist_opt_in() -> None:
         "input",
         "purpose",
         "model",
+        "workspace",
         "file_ids",
         "harness",
         "cost_budget",
