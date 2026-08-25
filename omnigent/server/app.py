@@ -27,6 +27,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from omnigent._platform import resolve_repo_symlink
 from omnigent.db.db_models import InvalidUuidError
+from omnigent.debug_logging import set_current_user_id
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_plugins import (
     NativeHarnessProvider,
@@ -1486,6 +1487,18 @@ def create_app(
         set_request_session_id_for_access_log(
             session_match.group(1) if session_match else None,
         )
+        # Bind the request's authenticated user so debug-log records emitted
+        # while handling it are attributed. Request-scoped: each request runs in
+        # its own task/context, so concurrent users never see each other's id.
+        # Best-effort — attribution must never fail a request. The raw identity
+        # (incl. the "local" single-user sentinel) is kept; it is a meaningful
+        # queryable value in the debug table.
+        try:
+            set_current_user_id(
+                auth_provider.get_user_id(request) if auth_provider is not None else None
+            )
+        except Exception:  # noqa: BLE001 — attribution is best-effort
+            set_current_user_id(None)
 
         failed = False
         status_code: int | None = None

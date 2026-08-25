@@ -251,6 +251,7 @@ function TerminalFirstViewProbe() {
       data-is-terminal-first={ctx.isTerminalFirst ? "true" : "false"}
       data-is-claude-native={ctx.isClaudeNative ? "true" : "false"}
       data-view={ctx.view}
+      data-terminal-view-key={ctx.terminalViewKey ?? "null"}
       data-terminals-available={ctx.terminalsAvailable ? "true" : "false"}
       data-terminal-starting-up={ctx.terminalStartingUp ? "true" : "false"}
     >
@@ -701,7 +702,7 @@ describe("TerminalFirstContext", () => {
       },
     ]);
     useTerminalsMock.mockReturnValue({
-      terminals: [{ id: "terminal_main", name: "claude", session: "main", running: true }],
+      terminals: [{ id: "terminal_claude_main", name: "claude", session: "main", running: true }],
       isLoading: false,
       error: null,
     });
@@ -718,6 +719,65 @@ describe("TerminalFirstContext", () => {
     const regularProbe = screen.getByTestId("view-probe");
     expect(regularProbe).toHaveAttribute("data-is-terminal-first", "false");
     expect(regularProbe).toHaveAttribute("data-is-claude-native", "false");
+  });
+
+  it("targets the agent terminal while a user shell remains open in the workspace rail", () => {
+    writeSessionWorkspaceState("conv_native", {
+      open: true,
+      selectedTerminalKey: "terminal:terminal_bash_s1",
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([
+      {
+        id: "conv_native",
+        permission_level: null,
+        labels: {
+          "omnigent.ui": "terminal",
+          "omnigent.wrapper": "codex-native-ui",
+        },
+      },
+    ]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [
+        { id: "terminal_bash_s1", name: "bash", session: "s1", running: true },
+        { id: "terminal_codex_main", name: "codex", session: "main", running: true },
+      ],
+      isLoading: false,
+      error: null,
+    });
+
+    renderShell("/c/conv_native");
+
+    expect(screen.getByTestId("terminal-view-stub")).toHaveTextContent("terminal_bash_s1");
+    fireEvent.click(screen.getByTestId("view-mode-terminal"));
+    expect(screen.getByTestId("view-probe")).toHaveAttribute(
+      "data-terminal-view-key",
+      "terminal:terminal_codex_main",
+    );
+    expect(screen.getByTestId("terminal-view-stub")).toHaveTextContent("terminal_bash_s1");
+  });
+
+  it("does not enable Terminal view when only a user shell is cached", () => {
+    mockConversations([
+      {
+        id: "conv_native",
+        permission_level: null,
+        labels: { "omnigent.ui": "terminal" },
+      },
+    ]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_bash_s1", name: "bash", session: "s1", running: true }],
+      isLoading: false,
+      error: null,
+    });
+
+    renderShell("/c/conv_native");
+
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminals-available", "false");
+    expect(screen.getByTestId("view-mode-terminal")).toBeDisabled();
   });
 
   it("flags a child (sub-agent) session terminal-first from the snapshot when the sidebar omits it", () => {
@@ -781,7 +841,7 @@ describe("TerminalFirstContext", () => {
       },
     ]);
     useTerminalsMock.mockReturnValue({
-      terminals: [{ id: "terminal_main", name: "claude", session: "main", running: true }],
+      terminals: [{ id: "terminal_claude_main", name: "claude", session: "main", running: true }],
       isLoading: false,
       error: null,
     });
@@ -847,7 +907,7 @@ describe("TerminalFirstContext", () => {
       { id: "conv_native", permission_level: null, labels: { "omnigent.ui": "terminal" } },
     ]);
     useTerminalsMock.mockReturnValue({
-      terminals: [{ id: "terminal_main", name: "claude", session: "main", running: true }],
+      terminals: [{ id: "terminal_claude_main", name: "claude", session: "main", running: true }],
       isLoading: false,
       error: null,
     });
@@ -901,7 +961,7 @@ describe("TerminalFirstContext", () => {
     // the list empties (see the startup-spinner tests above).
     useChatStore.setState({ terminalPending: true, sessionStatus: "running" });
     useTerminalsMock.mockReturnValue({
-      terminals: [{ id: "terminal_main", name: "claude", session: "main", running: true }],
+      terminals: [{ id: "terminal_claude_main", name: "claude", session: "main", running: true }],
       isLoading: false,
       error: null,
     });
@@ -960,7 +1020,7 @@ describe("TerminalFirstContext", () => {
       { id: "conv_other", permission_level: null, labels: {} },
     ]);
     useTerminalsMock.mockReturnValue({
-      terminals: [{ id: "terminal_main", name: "claude", session: "main", running: true }],
+      terminals: [{ id: "terminal_claude_main", name: "claude", session: "main", running: true }],
       isLoading: false,
       error: null,
     });
@@ -1002,7 +1062,7 @@ describe("TerminalFirstContext", () => {
       },
     ]);
     useTerminalsMock.mockReturnValue({
-      terminals: [{ id: "terminal_main", name: "claude", session: "main", running: true }],
+      terminals: [{ id: "terminal_claude_main", name: "claude", session: "main", running: true }],
       isLoading: false,
       error: null,
     });
@@ -1031,7 +1091,7 @@ describe("Right-rail terminals card", () => {
       },
     ]);
     useTerminalsMock.mockReturnValue({
-      terminals: [{ id: "terminal_main", name: "claude", session: "main", running: true }],
+      terminals: [{ id: "terminal_claude_main", name: "claude", session: "main", running: true }],
       isLoading: false,
       error: null,
     });
@@ -1070,7 +1130,7 @@ describe("Right-rail terminals card", () => {
       },
     ]);
     useTerminalsMock.mockReturnValue({
-      terminals: [{ id: "terminal_main", name: "claude", session: "main", running: true }],
+      terminals: [{ id: "terminal_claude_main", name: "claude", session: "main", running: true }],
       isLoading: false,
       error: null,
     });

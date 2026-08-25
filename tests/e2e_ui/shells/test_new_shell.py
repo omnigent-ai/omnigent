@@ -35,11 +35,13 @@ independent session.
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from pathlib import Path
 
-from playwright.sync_api import Page, expect
+import httpx
+from playwright.sync_api import Page, Route, expect
 
 from tests.e2e_ui.conftest import open_right_rail
 
@@ -139,6 +141,67 @@ def test_new_shell_accepts_typed_command(page: Page, terminal_session: tuple[str
     # "terminal session ended". A regression that drops user input or kills
     # the PTY on first keystroke would flip this out of ``connected``.
     expect(terminal_view).to_have_attribute("data-state", "connected")
+
+
+def test_terminal_toggle_stays_disabled_when_only_a_shell_is_open(
+    page: Page, terminal_session: tuple[str, str]
+) -> None:
+    """A live rail shell does not enable or populate the agent Terminal view."""
+    base_url, session_id = terminal_session
+
+    # Runner-hosted SDK sessions auto-create ``terminal_tui_main`` when the
+    # parity sidecar is available (as it is in CI). Hide that pane from this
+    # browser's terminal snapshot and stream so the test deterministically
+    # models the cache window from the bug: a user shell has landed while the
+    # agent pane has not. The shell itself is still launched and attached
+    # through the real runner below.
+    def _serve_shells_only(route: Route) -> None:
+        response = route.fetch()
+        payload = response.json()
+        rows = payload.get("data", [])
+        shells = [
+            row
+            for row in rows
+            if isinstance(row, dict)
+            and isinstance(row.get("metadata"), dict)
+            and str(row["metadata"].get("session_key", "")).startswith("u-")
+        ]
+        payload["data"] = shells
+        payload["first_id"] = shells[0]["id"] if shells else None
+        payload["last_id"] = shells[-1]["id"] if shells else None
+        payload["has_more"] = False
+        route.fulfill(
+            status=response.status,
+            headers={**response.headers, "content-type": "application/json"},
+            body=json.dumps(payload),
+        )
+
+    terminal_list = re.compile(rf"/v1/sessions/{re.escape(session_id)}/resources/terminals\?.*")
+    page.route(terminal_list, _serve_shells_only)
+    page.route(f"**/v1/sessions/{session_id}/stream*", lambda route: route.abort())
+
+    terminal_first = httpx.patch(
+        f"{base_url}/v1/sessions/{session_id}",
+        json={"labels": {"omnigent.ui": "terminal"}},
+        timeout=10.0,
+    )
+    terminal_first.raise_for_status()
+
+    page.goto(f"{base_url}/c/{session_id}")
+    _open_new_shell(page)
+
+    rail = page.get_by_role("complementary", name="Workspace")
+    shell_view = rail.get_by_test_id("terminal-view").last
+    expect(shell_view).to_have_attribute("data-state", "connected", timeout=60_000)
+
+    # This is the cache window from the bug: the user shell is live while the
+    # session's agent terminal is absent.
+    terminal_button = page.get_by_test_id("view-mode-terminal")
+    expect(terminal_button).to_be_disabled()
+    expect(page.locator('[data-testid="main-terminal-view"][data-visible="true"]')).to_have_count(
+        0
+    )
+    expect(shell_view).to_be_visible()
 
 
 def test_shell_wheel_scroll_reaches_mouse_tracking_program(

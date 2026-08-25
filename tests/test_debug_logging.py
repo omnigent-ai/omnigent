@@ -31,6 +31,8 @@ def _clear_env(monkeypatch: pytest.MonkeyPatch) -> None:
         dl.CLIENT_SECRET_ENV_VAR,
         dl.WORKSPACE_URL_ENV_VAR,
         dl.ENDPOINT_ENV_VAR,
+        dl.USER_ID_ENV_VAR,
+        dl.PRIMARY_SESSION_ID_ENV_VAR,
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -162,6 +164,64 @@ def test_debug_event_includes_explicit_correlation() -> None:
     }
 
 
+def test_debug_event_includes_explicit_user_id() -> None:
+    assert dl.debug_event("evt", user_id="u@x") == {
+        "event_name": "evt",
+        "attributes": {},
+        "user_id": "u@x",
+    }
+    assert "user_id" not in dl.debug_event("evt")
+
+
+def test_record_to_row_prefers_explicit_user_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An explicit record.user_id wins over both ambient fallbacks.
+    monkeypatch.setenv(dl.USER_ID_ENV_VAR, "env@x")
+    record = logging.LogRecord("omnigent", logging.INFO, __file__, 1, "hi", (), None)
+    record.user_id = "explicit@x"
+    with dl.current_user_id_scope("ctx@x"):
+        row = dl.record_to_row(record, source="server")
+    assert row["user_id"] == "explicit@x"
+
+
+def test_record_to_row_falls_back_to_context_var() -> None:
+    # No explicit user_id -> the request-scoped ContextVar (server), and only
+    # inside the scope.
+    record = logging.LogRecord("omnigent", logging.INFO, __file__, 1, "hi", (), None)
+    with dl.current_user_id_scope("ctx@x"):
+        assert dl.record_to_row(record, source="server")["user_id"] == "ctx@x"
+    assert dl.record_to_row(record, source="server")["user_id"] is None
+
+
+def test_record_to_row_falls_back_to_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    # No explicit user_id and no ContextVar -> the process-constant env (runner/host).
+    monkeypatch.setenv(dl.USER_ID_ENV_VAR, "env@x")
+    record = logging.LogRecord("omnigent.runner", logging.INFO, __file__, 1, "hi", (), None)
+    assert dl.record_to_row(record, source="runner")["user_id"] == "env@x"
+
+
+def test_current_user_id_priority(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert dl.current_user_id() is None
+    monkeypatch.setenv(dl.USER_ID_ENV_VAR, "env@x")
+    assert dl.current_user_id() == "env@x"
+    with dl.current_user_id_scope("ctx@x"):
+        assert dl.current_user_id() == "ctx@x"  # ContextVar beats env
+    assert dl.current_user_id() == "env@x"
+    # Empty values normalize to None and don't mask the lower-priority source.
+    with dl.current_user_id_scope(""):
+        assert dl.current_user_id() == "env@x"
+    monkeypatch.setenv(dl.USER_ID_ENV_VAR, "")
+    assert dl.current_user_id() is None
+
+
+def test_current_user_id_scope_resets() -> None:
+    with dl.current_user_id_scope("outer@x"):
+        assert dl.current_user_id() == "outer@x"
+        with dl.current_user_id_scope("inner@x"):
+            assert dl.current_user_id() == "inner@x"
+        assert dl.current_user_id() == "outer@x"
+    assert dl.current_user_id() is None
+
+
 def test_emit_revives_closed_uploader(_configured_env: None) -> None:
     # dictConfig() (uvicorn) calls logging.shutdown() → close() on the handler,
     # and os.fork() (the zygote) kills the thread — both leave it attached to
@@ -197,23 +257,6 @@ def test_ignored_loggers_are_dropped() -> None:
     assert not dl._is_ignored_logger("runner.native")
 
 
-def test_startup_probe_emits_sink_online(
-    _configured_env: None, caplog: pytest.LogCaptureFixture
-) -> None:
-    # The startup probe emits a `sink_online` record so every boot has a
-    # definitive health signal (and revives the worker even when idle).
-    config = dl.config_from_env()
-    assert config is not None
-    sink = dl.ZerobusLogHandler(config, "server")
-    try:
-        with caplog.at_level(logging.INFO, logger="omnigent.debug_logging"):
-            sink._probe()
-        assert any(getattr(r, "event_name", None) == "sink_online" for r in caplog.records)
-    finally:
-        sink._probe_timer.cancel()
-        sink.close()
-
-
 def test_attach_is_noop_when_disabled() -> None:
     target = logging.getLogger("test.debug_logging.disabled")
     target.handlers.clear()
@@ -242,7 +285,6 @@ def test_close_tears_down_captured_worker_not_a_concurrent_revive(
     config = dl.config_from_env()
     assert config is not None
     sink = dl.ZerobusLogHandler(config, "server")
-    sink._probe_timer.cancel()
     old_client = sink._client
     old_thread = sink._thread
     orig_join = old_thread.join

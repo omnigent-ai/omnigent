@@ -193,6 +193,13 @@ describe("MainTerminalView — terminal-first SDK sessions", () => {
     fireEvent.click(screen.getByRole("button", { name: "Close shell" }));
     expect(setView).toHaveBeenCalledWith("chat");
   });
+
+  it("never substitutes an open user shell for the agent terminal", () => {
+    renderView({ terminals: [BASH_SHELL] });
+
+    expect(screen.queryByTestId("terminal-view")).toBeNull();
+    expect(screen.getByText("Agent terminal unavailable.")).toBeInTheDocument();
+  });
 });
 
 describe("MainTerminalView — native wrapper sessions", () => {

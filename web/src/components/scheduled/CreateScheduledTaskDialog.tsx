@@ -367,6 +367,7 @@ export function CreateScheduledTaskDialog({
               rows={3}
               placeholder="What should the agent do each run?"
               data-testid="task-prompt-input"
+              componentId="tasks.scheduled.prompt"
               // No native resize grip — match the clean styling of the other fields.
               className="resize-none text-ui"
               onChange={(e) => setPrompt(e.target.value)}
@@ -484,6 +485,7 @@ export function CreateScheduledTaskDialog({
             <Label htmlFor="task-host">Host (optional)</Label>
             <Select
               value={hostId === "" ? UNSET_HOST : hostId}
+              componentId="tasks.scheduled.host"
               onValueChange={(v) => {
                 if (preservePinnedHost && v === UNSET_HOST) return;
                 const next = v === UNSET_HOST ? "" : v;
@@ -554,7 +556,11 @@ export function CreateScheduledTaskDialog({
         </div>
 
         <DialogFooter className="mx-0 mb-0 shrink-0 rounded-none border-t-0 bg-transparent px-6 py-4 sm:justify-end">
-          <Button variant="outline" onClick={() => handleOpenChange(false)}>
+          <Button
+            variant="outline"
+            onClick={() => handleOpenChange(false)}
+            componentId="tasks.scheduled.cancel"
+          >
             Cancel
           </Button>
           <Button
@@ -562,6 +568,7 @@ export function CreateScheduledTaskDialog({
             loading={mutationPending}
             disabled={!canSubmit}
             data-testid="create-scheduled-task-submit"
+            componentId="tasks.scheduled.save"
           >
             {isEdit ? "Save changes" : "Create task"}
           </Button>

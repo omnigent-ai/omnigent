@@ -474,6 +474,22 @@ def _inject_mcp_server_config(
     config_path.write_text(rendered, encoding="utf-8")
 
 
+class CodexAppServerResponseError(RuntimeError):
+    """Structured JSON-RPC error returned by the Codex app-server."""
+
+    def __init__(self, error: object) -> None:
+        """Preserve the JSON-RPC code and message while remaining a RuntimeError."""
+        self.error = error
+        self.code: int | None = None
+        self.message: str | None = None
+        if isinstance(error, dict):
+            code = error.get("code")
+            message = error.get("message")
+            self.code = code if isinstance(code, int) else None
+            self.message = message if isinstance(message, str) else None
+        super().__init__(str(error))
+
+
 class CodexAppServerClient:
     """JSON-RPC client for a Codex app-server.
 
@@ -569,7 +585,7 @@ class CodexAppServerClient:
         :param method: App-server method, e.g. ``"thread/start"``.
         :param params: JSON-serializable method parameters.
         :returns: Decoded response envelope.
-        :raises RuntimeError: If the app-server returns an error.
+        :raises CodexAppServerResponseError: If the app-server returns an error.
         """
         if self._ws is None:
             raise RuntimeError("Codex app-server client is not connected")
@@ -590,7 +606,7 @@ class CodexAppServerClient:
         response = await future
         error = response.get("error")
         if error:
-            raise RuntimeError(str(error))
+            raise CodexAppServerResponseError(error)
         return response
 
     async def notify(self, method: str, params: CodexParams | None = None) -> None:
@@ -1016,6 +1032,22 @@ async def codex_launch_catalog(*, codex_path: str | None = None) -> list[_JsonOb
             return None
 
     return await model_catalog_store.ensure_catalog("codex-native", fingerprint, _probe)
+
+
+async def codex_launch_catalog_is_stale() -> bool:
+    """
+    Whether the default launch shape's stored catalog is past the TTL.
+
+    :returns: ``True`` when the store holds only a stale entry; ``False``
+        when it is fresh, absent, or the launch shape cannot resolve.
+    """
+    from omnigent import model_catalog_store
+
+    try:
+        launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
+    except Exception:  # noqa: BLE001 — a broken provider config means no catalog
+        return False
+    return model_catalog_store.catalog_is_stale("codex-native", codex_catalog_fingerprint(launch))
 
 
 def _build_native_codex_app_server_argv(
@@ -2234,6 +2266,23 @@ class NativeCodexLaunch:
     summary: str = ""
 
 
+_MODEL_PROVIDER_OVERRIDE_PREFIX = "model_provider="
+
+
+def native_codex_launch_pins_model_provider(launch: NativeCodexLaunch) -> bool:
+    """Whether a launch overrides Codex's config-file provider choice.
+
+    Profiles route through generated provider config. Explicit
+    ``model_provider=`` overrides cover CLI-config, configured-provider, and
+    literal built-in OpenAI paths. An empty-override, profile-free launch alone
+    defers to the user's top-level ``config.toml`` provider.
+    """
+    return launch.profile is not None or any(
+        override.startswith(_MODEL_PROVIDER_OVERRIDE_PREFIX)
+        for override in launch.config_overrides
+    )
+
+
 def codex_session_meta_model_provider(launch: NativeCodexLaunch) -> str:
     """Return the provider id a launch routes through, for rollout synthesis.
 
@@ -2259,10 +2308,9 @@ def codex_session_meta_model_provider(launch: NativeCodexLaunch) -> str:
     :returns: Provider id for ``session_meta.model_provider``, e.g.
         ``"omnigent_databricks"``.
     """
-    prefix = "model_provider="
     for override in launch.config_overrides:
-        if override.startswith(prefix):
-            decoded: object = json.loads(override.removeprefix(prefix))
+        if override.startswith(_MODEL_PROVIDER_OVERRIDE_PREFIX):
+            decoded: object = json.loads(override.removeprefix(_MODEL_PROVIDER_OVERRIDE_PREFIX))
             if not isinstance(decoded, str):
                 raise ValueError("model_provider override must decode to a string")
             return decoded
@@ -2284,6 +2332,8 @@ def native_codex_launch_base_url(launch: NativeCodexLaunch) -> str | None:
     :returns: The base URL the launch routes through, or ``None`` when the
         launch pins none.
     """
+    # Profiles are pins too, but must resolve through their Databricks host
+    # before the generic provider-name path below.
     if launch.profile is not None:
         host = _databricks_gateway_host(launch.profile)
         if not host:
@@ -2307,22 +2357,12 @@ def native_codex_launch_base_url(launch: NativeCodexLaunch) -> str | None:
     # A cli-config entry pins only a provider *name*; its table (with the
     # base_url) lives in the user's shared ~/.codex/config.toml. Read that
     # file to resolve the base URL a cli-config launch actually routes through.
-    if _launch_pins_model_provider(launch):
+    if native_codex_launch_pins_model_provider(launch):
         return _cli_config_provider_base_url(codex_session_meta_model_provider(launch))
     # No provider pinned at all: the deliberate config-default path leaves
     # overrides empty so Codex uses its own config.toml top-level
     # ``model_provider`` default (a Databricks-wide setup). Resolve that.
     return _config_default_provider_base_url()
-
-
-def _launch_pins_model_provider(launch: NativeCodexLaunch) -> bool:
-    """Whether a launch carries an explicit ``model_provider=`` override.
-
-    Distinguishes a launch that pins a provider name (cli-config, or the
-    literal ``model_provider="openai"`` the subscription / dismissed paths
-    set) from the empty-override config-default launch, which pins none.
-    """
-    return any(override.startswith("model_provider=") for override in launch.config_overrides)
 
 
 def _config_default_provider_base_url() -> str | None:

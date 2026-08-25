@@ -117,6 +117,24 @@ describe("showNotification", () => {
     expect(showNotification({ title: "X" })).toBeNull();
   });
 
+  it("returns null (no throw) when the constructor is illegal on this platform", () => {
+    // Mobile Chrome / Android expose `Notification` as a function and report
+    // permission "granted", yet `new Notification()` throws "Illegal
+    // constructor" (the API is service-worker-only there). showNotification is
+    // called from a React effect, so a rethrow would trip the page's error
+    // boundary — it must degrade to a no-op instead.
+    const throwingCtor = vi.fn(() => {
+      throw new TypeError("Failed to construct 'Notification': Illegal constructor.");
+    }) as unknown as typeof Notification;
+    (throwingCtor as unknown as { permission: NotificationPermission }).permission = "granted";
+    vi.stubGlobal("Notification", throwingCtor);
+    let result: Notification | null = null;
+    expect(() => {
+      result = showNotification({ title: "X", body: "done" });
+    }).not.toThrow();
+    expect(result).toBeNull();
+  });
+
   it("focuses, runs onClick, and closes when clicked", () => {
     installNotification("granted");
     const focus = vi.spyOn(window, "focus").mockImplementation(() => {});

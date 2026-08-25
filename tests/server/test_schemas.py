@@ -28,6 +28,7 @@ from omnigent.server.schemas import (
     ElicitationRequestEvent,
     ElicitationRequestParams,
     FailedEvent,
+    FailedResponseObject,
     HeartbeatEvent,
     IncompleteEvent,
     InProgressEvent,
@@ -249,10 +250,10 @@ def test_response_envelope_event_carries_real_response_object(
     without a second parse step.
     """
     response = sample_response_object.model_copy(update={"status": status_value})
-    event = event_class(type=type_literal, response=response)
+    event = event_class(type=type_literal, response=response.model_dump())
     # response field must be a real ResponseObject, not a dict — so
     # downstream consumers see typed field access.
-    assert isinstance(event.response, ResponseObject)
+    assert isinstance(event.response, (ResponseObject, FailedResponseObject))
     assert event.response.status == status_value
     # model_dump produces the canonical wire shape with response nested.
     dumped = event.model_dump(exclude_none=True)
@@ -371,9 +372,78 @@ def test_response_stream_event_dispatches_envelope_events(
     )
     # response field round-trips back to a ResponseObject — proves
     # the union didn't downgrade it to a dict.
-    assert isinstance(parsed.response, ResponseObject)
+    assert isinstance(parsed.response, (ResponseObject, FailedResponseObject))
     assert parsed.response.id == "resp_abc123"
     assert parsed.response.status == status_value
+
+
+def test_response_failed_accepts_preallocation_failure_payload() -> None:
+    """Transport failures may occur before response metadata is allocated."""
+    adapter: TypeAdapter[ServerStreamEvent] = TypeAdapter(ServerStreamEvent)
+
+    parsed = adapter.validate_python(
+        {
+            "type": "response.failed",
+            "response": {
+                "status": "failed",
+                "error": {
+                    "code": "connection_error",
+                    "message": "Harness stream connection error",
+                    "type": "RemoteProtocolError",
+                },
+            },
+        }
+    )
+
+    assert isinstance(parsed, FailedEvent)
+    assert type(parsed.response) is FailedResponseObject
+    assert parsed.response.id is None
+    assert parsed.response.model is None
+    assert parsed.response.created_at is None
+    assert parsed.response.error is not None
+    assert parsed.response.error.code == "connection_error"
+    assert "id" not in parsed.response.model_dump()
+    assert "model" not in parsed.response.model_dump()
+    assert "created_at" not in parsed.response.model_dump()
+
+
+def test_response_failed_accepts_allocated_response_model() -> None:
+    """Harnesses may construct a failed event from a strict response model."""
+    response = ResponseObject(
+        id="resp_abc123",
+        status="failed",
+        model="test-agent",
+        created_at=1,
+        error={"code": "model_not_found", "message": "model not found"},
+    )
+
+    event = FailedEvent(type="response.failed", response=response)
+
+    assert event.response is response
+
+
+@pytest.mark.parametrize(
+    "event_type,status",
+    [
+        ("response.created", "queued"),
+        ("response.queued", "queued"),
+        ("response.in_progress", "in_progress"),
+        ("response.completed", "completed"),
+        ("response.cancelled", "cancelled"),
+        ("response.incomplete", "incomplete"),
+    ],
+)
+def test_nonfailed_response_events_reject_missing_metadata(event_type: str, status: str) -> None:
+    """Only pre-allocation failure events may omit response metadata."""
+    adapter: TypeAdapter[ServerStreamEvent] = TypeAdapter(ServerStreamEvent)
+
+    with pytest.raises(ValidationError):
+        adapter.validate_python(
+            {
+                "type": event_type,
+                "response": {"status": status},
+            }
+        )
 
 
 def test_response_stream_event_rejects_unknown_type() -> None:

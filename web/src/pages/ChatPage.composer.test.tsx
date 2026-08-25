@@ -146,6 +146,18 @@ describe("Composer growth layout", () => {
     expect(ta.style.height).toBe("200px");
     expect(form?.style.marginTop).toBe("");
   });
+
+  it("keeps long drafts scrollable without showing a native scrollbar", () => {
+    render(<Composer {...composerProps()} />);
+
+    const ta = textarea();
+    expect(ta).toHaveClass(
+      "overflow-y-auto",
+      "[scrollbar-width:none]",
+      "[&::-webkit-scrollbar]:hidden",
+    );
+    expect(ta.parentElement).toHaveClass("overflow-hidden");
+  });
 });
 
 describe("Composer Claude goal control", () => {

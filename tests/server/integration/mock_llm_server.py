@@ -45,7 +45,8 @@ Configuration via ``POST /mock/configure``::
                     {"call_id": "c1", "name": "grep", "arguments": "{}"}
                 ]
             },
-            {"error": "rate limit exceeded", "status_code": 429}
+            {"error": "rate limit exceeded", "status_code": 429},
+            {"text": "later", "delay": 1.5}
         ]
     }
 """
@@ -520,6 +521,13 @@ class QueuedResponse:
     :param stream: If True, stream text deltas before completed.
     :param error: If set, return an error response with this message.
     :param status_code: HTTP status code for error responses.
+    :param delay: Seconds to sleep before returning this response.
+        Unlike ``block`` (which waits for an external gate release),
+        this is a fixed wall-clock pause the mock owns — use it to
+        give a server-side side effect (e.g. a cold interactive
+        subprocess booting/evaluating) real time to land before the
+        next scripted tool call fires, without depending on the CI
+        runner being fast enough for a back-to-back agent loop.
     """
 
     text: str = "Mock LLM response"
@@ -529,6 +537,7 @@ class QueuedResponse:
     stream: bool = False
     error: str | None = None
     status_code: int = 500
+    delay: float = 0.0
     _gate: asyncio.Event = field(default_factory=asyncio.Event)
     _pending: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -761,6 +770,10 @@ async def create_response(
         queue = _state.resolve_queue_for_request(parsed)
         qr = queue.next()
 
+    # Fixed wall-clock pause the mock owns (see QueuedResponse.delay).
+    if qr.delay:
+        await asyncio.sleep(qr.delay)
+
     # Error response
     if qr.error is not None:
         return JSONResponse(
@@ -828,6 +841,10 @@ async def create_message(
         queue = _state.resolve_queue_for_request(parsed)
         qr = queue.next()
 
+    # Fixed wall-clock pause the mock owns (see QueuedResponse.delay).
+    if qr.delay:
+        await asyncio.sleep(qr.delay)
+
     if qr.error is not None:
         return JSONResponse(
             status_code=qr.status_code,
@@ -877,6 +894,10 @@ async def create_chat_completion(
         model = parsed.get("model") if isinstance(parsed, dict) else None
         queue = _state.resolve_queue_for_request(parsed)
         qr = queue.next()
+
+    # Fixed wall-clock pause the mock owns (see QueuedResponse.delay).
+    if qr.delay:
+        await asyncio.sleep(qr.delay)
 
     if qr.error is not None:
         return JSONResponse(
@@ -1001,6 +1022,7 @@ async def configure(request: Request) -> dict[str, object]:
                     stream=entry.get("stream", False),
                     error=entry.get("error"),
                     status_code=entry.get("status_code", 500),
+                    delay=entry.get("delay", 0.0),
                 )
             )
         count = len(queue.responses)

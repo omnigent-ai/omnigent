@@ -60,9 +60,8 @@ export interface TerminalFirstContextValue {
   /** Switch view. `"terminal"` opens the terminal surface. */
   setView: (view: TerminalFirstView) => void;
   /**
-   * True when a terminal exists AND is reachable (the runner is online) —
-   * i.e. there's a PTY the "Terminal" pill can open right now. False on a
-   * stopped/offline runner, which greys the button.
+   * True when the agent terminal exists and is reachable. User shells do not
+   * enable the Terminal-view toggle; they open through the workspace rail.
    */
   terminalsAvailable: boolean;
   /**

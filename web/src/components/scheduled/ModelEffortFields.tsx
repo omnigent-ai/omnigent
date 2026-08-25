@@ -85,6 +85,8 @@ export function ModelEffortFields({
           <Label htmlFor="task-model">Model</Label>
           <Select
             value={model === "" ? MODEL_SELECT_DEFAULT : model}
+            componentId="tasks.scheduled.model"
+            valueHasNoPii
             onValueChange={(v) => onModelChange(v === MODEL_SELECT_DEFAULT ? "" : v)}
             onOpenChange={onSelectOpenChange}
           >
@@ -110,6 +112,8 @@ export function ModelEffortFields({
           <Label htmlFor="task-effort">Effort</Label>
           <Select
             value={effort === "" ? EFFORT_SELECT_NONE : effort}
+            componentId="tasks.scheduled.effort"
+            valueHasNoPii
             onValueChange={(v) => onEffortChange(v === EFFORT_SELECT_NONE ? "" : v)}
             onOpenChange={onSelectOpenChange}
           >
@@ -136,6 +140,8 @@ export function ModelEffortFields({
         <Label htmlFor="task-permission">Permission mode</Label>
         <Select
           value={permissionMode === "" ? PERMISSION_SELECT_DEFAULT : permissionMode}
+          componentId="tasks.scheduled.permission_mode"
+          valueHasNoPii
           onValueChange={(v) => onPermissionModeChange(v === PERMISSION_SELECT_DEFAULT ? "" : v)}
           onOpenChange={onSelectOpenChange}
         >

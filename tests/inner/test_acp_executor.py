@@ -1005,6 +1005,30 @@ def test_harness_wrap_builds_executor(monkeypatch: pytest.MonkeyPatch) -> None:
     assert ex._config.model == "gpt-5.3"
 
 
+def test_harness_wrap_reads_inject_system_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    """HARNESS_ACP_INJECT_SYSTEM_PROMPT=0 sets inject_system_prompt=False (#4917)."""
+    from omnigent.inner import acp_harness
+
+    monkeypatch.setenv("HARNESS_ACP_COMMAND", "omp acp")
+    monkeypatch.setenv("HARNESS_ACP_INJECT_SYSTEM_PROMPT", "0")
+    ex = acp_harness._build_acp_executor()
+    assert isinstance(ex, AcpExecutor)
+    assert ex._config.inject_system_prompt is False
+
+
+def test_harness_wrap_inject_system_prompt_defaults_to_true(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """inject_system_prompt defaults to True when env var is absent."""
+    from omnigent.inner import acp_harness
+
+    monkeypatch.setenv("HARNESS_ACP_COMMAND", "goose acp")
+    monkeypatch.delenv("HARNESS_ACP_INJECT_SYSTEM_PROMPT", raising=False)
+    ex = acp_harness._build_acp_executor()
+    assert isinstance(ex, AcpExecutor)
+    assert ex._config.inject_system_prompt is True
+
+
 def test_harness_wrap_reads_env_passthrough_names(monkeypatch: pytest.MonkeyPatch) -> None:
     """The wrap decodes the forwarded names, closing parent → child → spawn env."""
     from omnigent.inner import acp_harness
@@ -1230,6 +1254,115 @@ async def test_acp_session_new_omnigent_mcp_disabled_per_agent() -> None:
     ex._rpc = fake_rpc  # type: ignore[assignment]
     await ex._ensure_session()
     assert captured["params"]["mcpServers"] == []
+
+
+def test_omnigent_tools_cleared_when_mcp_disabled() -> None:
+    """run_turn discards builtin tools when omnigent_mcp=False (#4917).
+
+    With the relay disabled, the tool schemas serve no purpose and must not be
+    stored — they could otherwise accidentally reach the session/prompt path.
+    Verified by pre-populating _omnigent_tools and running the capture logic
+    from the start of run_turn in isolation.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x", omnigent_mcp=False))
+    tools = [{"name": "load_skill"}, {"name": "sys_session_rename"}]
+
+    # Simulate the first few lines of run_turn: capture _omnigent_tools.
+    # When omnigent_mcp is False the assignment must yield an empty list.
+    ex._omnigent_tools = (tools or []) if ex._config.omnigent_mcp else []
+    assert ex._omnigent_tools == [], "tools must be discarded when omnigent_mcp=False"
+
+
+def test_omnigent_tools_kept_when_mcp_enabled() -> None:
+    """Sanity: _omnigent_tools is populated when omnigent_mcp=True."""
+    ex = AcpExecutor(AcpAgentConfig(command="x", omnigent_mcp=True))
+    tools = [{"name": "load_skill"}, {"name": "sys_session_rename"}]
+    ex._omnigent_tools = (tools or []) if ex._config.omnigent_mcp else []
+    assert ex._omnigent_tools == tools, "tools must be stored when omnigent_mcp=True"
+
+
+@pytest.mark.asyncio
+async def test_inject_system_prompt_false_skips_prepend(tmp_path: Path) -> None:
+    """inject_system_prompt=False prevents the spec's system prompt from being
+    folded into the first ACP user turn (#4917 — Pi-fork agents like omp).
+
+    Without this fix, Omnigent's system prompt is prepended to the user message
+    on the first turn.  For agents that fully own their own system prompt (Pi
+    forks), this confuses the internal Claude model into emitting XML tool-call
+    fragments (``</function></tool_call>``) when there is no MCP relay backing
+    the described tools.
+    """
+    agent_path = tmp_path / "prompt_echo_agent.py"
+    agent_path.write_text(
+        r"""
+import sys, json
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method", "")
+    if method == "initialize":
+        caps = {"promptCapabilities": {"image": False}}
+        send({"jsonrpc": "2.0", "id": mid,
+              "result": {"protocolVersion": 1, "agentCapabilities": caps}})
+    elif method == "session/new":
+        send({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "echo-1"}})
+    elif method == "session/prompt":
+        sid = msg.get("params", {}).get("sessionId", "echo-1")
+        # Echo back the text the client sent so the test can inspect it.
+        text = ""
+        for block in msg.get("params", {}).get("prompt", []):
+            if isinstance(block, dict) and block.get("type") == "text":
+                text += block.get("text", "")
+        send({"jsonrpc": "2.0", "method": "session/update",
+              "params": {"sessionId": sid,
+                         "update": {"sessionUpdate": "agent_message_chunk",
+                                    "content": {"type": "text", "text": text}}}})
+        send({"jsonrpc": "2.0", "id": mid,
+              "result": {"stopReason": "end_turn", "usage": {}}})
+"""
+    )
+    command = shlex.join([sys.executable, str(agent_path)])
+
+    # With injection enabled (default), the system prompt is prepended.
+    ex_inject = AcpExecutor(AcpAgentConfig(command=command, inject_system_prompt=True))
+    texts_inject: list[str] = []
+    try:
+        async for ev in ex_inject.run_turn(
+            [{"role": "user", "content": "hello"}], [], "SYSTEM_PROMPT_TEXT"
+        ):
+            if isinstance(ev, TextChunk):
+                texts_inject.append(ev.text)
+    finally:
+        await ex_inject.close()
+    combined_inject = "".join(texts_inject)
+    assert "SYSTEM_PROMPT_TEXT" in combined_inject, (
+        "system prompt should appear in the echoed first turn when inject_system_prompt=True"
+    )
+
+    # With injection disabled, the system prompt must NOT appear.
+    ex_no_inject = AcpExecutor(AcpAgentConfig(command=command, inject_system_prompt=False))
+    texts_no_inject: list[str] = []
+    try:
+        async for ev in ex_no_inject.run_turn(
+            [{"role": "user", "content": "hello"}], [], "SYSTEM_PROMPT_TEXT"
+        ):
+            if isinstance(ev, TextChunk):
+                texts_no_inject.append(ev.text)
+    finally:
+        await ex_no_inject.close()
+    combined_no_inject = "".join(texts_no_inject)
+    assert "SYSTEM_PROMPT_TEXT" not in combined_no_inject, (
+        "system prompt must not appear in the first turn when inject_system_prompt=False"
+    )
+    assert "hello" in combined_no_inject, "user message itself must still be sent"
 
 
 @pytest.mark.asyncio

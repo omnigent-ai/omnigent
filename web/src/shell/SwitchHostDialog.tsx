@@ -224,7 +224,11 @@ export function SwitchHostDialog({
           <>
             <div className="flex flex-col gap-2">
               <span className="text-xs font-medium text-muted-foreground">Host</span>
-              <Select value={selectedHostId ?? ""} onValueChange={(v) => setSelectedHostId(v)}>
+              <Select
+                value={selectedHostId ?? ""}
+                onValueChange={(v) => setSelectedHostId(v)}
+                componentId="switch_host.host"
+              >
                 <SelectTrigger className="w-full text-xs" data-testid="switch-host-select">
                   <SelectValue placeholder="Select a host" />
                 </SelectTrigger>

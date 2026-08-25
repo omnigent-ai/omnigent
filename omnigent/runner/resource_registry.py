@@ -1401,6 +1401,7 @@ class SessionResourceRegistry:
             on_status=on_status,
             pane_pid_getter=instance.pane_pid_sync,
             session_id_getter=_session_id_getter,
+            omnigent_session_id=session_id,
         )
 
     async def _handle_terminal_exit(

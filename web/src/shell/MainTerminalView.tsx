@@ -16,7 +16,12 @@
 import { TerminalIcon, XIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { TerminalView } from "@/components/blocks/TerminalView";
-import { AGENT_TERMINAL_IDS, terminalTabKey, useTerminals } from "@/hooks/useTerminals";
+import {
+  AGENT_TERMINAL_IDS,
+  findAgentTerminal,
+  terminalTabKey,
+  useTerminals,
+} from "@/hooks/useTerminals";
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { TerminalStatusBadge } from "./terminalStatus";
 import { useTerminalStatuses } from "./useTerminalStatuses";
@@ -67,10 +72,7 @@ export function MainTerminalView({
   const terminalFirstCtx = useTerminalFirst();
   // The agent's own terminal (SDK REPL / native vendor pane) — the
   // auto-selection target and the pane the pill's Terminal view shows.
-  const agentTerminals = useMemo(
-    () => terminals.filter((t) => AGENT_TERMINAL_IDS.has(t.id)),
-    [terminals],
-  );
+  const agentTerminal = useMemo(() => findAgentTerminal(terminals), [terminals]);
   // Seed from the explicit target so the mount-time validity effect
   // below sees the requested key already in place — a separate
   // set-on-mount effect would race it (both fire in the same commit
@@ -101,8 +103,8 @@ export function MainTerminalView({
   useEffect(() => {
     if (terminals.length === 0) return;
     const stillValid = terminals.some((t) => terminalTabKey(t) === activeKey);
-    if (!stillValid) setActiveKey(terminalTabKey(agentTerminals[0] ?? terminals[0]));
-  }, [terminals, agentTerminals, activeKey]);
+    if (!stillValid) setActiveKey(agentTerminal ? terminalTabKey(agentTerminal) : "");
+  }, [terminals, agentTerminal, activeKey]);
 
   // While hidden, drop a user-shell selection back to the agent terminal.
   // The surface used to unmount on close (forgetting the selection), so
@@ -111,9 +113,8 @@ export function MainTerminalView({
   // the pane the next open will actually show.
   useEffect(() => {
     if (visible || terminals.length === 0) return;
-    const fallback = agentTerminals[0] ?? terminals[0];
-    setActiveKey(terminalTabKey(fallback));
-  }, [visible, terminals, agentTerminals]);
+    setActiveKey(agentTerminal ? terminalTabKey(agentTerminal) : "");
+  }, [visible, terminals, agentTerminal]);
 
   const activeTerminal = terminals.find((t) => terminalTabKey(t) === activeKey) ?? null;
   // A user shell opened from the rail takes over the pane chrome-free:
@@ -154,9 +155,9 @@ export function MainTerminalView({
       className="main-terminal-view flex min-h-0 flex-1 flex-col px-3 pt-14 pb-1.5"
     >
       <div className="flex min-h-0 w-full flex-1 flex-col overflow-hidden rounded-lg border border-border bg-card p-3 shadow-sm">
-        {terminals.length === 0 ? (
+        {activeTerminal === null ? (
           <div className="flex flex-1 items-center justify-center text-muted-foreground text-ui">
-            No terminals available.
+            {terminals.length === 0 ? "No terminals available." : "Agent terminal unavailable."}
           </div>
         ) : (
           <>

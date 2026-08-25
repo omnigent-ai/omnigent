@@ -209,43 +209,11 @@ export function terminalKeyEventPayload(event: KeyboardEvent): string | null {
 const INPUT_ENCODER = new TextEncoder();
 
 /**
- * How recently the user must have typed for an inbound chunk to count as
- * an echo, and the largest chunk still eligible for the synchronous paint.
- */
-export const SYNC_ECHO_WINDOW_MS = 750;
-export const SYNC_ECHO_MAX_BYTES = 2048;
-
-/**
- * Decide whether an inbound PTY chunk should be painted synchronously
- * rather than queued through xterm's async ``write``.
- *
- * The public ``term.write`` defers parsing+paint to a later
- * microtask/frame, adding a frame (or more, under load) of keystroke→echo
- * latency. When the user typed within the last {@link SYNC_ECHO_WINDOW_MS}
- * and the chunk is small (≤ {@link SYNC_ECHO_MAX_BYTES} — an echo or
- * prompt redraw, not a flood), painting it in the same task makes typing
- * feel immediate. Large chunks stay on the async path so an output flood
- * can't monopolize the main thread. Mirrors openui's terminal input fast
- * path.
- *
- * Pure helper — exported for direct unit testing.
- *
- * :param byteLength: Size of the inbound chunk in bytes.
- * :param msSinceLastInput: Milliseconds since the last user keystroke.
- * :returns: ``true`` to take the synchronous echo path.
- */
-export function shouldEchoSynchronously(byteLength: number, msSinceLastInput: number): boolean {
-  return msSinceLastInput < SYNC_ECHO_WINDOW_MS && byteLength <= SYNC_ECHO_MAX_BYTES;
-}
-
-/**
- * Structural view of xterm's internal core, used only to reach the
- * synchronous ``writeSync`` method that the public types don't expose
- * (see {@link TerminalSession.writeOutput}).
+ * Structural view of xterm's internal mouse service. The public modes API
+ * exposes tracking but not the active encoding.
  */
 interface TerminalCore {
   _core?: {
-    writeSync?: (data: Uint8Array, maxSubsequentCalls?: number) => void;
     coreMouseService?: { activeEncoding?: string };
   };
 }
@@ -552,7 +520,7 @@ export class TerminalSession {
   private clipboardEnabled: boolean;
   /** Explicit server capability; defaults off so old/unknown servers fail safe. */
   private osc52ClipboardEnabled = false;
-  /** ``performance.now()`` of the last keystroke; gates the echo fast path. */
+  /** ``performance.now()`` of the last keystroke; gates clipboard writes. */
   private lastUserInputAt = 0;
   /** Guards {@link dispose} so calling it twice is a safe no-op. */
   private disposed = false;
@@ -706,7 +674,7 @@ export class TerminalSession {
       (ev) => {
         if (ev.data instanceof ArrayBuffer) {
           const bytes = new Uint8Array(ev.data);
-          this.writeOutput(bytes);
+          this.term.write(bytes);
           const now = performance.now();
           if (now - lastActivityTs > 300) {
             lastActivityTs = now;
@@ -744,9 +712,8 @@ export class TerminalSession {
 
     this.dataDispose = this.term.onData((d) => {
       onInput?.();
-      // Stamp the keystroke so the next inbound chunk can take the
-      // synchronous echo path; stamp before the readyState guard so a
-      // momentary WS hiccup doesn't disarm the fast path.
+      // Stamp before the readyState guard so clipboard trust still reflects
+      // local input during a momentary WebSocket hiccup.
       this.lastUserInputAt = performance.now();
       if (this.ws.readyState !== WebSocket.OPEN) return;
       this.ws.send(INPUT_ENCODER.encode(d));
@@ -864,17 +831,6 @@ export class TerminalSession {
     this.term.dispose();
   }
 
-  /**
-   * Write inbound PTY bytes to the terminal, taking the synchronous echo
-   * fast path for small chunks that arrive right after a keystroke (see
-   * {@link shouldEchoSynchronously}).
-   *
-   * ``writeSync`` is an internal xterm method not in the public typings,
-   * so it's feature-detected and wrapped in try/catch: any failure — or a
-   * future xterm that drops it — falls back to the async public ``write``.
-   * Correctness never depends on the private API; it only shaves a frame
-   * off the echo when present.
-   */
   private requestClipboardWrite(text: string): void {
     if (
       !this.clipboardEnabled ||
@@ -885,32 +841,15 @@ export class TerminalSession {
     this.onClipboardRequest?.(text);
   }
 
-  private writeOutput(bytes: Uint8Array): void {
-    if (shouldEchoSynchronously(bytes.length, performance.now() - this.lastUserInputAt)) {
-      // eslint-disable-next-line no-underscore-dangle
-      const core = (this.term as unknown as TerminalCore)._core;
-      if (typeof core?.writeSync === "function") {
-        try {
-          core.writeSync(bytes, 1);
-          return;
-        } catch {
-          /* fall through to the async public write */
-        }
-      }
-    }
-    this.term.write(bytes);
-  }
-
   /**
    * Whether the pane program requested SGR mouse encoding (``?1006h``).
    *
    * The public ``IModes`` exposes the tracking mode but not the encoding,
-   * so this feature-detects xterm's core mouse service — same pattern as
-   * the ``writeSync`` fast path. Both tmux with ``mouse on`` (PTY
-   * transport) and Claude Code (control transport) request SGR; when the
-   * private shape is missing or the encoding is anything else, the wheel
-   * handler defers to xterm rather than synthesizing reports the program
-   * could not parse.
+   * so this feature-detects xterm's core mouse service. Both tmux with
+   * ``mouse on`` (PTY transport) and Claude Code (control transport) request
+   * SGR; when the private shape is missing or the encoding is anything else,
+   * the wheel handler defers to xterm rather than synthesizing reports the
+   * program could not parse.
    */
   private sgrMouseEncodingActive(): boolean {
     // eslint-disable-next-line no-underscore-dangle
