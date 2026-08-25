@@ -2354,7 +2354,6 @@ class _StubTerminalInstance:
         self.tmux_target = "main"
         # ``terminal_resource_view`` reads this to project the effective
         # web-attach transport into metadata; ``None`` => the global default.
-        self.terminal_transport = None
         # Records on_activity callbacks the dispatch wires up so a fresh
         # launch's pane-activity watcher start is observable (and so the
         # call doesn't AttributeError against this stub).

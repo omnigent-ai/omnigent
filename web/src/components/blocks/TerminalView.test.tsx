@@ -31,7 +31,6 @@ const terminalSessionMock = vi.hoisted(() => ({
   instances: [] as {
     url: string;
     container: HTMLDivElement;
-    controlMode: boolean;
     clipboardEnabled: boolean;
     onClipboardRequest?: (text: string) => void;
     onState: (state: ConnectionState) => void;
@@ -59,14 +58,12 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
       _isDark?: boolean,
       _onActivity?: () => void,
       _onInput?: () => void,
-      controlMode = false,
       clipboardEnabled = true,
       onClipboardRequest?: (text: string) => void,
     ) {
       terminalSessionMock.instances.push({
         url,
         container,
-        controlMode,
         clipboardEnabled,
         onClipboardRequest,
         onState,
@@ -115,28 +112,15 @@ describe("buildAttachPath", () => {
     );
   });
 
-  it("appends ?transport= when a transport override is given", () => {
-    expect(buildAttachPath("conv_abc", "terminal_bash_s1", false, undefined, "control")).toBe(
-      "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach?transport=control",
-    );
-  });
-
-  it("combines read_only, slice_key, and transport params", () => {
-    const path = buildAttachPath("conv_abc", "terminal_bash_s1", true, "host_789", "control");
+  it("combines read_only and slice-key params", () => {
+    const path = buildAttachPath("conv_abc", "terminal_bash_s1", true, "host_789");
     expect(path).toContain("read_only=true");
     expect(path).toContain("omnigent_slice_key=host_789");
-    expect(path).toContain("transport=control");
   });
 
   it("omits ?omnigent_slice_key when no hostId is provided", () => {
     const path = buildAttachPath("conv_abc", "terminal_bash_s1", false);
     expect(path.includes("omnigent_slice_key")).toBe(false);
-  });
-
-  it("omits ?transport when no override is given", () => {
-    expect(buildAttachPath("conv_abc", "terminal_bash_s1", false).includes("transport")).toBe(
-      false,
-    );
   });
 
   it("url-encodes the session and terminal ids", () => {
@@ -162,34 +146,16 @@ describe("buildAttachPath", () => {
   });
 });
 
-describe("control-mode transport", () => {
-  it("forwards ?transport=control and marks the session as control mode", async () => {
-    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" transport="control" />);
-    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
-    const inst = terminalSessionMock.instances[0];
-    expect(inst.url).toContain("transport=control");
-    expect(inst.controlMode).toBe(true);
-  });
-
+describe("control-mode terminal", () => {
   it("disables clipboard bridging for read-only attaches", async () => {
-    render(
-      <TerminalView
-        sessionId="conv_abc"
-        terminalId="terminal_bash_s1"
-        transport="control"
-        readOnly
-      />,
-    );
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" readOnly />);
     await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
     expect(terminalSessionMock.instances[0].clipboardEnabled).toBe(false);
   });
 
-  it("keeps PTY clipboard behavior without rendering a selection hint", async () => {
+  it("does not render a legacy selection hint", async () => {
     render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
     await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
-    const inst = terminalSessionMock.instances[0];
-    expect(inst.url).not.toContain("transport");
-    expect(inst.controlMode).toBe(false);
     expect(screen.queryByTestId("terminal-selection-hint")).toBeNull();
   });
 });

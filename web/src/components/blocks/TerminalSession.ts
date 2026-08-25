@@ -5,8 +5,8 @@
 // down on the matching detach.
 //
 // Wire protocol (mirrors `omnigent/server/routes/terminal_attach.py`):
-//   - Server → client: binary frames, raw PTY bytes → `term.write`; text
-//     frames for JSON control messages (currently tmux clipboard writes).
+//   - Server → client: binary pane output → `term.write`; text frames for
+//     JSON control messages (currently tmux clipboard writes).
 //   - Client → server: binary frames for keystrokes (`term.onData`);
 //     text frames for JSON control messages (currently only resize).
 
@@ -36,7 +36,7 @@ function terminalFontOptions({ sizePx, family, weight }: CodeFont) {
 // WebSocket close codes (RFC 6455 reserves 4xxx).
 // 4400 signals wrong-replica routing: the keyed request reached the wrong
 // replica (the ``?omnigent_slice_key=`` doesn't match where the tunnel lives).
-// Mirrors ``ws_bridge.py`` ``WS_CLOSE_WRONG_REPLICA``.
+// Mirrors ``ws_common.py`` ``WS_CLOSE_WRONG_REPLICA``.
 export const WS_CLOSE_WRONG_REPLICA = 4400;
 
 /**
@@ -137,7 +137,7 @@ export type ConnectionState =
  * Deliberate closes — normal closure (1000), auth/policy rejections
  * (1008), and the app's own 4xxx codes (4404 terminal-not-found,
  * 4405 terminal-detached, 4500 internal error; see
- * ``omnigent/terminals/ws_bridge.py``) — mean the server decided the
+ * ``omnigent/terminals/ws_common.py``) — mean the server decided the
  * attach should end, so re-dialing would either loop on the same
  * answer or resurrect a terminal the user intentionally left.
  *
@@ -323,17 +323,6 @@ export function decodeTerminalClipboardBase64(encoded: string): string | null {
   return new TextDecoder().decode(bytes);
 }
 
-/** Parse a tmux-compatible OSC 52 clipboard-set payload. */
-export function parseOsc52Clipboard(data: string): string | null {
-  const separator = data.indexOf(";");
-  if (separator < 0) return null;
-  const selector = data.slice(0, separator);
-  const encoded = data.slice(separator + 1);
-  // tmux uses the empty selector; `c` is the standard system clipboard.
-  if ((selector !== "" && selector !== "c") || encoded === "?") return null;
-  return decodeTerminalClipboardBase64(encoded);
-}
-
 /** Parse the strict server→browser clipboard control-message schema. */
 export function parseTerminalClipboardMessage(message: string): string | null {
   let value: unknown;
@@ -352,25 +341,6 @@ export function parseTerminalClipboardMessage(message: string): string | null {
     return null;
   }
   return decodeTerminalClipboardBase64((value as { data: string }).data);
-}
-
-/** Parse the server's explicit PTY OSC 52 trust capability. */
-export function parseTerminalOsc52Capability(message: string): boolean | null {
-  let value: unknown;
-  try {
-    value = JSON.parse(message);
-  } catch {
-    return null;
-  }
-  if (
-    typeof value !== "object" ||
-    value === null ||
-    (value as { type?: unknown }).type !== "osc52-clipboard-capability" ||
-    typeof (value as { enabled?: unknown }).enabled !== "boolean"
-  ) {
-    return null;
-  }
-  return (value as { enabled: boolean }).enabled;
 }
 
 /** Whether a clipboard event is attributable to recent input on this attach. */
@@ -524,8 +494,6 @@ export class TerminalSession {
   private readonly onClipboardRequest?: TerminalClipboardListener;
   /** Whether this visible, interactive attach may write the local clipboard. */
   private clipboardEnabled: boolean;
-  /** Explicit server capability; defaults off so old/unknown servers fail safe. */
-  private osc52ClipboardEnabled = false;
   /** ``performance.now()`` of the last keystroke; gates clipboard writes. */
   private lastUserInputAt = 0;
   /** Guards {@link dispose} so calling it twice is a safe no-op. */
@@ -550,12 +518,10 @@ export class TerminalSession {
    * :param onState: Called with each state transition so React can
    *     render the connecting / closed / error overlay. Invoked
    *     synchronously from WS event handlers.
-   * :param onActivity: Called whenever PTY output arrives from the
+   * :param onActivity: Called whenever terminal output arrives from the
    *     server. This is a best-effort UI activity signal, not a shell
    *     job-state oracle.
    * :param onInput: Called when user input is sent to the terminal.
-   * :param controlMode: Whether this is the control transport. Control mode
-   *     forwards raw pane output, so pane OSC 52 must not be accepted directly.
    * :param clipboardEnabled: Whether tmux copies may write the local clipboard.
    * :param onClipboardRequest: Receives validated tmux copy-mode text.
    */
@@ -566,7 +532,6 @@ export class TerminalSession {
     isDark = false,
     onActivity?: TerminalActivityListener,
     onInput?: TerminalInputListener,
-    controlMode = false,
     clipboardEnabled = true,
     onClipboardRequest?: TerminalClipboardListener,
   ) {
@@ -590,18 +555,9 @@ export class TerminalSession {
       // Opt into xterm's proposed APIs, matching openui's terminal setup.
       allowProposedApi: true,
     });
-    // PTY tmux clients emit OSC 52 after copy-mode commits. Consume only
-    // bounded write requests; clipboard reads/queries are deliberately absent.
-    this.osc52Dispose = this.term.parser.registerOscHandler(52, (data) => {
-      // Control mode forwards raw pane output, so accepting pane OSC 52 there
-      // would bypass tmux's `set-clipboard external` trust boundary. Its copy
-      // path is the typed websocket message emitted from tmux notifications.
-      if (!controlMode && this.osc52ClipboardEnabled) {
-        const text = parseOsc52Clipboard(data);
-        if (text !== null) this.requestClipboardWrite(text);
-      }
-      return true;
-    });
+    // Control mode forwards raw pane output. Consume pane OSC 52 so clipboard
+    // writes can only arrive through validated tmux `clipboard-write` frames.
+    this.osc52Dispose = this.term.parser.registerOscHandler(52, () => true);
     this.fit = new FitAddon();
     this.term.loadAddon(this.fit);
     // Turn bare URLs in terminal output into clickable links. Without
@@ -673,14 +629,9 @@ export class TerminalSession {
             onActivity?.();
           }
         } else if (typeof ev.data === "string") {
-          const capability = parseTerminalOsc52Capability(ev.data);
-          if (capability !== null) {
-            this.osc52ClipboardEnabled = capability;
-          } else {
-            const text = parseTerminalClipboardMessage(ev.data);
-            if (text !== null) this.requestClipboardWrite(text);
-            // Unknown text frames stay ignored for protocol forward compatibility.
-          }
+          const text = parseTerminalClipboardMessage(ev.data);
+          if (text !== null) this.requestClipboardWrite(text);
+          // Unknown text frames stay ignored for protocol forward compatibility.
         }
       },
       { signal },
