@@ -195,13 +195,15 @@ const SESSION_STATE_SLOT_CLASS =
   "-translate-y-1/2 pointer-events-none absolute top-1/2 right-1 flex h-5 items-center transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0";
 
 // Small markers (running/starting/unseen dot, or the draft pencil when there's
-// no session state) get a fixed size-6 centered box so they line up vertically
-// under the kebab. The "awaiting" pill keeps its natural width — a fixed box
-// would clip its "Needs response" label.
+// no session state) get a fixed size-6 centered box so their glyph lands 16px
+// from the right edge — lining up vertically with the desktop kebab and the
+// size-6 section-header icons above (the marker column) in every viewport. The
+// "awaiting" pill keeps its natural width — a fixed box would clip its "Needs
+// response" label.
 function isDotMarker(state: SessionState | null): boolean {
   return state === null || state.kind !== "awaiting";
 }
-const SESSION_STATE_DOT_SLOT_CLASS = "md:w-6 md:justify-center";
+const SESSION_STATE_DOT_SLOT_CLASS = "w-6 justify-center";
 
 // Match the Settings sidebar's ghost-button hover treatment across every home
 // sidebar row.

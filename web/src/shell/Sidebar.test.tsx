@@ -397,7 +397,7 @@ describe("Sidebar session list", () => {
     renderSidebar();
 
     const slot = screen.getByTestId("session-state-badge").parentElement!;
-    expect(slot).toHaveClass("right-1", "md:w-6", "md:justify-center");
+    expect(slot).toHaveClass("right-1", "w-6", "justify-center");
   });
 
   it("does not constrain a row's awaiting pill to the dot slot", () => {
@@ -413,7 +413,7 @@ describe("Sidebar session list", () => {
 
     const slot = screen.getByTestId("session-state-badge").parentElement!;
     expect(slot).toHaveClass("right-1");
-    expect(slot).not.toHaveClass("md:w-6");
+    expect(slot).not.toHaveClass("w-6");
   });
 
   it("offers the four display filters and defaults to My sessions", () => {
