@@ -239,6 +239,25 @@ truly cannot be made to run here do you fall back (naming the specific blocker i
 `evidence`, per Step 4) — never silently swap in a `fire._create_session`-style
 direct call or a hand-written end-state as if it were the reproduction.
 
+**When the failure only appears under a fault, the fault *is* the trigger —
+inject it.** A whole class of bugs is an error/recovery state that the happy
+path never reaches: the model errors mid-turn, a stream dies before completing,
+a dependency 500s, a sub-agent fails. For these the user's journey is "drive a
+normal turn *while* the dependency misbehaves", so you reproduce by making it
+misbehave — do not conclude `not_reproduced` just because the happy path works.
+The `tests/e2e_ui/` suite drives a mock LLM (`tests/server/integration/mock_llm_server.py`)
+whose scripted responses take fault fields: `error` + `status_code` (fail the
+request at open time), `truncate_after: N` (open a normal `200` SSE stream, emit
+N events, then cut it off mid-stream — dropping the completion event so the turn
+dies in flight), and `block` + the `/gate/release` endpoint (hold a turn open to
+drive a stall/cancel). For faults on the *transport* rather than the model — a
+transient 4xx/5xx on the session stream, dropped events — a Playwright `route`
+handler that `fulfill`s or `abort`s the request works too (see
+`tests/e2e_ui/chat/test_stream_transient_404.py` and `test_stale_stream.py`).
+Pick the injection that matches the reported trigger, drive the turn through it,
+and observe the SPA's error/recovery UI (the error pill, retry, reconnect) — that
+observed error state is the reproduction, and the same test films it in Step 4.
+
 Judge **each sub-symptom** honestly and independently:
 
 - Failure reproduces → **`reproduced`**. Capture the evidence (snapshot, response,
@@ -379,7 +398,17 @@ only what you observed.
   same way as `web`: the Playwright test drives the session page with the terminal
   view shown, and the pane's contents land in the browser video (`before-`/`fixed-`
   by the facet's verdict, as above). Save `tmux capture-pane -e` text dumps
-  alongside as machine-checkable evidence.
+  alongside as machine-checkable evidence. **For a native-harness pane
+  (claude/codex/cursor/goose/hermes/kiro/… — the bug is in a real harness CLI's
+  output), don't hand-roll the launch: the existing render-parity tests already
+  drive the *real* CLI against the mock LLM with the terminal view shown, so copy
+  the closest one** (`tests/e2e_ui/messages/test_native_<harness>_render_parity.py`,
+  which use the `native_<harness>_session` / `native_<harness>_mock_session`
+  fixtures in `tests/e2e_ui/conftest.py`) and adapt its scripted turns to your
+  journey. The `--video on` recorder captures the pane with no extra plumbing.
+  These tests skip when the harness CLI isn't installed; if the one your bug needs
+  is unavailable here, keep `recordings: []` and name the missing CLI in
+  `evidence` (a real environment limit, not a `not_reproduced`).
 - **`cli` facets** — author a VHS tape (`recordings/<slug>/journey.tape`) that
   replays the SAME numbered journey steps as your PTY test: `Type`/`Enter` the
   user's commands, `Wait /pattern/` on the observable outcome (the failure for a

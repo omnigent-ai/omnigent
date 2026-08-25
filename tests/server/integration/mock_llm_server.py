@@ -46,9 +46,15 @@ Configuration via ``POST /mock/configure``::
                 ]
             },
             {"error": "rate limit exceeded", "status_code": 429},
-            {"text": "later", "delay": 1.5}
+            {"text": "later", "delay": 1.5},
+            {"text": "one two three", "stream": true, "truncate_after": 2}
         ]
     }
+
+``truncate_after`` opens a normal ``200`` SSE stream but emits only that many
+events before ending — dropping the terminal completion event — to simulate a
+stream that dies mid-flight (the mid-stream fault the ``error`` field, an
+open-time HTTP status, cannot express).
 """
 
 from __future__ import annotations
@@ -273,6 +279,20 @@ def sse_tool_call_response(
         )
     _add("response.completed", response=response_obj)
     return "".join(events)
+
+
+def truncate_sse(body: str, keep_events: int) -> str:
+    """Return the first *keep_events* SSE events of *body*, dropping the rest.
+
+    Events are ``\\n\\n``-delimited. Keeping a prefix drops the terminal
+    completion event (``response.completed`` / ``message_stop``), so a client
+    reading the stream sees deltas start and then the connection end without a
+    completion — the "dropped events mid-stream" fault used to drive the SPA's
+    error/recovery UI. ``keep_events=0`` yields an empty body (immediate EOF).
+    """
+    events = [seg for seg in body.split("\n\n") if seg]
+    kept = events[: max(0, keep_events)]
+    return "".join(f"{seg}\n\n" for seg in kept)
 
 
 def sse_streaming_text(text: str, model: str = "mock-model") -> str:
@@ -528,6 +548,14 @@ class QueuedResponse:
         subprocess booting/evaluating) real time to land before the
         next scripted tool call fires, without depending on the CI
         runner being fast enough for a back-to-back agent loop.
+    :param truncate_after: If set, open the SSE stream normally but emit only
+        this many events and then end the connection — dropping the terminal
+        completion event so the client sees a stream that starts and dies
+        mid-flight. Unlike ``error`` (an HTTP status at open time, before any
+        stream), this is a *mid-stream* fault: the response is a ``200`` SSE
+        body that stops early, which is what exercises the SPA's stream
+        error/recovery UI. ``0`` emits an empty body (immediate EOF after the
+        headers).
     """
 
     text: str = "Mock LLM response"
@@ -538,6 +566,7 @@ class QueuedResponse:
     error: str | None = None
     status_code: int = 500
     delay: float = 0.0
+    truncate_after: int | None = None
     _gate: asyncio.Event = field(default_factory=asyncio.Event)
     _pending: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -810,6 +839,10 @@ async def create_response(
     else:
         sse_body = sse_text_response(qr.text)
 
+    # Mid-stream fault: emit only a prefix and end, dropping the completion.
+    if qr.truncate_after is not None:
+        sse_body = truncate_sse(sse_body, qr.truncate_after)
+
     async def _generate() -> AsyncIterator[str]:
         yield sse_body
 
@@ -863,6 +896,10 @@ async def create_message(
         sse_body = anthropic_sse_tool_call_response(qr.tool_calls)
     else:
         sse_body = anthropic_sse_text_response(qr.text)
+
+    # Mid-stream fault: emit only a prefix and end, dropping message_stop.
+    if qr.truncate_after is not None:
+        sse_body = truncate_sse(sse_body, qr.truncate_after)
 
     async def _generate() -> AsyncIterator[str]:
         yield sse_body
@@ -969,8 +1006,14 @@ async def create_chat_completion(
             ],
         }
 
+        stream_body = f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n"
+        # Mid-stream fault: drop the trailing ``[DONE]`` (and, at 0, the chunk
+        # too) so the client sees the stream end without a terminator.
+        if qr.truncate_after is not None:
+            stream_body = truncate_sse(stream_body, qr.truncate_after)
+
         async def _stream() -> AsyncIterator[str]:
-            yield f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n"
+            yield stream_body
 
         return StreamingResponse(_stream(), media_type="text/event-stream")
     return JSONResponse(content=body_json)
@@ -1023,6 +1066,7 @@ async def configure(request: Request) -> dict[str, object]:
                     error=entry.get("error"),
                     status_code=entry.get("status_code", 500),
                     delay=entry.get("delay", 0.0),
+                    truncate_after=entry.get("truncate_after"),
                 )
             )
         count = len(queue.responses)
