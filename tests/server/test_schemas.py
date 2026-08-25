@@ -839,6 +839,92 @@ def test_session_create_external_rejects_repo_url_workspace() -> None:
         )
 
 
+def test_session_metadata_host_type_defaults_external() -> None:
+    """
+    Multipart ``SessionCreateMetadata.host_type`` defaults to
+    ``"external"`` — every existing bundle-upload client that omits the
+    field keeps its current external-host behaviour (backcompat).
+    """
+    from omnigent.server.schemas import SessionCreateMetadata
+
+    assert SessionCreateMetadata().host_type == "external"
+
+
+def test_session_metadata_managed_rejects_host_id() -> None:
+    """
+    Multipart ``host_type="managed"`` + a caller-supplied ``host_id`` is
+    a contradiction (the server provisions the host) — mirrors the JSON
+    path's contract.
+    """
+    from omnigent.server.schemas import SessionCreateMetadata
+
+    with pytest.raises(ValidationError, match="host_id must not be set"):
+        SessionCreateMetadata(host_type="managed", host_id="host_abc")
+
+
+def test_session_metadata_managed_rejects_path_workspace() -> None:
+    """
+    Multipart ``host_type="managed"`` + a PATH workspace 422s — a
+    managed workspace is a repository URL cloned into the sandbox.
+    """
+    from omnigent.server.schemas import SessionCreateMetadata
+
+    with pytest.raises(ValidationError, match="takes a git repository URL"):
+        SessionCreateMetadata(host_type="managed", workspace="/tmp/w")
+
+
+@pytest.mark.parametrize(
+    "workspace",
+    [
+        "https://github.com/org/repo",
+        "https://github.com/org/repo.git#release-1.2",
+        "git@github.com:org/repo.git",
+    ],
+)
+def test_session_metadata_managed_accepts_repo_url_workspace(workspace: str) -> None:
+    """
+    Multipart ``host_type="managed"`` accepts the ``<repo>[#<branch>]``
+    workspace forms verbatim for the launch path to clone.
+    """
+    from omnigent.server.schemas import SessionCreateMetadata
+
+    meta = SessionCreateMetadata(host_type="managed", workspace=workspace)
+    assert meta.workspace == workspace
+
+
+def test_session_metadata_managed_accepts_sandbox_provider() -> None:
+    """
+    ``sandbox_provider`` is accepted with ``host_type="managed"`` (chooses
+    which configured provider the server provisions).
+    """
+    from omnigent.server.schemas import SessionCreateMetadata
+
+    meta = SessionCreateMetadata(host_type="managed", sandbox_provider="lakebox")
+    assert meta.sandbox_provider == "lakebox"
+
+
+def test_session_metadata_external_rejects_sandbox_provider() -> None:
+    """
+    ``sandbox_provider`` without ``host_type="managed"`` 422s — external
+    hosts are not server-provisioned.
+    """
+    from omnigent.server.schemas import SessionCreateMetadata
+
+    with pytest.raises(ValidationError, match="sandbox_provider only applies"):
+        SessionCreateMetadata(sandbox_provider="lakebox")
+
+
+def test_session_metadata_external_rejects_repo_url_workspace() -> None:
+    """
+    A repository-URL workspace on an external multipart create 422s —
+    there, ``workspace`` is an absolute path on the host.
+    """
+    from omnigent.server.schemas import SessionCreateMetadata
+
+    with pytest.raises(ValidationError, match="requires host_type 'managed'"):
+        SessionCreateMetadata(workspace="https://github.com/org/repo")
+
+
 @pytest.mark.parametrize("status", ["idle", "running", "waiting", "failed"])
 def test_session_response_status_accepts_canonical_set(status: str) -> None:
     """

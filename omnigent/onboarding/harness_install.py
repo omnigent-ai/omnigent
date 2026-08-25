@@ -339,12 +339,13 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     "native-cursor": CURSOR_KEY,
     "kiro-native": KIRO_KEY,
     "native-kiro": KIRO_KEY,
-    # The native agy TUI bridge wraps the ``agy`` CLI; both spellings map to
-    # the Gemini family's install spec. (The in-process ``antigravity`` SDK
-    # harness is deliberately absent — like the other SDK harnesses it needs no
-    # CLI binary.)
+    # The native agy TUI bridge wraps the ``agy`` CLI. The in-process
+    # ``antigravity`` SDK harness is deliberately absent because it needs no
+    # CLI binary.
     "antigravity-native": GEMINI_FAMILY,
     "native-antigravity": GEMINI_FAMILY,
+    "agy-native": GEMINI_FAMILY,
+    "native-agy": GEMINI_FAMILY,
     "goose-native": GOOSE_KEY,
     "native-goose": GOOSE_KEY,
     # Headless Goose (``harness: goose``, drives ``goose acp``) wraps the same

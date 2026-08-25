@@ -472,14 +472,32 @@ class ZerobusLogHandler(logging.Handler):
                 pass
 
     def _run(self) -> None:
-        while not self._stop.is_set():
-            batch = self._collect_batch(self._FLUSH_WAIT)
-            if batch:
-                self._post(batch)
-        # Drain whatever is left on shutdown.
-        remaining = self._collect_batch(0.0)
-        if remaining:
-            self._post(remaining)
+        # This worker owns the client captured at start and closes it on exit,
+        # so close() never shuts the client down from another thread while a
+        # post/token-mint is in flight (which raises inside httpx and would
+        # otherwise kill this thread with an uncaught exception).
+        client = self._client
+        try:
+            while not self._stop.is_set():
+                try:
+                    batch = self._collect_batch(self._FLUSH_WAIT)
+                    if batch:
+                        self._post(batch)
+                except Exception:  # noqa: BLE001 — the uploader thread must never die
+                    # A transient error (or a closed client during a shutdown
+                    # race) must not kill the worker: emit()'s self-heal only
+                    # revives a *stopped* thread, so a crash would silently end
+                    # delivery for the process. Drop and keep going.
+                    time.sleep(0.1)
+            # Best-effort drain of whatever is left on shutdown.
+            remaining = self._collect_batch(0.0)
+            if remaining:
+                self._post(remaining)
+        except Exception:  # noqa: BLE001 — shutdown drain is best-effort
+            pass
+        finally:
+            with contextlib.suppress(Exception):
+                client.close()
 
     _FLUSH_WAIT = _FLUSH_INTERVAL_S
 
@@ -551,24 +569,52 @@ class ZerobusLogHandler(logging.Handler):
     def close(self) -> None:
         if self._closed:
             return
-        # Capture the worker we are tearing down first. A concurrent emit()
-        # (which runs under the handler lock) can revive the sink during the
-        # join below — reassigning self._stop/_thread/_client to fresh ones — so
-        # stop and close the captured locals, never the revived worker.
-        stop, thread, client = self._stop, self._thread, self._client
+        # Signal the worker and let it finish and close its own client. Capture
+        # the worker we are tearing down first: a concurrent emit() (under the
+        # handler lock) can revive the sink during the join below, reassigning
+        # self._stop/_thread to fresh ones. Do NOT close the client here — the
+        # worker's shutdown drain may still be minting a token / posting, and
+        # closing it underneath raises inside httpx and kills the thread.
+        stop, thread = self._stop, self._thread
         self._closed = True
         stop.set()
         thread.join(timeout=5.0)
-        try:
-            client.close()
-        finally:
-            super().close()
+        super().close()
 
 
 # Process-wide sink; recreated only if a prior instance was closed (e.g. a
 # logging reconfigure closed the root handlers out from under us).
 _active_sink: ZerobusLogHandler | None = None
 _sink_lock = threading.Lock()
+
+# Dedicated logger for the server's outgoing SSE-event stream. It gets the sink
+# as its sole handler with ``propagate=False`` (wired in attach_debug_log_sink),
+# so its high-volume, table-only records — one per emitted event, names + safe
+# ids, never content — never reach the on-disk/stderr logs.
+SSE_LOGGER_NAME = "omnigent.sse_events"
+
+
+def debug_sink_enabled() -> bool:
+    """Whether the debug-log sink is active in this process.
+
+    A cheap gate for opt-in, table-only logging (e.g. the SSE-event stream):
+    callers skip building records entirely when the sink is off, so the feature
+    adds no cost for OSS / non-internal users who never enabled it.
+    """
+    # Intentionally lock-free: a single global-object read is atomic under the
+    # GIL, and this is a best-effort gate — a stale read only mis-times one
+    # record around enable/close, never corrupts state.
+    return _active_sink is not None and not _active_sink.closed
+
+
+def sse_event_logger() -> logging.Logger:
+    """Return the table-only logger for SSE events (see :data:`SSE_LOGGER_NAME`).
+
+    Records go only to the debug sink (attached with ``propagate=False`` in
+    :func:`attach_debug_log_sink`); when the sink is disabled the logger has no
+    handlers and records are dropped -- so gate on :func:`debug_sink_enabled`.
+    """
+    return logging.getLogger(SSE_LOGGER_NAME)
 
 
 def attach_debug_log_sink(loggers: list[logging.Logger], *, source: str, level: int) -> None:
@@ -601,3 +647,10 @@ def attach_debug_log_sink(loggers: list[logging.Logger], *, source: str, level: 
         _active_sink.setLevel(level)
         for target in loggers:
             target.addHandler(_active_sink)
+        # Table-only SSE-event logger: the sink is its sole handler and it does
+        # not propagate to root, so per-token delta events populate the table
+        # without flooding the on-disk/stderr logs.
+        sse_logger = logging.getLogger(SSE_LOGGER_NAME)
+        sse_logger.setLevel(level)
+        sse_logger.propagate = False
+        sse_logger.addHandler(_active_sink)
