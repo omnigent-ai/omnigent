@@ -325,6 +325,21 @@ describe("HeaderConversationMenu", () => {
     expect(screen.getAllByRole("separator")).toHaveLength(baseSeparators + 1);
   });
 
+  it("wears the mobile glass surface and a round trigger", () => {
+    // The trigger sits inside the header's round floating pill; a rounded-lg
+    // open-state background showed through it as a square.
+    mocks.isMobile = true;
+    renderMenu();
+    const trigger = screen.getByRole("button", { name: "Conversation actions" });
+    expect(trigger).toHaveClass("max-md:rounded-full");
+
+    openMenu();
+    expect(screen.getByRole("menu")).toHaveClass(
+      "max-md:bg-background/70",
+      "max-md:backdrop-blur-xl",
+    );
+  });
+
   it("reflects pinned state and preserves the disabled share reason", () => {
     renderMenu({
       conversation: {

@@ -30,6 +30,7 @@ import type { Agent } from "@/hooks/useAgents";
 import type { Conversation } from "@/hooks/useConversations";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { cn } from "@/lib/utils";
+import { MOBILE_GLASS_PILL, MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { TAB_BADGE_BASE } from "./railTabs";
 import { ViewModeToggle } from "./ViewModeToggle";
 import { useCallback, useEffect, useRef } from "react";
@@ -158,16 +159,6 @@ interface ChatHeaderProps {
   /** Gating + handlers for the mobile session-menu FAB. */
   mobileMenu: MobileSessionMenuProps;
 }
-
-/**
- * Floating surface for the mobile header controls. The bar paints no
- * background and chat scrolls underneath it, so on a phone each control
- * cluster gets its own translucent pill — the pattern iOS chat apps use to
- * keep controls legible over moving content. Inert at `md+`, where the
- * desktop header sits above the conversation instead of over it.
- */
-const MOBILE_FLOATING_PILL =
-  "max-md:rounded-full max-md:border max-md:border-border/50 max-md:bg-background/80 max-md:shadow-[0_1px_10px_rgb(0_0_0/0.10)] max-md:backdrop-blur-md";
 
 /**
  * ChatHeader — the top action bar for the conversation region.
@@ -394,7 +385,7 @@ export function ChatHeader({
                 // reopen a collapsed sidebar.
                 className={cn(
                   "chat-header-sidebar-toggle text-muted-foreground hover:text-foreground md:size-6",
-                  MOBILE_FLOATING_PILL,
+                  MOBILE_GLASS_PILL,
                 )}
                 onPointerEnter={onPeekSidebar}
                 onPointerLeave={cancelPeek}
@@ -430,8 +421,8 @@ export function ChatHeader({
 
       <div
         className={cn(
-          "flex items-center gap-2 max-md:gap-0.5 max-md:px-1 max-md:py-1 max-md:empty:hidden",
-          MOBILE_FLOATING_PILL,
+          "flex items-center gap-2 max-md:gap-0 max-md:empty:hidden",
+          MOBILE_GLASS_PILL,
         )}
       >
         {/* Other users currently viewing this session (presence).
@@ -461,12 +452,12 @@ export function ChatHeader({
                 size="icon"
                 aria-label="Session actions"
                 data-testid="session-actions-menu"
-                className="text-muted-foreground hover:text-foreground md:hidden"
+                className="text-muted-foreground hover:text-foreground md:hidden max-md:rounded-full"
               >
                 <EllipsisVerticalIcon className="size-4" />
               </Button>
             </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" className="min-w-44">
+            <DropdownMenuContent align="end" className={cn("min-w-44", MOBILE_GLASS_SURFACE)}>
               {canShare && (
                 <DropdownMenuItem
                   onSelect={shareDisabled ? undefined : onShare}

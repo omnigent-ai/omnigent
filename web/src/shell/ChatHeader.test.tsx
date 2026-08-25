@@ -406,18 +406,80 @@ describe("ChatHeader — Chat/Terminal switcher wiring", () => {
 });
 
 describe("ChatHeader — floating mobile controls", () => {
-  it("gives the mobile control clusters their own surface", () => {
+  it("gives the mobile control clusters the same glass surface", () => {
     // The bar paints no background and chat scrolls under it, so each cluster
-    // needs its own pill to stay legible over moving content.
+    // needs its own blurred pill to stay legible over moving content.
     isMobileMock.mockReturnValue(true);
     renderHeader({ sidebarOpen: false, conversationId: "conv-1", canShare: true });
 
     const toggle = screen.getByRole("button", { name: "Open sidebar" });
-    expect(toggle).toHaveClass("max-md:rounded-full", "max-md:bg-background/80");
     const cluster = screen.getByRole("button", { name: "Share session" }).parentElement;
-    expect(cluster).toHaveClass("max-md:rounded-full", "max-md:bg-background/80");
+    for (const surface of [toggle, cluster]) {
+      expect(surface).toHaveClass(
+        "max-md:rounded-full",
+        "max-md:bg-background/70",
+        "max-md:backdrop-blur-xl",
+        "max-md:backdrop-saturate-150",
+      );
+    }
     // Nothing to show on the landing composer — the pill must not paint empty.
     expect(cluster).toHaveClass("max-md:empty:hidden");
+  });
+
+  it("keeps the two clusters the same size around a lone control", () => {
+    // The right pill read visibly larger than the left toggle while it padded
+    // its child; with no padding a lone size-10 kebab is the same 40px circle.
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: false,
+      conversationId: "conv-1",
+      conversationTitle: "Greeting",
+      actionConversation: {
+        id: "conv-1",
+        object: "conversation",
+        title: "Greeting",
+        created_at: 1,
+        updated_at: 2,
+        labels: {},
+        permission_level: 3,
+      },
+    });
+
+    const toggle = screen.getByRole("button", { name: "Open sidebar" });
+    const trigger = screen.getByRole("button", { name: "Conversation actions" });
+    expect(trigger.parentElement).not.toHaveClass("max-md:px-1", "max-md:py-1");
+    expect(trigger).toHaveClass("size-10");
+    expect(toggle).toHaveClass("size-10");
+  });
+
+  it("rounds the kebab's own background so no square shows inside the pill", () => {
+    // The ghost button paints `aria-expanded:bg-muted` at its rounded-lg
+    // radius, which showed as a square behind the round pill once open.
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "conv-1",
+      canShare: true,
+      hasHeaderMenu: true,
+    });
+
+    expect(screen.getByTestId("session-actions-menu")).toHaveClass("max-md:rounded-full");
+  });
+
+  it("gives the fallback menu the same glass as the controls", () => {
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "conv-1",
+      canShare: true,
+      hasHeaderMenu: true,
+    });
+
+    fireEvent.pointerDown(screen.getByTestId("session-actions-menu"), { button: 0 });
+    expect(screen.getByRole("menu")).toHaveClass(
+      "max-md:bg-background/70",
+      "max-md:backdrop-blur-xl",
+    );
   });
 });
 

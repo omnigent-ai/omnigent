@@ -57,6 +57,7 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { Link, useNavigate } from "@/lib/routing";
 import { showToast } from "@/components/ui/toast";
 import { cn } from "@/lib/utils";
+import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { conversationDisplayLabel } from "./sidebarNav";
 
 interface HeaderConversationMenuProps {
@@ -349,14 +350,18 @@ export function HeaderConversationMenu({
             size={isMobile ? "icon" : "icon-xs"}
             aria-label="Conversation actions"
             data-testid="header-conversation-actions"
-            className="shrink-0 border-none text-muted-foreground hover:text-foreground"
+            className="shrink-0 border-none text-muted-foreground hover:text-foreground max-md:rounded-full"
           >
             <EllipsisVerticalIcon className={isMobile ? "size-4" : "size-3.5"} />
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent
           align={isMobile ? "end" : "start"}
-          className={cn("min-w-56", isMobile && "max-w-[min(20rem,calc(100vw-1rem))]")}
+          className={cn(
+            "min-w-56",
+            MOBILE_GLASS_SURFACE,
+            isMobile && "max-w-[min(20rem,calc(100vw-1rem))]",
+          )}
         >
           {isMobile && !projectPickerOpen && (
             <>
