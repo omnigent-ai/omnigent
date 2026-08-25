@@ -1805,9 +1805,7 @@ def test_cli_accounts_login_happy_path_stores_token(
 
     def fake_post(url: str, **kw: object) -> _FakeResponse:
         calls["n"] += 1
-        assert url.endswith("/auth/cli-login"), (
-            f"CLI accounts login should POST to /auth/cli-login, got {url}"
-        )
+        assert url.endswith("/auth/login")
         body = kw["json"]
         assert body == {
             "username": "alice",
@@ -1838,7 +1836,7 @@ def test_cli_accounts_login_happy_path_stores_token(
     assert "Logged in as alice" in result.output
     # The store_token side effect lands in ~/.omnigent/auth_tokens.json.
     assert cli_auth.load_token("http://localhost:8000") == "fake.jwt.token"
-    # The refresh token from /auth/cli-login must also be persisted.
+    # The refresh token from /auth/login must also be persisted when present.
     entry = cli_auth._load_entry("http://localhost:8000")
     assert entry is not None and entry.get("refresh_token") == "fake.refresh.token"
 
@@ -2032,15 +2030,12 @@ def test_setup_is_single_use(accounts_app_needs_setup: TestClient) -> None:
     assert "bob" not in user_ids
 
 
-def test_browser_login_never_issues_refresh_token(accounts_app: TestClient) -> None:
-    """Regression test for P1 security: browser /auth/login must NEVER issue
-    a refresh_token, regardless of client input. Refresh grants are for
-    unattended flows (CLI/device); browser logins should never get long-lived
-    credentials that bypass session expiry.
+def test_login_issues_refresh_token_for_host_renewal(accounts_app: TestClient) -> None:
+    """/auth/login returns a refresh_token alongside the session JWT.
 
-    This was broken when LoginRequest.issue_refresh was a client-controllable
-    bool — XSS or form-hijack could POST issue_refresh=true and obtain a
-    30-day unattended credential.
+    Hosts authenticated via ``omnigent login`` can renew their access token
+    autonomously past the session-JWT TTL via /oauth/token, instead of
+    permanently failing with a misleading 403.
     """
     resp = accounts_app.post(
         "/auth/login",
@@ -2049,39 +2044,10 @@ def test_browser_login_never_issues_refresh_token(accounts_app: TestClient) -> N
     assert resp.status_code == 200, resp.text
     body = resp.json()
 
-    # Browser login must NEVER include refresh_token in response.
-    assert "refresh_token" not in body, (
-        "Browser /auth/login returned refresh_token — violates the security "
-        "invariant that unattended credentials are issued only via CLI/device flows"
-    )
-
-
-def test_cli_login_endpoint_returns_refresh_token(
-    accounts_app: TestClient,
-) -> None:
-    """``POST /auth/cli-login`` always returns a refresh_token (when grant store exists).
-
-    This is the accounts-mode counterpart to the OIDC cli-ticket grant
-    path. A CLI/host that uses the dedicated CLI endpoint can renew its
-    access token autonomously past session-JWT expiry via /oauth/token,
-    instead of dying with a misleading 403 and requiring a human to
-    re-run ``omnigent login``.
-
-    The endpoint is separate from /auth/login so the browser-facing
-    handler provably never issues refresh material, regardless of request
-    content.
-    """
-    resp = accounts_app.post(
-        "/auth/cli-login",
-        json={"username": "admin", "password": "admin-pw-12345"},
-    )
-    assert resp.status_code == 200, resp.text
-    body = resp.json()
-
     assert "token" in body
     assert "refresh_token" in body, (
-        "/auth/cli-login must return a refresh_token "
-        "so CLI-authenticated hosts can renew past session-JWT expiry"
+        "/auth/login must return a refresh_token so unattended hosts can renew "
+        "past session-JWT expiry without a human re-running omnigent login"
     )
     refresh_token = body["refresh_token"]
     assert isinstance(refresh_token, str) and len(refresh_token) > 10
@@ -2092,7 +2058,7 @@ def test_cli_login_endpoint_returns_refresh_token(
         data={"grant_type": "refresh_token", "refresh_token": refresh_token},
     )
     assert refresh_resp.status_code == 200, (
-        f"Refresh token from /auth/cli-login was not accepted at /oauth/token: "
+        f"Refresh token from /auth/login was not accepted at /oauth/token: "
         f"{refresh_resp.status_code} {refresh_resp.text}"
     )
     refresh_body = refresh_resp.json()
@@ -2100,21 +2066,3 @@ def test_cli_login_endpoint_returns_refresh_token(
     assert "refresh_token" in refresh_body
     # Login grants don't rotate — same token is returned.
     assert refresh_body["refresh_token"] == refresh_token
-
-
-def test_browser_login_endpoint_never_returns_refresh_token_with_cli_login_request(
-    accounts_app: TestClient,
-) -> None:
-    """``POST /auth/login`` must NEVER return refresh_token regardless of request body.
-
-    Even if a caller sends the same body shape as the CLI endpoint,
-    the browser-facing /auth/login must not issue refresh material.
-    The security boundary is the ENDPOINT, not a flag in the request.
-    """
-    # Even sending the same fields as /auth/cli-login, /auth/login never returns refresh_token.
-    resp = accounts_app.post(
-        "/auth/login",
-        json={"username": "admin", "password": "admin-pw-12345"},
-    )
-    assert resp.status_code == 200, resp.text
-    assert "refresh_token" not in resp.json()

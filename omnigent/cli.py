@@ -11372,26 +11372,12 @@ def _accounts_login(server: str) -> None:
 
     try:
         resp = _httpx.post(
-            f"{server}/auth/cli-login",
+            f"{server}/auth/login",
             json={"username": username, "password": password},
             timeout=10.0,
         )
     except _httpx.HTTPError as exc:
-        raise click.ClickException(f"Could not reach {server}/auth/cli-login: {exc}") from exc
-
-    if resp.status_code == 404:
-        # Older server without /auth/cli-login — fall back to the shared
-        # /auth/login endpoint (no refresh grant returned, but login still
-        # works). The host will hit the session-expiry 403 after the TTL, as
-        # before; once the server is upgraded it will start issuing grants.
-        try:
-            resp = _httpx.post(
-                f"{server}/auth/login",
-                json={"username": username, "password": password},
-                timeout=10.0,
-            )
-        except _httpx.HTTPError as exc:
-            raise click.ClickException(f"Could not reach {server}/auth/login: {exc}") from exc
+        raise click.ClickException(f"Could not reach {server}/auth/login: {exc}") from exc
 
     if resp.status_code == 401:
         # Generic message — matches what the server returns and
