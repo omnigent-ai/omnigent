@@ -404,6 +404,20 @@ cause is named from what you observed rather than guessed.
   (`before-<facet>.webm`). For an `already_fixed` facet the same test PASSES
   (it already asserts the correct behavior, per Step 3) — that passing run's video
   is the proof-it-works footage (`fixed-<facet>.webm`).
+
+  **`--video on` only instruments pytest-playwright's own `page` fixture.** Some
+  e2e_ui tests (e.g. the whole `tests/e2e_ui/start_session/` suite) drive
+  Playwright *manually* — `async_playwright()` + `browser.new_page()` — instead
+  of taking the `page` fixture. `--video on` records **nothing** for those: the
+  flag never sees their browser, so you get a green/red test but an empty
+  `recordings/`. If the test the bug lives in is that style (grep it for
+  `async_playwright(` / `new_page(`), author your reproduction so it records: use
+  a **context**, not a bare page — `ctx = await browser.new_context(record_video_dir="recordings/<slug>")`,
+  `page = await ctx.new_page()`, and `await ctx.close()` in a `finally` (the video
+  is only flushed on context close). Then move the emitted `*.webm` to
+  `before-`/`fixed-<facet>.webm` as above. Do **not** report `recordings: []` with
+  "this test style can't record" — it can; it just needs the context. Only fall
+  back to empty if wiring the context genuinely fails, and then name that.
 - **`terminal` facets** — the pane renders inside the web app, so record it the
   same way as `web`: the Playwright test drives the session page with the terminal
   view shown, and the pane's contents land in the browser video (`before-`/`fixed-`
