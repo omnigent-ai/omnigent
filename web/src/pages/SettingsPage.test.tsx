@@ -674,7 +674,7 @@ describe("SettingsPage", () => {
     const slider = screen.getByTestId("code-font-weight-slider") as HTMLInputElement;
     expect(slider.value).toBe("0");
     expect(slider).toHaveAttribute("aria-valuetext", "400 Normal");
-    expect(screen.getByTestId("code-font-weight-preview-400")).toHaveTextContent("Aa code");
+    expect(screen.getByTestId("code-font-weight-preview-400")).toHaveTextContent("Aa");
 
     fireEvent.change(slider, { target: { value: "1" } });
     expect(slider.value).toBe("1");
