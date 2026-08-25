@@ -93,12 +93,25 @@ and fall back rather than assuming a fixed structure:
    as a path-labelled code block (repro-agent's contract). Prefer reading the test
    body from that inline block in the log — unlike a live session transcript, the
    CI log is not truncated, so the pasted test is complete here.
+
+   **This run's handoff is authoritative.** The `ci_link` you were given names
+   exactly one repro run, and its `bug_url` is the bug you resolve — no other.
+   You are running on a **shared server that hosts many other repro sessions**;
+   do **not** call `sys_session_list` and pick "a" repro session, and do not
+   resolve a different bug because its session looks handy on this server. If you
+   cannot find the handoff block in this run's log, stop with `needs_more_info` —
+   never fall back to a bug you found by browsing the server.
 2. `gh run download <run-id>` to pull artifacts as a fallback for the test's
    content — an authored test file or a diff/patch artifact — if the log's inline
    block is unavailable or was clipped. Either way, materialize the full test into
    your checkout at `test_path`.
 3. If the run also recorded a shareable `session_id` you can reach, read it with
-   `sys_session_get_history` for richer context.
+   `sys_session_get_history` for richer context — but **only** the exact
+   `session_id` this run's handoff named. Before trusting it, confirm that
+   session's own handoff carries the **same `bug_url`** as the run log. If the
+   ids don't match, or that session is about a different bug, ignore it and rely
+   on the run log alone — do not resolve whatever bug that session turned out to
+   describe.
 4. If neither the artifacts nor the logs yield the test's content, **stop with
    `needs_more_info`** naming exactly what the run was missing. Do not reconstruct
    the test from a guess.
@@ -126,7 +139,12 @@ Do all of this before Step 1:
    it is not a resolution failure. When `public` is absent or false (the default),
    skip this — do not call `sys_session_share`.
 2. **Recover the handoff** (above): the verdict, `facets`, `journey`, `bug_url`,
-   and the e2e test's content at `test_path`.
+   and the e2e test's content at `test_path`. The `bug_url` comes **only** from
+   this run/session's own handoff — the pointer you were invoked with fixes which
+   bug you resolve. On the shared `--server` you can see other repro sessions;
+   never let one of them redirect you to a different bug. Every downstream action
+   (the PR you review or open, the ticket you comment on) must be about this
+   `bug_url` and no other.
 3. **Confirm the workspace**: your cwd is an omnigent checkout, the test exists at
    `test_path`, and your tooling works — `git`, `gh` (authenticated:
    `gh auth status`), and the test runner. If `gh` is not authenticated you can
