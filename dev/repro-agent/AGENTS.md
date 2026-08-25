@@ -165,6 +165,23 @@ the named code path. Whether the cause is exactly the function the report finger
 is something your live reproduction and root-cause work establish — you do not
 take it on faith and you do not let it stand in for driving the real journey.
 
+**Always reproduce as the human interaction — set up the real preconditions,
+don't reach past them.** Drive the same actions a *user* takes and let the system
+do the rest, even when that journey needs infrastructure to be in place first.
+Do **not** substitute a direct call to the internal function the report blames,
+and do **not** hand-fabricate the end-state the bug would produce (e.g. writing a
+session row with the labels you *expect* the buggy path to omit) — both bake your
+own root-cause guess into the reproduction, so if the guess is wrong the test
+guards the wrong thing. If the real journey can't run because a precondition is
+missing in your environment, **establish that precondition and drive the real
+path** rather than shortcutting around it. For example, a scheduled automation
+genuinely cannot fire without an online host, so a faithful repro *makes a host
+online* — e.g. `omnigent host --server <your nested server URL>` registers the
+current environment as a live host — then creates the automation through the UI
+and lets it fire on its own, so the actual create path (labels and all) runs for
+real. Standing up the missing precondition is part of reproducing the user's
+journey, not a workaround for it.
+
 **Stamp each sub-symptom with the user-facing surface it shows on.** Alongside
 the verdict you will give each facet (Step 2), record where a user *sees* the
 failure: `web` (the web SPA), `terminal` (a TUI or shell pane rendered inside
@@ -212,6 +229,15 @@ independently, because a compound bug can be partly fixed:
 - **Backend/behavioral bugs** — create a session and drive turns via
   `sys_session_*`, or exercise the server's HTTP API directly, and capture the
   bad response / traceback / exit.
+
+Reach for the real trigger, not the internal function it flows into. If the
+journey depends on a precondition your environment lacks (an online host for a
+scheduled fire, a connected runner, a seeded workspace), set it up — e.g.
+`omnigent host --server <nested server URL>` to bring a host online — and then
+drive the user action so the genuine path executes. Only when a user-facing path
+truly cannot be made to run here do you fall back (naming the specific blocker in
+`evidence`, per Step 4) — never silently swap in a `fire._create_session`-style
+direct call or a hand-written end-state as if it were the reproduction.
 
 Judge **each sub-symptom** honestly and independently:
 
