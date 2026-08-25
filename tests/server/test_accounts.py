@@ -1810,6 +1810,7 @@ def test_cli_accounts_login_happy_path_stores_token(
         assert body == {
             "username": "alice",
             "password": "alice-pw-1234",
+            "issue_refresh": True,
         }
         return _FakeResponse(
             200,
@@ -2030,25 +2031,35 @@ def test_setup_is_single_use(accounts_app_needs_setup: TestClient) -> None:
     assert "bob" not in user_ids
 
 
-def test_login_issues_refresh_token_for_host_renewal(accounts_app: TestClient) -> None:
-    """/auth/login returns a refresh_token alongside the session JWT.
-
-    Hosts authenticated via ``omnigent login`` can renew their access token
-    autonomously past the session-JWT TTL via /oauth/token, instead of
-    permanently failing with a misleading 403.
+def test_browser_login_never_issues_refresh_token(accounts_app: TestClient) -> None:
+    """Regression: browser /auth/login (no issue_refresh) must never return a
+    refresh_token. Gating is on the request field so the web form, which never
+    sends it, cannot receive long-lived unattended credentials under XSS or
+    form-hijack.
     """
     resp = accounts_app.post(
         "/auth/login",
         json={"username": "admin", "password": "admin-pw-12345"},
     )
     assert resp.status_code == 200, resp.text
+    assert "refresh_token" not in resp.json()
+
+
+def test_cli_login_with_issue_refresh_issues_grant(accounts_app: TestClient) -> None:
+    """``POST /auth/login`` with ``issue_refresh=True`` returns a usable refresh_token.
+
+    The CLI sends this flag; unattended hosts can renew past session-JWT expiry
+    via /oauth/token without a human re-running ``omnigent login``.
+    """
+    resp = accounts_app.post(
+        "/auth/login",
+        json={"username": "admin", "password": "admin-pw-12345", "issue_refresh": True},
+    )
+    assert resp.status_code == 200, resp.text
     body = resp.json()
 
     assert "token" in body
-    assert "refresh_token" in body, (
-        "/auth/login must return a refresh_token so unattended hosts can renew "
-        "past session-JWT expiry without a human re-running omnigent login"
-    )
+    assert "refresh_token" in body
     refresh_token = body["refresh_token"]
     assert isinstance(refresh_token, str) and len(refresh_token) > 10
 
@@ -2057,12 +2068,8 @@ def test_login_issues_refresh_token_for_host_renewal(accounts_app: TestClient) -
         "/oauth/token",
         data={"grant_type": "refresh_token", "refresh_token": refresh_token},
     )
-    assert refresh_resp.status_code == 200, (
-        f"Refresh token from /auth/login was not accepted at /oauth/token: "
-        f"{refresh_resp.status_code} {refresh_resp.text}"
-    )
+    assert refresh_resp.status_code == 200, refresh_resp.text
     refresh_body = refresh_resp.json()
     assert "access_token" in refresh_body
-    assert "refresh_token" in refresh_body
     # Login grants don't rotate — same token is returned.
     assert refresh_body["refresh_token"] == refresh_token

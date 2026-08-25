@@ -74,10 +74,18 @@ class LoginRequest(BaseModel):
         before lookup.
     :param password: Plaintext password, length-validated against
         :data:`_MIN_PASSWORD_LENGTH` but otherwise opaque.
+    :param issue_refresh: When ``True`` and a grant store is wired, also
+        issue a login-scoped refresh grant and include ``refresh_token``
+        in the response. Intended for CLI / unattended-host callers only
+        (``omnigent login``); the web form never sends this field, so
+        browser sessions never receive long-lived refresh material. Pydantic
+        coerces non-bool values to bool, so only the literal JSON booleans
+        ``true``/``false`` are accepted.
     """
 
     username: str = Field(min_length=1, max_length=128)
     password: str = Field(min_length=1, max_length=1024)
+    issue_refresh: bool = False
 
 
 class RegisterRequest(BaseModel):
@@ -322,7 +330,12 @@ def create_accounts_auth_router(
             "expires_in": _session_max_age,
             "user": {"id": user.id, "is_admin": user.is_admin},
         }
-        if device_grant_store is not None:
+        # Browser login must never receive refresh material — only CLI/device
+        # flows do (via issue_refresh=True or the device-grant callback).
+        # Gated on body.issue_refresh so the web form, which never sends
+        # the field, cannot obtain long-lived unattended credentials even
+        # under XSS or form-hijack (the browser has no way to set it True).
+        if body.issue_refresh is True and device_grant_store is not None:
             from omnigent.server.routes.device_auth import issue_login_grant
 
             try:
