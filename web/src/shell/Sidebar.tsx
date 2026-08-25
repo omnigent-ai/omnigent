@@ -1060,7 +1060,7 @@ export function Sidebar({
           drawer keeps once the collapse toggle is gone. */}
               <SidebarSettingsButton
                 testId="sidebar-settings-float"
-                className="absolute right-3 bottom-3 shadow-md max-md:bg-muted md:hidden"
+                className="absolute right-3 bottom-3 md:hidden"
               />
             </div>
 

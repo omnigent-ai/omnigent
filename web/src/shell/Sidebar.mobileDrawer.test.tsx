@@ -201,6 +201,39 @@ describe("mobile sidebar drawer", () => {
     );
   });
 
+  it("gives both floating chips one shared glass treatment", () => {
+    // These drifted apart once — Settings landed opaque with a heavier shadow
+    // than Search. The look now lives in a single CSS class, so assert both
+    // wear it and neither carries a competing background or shadow utility.
+    renderSidebar();
+
+    const search = screen.getByTestId("sidebar-search-button");
+    const settings = screen.getByTestId("sidebar-settings-float").closest("a, button")!;
+
+    // Where the chip sits, and which breakpoint it shows at, legitimately
+    // differ; everything about how it looks must not.
+    // `relative` is the Button base's own position, which tailwind-merge drops
+    // from the floating copy in favour of `absolute` — placement, not looks.
+    const PLACEMENT = new Set([
+      "absolute",
+      "relative",
+      "right-3",
+      "bottom-3",
+      "md:hidden",
+      "max-md:hidden",
+    ]);
+    const appearance = (el: Element) =>
+      el.className
+        .split(/\s+/)
+        .filter((c) => c && !PLACEMENT.has(c))
+        .sort()
+        .join(" ");
+
+    expect(search).toHaveClass("sidebar-glass-chip");
+    expect(settings).toHaveClass("sidebar-glass-chip");
+    expect(appearance(settings)).toBe(appearance(search));
+  });
+
   it("gives the session list a gutter so the last row clears the floating chip", () => {
     // The chip doesn't scroll, so without this the bottom row's always-visible
     // kebab sits underneath it and can't be tapped.
