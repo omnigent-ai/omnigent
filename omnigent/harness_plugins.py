@@ -648,6 +648,20 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
 for _acp_cli_name in ACP_CLI_HARNESSES:
     _BUILTIN_CAPABILITIES[_acp_cli_name] = _BUILTIN_CAPABILITIES["acp"]
 
+# The four parity axes are left undeclared on every builtin harness, and that
+# is deliberate. An earlier cut derived ``skills`` from the native tool relay —
+# which does not carry ``load_skill`` / ``read_skill_file`` — and concluded that
+# no native harness can load a skill. That is wrong: the relay is one mechanism
+# of several, and the native launch paths wire skills through the vendor's own
+# discovery instead. ``claude_native_skill_args`` passes the bundle to the real
+# ``claude`` binary via ``--plugin-dir``; ``populate_codex_skills_from_bundle``
+# links them into the per-bridge ``CODEX_HOME``. Both load ``SKILL.md`` files
+# the relay never carries.
+#
+# So the honest value is ``unknown`` until the harness bench observes each one.
+# Deriving a published claim from a single mechanism is how a parity matrix
+# stops being true, which is the failure this axis exists to prevent.
+
 
 _BUILTIN_CONTRIBUTION = HarnessContribution(
     name="omnigent",
