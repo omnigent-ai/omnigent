@@ -34,6 +34,7 @@ import {
   LaptopIcon,
   Loader2Icon,
   MailIcon,
+  MessageCircleDashedIcon,
   Maximize2Icon,
   Minimize2Icon,
   MoreHorizontalIcon,
@@ -3697,7 +3698,7 @@ function ConversationRow({
               data-testid="conversation-draft-indicator"
               className="inline-flex h-5 shrink-0 items-center justify-center text-muted-foreground"
             >
-              <PencilIcon aria-hidden className="size-3.5" />
+              <MessageCircleDashedIcon aria-hidden className="size-3.5" />
             </span>
           )}
         </span>

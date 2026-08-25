@@ -12,9 +12,24 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
 
+use crate::omnigent_cmd;
 use crate::pod::Pod;
 use crate::process::ProcSpec;
 use crate::state::{ProcId, ProcStatus, Shared};
+
+const CONVERSATION_PREFILL_VERSION: &str = "v1";
+const CONVERSATION_PREFILL_FIXTURES: &[&str] = &[
+    "dev/omnidev/fixtures/conversations/adding-api-pagination.jsonl",
+    "dev/omnidev/fixtures/conversations/debugging-a-flaky-test.jsonl",
+    "dev/omnidev/fixtures/conversations/fixing-an-accessibility-regression.jsonl",
+    "dev/omnidev/fixtures/conversations/improving-an-error-message.jsonl",
+    "dev/omnidev/fixtures/conversations/investigating-performance.jsonl",
+    "dev/omnidev/fixtures/conversations/planning-a-feature.jsonl",
+    "dev/omnidev/fixtures/conversations/quick-question.jsonl",
+    "dev/omnidev/fixtures/conversations/refactoring-a-parser.jsonl",
+    "dev/omnidev/fixtures/conversations/reviewing-a-database-migration.jsonl",
+    "dev/omnidev/fixtures/conversations/updating-documentation.jsonl",
+];
 
 /// Commands the TUI (and watcher) send to the supervisor.
 #[derive(Debug, Clone)]
@@ -157,11 +172,114 @@ impl Supervisor {
     async fn start_backend(&mut self) {
         self.spawn(ProcId::Server);
         if self.pod.host_enabled() && self.wait_healthy().await {
+            self.prefill_conversations().await;
             self.spawn(ProcId::Host);
         } else if self.pod.host_enabled() {
             self.event("server did not become healthy; host not started");
         } else {
             self.set_status(ProcId::Host, ProcStatus::Stopped);
+        }
+    }
+
+    /// Import curated transcripts concurrently once the OSS server is ready.
+    /// One marker per fixture makes retries safe if an import fails.
+    async fn prefill_conversations(&self) {
+        if self.pod.profile.is_some() {
+            return;
+        }
+
+        let marker_dir = self
+            .pod
+            .dir
+            .join("data/omnigent/omnidev-conversation-prefill")
+            .join(CONVERSATION_PREFILL_VERSION);
+        if let Err(error) = std::fs::create_dir_all(&marker_dir) {
+            self.event(format!(
+                "could not prepare conversation prefill markers: {error}"
+            ));
+            return;
+        }
+
+        let mut imports = tokio::task::JoinSet::new();
+        for relative_fixture in CONVERSATION_PREFILL_FIXTURES {
+            let fixture = self.pod.repo_root.join(relative_fixture);
+            let Some(file_name) = fixture
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+            else {
+                continue;
+            };
+            let marker = marker_dir.join(&file_name).with_extension("done");
+            if marker.exists() {
+                continue;
+            }
+            if !fixture.is_file() {
+                self.event(format!(
+                    "conversation prefill fixture is missing: {}",
+                    fixture.display()
+                ));
+                continue;
+            }
+
+            let args = vec![
+                "session".into(),
+                "import".into(),
+                "--input".into(),
+                fixture.display().to_string(),
+                "--server".into(),
+                self.pod.server_url(),
+            ];
+            let spec = omnigent_cmd::build(&self.pod, &args);
+            let mut command = Command::new(&spec.program);
+            command
+                .args(&spec.args)
+                .current_dir(&spec.cwd)
+                .envs(spec.env)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+
+            imports.spawn(async move {
+                let result = timeout(Duration::from_secs(60), command.output()).await;
+                (file_name, marker, result)
+            });
+        }
+
+        while let Some(joined) = imports.join_next().await {
+            let Ok((file_name, marker, result)) = joined else {
+                self.event("conversation prefill task failed");
+                continue;
+            };
+            match result {
+                Ok(Ok(output)) if output.status.success() => {
+                    if let Err(error) = std::fs::write(&marker, b"seeded\n") {
+                        self.event(format!(
+                            "prefilled {file_name} but could not write its marker: {error}"
+                        ));
+                    } else {
+                        self.event(format!("prefilled conversation {file_name}"));
+                    }
+                }
+                Ok(Ok(output)) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let detail = if stderr.trim().is_empty() {
+                        stdout.trim()
+                    } else {
+                        stderr.trim()
+                    };
+                    self.event(format!(
+                        "could not prefill {file_name} ({}): {}",
+                        output.status,
+                        detail.lines().last().unwrap_or("no output")
+                    ));
+                }
+                Ok(Err(error)) => self.event(format!(
+                    "could not start conversation prefill for {file_name}: {error}"
+                )),
+                Err(_) => self.event(format!("conversation prefill timed out for {file_name}")),
+            }
         }
     }
 
@@ -176,6 +294,7 @@ impl Supervisor {
         if !self.pod.host_enabled() {
             self.set_status(ProcId::Host, ProcStatus::Stopped);
         } else if self.wait_healthy().await {
+            self.prefill_conversations().await;
             self.spawn(ProcId::Host);
         } else {
             self.event("server did not become healthy after restart");
