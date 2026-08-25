@@ -22,6 +22,7 @@ function loadMainHarness({
 
   const ipcHandlers = new Map();
   const appEvents = new Map();
+  const mainImmediates = [];
   const calls = {
     appQuit: 0,
     appExit: 0,
@@ -194,6 +195,9 @@ function loadMainHarness({
       if (specifier in localRequires) return localRequires[specifier];
       return mainRequire(specifier);
     },
+    setImmediate: (callback, ...args) => {
+      mainImmediates.push(() => callback(...args));
+    },
     setInterval,
     setTimeout,
   };
@@ -216,7 +220,12 @@ function loadMainHarness({
       unpinned: { sender, senderFrame: { url: "https://evil.example/app" } },
     },
     ipcHandlers,
+    pendingMainImmediates: () => mainImmediates.length,
     readSettings: () => JSON.parse(fs.readFileSync(path.join(userData, "settings.json"), "utf8")),
+    runMainImmediates: () => {
+      const pending = mainImmediates.splice(0);
+      for (const run of pending) run();
+    },
   };
 }
 
@@ -501,6 +510,10 @@ describe("auto-update main-process wiring", () => {
     await flushPromises();
 
     assert.equal(prevented, 1);
+    assert.deepEqual(harness.calls.quitAndInstall, []);
+    assert.equal(harness.pendingMainImmediates(), 1);
+
+    harness.runMainImmediates();
     assert.deepEqual(harness.calls.quitAndInstall, [[false, true]]);
     assert.equal(harness.calls.appQuit, 1);
   });
@@ -529,6 +542,11 @@ describe("auto-update main-process wiring", () => {
     harness.api.setQuitTimeouts({ installFallback: 10 });
     harness.appEvents.get("before-quit")({ preventDefault: () => {} });
     await flushPromises();
+    assert.deepEqual(harness.calls.quitAndInstall, []);
+    assert.equal(harness.pendingMainImmediates(), 1);
+
+    harness.runMainImmediates();
+    assert.deepEqual(harness.calls.quitAndInstall, [[false, true]]);
     assert.equal(harness.calls.appQuit, 1); // still no re-issued quit
     assert.equal(harness.calls.appExit, 0); // fallback not fired yet
 
@@ -546,6 +564,10 @@ describe("auto-update main-process wiring", () => {
 
     harness.appEvents.get("before-quit")({ preventDefault: () => {} });
     await flushPromises();
+    assert.equal(harness.calls.appQuit, 0);
+    assert.equal(harness.pendingMainImmediates(), 1);
+
+    harness.runMainImmediates();
     assert.equal(harness.calls.appQuit, 1);
     assert.equal(harness.calls.appExit, 0);
 
@@ -562,8 +584,11 @@ describe("auto-update main-process wiring", () => {
 
     harness.appEvents.get("before-quit")({ preventDefault: () => {} });
     await flushPromises();
-    assert.equal(harness.calls.appQuit, 1);
+    assert.equal(harness.calls.appQuit, 0);
+    assert.equal(harness.pendingMainImmediates(), 1);
 
+    harness.runMainImmediates();
+    assert.equal(harness.calls.appQuit, 1);
     harness.appEvents.get("quit")();
     await new Promise((resolve) => {
       setTimeout(resolve, 30);
@@ -590,6 +615,7 @@ describe("auto-update main-process wiring", () => {
     harness.appEvents.get("before-quit")({ preventDefault: () => {} });
     await flushPromises();
     assert.equal(harness.calls.appQuit, 0); // shutdown hung, no re-issued quit
+    assert.equal(harness.pendingMainImmediates(), 0);
     assert.equal(harness.calls.appExit, 0); // cap not fired yet
 
     await new Promise((resolve) => {
