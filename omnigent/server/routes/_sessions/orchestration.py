@@ -1236,8 +1236,8 @@ def _accumulate_session_usage(
 
             # Load provider config to check for custom pricing
             provider_config = load_config()
-            # Get harness from conversation's harness_override if available
-            harness = conv.harness_override if conv else None
+            # Resolve harness from conversation (agent spec + overrides)
+            harness = _resolve_harness(conv) if conv else None
             pricing = fetch_model_pricing_with_provider(
                 llm_model, provider_config=provider_config, harness=harness
             )
@@ -1432,8 +1432,8 @@ def _persist_native_cumulative_usage(
 
             # Load provider config to check for custom pricing
             provider_config = load_config()
-            # Get harness from conversation's harness_override if available
-            harness = conv.harness_override if conv else None
+            # Resolve harness from conversation (agent spec + overrides)
+            harness = _resolve_harness(conv) if conv else None
             pricing = fetch_model_pricing_with_provider(
                 model_name, provider_config=provider_config, harness=harness
             )

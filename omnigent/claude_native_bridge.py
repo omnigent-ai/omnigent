@@ -2430,6 +2430,11 @@ def _transcript_model_pricing(model: str) -> ModelPricing | None:
     then falls back to catalog. This enables cost tracking for native
     claude-native sessions using self-hosted endpoints.
 
+    WARNING: This cache does not include provider identity in the key. If the
+    user switches providers or changes pricing config mid-session, stale rates
+    will be returned for already-cached models. For accurate cost tracking in
+    multi-provider scenarios, provider identity should be included in the key.
+
     :param model: API model id from a transcript ``message.model``,
         e.g. ``"claude-opus-4-8"`` or ``"databricks-claude-sonnet-4-6"``.
     :returns: The model's :class:`ModelPricing`, or ``None`` when pricing

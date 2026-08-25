@@ -562,9 +562,10 @@ def build_policy_engine(
     # Pass the full ModelPricing so the engine can price cache-read and
     # cache-write tokens at their own rates via compute_llm_cost(). Check
     # provider config first for custom pricing (self-hosted models), then
-    # fall back to catalog.
+    # fall back to catalog. Use the effective model from the session (honors
+    # model_override) rather than the static spec model.
     token_pricing: Any = None
-    if spec.llm:
+    if initial_model:
         # Load provider config to check for custom pricing
         from omnigent.onboarding.provider_config import load_config
 
@@ -573,7 +574,7 @@ def build_policy_engine(
         # fetch_model_pricing_with_provider for all call sites)
         harness = spec.harness_kind if hasattr(spec, "harness_kind") else None
         token_pricing = fetch_model_pricing_with_provider(
-            spec.llm.model, provider_config=provider_config, harness=harness
+            initial_model, provider_config=provider_config, harness=harness
         )
     server_connection = _resolve_server_llm_connection(server_llm)
     # host_connection carries the per-request caller token (billed to

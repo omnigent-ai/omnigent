@@ -295,18 +295,18 @@ def fetch_model_pricing_with_provider(
     harness: str | None = None,
 ) -> ModelPricing | None:
     """
-    Fetch model pricing, checking catalog first then provider config.
+    Fetch model pricing, checking provider config first then catalog.
 
     Resolution order:
-    1. MLflow catalog via :func:`fetch_model_pricing` (for known models)
-    2. Provider config custom pricing (for self-hosted models not in catalog)
+    1. Provider config custom pricing (for self-hosted/gateway models with configured rates)
+    2. MLflow catalog via :func:`fetch_model_pricing` (for known vendor models)
     3. ``None`` (unpriced)
 
     This enables cost tracking for self-hosted models (Ollama, vLLM, custom
-    gateways) that aren't in the MLflow catalog. Custom pricing is used ONLY
-    when the model is not found in the catalog, so catalog-priced models
-    (e.g. ``claude-opus-4``, ``databricks-claude-*``) are never repriced by
-    a self-hosted provider's ``pricing`` block.
+    gateways) and gateway endpoints that expose catalog-known model IDs but
+    charge their own configured rates. Custom pricing takes precedence when
+    configured, so a self-hosted provider serving ``claude-opus-4`` can
+    override the vendor catalog rate with its own.
 
     Example provider config::
 
@@ -332,13 +332,17 @@ def fetch_model_pricing_with_provider(
         normalized internally.
     :returns: A :class:`ModelPricing` (per-token rates), or ``None`` when
         pricing is unavailable.
-    """
-    # Step 1: Check catalog first (catalog models take precedence over custom pricing)
-    catalog_pricing = fetch_model_pricing(model)
-    if catalog_pricing is not None:
-        return catalog_pricing
 
-    # Step 2: Check provider config custom pricing for models not in catalog
+    .. note::
+        LIMITATION: This function uses ``default_provider_for_harness`` to
+        resolve the provider, which returns the DEFAULT provider for the given
+        harness, not necessarily the provider actually used by the session.
+        Sessions using named providers (via ``ProviderAuth``) that differ from
+        the default may be priced incorrectly. A future improvement should
+        thread the actual ``ProviderEntry`` from launch/session state instead
+        of re-resolving the default.
+    """
+    # Step 1: Check provider config custom pricing first (configured rates take precedence)
     # Canonicalize harness to handle SDK executor spellings (claude_sdk -> claude-sdk)
     if provider_config is not None and harness is not None:
         from omnigent.harness_aliases import canonicalize_harness
@@ -378,8 +382,13 @@ def fetch_model_pricing_with_provider(
                         )
         except Exception:
             # If provider lookup fails (e.g., malformed config, import error),
-            # return None rather than breaking cost tracking entirely.
+            # fall through to catalog rather than breaking cost tracking entirely.
             pass
+
+    # Step 2: Fall back to catalog pricing when provider pricing is not configured
+    catalog_pricing = fetch_model_pricing(model)
+    if catalog_pricing is not None:
+        return catalog_pricing
 
     # Step 3: No pricing available
     return None

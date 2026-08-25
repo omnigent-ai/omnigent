@@ -303,10 +303,11 @@ class FamilyConfig:
         ``default`` key consulted when the spec declares no model, e.g.
         ``{"default": "gpt-4o", "opus": "claude-opus-4"}``.
     :param pricing: Optional custom per-million-token pricing for
-        self-hosted models that aren't in the MLflow catalog (e.g., Ollama,
-        vLLM, custom gateways). Used only when a model is not found in the
-        catalog (catalog pricing takes precedence). ``None`` (the default)
-        means no custom pricing. See :class:`ModelPricingConfig`.
+        self-hosted models and gateways (e.g., Ollama, vLLM, custom endpoints).
+        When configured, this pricing takes precedence over catalog lookup,
+        allowing self-hosted providers serving catalog-known model IDs to use
+        their own rates. ``None`` (the default) means no custom pricing — falls
+        back to catalog. See :class:`ModelPricingConfig`.
     """
 
     base_url: str
