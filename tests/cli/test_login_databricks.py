@@ -487,9 +487,12 @@ def test_login_threads_org_id_through_workspace_login_and_verify(
     # The verify request routes to the workspace via ?o= (and used the token).
     assert fake.requests[-1]["params"] == {"o": _ORG_ID}
     assert fake.requests[-1]["authorization"] == "Bearer tok-fresh"
-    # The selector is persisted (from the URL, authoritative over any header).
-    assert load_databricks_org_id(_SELECTOR_URL) == _ORG_ID
-    assert load_databricks_workspace_host(_SELECTOR_URL) == _WORKSPACE
+    # The selector is persisted (from the URL, authoritative over any header),
+    # keyed by the canonical query-free base — ``ServerUrl`` never lets ``?o=``
+    # onto ``api_base``, so the store key is the bare host even though the
+    # identity-patched expansion above didn't strip the query itself.
+    assert load_databricks_org_id(_WORKSPACE) == _ORG_ID
+    assert load_databricks_workspace_host(_WORKSPACE) == _WORKSPACE
 
 
 # ── login sets the default server ───────────────────────────────────
@@ -683,7 +686,9 @@ def test_azure_vanity_url_falls_back_to_probed_canonical_host(
 
     result = cli_mod._resolve_server_url(f"{vanity_root}/?o=4173618801742158")
 
-    assert result == f"{canonical_root}/api/2.0/omnigent"
+    assert result.api_base == f"{canonical_root}/api/2.0/omnigent"
+    # The ?o= selector rides on the resolved value even though the probes strip it.
+    assert result.org_id == "4173618801742158"
     # The vanity root is probed first and the canonical host only after it fails.
     assert probed[0] == f"{vanity_root}/v1/me"
     assert f"{canonical_root}/v1/me" in probed
@@ -701,7 +706,7 @@ def test_azure_vanity_url_that_answers_is_never_rewritten(
 
     result = cli_mod._resolve_server_url(f"{vanity_root}/?o=4173618801742158")
 
-    assert result == vanity_root
+    assert result.api_base == vanity_root
     # No canonical host was ever synthesized or probed. The vanity root is asked
     # twice: once by the expansion, once by the usable check, which is the cost of
     # the expansion not reporting whether the URL it returned actually answered.
@@ -725,7 +730,7 @@ def test_azure_vanity_url_kept_when_canonical_host_is_dead(
 
     result = cli_mod._resolve_server_url(f"{vanity_root}/?o=4173618801742158")
 
-    assert result == vanity_root
+    assert result.api_base == vanity_root
     assert f"{canonical_root}/v1/me" in probed
 
 
@@ -1041,8 +1046,11 @@ def test_resolve_server_url_defaults_scheme_and_expands(
         },
     )
 
-    assert cli_mod._resolve_server_url("example.databricks.com") == _WORKSPACE_API_URL
-    assert cli_mod._resolve_server_url("example.databricks.com/omnigent") == _WORKSPACE_API_URL
+    assert cli_mod._resolve_server_url("example.databricks.com").api_base == _WORKSPACE_API_URL
+    assert (
+        cli_mod._resolve_server_url("example.databricks.com/omnigent").api_base
+        == _WORKSPACE_API_URL
+    )
 
 
 def test_resolve_server_url_strips_query_and_expands(
@@ -1066,7 +1074,9 @@ def test_resolve_server_url_strips_query_and_expands(
         },
     )
 
-    assert cli_mod._resolve_server_url(f"{_WORKSPACE}/?o=2850744067564480") == _WORKSPACE_API_URL
+    resolved = cli_mod._resolve_server_url(f"{_WORKSPACE}/?o=2850744067564480")
+    assert resolved.api_base == _WORKSPACE_API_URL
+    assert resolved.org_id == "2850744067564480"
     # The probes hit the CLEAN root/mount — never a ?o=-corrupted URL (which
     # would push the path into the query string, e.g. ``…/?o=123/v1/me``).
     assert probed and all("o=" not in url and "%2F" not in url for url in probed)
@@ -1082,10 +1092,9 @@ def test_resolve_server_url_strips_query_on_full_mount(
     """
     probed = _scripted_normalizer_httpx(monkeypatch, {})  # any probe fails the test
 
-    assert (
-        cli_mod._resolve_server_url(f"{_WORKSPACE_API_URL}?o=2850744067564480")
-        == _WORKSPACE_API_URL
-    )
+    resolved = cli_mod._resolve_server_url(f"{_WORKSPACE_API_URL}?o=2850744067564480")
+    assert resolved.api_base == _WORKSPACE_API_URL
+    assert resolved.org_id == "2850744067564480"
     assert probed == []
 
 

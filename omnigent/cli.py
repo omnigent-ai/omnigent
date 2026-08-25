@@ -82,6 +82,8 @@ from omnigent.integration_daemon import IntegrationDaemon
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.onboarding.sandboxes import available_providers as _sandbox_providers
 from omnigent.process_logging import LOG_LEVEL_ENV_VAR, LOG_TO_STDERR_ENV_VAR, data_dir, env_truthy
+from omnigent.server_url import ServerUrl
+from omnigent.server_url import org_id_from_url as _org_id_from_url
 
 if TYPE_CHECKING:
     import socket
@@ -2853,7 +2855,9 @@ def _terminate_host_unit(record: _HostDaemonRecord, *, reason: str) -> None:
         ``"config changed (auth)"`` or ``"host tunnel is offline"``.
     :returns: None.
     """
-    click.echo(f"Restarting host daemon for {record.target!r} ({reason}).", err=True)
+    click.echo(
+        f"Restarting host daemon for {_host_display_url(record.target)!r} ({reason}).", err=True
+    )
     # Best-effort: a daemon that refuses to die shouldn't hard-fail the
     # run — the fresh daemon's record overwrites this one regardless.
     with contextlib.suppress(click.ClickException):
@@ -3364,13 +3368,17 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
         if refreshed_probe.status_code == 200:
             store_databricks_auth(server, workspace_host, org_id=org_id)
             return
-    login_cmd = f"omnigent login {server}"
+    # User-facing: show the display form (the workspace /omnigent URL, with
+    # ?o= when known), not the internal API mount; it round-trips through
+    # `omnigent login` back to the same API base.
+    display = ServerUrl(api_base=server, org_id=org_id).display
+    login_cmd = f"omnigent login {display}"
     if non_interactive or not sys.stdin.isatty():
         raise click.ClickException(
-            f"Not signed in to {server} (Databricks-fronted; /v1/me answered "
+            f"Not signed in to {display} (Databricks-fronted; /v1/me answered "
             f"HTTP {probe.status_code}). Run `{login_cmd}` and retry."
         )
-    click.echo(f"Not signed in to {server} — running `{login_cmd}` first.")
+    click.echo(f"Not signed in to {display} — running `{login_cmd}` first.")
     _databricks_login(server, workspace_host, org_id=org_id)
 
 
@@ -3413,7 +3421,7 @@ def _ensure_backend(server: str | None) -> str:
         # is hidden under the longer daemon wait.
         import concurrent.futures
 
-        server = _resolve_server_url(server)
+        server = _resolve_server_url(server).api_base
         with (
             runner_startup_progress(initial_message=STARTUP_PHASE_CONNECTING_REMOTE),
             concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool,
@@ -4670,7 +4678,8 @@ def diagnose(server: str | None, json_output: bool) -> None:
         "(pass --server to report)" if snap["server_url"] is None else "(unreachable)"
     )
     click.echo(f"server  {server_line}")
-    click.echo(f"url     {snap['server_url'] or '(none)'}")
+    # Human view shows the display form; the --json view keeps the wire URL.
+    click.echo(f"url     {_host_display_url(snap['server_url']) or '(none)'}")
     click.echo(f"auth    {snap['auth_source']} ({snap['auth_source_origin']})")
     click.echo(f"os      {snap['os']}")
     click.echo(f"python  {snap['python']}")
@@ -5835,7 +5844,7 @@ def resume(
 
     run_resume(
         target=target,
-        server=_resolve_server_url(server) if server else server,
+        server=_resolve_server_url(server).api_base if server else server,
     )
 
 
@@ -7328,7 +7337,7 @@ def _dispatch_run(
             # Normalize like every other entry point: expand a bare workspace
             # URL to its /api/2.0/omnigent mount and strip any ?o= query. Else
             # a direct ``--server`` request hits the root and bounces to /login.
-            base_url = _resolve_server_url(server)
+            base_url = _resolve_server_url(server).api_base
             # Direct ``--server`` (no AGENT) has no local runner to bind, so an
             # interactive resume-by-id is an ATTACH: route it through the
             # `attach` pair (`_require_live_conversation` + `run_attach`), not
@@ -7565,7 +7574,7 @@ def _resolve_attach_server(server: str | None, configured_server: str | None) ->
     """
     chosen = server if server is not None else configured_server
     if chosen:
-        return _resolve_server_url(chosen)
+        return _resolve_server_url(chosen).api_base
     local = local_server_url_if_healthy()
     return local.rstrip("/") if local else None
 
@@ -7597,15 +7606,18 @@ def _require_live_conversation(
     )
     # ``_host_http_json`` reports transport failures as status 0 (never
     # raises), so the server-down and missing-session cases both land here.
+    from omnigent.server_url import display_server_url
+
     if result.status_code == 0:
         raise click.ClickException(
-            f"Couldn't reach a server at {base_url}: {_host_error_text(result.body)}. "
+            f"Couldn't reach a server at {display_server_url(base_url)}: "
+            f"{_host_error_text(result.body)}. "
             "`attach` never starts a server — check the URL, or start one with "
             "`omnigent run`."
         )
     if result.status_code != 200:
         raise click.ClickException(
-            f"No live session '{conversation_id}' on {base_url} "
+            f"No live session '{conversation_id}' on {display_server_url(base_url)} "
             f"(server returned {result.status_code}). Run `omnigent host status` "
             "to list live sessions, or `omnigent run <agent.yaml>` to start one."
         )
@@ -7666,9 +7678,11 @@ def attach(
             "`--server <url>`."
         )
     if conversation is None:
+        from omnigent.server_url import display_server_url
+
         raise click.ClickException(
             "Nothing to attach to: `attach` joins a LIVE session by id. "
-            f"Run `omnigent host status` to list sessions on {base_url}, or "
+            f"Run `omnigent host status` to list sessions on {display_server_url(base_url)}, or "
             "`omnigent run <agent.yaml>` to start a new one."
         )
     _require_live_conversation(base_url=base_url, conversation_id=conversation)
@@ -8174,7 +8188,8 @@ def _maybe_open_host_web_ui(
         cfg = _load_effective_config()
     if _resolve_auto_open_conversation_setting(cfg) is False:
         return
-    from omnigent.conversation_browser import display_server_url, open_conversation_url
+    from omnigent.conversation_browser import open_conversation_url
+    from omnigent.server_url import display_server_url
 
     web_url = display_server_url(server_url)
     try:
@@ -8227,8 +8242,10 @@ def _run_background_host(
         if _local_daemon_serves_target(target, server or None):
             local_record = _find_daemon_record(_LOCAL_DAEMON_MARKER)
             if local_record is not None:
+                from omnigent.server_url import display_server_url
+
                 _confirm_background_host_registered(local_record)
-                click.echo(f"The local host daemon already serves {target}.")
+                click.echo(f"The local host daemon already serves {display_server_url(target)}.")
                 return
         raise click.ClickException(
             "Could not spawn the background host daemon. See ~/.omnigent/logs/host/ for details."
@@ -8256,7 +8273,11 @@ def _run_background_host(
         bold=True,
     )
     click.echo(f"{headline} (pid {record.pid}).")
-    _echo_host_field("server", _cli_style(server_url, fg="cyan"))
+    # User-facing: the display form (workspace /omnigent URL with ?o= when
+    # known) — the API mount is an implementation detail.
+    from omnigent.server_url import display_server_url
+
+    _echo_host_field("server", _cli_style(display_server_url(server_url), fg="cyan"))
     if record.log_path is not None:
         _echo_host_field("log", _display_path(Path(record.log_path)))
     click.echo()
@@ -8373,7 +8394,7 @@ def host(
     if server is None:
         server = cfg.get("server")
     if server:
-        server = _resolve_server_url(server)
+        server = _resolve_server_url(server).api_base
     # Remote mode is decided here, before the local-mode branch reassigns
     # ``server`` to the spawned loopback URL — only a remote target needs
     # the sign-in pre-flight.
@@ -8466,7 +8487,7 @@ def _resolve_host_server(server: str | None) -> str | None:
     if server is None:
         configured = _load_effective_config().get("server")
         server = str(configured) if configured else None
-    return _resolve_server_url(server) if server else None
+    return _resolve_server_url(server).api_base if server else None
 
 
 def _daemon_base_url(record: _HostDaemonRecord) -> str | None:
@@ -9065,6 +9086,25 @@ def _host_link_safe(url: str) -> bool:
     return bool(url) and not any(char in _HOST_LINK_UNSAFE_CHARS or char < " " for char in url)
 
 
+def _host_display_url(value: _HostJsonValue) -> _HostJsonValue:
+    """Map a server-URL payload value to its user-facing display form.
+
+    Human-rendered rows show the workspace ``/omnigent`` URL (with ``?o=``
+    when known) instead of the internal API mount; non-URL values (the
+    local daemon marker, ``None``) pass through. JSON output keeps the raw
+    wire values — only apply this at render time.
+
+    :param value: Candidate URL, e.g.
+        ``"https://ws.databricks.com/api/2.0/omnigent"``.
+    :returns: The display URL, or *value* unchanged when it is not a URL.
+    """
+    if isinstance(value, str) and value.startswith(("http://", "https://")):
+        from omnigent.server_url import display_server_url
+
+        return display_server_url(value)
+    return value
+
+
 def _host_link_target(value: _HostJsonValue) -> str | None:
     """
     Build a hyperlink target from a server URL.
@@ -9122,8 +9162,8 @@ def _host_target_label(payload: _HostPayload, *, width: int) -> str:
     :param width: Maximum label width, e.g. ``48``.
     :returns: Compact target label for headers and error rows.
     """
-    target = _host_display_value(payload.get("target"))
-    server_url = payload.get("server_url")
+    target = _host_display_value(_host_display_url(payload.get("target")))
+    server_url = _host_display_url(payload.get("server_url"))
     if target == _LOCAL_DAEMON_MARKER and server_url:
         target = f"local ({server_url})"
     return _host_shorten(target, max_chars=width)
@@ -9278,8 +9318,8 @@ def _echo_daemon_payloads(payloads: list[_HostPayload]) -> None:
         target = _host_target_label(payload, width=max(24, min(console.width - 2, 96)))
         process = _host_display_value(payload.get("process"), missing="unknown")
         host_status = _host_display_value(payload.get("host_status"), missing="unknown")
-        server_link = _host_link_target(payload.get("server_url"))
-        target_link = server_link or _host_link_target(payload.get("target"))
+        server_link = _host_link_target(_host_display_url(payload.get("server_url")))
+        target_link = server_link or _host_link_target(_host_display_url(payload.get("target")))
         console.print(f"[bold cyan]{_host_linked(target, target=target_link)}[/bold cyan]")
         console.print(
             "  "
@@ -9289,7 +9329,7 @@ def _echo_daemon_payloads(payloads: list[_HostPayload]) -> None:
             f"host=[{_host_status_style(host_status)}]{host_status}[/]"
         )
         server_text = _host_shorten(
-            payload.get("server_url"),
+            _host_display_url(payload.get("server_url")),
             max_chars=max(24, console.width - 11),
         )
         console.print(f"  server={_host_linked(server_text, target=server_link)}")
@@ -9356,7 +9396,7 @@ def host_enable(
     except HostServiceError as exc:
         raise click.ClickException(str(exc)) from exc
 
-    click.echo(f"Enabled the Omnigent host user service for {target}.")
+    click.echo(f"Enabled the Omnigent host user service for {_host_display_url(target)}.")
     click.echo(f"Service definition: {_display_path(service.path)}")
     if service.log_path is not None:
         click.echo(f"Service output: {_display_path(service.log_path)}")
@@ -9491,10 +9531,13 @@ def _stop_daemon_sessions(
     result = _sessions_for_daemon(record)
     if result.error is not None:
         if force:
-            click.echo(f"{record.target}: skipping session stop: {result.error}", err=True)
+            click.echo(
+                f"{_host_display_url(record.target)}: skipping session stop: {result.error}",
+                err=True,
+            )
             return 0
         raise click.ClickException(
-            f"{record.target}: {result.error} — retry with --force to stop the "
+            f"{_host_display_url(record.target)}: {result.error} — retry with --force to stop the "
             f"daemon anyway, or --daemon-only to skip the session stop entirely."
         )
     if result.base_url is None:
@@ -9554,7 +9597,7 @@ def _signal_daemon_pid(record: _HostDaemonRecord, sig: int) -> bool:
         # reuse, or a daemon started under a different account). Drop the
         # stale record and warn rather than crashing the CLI on the EPERM.
         click.echo(
-            f"Skipping stale daemon record for {record.target!r}: pid "
+            f"Skipping stale daemon record for {_host_display_url(record.target)!r}: pid "
             f"{record.pid} is owned by another user and is not this daemon.",
             err=True,
         )
@@ -9593,7 +9636,8 @@ def _terminate_daemon(record: _HostDaemonRecord, *, force: bool) -> None:
                 return
             time.sleep(0.1)
     raise click.ClickException(
-        f"Daemon {record.pid} for {record.target!r} did not exit; retry with --force."
+        f"Daemon {record.pid} for {_host_display_url(record.target)!r} did not exit; "
+        "retry with --force."
     )
 
 
@@ -9635,7 +9679,10 @@ def host_stop(
         if not daemon_only:
             stopped = _stop_daemon_sessions(record, force=force)
         _terminate_daemon(record, force=force)
-        click.echo(f"Stopped {record.target} daemon pid={record.pid}; sessions_stopped={stopped}.")
+        click.echo(
+            f"Stopped {_host_display_url(record.target)} daemon "
+            f"pid={record.pid}; sessions_stopped={stopped}."
+        )
 
 
 @host.command("stop-session")
@@ -10815,7 +10862,7 @@ def _workspace_api_server_url(server: str) -> str:
 
     import httpx as _httpx
 
-    from omnigent.conversation_browser import (
+    from omnigent.server_url import (
         WORKSPACE_API_PATH,
         WORKSPACE_UI_PATH,
         display_server_url,
@@ -10990,9 +11037,9 @@ def _databricks_root_is_usable(server: str) -> bool:
     return _databricks_workspace_login_target(root, probe) is not None
 
 
-def _resolve_server_url(server: str) -> str:
+def _resolve_server_url(server: str) -> ServerUrl:
     """
-    Normalize a user-supplied ``--server`` value to the Omnigent API base.
+    Normalize a user-supplied ``--server`` value to a :class:`ServerUrl`.
 
     Every ``--server`` entry point (and ``login``) needs the same
     normalization, so they all route through here: strip a trailing slash,
@@ -11000,6 +11047,11 @@ def _resolve_server_url(server: str) -> str:
     then expand a bare Databricks workspace URL — or the ``/omnigent``
     web-UI URL the internal user guide hands out — to the
     ``/api/2.0/omnigent`` mount.
+
+    The ``?o=`` workspace selector is captured off the raw input (the
+    expansion strips it before probing) and rides on the returned value;
+    when the input carries none, the selector recorded by a previous
+    ``omnigent login`` for the resolved base is used instead.
 
     The URL is always tried as the user gave it first. Only when that fails
     to resolve, and only for an Azure custom (vanity) workspace URL, is the
@@ -11009,15 +11061,18 @@ def _resolve_server_url(server: str) -> str:
 
     :param server: A non-empty ``--server`` value, e.g.
         ``"example.cloud.databricks.com/omnigent"``.
-    :returns: The normalized API base URL without a trailing slash, e.g.
-        ``"https://example.cloud.databricks.com/api/2.0/omnigent"``.
+    :returns: The resolved :class:`ServerUrl` — requests target its
+        ``api_base`` (e.g.
+        ``"https://example.cloud.databricks.com/api/2.0/omnigent"``),
+        user-facing messages show its ``display`` form.
     :raises click.ClickException: If *server* is a local-server alias (empty or
         ``"local"``) rather than a URL. Callers route those to local mode before
         reaching here (see ``_is_local_server_request`` / ``_ensure_backend``);
         normalizing one would yield a nonsense target — the bare scheme
         ``"https:"`` for an empty value, or the unroutable ``https://local``.
     """
-    from omnigent.conversation_browser import display_server_url, strip_conversation_path
+    from omnigent.conversation_browser import strip_conversation_path
+    from omnigent.server_url import display_server_url
 
     if _is_local_server_request(server):
         raise click.ClickException(
@@ -11025,6 +11080,16 @@ def _resolve_server_url(server: str) -> str:
             "a remote URL is required. Pass `--server local` to the command you "
             "meant to run locally, or give this one a URL."
         )
+
+    # The ``?o=`` selector lives on the raw input; the expansion below strips
+    # it before probing, so capture it first. It becomes the resolved value's
+    # org id (raw input wins over a stored login record).
+    org_id = _org_id_from_url(server)
+
+    def _resolved(api_base: str) -> ServerUrl:
+        if org_id is not None:
+            return ServerUrl(api_base=api_base, org_id=org_id)
+        return ServerUrl.from_api_base(api_base)
 
     # A URL copied from the browser while a conversation is open carries the
     # SPA's ``/c/<id>`` route. The SPA catch-all answers any GET under it with
@@ -11034,21 +11099,21 @@ def _resolve_server_url(server: str) -> str:
     expanded = _workspace_api_server_url(normalized)
     candidate = _canonical_azure_databricks_url(normalized)
     if candidate is None:
-        return expanded  # not a vanity Azure workspace URL
+        return _resolved(expanded)  # not a vanity Azure workspace URL
     # A URL "resolved" if the expansion adopted a mount for it, or if the root
     # answers on its own. Compare against the root the expansion probed, not the
     # raw input: it drops the ?o= selector first, and that selector is what makes
     # a URL a candidate here, so comparing raw would always look like an adoption.
     if expanded != _probe_root(normalized) or _databricks_root_is_usable(normalized):
-        return expanded
+        return _resolved(expanded)
     canonical = _workspace_api_server_url(candidate)
     if canonical == _probe_root(candidate) and not _databricks_root_is_usable(candidate):
-        return expanded  # the canonical host is no better; keep what the user typed
+        return _resolved(expanded)  # the canonical host is no better; keep what the user typed
     click.echo(
         f"Note: {display_server_url(normalized)} did not answer as a workspace; "
         f"using its canonical host {display_server_url(canonical)}."
     )
-    return canonical
+    return _resolved(canonical)
 
 
 def _databricks_workspace_login_target(server: str, probe: httpx.Response) -> str | None:
@@ -11095,24 +11160,6 @@ def _databricks_workspace_login_target(server: str, probe: httpx.Response) -> st
                 return f"https://{parsed.netloc}"
 
     return None
-
-
-def _org_id_from_url(url: str) -> str | None:
-    """Extract the ``?o=<workspace-id>`` workspace selector from *url*.
-
-    A Databricks host can front many workspaces under one hostname, where
-    the bare host resolves to the account and ``?o=<workspace-id>`` picks
-    the workspace. The selector is threaded into both the login (to bind
-    the grant to the workspace) and every API request (to route to it).
-
-    :param url: A user-supplied server URL, possibly carrying ``?o=``,
-        e.g. ``"https://acme.databricks.com/?o=123"``.
-    :returns: The workspace id, e.g. ``"123"``, or ``None`` when absent.
-    """
-    from urllib.parse import parse_qs, urlsplit
-
-    values = parse_qs(urlsplit(url).query).get("o")
-    return values[0] if values and values[0] else None
 
 
 def _host_with_org(workspace_host: str, org_id: str | None) -> str:
@@ -11175,7 +11222,10 @@ def _databricks_login(server: str, workspace_host: str, org_id: str | None = Non
         databricks_sdk_installed,
     )
 
-    click.echo(f"{server} authenticates via the Databricks workspace {workspace_host}.")
+    # User-facing: the display form (workspace /omnigent URL with ?o= when
+    # known) — the API mount is an implementation detail.
+    display = ServerUrl(api_base=server, org_id=org_id).display
+    click.echo(f"{display} authenticates via the Databricks workspace {workspace_host}.")
 
     if not databricks_sdk_installed():
         raise click.ClickException(
@@ -11201,14 +11251,14 @@ def _databricks_login(server: str, workspace_host: str, org_id: str | None = Non
         # validated against the issuer). One fresh browser login
         # replaces the bad cache entry; then re-verify.
         click.echo(
-            f"The cached Databricks credentials were rejected by {server} "
+            f"The cached Databricks credentials were rejected by {display} "
             f"(HTTP {verify.status_code}) — refreshing the workspace login."
         )
         token = _login_and_mint_workspace_token(workspace_host, org_id)
         verify = _verify_databricks_server_token(server, token, org_id)
     if verify.status_code != 200:
         raise click.ClickException(
-            f"{workspace_host} accepted the login, but {server} rejected the token "
+            f"{workspace_host} accepted the login, but {display} rejected the token "
             f"(HTTP {verify.status_code}). Check that your user has access to this app."
         )
     user_id: str | None = None
@@ -11229,7 +11279,7 @@ def _databricks_login(server: str, workspace_host: str, org_id: str | None = Non
     )
     who = f" as {user_id}" if user_id else ""
     click.echo(
-        f"Logged in{who}. Commands targeting {server} now mint workspace tokens automatically."
+        f"Logged in{who}. Commands targeting {display} now mint workspace tokens automatically."
     )
 
 
@@ -11369,11 +11419,14 @@ def _remember_default_server(server: str) -> None:
     rare, and the server the user most recently logged in to is the best
     available signal of intent.
 
-    :param server: Normalized server URL the login succeeded against, e.g.
-        ``"https://example.databricks.com/api/2.0/omnigent"``.
+    :param server: Normalized API base URL the login succeeded against, e.g.
+        ``"https://example.databricks.com/api/2.0/omnigent"``. Stored as-is
+        (the wire form); the confirmation shows the display form.
     """
+    from omnigent.server_url import display_server_url
+
     _save_global_config({"server": server})
-    click.echo(f"Set {server} as your default server.")
+    click.echo(f"Set {display_server_url(server)} as your default server.")
 
 
 @cli.command("login")
@@ -11419,10 +11472,11 @@ def login(server_url: str) -> None:
     """
     import httpx as _httpx
 
-    server = _resolve_server_url(server_url)
-    # Read the ``?o=`` selector from the raw input: normalization strips the
-    # query when expanding to the API mount.
-    org_id = _org_id_from_url(server_url)
+    resolved = _resolve_server_url(server_url)
+    server = resolved.api_base
+    # The ``?o=`` selector rides on the resolved value (read off the raw
+    # input; normalization strips the query when expanding to the API mount).
+    org_id = resolved.org_id
 
     # ── Step 0: Probe the server's auth mode. ──────────────────
     # /v1/me returns a JSON ``login_url`` on 401 — "/login" for

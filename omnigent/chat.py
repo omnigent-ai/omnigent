@@ -558,8 +558,11 @@ def run_attach(
     # snapshot gives the agent name + harness for an honest banner.
     info = _attach_session_info(base_url=base_url, conversation_id=conversation_id)
     if not info.runner_online:
+        from omnigent.server_url import display_server_url
+
         raise click.ClickException(
-            f"Session {conversation_id} has no online runner on {base_url} — its "
+            f"Session {conversation_id} has no online runner on "
+            f"{display_server_url(base_url)} — its "
             "host is offline. `attach` never starts a runner; bring the host back "
             "(`omnigent run` locally, or reconnect it with `omnigent host`), "
             "then attach again."
@@ -1534,8 +1537,10 @@ def _unreachable_server_message(base_url: str) -> str:
             "It may have stopped — run `omnigent stop`, then try again. "
             "Server logs are under ~/.omnigent/logs/server/."
         )
+    from omnigent.server_url import display_server_url
+
     return (
-        f"Could not connect to the Omnigent server at {base_url}. "
+        f"Could not connect to the Omnigent server at {display_server_url(base_url)}. "
         "Check the URL, your network connection, and any HTTP proxy settings."
     )
 
