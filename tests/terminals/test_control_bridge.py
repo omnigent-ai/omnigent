@@ -21,7 +21,6 @@ from pathlib import Path
 
 import pytest
 
-import omnigent.terminals.control_bridge as control_bridge
 from omnigent.terminals.control_bridge import (
     _SEND_KEYS_HEX_BYTES_PER_CALL,
     _clipboard_buffer_name,
@@ -79,10 +78,10 @@ async def test_tmux_buffer_read_cancellation_reaps_subprocess(
     async def _spawn(*_args: object, **_kwargs: object) -> _BlockedProcess:
         return proc
 
-    monkeypatch.setattr(control_bridge.asyncio, "create_subprocess_exec", _spawn)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
     task = asyncio.create_task(_read_tmux_buffer("tmux", "socket", "buffer0"))
     await asyncio.sleep(0)
-    task.cancel()
+    assert task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
     assert proc.killed is True
@@ -214,6 +213,36 @@ async def _kill_and_join(sock: Path, task: asyncio.Task[None]) -> None:
         # return value is discarded but the wait is the point.
         with contextlib.suppress(asyncio.CancelledError):
             await task
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_control_bridge_outer_cancellation_joins_child_tasks() -> None:
+    """Cancelling the route cannot leave bridge reader/sender tasks detached."""
+    sock, target = await _new_private_tmux("sleep 30")
+    ws = _FakeWebSocket(inbound=[])
+    task = asyncio.create_task(
+        bridge_tmux_control_to_websocket(
+            ws, socket_path=str(sock), tmux_target=target, read_only=False
+        )
+    )
+    try:
+        await asyncio.sleep(0.2)
+        assert task.cancel()
+        [task_result] = await asyncio.gather(task, return_exceptions=True)
+        assert isinstance(task_result, asyncio.CancelledError)
+        await asyncio.sleep(0)
+        names = {pending.get_name() for pending in asyncio.all_tasks() if not pending.done()}
+        assert not names.intersection(
+            {
+                "tmux-control-read",
+                "tmux-control-forward",
+                "tmux-control-clipboard",
+                "tmux-ws-to-control",
+            }
+        )
+    finally:
+        await _kill_tmux(sock)
 
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")

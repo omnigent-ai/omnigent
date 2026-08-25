@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -6,15 +6,21 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Agent } from "@/hooks/useAgents";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as NativeBridgeModule from "@/lib/nativeBridge";
+import { setOmnigentHostConfig } from "@/lib/host";
 import { ChatHeader } from "./ChatHeader";
 import {
   TerminalFirstContextProvider,
   type TerminalFirstContextValue,
 } from "./TerminalFirstContext";
 
-const { isIOSShellMock, isAndroidShellMock } = vi.hoisted(() => ({
+const { isIOSShellMock, isAndroidShellMock, isMobileMock } = vi.hoisted(() => ({
   isIOSShellMock: vi.fn(() => false),
   isAndroidShellMock: vi.fn(() => false),
+  isMobileMock: vi.fn(() => false),
+}));
+
+vi.mock("@/hooks/useIsMobileViewport", () => ({
+  useIsMobileViewport: () => isMobileMock(),
 }));
 
 vi.mock("@/lib/nativeBridge", async (importOriginal) => {
@@ -64,6 +70,11 @@ function renderHeader(props: {
   canShare?: boolean;
   shareDisabled?: boolean;
   shareDisabledReason?: string;
+  hasHeaderMenu?: boolean;
+  hasAgentInfo?: boolean;
+  hasRailContent?: boolean;
+  showFilesPanel?: boolean;
+  mobileMenu?: typeof mobileMenu;
 }) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
@@ -75,7 +86,7 @@ function renderHeader(props: {
             onOpenSidebar={() => {}}
             isChildSession={props.isChildSession ?? false}
             // Defaults to no active session: PresenceAvatars / AgentInfoButton /
-            // right-panel toggle / mobile FAB all gate on conversationId and
+            // right-panel toggle / rail entries all gate on conversationId and
             // stay unmounted, isolating the left-slot affordances under test.
             conversationId={props.conversationId}
             actionConversation={props.actionConversation}
@@ -88,14 +99,14 @@ function renderHeader(props: {
             shareDisabled={props.shareDisabled}
             shareDisabledReason={props.shareDisabledReason}
             onShare={() => {}}
-            hasAgentInfo={false}
+            hasAgentInfo={props.hasAgentInfo ?? false}
             onAgentInfo={() => {}}
-            hasHeaderMenu={false}
-            showFilesPanel={false}
-            hasRailContent={false}
+            hasHeaderMenu={props.hasHeaderMenu ?? false}
+            showFilesPanel={props.showFilesPanel ?? false}
+            hasRailContent={props.hasRailContent ?? true}
             rightPanelOpen={false}
             onToggleRightPanel={() => {}}
-            mobileMenu={mobileMenu}
+            mobileMenu={props.mobileMenu ?? mobileMenu}
           />
         </TooltipProvider>
       </QueryClientProvider>
@@ -105,8 +116,10 @@ function renderHeader(props: {
 
 afterEach(() => {
   cleanup();
+  setOmnigentHostConfig({});
   isIOSShellMock.mockReturnValue(false);
   isAndroidShellMock.mockReturnValue(false);
+  isMobileMock.mockReturnValue(false);
 });
 
 describe("ChatHeader — deployed Share presentation", () => {
@@ -394,6 +407,84 @@ describe("ChatHeader — Chat/Terminal switcher wiring", () => {
   });
 });
 
+describe("ChatHeader — floating mobile controls", () => {
+  it("gives the mobile control clusters the same glass surface", () => {
+    // The bar paints no background and chat scrolls under it, so each cluster
+    // needs its own blurred pill to stay legible over moving content.
+    isMobileMock.mockReturnValue(true);
+    renderHeader({ sidebarOpen: false, conversationId: "conv-1", canShare: true });
+
+    const toggle = screen.getByRole("button", { name: "Open sidebar" });
+    const cluster = screen.getByRole("button", { name: "Share session" }).parentElement;
+    for (const surface of [toggle, cluster]) {
+      expect(surface).toHaveClass(
+        "max-md:rounded-full",
+        "max-md:bg-background/70",
+        "max-md:backdrop-blur-xl",
+        "max-md:backdrop-saturate-150",
+      );
+    }
+    // Nothing to show on the landing composer — the pill must not paint empty.
+    expect(cluster).toHaveClass("max-md:empty:hidden");
+  });
+
+  it("keeps the two clusters the same size around a lone control", () => {
+    // The right pill read visibly larger than the left toggle while it padded
+    // its child; with no padding a lone size-10 kebab is the same 40px circle.
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: false,
+      conversationId: "conv-1",
+      conversationTitle: "Greeting",
+      actionConversation: {
+        id: "conv-1",
+        object: "conversation",
+        title: "Greeting",
+        created_at: 1,
+        updated_at: 2,
+        labels: {},
+        permission_level: 3,
+      },
+    });
+
+    const toggle = screen.getByRole("button", { name: "Open sidebar" });
+    const trigger = screen.getByRole("button", { name: "Conversation actions" });
+    expect(trigger.parentElement).not.toHaveClass("max-md:px-1", "max-md:py-1");
+    expect(trigger).toHaveClass("size-10");
+    expect(toggle).toHaveClass("size-10");
+  });
+
+  it("rounds the kebab's own background so no square shows inside the pill", () => {
+    // The ghost button paints `aria-expanded:bg-muted` at its rounded-lg
+    // radius, which showed as a square behind the round pill once open.
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "conv-1",
+      canShare: true,
+      hasHeaderMenu: true,
+    });
+
+    expect(screen.getByTestId("session-actions-menu")).toHaveClass("max-md:rounded-full");
+  });
+
+  it("gives the fallback menu the same glass as the controls", () => {
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "conv-1",
+      canShare: true,
+      hasHeaderMenu: true,
+    });
+
+    fireEvent.pointerDown(screen.getByTestId("session-actions-menu"), { button: 0 });
+    expect(screen.getByRole("menu")).toHaveClass(
+      "max-md:bg-background/70",
+      "max-md:backdrop-blur-xl",
+    );
+  });
+});
+
 describe("ChatHeader — title-adjacent conversation actions", () => {
   const conversation: Conversation = {
     id: "conv-1",
@@ -418,6 +509,179 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     expect(title).toHaveClass("min-w-0", "truncate");
     expect(title.parentElement).toBe(trigger.parentElement);
     expect(title.compareDocumentPosition(trigger) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("moves the trigger out of the breadcrumb on mobile", () => {
+    isMobileMock.mockReturnValue(true);
+    isIOSShellMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      conversationTitle: conversation.title,
+      actionConversation: conversation,
+    });
+
+    // The native shells hide the breadcrumb, so the kebab has to live in the
+    // header's own control cluster to stay reachable.
+    const trigger = screen.getByRole("button", { name: "Conversation actions" });
+    expect(trigger.closest("nav.conversation-breadcrumb")).toBeNull();
+    // Rightmost control in the header's action cluster.
+    expect(trigger.parentElement?.lastElementChild).toBe(trigger);
+    expect(screen.getByText(conversation.title as string)).toBeInTheDocument();
+  });
+
+  it("keeps the mobile Share / Agent info analytics on the owner-managed path", () => {
+    // The owner-managed session hides the legacy Share · Agent info menu that
+    // used to report these ids, so the kebab it yields to must report them.
+    const analytics = vi.fn();
+    setOmnigentHostConfig({ analytics });
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      conversationTitle: conversation.title,
+      actionConversation: conversation,
+      canShare: true,
+      hasHeaderMenu: true,
+      hasAgentInfo: true,
+    });
+
+    const openKebab = () =>
+      fireEvent.pointerDown(screen.getByRole("button", { name: "Conversation actions" }), {
+        button: 0,
+      });
+
+    openKebab();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Share" }));
+    openKebab();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Agent info" }));
+
+    expect(analytics.mock.calls.map(([event]) => event.componentId)).toEqual([
+      "chat.header.mobile_share",
+      "chat.header.mobile_agent_info",
+    ]);
+  });
+
+  it("renders a single kebab on mobile, not one per menu", () => {
+    // The legacy Share · Agent info menu must yield to the full session menu,
+    // or a phone header ends up with two adjacent three-dot triggers.
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      conversationTitle: conversation.title,
+      actionConversation: conversation,
+      canShare: true,
+      hasHeaderMenu: true,
+      hasAgentInfo: true,
+    });
+
+    expect(screen.getByRole("button", { name: "Conversation actions" })).toBeInTheDocument();
+    expect(screen.queryByTestId("session-actions-menu")).toBeNull();
+  });
+
+  it("falls back to the Share · Agent info menu when the session isn't owner-managed", () => {
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      conversationTitle: conversation.title,
+      actionConversation: null,
+      canShare: true,
+      hasHeaderMenu: true,
+      hasAgentInfo: true,
+    });
+
+    expect(screen.queryByRole("button", { name: "Conversation actions" })).toBeNull();
+    expect(screen.getByTestId("session-actions-menu")).toBeInTheDocument();
+  });
+
+  it("folds the workspace-rail entries into the one mobile kebab", () => {
+    // Previously a second `PanelRight` trigger sat beside the kebab; the rail
+    // entries now ride in the same menu, so a phone has a single trigger.
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      conversationTitle: conversation.title,
+      actionConversation: conversation,
+      hasRailContent: true,
+      showFilesPanel: true,
+    });
+
+    expect(screen.queryByRole("button", { name: "Open session menu" })).toBeNull();
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Conversation actions" }), {
+      button: 0,
+    });
+
+    expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
+      "Pin",
+      "Rename",
+      "Mark as unread",
+      "Add to project",
+      "Files",
+      "Changes",
+      "Agents1",
+      "Archive",
+      "Delete",
+    ]);
+  });
+
+  it("routes a rail entry from the kebab to its drawer", () => {
+    const onOpenFiles = vi.fn();
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      conversationTitle: conversation.title,
+      actionConversation: conversation,
+      hasRailContent: true,
+      showFilesPanel: true,
+      mobileMenu: { ...mobileMenu, onOpenFiles },
+    });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Conversation actions" }), {
+      button: 0,
+    });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Files" }));
+    expect(onOpenFiles).toHaveBeenCalled();
+  });
+
+  it("keeps the rail entries reachable when the session isn't owner-managed", () => {
+    // No owner menu and nothing else to offer: the fallback kebab must still
+    // render, or the drawers have no mobile entry point at all.
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      conversationTitle: conversation.title,
+      actionConversation: null,
+      hasHeaderMenu: false,
+      hasRailContent: true,
+      showFilesPanel: true,
+    });
+
+    fireEvent.pointerDown(screen.getByTestId("session-actions-menu"), { button: 0 });
+    expect(screen.getByRole("menuitem", { name: "Files" })).toBeInTheDocument();
+  });
+
+  it("drops the rail entries while a push panel owns the right side", () => {
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      conversationTitle: conversation.title,
+      actionConversation: conversation,
+      hasRailContent: true,
+      showFilesPanel: true,
+      mobileMenu: { ...mobileMenu, filesPanelOpen: true },
+    });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Conversation actions" }), {
+      button: 0,
+    });
+    expect(screen.queryByRole("menuitem", { name: "Files" })).toBeNull();
+    expect(screen.getByRole("menuitem", { name: "Pin" })).toBeInTheDocument();
   });
 
   it("does not add a management menu to a sub-agent breadcrumb", () => {

@@ -16,7 +16,10 @@ from __future__ import annotations
 import pytest
 
 from omnigent.onboarding import ambient
-from omnigent.onboarding.ambient import DetectedProvider, detect_providers
+from omnigent.onboarding.ambient import (
+    DetectedProvider,
+    detect_providers,
+)
 
 # Every provider env var ambient may read — cleared in the base fixture so
 # the host's own keys don't leak into the deterministic detection tests.
@@ -664,6 +667,11 @@ def test_codex_config_not_detected(clean_env, label: str, body: str) -> None:
         (
             "authorization-header",
             '[model_providers.Custom.http_headers]\nAuthorization = "Bearer tok"',
+        ),
+        # Azure-style API key header.
+        (
+            "api-key-header",
+            '[model_providers.Custom.http_headers]\napi-key = "ak-test"',
         ),
     ],
 )

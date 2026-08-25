@@ -89,6 +89,7 @@
     "rrule": "^2.8.1",
     "shadcn": "0.0.0-beta.9d3f70e54",
     "shiki": "^4.0.2",
+    "sonner": "^2.0.8",
     "streamdown": "^2.5.0",
     "tailwind-merge": "^3.5.0",
     "three": "0.185.1",

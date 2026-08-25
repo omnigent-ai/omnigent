@@ -3827,6 +3827,14 @@ async function reconcileOnReconnect(id: string, set: Setter, get: Getter): Promi
     );
     const unseen = snapshotBlocks.filter((b) => b.ctx.itemId && !seen.has(b.ctx.itemId));
     const patch: Partial<ChatState> = reconnectStatusPatch(session, s);
+    // `session.input.consumed` is not replayed, so recovered user blocks are
+    // the durable equivalent of its FIFO acknowledgement.
+    const recoveredUserInputs = unseen.filter(
+      (b) => b.type === "user_message" && !isSystemUserContent(b.content),
+    ).length;
+    if (recoveredUserInputs > 0) {
+      patch.pendingUserMessages = s.pendingUserMessages.slice(recoveredUserInputs);
+    }
     let nextBlocks = s.blocks;
     if (unseen.length > 0) {
       // Splice the gap's committed items ahead of the active turn's

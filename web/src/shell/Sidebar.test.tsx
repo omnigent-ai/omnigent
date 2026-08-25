@@ -6,13 +6,14 @@
 // are no longer listed here — they live on the Settings page.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useEffect } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
+import { clearSessionDrafts, setSessionDraft } from "@/lib/sessionDrafts";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 
 // Project mocks are declared via vi.hoisted so they exist before the hoisted
@@ -267,6 +268,7 @@ beforeEach(() => {
   useHostsMock.mockReset();
   useHostsMock.mockReturnValue({ data: [] });
   localStorage.clear();
+  clearSessionDrafts();
   projectsMock.length = 0;
   moveToProjectSpy.mockReset();
   deleteProjectSpy.mockReset();
@@ -318,6 +320,25 @@ describe("Sidebar session list", () => {
     expect(scroller).toHaveClass("overflow-y-auto", "[scrollbar-width:none]");
     expect(scroller.className).toContain("[&::-webkit-scrollbar]:hidden");
     expect(scroller.className).not.toContain("scrollbar-gutter");
+  });
+
+  it("shows a draft icon only beside sessions with unfinished composer content", () => {
+    mockConversations([
+      conv("conv_draft", "Codex", { title: "Draft session" }),
+      conv("conv_empty", "Codex", { title: "Empty session" }),
+    ]);
+    renderSidebar();
+
+    const draftRow = screen.getByText("Draft session").closest("li")!;
+    const emptyRow = screen.getByText("Empty session").closest("li")!;
+    expect(within(draftRow).queryByTestId("conversation-draft-indicator")).toBeNull();
+
+    act(() => setSessionDraft("conv_draft", { text: "unfinished message", files: [] }));
+
+    const indicator = within(draftRow).getByTestId("conversation-draft-indicator");
+    expect(indicator).toHaveAccessibleName("Draft");
+    expect(indicator.parentElement).toHaveClass("absolute", "right-[4.5rem]", "md:right-1");
+    expect(within(emptyRow).queryByTestId("conversation-draft-indicator")).toBeNull();
   });
 
   it("uses balanced title padding until row actions are revealed", () => {
@@ -2022,6 +2043,18 @@ describe("Sidebar active-row auto-scroll", () => {
     expect(scrollIntoView).toHaveBeenCalledTimes(1);
     expect(scrollIntoView).toHaveBeenCalledWith({ behavior: "smooth", block: "center" });
 
+    vi.restoreAllMocks();
+  });
+
+  it("hides the draft indicator for the active conversation", () => {
+    vi.spyOn(Element.prototype, "scrollIntoView").mockImplementation(() => {});
+    mockConversations([conv("conv_active", "Claude Code", { title: "Active draft" })]);
+    setSessionDraft("conv_active", { text: "visible in the open composer", files: [] });
+
+    renderAtRoute("/c/conv_active");
+
+    const row = screen.getByText("Active draft").closest("li")!;
+    expect(within(row).queryByTestId("conversation-draft-indicator")).toBeNull();
     vi.restoreAllMocks();
   });
 

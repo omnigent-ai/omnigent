@@ -8,6 +8,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
+import { clearSessionDrafts, hasSessionDraft } from "@/lib/sessionDrafts";
 
 // Composer reads workspace files via a TanStack query hook (for "@"-file
 // mentions). These slash-command tests don't exercise that, so stub the hook
@@ -111,6 +112,28 @@ function activeRow(): HTMLElement | null {
 function renderWithTooltips(ui: ReactElement) {
   return render(<TooltipProvider>{ui}</TooltipProvider>);
 }
+
+describe("Composer session drafts", () => {
+  beforeEach(() => {
+    clearSessionDrafts();
+    useChatStore.setState({ conversationId: "conv_draft" });
+  });
+
+  afterEach(() => {
+    cleanup();
+    clearSessionDrafts();
+  });
+
+  it("publishes unfinished text for the sidebar and clears it after send", async () => {
+    render(<Composer {...composerProps()} />);
+
+    fireEvent.change(textarea(), { target: { value: "unfinished message" } });
+    await waitFor(() => expect(hasSessionDraft("conv_draft")).toBe(true));
+
+    fireEvent.submit(textarea().closest("form")!);
+    await waitFor(() => expect(hasSessionDraft("conv_draft")).toBe(false));
+  });
+});
 
 describe("Composer growth layout", () => {
   afterEach(() => {

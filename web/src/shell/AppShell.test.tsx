@@ -2763,14 +2763,14 @@ describe("Right-rail tab switching — file viewer close", () => {
 });
 
 describe("Mobile session menu", () => {
-  // The right-rail tabs have no room on a phone, so they're reached via the
-  // top-right session-menu FAB, which opens each tab's content as a full-
-  // screen drawer. jsdom doesn't apply the `md:hidden` CSS, so the FAB and
-  // its menu items are present in the DOM regardless of viewport.
+  // The right-rail tabs have no room on a phone, so they're reached from the
+  // header's single kebab, which opens each tab's content as a full-screen
+  // drawer alongside the session actions. jsdom doesn't apply the `md:hidden`
+  // CSS, so the trigger and its items are present regardless of viewport.
 
-  /** Open the session-menu dropdown and return its trigger. */
+  /** Open the session-actions dropdown and return its trigger. */
   function openSessionMenu() {
-    const trigger = screen.getByRole("button", { name: /open session menu/i });
+    const trigger = screen.getByTestId("session-actions-menu");
     // Radix DropdownMenu opens on pointerdown, not click.
     fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
     return trigger;
@@ -2978,11 +2978,11 @@ describe("Mobile session menu", () => {
     expect(drawer).toHaveAttribute("data-flat-view", "true");
   });
 
-  it("keeps the FAB with only the Agents entry for a minimal agent", () => {
+  it("keeps the kebab with only the Agents entry for a minimal agent", () => {
     // available:false → no files; no shells, no debug. The
     // Agents entry is unconditional (badge = 1, the main agent), so the
-    // FAB still renders with exactly that entry. A missing FAB means
-    // the always-visible Agents rule regressed on mobile.
+    // kebab still lists exactly that entry. Its absence means the
+    // always-visible Agents rule regressed on mobile.
     useEnvironmentMock.mockReturnValue({
       data: { available: false, root: null },
       isLoading: false,
@@ -2992,7 +2992,7 @@ describe("Mobile session menu", () => {
     renderShell("/c/conv_abc");
 
     // Radix DropdownMenu opens on pointerdown, not click.
-    fireEvent.pointerDown(screen.getByRole("button", { name: /open session menu/i }), {
+    fireEvent.pointerDown(screen.getByTestId("session-actions-menu"), {
       button: 0,
       ctrlKey: false,
     });

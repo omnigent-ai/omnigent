@@ -26,6 +26,7 @@ import {
   isMacElectronShell,
   onNativeSidebarDrag,
   supportsBrowser,
+  updateBridge,
 } from "@/lib/nativeBridge";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
 import {
@@ -38,6 +39,7 @@ import {
   readDefaultWorkspacePanelOpen,
   writeDefaultWorkspacePanelOpen,
 } from "@/lib/workspacePanelPreferences";
+import { updateOverlayToastOffset } from "@/lib/updateOverlayInset";
 import {
   Dialog,
   DialogContent,
@@ -104,7 +106,7 @@ import { TerminalsPanel } from "./TerminalsPanel";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { KeyboardShortcutsDialog } from "@/components/KeyboardShortcutsDialog";
 import { CommandPalette } from "./CommandPalette";
-import { Toaster } from "@/components/ui/toast";
+import { Toaster } from "@/components/ui/sonner";
 import { CloseShellDialog } from "./CloseShellDialog";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { ForkDialogContextProvider, type ForkDialogContextValue } from "./ForkDialogContext";
@@ -159,6 +161,32 @@ export function AppShell() {
   // the whole document (which would hide the header and break the layout).
   // No-op off the iOS shell. Scoped here so auth pages keep normal scrolling.
   useIOSViewportLock();
+
+  const desktopUpdates = useMemo(() => updateBridge(), []);
+  const [updateOverlayHeight, setUpdateOverlayHeight] = useState(0);
+  useEffect(() => {
+    if (!desktopUpdates?.getOverlayHeight || !desktopUpdates.onOverlayHeight) return;
+    let alive = true;
+    let receivedPush = false;
+    const unsubscribe = desktopUpdates.onOverlayHeight((height) => {
+      receivedPush = true;
+      setUpdateOverlayHeight(Math.max(0, Math.round(Number(height) || 0)));
+    });
+    void desktopUpdates
+      .getOverlayHeight()
+      .then((height) => {
+        if (alive && !receivedPush) {
+          setUpdateOverlayHeight(Math.max(0, Math.round(Number(height) || 0)));
+        }
+      })
+      .catch(() => {
+        // Older/mismatched shells may expose the method before registering IPC.
+      });
+    return () => {
+      alive = false;
+      unsubscribe();
+    };
+  }, [desktopUpdates]);
 
   // Read early: the conversationId scopes the per-session workspace state
   // (rail open/width/tab/open files) used throughout this component.
@@ -1992,7 +2020,20 @@ export function AppShell() {
           />
           {/* Transient toasts (e.g. "session archived"). Mounted once here so
               any surface can fire one via showToast(). */}
-          <Toaster />
+          {/* Match the previous toast system's effectively unbounded stack so
+              security prompts cannot be hidden behind ordinary notifications. */}
+          <Toaster
+            position="bottom-right"
+            visibleToasts={100}
+            offset={{
+              right: "1rem",
+              bottom: updateOverlayToastOffset(updateOverlayHeight),
+            }}
+            mobileOffset={{
+              right: "1rem",
+              bottom: updateOverlayToastOffset(updateOverlayHeight),
+            }}
+          />
         </ForkDialogContextProvider>
       </TerminalFirstContextProvider>
     </FileViewerContext.Provider>
