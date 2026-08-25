@@ -86,35 +86,42 @@ class SessionDeletedEvent:
 
 
 @dataclass
-class TurnTokenUsageEvent:
-    """Fired after each LLM turn that carries token usage data.
+class TurnEndEvent:
+    """Fired at the end of each LLM turn (relay path only).
 
-    Emitted once per ``response.completed`` event on the relay path and once per
-    ``external_session_usage`` broadcast on the native path.  Captures the
-    per-turn delta (relay) or cumulative totals (native) so token spend can be
-    aggregated without waiting for session deletion.
+    Emitted once per terminal ``response.*`` event (``completed``,
+    ``failed``, ``cancelled``, ``incomplete``) so per-turn latency,
+    status, and token spend can be tracked without waiting for session
+    deletion.
+
+    Token fields are only present on ``status="completed"`` turns; they
+    are ``None`` for ``failed`` / ``cancelled`` / ``incomplete``.
 
     :param installation_id: Server-side installation ID.
     :param session_id: Omnigent conversation/session identifier.
-    :param input_tokens: Input tokens consumed this turn (relay: delta;
-        native: cumulative session total at time of report).
-    :param output_tokens: Output tokens consumed this turn (relay: delta;
-        native: cumulative session total at time of report).
-    :param cost_usd: Cost for this turn in USD (relay: delta; native:
-        cumulative).  ``None`` when the model is unpriced.
+    :param status: Terminal status of the turn: ``"completed"``,
+        ``"failed"``, ``"cancelled"``, or ``"incomplete"``.
+    :param latency_ms: Wall-clock turn duration in milliseconds from
+        ``response.in_progress`` to the terminal event.  ``None`` when
+        the start timestamp was not captured (e.g. stream reconnect).
     :param model: LLM model name, e.g. ``"claude-3-7-sonnet-20250219"``.
         ``None`` when not reported by the harness.
-    :param is_cumulative: ``True`` for native-path events that carry a
-        cumulative total rather than a per-turn delta.
+    :param input_tokens: Input tokens for this turn (per-turn delta).
+        ``None`` for non-completed turns or when not reported.
+    :param output_tokens: Output tokens for this turn (per-turn delta).
+        ``None`` for non-completed turns or when not reported.
+    :param cost_usd: Cost for this turn in USD (per-turn delta).
+        ``None`` when the model is unpriced or the turn did not complete.
     """
 
     installation_id: str | None
     session_id: str
+    status: str
+    latency_ms: float | None
+    model: str | None
     input_tokens: int | None
     output_tokens: int | None
     cost_usd: float | None
-    model: str | None
-    is_cumulative: bool
 
 
 @dataclass

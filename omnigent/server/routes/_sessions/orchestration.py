@@ -342,7 +342,7 @@ from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.telemetry import emit as _tel_emit
 from omnigent.telemetry.events import SessionCreatedEvent as _TelSessionCreatedEvent
-from omnigent.telemetry.events import TurnTokenUsageEvent as _TelTurnTokenUsageEvent
+from omnigent.telemetry.events import TurnEndEvent as _TelTurnEndEvent
 from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
 from omnigent.telemetry.surface import classify_surface as _classify_surface
 
@@ -1530,23 +1530,6 @@ async def _persist_external_session_usage(
         body.data,
         conversation_store,
     )
-    _native_in = body.data.get("cumulative_input_tokens")
-    _native_out = body.data.get("cumulative_output_tokens")
-    _native_cost = body.data.get("cumulative_cost_usd")
-    _native_model: str | None = body.data.get("model") or None
-    if _native_in is not None or _native_out is not None:
-        _tel_emit(
-            _TelTurnTokenUsageEvent(
-                installation_id=_get_installation_id(),
-                session_id=session_id,
-                input_tokens=int(_native_in) if _native_in is not None else None,
-                output_tokens=int(_native_out) if _native_out is not None else None,
-                cost_usd=(float(_native_cost) if isinstance(_native_cost, (int, float)) else None),
-                model=_native_model,
-                is_cumulative=True,
-            )
-        )
-
     label_updates: dict[str, str] = {}
     if raw_tokens is not None:
         label_updates[_LAST_CONTEXT_TOKENS_LABEL_KEY] = str(raw_tokens)
@@ -5831,6 +5814,9 @@ async def _relay_runner_stream_once(
     # Model/agent label from the turn header, stamped on text segments
     # flushed at tool-call boundaries (the boundary event carries no model).
     current_model: str | None = None
+    # Wall-clock time when the current turn's response.in_progress arrived,
+    # used to compute per-turn latency in TurnEndEvent.
+    _turn_start_s: float | None = None
     # Map tool call_id → response_id so a function_call_output that
     # arrives after a new response.in_progress (different response_id)
     # still pairs with its matching function_call. Without this, the
@@ -5973,6 +5959,7 @@ async def _relay_runner_stream_once(
                     # Track the turn's response_id from lifecycle
                     # events so persisted items share one id.
                     if evt_type == "response.in_progress":
+                        _turn_start_s = time.monotonic()
                         resp_obj = event.get("response", {})
                         _rid = resp_obj.get("id")
                         if isinstance(_rid, str) and _rid:
@@ -6172,29 +6159,37 @@ async def _relay_runner_stream_once(
                             session_id,
                             conversation_store,
                         )
-                        _resp_usage = event.get("response", {}).get("usage") or {}
+                    if evt_type in _TERMINAL_RESPONSE_EVENT_TYPES:
+                        _turn_status = evt_type.split(".", 1)[1]  # "completed" etc.
+                        _latency_ms: float | None = None
+                        if _turn_start_s is not None:
+                            _latency_ms = (time.monotonic() - _turn_start_s) * 1000
+                        _turn_start_s = None
+                        _resp_usage = (
+                            event.get("response", {}).get("usage") or {}
+                            if evt_type == "response.completed"
+                            else {}
+                        )
                         _turn_in = _resp_usage.get("input_tokens")
                         _turn_out = _resp_usage.get("output_tokens")
                         _turn_cost = _resp_usage.get("cost_usd")
-                        _turn_model: str | None = _resp_usage.get("model") or None
-                        if _turn_in or _turn_out:
-                            _tel_emit(
-                                _TelTurnTokenUsageEvent(
-                                    installation_id=_get_installation_id(),
-                                    session_id=session_id,
-                                    input_tokens=(int(_turn_in) if _turn_in is not None else None),
-                                    output_tokens=(
-                                        int(_turn_out) if _turn_out is not None else None
-                                    ),
-                                    cost_usd=(
-                                        float(_turn_cost)
-                                        if isinstance(_turn_cost, (int, float))
-                                        else None
-                                    ),
-                                    model=_turn_model,
-                                    is_cumulative=False,
-                                )
+                        _turn_model: str | None = _resp_usage.get("model") or current_model or None
+                        _tel_emit(
+                            _TelTurnEndEvent(
+                                installation_id=_get_installation_id(),
+                                session_id=session_id,
+                                status=_turn_status,
+                                latency_ms=_latency_ms,
+                                model=_turn_model,
+                                input_tokens=(int(_turn_in) if _turn_in is not None else None),
+                                output_tokens=(int(_turn_out) if _turn_out is not None else None),
+                                cost_usd=(
+                                    float(_turn_cost)
+                                    if isinstance(_turn_cost, (int, float))
+                                    else None
+                                ),
                             )
+                        )
                         # Push the server-computed cost AND token breakdown
                         # to the web client's session indicator, rolled up
                         # over the spawn subtree. The session's own event
