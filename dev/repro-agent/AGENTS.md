@@ -443,6 +443,26 @@ cause is named from what you observed rather than guessed.
   after-fix recording. If `vhs` is unavailable, still author and keep the tape;
   note that rendering was skipped.
 
+  **Boot any server/host the journey needs BEFORE the tape drives it — don't
+  make the tape do the slow startup.** A journey like "a host logs in, then
+  reconnects" needs a live server (and maybe a host) already running; if the
+  tape's own commands start the server, VHS's per-command timeout fires during
+  the multi-second boot and the render dies half-way (the cli-lane analog of the
+  recorder-server race on the `web` lane). Start the server/host as a prior shell
+  step, then have the tape `Type` only the user's journey commands against the
+  already-running process and `Wait /pattern/` on the observable outcome. Keep
+  the tape's own steps fast (sub-second each) so no `Wait` straddles a boot.
+
+  **A clip of the reproduction TEST running is NOT the journey — never fall back
+  to it.** If the journey tape won't render (server boot times out, `ttyd`
+  missing, VHS unavailable), do **not** substitute a recording of
+  `pytest … FAILS` / the test's `AssertionError` as the clip. That films the
+  regression artifact, not the failure a user sees — a circular recording the
+  handoff must not carry. When the real journey can't be filmed, keep
+  `recordings: []` for that facet and name the specific blocker in `evidence`
+  (per the empty-recordings rule above), exactly as you would for an unreachable
+  `web`/`terminal` lane. The authored test still ships; it just isn't the video.
+
 A recording must end on the outcome the user observes — the failure (wrong screen
 state, bad output, error) for a `before` recording, or the correct end state for a
 `fixed` one. Convert to `.mp4` with `ffmpeg` when available; `.webm`/`.gif` are
