@@ -51,7 +51,12 @@ _MAX_CONTENT_CHARS = 50_000
 class _Backend:
     """A selectable ``read_provider`` engine in the ``_BACKENDS`` registry.
 
-    :param run: Callable ``(url, config) -> content_or_error`` for the engine.
+    :param run: Callable ``(url, config) -> (content, diagnostic)``. Exactly one
+        of the two is non-``None``: a successful read returns
+        ``(page_markdown, None)``; any failure or non-content outcome (missing
+        key, HTTP error, empty/blocked page) returns ``(None, message)``. This
+        explicit split is what lets the dispatcher tell content from a
+        diagnostic without inspecting the string.
     :param keyless: True if the engine needs no ``api_key`` (drives hint text).
     :param options: Optional config keys this engine reads *beyond* the shared
         ``read_provider`` / ``api_key`` (e.g. ``{"driver", "output_format"}`` for
@@ -59,7 +64,7 @@ class _Backend:
         silently-ignored option surfaces as a clear error.
     """
 
-    run: Callable[[str, dict[str, str]], str]
+    run: Callable[[str, dict[str, str]], tuple[str | None, str | None]]
     keyless: bool
     options: frozenset[str] = frozenset()
 
@@ -199,8 +204,13 @@ def _read(url: str, config: dict[str, str]) -> str:
     if key_error is not None:
         return key_error
 
-    result = engine.run(url, config)
-    return _finalize(result, url)
+    content, diagnostic = engine.run(url, config)
+    if diagnostic is not None:
+        # Failure or non-content outcome (error / empty / blocked): the backend's
+        # message is returned verbatim, with no Source header and no truncation.
+        return diagnostic
+    assert content is not None  # backends set exactly one of (content, diagnostic)
+    return _finalize(content, url)
 
 
 def _check_config_keys(backend: str, engine: _Backend, config: dict[str, str]) -> str | None:
@@ -234,72 +244,57 @@ def _check_config_keys(backend: str, engine: _Backend, config: dict[str, str]) -
     return None
 
 
-def _finalize(result: str, url: str) -> str:
+def _finalize(content: str, url: str) -> str:
     """
-    Add a source header and cap length for a successful read.
+    Add a source header and cap length for a page body.
 
-    Backends signal failure with a message rather than raising; those are
-    returned untouched (no header, no truncation) so the model sees the raw
-    diagnostic. A real page body gets a one-line ``Source:`` header — so the
-    model can ground and cite the content — and is capped at
-    :data:`_MAX_CONTENT_CHARS`.
+    Only ever called with real content — the dispatcher returns a backend's
+    diagnostic (error / empty / blocked) verbatim before reaching here — so this
+    always prepends the one-line ``Source:`` header (letting the model ground
+    and cite the content) and caps the length at :data:`_MAX_CONTENT_CHARS`.
 
-    :param result: The backend's return value (page content or an error/notice).
+    :param content: The extracted page body.
     :param url: The read URL, used in the source header.
     :returns: The finalized tool output.
     """
-    if _is_backend_error(result):
-        return result
-    if len(result) > _MAX_CONTENT_CHARS:
-        result = result[:_MAX_CONTENT_CHARS] + "\n\n[content truncated]"
-    return f"Source: {url}\n\n{result}"
+    if len(content) > _MAX_CONTENT_CHARS:
+        content = content[:_MAX_CONTENT_CHARS] + "\n\n[content truncated]"
+    return f"Source: {url}\n\n{content}"
 
 
-def _is_backend_error(result: str) -> bool:
-    """
-    :returns: True if ``result`` is a backend error/notice rather than content.
-
-    Backends prefix diagnostics with ``Error:``, ``web_read ...``, or
-    ``<Provider> read error:``; content never starts this way.
-    """
-    return result.startswith(("Error:", "web_read:", "web_read error:")) or (
-        " read error:" in result[:40]
-    )
-
-
-def _run_nimble(url: str, config: dict[str, str]) -> str:
+def _run_nimble(url: str, config: dict[str, str]) -> tuple[str | None, str | None]:
     """
     Read via Nimble's Web API (``/v2/extract``); default driver ``vx8``.
 
     :param url: The URL to read.
     :param config: Must contain ``api_key``; ``driver``/``output_format`` optional.
-    :returns: Extracted content or an error message.
+    :returns: ``(content, diagnostic)`` — exactly one is non-None.
     """
     from omnigent.tools.builtins.web_read_nimble import _read_nimble
 
     return _read_nimble(url, config)
 
 
-def _run_firecrawl(url: str, config: dict[str, str]) -> str:
+def _run_firecrawl(url: str, config: dict[str, str]) -> tuple[str | None, str | None]:
     """
     Read via Firecrawl (``/v2/scrape``); LLM-native markdown, self-hostable.
 
     :param url: The URL to read.
     :param config: Must contain ``api_key``; ``proxy`` optional.
-    :returns: Extracted markdown or an error message.
+    :returns: ``(content, diagnostic)`` — exactly one is non-None.
     """
     from omnigent.tools.builtins.web_read_firecrawl import _read_firecrawl
 
     return _read_firecrawl(url, config)
 
 
-def _run_jina(url: str, config: dict[str, str]) -> str:
+def _run_jina(url: str, config: dict[str, str]) -> tuple[str | None, str | None]:
     """
     Read via Jina Reader (``r.jina.ai``); keyless, LLM-ready markdown.
 
     :param url: The URL to read.
     :param config: ``api_key`` optional (lifts the rate limit).
-    :returns: Extracted markdown or an error message.
+    :returns: ``(content, diagnostic)`` — exactly one is non-None.
     """
     from omnigent.tools.builtins.web_read_jina import _read_jina
 

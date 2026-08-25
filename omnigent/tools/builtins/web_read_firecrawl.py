@@ -38,21 +38,23 @@ def _base_url() -> str:
     return os.environ.get("OMNIGENT_FIRECRAWL_BASE_URL", _DEFAULT_BASE_URL)
 
 
-def _read_firecrawl(url: str, config: dict[str, str]) -> str:
+def _read_firecrawl(url: str, config: dict[str, str]) -> tuple[str | None, str | None]:
     """
     Fetch one URL as markdown via Firecrawl.
 
     :param url: The page URL to read (validated by the caller).
     :param config: Spec-level config; ``api_key`` (required), ``proxy`` (optional).
-    :returns: Extracted markdown, or an error message (never raises).
+    :returns: ``(content, diagnostic)`` — the markdown on success, or a
+        diagnostic message on failure / empty page. Exactly one is non-None.
+        Never raises.
     """
     api_key = config.get("api_key")
     if not api_key:
-        return "Error: api_key must be provided in the web_read config in config.yaml."
+        return None, "Error: api_key must be provided in the web_read config in config.yaml."
 
     proxy = config.get("proxy", _DEFAULT_PROXY)
     if proxy not in _VALID_PROXIES:
-        return (
+        return None, (
             f"Error: unsupported proxy {proxy!r}. Use one of: {', '.join(sorted(_VALID_PROXIES))}."
         )
 
@@ -70,23 +72,23 @@ def _read_firecrawl(url: str, config: dict[str, str]) -> str:
     except httpx.HTTPStatusError as exc:
         code = exc.response.status_code
         if code in (401, 402, 403):
-            return (
+            return None, (
                 f"Firecrawl read error: HTTP {code} (auth/quota — check the api_key "
                 "and plan in the web_read config)."
             )
-        return f"Firecrawl read error: HTTP {code}"
+        return None, f"Firecrawl read error: HTTP {code}"
     except httpx.RequestError as exc:
         # Covers connect/timeout/redirect/protocol/decoding errors uniformly.
-        return f"Firecrawl read error: {exc}"
+        return None, f"Firecrawl read error: {exc}"
 
     try:
         payload = resp.json()
     except (ValueError, TypeError):
-        return "Firecrawl read error: non-JSON response."
+        return None, "Firecrawl read error: non-JSON response."
     return _format_read(payload, url)
 
 
-def _format_read(payload: dict[str, Any], url: str) -> str:
+def _format_read(payload: dict[str, Any], url: str) -> tuple[str | None, str | None]:
     """
     Pull the markdown out of Firecrawl's ``/v2/scrape`` response.
 
@@ -96,13 +98,15 @@ def _format_read(payload: dict[str, Any], url: str) -> str:
 
     :param payload: The parsed JSON response.
     :param url: The requested URL (for the empty-result message).
-    :returns: The markdown, or an error/empty message. Central truncation is
-        applied by the dispatcher, not here.
+    :returns: ``(content, diagnostic)`` — exactly one is non-None. Central
+        truncation is applied by the dispatcher, not here.
     """
     if not isinstance(payload, dict) or not payload.get("success", False):
-        return f"Firecrawl read error: {url} was not retrieved successfully."
-    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        return None, f"Firecrawl read error: {url} was not retrieved successfully."
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return None, "Firecrawl read error: malformed response (missing data object)."
     markdown = data.get("markdown")
     if not isinstance(markdown, str) or not markdown.strip():
-        return f"web_read: no content extracted from {url} (page may be empty or blocked)."
-    return markdown.strip()
+        return None, f"web_read: no content extracted from {url} (page may be empty or blocked)."
+    return markdown.strip(), None

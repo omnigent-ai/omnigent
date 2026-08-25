@@ -112,29 +112,31 @@ def _render_for(driver: str) -> bool | str:
     return driver not in _HTTP_ONLY_DRIVERS
 
 
-def _read_nimble(url: str, config: dict[str, str]) -> str:
+def _read_nimble(url: str, config: dict[str, str]) -> tuple[str | None, str | None]:
     """
     Fetch one URL as clean content via Nimble's Web API.
 
     :param url: The page URL to read (validated by the caller).
     :param config: Spec-level config; ``api_key`` (required), ``driver`` and
         ``output_format`` (optional).
-    :returns: Extracted content, or an error message (never raises).
+    :returns: ``(content, diagnostic)`` — the extracted content on success, or a
+        diagnostic message on failure / empty / blocked page. Exactly one is
+        non-None. Never raises.
     """
     api_key = config.get("api_key")
     if not api_key:
-        return "Error: api_key must be provided in the web_read config in config.yaml."
+        return None, "Error: api_key must be provided in the web_read config in config.yaml."
 
     driver = _resolve_driver(config)
     if driver is None:
-        return (
+        return None, (
             f"Error: unsupported driver {config.get('driver')!r}. "
             f"Use one of: {', '.join(sorted(_VALID_DRIVERS))}."
         )
 
     output_format = config.get("output_format", _DEFAULT_OUTPUT_FORMAT)
     if output_format not in _VALID_OUTPUT_FORMATS:
-        return (
+        return None, (
             f"Error: unsupported output_format {output_format!r}. "
             f"Use one of: {', '.join(sorted(_VALID_OUTPUT_FORMATS))}."
         )
@@ -168,25 +170,27 @@ def _read_nimble(url: str, config: dict[str, str]) -> str:
     except httpx.HTTPStatusError as exc:
         code = exc.response.status_code
         if code in (401, 403):
-            return (
+            return None, (
                 f"Nimble read error: HTTP {code} (authentication failed — check the "
                 "api_key in the web_read config)."
             )
-        return f"Nimble read error: HTTP {code}"
+        return None, f"Nimble read error: HTTP {code}"
     except httpx.RequestError as exc:
         # Covers connect/timeout/redirect/protocol/decoding errors uniformly.
-        return f"Nimble read error: {exc}"
+        return None, f"Nimble read error: {exc}"
 
     try:
         payload = resp.json()
     except (ValueError, TypeError):
-        return "Nimble read error: the extract returned a non-JSON response."
+        return None, "Nimble read error: the extract returned a non-JSON response."
     if not isinstance(payload, dict):
-        return "Nimble read error: the extract returned an unexpected response shape."
+        return None, "Nimble read error: the extract returned an unexpected response shape."
     return _format_read(payload, url, driver, output_format)
 
 
-def _format_read(payload: dict[str, Any], url: str, driver: str, output_format: str) -> str:
+def _format_read(
+    payload: dict[str, Any], url: str, driver: str, output_format: str
+) -> tuple[str | None, str | None]:
     """
     Pull the extracted content out of Nimble's ``/v2/extract`` response.
 
@@ -203,34 +207,33 @@ def _format_read(payload: dict[str, Any], url: str, driver: str, output_format: 
         can retry a stronger tier).
     :param output_format: The requested format (``markdown`` or ``html``), read
         preferentially from the response.
-    :returns: The content, or a blocked/empty message. Central truncation is
-        applied by the dispatcher, not here.
+    :returns: ``(content, diagnostic)`` — exactly one is non-None. Central
+        truncation is applied by the dispatcher, not here.
     """
     data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
     # Prefer the format we asked for; fall back to the other if it's missing.
     # "First present" (not None), so an empty string (empty page) isn't skipped.
     other = "html" if output_format == "markdown" else "markdown"
-    content: object = ""
+    raw: object = ""
     for candidate in (data.get(output_format), data.get(other)):
         if candidate is not None:
-            content = candidate
+            raw = candidate
             break
-    if not isinstance(content, str):
-        content = str(content)
+    content = raw if isinstance(raw, str) else str(raw)
     content = content.strip()
 
     if not content:
-        return (
+        return None, (
             f"web_read: no content extracted from {url} (the page may be empty or "
             f"blocked on driver {driver!r}; try a higher tier such as vx10 or vx12)."
         )
 
     lowered = content.lower()
     if len(content) < 500 and any(marker in lowered for marker in _BLOCK_MARKERS):
-        return (
+        return None, (
             f"web_read: {url} returned a challenge/denied response instead of the "
             f"page on driver {driver!r}. Try a higher tier (vx10 / vx12, or their "
             "-pro variants) or a different read_provider."
         )
 
-    return content
+    return content, None

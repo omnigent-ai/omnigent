@@ -34,7 +34,7 @@ def _base_url() -> str:
     return os.environ.get("OMNIGENT_JINA_BASE_URL", _DEFAULT_BASE_URL)
 
 
-def _read_jina(url: str, config: dict[str, str]) -> str:
+def _read_jina(url: str, config: dict[str, str]) -> tuple[str | None, str | None]:
     """
     Fetch one URL as markdown via Jina Reader.
 
@@ -43,7 +43,9 @@ def _read_jina(url: str, config: dict[str, str]) -> str:
 
     :param url: The page URL to read (validated by the caller).
     :param config: Spec-level config; ``api_key`` optional.
-    :returns: Extracted markdown, or an error message (never raises).
+    :returns: ``(content, diagnostic)`` — the markdown on success, or a
+        diagnostic message on failure / empty page. Exactly one is non-None.
+        Never raises.
     """
     headers = {
         # Ask Reader for markdown (its default) rather than the JSON envelope.
@@ -73,15 +75,15 @@ def _read_jina(url: str, config: dict[str, str]) -> str:
     except httpx.HTTPStatusError as exc:
         code = exc.response.status_code
         if code in (401, 403, 429):
-            return (
+            return None, (
                 f"Jina read error: HTTP {code} (rate/tier limit). Set an api_key in "
                 "the web_read config to raise the limit."
             )
-        return f"Jina read error: HTTP {code}"
+        return None, f"Jina read error: HTTP {code}"
     except httpx.RequestError as exc:
         # Covers connect/timeout/redirect/protocol/decoding errors uniformly.
-        return f"Jina read error: {exc}"
+        return None, f"Jina read error: {exc}"
 
     if not content:
-        return f"web_read: no content extracted from {url} (page may be empty or blocked)."
-    return content
+        return None, f"web_read: no content extracted from {url} (page may be empty or blocked)."
+    return content, None

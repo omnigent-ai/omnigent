@@ -594,6 +594,38 @@ def test_error_returns_have_no_source_header(tool_ctx: ToolContext) -> None:
     assert result.startswith("web_read:")
 
 
+def test_content_starting_like_a_diagnostic_is_still_content(tool_ctx: ToolContext) -> None:
+    """
+    A real page whose body starts with words that resemble a diagnostic
+    ("Error:", or text containing "read error:") is treated as content — it
+    gets the Source header — because the backend returns it in the content slot,
+    not because the dispatcher inspects the string. This is the case the old
+    prefix-sniffing misclassified.
+    """
+    body = "Error: the remote API returned 500. This guide explains read error: handling."
+    fake_response = MagicMock()
+    fake_response.text = body
+    tool = WebReadTool(config={"read_provider": "jina"})
+    with patch("omnigent.tools.builtins.web_read_jina.httpx.get") as mock_get:
+        mock_get.return_value = fake_response
+        result = tool.invoke(json.dumps({"url": "https://example.com/a"}), tool_ctx)
+    assert result.startswith("Source: https://example.com/a\n\n")
+    assert body in result
+
+
+def test_firecrawl_malformed_data_is_distinct_error(tool_ctx: ToolContext) -> None:
+    """A success:true response with a non-dict ``data`` reports a malformed error."""
+    fake_response = MagicMock()
+    fake_response.json.return_value = {"success": True, "data": "not-a-dict"}
+    tool = WebReadTool(config={"read_provider": "firecrawl", "api_key": "k"})
+    with patch("omnigent.tools.builtins.web_read_firecrawl.httpx.post") as mock_post:
+        mock_post.return_value = fake_response
+        result = tool.invoke(json.dumps({"url": "https://example.com"}), tool_ctx)
+    assert result.startswith("Firecrawl read error:")
+    assert "malformed" in result
+    assert not result.startswith("Source:")
+
+
 def test_content_truncated_centrally(tool_ctx: ToolContext) -> None:
     """Content beyond the cap is truncated once, centrally, with a marker."""
     huge = "x" * 60_000
