@@ -828,10 +828,10 @@ aside[aria-label="Workspace"][data-maximized] {
   /* Leading-edge shadow so the drawer reads as a native layer lifted above the
      chat while it slides, instead of a flat sheet. Scoped to the open/dragging
      state via `:not([data-collapsed])` (the sidebar sets `data-collapsed` only
-     when closed) so the full-bleed overlay doesn't cast a sliver along the
-     screen's left edge while parked off-screen. It's visible only mid-slide and
-     mid-drag — fully open the drawer covers the viewport, so its right edge (and
-     the shadow) sit past the screen. iOS-only: the web overlay is unchanged. */
+     when closed) so the drawer doesn't cast a sliver along the screen's left
+     edge while parked off-screen. The drawer stops short of the right edge, so
+     the shadow stays visible while open, separating it from the strip of chat
+     behind. iOS-only: the web overlay is unchanged. */
   :is([data-ios-native], [data-android-native]) .conversations-sidebar:not([data-collapsed]) {
     box-shadow: 8px 0 28px -6px rgb(0 0 0 / 0.22);
   }
