@@ -249,6 +249,9 @@ class QwenExecutor(Executor):
 
         # Asyncio subprocess (created on first run_turn call).
         self._proc: asyncio.subprocess.Process | None = None
+        # Serializes stdin writes: run_turn (prompt / request replies) and the
+        # adapter's interrupt_session() write from different tasks.
+        self._write_lock = asyncio.Lock()
 
         # Queue fed by the stdout-reader coroutine.
         self._queue: asyncio.Queue[_AcpJsonObject] = asyncio.Queue()
@@ -551,8 +554,9 @@ class QwenExecutor(Executor):
         """Write one newline-terminated JSON message to qwen stdin."""
         assert self._proc and self._proc.stdin
         encoded = (json.dumps(msg) + "\n").encode("utf-8")
-        self._proc.stdin.write(encoded)
-        await self._proc.stdin.drain()
+        async with self._write_lock:
+            self._proc.stdin.write(encoded)
+            await self._proc.stdin.drain()
 
     async def _rpc(
         self,
