@@ -280,6 +280,98 @@ def _append_output_during_composer_reflow(
     )
 
 
+def test_composer_hides_native_scrollbar_without_disabling_scroll(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A capped draft and transcript scroll without painting native browser chrome."""
+    base_url, session_id = seeded_session
+    for i in range(6):
+        seed_committed_turn(
+            session_id,
+            prompt=f"Question {i}?",
+            reply=f"Paragraph {i}. " + ("filler sentence for height. " * 12),
+            response_id=f"scrollbar_probe_{i}",
+        )
+    page.goto(f"{base_url}/c/{session_id}")
+
+    expect(page.locator(_TEXT_SECTION)).to_have_count(6, timeout=30_000)
+    composer = page.get_by_label("Message the agent")
+    expect(composer).to_be_visible(timeout=30_000)
+    transition = page.evaluate(
+        r"""async () => {
+            const composer = document.querySelector(
+                'textarea[aria-label="Message the agent"]'
+            );
+            const valueSetter = Object.getOwnPropertyDescriptor(
+                HTMLTextAreaElement.prototype,
+                'value'
+            ).set;
+            const samples = [];
+            for (let i = 0; i < 20; i += 1) {
+                valueSetter.call(
+                    composer,
+                    Array.from({ length: i + 1 }, (_, line) => `Draft line ${line}`).join('\n')
+                );
+                composer.dispatchEvent(new InputEvent('input', { bubbles: true }));
+                await new Promise((resolve) => requestAnimationFrame(resolve));
+                samples.push({
+                    inputViewportOverflowY:
+                        getComputedStyle(composer.parentElement).overflowY,
+                    rootOverflowY: getComputedStyle(document.documentElement).overflowY,
+                    bodyOverflowY: getComputedStyle(document.body).overflowY,
+                    rootScrollTop: document.scrollingElement.scrollTop,
+                });
+            }
+            return samples;
+        }"""
+    )
+    assert all(
+        sample
+        == {
+            "inputViewportOverflowY": "hidden",
+            "rootOverflowY": "hidden",
+            "bodyOverflowY": "hidden",
+            "rootScrollTop": 0,
+        }
+        for sample in transition
+    ), transition
+
+    geometry = page.evaluate(
+        """() => {
+            const composer = document.querySelector(
+                'textarea[aria-label="Message the agent"]'
+            );
+            const transcript = document.querySelector('[role="log"] > div');
+            const probe = (element) => ({
+                clientHeight: element.clientHeight,
+                scrollHeight: element.scrollHeight,
+                scrollbarWidth: getComputedStyle(element).scrollbarWidth,
+                webkitScrollbarDisplay:
+                    getComputedStyle(element, '::-webkit-scrollbar').display,
+            });
+            return {
+                composer: probe(composer),
+                transcript: probe(transcript),
+                inputViewportOverflowY:
+                    getComputedStyle(composer.parentElement).overflowY,
+                rootOverflowY: getComputedStyle(document.documentElement).overflowY,
+                bodyOverflowY: getComputedStyle(document.body).overflowY,
+            };
+        }"""
+    )
+    for surface in ("composer", "transcript"):
+        assert geometry[surface]["scrollHeight"] > geometry[surface]["clientHeight"], geometry
+        assert geometry[surface]["scrollbarWidth"] == "none", geometry
+        assert geometry[surface]["webkitScrollbarDisplay"] == "none", geometry
+    assert geometry["inputViewportOverflowY"] == "hidden", geometry
+    assert geometry["rootOverflowY"] == "hidden", geometry
+    assert geometry["bodyOverflowY"] == "hidden", geometry
+
+    composer.evaluate("textarea => { textarea.scrollTop = textarea.scrollHeight; }")
+    assert composer.evaluate("textarea => textarea.scrollTop") > 0
+
+
 def test_composer_growth_reflows_transcript_without_covering_output(
     page: Page,
     seeded_session: tuple[str, str],

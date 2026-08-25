@@ -2066,6 +2066,7 @@ async def _execute_subagent_tool(
                 "after completion."
             )
     else:
+        _auto_ordinal = False
         if not session_name:
             # No title hint — auto-generate a structured session name
             # (e.g. "researcher-1"). Recover ordinals from existing
@@ -2092,6 +2093,7 @@ async def _execute_subagent_tool(
                 str(sub_agent_name),
             )
             session_name = f"{sub_agent_name}-{ordinal}"
+            _auto_ordinal = True
         child_harness = _subagent_harness(str(sub_agent_name), agent_spec)
         # Apply an allowlisted per-dispatch harness override. The sub-agent
         # spec must explicitly opt in via executor.config.allowed_harnesses,
@@ -2194,7 +2196,28 @@ async def _execute_subagent_tool(
                 agent_spec=agent_spec,
                 harness=child_harness,
             )
-        resp = await server_client.post("/v1/sessions", json=create_body, timeout=30.0)
+
+        # Best-effort retry for auto-ordinal name collisions: a 409 means
+        # another runner (or a restart race) already created a child with
+        # this ordinal. Bump and retry. Not watertight — the server's
+        # (parent, title) check is SELECT-then-INSERT with no DB unique
+        # constraint, so truly concurrent creates can still race past it.
+        _max_ordinal_retries = 5 if _auto_ordinal else 0
+        for _ordinal_attempt in range(_max_ordinal_retries + 1):
+            resp = await server_client.post("/v1/sessions", json=create_body, timeout=30.0)
+            if (
+                resp.status_code == 409
+                and _auto_ordinal
+                and _ordinal_attempt < _max_ordinal_retries
+            ):
+                ordinal = _runner_app.next_subagent_ordinal(
+                    conversation_id,
+                    str(sub_agent_name),
+                )
+                session_name = f"{sub_agent_name}-{ordinal}"
+                create_body["title"] = f"{sub_agent_name}:{session_name}"
+                continue
+            break
         if resp.status_code >= 400:
             return f"Error: failed to create child session: {resp.status_code} {resp.text[:200]}"
         child_data = _string_object_dict(resp.json())

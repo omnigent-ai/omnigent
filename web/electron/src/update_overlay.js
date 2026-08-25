@@ -54,6 +54,20 @@ function createUpdateOverlay({
     return null;
   }
 
+  function overlayHeightForSender(event) {
+    for (const [parent, overlay] of overlays) {
+      if (!parent.isDestroyed() && parent.webContents === event.sender) {
+        return heights.get(overlay) ?? 0;
+      }
+    }
+    return 0;
+  }
+
+  function notifyParentHeight(parent, height) {
+    if (!parent || parent.isDestroyed()) return;
+    parent.webContents.send("omnigent:update-overlay-height", height);
+  }
+
   function position(parent, overlay, height) {
     if (!parent || parent.isDestroyed() || overlay.isDestroyed()) return;
     const content = parent.getContentBounds();
@@ -118,6 +132,7 @@ function createUpdateOverlay({
     };
     parent.on("closed", onParentClosed);
     overlay.on("closed", () => {
+      notifyParentHeight(parent, 0);
       overlays.delete(parent);
       if (!parent.isDestroyed()) {
         parent.removeListener("resize", reposition);
@@ -143,6 +158,7 @@ function createUpdateOverlay({
       const h = Math.max(0, Math.round(Number(height) || 0));
       heights.set(overlay, h);
       const parent = parentOf(overlay);
+      notifyParentHeight(parent, h);
       if (h > 0) {
         position(parent, overlay, h);
         overlay.setIgnoreMouseEvents(false);
@@ -152,6 +168,10 @@ function createUpdateOverlay({
       }
       if (!overlay.isVisible()) overlay.showInactive();
     });
+
+    // The parent SPA reads the current value on mount so an overlay that became
+    // visible before its listener attached still reserves the correct space.
+    ipcMain.handle("omnigent:get-update-overlay-height", (event) => overlayHeightForSender(event));
 
     // Trusted updater controls for the overlay page only.
     const guard = (event) => {

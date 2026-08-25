@@ -992,6 +992,7 @@ aside[aria-label="Workspace"][data-maximized] {
    * removes it — widening the layout viewport and every fixed-position
    * overlay with it. Scoped via :has so login/register/setup pages (outside
    * the shell) keep default document scrolling. */
+  html:has(.app-shell),
   body:has(.app-shell) {
     overflow: hidden;
   }

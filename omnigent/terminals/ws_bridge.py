@@ -43,7 +43,7 @@ import time
 import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 # fcntl/pty/termios are POSIX-only. This module drives tmux PTY ``attach``
 # sessions, a feature that is disabled on Windows (see the terminal
@@ -54,7 +54,8 @@ if sys.platform != "win32":
     import pty
     import termios
 
-from fastapi import WebSocket, WebSocketDisconnect
+if TYPE_CHECKING:
+    from fastapi import WebSocket
 
 _logger = logging.getLogger(__name__)
 
@@ -448,6 +449,8 @@ async def _forward_pty_to_ws(
         control frames; PTY mode has only this sender and leaves it unset.
     :returns: None on EOF or websocket disconnect.
     """
+    from fastapi import WebSocketDisconnect
+
     pending = bytearray()
     eof_seen = False
     while True:
@@ -561,6 +564,8 @@ async def bridge_tmux_pty_to_websocket(
         pane output could otherwise bypass ``set-clipboard external``. ``None``
         omits the capability frame for low-level test compatibility.
     """
+    from fastapi import WebSocketDisconnect
+
     # Attaching is itself a client interaction: tmux resizes the window to
     # the new client, which reflows the pane. Stamp it before the bridge
     # starts so that reflow is discounted.

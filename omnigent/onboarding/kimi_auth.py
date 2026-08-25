@@ -1,53 +1,205 @@
-"""Detect a Kimi Code (``kimi``) login for the ``kimi`` harness.
+"""Detect a usable Kimi Code (``kimi``) credential for the ``kimi`` harness.
 
-The ``kimi`` CLI authenticates against Moonshot AI's backend via ``kimi login``
-(an interactive OAuth flow or a Moonshot API key). It has **no** ``kimi logout``
-subcommand and no first-class "am I logged in?" exit-code probe, so login state
-can only be inspected from the credential file the login flow writes (verified
-live against kimi CLI v0.29.1):
+The ``kimi`` CLI authenticates against Moonshot AI's backend two ways:
 
-- ``kimi login`` writes ``~/.kimi-code/credentials/kimi-code.json`` — the file is
-  present exactly when a login has completed and absent (or empty) otherwise.
+- ``kimi login`` runs an interactive OAuth device flow. This grants
+  **membership** benefits and writes ``$KIMI_CODE_HOME/credentials/kimi-code.json``
+  (default ``~/.kimi-code/credentials/kimi-code.json``) — present exactly when
+  an interactive login has completed.
+- **Pay-per-use / API-platform** users cannot use ``kimi login``: the Kimi Code
+  coding endpoint rejects OAuth credentials without an active membership. They
+  authenticate instead by configuring a Kimi provider with an ``api_key`` (or an
+  ``env.KIMI_API_KEY``) in ``$KIMI_CODE_HOME/config.toml``. When such a provider
+  exists, ``kimi`` authenticates without an interactive login.
 
-Detection is file-based and subprocess-free: a non-empty credential file counts
-as a completed login. Like
+Detection is subprocess-free and reads only local state (verified live against
+kimi CLI v0.29.1): a non-empty credential file, or a Kimi provider with an API
+key in the config. Like
 :func:`omnigent.onboarding.gemini_auth.gemini_login_detected`, it cannot detect
-server-side revocation — its only job is to reject the "no-credential /
-file-empty" case so the readiness layer can distinguish a signed-in kimi from an
+server-side revocation — its only job is to reject the "no usable credential"
+case so the readiness layer can distinguish a configured kimi from an
 installed-but-unconfigured one without spawning a subprocess.
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
+from urllib.parse import urlparse
 
-# Where ``kimi login`` writes its credential after a completed sign-in
-# (verified against kimi CLI v0.29.1). Present and non-empty exactly when the
-# user is logged in.
-KIMI_CREDENTIALS_PATH: Path = (
-    Path(os.path.expanduser("~")) / ".kimi-code" / "credentials" / "kimi-code.json"
+import tomllib
+
+from omnigent.kimi_native_credentials import resolve_user_kimi_home
+
+# Provider ``type`` values that identify a Kimi / Moonshot API-key provider in
+# ``config.toml``. The manual coding-endpoint block uses ``kimi``; a provider
+# imported via ``kimi provider catalog add moonshotai`` carries the catalog's
+# own type (``moonshotai`` / its China variant, or ``moonshot``). Match all of
+# them so both pay-per-use paths are recognized.
+_KIMI_PROVIDER_TYPES: frozenset[str] = frozenset(
+    {"kimi", "moonshot", "moonshotai", "moonshotai-cn"}
 )
+# Endpoint hosts that identify a Kimi / Moonshot provider when its ``type`` is
+# opaque (an unrecognized catalog spelling): the Moonshot open platform
+# (``api.moonshot.ai`` / China ``api.moonshot.cn``) and the Kimi Code coding
+# endpoint (``api.kimi.com``).
+_KIMI_PROVIDER_HOSTS: tuple[str, ...] = ("moonshot.ai", "moonshot.cn", "kimi.com")
+# Env var names a Kimi / Moonshot API key is conventionally set under inside a
+# provider's ``[providers.<name>.env]`` table.
+_KIMI_API_KEY_ENV_VARS: tuple[str, ...] = ("KIMI_API_KEY", "MOONSHOT_API_KEY")
+
+
+def _kimi_config_path() -> Path:
+    """Return the path to the user's Kimi Code ``config.toml``.
+
+    Mirrors :func:`~omnigent.kimi_native_credentials.resolve_user_kimi_home`
+    (``$KIMI_CODE_HOME`` when set, else ``~/.kimi-code``) and appends
+    ``config.toml``.
+    """
+    return resolve_user_kimi_home() / "config.toml"
+
+
+def _kimi_credentials_path() -> Path:
+    """Return the credential file ``kimi login`` writes on a completed sign-in.
+
+    ``$KIMI_CODE_HOME/credentials/kimi-code.json`` (default
+    ``~/.kimi-code/credentials/kimi-code.json``), resolved at call time via
+    :func:`~omnigent.kimi_native_credentials.resolve_user_kimi_home` so it
+    honors ``$KIMI_CODE_HOME`` — matching where kimi actually stores auth.
+    """
+    return resolve_user_kimi_home() / "credentials" / "kimi-code.json"
+
+
+def _host_is_kimi(base_url: object) -> bool:
+    """Return whether *base_url* points at a Kimi / Moonshot endpoint host."""
+    if not isinstance(base_url, str) or not base_url.strip():
+        return False
+    # Parse a scheme-relative form when the value omits a scheme, so a bare
+    # ``api.moonshot.ai/v1`` still resolves a hostname instead of ``None``.
+    value = base_url.strip()
+    if "://" not in value:
+        value = f"//{value}"
+    host = (urlparse(value).hostname or "").lower()
+    return any(host == h or host.endswith(f".{h}") for h in _KIMI_PROVIDER_HOSTS)
+
+
+def _provider_is_kimi(provider: dict[str, object]) -> bool:
+    """Return whether *provider* is a Kimi / Moonshot provider.
+
+    Identified by a known ``type`` (covers the manual ``kimi`` block and the
+    ``moonshotai`` catalog import) or, when the type is unrecognized, by a
+    ``base_url`` on a Moonshot / Kimi host. This keeps an unrelated provider
+    (e.g. an OpenAI entry the user added to kimi) from counting as Kimi auth.
+    """
+    provider_type = provider.get("type")
+    if isinstance(provider_type, str) and provider_type.lower() in _KIMI_PROVIDER_TYPES:
+        return True
+    return _host_is_kimi(provider.get("base_url"))
+
+
+def _provider_has_key(provider: dict[str, object]) -> bool:
+    """Return whether *provider* carries a non-empty API key.
+
+    Accepts an inline ``api_key`` or a non-empty ``KIMI_API_KEY`` /
+    ``MOONSHOT_API_KEY`` entry in the provider's ``env`` sub-table — the two
+    shapes ``config.toml`` uses for a credential.
+    """
+    api_key = provider.get("api_key")
+    if isinstance(api_key, str) and api_key.strip():
+        return True
+    env = provider.get("env")
+    if isinstance(env, dict):
+        for var in _KIMI_API_KEY_ENV_VARS:
+            value = env.get(var)
+            if isinstance(value, str) and value.strip():
+                return True
+    return False
+
+
+def _has_kimi_api_key(config: dict[str, object]) -> bool:
+    """Return whether *config* declares a usable Kimi / Moonshot API-key provider.
+
+    A usable provider is a Kimi / Moonshot provider (by ``type`` or endpoint
+    host) that carries a non-empty API key — covering both pay-per-use paths:
+    the Moonshot open platform (``kimi provider catalog add moonshotai``) and
+    the Kimi Code coding endpoint (a manual ``type = "kimi"`` block).
+    """
+    providers = config.get("providers")
+    if not isinstance(providers, dict):
+        return False
+    for provider in providers.values():
+        if not isinstance(provider, dict):
+            continue
+        if _provider_is_kimi(provider) and _provider_has_key(provider):
+            return True
+    return False
+
+
+def kimi_api_key_configured(config_path: Path | None = None) -> bool:
+    """Return whether a Kimi API key is configured in ``config.toml``.
+
+    Reads the user's Kimi Code config (respecting ``$KIMI_CODE_HOME``) and
+    checks for at least one Kimi / Moonshot provider (by ``type`` or endpoint
+    host) carrying a non-empty API key — the pay-per-use / API-platform path
+    that does not require an interactive ``kimi login``. Covers both the
+    Moonshot open platform and the Kimi Code coding endpoint.
+
+    :param config_path: A specific config file to check; ``None`` uses
+        ``$KIMI_CODE_HOME/config.toml``.
+    :returns: ``True`` when a Kimi API-key provider is configured; ``False``
+        when the file is missing, malformed, or has no usable key.
+    """
+    path = config_path if config_path is not None else _kimi_config_path()
+    try:
+        with path.open("rb") as f:
+            config = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError):
+        # Missing, unreadable, or broken TOML is treated as "no API key" rather
+        # than crashing the readiness refresh.
+        return False
+    return _has_kimi_api_key(config)
 
 
 def kimi_login_detected(creds_path: Path | None = None) -> bool:
-    """Return whether ``kimi`` has a completed login on this machine.
+    """Return whether ``kimi`` has a completed interactive login on this machine.
 
     Subprocess-free file check: ``kimi login`` writes its credential to
-    :data:`KIMI_CREDENTIALS_PATH`, so a present, non-empty file is treated as a
-    completed sign-in. This cannot detect server-side revocation — it only
-    rejects the "no-credential / file-empty" case. Used by the readiness layer
-    to distinguish a signed-in kimi from an installed-but-unconfigured one.
+    :func:`_kimi_credentials_path` (honoring ``$KIMI_CODE_HOME``), so a present,
+    non-empty file is treated as a completed OAuth sign-in. This cannot detect
+    server-side revocation — it only rejects the "no-credential / file-empty"
+    case.
 
     :param creds_path: A specific credential file to check; ``None`` uses
-        :data:`KIMI_CREDENTIALS_PATH`.
+        ``$KIMI_CODE_HOME/credentials/kimi-code.json``.
     :returns: ``True`` when the credential file exists and is non-empty;
         ``False`` when it is missing, empty, or unreadable.
     """
-    path = creds_path if creds_path is not None else KIMI_CREDENTIALS_PATH
+    path = creds_path if creds_path is not None else _kimi_credentials_path()
     try:
         return path.is_file() and path.stat().st_size > 0
     except OSError:
         # A stat/permission error on the credential path is treated as "no
         # usable credential" rather than crashing the readiness refresh.
         return False
+
+
+def kimi_auth_configured(
+    *,
+    creds_path: Path | None = None,
+    config_path: Path | None = None,
+) -> bool:
+    """Return whether ``kimi`` has any usable credential on this machine.
+
+    Combines the interactive-login credential check with the API-key config
+    check: either a non-empty ``kimi-code.json`` from ``kimi login`` (membership
+    OAuth) or a configured Kimi API-key provider (pay-per-use) counts as
+    configured. Used by the readiness layer so API-platform users are not
+    wrongly reported as unconfigured just because they never ran ``kimi login``.
+
+    :param creds_path: A specific credential file to check; ``None`` uses
+        ``$KIMI_CODE_HOME/credentials/kimi-code.json``.
+    :param config_path: A specific config file to check; ``None`` uses
+        ``$KIMI_CODE_HOME/config.toml``.
+    :returns: ``True`` when an interactive-login credential exists or a Kimi
+        API key is configured; ``False`` when neither is present.
+    """
+    return kimi_login_detected(creds_path) or kimi_api_key_configured(config_path)

@@ -1109,6 +1109,54 @@ class ResponseObject(BaseModel):
     incomplete_details: IncompleteDetails | None = None
 
 
+class FailedResponseObject(BaseModel):
+    """Response payload for failures raised before response allocation.
+
+    Transport and setup failures can terminate a turn before the harness has
+    assigned the metadata required by :class:`ResponseObject`. The remaining
+    fields mirror that model so fully allocated failures retain their complete
+    wire representation.
+
+    :param id: Unique response identifier, e.g. ``"resp_abc123"``, or
+        ``None`` when allocation did not complete.
+    :param object: Fixed resource type, always ``"response"``.
+    :param status: Lifecycle status, normally ``"failed"``.
+    :param model: Agent name that produced the response, e.g.
+        ``"research-agent"``, or ``None`` when resolution did not complete.
+    :param created_at: Unix epoch timestamp of creation, or ``None`` when the
+        response failed before creation.
+    :param completed_at: Unix epoch timestamp of completion, or ``None``.
+    :param output: Heterogeneous serialized output items accumulated before
+        failure.
+    :param background: Whether the response was created as a background task.
+    :param store: Whether the response is persisted.
+    :param usage: Token usage statistics, or ``None`` when unavailable.
+    :param previous_response_id: ID of the prior response, or ``None``.
+    :param conversation: Reference to the owning conversation, or ``None``.
+    :param instructions: Per-request instructions override, or ``None``.
+    :param reasoning: Reasoning configuration, or ``None``.
+    :param error: Error details describing the failure, or ``None``.
+    :param incomplete_details: Incomplete-response details, or ``None``.
+    """
+
+    id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    object: str = "response"
+    status: str
+    model: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    created_at: int | None = Field(default=None, exclude_if=lambda value: value is None)
+    completed_at: int | None = None
+    output: list[dict[str, Any]] = Field(default_factory=list)
+    background: bool = False
+    store: bool = True
+    usage: Usage | None = None
+    previous_response_id: str | None = None
+    conversation: ConversationRef | None = None
+    instructions: str | None = None
+    reasoning: dict[str, str] | None = None
+    error: ErrorDetail | None = None
+    incomplete_details: IncompleteDetails | None = None
+
+
 class ToolResult(BaseModel):
     """
     A single tool result submitted by the client via PATCH.
@@ -3883,17 +3931,17 @@ class FailedEvent(_SSEEventBase):
     """
     Terminal event for a turn that ended with an error.
 
-    Carries the final
-    :class:`omnigent.server.schemas.ResponseObject` whose
-    ``error`` field describes the failure.
+    Carries a :class:`omnigent.server.schemas.FailedResponseObject`
+    whose ``error`` field describes the failure. Response metadata may
+    be absent when the failure occurs before response allocation.
 
     :param type: Always ``"response.failed"``.
-    :param response: The final response object with
-        ``status="failed"`` and ``error`` populated.
+    :param response: The failure response object with ``status="failed"``
+        and ``error`` populated.
     """
 
     type: Literal["response.failed"]
-    response: ResponseObject
+    response: ResponseObject | FailedResponseObject
 
 
 class CancelledEvent(_SSEEventBase):

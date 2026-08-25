@@ -386,11 +386,10 @@ async def test_teardown_codex_native_app_server_cancels_forwarder_and_closes_ser
     """
     Codex pane teardown cancels the forwarder and closes the app-server.
 
-    The idle pane reaper and an unexpected TUI exit both close only the tmux
-    pane; without this helper the per-session ``codex app-server`` (and its
-    forwarder) survives with no TUI, orphaning a ``codex`` process for the
-    runner's lifetime. Teardown must both cancel the registered forwarder and
-    close the registered app-server so neither leaks.
+    The idle pane reaper closes only the tmux pane; without this helper the
+    per-session ``codex app-server`` (and its forwarder) survives with no TUI,
+    orphaning a ``codex`` process for the runner's lifetime. Teardown must both
+    cancel the registered forwarder and close the registered app-server.
     """
     session_id = "c0d3f00d0000000000000000deadbeef"
     run = _ForwarderRun()
@@ -433,10 +432,9 @@ async def test_teardown_codex_native_app_server_noop_without_registered_server()
     """
     Teardown is a no-op for a session with no registered codex app-server.
 
-    The shared pane-teardown paths (reaper, terminal-exit publisher) fire for
-    every native harness, so calling this for a non-codex session — or a codex
-    session whose server is already gone — must not touch that session's
-    forwarder or raise.
+    Shared required-session and idle-reaper cleanup can fire for every native
+    harness, so calling this for a non-codex session — or a codex session whose
+    server is already gone — must not touch that session's forwarder or raise.
     """
     session_id = "1111111122222222aaaaaaaabbbbbbbb"
     run = _ForwarderRun()

@@ -458,6 +458,7 @@ _ISAAC_STYLE_DETECTION = DetectedProvider(
     kind="cli-config",
     family="openai",
     source="~/.codex/config.toml provider 'Databricks'",
+    cli="codex",
     model_provider="Databricks",
     display_name="Databricks AI Gateway",
 )
@@ -797,3 +798,195 @@ def test_prewarm_detect_providers_failure_falls_back_to_fresh_sweep(
     ambient.prewarm_detect_providers()
     assert detect_providers() == []
     assert sweeps == ["sweep", "sweep"]
+
+
+# --- Claude Code managed-settings gateway (the isaac configure claude shape) ---
+
+_ISAAC_STYLE_CLAUDE_SETTINGS: dict[str, object] = {
+    "env": {
+        "ANTHROPIC_BASE_URL": "https://dbc-test.cloud.databricks.com/ai-gateway/anthropic",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-4-8",
+    },
+    "apiKeyHelper": "jq -r '.access_token' ~/.databricks/model-serving-token.json",
+}
+
+_ISAAC_STYLE_CLAUDE_DETECTION = DetectedProvider(
+    name="claude-databricks",
+    kind="cli-config",
+    family="anthropic",
+    source="Claude Code managed settings gateway 'Databricks AI Gateway'",
+    cli="claude",
+    display_name="Databricks AI Gateway",
+)
+
+
+def _write_claude_managed_settings(home, monkeypatch, payload: object):
+    """Write a Claude Code managed-settings file and point detection at it.
+
+    The real chain lives at absolute, machine-global paths, so tests redirect
+    the tuple rather than the (tmp) ``$HOME`` — overriding the autouse
+    ``_isolate_claude_managed_settings`` fixture for this one test.
+
+    :param home: The tmp HOME directory (from the ``clean_env`` fixture).
+    :param monkeypatch: pytest's attr patching fixture.
+    :param payload: The JSON value to write (a settings object, or any value
+        for the malformed cases).
+    :returns: The path written.
+    """
+    import json
+
+    path = home / "managed-settings.json"
+    path.write_text(json.dumps(payload))
+    monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (path,))
+    return path
+
+
+def test_claude_managed_gateway_detected(clean_env, monkeypatch) -> None:
+    """An isaac-style managed-settings file (gateway + helper) is detected.
+
+    This is the exact state ``isaac configure claude`` leaves behind — no
+    ``.credentials.json`` and no Keychain subscription — which the login
+    detection cannot see. Failure means internal users' gateway-configured
+    Claude shows as "not configured" in setup, the Claude half of the bug the
+    codex config detection already fixed.
+    """
+    _write_claude_managed_settings(clean_env, monkeypatch, _ISAAC_STYLE_CLAUDE_SETTINGS)
+    assert detect_providers() == [_ISAAC_STYLE_CLAUDE_DETECTION]
+
+
+def test_claude_managed_gateway_suppresses_subscription_detection(clean_env, monkeypatch) -> None:
+    """The gateway wins and the CLI-login detection is dropped, not doubled.
+
+    ``claude auth status`` reports a managed ``apiKeyHelper`` as logged in
+    (``authMethod: "api_key_helper"``), so the login probe describes the SAME
+    credential. Failure means one gateway is adopted twice — once truthfully and
+    once mislabelled as a Claude plan subscription.
+    """
+    from omnigent.onboarding import harness_install
+
+    # A login the probe *would* report, exactly as on an enterprise Mac.
+    monkeypatch.setattr(harness_install, "harness_cli_logged_in", lambda key: True)
+    _write_claude_managed_settings(clean_env, monkeypatch, _ISAAC_STYLE_CLAUDE_SETTINGS)
+
+    assert [(d.name, d.kind) for d in detect_providers()] == [("claude-databricks", "cli-config")]
+
+
+def test_claude_subscription_still_detected_without_managed_gateway(
+    clean_env, monkeypatch
+) -> None:
+    """With no managed gateway, a real CLI login is still detected as before.
+
+    Guards the suppression above from swallowing the ordinary Pro/Max case.
+    """
+    from omnigent.onboarding import harness_install
+
+    monkeypatch.setattr(harness_install, "harness_cli_logged_in", lambda key: True)
+    # The Keychain fallback is darwin-gated; pin it so the test asserts the same
+    # behavior on Linux CI as on a Mac.
+    monkeypatch.setattr(ambient.sys, "platform", "darwin")
+
+    assert [(d.name, d.kind) for d in detect_providers()] == [("claude", "subscription")]
+
+
+@pytest.mark.parametrize(
+    "payload,reason",
+    [
+        # A base URL with no way to authenticate is not a usable credential.
+        (
+            {"env": {"ANTHROPIC_BASE_URL": "https://x.cloud.databricks.com/ai-gateway/a"}},
+            "gateway-without-credential",
+        ),
+        # A helper with no endpoint routes nowhere omnigent can vouch for.
+        ({"apiKeyHelper": "print-token"}, "credential-without-gateway"),
+        # Neither half present.
+        ({"env": {"MCP_TOOL_TIMEOUT": "1000"}}, "unrelated-settings"),
+        # Not an object at all.
+        ([1, 2, 3], "not-an-object"),
+    ],
+)
+def test_claude_managed_gateway_not_detected(
+    clean_env, monkeypatch, payload: object, reason: str
+) -> None:
+    """Half-configured or malformed managed settings detect nothing.
+
+    Failure means readiness would report a Claude credential that cannot
+    actually authenticate, stranding the launch at run time instead of
+    prompting the user to finish setup.
+    """
+    _write_claude_managed_settings(clean_env, monkeypatch, payload)
+    assert detect_providers() == [], reason
+
+
+def test_claude_managed_gateway_use_gateway_env_counts_as_credential(
+    clean_env, monkeypatch
+) -> None:
+    """A truthy ``CLAUDE_CODE_USE_GATEWAY`` delivers the credential too.
+
+    The ucode-style variant of the enterprise setup: no ``apiKeyHelper``, the
+    CLI mints its own gateway token. Parity with the Smart-Routing check, which
+    has always accepted this signal.
+    """
+    _write_claude_managed_settings(
+        clean_env,
+        monkeypatch,
+        {
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://dbc-test.cloud.databricks.com/ai-gateway/anthropic",
+                "CLAUDE_CODE_USE_GATEWAY": "1",
+            }
+        },
+    )
+    assert [d.name for d in detect_providers()] == ["claude-databricks"]
+
+
+def test_claude_managed_gateway_non_databricks_named_by_host(clean_env, monkeypatch) -> None:
+    """A non-Databricks gateway is still detected, named after its host.
+
+    The credential is real (endpoint + helper) even when it isn't a Databricks
+    AI Gateway, so it must not be dropped; only the Databricks *label* is
+    reserved for URLs the allowlist recognizes.
+    """
+    _write_claude_managed_settings(
+        clean_env,
+        monkeypatch,
+        {
+            "env": {"ANTHROPIC_BASE_URL": "https://llm.corp.example.com/v1"},
+            "apiKeyHelper": "print-token",
+        },
+    )
+    (det,) = detect_providers()
+    assert (det.name, det.cli, det.family) == (
+        "claude-llm-corp-example-com",
+        "claude",
+        "anthropic",
+    )
+    assert det.display_name == "llm.corp.example.com"
+
+
+def test_claude_managed_gateway_missing_file_is_graceful(clean_env, monkeypatch) -> None:
+    """An absent settings file detects nothing rather than raising."""
+    monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (clean_env / "nope.json",))
+    assert ambient.claude_config_custom_provider() is None
+    assert ambient.claude_config_detection() is None
+
+
+def test_claude_managed_gateway_first_readable_file_decides(clean_env, monkeypatch) -> None:
+    """A higher-precedence file without a gateway is not overridden by a lower one.
+
+    Mirrors Claude Code's own precedence: the file the CLI would apply decides,
+    so omnigent never reports a credential the CLI would ignore.
+    """
+    import json
+
+    high = clean_env / "high.json"
+    high.write_text(json.dumps({"env": {"MCP_TOOL_TIMEOUT": "1"}}))
+    low = clean_env / "low.json"
+    low.write_text(json.dumps(_ISAAC_STYLE_CLAUDE_SETTINGS))
+    monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (high, low))
+
+    assert ambient.claude_config_detection() is None
+    # An unreadable high-precedence entry is skipped, so the low one decides.
+    monkeypatch.setattr(
+        ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (clean_env / "absent.json", low)
+    )
+    assert ambient.claude_config_detection() == _ISAAC_STYLE_CLAUDE_DETECTION

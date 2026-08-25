@@ -14,6 +14,7 @@ import {
   createTerminal,
   deleteTerminal,
   fetchTerminals,
+  findAgentTerminal,
   inventoryTerminals,
   isAgentTerminalKey,
   PENDING_RECONCILE_INTERVAL_MS,
@@ -452,21 +453,17 @@ describe("deleteTerminal", () => {
 });
 
 describe("terminalsReconcileInterval", () => {
-  // The spinner is `terminalPending && !terminalsAvailable`. This decides
-  // when the terminals query re-polls to recover a missed
-  // `session.resource.created` (the dbx-apps stuck-spinner bug) — and,
-  // critically, when it STOPS so there's no steady-state polling.
-  it("polls only while pending AND no terminal is visible yet", () => {
-    expect(terminalsReconcileInterval(true, 0)).toBe(PENDING_RECONCILE_INTERVAL_MS);
+  it("polls only while pending AND no agent terminal is visible yet", () => {
+    expect(terminalsReconcileInterval(true, false)).toBe(PENDING_RECONCILE_INTERVAL_MS);
   });
 
-  it("stops the instant a terminal lands (clears the spinner via AND)", () => {
-    expect(terminalsReconcileInterval(true, 1)).toBe(false);
+  it("stops the instant the agent terminal lands", () => {
+    expect(terminalsReconcileInterval(true, true)).toBe(false);
   });
 
   it("never polls when the runner is not spinning up a terminal", () => {
-    expect(terminalsReconcileInterval(false, 0)).toBe(false);
-    expect(terminalsReconcileInterval(false, 2)).toBe(false);
+    expect(terminalsReconcileInterval(false, false)).toBe(false);
+    expect(terminalsReconcileInterval(false, true)).toBe(false);
   });
 });
 
@@ -491,6 +488,19 @@ describe("useTerminals reconcile poll (stuck-spinner self-heal)", () => {
   }
 
   const emptyList = () => mockResponse({ object: "list", data: [] });
+  const oneShell = () =>
+    mockResponse({
+      object: "list",
+      data: [
+        {
+          id: "terminal_bash_s1",
+          type: "terminal",
+          session_id: "conv_abc",
+          name: "bash:s1",
+          metadata: { terminal_name: "bash", session_key: "s1", running: true },
+        },
+      ],
+    });
   const oneTerminal = () =>
     mockResponse({
       object: "list",
@@ -505,13 +515,11 @@ describe("useTerminals reconcile poll (stuck-spinner self-heal)", () => {
       ],
     });
 
-  it("re-polls while pending until the terminal lands, then stops", async () => {
-    // Mount + first reconcile poll see no terminal; the auto-created
-    // terminal lands on the third fetch — exactly the missed-delta case
-    // a page refresh used to be the only recovery for.
+  it("re-polls while pending until the agent terminal lands, then stops", async () => {
+    // A user shell alone must not satisfy the pending agent-terminal launch.
     fetchMock
       .mockResolvedValueOnce(emptyList())
-      .mockResolvedValueOnce(emptyList())
+      .mockResolvedValueOnce(oneShell())
       .mockResolvedValue(oneTerminal());
 
     const { result } = renderHook(() => useTerminals("conv_abc", { reconcileWhilePending: true }), {
@@ -522,29 +530,21 @@ describe("useTerminals reconcile poll (stuck-spinner self-heal)", () => {
     expect(result.current.terminals).toEqual([]);
     const seedCalls = fetchMock.mock.calls.length;
 
-    // First reconcile poll fires while still empty: the interval scheduled a
-    // refetch, so the fetch count must climb past the seed. (Asserting `>`
-    // rather than an exact `+1` because React Query anchors the next interval
-    // off each fetch's settle time, so the precise count under fake timers is
-    // a scheduling detail; a count still == seedCalls would mean no poll fired
-    // — the bug we're guarding against.)
+    // The first interval starts reconciliation. Its exact settle point is a
+    // React Query scheduling detail, so assert that a refetch was issued.
     await act(async () => void (await vi.advanceTimersByTimeAsync(PENDING_RECONCILE_INTERVAL_MS)));
-    expect(result.current.terminals).toEqual([]);
     expect(fetchMock.mock.calls.length).toBeGreaterThan(seedCalls);
 
-    // Further reconcile polls -> terminal lands. Assert the full mapped row
-    // (not just id) so a broken resource→TerminalInfo mapping can't pass.
+    // A later poll finds the agent terminal and unions it with the cached shell.
     await act(
       async () => void (await vi.advanceTimersByTimeAsync(PENDING_RECONCILE_INTERVAL_MS * 2)),
     );
     expect(result.current.terminals).toEqual([
+      { id: "terminal_bash_s1", name: "bash", session: "s1", running: true },
       { id: "terminal_claude_main", name: "claude", session: "main", running: true },
     ]);
 
-    // Polling must stop now that a terminal is visible: the refetchInterval
-    // returns false once terminalCount > 0. Assert ZERO further fetches over
-    // 4 would-be intervals — a higher count would mean the interval was never
-    // disabled and the poll runs forever.
+    // The agent terminal stops the interval; shells alone did not.
     const callsAtLand = fetchMock.mock.calls.length;
     await act(
       async () => void (await vi.advanceTimersByTimeAsync(PENDING_RECONCILE_INTERVAL_MS * 4)),
@@ -890,5 +890,35 @@ describe("isAgentTerminalKey", () => {
 
   it("treats a user shell as not-the-agent-terminal", () => {
     expect(isAgentTerminalKey("terminal:terminal_bash_s1")).toBe(false);
+  });
+});
+
+describe("findAgentTerminal", () => {
+  it("selects the agent pane even when a user shell appears first", () => {
+    const shell: TerminalInfo = {
+      id: "terminal_bash_s1",
+      name: "bash",
+      session: "s1",
+      running: true,
+    };
+    const agent: TerminalInfo = {
+      id: "terminal_codex_main",
+      name: "codex",
+      session: "main",
+      running: true,
+    };
+
+    expect(findAgentTerminal([shell, agent])).toBe(agent);
+  });
+
+  it("does not substitute a user shell when the agent pane is absent", () => {
+    const shell: TerminalInfo = {
+      id: "terminal_bash_s1",
+      name: "bash",
+      session: "s1",
+      running: true,
+    };
+
+    expect(findAgentTerminal([shell])).toBeNull();
   });
 });

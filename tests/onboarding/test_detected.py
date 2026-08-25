@@ -387,6 +387,7 @@ def _codex_config_det() -> DetectedProvider:
         kind="cli-config",
         family=OPENAI_FAMILY,
         source="~/.codex/config.toml provider 'Databricks'",
+        cli="codex",
         model_provider="Databricks",
         display_name="Databricks AI Gateway",
     )
@@ -501,3 +502,79 @@ def test_malformed_dismissed_detections_treated_as_empty() -> None:
     assert dismissed_detection_names({"dismissed_detections": [3, "codex-databricks"]}) == (
         frozenset({"codex-databricks"})
     )
+
+
+def _claude_config_det() -> DetectedProvider:
+    """An ambient Claude Code managed-settings gateway detection."""
+    return DetectedProvider(
+        name="claude-databricks",
+        kind="cli-config",
+        family=ANTHROPIC_FAMILY,
+        source="Claude Code managed settings gateway 'Databricks AI Gateway'",
+        cli="claude",
+        display_name="Databricks AI Gateway",
+    )
+
+
+def test_synthesize_claude_cli_config_entry() -> None:
+    """A claude cli-config detection synthesizes an entry with NO model_provider.
+
+    Claude Code pins its endpoint directly, so there is no
+    ``[model_providers.X]`` id to record. Asserted by full equality: emitting a
+    ``model_provider`` key here would be a fabricated pin, and omitting ``cli``
+    would fail config parsing on adoption.
+    """
+    entries = synthesize_detected_entries([_claude_config_det()])
+    assert entries == {
+        "claude-databricks": {
+            "kind": "cli-config",
+            "cli": "claude",
+            "display_name": "Databricks AI Gateway",
+        }
+    }
+
+
+def test_claude_cli_config_becomes_anthropic_default() -> None:
+    """A detected Claude gateway auto-defaults the anthropic surface.
+
+    The whole point of the detection: on an enterprise host with nothing in
+    config.yaml, the Claude harness must resolve this credential rather than
+    report "not configured". Failure means the setup dead end the codex side
+    never had.
+    """
+    from omnigent.onboarding.provider_config import default_provider_for_harness
+
+    merged = effective_config_with_detected({}, [_claude_config_det()])
+    entry = default_provider_for_harness(merged, "claude-sdk")
+    assert entry is not None
+    assert (entry.name, entry.kind, entry.cli) == ("claude-databricks", "cli-config", "claude")
+
+
+def test_claude_cli_config_detection_can_be_dismissed() -> None:
+    """Removing the adopted entry keeps the Claude gateway from bouncing back.
+
+    Its credential can't be "signed out" (it lives in an enterprise file), so
+    without the dismissal Remove would be a no-op on the next configure open.
+    """
+    config = {"dismissed_detections": ["claude-databricks"]}
+    assert providers_to_adopt(config, [_claude_config_det()]) == {}
+    merged = effective_config_with_detected(config, [_claude_config_det()])
+    assert "claude-databricks" not in (merged.get("providers") or {})
+
+
+def test_claude_and_codex_cli_configs_coexist() -> None:
+    """Both harnesses' own-config credentials are adopted side by side.
+
+    An internal machine has both; each must default its own surface, with no
+    cross-talk between the codex ``model_provider`` pin and the Claude gateway.
+    """
+    from omnigent.onboarding.provider_config import default_provider_for_harness
+
+    merged = effective_config_with_detected({}, [_claude_config_det(), _codex_config_det()])
+    claude = default_provider_for_harness(merged, "claude-sdk")
+    codex = default_provider_for_harness(merged, "codex")
+    assert claude is not None and codex is not None
+    assert claude.name == "claude-databricks"
+    assert codex.name == "codex-databricks"
+    assert claude.model_provider is None
+    assert codex.model_provider == "Databricks"

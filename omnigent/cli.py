@@ -4874,6 +4874,7 @@ def _upgrade_vcs_install(
         _probe_installed_distribution,
         _remote_git_head,
         _run_upgrade_command,
+        _upgrade_failure_message,
     )
 
     current_sha = info.commit_sha or ""
@@ -4928,7 +4929,7 @@ def _upgrade_vcs_install(
     code = _run_upgrade_command(suggestion.command, console)
     if code != 0:
         raise click.ClickException(
-            f"Upgrade command exited with status {code}; your previous install is intact."
+            _upgrade_failure_message(code, set(info.extras) | set(extra_overrides))
         )
 
     # Verify by commit, not exit code: a re-pull of a ref that hasn't moved (or
@@ -4997,6 +4998,7 @@ def _upgrade_to_nightly(
         _latest_nightly_version,
         _probe_installed_distribution,
         _run_upgrade_command,
+        _upgrade_failure_message,
         _uv_tool_receipt_path,
     )
 
@@ -5073,7 +5075,7 @@ def _upgrade_to_nightly(
     code = _run_upgrade_command(suggestion.command, console)
     if code != 0:
         raise click.ClickException(
-            f"Upgrade command exited with status {code}; your previous install is intact."
+            _upgrade_failure_message(code, set(info.extras) | set(extra_overrides))
         )
 
     # Same trust-the-disk verification as the release path: re-read the
@@ -5195,6 +5197,7 @@ def upgrade(
         _probe_installed_distribution,
         _read_installed_wheel_info,
         _run_upgrade_command,
+        _upgrade_failure_message,
         _uv_tool_receipt_path,
         fetch_latest_version,
     )
@@ -5341,7 +5344,7 @@ def upgrade(
     code = _run_upgrade_command(suggestion.command, console)
     if code != 0:
         raise click.ClickException(
-            f"Upgrade command exited with status {code}; your previous install is intact."
+            _upgrade_failure_message(code, set(info.extras) | set(extra_overrides))
         )
 
     # Trust the installed version, not the installer's exit code. The running
@@ -5798,6 +5801,25 @@ def resume(
     )
 
 
+_IMPORT_BATCH_MAX_WORKERS = 8
+
+
+@dataclass
+class _SessionImportResult:
+    """Outcome of importing one source session.
+
+    Shared by the single-session path and the parallel batch path so both
+    interpret the same statuses.
+    """
+
+    session_id: str
+    status: Literal["imported", "already", "unreachable", "failed", "load_error"]
+    item_count: int = 0
+    link: str | None = None
+    message: str | None = None
+    raw_exc: BaseException | None = None
+
+
 @cli.command("import")
 @click.option(
     "--harness",
@@ -5896,24 +5918,14 @@ def import_session_command(
     if base_url is None:
         base_url = ensure_local_omnigent_server().url
     base_url = base_url.rstrip("/")
-    imported_count = 0
-    already_imported_count = 0
-    failed_count = 0
-    for current_source_session_id in source_session_ids:
+
+    def _import_one(sid: str) -> _SessionImportResult:
         try:
-            imported = load_local_session(source, current_source_session_id)
+            imported = load_local_session(source, sid)
         except SessionImportNotFoundError as exc:
-            if not is_batch:
-                raise click.ClickException(str(exc)) from exc
-            failed_count += 1
-            click.echo(f"Failed {current_source_session_id}: {exc}", err=True)
-            continue
+            return _SessionImportResult(sid, "load_error", message=str(exc), raw_exc=exc)
         except (OSError, TypeError, ValueError) as exc:
-            if not is_batch:
-                raise
-            failed_count += 1
-            click.echo(f"Failed {current_source_session_id}: {exc}", err=True)
-            continue
+            return _SessionImportResult(sid, "load_error", message=str(exc), raw_exc=exc)
 
         payload = {
             "source": imported.source,
@@ -5937,12 +5949,13 @@ def import_session_command(
                 timeout=120.0,
             )
         except httpx.RequestError as exc:
-            raise click.ClickException(f"Could not reach the Omnigent server: {exc}") from exc
+            return _SessionImportResult(
+                sid,
+                "unreachable",
+                message=f"Could not reach the Omnigent server: {exc}",
+                raw_exc=exc,
+            )
 
-        if response.status_code == 409 and is_batch:
-            already_imported_count += 1
-            click.echo(f"Already imported {current_source_session_id}; skipped.")
-            continue
         if response.is_error:
             try:
                 body = response.json()
@@ -5950,44 +5963,84 @@ def import_session_command(
             except (ValueError, AttributeError):
                 detail = None
             message = f"Import failed ({response.status_code}): {detail or response.text}"
-            if not is_batch:
-                raise click.ClickException(message)
-            failed_count += 1
-            click.echo(f"Failed {current_source_session_id}: {message}", err=True)
-            continue
+            status = "already" if response.status_code == 409 else "failed"
+            return _SessionImportResult(sid, status, message=message)
 
         try:
             result = response.json()
             session_id = result["session_id"]
             item_count = result["item_count"]
         except (AttributeError, KeyError, TypeError, ValueError) as exc:
-            if not is_batch:
-                raise click.ClickException("Import returned an invalid server response") from exc
-            failed_count += 1
-            click.echo(
-                f"Failed {current_source_session_id}: import returned an invalid server response",
-                err=True,
+            return _SessionImportResult(
+                sid,
+                "failed",
+                message="Import returned an invalid server response",
+                raw_exc=exc,
             )
-            continue
-        imported_count += 1
         # Surface the browser URL, not the bare id, so the user can open the
         # imported session straight into the web (where it offers the resume
         # picker). Maps a Databricks API base to its workspace SPA link.
-        session_link = conversation_url(base_url, session_id)
-        if is_batch:
-            click.echo(
-                f"Imported {item_count} item(s) from {current_source_session_id} "
-                f"into {session_link}"
-            )
-        else:
-            click.echo(f"Imported {item_count} item(s) into {session_link}")
+        return _SessionImportResult(
+            sid,
+            "imported",
+            item_count=item_count,
+            link=conversation_url(base_url, session_id),
+        )
 
-    if is_batch:
-        click.echo(f"\nImported: {imported_count}")
-        click.echo(f"Already imported: {already_imported_count}")
-        click.echo(f"Failed: {failed_count}")
-        if failed_count:
-            raise click.ClickException(f"{failed_count} session(s) failed to import")
+    if not is_batch:
+        result = _import_one(source_session_ids[0])
+        if result.status == "imported":
+            click.echo(f"Imported {result.item_count} item(s) into {result.link}")
+            return
+        if result.status == "load_error":
+            # A missing session is a clean CLI error; a corrupt transcript keeps
+            # its original exception so the traceback points at the parse fault.
+            if isinstance(result.raw_exc, SessionImportNotFoundError):
+                raise click.ClickException(str(result.raw_exc)) from result.raw_exc
+            assert result.raw_exc is not None
+            raise result.raw_exc
+        raise click.ClickException(result.message or "Import failed")
+
+    # Distinct sessions are independent conversations on the server (their own
+    # ids, row locks, and position counters), so importing them concurrently
+    # never contends. Resolve the remote auth token once up front to populate
+    # the per-URL SDK cache before the workers fan out, rather than have each
+    # worker cold-mint it in parallel.
+    _remote_headers(server_url=base_url, host_id=None)
+    results: dict[str, _SessionImportResult] = {}
+    max_workers = min(len(source_session_ids), _IMPORT_BATCH_MAX_WORKERS)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_import_one, sid): sid for sid in source_session_ids}
+        for future in concurrent.futures.as_completed(futures):
+            outcome = future.result()
+            results[outcome.session_id] = outcome
+
+    # A network failure is fatal for the whole batch, matching the serial import.
+    unreachable = next((r for r in results.values() if r.status == "unreachable"), None)
+    if unreachable is not None:
+        raise click.ClickException(unreachable.message or "Could not reach the Omnigent server")
+
+    imported_count = 0
+    already_imported_count = 0
+    failed_count = 0
+    # Report in the caller's requested order, not worker completion order.
+    for sid in source_session_ids:
+        outcome = results[sid]
+        if outcome.status == "imported":
+            imported_count += 1
+            click.echo(f"Imported {outcome.item_count} item(s) from {sid} into {outcome.link}")
+        elif outcome.status == "already":
+            already_imported_count += 1
+            click.echo(f"Already imported {sid}; skipped.")
+        else:
+            failed_count += 1
+            click.echo(f"Failed {sid}: {outcome.message}", err=True)
+
+    click.echo(f"\nImported: {imported_count}")
+    click.echo(f"Already imported: {already_imported_count}")
+    click.echo(f"Failed: {failed_count}")
+    if failed_count:
+        raise click.ClickException(f"{failed_count} session(s) failed to import")
 
 
 def _render_usage(report: dict[str, Any], limit: int) -> None:  # type: ignore[explicit-any]

@@ -66,7 +66,7 @@ vi.mock("@/hooks/useConversations", () => ({
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
-import { Toaster } from "@/components/ui/toast";
+import { Toaster } from "@/components/ui/sonner";
 import { Sidebar } from "./Sidebar";
 
 const useConvMock = vi.mocked(useConversations);
@@ -160,7 +160,7 @@ describe("archive flow", () => {
     expect(mocks.stop.mutate).not.toHaveBeenCalled();
   });
 
-  it("toasts a pointer to Settings once the archive succeeds", () => {
+  it("toasts a pointer to Settings once the archive succeeds", async () => {
     mockConversations([CONV]);
     renderSidebar();
     clickArchive();
@@ -169,7 +169,7 @@ describe("archive flow", () => {
     const archiveArgs = mocks.archive.mutate.mock.calls[0];
     act(() => (archiveArgs[1] as { onSuccess: () => void }).onSuccess());
 
-    const toast = screen.getByTestId("toast");
+    const toast = await screen.findByTestId("toast");
     expect(within(toast).getByText(/View archived sessions in/)).toBeInTheDocument();
     expect(within(toast).getByRole("link", { name: "Settings" })).toHaveAttribute(
       "href",

@@ -2286,6 +2286,72 @@ def test_forwarder_tracks_active_turn_across_terminal_event_sequences(
     ] == expected_statuses
 
 
+def test_terminal_turn_clears_control_state_before_blocked_delta_flush(tmp_path: Path) -> None:
+    """A slow output flush cannot leave a completed Codex turn steerable."""
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_123",
+        ),
+    )
+    posted: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Capture posts that must remain ordered after the output flush."""
+        posted.append(json.loads(request.content))
+        return httpx.Response(202, json={"queued": False})
+
+    async def run() -> None:
+        """Block output delivery and inspect bridge control state mid-boundary."""
+        flush_entered = asyncio.Event()
+        release_flush = asyncio.Event()
+
+        class _BlockingDeltaCoalescer:
+            """Delta coalescer that parks the terminal handler in ``flush``."""
+
+            async def flush(self) -> None:
+                """Signal entry and wait until the assertion releases delivery."""
+                flush_entered.set()
+                await release_flush.wait()
+
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            task = asyncio.create_task(
+                codex_native_forwarder._handle_event(
+                    client,
+                    session_id="conv_123",
+                    bridge_dir=tmp_path,
+                    usage_coalescer=_usage_coalescer(client),
+                    elicitation_tracker=_elicitation_tracker(),
+                    event=_completed_event("turn_123"),
+                    delta_coalescer=_BlockingDeltaCoalescer(),  # type: ignore[arg-type]
+                )
+            )
+            await asyncio.wait_for(flush_entered.wait(), timeout=5.0)
+
+            state = read_bridge_state(tmp_path)
+            assert state is not None
+            assert state.active_turn_id is None
+            assert posted == [], "terminal status must still follow pending output delivery"
+
+            release_flush.set()
+            await asyncio.wait_for(task, timeout=5.0)
+
+    asyncio.run(run())
+
+    assert [
+        payload["data"]["status"]
+        for payload in posted
+        if payload["type"] == "external_session_status"
+    ] == ["idle"]
+
+
 def test_forwarder_posts_agent_item_after_stale_terminal_event(tmp_path: Path) -> None:
     """
     Stale turn completion does not block newer Codex response mirroring.

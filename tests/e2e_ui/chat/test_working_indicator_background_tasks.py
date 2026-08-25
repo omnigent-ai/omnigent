@@ -135,11 +135,11 @@ def test_working_shimmer_and_pill_coexist_while_running(
     base_url, session_id = seeded_session
     working = page.locator(_WORKING)
     pill = page.locator(_PILL)
-    page.goto(f"{base_url}/c/{session_id}")
 
-    # A prior turn ended with a background shell: idle + a positive count lights
-    # the pill (turn over, no shimmer yet).
+    # A prior turn ended with a background shell: seed the persisted snapshot
+    # before navigation so page hydration cannot race the SSE subscription.
     _publish_status(base_url, session_id, "idle", background_task_count=2)
+    page.goto(f"{base_url}/c/{session_id}")
     expect(pill).to_contain_text("2 background tasks", timeout=15_000)
     expect(working).to_have_count(0)
 

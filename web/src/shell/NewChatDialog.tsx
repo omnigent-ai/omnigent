@@ -4260,132 +4260,134 @@ export function NewChatLandingScreen() {
                 onAttach={attachMention}
               />
             )}
-            <textarea
-              ref={textareaRef}
-              value={message}
-              onChange={(e) => {
-                setMessage(e.target.value);
-                // A rejected attachment is never added, so there's no chip to
-                // remove and nothing else would ever clear this. Left sticky it
-                // reads as a blocker on a composer the user can actually submit.
-                if (attachmentError !== null) setAttachmentError(null);
-                // Recompute the active "@"-mention from the caret each keystroke
-                // (native terminal agents with a workspace — ``mentionEnabled``).
-                setMention(
-                  mentionEnabled
-                    ? detectMentionAt(
-                        e.target.value,
-                        e.target.selectionStart ?? e.target.value.length,
-                      )
-                    : null,
-                );
-              }}
-              onFocus={() => {
-                // From here the textarea's caret is one the user placed, so
-                // dictation inserts there instead of at the end of the draft.
-                dictation.noteFocus();
-              }}
-              onBlur={() => {
-                // Dismiss the mention menu when focus leaves the textarea; menu
-                // rows preventDefault on mousedown so selecting one doesn't blur.
-                dismissMention();
-              }}
-              onCompositionStart={() => {
-                isComposingRef.current = true;
-              }}
-              onCompositionEnd={() => {
-                isComposingRef.current = false;
-              }}
-              onKeyDown={(e) => {
-                if (isImeCompositionKeyEvent(e, isComposingRef.current)) {
-                  return;
-                }
+            <div className="relative overflow-hidden">
+              <textarea
+                ref={textareaRef}
+                value={message}
+                onChange={(e) => {
+                  setMessage(e.target.value);
+                  // A rejected attachment is never added, so there's no chip to
+                  // remove and nothing else would ever clear this. Left sticky it
+                  // reads as a blocker on a composer the user can actually submit.
+                  if (attachmentError !== null) setAttachmentError(null);
+                  // Recompute the active "@"-mention from the caret each keystroke
+                  // (native terminal agents with a workspace — ``mentionEnabled``).
+                  setMention(
+                    mentionEnabled
+                      ? detectMentionAt(
+                          e.target.value,
+                          e.target.selectionStart ?? e.target.value.length,
+                        )
+                      : null,
+                  );
+                }}
+                onFocus={() => {
+                  // From here the textarea's caret is one the user placed, so
+                  // dictation inserts there instead of at the end of the draft.
+                  dictation.noteFocus();
+                }}
+                onBlur={() => {
+                  // Dismiss the mention menu when focus leaves the textarea; menu
+                  // rows preventDefault on mousedown so selecting one doesn't blur.
+                  dismissMention();
+                }}
+                onCompositionStart={() => {
+                  isComposingRef.current = true;
+                }}
+                onCompositionEnd={() => {
+                  isComposingRef.current = false;
+                }}
+                onKeyDown={(e) => {
+                  if (isImeCompositionKeyEvent(e, isComposingRef.current)) {
+                    return;
+                  }
 
-                // "@"-mention menu navigation (shared useMentionBrowser) —
-                // mutually exclusive with the slash menu (a token can't be both)
-                // and takes priority over submission.
-                if (handleMentionKeyDown(e)) return;
+                  // "@"-mention menu navigation (shared useMentionBrowser) —
+                  // mutually exclusive with the slash menu (a token can't be both)
+                  // and takes priority over submission.
+                  if (handleMentionKeyDown(e)) return;
 
-                // While the skills menu is open, ArrowUp/Down navigate it and
-                // Enter/Tab complete the highlighted item — these take
-                // priority over submission (same UX as the in-session
-                // composer).
-                if (slashMenuOpen && slashMenuMatches.length > 0) {
-                  if (e.key === "ArrowDown") {
-                    e.preventDefault();
-                    setSlashMenuIndex((i) => (i + 1) % slashMenuMatches.length);
-                    return;
+                  // While the skills menu is open, ArrowUp/Down navigate it and
+                  // Enter/Tab complete the highlighted item — these take
+                  // priority over submission (same UX as the in-session
+                  // composer).
+                  if (slashMenuOpen && slashMenuMatches.length > 0) {
+                    if (e.key === "ArrowDown") {
+                      e.preventDefault();
+                      setSlashMenuIndex((i) => (i + 1) % slashMenuMatches.length);
+                      return;
+                    }
+                    if (e.key === "ArrowUp") {
+                      e.preventDefault();
+                      setSlashMenuIndex((i) => (i <= 0 ? slashMenuMatches.length - 1 : i - 1));
+                      return;
+                    }
+                    if (
+                      (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) &&
+                      slashMenuIndex >= 0
+                    ) {
+                      e.preventDefault();
+                      applySlashSelection(slashMenuMatches[slashMenuIndex]!);
+                      return;
+                    }
+                    if (e.key === "Escape") {
+                      e.preventDefault();
+                      // Dismiss the menu by clearing the draft so the user can
+                      // start fresh.
+                      setMessage("");
+                      setSlashMenuIndex(-1);
+                      return;
+                    }
                   }
-                  if (e.key === "ArrowUp") {
+                  // Enter sends; Shift+Enter inserts a newline.
+                  if (e.key === "Enter" && !e.shiftKey) {
                     e.preventDefault();
-                    setSlashMenuIndex((i) => (i <= 0 ? slashMenuMatches.length - 1 : i - 1));
-                    return;
+                    // The mention menu is briefly closed while its listing loads;
+                    // swallow Enter so the in-progress "@dir/" token isn't sent.
+                    if (mentionListingPending) return;
+                    void handleCreate();
                   }
-                  if (
-                    (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) &&
-                    slashMenuIndex >= 0
-                  ) {
+                }}
+                onPaste={(e) => {
+                  // Pasted images/files attach instead of inserting as text,
+                  // mirroring the in-session composer.
+                  const pasted = Array.from(e.clipboardData.items)
+                    .filter((item) => item.kind === "file")
+                    .map((item) => item.getAsFile())
+                    .filter((f): f is File => f !== null);
+                  if (pasted.length > 0) {
                     e.preventDefault();
-                    applySlashSelection(slashMenuMatches[slashMenuIndex]!);
-                    return;
+                    addFiles(pasted);
                   }
-                  if (e.key === "Escape") {
-                    e.preventDefault();
-                    // Dismiss the menu by clearing the draft so the user can
-                    // start fresh.
-                    setMessage("");
-                    setSlashMenuIndex(-1);
-                    return;
-                  }
-                }
-                // Enter sends; Shift+Enter inserts a newline.
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  // The mention menu is briefly closed while its listing loads;
-                  // swallow Enter so the in-progress "@dir/" token isn't sent.
-                  if (mentionListingPending) return;
-                  void handleCreate();
-                }
-              }}
-              onPaste={(e) => {
-                // Pasted images/files attach instead of inserting as text,
-                // mirroring the in-session composer.
-                const pasted = Array.from(e.clipboardData.items)
-                  .filter((item) => item.kind === "file")
-                  .map((item) => item.getAsFile())
-                  .filter((f): f is File => f !== null);
-                if (pasted.length > 0) {
-                  e.preventDefault();
-                  addFiles(pasted);
-                }
-              }}
-              // Suppress the native placeholder when the overlay supplies its
-              // own prompt text; aria-label preserves the accessible name.
-              placeholder={pillSkills.length > 0 ? "" : placeholderText}
-              aria-label={placeholderText}
-              rows={1}
-              autoFocus
-              data-testid="new-chat-landing-input"
-              // Compose-pill text spec: SF Pro Text system stack at
-              // 14px/20px. (Note: sub-16px inputs make mobile Safari
-              // auto-zoom on focus — accepted tradeoff per the design.)
-              // Heights are border-box (12px top + 8px bottom padding lives
-              // inside them): max 200px = the spec's 180px of content.
-              // A 60px floor holds two 20px lines plus that padding;
-              // useAutoGrowTextarea expands from there to the unchanged cap.
-              className="min-h-[60px] max-h-[200px] w-full resize-none overflow-y-auto bg-transparent px-4 pt-3 pb-2 font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-ui leading-5 text-foreground outline-none placeholder:text-muted-foreground md:select-text"
-            />
-            {/* Gated on an empty draft so it reads as the placeholder.
-                pointer-events-none lets clicks fall through to focus the
-                textarea; the pills themselves opt back in. */}
-            {pillSkills.length > 0 && message.length === 0 && (
-              <div className="pointer-events-none absolute inset-x-4 top-3 flex flex-wrap items-center gap-2">
-                <span className="font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-ui leading-5 text-muted-foreground">
-                  Describe a task, or try a skill
-                </span>
-                <SkillPills skills={pillSkills} onPick={applySkillPill} />
-              </div>
-            )}
+                }}
+                // Suppress the native placeholder when the overlay supplies its
+                // own prompt text; aria-label preserves the accessible name.
+                placeholder={pillSkills.length > 0 ? "" : placeholderText}
+                aria-label={placeholderText}
+                rows={1}
+                autoFocus
+                data-testid="new-chat-landing-input"
+                // Compose-pill text spec: SF Pro Text system stack at
+                // 14px/20px. (Note: sub-16px inputs make mobile Safari
+                // auto-zoom on focus — accepted tradeoff per the design.)
+                // Heights are border-box (12px top + 8px bottom padding lives
+                // inside them): max 200px = the spec's 180px of content.
+                // A 60px floor holds two 20px lines plus that padding;
+                // useAutoGrowTextarea expands from there to the unchanged cap.
+                className="block min-h-[60px] max-h-[200px] w-full resize-none overflow-y-auto bg-transparent px-4 pt-3 pb-2 font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-ui leading-5 text-foreground outline-none [scrollbar-width:none] placeholder:text-muted-foreground md:select-text [&::-webkit-scrollbar]:hidden"
+              />
+              {/* Gated on an empty draft so it reads as the placeholder.
+                  pointer-events-none lets clicks fall through to focus the
+                  textarea; the pills themselves opt back in. */}
+              {pillSkills.length > 0 && message.length === 0 && (
+                <div className="pointer-events-none absolute inset-x-4 top-3 flex flex-wrap items-center gap-2">
+                  <span className="font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-ui leading-5 text-muted-foreground">
+                    Describe a task, or try a skill
+                  </span>
+                  <SkillPills skills={pillSkills} onPick={applySkillPill} />
+                </div>
+              )}
+            </div>
             {/* Hidden file input for the attach button. */}
             <input
               ref={fileInputRef}

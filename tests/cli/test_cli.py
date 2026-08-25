@@ -6756,10 +6756,13 @@ def test_manage_kimi_harness_back_does_not_login(
 
     monkeypatch.setattr(hi, "harness_cli_installed", lambda key: True)
     monkeypatch.setattr(it, "console", Mock())
+    # The drill-in seeds its status line from the auth probe; pin it so the test
+    # stays hermetic instead of reading the dev machine's real ~/.kimi-code.
+    monkeypatch.setattr("omnigent.onboarding.kimi_auth.kimi_auth_configured", lambda: False)
     login = Mock()
     monkeypatch.setattr(hi, "harness_login", login)
-    # rows = [Sign in, Show auth options, ← Back]; pick Back (2). There is no
-    # "Sign out" row — kimi has no ``kimi logout`` subcommand.
+    # rows = [Sign in with membership, Set up pay-per-use (API key), ← Back];
+    # pick Back (2). There is no "Sign out" row — kimi has no ``kimi logout``.
     monkeypatch.setattr(it, "select", lambda *a, **k: 2)
 
     _manage_kimi_harness()
@@ -6780,6 +6783,8 @@ def test_manage_kimi_harness_has_no_sign_out_row(
 
     monkeypatch.setattr(hi, "harness_cli_installed", lambda key: True)
     monkeypatch.setattr(it, "console", Mock())
+    # Pin the auth probe so the status-line seed doesn't read real local state.
+    monkeypatch.setattr("omnigent.onboarding.kimi_auth.kimi_auth_configured", lambda: False)
     monkeypatch.setattr(hi, "harness_login", Mock())
     captured: list[str] = []
 
@@ -6806,6 +6811,8 @@ def test_manage_kimi_harness_login_runs_kimi_login(
 
     monkeypatch.setattr(hi, "harness_cli_installed", lambda key: True)
     monkeypatch.setattr(it, "console", Mock())
+    # Pin the auth probe (seed + post-login) so the test stays hermetic.
+    monkeypatch.setattr("omnigent.onboarding.kimi_auth.kimi_auth_configured", lambda: False)
     login = Mock(return_value=False)  # kimi has no status probe; return is ignored
     monkeypatch.setattr(hi, "harness_login", login)
     # First iteration: Sign in (0); second: ← Back (2) to exit the loop.

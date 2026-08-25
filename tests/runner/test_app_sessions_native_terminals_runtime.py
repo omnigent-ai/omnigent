@@ -3235,3 +3235,252 @@ async def test_cold_start_agy_conversation_accepts_a_locally_owned_cascade(
     assert result is not None
     state = bridge_mod.read_bridge_state(bridge_dir)
     assert state is not None and state.conversation_id == result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("freshness", ["fresh", "stale"])
+async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
+    freshness: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A Default codex launch pins the stored default only while it is fresh.
+
+    Mirrors the claude rule: the store never forgets an entry, so a stale
+    ``isDefault`` row can name a model the account no longer serves, and
+    pinning it hard-fails the launch. A fresh entry resolves the Default
+    launch; a stale one defers to codex's own account default (no model
+    pin) while the store re-probes in the background.
+    """
+    import os
+    import time
+
+    import omnigent.codex_native_app_server as codex_app_mod
+    from omnigent import model_catalog_store
+    from omnigent.runner import app as runner_app_mod
+    from tests.runner.conftest import REAL_CODEX_LAUNCH_CATALOG
+
+    session_id = "83acdbadf84d4149b2a7d7441b6966aa"
+    thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936c"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+
+    # A bare subscription default shape, with the real store-backed catalog
+    # serving the seeded rows; the re-probe is stubbed off the real CLI.
+    monkeypatch.setattr(
+        codex_app_mod,
+        "resolve_native_codex_launch",
+        lambda *, model, spec=None: codex_app_mod.NativeCodexLaunch(
+            config_overrides=[], model=model, profile=None
+        ),
+    )
+    monkeypatch.setattr(codex_app_mod, "codex_launch_catalog", REAL_CODEX_LAUNCH_CATALOG)
+    refreshed = [{"id": "gpt-5.6-terra", "model": "gpt-5.6-terra", "isDefault": True}]
+
+    async def _fake_probe(*, codex_path: str | None = None) -> list[dict[str, object]]:
+        """
+        Stand in for the real codex probe on the background refresh path.
+
+        :param codex_path: Ignored executable override.
+        :returns: The refreshed catalog rows.
+        """
+        del codex_path
+        return refreshed
+
+    monkeypatch.setattr(codex_app_mod, "probe_codex_model_options", _fake_probe)
+    fingerprint = codex_app_mod.codex_catalog_fingerprint(
+        codex_app_mod.resolve_native_codex_launch(model=None)
+    )
+    model_catalog_store.write_catalog(
+        "codex-native",
+        fingerprint,
+        [{"id": "gpt-5.4-yesterday", "model": "gpt-5.4-yesterday", "isDefault": True}],
+    )
+    if freshness == "stale":
+        path = model_catalog_store.catalog_path("codex-native", fingerprint)
+        old = time.time() - (model_catalog_store.CATALOG_STALE_AFTER_S + 60)
+        os.utime(path, (old, old))
+
+    class _SnapshotServerClient:
+        """Server client returning a Default-launch resume snapshot."""
+
+        async def get(self, url: str, **kwargs: Any) -> httpx.Response:
+            """
+            Return the session snapshot / item history the helper reads.
+
+            :param url: Request path.
+            :param kwargs: Request keyword arguments.
+            :returns: HTTP 200 response.
+            """
+            del kwargs
+            if url == f"/v1/sessions/{session_id}/items":
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": [
+                            {
+                                "id": "b1649a5cbfec3f92bec12275c14f4b60",
+                                "response_id": "codex_turn_1",
+                                "type": "message",
+                                "role": "user",
+                                "content": [{"type": "input_text", "text": "remember this"}],
+                            }
+                        ],
+                        "has_more": False,
+                    },
+                    request=httpx.Request("GET", url),
+                )
+            return httpx.Response(
+                200,
+                json={"external_session_id": thread_id},
+                request=httpx.Request("GET", url),
+            )
+
+    class _FakeCodexAppServer:
+        """Minimal app-server object used by ``codex_terminal_env``."""
+
+        codex_path = "/opt/codex/bin/codex"
+        codex_cli_version: tuple[int, int, int] | None = (0, 145, 0)
+
+        def __init__(self) -> None:
+            """Initialize the fake app-server state."""
+            self.env = {"OPENAI_API_KEY": "sk-test"}
+            self.codex_home = tmp_path / "unconfigured-codex-home"
+            self.listen_url: str | None = None
+            self.started = False
+            self.config_overrides: list[str] = []
+
+        async def start(self) -> None:
+            """Mark the fake app-server started."""
+            self.started = True
+
+        async def close(self) -> None:
+            """No-op close."""
+
+    app_server = _FakeCodexAppServer()
+    build_calls: list[dict[str, Any]] = []
+
+    def _fake_build_codex_native_server(**kwargs: Any) -> _FakeCodexAppServer:
+        """
+        Capture app-server construction.
+
+        :param kwargs: Keyword arguments passed by the runner helper.
+        :returns: Fake app-server.
+        """
+        build_calls.append(kwargs)
+        app_server.codex_home = kwargs["codex_home"]
+        return app_server
+
+    class _UnexpectedDiscoveryClient:
+        """App-server client that must not connect on a known-thread resume."""
+
+        def __init__(self, *, ws_url: str, client_name: str) -> None:
+            """
+            :param ws_url: App-server WebSocket URL.
+            :param client_name: JSON-RPC client name.
+            """
+            self.ws_url = ws_url
+            self.client_name = client_name
+
+        async def connect(self) -> None:
+            """Fail if the resume path tries to discover a fresh thread."""
+            raise AssertionError("resume path must not connect discovery client")
+
+        async def close(self) -> None:
+            """No-op close."""
+
+    async def _fake_preload_thread(
+        transport: str,
+        loaded_thread_id: str,
+        *,
+        terminal_launch_args: list[str] | None = None,
+    ) -> None:
+        """
+        Accept preloading of the known Codex thread.
+
+        :param transport: App-server transport URL.
+        :param loaded_thread_id: Thread id passed to ``thread/resume``.
+        :param terminal_launch_args: Pass-through args, unused.
+        """
+        del transport, loaded_thread_id, terminal_launch_args
+
+    async def _fake_forward_known_thread(**kwargs: Any) -> None:
+        """
+        Accept the known-thread forwarder invocation.
+
+        :param kwargs: Forwarder keyword arguments.
+        """
+        del kwargs
+
+    class _FakeResourceRegistry:
+        """Resource registry that accepts the terminal launch."""
+
+        async def launch_auxiliary_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            """
+            Accept the terminal launch request.
+
+            :param session_id: Session id being launched.
+            :param terminal_name: Terminal name.
+            :param session_key: Terminal session key.
+            :param spec: Terminal launch spec.
+            :param resource_role: Private runner resource marker.
+            :param parent_os_env: Inherited os env, unused.
+            :returns: Terminal resource view.
+            """
+            del terminal_name, session_key, spec, resource_role, parent_os_env
+            return SessionResourceView(
+                id="terminal_codex_main",
+                type="terminal",
+                session_id=session_id,
+                name="Codex",
+            )
+
+    monkeypatch.setattr(
+        codex_app_mod, "build_codex_native_server", _fake_build_codex_native_server
+    )
+    monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _UnexpectedDiscoveryClient)
+    monkeypatch.setattr(codex_app_mod, "preload_codex_thread_for_resume", _fake_preload_thread)
+    monkeypatch.setattr(runner_app_mod, "_codex_forward_known_thread", _fake_forward_known_thread)
+
+    agent_spec = AgentSpec(
+        spec_version=1,
+        name="codex",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+    try:
+        await _auto_create_codex_terminal(
+            session_id,
+            _FakeResourceRegistry(),  # type: ignore[arg-type]
+            lambda _sid, _evt: None,
+            agent_spec=agent_spec,
+            server_client=_SnapshotServerClient(),  # type: ignore[arg-type]
+        )
+        await asyncio.sleep(0)
+    finally:
+        runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+
+    assert build_calls, "the app-server was never built"
+    if freshness == "fresh":
+        assert build_calls[0]["model"] == "gpt-5.4-yesterday"
+    else:
+        assert build_calls[0]["model"] is None, (
+            f"a stale default was still pinned: {build_calls[0]['model']!r}"
+        )
+        task = model_catalog_store._inflight.get(("codex-native", fingerprint))
+        if task is not None:
+            await task
+        # The background re-probe healed the store for the next launch.
+        assert model_catalog_store.read_catalog("codex-native", fingerprint) == refreshed

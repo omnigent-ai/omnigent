@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from omnigent.codex_native_app_server import CodexAppServerResponseError
 from omnigent.codex_native_bridge import (
     CodexNativeBridgeState,
     read_bridge_state,
@@ -620,6 +621,136 @@ def test_next_web_message_starts_new_codex_turn_after_forwarder_marks_idle(
         "turn/start",
         "turn/start",
     ]
+
+
+def test_stale_completed_turn_steer_retries_once_as_new_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Codex's explicit no-active-turn response reconciles and starts once."""
+
+    class _StaleSteerClient(_FakeCodexNativeClient):
+        """Reject the stale steer with Codex's structured JSON-RPC error."""
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            """Reject only the first steer and delegate the recovery start."""
+            if method == "turn/steer":
+                type(self).requests.append((method, params))
+                raise CodexAppServerResponseError(
+                    {"code": -32600, "message": "no active turn to steer"}
+                )
+            return await super().request(method, params)
+
+    _StaleSteerClient.requests = []
+    _StaleSteerClient.created = []
+    _StaleSteerClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.CodexAppServerClient",
+        _StaleSteerClient,
+    )
+    _seed_bridge(tmp_path, active_turn_id="turn_completed")
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    events = _collect_turn_events(executor, "follow up")
+
+    assert [type(event) for event in events] == [TurnComplete]
+    assert [method for method, _params in _StaleSteerClient.requests] == [
+        "turn/steer",
+        "turn/start",
+    ]
+    assert _StaleSteerClient.requests[0][1]["expectedTurnId"] == "turn_completed"
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id == "turn_1"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(RuntimeError("request timed out"), id="ambiguous-timeout"),
+        pytest.param(
+            CodexAppServerResponseError({"code": -32600, "message": "invalid turn id"}),
+            id="other-json-rpc-error",
+        ),
+    ],
+)
+def test_steer_does_not_retry_ambiguous_or_unrelated_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    error: Exception,
+) -> None:
+    """Only Codex's explicit idle semantic is safe to retry."""
+
+    class _FailingSteerClient(_FakeCodexNativeClient):
+        """Raise the parameterized failure for every steer."""
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            """Fail steering and delegate all other methods."""
+            if method == "turn/steer":
+                type(self).requests.append((method, params))
+                raise error
+            return await super().request(method, params)
+
+    _FailingSteerClient.requests = []
+    _FailingSteerClient.created = []
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.CodexAppServerClient",
+        _FailingSteerClient,
+    )
+    _seed_bridge(tmp_path, active_turn_id="turn_maybe_active")
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    events = _collect_turn_events(executor, "do not duplicate")
+
+    assert [type(event) for event in events] == [ExecutorError]
+    assert [method for method, _params in _FailingSteerClient.requests] == ["turn/steer"]
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id == "turn_maybe_active"
+
+
+def test_stale_steer_recovery_preserves_and_steers_concurrent_new_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A concurrent turn B is steered, never cleared or double-started."""
+
+    class _RacingSteerClient(_FakeCodexNativeClient):
+        """Publish turn B just before rejecting the stale steer to turn A."""
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            """Model turn B winning the bridge-state race during stale recovery."""
+            type(self).requests.append((method, params))
+            if method == "turn/steer" and params["expectedTurnId"] == "turn_a":
+                from omnigent.codex_native_bridge import update_active_turn_id
+
+                update_active_turn_id(tmp_path, "turn_b")
+                raise CodexAppServerResponseError(
+                    {"code": -32600, "message": "no active turn to steer"}
+                )
+            if method == "turn/steer":
+                return {"result": {"turnId": "turn_b"}}
+            raise AssertionError(f"recovery must not double-start: {method}")
+
+    _RacingSteerClient.requests = []
+    _RacingSteerClient.created = []
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.CodexAppServerClient",
+        _RacingSteerClient,
+    )
+    _seed_bridge(tmp_path, active_turn_id="turn_a")
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    events = _collect_turn_events(executor, "follow up")
+
+    assert [type(event) for event in events] == [TurnComplete]
+    assert [
+        (method, params.get("expectedTurnId")) for method, params in _RacingSteerClient.requests
+    ] == [("turn/steer", "turn_a"), ("turn/steer", "turn_b")]
+    assert all(method != "turn/start" for method, _params in _RacingSteerClient.requests)
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id == "turn_b"
 
 
 async def test_concurrent_steering_during_turn_start_is_not_dropped(

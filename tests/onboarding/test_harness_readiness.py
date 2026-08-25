@@ -462,8 +462,9 @@ def test_configured_harness_map_all_true_with_clis(
     cursor (key-gated) is satisfied by a ``CURSOR_API_KEY``, copilot
     (token-gated) by a ``GH_TOKEN``, antigravity-native (binary + credential
     gated) by a detected Gemini OAuth credential, kimi (binary + credential
-    gated) by a detected ``kimi login`` credential, and the generic ACP harness
-    (config-gated) by a registered agent — so nothing is reported unconfigured.
+    gated) by a detected ``kimi login`` credential or a Kimi API key in
+    ``~/.kimi-code/config.toml``, and the generic ACP harness (config-gated) by
+    a registered agent — so nothing is reported unconfigured.
     """
     import omnigent.onboarding.gemini_auth as _ga
     import omnigent.onboarding.kimi_auth as _ka
@@ -477,7 +478,7 @@ def test_configured_harness_map_all_true_with_clis(
     # antigravity-native also needs a credential (not just the ``agy`` binary).
     monkeypatch.setattr(_ga, "gemini_login_detected", lambda: True)
     # kimi also needs a credential (not just the ``kimi`` binary).
-    monkeypatch.setattr(_ka, "kimi_login_detected", lambda: True)
+    monkeypatch.setattr(_ka, "kimi_auth_configured", lambda: True)
     monkeypatch.setenv("GH_TOKEN", "gho_ready")
     # claude / pi are auth-aware on the credential axis now: satisfy the provider
     # check deterministically (don't depend on the dev machine's real config).
@@ -518,30 +519,31 @@ def test_configured_harness_map_probes_codex_readiness_once(
 def test_kimi_readiness_keys_off_binary_and_credential(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Kimi is configured iff the ``kimi`` binary is on PATH AND a login exists.
+    """Kimi is configured iff the ``kimi`` binary is on PATH AND auth exists.
 
-    Kimi authenticates against Moonshot AI's backend via ``kimi login`` (OAuth
-    or a Moonshot API key), which writes a credential file. Like agy, the
-    daemon has no CLI login-status probe, so readiness is binary presence PLUS
-    a subprocess-free credential check (``kimi_login_detected``). The alias
-    ``kimi-code`` resolves to the same verdict via canonicalization.
+    Kimi authenticates against Moonshot AI's backend via ``kimi login`` (OAuth,
+    membership) or a Moonshot API key in ``~/.kimi-code/config.toml``
+    (pay-per-use). Like agy, the daemon has no CLI login-status probe, so
+    readiness is binary presence PLUS a subprocess-free credential check
+    (``kimi_auth_configured``). The alias ``kimi-code`` resolves to the same
+    verdict via canonicalization.
     """
     import omnigent.onboarding.kimi_auth as _ka
 
     # No binary → not configured regardless of credential.
     _no_clis_installed(monkeypatch)
-    monkeypatch.setattr(_ka, "kimi_login_detected", lambda: True)
+    monkeypatch.setattr(_ka, "kimi_auth_configured", lambda: True)
     assert harness_is_configured("kimi") is False
     assert harness_is_configured("kimi-code") is False
 
-    # Binary present but no login → still not configured.
+    # Binary present but no auth → still not configured.
     _all_clis_installed(monkeypatch)
-    monkeypatch.setattr(_ka, "kimi_login_detected", lambda: False)
+    monkeypatch.setattr(_ka, "kimi_auth_configured", lambda: False)
     assert harness_is_configured("kimi") is False
     assert harness_is_configured("kimi-code") is False
 
-    # Binary present and login detected → configured.
-    monkeypatch.setattr(_ka, "kimi_login_detected", lambda: True)
+    # Binary present and auth detected → configured.
+    monkeypatch.setattr(_ka, "kimi_auth_configured", lambda: True)
     assert harness_is_configured("kimi") is True
     assert harness_is_configured("kimi-code") is True
 
@@ -645,3 +647,75 @@ def test_antigravity_native_requires_credential(
     monkeypatch.setattr(_ga, "gemini_login_detected", lambda: True)
     assert harness_is_configured("antigravity-native") is True
     assert harness_is_configured("native-antigravity") is True
+
+
+def test_claude_ready_via_managed_settings_gateway_without_cli_login(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Claude reads ready from its own managed-settings gateway alone.
+
+    The enterprise state (``isaac configure claude``): nothing in omnigent's
+    config, no subscription login, but Claude Code's managed settings pin an AI
+    Gateway + ``apiKeyHelper`` and the CLI applies them at its own launch. The
+    check is structural, so it must NOT depend on the ``claude auth status``
+    subprocess — which is exactly what used to fail here, reporting
+    ``needs-auth`` and surfacing as "Claude Code isn't configured on <host>"
+    with nothing in setup able to fix it.
+    """
+    import json
+
+    from omnigent.onboarding import ambient
+
+    _all_clis_installed(monkeypatch)
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_readiness._family_provider_configured", lambda _h: False
+    )
+    # The fragile probe stays broken; readiness must not need it.
+    monkeypatch.setattr(hi, "harness_cli_logged_in", lambda key, **_kw: False)
+    settings = tmp_path / "managed-settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "env": {
+                    "ANTHROPIC_BASE_URL": (
+                        "https://dbc-test.cloud.databricks.com/ai-gateway/anthropic"
+                    )
+                },
+                "apiKeyHelper": "print-token",
+            }
+        )
+    )
+    monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (settings,))
+
+    result = configured_harness_map()
+    assert result["claude-native"] is True
+    assert result["native-claude"] is True
+
+
+def test_claude_managed_settings_without_credential_still_needs_auth(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A managed gateway with no credential does NOT make Claude read ready.
+
+    A bare ``ANTHROPIC_BASE_URL`` is not something omnigent can authenticate
+    against, so crediting it would turn a real "finish setup" prompt into a
+    launch that dies on its first turn.
+    """
+    import json
+
+    from omnigent.onboarding import ambient
+
+    _all_clis_installed(monkeypatch)
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_readiness._family_provider_configured", lambda _h: False
+    )
+    monkeypatch.setattr(hi, "harness_cli_logged_in", lambda key, **_kw: False)
+    settings = tmp_path / "managed-settings.json"
+    settings.write_text(
+        json.dumps(
+            {"env": {"ANTHROPIC_BASE_URL": "https://dbc-t.cloud.databricks.com/ai-gateway/a"}}
+        )
+    )
+    monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (settings,))
+
+    assert configured_harness_map()["claude-native"] == "needs-auth"

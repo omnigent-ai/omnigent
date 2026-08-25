@@ -2453,17 +2453,19 @@ def create_runner_app(
                 "session_id": event.session_id,
             },
         )
-        # A codex TUI pane that exits on its own (crash / OOM / host recycle)
-        # never runs the DELETE-session cleanup, so its per-session app-server
-        # + forwarder would linger with no TUI. Tear them down here; no-op for
-        # any session without a registered codex app-server.
+        # Auxiliary terminals do not own the session control plane. In
+        # particular, losing Codex's streamable TUI must not cancel an active
+        # app-server turn; the native-terminal ensure path can recreate it.
+        if event.lifecycle != TerminalLifecycle.REQUIRED:
+            return
+
+        # A required terminal exit ends the session. Tear down any registered
+        # Codex app-server alongside it; this is a no-op for other harnesses.
         _teardown_task = asyncio.create_task(
             _native_runtime.teardown_codex_native_app_server(event.session_id)
         )
         _teardown_task.add_done_callback(_background_tasks.discard)
         _background_tasks.add(_teardown_task)
-        if event.lifecycle != TerminalLifecycle.REQUIRED:
-            return
 
         if event.terminal_name in ("qwen", "antigravity") and event.session_key == "main":
             _publish_event(event.session_id, {"type": "session.status", "status": "idle"})
@@ -7960,9 +7962,6 @@ def create_runner_app(
             # same dead instance we just probed.
             current = terminal_registry.get(conv_id, terminal_name, "main")
             if current is instance:
-                # is_alive() set instance.running=False as a side effect;
-                # restore it so close() issues tmux kill-server.
-                instance.running = True
                 try:
                     await terminal_registry.close(conv_id, terminal_name, "main")
                 except asyncio.CancelledError:

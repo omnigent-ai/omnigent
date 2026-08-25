@@ -22,6 +22,7 @@ import signal
 import stat
 import struct
 import subprocess
+import sys
 import termios
 import tty
 from pathlib import Path
@@ -40,6 +41,36 @@ from omnigent.terminals.ws_bridge import (
 )
 
 _HAS_TMUX = shutil.which("tmux") is not None
+
+
+def test_importing_claude_native_does_not_pull_in_fastapi() -> None:
+    """Importing the CLI module keeps the FastAPI server stack lazy.
+
+    ``claude_native`` imports terminal constants from ``ws_bridge`` on every
+    launch. The bridge must therefore avoid loading FastAPI until it is used
+    to serve a WebSocket.
+
+    :returns: None.
+    """
+    probe = (
+        "import sys\n"
+        "import omnigent.claude_native\n"
+        "assert 'fastapi' not in sys.modules, "
+        "'fastapi loaded via claude_native import'\n"
+    )
+    child_env = {**os.environ, "PYTHONPATH": os.pathsep.join(p for p in sys.path if p)}
+
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        env=child_env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, (
+        f"claude_native import pulled in the FastAPI stack. stderr:\n{result.stderr}"
+    )
 
 
 @pytest.mark.asyncio

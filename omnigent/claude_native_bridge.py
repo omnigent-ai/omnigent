@@ -139,20 +139,24 @@ _TMUX_SEND_TIMEOUT_S = 5.0
 # The glyph persists while Claude is busy responding, so its presence
 # means "input box mounted" (not "idle"), which is what injection needs.
 _CLAUDE_PROMPT_GLYPH = "❯"
-# Matches a selected numbered menu row (``❯ 2. No (recommended)``): the glyph
-# followed by a numbered choice, which the chat input never renders. Used to
-# exclude startup menus from the readiness scan (see ``_is_selected_menu_row``).
-_SELECTED_MENU_ROW_RE = re.compile(rf"{_CLAUDE_PROMPT_GLYPH}\s*\d+\.\s")
-# Box-drawing glyphs Claude Code's input-box frame is made of. A line of
-# these below ``❯`` marks the live input box (see ``_is_box_rule``),
-# distinguishing it from a bare prompt echoed into scrollback.
+# The composer glyph shell mode renders instead of ``❯``. A person enters
+# shell mode by typing ``!`` at an empty composer and leaves it with
+# Escape; everything typed there runs as a bash command, so an injected
+# web-UI message would be EXECUTED rather than sent.
+_SHELL_MODE_GLYPH = "!"
+# Every glyph the composer row can lead with — the input modes the box
+# has. A row starting with one of these is a candidate input box; which
+# glyph it is says whether a chat message may be typed there.
+_COMPOSER_MODE_GLYPHS = (_CLAUDE_PROMPT_GLYPH, _SHELL_MODE_GLYPH)
+# Box-drawing glyphs a TUI horizontal rule is made of. A rule directly
+# above a composer glyph is what marks the live input box rather than a
+# prompt echoed into scrollback (see :func:`_composer_row`), and the last
+# rule on screen is where the footer begins (see
+# :func:`_permission_mode_from_pane`). Corner glyphs are included because
+# Claude Code has framed the input box both ways across versions.
 _BOX_RULE_CHARS = frozenset("─━╭╮╰╯│┃╌╍")
-# How many trailing non-empty lines to scan for the prompt glyph. The
-# input box sits near the bottom of the pane; scanning only the tail
-# avoids false positives from the glyph appearing in scrollback output.
-# The window has to clear the footer rendered below the box — some
-# people's statuslines run ~3 lines — so the ``❯`` row isn't the last
-# non-empty line.
+# Footer rows the permission-mode reader falls back to scanning while the
+# input box has not mounted yet and no rule is on screen to anchor on.
 _PROMPT_SCAN_TAIL_LINES = 5
 _CLAUDE_READY_POLL_INTERVAL_S = 0.15
 _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit Enter
@@ -205,28 +209,11 @@ _MODE_FOOTER_POLL_INTERVAL_S = 0.1
 # picker the person opened by hand covers the input box, so an injection would
 # be lost; the readiness gate treats it as "not ready".
 _MODEL_PICKER_OPEN_HINT = "use this session only"
-# Header of the ctrl+r prompt-history search. Like the picker it covers the
-# input box, but its selected history row renders the composer's ``❯`` glyph
-# above the filter box's frame rule, so the readiness scan alone reads it as
-# a mounted input box — keystrokes would land in the filter field, and the
-# submit Enter would replay whatever old prompt is selected.
-_REVERSE_SEARCH_OPEN_HINT = "Search prompts ·"
-# Surfaces a person can leave covering the composer from the embedded
-# terminal. Each documents Escape as its dismissal ("Esc to cancel"), which
-# closes it without committing anything and restores the empty input box, so
-# an injected web-UI message reclaims the pane instead of typing into the
-# surface. Shell mode (``!``) also occupies the composer but has no safe
-# textual marker: its footer line ("! for shell mode") appears verbatim in
-# the ``?`` shortcuts panel while the composer is fully usable.
-_OCCUPIED_INPUT_HINTS: tuple[str, ...] = (
-    _REVERSE_SEARCH_OPEN_HINT,
-    _MODEL_PICKER_OPEN_HINT,
-)
 # How long to keep dismissing an occupying surface that verifiably stays on
 # screen, and the spacing between repeated Escapes — a busy repaint can
 # swallow one (same reasoning as ``_SUBMIT_RETRY_INTERVAL_S``). The spacing
 # also bounds a residual hazard: were a successful Escape's repaint to
-# outlast it, the stale hint would draw a retry onto the bare composer
+# outlast it, the stale frame would draw a retry onto the bare composer
 # (interrupting a turn). 0.75s dwarfs a TUI repaint, so that window is
 # accepted rather than confirmation-gated.
 _OCCUPIED_INPUT_DISMISS_TIMEOUT_S = 3.0
@@ -3061,11 +3048,11 @@ def inject_user_message(
     (see :func:`_wait_for_claude_prompt_ready`). The second gate closes
     a race on freshly-created sessions where the first message would
     otherwise be typed into a still-booting TUI and silently dropped.
-    Between the two, any surface the person left covering the composer
-    from the embedded terminal — a ctrl+r history search, a hand-opened
-    ``/model`` picker — is dismissed with Escape
-    (see :func:`_restore_occupied_input`), so the message reclaims the
-    input box instead of typing into that surface.
+    Between the two, anything the person left occupying the composer
+    from the embedded terminal — a ctrl+r history search, a rewind
+    dialog, a ``/config`` panel, ``!`` shell mode — is dismissed with
+    Escape (see :func:`_restore_occupied_input`), so the message reclaims
+    the input box instead of being typed into that surface.
 
     Delivered as one bracketed paste via ``tmux load-buffer`` (from a
     temp file) + ``paste-buffer -p`` so interior newlines ride as raw CR
@@ -3099,10 +3086,9 @@ def inject_user_message(
         after repeated submit Enters (message not delivered).
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    # A ctrl+r history search or hand-opened /model picker left covering
-    # the composer swallows everything typed below — and can hide the
-    # prompt glyph, wedging the readiness gate — so reclaim the input box
-    # before waiting on it.
+    # A surface left occupying the composer swallows everything typed
+    # below — and hides the input box, wedging the readiness gate — so
+    # reclaim the input box before waiting on it.
     _restore_occupied_input(info["socket_path"], info["tmux_target"])
     # tmux.json only means the tmux session exists; Claude Code's input
     # box mounts a few seconds later. Block until the prompt renders so
@@ -3329,8 +3315,8 @@ def inject_slash_command(
     """
     Type a Claude Code slash command into the tmux pane and submit it.
 
-    A surface the person left covering the composer from the embedded
-    terminal (ctrl+r history search, hand-opened ``/model`` picker) is
+    Anything the person left occupying the composer from the embedded
+    terminal (ctrl+r history search, rewind dialog, ``!`` shell mode) is
     dismissed first — see :func:`_restore_occupied_input` — so the
     command cannot be typed into it.
 
@@ -3370,9 +3356,8 @@ def inject_slash_command(
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
-    # Same reclaim as inject_user_message: a ctrl+r search or hand-opened
-    # /model picker left covering the composer would swallow the C-u and
-    # the typed command.
+    # Same reclaim as inject_user_message: a surface left occupying the
+    # composer would swallow the C-u and the typed command.
     _restore_occupied_input(socket_path, tmux_target)
     # ``C-u`` clears any draft the user is mid-typing; otherwise the
     # paste below concatenates with their text and Enter submits
@@ -3866,8 +3851,8 @@ def claude_pane_ready(bridge_dir: Path) -> bool:
     Report whether the Claude pane is showing a usable input box right now.
 
     "Usable" means the TUI is back at a mounted chat input with no ``/model``
-    picker or confirmation dialog on top of it — the state an injection needs
-    to land, and the settle signal after a model switch.
+    picker, confirmation dialog or other surface on top of it — the state an
+    injection needs to land, and the settle signal after a model switch.
 
     It is also the claude-native answer to "has the blocked prompt cleared?"
     for first-message routing: a blocked ``UserPromptSubmit`` starts no turn
@@ -3898,19 +3883,25 @@ def _restore_occupied_input(socket_path: str, tmux_target: str) -> None:
     """
     Dismiss a terminal-opened surface occupying Claude's input box.
 
-    A person can leave the composer covered from the embedded terminal —
-    the ctrl+r prompt-history search, or a hand-opened ``/model`` picker
-    (:data:`_OCCUPIED_INPUT_HINTS`). Keystrokes injected while one is up
-    land in that surface instead of the chat input: the history search
-    filters on the pasted text and its Enter replays whatever old prompt
-    is selected. Each surface documents Escape as its dismissal ("Esc to
-    cancel"), closing it without committing anything and restoring the
-    empty input box, so the web-UI message wins the pane.
+    A person can leave the composer taken over from the embedded terminal
+    in two shapes, both reported by :func:`_occupying_surface`: an overlay
+    drawn where the input box was (the ctrl+r prompt-history search, a
+    hand-opened ``/model`` picker, the double-Escape rewind dialog, a
+    ``/config`` or ``/resume`` panel), or the box itself switched to
+    another input mode (``!`` shell mode). Keystrokes injected into either
+    do not become a chat message: the history search filters on the pasted
+    text and its Enter replays an old prompt, the rewind dialog's Enter
+    restores a checkpoint, and shell mode runs the message as a bash
+    command. Every one of them documents Escape as its way out ("Esc to
+    cancel"), which commits nothing and hands the empty input box back, so
+    the web-UI message wins the pane.
 
-    Escape is only sent while a hint is verifiably in the current
-    capture — never blind, because on the bare composer Escape interrupts
-    an in-flight turn. An empty (torn) capture means "unknown" and gets
-    no Escape. A swallowed Escape is re-sent while the surface remains,
+    Escape is only sent while the surface is verifiably on screen —
+    never blind, because on the bare composer Escape interrupts an
+    in-flight turn. An empty (torn) capture means "unknown" and gets no
+    Escape, and a surface seen in a single frame is re-confirmed a poll
+    later before an Escape is spent on it, so a repaint artifact cannot
+    draw one. A swallowed Escape is re-sent while the surface remains,
     spaced by :data:`_OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S`.
     Best-effort: a surface that outlives
     :data:`_OCCUPIED_INPUT_DISMISS_TIMEOUT_S` is left on screen and the
@@ -3923,103 +3914,139 @@ def _restore_occupied_input(socket_path: str, tmux_target: str) -> None:
     """
     deadline = time.monotonic() + _OCCUPIED_INPUT_DISMISS_TIMEOUT_S
     last_escape: float | None = None
+    confirmed = False
     while True:
         pane = _capture_pane(socket_path, tmux_target)
-        hint = next((text for text in _OCCUPIED_INPUT_HINTS if text in pane), None)
-        if hint is None:
+        surface = _occupying_surface(pane)
+        if surface is None:
             return
         now = time.monotonic()
         if now >= deadline:
             _logger.warning(
-                "claude-native: input box still occupied (%r) after %.1fs; proceeding",
-                hint,
+                "claude-native: input box still occupied (%s) after %.1fs; proceeding",
+                surface,
                 _OCCUPIED_INPUT_DISMISS_TIMEOUT_S,
             )
             return
-        if last_escape is None or now - last_escape >= _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S:
-            _logger.info("claude-native: dismissing %r covering the input box", hint)
+        if not confirmed:
+            # One sighting is not enough to spend an Escape on: on a bare
+            # composer Escape interrupts the running turn, and a single frame
+            # can misreport during a repaint. A real surface is still there a
+            # poll later; a repaint artifact is not.
+            confirmed = True
+        elif last_escape is None or now - last_escape >= _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S:
+            _logger.info("claude-native: dismissing %s covering the input box", surface)
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
             last_escape = now
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
 
 
-def _claude_prompt_rendered(pane: str) -> bool:
+def _occupying_surface(pane: str) -> str | None:
     """
-    Return whether Claude Code's input prompt is rendered in a pane.
+    Name what is keeping the chat composer from accepting a message.
 
-    Scans the last :data:`_PROMPT_SCAN_TAIL_LINES` non-empty lines for
-    :data:`_CLAUDE_PROMPT_GLYPH`. Restricting to the tail avoids false
-    positives from the glyph appearing in scrollback (e.g. echoed in a
-    prior response), since the live input box always sits at the bottom.
-
-    A mid-turn injection grows the footer with running-state rows (a
-    ``○ Explore …`` subagent line, extra spinners) that can push ``❯``
-    past that window — arbitrarily far, since a subagent fan-out adds one
-    row per concurrent subagent. To reach it at any depth without also
-    matching a scrollback echo, a glyph above the window counts only when
-    it's framed by a box rule — the ``────`` closing line the live input
-    box always renders below ``❯`` but a bare echoed prompt never has.
-
-    A bare ``❯`` on a selected numbered menu row is not the chat input. A
-    numbered line with an input-box rule below it still counts, however: the
-    readiness gate runs before every injection, so a restored composer draft
-    may legitimately begin with text such as ``2. buy milk``.
+    The answer comes from the composer row (:func:`_composer_row`), not
+    from footer text a surface happens to print: those strings are
+    neither exhaustive nor unambiguous. The ``?`` shortcuts panel lists
+    "! for shell mode" verbatim above a perfectly usable composer, and
+    the panels ``/config``, ``/resume`` and friends open print nothing an
+    allow-list could have known in advance. A missing row means something
+    is drawn over the box; a row led by another mode's glyph means the
+    box itself is not taking chat input.
 
     :param pane: Captured pane text from :func:`_capture_pane`.
-    :returns: ``True`` when the input box appears mounted.
+    :returns: A short description for the log, e.g. ``"shell mode"``, or
+        ``None`` when the chat composer is free — and also when the
+        capture is empty, since a torn read says nothing and must not
+        draw an Escape.
+    """
+    if not pane.strip():
+        return None
+    row = _composer_row(pane)
+    if row is None:
+        return "an overlay"
+    if row.strip().startswith(_CLAUDE_PROMPT_GLYPH):
+        return None
+    return "shell mode"
+
+
+def _composer_row(pane: str) -> str | None:
+    """
+    Return the row Claude Code's live input box renders, or ``None``.
+
+    The box is the last thing on screen framed by rules
+    (:func:`_is_box_rule`), and its row is the one directly under that
+    frame's opening rule, led by a composer glyph
+    (:data:`_COMPOSER_MODE_GLYPHS`).
+
+    That frame is what tells the composer apart from every look-alike: a
+    prompt echoed into scrollback, the ctrl+r search's selected history
+    row, the rewind dialog's ``❯ (current)`` and a startup menu's
+    ``❯ 2. No (recommended)`` all carry the glyph without a rule directly
+    above them. Taking the row under the OPENING rule (rather than under
+    the lowest rule) is what keeps the ``?`` shortcuts panel's "! for
+    shell mode" row — which sits directly under the box's closing rule —
+    from reading as a shell-mode composer. When the pane is too short to
+    show the closing rule (a multi-line draft in a sliver-height
+    terminal), the lowest rule is the opening one and the row under it is
+    the composer.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: The row's text, e.g. ``"❯ fix the bug"`` or ``"!"`` in shell
+        mode, or ``None`` when no input box is on screen.
     """
     non_empty = [line for line in pane.splitlines() if line.strip()]
-    tail_start = max(0, len(non_empty) - _PROMPT_SCAN_TAIL_LINES)
-    for idx in range(tail_start, len(non_empty)):
-        line = non_empty[idx]
-        if _CLAUDE_PROMPT_GLYPH not in line:
+    rules = [idx for idx, line in enumerate(non_empty) if _is_box_rule(line)]
+    if not rules:
+        return None
+    candidates = [rules[-2] + 1] if len(rules) >= 2 else []
+    candidates.append(rules[-1] + 1)
+    for idx in candidates:
+        if idx >= len(non_empty):
             continue
-        if not _is_selected_menu_row(line) or any(
-            _is_box_rule(rule) for rule in non_empty[idx + 1 :]
-        ):
-            return True
-    # Above that window, trust the glyph only when a box rule sits below
-    # it — the live input box's closing frame, absent from scrollback.
-    # The footer height scales with concurrent subagents (a fan-out of
-    # ``○ Explore …`` rows), so no fixed window can bound it; the box rule
-    # is a reliable structural signal at any depth, and `capture-pane -p`
-    # returns only the visible pane, so this stays within one screen.
-    for idx, line in enumerate(non_empty):
-        if _CLAUDE_PROMPT_GLYPH not in line:
-            continue
-        if any(_is_box_rule(rule) for rule in non_empty[idx + 1 :]):
-            return True
-    return False
+        row = non_empty[idx]
+        if row.strip()[:1] in _COMPOSER_MODE_GLYPHS:
+            return row
+    return None
 
 
-def _is_selected_menu_row(line: str) -> bool:
+def _claude_prompt_rendered(pane: str) -> bool:
     """
-    Return whether a ``❯`` line is a selected numbered menu row.
+    Return whether Claude Code's chat input is rendered in a pane.
 
-    Claude Code's startup menus (e.g. the "Detected a custom API key"
-    confirmation) mark the highlighted choice with the same ``❯`` glyph the
-    chat input uses (``❯ 2. No (recommended)``). The readiness scan must not
-    treat such a row as the chat composer, or the first message gets typed
-    into the menu. A chat prompt never renders a numbered choice after the
-    glyph, so the ``<glyph> <digit>.`` shape distinguishes them.
+    The input box is located structurally (:func:`_composer_row`) and its
+    leading glyph read: only :data:`_CLAUDE_PROMPT_GLYPH` accepts a chat
+    message. Nothing else on screen qualifies — not a prompt echoed into
+    scrollback, not the ctrl+r search's selected history row, not a
+    startup menu's ``❯ 2. No (recommended)``, and not the same box
+    switched to ``!`` shell mode, where the message would run as a bash
+    command instead of being sent.
 
-    :param line: A single pane line, e.g. ``"❯ 2. No (recommended)"``.
-    :returns: ``True`` when the line is a selected numbered menu choice.
+    Locating the box by its frame rather than by a fixed tail window is
+    what reaches the prompt under a tall running-turn footer: a subagent
+    fan-out adds one ``○ Explore …`` row per concurrent subagent, so the
+    rows below the box are unbounded, while the opening rule directly
+    above it is not.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: ``True`` when the chat input box appears mounted.
     """
-    return bool(_SELECTED_MENU_ROW_RE.match(line.strip()))
+    row = _composer_row(pane)
+    return row is not None and row.strip().startswith(_CLAUDE_PROMPT_GLYPH)
 
 
 def _is_box_rule(line: str) -> bool:
     """
     Return whether a line is a TUI box-drawing horizontal rule.
 
-    Claude Code frames its input box with rows of ``─`` (plus corner
-    glyphs). Such a rule below ``❯`` marks the live input box, letting
-    the readiness scan reach a prompt buried under a tall running-turn
-    footer without matching a bare ``❯`` echoed into scrollback.
+    Claude Code frames the input box with a row of ``─``
+    (:data:`_BOX_RULE_CHARS`), with or without corner glyphs depending on
+    the version. Both spellings count: :func:`_composer_row` anchors on
+    the rule directly above the composer, so it is the position that
+    identifies the box, not the corners.
 
     :param line: A single pane line, e.g. ``"──────────"``.
-    :returns: ``True`` when the line is predominantly box-rule glyphs.
+    :returns: ``True`` when the line is a box-drawing rule.
     """
     stripped = line.strip()
     return len(stripped) >= 3 and all(ch in _BOX_RULE_CHARS for ch in stripped)

@@ -475,6 +475,22 @@ def _inject_mcp_server_config(
     config_path.write_text(rendered, encoding="utf-8")
 
 
+class CodexAppServerResponseError(RuntimeError):
+    """Structured JSON-RPC error returned by the Codex app-server."""
+
+    def __init__(self, error: object) -> None:
+        """Preserve the JSON-RPC code and message while remaining a RuntimeError."""
+        self.error = error
+        self.code: int | None = None
+        self.message: str | None = None
+        if isinstance(error, dict):
+            code = error.get("code")
+            message = error.get("message")
+            self.code = code if isinstance(code, int) else None
+            self.message = message if isinstance(message, str) else None
+        super().__init__(str(error))
+
+
 class CodexAppServerClient:
     """JSON-RPC client for a Codex app-server.
 
@@ -570,7 +586,7 @@ class CodexAppServerClient:
         :param method: App-server method, e.g. ``"thread/start"``.
         :param params: JSON-serializable method parameters.
         :returns: Decoded response envelope.
-        :raises RuntimeError: If the app-server returns an error.
+        :raises CodexAppServerResponseError: If the app-server returns an error.
         """
         if self._ws is None:
             raise RuntimeError("Codex app-server client is not connected")
@@ -591,7 +607,7 @@ class CodexAppServerClient:
         response = await future
         error = response.get("error")
         if error:
-            raise RuntimeError(str(error))
+            raise CodexAppServerResponseError(error)
         return response
 
     async def notify(self, method: str, params: CodexParams | None = None) -> None:
@@ -1017,6 +1033,22 @@ async def codex_launch_catalog(*, codex_path: str | None = None) -> list[_JsonOb
             return None
 
     return await model_catalog_store.ensure_catalog("codex-native", fingerprint, _probe)
+
+
+async def codex_launch_catalog_is_stale() -> bool:
+    """
+    Whether the default launch shape's stored catalog is past the TTL.
+
+    :returns: ``True`` when the store holds only a stale entry; ``False``
+        when it is fresh, absent, or the launch shape cannot resolve.
+    """
+    from omnigent import model_catalog_store
+
+    try:
+        launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
+    except Exception:  # noqa: BLE001 — a broken provider config means no catalog
+        return False
+    return model_catalog_store.catalog_is_stale("codex-native", codex_catalog_fingerprint(launch))
 
 
 def _build_native_codex_app_server_argv(
