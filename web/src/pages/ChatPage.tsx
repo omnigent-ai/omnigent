@@ -2,6 +2,7 @@ import {
   type DragEvent,
   type FormEvent,
   type KeyboardEvent,
+  type ReactNode,
   createContext,
   memo,
   useCallback,
@@ -17,11 +18,11 @@ import {
   BotIcon,
   CheckIcon,
   AlertTriangleIcon,
+  ChevronDownIcon,
   CornerUpLeftIcon,
   CopyIcon,
   FileTextIcon,
   FolderIcon,
-  GitBranchIcon,
   GitForkIcon,
   ImageIcon,
   Loader2Icon,
@@ -33,6 +34,13 @@ import {
   XIcon,
 } from "lucide-react";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
+import {
+  Popover,
+  PopoverContent,
+  PopoverHeader,
+  PopoverTitle,
+  PopoverTrigger,
+} from "@/components/ui/popover";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { userColor, userColorTint, userInitials } from "@/lib/userBadge";
 import { useNavigate, useParams } from "@/lib/routing";
@@ -211,7 +219,7 @@ import type { ServerInfo } from "@/lib/capabilities";
 import { MainTerminalView } from "@/shell/MainTerminalView";
 import { ChatPlanAccordion } from "@/shell/ChatPlanAccordion";
 import { UNTITLED_CONVERSATION_LABEL } from "@/shell/sidebarNav";
-import { NewChatLandingScreen } from "@/shell/NewChatDialog";
+import { NewChatLandingScreen, worktreePathTail } from "@/shell/NewChatDialog";
 import { ResumeWithDirectoryDialog } from "@/shell/ResumeWithDirectoryDialog";
 import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
@@ -224,9 +232,9 @@ import {
 } from "@/lib/claudePermissionMode";
 import { isCodexNativeSession } from "@/lib/codexPlanMode";
 import { getCliServerUrl } from "@/lib/host";
+import { copyText } from "@/lib/clipboard";
 import { SessionImage } from "@/components/SessionImage";
 import { GoalControl, GoalStatusPill, useGoalState, type Goal } from "@/components/goal";
-import { copyText } from "@/lib/clipboard";
 import { showToast } from "@/components/ui/toast";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 
@@ -4332,11 +4340,10 @@ export function formatModelEffortStatusLabel(
 }
 
 /**
- * Identity label for the composer status tray: which harness/agent is
- * running this session. Native vendor wrappers read as the bare vendor
- * name ("Claude" / "Codex"); SDK/bundle agents read as the agent name
- * with the brain harness in parens ("Polly (Pi)"). Lives in the status tray
- * below the composer, separate from the read-only model/effort label.
+ * Identity label for the composer's session-environment popover. Native
+ * vendor wrappers read as the bare vendor name ("Claude" / "Codex");
+ * SDK/bundle agents read as the agent name with the brain harness in parens
+ * ("Polly (Pi)"). Kept separate from the read-only model/effort label.
  *
  * A native sub-agent child (a Claude Code Task, a Codex collab thread) reads
  * as its vendor's product name ("Claude Code"), matching the Agents rail's
@@ -4373,17 +4380,145 @@ export function composerHarnessLabel(
   return display ?? harness;
 }
 
+function SessionEnvironmentRow({
+  label,
+  children,
+  testId,
+}: {
+  label: string;
+  children: ReactNode;
+  testId: string;
+}) {
+  return (
+    <div data-testid={testId} className="grid grid-cols-[7rem_minmax(0,1fr)] items-start gap-3">
+      <dt className="text-muted-foreground">{label}</dt>
+      <dd className="min-w-0 text-foreground">{children}</dd>
+    </div>
+  );
+}
+
+function SessionEnvironmentPopover({
+  conversationId,
+  workspace,
+  gitBranch,
+  harnessLabel,
+  isHostBound,
+  onHostReconnect,
+}: {
+  conversationId: string;
+  workspace: string | null;
+  gitBranch: string | null;
+  harnessLabel: string | null;
+  isHostBound: boolean;
+  onHostReconnect?: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [workspaceCopied, setWorkspaceCopied] = useState(false);
+  const workspaceLabel = workspace ? worktreePathTail(workspace) : "Directory unavailable";
+
+  function handleOpenChange(next: boolean) {
+    setOpen(next);
+    if (!next) setWorkspaceCopied(false);
+  }
+
+  function handleCopyWorkspace() {
+    if (!workspace) return;
+    void copyText(workspace)
+      .then(() => setWorkspaceCopied(true))
+      .catch(() => setWorkspaceCopied(false));
+  }
+
+  return (
+    <Popover open={open} onOpenChange={handleOpenChange}>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          data-testid="session-environment-trigger"
+          className="flex min-w-0 max-w-[min(18rem,45vw)] items-center gap-1 rounded-md px-1.5 py-0.5 text-sm text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+          title={workspace ?? "Session environment"}
+          aria-label={`Session environment, working directory ${workspace ?? "unavailable"}`}
+        >
+          <FolderIcon className="ui-icon" aria-hidden="true" />
+          <span className="sm:hidden">Details</span>
+          <span data-testid="composer-workspace" className="hidden min-w-0 truncate sm:block">
+            {workspaceLabel}
+          </span>
+          <ChevronDownIcon className="size-3 shrink-0" aria-hidden="true" />
+        </button>
+      </PopoverTrigger>
+      <PopoverContent
+        data-testid="session-environment-popover"
+        align="start"
+        side="top"
+        className="w-[28rem] max-w-[calc(100vw-2rem)] gap-3"
+      >
+        <PopoverHeader>
+          <PopoverTitle>Session environment</PopoverTitle>
+        </PopoverHeader>
+        <dl className="grid gap-3 text-sm">
+          <SessionEnvironmentRow label="Host" testId="session-environment-host">
+            {isHostBound ? (
+              <HostBadge sessionId={conversationId} onReconnect={onHostReconnect} />
+            ) : (
+              <span className="text-muted-foreground">Local (no host binding)</span>
+            )}
+          </SessionEnvironmentRow>
+          <SessionEnvironmentRow label="Working directory" testId="session-environment-workspace">
+            <div className="flex min-w-0 items-start gap-1.5">
+              <code className="min-w-0 flex-1 text-xs [overflow-wrap:anywhere]">
+                {workspace ?? "Unavailable"}
+              </code>
+              {workspace && (
+                <button
+                  type="button"
+                  className="shrink-0 rounded-sm p-0.5 text-muted-foreground hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+                  aria-label="Copy working directory"
+                  title="Copy working directory"
+                  onClick={handleCopyWorkspace}
+                >
+                  {workspaceCopied ? (
+                    <CheckIcon className="size-3.5" />
+                  ) : (
+                    <CopyIcon className="size-3.5" />
+                  )}
+                </button>
+              )}
+            </div>
+          </SessionEnvironmentRow>
+          <SessionEnvironmentRow label="Worktree" testId="session-environment-worktree">
+            {gitBranch ? (
+              <div className="grid gap-0.5">
+                <span className="[overflow-wrap:anywhere]">{gitBranch}</span>
+                <code className="text-xs text-muted-foreground [overflow-wrap:anywhere]">
+                  {workspace ?? "Path unavailable"}
+                </code>
+              </div>
+            ) : (
+              <span className="text-muted-foreground">None</span>
+            )}
+          </SessionEnvironmentRow>
+          <SessionEnvironmentRow label="Harness" testId="session-environment-harness">
+            {harnessLabel ?? <span className="text-muted-foreground">Unknown</span>}
+          </SessionEnvironmentRow>
+        </dl>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
 /**
- * Status tray under the composer: branch left, model/context right.
+ * Status tray under the composer: session environment left, context right.
  * Pulled up behind the card so a shelf peeks below; skips render when empty.
  * Session cost lives in the header agent-info popover, not here.
  */
 function ComposerStatusLine({
   goal,
+  harnessLabel,
   isSubAgentSession,
   onHostReconnect,
 }: {
   goal: Goal | null;
+  harnessLabel: string | null;
   isSubAgentSession: boolean;
   /**
    * Opens the reconnect help dialog, handed to the host badge — which turns
@@ -4405,6 +4540,7 @@ function ComposerStatusLine({
   // from the same source the badge does so the tray's render guard matches.
   const { session } = useSession(conversationId);
   const isHostBound = !!session?.hostId;
+  const workspace = session?.workspace ?? null;
 
   const showBranch = !!conversationId && !!gitBranch;
   // Host indicator (green/red dot + host name), left of the worktree branch.
@@ -4425,7 +4561,9 @@ function ComposerStatusLine({
   // the badge is where it lives and an unreachable session often has no
   // branch/ring at all.
   const showHostBadge = showHost && isHostBound;
-  if (!showBranch && !showPlanMode && !showGoal && !showRing && !showHostBadge) return null;
+  const showEnvironment =
+    showHost && (isHostBound || workspace !== null || harnessLabel !== null || gitBranch !== null);
+  if (!showBranch && !showPlanMode && !showGoal && !showRing && !showEnvironment) return null;
 
   return (
     <div
@@ -4436,14 +4574,29 @@ function ComposerStatusLine({
         CHAT_COLUMN_WIDTH,
       )}
     >
-      {/* Left: host + branch. flex-1 keeps the right cluster pinned; truncate, no wrap. */}
+      {/* Left: host + directory + branch. flex-1 keeps the right cluster pinned. */}
       <div className="flex min-w-0 flex-1 items-center gap-3 text-sm text-muted-foreground">
-        {showHost && conversationId && (
+        {showHostBadge && conversationId && (
           <HostBadge sessionId={conversationId} onReconnect={onHostReconnect} />
         )}
+        {showEnvironment && conversationId && (
+          <SessionEnvironmentPopover
+            conversationId={conversationId}
+            workspace={workspace}
+            gitBranch={gitBranch}
+            harnessLabel={harnessLabel}
+            isHostBound={isHostBound}
+            onHostReconnect={onHostReconnect}
+          />
+        )}
         {showBranch && (
-          <span className="flex min-w-0 items-center gap-1.5">
-            <GitBranchIcon className="ui-icon" />
+          <span
+            data-testid="composer-worktree"
+            className="flex min-w-0 items-center gap-1.5"
+            title={`Isolated worktree: ${gitBranch}`}
+            aria-label={`Isolated worktree branch ${gitBranch}`}
+          >
+            <GitForkIcon className="ui-icon" aria-hidden="true" />
             <span data-testid="composer-git-branch" className="min-w-0 truncate" title={gitBranch}>
               {gitBranch}
             </span>
@@ -4777,7 +4930,7 @@ export function Composer({
   );
 
   const codexPlanMode = useChatStore((s) => s.codexPlanMode);
-  // Harness/agent identity shown in the status tray below the card, separate
+  // Harness/agent identity shown in the session-environment popover, separate
   // from the composer's read-only model/effort label.
   const sessionHarness = useChatStore((s) => s.sessionHarness);
   const subAgentName = useChatStore((s) => s.subAgentName);
@@ -6003,6 +6156,7 @@ export function Composer({
       </div>
       <ComposerStatusLine
         goal={goal}
+        harnessLabel={harnessLabel}
         isSubAgentSession={subAgentLabel != null}
         onHostReconnect={onShowReconnectHelp}
       />
