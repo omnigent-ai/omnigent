@@ -453,6 +453,30 @@ cause is named from what you observed rather than guessed.
   already-running process and `Wait /pattern/` on the observable outcome. Keep
   the tape's own steps fast (sub-second each) so no `Wait` straddles a boot.
 
+  **Film the REAL command the user runs — not an API-call stand-in for it.**
+  When the failure surfaces as a command's console output, the tape must run
+  *that command* and capture *its* output — even when reproducing it needs a
+  precondition you have to stage first. Do **not** substitute a script that pokes
+  the underlying endpoint (a `curl`/`httpx` to `POST /auth/login`, a Python
+  snippet inspecting a response) as a proxy for the command: that films the
+  mechanism, not the failure the user sees, and is the same circular
+  substitution as filming the test. Stage the precondition, then run the command.
+  Example — the "host 403s after its login expires" journey: seed an **expired**
+  `auth_tokens.json` (the state `omnigent login` leaves once the JWT lapses —
+  write the entry with a past `expires_at`), then `Type` the actual
+  `omnigent host --server <url>` command and `Wait` for the console failure it
+  prints (e.g. `EXPIRED` / `Connection refused (HTTP 403)`). That console frame
+  is the recording. Only when the command genuinely cannot be driven here (name
+  why) do you fall back to `recordings: []` — never to an endpoint-poke proxy.
+
+  **End the tape on the OUTPUT, not a fixed timer.** A common failure is a clip
+  that stops on an empty prompt because the tape said "run command → `Sleep 10`
+  → stop" and the command's output took longer than the sleep to appear. Always
+  end on a `Wait /<pattern>/` that matches the *observable result line* (the
+  error text, the value, the exit message), with only a short trailing `Sleep`
+  after it lands — never a bare `Sleep`/short total duration as the stop
+  condition. The clip must show the outcome, not the moment before it.
+
   **A clip of the reproduction TEST running is NOT the journey — never fall back
   to it.** If the journey tape won't render (server boot times out, `ttyd`
   missing, VHS unavailable), do **not** substitute a recording of
