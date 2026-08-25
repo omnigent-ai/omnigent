@@ -107,9 +107,15 @@ function relayCredentials() {
   return null;
 }
 
-async function evaluate(type, target, data) {
+async function evaluate(type, target, data, failClosed) {
   // Returns {result, reason}. Not wired (no server/session) -> no-op allow.
   if (!BASE || !SESSION) return { result: "ALLOW" };
+  // ``failClosed`` mirrors ``FAIL_CLOSED_PHASES`` in omnigent/policies/types.py
+  // client-side: for a phase whose in-band verdict is the ONLY enforcement
+  // point, an unreachable engine must not wave the call through.
+  const unavailable = failClosed
+    ? { result: "POLICY_ACTION_DENY", reason: "policy engine unavailable" }
+    : { result: "ALLOW" };
   const relay = relayCredentials();
   const url = relay
     ? relay.url.replace(/\/+$/, "") + "/policies/evaluate"
@@ -126,13 +132,14 @@ async function evaluate(type, target, data) {
       body: JSON.stringify({ event: { type: type, target: target || "", data: data } }),
       signal: controller.signal,
     });
-    if (!resp.ok) return { result: "ALLOW" };
+    if (!resp.ok) return unavailable;
     const body = await resp.json();
-    return body && typeof body === "object" ? body : { result: "ALLOW" };
+    return body && typeof body === "object" ? body : unavailable;
   } catch (e) {
-    // Server unreachable / timeout: fail OPEN so a transient blip can't lock
-    // the session. The web approval card (if any) stays parked server-side.
-    return { result: "ALLOW" };
+    // Server unreachable / timeout: advisory phases fail OPEN so a transient
+    // blip can't lock the session. The web approval card (if any) stays parked
+    // server-side. TOOL_CALL passes failClosed and denies instead.
+    return unavailable;
   } finally {
     clearTimeout(timer);
   }
@@ -166,6 +173,23 @@ export const OmnigentPolicyPlugin = async () => ({
       // written to opencode's session log, so carry the policy reason there.
       throw new Error(
         "Omnigent policy blocked this prompt: " + (verdict.reason || "request denied"),
+      );
+    }
+  },
+  // TOOL_CALL phase: gate the call BEFORE the tool runs. opencode fires this
+  // hook ahead of dispatch, so a throw is a true block rather than an
+  // after-the-fact redaction. Without it the TOOL_RESULT hook below is the
+  // only tool-facing lever, and by then the write has already happened.
+  "tool.execute.before": async (input, output) => {
+    const verdict = await evaluate(
+      "PHASE_TOOL_CALL",
+      input && input.tool,
+      { name: (input && input.tool) || "", arguments: (output && output.args) || {} },
+      true,
+    );
+    if (verdict.result === "POLICY_ACTION_DENY") {
+      throw new Error(
+        "Omnigent policy blocked this tool call: " + (verdict.reason || "tool call denied"),
       );
     }
   },
