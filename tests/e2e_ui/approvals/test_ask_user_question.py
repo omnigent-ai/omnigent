@@ -41,6 +41,7 @@ _log = logging.getLogger(__name__)
 _APPROVAL_CARD = '[data-testid="approval-card"]'
 _FORM = '[data-testid="ask-user-question-form"]'
 _SUBMIT = '[data-testid="ask-user-question-submit"]'
+_CUSTOM_INPUT = '[data-testid="ask-user-question-custom-input"]'
 _WORKED_FOLD = '[data-testid="turn-worked-fold"]'
 _COMPOSER = "Ask the agent anything…"
 
@@ -52,6 +53,11 @@ _TURN_TIMEOUT_MS = 60_000
 # The exact option labels used in the hook payload and form assertions.
 _OPTION_ONE = "Alpha"
 _OPTION_TWO = "Bravo"
+
+# The question text is also the answer map's key — the payload carries no id.
+_QUESTION = "Which option do you prefer?"
+# Matches neither option, so this value can only have come from the typed row.
+_TYPED_ANSWER = "Charlie"
 
 
 def _pending_elicitations(base_url: str, session_id: str) -> list[dict]:
@@ -92,7 +98,7 @@ def _post_ask_user_question(base_url: str, session_id: str, holder: dict) -> thr
                     "tool_input": {
                         "questions": [
                             {
-                                "question": "Which option do you prefer?",
+                                "question": _QUESTION,
                                 "options": [_OPTION_ONE, _OPTION_TWO],
                             }
                         ]
@@ -150,6 +156,68 @@ def test_ask_user_question_form_renders_and_submits(
         raise AssertionError(f"hook thread failed: {result_holder['error']}") from result_holder[
             "error"
         ]
+
+    _wait_for(lambda: not _pending_elicitations(base_url, session_id))
+
+
+@pytest.mark.timeout(90)
+def test_typed_answer_submits_on_ctrl_enter(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Typed custom answer + Cmd/Ctrl+Enter → prompt drains with that answer.
+
+    The global accept hotkey (``useApproveHotkey``) skips AskUserQuestion, so
+    the card carries its own binding. Bare Enter stays a newline — the custom
+    row is a textarea — and only the modified chord submits.
+    """
+    base_url, session_id = seeded_session
+
+    result_holder: dict = {}
+    hook_thread = _post_ask_user_question(base_url, session_id, result_holder)
+
+    # Let the server park the elicitation before the SPA tries to render it.
+    page.wait_for_timeout(500)
+    page.goto(f"{base_url}/c/{session_id}")
+
+    card = (
+        page.locator(f'{_APPROVAL_CARD}[data-state="pending"]')
+        .filter(has=page.locator(_FORM))
+        .first
+    )
+    expect(card).to_be_visible(timeout=_MOCK_ELICITATION_TIMEOUT_MS)
+    form = card.locator(_FORM)
+    custom_input = form.locator(_CUSTOM_INPUT)
+
+    # Typing auto-checks the custom row's radio, so the question is answered.
+    custom_input.fill(_TYPED_ANSWER)
+
+    # Bare Enter types a newline instead of submitting.
+    custom_input.press("Enter")
+    expect(custom_input).to_have_value(f"{_TYPED_ANSWER}\n")
+    expect(page.locator(f'{_APPROVAL_CARD}[data-state="responded"]')).to_have_count(
+        0, timeout=2_000
+    )
+    assert _pending_elicitations(base_url, session_id), "bare Enter resolved the prompt"
+
+    # Ctrl+Enter is the Win/Linux chord (CI runs Linux chromium); the handler
+    # also takes Cmd+Enter via metaKey on macOS.
+    custom_input.press("Control+Enter")
+
+    responded = page.locator(f'{_APPROVAL_CARD}[data-state="responded"]').first
+    expect(responded).to_be_visible(timeout=_MOCK_ELICITATION_TIMEOUT_MS)
+    expect(responded).to_contain_text(_TYPED_ANSWER)
+
+    hook_thread.join(timeout=30)
+    if "error" in result_holder:
+        raise AssertionError(f"hook thread failed: {result_holder['error']}") from result_holder[
+            "error"
+        ]
+
+    # The typed value is what reaches Claude, not an empty accept.
+    decision = result_holder["response"]["hookSpecificOutput"]["decision"]
+    assert decision["behavior"] == "allow", decision
+    assert decision["updatedInput"]["answers"] == {_QUESTION: _TYPED_ANSWER}, decision
 
     _wait_for(lambda: not _pending_elicitations(base_url, session_id))
 
