@@ -134,19 +134,19 @@ uv run python deploy/databricks/deploy.py \
     --volume-name main.omnigent.artifacts
 ```
 
-The script builds wheels, moves the SPA into `dist/web-ui/`, copies the
-wheels and loose UI files into `src/`, regenerates `src/pyproject.toml`
+The script builds wheels, archives the SPA as `dist/web-ui.tar.gz`, copies the
+wheels and the single UI archive into `src/`, regenerates `src/pyproject.toml`
 and `src/uv.lock`, runs `databricks bundle deploy --target prod`, runs
 `databricks bundle run omnigent --target prod`, and polls `/health`
 with backoff until 200.
 
 Databricks Apps rejects any single source file over 10 MB. The SPA is
-therefore shipped as loose files in `src/web-ui/` instead of inside the
-main wheel; `src/app.py` points the server at that directory via
-`OMNIGENT_WEB_UI_DIST`. Each UI asset is checked against the same 10 MB
-limit. If a Python wheel still exceeds it, reduce the Python payload or
-use `--skip-web-ui`; uv lockfiles cannot point at UC Volume wheel paths
-because `uv lock` validates path sources locally.
+therefore shipped as one `src/web-ui.tar.gz` archive instead of inside the
+main wheel; `src/app.py` extracts it at startup and points the server at the
+extracted directory via `OMNIGENT_WEB_UI_DIST`. The archive is checked against
+the same 10 MB limit before upload. If a Python wheel still exceeds it, reduce
+the Python payload or use `--skip-web-ui`; uv lockfiles cannot point at UC
+Volume wheel paths because `uv lock` validates path sources locally.
 
 Re-running is safe — every step is idempotent.
 
@@ -287,8 +287,8 @@ uv run python deploy/databricks/deploy.py --skip-web-ui ...
 | `permission denied for schema public` | App SP missing schema grants | Run `grant_sp_perms.py` (one-time) |
 | `Field 'spec.role' cannot be empty` | Lakebase requires explicit role for extra databases | Use the project's default database; don't create extras |
 | Deploy refuses because a wheel is over 10 MB | Workspace files cap at 10 MB and uv needs local wheel path sources | Rebuild with `--skip-web-ui` or reduce wheel size |
-| Deploy refuses because an SPA asset is over 10 MB | A single Vite chunk crossed the Workspace file cap | Split the chunk in `web/`, or use `--skip-web-ui` |
-| App serves the API-only landing page | `src/web-ui/` was not included, or deploy used `--skip-web-ui` | Redeploy without `--skip-web-ui` and without `--skip-build` |
+| Deploy refuses because the SPA archive is over 10 MB | The compressed UI archive crossed the Workspace file cap | Split the chunk in `web/`, or use `--skip-web-ui` |
+| App serves the API-only landing page | `src/web-ui.tar.gz` was not included, or deploy used `--skip-web-ui` | Redeploy without `--skip-web-ui` and without `--skip-build` |
 | App starts cleanly but the first agent request 403s on the artifact volume | App SP has `WRITE_VOLUME` on the leaf but no `USE_CATALOG` / `USE_SCHEMA` on the parents | `deploy.py` grants both automatically — for a fresh catalog, redeploy or grant manually via `databricks grants update` |
 
 ## Files in this directory

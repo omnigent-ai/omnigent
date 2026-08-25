@@ -12,9 +12,75 @@ import sys
 import threading
 import time
 import traceback
+from pathlib import Path as _Path
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr, force=True)
 logger = logging.getLogger("omnigent-app")
+
+# ── Web UI location ────────────────────────────────────────
+#
+# The deploy ships the SPA outside the wheel as one archive beside this entry
+# point. Extract it before importing omnigent.server.app, which binds the
+# static-file directory at module import time. A loose directory is supported
+# for compatibility with deployments made by the earlier packaging scheme.
+_WEB_UI_MAX_MEMBERS = 4096
+_WEB_UI_MAX_MEMBER_BYTES = 10 * 1024 * 1024
+_WEB_UI_MAX_EXTRACTED_BYTES = 100 * 1024 * 1024
+
+
+def _extract_web_ui_archive(archive: _Path, destination: _Path) -> None:
+    """Safely extract a bounded web UI archive into ``destination``."""
+    import tarfile as _tarfile
+
+    with _tarfile.open(archive, "r:gz") as tar:
+        members = []
+        total_size = 0
+        # Iterate headers and validate each one before advancing over its data.
+        # This rejects a single large member before reading its compressed body.
+        for member in tar:
+            members.append(member)
+            if len(members) > _WEB_UI_MAX_MEMBERS:
+                raise ValueError(f"archive has too many members ({len(members)})")
+            if member.isfile():
+                if member.size < 0 or member.size > _WEB_UI_MAX_MEMBER_BYTES:
+                    raise ValueError("archive contains a file over the 10 MB limit")
+                total_size += member.size
+                if total_size > _WEB_UI_MAX_EXTRACTED_BYTES:
+                    raise ValueError("archive expands beyond the web UI size limit")
+        # The data filter rejects absolute paths, traversal, links, and special
+        # files that could escape or mutate state outside the extraction root.
+        tar.extractall(destination, members=members, filter="data")
+
+
+def _prepare_web_ui() -> None:
+    import shutil as _shutil
+    import tarfile as _tarfile
+    import tempfile as _tempfile
+
+    here = _Path(__file__).resolve().parent
+    archive = here / "web-ui.tar.gz"
+    loose = here / "web-ui"
+    if loose.is_dir() and not archive.is_file():
+        os.environ.setdefault("OMNIGENT_WEB_UI_DIST", str(loose))
+        logger.info("Web UI: serving legacy loose assets from %s", loose)
+        return
+    if not archive.is_file():
+        logger.info("Web UI: no archive at %s; using packaged assets", archive)
+        return
+
+    extracted = _Path(_tempfile.mkdtemp(prefix="omnigent-web-ui-"))
+    try:
+        _extract_web_ui_archive(archive, extracted)
+    except (OSError, ValueError, _tarfile.TarError) as exc:
+        _shutil.rmtree(extracted, ignore_errors=True)
+        logger.warning("Web UI: failed to extract %s: %s; using packaged assets", archive, exc)
+        return
+
+    os.environ.setdefault("OMNIGENT_WEB_UI_DIST", str(extracted))
+    logger.info("Web UI: serving extracted assets from %s", extracted)
+
+
+_prepare_web_ui()
 
 # ── Lakebase token cache ──────────────────────────────────
 #
@@ -120,16 +186,6 @@ try:
     # ── Start omnigent ─────────────────────────────────────
 
     import tempfile
-    from pathlib import Path
-
-    # The deploy keeps the SPA as loose files beside app.py because the
-    # packaged assets exceed the Workspace per-file limit.
-    _WEB_UI_DIST = Path(__file__).parent / "web-ui"
-    if (_WEB_UI_DIST / "index.html").is_file():
-        os.environ.setdefault("OMNIGENT_WEB_UI_DIST", str(_WEB_UI_DIST))
-        logger.info("Web UI: serving loose assets from %s", _WEB_UI_DIST)
-    else:
-        logger.info("Web UI: no loose assets at %s; using packaged assets")
 
     import uvicorn
 
@@ -171,7 +227,7 @@ try:
 
     DB_URI = f"postgresql+psycopg://{PGUSER}@{PGHOST}:{PGPORT}/{PGDATABASE}"
     ARTIFACT_URI = f"dbfs:{VOLUME_PATH}"
-    CACHE_DIR = Path(tempfile.mkdtemp(prefix="ap_cache_"))
+    CACHE_DIR = _Path(tempfile.mkdtemp(prefix="ap_cache_"))
 
     logger.info("DB_URI: %s", DB_URI[:80])
     logger.info("ARTIFACT_URI: %s", ARTIFACT_URI)

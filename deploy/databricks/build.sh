@@ -4,14 +4,14 @@
 #
 # Inputs:
 #   SKIP_WEB_UI=1         Skip the web SPA build for API-only deployments.
-#   WEB_UI_OUT_NAME=<name> Move the built SPA to dist/<name> instead of leaving
-#                         it in the wheel's package data.
+#   EXTERNALIZE_WEB_UI=1  Build the SPA, then archive it outside the wheel so
+#                         the Databricks Apps source sync uploads one file.
 #
 # Outputs:
 #   dist/omnigent-<version>-py3-none-any.whl
 #   dist/omnigent_client-<version>-py3-none-any.whl
 #   dist/omnigent_ui_sdk-<version>-py3-none-any.whl
-#   dist/$WEB_UI_OUT_NAME/  SPA assets, when WEB_UI_OUT_NAME is set
+#   dist/web-ui.tar.gz    SPA archive, when EXTERNALIZE_WEB_UI=1
 
 set -euo pipefail
 
@@ -33,18 +33,17 @@ if [[ "${SKIP_WEB_UI:-}" != "1" ]]; then
     echo "==> Building web SPA into omnigent/server/static/web-ui/"
     pnpm install --frozen-lockfile --filter web
     pnpm --filter web run build
-    if [[ -n "${WEB_UI_OUT_NAME:-}" ]]; then
-        if [[ ! "${WEB_UI_OUT_NAME}" =~ ^[A-Za-z0-9_-]+$ ]]; then
-            echo "ERROR: WEB_UI_OUT_NAME must be a bare directory name matching" \
-                 "[A-Za-z0-9_-]+ (got '${WEB_UI_OUT_NAME}')" >&2
-            exit 1
-        fi
+    if [[ "${EXTERNALIZE_WEB_UI:-}" == "1" ]]; then
+        # One archive avoids a Workspace round-trip for every one of the
+        # SPA's hundreds of hashed chunks. The fixed destination also means
+        # no caller-controlled path is ever passed to rm or mv.
+        echo "==> Packing SPA into dist/web-ui.tar.gz (excluded from wheel)"
         mkdir -p "${REPO_ROOT}/dist"
-        web_ui_out_dir="${REPO_ROOT}/dist/${WEB_UI_OUT_NAME}"
-        echo "==> Moving SPA out of the wheel into ${web_ui_out_dir}"
-        rm -rf "${web_ui_out_dir}"
-        mv omnigent/server/static/web-ui "${web_ui_out_dir}"
-        # Prevent setup.py from putting the moved SPA back into the wheel.
+        rm -rf "${REPO_ROOT}/dist/web-ui" "${REPO_ROOT}/dist/web-ui.tar.gz"
+        tar -czf "${REPO_ROOT}/dist/web-ui.tar.gz" \
+            -C "${REPO_ROOT}/omnigent/server/static/web-ui" .
+        rm -rf "${REPO_ROOT}/omnigent/server/static/web-ui"
+        # Prevent setup.py from putting the archived SPA back into the wheel.
         export OMNIGENT_SKIP_WEB_UI=true
     fi
 else
