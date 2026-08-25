@@ -602,3 +602,55 @@ def test_build_mcp_block_preserves_custom_timeout() -> None:
     block = build_opencode_mcp_block(servers)
     assert block["local_custom"]["timeout"] == 120
     assert block["remote_custom"]["timeout"] == 45
+
+
+def test_extract_progress_token_variants() -> None:
+    from omnigent.claude_native_bridge import _extract_progress_token
+
+    # Meta style (MCP standard)
+    assert _extract_progress_token({"_meta": {"progressToken": "tok-123"}}) == "tok-123"
+    assert _extract_progress_token({"_meta": {"progressToken": 42}}) == 42
+    # Top-level fallback
+    assert _extract_progress_token({"progressToken": "tok-456"}) == "tok-456"
+    # None or malformed
+    assert _extract_progress_token(None) is None
+    assert _extract_progress_token({}) is None
+    assert _extract_progress_token({"_meta": {}}) is None
+    assert _extract_progress_token({"_meta": {"progressToken": ["invalid"]}}) is None
+
+
+def test_mcp_progress_heartbeat_lifecycle() -> None:
+    import threading
+    import time
+
+    from omnigent.claude_native_bridge import _McpProgressHeartbeat
+
+    lock = threading.Lock()
+    written_messages: list[dict[str, object]] = []
+
+    def fake_write(
+        payload: dict[str, object],
+        stdout_lock: threading.Lock,
+        **_kwargs: object,
+    ) -> None:
+        with stdout_lock:
+            written_messages.append(payload)
+
+    import omnigent.claude_native_bridge as bridge_mod
+
+    orig_write = bridge_mod._write_jsonrpc
+    bridge_mod._write_jsonrpc = fake_write
+    try:
+        # With interval = 0.05s, should emit progress notifications
+        with _McpProgressHeartbeat("test-token", lock, interval_s=0.05):
+            time.sleep(0.12)
+        assert len(written_messages) >= 2
+        assert all(m["method"] == "notifications/progress" for m in written_messages)
+        assert all(m["params"]["progressToken"] == "test-token" for m in written_messages)
+
+        # Once exited, no more messages are emitted
+        count_at_exit = len(written_messages)
+        time.sleep(0.1)
+        assert len(written_messages) == count_at_exit
+    finally:
+        bridge_mod._write_jsonrpc = orig_write
