@@ -221,6 +221,7 @@ class Conversation:
     session_usage: dict[str, Any] = field(default_factory=dict)
     reasoning_effort: str | None = None
     model_override: str | None = None
+    reported_model: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
     harness_override: str | None = None
