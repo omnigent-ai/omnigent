@@ -173,7 +173,6 @@ def test_write_opencode_policy_plugin(bridge_dir: Path) -> None:
     assert write_opencode_policy_plugin(bridge_dir) == path
 
 
-
 def test_policy_plugin_gates_tool_calls_before_dispatch(bridge_dir: Path) -> None:
     """TOOL_CALL is the only phase that can stop a write from happening.
 
@@ -206,6 +205,35 @@ def test_policy_plugin_fails_closed_on_the_fail_closed_phases(
     # Not wired at all (no server/session) still short-circuits to ALLOW, so a
     # plain opencode session without Omnigent is never bricked by this plugin.
     assert 'if (!BASE || !SESSION) return { result: "ALLOW" };' in src
+
+
+def test_policy_plugin_treats_a_non_verdict_body_as_unavailable(
+    bridge_dir: Path,
+) -> None:
+    """A 2xx that carries no verdict must not read as ALLOW on a gated phase.
+
+    A proxy envelope, a ``{"detail": ...}`` error body, or a renamed field would
+    otherwise leave ``verdict.result`` undefined and let the call through --
+    defeating failClosed with a *successful* response.
+    """
+    src = write_opencode_policy_plugin(bridge_dir).read_text(encoding="utf-8")
+    assert "KNOWN_VERDICTS" in src
+    assert "POLICY_ACTION_UNSPECIFIED" in src
+
+
+def test_policy_plugin_denies_an_unresolved_ask_at_tool_call(
+    bridge_dir: Path,
+) -> None:
+    """ASK reaching the plugin means it was not resolved server-side.
+
+    TOOL_CALL is the only pre-execution gate, so allowing it would run the very
+    tool the user was being asked to approve. Matches the ``POLICY_ACTION_ASK ->
+    deny`` mapping in ``omnigent/native_policy_hook.py``.
+    """
+    src = write_opencode_policy_plugin(bridge_dir).read_text(encoding="utf-8")
+    assert 'verdict.result === "POLICY_ACTION_ASK"' in src
+    assert "requires approval for this tool call" in src
+
 
 def test_update_last_event_id(bridge_dir: Path) -> None:
     write_bridge_state(bridge_dir, _state(bridge_dir))
