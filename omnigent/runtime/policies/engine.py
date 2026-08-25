@@ -113,7 +113,7 @@ class PolicyEngine:
         initial_usage: dict[str, float] | None = None,
         initial_subtree_usage: dict[str, float] | None = None,
         initial_user_daily_cost: dict[str, float | str] | None = None,
-        initial_user_period_cost: dict[str, float | str | None] | None = None,
+        initial_user_period_cost: list[dict[str, float | str | None]] | None = None,
         token_pricing: ModelPricing | None = None,
         initial_model: str | None = None,
         conversation_store: ConversationStore,
@@ -667,8 +667,11 @@ class PolicyEngine:
         self._store.set_daily_ask_approved(owner, today, approved)
         # Keep the in-memory snapshot current so any later evaluate() on
         # this engine sees the approval and doesn't re-ASK the checkpoint
-        # the user just approved.
-        self._user_period_cost["ask_approved_usd"] = approved
+        # the user just approved. Find today's record in the list.
+        for record in self._user_period_cost:
+            if record.get("day_utc") == today:
+                record["ask_approved_usd"] = approved
+                break
 
     def record_usage(
         self,
@@ -792,20 +795,20 @@ class PolicyEngine:
         """
         Return a copy of *ctx* with ``user_period_cost`` populated, when seeded.
 
-        Injects the session owner's per-UTC-month cost rollup (read once at
-        engine-build time) so the per-user monthly cost-budget policy can
-        read it via ``event["context"]["user_period_cost"]`` without
+        Injects the session owner's period cost rollup (list of daily records,
+        read once at engine-build time) so the per-user period cost-budget policy
+        can read it via ``event["context"]["user_period_cost"]`` without
         re-querying the store. When the engine was built without it
         (``None`` — no policy needs it), *ctx* is returned unchanged so
-        sessions that don't use the monthly policy never carry it.
+        sessions that don't use the period policy never carry it.
 
         :param ctx: Original :class:`EvaluationContext` from the caller.
-        :returns: *ctx* unchanged when no monthly-cost was seeded, else a
+        :returns: *ctx* unchanged when no period-cost was seeded, else a
             copy with ``user_period_cost`` set to a defensive copy.
         """
         if self._user_period_cost is None:
             return ctx
-        return replace(ctx, user_period_cost=dict(self._user_period_cost))
+        return replace(ctx, user_period_cost=[dict(d) for d in self._user_period_cost])
 
     def _inject_model(self, ctx: EvaluationContext) -> EvaluationContext:
         """

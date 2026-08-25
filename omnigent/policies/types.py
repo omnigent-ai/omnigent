@@ -212,6 +212,7 @@ class EvaluationContext:
     usage: dict[str, float] | None = None
     subtree_usage: dict[str, float] | None = None
     user_daily_cost: dict[str, float | str] | None = None
+    user_period_cost: list[dict[str, float | str | None]] | None = None
     model: str | None = None
     harness: str | None = None
     labels: dict[str, str] | None = None

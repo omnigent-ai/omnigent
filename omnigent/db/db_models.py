@@ -1364,6 +1364,7 @@ class SqlUserDailyCost(OmnigentBase):
     )
     user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     day_utc: Mapped[str] = mapped_column(String(10), primary_key=True)
+    harness: Mapped[str] = mapped_column(String(64), primary_key=True, server_default=CROSS_HARNESS_SENTINEL)
     cost_usd: Mapped[float] = mapped_column(Float, nullable=False)
     ask_approved_usd: Mapped[float] = mapped_column(Float, nullable=False, server_default="0")
     updated_at: Mapped[int] = mapped_column(Integer)

@@ -70,7 +70,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import cast
 
 from omnigent.policies.schema import (
     SESSION_COST_ASK_APPROVED_STATE_KEY,
@@ -1010,15 +1009,15 @@ def user_period_cost_budget(
         daily_records = context.get(context_key) or []
         if not isinstance(daily_records, list):
             return 0.0
+        from contextlib import suppress
+
         total = 0.0
         for record in daily_records:
             if isinstance(record, dict):
                 raw = record.get("cost_usd")
                 if raw is not None:
-                    try:
+                    with suppress(TypeError, ValueError):
                         total += float(raw)
-                    except (TypeError, ValueError):
-                        pass
         return total
 
     def _read_period_approved(event: PolicyEvent) -> float:

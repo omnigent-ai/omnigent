@@ -382,24 +382,18 @@ def _load_user_period_cost(
     else:
         # Fallback: treat as single day
         start = dt.date()
-        end = dt.date()
 
     start_date = start.isoformat()
-    end_date = end.isoformat()
 
     # Query daily cost records for the period
-    daily_records = conversation_store.list_daily_costs(owner, start_date, end_date)
+    daily_records = conversation_store.list_daily_cost_states(owner, start_date, harness)
 
-    # Convert to the expected schema format
+    # Tag each record with user_id
     results: list[dict[str, float | str | None]] = []
     for record in daily_records:
-        results.append({
-            "cost_usd": record.get("cost_usd", 0.0),
-            "ask_approved_usd": record.get("ask_approved_usd", 0.0),
-            "user_id": owner,
-            "day_utc": record.get("day_utc", ""),
-            "harness": harness,
-        })
+        # Record already has cost_usd, ask_approved_usd, day_utc, harness
+        record["user_id"] = owner
+        results.append(record)
 
     return results
 

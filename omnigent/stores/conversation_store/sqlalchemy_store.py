@@ -1702,6 +1702,39 @@ class SqlAlchemyConversationStore(ConversationStore):
                 existing.ask_approved_usd = ask_approved_usd
                 existing.updated_at = now
 
+    def list_daily_cost_states(
+        self,
+        user_id: str,
+        since_day_utc: str,
+        harness: str | None = None,
+    ) -> list[dict[str, float | str | None]]:
+        """
+        Return daily cost states for a user from since_day_utc onward.
+
+        Reads cost_usd, ask_approved_usd, day_utc, and harness for each
+        day >= since_day_utc. Used by period cost policies to aggregate
+        daily records at read time.
+        """
+        harness_filter = CROSS_HARNESS_SENTINEL if harness is None else harness
+        with self._session("list_daily_cost_states") as session:
+            rows = session.execute(
+                select(SqlUserDailyCost)
+                .where(SqlUserDailyCost.workspace_id == current_workspace_id())
+                .where(SqlUserDailyCost.user_id == user_id)
+                .where(SqlUserDailyCost.day_utc >= since_day_utc)
+                .where(SqlUserDailyCost.harness == harness_filter)
+                .order_by(SqlUserDailyCost.day_utc.asc())
+            ).scalars()
+            return [
+                {
+                    "cost_usd": float(row.cost_usd),
+                    "ask_approved_usd": float(row.ask_approved_usd or 0.0),
+                    "day_utc": row.day_utc,
+                    "harness": None if row.harness == CROSS_HARNESS_SENTINEL else row.harness,
+                }
+                for row in rows
+            ]
+
     def get_session_owner(self, conversation_id: str) -> str | None:
         """
         Return the user id that owns a session (its creator).

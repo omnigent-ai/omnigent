@@ -1172,6 +1172,30 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def list_daily_cost_states(
+        self,
+        user_id: str,
+        since_day_utc: str,
+        harness: str | None = None,
+    ) -> list[dict[str, float | str | None]]:
+        """
+        Return daily cost states for a user from since_day_utc onward.
+
+        Reads the full state (cost_usd, ask_approved_usd, day_utc, harness)
+        for each day with recorded cost >= since_day_utc. Used by period-based
+        cost-budget policies to aggregate daily records at read time.
+
+        :param user_id: The user to read, e.g. ``"alice@example.com"``.
+        :param since_day_utc: Inclusive lower-bound UTC day as ``"YYYY-MM-DD"``.
+        :param harness: Harness to filter by (e.g. ``"codex-native"``), or
+            ``None`` for cross-harness budgets (filters to ``harness="__all__"``).
+        :returns: List of dicts, each containing ``{"cost_usd": <float>,
+            "ask_approved_usd": <float>, "day_utc": <str>, "harness": <str | None>}``.
+            Days with no spend are omitted. Sorted ascending by day_utc.
+        """
+        ...
+
+    @abstractmethod
     def get_session_owner(self, conversation_id: str) -> str | None:
         """
         Return the user id that owns a session (its creator).
