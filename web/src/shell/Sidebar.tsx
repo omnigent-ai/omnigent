@@ -3760,12 +3760,14 @@ function ConversationRow({
                 size="icon-xs"
                 aria-label="Conversation actions"
                 data-testid="conversation-actions"
-                // On mobile (no hover state) it's always visible. On desktop it
-                // stays hidden until hover / keyboard focus, with `aria-expanded`
-                // keeping it surfaced while the menu is open so the trigger
-                // doesn't vanish under the cursor.
+                // Desktop-only: the chat page's own header menu covers these
+                // per-session actions on mobile, so the row kebab is dropped
+                // there. From `md` up it stays hidden until hover / keyboard
+                // focus, with `aria-expanded` keeping it surfaced while the menu
+                // is open so the trigger doesn't vanish under the cursor.
                 className={cn(
                   "text-muted-foreground transition-opacity",
+                  "hidden md:inline-flex",
                   "md:opacity-0 md:group-hover:opacity-100 md:group-has-[:focus-visible]:opacity-100",
                   "md:aria-expanded:opacity-100",
                 )}

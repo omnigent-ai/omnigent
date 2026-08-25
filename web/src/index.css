@@ -965,11 +965,18 @@ aside[aria-label="Workspace"][data-maximized] {
  * chip. */
 @media (width < 48rem) {
   .sidebar-glass-chip {
-    /* -webkit- must come BEFORE the unprefixed property: LightningCSS (vite
+    /* Opaque --card-solid base UNDER the glass tint: WebKit drops
+     * backdrop-filter on mobile once a Radix popper opens, and a purely
+     * translucent fill then shows the scrolling session rows straight through,
+     * so the chip reads as transparent. The solid base keeps it a chip no
+     * matter what the filter does; the tint + blur just add frost on top.
+     *
+     * -webkit- must come BEFORE the unprefixed property: LightningCSS (vite
      * build) collapses the pair and keeps only the last declaration. */
     -webkit-backdrop-filter: blur(20px) saturate(180%);
     backdrop-filter: blur(20px) saturate(180%);
-    background-color: rgba(255, 255, 255, 0.6);
+    background-color: var(--card-solid);
+    background-image: linear-gradient(rgba(255, 255, 255, 0.6), rgba(255, 255, 255, 0.6));
     border: 1px solid rgba(0, 0, 0, 0.06);
     box-shadow:
       inset 0 1px 0 rgba(255, 255, 255, 0.8),
@@ -978,7 +985,7 @@ aside[aria-label="Workspace"][data-maximized] {
   }
 
   .dark .sidebar-glass-chip {
-    background-color: rgba(255, 255, 255, 0.1);
+    background-image: linear-gradient(rgba(255, 255, 255, 0.1), rgba(255, 255, 255, 0.1));
     border: 1px solid rgba(255, 255, 255, 0.14);
     box-shadow:
       inset 0 1px 0 rgba(255, 255, 255, 0.12),

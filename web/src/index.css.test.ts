@@ -458,6 +458,32 @@ describe("index.css mobile sidebar opacity", () => {
   });
 });
 
+/* Regression test for the "mobile floating Settings/Search chip is see-through"
+ * bug.
+ *
+ * The two floating chips (`.sidebar-glass-chip`) frost their fill with
+ * `backdrop-filter`, but WebKit drops that filter on mobile once a Radix popper
+ * opens. With a purely translucent fill (rgba white) the scrolling session rows
+ * then show straight through and the chip reads as transparent. An opaque
+ * `--card-solid` base UNDER the tint keeps it a chip whether or not the blur
+ * survives.
+ */
+describe("index.css mobile sidebar glass chip opacity", () => {
+  const chipRule = cssSource.match(/\.sidebar-glass-chip \{[^}]*\}/)?.[0];
+
+  it("has the glass chip rule this test exists to protect", () => {
+    expect(chipRule, "the .sidebar-glass-chip rule is gone from index.css").toBeDefined();
+  });
+
+  it("bases the chip on an opaque fill so it never goes see-through", () => {
+    // The translucent tint lives on background-image (a layer over the base),
+    // NOT on background-color — that must stay the opaque token, or the chip
+    // turns transparent the moment WebKit drops the backdrop-filter.
+    expect(chipRule).toMatch(/background-color:\s*var\(--card-solid\)/);
+    expect(chipRule).not.toMatch(/background-color:\s*rgba/);
+  });
+});
+
 describe("index.css text selection colors", () => {
   const selectionRule = cssSource.match(/::selection\s*\{([^}]*)\}/)?.[1];
 
