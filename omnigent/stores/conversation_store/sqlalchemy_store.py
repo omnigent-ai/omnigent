@@ -26,6 +26,7 @@ from sqlalchemy.sql.selectable import Subquery
 from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
 from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
+    CROSS_HARNESS_SENTINEL,
     LABEL_VALUE_MAX_LEN,
     SqlAgent,
     SqlComment,
@@ -118,6 +119,7 @@ class _RowCountResult(Protocol):
 _SESSION_OVERRIDE_KEYS = (
     "reasoning_effort",
     "model_override",
+    "reported_model",
     "cost_control_mode_override",
     "subagent_routing_override",
     "harness_override",
@@ -209,6 +211,7 @@ def _to_conversation(
         session_usage=session_usage,
         reasoning_effort=overrides["reasoning_effort"],
         model_override=overrides["model_override"],
+        reported_model=overrides["reported_model"],
         cost_control_mode_override=overrides["cost_control_mode_override"],
         subagent_routing_override=overrides["subagent_routing_override"],
         harness_override=overrides["harness_override"],
@@ -1469,12 +1472,16 @@ class SqlAlchemyConversationStore(ConversationStore):
             # Generic dialect fallback — SELECT-then-INSERT/UPDATE in one
             # transaction (race-safe under SERIALIZABLE / SQLite's
             # single-writer semantics).
-            existing = session.get(SqlUserDailyCost, (current_workspace_id(), user_id, day_utc))
+            existing = session.get(
+                SqlUserDailyCost,
+                (current_workspace_id(), user_id, day_utc, CROSS_HARNESS_SENTINEL),
+            )
             if existing is None:
                 session.add(
                     SqlUserDailyCost(
                         user_id=user_id,
                         day_utc=day_utc,
+                        harness=CROSS_HARNESS_SENTINEL,
                         cost_usd=delta_usd,
                         updated_at=now,
                     )
@@ -1524,9 +1531,15 @@ class SqlAlchemyConversationStore(ConversationStore):
             from sqlalchemy.dialects.postgresql import insert as pg_insert
 
             stmt = pg_insert(SqlUserDailyCost)
-        stmt = stmt.values(user_id=user_id, day_utc=day_utc, cost_usd=delta_usd, updated_at=now)
+        stmt = stmt.values(
+            user_id=user_id,
+            day_utc=day_utc,
+            harness=CROSS_HARNESS_SENTINEL,
+            cost_usd=delta_usd,
+            updated_at=now,
+        )
         stmt = stmt.on_conflict_do_update(
-            index_elements=["workspace_id", "user_id", "day_utc"],
+            index_elements=["workspace_id", "user_id", "day_utc", "harness"],
             set_={
                 "cost_usd": SqlUserDailyCost.cost_usd + stmt.excluded.cost_usd,
                 "updated_at": stmt.excluded.updated_at,
@@ -1545,7 +1558,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             exists for ``(user_id, day_utc)``.
         """
         with self._session("get_daily_cost") as session:
-            row = session.get(SqlUserDailyCost, (current_workspace_id(), user_id, day_utc))
+            row = session.get(
+                SqlUserDailyCost,
+                (current_workspace_id(), user_id, day_utc, CROSS_HARNESS_SENTINEL),
+            )
             return float(row.cost_usd) if row is not None else 0.0
 
     def sum_daily_cost(self, user_id: str, since_day_utc: str) -> float:
@@ -1556,6 +1572,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         lexicographically (zero-padded ``"YYYY-MM-DD"``), so the range is
         a plain ``>=`` on the string column; ``SUM`` returns ``NULL`` for
         an empty range, coalesced to ``0.0``.
+
+        Filters to daily rows only (``LENGTH(day_utc) = 10``) to exclude
+        period rollup rows (week/month/quarter/year) stored in the same table.
         """
         with self._session("sum_daily_cost") as session:
             total = session.execute(
@@ -1563,16 +1582,24 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .where(SqlUserDailyCost.workspace_id == current_workspace_id())
                 .where(SqlUserDailyCost.user_id == user_id)
                 .where(SqlUserDailyCost.day_utc >= since_day_utc)
+                .where(func.length(SqlUserDailyCost.day_utc) == 10)
             ).scalar_one()
             return float(total or 0.0)
 
     def list_daily_costs(self, user_id: str, since_day_utc: str) -> list[tuple[str, float]]:
+        """
+        List a user's per-day LLM spend for all days ``>= since_day_utc``.
+
+        Filters to daily rows only (``LENGTH(day_utc) = 10``) to exclude
+        period rollup rows (week/month/quarter/year) stored in the same table.
+        """
         with self._session("list_daily_costs") as session:
             rows = session.execute(
                 select(SqlUserDailyCost.day_utc, SqlUserDailyCost.cost_usd)
                 .where(SqlUserDailyCost.workspace_id == current_workspace_id())
                 .where(SqlUserDailyCost.user_id == user_id)
                 .where(SqlUserDailyCost.day_utc >= since_day_utc)
+                .where(func.length(SqlUserDailyCost.day_utc) == 10)
                 .order_by(SqlUserDailyCost.day_utc.asc())
             ).all()
             return [(row.day_utc, float(row.cost_usd)) for row in rows]
@@ -1592,7 +1619,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             both ``0.0`` when no row exists for ``(user_id, day_utc)``.
         """
         with self._session("get_daily_cost_state") as session:
-            row = session.get(SqlUserDailyCost, (current_workspace_id(), user_id, day_utc))
+            row = session.get(
+                SqlUserDailyCost,
+                (current_workspace_id(), user_id, day_utc, CROSS_HARNESS_SENTINEL),
+            )
             if row is None:
                 return {"cost_usd": 0.0, "ask_approved_usd": 0.0}
             return {
@@ -1636,6 +1666,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 stmt = stmt.values(
                     user_id=user_id,
                     day_utc=day_utc,
+                    harness=CROSS_HARNESS_SENTINEL,
                     cost_usd=0.0,
                     ask_approved_usd=ask_approved_usd,
                     updated_at=now,
@@ -1643,7 +1674,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # On conflict touch only the approval (+ stamp) — never
                 # the accumulated cost.
                 stmt = stmt.on_conflict_do_update(
-                    index_elements=["workspace_id", "user_id", "day_utc"],
+                    index_elements=["workspace_id", "user_id", "day_utc", "harness"],
                     set_={
                         "ask_approved_usd": stmt.excluded.ask_approved_usd,
                         "updated_at": stmt.excluded.updated_at,
@@ -1652,11 +1683,15 @@ class SqlAlchemyConversationStore(ConversationStore):
                 session.execute(stmt)
                 return
             # Generic dialect fallback — SELECT-then-INSERT/UPDATE.
-            existing = session.get(SqlUserDailyCost, (current_workspace_id(), user_id, day_utc))
+            existing = session.get(
+                SqlUserDailyCost,
+                (current_workspace_id(), user_id, day_utc, CROSS_HARNESS_SENTINEL),
+            )
             if existing is None:
                 session.add(
                     SqlUserDailyCost(
                         user_id=user_id,
+                        harness=CROSS_HARNESS_SENTINEL,
                         day_utc=day_utc,
                         cost_usd=0.0,
                         ask_approved_usd=ask_approved_usd,
@@ -2697,6 +2732,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         _unset_harness_override: bool = False,
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
+        reported_model: str | None = None,
     ) -> Conversation | None:
         """
         Update mutable fields on a conversation.
@@ -2708,10 +2744,15 @@ class SqlAlchemyConversationStore(ConversationStore):
             e.g. ``"high"``. ``None`` leaves unchanged.
         :param _unset_reasoning_effort: When ``True``, clear
             ``reasoning_effort`` to ``None``.
-        :param model_override: Per-session LLM model override,
-            e.g. ``"claude-opus-4-7"``. ``None`` leaves unchanged.
+        :param model_override: Per-session LLM model override — the
+            user's request, e.g. ``"claude-opus-4-7"``. ``None``
+            leaves unchanged.
         :param _unset_model_override: When ``True``, clear
             ``model_override`` to ``None``.
+        :param reported_model: The model the harness last reported the
+            session is actually on, verbatim, e.g.
+            ``"claude-opus-4-8[1m]"``. ``None`` leaves unchanged.
+            No ``_unset`` variant — reports only ever move forward.
         :param cost_control_mode_override: Per-session cost-control
             switch, ``"on"`` or ``"off"``. ``None`` leaves unchanged.
         :param _unset_cost_control_mode_override: When ``True``, clear
@@ -2763,6 +2804,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                 overrides_changed = True
             elif model_override is not None:
                 overrides["model_override"] = model_override
+                overrides_changed = True
+            if reported_model is not None:
+                overrides["reported_model"] = reported_model
                 overrides_changed = True
             if _unset_cost_control_mode_override:
                 overrides["cost_control_mode_override"] = None

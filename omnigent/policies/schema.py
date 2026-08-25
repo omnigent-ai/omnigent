@@ -98,6 +98,15 @@ USER_DAILY_ASK_APPROVED_STATE_KEY = "_policy_user_daily_ask_approved_usd"
 # (emits it) and the engine (routes + seeds it).
 SESSION_COST_ASK_APPROVED_STATE_KEY = "_policy_cost_ask_approved_usd"
 
+# Reserved ``state_updates`` key the per-user period cost-budget policy emits
+# on an ASK to record the highest soft checkpoint approved for a period+harness.
+# Routed by :class:`PolicyEngine.apply_state_updates` to
+# ``user_period_cost.ask_approved_usd`` (per user+period+harness) instead of
+# the per-conversation ``session_state``. Shared by the policy (emits it) and
+# the engine (intercepts it) so a period approval persists across the user's
+# sessions, not just the one conversation.
+USER_PERIOD_ASK_APPROVED_STATE_KEY = "_policy_user_period_ask_approved_usd"
+
 # Reserved ``state_updates`` key the cost-budget policy emits when the user
 # approves continuing despite an unpriced model. Like
 # ``SESSION_COST_ASK_APPROVED_STATE_KEY``, routed to the ROOT conversation so
@@ -109,27 +118,38 @@ SESSION_COST_UNPRICED_APPROVED_KEY = "_policy_cost_unpriced_approved"
 class UserDailyCostContext(TypedDict, total=False):
     """The session owner's per-UTC-day LLM cost rollup.
 
-    Injected into the event context only when a policy needs it (the
-    per-user daily cost-budget policy is configured); absent / empty
-    otherwise. Read via ``event["context"]["user_daily_cost"]``.
+    Injected into the event context when a policy needs it (the per-user
+    daily cost-budget policy or period cost-budget policy is configured);
+    absent / empty otherwise. For daily budgets, read via
+    ``event["context"]["user_daily_cost"]``. For period budgets, read via
+    ``event["context"]["user_period_cost"]`` as a list of daily records.
 
     :param cost_usd: The session owner's accumulated LLM spend (USD)
-        for the current UTC day, as of this turn's start, e.g.
-        ``0.18``. ``0.0`` when nothing recorded yet / pricing
-        unavailable.
+        for this UTC day, as of this turn's start, e.g. ``0.18``. ``0.0``
+        when nothing recorded yet / pricing unavailable.
     :param ask_approved_usd: Highest soft warning checkpoint (USD) the
-        owner has already approved continuing past today, so an
+        owner has already approved continuing past this day, so an
         approved checkpoint does not re-prompt across the owner's
         sessions. ``0.0`` when none approved.
     :param user_id: The session owner the rollup belongs to, e.g.
         ``"alice@example.com"`` — surfaced so the budget policy can name
         whose spend tripped the gate. Absent in single-user mode (no
         owner grant), where messages fall back to an un-named phrasing.
+    :param day_utc: The UTC calendar day this record represents, as
+        ``"YYYY-MM-DD"``, e.g. ``"2026-08-25"``. Present when this record
+        is part of a period cost list.
+    :param harness: The harness this record is scoped to, e.g.
+        ``"codex-native"``, when the policy is configured for per-harness
+        budgets. ``None`` when the policy uses cross-harness budgets
+        (summing across all harnesses). Present when this record is part
+        of a period cost list.
     """
 
     cost_usd: float
     ask_approved_usd: float
     user_id: str
+    day_utc: str
+    harness: str | None
 
 
 class EventContext(TypedDict, total=False):
@@ -143,6 +163,12 @@ class EventContext(TypedDict, total=False):
         rollup (``cost_usd`` / ``ask_approved_usd``). Present only when
         the per-user daily cost-budget policy is configured; read via
         ``event["context"]["user_daily_cost"]``.
+    :param user_period_cost: List of the session owner's daily cost
+        records for the current period. Each record contains ``cost_usd``,
+        ``ask_approved_usd``, ``day_utc``, and ``harness``. Present only
+        when the per-user period cost-budget policy is configured; read via
+        ``event["context"]["user_period_cost"]``. The policy function
+        aggregates these records to compute the period total.
     :param model: The model the session is currently using —
         the conversation's ``model_override`` when set (e.g. via a
         mid-session ``/model`` change), else the agent spec's
@@ -167,6 +193,7 @@ class EventContext(TypedDict, total=False):
     usage: UsageContext
     subtree_usage: UsageContext
     user_daily_cost: UserDailyCostContext
+    user_period_cost: list[UserDailyCostContext]
     # ``str | None`` (not ``str``): the value is ``ctx.model``, which is
     # ``None`` when the engine could not determine a model — the dict carries
     # ``None``, it is not merely absent. Cost policies treat ``None`` as an
@@ -405,6 +432,7 @@ def request_attachments(data: object) -> list[dict[str, object]]:
 
 __all__ = [
     "USER_DAILY_ASK_APPROVED_STATE_KEY",
+    "USER_PERIOD_ASK_APPROVED_STATE_KEY",
     "ActorContext",
     "EventContext",
     "PolicyCallable",
