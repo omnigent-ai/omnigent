@@ -625,3 +625,32 @@ describe("index.css native conversation breadcrumb", () => {
     );
   });
 });
+
+describe("index.css native safe-area insets for mobile overlays", () => {
+  // The `fixed inset-0` overlays cover the whole screen on a phone, status bar
+  // and home indicator included, so each one needs the safe-area padding. The
+  // Shells drawer once missed it (the rule listed drawers by `data-testid` and
+  // its id was never added), putting the title and Close button under the
+  // dynamic island with no way to dismiss the panel. Selecting the shared
+  // `.mobile-panel-drawer` class covers every drawer built from
+  // `MobilePanelDrawer`, present and future.
+  const rule = cssSource.match(
+    /:is\(\[data-ios-native\], \[data-android-native\]\)\s*:is\(([^)]*)\)\s*\{([^}]*)\}/,
+  );
+
+  it("has the inset rule this test exists to protect", () => {
+    expect(rule).not.toBeNull();
+    expect(rule?.[2]).toContain("padding-top: var(--omnigent-safe-top)");
+    expect(rule?.[2]).toContain("padding-bottom: var(--omnigent-safe-bottom)");
+  });
+
+  it.each([
+    ".conversations-sidebar",
+    '[data-testid="file-viewer"]',
+    '[data-testid="files-panel-drawer"]',
+    '[data-testid="terminals-panel"]',
+    ".mobile-panel-drawer",
+  ])("insets %s", (selector) => {
+    expect(rule?.[1]).toContain(selector);
+  });
+});

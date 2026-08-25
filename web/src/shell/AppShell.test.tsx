@@ -3064,6 +3064,10 @@ describe("Mobile session menu", () => {
     const drawer = screen.getByTestId("shells-panel-drawer");
     expect(drawer).toHaveAttribute("data-state", "open");
     expect(within(drawer).getByTestId("inline-terminals-section")).toBeInTheDocument();
+    // The drawer covers the whole phone screen; without the safe-area class
+    // its header (title + Close) renders under the status bar / dynamic
+    // island and the panel can't be dismissed.
+    expect(drawer).toHaveClass("mobile-panel-drawer");
   });
 
   it("opens the Agents drawer and mounts the subagents panel", () => {
@@ -3111,6 +3115,7 @@ describe("Mobile session menu", () => {
       "data-conversation-id",
       "conv_abc",
     );
+    expect(openDrawer).toHaveClass("mobile-panel-drawer");
   });
 
   it("opens the files drawer in the tree view from the Files entry", () => {

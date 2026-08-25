@@ -930,8 +930,7 @@ aside[aria-label="Workspace"][data-maximized] {
       [data-testid="file-viewer"],
       [data-testid="files-panel-drawer"],
       [data-testid="terminals-panel"],
-      [data-testid="subagents-panel-drawer"],
-      [data-testid="todos-panel-drawer"]
+      .mobile-panel-drawer
     ) {
     padding-top: var(--omnigent-safe-top);
     padding-bottom: var(--omnigent-safe-bottom);
