@@ -355,16 +355,7 @@ def register_core_routes(
         user_id = _require_user(request, auth_provider)
         content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
         if content_type == "multipart/form-data":
-            result = await _create_bundled_session_from_multipart(request, user_id)
-            if permission_store is not None and user_id is not None:
-                await asyncio.to_thread(permission_store.ensure_user, user_id)
-                await asyncio.to_thread(
-                    permission_store.grant, user_id, result.session_id, LEVEL_OWNER
-                )
-            # Push the new session to this user's other open tabs so it
-            # enters the sidebar without a list poll (WS /sessions/updates).
-            _announce_session_added(user_id, result.session_id)
-            return result
+            return await _create_bundled_session_from_multipart(request, user_id)
 
         try:
             payload = await request.json()
@@ -647,6 +638,17 @@ def register_core_routes(
                 result.agent_id,
                 runner_router,
             )
+        # Grant the creator ownership BEFORE scheduling the managed
+        # launch, mirroring the JSON path: a managed-guard failure
+        # (misconfigured server, unconfigured provider) must not leave
+        # the just-persisted session unowned and thus invisible to the
+        # caller. Push to the caller's other open tabs, too.
+        if permission_store is not None and user_id is not None:
+            await asyncio.to_thread(permission_store.ensure_user, user_id)
+            await asyncio.to_thread(
+                permission_store.grant, user_id, result.session_id, LEVEL_OWNER
+            )
+        _announce_session_added(user_id, result.session_id)
         # Managed bundle create: provision a sandbox host for the
         # just-uploaded session-scoped agent (same background launch as
         # the JSON path). The managed runner fetches the uploaded bundle
