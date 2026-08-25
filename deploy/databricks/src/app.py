@@ -14,6 +14,8 @@ import time
 import traceback
 from pathlib import Path as _Path
 
+from web_ui_archive import extract_web_ui_archive as _extract_web_ui_archive
+
 logging.basicConfig(level=logging.INFO, stream=sys.stderr, force=True)
 logger = logging.getLogger("omnigent-app")
 
@@ -23,33 +25,6 @@ logger = logging.getLogger("omnigent-app")
 # point. Extract it before importing omnigent.server.app, which binds the
 # static-file directory at module import time. A loose directory is supported
 # for compatibility with deployments made by the earlier packaging scheme.
-_WEB_UI_MAX_MEMBERS = 4096
-_WEB_UI_MAX_MEMBER_BYTES = 10 * 1024 * 1024
-_WEB_UI_MAX_EXTRACTED_BYTES = 100 * 1024 * 1024
-
-
-def _extract_web_ui_archive(archive: _Path, destination: _Path) -> None:
-    """Safely extract a bounded web UI archive into ``destination``."""
-    import tarfile as _tarfile
-
-    with _tarfile.open(archive, "r:gz") as tar:
-        members = []
-        total_size = 0
-        # Iterate headers and validate each one before advancing over its data.
-        # This rejects a single large member before reading its compressed body.
-        for member in tar:
-            members.append(member)
-            if len(members) > _WEB_UI_MAX_MEMBERS:
-                raise ValueError(f"archive has too many members ({len(members)})")
-            if member.isfile():
-                if member.size < 0 or member.size > _WEB_UI_MAX_MEMBER_BYTES:
-                    raise ValueError("archive contains a file over the 10 MB limit")
-                total_size += member.size
-                if total_size > _WEB_UI_MAX_EXTRACTED_BYTES:
-                    raise ValueError("archive expands beyond the web UI size limit")
-        # The data filter rejects absolute paths, traversal, links, and special
-        # files that could escape or mutate state outside the extraction root.
-        tar.extractall(destination, members=members, filter="data")
 
 
 def _prepare_web_ui() -> None:

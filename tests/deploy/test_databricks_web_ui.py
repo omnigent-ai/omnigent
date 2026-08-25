@@ -13,7 +13,6 @@ server reads it at import time, so it is checked in a subprocess.
 
 from __future__ import annotations
 
-import ast
 import importlib.util
 import io
 import os
@@ -63,29 +62,13 @@ def _make_spa_archive(root: Path, *, asset_bytes: int = 32) -> Path:
 
 def _load_archive_extractor():
     """Load the side-effect-free archive helper without starting the app."""
-    tree = ast.parse(_APP_PY.read_text())
-    constant_names = {
-        "_WEB_UI_MAX_MEMBERS",
-        "_WEB_UI_MAX_MEMBER_BYTES",
-        "_WEB_UI_MAX_EXTRACTED_BYTES",
-    }
-    nodes = [
-        node
-        for node in tree.body
-        if (
-            (isinstance(node, ast.FunctionDef) and node.name == "_extract_web_ui_archive")
-            or (
-                isinstance(node, ast.Assign)
-                and any(
-                    isinstance(target, ast.Name) and target.id in constant_names
-                    for target in node.targets
-                )
-            )
-        )
-    ]
-    namespace = {"_Path": Path}
-    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(_APP_PY), "exec"), namespace)
-    return namespace["_extract_web_ui_archive"], namespace
+    helper = _DEPLOY_DIR / "src" / "web_ui_archive.py"
+    spec = importlib.util.spec_from_file_location("web_ui_archive_test", helper)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module.extract_web_ui_archive, module
 
 
 def test_server_honours_web_ui_dist_env(tmp_path: Path) -> None:
@@ -110,8 +93,7 @@ def test_app_py_extracts_web_ui_before_importing_server() -> None:
     import_at = source.index("from omnigent.server.app import create_app")
     assert prepare_at < import_at, "web UI setup is too late to take effect"
     assert 'archive = here / "web-ui.tar.gz"' in source
-    assert 'tar.extractall(destination, members=members, filter="data")' in source
-    assert "getmembers()" not in source
+    assert "from web_ui_archive import extract_web_ui_archive" in source
     assert 'loose = here / "web-ui"' in source
 
 
@@ -128,9 +110,9 @@ def test_app_extractor_extracts_normal_archive(tmp_path: Path) -> None:
 
 
 def test_app_extractor_rejects_oversize_expansion_before_writing(tmp_path: Path) -> None:
-    extractor, namespace = _load_archive_extractor()
+    extractor, module = _load_archive_extractor()
     archive = tmp_path / "web-ui.tar.gz"
-    payload = b"x" * (namespace["_WEB_UI_MAX_MEMBER_BYTES"] + 1)
+    payload = b"x" * (module.MAX_MEMBER_BYTES + 1)
     info = tarfile.TarInfo("assets/bomb.js")
     info.size = len(payload)
     with tarfile.open(archive, "w:gz") as tar:
@@ -144,10 +126,10 @@ def test_app_extractor_rejects_oversize_expansion_before_writing(tmp_path: Path)
 
 
 def test_app_extractor_rejects_aggregate_expansion_before_writing(tmp_path: Path) -> None:
-    extractor, namespace = _load_archive_extractor()
+    extractor, module = _load_archive_extractor()
     archive = tmp_path / "web-ui.tar.gz"
     member_bytes = 1024 * 1024
-    member_count = namespace["_WEB_UI_MAX_EXTRACTED_BYTES"] // member_bytes + 1
+    member_count = module.MAX_EXTRACTED_BYTES // member_bytes + 1
     with tarfile.open(archive, "w:gz") as tar:
         for index in range(member_count):
             info = tarfile.TarInfo(f"assets/chunk-{index}.js")
@@ -162,10 +144,10 @@ def test_app_extractor_rejects_aggregate_expansion_before_writing(tmp_path: Path
 
 
 def test_app_extractor_rejects_too_many_members_before_writing(tmp_path: Path) -> None:
-    extractor, namespace = _load_archive_extractor()
+    extractor, module = _load_archive_extractor()
     archive = tmp_path / "web-ui.tar.gz"
     with tarfile.open(archive, "w:gz") as tar:
-        for index in range(namespace["_WEB_UI_MAX_MEMBERS"] + 1):
+        for index in range(module.MAX_MEMBERS + 1):
             tar.addfile(tarfile.TarInfo(f"assets/chunk-{index}.js"))
     destination = tmp_path / "extracted"
     destination.mkdir()
