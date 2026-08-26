@@ -947,6 +947,19 @@ gh issue view <closing_issue_number> --json assignees --jq '.assignees[].login'
 gh pr edit <pr> --add-reviewer <login>
 ```
 
+**You have write access — actually run the command; don't excuse your way out of
+it.** You act as the resolve-agent GitHub App (`omni-resolve-agent[bot]`), whose
+installation token has **read *and* write** on pull requests. Requesting a
+reviewer, editing the PR, and commenting all succeed with it (the same token
+already pushed your branch and opened this PR). So **`gh pr edit --add-reviewer`
+is expected to work** — run it. Do **not** write `maintainer_review` claiming you
+*couldn't* tag a reviewer for a permissions/PAT/`pull_requests:read`-only reason:
+that is false, and it silently drops the hand-off. If the command genuinely
+errors, **paste the real command output** and retry once; only a real, quoted
+error — not an assumption about your token — may go in `maintainer_review`, and
+even then still leave the `@mention` comment below as the fallback so a human is
+pinged.
+
 - If there are **multiple assignees**, request all of them.
 - If there is **no assignee on the Linear ticket and no `closing_issue_number`**
   (so there's no assignee to read anywhere), the
