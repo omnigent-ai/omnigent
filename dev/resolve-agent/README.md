@@ -96,13 +96,22 @@ the review gate after the fact.
 3. *(author path)* **Audits the e2e test against the unfixed tree first** — it must
    fail on the real buggy behavior, not because it references something the fix
    would add. Existence-checks are rewritten into behavioral assertions and
-   flagged.
+   flagged. A test that *passes* on the unfixed tree means `main` has since
+   fixed the bug: outcome `nothing_to_fix` with the fixing commit named and a
+   ticket-closure recommendation — stale reproductions are retired, not
+   "fixed" again.
 4. *(author path)* Root-causes, implements the fix, and adds targeted
    unit/integration tests at the layer it changed, each fail→pass on the bug.
 5. *(author path)* Re-runs the whole set to prove every live facet goes fail→pass
    (not just a loosened test), and — when the fix touches env-derived defaults —
    **re-runs new tests with ambient vars set** to prove the fixtures are hermetic,
-   not flaky-green on a clean machine.
+   not flaky-green on a clean machine. When the repro handoff carries
+   before-fix recordings, **re-records the same drivers on the fixed tree**
+   (building the SPA up front, then pytest-playwright `--video` for web/terminal
+   facets, the VHS tape for CLI facets), captions each after clip with the actions
+   it performs, and carries the before clips' captions through — so the captioned
+   before/after pair lands in the PR's Demo section and, for Linear bugs with a
+   key available, on the ticket.
 6. *(author path)* **Gets an independent cross-vendor review before opening the
    PR** — spawns a different-model reviewer child (a `codex-native` bundle) on its
    own diff, the same review polly runs after the fact but here *before* publish,

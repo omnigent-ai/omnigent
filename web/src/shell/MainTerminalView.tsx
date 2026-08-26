@@ -248,7 +248,6 @@ export function MainTerminalView({
                     sessionId={conversationId}
                     terminalId={activeTerminal.id}
                     readOnly={readOnly}
-                    transport={activeTerminal.transport}
                     active={visible}
                     directAttachUrl={activeTerminal.directAttachUrl}
                     onResume={runnerOffline && onResume ? handleResume : undefined}

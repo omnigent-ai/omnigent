@@ -35,7 +35,7 @@ from omnigent.databricks_model_discovery import DatabricksClaudeCatalog
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.runtime import tool_result_replay as trc
 from omnigent.spec import load_omnigent_yaml
-from omnigent.terminals.ws_bridge import (
+from omnigent.terminals.ws_common import (
     WS_CLOSE_TERMINAL_DETACHED,
     WS_CLOSE_TERMINAL_NOT_FOUND,
 )

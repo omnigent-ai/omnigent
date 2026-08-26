@@ -1690,7 +1690,7 @@ export interface WarmTerminalEntry {
 /**
  * How many sessions' terminal surfaces stay warm at once (the active one
  * included). Each warm surface holds a WebSocket + a runner-side
- * ``tmux attach``, a WebGL context (browsers cap those per page; losing
+ * tmux control client, a WebGL context (browsers cap those per page; losing
  * one falls back to xterm's DOM renderer), and keeps parsing any output
  * its TUI streams while hidden — so the cache is bounded rather than
  * unbounded, but sized to cover a working set of sessions, not just a

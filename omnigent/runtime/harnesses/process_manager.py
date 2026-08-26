@@ -455,12 +455,12 @@ class _SubprocessEntry:
     :param last_used_at: Monotonic timestamp of the most recent
         ``get_client`` call for this conversation. Used by the
         idle reaper to detect abandoned entries.
-    :param model: The ``HARNESS_<H>_MODEL`` value this subprocess
+        :param model: The ``HARNESS_<H>_MODEL`` value this subprocess
         was spawned with (or ``None`` when the spawn env set no
-        model). The model is fixed at spawn time (it's a process
-        env var), so :meth:`HarnessProcessManager.get_client`
-        re-spawns when a later turn requests a different model —
-        e.g. after the user runs ``/model``.
+        model). Most harnesses fix the model at spawn, so
+        :meth:`HarnessProcessManager.get_client` re-spawns on a
+        later model change. Harnesses in
+        :data:`_LIVE_MODEL_CONFIG_HARNESSES` apply it in-process.
     """
 
     def __init__(
@@ -493,6 +493,9 @@ def _model_env_key(harness: str) -> str:
         ``"claude-sdk"`` or ``"HARNESS_CODEX_MODEL"`` for ``"codex"``.
     """
     return f"HARNESS_{harness.upper().replace('-', '_')}_MODEL"
+
+
+_LIVE_MODEL_CONFIG_HARNESSES = frozenset({"qwen"})
 
 
 def _build_harness_spawn_env(env: dict[str, str] | None) -> dict[str, str]:
@@ -800,13 +803,10 @@ class HarnessProcessManager:
                 await self._close_entry(entry)
                 entry = None
                 respawn_reason = "harness_respawn_agent_switch"
-            if entry is not None:
-                # The model is baked into the subprocess env at spawn time;
-                # a later turn requesting a different model (e.g. after the
-                # user runs ``/model``) must respawn, otherwise the cached
-                # process keeps serving the old model. Only respawn when a
-                # concrete different model is requested — a turn that sets no
-                # model env (``None``) keeps the running process.
+            if entry is not None and harness not in _LIVE_MODEL_CONFIG_HARNESSES:
+                # Most harnesses bake the model into the subprocess env. A
+                # later concrete model change must respawn them; ACP harnesses
+                # in the live-config set instead apply the request in-session.
                 requested_model = (env or {}).get(_model_env_key(harness))
                 if requested_model is not None and requested_model != entry.model:
                     _logger.info(
