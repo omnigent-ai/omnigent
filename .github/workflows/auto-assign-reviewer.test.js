@@ -406,4 +406,20 @@ function assert(name, cond, detail) {
   assert("edited, nothing to adopt, only external reviewer -> adds managed pick, keeps external",
     r.added.includes("dhruv0811") && !r.removed.includes("some-external-human"),
     JSON.stringify(r));
+
+  // 26. `edited` with nothing to adopt, a managed ASSIGNEE present but NO
+  //     requested reviewer: models a PR whose managed reviewer already submitted
+  //     a review (GitHub drops them from requested_reviewers but keeps them in
+  //     assignees). The assignee is the durable "already picked" signal, so this
+  //     must be a no-op -- not a re-request/reshuffle of the reviewer.
+  r = await run({
+    action: "edited",
+    files: ["omnigent/inner/foo.py"],
+    load: { SabhyaC26: 5, TomeHirata: 4, dhruv0811: 0, dbczumar: 1 },
+    current: [], currentAssignees: ["dbczumar"],
+    linkedIssues: [],
+  });
+  assert("edited, nothing to adopt, managed assignee (post-review) -> unchanged",
+    r.added.length === 0 && r.removed.length === 0 &&
+    r.assigned.length === 0 && r.unassigned.length === 0, JSON.stringify(r));
 })();

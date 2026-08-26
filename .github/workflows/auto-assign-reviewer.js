@@ -214,23 +214,30 @@ module.exports = async ({ github, context, core }) => {
   // fallback -- otherwise a routine title/body edit would thrash a
   // deliberately-chosen reviewer.
   //
-  // EXCEPTION: if the PR currently has NO managed reviewer, don't bail -- fall
+  // EXCEPTION: if the PR currently has NO managed pick, don't bail -- fall
   // through to the load-balanced pick. Under `cancel-in-progress: true` this
   // same edit can cancel the still-running `opened` job before it assigned
   // anyone (its LLM ranking step is network-bound and slow); bailing here would
-  // then leave the PR permanently unassigned. Skipping only when a managed
-  // reviewer is already in place preserves the anti-thrash intent (there is
-  // nothing to thrash when none is set) while guaranteeing every PR gets one.
+  // then leave the PR permanently unassigned. Skipping only when a managed pick
+  // is already in place preserves the anti-thrash intent (there is nothing to
+  // thrash when none is set) while guaranteeing every PR gets one.
+  //
+  // "Managed pick" checks BOTH requested reviewers and assignees: GitHub drops a
+  // reviewer from `requested_reviewers` once they submit a review, but leaves
+  // them in `assignees` (the two are kept in sync when we assign). Checking only
+  // reviewers would treat a post-review edit as "nothing set" and re-request /
+  // reshuffle -- the exact thrash this guard prevents -- so the assignee, which
+  // survives review, is the durable signal.
   const action = context.payload && context.payload.action;
   if (action === "edited" && issueReviewers.length === 0) {
-    const hasManagedReviewer = (pr.requested_reviewers || []).some(
-      (r) => managed.has((r.login || "").toLowerCase())
-    );
-    if (hasManagedReviewer) {
-      core.info("Edited event, nothing to adopt, managed reviewer already set; leaving reviewer/assignee unchanged.");
+    const hasManagedPick =
+      (pr.requested_reviewers || []).some((r) => managed.has((r.login || "").toLowerCase())) ||
+      (pr.assignees || []).some((a) => managed.has((a.login || "").toLowerCase()));
+    if (hasManagedPick) {
+      core.info("Edited event, nothing to adopt, managed reviewer/assignee already set; leaving reviewer/assignee unchanged.");
       return;
     }
-    core.info("Edited event, nothing to adopt and no managed reviewer set (opened run may have been cancelled); assigning the load-balanced pick.");
+    core.info("Edited event, nothing to adopt and no managed reviewer/assignee set (opened run may have been cancelled); assigning the load-balanced pick.");
   }
 
   // --- Global open-review load (stateless fairness signal).
