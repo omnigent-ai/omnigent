@@ -16,7 +16,6 @@ import {
   ArrowUpIcon,
   BotIcon,
   CheckIcon,
-  AlertTriangleIcon,
   CornerUpLeftIcon,
   CopyIcon,
   FileTextIcon,
@@ -29,8 +28,6 @@ import {
   SettingsIcon,
   SquareIcon,
   SquareTerminalIcon,
-  UnplugIcon,
-  WifiOffIcon,
   XIcon,
 } from "lucide-react";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
@@ -75,13 +72,7 @@ import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
 import { TurnRail, type Turn } from "@/pages/TurnRail";
 import { attachmentKey, validateAttachments } from "@/lib/attachments";
 import { useSurfaceFrontmost } from "@/hooks/useNativeServerSwitcher";
-import {
-  isIOSShell,
-  onNativeSidebarDrag,
-  onNativeViewModeChanged,
-  setNativeServerSwitcherHidden,
-  setNativeViewMode,
-} from "@/lib/nativeBridge";
+import { isIOSShell, onNativeSidebarDrag, setNativeServerSwitcherHidden } from "@/lib/nativeBridge";
 import { type Agent, useSessionAgent, useAgents } from "@/hooks/useAgents";
 import { agentDisplayLabel } from "@/components/AgentInfo";
 import {
@@ -91,11 +82,10 @@ import {
 } from "@/lib/agentLabels";
 import { useConversations } from "@/hooks/useConversations";
 import { usePermissions } from "@/hooks/usePermissions";
-import type { NativeModelOption, SandboxStatus, Session, SessionStatus } from "@/lib/types";
+import type { NativeModelOption, Session, SessionStatus } from "@/lib/types";
 import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
-import { useIOSNativeKeyboardVisible } from "@/hooks/useIOSNativeKeyboardInset";
 import type { MessageContentBlock } from "@/lib/blocks";
 import { ELICITATION_RESPONSE_PREFIX } from "@/lib/blocks";
 import {
@@ -231,6 +221,12 @@ import { GoalControl, GoalStatusPill, useGoalState, type Goal } from "@/componen
 import { copyText } from "@/lib/clipboard";
 import { showToast } from "@/components/ui/toast";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import {
+  ConnectionIndicator,
+  McpStartupIndicator,
+  RunnerStartingIndicator,
+} from "./ChatIndicators";
+import { CHAT_COLUMN_WIDTH } from "./chatLayout";
 
 // Matches both wordings the native executors emit: "[Attached: <path>]"
 // (claude/pi/cursor) and "[Attached file: <path>]" (codex). Capturing group
@@ -387,10 +383,6 @@ export function collectBubbleMarkdown(items: RenderItem[]): string {
     .join("\n\n")
     .trim();
 }
-
-// All chat-column elements must share this width to stay aligned.
-const CHAT_COLUMN_WIDTH =
-  "max-w-3xl min-[1921px]:max-w-4xl min-[2561px]:max-w-[clamp(64rem,40vw,100rem)]";
 
 const TABLE_SEPARATOR_RE = /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/;
 const DISPLAY_MATH_RE = /(^|\n)\s*(\$\$[\s\S]*?\$\$|\\\[[\s\S]*?\\\])/;
@@ -3121,491 +3113,6 @@ function WorkingIndicator() {
 export function shouldShowWorkingIndicator(showsWorking: boolean, bubbles: Bubble[]): boolean {
   if (!showsWorking) return false;
   return bubbles[bubbles.length - 1]?.kind !== "compaction_loading";
-}
-
-/**
- * Band copy for each in-flight managed-sandbox launch stage, in
- * pipeline order: provisioning → cloning (repo workspaces only) →
- * starting → connecting. `starting` is the in-sandbox host booting
- * and dialing back to the server (so it reads "Connecting host");
- * `connecting` is the agent runner being launched on that host
- * (so it reads "Starting agent"). Terminal stages are absent on
- * purpose — `ready` clears the band and `failed` renders its own
- * error band.
- */
-const SANDBOX_STAGE_LABELS: Record<string, string | undefined> = {
-  provisioning: "Provisioning sandbox",
-  cloning: "Cloning repository",
-  starting: "Connecting host",
-  connecting: "Starting agent",
-};
-
-/**
- * Failure band for a managed-sandbox session whose background launch
- * died. Renders the recorded reason so a dead launch explains itself
- * instead of presenting a silent dead chat. In-flight launch progress
- * does NOT render here — it shares the in-thread
- * :func:`RunnerStartingIndicator` spot so all launch states live on
- * one consistent line.
- */
-export function SandboxFailedIndicator({ status }: { status: SandboxStatus }) {
-  return (
-    <div
-      data-testid="sandbox-failed-indicator"
-      role="status"
-      className={cn("mx-auto w-full", CHAT_COLUMN_WIDTH)}
-    >
-      <ErrorBanner message={status.error ?? ""} source="" code="" title="Sandbox launch failed" />
-    </div>
-  );
-}
-
-export function ConnectionIndicator({
-  liveness,
-  onShowReconnectHelp,
-  onAttach,
-  surfaceFrontmost = true,
-}: {
-  liveness: SessionLiveness;
-  onShowReconnectHelp: () => void;
-  /**
-   * Direct attach action for a downed-but-wakeable runner (`runner_asleep`).
-   * Reconnects/relaunches the runner via `retry_session` without sending a
-   * message. Absent for non-owners (who can't relaunch); then the state stays
-   * on the send-a-message path with no banner.
-   */
-  onAttach?: () => void | Promise<void>;
-  // Whether the chat/terminal surface is frontmost (not under a drawer). Gates
-  // the native iOS bar so it doesn't float over an opened sidebar/panel.
-  surfaceFrontmost?: boolean;
-}) {
-  const terminalFirst = useTerminalFirst();
-  const [attaching, setAttaching] = useState(false);
-  const [attachError, setAttachError] = useState<string | null>(null);
-  // Safety timer that re-enables Attach if liveness never clears (a genuinely
-  // failed relaunch), so the button doesn't get stuck pending. Longer than the
-  // runner-health poll so a normal recovery unmounts the banner first.
-  const attachSettleTimer = useRef<number | null>(null);
-  const handleAttach = useCallback(async () => {
-    if (!onAttach) return;
-    setAttachError(null);
-    setAttaching(true);
-    try {
-      await onAttach();
-      // Stay pending until the liveness poll confirms the runner is back and
-      // this banner unmounts. Re-enabling the instant retry_session returns
-      // (well before the poll refresh) flips the label back to "Attach" over a
-      // still-shown banner — it reads as a no-op and invites a redundant click.
-      if (attachSettleTimer.current) window.clearTimeout(attachSettleTimer.current);
-      attachSettleTimer.current = window.setTimeout(() => setAttaching(false), 12_000);
-    } catch (error) {
-      setAttachError(error instanceof Error && error.message ? error.message : "Couldn't attach.");
-      setAttaching(false);
-    }
-  }, [onAttach]);
-  // Recovery (or any move off runner_asleep) resets pending/error so a later
-  // disconnect starts clean; the cleanup also clears the timer on unmount.
-  useEffect(() => {
-    if (liveness.kind !== "runner_asleep") {
-      setAttaching(false);
-      setAttachError(null);
-    }
-    return () => {
-      if (attachSettleTimer.current) window.clearTimeout(attachSettleTimer.current);
-    };
-  }, [liveness.kind]);
-  const keyboardVisible = useIOSNativeKeyboardVisible(
-    terminalFirst?.isTerminalFirst === true,
-    terminalFirst?.view === "chat",
-  );
-  const sandboxStatus = useChatStore((s) => s.sandboxStatus);
-  // Genuinely-unreachable states get the reconnect banner, for
-  // both terminal-first and regular sessions. `runner_asleep` (host up,
-  // runner relaunches on the next message), `host_asleep` (resumable managed
-  // host the server wakes on the next message), and `unknown` (pre-poll) are
-  // NOT unreachable — they're handled below.
-  const unreachable = liveness.kind === "host_offline" || liveness.kind === "local_stranded";
-
-  // In the iOS shell the Chat/Terminal toggle is the native Liquid Glass bar,
-  // not the in-page pill. Drive it from here (always mounted) with the SAME
-  // visibility the pill would have, expressed as a stable boolean so switching
-  // views never flickers the bar. Hook is called unconditionally (before any
-  // early return) to satisfy the rules of hooks.
-  const nativeBarVisible =
-    isIOSShell() &&
-    terminalFirst?.isTerminalFirst === true &&
-    !terminalFirst.isShellView &&
-    sandboxStatus?.stage !== "failed" &&
-    !keyboardVisible &&
-    surfaceFrontmost;
-  useNativeChatTerminalBar(terminalFirst, nativeBarVisible);
-
-  if (sandboxStatus !== null) {
-    // A failed launch owns this band with its reason. An IN-FLIGHT
-    // launch renders in the chat thread (RunnerStartingIndicator)
-    // instead — but still suppresses the liveness bands below, which
-    // would misread the not-yet-bound session as stranded.
-    if (sandboxStatus.stage === "failed") {
-      return <SandboxFailedIndicator status={sandboxStatus} />;
-    }
-    return null;
-  }
-  if (unreachable) {
-    // A host-bound session carries the reconnect affordance in the composer's
-    // host badge (ComposerStatusLine), which names the host that dropped — so
-    // render nothing here whenever that composer is on screen (sub-agent
-    // sessions included; their badge carries it just like a normal session's).
-    // The composer is hidden only in the terminal-first *terminal* view (the
-    // PTY owns the surface); there the banner still carries the affordance.
-    // `local_stranded` keeps the banner everywhere (no host, hence no badge).
-    const composerOnScreen = !(terminalFirst?.isTerminalFirst && terminalFirst.view === "terminal");
-    if (liveness.kind === "host_offline" && composerOnScreen) {
-      return nativeBarVisible ? (
-        <div
-          aria-hidden
-          className={cn(
-            "omnigent-native-bottom-spacer",
-            terminalFirst?.view === "chat" && "omnigent-native-bottom-spacer--chat",
-          )}
-        />
-      ) : null;
-    }
-    return (
-      <>
-        <div className={cn("mx-auto mb-4 flex w-full justify-center px-6", CHAT_COLUMN_WIDTH)}>
-          {/* Reconnect affordance styled as the destructive error pill (never
-              raw red text). Keeps its own click → reconnect dialog rather than
-              the ErrorBanner's async Retry, since some states need the picker. */}
-          <button
-            type="button"
-            data-testid="disconnected-indicator"
-            onClick={onShowReconnectHelp}
-            className="flex items-center gap-2 rounded-[12px] px-4 py-2 text-sm text-destructive transition-[filter] hover:brightness-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
-            style={{
-              background:
-                "color-mix(in srgb, var(--destructive) 4%, var(--app-shell-bg, var(--background)))",
-              border: "1px solid color-mix(in srgb, var(--destructive) 32%, transparent)",
-            }}
-          >
-            <WifiOffIcon className="size-3.5 shrink-0" />
-            <span>
-              {liveness.kind === "host_offline"
-                ? "Host is offline — click to reconnect"
-                : "Agent disconnected — click to reconnect"}
-            </span>
-          </button>
-        </div>
-        {nativeBarVisible && (
-          <div
-            aria-hidden
-            className={cn(
-              "omnigent-native-bottom-spacer",
-              terminalFirst?.view === "chat" && "omnigent-native-bottom-spacer--chat",
-            )}
-          />
-        )}
-      </>
-    );
-  }
-
-  // Runner down but the host is up: the runner relaunches on the next message,
-  // but offer a direct Attach so the user recovers without sending one. Only
-  // where the composer is on screen (the terminal-first *terminal* view is
-  // owned by the PTY overlay, which carries its own Resume) and only for owners
-  // (onAttach is undefined otherwise, leaving the silent send-to-wake path).
-  const composerOnScreen = !(terminalFirst?.isTerminalFirst && terminalFirst.view === "terminal");
-  if (liveness.kind === "runner_asleep" && onAttach && composerOnScreen) {
-    return (
-      <div
-        data-testid="runner-asleep-indicator"
-        className={cn(
-          "mx-auto mb-4 flex w-full flex-wrap items-center justify-center gap-x-2 gap-y-1 px-6",
-          CHAT_COLUMN_WIDTH,
-        )}
-      >
-        <span className="flex items-center gap-1.5 text-muted-foreground text-sm">
-          <UnplugIcon className="size-3.5 shrink-0" />
-          Agent disconnected
-        </span>
-        <Button
-          type="button"
-          size="xs"
-          variant="secondary"
-          onClick={handleAttach}
-          disabled={attaching}
-          componentId="diagnostics.session.attach"
-        >
-          {attaching ? "Attaching…" : "Attach"}
-        </Button>
-        {attachError && (
-          <span className="basis-full text-center text-destructive text-sm">{attachError}</span>
-        )}
-      </div>
-    );
-  }
-
-  // Terminal-first sessions: the Chat/Terminal toggle lives in the header
-  // (ViewModeToggle) for every reachable state — only the unreachable
-  // states above replace this band with the reconnect banner. In the iOS
-  // shell the toggle is the native Liquid Glass bar, so this band still
-  // reserves a spacer for its footprint.
-  if (terminalFirst?.isTerminalFirst) {
-    // In the iOS shell the toggle is the native bar (driven above). Render only
-    // a spacer reserving its fixed footprint so the composer clears it — and
-    // nothing when the bar is hidden.
-    if (isIOSShell()) {
-      // Chat reserves a touch less than terminal: the composer's own bottom
-      // content (the status line) already cushions the gap to the bar.
-      return nativeBarVisible ? (
-        <div
-          aria-hidden
-          className={cn(
-            "omnigent-native-bottom-spacer",
-            terminalFirst.view === "chat" && "omnigent-native-bottom-spacer--chat",
-          )}
-        />
-      ) : null;
-    }
-    // Outside the iOS shell the Chat/Terminal switcher lives in the header
-    // (ViewModeToggle) — this band renders nothing for terminal-first
-    // sessions now that the in-page pill is gone.
-    return null;
-  }
-
-  // A regular (non-terminal-first) session whose runner is still spinning
-  // up shows a passive "Connecting…" row — no action, no banner, just a
-  // heartbeat so the empty chat doesn't read as broken.
-  if (liveness.kind === "starting") {
-    return (
-      <div
-        data-testid="connecting-indicator"
-        className={cn(
-          "mx-auto mb-4 flex w-full items-center justify-center gap-2 px-6 py-1.5 text-muted-foreground text-sm",
-          CHAT_COLUMN_WIDTH,
-        )}
-      >
-        <Loader2Icon className="size-3.5 shrink-0 animate-spin" aria-hidden />
-        <span>Connecting…</span>
-      </div>
-    );
-  }
-
-  // `online`/`unknown` for a non-terminal-first session and
-  // `runner_asleep`/`host_asleep` for any session: status lives in the
-  // sidebar / the composer stays open, so render nothing here.
-  return null;
-}
-
-/**
- * Main-pane launch indicator — the single in-thread line for every
- * "session is coming up" state. Two launch shapes feed it, in
- * priority order:
- *
- * 1. A managed-sandbox launch (`sandboxStatus` in flight): shows the
- *    current pipeline stage ("Provisioning sandbox…", "Cloning
- *    repository…", …) for ANY session type.
- * 2. A terminal-first runner spin-up (`terminalStartingUp`): shows the
- *    generic "Starting up…" terminal copy. The sandbox stages win
- *    while both are active — they're strictly more specific.
- *
- * Self-gates to null when neither applies. `hero` is the centered
- * empty-state placeholder (no bubbles yet); `row` is the in-thread
- * spinner beneath the user's first message (the create-then-send path
- * renders that bubble immediately, so the empty state never shows
- * there).
- */
-export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }) {
-  const terminalFirst = useTerminalFirst();
-  const sandboxStatus = useChatStore((s) => s.sandboxStatus);
-  // `ready` never reaches the store (cleared) and `failed` renders the
-  // destructive band in ConnectionIndicator — only in-flight stages
-  // with known copy show here.
-  const sandboxLabel =
-    sandboxStatus !== null && sandboxStatus.stage !== "failed"
-      ? SANDBOX_STAGE_LABELS[sandboxStatus.stage]
-      : undefined;
-  // `terminalStartingUp` is computed for ALL sessions in AppShell (it does not
-  // check isTerminalFirst), so gate on isTerminalFirst too: regular agents
-  // (e.g. polly) get the generic ConnectionIndicator "Connecting…" band and
-  // must not also render this.
-  const terminalSpinUp = Boolean(
-    terminalFirst?.isTerminalFirst && terminalFirst.terminalStartingUp,
-  );
-  if (sandboxLabel === undefined && !terminalSpinUp) {
-    return null;
-  }
-  const line = sandboxLabel !== undefined ? `${sandboxLabel}…` : "Starting up…";
-  // role=status + aria-live so assistive tech announces the transient wait;
-  // the spinner glyph itself is decorative (aria-hidden).
-  if (variant === "hero") {
-    return (
-      <ConversationEmptyState
-        data-testid="runner-starting-indicator"
-        role="status"
-        aria-live="polite"
-        icon={<Loader2Icon className="size-7 animate-spin" aria-hidden />}
-        title={sandboxLabel !== undefined ? `${sandboxLabel}…` : "Starting up…"}
-        description={
-          sandboxLabel !== undefined
-            ? "Setting up your sandbox — this can take a minute."
-            : "This can take a few seconds."
-        }
-      />
-    );
-  }
-  return (
-    <Message
-      from="assistant"
-      data-testid="runner-starting-indicator"
-      role="status"
-      aria-live="polite"
-    >
-      <MessageContent>
-        <span className="flex items-center gap-2 text-muted-foreground text-ui">
-          <Loader2Icon className="size-4 shrink-0 animate-spin" aria-hidden />
-          {line}
-        </span>
-      </MessageContent>
-    </Message>
-  );
-}
-
-// How many still-starting server names the startup band spells out
-// before collapsing the rest into "…" — mirrors the Codex TUI's own
-// startup header, and keeps a 20-server config to one line.
-const MCP_STARTING_NAMES_SHOWN = 3;
-// Cap for the settled warning's failed/cancelled name lists. Longer
-// than the starting cap because these name servers the user may need
-// to fix; beyond this the count carries the signal.
-const MCP_SETTLED_NAMES_SHOWN = 8;
-
-/**
- * The startup band's in-flight line, mirroring the Codex TUI's header.
- *
- * @param starting Still-starting server names, sorted.
- * @param total Total servers in the round.
- * @returns e.g. `"Starting MCP servers (1/20): glean, jira, safe, …"`.
- */
-export function mcpStartingLine(starting: string[], total: number): string {
-  if (total === 1 && starting.length === 1) {
-    return `Starting MCP server: ${starting[0]}…`;
-  }
-  const shown = starting.slice(0, MCP_STARTING_NAMES_SHOWN);
-  if (starting.length > MCP_STARTING_NAMES_SHOWN) shown.push("…");
-  return `Starting MCP servers (${total - starting.length}/${total}): ${shown.join(", ")}`;
-}
-
-/**
- * A settled warning's name list, capped so the band stays scannable.
- *
- * @param names Failed or cancelled server names, sorted.
- * @returns e.g. `"a, b, c, d, e, f, g, h, +12 more"`.
- */
-export function mcpSettledNames(names: string[]): string {
-  if (names.length <= MCP_SETTLED_NAMES_SHOWN) return names.join(", ");
-  const shown = names.slice(0, MCP_SETTLED_NAMES_SHOWN);
-  return `${shown.join(", ")}, +${names.length - MCP_SETTLED_NAMES_SHOWN} more`;
-}
-
-/**
- * Per-MCP-server startup band for native harness sessions (codex-native).
- * Codex defers a mid-startup turn's execution until its MCP servers
- * settle, and the session previously showed nothing during that window.
- * Renders a spinner naming the still-starting servers; once startup
- * settles with failures/cancellations, a one-line notice says which
- * servers never came up. Self-gates to null when the store carries no
- * startup state (an all-ready map is cleared by the store handler).
- */
-export function McpStartupIndicator() {
-  const mcpStartup = useChatStore((s) => s.mcpStartup);
-  if (mcpStartup === null) return null;
-  const names = Object.keys(mcpStartup).sort();
-  const starting = names.filter((name) => mcpStartup[name].status === "starting");
-  if (starting.length > 0) {
-    return (
-      <Message
-        from="assistant"
-        data-testid="mcp-startup-indicator"
-        role="status"
-        aria-live="polite"
-      >
-        <MessageContent>
-          <span className="flex items-center gap-2 text-muted-foreground text-ui">
-            <Loader2Icon className="size-4 shrink-0 animate-spin" aria-hidden />
-            {mcpStartingLine(starting, names.length)}
-          </span>
-        </MessageContent>
-      </Message>
-    );
-  }
-  const failed = names.filter((name) => mcpStartup[name].status === "failed");
-  const cancelled = names.filter((name) => mcpStartup[name].status === "cancelled");
-  if (failed.length === 0 && cancelled.length === 0) return null;
-  const parts: string[] = [];
-  if (failed.length > 0) parts.push(`failed: ${mcpSettledNames(failed)}`);
-  if (cancelled.length > 0) parts.push(`cancelled: ${mcpSettledNames(cancelled)}`);
-  return (
-    <Message from="assistant" data-testid="mcp-startup-indicator" role="status">
-      <MessageContent>
-        <span className="flex items-center gap-2 text-muted-foreground text-ui">
-          <AlertTriangleIcon className="size-4 shrink-0" aria-hidden />
-          {`MCP startup incomplete (${parts.join("; ")})`}
-        </span>
-      </MessageContent>
-    </Message>
-  );
-}
-
-/**
- * Mirrors the Chat/Terminal state onto the iOS shell's native Liquid Glass
- * switcher and routes its taps back into `setView`. Driven by a stable
- * `visible` boolean (not this hook's mount/unmount), so toggling Chat/Terminal
- * updates the bar in place instead of flickering it hidden→shown. A no-op
- * outside the iOS shell; the caller renders its own in-page pill there.
- */
-function useNativeChatTerminalBar(
-  ctx: ReturnType<typeof useTerminalFirst> | null,
-  visible: boolean,
-): void {
-  const native = isIOSShell();
-  const view = ctx?.view ?? "chat";
-  const terminalEnabled = ctx?.isTerminalFirst === true;
-  const terminalStartingUp = ctx?.terminalStartingUp ?? false;
-
-  // Keep `setView` reachable from the subscribe-once effect without
-  // resubscribing whenever the callback identity changes.
-  const setViewRef = useRef(ctx?.setView);
-  setViewRef.current = ctx?.setView;
-
-  // Push current state + visibility down whenever any of it changes.
-  useEffect(() => {
-    if (!native) return;
-    setNativeViewMode({
-      mode: view,
-      terminalEnabled,
-      terminalStartingUp,
-      visible,
-    });
-  }, [native, view, terminalEnabled, terminalStartingUp, visible]);
-
-  // Belt-and-suspenders: hide the bar if the host component ever unmounts.
-  useEffect(() => {
-    if (!native) return;
-    return () => {
-      setNativeViewMode({
-        mode: "chat",
-        terminalEnabled: false,
-        terminalStartingUp: false,
-        visible: false,
-      });
-    };
-  }, [native]);
-
-  // Route native taps back into the web layer.
-  useEffect(() => {
-    if (!native) return;
-    return onNativeViewModeChanged((mode) => setViewRef.current?.(mode));
-  }, [native]);
 }
 
 /**

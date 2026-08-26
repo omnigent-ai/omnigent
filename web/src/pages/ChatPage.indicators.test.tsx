@@ -3,12 +3,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
 import type { Bubble } from "@/lib/renderItems";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
+import { BubbleView } from "./ChatPage";
 import {
-  BubbleView,
   ConnectionIndicator,
   RunnerStartingIndicator,
   SandboxFailedIndicator,
-} from "./ChatPage";
+} from "./ChatIndicators";
 
 // Render-level coverage for the chat surface's status bands and bubble
 // dispatcher. These exercise the branches that the pure-helper tests can't:
