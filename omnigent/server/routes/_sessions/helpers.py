@@ -3950,6 +3950,17 @@ def _publish_status(
     if status == "idle":
         session_live_state.persist_scheduled_run_completion(session_id, "succeeded")
     elif status == "failed":
+        # Canonical server-side broken-turn signal: every server-originated
+        # failed turn (runner disconnect mid-turn, setup/dispatch failure,
+        # rejection) funnels through here, so log once at ERROR for the
+        # dashboard. Relayed runner failures arrive via session_stream and are
+        # already logged runner-side, so they don't reach this path.
+        _logger.error(
+            "session turn failed for %s: %s",
+            session_id,
+            error.message if error is not None else "no detail",
+            extra={"session_id": session_id},
+        )
         session_live_state.persist_scheduled_run_completion(
             session_id,
             "failed",

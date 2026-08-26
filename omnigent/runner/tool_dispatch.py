@@ -5738,7 +5738,12 @@ async def execute_tool(
             output = await _execute_uc_function_tool(tool_name, args, agent_spec=agent_spec)
         else:
             output = await _execute_spec_callable_tool(tool_name, args, agent_spec=agent_spec)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
+        _logger.exception(
+            "tool %s failed",
+            tool_name,
+            extra={"session_id": conversation_id},
+        )
         output = f"Error: {type(exc).__name__}: {exc}"
 
     return output
@@ -7308,7 +7313,8 @@ def _spawn_async_tool(
                 }
             )
             raise
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
+            _logger.exception("async tool %s failed", target_tool)
             session_inbox.put_nowait(
                 {
                     "handle_id": handle_id,

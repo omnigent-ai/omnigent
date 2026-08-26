@@ -358,7 +358,7 @@ describe("BubbleView dispatch", () => {
     // under an answered turn.
     render(<BubbleView bubble={foldOnlyBubble([toolItem("c4")])} />);
     const bubble = screen.getByTestId("message-bubble");
-    expect(bubble).toHaveClass("max-w-3xl");
+    expect(bubble).toHaveClass("max-w-3xl", "min-[2561px]:max-w-[clamp(56rem,28vw,64rem)]");
     expect(bubble.firstElementChild).toHaveClass("w-full");
     expect(bubble.firstElementChild).not.toHaveClass("w-fit");
   });
