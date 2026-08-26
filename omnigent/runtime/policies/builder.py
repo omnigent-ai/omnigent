@@ -570,9 +570,13 @@ def build_policy_engine(
         from omnigent.onboarding.provider_config import load_config
 
         provider_config = load_config()
-        # Get harness kind from spec (canonicalization handled inside
-        # fetch_model_pricing_with_provider for all call sites)
-        harness = spec.harness_kind if hasattr(spec, "harness_kind") else None
+        # Match the harness running this session; an override wins over the
+        # agent's configured executor harness.
+        harness = (
+            conv.harness_override
+            if conv is not None and conv.harness_override
+            else spec.executor.harness_kind
+        )
         token_pricing = fetch_model_pricing_with_provider(
             initial_model, provider_config=provider_config, harness=harness
         )

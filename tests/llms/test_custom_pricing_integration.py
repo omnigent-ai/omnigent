@@ -129,8 +129,21 @@ def test_fetch_pricing_with_custom_provider():
     assert pricing.output_per_token == 0.0
 
 
-def test_fetch_pricing_fallback_to_catalog():
+def test_fetch_pricing_fallback_to_catalog(monkeypatch: pytest.MonkeyPatch):
     """Test that pricing falls back to catalog when no custom pricing."""
+    from omnigent.llms.context_window import ModelPricing
+
+    catalog_pricing = ModelPricing(input_per_token=1.0, output_per_token=2.0)
+    requested_models: list[str] = []
+
+    def fetch_catalog_pricing(model: str) -> ModelPricing:
+        requested_models.append(model)
+        return catalog_pricing
+
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        fetch_catalog_pricing,
+    )
     # Provider with no custom pricing
     provider_config = {
         "providers": {
@@ -146,15 +159,12 @@ def test_fetch_pricing_fallback_to_catalog():
         }
     }
 
-    # Fetch pricing for claude-sdk harness
-    # This should fall back to catalog (which may return None if model not found)
-    # Using a generic model name to avoid hardcoding specific model IDs
-    fetch_model_pricing_with_provider(
+    pricing = fetch_model_pricing_with_provider(
         model="test-model", provider_config=provider_config, harness="claude-sdk"
     )
 
-    # The catalog lookup happens (may or may not find pricing)
-    # This test just ensures no errors and the function doesn't crash
+    assert pricing is catalog_pricing
+    assert requested_models == ["test-model"]
 
 
 def test_compute_cost_with_custom_pricing():
