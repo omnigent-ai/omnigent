@@ -328,9 +328,12 @@ the two are linked. **Then close the superseded PR** (same reason as the fork
 take-over: two open PRs on one issue trip the duplicate-PR automation, which
 auto-closes the newer one — yours): `gh pr comment <old> --body 'Superseded by
 #<yours> — a different approach was needed; see there.'` then `gh pr close <old>`.
-If the close is rejected (e.g. a contributor's PR the App token can't close), note
-it in `maintainer_review` and ask the maintainer to close it — don't leave both
-open. Use this escape hatch deliberately, not for style preferences — a working,
+Closing a PR is a base-repo operation (it flips `state` on the PR object in
+`omnigent-ai/omnigent`), so `pull_requests: write` covers it **even for a
+contributor's fork PR** — expect the close to succeed; run it. Only if it returns
+a real error, record that error in `maintainer_review` and ask the maintainer to
+close it — never leave both open. Use this escape hatch deliberately, not for
+style preferences — a working,
 root-cause-sound PR should be reviewed and improved in place, not replaced.
 
 When you keep the PR, you drive it to landable per Step 4 — pushing fixes directly
@@ -638,10 +641,13 @@ can land a fix depends on where its branch lives:
       gh pr close <fork-pr>
       ```
       This both keeps the contributor informed and stops the dedup bot from closing
-      your PR as the duplicate. If the close is rejected (an App token may not be
-      able to close a contributor’s fork PR), **say so in `maintainer_review`** and
-      ask the maintainer to close `#<fork-pr>` in favor of yours — never leave both
-      silently open.
+      your PR as the duplicate. Closing a PR is a base-repo operation (it flips
+      `state` on the PR object in `omnigent-ai/omnigent`), so `pull_requests: write`
+      covers it **even though the head branch is on a fork** — the fork-push
+      restriction does not apply to a close. Expect it to succeed; run it. Only if
+      the close returns a real error, **record that error in `maintainer_review`**
+      and ask the maintainer to close `#<fork-pr>` in favor of yours — never leave
+      both silently open.
     - Set `mode: "authored_fix"`, record the fork PR's number in `reviewed_pr_url`,
       and drive **your** PR through the rest of Step 4 (you can push to it).
   - **If the fork PR needs no fix** (repro passes against it, CI green, review
