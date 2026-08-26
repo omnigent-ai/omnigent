@@ -7,6 +7,7 @@ packages contribute additional harnesses through the
 
 from __future__ import annotations
 
+import dataclasses
 import importlib
 import importlib.metadata
 import logging
@@ -42,6 +43,7 @@ from omnigent.harness_capabilities import (
     Resume,
 )
 from omnigent.harness_install_spec import HarnessInstallSpec
+from omnigent.inner.devin import DEVIN_ACP_EXTENSION
 
 _logger = logging.getLogger(__name__)
 
@@ -648,6 +650,15 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
 for _acp_cli_name in ACP_CLI_HARNESSES:
     _BUILTIN_CAPABILITIES[_acp_cli_name] = _BUILTIN_CAPABILITIES["acp"]
 
+# Devin is the one row that diverges: its own wrap injects a vendor extension
+# (omnigent.inner.devin), so it surfaces the agent's sub-agents as child sessions
+# where a generic ACP agent cannot. Derived from the extension so this declared
+# capability cannot drift from the dialect that implements it.
+_BUILTIN_CAPABILITIES["devin"] = dataclasses.replace(
+    _BUILTIN_CAPABILITIES["acp"],
+    subagents=DEVIN_ACP_EXTENSION.surfaces_subagents,
+)
+
 
 _BUILTIN_CONTRIBUTION = HarnessContribution(
     name="omnigent",
@@ -683,9 +694,12 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         | set(ACP_CLI_HARNESSES)
     ),
     harness_modules={
-        # Every catalog row runs the shared generic ACP wrap.
+        # Every catalog row runs the shared generic ACP wrap...
         **dict.fromkeys(ACP_CLI_HARNESSES, "omnigent.inner.acp_harness"),
         "acp": "omnigent.inner.acp_harness",
+        # ...except a row with vendor behavior, which runs its own thin wrap to
+        # inject an AcpExtension into the same shared executor.
+        "devin": "omnigent.inner.devin.harness",
         "antigravity": "omnigent.inner.antigravity_harness",
         "antigravity-native": "omnigent.inner.antigravity_native_harness",
         "claude-native": "omnigent.inner.claude_native_harness",

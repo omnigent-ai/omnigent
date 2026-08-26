@@ -60,6 +60,7 @@ from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
+from omnigent.inner.acp_extension import NO_ACP_EXTENSION, AcpExtension
 from omnigent.inner.acp_subagents import SubAgentStart, read_subagent_events
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
@@ -302,6 +303,8 @@ class AcpExecutor(Executor):
         config: AcpAgentConfig,
         cwd: str | None = None,
         os_env: OSEnvSpec | None = None,
+        *,
+        extension: AcpExtension = NO_ACP_EXTENSION,
     ) -> None:
         """Initialize the generic ACP executor.
 
@@ -311,8 +314,13 @@ class AcpExecutor(Executor):
         :param os_env: Environment / sandbox spec. When its ``sandbox`` is not
             ``"none"``, the whole agent process tree is wrapped in the platform
             sandbox (bwrap/seatbelt) at spawn — see :meth:`_sandbox_launch_path`.
+        :param extension: Vendor behavior for the agent being driven, injected by
+            that vendor's harness wrap (e.g.
+            :mod:`omnigent.inner.devin.harness`). The default is protocol-only,
+            so the generic ``acp`` harness reads no vendor field.
         """
         self._config = config
+        self._extension = extension
         self._cwd = cwd or os.getcwd()
         self._os_env = os_env
         # Advertise ``clientCapabilities.fs`` so the agent delegates file
@@ -1229,11 +1237,11 @@ class AcpExecutor(Executor):
         elif update_type == _UPDATE_CONFIG_OPTION:
             self._note_config_options(update.get("configOptions"))
 
-        # Sub-agent lifecycle rides on these updates in a per-agent dialect
-        # (Devin: cognition.ai/subagent_* on the _meta). A source recognizes its
-        # own dialect and normalizes it; the runner mints a child session per
-        # start so the "Subagents" panel lists it. See omnigent.inner.acp_subagents.
-        for sub in read_subagent_events(update):
+        # Sub-agent lifecycle rides on these updates in a per-agent dialect, so
+        # only the sources this agent's extension supplies can recognize it —
+        # none for a generic ACP agent. The runner mints a child session per
+        # start so the "Subagents" panel lists it.
+        for sub in read_subagent_events(update, self._extension.subagent_sources):
             if isinstance(sub, SubAgentStart):
                 events.append(
                     SubAgentStarted(child_key=sub.child_key, title=sub.title, task=sub.task)

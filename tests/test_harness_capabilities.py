@@ -29,6 +29,7 @@ from omnigent.harness_plugins import (
     native_agents,
     valid_harnesses,
 )
+from omnigent.inner.devin import DEVIN_ACP_EXTENSION
 from omnigent.model_override import (
     _ANTIGRAVITY_FAMILY_HARNESSES,
     _CLAUDE_FAMILY_HARNESSES,
@@ -71,10 +72,24 @@ def test_model_family_matches_model_override_sets() -> None:
             assert family is ModelFamily.MULTI, harness
 
 
-def test_subagents_matches_native_wrapper_label() -> None:
-    # subagents is derivable: only native agents with a subagent_wrapper_label
-    # can spawn Omnigent native sub-agents.
+def test_subagents_matches_its_implementing_mechanism() -> None:
+    """``subagents`` is derivable — from the two mechanisms that implement it.
+
+    1. A **native** agent with a ``subagent_wrapper_label``: Omnigent intercepts
+       the vendor's own spawn and mints the child session.
+    2. An **ACP vendor extension** carrying a sub-agent dialect
+       (:mod:`omnigent.inner.devin`): the agent reports its sub-agent lifecycle in
+       its own ``_meta``, and the runner mints the child from that. No native
+       wrapper label is involved — deliberately, since the child inherits its
+       parent's harness identity rather than claiming a vendor's.
+
+    Keeping the derivation here means a harness cannot publish a ``subagents``
+    capability on ``/v1/harnesses`` that nothing implements, or implement one it
+    does not publish.
+    """
     subagent_capable = {agent.harness for agent in native_agents() if agent.subagent_wrapper_label}
+    if DEVIN_ACP_EXTENSION.surfaces_subagents:
+        subagent_capable.add("devin")
     for harness, capability in harness_capabilities().items():
         expected = harness in subagent_capable
         assert capability.subagents == expected, harness

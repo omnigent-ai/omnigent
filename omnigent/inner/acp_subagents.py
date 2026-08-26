@@ -1,32 +1,26 @@
-"""Surface an ACP agent's sub-agents as Omnigent child sessions.
+"""Normalized sub-agent lifecycle for ACP agents.
 
 The Agent Client Protocol has not standardized sub-agents. An RFD proposes a
 ``tool_call`` with ``kind: "subagent"`` plus a ``childSessionId`` and a distinct
 child ``sessionId``, but no shipping agent emits that yet, so an agent that
-spawns sub-agents reports them in its own dialect. Devin, for instance, carries
-the whole lifecycle in vendor ``_meta`` on a ``tool_call_update`` whose
-``toolCallId`` is the sub-agent's ``agentId``::
+spawns sub-agents reports them in its own dialect.
 
-    _meta["cognition.ai/subagent_started"]   = {agentId, title, task}
-    _meta["cognition.ai/subagent_completed"] = {agentId, success, summary}
-
-An :class:`AcpSubAgentSource` maps one such dialect onto a small normalized
-lifecycle (:class:`SubAgentStart` / :class:`SubAgentEnd`).
-:class:`~omnigent.inner.acp_executor.AcpExecutor` runs the registered sources
-over every ``session/update`` and emits the matching
+This module owns only the **generic** half: a small normalized lifecycle
+(:class:`SubAgentStart` / :class:`SubAgentEnd`) and the
+:class:`AcpSubAgentSource` protocol that maps one dialect onto it. It reads no
+vendor field and names no vendor;
+:class:`~omnigent.inner.acp_executor.AcpExecutor` runs whatever sources its
+:class:`~omnigent.inner.acp_extension.AcpExtension` supplies and emits
 :class:`~omnigent.inner.executor.SubAgentStarted` /
-:class:`~omnigent.inner.executor.SubAgentCompleted` events; the runner turns
-those into child sessions via the same ``external_subagent_start`` path the
-native harnesses already use, so the web "Subagents" panel lists one row per
-child.
+:class:`~omnigent.inner.executor.SubAgentCompleted`, which the runner turns into
+Omnigent child sessions so the web "Subagents" panel lists one row per child.
 
-Supporting another agent's sub-agents means adding one source here — the
-executor, adapter, runner, and server child-session machinery are untouched. A
-source **self-gates** by recognizing its own dialect's markers, so it is inert
-for agents that don't speak it (Devin's source fires only on ``cognition.ai/*``
-keys) and there is no per-harness switch to maintain. When ACP standardizes the
-sub-agent convention, a single source keyed on the standard fields covers every
-compliant agent at once.
+A vendor's dialect lives with that vendor — see
+:class:`omnigent.inner.devin.subagents.DevinSubAgentSource` for the worked
+example — so supporting another agent means adding one source in that agent's
+own package, with nothing here or downstream to change. When ACP standardizes
+the convention, a single source keyed on the standard fields covers every
+compliant agent at once, and can ship here rather than per-vendor.
 """
 
 from __future__ import annotations
@@ -58,7 +52,7 @@ class SubAgentEnd:
 
     :param child_key: Matches the originating :attr:`SubAgentStart.child_key`.
     :param ok: Whether the sub-agent reported success.
-    :param summary: The sub-agent's closing summary, shown on the child row.
+    :param summary: The sub-agent's closing summary, shown in the child chat.
     """
 
     child_key: str
@@ -75,73 +69,30 @@ class AcpSubAgentSource(Protocol):
 
     Pure and stateless: given a single ACP ``session/update`` payload (the
     ``params.update`` object, which carries ``sessionUpdate`` and any ``_meta``),
-    return the sub-agent lifecycle events it carries — almost always none. An
-    implementation MUST self-gate on its own dialect's markers so it stays inert
-    for agents that don't speak it.
+    return the sub-agent lifecycle events it carries — almost always none.
+
+    An implementation MUST self-gate on its own dialect's markers rather than
+    assume it is only handed its own vendor's traffic. Two reasons: a source is
+    the only thing that knows its dialect, and self-gating means a source stays
+    correct if an agent's fork or a future multi-dialect wrap sends it frames it
+    does not recognize.
     """
 
     def read(self, update: Mapping[str, Any]) -> Sequence[SubAgentEvent]: ...
 
 
-# --- Devin (Cognition) --------------------------------------------------------
-# Devin conveys the sub-agent lifecycle only through vendor ``_meta``; there is
-# no ACP-standard field to read. The sub-agent's ``agentId`` is the stable key.
-_DEVIN_STARTED = "cognition.ai/subagent_started"
-_DEVIN_COMPLETED = "cognition.ai/subagent_completed"
-
-
-class DevinSubAgentSource:
-    """Reads Devin's ``cognition.ai/subagent_*`` ``_meta`` lifecycle.
-
-    Fires only when those keys are present, so it is inert for every other ACP
-    agent — the ``devin``-only gating is the dialect itself, not a harness check.
-    """
-
-    def read(self, update: Mapping[str, Any]) -> Sequence[SubAgentEvent]:
-        meta = update.get("_meta")
-        if not isinstance(meta, Mapping):
-            return ()
-        events: list[SubAgentEvent] = []
-        started = meta.get(_DEVIN_STARTED)
-        if isinstance(started, Mapping):
-            agent_id = started.get("agentId")
-            if isinstance(agent_id, str) and agent_id:
-                events.append(
-                    SubAgentStart(
-                        child_key=agent_id,
-                        title=str(started.get("title") or agent_id),
-                        task=str(started.get("task") or ""),
-                    )
-                )
-        completed = meta.get(_DEVIN_COMPLETED)
-        if isinstance(completed, Mapping):
-            agent_id = completed.get("agentId")
-            if isinstance(agent_id, str) and agent_id:
-                events.append(
-                    SubAgentEnd(
-                        child_key=agent_id,
-                        ok=bool(completed.get("success", True)),
-                        summary=str(completed.get("summary") or ""),
-                    )
-                )
-        return tuple(events)
-
-
-# The dialects :class:`AcpExecutor` consults, in order. Each self-gates, so
-# listing a source is harmless for agents that don't speak its dialect. Add a
-# new vendor source — or the eventual ACP-standard subagent source — here.
-DEFAULT_ACP_SUBAGENT_SOURCES: tuple[AcpSubAgentSource, ...] = (DevinSubAgentSource(),)
-
-
 def read_subagent_events(
     update: Mapping[str, Any],
-    sources: Sequence[AcpSubAgentSource] = DEFAULT_ACP_SUBAGENT_SOURCES,
+    sources: Sequence[AcpSubAgentSource],
 ) -> list[SubAgentEvent]:
     """Run every source over one ``session/update``; return all events found.
 
     :param update: The ACP ``params.update`` object.
-    :param sources: Dialects to try; defaults to :data:`DEFAULT_ACP_SUBAGENT_SOURCES`.
-    :returns: All sub-agent lifecycle events the sources recognized (usually empty).
+    :param sources: Dialects to try, from the executor's
+        :class:`~omnigent.inner.acp_extension.AcpExtension`. Empty (the generic
+        ACP harness) short-circuits to no events.
+    :returns: All sub-agent lifecycle events the sources recognized (usually
+        empty).
     """
     out: list[SubAgentEvent] = []
     for source in sources:
