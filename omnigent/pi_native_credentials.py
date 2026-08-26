@@ -314,6 +314,8 @@ class PiProviderConfig:
             surface = self._fallback_surface()
             if not self._primary_claude_only:
                 # The primary's api came from the model's own family.
+                # Non-Databricks anthropic-messages providers use thinking.type.enabled;
+                # set reasoning:true so Pi's thinking level controls are enabled.
                 base: _PiModelEntry = (
                     {"id": self.model, "input": ["text", "image"]}
                     if self.extra_models
@@ -323,7 +325,10 @@ class PiProviderConfig:
                     base["reasoning"] = True
                 models.append(base)
             elif surface is DatabricksPiSurface.ANTHROPIC:
-                models.append({"id": self.model, "input": ["text", "image"], "reasoning": True})
+                # Databricks anthropic-messages uses thinking.type.adaptive (not
+                # thinking.type.enabled), which Pi 0.84.x does not support;
+                # omit reasoning:true so Pi does not attempt extended thinking.
+                models.append({"id": self.model, "input": ["text", "image"]})
             elif surface is not None:
                 self._register_on_surface(additional, surface)
             else:
@@ -344,17 +349,6 @@ class PiProviderConfig:
         }
         if self.auth_header:
             provider["authHeader"] = True
-        # anthropic-messages providers support extended thinking; Pi gates the
-        # thinking level controls on this compat flag and silently falls back to
-        # off when it is absent or false.
-        if self.api == "anthropic-messages":
-            provider["compat"] = {
-                "supportsDeveloperRole": False,
-                "supportsStore": False,
-                "supportsStrictMode": False,
-                "supportsReasoningEffort": True,
-                "supportsUsageInStreaming": False,
-            }
         providers = {self.provider_id: provider}
         providers.update(additional)
         return {"providers": providers}
