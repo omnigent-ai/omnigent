@@ -289,8 +289,9 @@ reproduction test is your objective instrument.
    merge gate (a human maintainer's approval is always required); it's an
    *indicator* for that maintainer. Choose:
    - **`fixed` and you never pushed to or authored this code** (pure reviewer: the
-     repro test passes against the PR as-is, CI green, Polly clean, no fix from you
-     was needed) → submit an **approving** review: `gh pr review <pr> --approve
+     repro test passes against the PR as-is, CI green, Polly clean, **the branch is
+     mergeable** — not `CONFLICTING`/`DIRTY` — and no fix from you was needed) →
+     submit an **approving** review: `gh pr review <pr> --approve
      --body '…'`. A genuine independent verification — the "someone checked it, take
      your pass" signal a maintainer wants. Note in the body that it's an automated
      reviewer's approval and a maintainer's approval is still required to merge.
@@ -726,9 +727,46 @@ that no URL was produced, and in 4.4/4.5 fall back to "run against your own app"
 with the same `-p` command minus a preview `--server`. The preview is a
 convenience, not a gate.
 
-### 4.2 — Drive CI to green
+### 4.2 — Keep the branch mergeable, then drive CI to green
 
-Watch the PR's checks and don't consider the work done until they pass:
+**First, the branch must merge cleanly into latest `origin/main`.** A PR can pass
+CI and still be un-landable because `main` moved under it — GitHub reports this as
+`mergeable: CONFLICTING` / `mergeStateStatus: DIRTY`, and a conflicted branch is
+**not done** no matter how green its checks look (its CI and preview ran against a
+stale base). Never report `fixed` on a branch that doesn't merge. Check it, and
+re-check after every push and again right before the final verdict (4.5):
+
+```
+gh pr view <pr> --json mergeable,mergeStateStatus,baseRefName
+```
+
+- **`mergeable: MERGEABLE`** (clean) → proceed to CI below.
+- **`CONFLICTING` / `DIRTY`, or behind by enough to matter** → **rebase onto latest
+  `origin/main` and resolve the conflicts** before anything else. On a branch you
+  can push to (your PR, or an in-repo branch):
+
+  ```
+  git fetch origin main
+  git rebase origin/main        # resolve conflicts: edit, `git add`, `git rebase --continue`
+  # re-run the repro test + your targeted tests after resolving, then:
+  git push --force-with-lease
+  ```
+
+  Resolve conflicts by **understanding both sides**, not by blindly taking one —
+  the incoming `main` change may interact with the fix. After resolving, **re-run
+  the repro test and your targeted tests** (the merge may have silently broken the
+  fix), then force-push. On a **fork PR you can't push to**, a conflict is one more
+  reason to **take over** into your own PR (Step 4 preamble): branch off latest
+  `main`, replay their commits (`git cherry-pick` / `am`), resolve there, and
+  continue on your PR. If a rebase is beyond mechanical resolution (a deep semantic
+  conflict you can't confidently settle), don't guess — say so in the handoff and
+  leave it for the maintainer rather than force-pushing a bad merge.
+
+  `mergeable` can read `UNKNOWN` briefly while GitHub computes it — re-poll a few
+  seconds later before concluding.
+
+**Then drive CI to green.** Watch the PR's checks and don't consider the work done
+until they pass:
 
 ```
 gh pr checks <pr> --watch --json name,state,bucket,link
@@ -873,8 +911,12 @@ lives in the PR body and the maintainer comment.
 
 ### 4.5 — Submit the final review verdict, then tag the maintainer
 
-When CI is green (4.2) **and** the automated review is clean (4.3), you're done
-iterating — now record your verdict and hand off to a human.
+When the branch is **mergeable** (4.2 — re-check `mergeable` now; `main` may have
+moved again since your last push), CI is green (4.2), **and** the automated review
+is clean (4.3), you're done iterating — now record your verdict and hand off to a
+human. A `CONFLICTING`/`DIRTY` branch is **not** `fixed`: rebase and resolve
+(4.2) before you submit a verdict, or, if you truly can't, downgrade the outcome
+and say the PR needs a conflict resolution the maintainer must do.
 
 **First, submit your final review** per the verdict rule in 2A.5 (review path
 only): **approve** when you were a pure reviewer and the PR is `fixed` (you pushed
