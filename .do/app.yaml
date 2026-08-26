@@ -1,0 +1,105 @@
+name: omnigent
+region: sgp
+services:
+  - name: server
+    github:
+      repo: singhrover/omnigent
+      branch: main
+      deploy_on_push: true
+    source_dir: /
+    dockerfile_path: deploy/docker/Dockerfile
+    run_command: python /app/digitalocean-entrypoint.py
+    http_port: 8000
+    instance_count: 1
+    instance_size_slug: apps-s-1vcpu-2gb
+    health_check:
+      http_path: /health
+      initial_delay_seconds: 30
+      period_seconds: 10
+      timeout_seconds: 5
+      success_threshold: 1
+      failure_threshold: 6
+    termination:
+      drain_seconds: 15
+      grace_period_seconds: 120
+    envs:
+      - key: PORT
+        value: "8000"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: OMNIGENT_EXTRAS
+        value: s3
+        scope: BUILD_TIME
+        type: GENERAL
+      - key: OMNIGENT_PUBLIC_URL
+        value: ${APP_URL}
+        scope: RUN_TIME
+        type: GENERAL
+      - key: OMNIGENT_AUTH_PROVIDER
+        value: accounts
+        scope: RUN_TIME
+        type: GENERAL
+      - key: OMNIGENT_FEATURES
+        value: harness_install
+        scope: RUN_TIME
+        type: GENERAL
+      - key: DIGITALOCEAN_REGION
+        value: sgp1
+        scope: RUN_TIME
+        type: GENERAL
+      - key: DIGITALOCEAN_DROPLET_SIZE
+        value: s-4vcpu-8gb
+        scope: RUN_TIME
+        type: GENERAL
+      - key: DIGITALOCEAN_DROPLET_IMAGE
+        value: ubuntu-24-04-x64
+        scope: RUN_TIME
+        type: GENERAL
+      - key: DIGITALOCEAN_WORKSPACE_SIZE_GB
+        value: "100"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: DIGITALOCEAN_WORKSPACE_MOUNT_PATH
+        value: /workspace
+        scope: RUN_TIME
+        type: GENERAL
+      - key: OMNIGENT_DIGITALOCEAN_HOST_IMAGE
+        value: ghcr.io/omnigent-ai/omnigent-host:latest
+        scope: RUN_TIME
+        type: GENERAL
+      - key: DATABASE_URL
+        scope: RUN_TIME
+        type: SECRET
+      - key: DIGITALOCEAN_TOKEN
+        scope: RUN_TIME
+        type: SECRET
+      - key: OMNIGENT_ACCOUNTS_COOKIE_SECRET
+        scope: RUN_TIME
+        type: SECRET
+      - key: OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD
+        scope: RUN_TIME
+        type: SECRET
+      - key: OMNIGENT_ARTIFACT_URI
+        value: s3://REPLACE_WITH_SPACES_BUCKET/omnigent
+        scope: RUN_TIME
+        type: GENERAL
+      - key: AWS_ENDPOINT_URL_S3
+        value: https://sgp1.digitaloceanspaces.com
+        scope: RUN_TIME
+        type: GENERAL
+      - key: AWS_ACCESS_KEY_ID
+        scope: RUN_TIME
+        type: SECRET
+      - key: AWS_SECRET_ACCESS_KEY
+        scope: RUN_TIME
+        type: SECRET
+alerts:
+  - rule: DEPLOYMENT_FAILED
+  - rule: DOMAIN_FAILED
+ingress:
+  rules:
+    - component:
+        name: server
+      match:
+        path:
+          prefix: /

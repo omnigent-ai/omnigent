@@ -1,0 +1,109 @@
+name: DigitalOcean validation
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - '.do/**'
+      - 'deploy/digitalocean/**'
+      - 'deploy/docker/Dockerfile'
+      - 'omnigent/onboarding/sandboxes/**'
+      - 'omnigent/server/managed_hosts.py'
+      - 'omnigent/server/routes/hosts.py'
+      - 'tests/onboarding/sandboxes/**'
+      - 'tests/server/test_managed_hosts.py'
+      - '.github/workflows/digitalocean.yml'
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: digitalocean-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  OMNIGENT_SKIP_WEB_UI: "true"
+  UV_INDEX_URL: https://pypi.org/simple
+  PIP_INDEX_URL: https://pypi.org/simple
+
+jobs:
+  provider:
+    name: Provider and App Spec
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version-file: .python-version
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v3
+        with:
+          enable-cache: true
+
+      - name: Install locked dependencies
+        run: uv sync --locked --extra all --group dev
+
+      - name: Validate YAML and DigitalOcean configuration
+        run: |
+          uv run python - <<'PY'
+          from pathlib import Path
+          import yaml
+
+          for path in (Path('.do/app.yaml'), Path('.github/workflows/digitalocean.yml')):
+              value = yaml.safe_load(path.read_text())
+              if not isinstance(value, dict):
+                  raise SystemExit(f'{path} must contain a YAML mapping')
+          spec = yaml.safe_load(Path('.do/app.yaml').read_text())
+          service = spec['services'][0]
+          assert spec['region'] == 'sgp'
+          assert service['github']['deploy_on_push'] is True
+          assert service['http_port'] == 8000
+          assert service['health_check']['http_path'] == '/health'
+          PY
+
+      - name: Run DigitalOcean provider tests
+        run: >-
+          uv run pytest
+          tests/deploy/test_digitalocean_entrypoint.py
+          tests/onboarding/sandboxes/test_digitalocean.py
+          tests/onboarding/sandboxes/test_registry.py
+          tests/server/test_managed_hosts.py
+          -q
+
+      - name: Run Python type checking
+        run: uv run pyrefly check
+
+      - name: Check patch whitespace
+        run: git diff --check
+
+  docker:
+    name: DigitalOcean Docker build
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Build App Platform image without pushing
+        run: >-
+          docker build
+          --build-arg OMNIGENT_EXTRAS=s3
+          --tag omnigent-digitalocean:ci
+          --file deploy/docker/Dockerfile
+          .
+
+      - name: Verify DigitalOcean entrypoint is present
+        run: >-
+          docker run --rm --entrypoint python
+          omnigent-digitalocean:ci
+          -m py_compile
+          /app/digitalocean-entrypoint.py

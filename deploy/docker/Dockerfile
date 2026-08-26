@@ -379,6 +379,7 @@ RUN apt-get update \
 COPY --from=server-builder /opt/venv /opt/venv
 COPY --from=server-builder /build /build
 COPY deploy/docker/entrypoint.py /app/entrypoint.py
+COPY deploy/digitalocean/entrypoint.py /app/digitalocean-entrypoint.py
 
 WORKDIR /app
 

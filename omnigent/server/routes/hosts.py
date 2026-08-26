@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
@@ -55,6 +55,9 @@ from omnigent.server.schemas import SessionGitOptions
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
+
+if TYPE_CHECKING:
+    from omnigent.server.managed_hosts import ManagedSandboxDeployment
 
 _logger = logging.getLogger(__name__)
 
@@ -550,6 +553,7 @@ def create_hosts_router(
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
     feature_flags: FeatureFlags | None = None,
+    sandbox_config: ManagedSandboxDeployment | None = None,
 ) -> APIRouter:
     """Build the router for host REST endpoints.
 
@@ -572,6 +576,8 @@ def create_hosts_router(
         ``os_env.cwd`` boundary. Paired with ``agent_store``.
     :param feature_flags: Immutable deployment release-feature snapshot.
         When omitted, resolves ``OMNIGENT_FEATURES`` at router construction.
+    :param sandbox_config: Managed-provider configuration used by the explicit
+        suspend, resume, and permanent-delete lifecycle endpoints.
     :returns: A FastAPI router with host endpoints.
     """
     flags = feature_flags or resolve_feature_flags()
@@ -675,6 +681,48 @@ def create_hosts_router(
             "gateway_inference": host_registry.gateway_inference(host.host_id),
             "runners": [],
         }
+
+    async def _owned_managed_host(request: Request, host_id: str) -> Host:
+        user_id = require_user(request, auth_provider)
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.user_id != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+        if host.sandbox_id is None or host.sandbox_provider is None:
+            raise HTTPException(status_code=409, detail="host is not server-managed")
+        return host
+
+    @router.post("/hosts/{host_id}/suspend")
+    async def suspend_host(request: Request, host_id: str) -> dict[str, str]:
+        """Destroy managed compute while retaining its persistent workspace."""
+        from omnigent.server.managed_hosts import suspend_managed_host
+
+        host = await _owned_managed_host(request, host_id)
+        await suspend_managed_host(host, host_store, sandbox_config)
+        return {"object": "host_lifecycle", "host_id": host.host_id, "status": "suspended"}
+
+    @router.post("/hosts/{host_id}/resume")
+    async def resume_host(request: Request, host_id: str) -> dict[str, str]:
+        """Create fresh managed compute and reattach the preserved workspace."""
+        from omnigent.server.managed_hosts import resume_managed_host
+
+        host = await _owned_managed_host(request, host_id)
+        if host_is_live(host):
+            return {"object": "host_lifecycle", "host_id": host.host_id, "status": "online"}
+        await resume_managed_host(host.host_id, host_store, sandbox_config, force=True)
+        refreshed = await asyncio.to_thread(host_store.get_host, host.host_id)
+        status = "online" if refreshed is not None and host_is_live(refreshed) else "offline"
+        return {"object": "host_lifecycle", "host_id": host.host_id, "status": status}
+
+    @router.delete("/hosts/{host_id}")
+    async def delete_managed_host(request: Request, host_id: str) -> dict[str, str]:
+        """Permanently delete managed compute, workspace storage, and registration."""
+        from omnigent.server.managed_hosts import terminate_managed_host
+
+        host = await _owned_managed_host(request, host_id)
+        await terminate_managed_host(host, host_store, sandbox_config)
+        return {"object": "host_lifecycle", "host_id": host.host_id, "status": "deleted"}
 
     @router.get("/hosts/{host_id}/harnesses/{harness}/model-options")
     async def get_host_model_options(

@@ -413,6 +413,7 @@ class SandboxLifecycle(ABC):
             local_port_forward=self.supports_local_port_forward,
             resume_stopped=self.can_resume,
             programmatic_terminate=self._is_capability_overridden("terminate"),
+            suspend_compute=self._is_capability_overridden("suspend"),
             file_copy=self._is_capability_overridden("put"),
             streaming_exec=self._is_capability_overridden("stream_exec"),
             foreground_exec=self._is_capability_overridden("exec_foreground"),
@@ -556,6 +557,10 @@ class SandboxLifecycle(ABC):
             "sandbox termination — delete the sandbox with the provider's "
             "own tooling."
         )
+
+    def suspend(self, sandbox_id: str) -> None:
+        """Release compute while retaining provider-managed durable storage."""
+        raise self._capability_error("suspend compute while preserving the workspace")
 
     def resume(self, sandbox_id: str) -> None:
         """

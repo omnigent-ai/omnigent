@@ -69,6 +69,7 @@ def test_plugin_state_loads_builtins() -> None:
     assert "modal" in state
     assert "blaxel" in state
     assert "kubernetes" in state
+    assert "digitalocean" in state
 
 
 def test_plugin_state_is_cached() -> None:
@@ -95,6 +96,7 @@ def test_available_providers_returns_builtins() -> None:
     assert "modal" in names
     assert "blaxel" in names
     assert "kubernetes" in names
+    assert "digitalocean" in names
 
 
 def test_get_provider_metadata_known_provider() -> None:

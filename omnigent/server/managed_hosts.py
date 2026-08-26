@@ -96,6 +96,12 @@ stores into ``create_app``):
            env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES injected
                                              # as sandbox env
            cluster: my-gateway              # optional OpenShell gateway name
+         digitalocean:            # optional block (provider: digitalocean)
+           region: sgp1
+           size: s-4vcpu-8gb
+           image: ubuntu-24-04-x64
+           host_image: ghcr.io/omnigent-ai/omnigent-host:latest
+           workspace: {size_gb: 100, mount_path: /workspace}
 
    Most providers default to a public prebaked host image, so
    ``provider`` + ``server_url`` is a complete config. Registry-backed
@@ -180,6 +186,7 @@ SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
         "e2b",
         "openshell",
         "kubernetes",
+        "digitalocean",
     }
 )
 PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
@@ -193,6 +200,7 @@ PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
         "e2b",
         "openshell",
         "kubernetes",
+        "digitalocean",
     }
 )
 
@@ -253,6 +261,12 @@ OPENSHELL_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 # reconnects while still expiring tokens of Pods nobody deleted. A relaunch
 # mints a fresh token (and the per-Pod token Secret is replaced).
 KUBERNETES_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
+
+# DigitalOcean compute generations are explicitly deleted on suspend and a
+# resume mints a fresh token for the replacement Droplet. Seven days matches
+# the other operator-managed providers and permits tunnel reconnects while a
+# Droplet remains active.
+DIGITALOCEAN_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 
 # The cwsandbox launch-token TTL is NOT a constant: CW Sandbox's lifetime is
 # operator-overridable (OMNIGENT_CWSANDBOX_MAX_LIFETIME_S), so the TTL is
@@ -1147,6 +1161,55 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
             workspace=_parse_provider_string(raw, "openshell", "workspace"),
         )
         token_ttl_s = OPENSHELL_MANAGED_TOKEN_TTL_S
+    elif provider == "digitalocean":
+        section = _parse_provider_section(raw, "digitalocean")
+        if section is not None:
+            _reject_unknown_keys(
+                section,
+                {"region", "size", "image", "host_image", "workspace"},
+                "sandbox.digitalocean",
+            )
+        workspace = section.get("workspace") if section is not None else None
+        if workspace is not None and not isinstance(workspace, dict):
+            raise ValueError("server config 'sandbox.digitalocean.workspace' must be a mapping")
+        if isinstance(workspace, dict):
+            _reject_unknown_keys(
+                workspace,
+                {"size_gb", "mount_path"},
+                "sandbox.digitalocean.workspace",
+            )
+        workspace_size_gb = None
+        mount_path = None
+        if isinstance(workspace, dict):
+            raw_size = workspace.get("size_gb")
+            if raw_size is not None:
+                if isinstance(raw_size, bool) or not isinstance(raw_size, int) or raw_size <= 0:
+                    raise ValueError(
+                        "server config 'sandbox.digitalocean.workspace.size_gb' "
+                        "must be a positive integer"
+                    )
+                workspace_size_gb = raw_size
+            raw_mount = workspace.get("mount_path")
+            if raw_mount is not None:
+                if (
+                    not isinstance(raw_mount, str)
+                    or not raw_mount.startswith("/")
+                    or raw_mount == "/"
+                ):
+                    raise ValueError(
+                        "server config 'sandbox.digitalocean.workspace.mount_path' "
+                        "must be an absolute non-root path"
+                    )
+                mount_path = raw_mount.rstrip("/")
+        launcher_factory = _digitalocean_launcher_factory(
+            region=_parse_provider_string(raw, "digitalocean", "region"),
+            size=_parse_provider_string(raw, "digitalocean", "size"),
+            image=_parse_provider_string(raw, "digitalocean", "image"),
+            host_image=_parse_provider_string(raw, "digitalocean", "host_image"),
+            workspace_size_gb=workspace_size_gb,
+            mount_path=mount_path,
+        )
+        token_ttl_s = DIGITALOCEAN_MANAGED_TOKEN_TTL_S
     elif provider == "kubernetes":
         kubernetes_section = _parse_provider_section(raw, "kubernetes")
         if kubernetes_section is not None:
@@ -1888,6 +1951,40 @@ def _openshell_launcher_factory(
         from omnigent.onboarding.sandboxes.openshell import OpenShellSandboxLauncher
 
         return OpenShellSandboxLauncher(image=image, env=env, cluster=cluster, workspace=workspace)
+
+    return _build
+
+
+def _digitalocean_launcher_factory(
+    *,
+    region: str | None,
+    size: str | None,
+    image: str | None,
+    host_image: str | None,
+    workspace_size_gb: int | None,
+    mount_path: str | None,
+) -> Callable[[], SandboxHostLauncher]:
+    """Build a DigitalOcean launcher without adding a provider SDK dependency."""
+
+    def _build() -> SandboxHostLauncher:
+        from omnigent.onboarding.sandboxes.base import DEFAULT_HOST_IMAGE
+        from omnigent.onboarding.sandboxes.digitalocean import (
+            DEFAULT_IMAGE,
+            DEFAULT_MOUNT_PATH,
+            DEFAULT_REGION,
+            DEFAULT_SIZE,
+            DEFAULT_WORKSPACE_SIZE_GB,
+            DigitalOceanSandboxLauncher,
+        )
+
+        return DigitalOceanSandboxLauncher(
+            region=region or DEFAULT_REGION,
+            size=size or DEFAULT_SIZE,
+            image=image or DEFAULT_IMAGE,
+            host_image=host_image or DEFAULT_HOST_IMAGE,
+            workspace_size_gb=workspace_size_gb or DEFAULT_WORKSPACE_SIZE_GB,
+            mount_path=mount_path or DEFAULT_MOUNT_PATH,
+        )
 
     return _build
 
@@ -2981,6 +3078,19 @@ def host_resume_supported(
     )
 
 
+def host_suspend_supported(
+    host: Host,
+    config: ManagedSandboxDeployment | None,
+) -> bool:
+    """Return whether the matched provider can remove compute but retain storage."""
+    launcher = _launcher_for_teardown(host, config)
+    return (
+        launcher is not None
+        and launcher.capabilities.suspend_compute
+        and host.sandbox_id is not None
+    )
+
+
 def host_sandbox_is_running(
     host: Host,
     config: ManagedSandboxDeployment | None,
@@ -3121,6 +3231,32 @@ async def resume_managed_host(
             raise HTTPException(
                 status_code=502, detail=f"managed host wake failed: {message}"
             ) from exc
+
+
+async def suspend_managed_host(
+    host: Host,
+    host_store: HostStore,
+    config: ManagedSandboxDeployment | None,
+) -> None:
+    """Release a managed host's compute while preserving its provider storage."""
+    launcher = _launcher_for_teardown(host, config)
+    if launcher is None or not launcher.capabilities.suspend_compute or host.sandbox_id is None:
+        raise HTTPException(
+            status_code=409,
+            detail="this managed host provider does not support storage-preserving suspend",
+        )
+    try:
+        await asyncio.to_thread(launcher.suspend, host.sandbox_id)
+    except Exception as exc:
+        message = exc.message if isinstance(exc, click.ClickException) else str(exc)
+        raise HTTPException(
+            status_code=502,
+            detail=f"managed host suspend failed: {message}",
+        ) from exc
+    # The Droplet and its copy of the raw token are gone. Revoke the digest so
+    # a captured token cannot reconnect; resume mints a fresh generation token.
+    await asyncio.to_thread(host_store.revoke_launch_token, host.host_id)
+    await asyncio.to_thread(host_store.set_offline, host.host_id)
 
 
 async def terminate_managed_host(

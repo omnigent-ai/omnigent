@@ -172,6 +172,13 @@ def _builtin_contribution() -> SandboxProviderContribution:
                 launcher_class="omnigent.onboarding.sandboxes.kubernetes:KubernetesSandboxLauncher",
                 managed_token_ttl_s=7 * 24 * 3600,
             ),
+            "digitalocean": SandboxProviderMetadata(
+                name="digitalocean",
+                launcher_class=(
+                    "omnigent.onboarding.sandboxes.digitalocean:DigitalOceanSandboxLauncher"
+                ),
+                managed_token_ttl_s=7 * 24 * 3600,
+            ),
         },
     )
 

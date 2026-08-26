@@ -2726,6 +2726,7 @@ def create_app(
                 agent_store=agent_store,
                 agent_cache=agent_cache,
                 feature_flags=resolved_feature_flags,
+                sandbox_config=sandbox_config,
             ),
             prefix="/v1",
             tags=["hosts"],

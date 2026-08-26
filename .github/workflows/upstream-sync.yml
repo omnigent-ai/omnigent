@@ -1,0 +1,131 @@
+name: Upstream sync
+
+on:
+  schedule:
+    # Monday 10:17 Asia/Bangkok. The non-round minute reduces scheduler load.
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge upstream into a review branch
+    if: github.repository != 'omnigent-ai/omnigent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      UPSTREAM_REPOSITORY: ${{ vars.OMNIGENT_UPSTREAM_REPOSITORY || 'omnigent-ai/omnigent' }}
+      UPSTREAM_BRANCH: ${{ vars.OMNIGENT_UPSTREAM_BRANCH || 'main' }}
+      SYNC_BRANCH: automation/upstream-sync
+      GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+    steps:
+      - name: Check out fork main
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --no-tags upstream "${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}"
+
+      - name: Merge upstream safely
+        id: merge
+        run: |
+          if git merge-base --is-ancestor "upstream/${UPSTREAM_BRANCH}" origin/main; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Fork main already contains upstream/${UPSTREAM_BRANCH}."
+            exit 0
+          fi
+
+          git config user.name "upstream-sync[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -C "$SYNC_BRANCH" origin/main
+          if ! git merge --no-ff --no-edit "upstream/${UPSTREAM_BRANCH}"; then
+            git status --short
+            echo "::error::Upstream merge has conflicts. Resolve them locally using the documented rebase workflow."
+            exit 1
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Push rolling sync branch
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          gh auth setup-git
+          remote_sha="$(git ls-remote --heads origin "$SYNC_BRANCH" | awk '{print $1}')"
+          if [ -n "$remote_sha" ]; then
+            git fetch origin "$SYNC_BRANCH:refs/remotes/origin/$SYNC_BRANCH"
+            git push --force-with-lease="refs/heads/$SYNC_BRANCH:$remote_sha" origin "HEAD:refs/heads/$SYNC_BRANCH"
+          else
+            git push origin "HEAD:refs/heads/$SYNC_BRANCH"
+          fi
+
+      - name: Open or refresh pull request
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          PR_BODY: |
+            ## Related issue
+
+            N/A
+
+            ## Summary
+
+            Periodic merge of `omnigent-ai/omnigent:main` into this fork. The rolling branch keeps the fork's DigitalOcean changes reviewable and leaves `main` untouched until this PR is approved.
+
+            ## Test Plan
+
+            Repository CI runs automatically when `UPSTREAM_SYNC_TOKEN` is configured. With the default token, approve the generated pull-request workflow runs before merging.
+
+            ## Demo
+
+            N/A
+
+            ## Type of change
+
+            - [ ] Bug fix
+            - [ ] Feature
+            - [ ] UI / frontend change
+            - [x] Refactor / chore
+            - [ ] Docs
+            - [ ] Test / CI
+            - [ ] Breaking change
+
+            ## Test coverage
+
+            - [ ] Unit tests added / updated
+            - [ ] Integration tests added / updated
+            - [ ] E2E tests added / updated
+            - [ ] Manual verification completed
+            - [x] Existing tests cover this change
+            - [ ] Not applicable
+
+            ## Coverage notes
+
+            This automation only merges upstream commits; the resulting pull request is validated by the repository's existing CI.
+
+            ## Changelog
+
+            N/A
+        run: |
+          existing="$(gh pr list --base main --head "$SYNC_BRANCH" --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            echo "Upstream sync PR #$existing now points at the refreshed branch."
+            exit 0
+          fi
+
+          if ! gh pr create \
+              --base main \
+              --head "$SYNC_BRANCH" \
+              --title "chore: sync upstream main" \
+              --body "$PR_BODY"; then
+            echo "::warning::The sync branch was pushed, but GitHub blocked automatic PR creation. Enable Actions PR creation or configure UPSTREAM_SYNC_TOKEN."
+          fi

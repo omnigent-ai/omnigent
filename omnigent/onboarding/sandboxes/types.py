@@ -72,6 +72,8 @@ class SandboxCapabilities:
         with its persistent volume.
     :param programmatic_terminate: Provider can terminate a sandbox
         programmatically.
+    :param suspend_compute: Provider can remove compute while preserving the
+        sandbox's durable workspace for a later resume.
     :param file_copy: Provider supports copying files into the sandbox.
     :param streaming_exec: Provider supports streaming process execution
         inside the sandbox.
@@ -90,6 +92,7 @@ class SandboxCapabilities:
     local_port_forward: bool = False
     resume_stopped: bool = False
     programmatic_terminate: bool = False
+    suspend_compute: bool = False
     file_copy: bool = False
     streaming_exec: bool = False
     foreground_exec: bool = False

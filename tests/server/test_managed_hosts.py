@@ -26,6 +26,7 @@ from omnigent.server.app import create_app
 from omnigent.server.managed_hosts import (
     BOXLITE_MANAGED_TOKEN_TTL_S,
     DAYTONA_MANAGED_TOKEN_TTL_S,
+    DIGITALOCEAN_MANAGED_TOKEN_TTL_S,
     ISLO_MANAGED_TOKEN_TTL_S,
     KUBERNETES_MANAGED_TOKEN_TTL_S,
     MODAL_MANAGED_TOKEN_TTL_S,
@@ -42,6 +43,7 @@ from omnigent.server.managed_hosts import (
     relaunch_managed_host,
     resolve_managed_agent_label,
     resume_managed_host,
+    suspend_managed_host,
     terminate_managed_host,
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -138,6 +140,56 @@ class _StubAgentStore:
 def test_parse_absent_section_disables_managed_hosts() -> None:
     """No ``sandbox:`` section → managed hosts simply not configured."""
     assert parse_sandbox_config(None) is None
+
+
+def test_parse_digitalocean_config_builds_parameterized_launcher() -> None:
+    cfg = parse_sandbox_config(
+        {
+            "provider": "digitalocean",
+            "server_url": "https://omnigent.example.com/",
+            "digitalocean": {
+                "region": "sgp1",
+                "size": "s-4vcpu-8gb",
+                "image": "ubuntu-24-04-x64",
+                "host_image": "ghcr.io/example/omnigent-host:sha-abc",
+                "workspace": {"size_gb": 200, "mount_path": "/workspace"},
+            },
+        }
+    )
+    assert cfg is not None
+    entry = cfg.default
+    assert entry.provider == "digitalocean"
+    assert entry.server_url == "https://omnigent.example.com"
+    assert entry.token_ttl_s == DIGITALOCEAN_MANAGED_TOKEN_TTL_S
+    launcher = entry.launcher_factory()
+    assert launcher.provider == "digitalocean"
+    assert launcher.region == "sgp1"
+    assert launcher.size == "s-4vcpu-8gb"
+    assert launcher.image == "ubuntu-24-04-x64"
+    assert launcher.host_image == "ghcr.io/example/omnigent-host:sha-abc"
+    assert launcher.workspace_size_gb == 200
+    assert launcher.mount_path == "/workspace"
+
+
+@pytest.mark.parametrize(
+    ("digitalocean", "message"),
+    [
+        ({"workspace": {"size_gb": 0}}, "workspace.size_gb"),
+        ({"workspace": {"mount_path": "relative"}}, "workspace.mount_path"),
+        ({"unknown": True}, "unknown key"),
+    ],
+)
+def test_parse_digitalocean_config_rejects_invalid_values(
+    digitalocean: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        parse_sandbox_config(
+            {
+                "provider": "digitalocean",
+                "server_url": "https://omnigent.example.com",
+                "digitalocean": digitalocean,
+            }
+        )
 
 
 def test_parse_valid_modal_config_builds_image_parameterized_factory(
@@ -2010,6 +2062,44 @@ async def test_launch_and_resume_without_optional_kwargs_support_legacy_start_ho
 
     assert [start.host_id for start in fake.host_starts] == [result.host_id, result.host_id]
     assert fake.resumed == ["sb-fake-1"]
+
+
+async def test_suspend_managed_host_revokes_token_and_preserves_registration(db_uri: str) -> None:
+    host_store = HostStore(db_uri)
+
+    class _SuspendLauncher(FakeSandboxLauncher):
+        def __init__(self) -> None:
+            super().__init__(on_host_start=self._register)
+            self.suspended: list[str] = []
+
+        @property
+        def capabilities(self) -> Any:
+            return replace(super().capabilities, suspend_compute=True)
+
+        def _register(self, invocation: HostStartInvocation) -> None:
+            host_store.upsert_on_connect(
+                host_id=invocation.host_id,
+                name=invocation.host_name,
+                user_id=_OWNER,
+            )
+
+        def suspend(self, sandbox_id: str) -> None:
+            self.suspended.append(sandbox_id)
+
+    fake = _SuspendLauncher()
+    config = _injected_config(fake)
+    result = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
+    host = host_store.get_host(result.host_id)
+    assert host is not None
+    launch = fake.host_starts[0]
+    assert host_store.resolve_launch_token(host.host_id, launch.token) is not None
+
+    await suspend_managed_host(host, host_store, config)
+
+    assert fake.suspended == ["sb-fake-1"]
+    assert host_store.get_host(host.host_id) is not None
+    assert not host_store.is_online(host.host_id)
+    assert host_store.resolve_launch_token(host.host_id, launch.token) is None
 
 
 async def test_launch_with_injected_custom_launcher(db_uri: str) -> None:
