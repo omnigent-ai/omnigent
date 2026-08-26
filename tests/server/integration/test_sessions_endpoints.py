@@ -990,6 +990,67 @@ async def test_external_acp_subagent_start_allows_duplicate_titles(
     assert len(ids) == 2, "parallel sub-agents with the same title must get distinct children"
 
 
+async def test_acp_subagent_summary_needs_an_agent_to_persist(
+    client: httpx.AsyncClient,
+) -> None:
+    """An assistant message seeded into an ACP sub-agent child must carry ``agent``.
+
+    This is the server contract the runner's summary-seeding depends on, and the
+    root cause of the reported "sub-agent's response is missing from its chat"
+    bug: ``MessageData`` rejects an assistant message with no ``agent``, so an
+    item that omits it 400s and never persists (the runner posts best-effort and
+    swallows the rejection). With ``agent`` set — as the fix now sends — it
+    persists and appears in the child's items, exactly as the summary must.
+    """
+    import json
+
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+    mint = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_acp_subagent_start",
+            "data": {"subagent_id": "a0ac9364", "title": "mathutils", "description": "t"},
+        },
+    )
+    child_id = mint.json()["child_session_id"]
+
+    def _summary_event(*, with_agent: bool) -> dict[str, object]:
+        item_data: dict[str, object] = {
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "3 tests pass"}],
+        }
+        if with_agent:
+            item_data["agent"] = "mathutils"
+        return {
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": item_data,
+                "response_id": "resp_acpsub_a0ac9364",
+            },
+        }
+
+    # Without agent: rejected — the exact server response that silently hid the
+    # summary when the runner swallowed it.
+    missing = await client.post(
+        f"/v1/sessions/{child_id}/events", json=_summary_event(with_agent=False)
+    )
+    assert missing.status_code == 400, (
+        f"expected reject, got {missing.status_code}: {missing.text}"
+    )
+
+    # With agent (the fix): accepted and present in the child's transcript.
+    ok = await client.post(f"/v1/sessions/{child_id}/events", json=_summary_event(with_agent=True))
+    assert ok.status_code in (200, 202), ok.text
+
+    items = (await client.get(f"/v1/sessions/{child_id}/items")).json()["data"]
+    assert any(it.get("type") == "message" for it in items)
+    assert "3 tests pass" in json.dumps(items), (
+        f"summary not persisted into child items: {items!r}"
+    )
+
+
 async def test_external_subagent_start_handles_duplicate_agent_type_and_description(
     client: httpx.AsyncClient,
 ) -> None:

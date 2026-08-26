@@ -718,6 +718,7 @@ async def _post_acp_subagent_message(
     child_key: str,
     role: str,
     text: str,
+    agent: str | None = None,
 ) -> None:
     """Append one message to an ACP sub-agent's child transcript.
 
@@ -730,8 +731,21 @@ async def _post_acp_subagent_message(
     :param child_key: Sub-agent id, used for the response id and log context.
     :param role: ``"user"`` (the delegated task) or ``"assistant"`` (its result).
     :param text: Message text.
+    :param agent: Author name for an ``"assistant"`` message (ignored for
+        ``"user"``). ``MessageData`` requires a non-empty ``agent`` on assistant
+        messages, so this falls back to *child_key* when unset.
     """
     block_type = "input_text" if role == "user" else "output_text"
+    item_data: dict[str, object] = {
+        "role": role,
+        "content": [{"type": block_type, "text": text}],
+    }
+    if role == "assistant":
+        # MessageData rejects an assistant message with no ``agent`` (its
+        # ``check_agent_for_assistant`` validator), so an assistant item that
+        # omits it 400s and the summary silently never lands. Mirror codex's
+        # assistant transcript post, which sets ``agent`` for this exact reason.
+        item_data["agent"] = agent or child_key
     try:
         resp = await client.post(
             f"/v1/sessions/{child_id}/events",
@@ -739,7 +753,7 @@ async def _post_acp_subagent_message(
                 "type": "external_conversation_item",
                 "data": {
                     "item_type": "message",
-                    "item_data": {"role": role, "content": [{"type": block_type, "text": text}]},
+                    "item_data": item_data,
                     "response_id": f"resp_acpsub_{child_key}",
                 },
             },
@@ -756,6 +770,7 @@ async def _complete_acp_subagent_child(
     ok: bool,
     summary: str,
     child_id_future: asyncio.Future[str],
+    title: str = "",
 ) -> None:
     """Record a harness-reported sub-agent's outcome on its child session (end edge).
 
@@ -769,6 +784,8 @@ async def _complete_acp_subagent_child(
     :param ok: Whether the sub-agent reported success.
     :param summary: The sub-agent's closing summary, attached as the child output.
     :param child_id_future: Future the start edge resolves with the child id.
+    :param title: The sub-agent's display name, used as the summary message's
+        author; falls back to *child_key* when empty.
     """
     from omnigent._native_post_delivery import post_external_session_status
 
@@ -785,7 +802,12 @@ async def _complete_acp_subagent_child(
     # reports, so it goes in the child's transcript, not just the status edge.
     if summary:
         await _post_acp_subagent_message(
-            client, child_id=child_id, child_key=child_key, role="assistant", text=summary
+            client,
+            child_id=child_id,
+            child_key=child_key,
+            role="assistant",
+            text=summary,
+            agent=title or child_key,
         )
     try:
         await post_external_session_status(
@@ -6827,6 +6849,9 @@ def create_runner_app(
                     # Sub-agent start edge → minted child id, so the completion
                     # edge can address the child it created. Per-stream.
                     _subagent_child_futures: dict[str, _asyncio.Future[str]] = {}
+                    # Sub-agent start edge → its title, so the completion edge can
+                    # author the summary message (assistant messages need one).
+                    _subagent_titles: dict[str, str] = {}
                     _text_acc: list[str] = []
                     _stream_failed_error: _JsonObject | None = None
                     async for chunk in harness_resp.aiter_text():
@@ -7088,6 +7113,7 @@ def create_runner_app(
                                             _asyncio.get_running_loop().create_future()
                                         )
                                         _subagent_child_futures[_sa_key] = _sa_start_future
+                                        _subagent_titles[_sa_key] = event.get("title", "")
                                         _dispatch_tasks.append(
                                             _asyncio.create_task(
                                                 _mint_acp_subagent_child(
@@ -7118,6 +7144,7 @@ def create_runner_app(
                                                     ok=bool(event.get("ok", True)),
                                                     summary=event.get("summary", ""),
                                                     child_id_future=_sa_done_future,
+                                                    title=_subagent_titles.get(_sa_done_key, ""),
                                                 )
                                             )
                                         )

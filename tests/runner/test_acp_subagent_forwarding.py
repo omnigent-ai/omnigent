@@ -184,7 +184,13 @@ async def test_mint_subagent_child_records_failure_on_non_2xx() -> None:
 
 @pytest.mark.asyncio
 async def test_complete_subagent_child_posts_summary_then_idle_status() -> None:
-    """The success edge writes the summary into the child chat, then marks it idle."""
+    """The success edge writes the summary into the child chat, then marks it idle.
+
+    The summary item MUST carry an ``agent`` — ``MessageData`` rejects an
+    assistant message without one, so an item that omits it 400s and the summary
+    silently never lands (the reported "assistant response missing" bug). The
+    author is the sub-agent's title.
+    """
     child_url = "/v1/sessions/child_abc/events"
     client = _RecordingServerClient([_ok(child_url), _ok(child_url)])
     fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
@@ -196,6 +202,7 @@ async def test_complete_subagent_child_posts_summary_then_idle_status() -> None:
         ok=True,
         summary="3 tests pass",
         child_id_future=fut,
+        title="mathutils",
     )
 
     assert len(client.calls) == 2
@@ -203,11 +210,34 @@ async def test_complete_subagent_child_posts_summary_then_idle_status() -> None:
     assert msg.url == child_url
     assert msg.body["data"]["item_data"] == {
         "role": "assistant",
+        "agent": "mathutils",
         "content": [{"type": "output_text", "text": "3 tests pass"}],
     }
     assert status.body["type"] == "external_session_status"
     assert status.body["data"]["status"] == "idle"
     assert status.body["data"]["output"] == "3 tests pass"
+
+
+@pytest.mark.asyncio
+async def test_summary_author_falls_back_to_child_key_without_a_title() -> None:
+    """With no title, the assistant author is the child_key — never blank.
+
+    A blank ``agent`` fails the same ``MessageData`` validator, so the fallback
+    must be non-empty for the summary to persist at all.
+    """
+    child_url = "/v1/sessions/child_abc/events"
+    client = _RecordingServerClient([_ok(child_url), _ok(child_url)])
+    fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+    fut.set_result("child_abc")
+
+    await runner_app_mod._complete_acp_subagent_child(
+        client,  # type: ignore[arg-type]
+        child_key="a0ac9364",
+        ok=True,
+        summary="done",
+        child_id_future=fut,
+    )
+    assert client.calls[0].body["data"]["item_data"]["agent"] == "a0ac9364"
 
 
 @pytest.mark.asyncio
