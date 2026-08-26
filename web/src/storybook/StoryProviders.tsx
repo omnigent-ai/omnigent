@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useEffect, useState, type ReactNode } from "react";
 import { MemoryRouter } from "react-router-dom";
 import { useChatStore } from "@/store/chatStore";
+import { getOmnigentHostConfig, setOmnigentHostConfig, type OmnigentHostConfig } from "@/lib/host";
 
 type ChatStoreState = ReturnType<typeof useChatStore.getState>;
 
@@ -22,6 +23,22 @@ export function ChatStoreSeed({
     return snapshot;
   });
   useEffect(() => () => useChatStore.setState(previous), [previous]);
+  return children;
+}
+
+export function HostConfigSeed({
+  config,
+  children,
+}: {
+  config: OmnigentHostConfig;
+  children: ReactNode;
+}) {
+  const [previous] = useState(() => {
+    const current = getOmnigentHostConfig();
+    setOmnigentHostConfig(config);
+    return current;
+  });
+  useEffect(() => () => setOmnigentHostConfig(previous), [previous]);
   return children;
 }
 

@@ -264,6 +264,11 @@ export default defineConfig({
         "src/**/*.test.{ts,tsx}",
         "src/**/*.d.ts",
         "src/test-setup.ts",
+        // Storybook-only modules are covered by the pinned visual snapshot suite.
+        "src/**/*.stories.{ts,tsx}",
+        "src/storybook/**",
+        "src/**/*storyFixtures.{ts,tsx}",
+        "src/**/*StoryFixtures.{ts,tsx}",
         // Vendored UI kit, not product code (see tests/e2e_ui/COVERAGE_GAPS.md).
         "src/components/ai-elements/**",
       ],
