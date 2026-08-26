@@ -658,6 +658,31 @@ comment) — filled in with the real `<url>` and prompt, never left as placehold
 If the bug is specific to a different harness, use that harness's launcher instead
 (e.g. `omnigent codex`), but `omnigent claude` is the default.
 
+**Classify the fix's validation surface — the preview does not always carry your
+code.** `--server <preview>` puts the fix only on the **server** side: the preview
+deploy runs the PR build, but the reviewer's *local runner* is their **installed**
+omnigent, not your branch. So which side your diff runs on decides whether the
+preview attach actually exercises the fix. Set a `validation_surface` in your
+handoff:
+
+- **`server`** — the fix lives in server/web/UI code (`omnigent/server/**`, `web/**`,
+  routing, schemas). The preview build *is* the fix; `--server <preview>` validates
+  it end-to-end. This is the default.
+- **`runner`** — the fix lives in **runner** code that runs in the host/runner
+  process (`omnigent/runner/**`, `omnigent/host/**`, the runner half of a transport
+  like `ws_tunnel/serve.py`). Attaching a local runner to the preview runs your
+  **fixed server against an unfixed runner** — the fix half never executes, so the
+  preview attach proves nothing. The reviewer must run the **PR build on the runner
+  side**: `gh pr checkout <pr>` then `omnigent claude --server ""` (a local server
+  the same checkout serves), so both halves are your code.
+- **`both`** — the diff spans both sides (e.g. a wire-format change touching
+  `frames.py` used by server and runner). Treat it like `runner`: only a local PR
+  build validates the whole change.
+
+Judge this from `files_changed`, not a guess. When you can't cleanly tell, use
+`both` (the safe, self-consistent option). This drives which command you put in
+front of the reviewer in 4.4 and 4.5.
+
 If the preview deploy **fails** or never posts a URL (e.g. workspace secrets not
 configured in this environment, or a non-member author before the labelled-fork
 preview path applies), don't block on it — note it in the handoff (`ui_preview`)
@@ -766,29 +791,49 @@ Put it where it belongs for the path you're on, and carry the same text in the
   **"Validate the fix live"** block as a PR comment (`gh pr comment <pr>`) so the
   reviewer and author get the command without you editing their description.
 
-**Lead with the one command that runs it against the preview.** When 4.1 produced
-a preview `<url>`, put a ready-to-run `omnigent claude` line first, with the real
-URL and the prompt inlined — so a reviewer copies one line rather than assembling
-it. When there was no preview URL, give the same command without `--server` (runs
-against the reviewer's own local app). Shape:
+**Lead with the one command that runs it — and pick it by `validation_surface`
+(4.1).** The command shape differs by which side your fix runs on:
 
-> **Validate the fix live**
->
-> Run this against the deployed UI preview (attaches your own host, which carries
-> your model credentials):
-> ```
-> omnigent claude -p 'Reproduce and validate a bug fix. Steps: <the journey —
-> concrete inputs/clicks/routes>. Before this fix, <the buggy behavior>. Confirm
-> the fix by checking that <the corrected behavior / value for each live facet>.
-> Report whether each step now behaves correctly.' --server <url>
-> ```
-> No preview URL? Drop `--server <url>` to run against your own local app. Or paste
-> just the prompt to an agent already connected to an Omnigent app.
+- **`server` surface** — the preview build carries the fix. When 4.1 produced a
+  preview `<url>`, lead with the `--server <url>` line so a reviewer copies one
+  line. When there was no preview URL, give the same command without `--server`
+  (runs against the reviewer's own local app). Shape:
 
-Use the real `<url>` from 4.1 and the concrete journey — no placeholders in what
-you post. Keep the `validation_prompt` handoff field as the bare prompt text (the
-part inside `-p '…'`), so the workflow can reuse it; the assembled command lives in
-the PR body and the maintainer comment.
+  > **Validate the fix live**
+  >
+  > Run this against the deployed UI preview (attaches your own host, which carries
+  > your model credentials):
+  > ```
+  > omnigent claude -p 'Reproduce and validate a bug fix. Steps: <the journey —
+  > concrete inputs/clicks/routes>. Before this fix, <the buggy behavior>. Confirm
+  > the fix by checking that <the corrected behavior / value for each live facet>.
+  > Report whether each step now behaves correctly.' --server <url>
+  > ```
+  > No preview URL? Drop `--server <url>` to run against your own local app. Or paste
+  > just the prompt to an agent already connected to an Omnigent app.
+
+- **`runner` or `both` surface** — the preview's server carries the fix but the
+  reviewer's local runner would not, so **do not** lead with `--server <preview>`
+  (it validates only half the change). Lead with a **local PR build** instead, so
+  both halves are your code:
+
+  > **Validate the fix live** (this fix runs in the runner/host process, so check
+  > out the PR — attaching a local runner to the preview would run an *unfixed*
+  > runner):
+  > ```
+  > gh pr checkout <pr>
+  > omnigent claude -p 'Reproduce and validate a bug fix. Steps: <the journey>.
+  > Before this fix, <the buggy behavior>. Confirm the fix by checking that <the
+  > corrected behavior>. Report whether each step now behaves correctly.' --server ''
+  > ```
+  > `--server ''` runs a local server from this same checkout, so the server *and*
+  > runner are the PR build. (The preview `<url>` is still linked for the UI, but
+  > it can't exercise a runner-side fix on its own.)
+
+Use the real `<pr>`/`<url>` from 4.1 and the concrete journey — no placeholders in
+what you post. Keep the `validation_prompt` handoff field as the bare prompt text
+(the part inside `-p '…'`), so the workflow can reuse it; the assembled command
+lives in the PR body and the maintainer comment.
 
 ### 4.5 — Submit the final review verdict, then tag the maintainer
 
@@ -887,6 +932,7 @@ the message. Same discipline as repro-agent:
   "ci_status": "green (all required checks pass)",
   "polly_review": "clean: no blocking/security findings after 1 round (fixed a null-deref Polly flagged, re-triggered via workflow_dispatch)",
   "ui_preview": "labeled ui-preview on every PR; preview at https://…; posted connect instructions",
+  "validation_surface": "server",
   "validation_prompt": "Reproduce and validate a bug fix. Steps: open the model picker in the catalog view… Before this fix, raw catalog IDs were shown. Confirm the fix by checking that friendly labels appear. Report whether each step now behaves correctly.",
   "maintainer_review": "requested review from @PattaraS (issue assignee)",
   "session_id": "dc59e331-..."
@@ -962,6 +1008,12 @@ Field meanings:
   reviewer can `omnigent claude -p '<prompt>' --server <url>`), or why it failed to
   deploy (e.g. workspace secrets not configured, non-member author). Empty when no
   PR was opened.
+- `validation_surface` — which side the fix runs on, from Step 4.1: `server` (the
+  preview build carries it; `--server <preview>` validates it), `runner` (runs in
+  the runner/host process, so only a local `gh pr checkout` + `--server ''` build
+  validates it — the preview's local runner is unfixed), or `both` (spans both —
+  treat like `runner`). Judge from `files_changed`; default `server`, use `both`
+  when unsure. Tells the write-back which command to render.
 - `validation_prompt` — the Step 4.4 paste-to-an-agent prompt that reproduces the
   journey and confirms the fix. Empty when no PR was opened.
 - `maintainer_review` — who you requested review from in Step 4.5 (the issue
