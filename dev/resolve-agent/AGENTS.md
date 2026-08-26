@@ -209,11 +209,15 @@ Determine the number now so Step 3 and the maintainer handoff can use it:
 
   ```
   # GraphQL: the synced GitHub issue is an attachment whose url is the GH link
-  query { issue(id:"OMNI-1519") { attachments { nodes { url sourceType title } } } }
+  query { issue(id:"OMNI-1519") { attachments { nodes { url sourceType } } } }
   ```
 
-  Take the attachment whose `url` is a `github.com/.../issues/<n>` link (or whose
-  `sourceType` names github); `<n>` is `closing_issue_number`. This is
+  **Discriminate by the URL path, not `sourceType`.** Every GitHub attachment —
+  the synced issue *and* any linked PRs — has `sourceType: "github"`, so that field
+  doesn't tell them apart. The **mirror is the node whose `url` matches
+  `github.com/<owner>/<repo>/issues/<n>`**; nodes matching `/pull/<n>` are PRs
+  (often the fix PRs, including your own once you open one — ignore those here).
+  Take `<n>` from the `/issues/<n>` node as `closing_issue_number`. This is
   authoritative — prefer it over any search.
 - **Only if the API shows no synced attachment**, fall back to a title search —
   **not** the OMNI key. The mirror almost never contains the `OMNI-####` string
