@@ -240,7 +240,11 @@ export function CommandPalette({
                 top: 0,
                 height: "var(--omnigent-viewport-height, 100dvh)",
                 maxHeight: "var(--omnigent-viewport-height, 100dvh)",
+                // Pad both insets: safe-top clears the notch, safe-bottom keeps
+                // the last row above the home indicator when the keyboard is
+                // closed (the visible-viewport height then spans the home bar).
                 paddingTop: "var(--omnigent-safe-top, 0px)",
+                paddingBottom: "var(--omnigent-safe-bottom, 0px)",
               }
             : undefined
         }
@@ -250,12 +254,8 @@ export function CommandPalette({
         {/* shouldFilter=false: the server filters sessions and we filter actions
             (see file header). vimBindings=false: keep Ctrl+K/J from doubling as
             list-nav on Win/Linux, where Ctrl+K is also the opener. */}
-        <Command
-          shouldFilter={false}
-          vimBindings={false}
-          label="Command palette"
-          className={isMobile ? "h-full" : undefined}
-        >
+        {/* Command's base class is `size-full`, so it already fills the sheet. */}
+        <Command shouldFilter={false} vimBindings={false} label="Command palette">
           {isMobile ? (
             // Search field and an explicit close button share a top row; the
             // full-screen sheet has no ⌘K/Esc affordance the way the desktop
