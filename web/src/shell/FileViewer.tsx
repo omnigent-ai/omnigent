@@ -89,6 +89,7 @@ import {
   MONACO_SPLIT_BREAKPOINT,
   type SaveStatus,
   detectLang,
+  isExcalidrawPath,
   isImageFile,
   isModelFile,
   isNotebookPath,
@@ -629,10 +630,12 @@ function FileViewerBody({
     return () => window.removeEventListener("keydown", handler);
   }, [open, onCloseTab, searchOpen, guardDirty]);
 
-  // View mode toggle — markdown defaults to the rich-text editor, HTML and
-  // notebooks to their rendered preview, and everything else to source.
+  // View mode toggle — markdown defaults to the rich-text editor; HTML,
+  // notebooks, and Excalidraw scenes default to preview; everything else to source.
   const lang = detectLang(path);
-  const isPreviewable = lang === "markdown" || lang === "html" || isNotebookPath(path);
+  const isExcalidraw = isExcalidrawPath(path);
+  const isPreviewable =
+    lang === "markdown" || lang === "html" || isNotebookPath(path) || isExcalidraw;
   // Images and PDFs render through CodeViewer's own viewers regardless of view
   // mode; they have no source/diff representation, so diff is suppressed for
   // them (Monaco would otherwise render the base64 payload as garbage text).
@@ -892,8 +895,8 @@ function FileViewerBody({
       icon: activeMode.icon,
       options: modeOptions,
     });
-  } else if ((lang === "html" || isNotebookPath(path)) && viewMode !== "diff") {
-    // HTML and notebooks have no rich-text editor — a single toggle flips
+  } else if ((lang === "html" || isNotebookPath(path) || isExcalidraw) && viewMode !== "diff") {
+    // HTML, notebooks, and Excalidraw scenes have no rich-text editor — a single toggle flips
     // preview ↔ source.
     toolbarActions.push({
       key: "preview",
