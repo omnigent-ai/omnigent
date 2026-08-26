@@ -55,6 +55,7 @@ import {
 } from "@/components/ui/command";
 import {
   CLAUDE_NATIVE_EFFORTS,
+  PI_NATIVE_EFFORTS,
   ConfigRow,
   DescribedSelect,
   EFFORT_SELECT_NONE,
@@ -1680,7 +1681,8 @@ function HarnessConfigModal({
       }
     } else if (hasModelPicker) {
       setPickedModel(draftModel);
-      if (entryHarness) writeHarnessOption(entryHarness, { model: draftModel });
+      setPickedEffort(draftEffort);
+      if (entryHarness) writeHarnessOption(entryHarness, { model: draftModel, effort: draftEffort });
     } else if (hasApproval) {
       if (isCodex) setPickedModel(draftModel);
       setApprovalMode(draftApproval);
@@ -1750,14 +1752,42 @@ function HarnessConfigModal({
 
         <div className="flex flex-col gap-5 py-1">
           {!autoRouting && hasModelPicker && !hasPermission && (
-            <ConfigRow label="Model" description="Underlying LLM" controlClassName="sm:w-80">
-              <SearchableModelPicker
-                value={modelValue}
-                options={piModelOptions}
-                loading={piModelsLoading}
-                onValueChange={onModelChange}
-              />
-            </ConfigRow>
+            <>
+              <ConfigRow label="Model" description="Underlying LLM" controlClassName="sm:w-80">
+                <SearchableModelPicker
+                  value={modelValue}
+                  options={piModelOptions}
+                  loading={piModelsLoading}
+                  onValueChange={onModelChange}
+                />
+              </ConfigRow>
+              <ConfigRow label="Thinking level" description="Reasoning depth vs. speed">
+                <Select
+                  value={draftEffort || EFFORT_SELECT_NONE}
+                  onValueChange={(v) => setDraftEffort(v === EFFORT_SELECT_NONE ? "" : v)}
+                >
+                  <SelectTrigger
+                    className="w-full cursor-pointer"
+                    data-testid="new-chat-landing-config-pi-effort"
+                    aria-label="Thinking level"
+                  >
+                    <SelectValue placeholder={EFFORT_UNAVAILABLE_PLACEHOLDER} />
+                  </SelectTrigger>
+                  <SelectContent
+                    position="popper"
+                    align="start"
+                    className="w-(--radix-select-trigger-width) [&_[data-slot=select-item]]:pl-2.5"
+                  >
+                    <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
+                    {PI_NATIVE_EFFORTS.map((e) => (
+                      <SelectItem key={e.value} value={e.value}>
+                        {e.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </ConfigRow>
+            </>
           )}
 
           {!autoRouting && hasPermission && (
@@ -3082,6 +3112,11 @@ export function NewChatLandingScreen() {
       setPickedModel(
         stored.model != null && piModelOptions.some((model) => model.id === stored.model)
           ? stored.model
+          : "",
+      );
+      setPickedEffort(
+        stored.effort != null && PI_NATIVE_EFFORTS.some((e) => e.value === stored.effort)
+          ? stored.effort
           : "",
       );
     }
