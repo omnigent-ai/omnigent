@@ -4533,7 +4533,60 @@ class PolicyEvaluationRequestEvent(_SSEEventBase):
     data: dict[str, Any]
 
 
-HarnessStreamEvent = ServerStreamEvent | InjectionConsumedEvent | PolicyEvaluationRequestEvent
+class SubagentStartedEvent(_SSEEventBase):
+    """
+    Runner-internal marker: the harness agent spawned a sub-agent.
+
+    ACP agents that delegate report it in their own dialect (see
+    :mod:`omnigent.inner.acp_subagents`); the executor normalizes that to a
+    :class:`~omnigent.inner.executor.SubAgentStarted`, which the adapter emits as
+    this event. The runner intercepts it in ``proxy_stream`` and POSTs
+    ``external_subagent_start`` to the Omnigent server, minting a child session so
+    the web "Subagents" panel lists one row per child. **Never** relayed to
+    external clients — the client learns of the child via ``session.created``.
+
+    :param type: Always ``"subagent.started"``.
+    :param child_key: Stable, per-turn-unique id for the sub-agent — the
+        idempotency key when the child is minted and the correlation key for the
+        later :class:`SubagentCompletedEvent`.
+    :param title: Short human label for the row, e.g. ``"mathutils"``.
+    :param task: The instruction the sub-agent was given.
+    """
+
+    type: Literal["subagent.started"]
+    child_key: str
+    title: str
+    task: str = ""
+
+
+class SubagentCompletedEvent(_SSEEventBase):
+    """
+    Runner-internal marker: a previously-announced sub-agent finished.
+
+    Emitted by the adapter from a
+    :class:`~omnigent.inner.executor.SubAgentCompleted`. The runner records the
+    outcome on the child session minted for the matching ``child_key`` (status +
+    the summary as its output). **Never** relayed to external clients.
+
+    :param type: Always ``"subagent.completed"``.
+    :param child_key: Matches the :attr:`SubagentStartedEvent.child_key`.
+    :param ok: Whether the sub-agent reported success.
+    :param summary: The sub-agent's closing summary.
+    """
+
+    type: Literal["subagent.completed"]
+    child_key: str
+    ok: bool = True
+    summary: str = ""
+
+
+HarnessStreamEvent = (
+    ServerStreamEvent
+    | InjectionConsumedEvent
+    | PolicyEvaluationRequestEvent
+    | SubagentStartedEvent
+    | SubagentCompletedEvent
+)
 
 
 # ── Projects ──────────────────────────────────────────────────────

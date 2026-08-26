@@ -640,6 +640,107 @@ async def _evaluate_policy_via_omnigent(
         await on_delivery_failure(conversation_id)
 
 
+# Bounded wait for a sub-agent's start edge to mint its child session before the
+# completion edge records the outcome. The mint POST carries its own timeout, so
+# this only guards the unexpected case where the start task never resolves.
+_SUBAGENT_MINT_WAIT_S: float = 30.0
+
+
+async def _mint_acp_subagent_child(
+    client: httpx.AsyncClient,
+    *,
+    parent_id: str,
+    child_key: str,
+    title: str,
+    task: str,
+    child_id_future: asyncio.Future[str],
+) -> None:
+    """Mint a child session for a harness-reported sub-agent (the start edge).
+
+    POSTs ``external_subagent_start`` — idempotent on ``child_key`` server-side —
+    and resolves ``child_id_future`` with the returned child id so the completion
+    edge can address the child. Best-effort: a failure resolves the future with
+    the exception (so the completion edge fails fast rather than hanging) and is
+    logged, never raised into the turn.
+
+    :param client: Omnigent HTTP client for the runner subprocess.
+    :param parent_id: The parent conversation the sub-agent belongs to.
+    :param child_key: Stable sub-agent id; the idempotency + correlation key.
+    :param title: Row label, forwarded as ``agent_type``.
+    :param task: The delegated instruction, forwarded as ``description``.
+    :param child_id_future: Resolved with the minted child session id.
+    """
+    try:
+        resp = await client.post(
+            f"/v1/sessions/{parent_id}/events",
+            json={
+                "type": "external_subagent_start",
+                "data": {
+                    "subagent_id": child_key,
+                    "agent_type": title or child_key,
+                    "description": task,
+                    "tool_use_id": child_key,
+                },
+            },
+        )
+        resp.raise_for_status()
+        payload = resp.json() if resp.content else {}
+        child_id = payload.get("child_session_id") if isinstance(payload, dict) else None
+        if not (isinstance(child_id, str) and child_id):
+            raise ValueError("external_subagent_start returned no child_session_id")
+        if not child_id_future.done():
+            child_id_future.set_result(child_id)
+    except Exception as exc:  # noqa: BLE001 — surfacing a sub-agent must never break the turn
+        _logger.warning("acp sub-agent child mint failed (child_key=%s): %s", child_key, exc)
+        if not child_id_future.done():
+            child_id_future.set_exception(exc)
+
+
+async def _complete_acp_subagent_child(
+    client: httpx.AsyncClient,
+    *,
+    child_key: str,
+    ok: bool,
+    summary: str,
+    child_id_future: asyncio.Future[str],
+) -> None:
+    """Record a harness-reported sub-agent's outcome on its child session (end edge).
+
+    Waits (bounded) for the start edge to mint the child, then marks the child's
+    status (``idle`` on success, ``failed`` otherwise) with the summary attached
+    as its output. Best-effort: a missing or failed mint is logged and skipped,
+    never raised into the turn.
+
+    :param client: Omnigent HTTP client for the runner subprocess.
+    :param child_key: Stable sub-agent id, matching the start edge.
+    :param ok: Whether the sub-agent reported success.
+    :param summary: The sub-agent's closing summary, attached as the child output.
+    :param child_id_future: Future the start edge resolves with the child id.
+    """
+    from omnigent._native_post_delivery import post_external_session_status
+
+    try:
+        child_id = await asyncio.wait_for(
+            asyncio.shield(child_id_future), timeout=_SUBAGENT_MINT_WAIT_S
+        )
+    except Exception as exc:  # noqa: BLE001 — includes the start edge's own mint failure
+        _logger.warning(
+            "acp sub-agent child unavailable for completion (child_key=%s): %s", child_key, exc
+        )
+        return
+    try:
+        await post_external_session_status(
+            client,
+            session_id=child_id,
+            status="idle" if ok else "failed",
+            output=summary or None,
+        )
+    except Exception as exc:  # noqa: BLE001 — a status edge failure must not break the turn
+        _logger.warning(
+            "acp sub-agent completion status failed (child_key=%s): %s", child_key, exc
+        )
+
+
 def _response_body_preview(resp: object, *, limit: int = 500) -> str:
     """
     Return a short response-body preview for diagnostics.
@@ -6664,6 +6765,9 @@ def create_runner_app(
                     _omnigent_task_id = cast(str | None, body.get("task_id"))
                     _buffer = ""
                     _dispatch_tasks: list[_asyncio.Task[object]] = []
+                    # Sub-agent start edge → minted child id, so the completion
+                    # edge can address the child it created. Per-stream.
+                    _subagent_child_futures: dict[str, _asyncio.Future[str]] = {}
                     _text_acc: list[str] = []
                     _stream_failed_error: _JsonObject | None = None
                     async for chunk in harness_resp.aiter_text():
@@ -6913,6 +7017,51 @@ def create_runner_app(
                                             )
                                         )
                                     )
+                                    continue
+
+                                if _evt_type == "subagent.started":
+                                    # A harness reported spawning a sub-agent; mint
+                                    # a child session so it shows in the Subagents
+                                    # panel. Swallowed (never relayed to clients).
+                                    _sa_key = event.get("child_key", "")
+                                    if isinstance(_sa_key, str) and _sa_key:
+                                        _sa_start_future: _asyncio.Future[str] = (
+                                            _asyncio.get_running_loop().create_future()
+                                        )
+                                        _subagent_child_futures[_sa_key] = _sa_start_future
+                                        _dispatch_tasks.append(
+                                            _asyncio.create_task(
+                                                _mint_acp_subagent_child(
+                                                    server_client,
+                                                    parent_id=conv_id,
+                                                    child_key=_sa_key,
+                                                    title=event.get("title", ""),
+                                                    task=event.get("task", ""),
+                                                    child_id_future=_sa_start_future,
+                                                )
+                                            )
+                                        )
+                                    continue
+
+                                if _evt_type == "subagent.completed":
+                                    _sa_done_key = event.get("child_key", "")
+                                    _sa_done_future = (
+                                        _subagent_child_futures.get(_sa_done_key)
+                                        if isinstance(_sa_done_key, str)
+                                        else None
+                                    )
+                                    if _sa_done_future is not None:
+                                        _dispatch_tasks.append(
+                                            _asyncio.create_task(
+                                                _complete_acp_subagent_child(
+                                                    server_client,
+                                                    child_key=_sa_done_key,
+                                                    ok=bool(event.get("ok", True)),
+                                                    summary=event.get("summary", ""),
+                                                    child_id_future=_sa_done_future,
+                                                )
+                                            )
+                                        )
                                     continue
 
                             if event is None:

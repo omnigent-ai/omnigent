@@ -30,6 +30,8 @@ from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
     ExecutorError,
     ReasoningChunk,
+    SubAgentCompleted,
+    SubAgentStarted,
     TextChunk,
     ToolCallComplete,
     ToolCallRequest,
@@ -351,6 +353,77 @@ def test_in_progress_tool_update_emits_nothing() -> None:
         )
         == []
     )
+
+
+# ---------------------------------------------------------------------------
+# Sub-agent surfacing (dialect source -> normalized events)
+# ---------------------------------------------------------------------------
+
+
+def test_handle_session_update_emits_subagent_started() -> None:
+    """A Devin ``subagent_started`` frame yields a ``SubAgentStarted`` event.
+
+    This is the executor half of the seam: the runner turns this event into a
+    child session, so if it stops firing the "Subagents" panel goes empty for
+    Devin. The frame shape is copied from a real ``devin acp`` turn.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="devin acp"))
+    events = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "a0ac9364",
+            "status": "in_progress",
+            "_meta": {
+                "cognition.ai/subagent_started": {
+                    "agentId": "a0ac9364",
+                    "title": "mathutils",
+                    "task": "create mathutils.py + tests",
+                }
+            },
+        }
+    )
+    started = [e for e in events if isinstance(e, SubAgentStarted)]
+    assert started == [
+        SubAgentStarted(
+            child_key="a0ac9364", title="mathutils", task="create mathutils.py + tests"
+        )
+    ]
+
+
+def test_handle_session_update_emits_subagent_completed() -> None:
+    """A Devin ``subagent_completed`` frame yields a ``SubAgentCompleted`` event."""
+    ex = AcpExecutor(AcpAgentConfig(command="devin acp"))
+    events = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "a0ac9364",
+            "status": "completed",
+            "_meta": {
+                "cognition.ai/subagent_completed": {
+                    "agentId": "a0ac9364",
+                    "success": True,
+                    "summary": "3 tests pass.",
+                }
+            },
+        }
+    )
+    completed = [e for e in events if isinstance(e, SubAgentCompleted)]
+    assert completed == [SubAgentCompleted(child_key="a0ac9364", ok=True, summary="3 tests pass.")]
+
+
+def test_handle_session_update_no_subagent_events_for_plain_frames() -> None:
+    """Ordinary frames emit no sub-agent events — the scan is inert without the dialect.
+
+    A plain tool_call still becomes a tool card (existing behavior), and no
+    SubAgent* event is produced, so non-Devin ACP agents are unaffected.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="goose acp"))
+    for frame in (
+        {"sessionUpdate": "agent_message_chunk", "content": {"text": "hi"}},
+        {"sessionUpdate": "tool_call", "toolCallId": "c1", "title": "Ran ls", "kind": "execute"},
+    ):
+        events = ex._handle_session_update(frame)
+        assert not any(isinstance(e, (SubAgentStarted, SubAgentCompleted)) for e in events)
 
 
 # ---------------------------------------------------------------------------

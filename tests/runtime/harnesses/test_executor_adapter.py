@@ -2160,3 +2160,54 @@ async def test_run_turn_installs_the_choice_bridge_only_where_supported() -> Non
         assert installed is expected, type(executor).__name__
         # The yes/no bridge is installed on both — the choice bridge is additive.
         assert getattr(executor, "_elicitation_handler", None) is not None
+
+
+def test_translate_event_emits_subagent_started() -> None:
+    """A ``SubAgentStarted`` becomes the runner-internal ``subagent.started`` SSE event.
+
+    This is the harness half of the surfacing seam: the runner turns this event
+    into a child session. If it stops emitting, the Subagents panel goes empty
+    for the agent.
+    """
+    from omnigent.inner.executor import SubAgentStarted
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import SubagentStartedEvent
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext(response_id="resp_sa")
+    adapter._translate_event(
+        SubAgentStarted(child_key="a0ac9364", title="mathutils", task="create files"),
+        ctx,  # type: ignore[arg-type]
+    )
+    assert len(ctx.emitted) == 1
+    ev = ctx.emitted[0]
+    assert isinstance(ev, SubagentStartedEvent)
+    assert (ev.type, ev.child_key, ev.title, ev.task) == (
+        "subagent.started",
+        "a0ac9364",
+        "mathutils",
+        "create files",
+    )
+
+
+def test_translate_event_emits_subagent_completed() -> None:
+    """A ``SubAgentCompleted`` becomes the runner-internal ``subagent.completed`` SSE event."""
+    from omnigent.inner.executor import SubAgentCompleted
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import SubagentCompletedEvent
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext(response_id="resp_sa")
+    adapter._translate_event(
+        SubAgentCompleted(child_key="a0ac9364", ok=True, summary="3 tests pass"),
+        ctx,  # type: ignore[arg-type]
+    )
+    assert len(ctx.emitted) == 1
+    ev = ctx.emitted[0]
+    assert isinstance(ev, SubagentCompletedEvent)
+    assert (ev.type, ev.child_key, ev.ok, ev.summary) == (
+        "subagent.completed",
+        "a0ac9364",
+        True,
+        "3 tests pass",
+    )

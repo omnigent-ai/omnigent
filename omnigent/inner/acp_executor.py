@@ -60,6 +60,7 @@ from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
+from omnigent.inner.acp_subagents import SubAgentStart, read_subagent_events
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
@@ -69,6 +70,8 @@ from omnigent.inner.executor import (
     ExecutorEvent,
     Message,
     ReasoningChunk,
+    SubAgentCompleted,
+    SubAgentStarted,
     TextChunk,
     ToolCallComplete,
     ToolCallRequest,
@@ -1225,6 +1228,20 @@ class AcpExecutor(Executor):
 
         elif update_type == _UPDATE_CONFIG_OPTION:
             self._note_config_options(update.get("configOptions"))
+
+        # Sub-agent lifecycle rides on these updates in a per-agent dialect
+        # (Devin: cognition.ai/subagent_* on the _meta). A source recognizes its
+        # own dialect and normalizes it; the runner mints a child session per
+        # start so the "Subagents" panel lists it. See omnigent.inner.acp_subagents.
+        for sub in read_subagent_events(update):
+            if isinstance(sub, SubAgentStart):
+                events.append(
+                    SubAgentStarted(child_key=sub.child_key, title=sub.title, task=sub.task)
+                )
+            else:
+                events.append(
+                    SubAgentCompleted(child_key=sub.child_key, ok=sub.ok, summary=sub.summary)
+                )
 
         return events
 
