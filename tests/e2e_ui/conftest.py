@@ -53,7 +53,7 @@ from typing import Any
 import filelock
 import httpx
 import pytest
-from playwright.sync_api import Locator, Page, expect
+from playwright.sync_api import APIResponse, Error, Locator, Page, Route, expect
 
 from tests._helpers.compat import apply_server_env, compat_server_cwd, server_executable
 from tests.codex_parity.helpers import ev_assistant_message, ev_completed, ev_response_created
@@ -68,6 +68,32 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _ALLOW_DEV_BASE_URL_ENV = "OMNIGENT_E2E_ALLOW_DEV_BASE_URL"
 _CODEX_GOAL_MIN_VERSION = (0, 139, 0)
 _PUBLIC_LOOPBACK_HOST = "omnigent-e2e-public.test"
+
+
+# A pooled connection the server closes as the replay goes out surfaces as one
+# of these; the request itself is fine on a retry.
+_TRANSIENT_FETCH_ERRORS = ("ECONNRESET", "socket hang up")
+
+
+def fetch_with_retry(route: Route, *, attempts: int = 3) -> APIResponse:
+    """Replay *route*'s request upstream, retrying a dropped connection.
+
+    Intercepting a request opts out of the browser's own connection handling,
+    which retries an idempotent GET when the server closes a pooled keep-alive
+    connection. Replaying by hand does not, so a reset fails the test on
+    something it never meant to assert.
+
+    :param route: Route whose request to replay upstream.
+    :param attempts: Total tries before the error surfaces.
+    :returns: The upstream response.
+    """
+    for _ in range(attempts - 1):
+        try:
+            return route.fetch()
+        except Error as exc:
+            if not any(marker in str(exc) for marker in _TRANSIENT_FETCH_ERRORS):
+                raise
+    return route.fetch()
 
 
 def open_right_rail(page: Page) -> None:
@@ -2204,6 +2230,47 @@ def _ui_defaults() -> None:
     for streaming-text assertions without masking real hangs.
     """
     expect.set_options(timeout=15_000)
+
+
+@pytest.fixture(autouse=True)
+def _record_video(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[None]:
+    """Capture a screen recording of the journey when recording is requested.
+
+    Most e2e_ui tests drive Playwright through ``async_playwright()`` directly
+    (``browser.new_page()`` / ``browser.new_context()``), not the
+    pytest-playwright ``page`` fixture, so ``pytest --video`` records nothing for
+    them. When ``OMNIGENT_E2E_RECORD_DIR`` is set, patch the async ``Browser``
+    methods to inject ``record_video_dir`` into every page/context they open, so
+    the rendered journey lands as a ``.webm`` regardless of how the test opened
+    the browser. A caller that already passes ``record_video_dir`` is left alone.
+    Playwright writes the file (a random hash name) when the context closes;
+    callers/harnesses pick it up from the directory. No-op when the env var is
+    unset, so ordinary runs are unaffected.
+    """
+    record_dir = os.environ.get("OMNIGENT_E2E_RECORD_DIR")
+    if not record_dir:
+        yield
+        return
+
+    from playwright.async_api import Browser as _AsyncBrowser
+
+    Path(record_dir).mkdir(parents=True, exist_ok=True)
+    _orig_new_page = _AsyncBrowser.new_page
+    _orig_new_context = _AsyncBrowser.new_context
+
+    async def _new_page(self: Any, *args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("record_video_dir", record_dir)
+        return await _orig_new_page(self, *args, **kwargs)
+
+    async def _new_context(self: Any, *args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("record_video_dir", record_dir)
+        return await _orig_new_context(self, *args, **kwargs)
+
+    monkeypatch.setattr(_AsyncBrowser, "new_page", _new_page)
+    monkeypatch.setattr(_AsyncBrowser, "new_context", _new_context)
+    yield
 
 
 @pytest.fixture

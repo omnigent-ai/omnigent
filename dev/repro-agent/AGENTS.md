@@ -185,8 +185,10 @@ journey, not a workaround for it.
 **Stamp each sub-symptom with the user-facing surface it shows on.** Alongside
 the verdict you will give each facet (Step 2), record where a user *sees* the
 failure: `web` (the web SPA), `terminal` (a TUI or shell pane rendered inside
-the app — a native-harness pane, an embedded shell), or `cli` (a command-line
-surface outside the app: the `omnigent` CLI, the REPL, a host daemon's output).
+the app — a native-harness pane, an embedded shell), `cli` (a command-line
+surface outside the app: the `omnigent` CLI, the REPL, a host daemon's output),
+or `desktop` (a failure in the Electron desktop shell itself — the setup/connect
+page, a native dialog, the window/popup policy — not the SPA it hosts).
 The surface picks the kind of test you author (Step 3) and the recorder that
 captures it (Step 4).
 
@@ -325,9 +327,9 @@ saved under `recordings/<slug>/` in your workspace:
   behaving correctly on the running build (e.g. `recordings/1234/fixed-picker.webm`).
 
 `not_reproduced` and `needs_more_info` facets have nothing to film — skip them.
-A `web` / `terminal` / `cli` facet is expected to yield a recording: reproduce it
-on that surface and film it. Only an `api` facet (a failure no user observes on
-any surface) legitimately has no recording.
+A `web` / `terminal` / `cli` / `desktop` facet is expected to yield a recording:
+reproduce it on that surface and film it. Only an `api` facet (a failure no user
+observes on any surface) legitimately has no recording.
 
 **Record exactly the verdict-appropriate clip per facet — nothing else.** One
 recording per `reproduced` facet (`kind: "before"`) and one per `already_fixed`
@@ -486,6 +488,27 @@ cause is named from what you observed rather than guessed.
   `recordings: []` for that facet and name the specific blocker in `evidence`
   (per the empty-recordings rule above), exactly as you would for an unreachable
   `web`/`terminal` lane. The authored test still ships; it just isn't the video.
+- **`desktop` facets (Electron shell)** — when the failure lives in the desktop
+  shell itself (the dead-end 401 fallback to the setup page, in-window IdP
+  rendering, the session-expiry reload, the OAuth-popup / window-open policy,
+  the native host-enrollment dialog) rather than in the SPA, the browser tools
+  and the `tests/e2e_ui/` Playwright lane can't reach it: the defect is in
+  Electron's main process, and Python Playwright has **no** Electron API. Use
+  the JS desktop lane in `web/electron/e2e/` instead — **copy the reference test
+  `desktop_connect.e2e.js`**, which launches the REAL packaged shell under
+  `_electron.launch({ recordVideo })` (via `desktopHarness.js`, which spawns the
+  same mock-LLM + `omnigent server` pair the Python suite does) and films the
+  actual window. Pass `serverUrl` to `launchDesktop` when the failure is *past*
+  connect (boot straight into the shell); omit it to film the connect/setup/
+  fallback flow itself. Run with `node --test e2e/desktop_<slug>.e2e.js` from
+  `web/electron`, after building the SPA. On a headless box wrap it in
+  `xvfb-run -a` and set `OMNIGENT_PW_NO_SANDBOX=1` so Electron's Chromium starts
+  (the repro-agent CI sets both for you, and points `OMNIGENT_PYTHON` at the
+  venv the harness spawns the server with). This lane needs `electron` +
+  `playwright` on disk (neither is in the fast `web-test` CI path); the harness
+  **skips** cleanly when they're absent, so if they can't be installed here keep
+  `recordings: []` and name the missing dep in `evidence` (a real environment
+  limit, not a `not_reproduced`). See `web/electron/e2e/README.md`.
 
 A recording must end on the outcome the user observes — the failure (wrong screen
 state, bad output, error) for a `before` recording, or the correct end state for a
@@ -558,7 +581,7 @@ Field meanings:
   `already_fixed`).
 - `facets` — an array of the per-sub-symptom breakdown from Steps 1–2, each an
   object with `symptom`, its own `verdict` (same four literals), its `surface`
-  (`web` / `terminal` / `cli` / `api`, from Step 1), and one line of
+  (`web` / `terminal` / `cli` / `desktop` / `api`, from Step 1), and one line of
   `evidence`. Always a list, even for a single-symptom bug (then it's one
   element). This is what stops a partially-landed fix from being averaged into a
   misleading single verdict.

@@ -1443,7 +1443,8 @@ class QwenExecutor(Executor):
             if fut.done() and self._queue.empty():
                 try:
                     response = fut.result()
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
+                    logger.exception("qwen process response retrieval failed")
                     # The stdout reader sets an exception on the future when the
                     # subprocess dies. Surface it as a clean retryable error
                     # rather than letting it raise out of the generator.

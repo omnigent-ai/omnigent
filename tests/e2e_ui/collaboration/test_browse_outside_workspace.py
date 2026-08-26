@@ -42,6 +42,7 @@ from tests.e2e_ui.conftest import (
     _build_hello_world_bundle,
     _ensure_runner_online,
     _server_state,
+    fetch_with_retry,
     open_right_rail,
 )
 
@@ -146,7 +147,7 @@ def _stub_host_binding(page: Page, session_id: str, *, entry: Path) -> None:
         if request.method != "GET" or urlparse(request.url).path != f"/v1/sessions/{session_id}":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         payload["host_id"] = _FAKE_HOST_ID
         route.fulfill(
@@ -257,7 +258,7 @@ def test_owner_browses_outside_workspace_but_shared_collaborator_cannot(
         # Proof the tree re-rooted: this file exists only outside the workspace.
         expect(owner_rail.get_by_text("owner-only.txt")).to_be_visible(timeout=30_000)
     finally:
-        # The snapshot stub does a real `route.fetch()`, and `useSession`
+        # The snapshot stub does a real upstream fetch, and `useSession`
         # refetches that URL for as long as the page lives. Closing with one in
         # flight leaks its error onto the next Playwright call — landing on an
         # unrelated later test — so drop the routes before closing.

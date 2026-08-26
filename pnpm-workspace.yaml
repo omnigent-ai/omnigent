@@ -88,10 +88,18 @@ allowBuilds:
   '@google/genai': true
   '@vscode/vsce-sign': true
   canvas: true
+  # electron + playwright: the desktop recording lane (web/electron/e2e/) needs
+  # their postinstall scripts to run — electron downloads its ~100MB runtime
+  # binary and playwright its driver. Without these, `pnpm install` in the
+  # electron package "succeeds" but leaves the binaries absent, so the lane
+  # can't launch. Dev/test only (both are web/electron devDependencies; not
+  # bundled into the shipped app).
+  electron: true
   electron-winstaller: true
   esbuild: true
   keytar: true
   msw: true
+  playwright: true
   protobufjs: true
   sharp: true
   workerd: true

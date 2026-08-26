@@ -2474,6 +2474,13 @@ def create_runner_app(
             return
 
         error = _build_required_terminal_error(event)
+        _logger.error(
+            "required terminal %s exited; failing turn for %s: %s",
+            event.terminal_name,
+            event.session_id,
+            error.get("message"),
+            extra={"session_id": event.session_id},
+        )
         _publish_event(
             event.session_id,
             {
@@ -4088,6 +4095,16 @@ def create_runner_app(
         event: _JsonObject = {"type": "session.status", "status": status}
         if error is not None:
             event["error"] = error
+        if status == "failed":
+            # Canonical broken-turn signal: every failed turn shown in the UI
+            # funnels through here, so log once at ERROR for the dashboard.
+            _logger.error(
+                "turn surfaced to UI as failed for %s (harness=%s): %s",
+                conv_id,
+                harness,
+                error,
+                extra={"session_id": conv_id},
+            )
         _publish_event(conv_id, event)
 
     def _is_native_harness(conv_id: str) -> bool:
@@ -6644,6 +6661,12 @@ def create_runner_app(
                     timeout=None,
                 ) as harness_resp:
                     if harness_resp.status_code != 200:
+                        _logger.error(
+                            "harness rejected turn delivery for %s with status %d",
+                            conv_id,
+                            harness_resp.status_code,
+                            extra={"session_id": conv_id},
+                        )
                         _fail_status = {
                             "type": "response.failed",
                             "error": {
@@ -6951,11 +6974,10 @@ def create_runner_app(
                 yield _response_failed_event(_error)
 
             except (httpx.HTTPError, RuntimeError) as exc:
-                _logger.warning(
+                _logger.exception(
                     "proxy stream connection error for %s: %s",
                     conv_id,
                     exc,
-                    exc_info=True,
                     extra={"session_id": conv_id},
                 )
                 _error = {
@@ -9473,7 +9495,12 @@ def create_runner_app(
                             },
                         },
                     )
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
+                    _logger.exception(
+                        "MCP tool dispatch failed for %s",
+                        tool_name,
+                        extra={"session_id": session_id},
+                    )
                     return JSONResponse(
                         status_code=200,
                         content={
@@ -9527,7 +9554,12 @@ def create_runner_app(
                         publish_event=_publish_event,
                         filesystem_registry=filesystem_registry,
                     )
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
+                    _logger.exception(
+                        "MCP tool dispatch failed for %s",
+                        tool_name,
+                        extra={"session_id": session_id},
+                    )
                     return JSONResponse(
                         status_code=200,
                         content={

@@ -235,8 +235,8 @@ describe("mobile sidebar drawer", () => {
   });
 
   it("gives the session list a gutter so the last row clears the floating chip", () => {
-    // The chip doesn't scroll, so without this the bottom row's always-visible
-    // kebab sits underneath it and can't be tapped.
+    // The chip doesn't scroll, so without this it would cover the last row,
+    // hiding its title and state badge and blocking the tap target.
     renderSidebar();
 
     expect(screen.getByRole("navigation")).toHaveClass("max-md:pb-14");

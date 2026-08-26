@@ -29,6 +29,7 @@
 
 import {
   lazy,
+  type CSSProperties,
   type ReactNode,
   Suspense,
   useCallback,
@@ -758,7 +759,7 @@ function ColorThemeControl() {
             label="Accent"
             value={editableTheme.accent}
             testId="custom-theme-accent"
-            onChange={(accent) => updateCustomTheme({ accent })}
+            onChange={(accent) => updateCustomTheme({ accent, darkAccent: accent })}
           />
           <ThemeColorPicker
             label="Background tint"
@@ -783,7 +784,8 @@ function ColorThemeControl() {
                 aria-label="Theme contrast"
                 data-testid="custom-theme-contrast"
                 onChange={(event) => updateCustomTheme({ contrast: Number(event.target.value) })}
-                className="h-1.5 min-w-0 flex-1 cursor-pointer accent-primary"
+                className="theme-contrast-range min-w-0 flex-1 cursor-pointer"
+                style={{ "--range-progress": `${editableTheme.contrast}%` } as CSSProperties}
               />
               <output
                 htmlFor="custom-theme-contrast"

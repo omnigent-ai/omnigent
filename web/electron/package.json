@@ -34,7 +34,8 @@
   },
   "devDependencies": {
     "electron": "^42.3.2",
-    "electron-builder": "^26.0.0"
+    "electron-builder": "^26.0.0",
+    "playwright": "^1.62.1"
   },
   "build": {
     "appId": "ai.omnigent.desktop",

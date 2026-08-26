@@ -188,20 +188,23 @@ import {
 import { SidebarServerPicker } from "./SidebarServerPicker";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 
-// Positioning for a row's trailing session-state badge. Anchored at the
-// controls' right-1 edge and fades on hover so the pin + kebab take its place;
-// on mobile it sits left of the always-visible controls.
+// Positioning for a row's trailing session-state badge. Anchored at the row's
+// right-1 edge in every viewport: on desktop it fades on hover so the pin +
+// kebab take its place; on mobile those controls are gone, so the badge simply
+// holds the right edge.
 const SESSION_STATE_SLOT_CLASS =
-  "-translate-y-1/2 pointer-events-none absolute top-1/2 right-[4.5rem] flex h-5 items-center transition-opacity md:right-1 md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0";
+  "-translate-y-1/2 pointer-events-none absolute top-1/2 right-1 flex h-5 items-center transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0";
 
 // Small markers (running/starting/unseen dot, or the draft pencil when there's
-// no session state) get a fixed size-6 centered box so they line up vertically
-// under the kebab. The "awaiting" pill keeps its natural width — a fixed box
-// would clip its "Needs response" label.
+// no session state) get a fixed size-6 centered box so their glyph lands 16px
+// from the right edge — lining up vertically with the desktop kebab and the
+// size-6 section-header icons above (the marker column) in every viewport. The
+// "awaiting" pill keeps its natural width — a fixed box would clip its "Needs
+// response" label.
 function isDotMarker(state: SessionState | null): boolean {
   return state === null || state.kind !== "awaiting";
 }
-const SESSION_STATE_DOT_SLOT_CLASS = "md:w-6 md:justify-center";
+const SESSION_STATE_DOT_SLOT_CLASS = "w-6 justify-center";
 
 // Match the Settings sidebar's ghost-button hover treatment across every home
 // sidebar row.
@@ -3527,12 +3530,11 @@ function ConversationRow({
         // Full width (not 100%+1rem) so the highlight stays inset from the
         // right edge, aligning with the project/folder rows above.
         "w-full",
+        // Mobile drops the pin + kebab (see the trailing controls below), so it
+        // reserves only what the badge needs — the same width desktop uses at
+        // rest, before hover reveals the controls.
         !selectionMode &&
-          (sessionState?.kind === "awaiting"
-            ? "pr-48 md:pr-29"
-            : hasTrailingIndicator
-              ? "pr-28 md:pr-8"
-              : "pr-28 md:pr-2"),
+          (sessionState?.kind === "awaiting" ? "pr-29" : hasTrailingIndicator ? "pr-8" : "pr-2"),
         // The narrowed reserve must track exactly when the trailing controls
         // appear and the state marker fades — both keyed on `:focus-visible`.
         // `focus-within` also fires for a plain click, which shrank the reserve
@@ -3763,12 +3765,14 @@ function ConversationRow({
                 size="icon-xs"
                 aria-label="Conversation actions"
                 data-testid="conversation-actions"
-                // On mobile (no hover state) it's always visible. On desktop it
-                // stays hidden until hover / keyboard focus, with `aria-expanded`
-                // keeping it surfaced while the menu is open so the trigger
-                // doesn't vanish under the cursor.
+                // Desktop-only: the chat page's own header menu covers these
+                // per-session actions on mobile, so the row kebab is dropped
+                // there. From `md` up it stays hidden until hover / keyboard
+                // focus, with `aria-expanded` keeping it surfaced while the menu
+                // is open so the trigger doesn't vanish under the cursor.
                 className={cn(
                   "text-muted-foreground transition-opacity",
+                  "hidden md:inline-flex",
                   "md:opacity-0 md:group-hover:opacity-100 md:group-has-[:focus-visible]:opacity-100",
                   "md:aria-expanded:opacity-100",
                 )}
