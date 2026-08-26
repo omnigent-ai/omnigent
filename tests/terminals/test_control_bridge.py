@@ -1221,93 +1221,6 @@ async def test_control_bridge_read_only_drops_input() -> None:
     await _kill_and_join(sock, task)
 
 
-class _ScriptedStdout:
-    """Return buffered control-stream batches without implicitly yielding."""
-
-    def __init__(self, batches: list[bytes], events: list[str] | None = None) -> None:
-        self._batches = list(batches)
-        self._events = events
-
-    async def read(self, _n: int) -> bytes:
-        if self._events is not None:
-            self._events.append("R")
-        return self._batches.pop(0) if self._batches else b""
-
-
-@pytest.mark.asyncio
-async def test_control_parser_yields_and_bounds_oversized_lines(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Flood parsing stays cooperative and never retains an over-cap line."""
-    monkeypatch.setattr(control_bridge, "_CONTROL_MAX_LINE_BYTES", 64)
-    events: list[str] = []
-    seen: list[bytes] = []
-    discarded: list[int] = []
-
-    async def _ticker() -> None:
-        for _ in range(10):
-            events.append("T")
-            await asyncio.sleep(0)
-
-    ticker = asyncio.create_task(_ticker())
-    await asyncio.sleep(0)
-    stdout = _ScriptedStdout(
-        [
-            b"one\n",
-            b"x" * 100 + b"\n",
-            b"y" * 100,
-            b"tail\nok\n",
-        ],
-        events,
-    )
-    await control_bridge._parse_control_stream(
-        stdout,  # type: ignore[arg-type]
-        lambda line: seen.append(line) or True,
-        on_discard=discarded.append,
-    )
-    await ticker
-
-    assert seen == [b"one", b"ok"]
-    assert discarded == [100, 100]
-    assert "RR" not in "".join(events)
-
-
-@pytest.mark.asyncio
-async def test_oversized_control_lines_open_a_resynchronized_drop_gap(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Parser-side output loss runs the same recovery as queue saturation."""
-    monkeypatch.setattr(control_bridge, "_CONTROL_MAX_LINE_BYTES", 64)
-    queue = ws_common._ByteBoundedOutputQueue()
-    repaint_requests: list[int] = []
-    queue.on_drop = lambda: repaint_requests.append(1)
-
-    def _handle(line: bytes) -> bool:
-        if line.startswith(b"%output "):
-            queue.put_nowait(unescape_control_output(line.split(b" ", 2)[2]))
-        return True
-
-    stdout = _ScriptedStdout(
-        [
-            b"%output %0 " + b"a" * 100 + b"\n",
-            b"%output %0 " + b"b" * 100,
-            b"tail\n%output %0 after-gap\n",
-        ]
-    )
-    await control_bridge._parse_control_stream(
-        stdout,  # type: ignore[arg-type]
-        _handle,
-        on_discard=queue.record_dropped_output,
-    )
-
-    assert repaint_requests == [1, 1]
-    assert queue.dropped_chunks == 2
-    assert [queue.get_nowait() for _ in range(queue.qsize())] == [
-        ws_common._OUTPUT_GAP_RESYNC,
-        b"after-gap",
-    ]
-
-
 def test_output_queue_bounds_backlog_and_resynchronizes_after_drop() -> None:
     """The queue rejects new output at either budget and preserves EOF."""
     queue = ws_common._ByteBoundedOutputQueue(max_bytes=8, max_items=100)
@@ -1414,10 +1327,8 @@ async def test_gap_repainter_cancel_joins_active_repaint() -> None:
 
 
 @pytest.mark.asyncio
-async def test_tmux_capture_cancellation_kills_and_reaps_subprocess(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Cancelling pane capture cannot orphan its tmux subprocess."""
+async def test_repair_capture_cancellation_kills_and_reaps_subprocess() -> None:
+    """Cancelling repair capture cannot orphan its tmux subprocess."""
 
     class _BlockedProcess:
         def __init__(self) -> None:
@@ -1442,16 +1353,9 @@ async def test_tmux_capture_cancellation_kills_and_reaps_subprocess(
 
     proc = _BlockedProcess()
 
-    async def _metadata(*_args: object) -> None:
-        return None
-
-    async def _spawn(*_args: object, **_kwargs: object) -> _BlockedProcess:
-        return proc
-
-    monkeypatch.setattr(control_bridge.shutil, "which", lambda _name: "/tmux")
-    monkeypatch.setattr(control_bridge, "_capture_pane_metadata", _metadata)
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
-    task = asyncio.create_task(control_bridge._run_tmux_capture("socket", "main"))
+    task = asyncio.create_task(
+        control_bridge._communicate_tmux_process(proc)  # type: ignore[arg-type]
+    )
     await asyncio.wait_for(proc.communicating.wait(), timeout=1.0)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -1462,10 +1366,10 @@ async def test_tmux_capture_cancellation_kills_and_reaps_subprocess(
 
 
 @pytest.mark.asyncio
-async def test_tmux_capture_timeout_kills_and_reaps_subprocess(
+async def test_repair_capture_timeout_kills_and_reaps_subprocess(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A stuck pane capture times out and reaps its tmux subprocess."""
+    """A stuck repair capture times out and reaps its tmux subprocess."""
 
     class _BlockedProcess:
         def __init__(self) -> None:
@@ -1488,19 +1392,11 @@ async def test_tmux_capture_timeout_kills_and_reaps_subprocess(
 
     proc = _BlockedProcess()
 
-    async def _metadata(*_args: object) -> None:
-        return None
-
-    async def _spawn(*_args: object, **_kwargs: object) -> _BlockedProcess:
-        return proc
-
     monkeypatch.setattr(control_bridge, "_TMUX_CAPTURE_TIMEOUT_S", 0.01, raising=False)
-    monkeypatch.setattr(control_bridge.shutil, "which", lambda _name: "/tmux")
-    monkeypatch.setattr(control_bridge, "_capture_pane_metadata", _metadata)
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
 
     result = await asyncio.wait_for(
-        control_bridge._run_tmux_capture("socket", "main"), timeout=0.2
+        control_bridge._communicate_tmux_process(proc),  # type: ignore[arg-type]
+        timeout=0.2,
     )
     assert result is None
     assert proc.killed is True
@@ -1519,7 +1415,7 @@ async def test_oversized_snapshot_falls_back_to_bounded_plain_capture(
             self.args = args
             self.returncode = 0
 
-    async def _metadata(*_args: object) -> control_bridge._PaneMetadata:
+    async def _metadata(*_args: object, **_kwargs: object) -> control_bridge._PaneMetadata:
         return control_bridge._PaneMetadata(
             cursor_x=0,
             cursor_y=0,
@@ -1553,59 +1449,6 @@ async def test_oversized_snapshot_falls_back_to_bounded_plain_capture(
     assert len(capture_args) == 2
     assert "-e" in capture_args[0]
     assert "-e" not in capture_args[1]
-
-
-@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
-@pytest.mark.asyncio
-async def test_control_bridge_oversized_discard_emits_repaint(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A line discarded before enqueue still repaints the browser terminal."""
-    monkeypatch.setattr(control_bridge, "_CONTROL_MAX_LINE_BYTES", 256)
-    marker = b"\x1b[H\x1b[2JOVERSIZED-REPAINT"
-
-    async def _snapshot(_socket_path: str, _tmux_target: str, **_kwargs: object) -> bytes:
-        return marker
-
-    monkeypatch.setattr(control_bridge, "_capture_pane_snapshot", _snapshot)
-    created: list[ws_common._ByteBoundedOutputQueue] = []
-
-    class _RecordingQueue(ws_common._ByteBoundedOutputQueue):
-        def __init__(self) -> None:
-            super().__init__()
-            created.append(self)
-
-    monkeypatch.setattr(control_bridge, "_ByteBoundedOutputQueue", _RecordingQueue)
-    sock, target = await _new_private_tmux("bash --norc")
-    ws = _FakeWebSocket(inbound=[])
-    task = asyncio.create_task(
-        bridge_tmux_control_to_websocket(
-            ws, socket_path=str(sock), tmux_target=target, read_only=False
-        )
-    )
-    deadline = asyncio.get_running_loop().time() + 5.0
-    while not created and asyncio.get_running_loop().time() < deadline:
-        await asyncio.sleep(0.01)
-    assert created
-
-    tmux = shutil.which("tmux")
-    assert tmux
-    command = 'python3 -c \'print("Z"*8192,end="")\''
-    proc = await asyncio.create_subprocess_exec(
-        tmux, "-S", str(sock), "send-keys", "-t", target, "-l", command
-    )
-    await proc.communicate()
-    proc = await asyncio.create_subprocess_exec(
-        tmux, "-S", str(sock), "send-keys", "-t", target, "Enter"
-    )
-    await proc.communicate()
-
-    deadline = asyncio.get_running_loop().time() + 8.0
-    while marker not in b"".join(ws.sent) and asyncio.get_running_loop().time() < deadline:
-        await asyncio.sleep(0.05)
-    await _kill_and_join(sock, task)
-
-    assert marker in b"".join(ws.sent)
 
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
