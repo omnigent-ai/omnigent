@@ -8,8 +8,6 @@ export interface TerminalInfo {
   session: string;
   /** Whether the underlying tmux session is currently running. */
   running: boolean;
-  /** Web-attach transport, when supplied by the server. */
-  transport?: "control" | "pty";
   /**
    * Loopback attach URL advertised by the session's runner, when the
    * server disclosed one (owner-level callers only). Lets a browser on
@@ -40,14 +38,9 @@ export function parseDirectAttachUrl(value: unknown): string | undefined {
  * params join with ``&``. Mirrors ``buildAttachPath``'s param policy:
  * only emit what is set.
  */
-export function withAttachParams(
-  directAttachUrl: string,
-  readOnly: boolean,
-  transport?: string,
-): string {
+export function withAttachParams(directAttachUrl: string, readOnly: boolean): string {
   const params = new URLSearchParams();
   if (readOnly) params.set("read_only", "true");
-  if (transport) params.set("transport", transport);
   const qs = params.toString();
   return qs ? `${directAttachUrl}&${qs}` : directAttachUrl;
 }
@@ -242,8 +235,6 @@ export function terminalInfoFromResource(resource: Record<string, unknown>): Ter
   const terminalName = metadata.terminal_name;
   const sessionKey = metadata.session_key;
   const running = metadata.running;
-  const rawTransport = metadata.terminal_transport;
-  const transport = rawTransport === "control" || rawTransport === "pty" ? rawTransport : undefined;
   const fallbackName = resource.name;
   return {
     id,
@@ -255,7 +246,6 @@ export function terminalInfoFromResource(resource: Record<string, unknown>): Ter
           : "",
     session: typeof sessionKey === "string" ? sessionKey : "",
     running: typeof running === "boolean" ? running : false,
-    transport,
     directAttachUrl: parseDirectAttachUrl(metadata.direct_attach_url),
   };
 }

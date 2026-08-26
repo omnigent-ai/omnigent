@@ -122,10 +122,15 @@ import {
   CODE_FONT_SIZE_MAX,
   CODE_FONT_SIZE_MIN,
   CODE_FONT_SIZE_STEP,
+  CODE_FONT_WEIGHT_DEFAULT,
+  CODE_FONT_WEIGHT_HEAVIER,
+  CODE_FONT_WEIGHT_NORMAL,
   readCodeFontFamily,
   readCodeFontSizePx,
+  readCodeFontWeight,
   writeCodeFontFamily,
   writeCodeFontSizePx,
+  writeCodeFontWeight,
 } from "@/lib/codeFontPreferences";
 import {
   readTerminalThemeMode,
@@ -922,6 +927,7 @@ function AppearanceSection() {
 
     writeCodeFontSizePx(CODE_FONT_SIZE_DEFAULT);
     writeCodeFontFamily(CODE_FONT_FAMILY_DEFAULT);
+    writeCodeFontWeight(CODE_FONT_WEIGHT_DEFAULT);
 
     // Remove the persisted keys so this device has no appearance overrides at
     // all. Some write helpers already remove the key for the default value;
@@ -934,6 +940,7 @@ function AppearanceSection() {
           "omnigent:ui-font-family",
           "omnigent:code-font-size",
           "omnigent:code-font-family",
+          "omnigent:code-font-weight",
           "omnigent:terminal-theme",
           "omnigent:ui-theme-palette",
           "omnigent:custom-theme",
@@ -990,16 +997,18 @@ function AppearanceSection() {
 
         <UiFontFamilyControl />
 
-        {/* Code font (Monaco + xterm) sits as its own two rows — labelled in full
-            ("Code font size" / "Code font family") rather than under a shared
+        {/* Code font (Monaco + xterm) sits as its own rows — labelled in full
+            ("Code font size" / "Code font family" / "Code font weight") rather than under a shared
             heading — so each control reads unambiguously next to the UI-font rows
             above and it's clear these don't scale the surrounding chrome. */}
         <UiCodeFontSizeControl />
 
         <UiCodeFontFamilyControl />
+
+        <UiCodeFontWeightControl />
       </div>
 
-      <div className="flex items-center justify-end">
+      <div className="mt-4 flex items-center justify-end">
         <Dialog open={isResetDialogOpen} onOpenChange={setIsResetDialogOpen}>
           <DialogTrigger asChild>
             <Button
@@ -1418,6 +1427,35 @@ function UiCodeFontFamilyControl() {
           onChange={(e) => update(e.target.value)}
         />
       </div>
+    </div>
+  );
+}
+
+/** Font weight preset shared by Monaco and xterm code surfaces. */
+function UiCodeFontWeightControl() {
+  const [heavier, setHeavier] = useState(() => readCodeFontWeight() === CODE_FONT_WEIGHT_HEAVIER);
+
+  const toggle = (enabled: boolean) => {
+    setHeavier(enabled);
+    writeCodeFontWeight(enabled ? CODE_FONT_WEIGHT_HEAVIER : CODE_FONT_WEIGHT_NORMAL);
+  };
+
+  return (
+    <div className="flex items-center justify-between gap-6" data-testid="code-font-weight-control">
+      <div className="min-w-0 flex-1">
+        <span className="text-ui font-medium">Heavier code font</span>
+        <span className="block text-sm text-muted-foreground">
+          Use a slightly heavier font weight in the code editor and terminal.
+        </span>
+      </div>
+      <Switch
+        aria-label="Use heavier code text"
+        checked={heavier}
+        onCheckedChange={toggle}
+        data-testid="heavier-code-text-toggle"
+        className="shrink-0"
+        componentId="settings.appearance.heavier_code_text"
+      />
     </div>
   );
 }

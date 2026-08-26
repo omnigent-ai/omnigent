@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -75,6 +75,7 @@ function renderHeader(props: {
   hasRailContent?: boolean;
   showFilesPanel?: boolean;
   mobileMenu?: typeof mobileMenu;
+  onOpenSidebar?: (peek?: boolean) => void;
 }) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
@@ -83,7 +84,7 @@ function renderHeader(props: {
         <TooltipProvider>
           <ChatHeader
             sidebarOpen={props.sidebarOpen}
-            onOpenSidebar={() => {}}
+            onOpenSidebar={props.onOpenSidebar ?? (() => {})}
             isChildSession={props.isChildSession ?? false}
             // Defaults to no active session: PresenceAvatars / AgentInfoButton /
             // right-panel toggle / rail entries all gate on conversationId and
@@ -187,6 +188,25 @@ describe("ChatHeader — open-sidebar toggle visibility", () => {
     // present. A regression here would hide the only way to reopen the
     // sidebar via pointer.
     expect(screen.getByRole("button", { name: "Open sidebar" })).toBeInTheDocument();
+  });
+
+  it("cancels the pending peek as soon as the toggle is pressed", () => {
+    vi.useFakeTimers();
+    const onOpenSidebar = vi.fn();
+    try {
+      renderHeader({ sidebarOpen: false, onOpenSidebar });
+      const toggle = screen.getByRole("button", { name: "Open sidebar" });
+
+      fireEvent.pointerEnter(toggle);
+      fireEvent.pointerDown(toggle);
+      act(() => vi.advanceTimersByTime(400));
+
+      expect(onOpenSidebar).not.toHaveBeenCalledWith(true);
+      fireEvent.click(toggle);
+      expect(onOpenSidebar).toHaveBeenLastCalledWith(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -508,6 +528,7 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     const trigger = screen.getByRole("button", { name: "Conversation actions" });
     expect(title).toHaveClass("min-w-0", "truncate");
     expect(title.parentElement).toBe(trigger.parentElement);
+    expect(trigger.closest("nav.conversation-breadcrumb")).not.toHaveClass("group/breadcrumb");
     expect(title.compareDocumentPosition(trigger) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 

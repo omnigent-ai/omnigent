@@ -10,7 +10,7 @@ import {
   ArchiveIcon,
   CheckIcon,
   ChevronLeftIcon,
-  EllipsisVerticalIcon,
+  EllipsisIcon,
   FolderInputIcon,
   GitBranchIcon,
   InfoIcon,
@@ -371,7 +371,7 @@ export function HeaderConversationMenu({
             data-testid="header-conversation-actions"
             className="shrink-0 border-none text-muted-foreground hover:text-foreground max-md:rounded-full"
           >
-            <EllipsisVerticalIcon className={isMobile ? "size-4" : "size-3.5"} />
+            <EllipsisIcon className={isMobile ? "size-4" : "size-3.5"} />
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent

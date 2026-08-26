@@ -346,26 +346,30 @@ describe("quick pin/unpin hover button", () => {
     }
   });
 
-  it("keeps the Projects group-header actions visible on mobile, hover-revealed on desktop", () => {
+  it("keeps the Projects group-header actions visible without hover, hover-revealed on desktop", () => {
     // The "New project" (+) button is the only way to create a project, so its
-    // group-header wrapper must stay visible on mobile (no hover there) rather
-    // than fade out like the desktop-only session-header controls. jsdom
-    // doesn't evaluate media queries, so assert the responsive classes: base
-    // `flex` (shown at every breakpoint) with `md:opacity-0` + hover/focus
-    // reveals (so desktop keeps the fade-until-hover behavior unchanged).
+    // group-header wrapper must stay visible wherever hover is unavailable —
+    // phones AND touch tablets at `md`+ widths — rather than fade out like the
+    // desktop-only session-header controls. jsdom doesn't evaluate media
+    // queries, so assert the responsive classes: base `flex` (shown at every
+    // breakpoint) with the fade + hover/focus reveals gated on hover
+    // capability, not just the `md` width.
     mocks.projects = ["Sprint 42"];
     renderSidebar();
 
     const wrapper = screen.getByTestId("new-project").closest(".transition-opacity");
     expect(wrapper).not.toBeNull();
-    // Visible on mobile: base display is `flex`, never `hidden`.
+    // Visible without hover: base display is `flex`, never `hidden`, and the
+    // fade is not applied by viewport width alone.
     expect(wrapper).toHaveClass("flex");
     expect(wrapper).not.toHaveClass("hidden");
-    // Desktop: fades out until the header is hovered / focused / a menu opens.
+    expect(wrapper).not.toHaveClass("md:opacity-0");
+    // Hover-capable desktop: fades out until the header is hovered / focused /
+    // a menu opens.
     expect(wrapper).toHaveClass(
-      "md:opacity-0",
-      "md:group-hover/header:opacity-100",
-      "md:has-[:focus-visible]:opacity-100",
+      "[@media(hover:hover)]:md:opacity-0",
+      "[@media(hover:hover)]:md:group-hover/header:opacity-100",
+      "[@media(hover:hover)]:md:has-[:focus-visible]:opacity-100",
     );
   });
 
