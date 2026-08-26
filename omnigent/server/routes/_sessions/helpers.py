@@ -9461,13 +9461,33 @@ async def _handle_mcp_tools_list(
     for srv, msg in failures.items():
         _logger.warning("runner MCP server %r unavailable: %s", srv, msg)
 
+    # Omnigent extension (not part of the MCP tools/list schema): pass through
+    # InitializeResult.instructions captured on the runner so ProxyMcpManager
+    # can append them to the system prompt. Accept either spelling from the
+    # runner, emit camelCase to the proxy (MCP-JSON convention on this hop).
+    server_instructions = (
+        result.get("server_instructions") or result.get("serverInstructions") or {}
+    )
+    if not isinstance(server_instructions, dict):
+        server_instructions = {}
+    server_labels = result.get("server_labels") or result.get("serverLabels") or {}
+    if not isinstance(server_labels, dict):
+        server_labels = {}
+
     _logger.debug(
         "MCP tools/list: session=%r returning %d tools, %d failures",
         session_id,
         len(tools),
         len(failures),
     )
-    return _mcp_ok_response(rpc_id, {"tools": tools})
+    return _mcp_ok_response(
+        rpc_id,
+        {
+            "tools": tools,
+            "serverInstructions": server_instructions,
+            "serverLabels": server_labels,
+        },
+    )
 
 
 async def _read_upload_capped(file: UploadFile, limit_bytes: int) -> bytes:

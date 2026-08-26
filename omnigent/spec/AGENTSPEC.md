@@ -266,6 +266,12 @@ defaults apply: **5 seconds** for the initial HTTP connection handshake and
 **300 seconds (5 minutes)** for each SSE event read. Setting an explicit
 `timeout` overrides both values to the same number of seconds.
 
+When an MCP server returns `InitializeResult.instructions`, the
+runner-mediated (SSE) turn path appends that text to the agent system
+prompt after `AGENTS.md` as untrusted routing guidance. Native harness
+launch prompts do not receive it. Disable globally with
+`OMNIGENT_MCP_INSTRUCTIONS_ENABLED=0` (or `false` / `no` / `off`).
+
 **Security note — `${VAR}` is NOT expanded for uploaded bundles:**
 ``${VAR}`` references in `headers`, `env`, and connection blocks are
 resolved against the spec author's *own* environment at the client /

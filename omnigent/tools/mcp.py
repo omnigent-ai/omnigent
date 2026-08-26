@@ -482,6 +482,11 @@ class McpServerConnection:
         default=None, init=False, repr=False
     )
     _discovered_tools: list[McpToolDef] = field(default_factory=list, init=False, repr=False)
+    # Captured from InitializeResult after session.initialize(); used by the
+    # runner to append MCP server routing guidance into the system prompt.
+    # Cleared on close/reconnect.
+    _initialize_instructions: str | None = field(default=None, init=False, repr=False)
+    _server_info_name: str | None = field(default=None, init=False, repr=False)
     _breaker: _CircuitBreaker = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -492,6 +497,16 @@ class McpServerConnection:
             failure_threshold=_CIRCUIT_BREAKER_THRESHOLD,
             cooldown_seconds=_CIRCUIT_BREAKER_COOLDOWN_SECONDS,
         )
+
+    @property
+    def initialize_instructions(self) -> str | None:
+        """Non-empty ``InitializeResult.instructions`` from the last connect, if any."""
+        return self._initialize_instructions
+
+    @property
+    def server_info_name(self) -> str | None:
+        """``InitializeResult.serverInfo.name`` from the last connect, if any."""
+        return self._server_info_name
 
     async def connect(self) -> list[McpToolDef]:
         """
@@ -766,7 +781,8 @@ class McpServerConnection:
                     ),
                 )
                 await stack.enter_async_context(session)
-                await session.initialize()
+                init_result = await session.initialize()
+                self._capture_initialize_result(init_result)
                 self._session = session
                 discovered = await self._discover_or_use_cache()
                 ready.set_result(discovered)
@@ -793,6 +809,58 @@ class McpServerConnection:
             )
         finally:
             self._session = None
+            self._initialize_instructions = None
+            self._server_info_name = None
+
+    def _capture_initialize_result(self, init_result: object) -> None:
+        """Persist ``instructions`` / ``serverInfo.name`` from an initialize result.
+
+        Tolerates both attribute access (MCP SDK pydantic models) and
+        mapping-shaped mocks used in unit tests. Empty / whitespace-only
+        instructions are stored as ``None``.
+
+        First non-empty capture in a lifecycle wins. Reconnect goes through
+        ``finally`` (which clears these fields) so a later successful
+        initialize can replace them. A second initialize in the same
+        lifecycle that would change the stored text is logged and ignored.
+
+        :param init_result: Value returned by ``ClientSession.initialize()``.
+        """
+        from omnigent.runtime.prompt import MCP_INSTRUCTIONS_PER_SERVER_MAX
+
+        instructions: object | None
+        if isinstance(init_result, dict):
+            instructions = init_result.get("instructions")
+            server_info = init_result.get("serverInfo") or init_result.get("server_info")
+        else:
+            instructions = getattr(init_result, "instructions", None)
+            server_info = getattr(init_result, "serverInfo", None)
+            if server_info is None:
+                server_info = getattr(init_result, "server_info", None)
+
+        captured: str | None
+        if isinstance(instructions, str) and instructions.strip():
+            captured = instructions.strip()[:MCP_INSTRUCTIONS_PER_SERVER_MAX]
+        else:
+            captured = None
+
+        name: object | None = None
+        if isinstance(server_info, dict):
+            name = server_info.get("name")
+        elif server_info is not None:
+            name = getattr(server_info, "name", None)
+        captured_name = name.strip() if isinstance(name, str) and name.strip() else None
+
+        if self._initialize_instructions is not None:
+            if captured != self._initialize_instructions:
+                _logger.warning(
+                    "MCP server %r ignored a mid-lifecycle initialize.instructions change",
+                    self.config.name,
+                )
+            return
+
+        self._initialize_instructions = captured
+        self._server_info_name = captured_name
 
     async def _discover_or_use_cache(
         self,

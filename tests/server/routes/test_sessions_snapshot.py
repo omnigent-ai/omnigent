@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 from sqlalchemy.exc import StatementError
 
+from omnigent.db.db_models import InvalidUuidError
 from omnigent.entities import Conversation, ConversationItem, MessageData, PagedList
 from omnigent.server.routes import sessions as _sessions_mod
 from omnigent.server.routes.sessions import (
@@ -346,6 +347,81 @@ async def test_session_snapshot_uses_child_spec_metadata(
     assert child.context_window == 100_000
     assert child.harness == "codex"
     assert cache_loads == [True, True, True, True]
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_tolerates_global_store_uuid_bind_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Snapshot must not fail when harness resolution hits a polluted global store.
+
+    ``_build_session_response`` always calls ``_resolve_harness``, which reads
+    the runtime-global agent store (not the injected stub). Under xdist a real
+    SQL store can remain set; non-uuid test ids then raise ``StatementError``.
+    """
+    conversations = {
+        "conv_parent": Conversation(
+            id="conv_parent",
+            created_at=1,
+            updated_at=1,
+            root_conversation_id="conv_parent",
+            agent_id="ag_advisor",
+        ),
+    }
+    conv_store = _ConversationStore([], conversations=conversations)
+
+    class _AgentStore:
+        @staticmethod
+        def get(agent_id: str) -> Any:
+            return type(
+                "StoredAgent",
+                (),
+                {"id": agent_id, "name": "advisor-row", "bundle_location": "bundle"},
+            )()
+
+    class _AgentCache:
+        @staticmethod
+        def load(agent_id: str, bundle_location: str) -> Any:
+            del agent_id, bundle_location
+            return type(
+                "LoadedAgent",
+                (),
+                {
+                    "spec": AgentSpec(
+                        spec_version=1,
+                        name="advisor",
+                        executor=ExecutorSpec(
+                            config={"harness": "codex"},
+                            model="openai-codex/gpt-5.6-sol:high",
+                            context_window=200_000,
+                        ),
+                    )
+                },
+            )()
+
+    class _BoomGlobalStore:
+        def get(self, agent_id: str) -> Any:
+            raise StatementError(
+                "bind failed",
+                None,
+                None,
+                InvalidUuidError(f"expected a 32-char hex uuid, got {agent_id!r}"),
+            )
+
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+    monkeypatch.setattr("omnigent.runtime._globals._agent_store", _BoomGlobalStore())
+
+    snapshot = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        "conv_parent",
+        agent_store=_AgentStore(),  # type: ignore[arg-type]
+        agent_cache=_AgentCache(),  # type: ignore[arg-type]
+    )
+
+    assert snapshot.agent_name == "advisor"
+    assert snapshot.llm_model == "openai-codex/gpt-5.6-sol:high"
+    assert snapshot.harness is None
 
 
 @pytest.mark.asyncio
