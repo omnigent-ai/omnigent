@@ -802,19 +802,31 @@ nothing); **request-changes** when it's `not_fixed` / `partially_fixed`; a plain
 author path, there's no self-review — your own PR just gets tagged. Remember: a bot
 approval is only an indicator; a human maintainer's approval is always what merges.
 
-**Then hand the PR to a human** — the **same maintainer the issue is assigned to**
-— on **both paths** (a PR you authored and an existing PR you reviewed and kept).
-This applies whenever you have a `closing_issue_number` (Step 1) — the `bug_url`
-issue itself, or the mirrored GitHub issue for a Linear ticket. Read that issue's
-assignee and request their review:
+**Then hand the PR to a human** — the **person the bug is assigned to** — on
+**both paths** (a PR you authored and an existing PR you reviewed and kept).
+**Never pick a reviewer arbitrarily.** Determine the assignee in this priority:
+
+1. **The `bug_url` assignee is authoritative.** When `bug_url` is a **Linear
+   ticket**, its assignee is the one to tag — read it from Linear (GraphQL
+   `issue(id:"OMNI-XXXX"){ assignee { displayName email } }`) and map to their
+   GitHub login (by matching the mirrored issue's assignee, or the email/handle).
+   When `bug_url` is a **GitHub issue**, its own assignee is authoritative.
+2. **Fallback to the mirrored GitHub issue's assignee.** If the Linear ticket has
+   **no** assignee (or you can't map it to a GitHub login), fall back to the
+   `closing_issue_number` issue's assignee — often the same person, since the
+   mirror is assigned to whoever owns the Linear ticket.
+
+Read the chosen assignee and request their review:
 
 ```
+# Linear ticket → its assignee (authoritative); else the mirrored issue's assignee
 gh issue view <closing_issue_number> --json assignees --jq '.assignees[].login'
 gh pr edit <pr> --add-reviewer <login>
 ```
 
 - If there are **multiple assignees**, request all of them.
-- If there is **no `closing_issue_number`** (so there's no assignee to read), the
+- If there is **no assignee on the Linear ticket and no `closing_issue_number`**
+  (so there's no assignee to read anywhere), the
   assignee **is the PR author** (you can't request review from the author — common
   on the review path, where the assignee often *is* whoever opened the PR you
   reviewed), or the issue has **no assignee**, don't force a reviewer — instead
