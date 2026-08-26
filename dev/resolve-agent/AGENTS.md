@@ -37,8 +37,16 @@ itself (repro-agent already read that). Exactly one of these is provided:
   This is the **CI** path: repro-agent ran in a throwaway CI worktree that no
   longer exists, so you recover everything from the run itself (see below).
 
-Plus one optional flag:
+Plus optional fields:
 
+- `bug_url` (optional, string) — the **authoritative** bug this reproduction is
+  for (a GitHub issue or Linear ticket URL). When present, **this is the bug you
+  resolve, full stop.** The `session` / `ci_link` run is then used *only* to
+  recover the reproduction test, verdict, facets, and journey — never to decide
+  *which* bug. If the run's own recovered `bug_url` disagrees with the one you
+  were given, that's a broken hand-off: **stop with `needs_more_info`** naming
+  both, do not resolve either. When absent, recover `bug_url` from the run as
+  described below (the legacy path).
 - `skip_push` (optional, boolean) — when `true`, the **author path commits the fix
   locally but does not push the branch or open the PR** (Step 3), leaving the
   commit in the local worktree for a human to inspect, push, and PR. It has no
@@ -139,12 +147,18 @@ Do all of this before Step 1:
    it is not a resolution failure. When `public` is absent or false (the default),
    skip this — do not call `sys_session_share`.
 2. **Recover the handoff** (above): the verdict, `facets`, `journey`, `bug_url`,
-   and the e2e test's content at `test_path`. The `bug_url` comes **only** from
-   this run/session's own handoff — the pointer you were invoked with fixes which
-   bug you resolve. On the shared `--server` you can see other repro sessions;
-   never let one of them redirect you to a different bug. Every downstream action
-   (the PR you review or open, the ticket you comment on) must be about this
-   `bug_url` and no other.
+   and the e2e test's content at `test_path`.
+   - **If the input carried a `bug_url`, that is the bug — authoritative.** Use
+     the run only to recover the test/verdict/facets/journey. Cross-check: the
+     `bug_url` you recover from the run **must equal** the one you were given; if
+     they differ, stop with `needs_more_info` naming both (a mis-chained pointer),
+     do not resolve either.
+   - **If the input carried no `bug_url`,** recover it from this run/session's own
+     handoff — the pointer you were invoked with fixes which bug you resolve. On
+     the shared `--server` you can see other repro sessions; never let one of them
+     redirect you to a different bug.
+   Either way, every downstream action (the PR you review or open, the ticket you
+   comment on) must be about this `bug_url` and no other.
 3. **Confirm the workspace**: your cwd is an omnigent checkout, the test exists at
    `test_path`, and your tooling works — `git`, `gh` (authenticated:
    `gh auth status`), and the test runner. If `gh` is not authenticated you can
