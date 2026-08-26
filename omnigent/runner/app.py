@@ -10741,7 +10741,9 @@ def _build_spawn_env_from_spec(
             "%s gateway routing: gateway=%s base_url=%s profile=%s model=%s",
             harness,
             env.get(f"{prefix}_GATEWAY"),
-            env.get(f"{prefix}_GATEWAY_BASE_URL"),
+            # A harness that carries per-family URLs (pi) sets only the plural
+            # ``_BASE_URLS`` JSON; without the fallback it logs base_url=None.
+            env.get(f"{prefix}_GATEWAY_BASE_URL") or env.get(f"{prefix}_GATEWAY_BASE_URLS"),
             env.get(f"{prefix}_DATABRICKS_PROFILE"),
             env.get(_HARNESS_MODEL_ENV_KEY.get(harness, f"{prefix}_MODEL")),
             extra={"session_id": session_id},
