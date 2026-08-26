@@ -354,6 +354,7 @@ from omnigent.server.routes._sessions.helpers import (
     _add_model_usage_delta as _add_model_usage_delta,
     _agent_carries_cursor_fork_history as _agent_carries_cursor_fork_history,
     _agent_carries_native_fork_history_impl as _agent_carries_native_fork_history_impl,
+    _agent_clone_root_name as _agent_clone_root_name,
     _agent_is_native_impl as _agent_is_native_impl,
     _agent_provider_family as _agent_provider_family,
     _allow_all_edits_eligible as _allow_all_edits_eligible,
@@ -750,6 +751,7 @@ from omnigent.util.session_lifecycle import (
 if TYPE_CHECKING:
     __all__ = [
         "_agent_carries_native_fork_history",
+        "_agent_clone_root_name",
         "_agent_is_native",
         "_build_policy_engine_from_spec",
         "_dispatch_session_event_to_runner",

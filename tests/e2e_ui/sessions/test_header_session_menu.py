@@ -54,7 +54,7 @@ def test_header_session_menu_renames_owner_and_hides_for_subagent(
         # shortcuts. "Add to project" is a submenu trigger, so its label carries
         # the flyout's own items; match only the leading action label.
         menu_items = page.get_by_role("menuitem")
-        expect(menu_items).to_have_count(8)
+        expect(menu_items).to_have_count(9)
         labels = [text.split("\n")[0] for text in menu_items.all_inner_texts()]
         assert labels == [
             "Pin",
@@ -62,6 +62,7 @@ def test_header_session_menu_renames_owner_and_hides_for_subagent(
             "Export",
             "Rename",
             "Mark as unread",
+            "Restart session…",
             "Add to project",
             "Archive",
             "Delete",
