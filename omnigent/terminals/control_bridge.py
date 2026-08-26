@@ -142,6 +142,8 @@ _CLIPBOARD_BUFFER_NAME_RE: Final = re.compile(rb"[A-Za-z0-9_.:-]{1,128}\Z")
 # base64/JSON expansion so a huge tmux buffer cannot become a websocket DoS.
 _CLIPBOARD_MAX_BYTES: Final[int] = MAX_CLIPBOARD_BYTES
 _CLIPBOARD_READ_TIMEOUT_S: Final[float] = 2.0
+# Pane capture commands must not outlive a detached terminal bridge.
+_TMUX_CAPTURE_TIMEOUT_S: Final[float] = 5.0
 # A copy-mode commit follows the initiating key or mouse release immediately.
 # Correlating the notification with this client's recent input prevents one
 # attached browser from overwriting every other viewer's local clipboard.
@@ -268,6 +270,30 @@ class _WindowNameFilter:
         if state is _WindowNameState.NAME_ESCAPE:
             return _STRING_TERMINATOR
         return b""
+
+
+async def _communicate_tmux_process(
+    proc: asyncio.subprocess.Process,
+) -> tuple[bytes, bytes] | None:
+    """Bound tmux output collection and reap the process on interruption."""
+
+    async def _kill_and_reap() -> None:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(proc.wait(), timeout=_TMUX_CAPTURE_TIMEOUT_S)
+
+    try:
+        return await asyncio.wait_for(
+            proc.communicate(),
+            timeout=_TMUX_CAPTURE_TIMEOUT_S,
+        )
+    except asyncio.CancelledError:
+        await _kill_and_reap()
+        raise
+    except (asyncio.TimeoutError, OSError, ValueError):
+        await _kill_and_reap()
+        return None
 
 
 async def _read_tmux_buffer(
@@ -434,9 +460,12 @@ async def _run_tmux_capture(socket_path: str, tmux_target: str) -> bytes | None:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
-        stdout, _ = await proc.communicate()
     except (OSError, ValueError):
         return None
+    result = await _communicate_tmux_process(proc)
+    if result is None:
+        return None
+    stdout, _ = result
     if proc.returncode != 0:
         return None
     # ``capture-pane -p`` emits one LF per row — INCLUDING a trailing LF after
@@ -577,9 +606,12 @@ async def _capture_pane_metadata(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
-        stdout, _ = await proc.communicate()
     except (OSError, ValueError):
         return None
+    result = await _communicate_tmux_process(proc)
+    if result is None:
+        return None
+    stdout, _ = result
     if proc.returncode != 0:
         return None
     try:
@@ -844,6 +876,8 @@ async def bridge_tmux_control_to_websocket(
             tail = window_name_filter.finish()
             if tail:
                 output_chunks.put_nowait(tail)
+            output_chunks.on_drop = None
+            await repainter.cancel()
             output_chunks.put_nowait(None)
             clipboard_buffers.put_nowait(None)
             if reader_done is not None:
@@ -1008,6 +1042,7 @@ async def bridge_tmux_control_to_websocket(
         for result in task_results:
             if isinstance(result, Exception):
                 _logger.warning("control-attach: bridge task failed during teardown: %r", result)
+        await repainter.cancel()
         # Detach reflows the pane back to remaining clients — stamp it.
         if on_client_interaction is not None:
             on_client_interaction()
