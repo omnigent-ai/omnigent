@@ -11,7 +11,9 @@ import { UI_FONT_SIZE_DEFAULT, UI_FONT_SIZE_MAX, UI_FONT_SIZE_MIN } from "./lib/
 
 // Relative to the vitest root (web/) — import.meta.url is not a file://
 // URL inside vitest's module graph, so it can't locate the file.
-const cssSource = readFileSync("src/index.css", "utf8");
+const indexCssSource = readFileSync("src/index.css", "utf8");
+const generatedPaletteCssSource = readFileSync("src/themePalettes.generated.css", "utf8");
+const cssSource = `${generatedPaletteCssSource}\n${indexCssSource}`;
 
 /* Regression test for the "transparent dropdown in prod" bug.
  *
@@ -133,6 +135,18 @@ describe("index.css bg-card glass rule selector", () => {
   });
 });
 
+describe("index.css app-shell viewport lock", () => {
+  const rule = (cssSource.match(/[^{}]+\{[^{}]*\}/g) ?? []).find(
+    (block) => block.includes("body:has(.app-shell)") && /overflow\s*:\s*hidden/.test(block),
+  );
+
+  it("locks both document roots while the fixed app shell is mounted", () => {
+    expect(rule, "the app-shell viewport lock is gone from index.css").toBeDefined();
+    expect(rule).toContain("html:has(.app-shell)");
+    expect(rule).toContain("body:has(.app-shell)");
+  });
+});
+
 /* Regression test for the "table link column collapses to ~2ch" bug.
  *
  * Streamdown styles links with `wrap-anywhere`, which also drops the
@@ -241,21 +255,16 @@ describe("index.css sidebar canvas", () => {
   const omniDarkRule = cssSource.match(
     /\.dark:not\(\[data-theme\]\) \.conversations-sidebar \{[^}]*\}/,
   )?.[0];
-  const paletteRule = cssSource.match(
-    /:root:not\(\.dark\)\[data-theme\] \.conversations-sidebar,[^{]*\.dark\[data-theme\] \.conversations-sidebar \{[^}]*\}/,
-  )?.[0];
   const lightEdgeRule = cssSource.match(
     /html:not\(\.dark\) \.conversations-sidebar(?::not\(\.is-peek\))? \{[^}]*\}/,
   )?.[0];
   const darkEdgeRule = cssSource.match(/\.dark \.conversations-sidebar \{[^}]*\}/)?.[0];
+  const peekBackgroundRule = cssSource.match(
+    /:root:not\(\.dark\):not\(\[data-theme\]\) \.conversations-sidebar\.is-peek,[\s\S]*?\.dark\[data-theme\] \.conversations-sidebar\.is-peek \{[^}]*\}/,
+  )?.[0];
 
-  it("uses the specified left-to-right gradient for Omnigent light only", () => {
-    expect(omniLightRule).toContain("background: #fffefe");
-    expect(omniLightRule).toContain(
-      "background: -webkit-linear-gradient(to right, #fffefe, #fcf6fa)",
-    );
-    expect(omniLightRule).toContain("background: linear-gradient(to right, #fffefe, #fcf6fa)");
-    expect(paletteRule).toContain("background: var(--sidebar)");
+  it("uses the specified left-to-right gradient for Omnigent light", () => {
+    expect(omniLightRule).toContain("background: linear-gradient(90deg, #fffefe, #fcf6fa)");
   });
 
   it("removes the dot-grid layer from both modes", () => {
@@ -270,6 +279,14 @@ describe("index.css sidebar canvas", () => {
     expect(darkEdgeRule).toContain(`box-shadow: ${shadow}`);
     expect(lightEdgeRule).toContain("border-right: none");
     expect(darkEdgeRule).toContain("border-right: 1px solid rgb(255 255 255 / 2%)");
+  });
+
+  it("backs floating peek cards with the opaque card color in every theme", () => {
+    expect(peekBackgroundRule).toContain(".dark:not([data-theme]) .conversations-sidebar.is-peek");
+    expect(peekBackgroundRule).toContain(
+      ":root:not(.dark)[data-theme] .conversations-sidebar.is-peek",
+    );
+    expect(peekBackgroundRule).toContain("background-color: var(--card-solid)");
   });
 });
 
@@ -430,19 +447,41 @@ describe("index.css mobile sidebar opacity", () => {
   it("declares it after the per-theme canvas rules so it wins the cascade", () => {
     // Matching specificity — the shorthand in the theme rules would otherwise
     // keep background-color transparent.
-    const light = cssSource.indexOf(":root:not(.dark):not([data-theme]) .conversations-sidebar {");
-    const dark = cssSource.indexOf(".dark:not([data-theme]) .conversations-sidebar {");
-    const palette = cssSource.indexOf(":root:not(.dark)[data-theme] .conversations-sidebar,");
+    const palette = generatedPaletteCssSource.lastIndexOf(".conversations-sidebar {");
     const mobile = cssSource.indexOf(mobileRule!);
-    expect(light).toBeGreaterThan(-1);
-    expect(dark).toBeGreaterThan(-1);
     expect(palette).toBeGreaterThan(-1);
-    expect(mobile).toBeGreaterThan(Math.max(light, dark, palette));
+    expect(mobile).toBeGreaterThan(palette);
     // Every palette/mode selector must be covered, or one can go transparent.
     expect(mobileRule).toContain(":root:not(.dark):not([data-theme]) .conversations-sidebar");
     expect(mobileRule).toContain(":root:not(.dark)[data-theme] .conversations-sidebar");
     expect(mobileRule).toContain(".dark:not([data-theme]) .conversations-sidebar");
     expect(mobileRule).toContain(".dark[data-theme] .conversations-sidebar");
+  });
+});
+
+/* Regression test for the "mobile floating Settings/Search chip is see-through"
+ * bug.
+ *
+ * The two floating chips (`.sidebar-glass-chip`) frost their fill with
+ * `backdrop-filter`, but WebKit drops that filter on mobile once a Radix popper
+ * opens. With a purely translucent fill (rgba white) the scrolling session rows
+ * then show straight through and the chip reads as transparent. An opaque
+ * `--card-solid` base UNDER the tint keeps it a chip whether or not the blur
+ * survives.
+ */
+describe("index.css mobile sidebar glass chip opacity", () => {
+  const chipRule = cssSource.match(/\.sidebar-glass-chip \{[^}]*\}/)?.[0];
+
+  it("has the glass chip rule this test exists to protect", () => {
+    expect(chipRule, "the .sidebar-glass-chip rule is gone from index.css").toBeDefined();
+  });
+
+  it("bases the chip on an opaque fill so it never goes see-through", () => {
+    // The translucent tint lives on background-image (a layer over the base),
+    // NOT on background-color — that must stay the opaque token, or the chip
+    // turns transparent the moment WebKit drops the backdrop-filter.
+    expect(chipRule).toMatch(/background-color:\s*var\(--card-solid\)/);
+    expect(chipRule).not.toMatch(/background-color:\s*rgba/);
   });
 });
 
@@ -613,3 +652,64 @@ describe("index.css native conversation breadcrumb", () => {
     );
   });
 });
+
+describe("index.css native safe-area insets for mobile overlays", () => {
+  // The `fixed inset-0` overlays cover the whole screen on a phone, status bar
+  // and home indicator included, so each one needs the safe-area padding. The
+  // Shells drawer once missed it (the rule listed drawers by `data-testid` and
+  // its id was never added), putting the title and Close button under the
+  // dynamic island with no way to dismiss the panel. Selecting the shared
+  // `.mobile-panel-drawer` class covers every drawer built from
+  // `MobilePanelDrawer`, present and future.
+  // Balance-aware slice instead of `[^)]*`: a selector in this list may well
+  // grow a functional pseudo-class (`:not(...)`), which a naive capture would
+  // truncate at its first `)` — silently dropping selectors from the assertions
+  // below.
+  const rule = extractInsetRule(cssSource);
+
+  it("has the inset rule this test exists to protect", () => {
+    expect(rule).not.toBeNull();
+    expect(rule?.body).toContain("padding-top: var(--omnigent-safe-top)");
+    expect(rule?.body).toContain("padding-bottom: var(--omnigent-safe-bottom)");
+  });
+
+  it.each([
+    ".conversations-sidebar",
+    '[data-testid="file-viewer"]',
+    '[data-testid="files-panel-drawer"]',
+    '[data-testid="terminals-panel"]',
+    ".mobile-panel-drawer",
+  ])("insets %s", (selector) => {
+    expect(rule?.selectors).toContain(selector);
+  });
+});
+
+/**
+ * Slice the native safe-area inset rule out of the CSS source.
+ *
+ * Walks parens/braces so a selector containing `)` (e.g. `:not(...)`) can't
+ * truncate the selector list, and returns the selector text and declaration
+ * body separately. `null` when the rule is gone (a real failure, not a silent
+ * pass).
+ */
+function extractInsetRule(css: string): { selectors: string; body: string } | null {
+  // The native prefix appears on several rules; the inset rule is the one whose
+  // subject is an `:is(...)` selector list.
+  const match = /:is\(\[data-ios-native\], \[data-android-native\]\)\s*:is\(/.exec(css);
+  if (match === null) return null;
+  let depth = 1; // the `:is(` the match ends on
+  let i = match.index + match[0].length;
+  for (; i < css.length; i += 1) {
+    if (css[i] === "(") depth += 1;
+    else if (css[i] === ")") {
+      depth -= 1;
+      if (depth === 0) break;
+    }
+  }
+  if (depth !== 0) return null;
+  const selectors = css.slice(match.index + match[0].length, i);
+  const bodyStart = css.indexOf("{", i);
+  const bodyEnd = css.indexOf("}", bodyStart);
+  if (bodyStart === -1 || bodyEnd === -1) return null;
+  return { selectors, body: css.slice(bodyStart + 1, bodyEnd) };
+}

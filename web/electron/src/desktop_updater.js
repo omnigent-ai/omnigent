@@ -84,6 +84,8 @@ function isUpdateSecurityError(message) {
  *   config in an unpackaged build (main.js sets this from !app.isPackaged).
  * @param {() => string} [deps.getCurrentVersion] Version shown in update UI.
  *   Defaults to Electron's real app version.
+ * @param {(installReady: boolean) => void} [deps.onInstallReadyChange]
+ *   Called when a downloaded update becomes ready or stops being ready.
  * @returns {{
  *   getConfig: () => { mode: string, autoInstall: boolean, skippedVersion: string | null },
  *   setConfig: (patch?: object) => { mode: string, autoInstall: boolean, skippedVersion: string | null },
@@ -110,6 +112,7 @@ function createDesktopUpdater({
   iconPath,
   forceDevUpdateConfig = false,
   getCurrentVersion = () => app.getVersion(),
+  onInstallReadyChange = () => {},
 }) {
   let updateCheckTimer = null;
   let currentUpdateStatus = { state: "idle" };
@@ -144,7 +147,10 @@ function createDesktopUpdater({
   }
 
   function broadcast(status) {
+    const wasInstallReady = currentUpdateStatus.state === "downloaded";
     currentUpdateStatus = status;
+    const installReady = status.state === "downloaded";
+    if (installReady !== wasInstallReady) onInstallReadyChange(installReady);
     for (const win of BrowserWindow.getAllWindows()) {
       if (win.isDestroyed()) continue;
       try {

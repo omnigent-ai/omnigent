@@ -246,6 +246,41 @@ let identityPromise: Promise<string | null> | null = null;
 // Hardcoding "/login" here previously sent OIDC users to an accounts
 // password form that had no connection to their IdP.
 let serverLoginUrl: string | null = null;
+// Set the moment we hand the browser to the login page. Assigning
+// `location.href` starts a navigation but does NOT stop this document:
+// requests already in flight keep landing, and every 401 among them used
+// to re-assign the same URL, so one logged-out page load queued ~28
+// navigations. Boot also reads this to skip mounting the app when the
+// session is already on its way out (see `isLoginRedirectPending`).
+let loginRedirectPending = false;
+
+/**
+ * Hand the browser to `loginUrl`, at most once per document.
+ *
+ * :param loginUrl: Login path from the capabilities probe or `/v1/me`.
+ * :returns: True if this call started the navigation, False if one was
+ *     already under way.
+ */
+function redirectToLogin(loginUrl: string): boolean {
+  if (loginRedirectPending) return false;
+  loginRedirectPending = true;
+  const returnTo = encodeURIComponent(window.location.pathname + window.location.search);
+  window.location.href = `${loginUrl}?return_to=${returnTo}`;
+  return true;
+}
+
+/**
+ * Whether a login redirect is under way.
+ *
+ * The navigation is asynchronous, so this document keeps running until
+ * the login page commits. Boot checks this before mounting React —
+ * otherwise the app renders and fans its queries out against a session
+ * we already know is invalid, and each one 401s behind the pending
+ * navigation. Always false in header mode, which has no login page.
+ */
+export function isLoginRedirectPending(): boolean {
+  return loginRedirectPending;
+}
 
 /**
  * Whether the current page IS the login or register page, so we
@@ -290,10 +325,7 @@ export async function resolveIdentity(): Promise<string | null> {
           if (data.login_url) {
             serverLoginUrl = data.login_url;
             if (!isOnLoginPath()) {
-              const returnTo = encodeURIComponent(
-                window.location.pathname + window.location.search,
-              );
-              window.location.href = `${data.login_url}?return_to=${returnTo}`;
+              redirectToLogin(data.login_url);
               return null;
             }
           }
@@ -504,10 +536,11 @@ export async function authenticatedFetch(
     // the default for a bare local server, so we surface the 401 to
     // the caller instead. (serverLoginUrl from the /v1/me probe is a
     // fallback for the brief window before capabilities resolves.)
+    // Once-only (see redirectToLogin): a burst of 401s from one page load
+    // all reach here, and re-assigning the same URL per failure just piles
+    // up navigations to a page we're already going to.
     const loginUrl = getCachedServerInfo()?.login_url ?? serverLoginUrl;
-    if (loginUrl) {
-      window.location.href = `${loginUrl}?return_to=${encodeURIComponent(window.location.pathname + window.location.search)}`;
-    }
+    if (loginUrl) redirectToLogin(loginUrl);
   }
   return res;
 }

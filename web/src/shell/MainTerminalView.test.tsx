@@ -1,6 +1,6 @@
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { useRef } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type TerminalInfo, useTerminals } from "@/hooks/useTerminals";
@@ -18,10 +18,14 @@ vi.mock("@/components/blocks/TerminalView", () => ({
     sessionId,
     terminalId,
     readOnly,
+    onResume,
+    resumePending,
   }: {
     sessionId: string;
     terminalId: string;
     readOnly?: boolean;
+    onResume?: () => void | Promise<void>;
+    resumePending?: boolean;
   }) => {
     // Assign once per mount (useRef(arg) evaluates arg every render but keeps
     // the first value), so the id is stable across re-renders and only changes
@@ -35,7 +39,14 @@ vi.mock("@/components/blocks/TerminalView", () => ({
         data-terminal-id={terminalId}
         data-read-only={String(readOnly ?? false)}
         data-instance={String(instance.current)}
-      />
+        data-resume-pending={String(resumePending ?? false)}
+      >
+        {onResume && (
+          <button type="button" onClick={() => void onResume()}>
+            Resume terminal
+          </button>
+        )}
+      </div>
     );
   },
 }));
@@ -99,6 +110,8 @@ function renderView({
   initialTerminalKey = null,
   readOnly = false,
   conversationId = "conv_sdk",
+  runnerOnline,
+  onResume,
   setView,
 }: {
   terminals: TerminalInfo[];
@@ -106,6 +119,8 @@ function renderView({
   initialTerminalKey?: string | null;
   readOnly?: boolean;
   conversationId?: string;
+  runnerOnline?: boolean;
+  onResume?: () => void | Promise<void>;
   setView?: (view: "chat" | "terminal") => void;
 }) {
   useTerminalsMock.mockReturnValue({ terminals, isLoading: false, error: null });
@@ -115,6 +130,8 @@ function renderView({
         conversationId={conversationId}
         initialTerminalKey={initialTerminalKey}
         readOnly={readOnly}
+        runnerOnline={runnerOnline}
+        onResume={onResume}
       />
     </TerminalFirstContextProvider>,
   );
@@ -192,6 +209,34 @@ describe("MainTerminalView — terminal-first SDK sessions", () => {
     // hidden in shell view — ConnectionIndicator gates on isShellView).
     fireEvent.click(screen.getByRole("button", { name: "Close shell" }));
     expect(setView).toHaveBeenCalledWith("chat");
+  });
+
+  it("never substitutes an open user shell for the agent terminal", () => {
+    renderView({ terminals: [BASH_SHELL] });
+
+    expect(screen.queryByTestId("terminal-view")).toBeNull();
+    expect(screen.getByText("Agent terminal unavailable.")).toBeInTheDocument();
+  });
+
+  it("treats an empty terminal inventory as resumable before health catches up", async () => {
+    const onResume = vi.fn().mockResolvedValue(undefined);
+    renderView({ terminals: [], onResume });
+
+    expect(screen.getByText("The harness is not running.")).toBeInTheDocument();
+    expect(screen.getByText("Resume the session to reconnect the terminal.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Resume session" }));
+
+    await waitFor(() => expect(onResume).toHaveBeenCalledTimes(1));
+  });
+
+  it("keeps the offline state actionable when resuming fails", async () => {
+    const onResume = vi.fn().mockRejectedValue(new Error("host offline"));
+    renderView({ terminals: [], runnerOnline: false, onResume });
+
+    fireEvent.click(screen.getByRole("button", { name: "Resume session" }));
+
+    expect(await screen.findByText("Couldn't resume session: host offline")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Resume session" })).toBeEnabled();
   });
 });
 
@@ -314,6 +359,23 @@ describe("MainTerminalView — persistent hidden mount", () => {
       </TerminalFirstContextProvider>,
     );
     expect(screen.getByTestId("terminal-view").getAttribute("data-instance")).toBe(instance);
+  });
+
+  it("falls back to the agent pane when the restored target no longer exists", () => {
+    // `?view=terminal` resolves against the per-session stored panel key, which
+    // can name a shell that has since been closed. The stale key must degrade to
+    // the agent terminal, not leave the pane empty.
+    renderView({
+      terminals: [REPL_TERMINAL],
+      initialTerminalKey: "terminal:terminal_bash_gone",
+    });
+
+    expect(screen.getByTestId("terminal-view")).toHaveAttribute(
+      "data-terminal-id",
+      "terminal_tui_main",
+    );
+    // No shell header: the pane is the agent's, not a phantom shell.
+    expect(screen.queryByRole("button", { name: "Close shell" })).toBeNull();
   });
 
   it("resets a shell selection to the agent terminal while hidden", () => {

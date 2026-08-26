@@ -439,6 +439,55 @@ async def test_compact_errors_when_runner_injection_fails(
     )
 
 
+async def test_compact_native_session_no_runner_returns_reconnect_error(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A native-terminal /compact with no reachable runner surfaces a clear
+    "reconnect first" error, not the confusing no-LLM-model message.
+
+    A native session compacts only in its vendor TUI, so when no runner is
+    bound (disconnected session) the compact branch must NOT fall through to
+    server-side ``_run_compact_locked`` — which would 400 with the opaque
+    "does not declare an LLM model" text. Instead it should try to wake the
+    runner; an un-host-bound native session can't be woken, so it returns a
+    503 RUNNER_UNAVAILABLE the user can act on.
+    """
+
+    async def _must_not_run(**_: Any) -> CompactionResult:
+        """Fail loudly if AP-side compaction is reached on the native path."""
+        raise AssertionError(
+            "compact_conversation_now must not run for a native-terminal "
+            "session with no runner — the compact branch fell through to "
+            "in-process compaction instead of the reconnect error."
+        )
+
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow.compact_conversation_now",
+        _must_not_run,
+    )
+
+    # No runner bound (no set_runner_client) and no host_id → unwakeable.
+    agent = await create_test_agent(
+        client,
+        name="claude-native-compact",
+        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+    )
+    sid = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{sid}/events",
+        json={"type": "compact", "data": {}},
+    )
+
+    # 503 = RUNNER_UNAVAILABLE (reconnect-first). A 400 would mean it fell
+    # through to the no-LLM-model check (the original confusing bug).
+    assert resp.status_code == 503, resp.text
+    assert "Reconnect the session" in resp.text
+    assert "llm.model" not in resp.text
+
+
 # ── external_compaction_status: terminal-observed compaction edge ────────
 #
 # The claude-native forwarder posts external_compaction_status when Claude

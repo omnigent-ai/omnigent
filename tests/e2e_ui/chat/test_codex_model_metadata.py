@@ -8,6 +8,8 @@ from urllib.parse import urlparse
 
 from playwright.sync_api import Page, Route, expect
 
+from tests.e2e_ui.conftest import fetch_with_retry
+
 
 def _patch_session_as_codex_native(page: Page, session_id: str) -> list[dict]:
     """Patch the browser's session snapshot into a codex-native response.
@@ -35,9 +37,22 @@ def _patch_session_as_codex_native(page: Page, session_id: str) -> list[dict]:
 
         headers = {"content-type": "application/json"}
         if request.method == "GET":
-            response = route.fetch()
+            response = fetch_with_retry(route)
             payload = response.json()
             headers = {**response.headers, **headers}
+            # A real server persists the collaboration_mode a prior PATCH set, so
+            # a session rebind/refetch after toggling Plan mode still reports it.
+            # The seeded hello_world session carries no such label, so carry the
+            # last mode this mock recorded forward — otherwise a rebind (e.g. a
+            # stream re-bind) re-derives Plan mode as off and the toggle snaps
+            # back to "Enter Plan mode" mid-test.
+            prior_labels = (latest_payload or {}).get("labels", {})
+            prior_mode = prior_labels.get("omnigent.codex_native.collaboration_mode")
+            if prior_mode is not None:
+                payload["labels"] = {
+                    **payload.get("labels", {}),
+                    "omnigent.codex_native.collaboration_mode": prior_mode,
+                }
         elif request.method == "PATCH":
             request_body = json.loads(request.post_data or "{}")
             patch_bodies.append(request_body)
@@ -227,7 +242,7 @@ def _patch_precatalog_codex_session_on_host(page: Page, session_id: str) -> None
         if request.method != "GET" or urlparse(request.url).path != f"/v1/sessions/{session_id}":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         payload["labels"] = {
             **payload.get("labels", {}),
@@ -255,7 +270,7 @@ def _patch_precatalog_codex_session_on_host(page: Page, session_id: str) -> None
         if request.method != "GET" or urlparse(request.url).path != "/health":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         online = {"runner_online": True, "host_online": True}
         if isinstance(payload.get("sessions"), dict):

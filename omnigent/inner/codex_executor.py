@@ -130,8 +130,10 @@ _STDERR_CHUNK_LIMIT = 65536
 _STREAM_READ_CHUNK_SIZE = 65536
 # Files symlinked from the real CODEX_HOME into the per-session temp home.
 # Symlinks (not copies) so credential refreshes in the real home propagate
-# to running sessions without any action from Omnigent.
-_CODEX_HOME_SYMLINK_FILES = ("auth.json",)
+# to running sessions without any action from Omnigent. ``.credentials.json``
+# is codex's OAuth store for remote (``url =``) MCP servers; without it a
+# private home starts those servers unauthenticated while stdio ones work.
+_CODEX_HOME_SYMLINK_FILES = ("auth.json", ".credentials.json")
 _CODEX_HOME_GLOBAL_INSTRUCTION_FILES = ("AGENTS.md", "AGENTS.override.md", "hooks.json")
 # Name of the hooks file inside a CODEX_HOME. Symlinked from the user's home
 # by default; generated as a merged regular file when subagent routing is on.
@@ -149,7 +151,12 @@ _CODEX_HOME_COPY_FILES = ("config.toml",)
 # otherwise re-materialize tens of MB into every private home. Sharing the
 # one real cache dedupes it across sessions; codex's own writes land in the
 # shared cache exactly as they would without the private home.
-_CODEX_HOME_SYMLINK_DIRS = (Path("plugins") / "cache",)
+_CODEX_HOME_SYMLINK_DIRS = (
+    Path("plugins") / "cache",
+    # Cross-process lock guarding ``.credentials.json``; shared so a token
+    # refresh in one session cannot race another into a stale refresh token.
+    Path("mcp-oauth-locks"),
+)
 _CODEX_MINIMAL_CONFIG_ENV = "HARNESS_CODEX_MINIMAL_CONFIG"
 _CODEX_PROVIDER_CONFIG_PREFIX = "model_providers."
 
@@ -2123,6 +2130,9 @@ class _CodexAppServerSession:
         # on the next ``turn/completed`` so each TurnComplete carries the
         # usage for the turn that just finished.
         self._last_turn_usage: dict[str, object] | None = None
+        # Serialize concurrent writes to the subprocess stdin so that parallel
+        # tool-call responses don't interleave bytes on the pipe.
+        self._stdin_lock = asyncio.Lock()
 
     async def start(self) -> None:
         if self._started:
@@ -2947,8 +2957,9 @@ class _CodexAppServerSession:
 
     async def _send_message(self, payload: CodexMessage) -> None:
         assert self._proc is not None and self._proc.stdin is not None
-        self._proc.stdin.write((json.dumps(payload) + "\n").encode("utf-8"))
-        await self._proc.stdin.drain()
+        async with self._stdin_lock:
+            self._proc.stdin.write((json.dumps(payload) + "\n").encode("utf-8"))
+            await self._proc.stdin.drain()
 
     @staticmethod
     async def _iter_stream_chunks(stream: asyncio.StreamReader) -> AsyncIterator[bytes]:

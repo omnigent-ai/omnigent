@@ -14,6 +14,7 @@ from sqlalchemy import (
     delete,
     desc,
     func,
+    insert,
     literal_column,
     or_,
     select,
@@ -2041,7 +2042,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                     + 1
                 )
 
+            workspace_id = current_workspace_id()
+            completed_status = encode_item_status("completed")  # items are final on append
             fts_rows: list[tuple[str, str, str]] = []
+            row_values: list[dict[str, object]] = []
             for item in items:
                 position = next_pos
                 next_pos += 1
@@ -2053,38 +2057,46 @@ class SqlAlchemyConversationStore(ConversationStore):
                 data = self._encode_item_data(strip_nul_bytes(json.dumps(data_dict)))
                 search = self._item_search_text(item)
                 item_id = generate_item_id(item.type)
-                row = SqlConversationItem(
-                    id=item_id,
-                    conversation_id=conversation_id,
-                    response_id=item.response_id,
-                    created_at=now,
-                    status=encode_item_status("completed"),  # items are final on append
-                    position=position,
-                    type=encode_item_type(item.type),
-                    data=data,
-                    created_by=item.created_by,
-                )
-                # A backend may omit search_text (see _item_search_text); leaving
-                # the attribute unset drops it from the INSERT so a schema without
-                # the column still works, and skips its FTS row.
+                values: dict[str, object] = {
+                    "workspace_id": workspace_id,
+                    "id": item_id,
+                    "conversation_id": conversation_id,
+                    "response_id": item.response_id,
+                    "created_at": now,
+                    "status": completed_status,
+                    "position": position,
+                    "type": encode_item_type(item.type),
+                    "data": data,
+                    "created_by": item.created_by,
+                }
+                # A backend may omit search_text (see _item_search_text): when it
+                # returns None we drop the column so a schema without it still
+                # works, and skip its FTS row. The hook is all-or-nothing per
+                # store, so the key set stays uniform across the executemany.
                 if search is not None:
-                    row.search_text = search
+                    values["search_text"] = search
                     fts_rows.append((item_id, conversation_id, search))
-                session.add(row)
+                row_values.append(values)
                 persisted.append(
                     ConversationItem(
-                        id=row.id,
+                        id=item_id,
                         # The row stores int codes; the entity carries the
                         # string names. item.type is the source string and
                         # the status was just written as "completed".
                         type=item.type,
                         status="completed",
-                        response_id=row.response_id,
-                        created_at=row.created_at,
+                        response_id=item.response_id,
+                        created_at=now,
                         data=item.data,
                         created_by=item.created_by,
                     )
                 )
+            # One executemany for the batch: positions are pre-allocated above so
+            # the rows carry no inter-row dependency, and a single round-trip
+            # persists all N. A per-row ORM add round-trips per item, which
+            # dominates append latency against a remote managed Postgres.
+            if row_values:
+                session.execute(insert(SqlConversationItem), row_values)
             insert_fts_bulk(session, fts_rows)
 
             # Persist the advanced counter so the next append reads it instead
@@ -3659,11 +3671,32 @@ class SqlAlchemyConversationStore(ConversationStore):
                 items_query = items_query.where(SqlConversationItem.position <= cutoff_position)
             source_items = session.execute(items_query).scalars().all()
 
+            # Compaction cursors refer to item IDs. Since every copied item gets
+            # a fresh ID, build the complete mapping before copying any payloads
+            # so compaction records can point at the fork's boundary item.
+            copied_item_ids = {
+                src_item.id: generate_item_id(decode_item_type(src_item.type))
+                for src_item in source_items
+            }
+            decoded_item_data = self._decode_item_data_batch(
+                [src_item.data for src_item in source_items]
+            )
+
             fts_rows: list[tuple[str, str, str]] = []
-            for pos, src_item in enumerate(source_items):
+            for pos, (src_item, decoded_data) in enumerate(
+                zip(source_items, decoded_item_data, strict=True)
+            ):
                 # src_item.type/status are int codes copied verbatim to the new
-                # row; only generate_item_id needs the decoded string type.
-                new_item_id = generate_item_id(decode_item_type(src_item.type))
+                # row. Compaction data is the sole payload containing an item ID.
+                new_item_id = copied_item_ids[src_item.id]
+                copied_data = decoded_data
+                if decode_item_type(src_item.type) == "compaction":
+                    compaction_data = json.loads(decoded_data)
+                    boundary_id = compaction_data.get("last_item_id")
+                    mapped_boundary_id = copied_item_ids.get(boundary_id)
+                    if mapped_boundary_id is not None:
+                        compaction_data["last_item_id"] = mapped_boundary_id
+                        copied_data = json.dumps(compaction_data)
                 new_item = SqlConversationItem(
                     id=new_item_id,
                     conversation_id=new_conv.id,
@@ -3672,7 +3705,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     status=src_item.status,
                     position=pos,
                     type=src_item.type,
-                    data=src_item.data,
+                    data=self._encode_item_data(copied_data),
                     search_text=src_item.search_text,
                     created_by=src_item.created_by,
                 )

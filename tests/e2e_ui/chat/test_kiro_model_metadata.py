@@ -7,6 +7,8 @@ from urllib.parse import urlparse
 
 from playwright.sync_api import Page, Route, expect
 
+from tests.e2e_ui.conftest import fetch_with_retry
+
 
 def _patch_session_as_kiro_native(page: Page, session_id: str) -> list[dict]:
     """Patch the browser's session snapshot into a kiro-native response.
@@ -34,7 +36,7 @@ def _patch_session_as_kiro_native(page: Page, session_id: str) -> list[dict]:
 
         headers = {"content-type": "application/json"}
         if request.method == "GET":
-            response = route.fetch()
+            response = fetch_with_retry(route)
             payload = response.json()
             headers = {**response.headers, **headers}
         elif request.method == "PATCH":

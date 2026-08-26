@@ -28,6 +28,7 @@ from pathlib import Path
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 _COMPOSER = "Ask the agent anything…"
 _AGENT_INFO_TRIGGER = '[data-testid="agent-info-trigger"]'
@@ -153,6 +154,17 @@ def _open_popover(page: Page) -> None:
     the same way a real user's pointer does, and the settle wait lets the
     animation finish so the control is at rest before callers click it.
 
+    The pointer-park itself is part of the race, not just its cure: leaving the
+    trigger to reach the panel schedules the 150ms hover-close, and the panel's
+    ``pointerenter`` (``cancelCloseOnEnter``) is what cancels it. Under load the
+    event loop can stall >150ms between those two handlers, so the close timer
+    fires and the panel animates shut *while* ``panel.hover()`` is still waiting
+    for it to be "visible and stable" — a lost race that, with hover's default
+    30s timeout, became a 30s hang and hard failure. So the park + settle live
+    inside the retry: hover on a short timeout, then re-confirm the panel stayed
+    open after settling; a lost race re-arms from a closed state instead of
+    hanging.
+
     :param page: Playwright page on a ``/c/<id>`` route.
     """
     page.keyboard.press("Escape")
@@ -163,20 +175,29 @@ def _open_popover(page: Page) -> None:
         trigger.click()
         try:
             expect(panel).to_be_visible(timeout=3_000)
+            # Land the pointer on the panel so leaving the trigger can't
+            # schedule a hover-close under a subsequent in-panel click, then let
+            # the open animation settle so in-panel controls are stable geometry.
+            # Reaching the panel is itself what arms the hover-close, so a short
+            # hover timeout keeps a lost race a quick retry rather than a 30s hang.
+            panel.hover(timeout=3_000)
+            page.wait_for_timeout(_PANEL_SETTLE_MS)
+            # The hover-close may still have fired if the event loop stalled
+            # past the 150ms timer before ``pointerenter`` cancelled it; only
+            # accept the open once the panel survives the settle.
+            expect(panel).to_be_visible(timeout=1_000)
             break
-        except AssertionError:
-            # The hover-open was toggled shut by the same click; re-arm from a
-            # closed state and try again.
+        except (AssertionError, PlaywrightTimeoutError):
+            # The hover-open was toggled shut by the same click, or a hover-close
+            # won the race and dismissed the panel; re-arm from a closed state.
             page.keyboard.press("Escape")
     else:
+        trigger.click()
         expect(panel).to_be_visible(timeout=3_000)
+        panel.hover(timeout=3_000)
+        page.wait_for_timeout(_PANEL_SETTLE_MS)
     # "Policies" section label proves the popover content mounted.
     expect(page.get_by_text("Policies", exact=True)).to_be_visible(timeout=15_000)
-    # Land the pointer on the panel so leaving the trigger can't schedule a
-    # hover-close under a subsequent in-panel click, then let the open
-    # animation settle so in-panel controls are stable geometry.
-    panel.hover()
-    page.wait_for_timeout(_PANEL_SETTLE_MS)
 
 
 def test_agent_info_policy_add_and_remove(

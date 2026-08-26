@@ -705,6 +705,54 @@ async def test_codex_launch_catalog_reads_the_store_then_probes_once(
     assert len(calls) == 1, "the second read must come from the store, not a re-probe"
 
 
+async def test_codex_launch_catalog_is_stale_reads_the_default_shape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Stale only when the default shape's stored entry is past the TTL.
+    """
+    from omnigent import codex_native_app_server, model_catalog_store
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "resolve_native_codex_launch",
+        lambda *, model, spec=None: codex_native_app_server.NativeCodexLaunch(
+            config_overrides=[], model=model, profile=None
+        ),
+    )
+    fingerprint = codex_native_app_server.codex_catalog_fingerprint(
+        codex_native_app_server.resolve_native_codex_launch(model=None)
+    )
+    assert await codex_native_app_server.codex_launch_catalog_is_stale() is False
+    model_catalog_store.write_catalog(
+        "codex-native", fingerprint, [{"id": "gpt-5.6-terra", "isDefault": True}]
+    )
+    assert await codex_native_app_server.codex_launch_catalog_is_stale() is False
+    path = model_catalog_store.catalog_path("codex-native", fingerprint)
+    old = path.stat().st_mtime - (model_catalog_store.CATALOG_STALE_AFTER_S + 60)
+    import os
+
+    os.utime(path, (old, old))
+    assert await codex_native_app_server.codex_launch_catalog_is_stale() is True
+
+
+async def test_codex_launch_catalog_is_stale_unresolvable_launch_is_not_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A broken provider config means no catalog to distrust — never a crash.
+    """
+    from omnigent import codex_native_app_server
+
+    def _boom(*, model: object, spec: object = None) -> object:
+        raise RuntimeError("broken provider config")
+
+    monkeypatch.setattr(codex_native_app_server, "resolve_native_codex_launch", _boom)
+    assert await codex_native_app_server.codex_launch_catalog_is_stale() is False
+
+
 def _test_app_server(
     tmp_path: Path,
     codex_home: Path,

@@ -145,18 +145,24 @@ def list_skill_resources(skill: SkillSpec) -> list[str]:
     """
     List resource files in a skill's directory.
 
-    Scans ``references/``, ``scripts/``, and ``assets/``
-    subdirectories. Returns relative paths suitable for
-    ``read_skill_file``.
+    Covers auxiliary files beside ``SKILL.md`` (a common layout for
+    skills that split long guidance across sibling documents) plus
+    everything under ``references/``, ``scripts/``, and ``assets/``.
+    Returns relative paths suitable for ``read_skill_file``.
 
     :param skill: The skill to scan.
-    :returns: Sorted list of relative path strings, e.g.
-        ``["references/style-guide.md"]``. Empty if the
-        skill has no ``skill_dir`` or no resource files.
+    :returns: List of relative path strings, e.g.
+        ``["DEEPENING.md", "references/style-guide.md"]``. Root-level
+        files come first, each group sorted. Empty if the skill has no
+        ``skill_dir`` or no resource files.
     """
-    if skill.skill_dir is None:
+    if skill.skill_dir is None or not skill.skill_dir.is_dir():
         return []
     files: list[str] = []
+    for fp in sorted(skill.skill_dir.iterdir()):
+        # Dotfiles are editor/OS cruft, and SKILL.md is the skill itself.
+        if fp.is_file() and fp.name != "SKILL.md" and not fp.name.startswith("."):
+            files.append(fp.name)
     for subdir_name in ("references", "scripts", "assets"):
         subdir = skill.skill_dir / subdir_name
         if not subdir.is_dir():
