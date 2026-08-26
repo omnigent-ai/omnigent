@@ -541,24 +541,31 @@ Databricks App is up (a few minutes). Poll for the ready comment:
 gh pr view <pr> --json comments --jq '.comments[] | select(.body | startswith("<!-- ui-preview -->")) | .body'
 ```
 
-Once it shows a URL, **post a follow-up comment with concrete connect
-instructions** (the preview ships the UI only — no LLM/runner — so a reviewer
-drives it by connecting their own host). Use `gh pr comment <pr> --body '…'` with
-the actual `<url>` filled in, e.g.:
+Once it shows a URL, **capture that exact `<url>`** — you will thread it into the
+live-validation instructions (4.4) and the maintainer hand-off (4.5) so a reviewer
+gets a one-command way to drive the deployed preview, not a vague "connect an app."
+Record it in the handoff (`ui_preview`) with the URL, so the workflow's ticket
+write-back can surface it too.
 
-> **How to try this in the UI preview**
-> The preview at `<url>` serves the UI only (maintainers with workspace access).
-> To drive a real session against it, connect your own host — where your model
-> credentials live:
-> ```
-> omnigent run --server <url>          # attach a runner to the preview
-> ```
-> Then open `<url>` in your browser and exercise the flow below (see "Validate
-> the fix live").
+The preview ships the **UI only** — no LLM/runner — so a reviewer drives it by
+attaching their own host (where their model credentials live). The single command
+that both attaches a runner and runs the validation journey against the preview is:
+
+```
+omnigent run -p '<validation_prompt>' --server <url>
+```
+
+`-p` is the validation prompt from 4.4 (bug-specific); `--server <url>` is the
+preview URL. That one line is what you put in front of the reviewer (in the PR
+body's "Validate the fix live" section and the maintainer comment) — filled in
+with the real `<url>` and prompt, never left as placeholders.
 
 If the preview deploy **fails** or never posts a URL (e.g. workspace secrets not
-configured in this environment), don't block on it — note it in the handoff
-(`ui_preview`) and continue. The preview is a convenience, not a gate.
+configured in this environment, or a non-member author before the labelled-fork
+preview path applies), don't block on it — note it in the handoff (`ui_preview`)
+that no URL was produced, and in 4.4/4.5 fall back to "run against your own app"
+with the same `-p` command minus a preview `--server`. The preview is a
+convenience, not a gate.
 
 ### 4.2 — Drive CI to green
 
@@ -639,16 +646,31 @@ compound bug, every reproduced facet.
 
 Add it to the PR body under a **"Validate the fix live"** section (edit the body
 with `gh pr edit <pr> --body-file …`, preserving the existing template sections),
-and carry the same text in the `validation_prompt` handoff field. Shape:
+and carry the same text in the `validation_prompt` handoff field.
 
-> **Validate the fix live** — paste this to an agent (connect it to the UI preview
-> URL above, or run against your own app):
+**Lead with the one command that runs it against the preview.** When 4.1 produced
+a preview `<url>`, put a ready-to-run `omnigent run` line first, with the real URL
+and the prompt inlined — so a reviewer copies one line rather than assembling it.
+When there was no preview URL, give the same command without `--server` (runs
+against the reviewer's own local app). Shape:
+
+> **Validate the fix live**
+>
+> Run this against the deployed UI preview (attaches your own host, which carries
+> your model credentials):
 > ```
-> Reproduce and validate a bug fix. Steps: <the journey — concrete inputs/clicks/
-> routes>. Before this fix, <the buggy behavior>. Confirm the fix by checking that
-> <the corrected behavior / value for each live facet>. Report whether each step
-> now behaves correctly.
+> omnigent run -p 'Reproduce and validate a bug fix. Steps: <the journey —
+> concrete inputs/clicks/routes>. Before this fix, <the buggy behavior>. Confirm
+> the fix by checking that <the corrected behavior / value for each live facet>.
+> Report whether each step now behaves correctly.' --server <url>
 > ```
+> No preview URL? Drop `--server <url>` to run against your own local app. Or paste
+> just the prompt to an agent already connected to an Omnigent app.
+
+Use the real `<url>` from 4.1 and the concrete journey — no placeholders in what
+you post. Keep the `validation_prompt` handoff field as the bare prompt text (the
+part inside `-p '…'`), so the workflow can reuse it; the assembled command lives in
+the PR body and the maintainer comment.
 
 ### 4.5 — Tag the maintainer to review
 
@@ -670,8 +692,13 @@ gh pr edit <pr> --add-reviewer <login>
   comment asking them (or, with no assignee/non-issue bug, noting the PR is ready
   for a maintainer):
   ```
-  gh pr comment <pr> --body '@<login> this fixes #<issue-number> — CI is green and the automated review is clean. Ready for your review. See "Validate the fix live" in the PR body to reproduce it.'
+  gh pr comment <pr> --body '@<login> this fixes #<issue-number> — CI is green and the automated review is clean. Ready for your review. Try it live: `omnigent run -p '\''<validation_prompt>'\'' --server <url>` (the UI preview from the ui-preview comment). See "Validate the fix live" in the PR body.'
   ```
+
+When there is a preview `<url>`, always include the ready-to-run
+`omnigent run -p '<validation_prompt>' --server <url>` line in this comment with
+the real URL — that is the reviewer's fastest path to see the fix work. Drop
+`--server <url>` when no preview was produced.
 
 Record who you tagged in the handoff (`maintainer_review`). Only tag once the PR
 is genuinely green and clean — don't ping a human to look at a red PR. You still do
@@ -797,8 +824,9 @@ Field meanings:
   fixed, or the unresolved critical findings if you hit the round cap. Empty when
   no PR was opened.
 - `ui_preview` — the result of Step 4.1 (run on every PR, not just frontend fixes):
-  the preview URL and that you posted connect instructions, or why it failed to
-  deploy (e.g. workspace secrets not configured). Empty when no PR was opened.
+  the **preview URL** (verbatim, so the ticket write-back can surface it and a
+  reviewer can `omnigent run --server <url>`), or why it failed to deploy (e.g.
+  workspace secrets not configured, non-member author). Empty when no PR was opened.
 - `validation_prompt` — the Step 4.4 paste-to-an-agent prompt that reproduces the
   journey and confirms the fix. Empty when no PR was opened.
 - `maintainer_review` — who you requested review from in Step 4.5 (the issue
