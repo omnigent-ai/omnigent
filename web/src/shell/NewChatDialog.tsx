@@ -168,7 +168,9 @@ import {
   controlHost,
   getHostIdentity,
   isElectronShell,
+  isIOSShell,
   onHostStatusChanged,
+  setNativeViewMode,
   type HostIdentity,
 } from "@/lib/nativeBridge";
 import {
@@ -2067,13 +2069,33 @@ export function NewChatLandingScreen() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const queryClient = useQueryClient();
+  const isMobileViewport = useIsMobileViewport();
+  // No session here, so there is nothing to switch between: assert the iOS
+  // shell's native Chat/Terminal bar is hidden. ChatPage's own bar is driven by
+  // the session surface and hides itself on unmount, but that is the only thing
+  // holding the native state down — and the bar was showing over this screen,
+  // so state the truth for this route instead of trusting a teardown that runs
+  // elsewhere. Idempotent, and re-asserted on every mount of this screen.
+  useEffect(() => {
+    if (!isIOSShell()) return;
+    setNativeViewMode({
+      mode: "chat",
+      terminalEnabled: false,
+      terminalStartingUp: false,
+      visible: false,
+    });
+  }, []);
   const heading = useHeading();
   const poweredBy = usePoweredBy();
   const serverUrl = getCliServerUrl();
   const { data: agents } = useAvailableAgents();
   // refetchOnFocus: returning from a terminal `omni setup` must clear the
   // readiness badge even if the live push was missed while the tab was hidden.
-  const { data: hosts, isLoading: hostsLoading } = useHosts({ refetchOnFocus: true });
+  const {
+    data: hosts,
+    isLoading: hostsLoading,
+    isFetching: hostsFetching,
+  } = useHosts({ refetchOnFocus: true });
 
   const agentList = useMemo(
     () =>
@@ -2660,7 +2682,11 @@ export function NewChatLandingScreen() {
         setSelectedHostId(stored.host_id);
         return;
       }
-      // Stored host is gone or offline — fall through to the default.
+      // Cached data can omit the remembered host while a fresh list is already
+      // in flight. Let that refresh settle before using the normal fallback.
+      if (hostsFetching) return;
+      // The fresh list confirms the stored host is gone or offline — fall
+      // through to the default.
     }
 
     if (managedSandboxesEnabled) {
@@ -2673,6 +2699,7 @@ export function NewChatLandingScreen() {
   }, [
     hosts,
     hostsLoading,
+    hostsFetching,
     selectedHostId,
     sandboxSelected,
     managedSandboxesEnabled,
@@ -4365,23 +4392,29 @@ export function NewChatLandingScreen() {
                 placeholder={pillSkills.length > 0 ? "" : placeholderText}
                 aria-label={placeholderText}
                 rows={1}
-                autoFocus
+                // Desktop only. This screen mounts on every arrival at "/" —
+                // including ones the user didn't make to type, like Back out of
+                // Settings — and on a phone focusing the field throws up the
+                // keyboard (and auto-zooms, per the note below) over whatever
+                // is on screen, sometimes with the sidebar drawer still open on
+                // top of it. Phones expect to be tapped before they type.
+                autoFocus={!isMobileViewport}
                 data-testid="new-chat-landing-input"
-                // Compose-pill text spec: SF Pro Text system stack at
-                // 14px/20px. (Note: sub-16px inputs make mobile Safari
+                // Compose-pill text spec: inherited UI font at 14px/20px.
+                // (Note: sub-16px inputs make mobile Safari
                 // auto-zoom on focus — accepted tradeoff per the design.)
                 // Heights are border-box (12px top + 8px bottom padding lives
                 // inside them): max 200px = the spec's 180px of content.
                 // A 60px floor holds two 20px lines plus that padding;
                 // useAutoGrowTextarea expands from there to the unchanged cap.
-                className="block min-h-[60px] max-h-[200px] w-full resize-none overflow-y-auto bg-transparent px-4 pt-3 pb-2 font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-ui leading-5 text-foreground outline-none [scrollbar-width:none] placeholder:text-muted-foreground md:select-text [&::-webkit-scrollbar]:hidden"
+                className="block min-h-[60px] max-h-[200px] w-full resize-none overflow-y-auto bg-transparent px-4 pt-3 pb-2 text-ui leading-5 text-foreground outline-none [scrollbar-width:none] placeholder:text-muted-foreground md:select-text [&::-webkit-scrollbar]:hidden"
               />
               {/* Gated on an empty draft so it reads as the placeholder.
                   pointer-events-none lets clicks fall through to focus the
                   textarea; the pills themselves opt back in. */}
               {pillSkills.length > 0 && message.length === 0 && (
                 <div className="pointer-events-none absolute inset-x-4 top-3 flex flex-wrap items-center gap-2">
-                  <span className="font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-ui leading-5 text-muted-foreground">
+                  <span className="text-ui leading-5 text-muted-foreground">
                     Describe a task, or try a skill
                   </span>
                   <SkillPills skills={pillSkills} onPick={applySkillPill} />

@@ -337,7 +337,7 @@ describe("Sidebar session list", () => {
 
     const indicator = within(draftRow).getByTestId("conversation-draft-indicator");
     expect(indicator).toHaveAccessibleName("Draft");
-    expect(indicator.parentElement).toHaveClass("absolute", "right-[4.5rem]", "md:right-1");
+    expect(indicator.parentElement).toHaveClass("absolute", "right-1");
     expect(within(emptyRow).queryByTestId("conversation-draft-indicator")).toBeNull();
   });
 
@@ -346,7 +346,10 @@ describe("Sidebar session list", () => {
     renderSidebar();
 
     const row = screen.getByText("Balanced row title").closest("a")!;
-    expect(row).toHaveClass("pr-28", "md:pr-2");
+    // Mobile drops the pin + kebab, so at rest it reserves the same slim `pr-2`
+    // as desktop; only desktop hover widens it for the revealed controls.
+    expect(row).toHaveClass("pr-2");
+    expect(row.className).not.toMatch(/(?:^|\s)pr-28(?:\s|$)/);
     expect(row.className).toContain("md:group-hover:pr-14");
     // Keyed on `:focus-visible`, matching when the trailing controls appear and
     // the state marker fades. `focus-within` would also fire for a plain click,
@@ -394,7 +397,7 @@ describe("Sidebar session list", () => {
     renderSidebar();
 
     const slot = screen.getByTestId("session-state-badge").parentElement!;
-    expect(slot).toHaveClass("md:right-1", "md:w-6", "md:justify-center");
+    expect(slot).toHaveClass("right-1", "w-6", "justify-center");
   });
 
   it("does not constrain a row's awaiting pill to the dot slot", () => {
@@ -409,8 +412,8 @@ describe("Sidebar session list", () => {
     renderSidebar();
 
     const slot = screen.getByTestId("session-state-badge").parentElement!;
-    expect(slot).toHaveClass("md:right-1");
-    expect(slot).not.toHaveClass("md:w-6");
+    expect(slot).toHaveClass("right-1");
+    expect(slot).not.toHaveClass("w-6");
   });
 
   it("offers the four display filters and defaults to My sessions", () => {

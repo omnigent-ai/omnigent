@@ -542,7 +542,10 @@ def configure_mock_llm(
     :param mock_url: Mock server base URL.
     :param responses: List of response configs. Keys:
         ``text``, ``tool_calls``, ``block``, ``stream``,
-        ``error``, ``status_code``.
+        ``error``, ``status_code``, ``delay``, ``truncate_after``
+        (emit only N SSE events then end the stream, dropping the
+        completion event — a mid-stream fault for exercising the SPA's
+        stream error/recovery UI).
     :param key: Queue key — typically the model name baked into the
         agent spec. Defaults to ``"default"`` (matches any model
         not assigned to a more specific queue).

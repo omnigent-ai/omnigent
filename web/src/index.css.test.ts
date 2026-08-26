@@ -260,6 +260,9 @@ describe("index.css sidebar canvas", () => {
     /html:not\(\.dark\) \.conversations-sidebar(?::not\(\.is-peek\))? \{[^}]*\}/,
   )?.[0];
   const darkEdgeRule = cssSource.match(/\.dark \.conversations-sidebar \{[^}]*\}/)?.[0];
+  const peekBackgroundRule = cssSource.match(
+    /:root:not\(\.dark\):not\(\[data-theme\]\) \.conversations-sidebar\.is-peek,[\s\S]*?\.dark\[data-theme\] \.conversations-sidebar\.is-peek \{[^}]*\}/,
+  )?.[0];
 
   it("uses the specified left-to-right gradient for Omnigent light only", () => {
     expect(omniLightRule).toContain("background: #fffefe");
@@ -282,6 +285,14 @@ describe("index.css sidebar canvas", () => {
     expect(darkEdgeRule).toContain(`box-shadow: ${shadow}`);
     expect(lightEdgeRule).toContain("border-right: none");
     expect(darkEdgeRule).toContain("border-right: 1px solid rgb(255 255 255 / 2%)");
+  });
+
+  it("backs floating peek cards with the opaque card color in every theme", () => {
+    expect(peekBackgroundRule).toContain(".dark:not([data-theme]) .conversations-sidebar.is-peek");
+    expect(peekBackgroundRule).toContain(
+      ":root:not(.dark)[data-theme] .conversations-sidebar.is-peek",
+    );
+    expect(peekBackgroundRule).toContain("background-color: var(--card-solid)");
   });
 });
 
@@ -455,6 +466,32 @@ describe("index.css mobile sidebar opacity", () => {
     expect(mobileRule).toContain(":root:not(.dark)[data-theme] .conversations-sidebar");
     expect(mobileRule).toContain(".dark:not([data-theme]) .conversations-sidebar");
     expect(mobileRule).toContain(".dark[data-theme] .conversations-sidebar");
+  });
+});
+
+/* Regression test for the "mobile floating Settings/Search chip is see-through"
+ * bug.
+ *
+ * The two floating chips (`.sidebar-glass-chip`) frost their fill with
+ * `backdrop-filter`, but WebKit drops that filter on mobile once a Radix popper
+ * opens. With a purely translucent fill (rgba white) the scrolling session rows
+ * then show straight through and the chip reads as transparent. An opaque
+ * `--card-solid` base UNDER the tint keeps it a chip whether or not the blur
+ * survives.
+ */
+describe("index.css mobile sidebar glass chip opacity", () => {
+  const chipRule = cssSource.match(/\.sidebar-glass-chip \{[^}]*\}/)?.[0];
+
+  it("has the glass chip rule this test exists to protect", () => {
+    expect(chipRule, "the .sidebar-glass-chip rule is gone from index.css").toBeDefined();
+  });
+
+  it("bases the chip on an opaque fill so it never goes see-through", () => {
+    // The translucent tint lives on background-image (a layer over the base),
+    // NOT on background-color — that must stay the opaque token, or the chip
+    // turns transparent the moment WebKit drops the backdrop-filter.
+    expect(chipRule).toMatch(/background-color:\s*var\(--card-solid\)/);
+    expect(chipRule).not.toMatch(/background-color:\s*rgba/);
   });
 });
 

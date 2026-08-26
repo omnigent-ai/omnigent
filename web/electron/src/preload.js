@@ -89,14 +89,13 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     return () => ipcRenderer.removeListener("omnigent:open-path", listener);
   },
   /**
-   * Title-bar server picker data: the window's current server origin and the
-   * recently-connected server URLs (most recent first). Resolves null on
-   * pages that aren't a connected server.
+   * Server picker data: the current origin plus organization-provided and
+   * recently-connected server URLs. Resolves null off a connected server.
    */
   getServerPicker: () => ipcRenderer.invoke("omnigent:get-server-picker"),
   /**
-   * Re-point this window to a previously-connected server URL (must come
-   * from getServerPicker's recentServers list; anything else rejects).
+   * Re-point this window to a URL returned by getServerPicker (anything else
+   * rejects in the main process).
    */
   switchServer: (url) => ipcRenderer.invoke("omnigent:switch-server", url),
   /** Return this window to the bundled "connect to server" setup page. */
@@ -422,6 +421,8 @@ contextBridge.exposeInMainWorld("omnigentSetup", {
    * @param {string} url
    */
   setServerUrl: (url) => ipcRenderer.invoke("omnigent:set-server-url", url),
+  /** Organization-provided server URLs from macOS Managed Preferences. */
+  getManagedServers: () => ipcRenderer.invoke("omnigent:get-managed-servers"),
   /** Recently-connected server URLs, most recent first. */
   getRecentServers: () => ipcRenderer.invoke("omnigent:get-recent-servers"),
   /** Copy text from the bundled setup page to the native clipboard. */

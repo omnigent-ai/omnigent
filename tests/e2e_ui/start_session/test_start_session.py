@@ -1212,6 +1212,77 @@ async def _drive_remembers_last_picked_host(base_url: str, session_id: str) -> N
             await browser.close()
 
 
+def test_start_session_waits_for_refreshed_remembered_host(
+    seeded_session: tuple[str, str],
+) -> None:
+    """Cached Mac-only hosts do not displace a remembered VM during refresh."""
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_waits_for_refreshed_remembered_host(base_url, session_id))
+
+
+async def _drive_waits_for_refreshed_remembered_host(base_url: str, session_id: str) -> None:
+    alpha_id, _alpha_name = _HOST_ALPHA
+    beta_id, beta_name = _HOST_BETA
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        release_refresh = asyncio.Event()
+        route_state = {"delay_refresh": False, "initial_requests": 0}
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page, created_session_id=session_id, create_bodies=create_bodies
+            )
+
+            async def handle_hosts(route: Route) -> None:
+                if route_state["delay_refresh"]:
+                    await release_refresh.wait()
+                    body = _two_hosts_body()
+                else:
+                    route_state["initial_requests"] += 1
+                    body = json.dumps(
+                        {
+                            "hosts": [
+                                {
+                                    "host_id": alpha_id,
+                                    "name": _HOST_ALPHA[1],
+                                    "owner": "e2e",
+                                    "status": "online",
+                                }
+                            ]
+                        }
+                    )
+                await route.fulfill(status=200, content_type="application/json", body=body)
+
+            # Registered after the common route so this stateful handler wins.
+            await page.route("**/v1/hosts", handle_hosts)
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:last-host-choice",
+                    "{beta_id}"
+                );"""
+            )
+
+            # ChatPage and Sidebar warm the shared host-query cache while the
+            # stub exposes only the Mac. No landing draft exists on this path.
+            await page.goto(f"{base_url}/c/{session_id}")
+            await page.get_by_test_id("new-chat-button").wait_for(state="visible", timeout=30_000)
+            await _wait_until(lambda: route_state["initial_requests"] >= 2)
+
+            # NewChat mounts with cached Mac-only data and immediately starts a
+            # fresh request. Hold it so the intermediate choice is observable.
+            route_state["delay_refresh"] = True
+            await page.get_by_test_id("new-chat-button").click()
+            chip = page.get_by_test_id("new-chat-landing-host-chip")
+            await expect(chip).to_contain_text("Choose host")
+
+            release_refresh.set()
+            await expect(chip).to_contain_text(beta_name)
+        finally:
+            release_refresh.set()
+            await browser.close()
+
+
 def _managed_info_body() -> str:
     """Stub body for ``GET /v1/info``: a managed deployment offering a sandbox.
 
