@@ -331,6 +331,19 @@ describe("Composer slash-command menu", () => {
     });
   });
 
+  it("Enter on an empty composer neither sends nor reports a send", () => {
+    const onSend = vi.fn();
+    const analytics = vi.fn();
+    setOmnigentHostConfig({ analytics });
+    render(<Composer {...composerProps({ onSend })} />);
+
+    // Empty draft: the Send button is disabled, so a click can't fire the
+    // event — the guarded Enter path must not fire it either.
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(onSend).not.toHaveBeenCalled();
+    expect(analytics).not.toHaveBeenCalled();
+  });
+
   it("does not send when Enter confirms active IME composition", () => {
     const onSend = vi.fn();
     render(<Composer {...composerProps({ onSend })} />);

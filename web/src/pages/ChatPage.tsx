@@ -4749,8 +4749,9 @@ export function Composer({
   // Nonce bumped when bare "/model" is submitted; opens the AgentPicker
   // dropdown instead of sending (see submit()).
   const [pickerOpenNonce, setPickerOpenNonce] = useState(0);
-  // Enter-key sends bypass the send Button's onClick (a textarea Enter doesn't
-  // submit the form), so mirror the Button's componentId telemetry here.
+  // Single send-telemetry point (see submit()). Emitting here rather than via
+  // the Button's componentId covers Enter-key sends too — a textarea Enter never
+  // submits the form, so it would otherwise bypass the Button entirely.
   const { trackClick } = useOmnigentAnalytics();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -5325,6 +5326,11 @@ export function Composer({
     )
       return;
 
+    // A send is actually happening: report it for both pointer clicks (which
+    // reach here via the form submit) and Enter-key sends. Placed after the
+    // guard so guarded no-ops don't emit, matching the disabled Send button.
+    trackClick("chat.composer.send", "button");
+
     // Slash command path: the first token must read as "/name" (the shared
     // isSlashCommandText guard — file paths like "/Users/foo/bar.txt" don't
     // match, while args after the name may carry paths or URLs, e.g.
@@ -5485,7 +5491,6 @@ export function Composer({
       // ``mentionListingPending``); swallow Enter so the in-progress "@dir/"
       // token isn't sent as a chat message. The menu reopens when entries land.
       if (mentionListingPending) return;
-      trackClick("chat.composer.send", "button");
       submit();
       return;
     }
@@ -5980,7 +5985,6 @@ export function Composer({
             <Button
               type="submit"
               size="icon"
-              componentId="chat.composer.send"
               variant={showInterruptButton ? "destructive" : "default"}
               // Send button fades more decisively when there's no draft —
               // overrides the base 50% disabled-opacity so the affordance
