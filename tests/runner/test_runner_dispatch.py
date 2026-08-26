@@ -2682,7 +2682,6 @@ class _StubTerminalInstance:
         self.tmux_target = "main"
         # ``terminal_resource_view`` reads this to project the effective
         # web-attach transport into metadata; ``None`` => the global default.
-        self.terminal_transport = None
         # Records on_activity callbacks the dispatch wires up so a fresh
         # launch's pane-activity watcher start is observable (and so the
         # call doesn't AttributeError against this stub).
@@ -4397,8 +4396,10 @@ async def test_sys_list_models_dispatches_locally_with_static_provider(
 
     With a subscription default (static — no HTTP), the payload must
     carry one row per declared sub-agent plus ``self``, each in the
-    documented ``{source, verified, models, note}`` shape with the
-    curated claude ids surviving the claude-family filter.
+    documented ``{source, verified, models, note}`` shape. Subscription
+    listings enumerate nothing pre-launch (the curated stand-ins are
+    gone; live harness probes are the source of truth), so the row is
+    an honest empty listing, not a failure shape.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tmp_path: Per-test temp dir for the isolated provider config.
@@ -4421,17 +4422,10 @@ async def test_sys_list_models_dispatches_locally_with_static_provider(
     worker = payload["worker"]
     assert worker["source"] == "static"
     assert worker["verified"] is False
-    # The curated claude aliases survive the claude-family filter — the
-    # exact ids an orchestrator may pass back as args.model.
-    assert [m["id"] for m in worker["models"]] == [
-        "claude-fable-5",
-        "claude-opus-5",
-        "claude-opus-4-8",
-        "claude-sonnet-5",
-        "claude-sonnet-4-6",
-        "claude-haiku-4-5",
-    ]
-    assert worker["note"]
+    # No curated stand-ins: a path that cannot probe reports nothing
+    # rather than a plausible-but-stale list.
+    assert worker["models"] == []
+    assert "probing the harness" in worker["note"]
 
 
 @pytest.mark.asyncio
@@ -5519,6 +5513,159 @@ async def test_sys_cancel_task_interrupts_non_native_subagent() -> None:
     }
 
 
+@pytest.mark.asyncio
+async def test_sys_cancel_task_stops_terminal_claude_native_entry() -> None:
+    """A failed work status does not block cleanup of a live Claude pane."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import _cancel_subagent_task
+
+    parent_id = "conv_parent_terminal"
+    child_id = "conv_child_terminal"
+    entry = runner_app.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent="worker",
+        title="implementation",
+        wrapper_label="claude-code-native-ui",
+    )
+    entry.status = "failed"
+    posts: list[dict[str, Any]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        posts.append(json.loads(request.content))
+        entry.status = "cancelled"
+        return httpx.Response(204)
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_server_handler),
+            base_url="http://server",
+        ) as server_client:
+            output = json.loads(
+                await _cancel_subagent_task(
+                    {"task_id": child_id},
+                    conversation_id=parent_id,
+                    server_client=server_client,
+                )
+            )
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+
+    assert posts == [{"type": "stop_session", "data": {}}]
+    assert output == {"cancelled": True, "task_id": child_id, "status": "cancelled"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "cancelled"),
+    [("completed", False), ("cancelled", True)],
+)
+async def test_sys_cancel_task_returns_cached_finished_claude_native_status(
+    status: str,
+    cancelled: bool,
+) -> None:
+    """Finished Claude work does not issue a redundant hard-stop."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import _cancel_subagent_task
+
+    parent_id = "conv_parent_finished"
+    child_id = f"conv_child_{status}"
+    entry = runner_app.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent="worker",
+        title="implementation",
+        wrapper_label="claude-code-native-ui",
+    )
+    entry.status = status
+
+    try:
+        output = json.loads(
+            await _cancel_subagent_task(
+                {"task_id": child_id},
+                conversation_id=parent_id,
+                server_client=None,
+            )
+        )
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+
+    assert output == {"cancelled": cancelled, "task_id": child_id, "status": status}
+
+
+@pytest.mark.asyncio
+async def test_sys_cancel_task_stops_evicted_claude_native_entry() -> None:
+    """Server metadata restores the cleanup path after local eviction."""
+    from omnigent.runner.tool_dispatch import _cancel_subagent_task
+
+    parent_id = "conv_parent_evicted"
+    child_id = "conv_child_evicted"
+    posts: list[dict[str, Any]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "id": child_id,
+                    "parent_session_id": parent_id,
+                    "labels": {"omnigent.wrapper": "claude-code-native-ui"},
+                },
+            )
+        posts.append(json.loads(request.content))
+        return httpx.Response(204)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = json.loads(
+            await _cancel_subagent_task(
+                {"task_id": child_id},
+                conversation_id=parent_id,
+                server_client=server_client,
+            )
+        )
+
+    assert posts == [{"type": "stop_session", "data": {}}]
+    assert output == {"cancelled": True, "task_id": child_id, "status": "cancelled"}
+
+
+@pytest.mark.asyncio
+async def test_sys_cancel_task_rejects_foreign_evicted_entry() -> None:
+    """Eviction recovery cannot stop another parent's child."""
+    from omnigent.runner.tool_dispatch import _cancel_subagent_task
+
+    child_id = "conv_child_foreign"
+    posts: list[dict[str, Any]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "id": child_id,
+                    "parent_session_id": "conv_other_parent",
+                    "labels": {"omnigent.wrapper": "claude-code-native-ui"},
+                },
+            )
+        posts.append(json.loads(request.content))
+        return httpx.Response(204)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await _cancel_subagent_task(
+            {"task_id": child_id},
+            conversation_id="conv_requesting_parent",
+            server_client=server_client,
+        )
+
+    assert posts == []
+    assert output == f"Error: no in-flight task with task_id {child_id}"
+
+
 def test_session_status_to_task_status_maps_known_values() -> None:
     """
     ``_session_status_to_task_status`` maps a session.status value to the
@@ -6579,11 +6726,9 @@ async def test_sys_agent_get_projects_agent_metadata() -> None:
 @pytest.mark.asyncio
 async def test_sys_agent_list_degrades_when_sources_fail(tmp_path: Path) -> None:
     """
-    A failing source degrades to an empty section rather than failing the
-    whole call. Here the server 500s both list endpoints and no local
-    config dir exists, so all three sections come back empty — but the
-    tool still returns a well-formed result. If a source error
-    propagated, the tool would return an ``error`` instead.
+    A failing source degrades to an empty, retryable section rather than
+    failing the whole call or claiming that the source is exhausted. Here
+    the server 500s both list endpoints and no local config dir exists.
 
     :param tmp_path: Workspace dir with no agent-config subdir.
     """
@@ -6605,7 +6750,15 @@ async def test_sys_agent_list_degrades_when_sources_fail(tmp_path: Path) -> None
         )
 
     info = json.loads(output)
-    assert info == {"builtins": [], "session_agents": [], "local_configs": []}
+    assert info["builtins"] == []
+    assert info["session_agents"] == []
+    assert info["local_configs"] == []
+    assert info["page"]["has_more"] == {
+        "builtins": True,
+        "session_agents": True,
+        "local_configs": False,
+    }
+    assert isinstance(info["page"]["next_cursor"], str)
 
 
 @pytest.mark.asyncio
@@ -8263,6 +8416,89 @@ async def test_spawn_async_tool_phase_tool_call_policy_allow(
     item = inbox.get_nowait()
     assert item["status"] == "completed"
     assert item["output"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_dispatch_admits_researcher_without_harness_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """web_fetch's synthesized ``__web_researcher`` passes the dispatch gate,
+    and the child create carries no ``harness_override`` / ``model_override``
+    (#2426).
+
+    The runner never persists ``__web_researcher``, so before the gate/lookup
+    reconciliation the dispatch aborted with "sub-agent '__web_researcher' not
+    found in agent spec". After it, the gate admits the researcher AND the
+    create body is unchanged: ``harness_override`` stays absent (it comes only
+    from an explicit ``args.harness``, never set on the web_fetch path), so the
+    server-side reconstruction that resolves the researcher spec remains
+    authoritative. This locks down that the fix reconciled the local resolvers
+    without altering what is POSTed to ``/v1/sessions``.
+    """
+    import shutil
+
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+    from omnigent.spec.types import BuiltinToolConfig, LLMConfig, ToolsConfig
+    from omnigent.tools.builtins.web_fetch import RESEARCHER_NAME
+
+    # Hermetic bwrap probe: ``build_researcher_spec`` probes PATH for a
+    # no-``os_env`` parent; don't depend on bubblewrap on the test host.
+    monkeypatch.setattr(shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+
+    parent = AgentSpec(
+        spec_version=1,
+        name="coordinator",
+        llm=LLMConfig(model="openai/gpt-5.4"),
+        executor=ExecutorSpec(max_iterations=40, config={"harness": "claude-sdk"}),
+        tools=ToolsConfig(builtins=[BuiltinToolConfig(name="web_fetch")]),
+    )
+    # Precondition: the re-parsed bundle does not carry the researcher.
+    assert RESEARCHER_NAME not in [s.name for s in parent.sub_agents]
+
+    create_bodies: list[dict[str, Any]] = []
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_wf_parent/child_sessions"
+        ):
+            return httpx.Response(200, json={"data": []})
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_bodies.append(json.loads(request.content))
+            return httpx.Response(201, json={"id": "conv_wf_child"})
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_wf_child/events":
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="web_fetch",
+                arguments=json.dumps({"query": "latest score"}),
+                server_client=server_client,
+                conversation_id="conv_wf_parent",
+                agent_spec=parent,
+                task_id="t1",
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_wf_child")
+            runner_app._session_inboxes_ref.pop("conv_wf_parent", None)
+
+    # The gate admitted the researcher -- no "not found in agent spec" error.
+    assert "not found in agent spec" not in output
+    assert len(create_bodies) == 1, "web_fetch must create exactly one researcher child"
+    body = create_bodies[0]
+    assert body["sub_agent_name"] == RESEARCHER_NAME
+    # Acceptance C: server-side reconstruction stays authoritative.
+    assert "harness_override" not in body
+    assert "model_override" not in body
 
 
 # ── cross-process lifecycle desync recovery ── ──────────────────────────

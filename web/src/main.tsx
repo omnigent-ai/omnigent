@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { StrictMode } from "react";
+import { StrictMode, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter } from "react-router-dom";
 import App from "./App.tsx";
@@ -11,7 +11,8 @@ import { QueueFlushProvider } from "./hooks/QueueFlushProvider";
 import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
 import { resolveServerInfo, type ServerInfo } from "./lib/capabilities";
 import { CapabilitiesProvider } from "./lib/CapabilitiesContext";
-import { resolveIdentity } from "./lib/identity";
+import { createBootServerInfo, withBootTimeout } from "./lib/bootCapabilities";
+import { isLoginRedirectPending, resolveIdentity } from "./lib/identity";
 import { initNativeInsets } from "./lib/nativeInsets";
 import { initBrowserTelemetry } from "./lib/telemetry";
 import {
@@ -52,7 +53,16 @@ initChatStore(queryClient);
 // Discover the current user identity from the server. Once resolved,
 // all subsequent fetch calls include X-Forwarded-Email so session
 // routes know who's making the request.
-void resolveIdentity();
+//
+// Started here but AWAITED at the render gate below, alongside the
+// /v1/info probe. The app's shell mounts ~8 queries (hosts, agents,
+// conversations, projects, harnesses) with no auth gating of their own,
+// so rendering before this settles fans them all out at once — logged
+// out, every one 401s in parallel and the login redirect races the
+// burst. Kicked off at module scope so it runs CONCURRENTLY with
+// `resolveServerInfo()`; the gate waits on the slower of the two rather
+// than chaining a second round-trip onto first paint.
+const bootIdentity = resolveIdentity();
 
 // Mirror the iOS shell's native bar footprints into the inset CSS variables.
 // No-op off the iOS shell (the inset vars stay at their env()-only defaults).
@@ -83,68 +93,70 @@ applyThemePalette(readThemePalette());
 // missing server doesn't deadlock first paint. We add a small
 // safety timeout (1.5s) so users on a flaky network still get
 // something on screen.
-const bootProbe: Promise<ServerInfo> = Promise.race([
-  resolveServerInfo(),
-  new Promise<ServerInfo>((resolve) => {
-    setTimeout(
-      () =>
-        resolve({
-          accounts_enabled: false,
-          single_user: false,
-          login_url: null,
-          needs_setup: false,
-          databricks_features: false,
-          managed_sandboxes_enabled: false,
-          sandbox_provider: null,
-          sharing_mode: "on",
-          public_sharing_enabled: true,
-          server_version: null,
-          smart_routing_enabled: false,
-          smart_routing_sources: { external: false, oss: false },
-          harness_install_enabled: false,
-          installable_harnesses: [],
-          dictation_available: false,
-        }),
-      1500,
-    );
-  }),
-]);
+const bootServerInfo = createBootServerInfo(resolveServerInfo());
 
-const root = createRoot(document.getElementById("root")!);
-const renderApp = (info: ServerInfo) => {
-  root.render(
+// Same 1.5s safety net for the identity probe: a hung /v1/me must not
+// deadlock first paint. On timeout we render anyway and the app degrades
+// exactly as it did before this gate existed.
+const bootIdentityGate = withBootTimeout<string | null>(bootIdentity, null);
+
+function RootApp({ initialInfo }: { initialInfo: ServerInfo }) {
+  const [info, setInfo] = useState(initialInfo);
+  useEffect(() => {
+    let alive = true;
+    void bootServerInfo.settled.then((resolved) => {
+      if (alive) setInfo(resolved);
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
+  useEffect(() => {
+    if (info.branding?.app_name) document.title = info.branding.app_name;
+    const faviconUrl = info.branding?.logos.favicon;
+    if (!faviconUrl) return;
+    let link = document.querySelector<HTMLLinkElement>('link[rel="icon"]');
+    if (!link) {
+      link = document.createElement("link");
+      link.rel = "icon";
+      document.head.appendChild(link);
+    }
+    link.removeAttribute("type");
+    link.href = faviconUrl;
+  }, [info]);
+  return (
+    <CapabilitiesProvider info={info}>
+      <QueryClientProvider client={queryClient}>
+        <ThemeProvider>
+          <TooltipProvider>
+            <ImageLightboxProvider>
+              <BrowserRouter>
+                <SessionUpdatesProvider>
+                  <RunnerHealthProvider>
+                    <QueueFlushProvider>
+                      <App />
+                    </QueueFlushProvider>
+                  </RunnerHealthProvider>
+                </SessionUpdatesProvider>
+              </BrowserRouter>
+            </ImageLightboxProvider>
+          </TooltipProvider>
+        </ThemeProvider>
+      </QueryClientProvider>
+    </CapabilitiesProvider>
+  );
+}
+
+void Promise.all([bootServerInfo.initial, bootIdentityGate]).then(([initialInfo]) => {
+  // `/v1/me` came back 401 with a login page and we're already on our way
+  // there. Mounting now would start a navigation race we lose either way:
+  // the shell's queries fire against a session we know is invalid, 401,
+  // and get torn down mid-flight when the login page commits. Header mode
+  // never lands here (no login page), so a proxy-less deploy still renders.
+  if (isLoginRedirectPending()) return;
+  createRoot(document.getElementById("root")!).render(
     <StrictMode>
-      <CapabilitiesProvider info={info}>
-        <QueryClientProvider client={queryClient}>
-          <ThemeProvider>
-            <TooltipProvider>
-              <ImageLightboxProvider>
-                <BrowserRouter>
-                  <SessionUpdatesProvider>
-                    <RunnerHealthProvider>
-                      <QueueFlushProvider>
-                        <App />
-                      </QueueFlushProvider>
-                    </RunnerHealthProvider>
-                  </SessionUpdatesProvider>
-                </BrowserRouter>
-              </ImageLightboxProvider>
-            </TooltipProvider>
-          </ThemeProvider>
-        </QueryClientProvider>
-      </CapabilitiesProvider>
+      <RootApp initialInfo={initialInfo} />
     </StrictMode>,
   );
-};
-
-// Paint as soon as the boot probe settles — the real value, or the 1.5s
-// fallback on a slow/missing probe.
-void bootProbe.then(renderApp);
-// Then settle on the real value once it lands. If the 1.5s fallback painted
-// first (slow-but-successful probe), this adopts the real /v1/info and
-// re-renders the same root — so capability-gated UI (e.g. the managed-sandbox
-// host option, accounts routes) isn't pinned off for the tab's lifetime.
-// resolveServerInfo caches, so this shares the boot probe's single fetch, and
-// the real value always resolves no earlier than the fallback, so it never
-// downgrades a real render back to the fallback.
-void resolveServerInfo().then(renderApp);
+});

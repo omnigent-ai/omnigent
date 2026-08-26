@@ -128,6 +128,21 @@ def test_kimi_required_cli_returns_install_spec() -> None:
     assert spec.binary == "kimi"
 
 
+@pytest.mark.parametrize(
+    "harness",
+    ["antigravity-native", "native-antigravity", "agy-native", "native-agy"],
+)
+def test_antigravity_native_aliases_require_agy_cli(
+    monkeypatch: pytest.MonkeyPatch, harness: str
+) -> None:
+    """Every native agy spelling fails early when its CLI is unavailable."""
+    monkeypatch.setattr(hi.shutil, "which", lambda _name: None)
+    spec = hi.required_cli_for_harness(harness)
+    assert spec is not None
+    assert spec.binary == "agy"
+    assert hi.missing_harness_cli(harness) == spec
+
+
 def test_kimi_only_upstream_binary_satisfies_readiness(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -369,13 +384,17 @@ def test_antigravity_install_spec_launches_auth_service_no_npm() -> None:
     assert spec.auth_hint is not None
 
 
-def test_harness_setup_hint_antigravity_surfaces_sign_in() -> None:
+@pytest.mark.parametrize(
+    "harness",
+    ["antigravity-native", "native-antigravity", "agy-native", "native-agy"],
+)
+def test_harness_setup_hint_antigravity_surfaces_sign_in(harness: str) -> None:
     """A not-yet-signed-in agy is fixed by launching ``agy`` itself, so the
     launch hint names the installer AND the "run agy to sign in" step —
     otherwise a user who already has agy installed gets a misleading
     install-only hint.
     """
-    hint = hi.harness_setup_hint("antigravity-native")
+    hint = hi.harness_setup_hint(harness)
     assert "antigravity.google/cli/install.sh" in hint
     assert "agy" in hint
     assert "sign" in hint.lower()

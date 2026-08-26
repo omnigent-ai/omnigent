@@ -12,11 +12,12 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from importlib import import_module
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 from sqlalchemy.exc import StatementError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.gzip import GZipMiddleware
@@ -26,6 +27,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from omnigent._platform import resolve_repo_symlink
 from omnigent.db.db_models import InvalidUuidError
+from omnigent.debug_logging import set_current_user_id
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_plugins import (
     NativeHarnessProvider,
@@ -42,12 +44,13 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-from omnigent.server import session_live_state
+from omnigent.server import session_live_state, shutdown_state
 from omnigent.server.auth import AuthProvider, SharingMode
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     RunnerBackgroundTitleGenerator,
 )
+from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.mcp_pool import ServerMcpPool
 from omnigent.server.performance_metrics import (
@@ -99,6 +102,45 @@ from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
 _logger = logging.getLogger(__name__)
+
+
+class SmartRoutingSourcesInfo(BaseModel):
+    external: bool
+    oss: bool
+
+
+class BrandingLogosInfo(BaseModel):
+    main: str | None
+    loading: str | None
+    favicon: str | None
+
+
+class BrandingInfo(BaseModel):
+    app_name: str | None
+    heading: str | None
+    logos: BrandingLogosInfo
+    powered_by: bool
+
+
+class ServerInfoResponse(BaseModel):
+    accounts_enabled: bool
+    single_user: bool
+    login_url: str | None
+    needs_setup: bool
+    databricks_features: bool
+    managed_sandboxes_enabled: bool
+    sandbox_provider: str | None
+    sandbox_providers: list[str]
+    sharing_mode: Literal["on", "read_only", "restricted_read_only", "off"]
+    public_sharing_enabled: bool
+    server_version: str
+    smart_routing_enabled: bool
+    smart_routing_sources: SmartRoutingSourcesInfo
+    features: dict[str, bool]
+    harness_install_enabled: bool
+    installable_harnesses: list[str]
+    dictation_available: bool
+    branding: BrandingInfo
 
 
 def _server_version() -> str:
@@ -478,6 +520,7 @@ def _ensure_default_agents(
     :param agent_cache: Cache for loaded agent specs.
     """
     _ensure_default_native_agents(agent_store, artifact_store, agent_cache)
+    _ensure_default_acp_agents(agent_store, artifact_store, agent_cache)
     _ensure_default_debby_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_polly_agent(agent_store, artifact_store, agent_cache)
     _ensure_extra_builtin_agents(agent_store, artifact_store, agent_cache)
@@ -624,6 +667,125 @@ def _ensure_default_native_agents(
         )
 
 
+# Light framing for a seeded ACP picker agent. ACP agents run their own tool
+# loop, so the vendor CLI supplies the real behavior; this is just enough to
+# name the role.
+_ACP_AGENT_PROMPT = (
+    "You are a coding agent running inside Omnigent through the Agent Client "
+    "Protocol. Help the user with software engineering tasks in their workspace: "
+    "read and edit files, run commands, investigate, and implement changes. Work "
+    "within the current repository, explain what you are doing, and when you finish "
+    "a task tell the user how to verify it."
+)
+
+
+def _build_acp_bundle(*, harness: str, name: str) -> bytes:
+    """
+    Materialize a one-file ACP picker agent and tar it.
+
+    ACP agents have no provider row (unlike :func:`_build_native_bundle`), so the
+    spec is a generated single YAML on the debby-style directory path: just the
+    ``acp:<slug>`` (or builtin ACP CLI) harness id. The launch command is resolved
+    from the host's own ``acp:`` config (user agents) or PATH (builtin CLI rows)
+    at spawn time, so nothing host-specific is baked into the bundle.
+
+    :param harness: The harness id, e.g. ``"acp:devin"`` or ``"grok"``.
+    :param name: The agent name / stable-id seed — a valid ``[a-zA-Z0-9_-]+``
+        slug (e.g. ``"devin"``, ``"grok"``), never a display label with spaces.
+    :returns: Gzipped tarball bytes suitable for the artifact store.
+    """
+    import tempfile
+
+    import yaml
+
+    from omnigent.spec import materialize_bundle
+
+    raw = {
+        "spec_version": 1,
+        "name": name,
+        "prompt": _ACP_AGENT_PROMPT,
+        "executor": {"type": "omnigent", "config": {"harness": harness}},
+        "os_env": {"type": "caller_process", "cwd": ".", "sandbox": {"type": "none"}},
+    }
+    with tempfile.TemporaryDirectory() as tmpdir:
+        source = Path(tmpdir) / "src"
+        source.mkdir()
+        (source / "config.yaml").write_text(yaml.safe_dump(raw, sort_keys=False))
+        bundle_dir = materialize_bundle(source, Path(tmpdir) / "bundle")
+        return _tar_gz_dir(bundle_dir)
+
+
+def _ensure_default_acp_agents(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+) -> None:
+    """
+    Seed a picker agent for each ACP harness set up on THIS server's host.
+
+    Native harnesses seed a fixed ``<harness>-ui`` agent each
+    (:func:`_ensure_default_native_agents`). ACP agents are host config rather
+    than a fixed catalog, so seed one agent per user-configured ``acp:<slug>``
+    agent (``harness_is_configured("acp:...")`` treats "in config" as set up) and
+    per builtin ACP CLI harness whose binary is on PATH (its readiness gate). On a
+    host with no ACP setup — the common remote-server case, where the server holds
+    no ``acp:`` config — this seeds nothing. When both sources name the same
+    harness, the configured agent wins (see :func:`shadowed_builtin_acp_rows`).
+
+    Purely additive: it only adds picker rows and never touches native seeding.
+    A malformed ``acp:`` block is logged and skipped, never fatal to startup
+    (mirrors the dynamic ``acp:*`` catalog rows in ``harness_plugins``).
+
+    Note: a seeded row is keyed by the agent's display name, so renaming a
+    configured ACP agent leaves the old picker row behind until the store is
+    reseeded — acceptable since native names are fixed and never rename.
+
+    :param agent_store: Store for agent metadata.
+    :param artifact_store: Store for agent bundles.
+    :param agent_cache: Cache for loaded agent specs.
+    """
+    from omnigent._platform import resolve_cli_binary
+    from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+
+    # (1) User-configured acp:<slug> agents — "set up" == present in config.
+    try:
+        from omnigent.onboarding.acp_auth import acp_agents, shadowed_builtin_acp_rows
+
+        configured = list(acp_agents())
+        shadowed: frozenset[str] = shadowed_builtin_acp_rows(configured)
+    except Exception:  # noqa: BLE001 — a malformed acp: block must never break startup
+        _logger.debug("acp agent seeding skipped (config unreadable)", exc_info=True)
+        configured = []
+        shadowed = frozenset()
+    for agent in configured:
+        # Key the built-in by the slug, not the display label: agent names must be
+        # ``[a-zA-Z0-9_-]+`` (the spec validator rejects spaces/dots), and a label
+        # like "Gemini CLI" would fail to load. The web picker capitalizes the slug
+        # for display (e.g. ``devin`` -> "Devin").
+        _ensure_builtin_agent(
+            agent_store,
+            artifact_store,
+            agent_cache,
+            name=agent.slug,
+            bundle_bytes=_build_acp_bundle(harness=f"acp:{agent.slug}", name=agent.slug),
+        )
+
+    # (2) Builtin ACP CLI harnesses (e.g. grok) — "set up" == binary on PATH. Keyed
+    # by the catalog id (already a valid slug), not the display label. A row a
+    # configured agent already claims is skipped: both seed the same
+    # ``builtin_agent_id``, so the row would overwrite the user's chosen command.
+    for key, row in ACP_CLI_HARNESSES.items():
+        if key in shadowed or resolve_cli_binary(row.binary) is None:
+            continue
+        _ensure_builtin_agent(
+            agent_store,
+            artifact_store,
+            agent_cache,
+            name=key,
+            bundle_bytes=_build_acp_bundle(harness=key, name=key),
+        )
+
+
 def _build_debby_bundle() -> bytes:
     """
     Build a gzipped tarball of the ``examples/debby`` agent bundle.
@@ -763,6 +925,7 @@ def create_app(
     sharing_mode: SharingMode | Callable[[], SharingMode] | None = None,
     public_sharing: bool | Callable[[], bool] | None = None,
     server_config: dict[str, Any] | None = None,
+    feature_flags: FeatureFlags | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -853,6 +1016,9 @@ def create_app(
         open to ``ON`` when unset or unrecognized. Reported by
         ``GET /v1/info`` as ``sharing_mode`` so the web app can gate its
         Share controls to match.
+    :param feature_flags: Optional immutable release-feature snapshot.
+        When omitted, resolves the comma-separated ``OMNIGENT_FEATURES``
+        enabled set once at application construction.
     :param public_sharing: Whether public (anyone-with-the-link) read
         access may be granted — i.e. whether the ``__public__`` grant is
         allowed. Orthogonal to ``sharing_mode``: a server can keep normal
@@ -871,6 +1037,11 @@ def create_app(
     """
     if permission_store is not None and auth_provider is None:
         raise ValueError("auth_provider is required when permission_store is provided")
+
+    from omnigent.server.server_config import load_branding_snapshot
+
+    branding_snapshot = load_branding_snapshot(server_config)
+    resolved_feature_flags = feature_flags or resolve_feature_flags()
 
     # First-boot admin bootstrap for the accounts auth provider.
     # Runs before any route is mounted so the login page is never
@@ -1098,6 +1269,7 @@ def create_app(
                 agent_store=agent_store,
                 conversation_store=conversation_store,
                 permission_store=permission_store,
+                policy_store=policy_store,
                 host_store=host_store,
                 host_registry=host_registry,
                 agent_cache=agent_cache,
@@ -1185,6 +1357,8 @@ def create_app(
     app.state.host_store = host_store
     app.state.agent_store = agent_store
     app.state.sandbox_config = sandbox_config
+    app.state.branding_snapshot = branding_snapshot
+    app.state.feature_flags = resolved_feature_flags
     # Admin roster: the config ``admins:`` list (canonical) union'd with the
     # runtime-editable ``<data_dir>/admins`` file. Built once here so BOTH the
     # admin-gated auth routes AND ``/v1/me``'s is_admin computation consult the
@@ -1313,6 +1487,18 @@ def create_app(
         set_request_session_id_for_access_log(
             session_match.group(1) if session_match else None,
         )
+        # Bind the request's authenticated user so debug-log records emitted
+        # while handling it are attributed. Request-scoped: each request runs in
+        # its own task/context, so concurrent users never see each other's id.
+        # Best-effort — attribution must never fail a request. The raw identity
+        # (incl. the "local" single-user sentinel) is kept; it is a meaningful
+        # queryable value in the debug table.
+        try:
+            set_current_user_id(
+                auth_provider.get_user_id(request) if auth_provider is not None else None
+            )
+        except Exception:  # noqa: BLE001 — attribution is best-effort
+            set_current_user_id(None)
 
         failed = False
         status_code: int | None = None
@@ -1613,12 +1799,13 @@ def create_app(
                 host_version = host_versions.get(conn.host_id)
             if conn.runner_id is None:
                 # No runner binding: an in-process executor (or a session
-                # not yet dispatched) is reachable — EXCEPT an unbound fork
-                # of a session that had a working directory, which must
-                # rebind a host + directory first. Reporting it offline
-                # routes the first message into the directory picker instead
-                # of dropping it against a runner that can't start.
-                runner_online = not conn.needs_workspace
+                # not yet dispatched) is reachable — EXCEPT sessions that have
+                # no executor to reach and must launch a runner on a host
+                # first: an unbound fork (needs a workspace) or an imported
+                # transcript (no live executor anywhere). Reporting those
+                # offline routes the first message into the resume picker
+                # instead of dropping it against a runner that can't start.
+                runner_online = not (conn.needs_workspace or conn.imported)
             else:
                 # Strict: reachable only if the runner tunnel is up. No
                 # host-relaunch optimism — host state lives in host_online.
@@ -1776,8 +1963,8 @@ def create_app(
             "ui": {"server_picker": "sidebar"},
         }
 
-    @app.get("/v1/info")
-    async def info() -> dict[str, bool | str | list[str] | dict[str, bool] | None]:
+    @app.get("/v1/info", response_model=ServerInfoResponse)
+    async def info() -> ServerInfoResponse:
         """Runtime capabilities probe for the SPA + CLI.
 
         Returned at app boot by the frontend (and by ``omnigent
@@ -1888,17 +2075,10 @@ def create_app(
         except ImportError:
             smart_routing_enabled = False
             smart_routing_sources = {"external": False, "oss": False}
-        # harness_install_enabled gates the web UI's "Install" action for a
-        # missing, npm-installable harness on a connected host. Off by default
-        # (OMNIGENT_HARNESS_INSTALL_ENABLED=1 opts in) while the feature rolls
-        # out; when false the SPA keeps the prior "run omnigent setup" hint.
-        # Read live so flipping the env var takes effect without a rebuild.
-        # The env-var name is shared with the install route so the flag the UI
-        # sees and the flag the route enforces can never drift apart.
-        from omnigent.process_logging import env_truthy
-        from omnigent.server.routes.hosts import HARNESS_INSTALL_ENABLED_ENV
-
-        harness_install_enabled = env_truthy(os.environ.get(HARNESS_INSTALL_ENABLED_ENV))
+        # The immutable feature snapshot is shared by capability
+        # advertisement and route enforcement, so frontend and backend cannot
+        # disagree during a process lifetime.
+        harness_install_enabled = app.state.feature_flags.enabled(Feature.HARNESS_INSTALL)
         # installable_harnesses: the exact harness ids the install route accepts
         # (bare ids + native spellings resolving to an npm-installable family),
         # so the SPA offers setup only where it will succeed and never has to
@@ -1916,24 +2096,59 @@ def create_app(
         from omnigent.server.dictation import engine_availability
 
         dictation_available, _ = engine_availability()
-        return {
-            "accounts_enabled": accounts_enabled,
-            "single_user": single_user,
-            "login_url": login_url,
-            "needs_setup": needs_setup,
-            "databricks_features": databricks_features,
-            "managed_sandboxes_enabled": managed_sandboxes_enabled,
-            "sandbox_provider": sandbox_provider,
-            "sandbox_providers": sandbox_providers,
-            "sharing_mode": sharing_mode.value,
-            "public_sharing_enabled": public_sharing_enabled,
-            "server_version": _server_version(),
-            "smart_routing_enabled": smart_routing_enabled,
-            "smart_routing_sources": smart_routing_sources,
-            "harness_install_enabled": harness_install_enabled,
-            "installable_harnesses": installable_harnesses,
-            "dictation_available": dictation_available,
-        }
+        return ServerInfoResponse.model_validate(
+            {
+                "accounts_enabled": accounts_enabled,
+                "single_user": single_user,
+                "login_url": login_url,
+                "needs_setup": needs_setup,
+                "databricks_features": databricks_features,
+                "managed_sandboxes_enabled": managed_sandboxes_enabled,
+                "sandbox_provider": sandbox_provider,
+                "sandbox_providers": sandbox_providers,
+                "sharing_mode": sharing_mode.value,
+                "public_sharing_enabled": public_sharing_enabled,
+                "server_version": _server_version(),
+                "smart_routing_enabled": smart_routing_enabled,
+                "smart_routing_sources": smart_routing_sources,
+                "features": app.state.feature_flags.frontend_dict(),
+                "harness_install_enabled": harness_install_enabled,
+                "installable_harnesses": installable_harnesses,
+                "dictation_available": dictation_available,
+                "branding": branding_snapshot.config(),
+            }
+        )
+
+    @app.get(
+        "/v1/branding/logo/{variant}",
+        response_class=Response,
+        responses={
+            200: {
+                "description": "Validated raster branding image",
+                "content": {
+                    media_type: {"schema": {"type": "string", "format": "binary"}}
+                    for media_type in (
+                        "image/gif",
+                        "image/jpeg",
+                        "image/png",
+                        "image/webp",
+                        "image/x-icon",
+                    )
+                },
+            },
+            404: {"description": "Branding image not configured or invalid"},
+        },
+    )
+    async def branding_logo(variant: str) -> Response:
+        """Serve a validated public branding asset, or 404 when unset."""
+        asset = branding_snapshot.logo_asset(variant)
+        if asset is None:
+            raise StarletteHTTPException(status_code=404, detail="Branding logo not found")
+        return Response(
+            content=asset.content,
+            media_type=asset.media_type,
+            headers={"X-Content-Type-Options": "nosniff"},
+        )
 
     @app.get("/v1/me", response_model=None)  # Union return type (dict | JSONResponse)
     async def me(request: Request) -> dict[str, str | bool | None] | JSONResponse:
@@ -2032,6 +2247,7 @@ def create_app(
         create_usage_router(
             conversation_store,
             auth_provider=auth_provider,
+            feature_flags=resolved_feature_flags,
         ),
         prefix="/v1",
         tags=["usage"],
@@ -2180,6 +2396,11 @@ def create_app(
         :func:`_mark_runner_sessions_offline`, which fails only the
         interrupted turns and stamps the disconnect cause.
 
+        A server that is itself shutting down skips the marking too: it
+        closed the tunnel, and the runner cannot re-register with a
+        process that stopped listening — the replacement server re-adopts
+        it on reconnect (:mod:`omnigent.server.shutdown_state`).
+
         :param runner_id: The disconnected runner's id.
         """
         from omnigent.server.routes.sessions import (
@@ -2189,6 +2410,12 @@ def create_app(
         from omnigent.server.schemas import ErrorDetail
 
         await asyncio.sleep(RUNNER_DISCONNECT_GRACE_S)
+        if shutdown_state.server_shutting_down():
+            _logger.info(
+                "Runner %s dropped because this server is shutting down; skipping offline-marking",
+                runner_id,
+            )
+            return
         if tunnel_registry.get(runner_id) is not None:
             _logger.info(
                 "Runner %s reconnected within the disconnect grace; skipping offline-marking",
@@ -2498,6 +2725,7 @@ def create_app(
                 permission_store=permission_store,
                 agent_store=agent_store,
                 agent_cache=agent_cache,
+                feature_flags=resolved_feature_flags,
             ),
             prefix="/v1",
             tags=["hosts"],
@@ -2517,6 +2745,22 @@ def create_app(
         # auth routes and ``/v1/me`` share one roster. Consulted on each login
         # to promote listed identities — the only admin path for OIDC, and an
         # additive convenience for accounts.
+        # Login-issued refresh grants: both server-mintable providers
+        # (accounts, oidc) get a grant store so `omnigent login` can hand
+        # the CLI refresh material — without it, an unattended host dies
+        # permanently at session-JWT expiry (default 8 h). The store also
+        # backs the opt-in RFC 8628 device flow below.
+        device_grant_store = None
+        if (
+            isinstance(auth_provider, UnifiedAuthProvider)
+            and auth_provider._source in ("accounts", "oidc")
+            and permission_store is not None
+        ):
+            from omnigent.server.device_grant_store import DeviceGrantStore
+
+            device_grant_store = DeviceGrantStore(permission_store.storage_location)
+            auth_provider.set_grant_revocation_check(device_grant_store.is_revoked)
+
         if (
             isinstance(auth_provider, UnifiedAuthProvider)
             and auth_provider._source == "accounts"
@@ -2528,7 +2772,11 @@ def create_app(
 
             app.include_router(
                 create_accounts_auth_router(
-                    auth_provider, account_store, admin_list, permission_store
+                    auth_provider,
+                    account_store,
+                    admin_list,
+                    permission_store,
+                    device_grant_store,
                 ),
                 prefix="/auth",
                 tags=["auth"],
@@ -2559,6 +2807,7 @@ def create_app(
                     admin_list,
                     oidc_account_store,
                     allowed_domains=frozenset(allowed_domains or ()) or None,
+                    device_grant_store=device_grant_store,
                 ),
                 prefix="/auth",
                 tags=["auth"],
@@ -2570,24 +2819,20 @@ def create_app(
             )
 
         # Device Authorization Grant (RFC 8628): opt-in, default-off via
-        # OMNIGENT_DEVICE_GRANT_ENABLED, and accounts-mode only. OIDC delegates
-        # login to the IdP (cli-ticket flow), so it neither needs nor mounts
-        # these routes. Wires the revocation lookup into the auth provider so
-        # revoking a grant immediately rejects its delegated access tokens.
-        # See designs/DEVICE_AUTH.md.
+        # OMNIGENT_DEVICE_GRANT_ENABLED, and accounts-mode only (the
+        # in-browser consent flow needs the accounts login page). Wires
+        # the full /oauth/* surface including the token endpoint. See
+        # designs/DEVICE_AUTH.md.
         from omnigent.server.auth import env_var_is_truthy
 
         if (
             env_var_is_truthy("OMNIGENT_DEVICE_GRANT_ENABLED", default=False)
             and isinstance(auth_provider, UnifiedAuthProvider)
             and auth_provider._source == "accounts"
-            and permission_store is not None
+            and device_grant_store is not None
         ):
-            from omnigent.server.device_grant_store import DeviceGrantStore
             from omnigent.server.routes.device_auth import create_device_auth_router
 
-            device_grant_store = DeviceGrantStore(permission_store.storage_location)
-            auth_provider.set_grant_revocation_check(device_grant_store.is_revoked)
             app.include_router(
                 create_device_auth_router(auth_provider, device_grant_store),
                 tags=["oauth"],
@@ -2608,6 +2853,17 @@ def create_app(
                     "the server and its trusted client(s) to restrict initiation "
                     "to authorized clients. See designs/DEVICE_AUTH.md.",
                 )
+        elif isinstance(auth_provider, UnifiedAuthProvider) and device_grant_store is not None:
+            # No device flow, but login-issued refresh grants still need
+            # their token/revoke endpoints — in OIDC mode and in accounts
+            # mode without the flag alike.
+            from omnigent.server.routes.device_auth import create_oauth_token_router
+
+            app.include_router(
+                create_oauth_token_router(auth_provider, device_grant_store),
+                tags=["oauth"],
+            )
+            _logger.info("login-grant: /oauth/token + /oauth/revoke enabled")
 
     # Mount the built web SPA at "/" if a build is present. The SPA is
     # built into ``omnigent/server/static/web-ui/`` by ``web/``'s Vite

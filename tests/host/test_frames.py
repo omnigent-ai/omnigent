@@ -8,6 +8,7 @@ import pytest
 
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeFrame,
@@ -257,6 +258,17 @@ def test_hello_frame_configured_harnesses_round_trip() -> None:
     # Exact map equality: both the True and the False must survive —
     # False is the actionable "warn the user" value.
     assert decoded.configured_harnesses == {"claude-sdk": True, "codex": "needs-auth"}
+
+
+def test_connection_error_frame_round_trip() -> None:
+    """Connection errors preserve the server stage and exception message."""
+    original = HostConnectionErrorFrame(
+        stage="registration",
+        error="[Errno 13] Permission denied",
+        retryable=False,
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert decoded == original
 
 
 def test_harness_readiness_frame_round_trip() -> None:

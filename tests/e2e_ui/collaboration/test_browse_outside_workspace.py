@@ -213,6 +213,17 @@ def _absolute_fs_url(base_url: str, session_id: str, target: Path) -> str:
     )
 
 
+def _absolute_fs_url_base_host(base_url: str, session_id: str, target: Path) -> str:
+    """The proxy-safe wire form the web uses: a bare path (no leading ``%2F``)
+    named absolute by ``?base=host``. The owner gate must apply to this exactly
+    as it does to the ``%2F`` form, or the fix would be a way around it.
+    """
+    return (
+        f"{base_url}/v1/sessions/{session_id}/resources/environments/default"
+        f"/filesystem/{str(target).lstrip('/')}?base=host"
+    )
+
+
 def test_owner_browses_outside_workspace_but_shared_collaborator_cannot(
     browser: Browser,
     live_server: str,
@@ -288,6 +299,12 @@ def test_owner_browses_outside_workspace_but_shared_collaborator_cannot(
 
         refused = bob_page.request.get(_absolute_fs_url(live_server, session_id, outside))
         assert refused.status == 403, refused.text()
+        # The proxy-safe wire form is gated identically -- base=host is not a
+        # way around the owner check.
+        refused_base_host = bob_page.request.get(
+            _absolute_fs_url_base_host(live_server, session_id, outside)
+        )
+        assert refused_base_host.status == 403, refused_base_host.text()
     finally:
         bob_page.unroute_all(behavior="ignoreErrors")
         bob_page.close()
@@ -299,6 +316,10 @@ def test_owner_browses_outside_workspace_but_shared_collaborator_cannot(
         _absolute_fs_url(live_server, session_id, outside).removeprefix(live_server)
     )
     assert allowed.status_code == 200, allowed.text
+    allowed_base_host = shared_browse.owner.get(
+        _absolute_fs_url_base_host(live_server, session_id, outside).removeprefix(live_server)
+    )
+    assert allowed_base_host.status_code == 200, allowed_base_host.text
 
 
 def test_shared_collaborator_double_clicks_into_a_workspace_folder(

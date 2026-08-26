@@ -10,6 +10,9 @@
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
+const fs = require("node:fs");
+const path = require("node:path");
+const yaml = require("js-yaml");
 
 const {
   createDesktopUpdater,
@@ -27,9 +30,10 @@ const PINNED_ORIGIN = "https://server.example";
  * @param {object} [opts]
  * @param {Record<string, unknown>} [opts.settings] Initial persisted settings.
  * @param {boolean} [opts.isPackaged] Simulate a packaged build.
- * @param {boolean} [opts.forceDevUpdateConfig] Force the dev feed on.
+ * @param {boolean} [opts.forceDevUpdateConfig] Enable the development update config.
  * @param {boolean} [opts.pinnedSender] Whether IPC calls count as trusted.
  * @param {Array<{response: number}>} [opts.dialogResponses] Queued dialog answers.
+ * @param {() => string} [opts.getCurrentVersion] Display-version override.
  */
 function makeUpdater({
   settings = {},
@@ -37,6 +41,7 @@ function makeUpdater({
   forceDevUpdateConfig = false,
   pinnedSender = true,
   dialogResponses = [{ response: 1 }],
+  getCurrentVersion,
 } = {}) {
   let store = { ...settings };
   const calls = {
@@ -75,6 +80,7 @@ function makeUpdater({
   const deps = {
     app: {
       isPackaged,
+      getVersion: () => "0.3.0",
       quit: () => {
         calls.appQuit += 1;
       },
@@ -104,6 +110,7 @@ function makeUpdater({
     pinnedOrigin: () => PINNED_ORIGIN,
     iconPath: "/icons/icon.png",
     forceDevUpdateConfig,
+    getCurrentVersion,
   };
 
   const updater = createDesktopUpdater(deps);
@@ -143,6 +150,16 @@ describe("desktop_updater — pure helpers", () => {
   it("exposes the update-mode set and dev-unavailable message", () => {
     assert.deepEqual([...UPDATE_MODES].sort(), ["default", "manual", "none", "start"]);
     assert.match(UPDATES_UNAVAILABLE_IN_DEV, /unavailable in development/);
+  });
+
+  it("uses the production update endpoint in development", () => {
+    const devConfig = yaml.load(
+      fs.readFileSync(path.join(__dirname, "../dev-app-update.yml"), "utf8"),
+    );
+    const packageConfig = require("../package.json");
+
+    assert.equal(devConfig.url, packageConfig.build.publish[0].url);
+    assert.match(devConfig.url, /^https:\/\//);
   });
 
   it("classifies signing/integrity errors as security errors", () => {
@@ -197,14 +214,41 @@ describe("desktop_updater — event wiring + broadcast", () => {
     assert.equal(h.autoUpdater.forceDevUpdateConfig, true);
     assert.deepEqual(plain(h.updater.getStatus()), {
       state: "available",
+      currentVersion: "0.3.0",
       info: { version: "0.4.0" },
     });
     assert.deepEqual(plain(h.calls.sent), [
       {
         channel: "omnigent:update-status",
-        payload: { state: "available", info: { version: "0.4.0" } },
+        payload: {
+          state: "available",
+          currentVersion: "0.3.0",
+          info: { version: "0.4.0" },
+        },
       },
     ]);
+
+    h.autoUpdater.emit("update-downloaded", { version: "0.4.0" });
+    assert.deepEqual(plain(h.updater.getStatus()), {
+      state: "downloaded",
+      currentVersion: "0.3.0",
+      info: { version: "0.4.0" },
+    });
+  });
+
+  it("uses an injected display version for update prompts", () => {
+    const h = makeUpdater({
+      forceDevUpdateConfig: true,
+      settings: { update_mode: "manual" },
+      getCurrentVersion: () => "0.2.0",
+    });
+    h.updater.init();
+
+    h.autoUpdater.emit("update-available", { version: "0.4.0" });
+    assert.equal(h.updater.getStatus().currentVersion, "0.2.0");
+
+    h.autoUpdater.emit("update-downloaded", { version: "0.4.0" });
+    assert.equal(h.updater.getStatus().currentVersion, "0.2.0");
   });
 
   it("start mode kicks off a check with no lingering periodic timer", () => {
@@ -248,7 +292,7 @@ describe("desktop_updater — manual check errors", () => {
   });
 });
 
-describe("desktop_updater — dev feed gating", () => {
+describe("desktop_updater — development update config gating", () => {
   it("blocks manual paths when the feed is unavailable in development", async () => {
     const h = makeUpdater({ settings: { update_mode: "manual" } });
     h.updater.registerIpc();

@@ -16,12 +16,97 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.model_override import validate_model_override
 from omnigent.reasoning_effort import EFFORT_VALUES, validate_effort
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.server.auth import LEVEL_READ
+from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, local_single_user_enabled
 from omnigent.server.routes._auth_helpers import require_access
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.host_store import host_is_live
 
 _logger = logging.getLogger(__name__)
+
+
+# Claude Code's ``--permission-mode`` launch vocabulary — every value the CLI
+# accepts at start, not just the shift+tab-switchable subset. ``dontAsk`` and
+# ``bypassPermissions`` are launch-only (rejected on a running-session PATCH),
+# but a scheduled task launches a fresh session each fire, so all of them are
+# valid here. Mirrors the frontend's ``CLAUDE_NATIVE_PERMISSION_MODES``.
+CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES: frozenset[str] = frozenset(
+    {"default", "auto", "acceptEdits", "plan", "dontAsk", "bypassPermissions"}
+)
+
+
+# The only harness that accepts a ``--permission-mode`` launch arg — the same
+# ``permissionMode`` capability the web dialog gates its permission control on.
+# Other native CLIs (codex / cursor / …) use different flags, so injecting
+# ``--permission-mode`` there would be an unknown flag that breaks the launch.
+_PERMISSION_MODE_HARNESS = "claude-native"
+
+
+async def validate_permission_mode_agent_support(
+    *,
+    permission_mode: str | None,
+    agent: Any,
+    agent_cache: AgentCache | None,
+) -> None:
+    """Reject a ``permission_mode`` on an agent whose harness has no such flag.
+
+    Mirrors the web dialog's capability gate on the server so the REST endpoint
+    and agent tools enforce the same rule the UI does: only a ``claude-native``
+    agent may carry a ``permission_mode``. Without this, a task on a codex /
+    cursor agent could persist a mode the fire path would inject as an unknown
+    ``--permission-mode`` flag, breaking the launch.
+
+    This is an early, friendly 4xx at persist time. A ``None`` mode is always
+    allowed (nothing to gate). When the harness cannot be resolved (no bundle /
+    cache / a load error), this is a no-op rather than a rejection: the value has
+    already passed the vocabulary allowlist, and the fire path's launch-arg
+    derivation is itself harness-gated fail-safe (it injects ``--permission-mode``
+    ONLY for a confirmed ``claude-native`` agent, omitting it otherwise), so a
+    non-Claude mode can never actually reach the launch args regardless.
+    """
+    if permission_mode is None or agent is None:
+        return
+    if agent_cache is None or getattr(agent, "bundle_location", None) is None:
+        return
+    from omnigent.harness_aliases import canonicalize_harness
+
+    try:
+        loaded = await asyncio.to_thread(agent_cache.load, agent.id, agent.bundle_location)
+        executor = getattr(loaded.spec, "executor", None)
+        raw_harness = None
+        if executor is not None:
+            raw_harness = executor.config.get("harness") or executor.type
+        harness = canonicalize_harness(raw_harness) or raw_harness
+    except Exception:
+        # A spec that won't load fails elsewhere (workspace validation / fire);
+        # don't turn an unrelated load error into a permission_mode rejection.
+        _logger.exception("Failed to load agent spec for permission_mode gating")
+        return
+    if harness != _PERMISSION_MODE_HARNESS:
+        raise OmnigentError(
+            f"permission_mode is only supported for {_PERMISSION_MODE_HARNESS} agents, "
+            f"not {harness!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+
+def validate_session_permission_mode(permission_mode: str | None) -> str | None:
+    """Validate a persisted per-task permission mode shared by schedules.
+
+    A scheduled task fires a fresh native session each run, so the whole launch
+    vocabulary is allowed (including the launch-only ``dontAsk`` /
+    ``bypassPermissions``). The value reaches the native CLI as the
+    ``--permission-mode`` argv element the fire path derives, so reject anything
+    outside the known set before a row persists it.
+    """
+    if permission_mode is None:
+        return None
+    if permission_mode not in CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES:
+        raise OmnigentError(
+            f"invalid permission_mode: {permission_mode!r} (expected one of "
+            f"{sorted(CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES)})",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return permission_mode
 
 
 def validate_session_model_metadata(
@@ -84,8 +169,17 @@ async def validate_session_agent(
     # at least READ access to that owning session — otherwise they can execute
     # another user's private agent by guessing the raw agent id.
     if agent.session_id is not None:
+        # Single-user servers persist the local owner as NULL (scheduled tasks
+        # store user_id=None), but session grants are keyed by the "local"
+        # sentinel — the same identity POST /v1/sessions checks. Resolve None to
+        # it here so a session-scoped agent authorizes, instead of tripping the
+        # require_access unauthenticated guard. Multi-user servers leave None as
+        # None, which still correctly 401s.
+        access_user = user_id
+        if access_user is None and local_single_user_enabled():
+            access_user = RESERVED_USER_LOCAL
         await require_access(
-            user_id,
+            access_user,
             agent.session_id,
             LEVEL_READ,
             permission_store,
@@ -115,7 +209,9 @@ async def validate_existing_host_workspace(
             "workspace required when host_id is set",
             code=ErrorCode.INVALID_INPUT,
         )
-    if not workspace.startswith("/"):
+    from omnigent.server.routes._workspace_validation import _is_windows_absolute_path
+
+    if not workspace.startswith("/") and not _is_windows_absolute_path(workspace):
         raise OmnigentError(
             "workspace must be an absolute path starting with /",
             code=ErrorCode.INVALID_INPUT,

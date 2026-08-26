@@ -43,7 +43,12 @@ non-zero exit means at least one `DRIFT` cell was found.
 ### Flags
 
 - `--live` / `--no-live` -- force live probing or the declared-only matrix.
-  `--live` requires resolvable gateway credentials.
+  `--live` requires resolvable gateway credentials, unless every selected
+  harness authenticates its own model (`agy`, cursor, goose, hermes, kimi,
+  kiro, pi and qwen natives), in which case the vendor CLI's own login is
+  enough. Auto-live is still keyed on the gateway, so a bare run on a
+  credential-less machine renders the declared matrix rather than starting
+  vendor CLIs unasked.
 - `--profile NAME` -- optional Databricks profile override; it is not required
   when config or ambient `OPENAI_*` already supplies credentials.
 - `--harness NAME[=MODEL]` -- probe one harness (repeatable), optionally

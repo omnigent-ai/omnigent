@@ -48,12 +48,20 @@ _FAKE_ROW = AcpCliHarness(
 )
 
 
-def _spec(harness: str, os_env: OSEnvSpec | None = None) -> AgentSpec:
+def _spec(
+    harness: str,
+    os_env: OSEnvSpec | None = None,
+    *,
+    permission_mode: str | None = None,
+) -> AgentSpec:
+    config: dict[str, object] = {"harness": harness}
+    if permission_mode is not None:
+        config["permission_mode"] = permission_mode
     return AgentSpec(
         spec_version=1,
         name=f"test-{harness}",
         instructions="Test agent.",
-        executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
+        executor=ExecutorSpec(type="omnigent", config=config),
         os_env=os_env,
     )
 
@@ -218,3 +226,26 @@ def test_setup_drill_in_ignores_unknown_row() -> None:
     from omnigent import cli_config
 
     cli_config._show_acp_cli_harness("definitely-not-a-row")
+
+
+def test_spawn_env_forwards_permission_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A builtin row honors ``permission_mode`` too, not just configured agents.
+
+    Devin and Grok Build are builtin rows, so they take this builder rather than
+    ``_build_acp_spawn_env``. Missing it here would leave the option working for
+    a self-registered ``acp:devin`` but silently inert for the builtin ``devin``
+    the picker offers.
+    """
+    monkeypatch.setitem(ACP_CLI_HARNESSES, "fakecli", _FAKE_ROW)
+    monkeypatch.setattr(
+        "omnigent._platform.resolve_cli_binary", lambda _b, **k: "/usr/bin/fakecli"
+    )
+
+    env = _build_acp_cli_spawn_env(
+        _spec("fakecli", permission_mode="bypassPermissions"), harness="fakecli"
+    )
+    assert env["HARNESS_ACP_PERMISSION_MODE"] == "bypassPermissions"
+    # Absent -> unset, so the wrap keeps its prompting default.
+    assert "HARNESS_ACP_PERMISSION_MODE" not in _build_acp_cli_spawn_env(
+        _spec("fakecli"), harness="fakecli"
+    )

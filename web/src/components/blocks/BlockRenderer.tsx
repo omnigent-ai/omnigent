@@ -74,6 +74,7 @@ const FOLD_EXPAND_ANCHOR_HOLD_MS = 400;
 interface BlockRendererProps {
   items: RenderItem[];
   sessionStatus: SessionStatus;
+  onRetryError?: (item: Extract<RenderItem, { kind: "error" }>) => Promise<void>;
   /**
    * Lifecycle of the turn this bubble renders (`Bubble.lifecycle`).
    * `"streaming"` keeps the process trace expanded; any settled state
@@ -234,6 +235,7 @@ export function BlockRenderer({
   hasPendingElicitation = false,
   lastActivityAtS,
   showsWorking = false,
+  onRetryError,
 }: BlockRendererProps) {
   const { isOwnTurnLive, possiblyLive, isTurnLive } = turnLiveness({
     sessionStatus,
@@ -319,8 +321,10 @@ export function BlockRenderer({
         <TurnWorkedFold workedForS={workedForS} animateCollapse={animateCollapse}>
           {renderSequence(process, { liveEdge: false })}
         </TurnWorkedFold>
-        {exempt.map(({ item, index }) => renderItem(item, index, false, false, false))}
-        {renderSequence(final, { liveEdge: false, indexBase: finalStart })}
+        {exempt.map(({ item, index }) =>
+          renderItem(item, index, false, false, false, onRetryError),
+        )}
+        {renderSequence(final, { liveEdge: false, indexBase: finalStart, onRetryError })}
       </>
     );
   }
@@ -328,6 +332,7 @@ export function BlockRenderer({
   return renderSequence(items, {
     liveEdge: isTurnLive,
     suppressReasoningDuration: showsWorking,
+    onRetryError,
   });
 }
 
@@ -340,7 +345,7 @@ export function BlockRenderer({
  */
 function renderSequence(
   items: RenderItem[],
-  { liveEdge, suppressReasoningDuration = false, indexBase = 0 }: TurnSequenceOptions,
+  { liveEdge, suppressReasoningDuration = false, indexBase = 0, onRetryError }: TurnSequenceOptions,
 ): ReactNode[] {
   const rendered: ReactNode[] = [];
   let previousRenderedItemWasText = false;
@@ -402,6 +407,7 @@ function renderSequence(
         i === reasoningStreamingIdx,
         suppressReasoningDuration,
         followsText,
+        onRetryError,
       ),
     );
     previousRenderedItemWasText = item.kind === "text";
@@ -414,6 +420,7 @@ interface TurnSequenceOptions {
   liveEdge: boolean;
   suppressReasoningDuration?: boolean;
   indexBase?: number;
+  onRetryError?: BlockRendererProps["onRetryError"];
 }
 
 interface TurnPartition {
@@ -507,9 +514,9 @@ function isProvisionalTrace(items: RenderItem[]): boolean {
 /**
  * Codex-style demarcation for a completed turn: the whole process
  * trace (narration, tool folds, reasoning) collapses behind one muted
- * "Worked for Xs" row with a hairline rule, so the final answer below
- * is unambiguously where reading starts. Expanding replays the trace
- * inline.
+ * "Worked for Xs" disclosure, so the final answer below is
+ * unambiguously where reading starts. Expanding replays the trace
+ * beside a compact vertical guide.
  *
  * `animateCollapse` marks the render where the fold appeared while the
  * user was watching. The fold then MOUNTS OPEN — showing exactly the
@@ -601,23 +608,28 @@ function TurnWorkedFold({
       data-testid="turn-worked-fold"
     >
       <div ref={rowRef} className={cn("turn-fold-row", animateCollapse && "turn-fold-row-enter")}>
-        <CollapsibleTrigger className="flex w-full cursor-pointer items-center gap-1 py-0.5 text-left text-muted-foreground text-sm transition-colors hover:text-foreground">
+        <CollapsibleTrigger className="flex cursor-pointer items-center gap-2 rounded-sm py-1 text-left text-muted-foreground text-chat outline-none transition-colors hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50">
           <span className="shrink-0">{label}</span>
-          <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-data-[state=open]/turn-fold:rotate-90" />
-          <span aria-hidden className="ml-1 flex-1 border-border border-t" />
+          <ChevronRightIcon className="size-2.5 shrink-0 transition-transform group-data-[state=open]/turn-fold:rotate-90" />
         </CollapsibleTrigger>
       </div>
       {/* Height animation lives in index.css (it needs Radix's measured
           --radix-collapsible-content-height) and is disabled under
           prefers-reduced-motion. */}
-      {/* No padding/border on the animated element: any chrome here is
-          height that appears before the collapse starts, i.e. the jolt
-          this animation exists to remove. Expanded spacing comes from
-          the row's hairline above and the message column's gap below. */}
+      {/* Keep pt-2/pl-4 and the vertical pin inside the collapsible
+          content so the spacing and guide shrink with its existing
+          height animation. */}
       <CollapsibleContent
         className={cn("turn-fold-content", userOpened && "turn-fold-content-instant")}
       >
-        <div className="flex flex-col gap-2">{children}</div>
+        <div className="relative flex flex-col gap-1 pt-2 pl-4">
+          <span
+            aria-hidden
+            className="absolute top-2 bottom-0 left-1 w-px bg-border"
+            data-testid="turn-worked-fold-pin-line"
+          />
+          {children}
+        </div>
       </CollapsibleContent>
     </Collapsible>
   );
@@ -734,6 +746,7 @@ function renderItem(
   isReasoningStreaming: boolean,
   suppressReasoningDuration = false,
   followsText = false,
+  onRetryError?: BlockRendererProps["onRetryError"],
 ): ReactNode {
   const key = keyFor(item, index);
   switch (item.kind) {
@@ -825,6 +838,7 @@ function renderItem(
           title={item.title}
           cause={item.cause}
           remediation={item.remediation}
+          onRetry={onRetryError ? () => onRetryError(item) : undefined}
         />
       );
     case "policy_denied":

@@ -225,9 +225,32 @@ async def test_session_projects_unions_first_class_and_labels(
     resp = await project_client.get("/v1/sessions/projects")
     assert resp.status_code == 200
     assert resp.json() == [
-        {"id": both["id"], "name": "Both"},
-        {"id": empty["id"], "name": "Empty FC"},
-        {"id": None, "name": "Label Only"},
+        {"id": both["id"], "name": "Both", "icon": None},
+        {"id": empty["id"], "name": "Empty FC", "icon": None},
+        {"id": None, "name": "Label Only", "icon": None},
+    ]
+
+
+async def test_session_projects_surfaces_config_icon(
+    project_client: httpx.AsyncClient,
+) -> None:
+    """A first-class project's ``config.icon`` surfaces in the sidebar listing
+    so the folder can render the emoji; a non-string/absent icon stays None."""
+    fire = (
+        await project_client.post("/v1/projects", json={"name": "Fire", "config": {"icon": "🔥"}})
+    ).json()
+    # A config without an icon key surfaces None (default folder glyph).
+    plain = (
+        await project_client.post(
+            "/v1/projects", json={"name": "Plain", "config": {"host_id": "h"}}
+        )
+    ).json()
+
+    resp = await project_client.get("/v1/sessions/projects")
+    assert resp.status_code == 200
+    assert resp.json() == [
+        {"id": fire["id"], "name": "Fire", "icon": "🔥"},
+        {"id": plain["id"], "name": "Plain", "icon": None},
     ]
 
 

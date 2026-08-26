@@ -25,8 +25,10 @@ name: Issue Triage
 #   5. Flags incomplete issues — `needs-info` (replaces priority label)
 #   6. Optionally comments when a duplicate or related issue is found
 #      (disabled by default; never comments when nothing matches)
-#   7. Optionally closes validated high-confidence duplicates (disabled by default)
-#   8. Assigns P0/P1 issues to a maintainer via round-robin
+#   7. Assigns an owner to every triaged open issue via round-robin — duplicates
+#      included, so the owner persists if the issue is later reopened
+#   8. Optionally closes validated high-confidence duplicates (disabled by
+#      default), after the owner above is assigned
 
 on:
   issues:
@@ -714,40 +716,25 @@ jobs:
             exit 0
           fi
 
-          duplicate_decision=$(jq -r '.duplicate_decision' /tmp/triage_result.json)
-          if [ "$duplicate_decision" = "duplicate" ]; then
-            close_duplicate_issue=$(jq -r '.close_duplicate_issue' /tmp/triage_result.json)
-            if [ "$close_duplicate_issue" = "true" ]; then
-              duplicate_of=$(jq -r '.duplicate_of' /tmp/triage_result.json)
-              issue_state=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" \
-                --json state --jq '.state')
-              if [ "$issue_state" = "OPEN" ]; then
-                gh issue close "$ISSUE_NUMBER" --repo "$REPO" \
-                  --duplicate-of "$duplicate_of"
-              fi
-            else
-              echo "Duplicate closure disabled; leaving issue open."
-            fi
-            exit 0
-          fi
+          # Assign an owner to every triaged open issue, BEFORE the duplicate
+          # closure below. Duplicates get an owner too, and it persists if the
+          # issue is later reopened — triage only fires on `opened`, so a
+          # reopened issue would otherwise come back unassigned.
 
           # If the issue was filed by a maintainer, assign it to them directly.
           author=$(jq -r '.author.login // empty' /tmp/issue.json)
           maintainer_assigned=false
           if [ -n "$author" ] && grep -qxF "$author" .github/MAINTAINER; then
             echo "Issue filed by maintainer $author — assigning to author"
-            issue_state=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" \
-              --json state --jq '.state')
-            if [ "$issue_state" = "OPEN" ]; then
-              gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-assignee "$author"
-              maintainer_assigned=true
-            fi
+            gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-assignee "$author"
+            maintainer_assigned=true
           fi
 
           # Otherwise, assign an owner: the least-loaded area owner, with LLM
           # rank as a tiebreaker (load primary, rank secondary). Symmetric with
           # the PR reviewer path. Skipped if the maintainer-author was already
-          # assigned above. Every triaged issue gets an owner — the only issues
+          # assigned above. Every triaged issue gets an owner — duplicates
+          # included, even ones about to be closed below — so the only issues
           # left unassigned are needs_info ones (too vague to route until the
           # reporter adds detail).
           needs_info=$(jq -r '.needs_info // false' /tmp/triage_result.json)
@@ -794,11 +781,26 @@ jobs:
 
             assignee=$(cat /tmp/assignee.txt)
             if [ -n "$assignee" ]; then
+              gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-assignee "$assignee"
+            fi
+          fi
+
+          # Finally, close the issue if it is a high-confidence duplicate and
+          # closure is enabled. The owner assigned above stays on the issue,
+          # ready if it is reopened.
+          duplicate_decision=$(jq -r '.duplicate_decision' /tmp/triage_result.json)
+          if [ "$duplicate_decision" = "duplicate" ]; then
+            close_duplicate_issue=$(jq -r '.close_duplicate_issue' /tmp/triage_result.json)
+            if [ "$close_duplicate_issue" = "true" ]; then
+              duplicate_of=$(jq -r '.duplicate_of' /tmp/triage_result.json)
               issue_state=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" \
                 --json state --jq '.state')
               if [ "$issue_state" = "OPEN" ]; then
-                gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-assignee "$assignee"
+                gh issue close "$ISSUE_NUMBER" --repo "$REPO" \
+                  --duplicate-of "$duplicate_of"
               fi
+            else
+              echo "Duplicate closure disabled; leaving issue open."
             fi
           fi
 

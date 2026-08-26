@@ -1,8 +1,6 @@
 """Shared tmux control-mode (``tmux -C``) ↔ WebSocket bridge.
 
-Alternative transport to :mod:`omnigent.terminals.ws_bridge`. Where the PTY
-bridge forks a full ``tmux attach`` client and streams the rendered screen,
-this bridge attaches a *control-mode* client and consumes tmux's line protocol:
+The bridge attaches a control-mode client and consumes tmux's line protocol:
 
 - ``%output <pane-id> <octal-escaped-bytes>`` — the raw bytes the program in a
   pane just produced, forwarded to the browser xterm.js as binary frames. The
@@ -28,25 +26,20 @@ Design notes learned from the protocol (see ``control_bridge`` spike):
   the client exits; the hex channel is byte-exact for ESC sequences, control
   chars, and UTF-8 multibyte alike.
 
-The browser-facing wire protocol is identical to the PTY bridge (binary frames
-out = raw pane bytes; text frames in = JSON ``{"type":"resize",...}``; binary
-frames in = input bytes), so the two transports are interchangeable behind the
-same ``/attach`` WebSocket and a client cannot tell which one served it.
+The browser-facing stream uses binary frames for raw pane bytes, text JSON
+frames for resize controls, and binary frames for input. A typed text JSON
+frame carries tmux clipboard updates because outer-client OSC 52 is absent from
+``%output``.
 
-Known limitation vs the PTY bridge: tmux's own overlays (``display-popup``,
-copy-mode, status line) are NOT delivered to a control-mode client, so the
-native cost-approval popup (:mod:`omnigent.native_cost_popup`) does not render
-in a control-mode browser terminal. That popup is a secondary convenience for
-users working in a real native TTY; the web ApprovalCard (SSE-driven) remains
-the primary approval surface and is unaffected. The harnesses' own input,
-paste, and readiness logic run tmux commands directly against the socket
-(``send-keys``/``load-buffer``/``capture-pane``) and are independent of the
-attach transport, so they behave identically under either bridge.
+Tmux's own overlays (``display-popup``, copy-mode, status line) are not delivered
+to control clients. The native cost-approval popup remains available to users
+working in a real native TTY, while the web ApprovalCard is the browser surface.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 import logging
@@ -58,23 +51,15 @@ from typing import Final
 
 from fastapi import WebSocket, WebSocketDisconnect
 
-# Reuse the PTY bridge's application close codes AND its coalescing forwarder so
-# both transports speak the same dialect to the frontend and merge burst output
-# the same way (see ws_bridge for the authoritative definitions).
-# ``_forward_pty_to_ws`` is queue-driven and transport-agnostic — it drains
-# everything already queued into one bounded ``send_bytes`` — so the control
-# reader can feed it decoded ``%output`` payloads exactly like the PTY reader
-# feeds raw PTY reads. Under a burst the browser send lags tmux's firehose, a
-# backlog forms, and the forwarder collapses thousands of tiny per-line frames
-# into a few large ones. ``_coalesce_limit_after_input`` keeps the frame right
-# after a keystroke small so the echo stays on xterm's synchronous paint path.
-from omnigent.terminals.ws_bridge import (
+from omnigent.terminals.ws_common import (
     WS_CLOSE_INTERNAL_ERROR,
     WS_CLOSE_TERMINAL_DETACHED,
     WS_CLOSE_TERMINAL_NOT_FOUND,
+    _check_pane_dead_definitive,
     _coalesce_limit_after_input,
-    _forward_pty_to_ws,
+    _forward_terminal_to_ws,
     _monotonic,
+    _tmux_session_alive,
 )
 
 _logger = logging.getLogger(__name__)
@@ -117,6 +102,21 @@ _CONTROL_STDOUT_BUFFER_LIMIT: Final[int] = 16 * 1024 * 1024
 # stuck-slow client can't hang the close; a normal drain completes well within.
 _FORWARD_DRAIN_TIMEOUT_S: Final[float] = 5.0
 
+# tmux emits this control notification after copy-mode stores a selection in a
+# paste buffer. Only default-style, shell-safe names are accepted; copy-mode's
+# generated names (for example ``buffer0``) are covered without letting an
+# untrusted protocol line select an arbitrary command target.
+_CLIPBOARD_BUFFER_CHANGED_PREFIX: Final = b"%paste-buffer-changed "
+_CLIPBOARD_BUFFER_NAME_RE: Final = re.compile(rb"[A-Za-z0-9_.:-]{1,128}\Z")
+# Browser clipboard writes should stay text-sized. Bound the raw buffer before
+# base64/JSON expansion so a huge tmux buffer cannot become a websocket DoS.
+_CLIPBOARD_MAX_BYTES: Final[int] = 1024 * 1024
+_CLIPBOARD_READ_TIMEOUT_S: Final[float] = 2.0
+# A copy-mode commit follows the initiating key or mouse release immediately.
+# Correlating the notification with this client's recent input prevents one
+# attached browser from overwriting every other viewer's local clipboard.
+_CLIPBOARD_RECENT_INPUT_WINDOW_S: Final[float] = 5.0
+
 
 def unescape_control_output(value: bytes) -> bytes:
     """Un-escape a ``%output`` value back to raw pane bytes.
@@ -131,6 +131,82 @@ def unescape_control_output(value: bytes) -> bytes:
     :returns: The raw bytes, e.g. ``b"\\x1b[31mRED\\x1b[0m\\r\\n"``.
     """
     return _OCTAL_ESCAPE_RE.sub(lambda m: bytes([int(m.group(1), 8)]), value)
+
+
+async def _read_tmux_buffer(
+    tmux: str,
+    socket_path: str,
+    buffer_name: str,
+) -> bytes | None:
+    """Read one named tmux buffer exactly, rejecting failures and oversized data.
+
+    ``save-buffer ... -`` writes the raw bytes without ``show-buffer``'s display
+    formatting. ``readexactly(limit + 1)`` distinguishes an in-range buffer
+    (EOF with a partial result) from an oversized one without first buffering
+    an unbounded subprocess result in Python.
+
+    :param tmux: Absolute tmux executable path.
+    :param socket_path: Private tmux server socket.
+    :param buffer_name: Validated tmux buffer name, e.g. ``"buffer0"``.
+    :returns: Raw buffer bytes, or ``None`` when unavailable/oversized.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            tmux,
+            "-S",
+            socket_path,
+            "save-buffer",
+            "-b",
+            buffer_name,
+            "-",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except (OSError, ValueError):
+        return None
+    assert proc.stdout is not None
+
+    async def _kill_and_reap() -> None:
+        """Kill the buffer reader and bound the wait for its process record."""
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(proc.wait(), timeout=_CLIPBOARD_READ_TIMEOUT_S)
+
+    data = b""
+    try:
+        try:
+            await asyncio.wait_for(
+                proc.stdout.readexactly(_CLIPBOARD_MAX_BYTES + 1),
+                timeout=_CLIPBOARD_READ_TIMEOUT_S,
+            )
+            oversized = True
+        except asyncio.IncompleteReadError as exc:
+            data = exc.partial
+            oversized = False
+        if oversized:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+        await asyncio.wait_for(proc.wait(), timeout=_CLIPBOARD_READ_TIMEOUT_S)
+    except asyncio.CancelledError:
+        await _kill_and_reap()
+        raise
+    except (asyncio.TimeoutError, OSError):
+        await _kill_and_reap()
+        return None
+    if oversized or proc.returncode != 0:
+        return None
+    return data
+
+
+def _clipboard_buffer_name(line: bytes) -> str | None:
+    """Extract a safe buffer name from a tmux clipboard notification."""
+    if not line.startswith(_CLIPBOARD_BUFFER_CHANGED_PREFIX):
+        return None
+    raw_name = line[len(_CLIPBOARD_BUFFER_CHANGED_PREFIX) :]
+    if _CLIPBOARD_BUFFER_NAME_RE.fullmatch(raw_name) is None:
+        return None
+    return raw_name.decode("ascii")
 
 
 def _hex_send_keys_commands(target: str, data: bytes) -> list[bytes]:
@@ -402,11 +478,9 @@ async def bridge_tmux_control_to_websocket(
 ) -> None:
     """Bridge a tmux control-mode client to an already-accepted *websocket*.
 
-    Drop-in alternative to
-    :func:`omnigent.terminals.ws_bridge.bridge_tmux_pty_to_websocket` with the
-    same signature and browser wire protocol. Caller must have called
-    ``websocket.accept()``. On exit (any branch) the control client is torn
-    down and the websocket closed best-effort with the shared 4404/4405 codes.
+    Caller must have called ``websocket.accept()``. On exit the control client
+    is torn down and the websocket closed best-effort with the shared
+    4404/4405 codes.
 
     :param websocket: An accepted FastAPI :class:`WebSocket`.
     :param socket_path: Filesystem path to the tmux server socket.
@@ -415,8 +489,7 @@ async def bridge_tmux_control_to_websocket(
         binary input frames at the application layer (defense in depth).
     :param on_client_interaction: Optional callback fired on every client
         interaction (connect, disconnect, each input/resize frame) so the
-        idle watcher can discount client-driven repaints. See the PTY bridge
-        for the full rationale.
+        idle watcher can discount client-driven repaints.
     :param reader_done: Optional test-only event set once the reader has queued
         the full backlog and the ``None`` EOF sentinel, letting a test await the
         reader draining tmux instead of sleeping. Inert (never awaited) when
@@ -476,14 +549,36 @@ async def bridge_tmux_control_to_websocket(
     # one bounded ``send_bytes``, so when the browser send lags tmux's firehose
     # a backlog of tiny per-line payloads collapses into a few large frames.
     output_chunks: asyncio.Queue[bytes | None] = asyncio.Queue()
+    # Keep at most the newest pending clipboard buffer plus the EOF sentinel.
+    # A noisy pane cannot build an unbounded queue of names/subprocess reads.
+    clipboard_buffers: asyncio.Queue[str | None] = asyncio.Queue(maxsize=2)
+    # Terminal bytes and clipboard JSON have separate producer tasks but one
+    # websocket. Serialize sends so ASGI never sees concurrent send calls.
+    ws_send_lock = asyncio.Lock()
     # Monotonic stamp of the last forwarded browser input; the forwarder reads
-    # it to shrink the frame cap right after a keystroke (keeps the echo on
-    # xterm's synchronous paint path — see the PTY bridge).
+    # it to shrink the frame cap right after a keystroke (keeping the echo on
+    # xterm's synchronous paint path) and clipboard
+    # forwarding uses it to identify which attached client initiated a copy.
     last_client_input_at: float | None = None
 
     def _current_ws_coalesce_limit() -> int:
         """Per-frame cap: small right after input, larger for output floods."""
         return _coalesce_limit_after_input(last_client_input_at)
+
+    def _queue_clipboard_buffer(buffer_name: str) -> None:
+        """Replace pending clipboard names with the newest notification."""
+        eof_seen = False
+        while True:
+            try:
+                queued = clipboard_buffers.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if queued is None:
+                eof_seen = True
+        if eof_seen:
+            clipboard_buffers.put_nowait(None)
+        else:
+            clipboard_buffers.put_nowait(buffer_name)
 
     async def _send_command(line: bytes) -> None:
         """Write one newline-terminated control command, ignoring a dead pipe."""
@@ -511,6 +606,15 @@ async def bridge_tmux_control_to_websocket(
             parts = line.split(b" ", 2)
             if len(parts) == 3:
                 output_chunks.put_nowait(unescape_control_output(parts[2]))
+            return True
+        buffer_name = _clipboard_buffer_name(line)
+        if buffer_name is not None:
+            if (
+                not read_only
+                and last_client_input_at is not None
+                and _monotonic() - last_client_input_at <= _CLIPBOARD_RECENT_INPUT_WINDOW_S
+            ):
+                _queue_clipboard_buffer(buffer_name)
             return True
         if line.startswith(b"%exit"):
             return False
@@ -549,8 +653,48 @@ async def bridge_tmux_control_to_websocket(
                         return
         finally:
             output_chunks.put_nowait(None)
+            clipboard_buffers.put_nowait(None)
             if reader_done is not None:
                 reader_done.set()
+
+    async def _forward_clipboard_updates() -> None:
+        """Read copied tmux buffers and send bounded clipboard control frames."""
+        while True:
+            buffer_name = await clipboard_buffers.get()
+            if buffer_name is None:
+                return
+
+            # When several copies arrive before the subprocess starts, only the
+            # newest clipboard value matters. Preserve an EOF sentinel so the
+            # task exits after forwarding that final value.
+            eof_seen = False
+            while True:
+                try:
+                    next_name = clipboard_buffers.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if next_name is None:
+                    eof_seen = True
+                    break
+                buffer_name = next_name
+
+            data = await _read_tmux_buffer(tmux, socket_path, buffer_name)
+            if data is not None:
+                message = json.dumps(
+                    {
+                        "type": "clipboard-write",
+                        "encoding": "base64",
+                        "data": base64.b64encode(data).decode("ascii"),
+                    },
+                    separators=(",", ":"),
+                )
+                try:
+                    async with ws_send_lock:
+                        await websocket.send_text(message)
+                except (RuntimeError, WebSocketDisconnect):
+                    return
+            if eof_seen:
+                return
 
     async def _ws_to_control() -> None:
         """Read browser frames; resize via refresh-client -C, input via -H hex."""
@@ -599,10 +743,16 @@ async def bridge_tmux_control_to_websocket(
     # queued payloads into bounded WebSocket frames; ws task drives input.
     read_task = asyncio.create_task(_read_control(), name="tmux-control-read")
     forward_task = asyncio.create_task(
-        _forward_pty_to_ws(
-            websocket, output_chunks, max_coalesce_bytes=_current_ws_coalesce_limit
+        _forward_terminal_to_ws(
+            websocket,
+            output_chunks,
+            max_coalesce_bytes=_current_ws_coalesce_limit,
+            send_lock=ws_send_lock,
         ),
         name="tmux-control-forward",
+    )
+    clipboard_task = asyncio.create_task(
+        _forward_clipboard_updates(), name="tmux-control-clipboard"
     )
     if forward_done is not None:
         forward_task.add_done_callback(lambda _task: forward_done.set())
@@ -612,6 +762,9 @@ async def bridge_tmux_control_to_websocket(
     # finishing is downstream (it drains, then sees the EOF sentinel).
     control_ended_first = False
     try:
+        # The clipboard task is intentionally not a FIRST_COMPLETED trigger: it
+        # may finish after the reader's EOF sentinel, but the reader itself is
+        # the authoritative control-side completion signal.
         done, pending = await asyncio.wait(
             {read_task, forward_task, ws_task}, return_when=asyncio.FIRST_COMPLETED
         )
@@ -636,18 +789,33 @@ async def bridge_tmux_control_to_websocket(
                 await asyncio.wait_for(
                     asyncio.shield(forward_task), timeout=_FORWARD_DRAIN_TIMEOUT_S
                 )
-        for task in pending:
+        if control_ended_first and not clipboard_task.done():
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(
+                    asyncio.shield(clipboard_task), timeout=_FORWARD_DRAIN_TIMEOUT_S
+                )
+        for task in {*pending, clipboard_task}:
             if task.done():
                 continue
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
-        for task in {read_task, forward_task, ws_task}:
+        for task in {read_task, forward_task, clipboard_task, ws_task}:
             if task.done() and not task.cancelled():
                 exc = task.exception()
                 if exc is not None:
                     _logger.warning("control-attach: bridge task crashed: %r", exc)
     finally:
+        # Outer route cancellation can bypass the normal post-wait cleanup.
+        # Always stop and join every child task before detaching the tmux client.
+        bridge_tasks = {read_task, forward_task, clipboard_task, ws_task}
+        for task in bridge_tasks:
+            if not task.done():
+                task.cancel()
+        task_results = await asyncio.gather(*bridge_tasks, return_exceptions=True)
+        for result in task_results:
+            if isinstance(result, Exception):
+                _logger.warning("control-attach: bridge task failed during teardown: %r", result)
         # Detach reflows the pane back to remaining clients — stamp it.
         if on_client_interaction is not None:
             on_client_interaction()
@@ -661,17 +829,12 @@ async def bridge_tmux_control_to_websocket(
             with contextlib.suppress(ProcessLookupError):
                 proc.kill()
             with contextlib.suppress(Exception):
-                await proc.wait()
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
         with contextlib.suppress(RuntimeError):
             if control_ended_first:
                 # The control client ended: distinguish a genuine session-gone
                 # (%exit with a dead/absent pane) from a mere detach. Reuse the
-                # PTY bridge's pane-dead probe for a single source of truth.
-                from omnigent.terminals.ws_bridge import (
-                    _check_pane_dead_definitive,
-                    _tmux_session_alive,
-                )
-
+                # Use the shared pane-dead probe for a single source of truth.
                 pane_dead = await _check_pane_dead_definitive(socket_path, tmux_target)
                 if pane_dead is True or (
                     pane_dead is None and not await _tmux_session_alive(socket_path, tmux_target)

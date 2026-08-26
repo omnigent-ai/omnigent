@@ -53,6 +53,7 @@ import { useConversations } from "@/hooks/useConversations";
 import { collectInboxItems, type InboxItem, type InboxSource } from "@/lib/inbox";
 import { relativeTime } from "@/lib/relativeTime";
 import { Link } from "@/lib/routing";
+import { useOmnigentAnalytics } from "@/lib/analytics";
 import { approve, getSession } from "@/lib/sessionsApi";
 import { userColor, userInitials } from "@/lib/userBadge";
 import { cn } from "@/lib/utils";
@@ -66,6 +67,7 @@ type RespondedMap = Record<
 
 export function InboxPage() {
   const queryClient = useQueryClient();
+  const { trackClick } = useOmnigentAnalytics();
   const conversationsQuery = useConversations("", false, { reconcileWhileConnected: true });
   const [responded, setResponded] = useState<RespondedMap>({});
   // Manual expand/collapse toggles keyed by elicitation id. Anything
@@ -217,6 +219,7 @@ export function InboxPage() {
               failedSnapshots.forEach((q) => void q.refetch());
               commentInbox.retryFailed();
             }}
+            componentId="inbox.retry"
           >
             Retry
           </Button>
@@ -269,9 +272,10 @@ export function InboxPage() {
                 <button
                   type="button"
                   aria-expanded={expanded}
-                  onClick={() =>
-                    setExpandedOverrides((prev) => ({ ...prev, [elicitationId]: !expanded }))
-                  }
+                  onClick={() => {
+                    trackClick("inbox.approval.toggle_expanded", "button");
+                    setExpandedOverrides((prev) => ({ ...prev, [elicitationId]: !expanded }));
+                  }}
                   className="flex min-w-0 flex-1 items-center gap-2 text-left"
                 >
                   <ChevronDownIcon
@@ -300,7 +304,7 @@ export function InboxPage() {
                     {relativeTime(item.row.updated_at * 1000)}
                   </span>
                   <Button asChild variant="ghost" size="sm" className="text-sm">
-                    <Link to={`/c/${item.row.id}`}>
+                    <Link to={`/c/${item.row.id}`} componentId="inbox.approval.open_session">
                       Open session
                       <ArrowRightIcon className="ml-1 size-3.5" />
                     </Link>
@@ -369,6 +373,7 @@ export function InboxPage() {
                           is what clears this inbox item. */}
                       <Link
                         to={`/c/${item.row.id}?file=${encodeURIComponent(comment.path)}&comment=${encodeURIComponent(comment.id)}`}
+                        componentId="inbox.comment.open_file"
                       >
                         Open file
                         <ArrowRightIcon className="ml-1 size-3.5" />

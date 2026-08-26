@@ -16,8 +16,10 @@ Security defaults and require remote servers to use `https://`.
 
 The first version provides native setup chrome, recent servers, WKWebView
 loading, foreground local notifications, app badge updates, and notification
-tap routing back into the SPA. It does not implement APNs, background polling,
-or localhost proxy/CORS behavior.
+tap routing back into the SPA. OIDC authentication is delegated to the system
+browser and the resulting session is copied into the isolated WKWebView cookie
+store, so providers such as Google that reject embedded user agents work. It
+does not implement APNs, background polling, or localhost proxy/CORS behavior.
 
 ## Managed app configuration
 
