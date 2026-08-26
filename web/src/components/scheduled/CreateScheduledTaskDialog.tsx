@@ -106,18 +106,34 @@ export function CreateScheduledTaskDialog({
   );
   const agentEntries = useMemo(() => agentList.filter((a) => !isNativeCodingAgent(a)), [agentList]);
   // Resolve the effective selection: the explicit pick if it's still in the
-  // list, else the first agent (so the picker always has a concrete value).
+  // list, else the edited task's own agent (which may be hidden from the picker
+  // — never silently retarget it), else the first agent (so a fresh picker
+  // always has a concrete value).
   const effectiveAgentId =
-    (agentList.some((a) => a.id === pickedAgentId) ? pickedAgentId : agentList[0]?.id) ?? null;
+    (agentList.some((a) => a.id === pickedAgentId)
+      ? pickedAgentId
+      : isEdit
+        ? editingTask?.agentId
+        : agentList[0]?.id) ?? null;
   const selectedAgent = agentList.find((a) => a.id === effectiveAgentId);
   const agentLabel = selectedAgent
     ? selectedAgent.display_name
     : isEdit && editingTask
       ? editingTask.agentId
       : "Select agent";
+  // Editing a task only rebinds the agent when the user actually picks a
+  // different one — the prefill starts equal to the task's own agent.
+  const agentChanged =
+    isEdit && effectiveAgentId !== null && effectiveAgentId !== editingTask?.agentId;
 
   function handleSelectAgent(agent: AvailableAgent) {
     setPickedAgentId(agent.id);
+    // Per-agent settings don't transfer across harnesses (a model id is
+    // provider-bound; permission mode is Claude-only), so drop them with the
+    // switch — mirroring the clear the server applies on a rebind.
+    setPickedModel("");
+    setPickedEffort("");
+    setPickedPermission("");
   }
 
   // Model + effort are surfaced only for native coding agents that carry the
@@ -125,11 +141,9 @@ export function CreateScheduledTaskDialog({
   // dialog gates its Model/Effort/Permissions block on (Claude Code). Agents
   // without it (plain SDK agents like Polly, or native harnesses with no
   // model-picker surface) show no model/effort controls, exactly like
-  // interactive. In edit mode the agent is read-only, so gate on the loaded
-  // task's agent.
-  const modelEffortAgent = isEdit
-    ? agents?.find((a) => a.id === editingTask?.agentId)
-    : selectedAgent;
+  // interactive. Resolved from the full agent list so a task bound to an agent
+  // the picker hides still gates on its real capabilities.
+  const modelEffortAgent = agents?.find((a) => a.id === effectiveAgentId);
   const showModelEffort = nativeAgentHasCapability(modelEffortAgent, "permissionMode");
 
   // ── Nested dropdown dismiss guard ─────────────────────────────────────────
@@ -290,7 +304,13 @@ export function CreateScheduledTaskDialog({
           : {};
         await updateMutation.mutateAsync({
           id: editingTask.id,
-          input: { ...input, ...overrides },
+          input: {
+            ...input,
+            ...overrides,
+            // Only on a real switch: sending the unchanged agent is a server-side
+            // no-op, but omitting it keeps the PATCH honest about what changed.
+            ...(agentChanged && effectiveAgentId !== null ? { agentId: effectiveAgentId } : {}),
+          },
         });
       } else {
         if (effectiveAgentId === null) return;
@@ -379,57 +399,53 @@ export function CreateScheduledTaskDialog({
                 Code / Codex / Pi …) and agents (Polly / Debby), so "Agent" would
                 be misleading. */}
             <Label>Runs with</Label>
-            {isEdit ? (
-              <div
-                className="flex h-8 w-full items-center rounded-lg border border-input bg-transparent px-2.5 text-ui text-foreground dark:bg-input/30"
-                data-testid="task-agent-readonly"
-              >
-                {agentLabel}
-              </div>
-            ) : (
-              <div data-testid="task-agent-picker">
-                <AgentHarnessPicker
-                  agentEntries={agentEntries}
-                  harnessEntries={harnessEntries}
-                  effectiveAgentId={effectiveAgentId}
-                  agentLabel={agentLabel}
-                  hasAgents={agentList.length > 0}
-                  // Drives the per-row "needs setup" badges from
-                  // host.configured_harnesses. Uses the pinned host if any, else
-                  // falls back to the first online host so the badges show in the
-                  // fresh/default state (host is optional here — see `badgeHost`).
-                  host={badgeHost}
-                  onSelectAgent={handleSelectAgent}
-                  pendingAgent={null}
-                  pendingAgentId="__unused_pending_agent__"
-                  onSelectPending={() => {}}
-                  // Custom-agent creation is inert until there is a way to
-                  // persist a new agent independently of creating a session.
-                  onCreateCustomAgent={() => {}}
-                  sandboxSelected={false}
-                  // Forward the dropdown open/close into the dialog's outside-click
-                  // dismiss guard so opening the picker doesn't close the modal.
-                  onOpenChange={handleSelectOpenChange}
-                  // This picker is nested inside a Dialog. Radix DropdownMenu's
-                  // default modal mode can turn an inside-dialog click into a
-                  // parent Dialog outside interaction while the menu dismisses.
-                  dropdownModal={false}
-                  // Bound the dropdown height so it scrolls in the modal instead
-                  // of running off the bottom of the screen (the trigger sits near
-                  // the top of a tall dialog, unlike the composer footer). Width
-                  // matches the interactive picker so the "needs setup" pills +
-                  // agent descriptions fit without cramping (the shared default is
-                  // only min-w-64; pin a comfortable fixed width like interactive).
-                  contentClassName="max-h-80 w-80"
-                  // Full-width trigger → left-align the menu's edge to it.
-                  contentAlign="start"
-                  // Match the sibling <Select> fields (Frequency / host): full
-                  // width, bordered, h-8, normal foreground text — not the compact
-                  // muted ghost styling the composer footer uses.
-                  triggerClassName="h-8 w-full justify-between rounded-lg border border-input bg-transparent px-2.5 text-foreground hover:bg-transparent hover:text-foreground dark:bg-input/30"
-                  triggerLabelClassName="max-w-none text-ui"
-                />
-              </div>
+            <div data-testid="task-agent-picker">
+              <AgentHarnessPicker
+                agentEntries={agentEntries}
+                harnessEntries={harnessEntries}
+                effectiveAgentId={effectiveAgentId}
+                agentLabel={agentLabel}
+                hasAgents={agentList.length > 0}
+                // Drives the per-row "needs setup" badges from
+                // host.configured_harnesses. Uses the pinned host if any, else
+                // falls back to the first online host so the badges show in the
+                // fresh/default state (host is optional here — see `badgeHost`).
+                host={badgeHost}
+                onSelectAgent={handleSelectAgent}
+                pendingAgent={null}
+                pendingAgentId="__unused_pending_agent__"
+                onSelectPending={() => {}}
+                // Custom-agent creation is inert until there is a way to
+                // persist a new agent independently of creating a session.
+                onCreateCustomAgent={() => {}}
+                sandboxSelected={false}
+                // Forward the dropdown open/close into the dialog's outside-click
+                // dismiss guard so opening the picker doesn't close the modal.
+                onOpenChange={handleSelectOpenChange}
+                // This picker is nested inside a Dialog. Radix DropdownMenu's
+                // default modal mode can turn an inside-dialog click into a
+                // parent Dialog outside interaction while the menu dismisses.
+                dropdownModal={false}
+                // Bound the dropdown height so it scrolls in the modal instead
+                // of running off the bottom of the screen (the trigger sits near
+                // the top of a tall dialog, unlike the composer footer). Width
+                // matches the interactive picker so the "needs setup" pills +
+                // agent descriptions fit without cramping (the shared default is
+                // only min-w-64; pin a comfortable fixed width like interactive).
+                contentClassName="max-h-80 w-80"
+                // Full-width trigger → left-align the menu's edge to it.
+                contentAlign="start"
+                // Match the sibling <Select> fields (Frequency / host): full
+                // width, bordered, h-8, normal foreground text — not the compact
+                // muted ghost styling the composer footer uses.
+                triggerClassName="h-8 w-full justify-between rounded-lg border border-input bg-transparent px-2.5 text-foreground hover:bg-transparent hover:text-foreground dark:bg-input/30"
+                triggerLabelClassName="max-w-none text-ui"
+              />
+            </div>
+            {agentChanged && (
+              <p className="text-sm text-muted-foreground">
+                Future runs use {agentLabel}; past runs keep the agent they ran with
+              </p>
             )}
             {!showModelEffort && (
               <p className="text-sm text-muted-foreground">

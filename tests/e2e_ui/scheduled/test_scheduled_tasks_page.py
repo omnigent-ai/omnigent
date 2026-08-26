@@ -486,10 +486,11 @@ def test_scheduled_task_model_effort_controls_hidden_for_incapable_agent(
     model/effort surface is gated on. Rather than drive the create-dialog agent
     picker into Codex (it can fold into a hover-only "More" submenu when the host
     reports it unconfigured, which is fragile to click), we SEED a task against
-    the Codex agent and open its EDIT dialog: edit mode gates the row on the
-    loaded task's agent, so the row must be absent and the "uses defaults" helper
-    hint shown instead. (Chosen because the e2e server does register Codex; the
-    seeded-edit path is the deterministic way to exercise the hidden branch.)
+    the Codex agent and open its EDIT dialog: the row gates on the selected
+    agent, which edit mode seeds from the loaded task, so the row must be absent
+    and the "uses defaults" helper hint shown instead. (Chosen because the e2e
+    server does register Codex; the seeded-edit path is the deterministic way to
+    exercise the hidden branch.)
     """
     codex_agent_id = _builtin_agent_id(live_server, "codex-native-ui")
     _create_task(live_server, codex_agent_id, "Codex daily", "FREQ=DAILY;BYHOUR=9;BYMINUTE=0")
@@ -602,6 +603,52 @@ def test_scheduled_task_edit_prefills_model_and_effort(
     expect(page.get_by_test_id("task-model-effort-row")).to_be_visible()
     expect(page.get_by_test_id("task-model-trigger")).to_have_text("Opus")
     expect(page.get_by_test_id("task-effort-trigger")).to_have_text("High")
+
+
+def test_scheduled_task_edit_switches_the_harness(
+    page: Page,
+    live_server: str,
+) -> None:
+    """The edit dialog can rebind an existing automation to another harness.
+
+    Seeds a Codex task, switches it to Claude Code through the edit dialog's
+    picker, and asserts the PERSISTED ``agent_id`` changed on the SAME task id —
+    the whole point, since recreating the task would mint a new id and drop its
+    run history. (The route tests cover what a switch does to the per-agent
+    settings stored beside the binding.)
+    """
+    codex_agent_id = _builtin_agent_id(live_server, "codex-native-ui")
+    claude_agent_id = _builtin_agent_id(live_server, "claude-native-ui")
+    task_id = _create_task(
+        live_server,
+        codex_agent_id,
+        "Switch me",
+        "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+    )
+
+    page.goto(f"{live_server}/tasks")
+    row = _row_by_name(page, "Switch me")
+    expect(row).to_be_visible(timeout=30_000)
+    row.hover()
+    row.get_by_test_id("task-row-menu").click()
+    page.get_by_test_id("task-edit").click()
+
+    dialog = page.get_by_test_id("create-scheduled-task-dialog")
+    expect(dialog).to_be_visible(timeout=30_000)
+    agent_trigger = page.get_by_test_id("task-agent-picker").get_by_test_id(
+        "new-chat-landing-agent-select"
+    )
+    # Seeded from the task's own agent, not the first listed one.
+    expect(agent_trigger).to_contain_text("Codex", timeout=30_000)
+    agent_trigger.click()
+    page.get_by_role("menuitem").filter(has_text="Claude Code").click()
+    expect(agent_trigger).to_contain_text("Claude Code")
+    page.get_by_test_id("create-scheduled-task-submit").click()
+
+    expect(dialog).to_be_hidden(timeout=30_000)
+    task = httpx.get(f"{live_server}/v1/scheduled-tasks/{task_id}", timeout=10.0).json()
+    assert task["agent_id"] == claude_agent_id, task
+    assert task["id"] == task_id, task
 
 
 # ── Permission-mode selector ───────────────────────────────────────────────
