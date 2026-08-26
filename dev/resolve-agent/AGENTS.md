@@ -207,22 +207,23 @@ reproduction test is your objective instrument.
      `reproduced` facet; all live facets must pass for the PR to fully resolve it.
    - **Fails** → the PR does **not** actually fix the reproduced behavior. This is
      the single most valuable review finding — capture the exact failure.
-3. **Re-record the journey against the PR head — always, when before-footage
-   exists.** If the recovered handoff carries `recordings` (repro-agent's
-   before-fix footage plus the drivers that produced it — the e2e_ui test for
-   `web`/`terminal` facets, a VHS tape for `cli` facets), you **must** re-run
-   those drivers with recording on against the PR head and add an `after`-kind
-   entry to your handoff `recordings` — this is not optional polish. Use the same
-   commands (and SPA-up-front sequencing) as 2B.5's re-record step, saving to
-   `recordings/<slug>/after-<facet>.<ext>` with a `caption` for what the clip
-   shows. A passing run's footage is the "after" half of your before/after pair
-   (the bug resolved); a failing run's footage shows the PR author exactly what
-   still breaks — either way you record it. The before clip alone is a
-   half-finished result: a reviewer needs to *watch* the fix work, so carry the
-   before clip through **and** produce the after. Only skip the after clip when
-   it is genuinely unobtainable (the recorder tooling is missing, or the fixture
-   can't come online after the SPA build) — and then say so explicitly in your
-   review comment and in `evidence`, naming the blocker. Never drop it silently.
+3. **Record the journey against the PR head — always.** You drive the recorder
+   off the reproduction test (the e2e_ui test for `web`/`terminal` facets, a VHS
+   tape for `cli` facets) run against the PR head, and add an `after`-kind entry
+   to your handoff `recordings`. This is **not** gated on the repro handoff
+   carrying footage — you have the test and the journey, which is all the recorder
+   needs, so produce the after-clip whether or not any before-clip was recovered.
+   Use the same commands (and SPA-up-front sequencing) as 2B.5's record step,
+   saving to `recordings/<slug>/after-<facet>.<ext>` with a `caption` for what the
+   clip shows. A passing run's footage is the "after" half (the bug resolved); a
+   failing run's footage shows the PR author exactly what still breaks — either
+   way you record it. When the handoff *does* carry a before clip, carry it
+   through **and** produce the after; when it carries none, still produce the
+   after and note the missing before. Only omit the after clip when it is
+   genuinely unobtainable (recorder tooling missing, or the fixture can't come
+   online after the SPA build) — say so explicitly in your review comment and in
+   `evidence`, naming the blocker. A missing upstream before-clip is never that
+   blocker. Never drop it silently.
 4. **Review the diff** for quality, not just green: does it address the **root
    cause** or only mask the symptom? Does it miss facets or obvious adjacent edge
    cases? Does it introduce a regression in the surrounding code (run the touched
@@ -364,13 +365,22 @@ diff touches env-derived defaults; note it in the handoff (`hermetic_check`).
 If any live facet can't be made to pass with a real fix, say so honestly rather
 than shipping a hollow green.
 
-**Re-record the journey on the fixed tree.** The repro handoff may carry
-`recordings` — before-fix footage plus the drivers that produced it (each entry
-is `{surface, kind, path, format, caption}`; the before clip's `kind` is
-`"before"` for a `reproduced` facet or `"fixed"` for an `already_fixed` one —
-recover it whichever it is). Recover the recording files the same way you
-recovered the test (the repro session's `workspace` under `recordings/<slug>/`,
-or the CI run's artifact bundle).
+**Record the journey on the fixed tree — always, whether or not the upstream run
+left any footage.** The after-fix clip is *yours* to produce: you have the
+reproduction test at `test_path` and the journey, which is everything the
+recorder needs. Do **not** gate this on the repro handoff carrying `recordings` —
+a missing before-clip is common (the repro run may have skipped recording, or its
+worktree/artifacts are gone) and is **not** a reason to skip the after-clip. You
+drive the recorder off the test you already recovered, not off an upstream file.
+
+If the repro handoff *does* carry `recordings` — before-fix footage plus the
+drivers that produced it (each entry is `{surface, kind, path, format, caption}`;
+the before clip's `kind` is `"before"` for a `reproduced` facet or `"fixed"` for
+an `already_fixed` one) — recover those files the same way you recovered the test
+(the repro session's `workspace` under `recordings/<slug>/`, or the CI run's
+artifact bundle) and carry them through as the "before" half. When it carries
+none, produce the after-clip anyway and note in the handoff that no before-clip
+was available upstream.
 
 For a `web`/`terminal` facet, **build the SPA up front — before you run the
 recorder, not during it.** The `tests/e2e_ui/` server serves the SPA from
@@ -393,13 +403,18 @@ footage isn't collected twice. For each after clip, write a `caption` describing
 **the actions that clip performs**, ending in the *correct* behavior (a passing
 run) — the same per-clip action-caption repro-agent writes, e.g. `"open the model
 picker → select the catalog → picker now shows friendly names"`. Carry each before
-clip's `caption` through unchanged. The before/after pair is the human-visible
-half of your fail→pass proof; it goes in the PR's Demo section (Step 3) and the
-handoff (`recordings`). If the spawned runner still won't reach `online: true`
-after the SPA is built, capture the fixture's `runner.log` tail and skip with that
-note — report only what you observed, don't assert an internal cause. Best-effort,
-like repro-agent's recording step: missing tooling or missing before-footage skips
-this with a note — it never blocks the fix.
+clip's `caption` through unchanged (when a before clip exists). The after clip is
+the human-visible half of your fail→pass proof; it goes in the PR's Demo section
+(Step 3) and the handoff (`recordings`), and you produce it on **every** author
+run. The only reasons to omit it are genuine, environmental, and must be stated:
+the recorder **tooling is missing** (no vhs/ffmpeg for `cli`, no chromium/SPA for
+`web`/`terminal`), or the spawned runner **won't reach `online: true`** after the
+SPA is built — then capture the fixture's `runner.log` tail and note it in the
+handoff (`recordings: []` with the reason), reporting only what you observed. A
+**missing upstream before-clip is not** such a reason — record the after-clip
+regardless. Best-effort in the sense that a real environmental block degrades to a
+note; it never blocks the fix, and it is never skipped merely because the repro
+run left no footage.
 
 ### 2B.6 — Get an independent cross-vendor review before you open the PR
 
@@ -742,14 +757,19 @@ Field meanings:
   `outcome` and a `test_transition` (the fail→pass proof, or why it was skipped).
 - `tests` — `e2e` is the (possibly rewritten) repro test path; `added` is the list
   of targeted tests you wrote (empty in review mode).
-- `recordings` — the before-fix footage carried through from the repro handoff
-  plus your after-fix re-recordings (`kind: "after"`), same
-  `{surface, kind, path, format, caption}` shape as repro-agent's field. Carry
-  each before clip's `caption` through unchanged; write a `caption` for every
-  `after` clip too — the ordered actions that clip performs, ending in the
-  corrected behavior. In review mode, the "after" entries are the drivers
-  re-recorded against the reviewed PR head. Empty list when no footage exists or
-  the tooling was missing — say why in
+- `recordings` — your after-fix footage (`kind: "after"`), plus any before-fix
+  footage carried through from the repro handoff, same
+  `{surface, kind, path, format, caption}` shape as repro-agent's field. You
+  produce an `after` clip on **every** author/review run — it is driven off the
+  reproduction test, not off an upstream file, so it does not depend on the repro
+  handoff carrying footage. When a before clip was recovered, carry its `caption`
+  through unchanged; when none was, that's fine — still include the `after` clip
+  and note the missing before in prose. Write a `caption` for every `after` clip:
+  the ordered actions that clip performs, ending in the corrected behavior. In
+  review mode, the "after" entries are the drivers recorded against the reviewed
+  PR head. The list is empty **only** when recording is genuinely blocked — the
+  recorder tooling is missing, or the fixture can't come online after the SPA
+  build — never merely because the upstream run left no footage; say which in
   prose.
 - `test_audit` — the result of the Step 2B.1 audit (author mode). In review mode,
   note whether the repro test was behavioral as-is.
