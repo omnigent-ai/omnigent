@@ -1701,14 +1701,19 @@ async def test_sessions_native_clears_in_flight_on_lazy_spec_error() -> None:
     pm = _FakeProcessManager(harness_client)
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> Any:
-        # Before the harness streams response.created the two setup-phase
-        # resolutions run: return None (uncached spec → default harness) so the
-        # turn streams without populating _session_spec_cache. Once streaming
-        # has started the only caller is the lazy dispatch resolution — fail it.
+        # Setup-phase call: return a real spec so _resolve_harness_config picks
+        # the test harness and the turn can start. _resolve_harness_config does
+        # NOT populate _session_spec_cache, so _resolve_turn_spec_lazy still
+        # calls us after response.created — and we raise there to exercise the
+        # error path.
         del agent_id, session_id
         if created.is_set():
             raise RuntimeError("transient lazy spec resolution failure")
-        return None
+        return AgentSpec(
+            spec_version=1,
+            name="t",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "runner-test-default"}),
+        )
 
     app = create_runner_app(
         process_manager=pm,  # type: ignore[arg-type]
