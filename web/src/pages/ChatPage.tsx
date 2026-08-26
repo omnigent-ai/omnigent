@@ -7259,7 +7259,11 @@ function ComposerModelEffortLabel({
     ? formatStatusModelLabel(sessionModel, codexModelOptions)
     : null;
   const childEffortLabel = isSubAgentSession
-    ? formatStatusEffortLabel(sessionReasoningEffort, modelPickerKind === "codex")
+    ? sessionReasoningEffort
+      ? formatStatusEffortLabel(sessionReasoningEffort, modelPickerKind === "codex")
+      : showEffort
+        ? "Default"
+        : null
     : null;
   // Routing picks the model + effort per turn, so the label reads
   // "Smart Routing" with no pinned model/effort — matching the tooltip.

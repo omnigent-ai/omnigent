@@ -3441,6 +3441,23 @@ def _antigravity_subagent_labels_from_body(
     return labels
 
 
+async def _inherit_native_child_reasoning_effort(
+    child: Conversation,
+    parent_conv: Conversation,
+    conversation_store: ConversationStore,
+) -> Conversation:
+    """Persist a native child’s inherited parent reasoning effort."""
+    parent_effort = parent_conv.reasoning_effort
+    if child.reasoning_effort is not None or parent_effort is None:
+        return child
+    updated = await asyncio.to_thread(
+        conversation_store.update_conversation,
+        child.id,
+        reasoning_effort=parent_effort,
+    )
+    return updated or child
+
+
 async def _create_and_publish_antigravity_child(
     parent_id: str,
     parent_conv: Conversation,
@@ -3481,11 +3498,15 @@ async def _create_and_publish_antigravity_child(
         if existing is None:
             raise
         await asyncio.to_thread(conversation_store.set_labels, existing.id, labels)
+        existing = await _inherit_native_child_reasoning_effort(
+            existing, parent_conv, conversation_store
+        )
         # An orphaned row's creator died before publishing, so live clients have
         # never heard about this child; a duplicate publish in the race case is a
         # harmless extra cache invalidation.
         _publish_session_created(parent_id, existing.id, parent_conv.agent_id)
         return existing.id
+    child = await _inherit_native_child_reasoning_effort(child, parent_conv, conversation_store)
     await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
     _publish_session_created(parent_id, child.id, parent_conv.agent_id)
     return child.id
@@ -3718,6 +3739,9 @@ async def _create_and_publish_codex_child(
             )
         if existing is not None:
             await asyncio.to_thread(conversation_store.set_labels, existing.id, labels)
+            existing = await _inherit_native_child_reasoning_effort(
+                existing, parent_conv, conversation_store
+            )
             # An orphaned row's creator died before publishing
             # ``session.created``, so live clients have never heard about
             # this child — emit it now. In the concurrent-race case the
@@ -3726,6 +3750,7 @@ async def _create_and_publish_codex_child(
             _publish_session_created(parent_id, existing.id, parent_conv.agent_id)
             return existing.id
         raise
+    child = await _inherit_native_child_reasoning_effort(child, parent_conv, conversation_store)
     await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
     _publish_session_created(parent_id, child.id, parent_conv.agent_id)
     return child.id
@@ -9044,6 +9069,7 @@ def _child_session_summary_from_conversation(
     conv: Conversation,
     parent_session_id: str,
     last_message_preview: str | None,
+    parent_reasoning_effort: str | None = None,
 ) -> ChildSessionSummary:
     """
     Build a :class:`ChildSessionSummary` from a child conversation.
@@ -9072,6 +9098,9 @@ def _child_session_summary_from_conversation(
         be missing.
     :param last_message_preview: Preview text derived from a batched
         child-message lookup, or ``None`` when no visible message exists.
+    :param parent_reasoning_effort: Parent’s persisted effort, used as a
+        display fallback for older native child rows created before native
+        child inheritance was persisted.
     :returns: A populated :class:`ChildSessionSummary`.
     """
     display_title = title_without_closed_marker(conv.title)
@@ -9125,6 +9154,9 @@ def _child_session_summary_from_conversation(
             last_message_preview = collapsed[:_CHILD_PREVIEW_LIMIT] or None
 
     routing_decision_id = conv.labels.get(ROUTING_DECISION_LABEL_KEY)
+    reasoning_effort = conv.reasoning_effort
+    if reasoning_effort is None and _is_codex_native_subagent(conv):
+        reasoning_effort = parent_reasoning_effort
     return ChildSessionSummary(
         id=conv.id,
         parent_session_id=parent_session_id,
@@ -9156,7 +9188,7 @@ def _child_session_summary_from_conversation(
         routed_model=conv.model_override if routing_decision_id is not None else None,
         model_override=conv.model_override,
         llm_model=_child_llm_model_from_conversation(conv),
-        reasoning_effort=conv.reasoning_effort,
+        reasoning_effort=reasoning_effort,
         routing_decision_id=routing_decision_id,
     )
 

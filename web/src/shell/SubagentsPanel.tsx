@@ -601,7 +601,9 @@ function SubagentRow({
   const isActive = conversationId === child.id;
   const effectiveModel = child.model_override ?? child.routed_model ?? child.llm_model;
   const modelLabel = effectiveModel ? shortModelName(formatModelDisplayName(effectiveModel)) : null;
-  const effortLabel = child.reasoning_effort;
+  // ``null`` means the child uses its harness/model default. Keep that
+  // visible so every child row answers which reasoning mode it uses.
+  const effortLabel = child.reasoning_effort ?? "Default";
   const modelEffortTitle = [
     effectiveModel
       ? child.model_override
@@ -610,7 +612,7 @@ function SubagentRow({
           ? `Smart routing picked ${effectiveModel}`
           : `Spec model: ${effectiveModel}`
       : null,
-    effortLabel ? `Reasoning effort: ${effortLabel}` : null,
+    `Reasoning effort: ${effortLabel}`,
   ]
     .filter((part): part is string => part !== null)
     .join(" · ");

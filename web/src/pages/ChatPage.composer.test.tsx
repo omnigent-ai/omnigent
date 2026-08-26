@@ -804,6 +804,23 @@ describe("Composer model/effort label", () => {
     expect(within(label()).getByText("high")).toHaveClass("text-muted-foreground");
   });
 
+  it("shows Default reasoning for a child with no persisted override", () => {
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          subAgentLabel: "worker",
+          sessionModel: "gpt-5-6-luna",
+          sessionReasoningEffort: null,
+          showModels: false,
+          showEffort: true,
+          modelPickerKind: "codex",
+          readOnlyReason: "Sub-agent sessions are read-only",
+        })}
+      />,
+    );
+    expect(label()).toHaveTextContent("gpt-5.6-luna Default");
+    expect(within(label()).getByText("Default")).toHaveClass("text-muted-foreground");
+  });
   it("reads 'Smart Routing' with no model/effort when routing is on", () => {
     // The router picks model + effort per turn, so the label must not surface a
     // stale pinned model/effort — it reads "Smart Routing" instead.

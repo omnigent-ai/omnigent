@@ -2072,6 +2072,7 @@ def register_events_routes(
                     page.data,
                     session_id,
                     conversation_store,
+                    conv.reasoning_effort,
                 )
                 for summary in summaries:
                     events.append(

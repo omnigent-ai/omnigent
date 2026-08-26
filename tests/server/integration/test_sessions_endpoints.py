@@ -8961,6 +8961,11 @@ async def test_external_codex_subagent_start_mints_child_session(
         agent["id"],
         labels={"omnigent.wrapper": "codex-native-ui"},
     )
+    effort_response = await client.patch(
+        f"/v1/sessions/{parent['id']}",
+        json={"reasoning_effort": "max"},
+    )
+    assert effort_response.status_code == 200, effort_response.text
 
     resp = await client.post(
         f"/v1/sessions/{parent['id']}/events",
@@ -8986,6 +8991,7 @@ async def test_external_codex_subagent_start_mints_child_session(
     children = children_resp.json()["data"]
     child = next((c for c in children if c["id"] == child_id), None)
     assert child is not None, "Child session must appear in child_sessions listing"
+    assert child["reasoning_effort"] == "max"
 
     # tool is derived from agent_nickname → agent_role → "Codex".
     assert child["tool"] == "auth-auditor", (
@@ -9004,6 +9010,41 @@ async def test_external_codex_subagent_start_mints_child_session(
     assert child["last_message_preview"] == "Audit the auth flow", (
         f"Expected prompt preview before transcript exists; got {child['last_message_preview']!r}"
     )
+
+
+async def test_external_codex_subagent_start_surfaces_parent_effort_for_legacy_child(
+    client: httpx.AsyncClient,
+) -> None:
+    """Native child projections recover the parent effort for old rows."""
+    agent = await create_test_agent(client)
+    parent = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.wrapper": "codex-native-ui"},
+    )
+    started = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_codex_subagent_start",
+            "data": {"thread_id": "thread_child_legacy"},
+        },
+    )
+    assert started.status_code == 202, started.text
+    child_id = started.json()["child_session_id"]
+
+    effort_response = await client.patch(
+        f"/v1/sessions/{parent['id']}",
+        json={"reasoning_effort": "max"},
+    )
+    assert effort_response.status_code == 200, effort_response.text
+
+    child_snapshot = await client.get(f"/v1/sessions/{child_id}")
+    assert child_snapshot.status_code == 200, child_snapshot.text
+    assert child_snapshot.json()["reasoning_effort"] == "max"
+
+    children = (await client.get(f"/v1/sessions/{parent['id']}/child_sessions")).json()["data"]
+    child = next(c for c in children if c["id"] == child_id)
+    assert child["reasoning_effort"] == "max"
 
 
 async def test_external_codex_subagent_start_is_idempotent_and_upserts_labels(
@@ -9669,6 +9710,8 @@ async def test_create_child_session_duplicate_title_returns_409(
     assert resp2.status_code == 409, (
         f"expected 409 on duplicate child title, got {resp2.status_code}: {resp2.text}"
     )
+
+
 @pytest.mark.asyncio
 async def test_child_session_inherits_parent_reasoning_effort(
     client: httpx.AsyncClient,

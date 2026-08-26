@@ -1548,10 +1548,9 @@ describe("SubagentsPanel", () => {
     expect(within(pinned).getByTestId("subagent-model-effort")).toHaveTextContent(
       "gpt-5.6-luna | low",
     );
-    expect(within(childRow(container, "conv_plain")).queryByTestId("subagent-model")).toBeNull();
-    expect(
-      within(childRow(container, "conv_plain")).queryByTestId("subagent-reasoning-effort"),
-    ).toBeNull();
+    const plainCue = within(childRow(container, "conv_plain")).getByTestId("subagent-model-effort");
+    expect(plainCue).toHaveTextContent("Default");
+    expect(plainCue).toHaveAttribute("title", "Reasoning effort: Default");
   });
 
   it("falls back to the spec model for children without an override or routing pin", () => {

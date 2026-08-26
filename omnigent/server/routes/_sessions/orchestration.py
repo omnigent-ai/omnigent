@@ -970,6 +970,7 @@ def _build_session_response(
     viewer_id: str | None = None,
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
+    reasoning_effort_override: str | None = None,
 ) -> SessionResponse:
     """
     Build a :class:`SessionResponse` from store-side entities.
@@ -1080,7 +1081,11 @@ def _build_session_response(
         runner_online=runner_online,
         host_online=host_online,
         host_resumable=host_resumable,
-        reasoning_effort=conv.reasoning_effort,
+        reasoning_effort=(
+            reasoning_effort_override
+            if reasoning_effort_override is not None
+            else conv.reasoning_effort
+        ),
         items=items,
         permission_level=permission_level,
         sub_agent_name=conv.sub_agent_name,
@@ -8640,6 +8645,7 @@ async def _child_session_summaries_from_conversations(
     children: list[Conversation],
     parent_session_id: str,
     conv_store: ConversationStore,
+    parent_reasoning_effort: str | None = None,
 ) -> list[ChildSessionSummary]:
     """
     Build child summaries with one batched message-preview lookup.
@@ -8655,6 +8661,8 @@ async def _child_session_summaries_from_conversations(
         ``list_conversations(kind="sub_agent")``.
     :param parent_session_id: Parent session id, e.g. ``"conv_parent987"``.
     :param conv_store: Conversation store used for the batched message read.
+    :param parent_reasoning_effort: Parent’s persisted effort, used as a
+        display fallback for older native child rows.
     :returns: One :class:`ChildSessionSummary` per input child, preserving
         input order.
     """
@@ -8675,6 +8683,7 @@ async def _child_session_summaries_from_conversations(
             child,
             parent_session_id,
             previews.get(child.id),
+            parent_reasoning_effort,
         )
         for child in children
     ]
@@ -9314,6 +9323,17 @@ async def _get_session_snapshot(
         conv = await asyncio.to_thread(conv_store.get_conversation, session_id)
     if conv is None:
         raise _session_not_found()
+    reasoning_effort_override: str | None = None
+    if (
+        conv.reasoning_effort is None
+        and _is_codex_native_subagent(conv)
+        and conv.parent_conversation_id is not None
+    ):
+        parent_conv = await asyncio.to_thread(
+            conv_store.get_conversation, conv.parent_conversation_id
+        )
+        if parent_conv is not None:
+            reasoning_effort_override = parent_conv.reasoning_effort
     # Return the most recent committed items while preserving the
     # SessionResponse contract that ``items`` is chronological. The
     # store's default page is the oldest 100 (``order="asc"``), which
@@ -9550,6 +9570,7 @@ async def _get_session_snapshot(
             conv,
         ),
         subtree_usage=subtree_usage,
+        reasoning_effort_override=reasoning_effort_override,
         viewer_id=viewer_id,
         agent_store=agent_store,
         agent_cache=agent_cache,

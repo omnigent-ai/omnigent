@@ -194,6 +194,7 @@ def register_items_routes(
             page.data,
             session_id,
             conversation_store,
+            parent.reasoning_effort,
         )
         return PaginatedList(
             data=data,
