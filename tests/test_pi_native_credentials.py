@@ -238,7 +238,7 @@ def test_to_models_config_shape() -> None:
     assert entry["api"] == "anthropic-messages"
     assert entry["apiKey"] == "!get-token"
     assert entry["authHeader"] is True
-    assert entry["models"] == [{"id": "databricks-claude-sonnet-4-6"}]
+    assert entry["models"] == [{"id": "databricks-claude-sonnet-4-6", "reasoning": True}]
 
 
 def test_write_models_config_is_owner_only(tmp_path: Path) -> None:
@@ -1031,7 +1031,7 @@ def test_model_override_beats_inline_family_default() -> None:
     assert provider is not None
     assert provider.model == "claude-opus-4-7"
     cfg = provider.to_models_config()
-    assert cfg["providers"]["omnigent"]["models"] == [{"id": "claude-opus-4-7"}]
+    assert cfg["providers"]["omnigent"]["models"] == [{"id": "claude-opus-4-7", "reasoning": True}]
 
 
 def test_databricks_prefixed_override_normalized_for_inline_anthropic() -> None:
@@ -1064,7 +1064,7 @@ def test_databricks_prefixed_override_normalized_for_inline_anthropic() -> None:
     # The gateway prefix is stripped for the vendor-direct Anthropic endpoint.
     assert provider.model == "claude-opus-4-7"
     cfg = provider.to_models_config()
-    assert cfg["providers"]["omnigent"]["models"] == [{"id": "claude-opus-4-7"}]
+    assert cfg["providers"]["omnigent"]["models"] == [{"id": "claude-opus-4-7", "reasoning": True}]
 
 
 def test_databricks_prefixed_override_normalized_for_inline_openai() -> None:

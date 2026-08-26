@@ -314,13 +314,16 @@ class PiProviderConfig:
             surface = self._fallback_surface()
             if not self._primary_claude_only:
                 # The primary's api came from the model's own family.
-                models.append(
+                base: _PiModelEntry = (
                     {"id": self.model, "input": ["text", "image"]}
                     if self.extra_models
                     else {"id": self.model}
                 )
+                if self.api == "anthropic-messages":
+                    base["reasoning"] = True
+                models.append(base)
             elif surface is DatabricksPiSurface.ANTHROPIC:
-                models.append({"id": self.model, "input": ["text", "image"]})
+                models.append({"id": self.model, "input": ["text", "image"], "reasoning": True})
             elif surface is not None:
                 self._register_on_surface(additional, surface)
             else:
