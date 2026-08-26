@@ -5590,6 +5590,17 @@
             "description": "Git branch checked out in the session's worktree, e.g. `\"feature/login\"`. Set only when the session was created with a server-created git worktree; `None` otherwise. The Web UI uses a non-`None` value to offer the \"delete local branch\" cleanup checkbox on session delete. See designs/SESSION_GIT_WORKTREE.md.",
             "title": "Git Branch"
           },
+          "git_head_sha": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Git Head Sha"
+          },
           "harness": {
             "anyOf": [
               {
@@ -7312,6 +7323,17 @@
             ],
             "description": "Runtime-native session id captured by a wrapper bridge (e.g. Claude Code's session uuid for `omnigent claude` sessions). Idempotent on same-value writes; the server rejects attempts to overwrite an already-set different value with `invalid_input` to surface programmer errors. `None` leaves unchanged.",
             "title": "External Session Id"
+          },
+          "git_head_sha": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Git Head Sha"
           },
           "labels": {
             "anyOf": [

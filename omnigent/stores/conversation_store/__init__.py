@@ -344,6 +344,7 @@ class ConversationStore(ABC):
         host_id: str | None = None,
         workspace: str | None = None,
         git_branch: str | None = None,
+        git_head_sha: str | None = None,
         terminal_launch_args: list[str] | None = None,
         conversation_id: str | None = None,
     ) -> Conversation:
@@ -777,6 +778,7 @@ class ConversationStore(ABC):
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
         reported_model: str | None = None,
+        git_head_sha: str | None = None,
     ) -> Conversation | None:
         """
         Update mutable fields on a conversation.

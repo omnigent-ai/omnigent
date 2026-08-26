@@ -862,6 +862,7 @@ def _build_session_list_item(
         ),
         workspace=conv.workspace,
         git_branch=conv.git_branch,
+        git_head_sha=conv.git_head_sha,
         archived=conv.archived,
         comments_count=comments_fingerprint.count if comments_fingerprint else 0,
         comments_updated_at=(
@@ -1121,6 +1122,7 @@ def _build_session_response(
         pending_inputs=pending_inputs.snapshot_for(conv.id),
         workspace=conv.workspace,
         git_branch=conv.git_branch,
+        git_head_sha=conv.git_head_sha,
         archived=conv.archived,
         # Replay the latest todo list for claude-native sessions.
         # Populated by _handle_external_session_todos; empty list for

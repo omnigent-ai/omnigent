@@ -496,30 +496,49 @@ class FilesystemRegistry(ABC):
     # ── Abstract: must be implemented by subclasses ───────────────
 
     @abstractmethod
-    def list_changed_files(self, conversation_id: str, *, limit: int) -> list[dict[str, Any]]:
+    def list_changed_files(
+        self,
+        conversation_id: str,
+        *,
+        limit: int,
+        baseline_sha: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Return changed files visible to *conversation_id*, newest first.
 
         :param conversation_id: The session to query, e.g. ``"conv_abc123"``.
         :param limit: Maximum number of records to return.
+        :param baseline_sha: When set, only include files changed after this
+            commit. Used to scope the files panel to a single session's
+            lifetime.
         :returns: List of file-record dicts with ``path``, ``status``,
             ``bytes``, and ``modified_at`` fields, newest first.
         """
 
     @abstractmethod
-    def get_changed_file(self, session_id: str, path: str) -> dict[str, Any] | None:
+    def get_changed_file(
+        self,
+        session_id: str,
+        path: str,
+        *,
+        baseline_sha: str | None = None,
+    ) -> dict[str, Any] | None:
         """Return the change record for a single *path*, or ``None``.
 
         :param session_id: The session to query, e.g. ``"conv_abc123"``.
         :param path: Path relative to the workspace root, e.g. ``"src/foo.py"``.
+        :param baseline_sha: When set, detect changes relative to this commit
+            instead of HEAD.
         :returns: A file-record dict with ``path``, ``status``, ``bytes``, and
             ``modified_at`` fields, or ``None`` when the file has no changes.
         """
 
     @abstractmethod
-    def get_baseline(self, path: str) -> str | None:
+    def get_baseline(self, path: str, *, baseline_sha: str | None = None) -> str | None:
         """Return the pre-modification baseline content of *path*, or ``None``.
 
         :param path: Path relative to the workspace root, e.g. ``"src/foo.py"``.
+        :param baseline_sha: When set, return content at this commit instead
+            of HEAD.
         :returns: File content before modification, or ``None`` when no
             baseline is available (new/untracked file, or no snapshot seeded).
         """
@@ -624,12 +643,19 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
             for p in paths:
                 self._snapshots.pop(p, None)
 
-    def list_changed_files(self, conversation_id: str, *, limit: int) -> list[dict[str, Any]]:
+    def list_changed_files(
+        self,
+        conversation_id: str,
+        *,
+        limit: int,
+        baseline_sha: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Return files changed by the agent in *conversation_id*'s session.
 
         :param conversation_id: The session to query, e.g.
             ``"conv_abc123"``.
         :param limit: Maximum number of records to return.
+        :param baseline_sha: Ignored for non-git registries.
         :returns: List of file-record dicts suitable for the
             ``workspace.changed_files`` API response, newest first.
         """
@@ -675,7 +701,13 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
             for r in records[:limit]
         ]
 
-    def get_changed_file(self, session_id: str, path: str) -> dict[str, Any] | None:
+    def get_changed_file(
+        self,
+        session_id: str,
+        path: str,
+        *,
+        baseline_sha: str | None = None,
+    ) -> dict[str, Any] | None:
         """Return the change record for a single *path*, or ``None``.
 
         Equivalent to scanning :meth:`list_changed_files` for a specific path
@@ -686,6 +718,7 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         :param session_id: The conversation to query, e.g. ``"conv_abc123"``.
         :param path: Path relative to the workspace root, e.g.
             ``"src/foo.py"``.
+        :param baseline_sha: Ignored for agent-edit registries.
         :returns: A file-record dict (``path``, ``status``, ``bytes``,
             ``modified_at``) when the file was changed this session, or
             ``None`` when it was not touched.
@@ -710,7 +743,7 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
             "modified_at": last_event.modified_at,
         }
 
-    def get_baseline(self, path: str) -> str | None:
+    def get_baseline(self, path: str, *, baseline_sha: str | None = None) -> str | None:
         """Return the pre-modification baseline content of *path*, or ``None``.
 
         Falls back to the in-memory snapshot captured by :meth:`seed_snapshot`
@@ -719,6 +752,7 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
 
         :param path: Path relative to the workspace root,
             e.g. ``"src/foo.py"``.
+        :param baseline_sha: Ignored for agent-edit registries (snapshot-based).
         :returns: File content before it was first modified this session, or
             ``None`` when no baseline is available.
         """
@@ -895,28 +929,39 @@ class GitFilesystemRegistry(FilesystemRegistry):
             config.returncode,
         )
 
-    def list_changed_files(self, conversation_id: str, *, limit: int) -> list[dict[str, Any]]:
-        """Return all uncommitted changes in the working tree, newest first.
+    def list_changed_files(
+        self,
+        conversation_id: str,
+        *,
+        limit: int,
+        baseline_sha: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return changed files in the working tree, newest first.
 
-        *conversation_id* is accepted for API compatibility but is not used
-        to filter results — git status always reflects the current state
-        relative to HEAD.
+        When *baseline_sha* is set, results are scoped to changes that
+        differ from that commit (committed + uncommitted). This is a
+        time-based boundary, not a session-ownership boundary: changes
+        made by *any* actor after the baseline appear.  If the baseline
+        SHA is unreachable (rebase, gc, shallow clone) the method
+        degrades gracefully to the plain ``git status`` path.
 
         :param conversation_id: Ignored for git-backed registries.
         :param limit: Maximum number of records to return.
+        :param baseline_sha: When set, only include files that differ from
+            this commit (committed + uncommitted changes since that point).
         :returns: List of file-record dicts, newest first.
         """
-        # ``--untracked-files=all`` forces git to expand entirely-untracked
-        # directories into their individual files.  Without it, a new file
-        # inside a brand-new directory tree collapses to a single ``?? dir/``
-        # line, so the UI would show the directory (stat'd as ~96 B) instead
-        # of the added file.
-        #
-        # The ``:(exclude)`` pathspecs stop git from walking large untracked
-        # build/cache trees (node_modules/, .venv/ …) that we would discard
-        # below anyway.  With ``-uall`` git otherwise stat's every file in them,
-        # which dominates the runtime on big repos.  These mirror the
-        # ``_SKIP_DIRS`` root-level prune (kept below as a safety net).
+        if baseline_sha:
+            try:
+                return self._list_changed_files_since(baseline_sha, limit=limit)
+            except GitStatusUnavailable:
+                _logger.warning(
+                    "Baseline SHA %s is unreachable (rebase/gc/shallow?); "
+                    "falling back to full git status",
+                    baseline_sha,
+                )
+                # Fall through to the plain git-status path below.
+
         argv = ["git", "status", "--porcelain", "--untracked-files=all"]
         argv.extend(self._skip_dir_pathspecs())
         started = time.monotonic()
@@ -987,16 +1032,151 @@ class GitFilesystemRegistry(FilesystemRegistry):
         records.sort(key=lambda r: (r["modified_at"] or 0, r["path"]), reverse=True)
         return records[:limit]
 
-    def get_changed_file(self, session_id: str, path: str) -> dict[str, Any] | None:
+    def _list_changed_files_since(self, baseline_sha: str, *, limit: int) -> list[dict[str, Any]]:
+        """Return files that differ from *baseline_sha* in the working tree.
+
+        Combines committed changes (baseline..HEAD) with uncommitted changes
+        (HEAD vs working tree) to produce the full delta since the baseline.
+        """
+        _GIT_STATUS_TO_OP = {"A": "created", "M": "modified", "D": "deleted"}
+        argv = ["git", "diff", "--name-status", "--no-renames", "--end-of-options", baseline_sha]
+        started = time.monotonic()
+        try:
+            result = subprocess.run(
+                argv,
+                cwd=str(self._git_root),
+                capture_output=True,
+                timeout=_git_timeout_seconds(),
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            _logger.warning(
+                "GitFilesystemRegistry._list_changed_files_since: %r in %s failed: %s",
+                argv,
+                self._git_root,
+                exc,
+            )
+            raise GitStatusUnavailable(f"git diff {baseline_sha} failed: {exc}") from exc
+
+        elapsed = time.monotonic() - started
+        if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", errors="replace").strip()
+            _logger.warning(
+                "GitFilesystemRegistry._list_changed_files_since: %r exited %d after %.2fs: %s",
+                argv,
+                result.returncode,
+                elapsed,
+                stderr,
+            )
+            raise GitStatusUnavailable(
+                f"git diff exited {result.returncode}" + (f": {stderr}" if stderr else "")
+            )
+
+        numstat = self._run_git_numstat_since(baseline_sha)
+        records: list[dict[str, Any]] = []
+        for line in result.stdout.decode("utf-8", errors="replace").splitlines():
+            parts = line.split("\t", 1)
+            if len(parts) != 2:
+                continue
+            status_code, git_path = parts
+            operation = _GIT_STATUS_TO_OP.get(status_code[0], "modified")
+            rel_path = self._git_to_rel(_strip_git_quotes(git_path))
+            if rel_path is None:
+                continue
+            if _is_ephemeral(rel_path):
+                continue
+            first_component = Path(rel_path).parts[0] if Path(rel_path).parts else ""
+            if first_component in _SKIP_DIRS:
+                continue
+            counts = numstat.get(rel_path, (None, None))
+            records.append(self._make_record(rel_path, operation, counts))
+
+        seen_paths: set[str] = {r["path"] for r in records}
+        untracked = self._list_untracked_files()
+        for rel_path in untracked:
+            if rel_path in seen_paths:
+                continue
+            if _is_ephemeral(rel_path):
+                continue
+            first_component = Path(rel_path).parts[0] if Path(rel_path).parts else ""
+            if first_component in _SKIP_DIRS:
+                continue
+            records.append(self._make_record(rel_path, "created", (None, None)))
+
+        records.sort(key=lambda r: (r["modified_at"] or 0, r["path"]), reverse=True)
+        return records[:limit]
+
+    def _list_untracked_files(self) -> list[str]:
+        """Return repo-relative paths of untracked (new) files."""
+        argv = ["git", "ls-files", "--others", "--exclude-standard"]
+        try:
+            result = subprocess.run(
+                argv,
+                cwd=str(self._git_root),
+                capture_output=True,
+                timeout=_git_timeout_seconds(),
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return []
+        if result.returncode != 0:
+            return []
+        paths: list[str] = []
+        for line in result.stdout.decode("utf-8", errors="replace").splitlines():
+            rel = self._git_to_rel(_strip_git_quotes(line.strip()))
+            if rel is not None:
+                paths.append(rel)
+        return paths
+
+    def _run_git_numstat_since(
+        self, baseline_sha: str
+    ) -> dict[str, tuple[int | None, int | None]]:
+        """Like _run_git_numstat but diffs against *baseline_sha*."""
+        argv = ["git", "diff", "--numstat", "--no-renames", "--end-of-options", baseline_sha]
+        try:
+            result = subprocess.run(
+                argv,
+                cwd=str(self._git_root),
+                capture_output=True,
+                timeout=_git_timeout_seconds(),
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return {}
+        if result.returncode != 0:
+            return {}
+        counts: dict[str, tuple[int | None, int | None]] = {}
+        for line in result.stdout.decode("utf-8", errors="replace").splitlines():
+            fields = line.split("\t")
+            if len(fields) != 3:
+                continue
+            added_s, removed_s, git_path = fields
+            rel_path = self._git_to_rel(_strip_git_quotes(git_path))
+            if rel_path is None:
+                continue
+            try:
+                added = int(added_s) if added_s != "-" else None
+                removed = int(removed_s) if removed_s != "-" else None
+            except ValueError:
+                added, removed = None, None
+            counts[rel_path] = (added, removed)
+        return counts
+
+    def get_changed_file(
+        self,
+        session_id: str,
+        path: str,
+        *,
+        baseline_sha: str | None = None,
+    ) -> dict[str, Any] | None:
         """Return the change record for a single *path*, or ``None``.
 
-        Queries ``git status --porcelain -- <path>`` for the specific file
-        rather than scanning the full working-tree diff.
+        When *baseline_sha* is set, uses ``git diff`` against the baseline
+        to detect committed changes; otherwise falls back to
+        ``git status --porcelain``.
 
         :param session_id: Ignored for git-backed registries.
         :param path: Path relative to the workspace root.
+        :param baseline_sha: Optional baseline commit for scoped detection.
         :returns: A file-record dict or ``None`` when the file has no
-            uncommitted changes.
+            changes relative to the baseline (or HEAD).
         """
         norm = _normalize_path(path, self._cwd)
         if norm is None:
@@ -1009,11 +1189,76 @@ class GitFilesystemRegistry(FilesystemRegistry):
         except ValueError:
             return None
 
-        # Mirror list_changed_files: a read that *could not run* (timeout /
-        # spawn error / non-zero exit) raises so the diff endpoint surfaces it,
-        # instead of being swallowed to ``None`` — which the endpoint turns
-        # into a 404 indistinguishable from "this path has no changes".
+        if baseline_sha is not None:
+            try:
+                return self._get_changed_file_since(norm, git_path, baseline_sha)
+            except GitStatusUnavailable:
+                _logger.warning(
+                    "Baseline SHA %s is unreachable for get_changed_file; "
+                    "falling back to git status",
+                    baseline_sha,
+                )
+
+        return self._get_changed_file_status(norm, git_path)
+
+    def _get_changed_file_since(
+        self,
+        norm: str,
+        git_path: str,
+        baseline_sha: str,
+    ) -> dict[str, Any] | None:
+        """Detect changes for a single file relative to a baseline commit."""
+        _GIT_STATUS_TO_OP = {"A": "created", "M": "modified", "D": "deleted"}
+        argv = [
+            "git",
+            "diff",
+            "--name-status",
+            "--no-renames",
+            "--end-of-options",
+            baseline_sha,
+            "--",
+            git_path,
+        ]
+        result = self._run_git_command(argv, "get_changed_file")
+        output = result.stdout.decode("utf-8", errors="replace")
+        numstat = self._run_git_numstat_since(baseline_sha)
+        for line in output.splitlines():
+            parts = line.split("\t", 1)
+            if len(parts) != 2:
+                continue
+            status_code = parts[0]
+            operation = _GIT_STATUS_TO_OP.get(status_code[0], "modified")
+            counts = numstat.get(norm, (None, None))
+            return self._make_record(norm, operation, counts)
+        # Baseline diff found nothing — check for untracked file.
+        untracked = self._list_untracked_files()
+        if norm in untracked or git_path in untracked:
+            return self._make_record(norm, "created", (None, None))
+        return None
+
+    def _get_changed_file_status(
+        self,
+        norm: str,
+        git_path: str,
+    ) -> dict[str, Any] | None:
+        """Detect changes for a single file via git status --porcelain."""
         argv = ["git", "status", "--porcelain", "--", git_path]
+        result = self._run_git_command(argv, "get_changed_file")
+        output = result.stdout.decode("utf-8", errors="replace")
+        for line in output.splitlines():
+            parsed = _parse_git_porcelain_line(line)
+            if parsed is None:
+                continue
+            _, operation = parsed
+            return self._make_record(norm, operation)
+        return None
+
+    def _run_git_command(
+        self,
+        argv: list[str],
+        caller: str,
+    ) -> subprocess.CompletedProcess[bytes]:
+        """Run a git subprocess, raising GitStatusUnavailable on failure."""
         started = time.monotonic()
         try:
             result = subprocess.run(
@@ -1025,28 +1270,31 @@ class GitFilesystemRegistry(FilesystemRegistry):
         except subprocess.TimeoutExpired as exc:
             elapsed = time.monotonic() - started
             _logger.warning(
-                "GitFilesystemRegistry.get_changed_file: %r in %s timed out after %.2fs",
+                "GitFilesystemRegistry.%s: %r in %s timed out after %.2fs",
+                caller,
                 argv,
                 self._git_root,
                 elapsed,
             )
-            raise GitStatusUnavailable(f"git status timed out after {elapsed:.1f}s") from exc
+            raise GitStatusUnavailable(f"git timed out after {elapsed:.1f}s") from exc
         except OSError as exc:
             elapsed = time.monotonic() - started
             _logger.warning(
-                "GitFilesystemRegistry.get_changed_file: %r in %s could not run after %.2fs: %s",
+                "GitFilesystemRegistry.%s: %r in %s could not run after %.2fs: %s",
+                caller,
                 argv,
                 self._git_root,
                 elapsed,
                 exc,
             )
-            raise GitStatusUnavailable(f"git status could not run: {exc}") from exc
+            raise GitStatusUnavailable(f"git could not run: {exc}") from exc
 
         elapsed = time.monotonic() - started
         if result.returncode != 0:
             stderr = result.stderr.decode("utf-8", errors="replace").strip()
             _logger.warning(
-                "GitFilesystemRegistry.get_changed_file: %r in %s exited %d after %.2fs: %s",
+                "GitFilesystemRegistry.%s: %r in %s exited %d after %.2fs: %s",
+                caller,
                 argv,
                 self._git_root,
                 result.returncode,
@@ -1054,25 +1302,18 @@ class GitFilesystemRegistry(FilesystemRegistry):
                 stderr,
             )
             raise GitStatusUnavailable(
-                f"git status exited {result.returncode}" + (f": {stderr}" if stderr else "")
+                f"git exited {result.returncode}" + (f": {stderr}" if stderr else "")
             )
+        return result
 
-        output = result.stdout.decode("utf-8", errors="replace")
-        for line in output.splitlines():
-            parsed = _parse_git_porcelain_line(line)
-            if parsed is None:
-                continue
-            _, operation = parsed
-            return self._make_record(norm, operation)
-
-        return None
-
-    def get_baseline(self, path: str) -> str | None:
-        """Return committed content via ``git show HEAD:<path>``.
+    def get_baseline(self, path: str, *, baseline_sha: str | None = None) -> str | None:
+        """Return content at the baseline commit (or HEAD) via ``git show``.
 
         :param path: Path relative to the workspace root.
-        :returns: Content of the file at HEAD, or ``None`` for new/untracked
-            files or when the subprocess fails.
+        :param baseline_sha: When set, return content at this commit instead
+            of HEAD.
+        :returns: Content of the file at the baseline, or ``None`` for
+            new/untracked files or when the subprocess fails.
         """
         norm = _normalize_path(path, self._cwd)
         if norm is None:
@@ -1083,9 +1324,21 @@ class GitFilesystemRegistry(FilesystemRegistry):
         except ValueError:
             return None
 
+        ref = baseline_sha or "HEAD"
+        content = self._git_show(ref, git_path, norm)
+        if content is None and baseline_sha is not None:
+            _logger.warning(
+                "Baseline SHA %s is unreachable for get_baseline %r; falling back to HEAD",
+                baseline_sha,
+                norm,
+            )
+            content = self._git_show("HEAD", git_path, norm)
+        return content
+
+    def _git_show(self, ref: str, git_path: str, norm: str) -> str | None:
         try:
             result = subprocess.run(
-                ["git", "show", f"HEAD:{git_path}"],
+                ["git", "show", f"{ref}:{git_path}"],
                 cwd=str(self._git_root),
                 capture_output=True,
                 timeout=_git_timeout_seconds(),
@@ -1094,7 +1347,8 @@ class GitFilesystemRegistry(FilesystemRegistry):
                 return result.stdout.decode("utf-8", errors="replace")
         except Exception:
             _logger.debug(
-                "GitFilesystemRegistry.get_baseline: git show failed for %r",
+                "GitFilesystemRegistry.get_baseline: git show %s failed for %r",
+                ref,
                 norm,
                 exc_info=True,
             )

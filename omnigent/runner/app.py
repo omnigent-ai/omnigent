@@ -18,6 +18,7 @@ import logging
 import mimetypes
 import os
 import re
+import subprocess
 import tempfile
 import time
 import urllib.parse
@@ -664,6 +665,28 @@ def _response_body_preview(resp: object, *, limit: int = 500) -> str:
     return ""
 
 
+_GIT_SHA_RE = re.compile(r"[0-9a-f]{7,64}")
+
+
+def _resolve_git_head_from_workspace(workspace: str | None) -> str | None:
+    if not workspace:
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=workspace,
+            capture_output=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            sha = result.stdout.decode("utf-8", errors="replace").strip()
+            if _GIT_SHA_RE.fullmatch(sha):
+                return sha
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    return None
+
+
 @dataclasses.dataclass
 @dataclasses.dataclass(frozen=True)
 class _SessionSnapshot:
@@ -707,6 +730,7 @@ class _SessionSnapshot:
     sub_agent_name: str | None = None
     parent_session_id: str | None = None
     agent_name: str | None = None
+    git_head_sha: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2053,6 +2077,8 @@ def create_runner_app(
     _session_reasoning_effort: dict[str, str] = {}
     _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
+    _session_git_head_sha: dict[str, str | None] = {}  # session_id → HEAD SHA at session start
+    _session_git_head_locks: dict[str, asyncio.Lock] = {}  # session_id → SHA resolution lock
     _session_cursor_model_names: dict[str, dict[str, str]] = {}
     _session_claude_launch_configs: dict[str, ClaudeNativeUcodeConfig | None] = {}
     _session_claude_launch_config_tasks: dict[
@@ -2532,6 +2558,7 @@ def create_runner_app(
             sub_agent_name: str | None = None
             parent_session_id: str | None = None
             agent_name: str | None = None
+            git_head_sha: str | None = None
             try:
                 resp = await server_client.get(f"/v1/sessions/{session_id}")
                 status_code = resp.status_code
@@ -2553,6 +2580,11 @@ def create_runner_app(
                     raw_agent_name = body.get("agent_name")
                     if isinstance(raw_agent_name, str) and raw_agent_name:
                         agent_name = raw_agent_name
+                    raw_git_head_sha = body.get("git_head_sha")
+                    if isinstance(raw_git_head_sha, str) and _GIT_SHA_RE.fullmatch(
+                        raw_git_head_sha
+                    ):
+                        git_head_sha = raw_git_head_sha
             except Exception:  # noqa: BLE001 — best-effort; created_at falls back to wall time
                 pass
             snapshot = _SessionSnapshot(
@@ -2564,6 +2596,7 @@ def create_runner_app(
                 sub_agent_name=sub_agent_name,
                 parent_session_id=parent_session_id,
                 agent_name=agent_name,
+                git_head_sha=git_head_sha,
             )
             if snapshot.ok and snapshot.agent_id is not None:
                 _session_snapshot_cache[session_id] = snapshot
@@ -2589,7 +2622,7 @@ def create_runner_app(
         await _get_server_version(server_client)
         return _SessionInitContext(envelope=None)
 
-    def _load_envelope_session_init_context(
+    async def _load_envelope_session_init_context(
         envelope: RunnerSessionInitEnvelope,
         *,
         session_id: str,
@@ -2609,9 +2642,27 @@ def create_runner_app(
             agent_id=agent_id,
             sub_agent_name=envelope.sub_agent_name,
             parent_session_id=snapshot.parent_session_id,
+            git_head_sha=snapshot.git_head_sha,
         )
-        _session_start_cache[session_id] = float(snapshot.created_at)
         _session_workspace_cache[session_id] = snapshot.workspace
+        if session_id not in _session_git_head_sha:
+            if snapshot.git_head_sha:
+                _session_git_head_sha[session_id] = snapshot.git_head_sha
+            else:
+                resolved = await asyncio.to_thread(
+                    _resolve_git_head_from_workspace, snapshot.workspace
+                )
+                _session_git_head_sha[session_id] = resolved
+                if resolved and server_client is not None:
+                    with contextlib.suppress(Exception):
+                        await server_client.patch(
+                            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+                            json={"git_head_sha": resolved},
+                            timeout=10.0,
+                        )
+        # Set _session_start_cache last — it gates the early-return in
+        # _ensure_session_registered, so SHA must be populated first.
+        _session_start_cache[session_id] = float(snapshot.created_at)
         if envelope.sub_agent_name:
             _session_sub_agent_names[session_id] = envelope.sub_agent_name
         if snapshot.reasoning_effort:
@@ -2643,7 +2694,7 @@ def create_runner_app(
             body_sub_agent if isinstance(body_sub_agent, str) else None
         ):
             raise ValueError("session initialization envelope sub-agent mismatch")
-        return _load_envelope_session_init_context(
+        return await _load_envelope_session_init_context(
             envelope,
             session_id=session_id,
             agent_id=agent_id,
@@ -3560,6 +3611,8 @@ def create_runner_app(
         _drop_session_claude_launch_config(session_id)
         _session_start_cache.pop(session_id, None)
         _session_workspace_cache.pop(session_id, None)
+        _session_git_head_sha.pop(session_id, None)
+        _session_git_head_locks.pop(session_id, None)
         _session_snapshot_cache.pop(session_id, None)
         _session_snapshot_locks.pop(session_id, None)
         _session_init_envelopes.pop(session_id, None)
@@ -6219,9 +6272,16 @@ def create_runner_app(
                 model_override=cast(str | None, msg_body.get("model_override")),
                 session_id=conv,
             )
-            from omnigent.runtime.prompt import build_instructions
+            from omnigent.runtime.prompt import build_instructions, git_baseline_instruction
 
-            instructions = build_instructions(cached_spec, None, [])
+            await _ensure_session_registered(conv)
+            framework_instructions: list[str] = []
+            baseline = _session_git_head_sha.get(conv)
+            if baseline:
+                framework_instructions.append(git_baseline_instruction(baseline))
+            instructions = build_instructions(
+                cached_spec, None, [], framework_instructions=framework_instructions
+            )
 
         ctx = TurnDispatch(
             agent_id=_dispatched_agent_id,
@@ -7242,6 +7302,18 @@ def create_runner_app(
                 _publish_turn_status(conversation_id, "running")
 
                 if stream:
+                    await _ensure_session_registered(conversation_id)
+                    _baseline = _session_git_head_sha.get(conversation_id)
+                    if _baseline:
+                        from omnigent.runtime.prompt import (
+                            append_framework_instructions,
+                            git_baseline_instruction,
+                        )
+
+                        message_body["instructions"] = append_framework_instructions(
+                            message_body.get("instructions"),
+                            [git_baseline_instruction(_baseline)],
+                        )
                     response = await _stream_message_to_harness(message_body, conversation_id)
                     if not isinstance(response, StreamingResponse):
                         _on_proxy_stream_end(
@@ -8478,11 +8550,13 @@ def create_runner_app(
             # Offload to a thread so it never blocks the event loop — a blocked
             # loop can't answer the server's runner-stream relay probe and the
             # session's first turn 503s with runner_unavailable.
+            baseline = _session_git_head_sha.get(session_id)
             raw_changes = (
                 await _asyncio.to_thread(
                     session_registry.list_changed_files,
                     session_id,
                     limit=10_000,
+                    baseline_sha=baseline,
                 )
                 if session_registry is not None
                 else []
@@ -8556,9 +8630,13 @@ def create_runner_app(
         try:
             # Offloaded like list_filesystem_changes: get_changed_file shells out
             # to git (status + show) synchronously, so keep it off the loop.
+            baseline = _session_git_head_sha.get(session_id)
             record = (
                 await _asyncio.to_thread(
-                    session_registry.get_changed_file, session_id, relative_path
+                    session_registry.get_changed_file,
+                    session_id,
+                    relative_path,
+                    baseline_sha=baseline,
                 )
                 if session_registry is not None
                 else None
@@ -8584,7 +8662,9 @@ def create_runner_app(
         is_deleted = record.get("status") == "deleted"
 
         before: str | None = (
-            await _asyncio.to_thread(session_registry.get_baseline, relative_path)
+            await _asyncio.to_thread(
+                session_registry.get_baseline, relative_path, baseline_sha=baseline
+            )
             if session_registry is not None
             else None
         )
@@ -8783,12 +8863,33 @@ def create_runner_app(
     async def _ensure_session_registered(session_id: str) -> None:
         if session_id in _session_start_cache:
             return
-        snapshot = await _session_snapshot(session_id)
-        _session_start_cache[session_id] = snapshot.created_at
-        # Only memoize a workspace the server actually returned; a failed
-        # fetch is re-resolved lazily by _session_workspace_value.
-        if snapshot.ok:
-            _session_workspace_cache[session_id] = snapshot.workspace
+        lock = _session_git_head_locks.setdefault(session_id, asyncio.Lock())
+        async with lock:
+            if session_id in _session_start_cache:
+                return
+            snapshot = await _session_snapshot(session_id)
+            # Only memoize a workspace the server actually returned; a failed
+            # fetch is re-resolved lazily by _session_workspace_value.
+            if snapshot.ok:
+                _session_workspace_cache[session_id] = snapshot.workspace
+            if session_id not in _session_git_head_sha:
+                if snapshot.git_head_sha:
+                    _session_git_head_sha[session_id] = snapshot.git_head_sha
+                else:
+                    resolved = await asyncio.to_thread(
+                        _resolve_git_head_from_workspace, snapshot.workspace
+                    )
+                    _session_git_head_sha[session_id] = resolved
+                    if resolved and server_client is not None:
+                        with contextlib.suppress(Exception):
+                            await server_client.patch(
+                                f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+                                json={"git_head_sha": resolved},
+                                timeout=10.0,
+                            )
+            # Set _session_start_cache last — it gates the early-return
+            # above, so SHA must be populated first.
+            _session_start_cache[session_id] = snapshot.created_at
 
     async def _resolve_session_spec_entry(session_id: str) -> _SpecEntry | None:
         if session_id in _session_spec_cache:
