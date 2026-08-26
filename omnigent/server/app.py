@@ -477,11 +477,12 @@ def _ensure_builtin_agent(
         # Sha-segment compare: legacy rows keep an ``ag_``-prefixed left
         # segment (physical artifact key); only the sha encodes content.
         if existing.bundle_location.rsplit("/", 1)[-1] == bundle_hash:
-            # Row current, but the blob can be gone while the row survives
-            # (pruned artifacts, or DB restored without the store). Re-put from
-            # the in-hand bytes so boot self-heals instead of failing launches.
-            if not artifact_store.exists(new_loc):
-                artifact_store.put(new_loc, bundle_bytes)
+            # Blob can vanish while the row survives (pruned artifacts, DB
+            # restored without the store); re-put so boot self-heals. Keyed on
+            # the row's location, not ``new_loc``: this path never rewrites the
+            # row, so a legacy ``ag_``-prefixed value is what the loader reads.
+            if not artifact_store.exists(existing.bundle_location):
+                artifact_store.put(existing.bundle_location, bundle_bytes)
             # Evict so a lagging replica's stale cache reloads the bundle.
             agent_cache.evict(existing.id)
             return
