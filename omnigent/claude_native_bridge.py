@@ -4572,6 +4572,7 @@ def _tool_relay_handler_factory(
                 "/tool",
                 "/policies/evaluate",
                 "/hook/claude/evaluate-policy",
+                "/hook/pi/extension-ui",
             ):
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
@@ -4587,6 +4588,9 @@ def _tool_relay_handler_factory(
                 return
             if self.path == "/policies/evaluate":
                 self._handle_policy_evaluate(payload)
+                return
+            if self.path == "/hook/pi/extension-ui":
+                self._handle_pi_extension_ui(payload)
                 return
             name = payload.get("name")
             arguments = payload.get("arguments")
@@ -4688,6 +4692,37 @@ def _tool_relay_handler_factory(
 
             session_component = _up.quote(session_id, safe="")
             url = f"/v1/sessions/{session_component}/policies/evaluate"
+            future = asyncio.run_coroutine_threadsafe(policy_client.post(url, json=payload), loop)
+            try:
+                resp = future.result(timeout=86400.0)
+            except Exception as exc:  # noqa: BLE001
+                self._send_policy_proxy_error(exc)
+                return
+            raw = resp.content
+            self.send_response(resp.status_code)
+            for header in ("Content-Type", "Content-Length"):
+                val = resp.headers.get(header)
+                if val is not None:
+                    self.send_header(header, val)
+            if "Content-Length" not in resp.headers:
+                self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def _handle_pi_extension_ui(self, payload: _JsonObject) -> None:
+            """Proxy one pi-native extension UI park to the session hook.
+
+            Same long-poll as ``/policies/evaluate`` so a Databricks ASK that
+            outlives the server bearer still resolves through the relay's
+            refresh-capable client.
+            """
+            if policy_client is None or session_id is None:
+                self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
+                return
+            import urllib.parse as _up
+
+            session_component = _up.quote(session_id, safe="")
+            url = f"/v1/sessions/{session_component}/hooks/pi-extension-ui"
             future = asyncio.run_coroutine_threadsafe(policy_client.post(url, json=payload), loop)
             try:
                 resp = future.result(timeout=86400.0)

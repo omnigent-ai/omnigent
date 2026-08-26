@@ -115,6 +115,191 @@ function relayCredentials() {
   return null;
 }
 
+function mintPiUiElicitationId() {
+  return `elicit_pi_${crypto.randomBytes(16).toString("hex")}`;
+}
+
+const _KEEP_AS_IS_LABEL = "Keep as-is";
+
+function extensionUiJsResult(method, verdict, request) {
+  if (!verdict || verdict.action !== "accept") {
+    return method === "confirm" ? false : undefined;
+  }
+  if (method === "confirm") return true;
+  const content =
+    verdict.content && typeof verdict.content === "object" ? verdict.content : {};
+  let value = content["0"];
+  if (value == null && request && typeof request.title === "string") {
+    value = content[request.title];
+  }
+  if (Array.isArray(value)) value = value[0];
+  if (typeof value !== "string" || !value) return undefined;
+  if (method === "editor" && value === _KEEP_AS_IS_LABEL) {
+    return typeof request.prefill === "string" ? request.prefill : "";
+  }
+  return value;
+}
+
+/**
+ * Park a Pi TUI dialog on Omnigent's web elicitation hook.
+ *
+ * Same undici-safe re-attach loop as ``evalNativePolicyHttp``. Empty 200
+ * (timeout / disconnect) re-POSTs the same elicitation id. A JSON body
+ * with ``action`` is the web verdict. Fail closed (null) when the gate
+ * cannot be reached so the wrap does not fall through to the TUI prompt
+ * (that hang is the bug).
+ *
+ * @returns {Promise<object | null>} ElicitationResult, or null on cancel.
+ */
+async function parkPiExtensionUiHttp(config, request, opts) {
+  if (
+    !config ||
+    !config.serverUrl ||
+    !config.sessionId ||
+    typeof fetch !== "function"
+  ) {
+    return null;
+  }
+  if (opts && opts.signal && opts.signal.aborted) return null;
+  const timeoutMs =
+    opts && typeof opts.timeout === "number" && opts.timeout > 0
+      ? opts.timeout
+      : null;
+  const relay = relayCredentials();
+  const url = relay
+    ? `${relay.url}/hook/pi/extension-ui`
+    : `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/hooks/pi-extension-ui`;
+  const elicitationId = mintPiUiElicitationId();
+  const body = JSON.stringify({ elicitation_id: elicitationId, request });
+  const reqHeaders = relay
+    ? {
+        "content-type": "application/json",
+        authorization: `Bearer ${relay.token}`,
+      }
+    : {
+        "content-type": "application/json",
+        ...freshAuthHeaders(config.authHeaders),
+      };
+
+  const parkDeadline =
+    Date.now() + (timeoutMs != null ? timeoutMs : _PARK_TOTAL_BUDGET_MS);
+  let transientDeadline = Date.now() + _TRANSIENT_RETRY_BUDGET_MS;
+  let transientBackoff = _TRANSIENT_RETRY_INITIAL_BACKOFF_MS;
+
+  while (true) {
+    if (opts && opts.signal && opts.signal.aborted) return null;
+    if (Date.now() >= parkDeadline) return null;
+    const controller =
+      typeof AbortController === "function" ? new AbortController() : null;
+    const remaining = parkDeadline - Date.now();
+    const attemptMs = Math.min(_PARK_ATTEMPT_TIMEOUT_MS, Math.max(remaining, 1));
+    const timer = controller
+      ? setTimeout(() => controller.abort(), attemptMs)
+      : null;
+    const attemptStart = Date.now();
+    let resp;
+    try {
+      resp = await fetch(url, {
+        method: "POST",
+        headers: reqHeaders,
+        body,
+        ...(controller ? { signal: controller.signal } : {}),
+      });
+    } catch (_err) {
+      if (timer) clearTimeout(timer);
+      const aborted = !!(controller && controller.signal.aborted);
+      const elapsed = Date.now() - attemptStart;
+      const reattachFloor = Math.min(
+        _PARK_REATTACH_MIN_ELAPSED_MS,
+        Math.max(attemptMs - 5_000, attemptMs * 0.8),
+      );
+      const isLongPollReattach = aborted && elapsed >= reattachFloor;
+      if (isLongPollReattach) {
+        if (Date.now() >= parkDeadline) return null;
+        transientDeadline = Date.now() + _TRANSIENT_RETRY_BUDGET_MS;
+        transientBackoff = _TRANSIENT_RETRY_INITIAL_BACKOFF_MS;
+        continue;
+      }
+      if (Date.now() + transientBackoff >= transientDeadline) return null;
+      await sleep(transientBackoff);
+      transientBackoff = Math.min(
+        transientBackoff * 2,
+        _TRANSIENT_RETRY_MAX_BACKOFF_MS,
+      );
+      continue;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+
+    if (!resp.ok) {
+      if (resp.status >= 500) {
+        if (Date.now() + transientBackoff >= transientDeadline) return null;
+        await sleep(transientBackoff);
+        transientBackoff = Math.min(
+          transientBackoff * 2,
+          _TRANSIENT_RETRY_MAX_BACKOFF_MS,
+        );
+        continue;
+      }
+      return null;
+    }
+
+    let text;
+    try {
+      text = await resp.text();
+    } catch (_err) {
+      return null;
+    }
+    if (!text) {
+      // Empty 200: timeout/disconnect. Re-attach with the same id.
+      transientDeadline = Date.now() + _TRANSIENT_RETRY_BUDGET_MS;
+      transientBackoff = _TRANSIENT_RETRY_INITIAL_BACKOFF_MS;
+      continue;
+    }
+    let json;
+    try {
+      json = JSON.parse(text);
+    } catch (_err) {
+      return null;
+    }
+    if (json && typeof json.action === "string") return json;
+    return null;
+  }
+}
+
+function wrapExtensionUi(ctx, config) {
+  if (!ctx || ctx.mode !== "tui" || !ctx.ui || ctx.ui.__omnigentUiWrapped) {
+    return;
+  }
+  const ui = ctx.ui;
+  ui.__omnigentUiWrapped = true;
+
+  ui.confirm = async (title, message, opts) => {
+    const request = { method: "confirm", title, message };
+    const verdict = await parkPiExtensionUiHttp(config, request, opts);
+    return extensionUiJsResult("confirm", verdict, request);
+  };
+  ui.select = async (title, options, opts) => {
+    const request = {
+      method: "select",
+      title,
+      options: Array.isArray(options) ? options : [],
+    };
+    const verdict = await parkPiExtensionUiHttp(config, request, opts);
+    return extensionUiJsResult("select", verdict, request);
+  };
+  ui.input = async (title, placeholder, opts) => {
+    const request = { method: "input", title, placeholder };
+    const verdict = await parkPiExtensionUiHttp(config, request, opts);
+    return extensionUiJsResult("input", verdict, request);
+  };
+  ui.editor = async (title, prefill) => {
+    const request = { method: "editor", title, prefill };
+    const verdict = await parkPiExtensionUiHttp(config, request);
+    return extensionUiJsResult("editor", verdict, request);
+  };
+}
+
 /**
  * Evaluate a TOOL_CALL policy for a native Pi tool via the Omnigent server's
  * session-level HTTP endpoint (POST /v1/sessions/{sessionId}/policies/evaluate).
@@ -1744,6 +1929,7 @@ module.exports = function (pi) {
 
   pi.on("session_start", async (_event, ctx) => {
     rememberContext(ctx);
+    wrapExtensionUi(ctx, config);
     registerTaskToolIfMissing();
     restoreTaskList(ctx);
     if (taskList.length) await publishTaskList();

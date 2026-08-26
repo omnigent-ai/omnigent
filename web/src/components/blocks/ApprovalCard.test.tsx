@@ -775,6 +775,115 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     expect(screen.queryByText("Claude has questions")).toBeNull();
   });
 
+  it("labels Pi structured input prompts as Pi prompts", () => {
+    render(
+      <ApprovalCard
+        elicitationId="elic_pi_label"
+        message="Allow dangerous command?"
+        phase="pi_extension_ui"
+        policyName="pi_native_extension_ui"
+        contentPreview=""
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+        askUserQuestion={{
+          questions: [
+            {
+              id: "0",
+              question: "Allow dangerous command?",
+              options: [{ label: "Allow" }, { label: "Block" }],
+              multiSelect: false,
+            },
+          ],
+        }}
+      />,
+    );
+
+    expect(screen.getByText("Pi needs your input")).toBeDefined();
+    expect(screen.queryByText("Claude has questions")).toBeNull();
+  });
+
+  it("limits Pi select prompts to their supplied options", () => {
+    const submitSpy = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ submitApproval: submitSpy } as Partial<
+      ReturnType<typeof useChatStore.getState>
+    >);
+
+    render(
+      <ApprovalCard
+        elicitationId="elic_pi_select"
+        message="Allow dangerous command?"
+        phase="pi_extension_ui"
+        policyName="pi_native_extension_ui"
+        contentPreview=""
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+        askUserQuestion={{
+          questions: [
+            {
+              id: "0",
+              question: "Allow dangerous command?",
+              options: [{ label: "Allow" }, { label: "Block" }],
+              multiSelect: false,
+              isOther: false,
+            },
+          ],
+        }}
+      />,
+    );
+
+    expect(screen.queryByTestId("ask-user-question-custom-input")).toBeNull();
+    fireEvent.click(screen.getByLabelText("Allow"));
+    fireEvent.click(screen.getByTestId("ask-user-question-submit"));
+    expect(submitSpy).toHaveBeenCalledWith("elic_pi_select", "accept", {
+      "0": "Allow",
+    });
+  });
+
+  it("renders an empty-option Pi input as custom text only", () => {
+    const submitSpy = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ submitApproval: submitSpy } as Partial<
+      ReturnType<typeof useChatStore.getState>
+    >);
+
+    render(
+      <ApprovalCard
+        elicitationId="elic_pi_input"
+        message="Enter a value"
+        phase="pi_extension_ui"
+        policyName="pi_native_extension_ui"
+        contentPreview=""
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+        askUserQuestion={{
+          questions: [
+            {
+              id: "0",
+              question: "Enter a value",
+              header: "Input",
+              options: [],
+              multiSelect: false,
+              isOther: true,
+            },
+          ],
+        }}
+      />,
+    );
+
+    const submit = screen.getByTestId("ask-user-question-submit");
+    expect(submit.hasAttribute("disabled")).toBe(true);
+    fireEvent.change(screen.getByTestId("ask-user-question-custom-input"), {
+      target: { value: "hello world" },
+    });
+    expect(submit.hasAttribute("disabled")).toBe(false);
+    fireEvent.click(submit);
+    expect(submitSpy).toHaveBeenCalledWith("elic_pi_input", "accept", {
+      "0": "hello world",
+    });
+  });
+
   it("submits multi-select answers as an array", () => {
     const submitSpy = vi.fn().mockResolvedValue(undefined);
     useChatStore.setState({ submitApproval: submitSpy } as Partial<

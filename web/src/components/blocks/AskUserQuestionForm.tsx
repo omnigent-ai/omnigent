@@ -13,12 +13,12 @@
 //   - radio inputs (single-select) or checkboxes (multi-select)
 //     for the predefined options, with each option's description
 //     under the label in muted text
-//   - a "Type something" custom-input row at the bottom of the
-//     option list — same radio/checkbox prefix as the real
-//     options, so visually it's "one more option" whose value the
-//     user types. The radio/checkbox is part of the same group
-//     as the predefined options (single-select mutex; multi-select
-//     independent toggle).
+//   - when ``isOther !== false``, a "Type something" custom-input
+//     row at the bottom of the option list — same radio/checkbox
+//     prefix as the real options, so visually it's "one more
+//     option" whose value the user types. The radio/checkbox is
+//     part of the same group as the predefined options
+//     (single-select mutex; multi-select independent toggle).
 //   - <pre> blocks showing the ``preview`` of any currently-selected
 //     option that has one (single-select: 0 or 1; multi-select:
 //     one per selected option with a preview).
@@ -214,6 +214,7 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
     (opt) => selectedLabels.includes(opt.label) && opt.preview,
   );
 
+  const allowCustomInput = current.isOther !== false;
   const customRowId = `${currentKey}__custom`;
   const customRowChecked = customSelected[currentKey] ?? false;
   const customRowValue = customInputs[currentKey] ?? "";
@@ -292,40 +293,42 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
               </label>
             );
           })}
-          {/* Custom-input row — visually "one more option" with a
-              matching radio/checkbox prefix, so the user picks
-              between predefined options and free-form input the
-              same way. */}
-          <label
-            htmlFor={customRowId}
-            className="flex items-start gap-2 cursor-pointer text-ui text-foreground"
-          >
-            <input
-              type={current.multiSelect ? "checkbox" : "radio"}
-              id={customRowId}
-              name={current.multiSelect ? undefined : currentKey}
-              checked={customRowChecked}
-              onChange={() =>
-                current.multiSelect
-                  ? handleCustomToggleMulti(currentKey)
-                  : handleCustomToggleSingle(currentKey)
-              }
-              className="mt-1"
-              data-testid="ask-user-question-custom-toggle"
-            />
-            {/* ``field-sizing-content`` (Tailwind v4 / CSS) auto-grows
-                the textarea to fit its content, so typing past the
-                first line wraps and expands downward instead of
-                scrolling within a fixed single row. */}
-            <textarea
-              rows={1}
-              placeholder="Type something"
-              value={customRowValue}
-              onChange={(e) => handleCustomInput(currentKey, e)}
-              data-testid="ask-user-question-custom-input"
-              className="field-sizing-content flex-1 resize-none bg-transparent text-ui placeholder:text-muted-foreground focus:outline-none"
-            />
-          </label>
+          {allowCustomInput && (
+            /* Custom-input row — visually "one more option" with a
+               matching radio/checkbox prefix, so the user picks
+               between predefined options and free-form input the
+               same way. */
+            <label
+              htmlFor={customRowId}
+              className="flex items-start gap-2 cursor-pointer text-ui text-foreground"
+            >
+              <input
+                type={current.multiSelect ? "checkbox" : "radio"}
+                id={customRowId}
+                name={current.multiSelect ? undefined : currentKey}
+                checked={customRowChecked}
+                onChange={() =>
+                  current.multiSelect
+                    ? handleCustomToggleMulti(currentKey)
+                    : handleCustomToggleSingle(currentKey)
+                }
+                className="mt-1"
+                data-testid="ask-user-question-custom-toggle"
+              />
+              {/* ``field-sizing-content`` (Tailwind v4 / CSS) auto-grows
+                  the textarea to fit its content, so typing past the
+                  first line wraps and expands downward instead of
+                  scrolling within a fixed single row. */}
+              <textarea
+                rows={1}
+                placeholder="Type something"
+                value={customRowValue}
+                onChange={(e) => handleCustomInput(currentKey, e)}
+                data-testid="ask-user-question-custom-input"
+                className="field-sizing-content flex-1 resize-none bg-transparent text-ui placeholder:text-muted-foreground focus:outline-none"
+              />
+            </label>
+          )}
         </div>
         {previewsToShow.length > 0 && (
           <div className="flex flex-col gap-1" data-testid="ask-user-question-previews">

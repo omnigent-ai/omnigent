@@ -473,6 +473,127 @@ async function testRunningIdleShareResponseId() {
   );
 }
 
+function mockUi(overrides = {}) {
+  const originalCalls = [];
+  const ui = {
+    confirm: async () => {
+      originalCalls.push("confirm");
+      return true;
+    },
+    select: async () => {
+      originalCalls.push("select");
+      return "Allow";
+    },
+    input: async () => {
+      originalCalls.push("input");
+      return "typed";
+    },
+    editor: async () => {
+      originalCalls.push("editor");
+      return "edited";
+    },
+    notify: (msg) => {
+      originalCalls.push("notify");
+      return msg;
+    },
+    setStatus: () => {
+      originalCalls.push("setStatus");
+    },
+    setTitle: () => {
+      originalCalls.push("setTitle");
+    },
+    ...overrides,
+  };
+  return { ui, originalCalls };
+}
+
+async function testTuiWrapParksConfirmWithoutCallingOriginal() {
+  const h = makeHarness({ captureEvents: true });
+  const hookCalls = [];
+  global.fetch = async (url, opts) => {
+    const u = String(url);
+    if (u.includes("pi-extension-ui") || u.includes("/hook/pi/")) {
+      hookCalls.push({ url: u, body: JSON.parse(opts.body) });
+      return { ok: true, status: 200, text: async () => JSON.stringify({ action: "accept" }) };
+    }
+    return { ok: true, status: 204, text: async () => "" };
+  };
+  const { ui, originalCalls } = mockUi();
+  const ctx = { mode: "tui", ui };
+  await h.handlers.session_start({}, ctx);
+  const confirmed = await ctx.ui.confirm("Clear session?", "All messages will be lost.");
+  assert("wrapped confirm returns true on accept", confirmed === true);
+  assert(
+    "original confirm is not called",
+    !originalCalls.includes("confirm"),
+    JSON.stringify(originalCalls),
+  );
+  assert("hook was posted", hookCalls.length === 1, `calls=${hookCalls.length}`);
+  assert(
+    "hook path is pi-extension-ui",
+    String(hookCalls[0].url).includes("pi-extension-ui"),
+    hookCalls[0].url,
+  );
+  assert(
+    "hook body carries elicitation_id and confirm request",
+    typeof hookCalls[0].body.elicitation_id === "string" &&
+      hookCalls[0].body.request.method === "confirm",
+    JSON.stringify(hookCalls[0].body),
+  );
+}
+
+async function testTuiWrapReparksSameElicitationId() {
+  const h = makeHarness({ captureEvents: true });
+  const ids = [];
+  let n = 0;
+  global.fetch = async (url, opts) => {
+    const u = String(url);
+    if (u.includes("pi-extension-ui") || u.includes("/hook/pi/")) {
+      const body = JSON.parse(opts.body);
+      ids.push(body.elicitation_id);
+      n += 1;
+      if (n === 1) return { ok: true, status: 200, text: async () => "" };
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ action: "accept", content: { "0": "Allow" } }),
+      };
+    }
+    return { ok: true, status: 204, text: async () => "" };
+  };
+  const { ui } = mockUi();
+  const ctx = { mode: "tui", ui };
+  await h.handlers.session_start({}, ctx);
+  const value = await ctx.ui.select("Allow dangerous command?", ["Allow", "Block"]);
+  assert("select returns chosen label", value === "Allow", `value=${value}`);
+  assert("re-park used the same elicitation id", ids.length === 2 && ids[0] === ids[1], JSON.stringify(ids));
+}
+
+async function testRpcModeDoesNotWrapUi() {
+  const h = makeHarness({ captureEvents: true });
+  global.fetch = async () => ({ ok: true, status: 204, text: async () => "" });
+  const { ui, originalCalls } = mockUi();
+  const ctx = { mode: "rpc", ui };
+  await h.handlers.session_start({}, ctx);
+  const confirmed = await ctx.ui.confirm("Clear?", "Lost.");
+  assert("rpc confirm still calls original", confirmed === true && originalCalls.includes("confirm"));
+}
+
+async function testNotifyAndSetStatusStayUnwrapped() {
+  const h = makeHarness({ captureEvents: true });
+  global.fetch = async () => ({ ok: true, status: 204, text: async () => "" });
+  const { ui, originalCalls } = mockUi();
+  const ctx = { mode: "tui", ui };
+  await h.handlers.session_start({}, ctx);
+  ctx.ui.notify("hello", "info");
+  ctx.ui.setStatus("k", "v");
+  assert(
+    "notify and setStatus still hit the original TUI methods",
+    originalCalls.includes("notify") && originalCalls.includes("setStatus"),
+    JSON.stringify(originalCalls),
+  );
+}
+
 (async () => {
   try {
     await testRunningIdleShareResponseId();
@@ -484,6 +605,10 @@ async function testRunningIdleShareResponseId() {
     await testAgentLoopInterruptFallbackNoIsIdleBeforeTurnStart();
     await testMidTurnInterruptFallbackNoIsIdle();
     await testAgentStartClearsStaleWindow();
+    await testTuiWrapParksConfirmWithoutCallingOriginal();
+    await testTuiWrapReparksSameElicitationId();
+    await testRpcModeDoesNotWrapUi();
+    await testNotifyAndSetStatusStayUnwrapped();
   } finally {
     for (const h of harnesses) {
       if (h.pi.__omnigentInboxPoller) clearInterval(h.pi.__omnigentInboxPoller);

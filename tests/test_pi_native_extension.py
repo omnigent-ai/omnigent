@@ -9,6 +9,28 @@ from pathlib import Path
 import pytest
 
 
+def test_pi_native_extension_js_unit_suite() -> None:
+    """Run the Node unit suite for the pi-native bridge extension."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension unit tests")
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "omnigent"
+        / "resources"
+        / "pi_native"
+        / "omnigent_pi_native_extension.test.js"
+    )
+    result = subprocess.run(
+        [node, str(script)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + "\n" + result.stderr
+
+
 def test_delivery_cap_drops_followup_without_failed_session_status(
     tmp_path: Path,
 ) -> None:

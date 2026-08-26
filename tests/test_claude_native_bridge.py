@@ -8746,3 +8746,42 @@ async def test_curl_evaluate_policy_command_round_trips(
     output = json.loads(result.stdout)
     assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert output["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+@pytest.mark.asyncio
+async def test_pi_extension_ui_relay_path_proxies_to_session_hook(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The tool relay forwards ``/hook/pi/extension-ui`` to the session hook."""
+
+    class _RecordingClient:
+        def __init__(self) -> None:
+            self.urls: list[str] = []
+            self.payloads: list[object] = []
+
+        async def post(self, url: str, json: dict[str, object] | None = None) -> SimpleNamespace:
+            self.urls.append(url)
+            self.payloads.append(json)
+            raw = b'{"action":"accept"}'
+            return SimpleNamespace(
+                status_code=200,
+                content=raw,
+                headers={"Content-Type": "application/json"},
+            )
+
+    client = _RecordingClient()
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/pi/extension-ui",
+            {
+                "elicitation_id": "elicit_pi_" + "ab" * 16,
+                "request": {"method": "confirm", "title": "Clear?", "message": "Lost."},
+            },
+        )
+        assert json.loads(body) == {"action": "accept"}
+        assert client.urls == ["/v1/sessions/conv_hook_eval/hooks/pi-extension-ui"]
+    finally:
+        relay.close()

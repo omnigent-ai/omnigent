@@ -43,7 +43,11 @@ from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses._scaffold import HarnessApp, TurnContext
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
-from omnigent.server.schemas import CreateResponseRequest
+from omnigent.server.schemas import (
+    CreateResponseRequest,
+    ElicitationRequestParams,
+    ElicitationResult,
+)
 
 _TEST_HARNESS_NAME = "scaffold_fixture"
 _TEST_HARNESS_MODULE = "tests.runtime.harnesses._test_scaffold_harnesses"
@@ -203,6 +207,50 @@ async def test_build_terminal_event_handles_pending_task_cancellation() -> None:
     assert terminal.type == "response.cancelled"
     assert terminal.sequence_number == 3
     assert terminal.response.status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_elicit_emits_resolved_when_cancelled() -> None:
+    """Cancelling ``ctx.elicit`` must still clear the pending card.
+
+    ``asyncio.wait_for`` (Pi extension UI timeout) and turn interrupt both
+    cancel the parked Future. Without ``response.elicitation_resolved`` the
+    session stream keeps the ApprovalCard after the turn continues.
+    """
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    ctx = TurnContext("resp_elicit_cancel", queue, asyncio.Event())
+    params = ElicitationRequestParams(mode="form", message="approve?")
+    task = asyncio.create_task(ctx.elicit("elicit_test_1", params))
+    request = await queue.get()
+    assert request.type == "response.elicitation_request"
+    assert request.elicitation_id == "elicit_test_1"
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    resolved = await queue.get()
+    assert resolved.type == "response.elicitation_resolved"
+    assert resolved.elicitation_id == "elicit_test_1"
+    assert ctx._pending_elicitations == {}
+    assert queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_elicit_emits_resolved_on_verdict() -> None:
+    """A completed elicitation still emits resolved (idempotent duplicate)."""
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    ctx = TurnContext("resp_elicit_accept", queue, asyncio.Event())
+    params = ElicitationRequestParams(mode="form", message="approve?")
+    task = asyncio.create_task(ctx.elicit("elicit_test_1", params))
+    request = await queue.get()
+    assert request.type == "response.elicitation_request"
+    ctx._pending_elicitations["elicit_test_1"].set_result(ElicitationResult(action="accept"))
+    result = await task
+    assert result.action == "accept"
+    resolved = await queue.get()
+    assert resolved.type == "response.elicitation_resolved"
+    assert resolved.elicitation_id == "elicit_test_1"
+    assert ctx._pending_elicitations == {}
+    assert queue.empty()
 
 
 @pytest.mark.asyncio

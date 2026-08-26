@@ -2160,3 +2160,65 @@ async def test_run_turn_installs_the_choice_bridge_only_where_supported() -> Non
         assert installed is expected, type(executor).__name__
         # The yes/no bridge is installed on both — the choice bridge is additive.
         assert getattr(executor, "_elicitation_handler", None) is not None
+
+
+@pytest.mark.asyncio
+async def test_form_elicitation_handler_decline_does_not_cancel_the_turn() -> None:
+    """Pi extension dialogs return the declined verdict without killing the session."""
+    from omnigent.pi_extension_ui import to_elicitation_params
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import ElicitationResult
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _ElicitingTurnContext(ElicitationResult(action="decline"))
+    adapter._current_ctx = ctx  # type: ignore[assignment]
+    params = to_elicitation_params(
+        {"id": "uuid-2", "method": "confirm", "title": "Clear?", "message": "Lost."}
+    )
+    result = await adapter._stable_form_elicitation_handler(params)
+    assert result.action == "decline"
+    assert not ctx.cancelled.was_set
+    assert ctx.seen[0][0] == "elicit_pi_uuid-2"
+
+
+@pytest.mark.asyncio
+async def test_run_turn_installs_the_form_bridge_only_where_supported() -> None:
+    """The form bridge reaches PiExecutor-shaped executors, and only those."""
+    import asyncio
+
+    from omnigent.inner.executor import Executor, ExecutorConfig, Message, ToolSpec, TurnComplete
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    class _FormCapableExecutor(Executor):
+        def __init__(self) -> None:
+            self._form_elicitation_handler = None
+
+        async def run_turn(
+            self,
+            messages: list[Message],
+            tools: list[ToolSpec],
+            system_prompt: str,
+            config: ExecutorConfig | None = None,
+        ):
+            yield TurnComplete(response="ok")
+
+    class _BinaryOnlyExecutor(Executor):
+        async def run_turn(
+            self,
+            messages: list[Message],
+            tools: list[ToolSpec],
+            system_prompt: str,
+            config: ExecutorConfig | None = None,
+        ):
+            yield TurnComplete(response="ok")
+
+    for executor, expected in ((_FormCapableExecutor(), True), (_BinaryOnlyExecutor(), False)):
+        adapter = ExecutorAdapter(executor_factory=lambda e=executor: e)  # type: ignore[misc]
+        ctx = TurnContext(
+            response_id="resp_bridge", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+        )
+        await adapter.run_turn(CreateResponseRequest(model="agent", input="hi"), ctx)
+        installed = getattr(executor, "_form_elicitation_handler", None) is not None
+        assert installed is expected, type(executor).__name__

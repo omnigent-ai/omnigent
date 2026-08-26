@@ -137,6 +137,16 @@ NativePolicyGate: TypeAlias = Callable[  # type: ignore[explicit-any]
     Awaitable[dict[str, Any]] | dict[str, Any],
 ]
 
+# Form elicitation bridge for Pi ``extension_ui_request`` dialogs. Wired by
+# :class:`omnigent.runtime.harnesses._executor_adapter.ExecutorAdapter` to
+# ``ctx.elicit``; returns the web ``ElicitationResult`` (not a bool). Decline
+# must not abort the turn — a permission-gate ``select`` is one blocked tool,
+# not a killed session.
+FormElicitationHandler: TypeAlias = Callable[  # type: ignore[explicit-any]
+    [Any],
+    Awaitable[Any],
+]
+
 
 class _PiProviderConfig(TypedDict):
     baseUrl: str
@@ -1736,6 +1746,7 @@ class PiExecutor(Executor):
         self._extra_args.extend(_resolve_pi_skill_args(skills_filter, bundle_dir))
         # Set by Session._wire_sdk_executor().
         self._tool_executor: ToolExecutor | None = None
+        self._form_elicitation_handler: FormElicitationHandler | None = None
 
         if gateway:
             creds = None
@@ -2501,4 +2512,59 @@ class PiExecutor(Executor):
                         pending_error = str(msg.get("errorMessage", stop))
                 continue
 
+            if event_type == "extension_ui_request":
+                try:
+                    await self._handle_extension_ui_request(event, rpc)
+                except Exception as exc:  # noqa: BLE001 — executor boundary
+                    yield ExecutorError(message=f"Failed to answer Pi extension UI request: {exc}")
+                    return
+                continue
+
             logger.debug("PiExecutor: ignoring event type=%s", event_type)
+
+    async def _handle_extension_ui_request(
+        self,
+        event: dict[str, Any],
+        rpc: _PiRpcSession,
+    ) -> None:
+        """Park a Pi extension dialog on the web UI and write the RPC reply.
+
+        Fire-and-forget chrome methods (``notify``, ``setStatus``, …) are
+        ignored with no stdin response, matching Pi's RPC docs. Dialog
+        methods (``confirm`` / ``select`` / ``input`` / ``editor``) map to
+        an Omnigent elicitation; a missing handler or timeout fails closed
+        (``confirmed: false`` / ``cancelled: true``) so Pi does not hang.
+        Decline does not abort the turn.
+        """
+        from omnigent.pi_extension_ui import (
+            is_dialog_method,
+            is_fire_and_forget_method,
+            timeout_seconds,
+            to_elicitation_params,
+            to_ui_response,
+        )
+
+        method = event.get("method")
+        if is_fire_and_forget_method(method) or not is_dialog_method(method):
+            return
+        try:
+            params = to_elicitation_params(event)
+        except ValueError:
+            logger.debug("PiExecutor: malformed extension_ui_request: %s", event)
+            await rpc.send_command(to_ui_response(event, None))
+            return
+        handler = self._form_elicitation_handler
+        result = None
+        if handler is not None:
+            timeout_s = timeout_seconds(event)
+            try:
+                if timeout_s is not None:
+                    result = await asyncio.wait_for(handler(params), timeout=timeout_s)
+                else:
+                    result = await handler(params)
+            except TimeoutError:
+                result = None
+            except Exception:
+                logger.exception("PiExecutor: form elicitation handler failed")
+                result = None
+        await rpc.send_command(to_ui_response(event, result))

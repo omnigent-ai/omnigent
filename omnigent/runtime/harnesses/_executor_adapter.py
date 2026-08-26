@@ -44,6 +44,7 @@ from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.server.schemas import (
     CreateResponseRequest,
     ElicitationRequestParams,
+    ElicitationResult,
     InjectionConsumedEvent,
     OutputItemDoneEvent,
     OutputTextDeltaEvent,
@@ -179,6 +180,15 @@ class ExecutorAdapter(HarnessApp):
         ):
             executor._elicitation_choice_handler = (  # type: ignore[attr-defined]
                 self._stable_elicitation_choice_handler
+            )
+        # PiExecutor parks ``ctx.ui`` dialogs as form elicitations. Decline must
+        # not abort the turn (unlike the binary permission card).
+        if (
+            hasattr(executor, "_form_elicitation_handler")
+            and executor._form_elicitation_handler is None  # type: ignore[attr-defined]
+        ):
+            executor._form_elicitation_handler = (  # type: ignore[attr-defined]
+                self._stable_form_elicitation_handler
             )
         if getattr(executor, "_policy_evaluator", None) is None:
             executor._policy_evaluator = self._stable_policy_evaluator  # type: ignore[attr-defined]
@@ -636,6 +646,32 @@ class ExecutorAdapter(HarnessApp):
             return None
         answer = (result.content or {}).get("answer")
         return answer if isinstance(answer, str) else None
+
+    async def _stable_form_elicitation_handler(
+        self,
+        params: ElicitationRequestParams,
+    ) -> ElicitationResult:
+        """Stable bridge for Pi extension UI dialogs (``ctx.ui.*``).
+
+        Unlike :meth:`_stable_elicitation_handler`, decline / cancel does
+        **not** set ``ctx.cancelled``. A Pi permission-gate ``select`` that
+        returns No is one blocked tool call, not a killed session.
+        """
+        ctx = self._current_ctx
+        if ctx is None:
+            _logger.error(
+                "form elicitation callback fired with no active turn context; cancelling"
+            )
+            return ElicitationResult(action="cancel")
+
+        extra = params.model_extra or {}
+        raw = extra.get("pi_extension_ui")
+        req_id = raw.get("id") if isinstance(raw, dict) else None
+        if isinstance(req_id, str) and req_id:
+            elicitation_id = f"elicit_pi_{req_id}"
+        else:
+            elicitation_id = f"elicit_pi_{secrets.token_hex(16)}"
+        return await ctx.elicit(elicitation_id, params)
 
     async def _stable_policy_evaluator(
         self,

@@ -3884,3 +3884,235 @@ async def test_antigravity_elicitation_hook_rejects_non_dict_body(
         json=["not", "a", "dict"],
     )
     assert resp.status_code == 400, resp.text
+
+
+async def test_pi_extension_ui_hook_confirm_round_trip(
+    client: httpx.AsyncClient,
+) -> None:
+    """pi-native ``ctx.ui.confirm`` → web ApprovalCard → accept → verdict."""
+    agent = await create_test_agent(client, "test-pi-extension-ui-allow")
+    session_id = await _create_session(client, agent["id"])
+    elicitation_id = f"elicit_pi_{'ab' * 16}"
+    payload = {
+        "elicitation_id": elicitation_id,
+        "request": {
+            "id": "uuid-2",
+            "method": "confirm",
+            "title": "Clear session?",
+            "message": "All messages will be lost.",
+        },
+    }
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/pi-extension-ui",
+            json=payload,
+        )
+    )
+
+    event = await drain_task
+    assert event["elicitation_id"] == elicitation_id
+    params = event["params"]
+    assert params["phase"] == "pi_extension_ui"
+    assert params["policy_name"] == "pi_native_extension_ui"
+    assert "Clear session?" in params["message"]
+    assert "ask_user_question" not in params
+
+    verdict = await _post_approval(client, session_id, elicitation_id, "accept")
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["action"] == "accept"
+
+
+async def test_pi_extension_ui_hook_select_stamps_ask_user_question(
+    client: httpx.AsyncClient,
+) -> None:
+    """A Pi ``select`` becomes the existing AskUserQuestion form extra."""
+    agent = await create_test_agent(client, "test-pi-extension-ui-select")
+    session_id = await _create_session(client, agent["id"])
+    elicitation_id = f"elicit_pi_{'cd' * 16}"
+    payload = {
+        "elicitation_id": elicitation_id,
+        "request": {
+            "id": "uuid-1",
+            "method": "select",
+            "title": "Allow dangerous command?",
+            "options": ["Allow", "Block"],
+        },
+    }
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/pi-extension-ui",
+            json=payload,
+        )
+    )
+
+    event = await drain_task
+    questions = event["params"]["ask_user_question"]["questions"]
+    assert questions[0]["id"] == "0"
+    assert questions[0]["isOther"] is False
+    assert [opt["label"] for opt in questions[0]["options"]] == ["Allow", "Block"]
+
+    verdict = await _post_approval(
+        client, session_id, elicitation_id, "accept", content={"0": "Allow"}
+    )
+    assert verdict.status_code == 202, verdict.text
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["action"] == "accept"
+    assert body["content"]["0"] == "Allow"
+
+
+async def test_pi_extension_ui_hook_repark_keeps_one_pending_card(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A severed Pi long-poll re-attaches to the same pending elicitation."""
+    from omnigent.runtime import pending_elicitations
+
+    disconnect_calls = 0
+
+    async def _disconnect_first_call_only(_request: Any) -> None:
+        nonlocal disconnect_calls
+        disconnect_calls += 1
+        if disconnect_calls == 1:
+            await asyncio.sleep(0.01)
+            return
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        sessions_route,
+        "_poll_request_disconnect",
+        _disconnect_first_call_only,
+    )
+    monkeypatch.setattr(
+        sessions_route,
+        "_HARNESS_ELICITATION_REPARK_GRACE_S",
+        1.0,
+    )
+    pending_elicitations.reset_for_tests()
+    agent = await create_test_agent(client, "test-pi-extension-ui-repark")
+    session_id = await _create_session(client, agent["id"])
+    elicitation_id = f"elicit_pi_{'12' * 16}"
+    payload = {
+        "elicitation_id": elicitation_id,
+        "request": {
+            "method": "confirm",
+            "title": "Continue?",
+            "message": "Wait for a web answer.",
+        },
+    }
+
+    first = await client.post(
+        f"/v1/sessions/{session_id}/hooks/pi-extension-ui",
+        json=payload,
+    )
+    assert first.status_code == 200, first.text
+    assert first.content == b""
+    deferred_tasks = set(sessions_route._deferred_elicitation_clear_tasks)
+    assert len(deferred_tasks) == 1
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/pi-extension-ui",
+            json=payload,
+        )
+    )
+    event = await drain_task
+    assert event["elicitation_id"] == elicitation_id
+
+    for task in deferred_tasks:
+        await asyncio.wait_for(task, timeout=5.0)
+    assert pending_elicitations.count_for(session_id) == 1
+
+    verdict = await _post_approval(client, session_id, elicitation_id, "accept")
+    assert verdict.status_code == 202, verdict.text
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["action"] == "accept"
+    assert pending_elicitations.count_for(session_id) == 0
+    pending_elicitations.reset_for_tests()
+
+
+async def test_pi_extension_ui_hook_decline_does_not_interrupt(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Decline returns the cancelled verdict without forwarding interrupt."""
+    forwarded: list[dict[str, object]] = []
+
+    async def _capture_forward(
+        session_id: str,
+        router: object,
+        payload: dict[str, object],
+    ) -> None:
+        del session_id, router
+        forwarded.append(payload)
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.routes_hooks._forward_session_change_to_runner",
+        _capture_forward,
+    )
+
+    agent = await create_test_agent(client, "test-pi-extension-ui-decline")
+    session_id = await _create_session(client, agent["id"])
+    elicitation_id = f"elicit_pi_{'ef' * 16}"
+    payload = {
+        "elicitation_id": elicitation_id,
+        "request": {
+            "id": "uuid-2",
+            "method": "confirm",
+            "title": "Clear session?",
+            "message": "Lost.",
+        },
+    }
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/pi-extension-ui",
+            json=payload,
+        )
+    )
+    event = await drain_task
+    verdict = await _post_approval(client, session_id, event["elicitation_id"], "decline")
+    assert verdict.status_code == 202, verdict.text
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["action"] == "decline"
+    assert forwarded == []
+
+
+async def test_pi_extension_ui_hook_malformed_body_400(
+    client: httpx.AsyncClient,
+) -> None:
+    """Missing elicitation_id / request / unknown method are 400s."""
+    agent = await create_test_agent(client, "test-pi-extension-ui-400")
+    session_id = await _create_session(client, agent["id"])
+    url = f"/v1/sessions/{session_id}/hooks/pi-extension-ui"
+
+    missing_id = await client.post(url, json={"request": {"method": "confirm", "title": "x"}})
+    assert missing_id.status_code == 400, missing_id.text
+
+    missing_request = await client.post(url, json={"elicitation_id": "elicit_pi_x"})
+    assert missing_request.status_code == 400, missing_request.text
+
+    unknown = await client.post(
+        url,
+        json={
+            "elicitation_id": "elicit_pi_x",
+            "request": {"method": "notify", "message": "hi"},
+        },
+    )
+    assert unknown.status_code == 400, unknown.text

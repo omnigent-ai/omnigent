@@ -60,6 +60,7 @@ from omnigent.server.schemas import (
     CreateResponseRequest,
     ElicitationRequestEvent,
     ElicitationRequestParams,
+    ElicitationResolvedEvent,
     ElicitationResult,
     FailedEvent,
     HarnessStreamEvent,
@@ -540,6 +541,11 @@ class TurnContext:
         resolves the parked Future when upstream sends the reply.
         See §Elicitation in the design doc.
 
+        On every exit path (verdict, timeout, cancellation) emit
+        ``response.elicitation_resolved`` so the session stream can
+        drop the pending card. Idempotent when approval dispatch
+        already published the same id.
+
         :param elicitation_id: Unique correlation id for this
             elicitation, e.g. ``"elicit_abc123"``. Must appear
             in the URL of the upstream reply.
@@ -562,6 +568,12 @@ class TurnContext:
             return await future
         finally:
             self._pending_elicitations.pop(elicitation_id, None)
+            self.emit(
+                ElicitationResolvedEvent(
+                    type="response.elicitation_resolved",
+                    elicitation_id=elicitation_id,
+                )
+            )
 
     async def next_injection(self, timeout: float | None = None) -> CreateResponseRequest | None:
         """
