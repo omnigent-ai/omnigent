@@ -2417,11 +2417,11 @@ export function NewChatLandingScreen() {
   // the page — including a `?project=` switch that leaves it mounted, which the
   // textarea's `autoFocus` (mount-only) can't see.
   useEffect(() => {
-    textareaRef.current?.focus();
-  }, [projectParam]);
+    if (!isMobileViewport) textareaRef.current?.focus();
+  }, [projectParam, isMobileViewport]);
   // …and again when an overlay hands focus back after navigating here (see
   // composerFocus: its focus trap outlives the navigation).
-  useComposerFocusRequests(textareaRef);
+  useComposerFocusRequests(textareaRef, !isMobileViewport);
   // Permission mode for Claude Code (claude --permission-mode). Only
   // meaningful for the claude-native wrapper; ignored otherwise. Lives in
   // the footer tray's Advanced settings menu.
