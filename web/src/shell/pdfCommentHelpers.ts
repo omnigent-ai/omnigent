@@ -127,7 +127,7 @@ export function highlightRectsForPage(
     out.push({ key: c.id, rects: anchor.rects, active, comment: c });
   }
 
-  if (activeSelection) {
+  if (activeSelection && activeSelection.comment_id == null) {
     const pending = decodePdfAnchor(activeSelection.anchor_content);
     const alreadySaved = comments.some(
       (c) => c.status === "draft" && commentsMatchOffsets(activeSelection, c),

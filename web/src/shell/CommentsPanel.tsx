@@ -123,8 +123,8 @@ export function CommentsPanel({
     return () => cancelAnimationFrame(id);
   }, [activeSelectionStart, activeSelectionEnd, activeCommentId, comments]);
 
-  // Route a new selection, or a selected comment whose status changed, once.
-  // Repeated query refreshes must not override a later manual tab switch.
+  // activeSelection is FileViewer state and keeps its identity across query
+  // refreshes; this guard lets a later manual tab switch stick.
   useEffect(() => {
     if (!activeSelection) {
       autoRouteRef.current = null;

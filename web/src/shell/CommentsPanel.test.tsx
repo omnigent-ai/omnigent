@@ -523,6 +523,7 @@ describe("CommentsPanel active-comment reveal", () => {
   it("follows a selected comment into Addressed once without locking the tabs", async () => {
     Element.prototype.scrollIntoView = vi.fn();
 
+    // Matching ids model one comment changing status; only one tab renders at a time.
     const open = makeComment("c2", "draft", { start_index: 40, end_index: 60 });
     const addressed = makeComment("c2", "addressed", { start_index: 40, end_index: 60 });
     const activeSelection: ActiveSelection = {

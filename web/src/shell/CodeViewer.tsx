@@ -390,10 +390,11 @@ export function CodeViewer({
   pendingBodyRef,
 }: CodeViewerProps) {
   const canEdit = useCanEdit(conversationId);
-  const previewComments = [
-    ...comments,
-    ...addressedComments.filter((c) => c.id === activeSelection?.comment_id),
-  ];
+  const activeCommentId = activeSelection?.comment_id;
+  const previewComments = useMemo(
+    () => [...comments, ...addressedComments.filter((c) => c.id === activeCommentId)],
+    [comments, addressedComments, activeCommentId],
+  );
 
   const [tokenLines, setTokenLines] = useState<ThemedToken[][] | null>(null);
 

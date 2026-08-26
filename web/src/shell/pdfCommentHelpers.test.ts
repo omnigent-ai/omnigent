@@ -95,6 +95,24 @@ describe("highlightRectsForPage", () => {
     expect(active[0]!.active).toBe(true);
   });
 
+  it("does not add a pending overlay for a selected addressed comment", () => {
+    const anchor = encodePdfAnchor(1, [{ x: 0.1, y: 0.2, w: 0.3, h: 0.04 }], "Hello");
+    const addressed = makeComment({
+      status: "addressed",
+      start_index: anchor.start_index,
+      end_index: anchor.end_index,
+      anchor_content: anchor.anchor_content,
+    });
+
+    const highlights = highlightRectsForPage(1, [addressed], {
+      ...anchor,
+      comment_id: addressed.id,
+    });
+
+    expect(highlights).toHaveLength(1);
+    expect(highlights[0]).toMatchObject({ key: addressed.id, active: true, comment: addressed });
+  });
+
   it("keeps an addressed anchor clickable while a same-range draft stays pending", () => {
     const anchor = encodePdfAnchor(1, [{ x: 0.1, y: 0.2, w: 0.3, h: 0.04 }], "Hello");
     const addressed = makeComment({

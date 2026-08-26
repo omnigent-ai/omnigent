@@ -146,6 +146,8 @@ def test_html_preview_add_comment(
 
     # CommentsPanel opens alongside the preview.
     expect(file_viewer.locator("span.font-semibold", has_text="Comments")).to_be_visible()
+    selection_text = preview.locator("body").evaluate("() => window.getSelection().toString()")
+    assert selection_text == _ANCHOR_SENTENCE, "fresh draft selection should remain visible"
 
     comment_body = "This sentence needs a citation."
     comment_textarea = file_viewer.locator("textarea[placeholder='Add a comment…']")
