@@ -1090,6 +1090,152 @@ def test_tool_call_complete_suppressed_for_dispatched_executor() -> None:
     assert ctx.emitted == []
 
 
+def _fc_items(ctx: _RecordingTurnContext) -> list[dict[str, Any]]:
+    """The ``item`` dicts of the OutputItemDoneEvents ``ctx`` recorded."""
+    return [e.item for e in ctx.emitted if getattr(e, "item", None) is not None]
+
+
+def test_observed_tool_call_reemits_a_completed_function_call() -> None:
+    """An observed tool call's completion re-emits a durable ``completed`` card.
+
+    **What breaks if this fails**: the inline ToolCallRequest emits status
+    ``"in_progress"``, which the turn-persist filter drops — so the card renders
+    live but disappears on refresh (the reported bug for generic-ACP harnesses).
+    On completion the adapter re-emits the same call as a ``completed``
+    function_call (which persists), then the function_call_output. Same call_id →
+    the web dedupes the live in_progress render and this one into a single card.
+    """
+    from omnigent.inner.executor import ToolCallComplete, ToolCallRequest, ToolCallStatus
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext(response_id="resp_obs")
+    adapter._current_ctx = ctx  # type: ignore[assignment]
+
+    adapter._translate_event(  # type: ignore[arg-type]
+        ToolCallRequest(name="Ran command", args={"command": "ls"}, metadata={"call_id": "c1"}),
+        ctx,
+    )
+    adapter._translate_event(  # type: ignore[arg-type]
+        ToolCallComplete(
+            name="Ran command",
+            status=ToolCallStatus.SUCCESS,
+            result="a.txt",
+            metadata={"call_id": "c1"},
+        ),
+        ctx,
+    )
+
+    items = _fc_items(ctx)
+    assert [(i["type"], i.get("status")) for i in items] == [
+        ("function_call", "in_progress"),  # live-only; dropped by the persist filter
+        ("function_call", "completed"),  # durable — survives reload
+        ("function_call_output", None),
+    ]
+    completed = items[1]
+    assert completed["call_id"] == "c1", "same call_id → dedupes with the live card"
+    assert completed["name"] == "Ran command"
+    assert completed["arguments"] == '{"command": "ls"}', "args carried from the request"
+
+
+def test_uncached_completion_reemits_no_function_call() -> None:
+    """A completion with no cached in_progress request re-emits no card.
+
+    The re-emission is gated on the request having been cached (an in_progress
+    observation). A ToolCallComplete for a call the adapter never saw start emits
+    only the function_call_output — never a synthesized completed card. That gate
+    is what keeps the re-emission from firing for a call whose durable completed
+    form some other path already produced (see the observed_call_completed test).
+    """
+    from omnigent.inner.executor import ToolCallComplete, ToolCallStatus
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext(response_id="resp_obs")
+    adapter._current_ctx = ctx  # type: ignore[assignment]
+
+    adapter._translate_event(  # type: ignore[arg-type]
+        ToolCallComplete(
+            name="grep", status=ToolCallStatus.SUCCESS, result="hit", metadata={"call_id": "c9"}
+        ),
+        ctx,
+    )
+    items = _fc_items(ctx)
+    assert [(i["type"], i.get("status")) for i in items] == [
+        ("function_call_output", None),
+    ]
+
+
+def test_observed_call_completed_request_is_not_reemitted_at_completion() -> None:
+    """An executor that self-emits a durable completed card is not doubled.
+
+    Codex built-ins re-emit their own completed function_call at completion (via
+    ``observed_call_completed`` on the ToolCallRequest) because the relay persists
+    only completed calls. That request is emitted completed in one shot AND drops
+    the cache entry, so the ToolCallComplete that follows must NOT re-emit a second
+    completed card. Regression guard: without the cache pop, this observed call
+    would render (and persist) two identical completed cards.
+    """
+    from omnigent.inner.executor import ToolCallComplete, ToolCallRequest, ToolCallStatus
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext(response_id="resp_obs")
+    adapter._current_ctx = ctx  # type: ignore[assignment]
+
+    # Live start (in_progress), then codex's own completed re-emit + the completion.
+    adapter._translate_event(  # type: ignore[arg-type]
+        ToolCallRequest(name="shell", args={"command": "ls"}, metadata={"call_id": "cb"}),
+        ctx,
+    )
+    adapter._translate_event(  # type: ignore[arg-type]
+        ToolCallRequest(
+            name="shell",
+            args={"command": "ls"},
+            metadata={"call_id": "cb", "observed_call_completed": True},
+        ),
+        ctx,
+    )
+    adapter._translate_event(  # type: ignore[arg-type]
+        ToolCallComplete(
+            name="shell", status=ToolCallStatus.SUCCESS, result="a.txt", metadata={"call_id": "cb"}
+        ),
+        ctx,
+    )
+
+    items = _fc_items(ctx)
+    assert [(i["type"], i.get("status")) for i in items] == [
+        ("function_call", "in_progress"),  # live-only; dropped by the persist filter
+        ("function_call", "completed"),  # the executor's own durable re-emit
+        ("function_call_output", None),  # completion emits only the output — no 2nd card
+    ]
+    assert sum(i["type"] == "function_call" and i.get("status") == "completed" for i in items) == 1
+
+
+def test_dispatched_call_does_not_reemit_a_completed_function_call() -> None:
+    """A dispatched tool's completion stays suppressed — no duplicate card.
+
+    Dispatched (runner-side) tools already persist their own completed
+    function_call via dispatch_tool, so the ToolCallComplete short-circuits before
+    the re-emission. Re-emitting here would double the card.
+    """
+    from omnigent.inner.executor import ToolCallComplete, ToolCallStatus
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext()
+    adapter._current_ctx = ctx  # type: ignore[assignment]
+    adapter._dispatched_call_ids.add("d1")
+
+    adapter._translate_event(  # type: ignore[arg-type]
+        ToolCallComplete(
+            name="x", status=ToolCallStatus.SUCCESS, result="out", metadata={"call_id": "d1"}
+        ),
+        ctx,
+    )
+    assert ctx.emitted == []
+
+
 def test_translate_event_mcp_request_queues_tool_use_id_for_dispatch() -> None:
     """
     A ``ToolCallRequest`` with an MCP-prefixed name pushes the
@@ -1212,9 +1358,12 @@ def test_internally_executed_tool_bypasses_dispatch_correlation_queue() -> None:
     )
 
     assert list(adapter._pending_mcp_call_ids) == []
-    assert [event.item["type"] for event in ctx.emitted] == [
-        "function_call",
-        "function_call_output",
+    # The live in_progress card is cached and re-emitted completed at completion so
+    # it survives reload; the queue bypass asserted above is orthogonal to that.
+    assert [(e.item["type"], e.item.get("status")) for e in ctx.emitted] == [
+        ("function_call", "in_progress"),
+        ("function_call", "completed"),
+        ("function_call_output", None),
     ]
 
 
