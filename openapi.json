@@ -7277,6 +7277,17 @@
             "description": "New archived state. `True` archives (hides the session from the default sidebar listing), `False` unarchives, `None` leaves unchanged. Owner-only (unlike `title`, which needs only edit access).",
             "title": "Archived"
           },
+          "codex_approval_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Codex Approval Mode"
+          },
           "collaboration_mode": {
             "anyOf": [
               {

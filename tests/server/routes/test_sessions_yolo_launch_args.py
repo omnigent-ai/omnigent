@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import pytest
 
+from omnigent.entities import Conversation
+from omnigent.server.routes._sessions.helpers import _inherited_permission_launch_args
 from omnigent.server.routes.sessions import _derive_terminal_launch_args_from_spec
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 
@@ -43,6 +45,58 @@ def _spec_with_config(config: dict[str, object]) -> AgentSpec:
         name="impl",
         executor=ExecutorSpec(type="omnigent", config=config),
     )
+
+
+def _parent(
+    *, wrapper: str, args: list[str] | None = None, labels: dict[str, str] | None = None
+) -> Conversation:
+    return Conversation(
+        id="conv_parent",
+        root_conversation_id="conv_parent",
+        created_at=1,
+        updated_at=1,
+        labels={"omnigent.wrapper": wrapper, **(labels or {})},
+        terminal_launch_args=args,
+    )
+
+
+def test_subagent_inherits_same_harness_permission_mode() -> None:
+    inherited, args = _inherited_permission_launch_args(
+        _parent(wrapper="cursor-native-ui", args=["--mode", "plan"]),
+        "cursor-native",
+    )
+    assert inherited is True
+    assert args == ["--mode", "plan"]
+
+
+def test_subagent_inherits_explicit_default_over_spec_bypass() -> None:
+    inherited, args = _inherited_permission_launch_args(
+        _parent(wrapper="codex-native-ui"),
+        "codex-native",
+    )
+    assert inherited is True
+    assert args is None
+
+
+def test_subagent_inherits_codex_bypass_label() -> None:
+    inherited, args = _inherited_permission_launch_args(
+        _parent(
+            wrapper="codex-native-ui",
+            labels={"omnigent.codex_native.bypass_sandbox": "1"},
+        ),
+        "codex-native",
+    )
+    assert inherited is True
+    assert args == ["--dangerously-bypass-approvals-and-sandbox"]
+
+
+def test_subagent_does_not_translate_permissions_across_harnesses() -> None:
+    inherited, args = _inherited_permission_launch_args(
+        _parent(wrapper="claude-code-native-ui", args=["--permission-mode", "plan"]),
+        "cursor-native",
+    )
+    assert inherited is False
+    assert args is None
 
 
 def test_claude_native_permission_mode_translates_to_flag() -> None:

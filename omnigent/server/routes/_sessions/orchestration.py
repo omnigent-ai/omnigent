@@ -224,6 +224,7 @@ from omnigent.server.routes._sessions.helpers import (
     _forward_session_change_to_runner,
     _get_runner_client,
     _handle_advise_models_mcp,
+    _inherited_permission_launch_args,
     _invalidate_runner_backed_snapshot_state,
     _is_codex_native_subagent,
     _is_kiro_native_session,
@@ -8171,9 +8172,18 @@ async def _create_session_from_existing_agent(
             agent_cache=agent_cache,
         )
         try:
-            validated_launch_args = (
-                _derive_terminal_launch_args_from_spec(sub_spec) if sub_spec is not None else None
-            )
+            inherited = False
+            validated_launch_args = None
+            if sub_spec is not None and body.parent_session_id is not None:
+                parent_for_permissions = conversation_store.get_conversation(
+                    body.parent_session_id
+                )
+                if parent_for_permissions is not None:
+                    inherited, validated_launch_args = _inherited_permission_launch_args(
+                        parent_for_permissions, _spec_harness(sub_spec)
+                    )
+            if not inherited and sub_spec is not None:
+                validated_launch_args = _derive_terminal_launch_args_from_spec(sub_spec)
         except ValueError as exc:
             raise OmnigentError(
                 f"invalid terminal_launch_args in sub-agent spec: {exc}",

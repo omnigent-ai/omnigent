@@ -279,6 +279,7 @@ from omnigent.spec.types import (
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
+    CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     PINNED_LABEL_KEY,
     ConversationNotFoundError,
     NameAlreadyExistsError,
@@ -8344,6 +8345,54 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
     return None
 
 
+def _inherited_permission_launch_args(
+    parent: Conversation, child_harness: str
+) -> tuple[bool, list[str] | None]:
+    """Return the parent's effective permission args for a same-harness child.
+
+    The boolean distinguishes an inherited default (no args) from a harness
+    mismatch, so a parent's default can override a sub-agent spec's own mode.
+    """
+    parent_agent = _native_coding_agent_for_session(parent)
+    if parent_agent is None or parent_agent.harness != child_harness:
+        return False, None
+
+    args = list(parent.terminal_launch_args or [])
+    if child_harness == _CLAUDE_NATIVE_HARNESS:
+        mode = parent.labels.get(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
+        if mode:
+            return True, _validate_terminal_launch_args(["--permission-mode", mode])
+        for index, arg in enumerate(args[:-1]):
+            if arg == "--permission-mode":
+                return True, _validate_terminal_launch_args(args[index : index + 2])
+        return True, None
+    if child_harness == _CODEX_NATIVE_HARNESS:
+        if parent.labels.get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == "1":
+            return True, ["--dangerously-bypass-approvals-and-sandbox"]
+        permission_args: list[str] = []
+        index = 0
+        while index < len(args):
+            arg = args[index]
+            if arg == "--dangerously-bypass-approvals-and-sandbox":
+                permission_args.append(arg)
+            elif arg in ("--sandbox", "-s", "--ask-for-approval", "-a") and index + 1 < len(args):
+                permission_args.extend(args[index : index + 2])
+                index += 1
+            index += 1
+        return True, _validate_terminal_launch_args(permission_args) or None
+    if child_harness == _CURSOR_NATIVE_HARNESS:
+        for index, arg in enumerate(args):
+            if arg in ("--yolo", "--auto-review"):
+                return True, [arg]
+            if arg == "--mode" and index + 1 < len(args):
+                return True, _validate_terminal_launch_args(args[index : index + 2])
+        return True, None
+    if child_harness == _ANTIGRAVITY_NATIVE_HARNESS:
+        inherited = [arg for arg in args if arg == "--dangerously-skip-permissions"]
+        return True, inherited or None
+    return False, None
+
+
 def _native_subagent_wrapper_labels_from_spec(sub_spec: AgentSpec) -> dict[str, str]:
     """
     Resolve terminal-first wrapper labels from an already-loaded sub-spec.
@@ -9772,6 +9821,7 @@ __all__ = [
     "_mcp_input_required_response",
     "_mcp_ok_response",
     "_mcp_tool_result",
+    "_merge_codex_permission_launch_args",
     "_merge_pending_file_blocks",
     "_message_text",
     "_model_options_from_wire",

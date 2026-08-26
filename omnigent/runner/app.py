@@ -7354,6 +7354,37 @@ def create_runner_app(
                 )
             return Response(status_code=204)
 
+        if body_type == "codex_approval_mode_change":
+            if _session_harness_name(conversation_id) != "codex-native":
+                return Response(status_code=204)
+            mode = body.get("mode") if isinstance(body, dict) else None
+            if not isinstance(mode, str):
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "invalid_input", "detail": "Codex mode must be a string"},
+                )
+            presets: dict[str, _JsonObject] = {
+                "default": {
+                    "approvalPolicy": "on-request",
+                    "sandbox": "workspace-write",
+                },
+                "full-access": {
+                    "approvalPolicy": "never",
+                    "sandbox": "danger-full-access",
+                },
+                "read-only": {
+                    "approvalPolicy": "on-request",
+                    "sandbox": "read-only",
+                },
+            }
+            settings = presets.get(mode)
+            if settings is None:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "invalid_input", "detail": "Unknown Codex approval mode"},
+                )
+            return await _handle_codex_native_settings_update(conversation_id, settings)
+
         codex_goal_response = await codex_goal_runner.handle_event(
             conversation_id,
             body_type,

@@ -81,6 +81,7 @@ from omnigent.session_import.models import (
 from omnigent.stores.conversation_store import (
     _FORK_ONLY_DROPPED_LABEL_KEYS,
     _INSTANCE_SCOPED_LABEL_KEYS,
+    CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     FORK_CARRY_HISTORY_LABEL_KEY,
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
@@ -3752,6 +3753,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                 if key not in (_INSTANCE_SCOPED_LABEL_KEYS | _FORK_ONLY_DROPPED_LABEL_KEYS)
                 and not key.startswith(f"{PINNED_LABEL_KEY}.")
             }
+            if not copy_terminal_launch_args:
+                fork_labels.pop(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY, None)
+                fork_labels.pop("omnigent.claude_native.permission_mode", None)
             source_workspace = source_meta_ref.workspace if source_meta_ref else None
             source_ext_session = source_meta_ref.external_session_id if source_meta_ref else None
             # ``terminal_launch_args`` are CLI-specific launch flags. A fork
@@ -3765,6 +3769,25 @@ class SqlAlchemyConversationStore(ConversationStore):
                 if source_meta_ref and copy_terminal_launch_args
                 else None
             )
+            # Claude's live mode switch is stored as a label; make it the
+            # fork's launch mode instead of replaying stale create-time args.
+            live_permission_mode = fork_labels.get(
+                "omnigent.claude_native.permission_mode"
+            )
+            if live_permission_mode and copy_terminal_launch_args:
+                launch_args = json.loads(source_terminal_args) if source_terminal_args else []
+                filtered: list[str] = []
+                skip_next = False
+                for launch_arg in launch_args:
+                    if skip_next:
+                        skip_next = False
+                        continue
+                    if launch_arg == "--permission-mode":
+                        skip_next = True
+                        continue
+                    filtered.append(launch_arg)
+                filtered.extend(["--permission-mode", live_permission_mode])
+                source_terminal_args = json.dumps(filtered)
             if source_workspace is not None:
                 fork_labels[FORK_SOURCE_LABEL_KEY] = source_conversation_id
             # Carry the source's native session id as a one-shot fork
@@ -3869,6 +3892,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         now = now_epoch()
         drop_keys = (
             set(_INSTANCE_SCOPED_LABEL_KEYS)
+            | {CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY}
             | {FORK_SOURCE_LABEL_KEY, FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY}
             | {UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY}
             # Always drop the previous-builtin pointer, then re-stamp below

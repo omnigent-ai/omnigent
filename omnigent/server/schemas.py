@@ -2187,6 +2187,7 @@ class UpdateSessionRequest(BaseModel):
     model_override: str | None = None
     collaboration_mode: str | None = None
     permission_mode: str | None = None
+    codex_approval_mode: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
     external_session_id: str | None = None

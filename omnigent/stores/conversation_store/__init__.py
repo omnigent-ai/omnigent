@@ -153,20 +153,12 @@ def pinned_label_key(user_id: str | None) -> str:
 #     harness modules' ``*_BRIDGE_ID_LABEL_KEY`` constants; a store test
 #     cross-checks them so a rename in those modules fails loudly here.
 #
-#   * Per-context safety opt-in — the DANGEROUS codex full-bypass directive
-#     (:data:`CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY`). Letting it ride into a
-#     fork (a new session + workspace) or survive an agent switch would
-#     silently re-arm ``--dangerously-bypass-approvals-and-sandbox`` with no
-#     typed re-confirmation and no banner, violating the "impossible to
-#     enable accidentally" contract (#657). Dropping it forces each session
-#     that runs bypass to make its own explicit opt-in.
 _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
     {
         "omnigent.claude_native.bridge_id",
         "omnigent.codex_native.bridge_id",
         "omnigent.last_context_tokens",
         "omnigent.last_context_window",
-        CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     }
 )
 

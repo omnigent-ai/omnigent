@@ -100,6 +100,7 @@ from omnigent.server.routes._sessions.common import (
     _CLAUDE_NATIVE_UI_LABEL_VALUE,
     _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
     _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE,
+    _CODEX_NATIVE_APPROVAL_MODES,
     _CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY,
     _CODEX_NATIVE_COLLABORATION_MODES,
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
@@ -121,6 +122,7 @@ from omnigent.server.routes._sessions.helpers import (
     _forward_session_change_to_runner,
     _get_runner_client,
     _invalidate_runner_backed_snapshot_state,
+    _merge_codex_permission_launch_args,
     _multipart_missing_detail,
     _notify_runner_of_bundled_child,
     _parse_session_create_metadata,
@@ -1686,6 +1688,28 @@ def register_core_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
             requested_claude_permission_mode = body.permission_mode
+        requested_codex_approval_mode: str | None = None
+        conv_for_codex_approval: Conversation | None = None
+        if "codex_approval_mode" in body.model_fields_set:
+            if body.codex_approval_mode not in _CODEX_NATIVE_APPROVAL_MODES:
+                raise OmnigentError(
+                    f"codex_approval_mode must be one of {sorted(_CODEX_NATIVE_APPROVAL_MODES)}",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            conv_for_codex_approval = await asyncio.to_thread(
+                conversation_store.get_conversation, session_id
+            )
+            if conv_for_codex_approval is None:
+                raise _session_not_found()
+            if (
+                conv_for_codex_approval.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+                != _CODEX_NATIVE_WRAPPER_LABEL_VALUE
+            ):
+                raise OmnigentError(
+                    "codex_approval_mode is only supported for codex-native sessions",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            requested_codex_approval_mode = body.codex_approval_mode
         labels_to_set = dict(body.labels or {})
         # Pins are per-user. The client writes the canonical ``omnigent.pinned``
         # key; rewrite it to the caller's per-user key so one user's pin doesn't
@@ -1982,6 +2006,48 @@ def register_core_routes(
                     _mode_result,
                 )
             )
+        if requested_codex_approval_mode is not None and live_forward:
+            _codex_approval_result = await _forward_session_change_to_runner(
+                session_id,
+                runner_router,
+                {
+                    "type": "codex_approval_mode_change",
+                    "mode": requested_codex_approval_mode,
+                },
+            )
+            if _codex_approval_result is None or _codex_approval_result.status_code >= 400:
+                detail = (
+                    _codex_approval_result.body
+                    if _codex_approval_result is not None
+                    else "Codex runner is unavailable."
+                )
+                raise OmnigentError(detail, code=ErrorCode.RUNNER_UNAVAILABLE)
+            preset_args = {
+                "default": [],
+                "full-access": [
+                    "--sandbox",
+                    "danger-full-access",
+                    "--ask-for-approval",
+                    "never",
+                ],
+                "read-only": [
+                    "--sandbox",
+                    "read-only",
+                    "--ask-for-approval",
+                    "on-request",
+                ],
+            }[requested_codex_approval_mode]
+            assert conv_for_codex_approval is not None
+            terminal_launch_args = _merge_codex_permission_launch_args(
+                conv_for_codex_approval.terminal_launch_args, preset_args
+            )
+            updated = await asyncio.to_thread(
+                conversation_store.update_conversation,
+                session_id,
+                terminal_launch_args=terminal_launch_args,
+            )
+            if updated is None:
+                raise _session_not_found()
         # Some labels are cleared by DELETE, not by upserting an empty value:
         # the project membership (empty = "remove from project") and the pinned
         # flag (empty = "unpin"). Split any empty-valued clear keys out before

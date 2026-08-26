@@ -1822,7 +1822,7 @@ async def _drive_codex_model(base_url: str, session_id: str) -> None:
 
 
 def test_start_session_select_approval_mode(seeded_session: tuple[str, str]) -> None:
-    """Picking a non-default approval preset rides along to the create call.
+    """Picking a non-default permission preset rides along to the create call.
 
     Selecting "Full access" in the Codex config modal and saving must reach
     ``POST /v1/sessions`` as
@@ -1949,13 +1949,25 @@ async def _drive_approval_mode(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
-            # Codex auto-selects (only built-in); its approval presets live in
+            # Codex auto-selects (only built-in); its permission presets live in
             # the gear-icon config modal.
             await _open_entry_config(page, "ag_codex_e2e")
             approval = page.get_by_test_id("new-chat-landing-config-approval")
             await expect(approval).to_be_visible()
+            await expect(approval).to_have_attribute("aria-label", "Permissions")
+            await expect(
+                page.get_by_test_id("new-chat-landing-config-modal").get_by_text(
+                    "Permissions", exact=True
+                )
+            ).to_be_visible()
             await approval.click()
-            for label in ("Default", "Full access", "Read only"):
+            await expect(page.get_by_role("option")).to_have_count(4)
+            for label in (
+                "Default",
+                "Full access",
+                "Read only",
+                "Bypass approvals & sandbox",
+            ):
                 await expect(page.get_by_role("option", name=label, exact=True)).to_be_visible()
             await page.get_by_role("option", name="Full access", exact=True).click()
             await _save_config(page)
@@ -1979,16 +1991,7 @@ async def _drive_approval_mode(base_url: str, session_id: str) -> None:
 
 
 def test_start_session_bypass_sandbox(seeded_session: tuple[str, str]) -> None:
-    """Codex full-bypass reaches create and seeds the next session.
-
-    Bypass is the most-permissive option in the Codex config modal's Approval
-    dropdown — Codex's ``--dangerously-bypass-approvals-and-sandbox`` stance.
-    It reads back like Claude's "Bypass permissions": a plain dropdown pick with
-    no warning banner. When armed, the create ``POST /v1/sessions`` must carry
-    the ``omnigent.codex_native.bypass_sandbox: "1"`` conversation label so the
-    runner launches Codex with the bypass flag. After returning to New Session,
-    the same dropdown must still show bypass rather than resetting to Default.
-    """
+    """The launch-only Codex bypass reaches create and seeds the next session."""
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_bypass_sandbox(base_url, session_id))
 
@@ -2006,8 +2009,6 @@ async def _drive_bypass_sandbox(base_url: str, session_id: str) -> None:
                 agents_body=_codex_native_agents_body(),
             )
 
-            # Neutralize agent discovery so only the stubbed Codex agent
-            # feeds the picker.
             async def handle_agent_scan(route: Route) -> None:
                 await route.fulfill(
                     status=200,
@@ -2016,7 +2017,6 @@ async def _drive_bypass_sandbox(base_url: str, session_id: str) -> None:
                 )
 
             await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
-
             await page.add_init_script(
                 f"""window.localStorage.setItem(
                     "omnigent:recent-workspaces",
@@ -2028,12 +2028,7 @@ async def _drive_bypass_sandbox(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
-            # Codex auto-selects (only built-in); bypass is the most-permissive
-            # option in its config-modal Approval dropdown.
             await _open_entry_config(page, "ag_codex_e2e")
-
-            # Pick "Bypass approvals & sandbox" in the Approval dropdown; the
-            # trigger reads it back, then Save to commit.
             await _pick_config_select(
                 page, "new-chat-landing-config-approval", "Bypass approvals & sandbox"
             )
@@ -2050,8 +2045,6 @@ async def _drive_bypass_sandbox(base_url: str, session_id: str) -> None:
             assert body["agent_id"] == "ag_codex_e2e", body
             assert body["host_id"] == _HOST_ID, body
             assert body["workspace"] == "/work/repo", body
-            # The dangerous opt-in rides along as the canonical conversation
-            # label alongside the codex-native wrapper labels.
             labels = body.get("labels") or {}
             assert labels.get("omnigent.codex_native.bypass_sandbox") == "1", body
 

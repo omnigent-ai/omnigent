@@ -3610,6 +3610,22 @@ def test_fork_copies_terminal_launch_args_by_default(
     assert fetched.terminal_launch_args == ["--permission-mode", "auto"]
 
 
+def test_fork_uses_live_claude_permission_mode(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A mode changed after launch supersedes stale create-time arguments."""
+    source = conversation_store.create_conversation(
+        terminal_launch_args=["--permission-mode", "auto", "--verbose"],
+    )
+    conversation_store.set_labels(
+        source.id, {"omnigent.claude_native.permission_mode": "plan"}
+    )
+
+    fork = conversation_store.fork_conversation(source.id)
+
+    assert fork.terminal_launch_args == ["--verbose", "--permission-mode", "plan"]
+
+
 def test_fork_drops_terminal_launch_args_when_switching_agent(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -3757,11 +3773,8 @@ def test_fork_conversation_drops_instance_scoped_labels(
     marker wasn't the clone. The fork must drop them (and re-bind its
     own runtime), while ordinary labels still copy.
 
-    The DANGEROUS codex full-bypass directive is in the same set for a
-    different reason: a fork is a new session + workspace, so re-arming
-    ``--dangerously-bypass-approvals-and-sandbox`` there with no typed
-    re-confirmation would violate the "impossible to enable accidentally"
-    contract (#657). It must be dropped so the clone opts in afresh.
+    Permission settings are session configuration rather than runtime identity,
+    so the Codex bypass directive carries to the fork.
     """
     agent_store.create(
         agent_id="f88a23d7428c44557a974c2e07787713",
@@ -3776,7 +3789,7 @@ def test_fork_conversation_drops_instance_scoped_labels(
             "omnigent.codex_native.bridge_id": source.id,
             "omnigent.last_context_tokens": "39903",
             "omnigent.last_context_window": "1000000",
-            # The dangerous bypass opt-in must NOT ride into the fork.
+            # Permission configuration SHOULD ride into the fork.
             "omnigent.codex_native.bypass_sandbox": "1",
             # An ordinary, non-instance label that SHOULD carry over.
             "omnigent.wrapper": "claude-code-native-ui",
@@ -3789,7 +3802,10 @@ def test_fork_conversation_drops_instance_scoped_labels(
     # source's per-instance state. A bridge-id here would re-introduce
     # the cross-bridge bug; the metrics would show the source's stale
     # usage.
-    assert fork.labels == {"omnigent.wrapper": "claude-code-native-ui"}, (
+    assert fork.labels == {
+        "omnigent.codex_native.bypass_sandbox": "1",
+        "omnigent.wrapper": "claude-code-native-ui",
+    }, (
         f"Fork must drop instance-scoped labels, kept {fork.labels!r}"
     )
 

@@ -225,7 +225,12 @@ _HOST_PROBE_ROWS = [
 ]
 
 
-def _patch_precatalog_codex_session_on_host(page: Page, session_id: str) -> None:
+def _patch_precatalog_codex_session_on_host(
+    page: Page,
+    session_id: str,
+    *,
+    host_probe_rows: list[dict] | None = None,
+) -> None:
     """Shape ``session_id`` as a host-bound codex session with no catalog yet.
 
     The snapshot's ``model_options`` stay empty for the whole test — the
@@ -235,7 +240,10 @@ def _patch_precatalog_codex_session_on_host(page: Page, session_id: str) -> None
 
     :param page: Playwright page before navigation.
     :param session_id: Session id to patch.
+    :param host_probe_rows: Rows returned by the host probe. Defaults to the
+        populated fixture; pass an empty list to model a cold/failed probe.
     """
+    probe_rows = _HOST_PROBE_ROWS if host_probe_rows is None else host_probe_rows
 
     def _patch_snapshot(route: Route) -> None:
         request = route.request
@@ -262,7 +270,7 @@ def _patch_precatalog_codex_session_on_host(page: Page, session_id: str) -> None
         route.fulfill(
             status=200,
             headers={"content-type": "application/json"},
-            body=json.dumps({"models": _HOST_PROBE_ROWS}),
+            body=json.dumps({"models": probe_rows}),
         )
 
     def _force_online_health(route: Route) -> None:
@@ -339,3 +347,26 @@ def test_codex_gear_offers_host_probe_rows_before_the_session_catalog(
     effort_trigger.click()
     for level in ("low", "medium", "xhigh"):
         expect(page.locator(f'[role="option"][data-effort-level="{level}"]')).to_be_visible()
+
+
+def test_codex_effort_control_renders_while_all_catalogs_are_empty(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Show Default effort immediately even when model discovery is still cold."""
+    base_url, session_id = seeded_session
+    _patch_precatalog_codex_session_on_host(page, session_id, host_probe_rows=[])
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    gear = page.get_by_test_id("composer-config-gear")
+    expect(gear).to_be_visible(timeout=15_000)
+    gear.click()
+    expect(page.get_by_test_id("composer-config-modal")).to_be_visible()
+
+    effort_trigger = page.get_by_test_id("composer-config-effort")
+    expect(effort_trigger).to_be_visible(timeout=1_000)
+    expect(effort_trigger).to_contain_text("Default")
+    effort_trigger.click()
+    expect(page.get_by_role("option", name="Default", exact=True)).to_be_visible()
+    expect(page.locator('[role="option"][data-effort-level]')).to_have_count(0)
