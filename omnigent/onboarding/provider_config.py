@@ -44,6 +44,7 @@ never ``gemini``.
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field, replace
 from typing import Literal
@@ -58,6 +59,8 @@ from omnigent.env_credentials import (
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.spec.parser import check_unresolved_env_vars
+
+_logger = logging.getLogger(__name__)
 
 # Family keys. ``anthropic`` is the Messages-API surface (Claude SDK,
 # native Claude); ``openai`` is the Responses/Chat surface (Codex,
@@ -124,6 +127,14 @@ LOCAL_KIND = "local"
 DATABRICKS_KIND: Literal["databricks"] = "databricks"
 CLI_CONFIG_KIND = "cli-config"
 BEDROCK_KIND = "bedrock"
+
+# The CLIs whose own config file this build knows how to drive for a
+# ``cli-config`` provider. A ``cli-config`` entry naming any other CLI is a
+# shape from a newer build (or a stale entry a newer build wrote, e.g. a
+# ``cli: claude`` gateway): :func:`load_providers` SKIPS it with a warning
+# rather than raising, so one such entry cannot crash every turn's config
+# parse — the forward-compatibility gap that broke released runners.
+_CLI_CONFIG_RECOGNIZED_CLIS = frozenset({"codex"})
 _VALID_KINDS = (
     KEY_KIND,
     SUBSCRIPTION_KIND,
@@ -169,6 +180,7 @@ _HARNESS_FAMILY: dict[str, str] = {
     # Antigravity is Gemini-native but routes generic-provider traffic over
     # the OpenAI-compatible wire, so it consumes the ``openai`` family.
     "antigravity": OPENAI_FAMILY,
+    "agy": OPENAI_FAMILY,
     # NB: ``kimi`` is intentionally absent. Upstream Kimi Code CLI has no
     # per-spawn provider override flag, so Omnigent cannot thread a generic
     # provider through. Provider routing for kimi lives in ``~/.kimi/config.toml``
@@ -182,9 +194,11 @@ _HARNESS_FAMILY: dict[str, str] = {
     # (file-based, checked in :mod:`omnigent.onboarding.gemini_auth`) and the
     # detected GEMINI_API_KEY is adopted as a ``gemini``-family key, so the
     # native harness consumes the ``gemini`` family for onboarding / readiness.
-    # Both spellings are accepted, mirroring claude-native / native-claude.
+    # All spellings and aliases are accepted, mirroring claude-native / native-claude.
     "antigravity-native": GEMINI_FAMILY,
     "native-antigravity": GEMINI_FAMILY,
+    "agy-native": GEMINI_FAMILY,
+    "native-agy": GEMINI_FAMILY,
 }
 
 # Executor-type spellings that ``AgentSpec.harness_kind`` returns for SDK
@@ -953,6 +967,24 @@ def load_providers(config: dict[str, object]) -> dict[str, ProviderEntry]:
                 f"provider {str(name)!r} must be a mapping.",
                 code=ErrorCode.INVALID_INPUT,
             )
+        # Forward compatibility: a ``cli-config`` entry naming a CLI this build
+        # doesn't drive (e.g. a ``cli: claude`` gateway written by a newer
+        # build) is SKIPPED, not fatal. Raising here would propagate out of the
+        # whole parse and fail turn setup on every harness — the version-skew
+        # break that took down released runners. One unknown provider is
+        # ignored; the rest of the config still loads.
+        if (
+            raw.get("kind") == CLI_CONFIG_KIND
+            and raw.get("cli") not in _CLI_CONFIG_RECOGNIZED_CLIS
+        ):
+            _logger.warning(
+                "provider %r: ignoring cli-config entry for unrecognized cli %r "
+                "(a newer build may understand it; this build drives %s).",
+                str(name),
+                raw.get("cli"),
+                sorted(_CLI_CONFIG_RECOGNIZED_CLIS),
+            )
+            continue
         result[str(name)] = _parse_provider(str(name), raw)
     return result
 

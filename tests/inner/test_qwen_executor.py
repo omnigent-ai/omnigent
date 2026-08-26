@@ -22,7 +22,9 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from omnigent.inner.executor import (
+    ExecutorConfig,
     ExecutorError,
+    ReasoningChunk,
     TextChunk,
     ToolCallComplete,
     ToolCallRequest,
@@ -430,6 +432,78 @@ async def test_ensure_session_uses_server_assigned_id() -> None:
 
 
 @pytest.mark.asyncio
+async def test_ensure_session_records_config_options_without_legacy_model_param() -> None:
+    """Qwen model selection uses session config, not session/new.model."""
+    executor = QwenExecutor(model="qwen-plus")
+    captured: dict = {}
+
+    async def fake_rpc(method: str, params: dict, timeout: float = 30.0) -> dict:
+        captured.update(params)
+        return {
+            "result": {
+                "sessionId": "s1",
+                "configOptions": [{"id": "model", "currentValue": "qwen-turbo"}],
+            }
+        }
+
+    executor._rpc = fake_rpc  # type: ignore[method-assign]
+    await executor._ensure_session()
+
+    assert "model" not in captured
+    assert executor._active_model == "qwen-turbo"
+
+
+@pytest.mark.asyncio
+async def test_model_override_uses_standard_session_config() -> None:
+    executor = QwenExecutor()
+    executor._config_option_ids.add("model")
+    executor._active_model = "qwen-turbo"
+    executor._rpc = AsyncMock(
+        return_value={"result": {"configOptions": [{"id": "model", "currentValue": "qwen-plus"}]}}
+    )  # type: ignore[method-assign]
+
+    await executor._apply_model_override("s1", "qwen-plus")
+
+    executor._rpc.assert_awaited_once_with(
+        "session/set_config_option",
+        {"sessionId": "s1", "configId": "model", "value": "qwen-plus"},
+    )
+    assert executor._active_model == "qwen-plus"
+
+
+@pytest.mark.asyncio
+async def test_run_turn_applies_configured_model_without_per_turn_override() -> None:
+    """An empty per-turn config must not discard HARNESS_QWEN_MODEL."""
+    executor = QwenExecutor(model="qwen-plus")
+    executor._initialized = True
+    executor._session_id = "s1"
+    executor._system_prompt_sent = True
+    executor._proc = MagicMock(returncode=None)
+    executor._apply_model_override = AsyncMock()  # type: ignore[method-assign]
+
+    async def fake_send(msg: dict) -> None:
+        if msg.get("method") == "session/prompt":
+            executor._pending[msg["id"]].set_result(
+                {"id": msg["id"], "result": {"stopReason": "end_turn"}}
+            )
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    events = [
+        event
+        async for event in executor.run_turn(
+            [{"role": "user", "content": "hello"}],
+            [],
+            "",
+            ExecutorConfig(model=None),
+        )
+    ]
+
+    executor._apply_model_override.assert_awaited_once_with("s1", "qwen-plus")
+    assert any(isinstance(event, TurnComplete) for event in events)
+
+
+@pytest.mark.asyncio
 async def test_ensure_session_cached_after_first_call() -> None:
     """_ensure_session does not make a second RPC call once session is set."""
     executor = QwenExecutor()
@@ -521,6 +595,117 @@ async def test_run_turn_yields_text_chunks_and_turn_complete() -> None:
     assert text_chunks[0].text == "Hello!"
     assert len(turn_completes) == 1
     assert turn_completes[0].response == "Hello!"
+
+
+@pytest.mark.asyncio
+async def test_run_turn_forwards_reasoning_and_structured_tool_updates() -> None:
+    executor = QwenExecutor()
+    executor._initialized = True
+    executor._session_id = "sess-events"
+    executor._system_prompt_sent = True
+    executor._proc = MagicMock(returncode=None)
+
+    async def fake_send(msg: dict) -> None:
+        if msg.get("method") != "session/prompt":
+            return
+        for update in (
+            {
+                "sessionUpdate": "agent_thought_chunk",
+                "content": {"type": "text", "text": "checking"},
+            },
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tc1",
+                "title": "shell",
+                "rawInput": {"command": "pwd"},
+            },
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc1",
+                "status": "completed",
+                "rawOutput": "ok",
+            },
+        ):
+            await executor._queue.put(
+                {
+                    "method": "session/update",
+                    "params": {"sessionId": "sess-events", "update": update},
+                }
+            )
+        executor._pending[msg["id"]].set_result(
+            {"id": msg["id"], "result": {"stopReason": "end_turn"}}
+        )
+
+    executor._send = fake_send  # type: ignore[method-assign]
+    events = [
+        event
+        async for event in executor.run_turn(
+            [{"role": "user", "content": "inspect"}],
+            [],
+            "",
+            ExecutorConfig(),
+        )
+    ]
+
+    assert executor.handles_tools_internally() is True
+    assert [(e.delta, e.event_type) for e in events if isinstance(e, ReasoningChunk)] == [
+        ("checking", "reasoning_text")
+    ]
+    requests = [e for e in events if isinstance(e, ToolCallRequest)]
+    assert requests == [
+        ToolCallRequest(name="shell", args={"command": "pwd"}, metadata={"call_id": "tc1"})
+    ]
+    completes = [e for e in events if isinstance(e, ToolCallComplete)]
+    assert completes[0].name == "shell"
+    assert completes[0].status is ToolCallStatus.SUCCESS
+    assert completes[0].result == "ok"
+    assert completes[0].metadata == {"call_id": "tc1"}
+
+
+@pytest.mark.asyncio
+async def test_interrupt_sends_session_cancel_notification() -> None:
+    executor = QwenExecutor()
+    executor._session_id = "s1"
+    proc = MagicMock(returncode=None)
+    executor._proc = proc
+    executor._notify = AsyncMock()  # type: ignore[method-assign]
+
+    assert await executor.interrupt_session("ignored") is True
+    executor._notify.assert_awaited_once_with("session/cancel", {"sessionId": "s1"})
+    proc.terminate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_terminates_before_session_setup() -> None:
+    executor = QwenExecutor()
+    proc = MagicMock(returncode=None)
+    executor._proc = proc
+
+    assert await executor.interrupt_session("ignored") is True
+    proc.terminate.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_terminates_when_session_cancel_fails() -> None:
+    executor = QwenExecutor()
+    executor._session_id = "s1"
+    proc = MagicMock(returncode=None)
+    executor._proc = proc
+    executor._notify = AsyncMock(side_effect=OSError("closed"))  # type: ignore[method-assign]
+
+    assert await executor.interrupt_session("ignored") is True
+    proc.terminate.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_noops_without_live_process() -> None:
+    executor = QwenExecutor()
+    assert await executor.interrupt_session("ignored") is False
+
+    proc = MagicMock(returncode=0)
+    executor._proc = proc
+    assert await executor.interrupt_session("ignored") is False
+    proc.terminate.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

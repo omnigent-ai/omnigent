@@ -260,6 +260,9 @@ describe("index.css sidebar canvas", () => {
     /html:not\(\.dark\) \.conversations-sidebar(?::not\(\.is-peek\))? \{[^}]*\}/,
   )?.[0];
   const darkEdgeRule = cssSource.match(/\.dark \.conversations-sidebar \{[^}]*\}/)?.[0];
+  const peekBackgroundRule = cssSource.match(
+    /:root:not\(\.dark\):not\(\[data-theme\]\) \.conversations-sidebar\.is-peek,[\s\S]*?\.dark\[data-theme\] \.conversations-sidebar\.is-peek \{[^}]*\}/,
+  )?.[0];
 
   it("uses the specified left-to-right gradient for Omnigent light only", () => {
     expect(omniLightRule).toContain("background: #fffefe");
@@ -282,6 +285,14 @@ describe("index.css sidebar canvas", () => {
     expect(darkEdgeRule).toContain(`box-shadow: ${shadow}`);
     expect(lightEdgeRule).toContain("border-right: none");
     expect(darkEdgeRule).toContain("border-right: 1px solid rgb(255 255 255 / 2%)");
+  });
+
+  it("backs floating peek cards with the opaque card color in every theme", () => {
+    expect(peekBackgroundRule).toContain(".dark:not([data-theme]) .conversations-sidebar.is-peek");
+    expect(peekBackgroundRule).toContain(
+      ":root:not(.dark)[data-theme] .conversations-sidebar.is-peek",
+    );
+    expect(peekBackgroundRule).toContain("background-color: var(--card-solid)");
   });
 });
 

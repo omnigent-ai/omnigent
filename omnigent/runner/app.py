@@ -160,10 +160,7 @@ from omnigent.server.schemas import (
 from omnigent.spec.skill_sources import SkillSourceContext, resolve_harness_skills
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
 from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
-from omnigent.terminals.ws_bridge import (
-    WS_CLOSE_TERMINAL_NOT_FOUND,
-    bridge_tmux_pty_to_websocket,
-)
+from omnigent.terminals.ws_common import WS_CLOSE_TERMINAL_NOT_FOUND
 from omnigent.tools.builtins.load_skill import (
     find_skill_by_name,
     format_skill_meta_text,
@@ -8182,7 +8179,6 @@ def create_runner_app(
         session_id: str,
         terminal_id: str,
         read_only: bool = Query(default=False),
-        transport: str | None = Query(default=None),
     ) -> None:
         await websocket.accept()
         entry = resolve_terminal_entry_by_resource_id(
@@ -8217,32 +8213,13 @@ def create_runner_app(
         )
         _COST_POPUP_REPOP_TASKS.add(_repop_task)
         _repop_task.add_done_callback(_COST_POPUP_REPOP_TASKS.discard)
-        from omnigent.inner.terminal import (
-            TERMINAL_TRANSPORT_CONTROL,
-            resolve_terminal_transport,
+        await bridge_tmux_control_to_websocket(
+            websocket,
+            socket_path=str(entry.instance.socket_path),
+            tmux_target=entry.instance.tmux_target,
+            read_only=read_only,
+            on_client_interaction=entry.instance.note_client_interaction,
         )
-
-        resolved_transport = resolve_terminal_transport(
-            override=transport,
-            spec_transport=entry.instance.terminal_transport,
-        )
-        if resolved_transport == TERMINAL_TRANSPORT_CONTROL:
-            await bridge_tmux_control_to_websocket(
-                websocket,
-                socket_path=str(entry.instance.socket_path),
-                tmux_target=entry.instance.tmux_target,
-                read_only=read_only,
-                on_client_interaction=entry.instance.note_client_interaction,
-            )
-        else:
-            await bridge_tmux_pty_to_websocket(
-                websocket,
-                socket_path=str(entry.instance.socket_path),
-                tmux_target=entry.instance.tmux_target,
-                read_only=read_only,
-                on_client_interaction=entry.instance.note_client_interaction,
-                allow_osc52_clipboard=not entry.instance.tmux_allow_passthrough,
-            )
 
     # Reused by the loopback direct-attach listener (see
     # ``omnigent.runner.direct_attach``): same attach handler served on a

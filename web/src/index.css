@@ -467,6 +467,15 @@
   background: var(--sidebar);
 }
 
+/* A desktop peek floats over the chat instead of pushing it aside, so its
+ * gradient layers need an opaque base rather than the translucent card color. */
+:root:not(.dark):not([data-theme]) .conversations-sidebar.is-peek,
+:root:not(.dark)[data-theme] .conversations-sidebar.is-peek,
+.dark:not([data-theme]) .conversations-sidebar.is-peek,
+.dark[data-theme] .conversations-sidebar.is-peek {
+  background-color: var(--card-solid);
+}
+
 /* Edge treatment is mode-specific but palette-independent. */
 html:not(.dark) .conversations-sidebar:not(.is-peek) {
   border-right: none;

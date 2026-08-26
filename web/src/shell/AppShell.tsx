@@ -1196,7 +1196,9 @@ export function AppShell() {
   // dwell-to-peek would only work on a button the user can no longer see.
   // Same 400ms as ChatHeader: a quick pass-over must not open the card.
   const titleBarPeekTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const titleBarPeekRequest = useRef(0);
   const cancelTitleBarPeek = useCallback(() => {
+    titleBarPeekRequest.current += 1;
     if (titleBarPeekTimer.current) {
       clearTimeout(titleBarPeekTimer.current);
       titleBarPeekTimer.current = null;
@@ -1204,7 +1206,10 @@ export function AppShell() {
   }, []);
   const armTitleBarPeek = useCallback(() => {
     cancelTitleBarPeek();
+    const request = titleBarPeekRequest.current;
     titleBarPeekTimer.current = setTimeout(() => {
+      titleBarPeekTimer.current = null;
+      if (titleBarPeekRequest.current !== request) return;
       setSidebarPeek(true);
       setSidebarOpen(false);
     }, 400);
@@ -1738,6 +1743,7 @@ export function AppShell() {
                   // icon/tooltip lied until the sidebar was really open.
                   expanded={sidebarOpen}
                   onToggle={() => {
+                    cancelTitleBarPeek();
                     // Mirrors the ⌘⌥[ hotkey: a peeking sidebar counts as open,
                     // so toggling from peek pins it open rather than collapsing.
                     if (sidebarOpen) {
@@ -1754,6 +1760,7 @@ export function AppShell() {
                   // Only meaningful while collapsed — peeking or open, there is
                   // nothing to peek at.
                   onTogglePointerEnter={sidebarOpen || sidebarPeek ? undefined : armTitleBarPeek}
+                  onTogglePointerDown={cancelTitleBarPeek}
                   onTogglePointerLeave={cancelTitleBarPeek}
                 />
               </div>

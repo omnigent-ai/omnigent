@@ -401,6 +401,11 @@
       <button id="connect">Connect</button>
       <div class="err" id="err"></div>
 
+      <div class="recents" id="managed" hidden>
+        <p class="recents-title">Provided by your organization</p>
+        <div id="managed-list"></div>
+      </div>
+
       <div class="recents" id="recents" hidden>
         <p class="recents-title">Recent servers</p>
         <div id="recents-list"></div>
@@ -486,68 +491,75 @@
           });
       }
 
-      // Recently-connected servers (persisted by the main process after each
-      // successful non-ephemeral connection). The URL keeps its one-click Connect
-      // behavior; the adjacent clipboard action copies without navigating.
-      // An empty/unavailable list keeps the section hidden.
-      const recentsSection = document.getElementById("recents");
-      const recentsList = document.getElementById("recents-list");
+      // Organization-provided and recent servers share one rendering path.
+      // Managed choices are read-only offers: selecting one uses the ordinary
+      // explicit Connect flow and never auto-connects the app.
+      function renderServerList(urls, sectionId, listId, sourceLabel) {
+        if (!Array.isArray(urls) || urls.length === 0) return;
+        const section = document.getElementById(sectionId);
+        const list = document.getElementById(listId);
+        for (const url of urls) {
+          const label = serverDisplayLabel(url);
+          const row = document.createElement("div");
+          row.className = "recent-row";
+
+          const serverButton = document.createElement("button");
+          serverButton.type = "button";
+          serverButton.className = "recent-btn";
+          serverButton.textContent = label;
+          serverButton.title = sectionId === "managed" ? url : label;
+          serverButton.setAttribute("aria-label", `Connect to ${sourceLabel} server ${label}`);
+          serverButton.addEventListener("click", () => {
+            input.value = url;
+            void connect();
+          });
+
+          const copyButton = document.createElement("button");
+          copyButton.type = "button";
+          copyButton.className = "recent-copy";
+          copyButton.title = "Copy URL";
+          copyButton.setAttribute("aria-label", `Copy ${sourceLabel} server URL ${label}`);
+          copyButton.innerHTML = `
+            <svg class="copy-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <rect width="8" height="4" x="8" y="2" rx="1"></rect>
+              <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path>
+            </svg>
+            <svg class="copied-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="m5 12 4 4L19 6"></path>
+            </svg>`;
+          copyButton.addEventListener("click", async (event) => {
+            event.stopPropagation();
+            err.textContent = "";
+            try {
+              await setup.copyText(url);
+              copyButton.dataset.copied = "true";
+              copyButton.title = "Copied";
+              copyButton.setAttribute("aria-label", `Copied ${sourceLabel} server URL ${label}`);
+              setTimeout(() => {
+                delete copyButton.dataset.copied;
+                copyButton.title = "Copy URL";
+                copyButton.setAttribute("aria-label", `Copy ${sourceLabel} server URL ${label}`);
+              }, 1500);
+            } catch {
+              err.textContent = `Could not copy ${sourceLabel} server URL.`;
+            }
+          });
+
+          row.append(serverButton, copyButton);
+          list.appendChild(row);
+        }
+        section.hidden = false;
+      }
+
+      setup
+        .getManagedServers()
+        .then((servers) =>
+          renderServerList(servers, "managed", "managed-list", "organization-provided"),
+        )
+        .catch(() => {});
       setup
         .getRecentServers()
-        .then((recents) => {
-          if (!Array.isArray(recents) || recents.length === 0) return;
-          for (const url of recents) {
-            const label = serverDisplayLabel(url);
-            const row = document.createElement("div");
-            row.className = "recent-row";
-
-            const serverButton = document.createElement("button");
-            serverButton.type = "button";
-            serverButton.className = "recent-btn";
-            serverButton.textContent = label;
-            serverButton.title = label;
-            serverButton.setAttribute("aria-label", `Connect to recent server ${label}`);
-            serverButton.addEventListener("click", () => {
-              input.value = url;
-              void connect();
-            });
-
-            const copyButton = document.createElement("button");
-            copyButton.type = "button";
-            copyButton.className = "recent-copy";
-            copyButton.title = "Copy URL";
-            copyButton.setAttribute("aria-label", `Copy recent server URL ${label}`);
-            copyButton.innerHTML = `
-              <svg class="copy-icon" viewBox="0 0 24 24" aria-hidden="true">
-                <rect width="8" height="4" x="8" y="2" rx="1"></rect>
-                <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path>
-              </svg>
-              <svg class="copied-icon" viewBox="0 0 24 24" aria-hidden="true">
-                <path d="m5 12 4 4L19 6"></path>
-              </svg>`;
-            copyButton.addEventListener("click", async (event) => {
-              event.stopPropagation();
-              err.textContent = "";
-              try {
-                await setup.copyText(url);
-                copyButton.dataset.copied = "true";
-                copyButton.title = "Copied";
-                copyButton.setAttribute("aria-label", `Copied recent server URL ${label}`);
-                setTimeout(() => {
-                  delete copyButton.dataset.copied;
-                  copyButton.title = "Copy URL";
-                  copyButton.setAttribute("aria-label", `Copy recent server URL ${label}`);
-                }, 1500);
-              } catch {
-                err.textContent = "Could not copy recent server URL.";
-              }
-            });
-
-            row.append(serverButton, copyButton);
-            recentsList.appendChild(row);
-          }
-          recentsSection.hidden = false;
-        })
+        .then((servers) => renderServerList(servers, "recents", "recents-list", "recent"))
         .catch(() => {});
 
       // The exact URL value the user has already been warned about — a

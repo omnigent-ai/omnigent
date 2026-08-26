@@ -29,6 +29,7 @@ import logging
 import re
 import secrets
 import time
+from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
@@ -45,6 +46,9 @@ from omnigent.server.passwords import (
     verify_password,
 )
 from omnigent.stores.permission_store import PermissionStore
+
+if TYPE_CHECKING:
+    from omnigent.server.device_grant_store import DeviceGrantStore
 
 _logger = logging.getLogger(__name__)
 
@@ -70,10 +74,18 @@ class LoginRequest(BaseModel):
         before lookup.
     :param password: Plaintext password, length-validated against
         :data:`_MIN_PASSWORD_LENGTH` but otherwise opaque.
+    :param issue_refresh: When ``True`` and a grant store is wired, also
+        issue a login-scoped refresh grant and include ``refresh_token``
+        in the response. Intended for CLI / unattended-host callers only
+        (``omnigent login``); the web form never sends this field, so
+        browser sessions never receive long-lived refresh material. Pydantic
+        coerces non-bool values to bool, so only the literal JSON booleans
+        ``true``/``false`` are accepted.
     """
 
     username: str = Field(min_length=1, max_length=128)
     password: str = Field(min_length=1, max_length=1024)
+    issue_refresh: bool = False
 
 
 class RegisterRequest(BaseModel):
@@ -206,6 +218,7 @@ def create_accounts_auth_router(
     account_store: SqlAlchemyAccountStore,
     admin_list: AdminList,
     permission_store: PermissionStore | None = None,
+    device_grant_store: DeviceGrantStore | None = None,
 ) -> APIRouter:
     """Build the ``/auth/*`` router for the accounts provider.
 
@@ -228,6 +241,12 @@ def create_accounts_auth_router(
         deploys) leaves session permissions untouched, preserving the
         accounts-routes-don't-touch-PermissionStore boundary for the
         hosted product.
+    :param device_grant_store: When set, ``POST /auth/login`` issues a
+        login-scoped refresh grant alongside the session JWT when the
+        request body includes ``"issue_refresh": true``. The CLI sets
+        this flag; the web browser form never does, so long-lived
+        unattended credentials never reach a browser session. See
+        :func:`omnigent.server.routes.device_auth.issue_login_grant`.
     :returns: APIRouter to mount at ``/auth``.
     """
     if auth_provider._source != "accounts":
@@ -312,9 +331,24 @@ def create_accounts_auth_router(
             "user": {"id": user.id, "is_admin": user.is_admin},
         }
         # Browser login must never receive refresh material — only CLI/device
-        # flows do (via /auth/cli-poll or device-grant callback). This is
-        # enforced server-side so an XSS or form-hijack cannot obtain
-        # long-lived unattended credentials.
+        # flows do (via issue_refresh=True or the device-grant callback).
+        # Gated on body.issue_refresh so the web form, which never sends
+        # the field, cannot obtain long-lived unattended credentials even
+        # under XSS or form-hijack (the browser has no way to set it True).
+        if body.issue_refresh is True and device_grant_store is not None:
+            from omnigent.server.routes.device_auth import issue_login_grant
+
+            try:
+                body_payload["refresh_token"] = issue_login_grant(
+                    device_grant_store,
+                    user_id=username,
+                    cookie_secret=config.cookie_secret,
+                )
+            except Exception:  # grant failure must never break login
+                _logger.exception(
+                    "auth/login: refresh grant issuance failed for %s",
+                    _redact_for_log(username),
+                )
         resp = JSONResponse(status_code=200, content=body_payload)
         _set_session_cookie(
             resp,

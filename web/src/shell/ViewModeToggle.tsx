@@ -39,6 +39,7 @@ export function ViewModeToggle() {
         active={view === "chat"}
         onClick={() => setView("chat")}
         testId="view-mode-chat"
+        componentId="chat.header.view_chat"
       >
         <MessagesSquareIcon className="size-3.5" />
       </ViewModeSegment>
@@ -47,6 +48,7 @@ export function ViewModeToggle() {
         active={view === "terminal"}
         onClick={() => setView("terminal")}
         testId="view-mode-terminal"
+        componentId="chat.header.view_terminal"
       >
         {terminalStartingUp ? (
           <Loader2Icon className="size-3.5 animate-spin" aria-hidden />
@@ -69,12 +71,14 @@ function ViewModeSegment({
   active,
   onClick,
   testId,
+  componentId,
   children,
 }: {
   label: string;
   active: boolean;
   onClick: () => void;
   testId: string;
+  componentId: string;
   children: React.ReactNode;
 }) {
   return (
@@ -89,6 +93,7 @@ function ViewModeSegment({
             aria-pressed={active}
             onClick={onClick}
             data-testid={testId}
+            componentId={componentId}
             className={cn(
               "border-none",
               active

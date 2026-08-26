@@ -1608,6 +1608,7 @@ def _print_version_callback(ctx: click.Context, _param: click.Parameter, value: 
 # decorated below.
 _HARNESS_COMMANDS: frozenset[str] = frozenset(
     {
+        "agy",
         "antigravity",
         "claude",
         "codex",
@@ -1635,7 +1636,7 @@ _ACCENT_RGB = (244, 59, 166)
 # object registered under a second name, e.g. ``update`` -> ``upgrade``).
 # Kept runnable/registered but omitted from the ``--help`` listing so the
 # alias isn't shown as a duplicate line.
-_ALIAS_COMMANDS: frozenset[str] = frozenset({"update"})
+_ALIAS_COMMANDS: frozenset[str] = frozenset({"update", "antigravity"})
 
 
 def _harness_extra_checks() -> dict[str, Callable[[], bool]]:
@@ -1647,12 +1648,10 @@ def _harness_extra_checks() -> dict[str, Callable[[], bool]]:
     The predicates use ``importlib.util.find_spec`` (no heavy import).
     Commands absent from this map are always listed.
     """
-    from omnigent.onboarding.antigravity_auth import antigravity_sdk_installed
     from omnigent.onboarding.cursor_auth import cursor_sdk_installed
 
     return {
         "cursor": cursor_sdk_installed,
-        "antigravity": antigravity_sdk_installed,
     }
 
 
@@ -1950,6 +1949,7 @@ def cli() -> None:
 # Keep in sync with ``@cli.command()`` decorations below.
 _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
     {
+        "agy",
         "antigravity",
         "attach",
         "claude",
@@ -7962,9 +7962,9 @@ class _HostGroup(click.Group):
     ``omnigent host <url>`` is shorthand for ``omnigent host
     --server <url>`` when ``<url>`` is URL-like or the empty local-mode
     marker. A leading positional token that matches a registered
-    management subcommand (``status``, ``stop``, ``stop-session``)
-    still dispatches to that subcommand, and other unknown tokens fall
-    through to Click's normal unknown-command error.
+    management subcommand (``enable``, ``disable``, ``status``, ``stop``,
+    ``stop-session``) still dispatches to that subcommand, and other unknown
+    tokens fall through to Click's normal unknown-command error.
     """
 
     def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
@@ -8156,6 +8156,35 @@ def _confirm_background_host_registered(record: _HostDaemonRecord) -> None:
         time.sleep(0.2)
 
 
+def _stdin_is_tty() -> bool:
+    """Return whether stdin is an interactive terminal."""
+    return sys.stdin.isatty()
+
+
+def _maybe_open_host_web_ui(
+    server_url: str,
+    *,
+    non_interactive: bool,
+    cfg: dict[str, Any] | None = None,  # type: ignore[explicit-any]
+) -> None:
+    """Open the host web UI when interactive and enabled."""
+    if non_interactive or not _stdin_is_tty():
+        return
+    if cfg is None:
+        cfg = _load_effective_config()
+    if _resolve_auto_open_conversation_setting(cfg) is False:
+        return
+    from omnigent.conversation_browser import display_server_url, open_conversation_url
+
+    web_url = display_server_url(server_url)
+    try:
+        opened = open_conversation_url(web_url)
+    except OSError:
+        opened = False
+    if not opened:
+        click.echo(f"Open the Omnigent web UI: {web_url}", err=True)
+
+
 def _run_background_host(
     server: str | None,
     *,
@@ -8233,6 +8262,7 @@ def _run_background_host(
     click.echo()
     click.echo(_cli_style("Stop it with:", dim=True))
     click.echo(f"  {_cli_style(stop_command, bold=True)}")
+    _maybe_open_host_web_ui(server_url, non_interactive=non_interactive)
 
 
 def _echo_host_field(label: str, value: str) -> None:
@@ -8305,10 +8335,13 @@ def host(
       omnigent host --server https://omnigent-app.databricksapps.com
       omnigent host ""   # spawn + connect to a local server
       omnigent host --background   # spawn detached, return immediately
+      omnigent host enable   # install and start a per-user system service
+      omnigent host disable  # stop and remove the per-user system service
 
     The server URL may be given positionally (``omnigent host
     <url>``) or via ``--server <url>``. A leading ``status``, ``stop``,
-    or ``stop-session`` token still runs that management subcommand.
+    ``enable``, ``disable``, or ``stop-session`` token still runs that
+    management subcommand.
 
     When the target server is Databricks-fronted and you are not signed
     in, ``host`` runs the same flow ``omnigent login`` would before
@@ -8330,6 +8363,7 @@ def host(
     """
     ctx.ensure_object(dict)
     ctx.obj["server"] = server
+    ctx.obj["non_interactive"] = non_interactive
     if ctx.invoked_subcommand is not None:
         return
     # Kept before the config fallback below: `--background` echoes a `host
@@ -8388,6 +8422,7 @@ def host(
         # (or a headless invocation) fails loud with the command to run.
         if remote_mode:
             _ensure_databricks_server_auth(server, non_interactive=non_interactive)
+        _maybe_open_host_web_ui(server, non_interactive=non_interactive, cfg=cfg)
         run_host_process(server_url=server, daemon_target=target)
         stopped_cleanly = True
     except KeyboardInterrupt:
@@ -9273,6 +9308,76 @@ def _echo_daemon_payloads(payloads: list[_HostPayload]) -> None:
             )
             console.print(f"  [red]error={_host_markup(message)}[/red]")
         _add_host_payload_sessions_table(console, payload)
+
+
+@host.command("enable")
+@click.option("--server", default=None, help="Server target for the persistent service.")
+@click.option(
+    "--non-interactive",
+    is_flag=True,
+    default=False,
+    help="Do not launch browser sign-in while preparing the service.",
+)
+@click.pass_context
+def host_enable(
+    ctx: click.Context,
+    server: str | None,
+    non_interactive: bool,
+) -> None:
+    """Install and start the host as a per-user system service.
+
+    :param ctx: Click context carrying group-level options.
+    :param server: Optional server target; empty selects local mode.
+    :param non_interactive: Fail instead of launching browser sign-in.
+    """
+    if server is None:
+        server = _host_group_option(ctx, "server")
+    resolved_server = _resolve_host_server(server)
+    group_obj = ctx.obj if isinstance(ctx.obj, dict) else {}
+    non_interactive = non_interactive or bool(group_obj.get("non_interactive"))
+    if resolved_server:
+        _ensure_databricks_server_auth(
+            resolved_server,
+            non_interactive=non_interactive or not _stdin_is_tty(),
+        )
+
+    target = _normalize_daemon_target(resolved_server)
+    record = _find_daemon_record(target)
+    if record is not None:
+        _terminate_daemon(record, force=False)
+
+    from omnigent.host.service import HostServiceError, enable_user_host_service
+
+    try:
+        service = enable_user_host_service(
+            resolved_server,
+            environment=_build_host_daemon_env(server_url=resolved_server),
+        )
+    except HostServiceError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    click.echo(f"Enabled the Omnigent host user service for {target}.")
+    click.echo(f"Service definition: {_display_path(service.path)}")
+    if service.log_path is not None:
+        click.echo(f"Service output: {_display_path(service.log_path)}")
+
+
+@host.command("disable")
+def host_disable() -> None:
+    """Stop and remove the current user's host system service."""
+    from omnigent.host.service import HostServiceError, disable_user_host_service
+
+    try:
+        service = disable_user_host_service()
+    except HostServiceError as exc:
+        raise click.ClickException(str(exc)) from exc
+    # Service managers stop with SIGTERM, which can leave the foreground
+    # daemon's registry record behind after the process has exited.
+    for record in _list_daemon_records():
+        if not _pid_alive(record.pid):
+            _delete_daemon_record(record)
+    click.echo("Disabled the Omnigent host user service.")
+    click.echo(f"Removed service definition: {_display_path(service.path)}")
 
 
 @host.command("status")
@@ -11468,7 +11573,7 @@ def _accounts_login(server: str) -> None:
     try:
         resp = _httpx.post(
             f"{server}/auth/login",
-            json={"username": username, "password": password},
+            json={"username": username, "password": password, "issue_refresh": True},
             timeout=10.0,
         )
     except _httpx.HTTPError as exc:

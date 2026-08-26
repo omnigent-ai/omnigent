@@ -3408,3 +3408,50 @@ def test_credential_label_bedrock_not_duplicated() -> None:
 
     assert credential_label(BEDROCK_KIND, "bedrock") == "AWS Bedrock"
     assert credential_label(BEDROCK_KIND, "nexus") == "AWS Bedrock (nexus)"
+
+
+def test_claude_subscription_relabeled_as_managed_gateway(tmp_path, monkeypatch) -> None:
+    """A Claude subscription backed by the managed gateway shows the gateway name.
+
+    Answers the "why don't we get a clean Claude-Databricks like Codex-Databricks"
+    gap: when Claude Code's managed settings deliver the gateway, both the
+    per-credential row label and the adoption callout name it "Databricks AI
+    Gateway" instead of the generic "Subscription". Display only — the entry is
+    a plain subscription (no new persisted shape). With no managed gateway the
+    label stays "Subscription".
+    """
+    import json
+
+    from omnigent.cli_config import _compact_credential_label, _credential_label
+    from omnigent.onboarding import ambient
+    from omnigent.onboarding.ambient import DetectedProvider
+    from omnigent.onboarding.provider_config import ProviderEntry
+
+    entry = ProviderEntry(name="claude", kind="subscription", cli="claude")
+    det = DetectedProvider(
+        name="claude",
+        kind="subscription",
+        family="anthropic",
+        source="Claude Code managed settings",
+    )
+
+    # No managed gateway → generic labels.
+    monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (tmp_path / "none.json",))
+    assert _credential_label("claude", entry) == "Subscription"
+    assert _compact_credential_label(det) == "Claude Subscription"
+
+    # Managed Databricks gateway present → both surfaces name it.
+    settings = tmp_path / "managed-settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://dbc.cloud.databricks.com/ai-gateway/anthropic"
+                },
+                "apiKeyHelper": "print-token",
+            }
+        )
+    )
+    monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (settings,))
+    assert _credential_label("claude", entry) == "Databricks AI Gateway"
+    assert _compact_credential_label(det) == "Databricks AI Gateway"

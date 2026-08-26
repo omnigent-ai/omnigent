@@ -2776,6 +2776,7 @@ def create_app(
                     account_store,
                     admin_list,
                     permission_store,
+                    device_grant_store,
                 ),
                 prefix="/auth",
                 tags=["auth"],
