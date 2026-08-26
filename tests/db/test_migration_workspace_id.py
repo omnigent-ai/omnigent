@@ -53,6 +53,8 @@ _LATER_PK_OVERRIDES: dict[str, list[str]] = {
     # a7f3c1b9e2d4 widened comments to insert conversation_id between
     # workspace_id and id (dropping the now-redundant conversation index).
     "comments": ["workspace_id", "conversation_id", "id"],
+    # zb1a2b3c4d5e added harness to the PK to enable per-harness budget tracking.
+    "user_daily_cost": ["workspace_id", "user_id", "day_utc", "harness"],
 }
 
 
