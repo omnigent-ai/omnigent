@@ -1905,72 +1905,113 @@ aside[aria-label="Workspace"][data-maximized] {
   --foreground: var(--custom-light-foreground);
   --card: var(--custom-light-card);
   --card-solid: var(--custom-light-card-solid);
-  --card-foreground: var(--custom-light-foreground);
-  --tray: var(--custom-light-card);
-  --popover: var(--custom-light-card-solid);
-  --popover-foreground: var(--custom-light-foreground);
+  --card-foreground: var(--custom-light-card-foreground);
+  --tray: var(--custom-light-tray);
+  --popover: var(--custom-light-popover);
+  --popover-foreground: var(--custom-light-popover-foreground);
   --primary: var(--custom-light-primary);
   --primary-foreground: var(--custom-light-primary-foreground);
   --secondary: var(--custom-light-secondary);
-  --secondary-foreground: var(--custom-light-foreground);
+  --secondary-foreground: var(--custom-light-secondary-foreground);
   --muted: var(--custom-light-muted);
   --muted-foreground: var(--custom-light-muted-foreground);
   --code-bg: var(--custom-light-code-bg);
   --accent: var(--custom-light-accent);
-  --accent-foreground: var(--custom-light-foreground);
+  --accent-foreground: var(--custom-light-accent-foreground);
   --border: var(--custom-light-border);
   --border-strong: var(--custom-light-border-strong);
-  --button-border: var(--custom-light-border);
-  --input: var(--custom-light-border);
-  --ring: var(--custom-light-primary);
-  --brand-accent: var(--custom-light-primary);
+  --button-border: var(--custom-light-button-border);
+  --input: var(--custom-light-input);
+  --ring: var(--custom-light-ring);
+  --brand-accent: var(--custom-light-brand-accent);
   --sidebar: var(--custom-light-sidebar);
-  --sidebar-foreground: var(--custom-light-foreground);
-  --sidebar-primary: var(--custom-light-primary);
-  --sidebar-primary-foreground: var(--custom-light-primary-foreground);
-  --sidebar-accent: var(--custom-light-accent);
-  --sidebar-accent-foreground: var(--custom-light-foreground);
-  --sidebar-border: var(--custom-light-border);
-  --sidebar-ring: var(--custom-light-primary);
+  --sidebar-foreground: var(--custom-light-sidebar-foreground);
+  --sidebar-primary: var(--custom-light-sidebar-primary);
+  --sidebar-primary-foreground: var(--custom-light-sidebar-primary-foreground);
+  --sidebar-accent: var(--custom-light-sidebar-accent);
+  --sidebar-accent-foreground: var(--custom-light-sidebar-accent-foreground);
+  --sidebar-border: var(--custom-light-sidebar-border);
+  --sidebar-ring: var(--custom-light-sidebar-ring);
 }
 .dark[data-theme="custom"] {
   --background: var(--custom-dark-background);
   --foreground: var(--custom-dark-foreground);
   --card: var(--custom-dark-card);
   --card-solid: var(--custom-dark-card-solid);
-  --card-foreground: var(--custom-dark-foreground);
-  --tray: var(--custom-dark-card);
-  --popover: var(--custom-dark-card-solid);
-  --popover-foreground: var(--custom-dark-foreground);
+  --card-foreground: var(--custom-dark-card-foreground);
+  --tray: var(--custom-dark-tray);
+  --popover: var(--custom-dark-popover);
+  --popover-foreground: var(--custom-dark-popover-foreground);
   --primary: var(--custom-dark-primary);
   --primary-foreground: var(--custom-dark-primary-foreground);
   --secondary: var(--custom-dark-secondary);
-  --secondary-foreground: var(--custom-dark-foreground);
+  --secondary-foreground: var(--custom-dark-secondary-foreground);
   --muted: var(--custom-dark-muted);
   --muted-foreground: var(--custom-dark-muted-foreground);
   --code-bg: var(--custom-dark-code-bg);
   --accent: var(--custom-dark-accent);
-  --accent-foreground: var(--custom-dark-foreground);
+  --accent-foreground: var(--custom-dark-accent-foreground);
   --border: var(--custom-dark-border);
   --border-strong: var(--custom-dark-border-strong);
-  --button-border: var(--custom-dark-border);
-  --input: var(--custom-dark-border);
-  --ring: var(--custom-dark-primary);
-  --brand-accent: var(--custom-dark-primary);
+  --button-border: var(--custom-dark-button-border);
+  --input: var(--custom-dark-input);
+  --ring: var(--custom-dark-ring);
+  --brand-accent: var(--custom-dark-brand-accent);
   --sidebar: var(--custom-dark-sidebar);
-  --sidebar-foreground: var(--custom-dark-foreground);
-  --sidebar-primary: var(--custom-dark-primary);
-  --sidebar-primary-foreground: var(--custom-dark-primary-foreground);
-  --sidebar-accent: var(--custom-dark-accent);
-  --sidebar-accent-foreground: var(--custom-dark-foreground);
-  --sidebar-border: var(--custom-dark-border);
-  --sidebar-ring: var(--custom-dark-primary);
+  --sidebar-foreground: var(--custom-dark-sidebar-foreground);
+  --sidebar-primary: var(--custom-dark-sidebar-primary);
+  --sidebar-primary-foreground: var(--custom-dark-sidebar-primary-foreground);
+  --sidebar-accent: var(--custom-dark-sidebar-accent);
+  --sidebar-accent-foreground: var(--custom-dark-sidebar-accent-foreground);
+  --sidebar-border: var(--custom-dark-sidebar-border);
+  --sidebar-ring: var(--custom-dark-sidebar-ring);
 }
 :root:not(.dark)[data-theme="custom"] .app-shell {
   background: var(--custom-light-shell-background);
 }
 .dark[data-theme="custom"] .app-shell {
   background: var(--custom-dark-shell-background);
+}
+.theme-contrast-range {
+  appearance: none;
+  height: 0.375rem;
+  border-radius: 9999px;
+  background: linear-gradient(
+    to right,
+    var(--primary) 0%,
+    var(--primary) var(--range-progress),
+    var(--input) var(--range-progress),
+    var(--input) 100%
+  );
+}
+.theme-contrast-range::-webkit-slider-runnable-track {
+  height: 0.375rem;
+  border-radius: 9999px;
+  background: transparent;
+}
+.theme-contrast-range::-moz-range-track {
+  height: 0.375rem;
+  border-radius: 9999px;
+  background: transparent;
+}
+.theme-contrast-range::-moz-range-progress {
+  background: transparent;
+}
+.theme-contrast-range::-webkit-slider-thumb {
+  width: 0.75rem;
+  height: 0.75rem;
+  margin-top: -0.1875rem;
+  appearance: none;
+  border: 0;
+  border-radius: 9999px;
+  background: var(--primary);
+}
+.theme-contrast-range::-moz-range-thumb {
+  width: 0.75rem;
+  height: 0.75rem;
+  border: 0;
+  border-radius: 9999px;
+  background: var(--primary);
 }
 @media (min-width: 48rem) {
   :root:not(.dark)[data-theme="custom"][data-custom-translucent-sidebar]
