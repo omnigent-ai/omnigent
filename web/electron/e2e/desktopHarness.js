@@ -298,8 +298,18 @@ async function launchDesktop(opts) {
   }
   fs.mkdirSync(opts.recordDir, { recursive: true });
 
+  const args = [APP_ROOT, `--user-data-dir=${userDataDir}`];
+  // Headless-Linux / CI hardening, gated on the same env var the Python e2e_ui
+  // suite uses (conftest.browser_type_launch_args). Under xvfb — and especially
+  // as root or in a container — Electron's Chromium refuses to start without
+  // --no-sandbox, and --disable-dev-shm-usage avoids the tiny /dev/shm a
+  // container gives it. Off by default so local (macOS/dev) runs are unchanged.
+  if (process.env.OMNIGENT_PW_NO_SANDBOX) {
+    args.push("--no-sandbox", "--disable-dev-shm-usage");
+  }
+
   const electronApp = await electron.launch({
-    args: [APP_ROOT, `--user-data-dir=${userDataDir}`],
+    args,
     recordVideo: { dir: opts.recordDir },
     // Dev builds read dev-app-update.yml and would try to reach the update
     // endpoint; a version override keeps the app off the update path.
