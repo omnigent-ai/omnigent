@@ -240,13 +240,14 @@ reproduction test is your objective instrument.
    fix (the sound-PR default), it gets the **same landing treatment as a PR you
    authored**: `ui-preview`, green CI, a clean Polly review, a copy-paste
    live-validation command, and a maintainer tagged (Step 4, all sub-steps). The
-   one difference is whose branch you push to — Step 4's "push vs. comment" rule
-   handles it: push fixes to the PR's branch when you have access, otherwise post
-   the concrete fix as a review comment for the author. So you **do** iterate CI
-   and Polly here (via push-or-comment), rather than triggering one review and
-   stopping. Record `mode: "reviewed_existing_pr"` and its `pr_url`.
-   (If you instead take the escape hatch below and open your own PR, that PR goes
-   through Step 4 as the author path.)
+   one difference is whose branch a fix lands on — Step 4's "push or take over"
+   rule handles it: push fixes directly when the PR branch is in-repo; when it's a
+   **fork PR** you can't push to *and it needs a fix*, take over by opening your
+   own PR that carries their commits + your fix (crediting them). If the fork PR
+   needs no fix, keep it as-is. Either way you **do** iterate CI and Polly, rather
+   than triggering one review and stopping. Record `mode: "reviewed_existing_pr"`
+   and its `pr_url` when you keep it; if a fork takeover made you open your own,
+   record `mode: "authored_fix"` with the fork PR in `reviewed_pr_url`.
 
 **When the existing PR's *approach* is wrong, open your own fix instead.** The
 default above is for a sound PR. But if reviewing shows the PR is not a viable
@@ -262,11 +263,14 @@ the two are linked. Use this escape hatch deliberately, not for style
 preferences — a working, root-cause-sound PR should be reviewed and improved in
 place, not replaced.
 
-When you keep the PR, you drive it to landable per Step 4 — pushing fixes to its
-branch when you have write access, or posting them as review comments for the
-author when you don't (fork PRs). Modify its code in place only via that push path
-when access allows; never rewrite its approach wholesale — if the approach itself
-is wrong, take the escape hatch above and open your own PR instead.
+When you keep the PR, you drive it to landable per Step 4 — pushing fixes directly
+when its branch is in-repo, or (for a fork PR you can't push to that needs a fix)
+taking over into your own PR that carries their commits plus your fix. So there
+are **two** reasons you end up authoring your own PR from the review path: the
+existing approach is *wrong* (this escape hatch), or the approach is *fine* but
+it's an unpushable fork PR that needs changes (Step 4's take-over). Never rewrite a
+sound approach wholesale — a fork takeover replays the contributor's commits and
+adds to them, it doesn't discard their work.
 
 ## Step 2B — Author the fix
 
@@ -514,23 +518,41 @@ is clean, then hand it to a human. The sub-steps overlap in time (kick off the
 preview and the first review, then poll), so don't serialize what can run
 concurrently.
 
-**Whose branch — push vs. comment.** On the **author path** the PR is yours: push
-fix commits freely. On the **review path** the PR is someone else's; drive it to
-landable by adapting to your access:
+**Whose branch — push or take over.** On the **author path** the PR is yours: push
+fix commits freely. On the **review path** the PR is someone else's; whether you
+can land a fix depends on where its branch lives:
 
-- **You can push to its branch** (an in-repo PR branch you have write access to) →
-  push fixes the same as the author path, then re-check. Say in your review
-  comments that you pushed, so the author isn't surprised.
-- **You cannot push** (a fork PR, or the push is rejected) → do **not** force it.
-  Post the concrete fix (the diff or exact change) as a **review comment** on the
-  PR for the author to apply, and note in the handoff that landing depends on the
-  author. Everything else in Step 4 (preview, Polly trigger, try-it-out, maintainer
-  tag) still applies — those don't require write access to the branch.
+- **In-repo PR branch** (the head branch is on `omnigent-ai/omnigent`, not a fork)
+  → you have write access. Push fixes the same as the author path, then re-check.
+  Say in your review comments that you pushed, so the author isn't surprised.
+- **Fork PR** (the head branch is on a contributor's fork, `head.repo.fork ==
+  true`) → you **cannot** push to it. An App installation token is scoped to
+  `omnigent-ai/omnigent` only; GitHub does not honor "allow edits from maintainers"
+  for an App token (that grant is for maintainer *users*), so a push to the fork
+  branch is rejected. **Do not attempt the push** — it will always fail. Instead:
+  - **If the fork PR needs a fix** (repro test fails against it, CI is red from its
+    diff, or Polly flags a real blocking defect) → **take over: open your own PR**
+    that includes their work plus your fix. This is the same mechanic as the
+    "approach is wrong" escape hatch (Step 2A), but the reason is different — the
+    approach is fine, you just can't push the fix to a fork. Build it so the
+    contributor keeps credit:
+    - Branch off `main`, cherry-pick the fork PR's commits (`gh pr checkout <pr>`
+      then replay onto your branch, or `git cherry-pick`), then add your fix on top.
+    - Credit the original author on the commits (`Co-authored-by: <name> <email>`,
+      read from `gh pr view <pr> --json commits`).
+    - In your PR body, link the fork PR (`Builds on #<pr> by @<author>`) and say
+      why you re-opened it (couldn't push to the fork). Post a comment on the fork
+      PR pointing to yours, so the contributor isn't blindsided.
+    - Set `mode: "authored_fix"`, record the fork PR's number in `reviewed_pr_url`,
+      and drive **your** PR through the rest of Step 4 (you can push to it).
+  - **If the fork PR needs no fix** (repro passes against it, CI green, review
+    clean) → there's nothing to push, so keep it: comment your findings + the
+    try-it-out command, tag the maintainer. No takeover needed.
 
-Throughout, address the PR by its number `<pr>`. This whole step is a **bounded
-loop** — cap it at **~6 fix→(push-or-comment)→re-check rounds**. If you're still
-red or still getting blocking findings after that, stop, leave the PR open with an
-honest summary comment of what's unresolved, and report `outcome:
+Throughout, address the PR you're landing by its number `<pr>`. This whole step is
+a **bounded loop** — cap it at **~6 fix→(push-or-takeover)→re-check rounds**. If
+you're still red or still getting blocking findings after that, stop, leave the PR
+open with an honest summary comment of what's unresolved, and report `outcome:
 "partially_fixed"` with the specifics (see Output). Never loosen a test, skip a
 check, or merge to force green.
 
@@ -611,20 +633,19 @@ settles:
   **pre-existing / flaky / infra** (a failure unrelated to the files you touched,
   a known-flaky suite, a runner/secret problem):
   - **The diff caused it** → fix the code (not the test), re-run the relevant
-    tests locally to confirm, then land the fix per the **push-vs-comment rule**:
-    `git commit` + `git push` when it's your PR or a branch you can push to (the
-    push re-runs CI); otherwise post the concrete fix as a review comment for the
-    author (a fork PR you can't push to — CI will re-run when they push it).
+    tests locally to confirm, then land the fix per the **push-or-take-over rule**:
+    `git commit` + `git push` when it's your PR or an in-repo branch you can push
+    to (the push re-runs CI); on a **fork PR** you can't push to, take over and
+    open your own PR carrying their commits + your fix (see the Step 4 preamble),
+    then continue this loop on **your** PR.
   - **Pre-existing / flaky / infra** → do **not** chase it or paper over it. Note
     it in the handoff (`ci_status`) as an unrelated failure and, if it's a flake,
     you may re-run that job (`gh run rerun <run-id> --failed`) once. Don't loop on
     someone else's red.
 
-Re-poll after each push (or after the author applies your commented fix). Stay in
-this loop (within the round cap) until the checks you're responsible for are green.
-When landing is blocked on the author applying commented fixes, don't spin — note
-it in `ci_status` and move on; the round cap and the maintainer tag (4.5) hand it
-off.
+Re-poll after each push (or, if you took over a fork PR, on your own PR's checks).
+Stay in this loop (within the round cap) until the checks you're responsible for
+are green.
 
 ### 4.3 — Address the automated (Polly) review until it's clean
 
@@ -657,15 +678,13 @@ Wait for the review to land (a few minutes), then triage the newest comment:
   vulnerabilities** that is a real defect in the PR's diff. Fix each one at the root
   (same fail→pass discipline as Step 2B — add/adjust a targeted test where it
   makes sense), re-run the affected tests, then land the fix per the
-  **push-vs-comment rule**: `git commit` + `git push` when you can push to the
-  branch; otherwise post the concrete fix as a review comment for the author.
-  - After **pushing** a fix, **re-trigger the review** the same way — another
-    `gh workflow run polly-review.yml -f pr=<pr>` (again: not a `/review` comment
-    from you). Then poll for a **new** `<!-- polly-review-bot -->` comment and
-    triage again.
-  - When you could only *comment* the fix (a fork PR you can't push to), don't
-    re-trigger against unchanged code — record the outstanding findings in
-    `polly_review` for the author and stop looping.
+  **push-or-take-over rule**: `git commit` + `git push` when you can push to the
+  branch; on a **fork PR** you can't push to, take over into your own PR (Step 4
+  preamble) and continue on it.
+  - After **pushing** a fix (to your PR or an in-repo branch), **re-trigger the
+    review** the same way — another `gh workflow run polly-review.yml -f pr=<pr>`
+    (again: not a `/review` comment from you). Then poll for a **new**
+    `<!-- polly-review-bot -->` comment and triage again.
 - **No critical findings** — only non-blocking notes or a clean summary → the
   review is clean; you're done with this loop. You may address cheap non-blocking
   notes if they're clearly right, but they don't gate.
@@ -819,9 +838,12 @@ Field meanings:
 
 - `bug_url` — the bug link, carried through from the recovered handoff.
 - `mode` — `reviewed_existing_pr` (Step 2A: a candidate PR existed, you reviewed
-  it) or `authored_fix` (Step 2B: you wrote the fix). Use `authored_fix` when you
-  reviewed an existing PR but its approach wasn't viable and you opened your own
-  (2A.5) — name the reviewed PR in your prose so the two stay linked.
+  it and kept it as the fix) or `authored_fix` (Step 2B: you wrote the fix). Use
+  `authored_fix` when you started from an existing PR but opened your own — for
+  **either** reason: its approach wasn't viable (2A.5), or its approach was fine
+  but it was an unpushable **fork PR that needed a fix** so you took it over (Step
+  4 preamble). In both cases name the reviewed/forked PR in your prose and
+  `reviewed_pr_url` so the two stay linked.
 - `outcome` — overall: `fixed` (every live facet resolved and proven — by your fix
   or by the reviewed PR), `partially_fixed`, `not_fixed` (couldn't resolve, or the
   reviewed PR doesn't fix it), `nothing_to_fix` (recovered verdict was
@@ -861,17 +883,17 @@ Field meanings:
   review mode (there you *are* the independent reviewer on someone else's PR).
 - `pr_url` — the ready-for-review PR you **opened** (author mode). Empty in review
   mode, when `skip_push` was set, or if you stopped before opening one.
-- `reviewed_pr_url` — the existing PR you **reviewed** (review mode). Empty in
-  author mode.
+- `reviewed_pr_url` — the existing PR you **reviewed** (review mode), or the fork
+  PR you **took over** into your own (fork takeover — `pr_url` is then yours).
+  Empty when you authored from scratch with no upstream PR.
 - `pushed_branch` — the local branch holding the committed fix that you did
   **not** push because `skip_push` was set (author mode). Empty otherwise. A human
   pushes and opens the PR from it.
 - `ci_status` — the result of the Step 4.2 CI loop (run on **both** paths now):
   `green` when the checks you're responsible for pass, otherwise the failing checks
-  and whether each was diff-caused vs pre-existing/flaky/infra. On the review path,
-  also note if landing is blocked on the author applying a fix you could only
-  comment (couldn't push to a fork branch). Empty when `skip_push` was set or you
-  stopped before there was a PR to land.
+  and whether each was diff-caused vs pre-existing/flaky/infra. If a fork PR needed
+  a fix and you took over into your own PR, this reflects **your** PR's checks.
+  Empty when `skip_push` was set or you stopped before there was a PR to land.
 - `polly_review` — the result of the Step 4.3 automated-review loop: `clean` (no
   blocking/security findings) with how many `/review` rounds it took and what you
   fixed, or the unresolved critical findings if you hit the round cap. Empty when
@@ -889,11 +911,12 @@ Field meanings:
 - `session_id` — the repro session you consumed, carried through so the chain is
   traceable.
 
-Your work ends the same way on **both paths**: the PR (yours, or the one you
-reviewed and kept) has a preview, green CI, a clean automated review, a
-live-validation command, and the maintainer tagged (Step 4) — or you've hit the
-round cap and left an honest summary. The difference is only *whose* branch you
-pushed to vs. commented on (the push-vs-comment rule), and that the author path
-opens a PR while the review path adopts an existing one. `skip_push` and
+Your work ends the same way on **both paths**: the PR you're landing (one you
+opened, or an existing in-repo PR you reviewed and kept) has a preview, green CI, a
+clean automated review, a live-validation command, and the maintainer tagged (Step
+4) — or you've hit the round cap and left an honest summary. The difference is only
+how a fix lands (push directly, or — for an unpushable fork PR that needs changes —
+take over into your own PR carrying the contributor's commits), and that the author
+path opens a PR while the review path adopts an existing one. `skip_push` and
 `needs_more_info` runs end earlier, with no PR to land. Either way, **you do not
 merge.**
