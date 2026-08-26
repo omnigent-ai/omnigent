@@ -1647,6 +1647,11 @@ async def test_multipart_create_with_parent_links_child(
     the runner builds the orchestrator's handle from them.
     """
     parent = await _create_parent_session(client, agent_name="bundle-parent")
+    parent_update = await client.patch(
+        f"/v1/sessions/{parent['id']}",
+        json={"reasoning_effort": "high"},
+    )
+    assert parent_update.status_code == 200, parent_update.text
     child_bundle = build_agent_bundle(name="bundle-child")
     resp = await client.post(
         "/v1/sessions",
@@ -1656,7 +1661,6 @@ async def test_multipart_create_with_parent_links_child(
                     "parent_session_id": parent["id"],
                     "title": "bundled helper",
                     "model_override": "gpt-5.6-luna",
-                    "reasoning_effort": "high",
                 }
             )
         },
