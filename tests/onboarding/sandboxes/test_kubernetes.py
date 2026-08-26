@@ -920,6 +920,47 @@ def test_launch_host_times_out_with_reason(
         )
 
 
+@pytest.mark.parametrize(
+    ("wait_state", "expected"),
+    [
+        ("undiscovered", "did not create a child pod within 1s"),
+        ("replaced", "could not be rediscovered before the 1s deadline"),
+        ("read-error", "could not be read before the 1s deadline"),
+        ("pending", "did not start within 1s"),
+    ],
+)
+def test_configured_pod_ready_timeout_bounds_entire_job_wait(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+    monkeypatch: pytest.MonkeyPatch,
+    wait_state: str,
+    expected: str,
+) -> None:
+    """The configured budget bounds discovery, replacement, reads, and Pending."""
+    core, _batch = fake_clients
+    pod = _pod(phase="Pending")
+    if wait_state != "undiscovered":
+        core.pod_list_items = [pod]
+    if wait_state == "replaced":
+        core.read_default = _FakeApiException(status=404, reason="Not Found")
+    elif wait_state == "read-error":
+        core.read_default = _FakeApiException(status=500, reason="Internal Server Error")
+    else:
+        core.read_default = pod
+
+    ticks = iter((0.0, 1.0))
+    monkeypatch.setattr(k8s.time, "monotonic", lambda: next(ticks))
+    launcher = KubernetesSandboxLauncher(
+        in_cluster=True,
+        namespace="omnigent-sandboxes",
+        secret_name="omnigent-creds",
+        env=(),
+        pod_ready_timeout_s=1,
+    )
+
+    with pytest.raises(click.ClickException, match=expected):
+        launcher._wait_for_pod_running("omnigent-sandboxes", "omnigent-job-timeout")
+
+
 def test_terminate_deletes_job_and_secret(
     fake_clients: tuple[_FakeCore, _FakeBatch],
 ) -> None:

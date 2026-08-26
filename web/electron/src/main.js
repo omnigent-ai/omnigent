@@ -51,6 +51,7 @@ const { createBrowserViewRegistry } = require("./browserViewRegistry");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { registerBrowserIpc } = require("./browserIpc");
 const { isDeveloperModeEnabled } = require("./developer_mode");
+const { excludingManagedServers, getManagedServerUrls } = require("./managed_preferences");
 const { registerSessionExpiryReload } = require("./session-expiry");
 const { decideWindowOpen, stripCrossOriginOpenerHeaders, WEB_SCHEMES } = require("./popupPolicy");
 const omnigentCli = require("./omnigent_cli");
@@ -100,6 +101,17 @@ const ICON_PNG = path.join(__dirname, "..", "icons", "icon.png");
 function developerModeEnabled() {
   return isDeveloperModeEnabled({
     isPackaged: app.isPackaged,
+    platform: process.platform,
+    getUserDefault:
+      typeof systemPreferences.getUserDefault === "function"
+        ? systemPreferences.getUserDefault.bind(systemPreferences)
+        : undefined,
+  });
+}
+
+/** Read the current macOS MDM-provided server list without persisting it. */
+function managedServerUrls() {
+  return getManagedServerUrls({
     platform: process.platform,
     getUserDefault:
       typeof systemPreferences.getUserDefault === "function"
@@ -728,6 +740,7 @@ const updater = createDesktopUpdater({
   pinnedOrigin,
   iconPath: ICON_PNG,
   getCurrentVersion: () => currentDesktopVersion,
+  onInstallReadyChange: () => buildMenu(),
   // Dev builds use dev-app-update.yml, which mirrors the production HTTPS
   // endpoint; packaged builds always use their baked app-update.yml. Tying
   // this to !app.isPackaged — not an env var — ensures a packaged app can
@@ -1916,13 +1929,8 @@ function buildMenu() {
     {
       id: "restart_to_update",
       label: "Restart to Update",
+      visible: updater.getStatus().state === "downloaded",
       click: async () => {
-        // Production install path: the UpdateBanner toast is dismissible (and
-        // a user may have closed it), so the menubar must still offer a way to
-        // install a downloaded update. installUpdateNow() quits the app to
-        // hand off to the installer; it returns false when nothing is ready
-        // (e.g. the toast was for an update since skipped or not downloaded),
-        // which we surface with a native dialog instead of silently no-op'ing.
         if (!updater.installUpdateNow()) {
           await dialog.showMessageBox(activeWindow(), {
             type: "info",
@@ -2168,9 +2176,11 @@ function registerIpc() {
       // A server page must never be able to re-point which server is saved.
       throw new Error("set-server-url is only available to the setup page");
     }
-    const normalized = normalizeUrl(url); // throws → rejects → setup page shows error
-    // Bare Databricks workspace URLs serve a 404 at the root; expand them to
-    // the Omnigent UI mount so the user can paste just the workspace host.
+    // A managed choice is already validated and may name a workspace mount;
+    // preserve it exactly. The shared expansion is a no-op for paths, while a
+    // managed workspace root still gets the normal mount discovery.
+    const managedTarget = managedServerUrls().find((candidate) => candidate === url);
+    const normalized = managedTarget ?? normalizeUrl(url); // throws → setup page shows error
     const target = await expandDatabricksWorkspaceUrl(normalized);
     const win = BrowserWindow.fromWebContents(event.sender) ?? activeWindow();
     // Multi-server windows connect without touching the saved server —
@@ -2231,7 +2241,18 @@ function registerIpc() {
     if (!isSetupPageSender(event)) {
       throw new Error("get-recent-servers is only available to the setup page");
     }
-    return normalizeRecentServers(loadSettings().recent_servers);
+    const managed = managedServerUrls();
+    return excludingManagedServers(normalizeRecentServers(loadSettings().recent_servers), managed);
+  });
+
+  // Setup page → organization-provided server choices from macOS Managed
+  // Preferences. Re-read on every request so policy removal is never copied
+  // into or masked by settings.json.
+  ipcMain.handle("omnigent:get-managed-servers", (event) => {
+    if (!isSetupPageSender(event)) {
+      throw new Error("get-managed-servers is only available to the setup page");
+    }
+    return managedServerUrls();
   });
 
   ipcMain.handle("omnigent:copy-setup-text", (event, text) => {
@@ -2253,11 +2274,13 @@ function registerIpc() {
       return null;
     }
     const win = BrowserWindow.fromWebContents(event.sender);
-    const recents = loadSettings().recent_servers;
+    const managedServers = managedServerUrls();
+    const recents = excludingManagedServers(loadSettings().recent_servers, managedServers);
     return {
       // isPinnedOriginSender guarantees the sender window is tracked.
       currentOrigin: windows.get(win).origin,
-      recentServers: Array.isArray(recents) ? recents.filter((u) => typeof u === "string") : [],
+      managedServers,
+      recentServers: recents,
       // The connected server's manifest, forwarded so the SPA branches on the
       // same document the shell did rather than re-fetching it (and so an
       // older shell, which simply omits this field, is detectable as absent —
@@ -2267,19 +2290,18 @@ function registerIpc() {
   });
 
   // SPA title-bar server picker → re-point the SENDING window to another
-  // server. Only URLs already in the persisted recent-servers list are
-  // accepted: pinning is a privilege grant (notifications, badge, protocol
-  // grants), so a server page must never be able to pin a window to an
-  // arbitrary origin of its choosing — only to servers the user previously
-  // connected to by hand.
+  // server. Only URLs in the persisted recent list or the current managed list
+  // are accepted: pinning is a privilege grant (notifications, badge, protocol
+  // grants), so a server page must never choose an arbitrary origin.
   ipcMain.handle("omnigent:switch-server", (event, url) => {
     if (!isPinnedOriginSender(event)) {
       throw new Error("switch-server is only available to a connected server page");
     }
     const recents = loadSettings().recent_servers;
-    const known = Array.isArray(recents) && recents.includes(url);
-    if (!known) {
-      throw new Error("switch-server target must be a previously-connected server");
+    const knownRecent = Array.isArray(recents) && recents.includes(url);
+    const knownManaged = managedServerUrls().includes(url);
+    if (!knownRecent && !knownManaged) {
+      throw new Error("switch-server target must be a recent or managed server");
     }
     const win = BrowserWindow.fromWebContents(event.sender);
     const ephemeral = Boolean(win && windows.get(win)?.ephemeral);
@@ -3057,6 +3079,13 @@ if (!gotLock) {
   // pidfile that the next launch reuses or `omnigent server stop` reclaims.
   let quitCleanupDone = false;
   let quitCleanupStarted = false;
+  let quitForceExitTimer = null;
+  const clearQuitForceExitTimer = () => {
+    if (quitForceExitTimer === null) return;
+    clearTimeout(quitForceExitTimer);
+    quitForceExitTimer = null;
+  };
+  app.on("quit", clearQuitForceExitTimer);
   app.on("before-quit", (event) => {
     if (quitCleanupDone) return;
     // A second quit (e.g. Cmd-Q again during the SIGKILL grace window) must not
@@ -3069,12 +3098,12 @@ if (!gotLock) {
     // unref'd so the cap itself can't hold the event loop open; app.exit()
     // bypasses before-quit/will-quit, so it's the guaranteed way out when
     // app.quit() proves unreliable.
-    const cap = setTimeout(() => {
-      if (quitCleanupDone) return;
+    quitForceExitTimer = setTimeout(() => {
+      quitForceExitTimer = null;
       quitCleanupDone = true;
       app.exit(0);
     }, quitCleanupTimeoutMs);
-    if (typeof cap.unref === "function") cap.unref();
+    if (typeof quitForceExitTimer.unref === "function") quitForceExitTimer.unref();
 
     // resolvedCliPath() is evaluated inside the async IIFE so a throw (a future
     // change to settings/CLI resolution) becomes a rejection caught below,
@@ -3088,22 +3117,17 @@ if (!gotLock) {
       .finally(() => {
         if (quitCleanupDone) return; // the hard cap already forced the exit
         quitCleanupDone = true;
-        clearTimeout(cap);
-        // Hand off to a user-approved install if one is pending; otherwise
-        // complete the deferred quit. quitAndInstall() re-issues app.quit()
-        // (via setImmediate) only when it can actually install — so if the
-        // staged update is gone and install() returns false, fall back to a
-        // plain quit and then a forced exit after a short grace, rather than
-        // leave the app up waiting for an update that won't install. The
-        // installer is spawned synchronously inside quitAndInstall(), so by
-        // the time the fallback fires the update is already underway (or was
-        // never going to install) — force-exiting only ensures we quit.
-        if (updater.quitAndInstallIfPending()) {
-          const fallback = setTimeout(() => app.exit(0), quitInstallFallbackMs);
-          if (typeof fallback.unref === "function") fallback.unref();
-        } else {
-          app.quit();
-        }
+        // Re-entering app.quit() while Electron is unwinding the prevented quit
+        // can stop after before-quit, so resume on the next event-loop turn.
+        setImmediate(() => {
+          if (updater.quitAndInstallIfPending()) {
+            clearQuitForceExitTimer();
+            const fallback = setTimeout(() => app.exit(0), quitInstallFallbackMs);
+            if (typeof fallback.unref === "function") fallback.unref();
+          } else {
+            app.quit();
+          }
+        });
       });
   });
 }

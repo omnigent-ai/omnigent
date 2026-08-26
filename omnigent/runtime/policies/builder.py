@@ -26,7 +26,7 @@ import cachetools
 from omnigent.entities import Conversation
 from omnigent.entities import Policy as StoredPolicy
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.llms.context_window import fetch_model_pricing
+from omnigent.llms.context_window import fetch_model_pricing_with_provider
 from omnigent.policies.base import Policy
 from omnigent.policies.function import resolve_function_policy
 from omnigent.policies.schema import (
@@ -560,8 +560,26 @@ def build_policy_engine(
         else (spec.llm.model if spec.llm else None)
     )
     # Pass the full ModelPricing so the engine can price cache-read and
-    # cache-write tokens at their own rates via compute_llm_cost().
-    token_pricing = fetch_model_pricing(spec.llm.model) if spec.llm else None
+    # cache-write tokens at their own rates via compute_llm_cost(). Check
+    # provider config first for custom pricing (self-hosted models), then
+    # fall back to catalog. Use the effective model from the session (honors
+    # model_override) rather than the static spec model.
+    token_pricing: Any = None
+    if initial_model:
+        # Load provider config to check for custom pricing
+        from omnigent.onboarding.provider_config import load_config
+
+        provider_config = load_config()
+        # Match the harness running this session; an override wins over the
+        # agent's configured executor harness.
+        harness = (
+            conv.harness_override
+            if conv is not None and conv.harness_override
+            else spec.executor.harness_kind
+        )
+        token_pricing = fetch_model_pricing_with_provider(
+            initial_model, provider_config=provider_config, harness=harness
+        )
     server_connection = _resolve_server_llm_connection(server_llm)
     # host_connection carries the per-request caller token (billed to
     # the caller). It takes precedence over the static server-level

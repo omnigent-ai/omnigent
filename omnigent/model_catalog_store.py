@@ -45,8 +45,8 @@ def fingerprint_of(*parts: object) -> str:
     return digest.hexdigest()[:16]
 
 
-#: Catalog entries older than this get a background refresh on read (the
-#: readers decide; the store only reports staleness).
+#: Catalog entries older than this get a background refresh on read, and
+#: launch paths stop treating their ``isDefault`` row as launch authority.
 CATALOG_STALE_AFTER_S = 3600.0
 
 
@@ -100,6 +100,20 @@ def catalog_age_s(harness: str, fingerprint: str) -> float | None:
         return None
 
 
+def catalog_is_stale(harness: str, fingerprint: str) -> bool:
+    """
+    Whether the stored catalog is older than :data:`CATALOG_STALE_AFTER_S`.
+
+    :param harness: Canonical harness name.
+    :param fingerprint: The launch-config fingerprint.
+    :returns: ``True`` for an entry past the TTL. ``False`` for a fresh
+        entry — and for no entry at all, since rows served without a file
+        can only have come from a probe that just ran.
+    """
+    age = catalog_age_s(harness, fingerprint)
+    return age is not None and age > CATALOG_STALE_AFTER_S
+
+
 def write_catalog(harness: str, fingerprint: str, rows: list[dict[str, Any]]) -> None:
     """Persist catalog rows atomically (best-effort; failures only log).
 
@@ -143,7 +157,10 @@ async def ensure_catalog(
     """Store-first catalog access with a single probe in flight per key.
 
     A hit serves immediately; a miss runs *resolve* once (concurrent
-    callers join it), persists a non-empty answer, and returns it.
+    callers join it), persists a non-empty answer, and returns it. A hit
+    older than :data:`CATALOG_STALE_AFTER_S` still serves immediately but
+    kicks *resolve* in the background so the store converges — the probe's
+    own internal budgets bound it, so nothing here waits on it.
 
     :param harness: Canonical harness name.
     :param fingerprint: The launch-config fingerprint.
@@ -152,6 +169,8 @@ async def ensure_catalog(
     """
     cached = read_catalog(harness, fingerprint)
     if cached is not None:
+        if catalog_is_stale(harness, fingerprint):
+            _refresh_in_background(harness, fingerprint, resolve)
         return cached
     key = (harness, fingerprint)
     task = _inflight.get(key)
@@ -169,6 +188,41 @@ async def ensure_catalog(
         task = asyncio.create_task(_run(), name=f"model-catalog-{harness}")
         _inflight[key] = task
     return await asyncio.shield(task)
+
+
+def _refresh_in_background(
+    harness: str,
+    fingerprint: str,
+    resolve: Callable[[], Awaitable[list[dict[str, Any]] | None]],
+) -> None:
+    """
+    Re-probe a stale catalog off the caller's path, single-flight per key.
+
+    The stale rows keep serving; a successful probe rewrites the store so
+    the next read is fresh. Failures only log — staleness is not an outage.
+
+    :param harness: Canonical harness name.
+    :param fingerprint: The launch-config fingerprint.
+    :param resolve: Probe coroutine factory producing verbatim rows.
+    """
+    key = (harness, fingerprint)
+    task = _inflight.get(key)
+    if task is not None and not task.done():
+        return
+
+    async def _run() -> list[dict[str, Any]] | None:
+        try:
+            rows = await resolve()
+            if rows:
+                write_catalog(harness, fingerprint, rows)
+            return rows
+        except Exception:  # noqa: BLE001 — stale rows keep serving
+            _logger.warning("background %s catalog refresh failed", harness, exc_info=True)
+            return None
+        finally:
+            _inflight.pop(key, None)
+
+    _inflight[key] = asyncio.create_task(_run(), name=f"model-catalog-refresh-{harness}")
 
 
 def default_row(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -194,6 +248,7 @@ __all__ = [
     "CATALOG_STALE_AFTER_S",
     "catalog_age_s",
     "catalog_contains",
+    "catalog_is_stale",
     "catalog_path",
     "default_row",
     "ensure_catalog",

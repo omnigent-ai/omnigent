@@ -11,9 +11,16 @@ from omnigent.cli import cli
 from omnigent.host.local_server import LocalServerInfo
 from omnigent.update_check import (
     _build_nightly_upgrade_suggestion,
+    _build_upgrade_suggestion,
     _InstalledWheelInfo,
     _newest_nightly_version,
+    _upgrade_failure_message,
+    _uv_python_pin,
 )
+
+# uv upgrade commands pin the interpreter omnigent is running under, so
+# expectations derive the flag instead of hardcoding a python version.
+_UV_PY = _uv_python_pin()
 
 
 def _uv_registry_info() -> _InstalledWheelInfo:
@@ -490,7 +497,9 @@ def test_upgrade_git_install_repulls_and_verifies_commit(
     result = CliRunner().invoke(cli, ["upgrade"])
 
     assert result.exit_code == 0, result.output
-    assert ran == ["uv tool install --reinstall git+https://github.com/omnigent-ai/omnigent.git"]
+    assert ran == [
+        f"uv tool install --reinstall{_UV_PY} git+https://github.com/omnigent-ai/omnigent.git"
+    ]
     assert "Updated to git bbbbbbbbb" in result.output
 
 
@@ -578,7 +587,13 @@ def test_nightly_suggestion_shapes_per_installer() -> None:
         )
 
     uv = _build_nightly_upgrade_suggestion(info_for("uv"), version)
-    assert (uv.command, uv.runnable) == (f"uv tool install --force {spec}", True)
+    # ``--reinstall``, never ``--force``: uv's ``--force`` removes the working
+    # install before the replacement is built, and nightlies build from source,
+    # so a failed build would leave nothing behind.
+    assert (uv.command, uv.runnable) == (
+        f"uv tool install --reinstall{_UV_PY} {spec}",
+        True,
+    )
     pipx = _build_nightly_upgrade_suggestion(info_for("pipx"), version)
     assert (pipx.command, pipx.runnable) == (f"pipx install --force {spec}", True)
     pip = _build_nightly_upgrade_suggestion(info_for("pip"), version)
@@ -626,7 +641,8 @@ def test_upgrade_nightly_installs_pinned_tag(
 
     assert result.exit_code == 0, result.output
     assert ran == [
-        "uv tool install --force git+https://github.com/omnigent-ai/omnigent@v0.2.0.dev20260804"
+        f"uv tool install --reinstall{_UV_PY} "
+        "git+https://github.com/omnigent-ai/omnigent@v0.2.0.dev20260804"
     ]
     assert "Upgraded to nightly v0.2.0.dev20260804" in result.output
 
@@ -681,7 +697,7 @@ def test_nightly_suggestion_preserves_and_unions_extras() -> None:
 
     assert suggestion.runnable
     assert suggestion.command == (
-        "uv tool install --force "
+        f"uv tool install --reinstall{_UV_PY} "
         "git+https://github.com/omnigent-ai/omnigent@v0.9.0.dev20260804#egg=omnigent[all,server]"
     )
 
@@ -733,7 +749,7 @@ def test_upgrade_nightly_dry_run_prints_without_running(
 
     assert result.exit_code == 0, result.output
     assert (
-        "Would run: uv tool install --force "
+        f"Would run: uv tool install --reinstall{_UV_PY} "
         "git+https://github.com/omnigent-ai/omnigent@v0.2.0.dev20260804" in result.output
     )
 
@@ -746,3 +762,118 @@ def test_upgrade_nightly_rejects_target_version(
 
     assert result.exit_code == 2, result.output
     assert "mutually exclusive" in result.output
+
+
+def test_nightly_uv_never_uses_destructive_force() -> None:
+    """No uv upgrade command may use ``--force``, whatever the install shape.
+
+    uv's ``--force`` removes the tool environment (and the ``omni`` /
+    ``omnigent`` executables) before the replacement is built. Nightlies build
+    from source, so the build can fail, and then nothing is left to fall back
+    to. ``--reinstall`` performs the same registry-to-git hop and the same
+    tag-to-tag hop while keeping the working install until the new one exists.
+    """
+    version = "0.9.0.dev20260804"
+    for extras in ((), ("databricks",)):
+        for vcs_url in (None, "git+https://github.com/a-fork/omnigent.git"):
+            info = _InstalledWheelInfo(
+                install_time_epoch=0.0,
+                installer="uv",
+                vcs_url=vcs_url,
+                commit_sha=None,
+                is_editable=False,
+                package_version="0.8.2",
+                detected_installer="uv",
+                extras=extras,
+            )
+            command = _build_nightly_upgrade_suggestion(info, version).command
+            assert "--force" not in command, command
+            assert command.startswith(f"uv tool install --reinstall{_UV_PY} ")
+            # Always the nightly tag, never the fork's recorded URL.
+            assert f"git+https://github.com/omnigent-ai/omnigent@v{version}" in command
+
+
+def test_nightly_pipx_spells_out_the_tag_instead_of_reinstall() -> None:
+    """pipx must not fall back to ``reinstall`` for a nightly hop.
+
+    ``pipx reinstall`` re-pulls the spec pipx recorded at install time, i.e.
+    the *old* tag, which would silently no-op the upgrade. Only the extras-less
+    in-place refresh may use it.
+    """
+
+    def pipx_info(vcs_url: str | None) -> _InstalledWheelInfo:
+        return _InstalledWheelInfo(
+            install_time_epoch=0.0,
+            installer="pipx",
+            vcs_url=vcs_url,
+            commit_sha=None,
+            is_editable=False,
+            package_version="0.8.2",
+            detected_installer="pipx",
+        )
+
+    nightly = _build_nightly_upgrade_suggestion(pipx_info(None), "0.9.0.dev20260804")
+    assert nightly.command == (
+        "pipx install --force git+https://github.com/omnigent-ai/omnigent@v0.9.0.dev20260804"
+    )
+    # An ordinary extras-less VCS refresh still uses the cheap re-pull.
+    same_source = _build_upgrade_suggestion(pipx_info("git+https://host/omnigent.git"))
+    assert same_source.command == "pipx reinstall omnigent"
+
+
+def test_upgrade_failure_message_reports_a_destroyed_install(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed upgrade must not claim the old install survived when it didn't."""
+    monkeypatch.setattr(
+        "omnigent.update_check._probe_installed_distribution", lambda: (None, None)
+    )
+
+    message = _upgrade_failure_message(1, {"databricks"})
+
+    assert "your previous install is intact" not in message
+    assert "no longer installed" in message
+    # Actionable recovery, preserving the extras this install had.
+    assert "install.sh | sh -s -- --extra databricks" in message
+    assert "omnigent login" in message
+    assert "OMNIGENT_SKIP_WEB_UI=true" in message
+
+
+def test_upgrade_failure_message_confirms_a_surviving_install(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the probe still finds omnigent, the reassuring message is correct."""
+    monkeypatch.setattr(
+        "omnigent.update_check._probe_installed_distribution", lambda: ("0.8.2", None)
+    )
+
+    message = _upgrade_failure_message(1)
+
+    assert message == "Upgrade command exited with status 1; your previous install is intact."
+
+
+def test_upgrade_nightly_failure_surfaces_recovery_when_install_is_gone(
+    monkeypatch: pytest.MonkeyPatch, _wheel_install: None
+) -> None:
+    """A failed nightly build that took the install with it must say so.
+
+    This is the reported bug end to end: the web-UI build fails, the installer
+    exits non-zero, and the CLI used to answer "your previous install is
+    intact" purely from the exit code, sending the user to inspect PATH while
+    ``omni`` was actually gone.
+    """
+    monkeypatch.setattr(
+        "omnigent.update_check._latest_nightly_version", lambda: "0.2.0.dev20260804"
+    )
+    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", lambda *_a: 1)
+    # The installer replaced the environment, then the build failed.
+    monkeypatch.setattr(
+        "omnigent.update_check._probe_installed_distribution", lambda: (None, None)
+    )
+
+    result = CliRunner().invoke(cli, ["upgrade", "--nightly"])
+
+    assert result.exit_code != 0
+    assert "your previous install is intact" not in result.output
+    assert "no longer installed" in result.output
+    assert "install.sh" in result.output

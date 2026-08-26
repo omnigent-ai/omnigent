@@ -89,6 +89,7 @@ export function CommentsPanel({
   const [tab, setTab] = useState<Tab>("open");
   const addCommentTextareaRef = useRef<HTMLTextAreaElement>(null);
   const selectedCardRef = useRef<HTMLDivElement>(null);
+  const autoRouteRef = useRef<{ selection: ActiveSelection; tab: Tab } | null>(null);
   const { width, containerRef, isDesktop, handleProps } = useResizableCommentsPanel();
 
   // Editing or deleting a comment is author-only (the backend enforces this
@@ -101,16 +102,18 @@ export function CommentsPanel({
     canEdit && (c.created_by == null || c.created_by === currentAuthorId);
   const activeSelectionStart = activeSelection?.start_index;
   const activeSelectionEnd = activeSelection?.end_index;
+  const activeCommentId = activeSelection?.comment_id;
 
   useEffect(() => {
     setBody("");
     if (pendingBodyRef) pendingBodyRef.current = "";
-  }, [activeSelectionStart, activeSelectionEnd, pendingBodyRef]);
+  }, [activeSelectionStart, activeSelectionEnd, activeCommentId, pendingBodyRef]);
 
   // Auto-focus the textarea when a new pending selection appears (no existing
   // comment at that range) so the user can start typing immediately.
   useEffect(() => {
     if (activeSelectionStart == null || activeSelectionEnd == null) return;
+    if (activeCommentId) return;
     const isExisting = comments.some(
       (c) => c.start_index === activeSelectionStart && c.end_index === activeSelectionEnd,
     );
@@ -118,21 +121,24 @@ export function CommentsPanel({
     // rAF ensures the textarea has been rendered before we try to focus it.
     const id = requestAnimationFrame(() => addCommentTextareaRef.current?.focus());
     return () => cancelAnimationFrame(id);
-  }, [activeSelectionStart, activeSelectionEnd, comments]);
+  }, [activeSelectionStart, activeSelectionEnd, activeCommentId, comments]);
 
-  // Selecting a highlighted range in the file activates its comment; if that
-  // comment lives on the other tab, switch to the tab that holds it so its card
-  // is rendered (and can then be scrolled into view below).
+  // activeSelection is FileViewer state and keeps its identity across query
+  // refreshes; this guard lets a later manual tab switch stick.
   useEffect(() => {
-    if (!activeSelection) return;
-    const matches = (c: Comment) =>
-      c.start_index === activeSelection.start_index && c.end_index === activeSelection.end_index;
-    if (tab === "open" && !comments.some(matches) && addressedComments.some(matches)) {
-      setTab("addressed");
-    } else if (tab === "addressed" && !addressedComments.some(matches) && comments.some(matches)) {
-      setTab("open");
+    if (!activeSelection) {
+      autoRouteRef.current = null;
+      return;
     }
-  }, [activeSelection, comments, addressedComments, tab]);
+    const nextTab =
+      activeCommentId && addressedComments.some((c) => c.id === activeCommentId)
+        ? "addressed"
+        : "open";
+    const previous = autoRouteRef.current;
+    if (previous?.selection === activeSelection && previous.tab === nextTab) return;
+    autoRouteRef.current = { selection: activeSelection, tab: nextTab };
+    setTab(nextTab);
+  }, [activeSelection, activeCommentId, addressedComments]);
 
   // Scroll the active comment's card into view within the panel, so selecting a
   // highlight in the file reveals its card even when the list is long. rAF lets
@@ -145,6 +151,13 @@ export function CommentsPanel({
     );
     return () => cancelAnimationFrame(id);
   }, [activeSelection, tab]);
+
+  const isSelectedComment = (comment: Comment): boolean =>
+    activeCommentId
+      ? activeCommentId === comment.id
+      : comment.status === "draft" &&
+        activeSelectionStart === comment.start_index &&
+        activeSelectionEnd === comment.end_index;
 
   return (
     <div
@@ -211,9 +224,10 @@ export function CommentsPanel({
       )}
 
       <div className="flex-1 overflow-y-auto">
-        {/* Input section — shown when text is selected with no existing comment at same range and user can edit */}
+        {/* Input section — shown for a pending selection with no open comment at the same range */}
         {tab === "open" &&
           activeSelection != null &&
+          activeCommentId == null &&
           !comments.some(
             (c) =>
               c.start_index === activeSelection.start_index &&
@@ -271,9 +285,7 @@ export function CommentsPanel({
           ) : (
             <div className="space-y-2 p-3">
               {comments.map((c) => {
-                const isSelected =
-                  activeSelection?.start_index === c.start_index &&
-                  activeSelection?.end_index === c.end_index;
+                const isSelected = isSelectedComment(c);
                 return (
                   <CommentCard
                     key={c.id}
@@ -296,15 +308,14 @@ export function CommentsPanel({
         ) : (
           <div className="space-y-2 p-3">
             {addressedComments.map((c) => {
-              const isSelected =
-                activeSelection?.start_index === c.start_index &&
-                activeSelection?.end_index === c.end_index;
+              const isSelected = isSelectedComment(c);
               return (
                 <CommentCard
                   key={c.id}
                   comment={c}
                   isSelected={isSelected}
                   cardRef={isSelected ? selectedCardRef : undefined}
+                  onClick={() => onClickComment(c)}
                   onDelete={canModify(c) ? () => onDeleteComment(c.id) : undefined}
                   onCopyLink={onCopyCommentLink ? () => onCopyCommentLink(c.id) : undefined}
                 />

@@ -43,6 +43,7 @@ import rehypeRaw from "rehype-raw";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import { rehypeGithubAlerts } from "rehype-github-alerts";
 import { mermaid } from "@streamdown/mermaid";
+import { MarkdownErrorBoundary } from "@/components/ai-elements/MarkdownErrorBoundary";
 import { Streamdown } from "streamdown";
 import type { Comment } from "@/hooks/useComments";
 import {
@@ -97,6 +98,7 @@ const ModelViewer = lazy(() => import("./ModelViewer").then((m) => ({ default: m
 
 // Width of the line-number gutter — must match the `w-12` Tailwind class on the gutter div.
 const GUTTER_WIDTH = 48;
+const EMPTY_COMMENTS: Comment[] = [];
 
 // GFM covers tables, task lists, strikethrough, and autolinks; remark-emoji
 // renders GitHub-style `:shortcode:` emoji as their unicode glyphs so docs read
@@ -143,9 +145,11 @@ const MERMAID_STREAMDOWN_PLUGINS = { mermaid };
 function MermaidPreview({ source }: { source: string }) {
   return (
     <div data-testid="mermaid-preview" className="not-prose my-4 overflow-auto">
-      <Streamdown plugins={MERMAID_STREAMDOWN_PLUGINS}>
-        {`\`\`\`mermaid\n${source.replace(/\n$/, "")}\n\`\`\``}
-      </Streamdown>
+      <MarkdownErrorBoundary source={source}>
+        <Streamdown plugins={MERMAID_STREAMDOWN_PLUGINS}>
+          {`\`\`\`mermaid\n${source.replace(/\n$/, "")}\n\`\`\``}
+        </Streamdown>
+      </MarkdownErrorBoundary>
     </div>
   );
 }
@@ -340,6 +344,8 @@ export interface CodeViewerProps {
   path: string;
   fileQuery: ReturnType<typeof useFileContent>;
   comments: Comment[];
+  /** Addressed comments are available for temporarily revealing a selected anchor. */
+  addressedComments?: Comment[];
   /** Highlights the selection range in the code. */
   activeSelection: ActiveSelection | null;
   /**
@@ -371,6 +377,7 @@ export function CodeViewer({
   path,
   fileQuery,
   comments,
+  addressedComments = EMPTY_COMMENTS,
   activeSelection,
   onSetActiveSelection,
   panelOpen,
@@ -383,6 +390,11 @@ export function CodeViewer({
   pendingBodyRef,
 }: CodeViewerProps) {
   const canEdit = useCanEdit(conversationId);
+  const activeCommentId = activeSelection?.comment_id;
+  const previewComments = useMemo(
+    () => [...comments, ...addressedComments.filter((c) => c.id === activeCommentId)],
+    [comments, addressedComments, activeCommentId],
+  );
 
   const [tokenLines, setTokenLines] = useState<ThemedToken[][] | null>(null);
 
@@ -686,7 +698,7 @@ export function CodeViewer({
         <PdfViewer
           data={fileQuery.data}
           conversationId={conversationId}
-          comments={comments}
+          comments={previewComments}
           activeSelection={activeSelection}
           onSetActiveSelection={onSetActiveSelection}
         />
@@ -743,7 +755,7 @@ export function CodeViewer({
         conversationId={conversationId}
         content={content}
         truncated={truncated}
-        comments={comments}
+        comments={previewComments}
         activeSelection={activeSelection}
         onSetActiveSelection={onSetActiveSelection}
       />

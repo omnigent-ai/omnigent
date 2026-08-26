@@ -57,7 +57,11 @@ import {
   FilePathAwareMessageResponse,
   rendersOnlyWorkedFold,
 } from "@/components/blocks/BlockRenderer";
-import { CompactionMarker, RoutingDecisionCard } from "@/components/blocks/StatusBlocks";
+import {
+  CompactionMarker,
+  ErrorBanner,
+  RoutingDecisionCard,
+} from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
 import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
@@ -136,6 +140,7 @@ import {
   rankMentionEntries,
 } from "@/lib/composerMentions";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
+import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 // Re-exported so existing tests importing these from "./ChatPage" keep working
 // after the pure helpers moved to the shared lib.
 export { detectMentionAt, mentionMarkerFor };
@@ -219,6 +224,7 @@ import {
 } from "@/lib/claudePermissionMode";
 import { isCodexNativeSession } from "@/lib/codexPlanMode";
 import { getCliServerUrl } from "@/lib/host";
+import { useOmnigentAnalytics } from "@/lib/analyticsEmit";
 import { SessionImage } from "@/components/SessionImage";
 import { GoalControl, GoalStatusPill, useGoalState, type Goal } from "@/components/goal";
 import { copyText } from "@/lib/clipboard";
@@ -382,7 +388,8 @@ export function collectBubbleMarkdown(items: RenderItem[]): string {
 }
 
 // All chat-column elements must share this width to stay aligned.
-const CHAT_COLUMN_WIDTH = "max-w-3xl min-[1921px]:max-w-4xl min-[2561px]:max-w-5xl";
+const CHAT_COLUMN_WIDTH =
+  "max-w-3xl min-[1921px]:max-w-4xl min-[2561px]:max-w-[clamp(64rem,40vw,100rem)]";
 
 const TABLE_SEPARATOR_RE = /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/;
 const DISPLAY_MATH_RE = /(^|\n)\s*(\$\$[\s\S]*?\$\$|\\\[[\s\S]*?\\\])/;
@@ -671,47 +678,6 @@ function truncateTitle(raw: string, max = 60): string {
   const cut = lastSpace > max - 10 ? lastSpace : slice.length;
   return slice.slice(0, cut).join("").trimEnd() + "…";
 }
-
-// Per-session draft storage — module-level so it survives the Composer
-// unmount/remount that happens during the loading gate between session
-// switches (ChatPage returns <HydratingPlaceholder /> while
-// loadingConversation is true, which unmounts the entire chat surface).
-// Text drafts are also persisted to sessionStorage so they survive page
-// refreshes; File objects can't be serialized, so only text round-trips.
-const SESSION_DRAFTS_KEY = "omnigent.sessionDrafts";
-
-function loadDraftsFromStorage(): Map<string, { text: string; files: File[] }> {
-  try {
-    const raw = window.sessionStorage.getItem(SESSION_DRAFTS_KEY);
-    if (!raw) return new Map();
-    const entries = JSON.parse(raw) as Record<string, string>;
-    const map = new Map<string, { text: string; files: File[] }>();
-    for (const [id, text] of Object.entries(entries)) {
-      if (text) map.set(id, { text, files: [] });
-    }
-    return map;
-  } catch {
-    return new Map();
-  }
-}
-
-function saveDraftsToStorage(drafts: Map<string, { text: string; files: File[] }>): void {
-  try {
-    const obj: Record<string, string> = {};
-    for (const [id, draft] of drafts) {
-      if (draft.text) obj[id] = draft.text;
-    }
-    if (Object.keys(obj).length === 0) {
-      window.sessionStorage.removeItem(SESSION_DRAFTS_KEY);
-    } else {
-      window.sessionStorage.setItem(SESSION_DRAFTS_KEY, JSON.stringify(obj));
-    }
-  } catch {
-    // Storage full or unavailable — drafts still work in-memory.
-  }
-}
-
-const sessionDrafts = loadDraftsFromStorage();
 
 /**
  * Single component that drives the chat surface. Streaming + history
@@ -1603,9 +1569,8 @@ interface MainAgentSurfaceProps {
    *  Never includes child-session activity and never gates Stop/Interrupt. */
   showsWorking: boolean;
   /**
-   * Strict runner-tunnel liveness, used only to gate the inline terminal
-   * view (the PTY dies the moment the runner tunnel drops). The reconnect
-   * affordances key off `liveness` instead.
+   * Strict runner-tunnel liveness. The terminal view remains selectable when
+   * this is false and uses it to show the stopped-harness resume state.
    */
   runnerOnline: boolean | undefined;
   /** Derived open-session liveness — drives the reconnect hint/banner. */
@@ -1727,7 +1692,7 @@ export interface WarmTerminalEntry {
 /**
  * How many sessions' terminal surfaces stay warm at once (the active one
  * included). Each warm surface holds a WebSocket + a runner-side
- * ``tmux attach``, a WebGL context (browsers cap those per page; losing
+ * tmux control client, a WebGL context (browsers cap those per page; losing
  * one falls back to xterm's DOM renderer), and keeps parsing any output
  * its TUI streams while hidden — so the cache is bounded rather than
  * unbounded, but sized to cover a working set of sessions, not just a
@@ -1901,20 +1866,16 @@ function MainAgentSurface({
     [streamBubbles],
   );
 
-  // Cmd+Alt+↑/↓ (Ctrl+Alt on win/linux) — guarded so the composer's
-  // own unmodified ArrowUp/Down history-recall still works.
+  // Cmd+Alt+↑/↓ (Ctrl+Alt on win/linux) — the composer's own unmodified
+  // ArrowUp/Down history-recall skips modified arrows, so this fires there too.
   useEffect(() => {
     // globalThis prefix because React's KeyboardEvent is imported above.
     const handler = (e: globalThis.KeyboardEvent) => {
       if (!(e.metaKey || e.ctrlKey) || !e.altKey) return;
       if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
-      const target = e.target;
-      if (
-        target instanceof HTMLElement &&
-        target.closest('textarea, input, [contenteditable="true"]')
-      ) {
-        return;
-      }
+      // Yield to a focused widget that already claimed the chord for its own
+      // list navigation (command palette, mention / slash menus).
+      if (e.defaultPrevented) return;
       e.preventDefault();
       if (e.key === "ArrowUp") nav.goPrev();
       else nav.goNext();
@@ -2064,6 +2025,17 @@ function MainAgentSurface({
     mountTerminal && conversationId
       ? updateWarmTerminalSurfaces(warmTerminals, conversationId, terminalReadOnly)
       : warmTerminals;
+  const handleTerminalResume = useCallback(async () => {
+    if (!conversationId) throw new Error("Session is not available");
+    if (liveness.kind === "host_offline" || liveness.kind === "local_stranded") {
+      onShowReconnectHelp();
+      return;
+    }
+    const result = await retrySession(conversationId);
+    if (!result.recovered) {
+      throw new Error("The session is already connected; no recovery was performed");
+    }
+  }, [conversationId, liveness.kind, onShowReconnectHelp]);
   const terminalSurfaces = renderedTerminals.map((entry) => {
     const isActive = mountTerminal && entry.conversationId === conversationId;
     const isShown = isActive && showTerminal;
@@ -2077,6 +2049,8 @@ function MainAgentSurface({
           conversationId={entry.conversationId}
           initialTerminalKey={isActive ? terminalFirst?.terminalViewKey : null}
           visible={isShown}
+          runnerOnline={isActive ? runnerOnline : undefined}
+          onResume={isActive ? handleTerminalResume : undefined}
           onSurfaceElement={isActive ? setTerminalSurfaceEl : undefined}
           readOnly={entry.readOnly}
         />
@@ -2990,6 +2964,7 @@ export function JumpToTopButton({
         disabled={jumping}
         onClick={() => void jumpToTop()}
         aria-label="Jump to the first message"
+        componentId="chat.nav.jump_to_top"
         // When hidden (opacity-0 / pointer-events-none) keep the button out of
         // the tab order and the accessibility tree so it can't take focus or be
         // announced while invisible.
@@ -3175,13 +3150,9 @@ export function SandboxFailedIndicator({ status }: { status: SandboxStatus }) {
     <div
       data-testid="sandbox-failed-indicator"
       role="status"
-      className={cn(
-        "mx-auto mb-4 flex w-full items-center justify-center gap-2 px-6 py-1.5 text-destructive text-sm",
-        CHAT_COLUMN_WIDTH,
-      )}
+      className={cn("mx-auto w-full", CHAT_COLUMN_WIDTH)}
     >
-      <AlertTriangleIcon className="size-3.5 shrink-0" aria-hidden />
-      <span>Sandbox launch failed{status.error ? `: ${status.error}` : ""}</span>
+      <ErrorBanner message={status.error ?? ""} source="" code="" title="Sandbox launch failed" />
     </div>
   );
 }
@@ -3220,7 +3191,6 @@ export function ConnectionIndicator({
     terminalFirst?.isTerminalFirst === true &&
     !terminalFirst.isShellView &&
     sandboxStatus?.stage !== "failed" &&
-    !unreachable &&
     !keyboardVisible &&
     surfaceFrontmost;
   useNativeChatTerminalBar(terminalFirst, nativeBarVisible);
@@ -3245,25 +3215,51 @@ export function ConnectionIndicator({
     // `local_stranded` keeps the banner everywhere (no host, hence no badge).
     const composerOnScreen = !(terminalFirst?.isTerminalFirst && terminalFirst.view === "terminal");
     if (liveness.kind === "host_offline" && composerOnScreen) {
-      return null;
+      return nativeBarVisible ? (
+        <div
+          aria-hidden
+          className={cn(
+            "omnigent-native-bottom-spacer",
+            terminalFirst?.view === "chat" && "omnigent-native-bottom-spacer--chat",
+          )}
+        />
+      ) : null;
     }
     return (
-      <button
-        type="button"
-        data-testid="disconnected-indicator"
-        onClick={onShowReconnectHelp}
-        className={cn(
-          "mx-auto mb-4 flex w-full items-center justify-center gap-2 px-6 py-1.5 text-sm text-destructive underline-offset-2 hover:underline",
-          CHAT_COLUMN_WIDTH,
+      <>
+        <div className={cn("mx-auto mb-4 flex w-full justify-center px-6", CHAT_COLUMN_WIDTH)}>
+          {/* Reconnect affordance styled as the destructive error pill (never
+              raw red text). Keeps its own click → reconnect dialog rather than
+              the ErrorBanner's async Retry, since some states need the picker. */}
+          <button
+            type="button"
+            data-testid="disconnected-indicator"
+            onClick={onShowReconnectHelp}
+            className="flex items-center gap-2 rounded-[12px] px-4 py-2 text-sm text-destructive transition-[filter] hover:brightness-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+            style={{
+              background:
+                "color-mix(in srgb, var(--destructive) 4%, var(--app-shell-bg, var(--background)))",
+              border: "1px solid color-mix(in srgb, var(--destructive) 32%, transparent)",
+            }}
+          >
+            <WifiOffIcon className="size-3.5 shrink-0" />
+            <span>
+              {liveness.kind === "host_offline"
+                ? "Host is offline — click to reconnect"
+                : "Agent disconnected — click to reconnect"}
+            </span>
+          </button>
+        </div>
+        {nativeBarVisible && (
+          <div
+            aria-hidden
+            className={cn(
+              "omnigent-native-bottom-spacer",
+              terminalFirst?.view === "chat" && "omnigent-native-bottom-spacer--chat",
+            )}
+          />
         )}
-      >
-        <WifiOffIcon className="size-3.5 shrink-0" />
-        <span>
-          {liveness.kind === "host_offline"
-            ? "Host is offline — click to reconnect"
-            : "Agent disconnected — click to reconnect"}
-        </span>
-      </button>
+      </>
     );
   }
 
@@ -3494,7 +3490,7 @@ function useNativeChatTerminalBar(
 ): void {
   const native = isIOSShell();
   const view = ctx?.view ?? "chat";
-  const terminalsAvailable = ctx?.terminalsAvailable ?? false;
+  const terminalEnabled = ctx?.isTerminalFirst === true;
   const terminalStartingUp = ctx?.terminalStartingUp ?? false;
 
   // Keep `setView` reachable from the subscribe-once effect without
@@ -3507,11 +3503,11 @@ function useNativeChatTerminalBar(
     if (!native) return;
     setNativeViewMode({
       mode: view,
-      terminalEnabled: terminalsAvailable,
+      terminalEnabled,
       terminalStartingUp,
       visible,
     });
-  }, [native, view, terminalsAvailable, terminalStartingUp, visible]);
+  }, [native, view, terminalEnabled, terminalStartingUp, visible]);
 
   // Belt-and-suspenders: hide the bar if the host component ever unmounts.
   useEffect(() => {
@@ -3865,7 +3861,12 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             )}
             {text && (
               <MessageActions>
-                <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
+                <MessageAction
+                  tooltip="Copy"
+                  size="icon-xxs"
+                  onClick={handleCopy}
+                  componentId="chat.message.copy_user"
+                >
                   {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
                 </MessageAction>
               </MessageActions>
@@ -3942,6 +3943,7 @@ function AssistantBubble({
   // element — the hover footer's timestamp/actions belong to assistant text,
   // not to the error.
   const errorOnly = hasError && !markdownText;
+  const spansFullColumn = isWide || hasError;
 
   return (
     <>
@@ -3949,14 +3951,16 @@ function AssistantBubble({
         from="assistant"
         data-testid="message-bubble"
         data-role="assistant"
-        className={isWide ? "max-w-full" : "max-w-3xl"}
+        className={
+          spansFullColumn ? "max-w-full" : "max-w-3xl min-[2561px]:max-w-[clamp(56rem,30vw,64rem)]"
+        }
       >
         {/* A fold-only bubble takes w-full at the ordinary max-w-3xl cap
             rather than shrink-wrapping to the summary row's ~110px, which
             collapsed the row's trailing hairline (a flex-1 span) to zero
             and stopped its click target short of the column. Keeping the
             cap lands the hairline where an answered turn's does. */}
-        <MessageContent className={isWide || foldOnly || hasError ? "w-full" : undefined}>
+        <MessageContent className={spansFullColumn || foldOnly ? "w-full" : undefined}>
           <BlockRenderer
             items={bubble.items}
             sessionStatus={sessionStatus}
@@ -3991,7 +3995,12 @@ function AssistantBubble({
           <div className="flex items-center gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
             {markdownText && (
               <MessageActions>
-                <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
+                <MessageAction
+                  tooltip="Copy"
+                  size="icon-xxs"
+                  onClick={handleCopy}
+                  componentId="chat.message.copy_assistant"
+                >
                   {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
                 </MessageAction>
                 {/* Fork from this response: clone the session with history
@@ -4004,6 +4013,7 @@ function AssistantBubble({
                     size="icon-xxs"
                     data-testid="fork-from-response"
                     onClick={() => forkDialog.openForkDialog({ upToResponseId: bubble.responseId })}
+                    componentId="chat.message.fork"
                   >
                     <GitForkIcon size={14} />
                   </MessageAction>
@@ -4022,8 +4032,12 @@ function AssistantBubble({
         )}
       </Message>
 
-      {bubble.lifecycle === "failed" && (
-        <p className="text-destructive text-sm">Error: {bubble.error}</p>
+      {/* Surface a turn-level failure (a failed send or stream) as the same
+          destructive pill an error block renders — never raw red text. A
+          dropped host connection already carries its own error pill inside the
+          bubble and leaves `bubble.error` null, so this stays hidden there. */}
+      {bubble.lifecycle === "failed" && bubble.error && (
+        <ErrorBanner message={bubble.error} source="" code="" />
       )}
     </>
   );
@@ -4532,27 +4546,133 @@ function SubagentComposerTray({ label }: { label: string }) {
 }
 
 /**
- * Pill above the composer tallying background tasks that are running (a dev
- * server, a background shell, a sub-agent). Independent of the "Working…"
- * shimmer: while the turn is active both show — the shimmer for the turn, the
- * pill for the tally — and once the turn ends the pill carries on alone.
- * Label-only: the count spans shells, sub-agents, and tools, so there's no
- * single terminal to open.
+ * Pill above the composer tallying running background tasks (a dev server, a
+ * background shell, a sub-agent), shown independently of the "Working…" shimmer.
+ *
+ * The tally expands into a card listing each running shell by name: on hover
+ * for a mouse, on tap for touch (which focuses it, so a tap outside closes it
+ * via blur), and on focus for the keyboard. It morphs in place — the same
+ * element tweens width and height to the measured content size at a constant
+ * corner radius (CSS can't animate to an `auto` size), growing upward out of an
+ * absolute layer over a hidden spacer so the composer below never shifts. A
+ * count-only edge (older runner, no per-shell detail) stays a plain tally.
  */
 function BackgroundTaskPill() {
   const bgCount = useChatStore((s) => s.backgroundTaskCount);
+  const bgTasks = useChatStore((s) => s.backgroundTasks);
+  const [open, setOpen] = useState(false);
+  const contentRef = useRef<HTMLDivElement>(null);
+  const [box, setBox] = useState<{ width: number; height: number } | null>(null);
+  const canExpand = bgTasks.length > 0;
+
+  useEffect(() => {
+    if (bgCount <= 0 || !canExpand) setOpen(false);
+  }, [bgCount, canExpand]);
+
+  // Measure the current content so the container tweens to a concrete size in
+  // both dimensions. Re-measured whenever the state or the task list changes.
+  useLayoutEffect(() => {
+    const el = contentRef.current;
+    if (el) setBox({ width: el.offsetWidth, height: el.offsetHeight });
+  }, [open, canExpand, bgCount, bgTasks]);
+
   if (bgCount <= 0) return null;
+
+  const showCard = open && canExpand;
+
   return (
     <div className={cn("mx-auto flex w-full px-1 pb-1.5", CHAT_COLUMN_WIDTH)}>
-      <div
-        role="status"
-        data-testid="background-task-pill"
-        className="flex items-center gap-1.5 rounded-full border border-border bg-card px-3 py-1 text-sm text-muted-foreground shadow-sm"
-      >
-        <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
-        <span>
-          {bgCount} background task{bgCount === 1 ? "" : "s"}
-        </span>
+      <div className="relative">
+        {/* Reserves the collapsed footprint so the absolute, upward-growing
+            card never shoves the composer. */}
+        <div aria-hidden className="invisible px-3 py-1.5 text-sm">
+          <div className="flex items-center gap-1.5 whitespace-nowrap">
+            <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
+            <span>
+              {bgCount} background task{bgCount === 1 ? "" : "s"}
+            </span>
+          </div>
+        </div>
+        <div
+          role="status"
+          data-testid="background-task-pill"
+          aria-label={`${bgCount} background task${bgCount === 1 ? "" : "s"} still running`}
+          tabIndex={canExpand ? 0 : undefined}
+          // Hover opens ONLY for a real mouse. On touch, opening on emulated
+          // hover triggers iOS's "first tap reveals hover, second tap clicks"
+          // heuristic — which swallows the first tap inconsistently. Touch opens
+          // via onClick instead, so the first tap always lands.
+          onPointerEnter={(e) => {
+            if (e.pointerType === "mouse" && canExpand) setOpen(true);
+          }}
+          onPointerLeave={(e) => {
+            if (e.pointerType === "mouse") setOpen(false);
+          }}
+          // Tap/click: open and focus the pill so onBlur can close it on
+          // tap-out (a gesture-driven focus() works even on iOS, where tapping a
+          // non-button element otherwise won't focus it).
+          onClick={(e) => {
+            if (!canExpand) return;
+            setOpen(true);
+            e.currentTarget.focus({ preventScroll: true });
+          }}
+          onFocus={() => canExpand && setOpen(true)}
+          onBlur={(e) => {
+            // Close when focus leaves the pill entirely (tap/click outside,
+            // Tab away); staying open if it moves to a child.
+            if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setOpen(false);
+          }}
+          style={box ? { width: box.width, height: box.height } : undefined}
+          className={cn(
+            "absolute bottom-0 left-0 overflow-hidden rounded-2xl bg-card text-sm shadow-sm ring-1 ring-border transition-[width,height,box-shadow] duration-200 ease-out",
+            showCard && "z-10 shadow-menu",
+          )}
+        >
+          <div
+            ref={contentRef}
+            // Cap at Tailwind's `md` container (28rem/448px), but never wider
+            // than the viewport minus a margin so it can't overflow on a narrow
+            // screen. The margin exceeds the composer's own px-4/px-6 inset (this
+            // pill sits at px-1) so the card's right edge, ring included, stays
+            // inside the composer rather than overhanging it.
+            style={
+              showCard ? { maxWidth: "min(var(--container-md, 28rem), 100vw - 3rem)" } : undefined
+            }
+            className={cn("w-max text-left", showCard ? "px-3 py-2" : "px-3 py-1.5")}
+          >
+            {showCard ? (
+              <ul className="flex animate-in flex-col gap-1.5 fade-in-0 duration-200">
+                {bgTasks.map((task, i) => {
+                  const label = task.description || task.command || "Background shell";
+                  const cmd = task.command && task.command !== label ? task.command : null;
+                  return (
+                    <li key={task.id ?? i} className="flex items-start gap-2">
+                      <SquareTerminalIcon
+                        className="mt-0.5 size-3.5 shrink-0 text-muted-foreground"
+                        aria-hidden="true"
+                      />
+                      <div className="min-w-0">
+                        <div className="truncate text-foreground">{label}</div>
+                        {cmd ? (
+                          <div className="truncate font-mono text-xs text-muted-foreground">
+                            {cmd}
+                          </div>
+                        ) : null}
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            ) : (
+              <div className="flex items-center gap-1.5 whitespace-nowrap text-muted-foreground">
+                <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
+                <span>
+                  {bgCount} background task{bgCount === 1 ? "" : "s"}
+                </span>
+              </div>
+            )}
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -4631,6 +4751,10 @@ export function Composer({
   // Nonce bumped when bare "/model" is submitted; opens the AgentPicker
   // dropdown instead of sending (see submit()).
   const [pickerOpenNonce, setPickerOpenNonce] = useState(0);
+  // Single send-telemetry point (see submit()). Emitting here rather than via
+  // the Button's componentId covers Enter-key sends too — a textarea Enter never
+  // submits the form, so it would otherwise bypass the Button entirely.
+  const { trackClick } = useOmnigentAnalytics();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   // Declared after textareaRef so dictation can place the caret after the
@@ -4686,9 +4810,8 @@ export function Composer({
   );
 
   // Preserve unsent text + file attachments per session so switching
-  // tabs and coming back restores the draft. The drafts map lives at
-  // module scope (not useRef) because Composer unmounts during the
-  // loading gate between session switches.
+  // tabs and coming back restores the draft. The shared draft store also lets
+  // the sidebar surface which sessions have unfinished composer content.
   const conversationId = useChatStore((s) => s.conversationId);
   const queuedMessages = useChatStore((s) => s.queuedMessages);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
@@ -4761,7 +4884,7 @@ export function Composer({
   }, []);
 
   useEffect(() => {
-    const restored = conversationId ? sessionDrafts.get(conversationId) : undefined;
+    const restored = conversationId ? getSessionDraft(conversationId) : undefined;
     setValue(restored?.text ?? "");
     setFiles(restored?.files ?? []);
     dirtyRef.current = false;
@@ -4774,16 +4897,19 @@ export function Composer({
 
     return () => {
       if (!conversationId || !dirtyRef.current) return;
-      const text = valueRef.current;
-      const draftFiles = filesRef.current;
-      if (text || draftFiles.length > 0) {
-        sessionDrafts.set(conversationId, { text, files: draftFiles });
-      } else {
-        sessionDrafts.delete(conversationId);
-      }
-      saveDraftsToStorage(sessionDrafts);
+      setSessionDraft(conversationId, {
+        text: valueRef.current,
+        files: filesRef.current,
+      });
     };
   }, [conversationId]);
+
+  // Publish edits as they happen so the open sidebar updates immediately,
+  // rather than only learning about a draft when this composer unmounts.
+  useEffect(() => {
+    if (!conversationId || settledConversationId !== conversationId || !dirtyRef.current) return;
+    setSessionDraft(conversationId, { text: value, files });
+  }, [conversationId, settledConversationId, value, files]);
 
   // Adding a reply quote (via the floating "Reply" button) should drop the
   // caret straight into the composer so the user can type immediately. Only
@@ -5202,6 +5328,11 @@ export function Composer({
     )
       return;
 
+    // A send is actually happening: report it for both pointer clicks (which
+    // reach here via the form submit) and Enter-key sends. Placed after the
+    // guard so guarded no-ops don't emit, matching the disabled Send button.
+    trackClick("chat.composer.send", "button");
+
     // Slash command path: the first token must read as "/name" (the shared
     // isSlashCommandText guard — file paths like "/Users/foo/bar.txt" don't
     // match, while args after the name may carry paths or URLs, e.g.
@@ -5544,7 +5675,7 @@ export function Composer({
             (text-transparent, caret kept visible) and render an aligned mirror
             behind it. Same box/typography so wrapping matches the textarea
             exactly. Only mounted while the draft is a command. */}
-        <div className="relative">
+        <div className="relative overflow-hidden">
           {composerIsCommand && (
             <div
               ref={backdropRef}
@@ -5641,7 +5772,7 @@ export function Composer({
             disabled={disabled || isReadOnly || unreachable || hasPendingElicitation}
             data-slash-command={composerIsCommand ? "true" : undefined}
             className={cn(
-              "relative w-full resize-none bg-transparent px-4 pt-3 pb-2 text-ui outline-none placeholder:text-muted-foreground disabled:opacity-60",
+              "relative w-full resize-none overflow-y-auto bg-transparent px-4 pt-3 pb-2 text-ui outline-none [scrollbar-width:none] placeholder:text-muted-foreground disabled:opacity-60 [&::-webkit-scrollbar]:hidden",
               // Hand glyph painting to the overlay while a command is drafted;
               // the caret stays visible via caret-foreground.
               composerIsCommand && "text-transparent caret-foreground",
@@ -5732,6 +5863,7 @@ export function Composer({
               disabled={disabled || isReadOnly || hasPendingElicitation}
               onClick={() => fileInputRef.current?.click()}
               title="Attach files"
+              componentId="chat.composer.attach_files"
             >
               <PaperclipIcon className="size-4" data-icon-size="16" />
               <span className="sr-only">Attach files</span>
@@ -5782,6 +5914,7 @@ export function Composer({
                     data-testid="codex-plan-mode-toggle"
                     data-active={codexPlanMode ? "true" : undefined}
                     onClick={() => void toggleCodexPlanMode()}
+                    componentId="chat.composer.toggle_plan_mode"
                   >
                     {planModeBusy ? (
                       <Loader2Icon className="size-3.5 animate-spin" />
@@ -5854,7 +5987,6 @@ export function Composer({
             <Button
               type="submit"
               size="icon"
-              componentId="chat.composer.send"
               variant={showInterruptButton ? "destructive" : "default"}
               // Send button fades more decisively when there's no draft —
               // overrides the base 50% disabled-opacity so the affordance
@@ -6110,6 +6242,17 @@ const EFFORT_LEVELS = ["low", "medium", "high"] as const;
 /** Anthropic-side efforts for claude-native sessions (matches ANTHROPIC_EFFORTS in reasoning_effort.py). */
 const CLAUDE_NATIVE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 
+/** Pi thinking ladder (matches PI_EFFORTS in reasoning_effort.py; ``ultra`` aliases to ``max`` on Pi so omitted). */
+const PI_NATIVE_EFFORT_LEVELS = [
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+] as const;
+
 type NativeModelPickerKind = "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi";
 
 type LabelSource = { labels?: Record<string, string | null> | null } | null | undefined;
@@ -6152,6 +6295,8 @@ export function effortLevelsForConv(
       return CLAUDE_NATIVE_EFFORT_LEVELS;
     case "codex-native-ui":
       return codexEffortLevelsForModel(codexModelOptions, currentModel);
+    case "pi-native-ui":
+      return PI_NATIVE_EFFORT_LEVELS;
     default:
       return EFFORT_LEVELS;
   }
@@ -6543,6 +6688,7 @@ function SessionConfigModal({
                     : undefined
                 }
                 activeModelId={draftModelId}
+                componentId="chat.composer.model"
               />
             </ConfigRow>
           )}
@@ -6555,6 +6701,8 @@ function SessionConfigModal({
                 value={draftRoutingOn ? "" : (draftEffort ?? EFFORT_SELECT_NONE)}
                 onValueChange={(v) => setDraftEffort(v === EFFORT_SELECT_NONE ? null : v)}
                 disabled={draftRoutingOn}
+                componentId="chat.composer.effort"
+                valueHasNoPii
               >
                 <SelectTrigger
                   className="w-full"
@@ -6589,7 +6737,12 @@ function SessionConfigModal({
               footer in some pane states, and a guess would misreport it. */}
           {showClaudePermissionMode && claudePermissionMode !== "" && (
             <ConfigRow label="Permissions" description="How much Claude asks before acting">
-              <Select value={draftPermissionMode} onValueChange={setDraftPermissionMode}>
+              <Select
+                value={draftPermissionMode}
+                onValueChange={setDraftPermissionMode}
+                componentId="chat.composer.permission_mode"
+                valueHasNoPii
+              >
                 <SelectTrigger
                   className="w-full"
                   data-testid="composer-config-permission-mode"
@@ -6627,6 +6780,8 @@ function SessionConfigModal({
               <Select
                 value={subagentRoutingValue}
                 onValueChange={(v) => setPickedSubagentRouting(v === "on" ? "on" : "off")}
+                componentId="chat.composer.subagent_routing"
+                valueHasNoPii
               >
                 <SelectTrigger
                   className="w-full"

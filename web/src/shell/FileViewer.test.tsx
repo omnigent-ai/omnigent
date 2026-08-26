@@ -46,15 +46,22 @@ vi.mock("./CommentsPanel", () => ({
   // Expose each comment as a button so tests can trigger onClickComment.
   CommentsPanel: ({
     onClickComment,
+    onAddressAll,
     comments,
+    addressedComments,
+    activeSelection,
   }: {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     onClickComment?: (comment: any) => void;
+    onAddressAll?: () => void;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     comments?: any[];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    addressedComments?: any[];
+    activeSelection?: { comment_id?: string } | null;
   }) => (
-    <div data-testid="comments-panel">
-      {comments?.map((c: { id: string }) => (
+    <div data-testid="comments-panel" data-active-comment-id={activeSelection?.comment_id ?? ""}>
+      {[...(comments ?? []), ...(addressedComments ?? [])].map((c: { id: string }) => (
         <button
           key={c.id}
           type="button"
@@ -62,6 +69,7 @@ vi.mock("./CommentsPanel", () => ({
           onClick={() => onClickComment?.(c)}
         />
       ))}
+      <button type="button" aria-label="address all comments" onClick={onAddressAll} />
     </div>
   ),
 }));
@@ -142,6 +150,7 @@ vi.mock("@/store/chatStore", () => ({
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
 import { useComments } from "@/hooks/useComments";
+import { useOptionalCommentSender } from "@/hooks/CommentSenderContext";
 import { useFileDiff } from "@/hooks/useFileDiff";
 import { getSeenCommentIds } from "@/hooks/useSeenComments";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
@@ -151,12 +160,13 @@ import { writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import type { ChangedSort } from "./FlatFileList";
 
 const useCommentsMock = vi.mocked(useComments);
+const useOptionalCommentSenderMock = vi.mocked(useOptionalCommentSender);
 
 function makeCommentsQuery(data: Comment[] | undefined) {
   return { data } as ReturnType<typeof useComments>;
 }
 
-function makeComment(id: string): Comment {
+function makeComment(id: string, status: Comment["status"] = "draft"): Comment {
   return {
     id,
     conversation_id: "conv_1",
@@ -164,7 +174,7 @@ function makeComment(id: string): Comment {
     start_index: 0,
     end_index: 5,
     body: "test comment",
-    status: "draft",
+    status,
     created_at: 0,
     updated_at: 0,
     anchor_content: "hello",
@@ -240,6 +250,7 @@ function renderViewer(props: RenderProps = {}) {
 
 beforeEach(() => {
   useCommentsMock.mockReset();
+  useOptionalCommentSenderMock.mockReturnValue(null);
   // FileViewer persists global view preferences (diff/layout/preview) to
   // localStorage. Clear it between tests so a preference written by one test
   // can't leak into another that asserts the hardcoded defaults.
@@ -278,6 +289,38 @@ function installContentWidth(width: number): void {
     y: 0,
     toJSON: () => ({}),
   } as DOMRect);
+}
+
+/**
+ * Force the header's inline toolbar into its collapsed "⋯" overflow state.
+ *
+ * useToolbarOverflow bails in jsdom (no ResizeObserver, zero clientWidth, and
+ * empty computed padding → NaN reserve), so the toolbar never collapses on its
+ * own. This stubs a ResizeObserver so the measure effect runs, numeric header
+ * padding so the reserve math resolves, and a tiny-but-positive header width
+ * that sits below the minimum required width (the title reserve alone is 48px),
+ * which flips `collapsed` to true. getComputedStyle is proxied (not replaced)
+ * so Radix's own positioning reads still see real values.
+ */
+function installCollapsedToolbar(): void {
+  class StubResizeObserver {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  }
+  vi.stubGlobal("ResizeObserver", StubResizeObserver);
+  const originalGetComputedStyle = window.getComputedStyle.bind(window);
+  vi.spyOn(window, "getComputedStyle").mockImplementation((el, pseudo) => {
+    const real = originalGetComputedStyle(el, pseudo ?? undefined);
+    return new Proxy(real, {
+      get(target, prop) {
+        if (prop === "paddingLeft" || prop === "paddingRight") return "0px";
+        const val = Reflect.get(target, prop);
+        return typeof val === "function" ? val.bind(target) : val;
+      },
+    });
+  });
+  vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(10);
 }
 
 /**
@@ -703,6 +746,39 @@ describe("FileViewer URL sync — comment param (write)", () => {
     // URL must reflect the NEW selection, not accumulate both.
     expect(screen.getByTestId("url-params").textContent).toContain("comment=c2");
     expect(screen.getByTestId("url-params").textContent).not.toContain("comment=c1");
+  });
+
+  it("does not write an addressed card selection to the URL", () => {
+    const open = makeComment("c1");
+    const addressed = makeComment("c2", "addressed");
+    useCommentsMock.mockReturnValue(makeCommentsQuery([open, addressed]));
+
+    renderViewer({ open: true, path: "file1.py" });
+    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+    fireEvent.click(screen.getByRole("button", { name: "comment c1" }));
+    expect(screen.getByTestId("url-params").textContent).toContain("comment=c1");
+
+    fireEvent.click(screen.getByRole("button", { name: "comment c2" }));
+
+    expect(screen.getByTestId("url-params").textContent).not.toContain("comment=");
+    expect(screen.getByTestId("comments-panel")).toHaveAttribute("data-active-comment-id", "c2");
+  });
+});
+
+describe("FileViewer addressed selection", () => {
+  it("keeps the selected comment active while Address All moves it", () => {
+    const mutate = vi.fn();
+    useOptionalCommentSenderMock.mockReturnValue({ mutate, isPending: false });
+    const comment = makeComment("c1");
+    useCommentsMock.mockReturnValue(makeCommentsQuery([comment]));
+
+    renderViewer({ open: true, path: "file1.py" });
+    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+    fireEvent.click(screen.getByRole("button", { name: "comment c1" }));
+    fireEvent.click(screen.getByRole("button", { name: "address all comments" }));
+
+    expect(mutate).toHaveBeenCalledWith({ comment_ids: ["c1"] });
+    expect(screen.getByTestId("comments-panel")).toHaveAttribute("data-active-comment-id", "c1");
   });
 });
 
@@ -1302,6 +1378,62 @@ describe("FileViewer view-settings menu", () => {
     first.unmount();
     render(viewerTree({ open: true, initialSearch: "diff=1" }));
     expect(await screen.findByTestId("diff-viewer")).toHaveAttribute("data-wrap-lines", "true");
+  });
+});
+
+// ── Collapsed toolbar overflow "⋯" menu ─────────────────────────────────────
+//
+// When the header is too narrow for the inline action buttons, they all fold
+// into one "⋯" ("More actions") overflow menu. The settings menu's items
+// (Find, Download, and the diff-only wrap/whitespace toggles) are already
+// independent, so they flatten straight into this overflow rather than nesting
+// a second "⋯" submenu inside it. The mutually-exclusive view-mode picker still
+// collapses to a submenu (its "one selected choice" semantics need it).
+
+describe("FileViewer collapsed-toolbar overflow menu", () => {
+  beforeEach(() => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    installCollapsedToolbar();
+  });
+
+  const openOverflowMenu = () =>
+    fireEvent.pointerDown(screen.getByRole("button", { name: "More actions" }), { button: 0 });
+
+  it("collapses the inline actions into a single '⋯' overflow menu", () => {
+    render(viewerTree({ open: true }));
+    // The inline buttons are gone; only the single overflow trigger remains.
+    expect(screen.getByRole("button", { name: "More actions" })).toBeInTheDocument();
+  });
+
+  it("flattens the settings items into the overflow menu (no '⋯'-in-'⋯' submenu)", () => {
+    render(viewerTree({ open: true }));
+    openOverflowMenu();
+    // The settings items appear as flat rows in the overflow menu…
+    expect(screen.getByRole("menuitem", { name: "Find in file" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Download file" })).toBeInTheDocument();
+    // …and there is no nested "View settings" submenu trigger wrapping them.
+    expect(screen.queryByRole("menuitem", { name: "View settings" })).toBeNull();
+  });
+
+  it("flattens the diff-only wrap/whitespace toggles too, and they still work", async () => {
+    render(viewerTree({ open: true, initialSearch: "diff=1" }));
+    const diff = await screen.findByTestId("diff-viewer");
+    expect(diff).toHaveAttribute("data-wrap-lines", "false");
+    openOverflowMenu();
+    // Diff toggles are flat rows here, not behind a "View settings" submenu.
+    expect(screen.queryByRole("menuitem", { name: "View settings" })).toBeNull();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Wrap lines" }));
+    expect(screen.getByTestId("diff-viewer")).toHaveAttribute("data-wrap-lines", "true");
+  });
+
+  it("keeps the mutually-exclusive view-mode picker as a submenu", () => {
+    render(viewerTree({ open: true, path: "notes.md" }));
+    openOverflowMenu();
+    // Markdown's Preview/Edit/Source picker still nests (a submenu trigger),
+    // since it carries a single highlighted "selected choice".
+    expect(screen.getByRole("menuitem", { name: "View mode" })).toBeInTheDocument();
+    // Its choices are not surfaced at the top level of the overflow menu.
+    expect(screen.queryByRole("menuitem", { name: "Preview" })).toBeNull();
   });
 });
 

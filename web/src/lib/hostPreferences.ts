@@ -6,8 +6,9 @@
 // snapshot it when the user explicitly picks a host (or the managed sandbox),
 // so the next visit starts from the last choice instead of the auto-picked
 // default — the sandbox in managed deployments, the first online host in OSS.
-// The consumer still validates a stored host id against the live host list and
-// falls back to the default when that host is gone or offline.
+// The consumer still validates a stored host id against the live host list. It
+// waits for any active host-list refresh before falling back when that host is
+// gone or offline.
 
 const STORAGE_KEY = "omnigent:last-host-choice";
 const SANDBOX_PROVIDER_KEY = "omnigent:last-sandbox-provider";

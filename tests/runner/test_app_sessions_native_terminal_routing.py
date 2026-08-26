@@ -1037,17 +1037,15 @@ async def test_ensure_terminal_route_recreates_dead_registered_pane(
 
 
 @pytest.mark.asyncio
-async def test_dead_registered_pane_close_restores_running_for_kill_server(
+async def test_dead_registered_pane_close_does_not_restore_running(
     tmp_path: Path,
 ) -> None:
-    """``running`` must be restored before ``close()`` so kill-server runs.
+    """A dead-pane close no longer mutates the advisory ``running`` flag.
 
     ``is_alive()`` sets ``instance.running = False`` as a side effect when
-    the pane is dead. ``TerminalInstance.close()`` checks ``self.running``
-    before issuing ``tmux kill-server``. The self-heal path in
-    ``_ensure_native_terminal_for_turn`` must restore ``running = True``
-    after detecting a dead pane so the subsequent ``close()`` properly
-    kills the remain-on-exit tmux server instead of leaving it orphaned.
+    the pane is dead. ``TerminalInstance.close()`` now uses the private socket
+    to decide whether to issue ``tmux kill-server``, so the self-heal path does
+    not need to falsify this liveness state before closing the stale entry.
 
     This test exercises the contract directly on ``TerminalRegistry.close``
     with a tracking ``close()`` stub that captures ``running`` at call time.
@@ -1087,18 +1085,12 @@ async def test_dead_registered_pane_close_restores_running_for_kill_server(
     assert alive is False
     assert dead_instance.running is False, "is_alive() should set running=False"
 
-    # This is what _ensure_native_terminal_for_turn does: restore running
-    # before calling registry.close() so close() issues kill-server.
-    dead_instance.running = True
     await registry.close(sid, "claude", "main")
 
     assert len(running_at_close) == 1, (
         f"Expected close() to be called once; got {len(running_at_close)} calls"
     )
-    assert running_at_close[0] is True, (
-        "running must be True when close() is called so tmux kill-server runs; "
-        "was False — is_alive() side-effect was not restored"
-    )
+    assert running_at_close[0] is False
     assert registry.get(sid, "claude", "main") is None, (
         "Stale entry must be removed from the registry"
     )

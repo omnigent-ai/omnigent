@@ -60,6 +60,7 @@ from omnigent.server.routes._session_create_validation import (
     validate_existing_host_workspace,
     validate_session_agent,
     validate_session_model_metadata,
+    validate_session_permission_mode,
 )
 from omnigent.server.schemas import SessionEventInput
 
@@ -586,6 +587,49 @@ async def _resolve_default_workspace(deps: FireDeps, host_id: str) -> str:
     return canonical
 
 
+_PERMISSION_MODE_HARNESS = "claude-native"
+
+
+async def _permission_mode_launch_args(deps: FireDeps, task: ScheduledTask) -> list[str] | None:
+    """Derive the native-terminal ``--permission-mode`` args for a task.
+
+    Mirrors how the interactive New Chat dialog builds ``terminal_launch_args``:
+    a set permission mode becomes ``["--permission-mode", <value>]``, which the
+    runner appends to Claude Code's argv. ``None`` (agent default) sets nothing.
+
+    Fail-safe on harness: only Claude Code accepts ``--permission-mode``, so the
+    flag is injected ONLY when the task's agent is confirmed ``claude-native``.
+    If the harness can't be resolved (no cache / bundle / a load error), the flag
+    is omitted rather than injected — a session that just uses the agent's own
+    default is strictly safer than one launched with an unknown flag. This makes
+    the Claude-only guarantee hold regardless of whether the create/update/fire
+    capability gates ran, so a mis-stamped non-Claude row can never break a fire.
+    """
+    if task.permission_mode is None:
+        return None
+    if deps.agent_cache is None:
+        return None
+    from omnigent.harness_aliases import canonicalize_harness
+
+    try:
+        agent = await asyncio.to_thread(deps.agent_store.get, task.agent_id)
+        if agent is None or getattr(agent, "bundle_location", None) is None:
+            return None
+        loaded = await asyncio.to_thread(deps.agent_cache.load, agent.id, agent.bundle_location)
+        executor = getattr(loaded.spec, "executor", None)
+        raw_harness = (executor.config.get("harness") or executor.type) if executor else None
+        harness = canonicalize_harness(raw_harness) or raw_harness
+    except Exception:
+        _logger.exception(
+            "scheduled fire: could not resolve harness for task %s; omitting --permission-mode",
+            task.id,
+        )
+        return None
+    if harness != _PERMISSION_MODE_HARNESS:
+        return None
+    return ["--permission-mode", task.permission_mode]
+
+
 async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
     """Create a conversation bound to the task's agent, carrying the stored spec."""
     # Connected-host, existing-workspace runs create the conversation directly.
@@ -597,6 +641,7 @@ async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
         title=task.name,
         host_id=task.host_id,
         workspace=task.workspace,
+        terminal_launch_args=await _permission_mode_launch_args(deps, task),
     )
     if task.model_override is not None or task.reasoning_effort is not None:
         updated: Conversation | None = await asyncio.to_thread(
@@ -728,6 +773,11 @@ async def _validate_fire_session_inputs(
             model_override=task.model_override,
             reasoning_effort=task.reasoning_effort,
         )
+        validate_session_permission_mode(task.permission_mode)
+        # NB: the harness gate for permission_mode is enforced fail-safe in
+        # _permission_mode_launch_args (the flag is injected only for a confirmed
+        # claude-native agent), so a mis-stamped non-Claude row degrades to "no
+        # flag" rather than failing the whole fire here.
         if validate_workspace:
             if task.host_id is None or task.workspace is None:
                 return (

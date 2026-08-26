@@ -216,6 +216,109 @@ def register_core_routes(
 ) -> None:
     """Register the core session routes on router."""
 
+    async def _schedule_managed_launch(
+        request: Request,
+        *,
+        session_id: str,
+        agent_id: str | None,
+        user_id: str | None,
+        sandbox_provider: str | None,
+        workspace: str | None,
+    ) -> None:
+        """
+        Provision a managed sandbox host for a just-created session.
+
+        Shared by both create paths: the JSON path (an existing
+        ``agent_id``) and the multipart bundle path (a freshly-created
+        session-scoped ``agent_id``). Validates that managed hosts are
+        configured and the provider is offered, records the repository
+        workspace for relaunch, seeds the launch-progress indicator, and
+        schedules the background ``_run_managed_launch`` — returning
+        immediately, since provisioning takes tens of seconds and must
+        not block the create POST. Config problems and malformed repo
+        workspaces fail the POST synchronously (4xx).
+
+        :param request: The create request (for ``app.state`` lookups).
+        :param session_id: The newly-created session id to bind the host
+            to, e.g. ``"conv_abc123"``.
+        :param agent_id: The session's bound agent id (built-in for the
+            JSON path, session-scoped for the bundle path); the managed
+            runner fetches its spec over the tunnel either way.
+        :param user_id: Authenticated caller, or ``None`` on an
+            auth-disabled server (registers under the reserved local
+            owner).
+        :param sandbox_provider: Provider to provision, or ``None`` for
+            the server's first configured provider.
+        :param workspace: Managed workspace — a git repository URL
+            (optionally ``#<branch>``) cloned into the sandbox, or
+            ``None`` for an empty sandbox.
+        :raises OmnigentError: If managed hosts aren't configured or the
+            provider isn't offered.
+        """
+        sandbox_config = getattr(request.app.state, "sandbox_config", None)
+        host_store_for_managed = getattr(request.app.state, "host_store", None)
+        managed_launches = getattr(request.app.state, "managed_launches", None)
+        if sandbox_config is None or host_store_for_managed is None or managed_launches is None:
+            raise OmnigentError(
+                "managed hosts are not configured on this server — add a "
+                "'sandbox:' section to the server config",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        from omnigent.server.auth import RESERVED_USER_LOCAL
+        from omnigent.server.managed_hosts import (
+            MANAGED_REPO_LABEL_KEY,
+            parse_repo_workspace,
+        )
+
+        # Reject an unconfigured provider on the POST rather than in the
+        # background launch.
+        if sandbox_provider is not None and sandbox_config.for_provider(sandbox_provider) is None:
+            offered = ", ".join(sandbox_config.launchable_providers()) or "none"
+            raise OmnigentError(
+                f"sandbox provider '{sandbox_provider}' is not configured "
+                f"on this server — available: {offered}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        # A managed workspace is a repository URL (schema-validated) the
+        # launch clones inside the sandbox; parse it now so a malformed
+        # URL is a synchronous 4xx, not a background failure.
+        repo = parse_repo_workspace(workspace) if workspace is not None else None
+        if workspace is not None:
+            # The session row's workspace is overwritten with the CLONED
+            # path at bind time; record the raw request value so a
+            # sandbox relaunch can re-clone the same repository.
+            await asyncio.to_thread(
+                conversation_store.set_labels,
+                session_id,
+                {MANAGED_REPO_LABEL_KEY: workspace},
+            )
+        managed_launches.begin(session_id)
+        # Seed the launch-progress indicator before the background task
+        # starts, so the first GET snapshot (the Web UI navigates to the
+        # session page immediately after this 201) already carries the
+        # "provisioning" stage.
+        _publish_sandbox_status(session_id, "provisioning")
+        launch_task = asyncio.create_task(
+            _run_managed_launch(
+                session_id=session_id,
+                # On auth-disabled servers user_id is None; the sandbox
+                # host registers under the reserved local owner.
+                owner=user_id if user_id is not None else RESERVED_USER_LOCAL,
+                sandbox_config=sandbox_config,
+                repo=repo,
+                tracker=managed_launches,
+                conversation_store=conversation_store,
+                host_store=host_store_for_managed,
+                host_registry=getattr(request.app.state, "host_registry", None),
+                tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+                provider=sandbox_provider,
+                agent_store=agent_store,
+                agent_id=agent_id,
+            )
+        )
+        _managed_launch_tasks.add(launch_task)
+        launch_task.add_done_callback(_managed_launch_tasks.discard)
+
     @router.post(
         "/sessions",
         status_code=201,
@@ -257,16 +360,7 @@ def register_core_routes(
         user_id = _require_user(request, auth_provider)
         content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
         if content_type == "multipart/form-data":
-            result = await _create_bundled_session_from_multipart(request, user_id)
-            if permission_store is not None and user_id is not None:
-                await asyncio.to_thread(permission_store.ensure_user, user_id)
-                await asyncio.to_thread(
-                    permission_store.grant, user_id, result.session_id, LEVEL_OWNER
-                )
-            # Push the new session to this user's other open tabs so it
-            # enters the sidebar without a list poll (WS /sessions/updates).
-            _announce_session_added(user_id, result.session_id)
-            return result
+            return await _create_bundled_session_from_multipart(request, user_id)
 
         try:
             payload = await request.json()
@@ -370,79 +464,14 @@ def register_core_routes(
         # synchronously.
         launch_host_id = body.host_id
         if body.host_type == "managed" and resp.runner_id is None:
-            sandbox_config = getattr(request.app.state, "sandbox_config", None)
-            host_store_for_managed = getattr(request.app.state, "host_store", None)
-            managed_launches = getattr(request.app.state, "managed_launches", None)
-            if (
-                sandbox_config is None
-                or host_store_for_managed is None
-                or managed_launches is None
-            ):
-                raise OmnigentError(
-                    "managed hosts are not configured on this server — add a "
-                    "'sandbox:' section to the server config",
-                    code=ErrorCode.INVALID_INPUT,
-                )
-            from omnigent.server.auth import RESERVED_USER_LOCAL
-            from omnigent.server.managed_hosts import (
-                MANAGED_REPO_LABEL_KEY,
-                parse_repo_workspace,
+            await _schedule_managed_launch(
+                request,
+                session_id=resp.id,
+                agent_id=conv.agent_id if conv is not None else None,
+                user_id=user_id,
+                sandbox_provider=body.sandbox_provider,
+                workspace=body.workspace,
             )
-
-            # Like the repo parse below: reject an unconfigured provider on
-            # the POST rather than in the background launch.
-            if (
-                body.sandbox_provider is not None
-                and sandbox_config.for_provider(body.sandbox_provider) is None
-            ):
-                offered = ", ".join(sandbox_config.launchable_providers()) or "none"
-                raise OmnigentError(
-                    f"sandbox provider '{body.sandbox_provider}' is not configured "
-                    f"on this server — available: {offered}",
-                    code=ErrorCode.INVALID_INPUT,
-                )
-            # A managed workspace is a repository URL (schema-
-            # validated) the launch clones inside the sandbox; parse
-            # it now so a malformed URL is a synchronous 4xx, not a
-            # background failure.
-            repo = parse_repo_workspace(body.workspace) if body.workspace is not None else None
-            if body.workspace is not None:
-                # The session row's workspace is overwritten with the
-                # CLONED path at bind time; record the raw request
-                # value so a sandbox relaunch can re-clone the same
-                # repository into the new generation.
-                await asyncio.to_thread(
-                    conversation_store.set_labels,
-                    resp.id,
-                    {MANAGED_REPO_LABEL_KEY: body.workspace},
-                )
-            managed_launches.begin(resp.id)
-            # Seed the launch-progress indicator before the background
-            # task starts, so the first GET snapshot (the Web UI
-            # navigates to the session page immediately after this
-            # 201) already carries the "provisioning" stage.
-            _publish_sandbox_status(resp.id, "provisioning")
-            launch_task = asyncio.create_task(
-                _run_managed_launch(
-                    session_id=resp.id,
-                    # On auth-disabled servers user_id is None; the
-                    # sandbox host registers under the reserved local
-                    # owner, same as a directly-connected host would.
-                    owner=user_id if user_id is not None else RESERVED_USER_LOCAL,
-                    sandbox_config=sandbox_config,
-                    repo=repo,
-                    tracker=managed_launches,
-                    conversation_store=conversation_store,
-                    host_store=host_store_for_managed,
-                    host_registry=getattr(request.app.state, "host_registry", None),
-                    tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
-                    provider=body.sandbox_provider,
-                    agent_store=agent_store,
-                    agent_id=conv.agent_id if conv is not None else None,
-                )
-            )
-            _managed_launch_tasks.add(launch_task)
-            launch_task.add_done_callback(_managed_launch_tasks.discard)
 
         # Host launch: if a host is targeted (caller-supplied or
         # managed) and no runner is bound yet, authorize (caller must
@@ -613,6 +642,32 @@ def register_core_routes(
                 result.session_id,
                 result.agent_id,
                 runner_router,
+            )
+        # Grant the creator ownership BEFORE scheduling the managed
+        # launch, mirroring the JSON path: a managed-guard failure
+        # (misconfigured server, unconfigured provider) must not leave
+        # the just-persisted session unowned and thus invisible to the
+        # caller. Push to the caller's other open tabs, too.
+        if permission_store is not None and user_id is not None:
+            await asyncio.to_thread(permission_store.ensure_user, user_id)
+            await asyncio.to_thread(
+                permission_store.grant, user_id, result.session_id, LEVEL_OWNER
+            )
+        _announce_session_added(user_id, result.session_id)
+        # Managed bundle create: provision a sandbox host for the
+        # just-uploaded session-scoped agent (same background launch as
+        # the JSON path). The managed runner fetches the uploaded bundle
+        # over its tunnel like any session-scoped agent, so no separate
+        # bundle delivery is needed. A sub-agent child (inherited runner)
+        # is never itself managed — it co-locates on the parent's runner.
+        if parsed_metadata.host_type == "managed" and inherited_runner_id is None:
+            await _schedule_managed_launch(
+                request,
+                session_id=result.session_id,
+                agent_id=result.agent_id,
+                user_id=user_id,
+                sandbox_provider=parsed_metadata.sandbox_provider,
+                workspace=parsed_metadata.workspace,
             )
         return result
 

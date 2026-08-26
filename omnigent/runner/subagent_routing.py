@@ -1176,7 +1176,7 @@ def _handler_factory(
             self.wfile.write(raw)
 
         def log_message(self, format: str, *args: Any) -> None:
-            _logger.debug("subagent-router: " + format, *args)
+            _logger.debug("subagent-router: " + format, *args, extra={"session_id": session_id})
 
     return _Handler
 
@@ -1356,7 +1356,7 @@ def ensure_session_router(
     # Nothing from the rendezvous is logged — neither the URL nor the paths
     # and ids that reach it — so a log file can never carry the bearer token
     # or the identifiers that address it. The advertisement on disk names both.
-    _logger.info("subagent router started")
+    _logger.info("subagent router started", extra={"session_id": session_id})
     return router
 
 

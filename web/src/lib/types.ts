@@ -236,6 +236,25 @@ export interface ModelUsage {
   totalCostUsd: number | null;
 }
 
+/**
+ * One still-running background shell reported by the claude-native `Stop`
+ * hook, backing the composer pill's "N background tasks" tally. Every field
+ * is optional — the hook shape is external, so an entry may carry only a
+ * `description`, only a `command`, etc.
+ */
+export interface BackgroundTaskInfo {
+  /** Opaque per-shell id, e.g. `"abc123"`. */
+  id?: string;
+  /** Task kind, e.g. `"shell"`. */
+  type?: string;
+  /** Per-task status, e.g. `"running"`. */
+  status?: string;
+  /** Human-readable label, e.g. `"Wait for CI"`. */
+  description?: string;
+  /** The command the shell is running, e.g. `"sleep 120"`. */
+  command?: string;
+}
+
 export interface Session {
   id: string;
   agentId: string;
@@ -272,6 +291,12 @@ export interface Session {
    * session has settled to ``"idle"``. Absent/0 when none are tracked.
    */
   backgroundTaskCount?: number;
+  /**
+   * Per-shell detail behind {@link backgroundTaskCount}, so a reload can
+   * restore it. Absent when none are tracked (or an older runner reported only
+   * the count).
+   */
+  backgroundTasks?: BackgroundTaskInfo[];
   createdAt: number;
   /**
    * Human-readable session title, e.g. ``"researcher:auth"`` for a
