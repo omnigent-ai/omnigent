@@ -3949,7 +3949,9 @@ function AssistantBubble({
         data-testid="message-bubble"
         data-role="assistant"
         className={
-          spansFullColumn ? "max-w-full" : "max-w-3xl min-[2561px]:max-w-4xl"
+          spansFullColumn
+            ? "max-w-full"
+            : "max-w-3xl min-[2561px]:max-w-[clamp(56rem,28vw,64rem)]"
         }
       >
         {/* A fold-only bubble takes w-full at the ordinary max-w-3xl cap
