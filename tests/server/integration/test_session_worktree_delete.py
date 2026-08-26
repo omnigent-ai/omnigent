@@ -270,6 +270,65 @@ def test_has_other_live_session_answers_in_use_past_the_scan_bound(db_uri: str) 
     )
 
 
+def test_shared_worktree_check_stays_cheap(db_uri: str) -> None:
+    """
+    The gate's cost, which the delete path is sensitive to: one query when
+    nothing else is in the directory, a second only when it really is
+    shared, and the candidate query served by its own index.
+
+    A regression here is invisible behaviourally — the delete still returns
+    the right answer, just slower on every session delete.
+    """
+    from sqlalchemy import event, text
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    mine = _make_worktree_conversation(db_uri)
+
+    statements: list[str] = []
+    for engine in {conv_store._engine, conv_store._conv_engine}:
+        event.listen(
+            engine,
+            "before_cursor_execute",
+            # PRAGMAs are per-connection setup, not work this gate asked for.
+            lambda conn, cur, stmt, params, ctx, many: (
+                statements.append(stmt) if not stmt.startswith("PRAGMA") else None
+            ),
+        )
+
+    assert not conv_store.has_other_live_session_in_workspace(
+        host_id=_HOST_ID, workspace=_WORKTREE_PATH, exclude_conversation_id=mine
+    )
+    assert len(statements) == 1, (
+        f"expected a single query when the directory is unshared, got {len(statements)}: "
+        f"{statements}. The archived filter must not open the second database "
+        "on the common path."
+    )
+
+    _make_worktree_conversation(db_uri)
+    statements.clear()
+    assert conv_store.has_other_live_session_in_workspace(
+        host_id=_HOST_ID, workspace=_WORKTREE_PATH, exclude_conversation_id=mine
+    )
+    assert len(statements) == 2, (
+        f"a shared directory should cost the candidate query plus the archived "
+        f"filter, got {len(statements)}: {statements}"
+    )
+
+    # SQLite-only plan check; this suite's fixture is SQLite.
+    with conv_store._engine.connect() as conn:
+        plan = conn.execute(
+            text(
+                "EXPLAIN QUERY PLAN SELECT id FROM omnigent_conversation_metadata "
+                f"WHERE workspace_id = 0 AND host_id = x'{_HOST_ID}' "
+                f"AND workspace = '{_WORKTREE_PATH}' LIMIT 32"
+            )
+        ).fetchall()
+    assert "ix_conversation_metadata_host_id" in plan[0][-1], (
+        f"the candidate query fell off its index and is scanning the workspace's "
+        f"whole metadata table: {plan[0][-1]}"
+    )
+
+
 async def test_delete_non_worktree_session_ignores_flag(
     app: FastAPI,
     client: httpx.AsyncClient,
