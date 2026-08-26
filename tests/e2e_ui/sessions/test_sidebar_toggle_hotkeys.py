@@ -30,6 +30,8 @@ and always has content (the Agents tab is unconditional).
 
 from __future__ import annotations
 
+import re
+
 from playwright.sync_api import Page, expect
 
 _COMPOSER = "Ask the agent anything…"
@@ -41,6 +43,7 @@ _RIGHT_CHORD = "Control+Alt+BracketRight"
 # rail unmounts entirely when closed, so it reads off the complementary role.
 _CONVERSATIONS = 'aside[aria-label="Conversations"]'
 _DRAFT = "an unsent draft the sidebar chord must not disturb"
+_PEEK_CLASS = re.compile(r"(^|\s)is-peek(\s|$)")
 
 
 def test_sidebar_toggle_hotkeys(
@@ -87,3 +90,69 @@ def test_sidebar_toggle_hotkeys(
     # ... and ⌘⌥] again brings it back.
     page.keyboard.press(_RIGHT_CHORD)
     expect(workspace).to_be_visible()
+
+
+def test_sidebar_click_cancels_pending_peek(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A quick press pins the sidebar open instead of losing to the peek timer."""
+    base_url, session_id = seeded_session
+    page.goto(f"{base_url}/c/{session_id}")
+
+    conversations = page.locator(_CONVERSATIONS)
+    expect(page.get_by_role("complementary", name="Workspace")).to_be_visible(timeout=30_000)
+
+    page.keyboard.press(_LEFT_CHORD)
+    expect(conversations).to_have_attribute("data-collapsed", "true")
+
+    trigger = page.get_by_role("button", name="Open sidebar")
+    expect(trigger).to_be_visible()
+    trigger.hover()
+    page.wait_for_timeout(300)
+
+    page.mouse.down()
+    try:
+        page.wait_for_timeout(200)
+        expect(conversations).to_have_attribute("data-collapsed", "true")
+        expect(conversations).not_to_have_class(_PEEK_CLASS)
+    finally:
+        page.mouse.up()
+
+    expect(conversations).not_to_have_attribute("data-collapsed", "true")
+    expect(conversations).not_to_have_class(_PEEK_CLASS)
+    page.wait_for_timeout(200)
+    expect(conversations).not_to_have_class(_PEEK_CLASS)
+
+
+def test_sidebar_peek_is_opaque_in_dark_mode(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The dark-mode hover preview uses the opaque sidebar surface."""
+    page.emulate_media(color_scheme="dark")
+    base_url, session_id = seeded_session
+    page.goto(f"{base_url}/c/{session_id}")
+
+    conversations = page.locator(_CONVERSATIONS)
+    expect(page.get_by_role("complementary", name="Workspace")).to_be_visible(timeout=30_000)
+    expect(page.locator("html")).to_have_class(re.compile(r"(^|\s)dark(\s|$)"))
+
+    page.keyboard.press(_LEFT_CHORD)
+    expect(conversations).to_have_attribute("data-collapsed", "true")
+
+    page.get_by_role("button", name="Open sidebar").hover()
+    expect(conversations).to_have_class(_PEEK_CLASS)
+
+    colors = conversations.evaluate(
+        """element => {
+          const probe = document.createElement("div");
+          probe.style.backgroundColor = "var(--card-solid)";
+          document.body.appendChild(probe);
+          const expected = getComputedStyle(probe).backgroundColor;
+          const actual = getComputedStyle(element).backgroundColor;
+          probe.remove();
+          return { actual, expected };
+        }"""
+    )
+    assert colors["actual"] == colors["expected"]

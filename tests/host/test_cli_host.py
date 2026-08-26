@@ -287,6 +287,62 @@ def test_host_status_subcommand_still_dispatches(
     )
 
 
+def test_host_enable_subcommand_installs_user_service(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify ``host enable`` resolves the target and installs its service."""
+    from omnigent.host.service import HostService
+
+    captured: list[tuple[str | None, dict[str, str]]] = []
+    service_path = tmp_path / "omnigent-host.service"
+
+    def _enable(
+        server_url: str | None,
+        *,
+        environment: dict[str, str],
+    ) -> HostService:
+        captured.append((server_url, environment))
+        return HostService(kind="systemd_user", path=service_path, label=service_path.name)
+
+    monkeypatch.setattr("omnigent.cli._find_daemon_record", lambda target: None)
+    monkeypatch.setattr(
+        "omnigent.cli._build_host_daemon_env",
+        lambda *, server_url: {"HOME": str(tmp_path)},
+    )
+    monkeypatch.setattr("omnigent.host.service.enable_user_host_service", _enable)
+
+    result = CliRunner().invoke(cli, ["host", "enable", "--server", ""])
+
+    assert result.exit_code == 0, result.output
+    assert captured == [(None, {"HOME": str(tmp_path)})]
+    assert "Enabled the Omnigent host user service for local" in result.output
+
+
+def test_host_disable_subcommand_removes_user_service(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify ``host disable`` dispatches to the service remover."""
+    from omnigent.host.service import HostService
+
+    service_path = tmp_path / "omnigent-host.service"
+    removed: list[bool] = []
+
+    def _disable() -> HostService:
+        removed.append(True)
+        return HostService(kind="systemd_user", path=service_path, label=service_path.name)
+
+    monkeypatch.setattr("omnigent.host.service.disable_user_host_service", _disable)
+    monkeypatch.setattr("omnigent.cli._list_daemon_records", list)
+
+    result = CliRunner().invoke(cli, ["host", "disable"])
+
+    assert result.exit_code == 0, result.output
+    assert removed == [True]
+    assert "Disabled the Omnigent host user service" in result.output
+
+
 def test_host_rejects_unknown_plain_token_as_subcommand(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
