@@ -23,6 +23,8 @@ from urllib.parse import urlparse
 
 from playwright.sync_api import Locator, Page, Route, expect
 
+from tests.e2e_ui.conftest import fetch_with_retry
+
 
 def _row(page: Page, session_id: str) -> Locator:
     """Locate the sidebar row (``<li>``) for *session_id* by its href."""
@@ -115,7 +117,7 @@ def test_unread_dot_survives_reload_from_localStorage_when_server_seed_is_empty(
         if request.method != "GET" or parsed.path != "/v1/sessions":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         for conv in payload.get("data", []):
             conv["viewer_unread"] = False

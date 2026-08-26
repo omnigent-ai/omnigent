@@ -46,6 +46,8 @@ from urllib.parse import urlparse
 
 from playwright.sync_api import Page, Request, WebSocketRoute, expect
 
+from tests.e2e_ui.conftest import fetch_with_retry
+
 _FAKE_HOST_ID = "host_push_e2e"
 _OLD_CREATED_AT = 1_700_000_000  # far in the past → outside the host-asleep grace window
 
@@ -79,7 +81,7 @@ def _patch_session_snapshot(page: Page, session_id: str) -> None:
         if req.method != "GET" or urlparse(req.url).path != f"/v1/sessions/{session_id}":
             route.continue_()
             return
-        resp = route.fetch()
+        resp = fetch_with_retry(route)
         payload = resp.json()
         payload["host_id"] = _FAKE_HOST_ID
         payload["host_resumable"] = True
@@ -101,7 +103,7 @@ def _patch_session_list(page: Page, session_id: str) -> None:
         if req.method != "GET" or urlparse(req.url).path != "/v1/sessions":
             route.continue_()
             return
-        resp = route.fetch()
+        resp = fetch_with_retry(route)
         payload = resp.json()
         rows = payload.get("data") if isinstance(payload, dict) else None
         if isinstance(rows, list):
@@ -139,7 +141,7 @@ def _patch_health_drops_session(page: Page, session_id: str) -> None:
         if req.method != "GET" or urlparse(req.url).path != "/health":
             route.continue_()
             return
-        resp = route.fetch()
+        resp = fetch_with_retry(route)
         payload = resp.json()
         sessions = payload.get("sessions") if isinstance(payload, dict) else None
         if isinstance(sessions, dict):

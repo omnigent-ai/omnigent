@@ -26,6 +26,7 @@ import pytest
 from playwright.sync_api import Page, Route, expect
 
 from tests.e2e_ui.chat.test_model_flows_contract import _install_stream_controller
+from tests.e2e_ui.conftest import fetch_with_retry
 
 
 def _patch_session_as_harness(
@@ -62,7 +63,7 @@ def _patch_session_as_harness(
             return
         headers = {"content-type": "application/json"}
         if request.method == "GET":
-            response = route.fetch()
+            response = fetch_with_retry(route)
             payload = response.json()
             headers = {**response.headers, **headers}
         elif request.method == "PATCH":
