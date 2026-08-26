@@ -572,11 +572,14 @@ can land a fix depends on where its branch lives:
     is a bot indicator — the maintainer's approval still merges it.)
 
 Throughout, address the PR you're landing by its number `<pr>`. This whole step is
-a **bounded loop** — cap it at **~6 fix→(push-or-takeover)→re-check rounds**. If
-you're still red or still getting blocking findings after that, stop, leave the PR
-open with an honest summary comment of what's unresolved, and report `outcome:
-"partially_fixed"` with the specifics (see Output). Never loosen a test, skip a
-check, or merge to force green.
+a **bounded loop** — cap it at **~6 fix→(push-or-takeover)→re-check rounds**. A
+fork **takeover** is not one of those rounds: it opens a fresh PR and restarts CI +
+Polly from scratch on it, so treat it as a **reset** — the ~6-round budget applies
+to the new PR from that point, rather than being consumed by the takeover itself.
+If you're still red or still getting blocking findings after the budget, stop,
+leave the PR open with an honest summary comment of what's unresolved, and report
+`outcome: "partially_fixed"` with the specifics (see Output). Never loosen a test,
+skip a check, or merge to force green.
 
 ### 4.1 — Deploy a live preview so the fix can be validated
 
@@ -674,7 +677,7 @@ are green.
 The repo's **Polly AI Review** runs automatically on a ready PR and posts its
 findings as a PR comment marked `<!-- polly-review-bot -->`, structured as
 **Blocking issues**, **Security vulnerabilities**, **Non-blocking notes**, and a
-**Summary**. Each `/review` run posts a **fresh** comment, so always read the
+**Summary**. Each review run posts a **fresh** comment, so always read the
 **most recent** one:
 
 ```
@@ -926,7 +929,7 @@ Field meanings:
   a fix and you took over into your own PR, this reflects **your** PR's checks.
   Empty when `skip_push` was set or you stopped before there was a PR to land.
 - `polly_review` — the result of the Step 4.3 automated-review loop: `clean` (no
-  blocking/security findings) with how many `/review` rounds it took and what you
+  blocking/security findings) with how many review rounds it took and what you
   fixed, or the unresolved critical findings if you hit the round cap. Empty when
   no PR was opened.
 - `ui_preview` — the result of Step 4.1 (run on every PR, not just frontend fixes):
