@@ -324,9 +324,14 @@ review comment on that PR, so the author knows), then **switch to the author pat
 (Step 2B) and open your own PR** that resolves the bug correctly. In your PR,
 reference the existing one and summarize why a fresh approach was warranted.
 Record `mode: "authored_fix"` and put the reviewed PR's number in your prose so
-the two are linked. Use this escape hatch deliberately, not for style
-preferences — a working, root-cause-sound PR should be reviewed and improved in
-place, not replaced.
+the two are linked. **Then close the superseded PR** (same reason as the fork
+take-over: two open PRs on one issue trip the duplicate-PR automation, which
+auto-closes the newer one — yours): `gh pr comment <old> --body 'Superseded by
+#<yours> — a different approach was needed; see there.'` then `gh pr close <old>`.
+If the close is rejected (e.g. a contributor's PR the App token can't close), note
+it in `maintainer_review` and ask the maintainer to close it — don't leave both
+open. Use this escape hatch deliberately, not for style preferences — a working,
+root-cause-sound PR should be reviewed and improved in place, not replaced.
 
 When you keep the PR, you drive it to landable per Step 4 — pushing fixes directly
 when its branch is in-repo, or (for a fork PR you can't push to that needs a fix)
@@ -623,8 +628,20 @@ can land a fix depends on where its branch lives:
     - Credit the original author on the commits (`Co-authored-by: <name> <email>`,
       read from `gh pr view <pr> --json commits`).
     - In your PR body, link the fork PR (`Builds on #<pr> by @<author>`) and say
-      why you re-opened it (couldn't push to the fork). Post a comment on the fork
-      PR pointing to yours, so the contributor isn't blindsided.
+      why you re-opened it (couldn't push to the fork).
+    - **Close the fork PR so it doesn't collide with yours.** Two open PRs that fix
+      the same issue trip the repo's duplicate-PR automation, which will auto-close
+      the **newer** one — i.e. *yours*. Once your PR is open, comment on the fork PR
+      pointing to yours and close it:
+      ```
+      gh pr comment <fork-pr> --body 'Superseded by #<your-pr> — I took this over to add a fix I could not push to your fork (App tokens can’t push to forks). Your commits are carried over with credit. Thanks @<author>!'
+      gh pr close <fork-pr>
+      ```
+      This both keeps the contributor informed and stops the dedup bot from closing
+      your PR as the duplicate. If the close is rejected (an App token may not be
+      able to close a contributor’s fork PR), **say so in `maintainer_review`** and
+      ask the maintainer to close `#<fork-pr>` in favor of yours — never leave both
+      silently open.
     - Set `mode: "authored_fix"`, record the fork PR's number in `reviewed_pr_url`,
       and drive **your** PR through the rest of Step 4 (you can push to it).
   - **If the fork PR needs no fix** (repro passes against it, CI green, review
