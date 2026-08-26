@@ -660,6 +660,15 @@ class SqlConversationMetadata(OmnigentBase):
         Index("ix_conversation_metadata_runner_id", "workspace_id", "runner_id", "id"),
         # "list sessions in project X" + per-project counts (GROUP BY project_id).
         Index("ix_conversation_metadata_project_id", "workspace_id", "project_id", "id"),
+        # Backs the shared-worktree check on session delete: "does another
+        # session sit in this (host, workspace)?". ``workspace`` is
+        # deliberately NOT in the key — MySQL caps an index key at 3072 bytes
+        # and this VARCHAR(2048) exceeds that in utf8mb4. Seeking on
+        # (workspace_id, host_id) leaves only that host's rows to filter,
+        # which measured ~3x faster than the incidental project_id index.
+        # Next rung if profiling ever demands a full seek: key a digest
+        # column, like ``policy_name_cksum`` does for policy names.
+        Index("ix_conversation_metadata_host_id", "workspace_id", "host_id"),
     )
 
 
