@@ -42,8 +42,9 @@ class _ByteBoundedOutputQueue(asyncio.Queue[bytes | None]):
 
     Already-queued output remains contiguous with bytes sent to the terminal,
     so saturation rejects an incoming chunk whole. The next accepted chunk is
-    prefixed with parser-resynchronization bytes, and every loss invokes
-    ``on_drop`` so the bridge can request a full repaint. EOF is always kept.
+    prefixed with parser-resynchronization bytes. Producer loss invokes
+    ``on_drop`` so the bridge can request a full repaint; snapshot-priority
+    eviction is healed by the snapshot being inserted. EOF is always kept.
     """
 
     def __init__(
@@ -72,8 +73,8 @@ class _ByteBoundedOutputQueue(asyncio.Queue[bytes | None]):
             self.queued_bytes -= len(item)
         return item
 
-    def record_dropped_output(self, num_bytes: int) -> None:
-        """Record lost output, open a parser gap, and request a repaint."""
+    def record_dropped_output(self, num_bytes: int, *, request_repaint: bool = True) -> None:
+        """Record lost output, open a parser gap, and optionally request a repaint."""
         self.dropped_chunks += 1
         self.dropped_bytes += num_bytes
         self._in_gap = True
@@ -88,7 +89,7 @@ class _ByteBoundedOutputQueue(asyncio.Queue[bytes | None]):
                 self.dropped_chunks,
                 self.dropped_bytes,
             )
-        if self.on_drop is not None:
+        if request_repaint and self.on_drop is not None:
             self.on_drop()
 
     def put_nowait(self, item: bytes | None) -> None:
@@ -115,7 +116,7 @@ class _ByteBoundedOutputQueue(asyncio.Queue[bytes | None]):
             gap_bytes = len(_OUTPUT_GAP_RESYNC) if self._in_gap else 0
             added_items = 2 if self._in_gap else 1
             if gap_bytes + len(snapshot) > self.max_bytes or added_items > self.max_items:
-                self.record_dropped_output(len(snapshot))
+                self.record_dropped_output(len(snapshot), request_repaint=False)
                 return
             if (
                 self.queued_bytes + gap_bytes + len(snapshot) <= self.max_bytes
@@ -130,7 +131,8 @@ class _ByteBoundedOutputQueue(asyncio.Queue[bytes | None]):
             if discarded is None:
                 super().put_nowait(None)
                 return
-            self.record_dropped_output(len(discarded))
+            # The snapshot being inserted heals these priority evictions.
+            self.record_dropped_output(len(discarded), request_repaint=False)
 
 
 class _GapRepainter:
