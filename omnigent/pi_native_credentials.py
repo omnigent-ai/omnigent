@@ -314,20 +314,12 @@ class PiProviderConfig:
             surface = self._fallback_surface()
             if not self._primary_claude_only:
                 # The primary's api came from the model's own family.
-                # Non-Databricks anthropic-messages providers use thinking.type.enabled;
-                # set reasoning:true so Pi's thinking level controls are enabled.
-                base: _PiModelEntry = (
+                models.append(
                     {"id": self.model, "input": ["text", "image"]}
                     if self.extra_models
                     else {"id": self.model}
                 )
-                if self.api == "anthropic-messages":
-                    base["reasoning"] = True
-                models.append(base)
             elif surface is DatabricksPiSurface.ANTHROPIC:
-                # Databricks anthropic-messages uses thinking.type.adaptive (not
-                # thinking.type.enabled), which Pi 0.84.x does not support;
-                # omit reasoning:true so Pi does not attempt extended thinking.
                 models.append({"id": self.model, "input": ["text", "image"]})
             elif surface is not None:
                 self._register_on_surface(additional, surface)
