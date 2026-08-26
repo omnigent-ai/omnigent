@@ -2470,32 +2470,48 @@ def read_transcript_items_from_offset(
     )
 
 
-# Per-model pricing memo for transcript cost computation. Deliberately
-# NOT ``functools.lru_cache``: a transient ``fetch_model_pricing`` failure
-# returns ``None``, and lru_cache would pin that ``None`` for the model's
-# lifetime; this dict stores only successful lookups, so a later poll
-# retries a model whose first lookup failed.
-_TRANSCRIPT_PRICING_CACHE: dict[str, ModelPricing] = {}
+# Per-model pricing memo for transcript cost computation. Each successful
+# lookup is paired with the provider-config digest that produced it, so a
+# config change replaces stale pricing. ``None`` is never cached, allowing a
+# later poll to retry after a transient catalog failure.
+_TRANSCRIPT_PRICING_CACHE: dict[str, tuple[bytes, ModelPricing]] = {}
 
 
-def _transcript_model_pricing(model: str) -> ModelPricing | None:
+def _transcript_model_pricing(
+    model: str,
+    *,
+    provider_config: dict[str, object],
+    provider_config_fingerprint: bytes,
+) -> ModelPricing | None:
     """
-    Look up per-token pricing for *model*, memoizing successful results.
+    Look up per-token pricing for *model*, memoizing successful results for
+    the current provider configuration.
+
+    Checks provider config for custom pricing first (self-hosted models),
+    then falls back to catalog. This enables cost tracking for native
+    claude-native sessions using self-hosted endpoints.
 
     :param model: API model id from a transcript ``message.model``,
         e.g. ``"claude-opus-4-8"`` or ``"databricks-claude-sonnet-4-6"``.
+    :param provider_config: Parsed provider configuration for this transcript
+        scan.
+    :param provider_config_fingerprint: Digest used to invalidate pricing when
+        the provider configuration changes.
     :returns: The model's :class:`ModelPricing`, or ``None`` when pricing
         is unavailable (network error / model absent from the catalog),
         so the caller skips that message's cost.
     """
     cached = _TRANSCRIPT_PRICING_CACHE.get(model)
-    if cached is not None:
-        return cached
-    from omnigent.llms.context_window import fetch_model_pricing
+    if cached is not None and cached[0] == provider_config_fingerprint:
+        return cached[1]
+    from omnigent.llms.context_window import fetch_model_pricing_with_provider
 
-    pricing = fetch_model_pricing(model)
+    # For claude-native transcript pricing, assume claude-native harness
+    pricing = fetch_model_pricing_with_provider(
+        model, provider_config=provider_config, harness="claude-native"
+    )
     if pricing is not None:
-        _TRANSCRIPT_PRICING_CACHE[model] = pricing
+        _TRANSCRIPT_PRICING_CACHE[model] = (provider_config_fingerprint, pricing)
     return pricing
 
 
@@ -2553,6 +2569,10 @@ def compute_transcript_cumulative_cost(
         start_line=0,
     )
     from omnigent.llms.context_window import compute_llm_cost
+    from omnigent.onboarding.provider_config import load_config
+
+    provider_config = load_config()
+    provider_config_fingerprint = hashlib.sha256(repr(provider_config).encode("utf-8")).digest()
 
     # Per-``requestId`` cost (USD); last priceable record per id wins so a
     # response written across multiple transcript records is counted once.
@@ -2577,7 +2597,11 @@ def compute_transcript_cumulative_cost(
         model = _model_from_transcript_entry(entry)
         if model is None:
             continue
-        pricing = _transcript_model_pricing(model)
+        pricing = _transcript_model_pricing(
+            model,
+            provider_config=provider_config,
+            provider_config_fingerprint=provider_config_fingerprint,
+        )
         if pricing is None:
             continue
         request_id = entry.get("requestId")

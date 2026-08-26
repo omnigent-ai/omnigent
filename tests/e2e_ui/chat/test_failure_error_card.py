@@ -320,23 +320,20 @@ def test_persisted_failure_expands_retries_and_dismisses_locally(
 
 
 @pytest.mark.parametrize("viewport_width", [1440, 2400])
-def test_error_row_divider_spans_the_chat_column(
+def test_error_row_divider_aligns_with_message_edges(
     page: Page,
     seeded_session: tuple[str, str],
     viewport_width: int,
 ) -> None:
-    """The banner's dashed rule spans the full chat column, not just the pill.
+    """The dashed rule runs from the assistant edge to the user edge.
 
     Regression net for the error-only shrink-wrap: ``MessageContent``
     defaults to ``w-fit``, so an error-only bubble once clipped the rule to
-    the 560px pill (~592px) instead of the column. Widths are compared
-    against a long-text assistant turn measured in the same viewport — no
-    hardcoded pixel values. Runs at two widths since the column is
-    responsive below its ``max-w-3xl`` cap: 2400px lets the column reach
-    the cap (where the shrink-wrap shows — the pill fits inside it), while
-    1440px squeezes the column below the pill's width (``max-w-full`` caps
-    the pill either way) and locks the invariant against a wrapper that
-    narrows the row below the column.
+    the 560px pill. The full-width error turn must instead start where an
+    assistant message starts and end where a right-aligned user message
+    ends. Edges are measured from real messages in the same viewport, with
+    no hardcoded pixel values. Both widths guard the responsive conversation
+    column and the wider desktop layout.
 
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` from the local server.
@@ -364,25 +361,45 @@ def test_error_row_divider_spans_the_chat_column(
     pill = page.get_by_test_id("error-pill")
     expect(pill).to_be_visible(timeout=15_000)
 
-    widths = page.evaluate(
+    edges = page.evaluate(
         """() => {
           const pill = document.querySelector('[data-testid="error-pill"]');
           const row = pill.parentElement;
           const divider = row.querySelector('span[aria-hidden="true"]');
           const bubbles = [...document.querySelectorAll('[data-testid="message-bubble"]')];
-          const textBubble = bubbles.find((b) =>
-            b.textContent.includes('stretches the chat column'));
+          const assistantBubble = bubbles.find((bubble) =>
+            bubble.dataset.role === 'assistant' &&
+            bubble.textContent.includes('stretches the chat column'));
+          const userBubble = bubbles.find((bubble) =>
+            bubble.dataset.role === 'user' &&
+            bubble.textContent.includes('Write something long.'));
+          const rowRect = row.getBoundingClientRect();
+          const dividerRect = divider.getBoundingClientRect();
+          const assistantRect = assistantBubble.firstElementChild.getBoundingClientRect();
+          const userRect = userBubble.firstElementChild.getBoundingClientRect();
           return {
-            row: row.getBoundingClientRect().width,
-            divider: divider.getBoundingClientRect().width,
-            textTurn: textBubble.firstElementChild.getBoundingClientRect().width,
+            rowLeft: rowRect.left,
+            rowRight: rowRect.right,
+            dividerLeft: dividerRect.left,
+            dividerRight: dividerRect.right,
+            assistantLeft: assistantRect.left,
+            userRight: userRect.right,
           };
         }"""
     )
-    assert abs(widths["row"] - widths["textTurn"]) <= 2, (
-        f"error row spans {widths['row']:.0f}px but the chat column spans "
-        f"{widths['textTurn']:.0f}px — the banner shrink-wrapped the pill"
+    assert abs(edges["rowLeft"] - edges["assistantLeft"]) <= 2, (
+        f"error row starts at {edges['rowLeft']:.0f}px but the assistant message starts at "
+        f"{edges['assistantLeft']:.0f}px"
     )
-    assert abs(widths["divider"] - widths["row"]) <= 1, (
-        f"dashed rule spans {widths['divider']:.0f}px of its {widths['row']:.0f}px row"
+    assert abs(edges["rowRight"] - edges["userRight"]) <= 2, (
+        f"error row ends at {edges['rowRight']:.0f}px but the user message ends at "
+        f"{edges['userRight']:.0f}px"
+    )
+    assert abs(edges["dividerLeft"] - edges["rowLeft"]) <= 1, (
+        f"dashed rule starts at {edges['dividerLeft']:.0f}px but its row starts at "
+        f"{edges['rowLeft']:.0f}px"
+    )
+    assert abs(edges["dividerRight"] - edges["rowRight"]) <= 1, (
+        f"dashed rule ends at {edges['dividerRight']:.0f}px but its row ends at "
+        f"{edges['rowRight']:.0f}px"
     )

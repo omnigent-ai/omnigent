@@ -399,7 +399,10 @@ export const CodeBlockContent = ({
   const tokenized = asyncTokens ?? syncTokens;
 
   return (
-    <div className="relative overflow-auto">
+    <div
+      className="relative overflow-auto"
+      data-code-highlighted={tokenized === rawTokens ? "false" : "true"}
+    >
       <CodeBlockBody showLineNumbers={showLineNumbers} tokenized={tokenized} />
     </div>
   );

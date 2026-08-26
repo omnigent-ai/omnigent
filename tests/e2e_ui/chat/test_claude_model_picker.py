@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 from playwright.sync_api import Page, Route, expect
 
 from omnigent.claude_native import ClaudeNativeUcodeConfig, claude_native_model_options
-from tests.e2e_ui.conftest import seed_committed_turn
+from tests.e2e_ui.conftest import fetch_with_retry, seed_committed_turn
 
 _EXPECTED_ROWS = [
     ("opus", "Opus 4.10"),
@@ -86,7 +86,7 @@ def _patch_session_as_claude_native(
 
         headers = {"content-type": "application/json"}
         if request.method == "GET":
-            response = route.fetch()
+            response = fetch_with_retry(route)
             payload = response.json()
             headers = {**response.headers, **headers}
         elif request.method == "PATCH":
@@ -309,7 +309,7 @@ def _force_asleep_liveness(page: Page, session_id: str) -> None:
         if request.method != "GET" or urlparse(request.url).path != "/health":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         offline = {"runner_online": False, "host_online": False}
         if isinstance(payload.get("sessions"), dict):
@@ -327,7 +327,7 @@ def _force_asleep_liveness(page: Page, session_id: str) -> None:
         if request.method != "GET" or urlparse(request.url).path != "/v1/sessions":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         rows = payload.get("data") if isinstance(payload, dict) else None
         if isinstance(rows, list):
@@ -538,7 +538,7 @@ def _patch_native_session_pair(page: Page, codex_session_id: str, claude_session
             route.continue_()
             return
 
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         if path == f"/v1/sessions/{codex_session_id}":
             wrapper, harness = "codex-native-ui", "codex"

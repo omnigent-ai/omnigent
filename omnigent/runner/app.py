@@ -2047,6 +2047,10 @@ def create_runner_app(
     _session_spec_locks: dict[str, asyncio.Lock] = {}  # session_id → spec resolution lock
     _session_init_tasks: dict[tuple[str, str, str | None], asyncio.Task[JSONResponse]] = {}
     _session_init_envelopes: dict[str, tuple[float, RunnerSessionInitEnvelope]] = {}
+    # session_id → canonical reasoning effort, seeded from the session-init
+    # snapshot and updated by ``effort_change``. In-process harnesses learn the
+    # effort only from the forwarded turn body, which is built field by field.
+    _session_reasoning_effort: dict[str, str] = {}
     _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
     _session_cursor_model_names: dict[str, dict[str, str]] = {}
@@ -2474,6 +2478,13 @@ def create_runner_app(
             return
 
         error = _build_required_terminal_error(event)
+        _logger.error(
+            "required terminal %s exited; failing turn for %s: %s",
+            event.terminal_name,
+            event.session_id,
+            error.get("message"),
+            extra={"session_id": event.session_id},
+        )
         _publish_event(
             event.session_id,
             {
@@ -2603,6 +2614,8 @@ def create_runner_app(
         _session_workspace_cache[session_id] = snapshot.workspace
         if envelope.sub_agent_name:
             _session_sub_agent_names[session_id] = envelope.sub_agent_name
+        if snapshot.reasoning_effort:
+            _session_reasoning_effort[session_id] = snapshot.reasoning_effort
         _session_init_envelopes[session_id] = (time.monotonic(), envelope)
         return _SessionInitContext(envelope=envelope)
 
@@ -3550,6 +3563,7 @@ def create_runner_app(
         _session_snapshot_cache.pop(session_id, None)
         _session_snapshot_locks.pop(session_id, None)
         _session_init_envelopes.pop(session_id, None)
+        _session_reasoning_effort.pop(session_id, None)
         _session_spec_locks.pop(session_id, None)
         _session_fs_registries.pop(session_id, None)
         _session_agent_ids.pop(session_id, None)
@@ -4088,6 +4102,16 @@ def create_runner_app(
         event: _JsonObject = {"type": "session.status", "status": status}
         if error is not None:
             event["error"] = error
+        if status == "failed":
+            # Canonical broken-turn signal: every failed turn shown in the UI
+            # funnels through here, so log once at ERROR for the dashboard.
+            _logger.error(
+                "turn surfaced to UI as failed for %s (harness=%s): %s",
+                conv_id,
+                harness,
+                error,
+                extra={"session_id": conv_id},
+            )
         _publish_event(conv_id, event)
 
     def _is_native_harness(conv_id: str) -> bool:
@@ -4340,6 +4364,41 @@ def create_runner_app(
                 exc_info=True,
                 extra={"session_id": runner_primary_session_id()},
             )
+
+    async def _handle_pi_native_effort_change(
+        conv_id: str,
+        effort: str | None,
+    ) -> Response:
+        from omnigent.pi_native_bridge import (
+            bridge_dir_for_session_id,
+            enqueue_thinking_level_change,
+        )
+        from omnigent.reasoning_effort import to_pi_thinking_level
+
+        if effort is None or not effort.strip():
+            return Response(status_code=204)
+        thinking = to_pi_thinking_level(effort)
+        try:
+            await asyncio.to_thread(
+                enqueue_thinking_level_change,
+                bridge_dir_for_session_id(conv_id),
+                thinking,
+            )
+        except OSError as exc:
+            _logger.warning(
+                "Pi-native effort change failed for session=%s",
+                conv_id,
+                exc_info=True,
+                extra={"session_id": conv_id},
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "pi_native_effort_failed",
+                    "detail": _client_safe_error_detail(exc, context="pi-native effort change"),
+                },
+            )
+        return Response(status_code=204)
 
     async def _handle_pi_native_model_change(
         conv_id: str,
@@ -6027,6 +6086,25 @@ def create_runner_app(
             if _active_turns.get(conv) is _own_task and _own_task is not None:
                 _on_proxy_stream_end(conv)
 
+    def _turn_reasoning(conv: str, msg_body: _JsonObject) -> _JsonObject | None:
+        """Reasoning block to forward on a turn, or ``None`` when unset.
+
+        An explicit per-event value wins; otherwise the session's remembered
+        effort (session-init snapshot or a later ``effort_change``) applies, so
+        an in-process harness sees the same effort a native TUI got on its argv.
+
+        :param conv: Session/conversation id.
+        :param msg_body: The dispatched message body.
+        :returns: ``{"effort": "<level>"}`` or ``None``.
+        """
+        raw = msg_body.get("reasoning")
+        if isinstance(raw, dict):
+            effort = raw.get("effort")
+            if isinstance(effort, str) and effort:
+                return {"effort": effort}
+        remembered = _session_reasoning_effort.get(conv)
+        return {"effort": remembered} if remembered else None
+
     async def _run_turn_bg_setup_and_stream(
         msg_body: _JsonObject,
         conv: str,
@@ -6175,6 +6253,31 @@ def create_runner_app(
                 _model_override,
                 extra={"session_id": conv},
             )
+        # Resolve the effort for this turn — an explicit per-event value, else
+        # the session's remembered one — then deliver only what this harness can
+        # accept. The persisted effort is validated at create against the union
+        # vocabulary, so a value that is legal there ("none" on an
+        # Anthropic-family harness) can still be foreign here, and the executors
+        # reject an unsupported value by failing the turn. The native launch path
+        # filters the same way (see native/orchestration.py's ``--effort``
+        # guard); an unknown harness is passed through rather than dropped, since
+        # a plugin harness may accept efforts this registry has never heard of.
+        _reasoning = _turn_reasoning(conv, msg_body)
+        if _reasoning is not None:
+            from omnigent.reasoning_effort import efforts_for_harness, format_supported
+
+            _effort = _reasoning["effort"]
+            _supported = efforts_for_harness(harness_name)
+            if _supported is None or _effort in _supported:
+                harness_body["reasoning"] = _reasoning
+            else:
+                _logger.warning(
+                    "_run_turn_bg: conv=%s dropping reasoning effort %r — harness %s accepts %s",
+                    conv,
+                    _effort,
+                    harness_name,
+                    format_supported(_supported) if _supported else "no effort override",
+                )
         if _session_histories[conv]:
             harness_body["content"] = _session_histories[conv]
         else:
@@ -6644,6 +6747,12 @@ def create_runner_app(
                     timeout=None,
                 ) as harness_resp:
                     if harness_resp.status_code != 200:
+                        _logger.error(
+                            "harness rejected turn delivery for %s with status %d",
+                            conv_id,
+                            harness_resp.status_code,
+                            extra={"session_id": conv_id},
+                        )
                         _fail_status = {
                             "type": "response.failed",
                             "error": {
@@ -6951,11 +7060,10 @@ def create_runner_app(
                 yield _response_failed_event(_error)
 
             except (httpx.HTTPError, RuntimeError) as exc:
-                _logger.warning(
+                _logger.exception(
                     "proxy stream connection error for %s: %s",
                     conv_id,
                     exc,
-                    exc_info=True,
                     extra={"session_id": conv_id},
                 )
                 _error = {
@@ -7223,20 +7331,31 @@ def create_runner_app(
 
         if body_type == "effort_change":
             harness = _session_harness_name(conversation_id)
-            if harness in ("claude-native", "codex-native"):
-                effort = body.get("effort") if isinstance(body, dict) else None
-                if effort is not None and not isinstance(effort, str):
-                    return JSONResponse(
-                        status_code=400,
-                        content={
-                            "error": "invalid_input",
-                            "detail": "Body 'effort' must be a string or null",
-                        },
-                    )
+            effort = body.get("effort") if isinstance(body, dict) else None
+            if effort is not None and not isinstance(effort, str):
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "invalid_input",
+                        "detail": "Body 'effort' must be a string or null",
+                    },
+                )
+            # In-process harnesses apply the effort on their next turn, from the
+            # forwarded turn body (see ``_turn_reasoning``).
+            if effort:
+                _session_reasoning_effort[conversation_id] = effort
+            else:
+                _session_reasoning_effort.pop(conversation_id, None)
+            if harness in ("claude-native", "codex-native", "pi-native"):
                 if harness == "codex-native":
                     return await _handle_codex_native_settings_update(
                         conversation_id,
                         {"effort": effort},
+                    )
+                if harness == "pi-native":
+                    return await _handle_pi_native_effort_change(
+                        conversation_id,
+                        effort,
                     )
                 return await _handle_claude_native_effort_change(
                     conversation_id,
@@ -9473,7 +9592,12 @@ def create_runner_app(
                             },
                         },
                     )
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
+                    _logger.exception(
+                        "MCP tool dispatch failed for %s",
+                        tool_name,
+                        extra={"session_id": session_id},
+                    )
                     return JSONResponse(
                         status_code=200,
                         content={
@@ -9527,7 +9651,12 @@ def create_runner_app(
                         publish_event=_publish_event,
                         filesystem_registry=filesystem_registry,
                     )
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
+                    _logger.exception(
+                        "MCP tool dispatch failed for %s",
+                        tool_name,
+                        extra={"session_id": session_id},
+                    )
                     return JSONResponse(
                         status_code=200,
                         content={

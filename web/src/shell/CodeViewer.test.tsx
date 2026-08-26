@@ -1,7 +1,8 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { useFileContent } from "@/hooks/useFileContent";
-import { CodeViewer } from "./CodeViewer";
+import type { Comment } from "@/hooks/useComments";
+import { CodeViewer, type CodeViewerProps } from "./CodeViewer";
 import { ImageLightboxProvider } from "@/components/ImageLightbox";
 import { HTML_PREVIEW_SANDBOX } from "./codeViewerHelpers";
 
@@ -25,7 +26,9 @@ vi.mock("./MonacoCodeEditor", () => ({
 // jsdom) never load; its testid presence is the signal that a file was routed
 // to the PDF surface.
 vi.mock("./PdfViewer", () => ({
-  PdfViewer: () => <div data-testid="pdf-viewer-stub" />,
+  PdfViewer: ({ comments }: { comments: Comment[] }) => (
+    <div data-testid="pdf-viewer-stub" data-comment-ids={comments.map((c) => c.id).join(",")} />
+  ),
 }));
 // Stub the lazy ModelViewer so the heavy three.js bundle isn't loaded in jsdom
 // (which has no WebGL); its presence in the DOM is the signal that a model file
@@ -532,14 +535,18 @@ describe("CodeViewer PDF routing", () => {
     contentType: string | null = "application/pdf",
     path = "report.pdf",
     truncated = false,
+    comments: Comment[] = [],
+    addressedComments: Comment[] = [],
+    activeSelection: CodeViewerProps["activeSelection"] = null,
   ) {
     return render(
       <CodeViewer
         conversationId="conv_1"
         path={path}
         fileQuery={makePdfQuery(contentType, truncated)}
-        comments={[]}
-        activeSelection={null}
+        comments={comments}
+        addressedComments={addressedComments}
+        activeSelection={activeSelection}
         onSetActiveSelection={() => {}}
         panelOpen={true}
         searchOpen={false}
@@ -565,6 +572,29 @@ describe("CodeViewer PDF routing", () => {
   it("falls back to the .pdf extension when content type is null", async () => {
     renderPdf(null, "report.pdf");
     expect(await screen.findByTestId("pdf-viewer-stub")).toBeDefined();
+  });
+
+  it("renders an addressed anchor only while that comment is active", async () => {
+    const open = { id: "open", status: "draft" } as Comment;
+    const addressed = { id: "addressed", status: "addressed" } as Comment;
+
+    renderPdf("application/pdf", "report.pdf", false, [open], [addressed]);
+    expect(await screen.findByTestId("pdf-viewer-stub")).toHaveAttribute(
+      "data-comment-ids",
+      "open",
+    );
+
+    cleanup();
+    renderPdf("application/pdf", "report.pdf", false, [open], [addressed], {
+      start_index: 0,
+      end_index: 1,
+      anchor_content: "anchor",
+      comment_id: "addressed",
+    });
+    expect(await screen.findByTestId("pdf-viewer-stub")).toHaveAttribute(
+      "data-comment-ids",
+      "open,addressed",
+    );
   });
 });
 

@@ -19,6 +19,8 @@ export interface ActiveSelection {
   start_index: number;
   end_index: number;
   anchor_content: string;
+  /** Present when the selection activates a saved comment rather than a new draft. */
+  comment_id?: string;
 }
 
 /**
