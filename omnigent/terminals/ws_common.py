@@ -37,6 +37,167 @@ def _monotonic() -> float:
     return time.monotonic()
 
 
+class _ByteBoundedOutputQueue(asyncio.Queue[bytes | None]):
+    """Terminal-output queue that drops new chunks past its byte/item budget.
+
+    Already-queued output remains contiguous with bytes sent to the terminal,
+    so saturation rejects an incoming chunk whole. The next accepted chunk is
+    prefixed with parser-resynchronization bytes, and every loss invokes
+    ``on_drop`` so the bridge can request a full repaint. EOF is always kept.
+    """
+
+    def __init__(
+        self,
+        max_bytes: int = _OUTPUT_QUEUE_MAX_BYTES,
+        max_items: int = _OUTPUT_QUEUE_MAX_ITEMS,
+    ) -> None:
+        super().__init__()
+        self.max_bytes = max_bytes
+        self.max_items = max_items
+        self.queued_bytes = 0
+        self.dropped_chunks = 0
+        self.dropped_bytes = 0
+        self.on_drop: Callable[[], None] | None = None
+        self._in_gap = False
+        self._warned_at: float | None = None
+
+    def _put(self, item: bytes | None) -> None:
+        super()._put(item)
+        if item is not None:
+            self.queued_bytes += len(item)
+
+    def _get(self) -> bytes | None:
+        item = super()._get()
+        if item is not None:
+            self.queued_bytes -= len(item)
+        return item
+
+    def record_dropped_output(self, num_bytes: int) -> None:
+        """Record lost output, open a parser gap, and request a repaint."""
+        self.dropped_chunks += 1
+        self.dropped_bytes += num_bytes
+        self._in_gap = True
+        now = _monotonic()
+        if self._warned_at is None or now - self._warned_at >= _OUTPUT_DROP_WARN_INTERVAL_S:
+            self._warned_at = now
+            _logger.warning(
+                "terminal output queue saturated or producer shed output "
+                "(%d bytes / %d chunks queued); %d chunks (%d bytes) dropped so far",
+                self.queued_bytes,
+                self.qsize(),
+                self.dropped_chunks,
+                self.dropped_bytes,
+            )
+        if self.on_drop is not None:
+            self.on_drop()
+
+    def put_nowait(self, item: bytes | None) -> None:
+        if item is None:
+            super().put_nowait(item)
+            return
+        gap_bytes = len(_OUTPUT_GAP_RESYNC) if self._in_gap else 0
+        added_items = 2 if self._in_gap else 1
+        if (
+            gap_bytes + len(item) > self.max_bytes
+            or self.queued_bytes + gap_bytes + len(item) > self.max_bytes
+            or self.qsize() + added_items > self.max_items
+        ):
+            self.record_dropped_output(len(item))
+            return
+        if self._in_gap:
+            super().put_nowait(_OUTPUT_GAP_RESYNC)
+        self._in_gap = False
+        super().put_nowait(item)
+
+    def put_snapshot_nowait(self, snapshot: bytes) -> None:
+        """Prioritize a full repaint by evicting stale queued output."""
+        while True:
+            gap_bytes = len(_OUTPUT_GAP_RESYNC) if self._in_gap else 0
+            added_items = 2 if self._in_gap else 1
+            if gap_bytes + len(snapshot) > self.max_bytes or added_items > self.max_items:
+                self.record_dropped_output(len(snapshot))
+                return
+            if (
+                self.queued_bytes + gap_bytes + len(snapshot) <= self.max_bytes
+                and self.qsize() + added_items <= self.max_items
+            ):
+                if self._in_gap:
+                    super().put_nowait(_OUTPUT_GAP_RESYNC)
+                self._in_gap = False
+                super().put_nowait(snapshot)
+                return
+            discarded = self.get_nowait()
+            if discarded is None:
+                super().put_nowait(None)
+                return
+            self.record_dropped_output(len(discarded))
+
+
+class _GapRepainter:
+    """Coalesce repaint requests and pace them across repeated drop gaps."""
+
+    def __init__(
+        self,
+        repaint: Callable[[], Coroutine[object, object, None]],
+        min_interval_s: float = _REPAINT_MIN_INTERVAL_S,
+    ) -> None:
+        self._repaint = repaint
+        self._min_interval_s = min_interval_s
+        self._task: asyncio.Task[None] | None = None
+        self._last_started_at: float | None = None
+        self._capturing = False
+        self._trailing = False
+
+    def request(self) -> None:
+        """Schedule at most one active repaint and one trailing repaint."""
+        if self._task is not None and not self._task.done():
+            if self._capturing:
+                self._trailing = True
+            return
+        self._task = asyncio.create_task(self._run(self._cooldown()))
+
+    def _cooldown(self) -> float:
+        if self._last_started_at is None:
+            return 0.0
+        return max(0.0, self._last_started_at + self._min_interval_s - _monotonic())
+
+    async def _run(self, delay: float) -> None:
+        if delay > 0:
+            await asyncio.sleep(delay)
+        self._capturing = True
+        self._last_started_at = _monotonic()
+        try:
+            await self._repaint()
+        except Exception:
+            _logger.debug("gap repaint failed", exc_info=True)
+        finally:
+            self._capturing = False
+        if self._trailing:
+            self._trailing = False
+            self._task = asyncio.create_task(self._run(self._cooldown()))
+
+    async def flush(self, timeout_s: float) -> None:
+        """Wait briefly for pending repaint output to land before EOF."""
+        deadline = _monotonic() + timeout_s
+        while True:
+            task = self._task
+            if task is None or task.done():
+                return
+            remaining = deadline - _monotonic()
+            if remaining <= 0:
+                return
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
+            if self._task is task:
+                return
+
+    def cancel(self) -> None:
+        """Cancel pending repaint work during bridge teardown."""
+        self._trailing = False
+        if self._task is not None:
+            self._task.cancel()
+            self._task = None
+
 async def _tmux_session_alive(socket_path: str, tmux_target: str) -> bool:
     """Return whether the targeted tmux pane still has a live process.
 
