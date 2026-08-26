@@ -1051,6 +1051,53 @@ async def test_acp_subagent_summary_needs_an_agent_to_persist(
     )
 
 
+async def test_acp_subagent_tool_call_persists_into_the_child(
+    client: httpx.AsyncClient,
+) -> None:
+    """A sub-agent's own tool call persists into its child as a ``function_call``.
+
+    The transcript-depth path: the runner appends each of the sub-agent's tool
+    calls to its child as a ``function_call`` item so opening the row shows the
+    work it did, not just the task and summary. ``FunctionCallData`` requires
+    ``agent`` / ``name`` / ``arguments`` / ``call_id``, so this pins that the
+    exact shape the runner sends is accepted and appears in the child's items.
+    """
+    import json
+
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+    mint = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_acp_subagent_start",
+            "data": {"subagent_id": "a0ac9364", "title": "mathutils", "description": "t"},
+        },
+    )
+    child_id = mint.json()["child_session_id"]
+
+    resp = await client.post(
+        f"/v1/sessions/{child_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "function_call",
+                "item_data": {
+                    "agent": "mathutils",
+                    "name": "Wrote mathutils.py",
+                    "arguments": '{"file_path": "mathutils.py"}',
+                    "call_id": "toolu_01",
+                },
+                "response_id": "resp_acpsub_a0ac9364",
+            },
+        },
+    )
+    assert resp.status_code in (200, 202), resp.text
+
+    items = (await client.get(f"/v1/sessions/{child_id}/items")).json()["data"]
+    assert any(it.get("type") == "function_call" for it in items), items
+    assert "Wrote mathutils.py" in json.dumps(items)
+
+
 async def test_external_subagent_start_handles_duplicate_agent_type_and_description(
     client: httpx.AsyncClient,
 ) -> None:

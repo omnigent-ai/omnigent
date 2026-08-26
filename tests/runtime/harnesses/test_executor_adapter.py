@@ -2211,3 +2211,36 @@ def test_translate_event_emits_subagent_completed() -> None:
         True,
         "3 tests pass",
     )
+
+
+def test_translate_event_emits_subagent_tool_call() -> None:
+    """A ``SubAgentToolCall`` becomes ``subagent.tool_call`` with JSON arguments.
+
+    The runner appends this to the child transcript as a ``function_call`` card,
+    so ``arguments`` must be the JSON-encoded string the item expects.
+    """
+    from omnigent.inner.executor import SubAgentToolCall
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import SubagentToolCallEvent
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext(response_id="resp_sa")
+    adapter._translate_event(
+        SubAgentToolCall(
+            child_key="a0ac9364",
+            call_id="toolu_01",
+            name="Wrote mathutils.py",
+            args={"file_path": "mathutils.py"},
+        ),
+        ctx,  # type: ignore[arg-type]
+    )
+    assert len(ctx.emitted) == 1
+    ev = ctx.emitted[0]
+    assert isinstance(ev, SubagentToolCallEvent)
+    assert (ev.type, ev.child_key, ev.call_id, ev.name) == (
+        "subagent.tool_call",
+        "a0ac9364",
+        "toolu_01",
+        "Wrote mathutils.py",
+    )
+    assert json.loads(ev.arguments) == {"file_path": "mathutils.py"}

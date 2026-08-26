@@ -298,6 +298,27 @@ class SubAgentCompleted(ExecutorEvent):
 
 
 @dataclass
+class SubAgentToolCall(ExecutorEvent):
+    """A tool call an ACP sub-agent ran, to append to its child transcript.
+
+    Distinct from :class:`ToolCallRequest`, which renders in the *parent* stream:
+    this is a call the sub-agent made inside its delegated work, routed to the
+    sub-agent's own child session by :attr:`child_key`. See
+    :mod:`omnigent.inner.acp_subagents`.
+
+    :param child_key: Matches the owning :attr:`SubAgentStarted.child_key`.
+    :param call_id: The tool call's id, used as the child item's ``call_id``.
+    :param name: Human tool label for the card, e.g. ``"Wrote mathutils.py"``.
+    :param args: The tool's arguments (its raw input).
+    """
+
+    child_key: str
+    call_id: str
+    name: str
+    args: ToolArgs = field(default_factory=dict)
+
+
+@dataclass
 class TurnCancelled(ExecutorEvent):
     """The current assistant turn was cancelled before completion."""
 

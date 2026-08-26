@@ -7,9 +7,10 @@ three sub-agents (2026-08-25): no ``kind: "subagent"``, no ``childSessionId``,
 one session, and the whole lifecycle on a ``tool_call_update`` whose
 ``toolCallId`` is the sub-agent's ``agentId``::
 
-    _meta["cognition.ai/subagent_started"]   = {agentId, title, task}
-    _meta["cognition.ai/subagent_completed"] = {agentId, success, summary}
-    _meta["cognition.ai/subagent_context"]   = {parentAgentId}   # provenance only
+    _meta["cognition.ai/subagent_started"]   = {agentId, title, task}       # tool_call_update
+    _meta["cognition.ai/subagent_completed"] = {agentId, success, summary}  # tool_call_update
+    _meta["cognition.ai/subagent_context"]   = {parentAgentId}              # on the sub-agent's
+                                                                            # own tool_call frames
 
 Reading vendor ``_meta`` is not a shortcut here — it is the only structured
 sub-agent signal Devin emits, so there is no generic field to prefer. Confining
@@ -30,12 +31,20 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from omnigent.inner.acp_subagents import SubAgentEnd, SubAgentEvent, SubAgentStart
+from omnigent.inner.acp_subagents import (
+    SubAgentActivity,
+    SubAgentEnd,
+    SubAgentEvent,
+    SubAgentStart,
+)
 
 # Devin conveys the sub-agent lifecycle only through these vendor ``_meta`` keys;
-# the sub-agent's ``agentId`` is the stable key across both edges.
+# the sub-agent's ``agentId`` is the stable key across both edges. ``context``
+# tags the sub-agent's *own* tool calls with the owning agent, so they can be
+# routed into that sub-agent's child transcript instead of the parent stream.
 _STARTED = "cognition.ai/subagent_started"
 _COMPLETED = "cognition.ai/subagent_completed"
+_CONTEXT = "cognition.ai/subagent_context"
 
 
 class DevinSubAgentSource:
@@ -47,15 +56,40 @@ class DevinSubAgentSource:
     """
 
     def read(self, update: Mapping[str, Any]) -> Sequence[SubAgentEvent]:
-        """Return the sub-agent lifecycle events carried by one ``session/update``.
+        """Return the sub-agent events carried by one ``session/update``.
 
         :param update: The ACP ``params.update`` object.
-        :returns: Normalized start/end events, empty for a non-Devin frame.
+        :returns: Normalized start / end / activity events, empty for a non-Devin
+            frame. At most one applies per frame (the lifecycle keys ride
+            ``tool_call_update``; ``subagent_context`` rides the sub-agent's own
+            ``tool_call``).
         """
         meta = update.get("_meta")
         if not isinstance(meta, Mapping):
             return ()
         events: list[SubAgentEvent] = []
+
+        # The sub-agent's own tool call — route it to that sub-agent's child.
+        context = meta.get(_CONTEXT)
+        if isinstance(context, Mapping) and update.get("sessionUpdate") == "tool_call":
+            parent_agent_id = context.get("parentAgentId")
+            call_id = update.get("toolCallId")
+            if (
+                isinstance(parent_agent_id, str)
+                and parent_agent_id
+                and isinstance(call_id, str)
+                and call_id
+            ):
+                raw_input = update.get("rawInput")
+                events.append(
+                    SubAgentActivity(
+                        child_key=parent_agent_id,
+                        call_id=call_id,
+                        name=str(update.get("title") or update.get("kind") or "tool"),
+                        args=raw_input if isinstance(raw_input, Mapping) else {},
+                    )
+                )
+
         started = meta.get(_STARTED)
         if isinstance(started, Mapping):
             agent_id = started.get("agentId")

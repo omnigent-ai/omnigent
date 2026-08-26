@@ -32,6 +32,7 @@ from omnigent.inner.executor import (
     ReasoningChunk,
     SubAgentCompleted,
     SubAgentStarted,
+    SubAgentToolCall,
     TextChunk,
     ToolCallComplete,
     ToolCallRequest,
@@ -364,11 +365,17 @@ class _FakeSubAgentDialect:
     """An invented dialect, so this generic suite names no vendor."""
 
     def read(self, update: dict[str, object]) -> tuple[object, ...]:
-        """Return a start/end for ``acme.dev/spawn`` / ``acme.dev/done``."""
-        from omnigent.inner.acp_subagents import SubAgentEnd, SubAgentStart
+        """Return start / activity / end for ``acme.dev/{spawn,work,done}``."""
+        from omnigent.inner.acp_subagents import SubAgentActivity, SubAgentEnd, SubAgentStart
 
         if isinstance(update.get("acme.dev/spawn"), dict):
             return (SubAgentStart(child_key="w1", title="worker", task="do a thing"),)
+        if isinstance(update.get("acme.dev/work"), dict):
+            return (
+                SubAgentActivity(
+                    child_key="w1", call_id="c9", name="Wrote out.txt", args={"path": "out.txt"}
+                ),
+            )
         if isinstance(update.get("acme.dev/done"), dict):
             return (SubAgentEnd(child_key="w1", ok=True, summary="done"),)
         return ()
@@ -427,11 +434,44 @@ def test_generic_executor_does_no_subagent_scanning() -> None:
 
 
 def test_tool_cards_still_render_alongside_the_scan() -> None:
-    """The scan is additive — an ordinary tool_call still produces its card."""
+    """An ordinary (unclaimed) tool_call still produces a parent card."""
     events = _extended_executor()._handle_session_update(
         {"sessionUpdate": "tool_call", "toolCallId": "c1", "title": "Ran ls", "kind": "execute"}
     )
     assert [type(e) for e in events] == [ToolCallRequest]
+
+
+def test_handle_session_update_routes_activity_to_the_child() -> None:
+    """A claimed tool call becomes a ``SubAgentToolCall``, not a parent card.
+
+    **What breaks if this fails**: the sub-agent's own work renders in the parent
+    stream (or nowhere) instead of the child transcript — the exact gap this
+    change closes.
+    """
+    events = _extended_executor()._handle_session_update(
+        {"sessionUpdate": "tool_call", "toolCallId": "c9", "acme.dev/work": {"any": 1}}
+    )
+    assert events == [
+        SubAgentToolCall(
+            child_key="w1", call_id="c9", name="Wrote out.txt", args={"path": "out.txt"}
+        )
+    ]
+    # The frame is claimed, so it does NOT also emit a parent tool card.
+    assert not any(isinstance(e, ToolCallRequest) for e in events)
+
+
+def test_claimed_completion_frame_emits_no_spurious_parent_card() -> None:
+    """A claimed ``tool_call_update`` doesn't also close a parent tool card.
+
+    The sub-agent's completion rides a ``tool_call_update`` whose id was never an
+    originating ``tool_call``; without the short-circuit the terminal-status
+    branch would emit a stray ``ToolCallComplete(name="tool")`` in the parent.
+    """
+    events = _extended_executor()._handle_session_update(
+        {"sessionUpdate": "tool_call_update", "status": "completed", "acme.dev/done": {"id": "w1"}}
+    )
+    assert [type(e) for e in events] == [SubAgentCompleted]
+    assert not any(isinstance(e, ToolCallComplete) for e in events)
 
 
 # ---------------------------------------------------------------------------

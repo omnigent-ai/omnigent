@@ -33,6 +33,7 @@ from omnigent.inner.executor import (
     ReasoningChunk,
     SubAgentCompleted,
     SubAgentStarted,
+    SubAgentToolCall,
     TextChunk,
     ToolCallComplete,
     ToolCallRequest,
@@ -798,6 +799,18 @@ class ExecutorAdapter(HarnessApp):
                     child_key=event.child_key,
                     ok=event.ok,
                     summary=event.summary,
+                )
+            )
+        elif isinstance(event, SubAgentToolCall):
+            from omnigent.server.schemas import SubagentToolCallEvent
+
+            ctx.emit(
+                SubagentToolCallEvent(
+                    type="subagent.tool_call",
+                    child_key=event.child_key,
+                    call_id=event.call_id,
+                    name=event.name,
+                    arguments=_serialize_args(event.args),
                 )
             )
         # ExecutorError handled by the caller (re-raises so the

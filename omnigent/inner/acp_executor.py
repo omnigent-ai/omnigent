@@ -61,7 +61,7 @@ from typing import Any, Protocol, TypeAlias
 
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
 from omnigent.inner.acp_extension import NO_ACP_EXTENSION, AcpExtension
-from omnigent.inner.acp_subagents import SubAgentStart, read_subagent_events
+from omnigent.inner.acp_subagents import SubAgentActivity, SubAgentStart, read_subagent_events
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
@@ -73,6 +73,7 @@ from omnigent.inner.executor import (
     ReasoningChunk,
     SubAgentCompleted,
     SubAgentStarted,
+    SubAgentToolCall,
     TextChunk,
     ToolCallComplete,
     ToolCallRequest,
@@ -1187,6 +1188,36 @@ class AcpExecutor(Executor):
         update_type = update.get("sessionUpdate", "")
         events: list[ExecutorEvent] = []
 
+        # Sub-agent frames ride a per-agent dialect (Devin: cognition.ai/* on the
+        # ``_meta``); a source claims them. When one does, the frame belongs to a
+        # *child* session, not the parent stream — so emit the child-directed
+        # events and stop. The tool-card branches below would otherwise render the
+        # sub-agent's own work in the parent, and a lifecycle ``tool_call_update``
+        # (whose id was never an originating ``tool_call``) would close a spurious
+        # "tool" card there. Empty for a generic ACP agent (no sources), so this
+        # is a no-op for every non-Devin harness.
+        sub_events = read_subagent_events(update, self._extension.subagent_sources)
+        if sub_events:
+            for sub in sub_events:
+                if isinstance(sub, SubAgentStart):
+                    events.append(
+                        SubAgentStarted(child_key=sub.child_key, title=sub.title, task=sub.task)
+                    )
+                elif isinstance(sub, SubAgentActivity):
+                    events.append(
+                        SubAgentToolCall(
+                            child_key=sub.child_key,
+                            call_id=sub.call_id,
+                            name=sub.name,
+                            args=dict(sub.args),
+                        )
+                    )
+                else:  # SubAgentEnd
+                    events.append(
+                        SubAgentCompleted(child_key=sub.child_key, ok=sub.ok, summary=sub.summary)
+                    )
+            return events
+
         if update_type == _UPDATE_AGENT_MESSAGE_CHUNK:
             content = update.get("content", {})
             text = content.get("text", "") if isinstance(content, dict) else ""
@@ -1236,20 +1267,6 @@ class AcpExecutor(Executor):
 
         elif update_type == _UPDATE_CONFIG_OPTION:
             self._note_config_options(update.get("configOptions"))
-
-        # Sub-agent lifecycle rides on these updates in a per-agent dialect, so
-        # only the sources this agent's extension supplies can recognize it —
-        # none for a generic ACP agent. The runner mints a child session per
-        # start so the "Subagents" panel lists it.
-        for sub in read_subagent_events(update, self._extension.subagent_sources):
-            if isinstance(sub, SubAgentStart):
-                events.append(
-                    SubAgentStarted(child_key=sub.child_key, title=sub.title, task=sub.task)
-                )
-            else:
-                events.append(
-                    SubAgentCompleted(child_key=sub.child_key, ok=sub.ok, summary=sub.summary)
-                )
 
         return events
 

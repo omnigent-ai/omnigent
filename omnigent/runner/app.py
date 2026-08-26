@@ -822,6 +822,92 @@ async def _complete_acp_subagent_child(
         )
 
 
+async def _post_acp_subagent_tool_call(
+    client: httpx.AsyncClient,
+    *,
+    child_key: str,
+    call_id: str,
+    name: str,
+    arguments: str,
+    child_id_future: asyncio.Future[str],
+    title: str = "",
+) -> None:
+    """Append one of a sub-agent's own tool calls to its child transcript.
+
+    Renders as a ``function_call`` card in the child's chat (the same shape the
+    parent uses for an observed tool call), so opening a sub-agent shows the work
+    it did, not just the task and summary. Shares the ``response_id`` the task and
+    summary messages use, so the card groups into the same turn.
+
+    Waits (bounded) for the start edge to mint the child. Best-effort: a missing
+    or failed mint is logged and skipped, never raised into the turn.
+
+    :param client: Omnigent HTTP client for the runner subprocess.
+    :param child_key: Stable sub-agent id, matching the start edge.
+    :param call_id: The tool call's id (the child item's ``call_id``).
+    :param name: Human tool label, e.g. ``"Wrote mathutils.py"``.
+    :param arguments: JSON-encoded arguments string (the tool's raw input).
+    :param child_id_future: Future the start edge resolves with the child id.
+    :param title: The sub-agent's display name, used as the item's author; falls
+        back to *child_key* when empty.
+    """
+    try:
+        child_id = await asyncio.wait_for(
+            asyncio.shield(child_id_future), timeout=_SUBAGENT_MINT_WAIT_S
+        )
+    except Exception as exc:  # noqa: BLE001 — includes the start edge's own mint failure
+        _logger.warning(
+            "acp sub-agent child unavailable for tool call (child_key=%s): %s", child_key, exc
+        )
+        return
+    try:
+        resp = await client.post(
+            f"/v1/sessions/{child_id}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "function_call",
+                    "item_data": {
+                        # FunctionCallData.agent (validated by name, serialized as "model").
+                        "agent": title or child_key,
+                        "name": name,
+                        "arguments": arguments or "{}",
+                        "call_id": call_id,
+                    },
+                    "response_id": f"resp_acpsub_{child_key}",
+                },
+            },
+        )
+        resp.raise_for_status()
+    except Exception as exc:  # noqa: BLE001 — a transcript item must not break the turn
+        _logger.warning("acp sub-agent tool-call item failed (child_key=%s): %s", child_key, exc)
+
+
+def _chain_acp_subagent_post(
+    prev: asyncio.Task[object] | None, coro: Awaitable[None]
+) -> asyncio.Task[object]:
+    """Serialize a child's transcript posts so its items land in stream order.
+
+    The start/tool-call/completion edges for one sub-agent are dispatched as
+    independent tasks; without ordering, the summary could race ahead of a tool
+    card. Each post is chained after the child's previous one (mint → tool calls
+    → summary), and the stream is never blocked because chaining only schedules a
+    task. A failure in *prev* is suppressed so one bad post can't strand the rest.
+
+    :param prev: The child's previous post task, or ``None`` for the first.
+    :param coro: The post coroutine to run after *prev* completes.
+    :returns: The new tail task for this child.
+    """
+
+    async def _run() -> None:
+        if prev is not None:
+            with contextlib.suppress(Exception):
+                await prev
+        await coro
+
+    return asyncio.create_task(_run())
+
+
 def _response_body_preview(resp: object, *, limit: int = 500) -> str:
     """
     Return a short response-body preview for diagnostics.
@@ -6961,6 +7047,10 @@ def create_runner_app(
                     # Sub-agent start edge → its title, so the completion edge can
                     # author the summary message (assistant messages need one).
                     _subagent_titles: dict[str, str] = {}
+                    # Sub-agent child_key → its latest transcript-post task, so the
+                    # mint / tool-call / completion posts for one child land in
+                    # order instead of racing.
+                    _subagent_post_chains: dict[str, _asyncio.Task[object]] = {}
                     _text_acc: list[str] = []
                     _stream_failed_error: _JsonObject | None = None
                     async for chunk in harness_resp.aiter_text():
@@ -7216,6 +7306,8 @@ def create_runner_app(
                                     # A harness reported spawning a sub-agent; mint
                                     # a child session so it shows in the Subagents
                                     # panel. Swallowed (never relayed to clients).
+                                    # The mint task heads the child's post chain, so
+                                    # its tool calls and summary land after it.
                                     _sa_key = event.get("child_key", "")
                                     if isinstance(_sa_key, str) and _sa_key:
                                         _sa_start_future: _asyncio.Future[str] = (
@@ -7223,18 +7315,45 @@ def create_runner_app(
                                         )
                                         _subagent_child_futures[_sa_key] = _sa_start_future
                                         _subagent_titles[_sa_key] = event.get("title", "")
-                                        _dispatch_tasks.append(
-                                            _asyncio.create_task(
-                                                _mint_acp_subagent_child(
-                                                    server_client,
-                                                    parent_id=conv_id,
-                                                    child_key=_sa_key,
-                                                    title=event.get("title", ""),
-                                                    task=event.get("task", ""),
-                                                    child_id_future=_sa_start_future,
-                                                )
+                                        _sa_mint_task = _asyncio.create_task(
+                                            _mint_acp_subagent_child(
+                                                server_client,
+                                                parent_id=conv_id,
+                                                child_key=_sa_key,
+                                                title=event.get("title", ""),
+                                                task=event.get("task", ""),
+                                                child_id_future=_sa_start_future,
                                             )
                                         )
+                                        _subagent_post_chains[_sa_key] = _sa_mint_task
+                                        _dispatch_tasks.append(_sa_mint_task)
+                                    continue
+
+                                if _evt_type == "subagent.tool_call":
+                                    # A tool call the sub-agent ran; append it to the
+                                    # child's transcript, chained after the child's
+                                    # previous post so it stays ordered.
+                                    _sa_tc_key = event.get("child_key", "")
+                                    _sa_tc_future = (
+                                        _subagent_child_futures.get(_sa_tc_key)
+                                        if isinstance(_sa_tc_key, str)
+                                        else None
+                                    )
+                                    if _sa_tc_future is not None:
+                                        _sa_tc_task = _chain_acp_subagent_post(
+                                            _subagent_post_chains.get(_sa_tc_key),
+                                            _post_acp_subagent_tool_call(
+                                                server_client,
+                                                child_key=_sa_tc_key,
+                                                call_id=event.get("call_id", ""),
+                                                name=event.get("name", "tool"),
+                                                arguments=event.get("arguments", ""),
+                                                child_id_future=_sa_tc_future,
+                                                title=_subagent_titles.get(_sa_tc_key, ""),
+                                            ),
+                                        )
+                                        _subagent_post_chains[_sa_tc_key] = _sa_tc_task
+                                        _dispatch_tasks.append(_sa_tc_task)
                                     continue
 
                                 if _evt_type == "subagent.completed":
@@ -7245,18 +7364,19 @@ def create_runner_app(
                                         else None
                                     )
                                     if _sa_done_future is not None:
-                                        _dispatch_tasks.append(
-                                            _asyncio.create_task(
-                                                _complete_acp_subagent_child(
-                                                    server_client,
-                                                    child_key=_sa_done_key,
-                                                    ok=bool(event.get("ok", True)),
-                                                    summary=event.get("summary", ""),
-                                                    child_id_future=_sa_done_future,
-                                                    title=_subagent_titles.get(_sa_done_key, ""),
-                                                )
-                                            )
+                                        _sa_done_task = _chain_acp_subagent_post(
+                                            _subagent_post_chains.get(_sa_done_key),
+                                            _complete_acp_subagent_child(
+                                                server_client,
+                                                child_key=_sa_done_key,
+                                                ok=bool(event.get("ok", True)),
+                                                summary=event.get("summary", ""),
+                                                child_id_future=_sa_done_future,
+                                                title=_subagent_titles.get(_sa_done_key, ""),
+                                            ),
                                         )
+                                        _subagent_post_chains[_sa_done_key] = _sa_done_task
+                                        _dispatch_tasks.append(_sa_done_task)
                                     continue
 
                             if event is None:

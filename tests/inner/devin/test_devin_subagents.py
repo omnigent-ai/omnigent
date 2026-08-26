@@ -9,7 +9,7 @@ against what Devin actually emits, not a paraphrase.
 
 from __future__ import annotations
 
-from omnigent.inner.acp_subagents import SubAgentEnd, SubAgentStart
+from omnigent.inner.acp_subagents import SubAgentActivity, SubAgentEnd, SubAgentStart
 from omnigent.inner.devin import DEVIN_ACP_EXTENSION, DevinSubAgentSource
 
 # --- real captured frames (params.update objects) -----------------------------
@@ -40,11 +40,14 @@ _DEVIN_COMPLETED = {
     },
 }
 
-# A nested tool call the sub-agent made — marks provenance, NOT a lifecycle edge.
+# A nested tool call the sub-agent made — tagged with the owning agentId so it
+# can be routed into that sub-agent's child transcript.
 _DEVIN_CONTEXT = {
     "sessionUpdate": "tool_call",
     "toolCallId": "toolu_bdrk_01Ha8UacTecWfxbxgERXdGtN",
-    "title": "Wrote mathutils.py",
+    "title": "Wrote /tmp/x/mathutils.py",
+    "kind": "edit",
+    "rawInput": {"file_path": "/tmp/x/mathutils.py", "content": "def add(a, b): ..."},
     "_meta": {"cognition.ai/subagent_context": {"parentAgentId": "a0ac9364"}},
 }
 
@@ -77,13 +80,66 @@ def test_devin_source_reads_a_completion() -> None:
     )
 
 
-def test_devin_source_ignores_context_marker() -> None:
-    """``subagent_context`` marks a nested call's provenance — not a lifecycle edge.
+def test_devin_source_reads_context_as_activity() -> None:
+    """``subagent_context`` on a ``tool_call`` → a ``SubAgentActivity`` for the child.
 
-    Treating it as a start/end would mint or close a phantom child on every tool
-    call the sub-agent makes.
+    **What breaks if this fails**: the sub-agent's own work (its file writes,
+    commands) never reaches its child transcript — the child chat shows only the
+    task and summary. ``parentAgentId`` is the child_key, so the runner can route
+    the card to the right sub-agent.
     """
-    assert DevinSubAgentSource().read(_DEVIN_CONTEXT) == ()
+    events = DevinSubAgentSource().read(_DEVIN_CONTEXT)
+    assert events == (
+        SubAgentActivity(
+            child_key="a0ac9364",
+            call_id="toolu_bdrk_01Ha8UacTecWfxbxgERXdGtN",
+            name="Wrote /tmp/x/mathutils.py",
+            args={"file_path": "/tmp/x/mathutils.py", "content": "def add(a, b): ..."},
+        ),
+    )
+
+
+def test_devin_source_ignores_context_on_a_non_tool_call() -> None:
+    """A ``subagent_context`` marker off a ``tool_call`` frame is not an activity.
+
+    Only the sub-agent's own ``tool_call`` frames are its work; the same marker on
+    another update kind is not a tool card, so it is left alone (and not routed).
+    """
+    assert (
+        DevinSubAgentSource().read(
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "toolu_x",
+                "status": "in_progress",
+                "_meta": {"cognition.ai/subagent_context": {"parentAgentId": "a0ac9364"}},
+            }
+        )
+        == ()
+    )
+
+
+def test_devin_source_skips_context_with_a_blank_parent_or_call_id() -> None:
+    """Activity needs both a parent agent id and a call id to be addressable."""
+    source = DevinSubAgentSource()
+    assert (
+        source.read(
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "c1",
+                "_meta": {"cognition.ai/subagent_context": {}},
+            }
+        )
+        == ()
+    )
+    assert (
+        source.read(
+            {
+                "sessionUpdate": "tool_call",
+                "_meta": {"cognition.ai/subagent_context": {"parentAgentId": "a0"}},
+            }
+        )
+        == ()
+    )
 
 
 def test_devin_source_self_gates_on_plain_frames() -> None:
@@ -138,10 +194,16 @@ def test_devin_dialect_reaches_the_executor_through_the_extension() -> None:
     a rename on either side of the seam fails here rather than silently.
     """
     from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
-    from omnigent.inner.executor import SubAgentCompleted, SubAgentStarted
+    from omnigent.inner.executor import (
+        SubAgentCompleted,
+        SubAgentStarted,
+        SubAgentToolCall,
+        ToolCallComplete,
+    )
 
     ex = AcpExecutor(AcpAgentConfig(command="devin acp"), extension=DEVIN_ACP_EXTENSION)
     started = ex._handle_session_update(_DEVIN_STARTED)
+    activity = ex._handle_session_update(_DEVIN_CONTEXT)
     completed = ex._handle_session_update(_DEVIN_COMPLETED)
 
     assert [e for e in started if isinstance(e, SubAgentStarted)] == [
@@ -151,6 +213,14 @@ def test_devin_dialect_reaches_the_executor_through_the_extension() -> None:
             task="In the directory /tmp/x create mathutils.py with add/sub/mul and tests.",
         )
     ]
+    assert [e for e in activity if isinstance(e, SubAgentToolCall)] == [
+        SubAgentToolCall(
+            child_key="a0ac9364",
+            call_id="toolu_bdrk_01Ha8UacTecWfxbxgERXdGtN",
+            name="Wrote /tmp/x/mathutils.py",
+            args={"file_path": "/tmp/x/mathutils.py", "content": "def add(a, b): ..."},
+        )
+    ]
     assert [e for e in completed if isinstance(e, SubAgentCompleted)] == [
         SubAgentCompleted(
             child_key="a0ac9364",
@@ -158,3 +228,7 @@ def test_devin_dialect_reaches_the_executor_through_the_extension() -> None:
             summary="Created mathutils.py and test_mathutils.py; 3 tests pass.",
         )
     ]
+    # The sub-agent's frames never leak into the parent stream as tool cards —
+    # in particular the completed lifecycle frame must not close a spurious
+    # "tool" card (its toolCallId was never an originating tool_call).
+    assert not any(isinstance(e, ToolCallComplete) for e in completed)
