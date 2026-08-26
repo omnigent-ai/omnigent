@@ -219,7 +219,10 @@ reproduction test is your objective instrument.
 
 1. **Check out the PR head** into your worktree (`gh pr checkout <number>`), then
    ensure the repro test at `test_path` is present on top of it (it is your
-   artifact, not theirs — re-apply it if the checkout doesn't carry it).
+   artifact, not theirs — re-apply it if the checkout doesn't carry it). If a test
+   you keep — the repro test, or one the PR adds — names a ticket/issue in its
+   filename or code, rename it and strip the reference per the "name by the
+   problem, never the ticket" rule in 2B.4.
 2. **Run the repro test against the PR.** This is the verdict:
    - **Passes** → the PR fixes this bug. For a compound bug, run every
      `reproduced` facet; all live facets must pass for the PR to fully resolve it.
@@ -377,6 +380,16 @@ test on the function/module/component you edited):
   edge cases the root cause implies — not just "the function runs."
 - Put them where the repo keeps tests for that layer, following existing files'
   fixtures and structure. Do not invent a new harness.
+- **Name by the problem, never the ticket.** Test files, test functions, fixtures,
+  and any other identifier must describe the *behavior* — never embed an issue or
+  ticket number (no `test_omni_2812_*.py`, no `OMNI-2812`/`#4458` in symbol names
+  or comments). Prefer the observable defect: e.g.
+  `test_mid_stream_error_surfaces_as_abort.py`, not `test_omni_2812_*`. This
+  applies to the repro e2e test too — if the file you recovered at `test_path` has
+  a ticket-numbered name or ticket references in code, **rename it and strip the
+  references** as part of the fix (fold the rename into your diff). A reader six
+  months from now shouldn't need to chase a ticket to know what the test guards.
+  The bug link belongs in the **PR body** (Step 3.4), not in code.
 
 ### 2B.5 — Prove the whole set goes fail→pass
 
