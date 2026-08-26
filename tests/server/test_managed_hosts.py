@@ -58,6 +58,7 @@ from tests.server.helpers import (
     install_fake_e2b_launcher,
     install_fake_islo_launcher,
     install_fake_kubernetes_launcher,
+    install_fake_mesos_launcher,
     install_fake_modal_launcher,
     install_fake_openshell_launcher,
 )
@@ -712,6 +713,51 @@ def test_parse_kubernetes_without_section_defaults(monkeypatch: pytest.MonkeyPat
     assert fake.in_cluster is None
     assert fake.resources is None
     assert fake.pvc_mounts is None
+
+
+def test_parse_valid_mesos_compose_config_builds_parameterized_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = parse_sandbox_config(
+        {
+            "provider": "mesos",
+            "server_url": "https://omnigent.example.test/",
+            "mesos": {
+                "image": "registry.example.test/omnigent-host:test",
+                "env": ["TEST_MODEL_BASE_URL"],
+                "compose_url": "https://mesos-compose.example.test/",
+                "username": "test-user",
+                "verify_ssl": False,
+                "target_hostname": "mesos-agent.example.test",
+            },
+        }
+    )
+
+    assert cfg is not None
+    fake = FakeSandboxLauncher()
+    install_fake_mesos_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.image == "registry.example.test/omnigent-host:test"
+    assert fake.env == ["TEST_MODEL_BASE_URL"]
+    assert fake.compose_url == "https://mesos-compose.example.test/"
+    assert fake.username == "test-user"
+    assert fake.verify_ssl is False
+    assert fake.target_hostname == "mesos-agent.example.test"
+
+
+def test_parse_mesos_rejects_inline_password() -> None:
+    with pytest.raises(ValueError, match=r"unknown key.*password"):
+        parse_sandbox_config(
+            {
+                "provider": "mesos",
+                "server_url": "https://omnigent.example",
+                "mesos": {
+                    "compose_url": "https://compose.example",
+                    "username": "user",
+                    "password": "must-not-live-in-yaml",
+                },
+            }
+        )
 
 
 def test_parse_host_config_threads_verbatim_without_resolving_secrets(
@@ -2753,6 +2799,40 @@ async def test_terminate_managed_host_deletes_row_even_when_terminate_fails(
     assert host_store.get_host("057e7fa3f1cdb40c0ec393a3d42affc7") is None
     assert (
         host_store.resolve_launch_token("057e7fa3f1cdb40c0ec393a3d42affc7", "tok-term-2") is None
+    )
+
+
+async def test_mesos_terminate_failure_revokes_token_but_preserves_cleanup_record(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _MesosFakeLauncher(FakeSandboxLauncher):
+        provider = "mesos"
+
+    fake = _MesosFakeLauncher()
+
+    def _explode(_sandbox_id: str) -> None:
+        raise click.ClickException("compose unavailable")
+
+    monkeypatch.setattr(fake, "terminate", _explode)
+    host_store = HostStore(db_uri)
+    host = host_store.register_managed_host(
+        host_id="aa7e7fa3f1cdb40c0ec393a3d42affc7",
+        name="managed-mesos-orphan",
+        user_id=_OWNER,
+        token="tok-mesos-orphan",
+        provider="mesos",
+        sandbox_id="omnigent-managed-orphan",
+        token_expires_at=now_epoch() + 3600,
+    )
+
+    await terminate_managed_host(host, host_store, _injected_config(fake))
+
+    retained = host_store.get_host("aa7e7fa3f1cdb40c0ec393a3d42affc7")
+    assert retained is not None
+    assert retained.sandbox_id == "omnigent-managed-orphan"
+    assert (
+        host_store.resolve_launch_token("aa7e7fa3f1cdb40c0ec393a3d42affc7", "tok-mesos-orphan")
+        is None
     )
 
 
