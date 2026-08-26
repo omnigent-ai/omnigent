@@ -60,6 +60,7 @@ from omnigent.process_logging import (
     child_logging_popen_kwargs,
     logs_root,
     open_process_log_file,
+    process_log_dir_reference,
 )
 from omnigent.spec import load as load_spec
 from omnigent.spec._omnigent_compat import OMNIGENT_EXECUTOR_TYPE
@@ -1535,7 +1536,7 @@ def _unreachable_server_message(base_url: str) -> str:
         return (
             f"Could not connect to the local Omnigent server at {base_url}. "
             "It may have stopped — run `omnigent stop`, then try again. "
-            "Server logs are under ~/.omnigent/logs/server/."
+            f"Server logs are under {process_log_dir_reference('server')}."
         )
     from omnigent.server_url import display_server_url
 

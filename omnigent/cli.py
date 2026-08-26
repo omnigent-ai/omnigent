@@ -81,7 +81,13 @@ from omnigent.inner import _proc, ui
 from omnigent.integration_daemon import IntegrationDaemon
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.onboarding.sandboxes import available_providers as _sandbox_providers
-from omnigent.process_logging import LOG_LEVEL_ENV_VAR, LOG_TO_STDERR_ENV_VAR, data_dir, env_truthy
+from omnigent.process_logging import (
+    LOG_LEVEL_ENV_VAR,
+    LOG_TO_STDERR_ENV_VAR,
+    data_dir,
+    env_truthy,
+    process_log_dir_reference,
+)
 from omnigent.server_url import ServerUrl
 from omnigent.server_url import org_id_from_url as _org_id_from_url
 
@@ -3513,13 +3519,13 @@ def _discover_local_server_url(
         if not _host_daemon_alive():
             raise click.ClickException(
                 "The local daemon exited before its Omnigent server became ready. "
-                "See logs under ~/.omnigent/logs/host/ and "
-                "~/.omnigent/logs/server/."
+                f"See logs under {process_log_dir_reference('host')} and "
+                f"{process_log_dir_reference('server')}."
             )
         time.sleep(0.2)
     raise click.ClickException(
         f"Timed out after {timeout:.0f}s waiting for the local Omnigent server to "
-        "start. See ~/.omnigent/logs/server/ for details."
+        f"start. See {process_log_dir_reference('server')} for details."
     )
 
 
@@ -8248,7 +8254,8 @@ def _run_background_host(
                 click.echo(f"The local host daemon already serves {display_server_url(target)}.")
                 return
         raise click.ClickException(
-            "Could not spawn the background host daemon. See ~/.omnigent/logs/host/ for details."
+            "Could not spawn the background host daemon. "
+            f"See {process_log_dir_reference('host')} for details."
         )
     reused = previous is not None and previous.pid == record.pid
     try:
