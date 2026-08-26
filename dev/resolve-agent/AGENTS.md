@@ -549,16 +549,21 @@ write-back can surface it too.
 
 The preview ships the **UI only** — no LLM/runner — so a reviewer drives it by
 attaching their own host (where their model credentials live). The single command
-that both attaches a runner and runs the validation journey against the preview is:
+that both attaches a runner and opens Claude Code on the validation journey
+against the preview is:
 
 ```
-omnigent run -p '<validation_prompt>' --server <url>
+omnigent claude -p '<validation_prompt>' --server <url>
 ```
 
-`-p` is the validation prompt from 4.4 (bug-specific); `--server <url>` is the
-preview URL. That one line is what you put in front of the reviewer (in the PR
-body's "Validate the fix live" section and the maintainer comment) — filled in
-with the real `<url>` and prompt, never left as placeholders.
+`omnigent claude` launches native Claude Code against the remote `--server`
+(starting a local runner that carries the reviewer's credentials); `-p` is the
+validation prompt from 4.4 (bug-specific) used as the TUI's initial prompt;
+`--server <url>` is the preview URL. That one line is what you put in front of the
+reviewer (in the PR body's "Validate the fix live" section and the maintainer
+comment) — filled in with the real `<url>` and prompt, never left as placeholders.
+If the bug is specific to a different harness, use that harness's launcher instead
+(e.g. `omnigent codex`), but `omnigent claude` is the default.
 
 If the preview deploy **fails** or never posts a URL (e.g. workspace secrets not
 configured in this environment, or a non-member author before the labelled-fork
@@ -649,9 +654,9 @@ with `gh pr edit <pr> --body-file …`, preserving the existing template section
 and carry the same text in the `validation_prompt` handoff field.
 
 **Lead with the one command that runs it against the preview.** When 4.1 produced
-a preview `<url>`, put a ready-to-run `omnigent run` line first, with the real URL
-and the prompt inlined — so a reviewer copies one line rather than assembling it.
-When there was no preview URL, give the same command without `--server` (runs
+a preview `<url>`, put a ready-to-run `omnigent claude` line first, with the real
+URL and the prompt inlined — so a reviewer copies one line rather than assembling
+it. When there was no preview URL, give the same command without `--server` (runs
 against the reviewer's own local app). Shape:
 
 > **Validate the fix live**
@@ -659,7 +664,7 @@ against the reviewer's own local app). Shape:
 > Run this against the deployed UI preview (attaches your own host, which carries
 > your model credentials):
 > ```
-> omnigent run -p 'Reproduce and validate a bug fix. Steps: <the journey —
+> omnigent claude -p 'Reproduce and validate a bug fix. Steps: <the journey —
 > concrete inputs/clicks/routes>. Before this fix, <the buggy behavior>. Confirm
 > the fix by checking that <the corrected behavior / value for each live facet>.
 > Report whether each step now behaves correctly.' --server <url>
@@ -692,11 +697,11 @@ gh pr edit <pr> --add-reviewer <login>
   comment asking them (or, with no assignee/non-issue bug, noting the PR is ready
   for a maintainer):
   ```
-  gh pr comment <pr> --body '@<login> this fixes #<issue-number> — CI is green and the automated review is clean. Ready for your review. Try it live: `omnigent run -p '\''<validation_prompt>'\'' --server <url>` (the UI preview from the ui-preview comment). See "Validate the fix live" in the PR body.'
+  gh pr comment <pr> --body '@<login> this fixes #<issue-number> — CI is green and the automated review is clean. Ready for your review. Try it live: `omnigent claude -p '\''<validation_prompt>'\'' --server <url>` (the UI preview from the ui-preview comment). See "Validate the fix live" in the PR body.'
   ```
 
 When there is a preview `<url>`, always include the ready-to-run
-`omnigent run -p '<validation_prompt>' --server <url>` line in this comment with
+`omnigent claude -p '<validation_prompt>' --server <url>` line in this comment with
 the real URL — that is the reviewer's fastest path to see the fix work. Drop
 `--server <url>` when no preview was produced.
 
@@ -825,8 +830,9 @@ Field meanings:
   no PR was opened.
 - `ui_preview` — the result of Step 4.1 (run on every PR, not just frontend fixes):
   the **preview URL** (verbatim, so the ticket write-back can surface it and a
-  reviewer can `omnigent run --server <url>`), or why it failed to deploy (e.g.
-  workspace secrets not configured, non-member author). Empty when no PR was opened.
+  reviewer can `omnigent claude -p '<prompt>' --server <url>`), or why it failed to
+  deploy (e.g. workspace secrets not configured, non-member author). Empty when no
+  PR was opened.
 - `validation_prompt` — the Step 4.4 paste-to-an-agent prompt that reproduces the
   journey and confirms the fix. Empty when no PR was opened.
 - `maintainer_review` — who you requested review from in Step 4.5 (the issue
