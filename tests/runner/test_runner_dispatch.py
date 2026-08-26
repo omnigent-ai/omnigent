@@ -849,6 +849,85 @@ class _ContentCapturingHarnessClient:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("effort", ("high", "max", "ultra"))
+async def test_runner_background_forwards_reasoning_to_harness_body(effort: str) -> None:
+    """The background turn path preserves the inbound reasoning hint.
+
+    The server normally posts without ``?stream=true``, so the runner rebuilds
+    the harness body field by field. ``reasoning`` must survive that rebuild so
+    in-process executors receive the persisted session effort.
+    """
+    from omnigent.runner import app as runner_app
+
+    conv = "conv_background_reasoning"
+
+    def _server_handler(request: httpx.Request) -> httpx.Response:
+        """Return the minimal session snapshot and empty history."""
+        if request.method == "GET" and request.url.path == f"/v1/sessions/{conv}":
+            return httpx.Response(200, json={"id": conv, "agent_id": "ag_reasoning"})
+        if request.url.path.endswith("/items"):
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [],
+                    "first_id": None,
+                    "last_id": None,
+                    "has_more": False,
+                },
+            )
+        return httpx.Response(200, json={})
+
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    )
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Resolve a minimal spec for the background turn."""
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="reasoning-agent",
+            executor=ExecutorSpec(
+                type="omnigent",
+                config={"harness": "runner-test-resolved"},
+            ),
+        )
+
+    captured: dict[str, Any] = {}
+    reached = asyncio.Event()
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _ContentCapturingProcessManager(captured, reached),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=server_client,
+    )
+    runner_app._session_histories_ref.pop(conv, None)
+    try:
+        async with _runner_test_client(app) as http:
+            response = await http.post(
+                f"/v1/sessions/{conv}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "model": "x",
+                    "reasoning": {"effort": effort},
+                    "content": [{"type": "input_text", "text": "hello"}],
+                },
+            )
+            assert response.status_code == 202
+            await asyncio.wait_for(reached.wait(), timeout=10.0)
+    finally:
+        await server_client.aclose()
+        runner_app._session_histories_ref.pop(conv, None)
+
+    assert captured["body"]["reasoning"] == {"effort": effort}
+
+
+@pytest.mark.asyncio
 async def test_runner_reloads_full_history_on_cold_cache_after_restart() -> None:
     """A message to a cold session reloads prior history, not just itself.
 
