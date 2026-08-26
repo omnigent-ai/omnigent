@@ -3,6 +3,7 @@ import { CheckIcon, Link2Icon, WandSparklesIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useResizableCommentsPanel } from "@/hooks/useResizableCommentsPanel";
+import { formatMonthDay, formatTime, isSameLocalDay } from "@/lib/dateFormat";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { cn } from "@/lib/utils";
 import type { Comment } from "@/hooks/useComments";
@@ -18,12 +19,12 @@ function avatarStyle(name: string): { backgroundColor: string; color: string } {
 function formatCommentTime(createdAt: number): string {
   const date = new Date(createdAt * 1000);
   const now = new Date();
-  const time = date.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
-  if (date.toDateString() === now.toDateString()) return `${time} Today`;
+  const time = formatTime(date);
+  if (isSameLocalDay(date, now)) return `${time} Today`;
   const yesterday = new Date(now);
   yesterday.setDate(now.getDate() - 1);
-  if (date.toDateString() === yesterday.toDateString()) return `${time} Yesterday`;
-  return `${date.toLocaleDateString(undefined, { month: "short", day: "numeric" })} ${time}`;
+  if (isSameLocalDay(date, yesterday)) return `${time} Yesterday`;
+  return `${formatMonthDay(date)} ${time}`;
 }
 
 // ---------------------------------------------------------------------------

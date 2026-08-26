@@ -6,13 +6,18 @@ export function formatSessionCostUsd(costUsd: number): string {
   return `$${costUsd.toFixed(2)}`;
 }
 
+// Built once, not per call: constructing an `Intl.NumberFormat` costs far more
+// than formatting with an existing one, and the usage tables format a count per
+// row.
+const compactTokenFormat = new Intl.NumberFormat(undefined, {
+  notation: "compact",
+  maximumFractionDigits: 1,
+});
+
 /**
  * Compact token-count formatter, e.g. ``842`` -> ``"842"``,
  * ``12_400`` -> ``"12.4K"``, ``1_530_000`` -> ``"1.5M"``.
  */
 export function formatTokenCount(tokens: number): string {
-  return new Intl.NumberFormat(undefined, {
-    notation: "compact",
-    maximumFractionDigits: 1,
-  }).format(tokens);
+  return compactTokenFormat.format(tokens);
 }
