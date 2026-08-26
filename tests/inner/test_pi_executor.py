@@ -319,13 +319,14 @@ def test_sanitize_real_sys_session_send_args_collapses_to_object() -> None:
 
     sanitized_args = _sanitize_schema(params)["properties"]["args"]
 
-    # Structured fields the purpose guard and the per-dispatch model
-    # override read must survive the collapse.
+    # Structured fields the purpose guard and the per-dispatch model /
+    # reasoning-effort overrides read must survive the collapse.
     assert sanitized_args["type"] == "object"
     assert set(sanitized_args["properties"]) == {
         "input",
         "purpose",
         "model",
+        "reasoning_effort",
         "file_ids",
         "cost_budget",
     }
@@ -3461,6 +3462,7 @@ def test_build_models_json_registers_selected_catalog_alias_once() -> None:
             "id": selected_model,
             "input": ["text", "image"],
             "contextWindow": 200_000,
+            "reasoning": True,
         }
     ]
 
@@ -4381,3 +4383,227 @@ def test_pi_turn_without_usage_leaves_usage_none() -> None:
         assert turn_complete[0].response == "Hi there"
 
     _run(_test())
+
+
+# ---------------------------------------------------------------------------
+# Reasoning effort → pi thinking level
+# ---------------------------------------------------------------------------
+
+
+def _levels_response(levels: list[str]) -> str:
+    return json.dumps(
+        {
+            "type": "response",
+            "command": "get_available_thinking_levels",
+            "success": True,
+            "data": {"levels": levels},
+        }
+    )
+
+
+def _live_session_executor(
+    lines: list[str], *, applied_thinking: str | None = None
+) -> tuple[PiExecutor, _PiRpcSession]:
+    """Executor with one live session whose RPC replays *lines*.
+
+    :param lines: JSONL lines the fake pi process emits, in order.
+    :param applied_thinking: Level the session is already running at.
+    :returns: ``(executor, rpc)`` — the rpc's ``process.stdin.data`` records
+        every command the executor sent, in order.
+    """
+    from omnigent.inner.pi_executor import _PiSessionState
+
+    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        executor = PiExecutor()
+    rpc = _PiRpcSession()
+    rpc._line_queue = asyncio.Queue()
+    rpc.process = MagicMock()
+    rpc.process.returncode = None
+    rpc.process.stdin = _FakeStreamWriter()
+    rpc._stderr_lines = []
+    for line in lines:
+        rpc._line_queue.put_nowait(line)
+    executor._session_states["s1"] = _PiSessionState(
+        rpc=rpc,
+        system_prompt="system",
+        model=None,
+        applied_thinking=applied_thinking,
+    )
+    return executor, rpc
+
+
+def _sent_commands(rpc: _PiRpcSession) -> list[dict]:
+    return [json.loads(chunk.decode()) for chunk in rpc.process.stdin.data]
+
+
+def test_pi_thinking_from_config_translates_and_clears() -> None:
+    """Canonical effort → pi level; a clear value or absence → ``None``."""
+    from omnigent.inner.pi_executor import _pi_thinking_from_config
+
+    assert _pi_thinking_from_config(ExecutorConfig(extra={"reasoning_effort": "high"})) == "high"
+    assert _pi_thinking_from_config(ExecutorConfig(extra={"reasoning_effort": "none"})) == "off"
+    for clear in ("default", "off", "reset"):
+        assert _pi_thinking_from_config(ExecutorConfig(extra={"reasoning_effort": clear})) is None
+    assert _pi_thinking_from_config(ExecutorConfig()) is None
+    assert _pi_thinking_from_config(None) is None
+
+
+def test_run_turn_spawns_pi_with_thinking_flag(monkeypatch) -> None:
+    """``reasoning_effort=high`` reaches the pi subprocess as ``--thinking high``."""
+    from omnigent.inner import pi_executor as pi_mod
+
+    captured: dict[str, tuple[str, ...]] = {}
+
+    async def _fake_spawn(*args, **kwargs):
+        captured["args"] = args
+        return _FakeProcess(
+            stdout_lines=[
+                _levels_response(["off", "low", "medium", "high", "xhigh", "max"]),
+                json.dumps({"type": "response", "command": "prompt", "success": True}),
+                json.dumps({"type": "agent_end", "messages": []}),
+            ]
+        )
+
+    monkeypatch.setattr(pi_mod, "_create_subprocess_exec", _fake_spawn)
+
+    async def _test():
+        with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+            executor = PiExecutor()
+        events = [
+            e
+            async for e in executor.run_turn(
+                [{"role": "user", "content": "hi", "session_id": "s1"}],
+                [],
+                "system",
+                ExecutorConfig(extra={"reasoning_effort": "high"}),
+            )
+        ]
+        await executor.close()
+        return events
+
+    events = _run(_test())
+
+    argv = list(captured["args"])
+    assert "--thinking" in argv
+    assert argv[argv.index("--thinking") + 1] == "high"
+    assert not [e for e in events if isinstance(e, ExecutorError)]
+
+
+def test_midsession_effort_change_sets_thinking_level_before_prompt() -> None:
+    """A changed effort is applied over RPC on the live session, before the prompt."""
+    executor, rpc = _live_session_executor(
+        [
+            _levels_response(["off", "low", "medium", "high", "xhigh", "max"]),
+            json.dumps({"type": "response", "command": "prompt", "success": True}),
+            json.dumps({"type": "agent_end", "messages": []}),
+        ],
+        applied_thinking="low",
+    )
+
+    async def _test():
+        return [
+            e
+            async for e in executor.run_turn(
+                [{"role": "user", "content": "hi", "session_id": "s1"}],
+                [],
+                "system",
+                ExecutorConfig(extra={"reasoning_effort": "high"}),
+            )
+        ]
+
+    _run(_test())
+
+    types = [cmd["type"] for cmd in _sent_commands(rpc)]
+    assert types == ["get_available_thinking_levels", "set_thinking_level", "prompt"]
+    assert _sent_commands(rpc)[1]["level"] == "high"
+    assert executor._session_states["s1"].applied_thinking == "high"
+
+
+def test_unsupported_thinking_level_clamps_with_warning(caplog) -> None:
+    """A level the current model doesn't report clamps down instead of failing.
+
+    Guards the model-change path too: a model switch respawns pi with
+    ``--thinking``, and the same probe re-asserts (or clamps) the level there.
+    """
+    executor, rpc = _live_session_executor(
+        [
+            _levels_response(["off", "low", "high"]),
+            json.dumps({"type": "response", "command": "prompt", "success": True}),
+            json.dumps({"type": "agent_end", "messages": []}),
+        ],
+        applied_thinking=None,
+    )
+
+    async def _test():
+        return [
+            e
+            async for e in executor.run_turn(
+                [{"role": "user", "content": "hi", "session_id": "s1"}],
+                [],
+                "system",
+                ExecutorConfig(extra={"reasoning_effort": "xhigh"}),
+            )
+        ]
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.inner.pi_executor"):
+        _run(_test())
+
+    commands = _sent_commands(rpc)
+    assert [cmd["type"] for cmd in commands] == [
+        "get_available_thinking_levels",
+        "set_thinking_level",
+        "prompt",
+    ]
+    assert commands[1]["level"] == "high"
+    assert "does not support thinking level" in caplog.text
+
+
+def test_midsession_effort_clear_leaves_level_untouched() -> None:
+    """A clear value is a no-op mid-session: no RPC, current level persists."""
+    executor, rpc = _live_session_executor(
+        [
+            json.dumps({"type": "response", "command": "prompt", "success": True}),
+            json.dumps({"type": "agent_end", "messages": []}),
+        ],
+        applied_thinking="high",
+    )
+
+    async def _test():
+        return [
+            e
+            async for e in executor.run_turn(
+                [{"role": "user", "content": "hi", "session_id": "s1"}],
+                [],
+                "system",
+                ExecutorConfig(extra={"reasoning_effort": "default"}),
+            )
+        ]
+
+    _run(_test())
+
+    assert [cmd["type"] for cmd in _sent_commands(rpc)] == ["prompt"]
+    assert executor._session_states["s1"].applied_thinking == "high"
+
+
+def test_unsupported_effort_value_fails_the_turn() -> None:
+    """An effort outside pi's ladder surfaces a non-retryable executor error."""
+    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        executor = PiExecutor()
+
+    async def _test():
+        return [
+            e
+            async for e in executor.run_turn(
+                [{"role": "user", "content": "hi", "session_id": "s1"}],
+                [],
+                "system",
+                ExecutorConfig(extra={"reasoning_effort": "turbo"}),
+            )
+        ]
+
+    events = _run(_test())
+
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    assert events[0].retryable is False
+    assert "not supported by pi" in events[0].message

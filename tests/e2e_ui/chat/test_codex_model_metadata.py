@@ -8,6 +8,8 @@ from urllib.parse import urlparse
 
 from playwright.sync_api import Page, Route, expect
 
+from tests.e2e_ui.conftest import fetch_with_retry
+
 
 def _patch_session_as_codex_native(page: Page, session_id: str) -> list[dict]:
     """Patch the browser's session snapshot into a codex-native response.
@@ -35,7 +37,7 @@ def _patch_session_as_codex_native(page: Page, session_id: str) -> list[dict]:
 
         headers = {"content-type": "application/json"}
         if request.method == "GET":
-            response = route.fetch()
+            response = fetch_with_retry(route)
             payload = response.json()
             headers = {**response.headers, **headers}
             # A real server persists the collaboration_mode a prior PATCH set, so
@@ -240,7 +242,7 @@ def _patch_precatalog_codex_session_on_host(page: Page, session_id: str) -> None
         if request.method != "GET" or urlparse(request.url).path != f"/v1/sessions/{session_id}":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         payload["labels"] = {
             **payload.get("labels", {}),
@@ -268,7 +270,7 @@ def _patch_precatalog_codex_session_on_host(page: Page, session_id: str) -> None
         if request.method != "GET" or urlparse(request.url).path != "/health":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         online = {"runner_online": True, "host_online": True}
         if isinstance(payload.get("sessions"), dict):

@@ -34,7 +34,7 @@ from urllib.parse import urlparse, urlunparse
 import pytest
 from playwright.sync_api import Page, Route, expect
 
-from tests.e2e_ui.conftest import open_right_rail
+from tests.e2e_ui.conftest import fetch_with_retry, open_right_rail
 
 
 def test_files_rail_working_folder_header_is_a_static_label(
@@ -176,7 +176,7 @@ _FAKE_HOST_ID = "host_files_panel_browse"
 def _drop_routes(page: Page) -> Iterator[None]:
     """Drop this module's route handlers before the page closes.
 
-    A handler that calls ``route.fetch()`` as the page tears down raises
+    A handler that replays upstream as the page tears down raises
     ``TargetClosedError``, which would surface as an error in the NEXT test's
     setup. Mirrors the same guard in ``sessions/test_host_badge.py``.
 
@@ -208,7 +208,7 @@ def _bind_host_with_listing(page: Page, session_id: str, *, entry: Path) -> None
         if request.method != "GET" or urlparse(request.url).path != f"/v1/sessions/{session_id}":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         payload["host_id"] = _FAKE_HOST_ID
         route.fulfill(

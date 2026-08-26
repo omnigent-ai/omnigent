@@ -480,6 +480,19 @@ describe("quick pin/unpin hover button", () => {
     expect(quickButton).toHaveClass("md:inline-flex");
     expect(quickButton).not.toHaveClass("md:block");
   });
+
+  it("drops the row kebab on mobile, revealing it only from md up", () => {
+    // The per-row "..." menu is desktop-only: on mobile the chat page's own
+    // header menu covers these per-session actions, so the row kebab is hidden
+    // (`hidden`) and only surfaces from `md` up (`md:inline-flex`). It reveals
+    // like the quick-pin button — flex, not block — so its glyph stays
+    // centered.
+    renderSidebar();
+
+    const kebab = screen.getByTestId("conversation-actions");
+    expect(kebab).toHaveClass("hidden", "md:inline-flex");
+    expect(kebab).not.toHaveClass("md:block");
+  });
 });
 
 describe("double-click to rename", () => {

@@ -69,6 +69,13 @@ from omnigent.pi_native_credentials import (
     _databricks_workspace_url_for_gateway,
     _is_databricks_ai_gateway_url,
 )
+from omnigent.reasoning_effort import (
+    EFFORT_CLEAR_VALUES,
+    PI_EFFORTS,
+    nearest_pi_thinking_level,
+    to_pi_thinking_level,
+    validate_effort,
+)
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 from omnigent.spec.types import RetryPolicy
 
@@ -994,6 +1001,7 @@ class _PiRpcSession:
         cwd: str | None = None,
         model: str | None = None,
         system_prompt: str | None = None,
+        thinking: str | None = None,
         extra_args: list[str] | None = None,
     ) -> None:
         """
@@ -1013,6 +1021,9 @@ class _PiRpcSession:
             ``None`` lets Pi pick its default.
         :param system_prompt: Text appended to Pi's default system
             prompt via ``--append-system-prompt``. ``None`` skips it.
+        :param thinking: Pi thinking level in Pi's own vocabulary
+            (``off``/``minimal``/.../``max``), passed as ``--thinking``.
+            ``None`` omits the flag so Pi's model default applies.
         :param extra_args: Extra CLI tokens (``--extension``,
             ``--tools``, ...). ``None`` appends nothing.
         """
@@ -1027,6 +1038,8 @@ class _PiRpcSession:
                     else model,
                 ]
             )
+        if thinking:
+            args.extend(["--thinking", thinking])
         if system_prompt:
             # Use --append-system-prompt instead of --system-prompt so Pi
             # keeps its default prompt (which includes tool descriptions from
@@ -1108,6 +1121,47 @@ class _PiRpcSession:
         self.process.stdin.write(line.encode("utf-8"))
         await self.process.stdin.drain()
 
+    async def request(
+        self,
+        command: CodexEvent,
+        expected: str,
+        *,
+        timeout: float = 15.0,
+    ) -> CodexEvent | None:
+        """Send *command* and return its ``response`` line's payload.
+
+        Only safe between turns: lines that arrive before the response are
+        re-queued in order, but a caller reading them concurrently would race.
+
+        :param command: The RPC command to send; must carry an ``id``.
+        :param expected: The ``command`` value the response must name.
+        :returns: The response event, or ``None`` on EOF/timeout/failure.
+        """
+        await self.send_command(command)
+        deferred: list[str] = []
+        result: CodexEvent | None = None
+        try:
+            while True:
+                line = await self.read_line(timeout=timeout)
+                if line is None:
+                    break
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if (
+                    isinstance(event, dict)
+                    and event.get("type") == "response"
+                    and event.get("command") == expected
+                ):
+                    result = event if event.get("success", True) else None
+                    break
+                deferred.append(line)
+        finally:
+            for line in deferred:
+                self._line_queue.put_nowait(line)
+        return result
+
     async def read_line(self, timeout: float = 120.0) -> str | None:
         """Read the next JSONL line from Pi's stdout. Returns None on EOF."""
         try:
@@ -1151,6 +1205,9 @@ class _PiSessionState:
     rpc: _PiRpcSession | None = None
     system_prompt: str | None = None
     model: str | None = None
+    # Thinking level (Pi vocabulary) this process is known to be running at,
+    # so an unchanged effort costs no RPC and a changed one is applied live.
+    applied_thinking: str | None = None
     _has_sent_prompt: bool = False
 
 
@@ -1596,6 +1653,26 @@ def _aggregate_pi_turn_usage(
         "context_tokens": context_tokens,
         "model": model,
     }
+
+
+def _pi_thinking_from_config(config: ExecutorConfig | None) -> str | None:
+    """Resolve the per-turn ``--thinking``/RPC level from a turn's config.
+
+    Canonical omnigent efforts (:data:`PI_EFFORTS`) are translated to Pi's
+    vocabulary; a clear value (``default``/``off``/``reset``) resolves to
+    ``None``, which leaves a live session at its current level and omits
+    ``--thinking`` on the next spawn so Pi's model default applies.
+
+    :param config: The turn's executor config, or ``None``.
+    :returns: A Pi thinking level, or ``None`` when no effort is requested.
+    :raises ValueError: If the requested effort is not one Pi supports.
+    """
+    cfg = config or ExecutorConfig()
+    raw = cfg.extra.get("reasoning_effort")
+    if isinstance(raw, str) and raw in EFFORT_CLEAR_VALUES:
+        return None
+    effort = validate_effort(raw, "pi", PI_EFFORTS)
+    return to_pi_thinking_level(effort) if effort is not None else None
 
 
 class PiExecutor(Executor):
@@ -2149,14 +2226,83 @@ class PiExecutor(Executor):
 
         return PiSubprocessConfig(env=env, tmp_dir=tmp_dir, extra_args=extra_args)
 
+    async def _available_thinking_levels(self, rpc: _PiRpcSession) -> list[str] | None:
+        """Ask Pi which thinking levels the current model offers.
+
+        :returns: The reported levels, or ``None`` when Pi did not answer (an
+            older build, a busy stream) — the caller then skips clamping.
+        """
+        try:
+            response = await rpc.request(
+                {"type": "get_available_thinking_levels", "id": "thinking_levels"},
+                "get_available_thinking_levels",
+            )
+        except Exception:  # noqa: BLE001 — a probe failure must not sink the turn
+            logger.debug("PiExecutor: get_available_thinking_levels failed", exc_info=True)
+            return None
+        data = response.get("data") if response else None
+        levels = data.get("levels") if isinstance(data, dict) else None
+        if not isinstance(levels, list):
+            return None
+        return [level for level in levels if isinstance(level, str)]
+
+    async def _apply_thinking_level(
+        self,
+        state: _PiSessionState,
+        rpc: _PiRpcSession,
+        thinking: str | None,
+        *,
+        spawned: bool,
+    ) -> None:
+        """Make the live Pi session run at *thinking*, clamping if unsupported.
+
+        A fresh spawn already carries the level on its argv, so it only needs
+        an RPC when the model doesn't offer that rung; a live session gets
+        ``set_thinking_level`` whenever the requested level changed.
+
+        :param state: Session state whose ``applied_thinking`` is updated.
+        :param rpc: The live Pi RPC session.
+        :param thinking: Requested level in Pi vocabulary, or ``None`` to leave
+            the session alone (clear-to-default is a no-op mid-session).
+        :param spawned: ``True`` when *rpc* was just spawned with ``--thinking``.
+        """
+        if thinking is None:
+            return
+        if not spawned and thinking == state.applied_thinking:
+            return
+        supported = await self._available_thinking_levels(rpc)
+        level = nearest_pi_thinking_level(thinking, supported) if supported else None
+        if level is None:
+            level = thinking
+        if level != thinking:
+            logger.warning(
+                "PiExecutor: model %s does not support thinking level %r; using %r",
+                state.model,
+                thinking,
+                level,
+            )
+        elif spawned:
+            return
+        await rpc.send_command(
+            {"type": "set_thinking_level", "level": level, "id": f"thinking_{level}"}
+        )
+        state.applied_thinking = thinking
+
     async def _ensure_rpc(
         self,
         session_key: str,
         system_prompt: str,
         model: str | None,
         tools: list[ToolSpec],
+        thinking: str | None = None,
     ) -> _PiRpcSession:
-        """Get or create a Pi RPC subprocess for the given session."""
+        """Get or create a Pi RPC subprocess for the given session.
+
+        :param thinking: Pi thinking level for a fresh spawn (``--thinking``).
+            A change on a live process is applied over RPC instead — see
+            :meth:`_apply_thinking_level` — so it is not part of the reuse
+            signature. A model change respawns, which re-asserts the level.
+        """
         state = self._session_states.setdefault(session_key, _PiSessionState())
 
         effective_model = model
@@ -2206,11 +2352,13 @@ class PiExecutor(Executor):
             cwd=self._cwd,
             model=pi_model or None,
             system_prompt=system_prompt or None,
+            thinking=thinking,
             extra_args=extra_args or None,
         )
         state.rpc = rpc
         state.system_prompt = system_prompt
         state.model = effective_model
+        state.applied_thinking = thinking
         state._has_sent_prompt = False
         return rpc
 
@@ -2233,12 +2381,27 @@ class PiExecutor(Executor):
                     self._databricks_token = token
         session_key = self._session_key(messages)
         model = await self._resolve_model(config)
-
         try:
-            rpc = await self._ensure_rpc(session_key, system_prompt, model, tools)
+            thinking = _pi_thinking_from_config(config)
+        except ValueError as exc:
+            yield ExecutorError(message=str(exc), retryable=False)
+            return
+
+        prior_rpc = (self._session_states.get(session_key) or _PiSessionState()).rpc
+        try:
+            rpc = await self._ensure_rpc(session_key, system_prompt, model, tools, thinking)
         except Exception as exc:  # noqa: BLE001 — executor boundary surfaces startup errors as ExecutorError
             yield ExecutorError(message=f"Failed to start Pi: {exc}")
             return
+
+        turn_state = self._session_states.get(session_key)
+        if turn_state is not None:
+            try:
+                await self._apply_thinking_level(
+                    turn_state, rpc, thinking, spawned=rpc is not prior_rpc
+                )
+            except Exception as exc:  # noqa: BLE001 — executor boundary: an effort failure must not sink the turn
+                logger.warning("PiExecutor: could not apply thinking level: %s", exc)
 
         # Build the prompt to send to Pi.  On the first turn of a new Pi
         # process, if there are prior messages (e.g. parent history passed

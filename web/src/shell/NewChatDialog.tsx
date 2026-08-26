@@ -55,6 +55,7 @@ import {
 } from "@/components/ui/command";
 import {
   CLAUDE_NATIVE_EFFORTS,
+  PI_NATIVE_EFFORTS,
   ConfigRow,
   DescribedSelect,
   EFFORT_SELECT_NONE,
@@ -380,6 +381,7 @@ function createdHarnessOptions({
   supportsCursorMode,
   supportsAgySkipPermissions,
   supportsModelPicker,
+  supportsEffortPicker,
   permissionMode,
   approvalMode,
   bypassSandbox,
@@ -396,6 +398,7 @@ function createdHarnessOptions({
   supportsCursorMode: boolean;
   supportsAgySkipPermissions: boolean;
   supportsModelPicker: boolean;
+  supportsEffortPicker: boolean;
   permissionMode: string;
   approvalMode: string;
   bypassSandbox: boolean;
@@ -410,6 +413,7 @@ function createdHarnessOptions({
 
   const options: HarnessOptions = {};
   if (supportsModelPicker) options.model = pickedModel;
+  if (supportsEffortPicker && !supportsPermissionMode) options.effort = pickedEffort;
   if (supportsPermissionMode) {
     options.mode = permissionMode;
     options.effort = pickedEffort;
@@ -1680,7 +1684,9 @@ function HarnessConfigModal({
       }
     } else if (hasModelPicker) {
       setPickedModel(draftModel);
-      if (entryHarness) writeHarnessOption(entryHarness, { model: draftModel });
+      setPickedEffort(draftEffort);
+      if (entryHarness)
+        writeHarnessOption(entryHarness, { model: draftModel, effort: draftEffort });
     } else if (hasApproval) {
       if (isCodex) setPickedModel(draftModel);
       setApprovalMode(draftApproval);
@@ -1750,14 +1756,42 @@ function HarnessConfigModal({
 
         <div className="flex flex-col gap-5 py-1">
           {!autoRouting && hasModelPicker && !hasPermission && (
-            <ConfigRow label="Model" description="Underlying LLM" controlClassName="sm:w-80">
-              <SearchableModelPicker
-                value={modelValue}
-                options={piModelOptions}
-                loading={piModelsLoading}
-                onValueChange={onModelChange}
-              />
-            </ConfigRow>
+            <>
+              <ConfigRow label="Model" description="Underlying LLM" controlClassName="sm:w-80">
+                <SearchableModelPicker
+                  value={modelValue}
+                  options={piModelOptions}
+                  loading={piModelsLoading}
+                  onValueChange={onModelChange}
+                />
+              </ConfigRow>
+              <ConfigRow label="Thinking level" description="Reasoning depth vs. speed">
+                <Select
+                  value={draftEffort || EFFORT_SELECT_NONE}
+                  onValueChange={(v) => setDraftEffort(v === EFFORT_SELECT_NONE ? "" : v)}
+                >
+                  <SelectTrigger
+                    className="w-full cursor-pointer"
+                    data-testid="new-chat-landing-config-pi-effort"
+                    aria-label="Thinking level"
+                  >
+                    <SelectValue placeholder={EFFORT_UNAVAILABLE_PLACEHOLDER} />
+                  </SelectTrigger>
+                  <SelectContent
+                    position="popper"
+                    align="start"
+                    className="w-(--radix-select-trigger-width) [&_[data-slot=select-item]]:pl-2.5"
+                  >
+                    <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
+                    {PI_NATIVE_EFFORTS.map((e) => (
+                      <SelectItem key={e.value} value={e.value}>
+                        {e.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </ConfigRow>
+            </>
           )}
 
           {!autoRouting && hasPermission && (
@@ -2070,6 +2104,10 @@ export function NewChatLandingScreen() {
   const [searchParams] = useSearchParams();
   const queryClient = useQueryClient();
   const isMobileViewport = useIsMobileViewport();
+  // Single send-telemetry point (see handleCreate). Emitting there rather than
+  // via the Start button's componentId covers Enter-key sends too, which never
+  // submit the form and would otherwise bypass the Button entirely.
+  const { trackClick } = useOmnigentAnalytics();
   // No session here, so there is nothing to switch between: assert the iOS
   // shell's native Chat/Terminal bar is hidden. ChatPage's own bar is driven by
   // the session surface and hides itself on unmount, but that is the only thing
@@ -3084,6 +3122,11 @@ export function NewChatLandingScreen() {
           ? stored.model
           : "",
       );
+      setPickedEffort(
+        stored.effort != null && PI_NATIVE_EFFORTS.some((e) => e.value === stored.effort)
+          ? stored.effort
+          : "",
+      );
     }
     if (supportsPermissionMode) {
       setPermissionMode(
@@ -3827,6 +3870,10 @@ export function NewChatLandingScreen() {
     // and form-submit paths that call this directly can't create a session with
     // a blank message, host, agent, or workspace.
     if (!canSubmit) return;
+    // A create is actually happening: report it for pointer clicks (via the
+    // form submit) and Enter-key sends alike. After the guard so guarded no-ops
+    // don't emit, matching the disabled Start button.
+    trackClick("new_chat.start_session", "button");
     setCreating(true);
     setCreateError(null);
     // The draft is spent from the moment it is submitted: it belongs to the
@@ -4030,7 +4077,7 @@ export function NewChatLandingScreen() {
             reasoning_effort:
               !smartRoutingHarnessSelected &&
               !routingOwnsModel &&
-              agentSupportsPermissionMode &&
+              (agentSupportsPermissionMode || selectedNativeHarness === "pi-native") &&
               pickedEffort
                 ? pickedEffort
                 : undefined,
@@ -4096,6 +4143,7 @@ export function NewChatLandingScreen() {
           supportsCursorMode: agentSupportsCursorMode,
           supportsAgySkipPermissions: agentSupportsAgySkip,
           supportsModelPicker: agentSupportsModelPicker || nativeAgent?.harness === "codex-native",
+          supportsEffortPicker: selectedNativeHarness === "pi-native",
           permissionMode,
           approvalMode,
           bypassSandbox,
@@ -4678,7 +4726,6 @@ export function NewChatLandingScreen() {
                           aria-busy={creating}
                           data-testid="new-chat-landing-submit"
                           className="size-8 rounded-lg bg-foreground disabled:bg-muted disabled:text-muted-foreground transition-opacity hover:opacity-80 disabled:opacity-100 "
-                          componentId="new_chat.start_session"
                         >
                           {creating ? (
                             <Loader2Icon className="size-4 animate-spin" />

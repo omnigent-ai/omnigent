@@ -237,6 +237,51 @@ def provider_family_for_harness(harness: str | None) -> str | None:
 
 
 @dataclass(frozen=True)
+class ModelPricingConfig:
+    """Custom per-million-token pricing for self-hosted models.
+
+    Allows users to specify pricing in their provider config when the
+    model isn't in the MLflow catalog (e.g., Ollama, vLLM, custom gateways).
+    Prices are specified per million tokens and later converted to per-token
+    rates for cost computation.
+
+    All price values must be >= 0. When cache pricing is omitted, the cost
+    computation will derive it from the input rate using standard fallback
+    ratios (cache read ≈ 0.10×, cache write ≈ 1.25×).
+
+    :param input_per_million: Input price per million tokens (USD), e.g.
+        ``0.25`` for $0.25 per 1M input tokens.
+    :param output_per_million: Output price per million tokens (USD), e.g.
+        ``1.0`` for $1.00 per 1M output tokens.
+    :param cache_read_per_million: Optional cache-read (cache-hit) price per
+        million tokens (USD). Typically ~0.1× the input rate.
+    :param cache_write_per_million: Optional cache-write (cache-creation)
+        price per million tokens (USD). Typically ~1.25× the input rate.
+    :raises ValueError: If any price value is negative.
+    """
+
+    input_per_million: float
+    output_per_million: float
+    cache_read_per_million: float | None = None
+    cache_write_per_million: float | None = None
+
+    def __post_init__(self) -> None:
+        """Validate that all pricing values are non-negative."""
+        if self.input_per_million < 0:
+            raise ValueError(f"input_per_million must be >= 0, got {self.input_per_million}")
+        if self.output_per_million < 0:
+            raise ValueError(f"output_per_million must be >= 0, got {self.output_per_million}")
+        if self.cache_read_per_million is not None and self.cache_read_per_million < 0:
+            raise ValueError(
+                f"cache_read_per_million must be >= 0, got {self.cache_read_per_million}"
+            )
+        if self.cache_write_per_million is not None and self.cache_write_per_million < 0:
+            raise ValueError(
+                f"cache_write_per_million must be >= 0, got {self.cache_write_per_million}"
+            )
+
+
+@dataclass(frozen=True)
 class FamilyConfig:
     """One provider family (``anthropic`` or ``openai``) for a harness surface.
 
@@ -271,6 +316,12 @@ class FamilyConfig:
     :param models: Map of role/tier to model id, with an optional
         ``default`` key consulted when the spec declares no model, e.g.
         ``{"default": "gpt-4o", "opus": "claude-opus-4"}``.
+    :param pricing: Optional custom per-million-token pricing for
+        self-hosted models and gateways (e.g., Ollama, vLLM, custom endpoints).
+        When configured, this pricing takes precedence over catalog lookup,
+        allowing self-hosted providers serving catalog-known model IDs to use
+        their own rates. ``None`` (the default) means no custom pricing — falls
+        back to catalog. See :class:`ModelPricingConfig`.
     """
 
     base_url: str
@@ -279,6 +330,7 @@ class FamilyConfig:
     auth_command: str | None = None
     wire_api: str | None = None
     models: dict[str, str] = field(default_factory=dict)
+    pricing: ModelPricingConfig | None = None
 
     @property
     def default_model(self) -> str | None:
@@ -665,6 +717,45 @@ def _parse_family(provider_name: str, family_name: str, raw: dict[str, object]) 
     models = (
         {str(k): str(v) for k, v in models_raw.items()} if isinstance(models_raw, dict) else {}
     )
+
+    # Parse optional custom pricing for self-hosted models
+    pricing_raw = raw.get("pricing")
+    pricing: ModelPricingConfig | None = None
+    if pricing_raw is not None:
+        if not isinstance(pricing_raw, dict):
+            raise OmnigentError(
+                f"{prefix}.pricing must be a mapping, got {type(pricing_raw).__name__}.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        input_price = pricing_raw.get("input_per_million")
+        output_price = pricing_raw.get("output_per_million")
+        if input_price is None or output_price is None:
+            raise OmnigentError(
+                f"{prefix}.pricing requires both 'input_per_million' and "
+                "'output_per_million' fields.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        try:
+            pricing = ModelPricingConfig(
+                input_per_million=float(input_price),
+                output_per_million=float(output_price),
+                cache_read_per_million=(
+                    float(pricing_raw["cache_read_per_million"])
+                    if "cache_read_per_million" in pricing_raw
+                    else None
+                ),
+                cache_write_per_million=(
+                    float(pricing_raw["cache_write_per_million"])
+                    if "cache_write_per_million" in pricing_raw
+                    else None
+                ),
+            )
+        except ValueError as exc:
+            raise OmnigentError(
+                f"{prefix}.pricing: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+
     return FamilyConfig(
         base_url=base_url_raw,
         api_key=api_key,
@@ -672,6 +763,7 @@ def _parse_family(provider_name: str, family_name: str, raw: dict[str, object]) 
         auth_command=auth_command,
         wire_api=wire_api,
         models=models,
+        pricing=pricing,
     )
 
 

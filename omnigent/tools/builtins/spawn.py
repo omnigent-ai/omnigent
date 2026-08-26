@@ -91,10 +91,9 @@ class SysSessionSendTool(Tool):
     - ``sub_agent_busy`` — the existing session has a non-terminal
       task already running. Wait for completion (it auto-delivers
       via the drain) or cancel before sending again.
-    - ``model`` rejections — the optional ``args.model`` override is
-      create-time-only and only valid for harnesses with model
-      plumbing; sends that pass it to an existing session, an
-      unplumbed harness, or with a malformed id return an error.
+    - ``model`` / ``reasoning_effort`` rejections — these optional
+      overrides are create-time-only and must be supported by the
+      resolved child harness; invalid or continuation-time values fail loud.
 
     There is no ``name_already_exists`` error in this merged tool
     — a pre-existing ``(agent, title)`` is the expected case
@@ -352,6 +351,27 @@ def _build_sys_session_send_schema(
                                             "Applies only when this send "
                                             "CREATES the sub-agent session; "
                                             "omitted = the harness default."
+                                        ),
+                                    },
+                                    "reasoning_effort": {
+                                        "type": "string",
+                                        "enum": [
+                                            "none",
+                                            "minimal",
+                                            "low",
+                                            "medium",
+                                            "high",
+                                            "xhigh",
+                                            "max",
+                                            "ultra",
+                                        ],
+                                        "description": (
+                                            "Optional reasoning level for the "
+                                            "resolved sub-agent harness. Applies "
+                                            "only when this send CREATES the "
+                                            "session; unsupported harness/value "
+                                            "combinations are rejected. Omitted = "
+                                            "the harness or model default."
                                         ),
                                     },
                                     "file_ids": {
@@ -953,6 +973,26 @@ class SysSessionCreateTool(Tool):
                                 "or 'provider-local-model-id'. Sets the harness "
                                 "model at session creation; omit to use the "
                                 "agent's default."
+                            ),
+                        },
+                        "reasoning_effort": {
+                            "type": "string",
+                            "enum": [
+                                "none",
+                                "minimal",
+                                "low",
+                                "medium",
+                                "high",
+                                "xhigh",
+                                "max",
+                                "ultra",
+                            ],
+                            "description": (
+                                "Optional reasoning level for the child "
+                                "session, e.g. 'high'. Only valid with "
+                                "'agent_id', and only for harnesses with "
+                                "effort plumbing; omit to use the agent's "
+                                "default."
                             ),
                         },
                     },

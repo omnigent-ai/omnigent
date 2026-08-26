@@ -142,7 +142,12 @@ class NativeServerHarness(Executor):
             else:
                 try:
                     await self.transport.send_prompt(session_id, prompt)
-                except Exception as exc:  # noqa: BLE001 - converted to a harness error event.
+                except Exception as exc:
+                    _logger.exception(
+                        "%s: failed to deliver prompt to harness",
+                        self._harness_id,
+                        extra={"session_id": session_id},
+                    )
                     error_msg = f"{self._harness_id} executor error: {exc}"
         if error_msg is not None:
             yield ExecutorError(message=error_msg)
