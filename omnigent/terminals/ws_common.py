@@ -191,12 +191,17 @@ class _GapRepainter:
             if self._task is task:
                 return
 
-    def cancel(self) -> None:
-        """Cancel pending repaint work during bridge teardown."""
+    async def cancel(self) -> None:
+        """Cancel and join pending repaint work during bridge teardown."""
         self._trailing = False
-        if self._task is not None:
-            self._task.cancel()
+        task = self._task
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        if self._task is task:
             self._task = None
+        self._trailing = False
 
 async def _tmux_session_alive(socket_path: str, tmux_target: str) -> bool:
     """Return whether the targeted tmux pane still has a live process.
