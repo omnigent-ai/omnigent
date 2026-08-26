@@ -994,6 +994,29 @@ def delete_fts_by_conversation(session: Session, conversation_id: str) -> None:
         )
 
 
+def delete_fts_by_item_ids(session: Session, item_ids: list[str]) -> None:
+    """
+    Remove FTS rows for a list of conversation items in a single query.
+
+    No-op when ``item_ids`` is empty or the dialect lacks FTS5. Used when
+    individual items are removed (truncation) rather than a whole
+    conversation being deleted.
+
+    :param session: An active SQLAlchemy session.
+    :param item_ids: Conversation-item IDs whose FTS rows should be
+        removed, e.g. ``["msg_a1b2c3d4..."]``.
+    """
+    if not item_ids:
+        return
+    if session.bind and _supports_fts5(session.bind.dialect.name):
+        placeholders = ", ".join(f":iid{i}" for i in range(len(item_ids)))
+        params = {f"iid{i}": iid for i, iid in enumerate(item_ids)}
+        session.execute(
+            text(f"DELETE FROM {_FTS_TABLE} WHERE item_id IN ({placeholders})"),
+            params,
+        )
+
+
 def delete_fts_by_conversation_ids(session: Session, conv_ids: list[str]) -> None:
     """
     Remove all FTS rows for a list of conversations in a single query.

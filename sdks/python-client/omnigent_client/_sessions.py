@@ -1129,6 +1129,51 @@ class SessionsNamespace:
             f"POST /v1/sessions/{source_session_id}/fork",
         )
 
+    async def restart(
+        self,
+        session_id: str,
+        *,
+        up_to_response_id: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Restart a session's harness execution in place.
+
+        Calls ``POST /v1/sessions/{session_id}/restart``. The current
+        harness is stopped and a fresh one is started from the latest
+        installed agent version/configuration, keeping the same
+        session identity (transcript, title, pin state, project,
+        workspace).
+
+        :param session_id: ID of the session to restart, e.g.
+            ``"conv_abc123"``.
+        :param up_to_response_id: Optional restore point, e.g.
+            ``"resp_abc123"``. When set, items after that response are
+            removed and the restarted harness rebuilds its context
+            from the remaining items; ``None`` (default) resumes from
+            the session's latest state.
+        :returns: Raw response dict matching the ``SessionResponse``
+            shape: ``id``, ``agent_id``, ``status``, ``created_at``,
+            ``title``, ``labels``, ``reasoning_effort``, and
+            ``items``.
+        :raises OmnigentError: 404 if *session_id* does not exist;
+            400 if the session has no agent binding or
+            *up_to_response_id* names no response in the session;
+            409 if a turn is running; 503 if no replacement harness
+            could be started.
+        """
+        body: dict[str, Any] = {}
+        if up_to_response_id is not None:
+            body["up_to_response_id"] = up_to_response_id
+        resp = await self._http.post(
+            f"{self._base}/v1/sessions/{session_id}/restart",
+            json=body,
+        )
+        raise_for_status(resp.status_code, response_body(resp))
+        return require_json_object(
+            resp,
+            f"POST /v1/sessions/{session_id}/restart",
+        )
+
     async def compact(self, session_id: str) -> None:
         """
         Request explicit context compaction for a session.

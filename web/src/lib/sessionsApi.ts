@@ -700,6 +700,39 @@ export async function switchSessionAgent(sessionId: string, agentId: string): Pr
 }
 
 /**
+ * Restart a session's harness execution in place:
+ * ``POST /v1/sessions/{id}/restart``.
+ *
+ * Stops the current harness and starts a fresh one from the latest
+ * installed agent version/configuration, keeping the SAME session
+ * (transcript, title, pin, project, comments, files, workspace). With
+ * ``upToResponseId`` the transcript is first rewound to that conversation
+ * point (later items are removed) so the relaunched harness restores from
+ * the selected message. Only valid while the session is idle (a running
+ * turn → 409).
+ *
+ * @param sessionId - The session to restart, e.g. ``"conv_abc123"``.
+ * @param upToResponseId - Optional response id to rewind the transcript
+ *   to before relaunching (restore-from-point).
+ * @returns The session as it stands after the restart.
+ * @throws Error carrying the server's failure detail (e.g. 409 when a
+ *   turn is running, 503 when the runner can't be relaunched) so the
+ *   caller can surface it inline.
+ */
+export async function restartSession(sessionId: string, upToResponseId?: string): Promise<Session> {
+  const body: { up_to_response_id?: string } = {};
+  if (upToResponseId !== undefined) {
+    body.up_to_response_id = upToResponseId;
+  }
+  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/restart`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
+}
+
+/**
  * Bind an existing (unbound) session to a host + working directory and
  * launch its runner: ``POST /v1/hosts/{hostId}/runners``.
  *

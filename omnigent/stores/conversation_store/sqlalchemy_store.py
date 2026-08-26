@@ -56,6 +56,7 @@ from omnigent.db.utils import (
     _supports_fts5,
     build_search_snippet,
     delete_fts_by_conversation_ids,
+    delete_fts_by_item_ids,
     ensure_fts_table,
     extract_search_text,
     generate_conversation_id,
@@ -4121,6 +4122,129 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
                 is not None
             )
+    def restart_conversation(
+        self,
+        conversation_id: str,
+        *,
+        new_agent_id: str | None,
+        new_agent_name: str | None,
+        new_agent_bundle_location: str | None,
+        new_agent_description: str | None,
+        presentation_labels: dict[str, str] | None,
+        up_to_response_id: str | None,
+        carry_history_into_native: bool,
+    ) -> Conversation:
+        """
+        Restart a session in place, refreshing its agent binding.
+
+        See :meth:`ConversationStore.restart_conversation` for the full
+        contract. Unlike switch-agent, the model settings and
+        ``terminal_launch_args`` are kept — a restart stays on the same
+        agent family, so the session's choices stay valid.
+        """
+        now = now_epoch()
+        # Agent Platform side: conversation row (agent rebinding, updated_at),
+        # item truncation, and label drops/upserts.
+        with self._conv_session("restart_conversation") as ap_sess:
+            row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
+            if row is None:
+                raise LookupError(f"conversation not found: {conversation_id!r}")
+            old_agent_id = row.agent_id
+            if new_agent_id is not None:
+                row.agent_id = new_agent_id
+            row.updated_at = now
+
+            if up_to_response_id is not None:
+                cutoff = ap_sess.execute(
+                    select(func.max(SqlConversationItem.position)).where(
+                        SqlConversationItem.workspace_id == current_workspace_id(),
+                        SqlConversationItem.conversation_id == conversation_id,
+                        SqlConversationItem.response_id == up_to_response_id,
+                    )
+                ).scalar_one()
+                if cutoff is None:
+                    raise ValueError(
+                        f"response_id {up_to_response_id!r} not found in conversation"
+                    )
+                doomed = list(
+                    ap_sess.execute(
+                        select(SqlConversationItem.id).where(
+                            SqlConversationItem.workspace_id == current_workspace_id(),
+                            SqlConversationItem.conversation_id == conversation_id,
+                            SqlConversationItem.position > cutoff,
+                        )
+                    ).scalars()
+                )
+                if doomed:
+                    ap_sess.execute(
+                        delete(SqlConversationItem).where(SqlConversationItem.id.in_(doomed))
+                    )
+                    delete_fts_by_item_ids(ap_sess, doomed)
+
+            existing = _fetch_labels(ap_sess, conversation_id)
+            drop_keys = {
+                WRAPPER_LABEL_KEY,
+                UI_MODE_LABEL_KEY,
+                *_INSTANCE_SCOPED_LABEL_KEYS,
+            }
+            upserts: dict[str, str] = dict(presentation_labels or {})
+            if up_to_response_id is not None:
+                # The source native transcript no longer matches the
+                # truncated items; cloning it would replay the dropped
+                # tail. Rebuild from items instead. A carry marker left
+                # by an earlier fork is stale for the same reason —
+                # re-stamp it only when the current harness can rebuild.
+                drop_keys.add(FORK_SOURCE_LABEL_KEY)
+                drop_keys.add(FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY)
+                drop_keys.add(FORK_CARRY_HISTORY_LABEL_KEY)
+                if carry_history_into_native:
+                    upserts[FORK_CARRY_HISTORY_LABEL_KEY] = "1"
+            present_drop = [key for key in drop_keys if key in existing]
+            if present_drop:
+                ap_sess.execute(
+                    delete(SqlConversationLabel).where(
+                        SqlConversationLabel.workspace_id == current_workspace_id(),
+                        SqlConversationLabel.conversation_id == conversation_id,
+                        SqlConversationLabel.key.in_(present_drop),
+                    )
+                )
+            if upserts:
+                _upsert_labels(ap_sess, conversation_id, upserts, now)
+
+        # Omnigent side: agent rows + metadata. The rebind swaps the old
+        # session-scoped clone for a fresh row in one transaction, so a
+        # failure leaves the original binding intact; clones orphaned by
+        # an earlier crash are swept at startup.
+        with self._session("restart_conversation") as session:
+            if new_agent_id is not None:
+                # The route resolves all-or-none rebind params; a clone
+                # without name/bundle is a caller bug, not a state to
+                # persist.
+                assert new_agent_name is not None
+                assert new_agent_bundle_location is not None
+                if old_agent_id is not None:
+                    old_agent = session.get(SqlAgent, (current_workspace_id(), old_agent_id))
+                    if old_agent is not None and old_agent.kind == encode_agent_kind("session"):
+                        session.delete(old_agent)
+                        session.flush()
+                session.add(
+                    _new_session_agent_row(
+                        agent_id=new_agent_id,
+                        agent_name=new_agent_name,
+                        agent_bundle_location=new_agent_bundle_location,
+                        agent_description=new_agent_description,
+                        now=now,
+                    )
+                )
+
+            meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
+            if meta is not None and up_to_response_id is not None:
+                meta.external_session_id = None
+
+        conv = self.get_conversation(conversation_id)
+        if conv is None:
+            raise LookupError(f"conversation not found: {conversation_id!r}")
+        return conv
 
     async def delete_conversation(self, conversation_id: str) -> bool:
         """

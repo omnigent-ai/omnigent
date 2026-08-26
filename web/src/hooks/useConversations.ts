@@ -41,7 +41,7 @@ import {
 import { showToast } from "@/components/ui/toast";
 import { revokePermission } from "@/lib/permissionsApi";
 import { conversationDisplayLabel, setLegacyPinnedConversationId } from "@/shell/sidebarNav";
-import { stopSession } from "@/lib/sessionsApi";
+import { restartSession, stopSession } from "@/lib/sessionsApi";
 import { setSessionHost } from "@/lib/sessionHost";
 import {
   createProject as apiCreateProject,
@@ -961,6 +961,26 @@ export function useStopSession() {
     onSuccess: (_data, id) => {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["session", id] });
+    },
+  });
+}
+
+/**
+ * Restart a session's harness execution in place via
+ * `POST /v1/sessions/{id}/restart`.
+ *
+ * Invalidates the session snapshot (`["session", id]`), its bound-agent
+ * query (`["session-agent", id]` — a refresh rebind changes it), and the
+ * conversations list so the header/sidebar reflect the restarted state.
+ */
+export function useRestartConversation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => restartSession(id),
+    onSuccess: (_data, id) => {
+      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      void queryClient.invalidateQueries({ queryKey: ["session", id] });
+      void queryClient.invalidateQueries({ queryKey: ["session-agent", id] });
     },
   });
 }

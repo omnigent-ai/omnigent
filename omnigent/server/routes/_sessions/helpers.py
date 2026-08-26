@@ -7331,6 +7331,28 @@ def _presentation_labels_for_agent(*args: Any, **kwargs: Any) -> dict[str, str]:
     return _facade._presentation_labels_for_agent(*args, **kwargs)
 
 
+_CLONE_NAME_SUFFIX_RE = re.compile(r" \((?:fork|switch) [^)]+\)$")
+
+
+def _agent_clone_root_name(name: str) -> str:
+    """Return the root agent name behind fork/switch clone suffixes.
+
+    Clone rows are named ``"<name>"`` (fork) or ``"<name> (switch <id>)"``
+    (switch), and a clone of a clone stacks suffixes. Peeling every layer
+    lets a restart match a session-scoped clone back to the built-in it
+    derives from by name. Mirrors the web client's ``agentRootName``.
+
+    :param name: An agent name, possibly with nested clone suffixes.
+    :returns: The name with every clone suffix removed.
+    """
+    prev = None
+    cur = name
+    while cur != prev:
+        prev = cur
+        cur = _CLONE_NAME_SUFFIX_RE.sub("", cur)
+    return cur
+
+
 def _presentation_labels_for_agent_impl(agent: Agent) -> dict[str, str]:
     """Return the Web UI presentation labels for an agent's harness.
 

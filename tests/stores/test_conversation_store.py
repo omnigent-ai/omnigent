@@ -4587,6 +4587,361 @@ def test_switch_conversation_agent_same_family_keeps_model_settings(
     assert SWITCH_PREVIOUS_BUILTIN_LABEL_KEY not in updated.labels
 
 
+def test_restart_conversation_rebind_keeps_settings_and_native_state(
+    conversation_store: SqlAlchemyConversationStore,
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """A restart that re-clones from a refreshed built-in replaces the
+    session-scoped agent but keeps the model settings, launch args, items,
+    and — in latest-state mode — the native session id.
+    """
+    from omnigent._wrapper_labels import (
+        UI_MODE_LABEL_KEY,
+        UI_MODE_TERMINAL_VALUE,
+        WRAPPER_LABEL_KEY,
+    )
+
+    instance_label = "omnigent.last_context_tokens"
+    created = conversation_store.create_session_with_agent(
+        agent_id="af75a9579488e3520ba6842699e43323",
+        agent_name="claude",
+        agent_bundle_location="af75a9579488e3520ba6842699e43323/oldhash",
+        agent_description="old",
+        title="keep me",
+    )
+    conv_id = created.conversation.id
+    conversation_store.update_conversation(
+        conv_id,
+        model_override="claude-opus-4-7",
+        reasoning_effort="high",
+        harness_override="pi",
+        terminal_launch_args=["--verbose"],
+    )
+    conversation_store.set_external_session_id(conv_id, "native-uuid-1")
+    conversation_store.set_labels(
+        conv_id,
+        {
+            instance_label: "1",
+            UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
+            WRAPPER_LABEL_KEY: "claude-code-native-ui",
+            "omnigent.pinned": "1",
+        },
+    )
+    conversation_store.append(
+        conv_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_1",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+            )
+        ],
+    )
+
+    updated = conversation_store.restart_conversation(
+        conv_id,
+        new_agent_id="9d2c8d5e342b7da390dc38351c49fb72",
+        new_agent_name="claude",
+        new_agent_bundle_location="builtin-id/newhash",
+        new_agent_description="new",
+        presentation_labels={
+            UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
+            WRAPPER_LABEL_KEY: "claude-code-native-ui",
+        },
+        up_to_response_id=None,
+        carry_history_into_native=False,
+    )
+
+    # Rebound to the fresh clone; the stale clone row is deleted.
+    assert updated.agent_id == "9d2c8d5e342b7da390dc38351c49fb72"
+    assert agent_store.get("af75a9579488e3520ba6842699e43323") is None
+    new_agent = agent_store.get("9d2c8d5e342b7da390dc38351c49fb72")
+    assert new_agent is not None and new_agent.session_id == conv_id
+    assert new_agent.bundle_location == "builtin-id/newhash"
+    # Same agent family → every per-session setting survives.
+    assert updated.model_override == "claude-opus-4-7"
+    assert updated.reasoning_effort == "high"
+    assert updated.harness_override == "pi"
+    assert updated.terminal_launch_args == ["--verbose"]
+    # Latest-state mode keeps the native session id so the relaunch resumes.
+    assert updated.external_session_id == "native-uuid-1"
+    # Identity + non-instance labels untouched; instance-scoped dropped.
+    assert updated.title == "keep me"
+    assert updated.labels["omnigent.pinned"] == "1"
+    assert instance_label not in updated.labels
+    assert updated.labels[WRAPPER_LABEL_KEY] == "claude-code-native-ui"
+    # Transcript untouched.
+    assert len(conversation_store.list_items(conv_id).data) == 1
+
+
+def test_restart_conversation_without_rebind_keeps_agent_binding(
+    conversation_store: SqlAlchemyConversationStore,
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """``new_agent_id=None`` keeps the current binding — the shape used for
+    sessions bound directly to a built-in (which already tracks the latest
+    bundle) — while still refreshing labels.
+    """
+    from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
+
+    agent_store.create(
+        agent_id="6239422fb5e1335506bb6dedf0f5e8cb",
+        name="builtin-agent",
+        bundle_location="6239422fb5e1335506bb6dedf0f5e8cb/hash",
+    )
+    conv = conversation_store.create_conversation(agent_id="6239422fb5e1335506bb6dedf0f5e8cb")
+    conversation_store.set_labels(
+        conv.id,
+        {
+            WRAPPER_LABEL_KEY: "claude-code-native-ui",
+            UI_MODE_LABEL_KEY: "terminal",
+            "omnigent.last_context_tokens": "1",
+        },
+    )
+
+    updated = conversation_store.restart_conversation(
+        conv.id,
+        new_agent_id=None,
+        new_agent_name=None,
+        new_agent_bundle_location=None,
+        new_agent_description=None,
+        presentation_labels={},  # refresh source resolves to plain chat
+        up_to_response_id=None,
+        carry_history_into_native=False,
+    )
+
+    assert updated.agent_id == "6239422fb5e1335506bb6dedf0f5e8cb"
+    assert agent_store.get("6239422fb5e1335506bb6dedf0f5e8cb") is not None
+    assert WRAPPER_LABEL_KEY not in updated.labels
+    assert UI_MODE_LABEL_KEY not in updated.labels
+    assert "omnigent.last_context_tokens" not in updated.labels
+
+
+def test_restart_conversation_truncates_and_clears_native_state(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A restart with ``up_to_response_id`` removes later items (and their
+    FTS rows), clears the native session id, drops fork-source directives,
+    and stamps carry-history so the harness rebuilds from the kept items.
+    """
+    from omnigent.stores.conversation_store import (
+        FORK_CARRY_HISTORY_LABEL_KEY,
+        FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
+        FORK_SOURCE_LABEL_KEY,
+    )
+
+    created = conversation_store.create_session_with_agent(
+        agent_id="06efca8dd5c2e87b8cfed1aae99cc239",
+        agent_name="claude-native-ui",
+        agent_bundle_location="06efca8dd5c2e87b8cfed1aae99cc239/hash",
+        agent_description=None,
+    )
+    conv_id = created.conversation.id
+    conversation_store.set_external_session_id(conv_id, "native-uuid-2")
+    conversation_store.set_labels(
+        conv_id,
+        {
+            FORK_SOURCE_LABEL_KEY: "conv_source",
+            FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY: "source-native-uuid",
+            FORK_CARRY_HISTORY_LABEL_KEY: "1",
+        },
+    )
+    conversation_store.append(
+        conv_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_1",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "first"}]),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id="resp_1",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "reply"}]),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id="resp_2",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "second"}]),
+            ),
+        ],
+    )
+
+    updated = conversation_store.restart_conversation(
+        conv_id,
+        new_agent_id=None,
+        new_agent_name=None,
+        new_agent_bundle_location=None,
+        new_agent_description=None,
+        presentation_labels=None,
+        up_to_response_id="resp_1",
+        carry_history_into_native=True,
+    )
+
+    items = conversation_store.list_items(conv_id).data
+    assert [item.response_id for item in items] == ["resp_1", "resp_1"]
+    # The native transcript no longer matches → cleared + rebuild directive.
+    assert updated.external_session_id is None
+    assert FORK_SOURCE_LABEL_KEY not in updated.labels
+    assert FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY not in updated.labels
+    assert updated.labels[FORK_CARRY_HISTORY_LABEL_KEY] == "1"
+
+
+def test_restart_conversation_truncation_drops_stale_carry_marker(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """When the harness cannot rebuild from items (carry=False), a carry
+    marker left by an earlier fork must not survive the truncation.
+    """
+    from omnigent.stores.conversation_store import FORK_CARRY_HISTORY_LABEL_KEY
+
+    created = conversation_store.create_session_with_agent(
+        agent_id="b5f73b57f0e44bd3a3c16c988d8b2e9a",
+        agent_name="cursor-agent",
+        agent_bundle_location="b5f73b57f0e44bd3a3c16c988d8b2e9a/hash",
+        agent_description=None,
+    )
+    conv_id = created.conversation.id
+    conversation_store.set_labels(conv_id, {FORK_CARRY_HISTORY_LABEL_KEY: "1"})
+    conversation_store.append(
+        conv_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_1",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id="resp_2",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "later"}]),
+            ),
+        ],
+    )
+
+    updated = conversation_store.restart_conversation(
+        conv_id,
+        new_agent_id=None,
+        new_agent_name=None,
+        new_agent_bundle_location=None,
+        new_agent_description=None,
+        presentation_labels=None,
+        up_to_response_id="resp_1",
+        carry_history_into_native=False,
+    )
+
+    assert FORK_CARRY_HISTORY_LABEL_KEY not in updated.labels
+    assert len(conversation_store.list_items(conv_id).data) == 1
+
+
+def test_restart_conversation_unknown_response_id_raises_without_mutation(
+    conversation_store: SqlAlchemyConversationStore,
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """An unknown ``up_to_response_id`` raises ValueError and must leave the
+    session — including the agent binding — untouched.
+    """
+    created = conversation_store.create_session_with_agent(
+        agent_id="c7a1c41b0d2f4b6b9d0d9a75c0f5a111",
+        agent_name="claude",
+        agent_bundle_location="c7a1c41b0d2f4b6b9d0d9a75c0f5a111/hash",
+        agent_description=None,
+    )
+    conv_id = created.conversation.id
+    conversation_store.append(
+        conv_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_1",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="resp_missing"):
+        conversation_store.restart_conversation(
+            conv_id,
+            new_agent_id="9d2c8d5e342b7da390dc38351c49fb72",
+            new_agent_name="claude",
+            new_agent_bundle_location="builtin/newhash",
+            new_agent_description=None,
+            presentation_labels=None,
+            up_to_response_id="resp_missing",
+            carry_history_into_native=False,
+        )
+
+    conv = conversation_store.get_conversation(conv_id)
+    assert conv is not None and conv.agent_id == "c7a1c41b0d2f4b6b9d0d9a75c0f5a111"
+    assert agent_store.get("c7a1c41b0d2f4b6b9d0d9a75c0f5a111") is not None
+    assert agent_store.get("9d2c8d5e342b7da390dc38351c49fb72") is None
+    assert len(conversation_store.list_items(conv_id).data) == 1
+
+
+def test_restart_conversation_missing_conversation_raises(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A restart of a conversation that does not exist raises LookupError."""
+    with pytest.raises(LookupError):
+        conversation_store.restart_conversation(
+            "f0e1d2c3b4a5968778695a4b3c2d1e0f",
+            new_agent_id=None,
+            new_agent_name=None,
+            new_agent_bundle_location=None,
+            new_agent_description=None,
+            presentation_labels=None,
+            up_to_response_id=None,
+            carry_history_into_native=False,
+        )
+
+
+def test_restart_conversation_split_db_truncates_across_databases(
+    split_db_conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Under a split-DB deployment the truncation lands in the AP database
+    while the native-session-id clear lands in the Omnigent database.
+    """
+    conversation_store = split_db_conversation_store
+    created = conversation_store.create_session_with_agent(
+        agent_id="d3b5c91e2f0a4c5b8d7e6f5a4b3c2d1e",
+        agent_name="claude",
+        agent_bundle_location="d3b5c91e2f0a4c5b8d7e6f5a4b3c2d1e/hash",
+        agent_description=None,
+    )
+    conv_id = created.conversation.id
+    conversation_store.set_external_session_id(conv_id, "native-uuid-3")
+    conversation_store.append(
+        conv_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_1",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id="resp_2",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "later"}]),
+            ),
+        ],
+    )
+
+    updated = conversation_store.restart_conversation(
+        conv_id,
+        new_agent_id="e4c6da2f3a1b5d6c9e8f7a6b5c4d3e2f",
+        new_agent_name="claude",
+        new_agent_bundle_location="builtin/newhash",
+        new_agent_description=None,
+        presentation_labels=None,
+        up_to_response_id="resp_1",
+        carry_history_into_native=False,
+    )
+
+    assert updated.agent_id == "e4c6da2f3a1b5d6c9e8f7a6b5c4d3e2f"
+    assert updated.external_session_id is None
+    assert len(conversation_store.list_items(conv_id).data) == 1
+
+
 def test_get_session_connectivity_batches_runner_and_host(
     conversation_store: SqlAlchemyConversationStore,
     db_uri: str,
