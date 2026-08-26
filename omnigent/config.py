@@ -122,7 +122,7 @@ def env_passthrough_names(
     :returns: Sorted tuple of unique variable names, possibly empty.
     """
     g = global_cfg if global_cfg is not None else load_global_config()
-    l = local_cfg if local_cfg is not None else load_local_config()
+    lc = local_cfg if local_cfg is not None else load_local_config()
 
     def _names(cfg: _Config) -> list[str]:
         raw = cfg.get("env_passthrough")
@@ -132,7 +132,7 @@ def env_passthrough_names(
             return [str(n) for n in raw if n]
         return []
 
-    return tuple(sorted(set(_names(g)) | set(_names(l))))
+    return tuple(sorted(set(_names(g)) | set(_names(lc))))
 
 
 __all__ = [
