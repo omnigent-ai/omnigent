@@ -21,6 +21,11 @@ from omnigent.spec._omnigent_compat import OMNIGENT_HARNESSES
         # Docs / runtime-dispatch spelling of the openai-agents harness;
         # specs and OMNIGENT_HARNESSES use "openai-agents".
         ("openai-agents-sdk", "openai-agents"),
+        # Goose is ACP-only: both retired native spellings land on the ACP
+        # harness so an existing ``harness: goose-native`` spec still loads.
+        ("goose-native", "goose"),
+        ("native-goose", "goose"),
+        ("goose", "goose"),
         # Canonical names pass through unchanged.
         ("openai-agents", "openai-agents"),
         ("pi", "pi"),
@@ -108,7 +113,6 @@ def test_kiro_native_is_valid_omnigent_harness_but_plain_kiro_is_not() -> None:
         ("native-claude", "claude"),  # reversed alias
         ("codex-native", "codex"),
         ("cursor-native", "cursor"),
-        ("goose-native", "goose"),
         ("hermes-native", "hermes"),
         ("kiro-native", "kiro"),
         ("qwen-native", "qwen"),
@@ -121,6 +125,11 @@ def test_kiro_native_is_valid_omnigent_harness_but_plain_kiro_is_not() -> None:
         ("opencode-native", "opencode"),
         ("opencode", "opencode"),  # alias folds to opencode-native
         # Non-native harnesses (and the SDK shorthands) have no native pane.
+        ("goose", None),
+        # goose-native is a retired spelling that canonicalizes to the ACP
+        # ``goose`` harness, which owns no pane.
+        ("goose-native", None),
+        ("native-goose", None),
         ("claude-sdk", None),
         ("claude", None),
         ("codex", None),

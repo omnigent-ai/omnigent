@@ -582,10 +582,9 @@
       "priority_label": "comp:harness-t3",
       "weight": 0.9,
       "weight_source": "telemetry",
-      "definition": "The Goose harness: SDK executor/harness, native TUI/ACP integration, and Goose auth.",
+      "definition": "The Goose harness: the ACP executor/harness wrap and Goose auth.",
       "paths": [
         "omnigent/inner/goose_",
-        "omnigent/goose_native",
         "omnigent/onboarding/goose_auth.py"
       ],
       "owners": [

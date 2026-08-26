@@ -658,7 +658,7 @@ def _ensure_ctx(registry: _FakeEnsureRegistry, session_id: str = "conv_e") -> Na
     )
 
 
-def _terminal_view(name: str, terminal_id: str = "terminal_goose_main") -> SessionResourceView:
+def _terminal_view(name: str, terminal_id: str = "terminal_kiro_main") -> SessionResourceView:
     return SessionResourceView(id=terminal_id, type="terminal", session_id="conv_e", name=name)
 
 
@@ -676,9 +676,9 @@ async def test_ensure_native_terminal_returns_existing_without_creating(
         created = True
         return object()
 
-    monkeypatch.setattr("omnigent.runner.native._launch_goose", _fake_launch)
+    monkeypatch.setattr("omnigent.runner.native._launch_kiro", _fake_launch)
     registry = _FakeEnsureRegistry(existing=_terminal_view("existing"))
-    resp = await _ensure_native_terminal("goose", _ensure_ctx(registry), ensure_locks={})
+    resp = await _ensure_native_terminal("kiro", _ensure_ctx(registry), ensure_locks={})
 
     assert resp is not None and resp.status_code == 200
     assert json.loads(bytes(resp.body))["name"] == "existing"
@@ -695,10 +695,10 @@ async def test_ensure_native_terminal_creates_when_absent(
     async def _fake_launch(ctx: NativeLaunchContext) -> SessionResourceView:
         return _terminal_view("auto-created")
 
-    monkeypatch.setattr("omnigent.runner.native._launch_goose", _fake_launch)
+    monkeypatch.setattr("omnigent.runner.native._launch_kiro", _fake_launch)
     registry = _FakeEnsureRegistry(existing=None)
     locks: dict[str, Any] = {}
-    resp = await _ensure_native_terminal("goose", _ensure_ctx(registry), ensure_locks=locks)
+    resp = await _ensure_native_terminal("kiro", _ensure_ctx(registry), ensure_locks=locks)
 
     assert resp is not None and resp.status_code == 200
     assert json.loads(bytes(resp.body))["name"] == "auto-created"
@@ -713,19 +713,19 @@ async def test_ensure_native_terminal_builder_error_returns_500(
     from omnigent.runner.native import _ensure_native_terminal
 
     async def _boom(ctx: NativeLaunchContext) -> object:
-        raise ImportError("Native goose requires the 'goose' CLI on PATH.")
+        raise ImportError("Native kiro requires the 'kiro-cli' CLI on PATH.")
 
-    monkeypatch.setattr("omnigent.runner.native._launch_goose", _boom)
+    monkeypatch.setattr("omnigent.runner.native._launch_kiro", _boom)
     resp = await _ensure_native_terminal(
-        "goose", _ensure_ctx(_FakeEnsureRegistry(existing=None)), ensure_locks={}
+        "kiro", _ensure_ctx(_FakeEnsureRegistry(existing=None)), ensure_locks={}
     )
 
     assert resp is not None and resp.status_code == 500
     body = json.loads(bytes(resp.body))
     # The raw ImportError text must not leak; a fixed client-safe message is used
-    # (the display name "Goose" identifies the runtime, not the raw cause).
-    assert "requires the 'goose' CLI" not in body["error"]["message"]
-    assert "Goose" in body["error"]["message"]
+    # (the display name "Kiro" identifies the runtime, not the raw cause).
+    assert "requires the 'kiro-cli' CLI" not in body["error"]["message"]
+    assert "Kiro" in body["error"]["message"]
 
 
 @pytest.mark.asyncio
@@ -833,18 +833,18 @@ async def test_ensure_native_terminal_build_context_runs_only_on_create(
         calls.append("build")
         return dataclasses.replace(ctx, agent_name="resolved")
 
-    monkeypatch.setattr("omnigent.runner.native._launch_goose", _fake_launch)
+    monkeypatch.setattr("omnigent.runner.native._launch_kiro", _fake_launch)
 
     # Create path: build_context runs.
     await _ensure_native_terminal(
-        "goose",
+        "kiro",
         _ensure_ctx(_FakeEnsureRegistry(existing=None)),
         ensure_locks={},
         build_context=_build,
     )
     # Existing path: build_context skipped.
     await _ensure_native_terminal(
-        "goose",
+        "kiro",
         _ensure_ctx(_FakeEnsureRegistry(existing=_terminal_view("existing"))),
         ensure_locks={},
         build_context=_build,

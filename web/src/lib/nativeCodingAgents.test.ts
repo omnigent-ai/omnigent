@@ -258,7 +258,6 @@ describe("nativeCodingAgentForPolicyName", () => {
     ["agy_native_permission", "Antigravity"],
     ["agy_native_ask_question", "Antigravity"],
     ["kiro_native_permission", "Kiro"],
-    ["goose_native_permission", "Goose"],
     ["qwen_native_permission", "Qwen Code"],
     ["hermes_native_permission", "Hermes"],
   ])("maps %s to %s", (policyName, displayName) => {

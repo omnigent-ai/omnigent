@@ -2,14 +2,14 @@
 
 ``omnigent hermes`` launches Nous Research's Hermes Agent interactive TUI (the bare
 ``hermes`` command) inside an Omnigent-runner-owned tmux terminal and attaches the
-local TTY — the Hermes analog of ``omnigent goose`` / ``omnigent cursor``. The
+local TTY — the Hermes analog of ``omnigent qwen`` / ``omnigent cursor``. The
 runner spawns the process (see
 :func:`omnigent.runner.app._auto_create_hermes_terminal`); this module owns the
 CLI-side orchestration: session create/resume, daemon runner bind, terminal-ready
 poll, and the direct tmux attach.
 
 Auth is Hermes' own configuration (``hermes setup`` / ``hermes model`` →
-``~/.hermes/config.yaml``); no Omnigent-managed key is required. Like goose there
+``~/.hermes/config.yaml``); no Omnigent-managed key is required. Like qwen there
 is no extension bridge — the runner sets up the terminal environment directly
 (forcing ``NO_COLOR`` so the pane scrapes cleanly).
 """
@@ -96,7 +96,7 @@ class PreparedHermesTerminal:
         was reused (the live-reattach path: prior session intact).
     :param cold_resumed: ``True`` when resuming an existing Omnigent session whose
         terminal had already exited, so a *fresh* ``hermes`` TUI was launched.
-        Mirrors goose-native: ``cold_resumed`` and ``reattached`` are mutually
+        Mirrors qwen-native: ``cold_resumed`` and ``reattached`` are mutually
         exclusive (the cold-resume path leaves ``reattached`` False).
     """
 

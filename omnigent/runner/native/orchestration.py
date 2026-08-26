@@ -62,7 +62,6 @@ from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
     CURSOR_NATIVE_TERMINAL_ROLE,
-    GOOSE_NATIVE_TERMINAL_ROLE,
     HERMES_NATIVE_TERMINAL_ROLE,
     KIMI_NATIVE_TERMINAL_ROLE,
     KIRO_NATIVE_TERMINAL_ROLE,
@@ -2606,173 +2605,6 @@ async def _auto_create_cursor_terminal(
     return terminal_view
 
 
-async def _auto_create_goose_terminal(
-    session_id: str,
-    resource_registry: SessionResourceRegistry,
-    publish_event: Callable[[str, _JsonObject], None],
-    *,
-    server_client: httpx.AsyncClient | None,
-    ensure_comment_relay: _EnsureCommentRelay | None = None,
-) -> SessionResourceView:
-    """
-    Auto-create the Goose TUI terminal for a goose-native session.
-
-    Launches ``goose session --name <session_id>`` in a runner-owned tmux pane.
-    Auth is Goose's own configuration (``goose configure`` → keyring /
-    ``~/.config/goose/config.yaml``), so HOME is inherited and Omnigent writes no
-    vendor config (Goose owns its own tool surface / MCP extensions). The
-    ``--name`` lets the forwarder discover *this* session's row deterministically.
-    Mirrors :func:`_auto_create_cursor_terminal`, minus the MCP machinery.
-
-    :param session_id: Session/conversation identifier (also the goose ``--name``).
-    :param resource_registry: Session resource registry for launching the terminal.
-    :param publish_event: Runner session event publisher.
-    :param server_client: Runner Omnigent server client.
-    :returns: Created terminal resource view.
-    """
-    from omnigent.goose_native import resolve_goose_executable
-    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
-
-    # Tear down any forwarder left from a prior terminal for this session before
-    # re-creating, so old and new tasks can't both mirror (double-posting), and
-    # drop the prior terminal's stale forward cursor.
-    await _cancel_auto_forwarder_task(session_id)
-    from omnigent.goose_native_bridge import bridge_dir_for_session_id, write_tmux_target
-    from omnigent.goose_native_forwarder import clear_goose_bridge_state
-
-    bridge_dir = bridge_dir_for_session_id(session_id)
-    clear_goose_bridge_state(bridge_dir)
-
-    # ``_pi_native_launch_config`` is a generic session-snapshot reader
-    # (workspace + terminal_launch_args); reused here, not Pi-specific.
-    launch_config = await _pi_native_launch_config(
-        session_id=session_id,
-        server_client=server_client,
-    )
-    workspace = os.path.realpath(str(launch_config.workspace))
-    goose_command = resolve_goose_executable()
-    # GOOSE_MODE=smart_approve so Goose prompts in its TUI before sensitive tools
-    # (its native approval, which shows in the terminal and the web's embedded
-    # terminal). Goose's default mode is Auto (no prompt), so we set this for the
-    # approval flow to appear at all. Provider/model come from `goose configure`.
-    goose_env: dict[str, str] = {
-        "GOOSE_CLI_THEME": "ansi",
-        "GOOSE_TELEMETRY_OFF": "1",
-        "GOOSE_MODE": "smart_approve",
-    }
-    # Launch-unique Goose session name. `goose session --name X` (without
-    # --resume) creates a NEW sessions row each launch (verified, Goose 1.38),
-    # so a per-launch-unique name lets the forwarder bind to EXACTLY this
-    # launch's row — never an older same-conversation row left by a prior
-    # cold-resume. This closes the "replay the whole transcript on restart"
-    # risk: discovery resolves one session, and the wiped bridge cursor
-    # (clear_goose_bridge_state above) starts it at the new row's first message.
-    goose_session_name = f"{session_id}-{int(time.time() * 1000)}"
-    goose_args = [
-        "session",
-        "--name",
-        goose_session_name,
-        *(launch_config.terminal_launch_args or []),
-    ]
-    terminal_view = await resource_registry.launch_required_terminal(
-        session_id=session_id,
-        terminal_name="goose",
-        session_key="main",
-        resource_role=GOOSE_NATIVE_TERMINAL_ROLE,
-        spec=TerminalEnvSpec(
-            os_env=OSEnvSpec(type="caller_process", cwd=workspace),
-            command=goose_command,
-            args=goose_args,
-            # ANSI theme keeps the pane cheap to scrape; GOOSE_TELEMETRY_OFF
-            # suppresses Goose's first-run "share usage data?" prompt, which
-            # would otherwise block the headless pane on a fresh install;
-            # GOOSE_MODE=smart_approve turns on Goose's own in-TUI approval. Goose's
-            # provider/model come from the user's own `goose configure` (KTD4).
-            env=goose_env,
-            scrollback=100_000,
-            tmux_allow_passthrough=True,
-            tmux_start_on_attach=False,
-        ),
-    )
-    # Advertise the tmux socket+target so the goose-native harness executor can
-    # inject web-UI messages into this same pane (tmux paste).
-    terminal_registry = resource_registry.terminal_registry
-    if terminal_registry is not None:
-        instance = terminal_registry.get(session_id, "goose", "main")
-        if instance is not None and instance.running:
-            write_tmux_target(
-                bridge_dir,
-                socket_path=instance.socket_path,
-                tmux_target=instance.tmux_target,
-            )
-    publish_event(
-        session_id,
-        {
-            "type": "session.resource.created",
-            "resource": session_resource_view_to_dict(terminal_view),
-        },
-    )
-
-    # Mirror the Goose TUI's conversation back into the Omnigent session so the
-    # chat view tracks the embedded terminal. Host-spawned sessions have no CLI
-    # client to start this, so the runner owns it — reusing the runner's own
-    # server URL + refresh-capable auth.
-    from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
-
-    server_url = _required_runner_env("RUNNER_SERVER_URL")
-    _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
-
-    from omnigent.goose_native_forwarder import supervise_goose_forwarder
-    from omnigent.goose_native_permissions import supervise_goose_approval_mirror
-
-    if server_client is not None and ensure_comment_relay is not None:
-        await ensure_comment_relay(
-            session_id,
-            explicit_bridge_dir=bridge_dir,
-            await_notify=False,
-        )
-
-    async def _supervise_goose_native_bridges() -> None:
-        """Run the transcript forwarder and the approval mirror together.
-
-        Both are per-session, runner-owned, restart-on-failure; gathering them
-        under one task keeps a single registration/cancellation handle for
-        teardown. The forwarder mirrors Goose's transcript onto the conversation;
-        the approval mirror surfaces Goose's cliclack tool-confirmation prompt as
-        a web elicitation (see :mod:`omnigent.goose_native_permissions`).
-        """
-        await asyncio.gather(
-            supervise_goose_forwarder(
-                base_url=server_url,
-                headers={},
-                session_id=session_id,
-                bridge_dir=bridge_dir,
-                agent_name="goose-native-ui",
-                goose_session_name=goose_session_name,
-                auth=_runner_auth,
-            ),
-            supervise_goose_approval_mirror(
-                base_url=server_url,
-                headers={},
-                session_id=session_id,
-                bridge_dir=bridge_dir,
-                auth=_runner_auth,
-            ),
-        )
-
-    _forwarder_task = asyncio.create_task(
-        _supervise_goose_native_bridges(),
-        name=f"goose-bridges-{session_id}",
-    )
-    _register_auto_forwarder_task(session_id, _forwarder_task)
-    _logger.info(
-        "Auto-created goose terminal + forwarder/approval-mirror for session %s; task=%s",
-        session_id,
-        _forwarder_task.get_name(),
-    )
-    return terminal_view
-
-
 async def _auto_create_hermes_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
@@ -2790,7 +2622,7 @@ async def _auto_create_hermes_terminal(
     config (Hermes owns its own tool surface / skills). Hermes can't be told its
     session id in advance, so the forwarder discovers *this* launch's row by
     ``cwd`` + ``started_at`` floor (see :mod:`omnigent.hermes_native_forwarder`).
-    Mirrors :func:`_auto_create_goose_terminal`.
+    Mirrors :func:`_auto_create_cursor_terminal`.
 
     :param session_id: Session/conversation identifier.
     :param resource_registry: Session resource registry for launching the terminal.
@@ -3294,7 +3126,7 @@ async def _auto_create_qwen_terminal(
     ``submit`` commands) and ``--json-file`` (qwen streams structured events here
     for the forwarder to mirror). Auth is qwen's own configuration (OpenAI-compat
     env vars or ``~/.qwen`` from ``/auth``), so HOME is inherited and Omnigent
-    writes no vendor config. Mirrors :func:`_auto_create_goose_terminal`, with a
+    writes no vendor config. Mirrors :func:`_auto_create_hermes_terminal`, with a
     file-based bridge instead of tmux ``send-keys``.
 
     :param session_id: Session/conversation identifier.
@@ -7060,8 +6892,8 @@ async def _delete_native_bridge_dirs(
     holding a bridge token / auth secret + MCP config — secret material. Closing
     the pane does not remove it, so without this they accumulate even on a clean
     session delete (issue #1350). We don't know which harness this session used,
-    so delete every candidate dir for all 11 native families
-    (antigravity/claude/codex/cursor/goose/hermes/kimi/kiro/opencode/pi/qwen);
+    so delete every candidate dir for all 10 native families
+    (antigravity/claude/codex/cursor/hermes/kimi/kiro/opencode/pi/qwen);
     the per-target ``FileNotFoundError`` swallow makes wrong-harness / already-gone
     cases a no-op, while other ``OSError``s are logged at debug rather than hidden.
     Antigravity/claude/codex/opencode bridge ids can be rotated via a session
@@ -7092,9 +6924,6 @@ async def _delete_native_bridge_dirs(
     )
     from omnigent.cursor_native_bridge import (
         bridge_dir_for_session_id as cursor_bridge_dir,
-    )
-    from omnigent.goose_native_bridge import (
-        bridge_dir_for_session_id as goose_bridge_dir,
     )
     from omnigent.hermes_native_bridge import (
         bridge_dir_for_session_id as hermes_bridge_dir,
@@ -7133,7 +6962,6 @@ async def _delete_native_bridge_dirs(
         codex_bridge_dir(labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id),
         codex_bridge_dir(session_id),
         cursor_bridge_dir(session_id),
-        goose_bridge_dir(session_id),
         hermes_bridge_dir(session_id),
         kimi_bridge_dir(session_id),
         kiro_bridge_dir(session_id),
@@ -7374,17 +7202,6 @@ async def _launch_opencode(ctx: NativeLaunchContext) -> SessionResourceView:
         ctx.resource_registry,
         ctx.publish_event,
         agent_spec=ctx.agent_spec,
-        server_client=ctx.server_client,
-        ensure_comment_relay=ctx.ensure_comment_relay,
-    )
-
-
-async def _launch_goose(ctx: NativeLaunchContext) -> SessionResourceView:
-    """Adapter: build the goose-native terminal from a launch context."""
-    return await _auto_create_goose_terminal(
-        ctx.session_id,
-        ctx.resource_registry,
-        ctx.publish_event,
         server_client=ctx.server_client,
         ensure_comment_relay=ctx.ensure_comment_relay,
     )

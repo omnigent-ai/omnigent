@@ -55,10 +55,8 @@ describe("AgentCard icon selection", () => {
     { name: "claude-native-ui", harness: "claude-native", expected: "claude" },
     { name: "pi-native-ui", harness: "pi-native", expected: "pi" },
     { name: "cursor-native-ui", harness: "cursor-native", expected: "cursor" },
-    { name: "goose-native-ui", harness: "goose-native", expected: "goose" },
-    // A goose-harnessed agent also reads as Goose via the harness fallback —
-    // both the native TUI ("goose-native") and the headless ACP harness ("goose").
-    { name: "x", harness: "goose-native", expected: "goose" },
+    // Goose reads as Goose via the harness fallback: it has no native wrapper
+    // agent, so the harness is the only signal.
     { name: "x", harness: "goose", expected: "goose" },
     // The SDK "cursor" harness also reads as Cursor via the harness fallback.
     { name: "x", harness: "cursor", expected: "cursor" },

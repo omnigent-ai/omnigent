@@ -166,16 +166,16 @@ def test_generic_native_permission_card_names_the_vendor_or_nothing(
 ) -> None:
     """The vendor-agnostic hook: a vendor stamp names the product, a bare one names nothing."""
     base_url, session_id = seeded_session
-    # Neither message names a vendor, so "Goose" on the card can only have come
+    # Neither message names a vendor, so "Hermes" on the card can only have come
     # from resolving the stamp — not from echoing the prompt text.
-    goose_message = "A vendor-stamped bridge wants approval to run a tool"
+    hermes_message = "A vendor-stamped bridge wants approval to run a tool"
     bare_message = "An unnamed bridge wants approval to run a tool"
     errors: list[Exception] = []
 
     def _post_hook(elicitation_id: str, message: str, policy_name: str | None) -> None:
         body: dict = {
             "elicitation_id": elicitation_id,
-            "agent": "Goose",
+            "agent": "Hermes",
             "message": message,
         }
         if policy_name is not None:
@@ -192,7 +192,7 @@ def test_generic_native_permission_card_names_the_vendor_or_nothing(
     threads = [
         threading.Thread(
             target=_post_hook,
-            args=("elic_goose", goose_message, "goose_native_permission"),
+            args=("elic_hermes", hermes_message, "hermes_native_permission"),
             daemon=True,
         ),
         # No policy_name → the hook's vendor-less "native_permission" fallback.
@@ -205,13 +205,13 @@ def test_generic_native_permission_card_names_the_vendor_or_nothing(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    # Goose stamps `goose_native_permission`, which the shared vendor registry
-    # resolves — so the card says "Goose" and hides both the id and the phase.
-    goose_card = page.locator(_APPROVAL_CARD).filter(has_text=goose_message).first
-    expect(goose_card).to_be_visible(timeout=_MOCK_ELICITATION_TIMEOUT_MS)
-    expect(goose_card).to_contain_text("Goose")
-    expect(goose_card).not_to_contain_text("goose_native_permission")
-    expect(goose_card).not_to_contain_text("pre_tool_use")
+    # Hermes stamps `hermes_native_permission`, which the shared vendor registry
+    # resolves — so the card says "Hermes" and hides both the id and the phase.
+    hermes_card = page.locator(_APPROVAL_CARD).filter(has_text=hermes_message).first
+    expect(hermes_card).to_be_visible(timeout=_MOCK_ELICITATION_TIMEOUT_MS)
+    expect(hermes_card).to_contain_text("Hermes")
+    expect(hermes_card).not_to_contain_text("hermes_native_permission")
+    expect(hermes_card).not_to_contain_text("pre_tool_use")
 
     # The fallback names no vendor, so the tag slot stays empty rather than
     # printing the stamp.
@@ -220,7 +220,7 @@ def test_generic_native_permission_card_names_the_vendor_or_nothing(
     expect(bare_card).not_to_contain_text("native_permission")
     expect(bare_card).not_to_contain_text("pre_tool_use")
 
-    for card in (goose_card, bare_card):
+    for card in (hermes_card, bare_card):
         card.get_by_role("button", name="Approve", exact=True).click()
     for thread in threads:
         thread.join(timeout=30)

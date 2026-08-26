@@ -7,7 +7,7 @@ produce that env:
 
 * :func:`build_kiro_native_spawn_env` — the minimal env handed to the harness
   executor: *only* the bridge-dir pointer (kiro has no provider/model/theme env,
-  unlike goose-native's ``build_goose_native_spawn_env``).
+  unlike qwen-native's ``build_qwen_native_spawn_env``).
 * :func:`build_kiro_native_terminal_env` — the allowlisted child env for the
   ``kiro-cli`` process itself: the bridge-dir pointer and the ACP-record path,
   plus a fixed allowlist of terminal/locale vars, with everything else (ambient

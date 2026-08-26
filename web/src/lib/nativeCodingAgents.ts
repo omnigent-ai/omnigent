@@ -11,7 +11,6 @@ export type NativeCodingAgentIconKind =
   | "pi"
   | "cursor"
   | "kiro"
-  | "goose"
   | "qwen"
   | "antigravity"
   | "kimi"
@@ -137,15 +136,6 @@ export const NATIVE_CODING_AGENTS = [
     capabilities: ["skipPermissions"],
   },
   {
-    key: "goose",
-    agentName: "goose-native-ui",
-    harness: "goose-native",
-    wrapperLabel: "goose-native-ui",
-    displayName: "Goose",
-    iconKind: "goose",
-    sortRank: 60,
-  },
-  {
     // qwen has no brand glyph yet, so it falls back to the generic bot icon
     // (see AgentCard.iconForAgent / SubagentsPanel) — the `iconKind: "qwen"`
     // intentionally matches no icon branch. Auth/approval surface in the
@@ -211,7 +201,6 @@ const HARNESS_ALIASES: Record<string, string> = {
   "native-antigravity": "antigravity-native",
   "agy-native": "antigravity-native",
   "native-agy": "antigravity-native",
-  "native-goose": "goose-native",
   "native-qwen": "qwen-native",
   "native-kimi": "kimi-native",
   "native-hermes": "hermes-native",

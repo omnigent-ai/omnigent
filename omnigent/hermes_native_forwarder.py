@@ -8,15 +8,15 @@ bubbles, title) stays empty because nothing mirrors the TUI's transcript back in
 the session.
 
 This module is that missing mirror — the Hermes analog of
-:mod:`omnigent.goose_native_forwarder`. Hermes stores all sessions in a single
+:mod:`omnigent.cursor_native_forwarder`. Hermes stores all sessions in a single
 SQLite database at ``$HERMES_HOME/state.db`` (default ``~/.hermes/state.db``,
 verified against the hermes-agent ``hermes_state.py`` schema): a ``sessions`` row
 per session (``id`` TEXT, ``source``, ``cwd``, ``started_at`` REAL-seconds) and a
 ``messages`` row per turn (``id`` autoincrement, ``session_id`` FK, ``role``,
 ``content`` TEXT, ``active``).
 
-Unlike goose-native, Hermes auto-generates its ``sessions.id`` and gives no
-``--name`` to pin it, so discovery follows cursor-native instead: bind the newest
+Hermes auto-generates its ``sessions.id`` and gives no ``--name`` to pin it, so
+discovery follows cursor-native: bind the newest
 session whose ``cwd`` matches this terminal's workspace and whose ``started_at`` is
 at/after the recorded launch time, with a claim guard so two hermes-native sessions
 launched in the same cwd never mirror the same row into two conversations. We then
@@ -34,7 +34,7 @@ id (see :func:`_annotate_turn_actions`). The server keys the live card off a
 The forwarder deliberately does NOT take ``idle`` ownership: the runner's
 PTY-activity watcher (see :mod:`omnigent.runner.app`) still emits the id-less
 ``running``/``idle`` ``session.status`` edges for hermes-native (as for
-goose-/cursor-native), and the server pops the active response id on *any* ``idle``.
+qwen-/cursor-native), and the server pops the active response id on *any* ``idle``.
 A silent tool (e.g. ``sleep``) leaves the pane quiet, so that watcher's ~1s idle
 would settle a live card mid-turn — the forwarder therefore re-asserts the in-flight
 turn's ``running`` each poll. The trade-off: an aborted turn whose terminal row is
@@ -80,7 +80,7 @@ _logger = logging.getLogger(__name__)
 _DEFAULT_POLL_INTERVAL_S = 0.4
 _POST_TIMEOUT_S = 30.0
 
-# Supervisor backoff (mirrors goose_native_forwarder.supervise_goose_forwarder).
+# Supervisor backoff (mirrors cursor_native_forwarder.supervise_cursor_forwarder).
 _SUPERVISOR_INITIAL_BACKOFF_S = 1.0
 _SUPERVISOR_MAX_BACKOFF_S = 30.0
 _SUPERVISOR_HEALTHY_UPTIME_S = 60.0
@@ -1477,7 +1477,7 @@ async def supervise_hermes_forwarder(
 ) -> None:
     """Run :func:`forward_hermes_store_to_session` under a restart supervisor.
 
-    Mirrors :func:`omnigent.goose_native_forwarder.supervise_goose_forwarder`:
+    Mirrors :func:`omnigent.cursor_native_forwarder.supervise_cursor_forwarder`:
     bounded exponential backoff, :class:`asyncio.CancelledError` propagates for
     clean teardown, and the persisted ``id`` cursor means restarts resume exactly
     where they left off.

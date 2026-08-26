@@ -94,8 +94,8 @@ KIRO_KEY = "kiro"
 #   (``omnigent/pi_native_credentials.py``).
 # - qwen: ``--input-file`` / ``--json-file`` bridge verified on v0.18.1
 #   (``omnigent/qwen_native_forwarder.py`` / ``docs/QWEN_NATIVE_DESIGN.md``).
-# - goose: SQLite forwarder schema verified on Goose 1.38.0
-#   (``omnigent/goose_native_forwarder.py``).
+# - goose: ACP protocol + ``result.usage`` shape verified on Goose 1.38.0
+#   (``omnigent/inner/goose_executor.py``).
 # - hermes: parent_session_id schema introduced in v0.17.0
 #   (``omnigent/hermes_native_forwarder.py``).
 # - kiro: MCP config schema (``{"mcpServers": ...}``) verified on kiro-cli 2.10.0
@@ -349,10 +349,8 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     "native-antigravity": GEMINI_FAMILY,
     "agy-native": GEMINI_FAMILY,
     "native-agy": GEMINI_FAMILY,
-    "goose-native": GOOSE_KEY,
-    "native-goose": GOOSE_KEY,
-    # Headless Goose (``harness: goose``, drives ``goose acp``) wraps the same
-    # ``goose`` CLI as the native TUI, so it gates on the same binary.
+    # Goose (``harness: goose``) drives ``goose acp``; its retired
+    # ``goose-native`` / ``native-goose`` spellings canonicalize here.
     GOOSE_KEY: GOOSE_KEY,
     # Native Kimi TUI harness — same binary gate as the bare ``kimi`` surface.
     "kimi-native": KIMI_KEY,

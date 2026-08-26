@@ -146,7 +146,6 @@ _NATIVE_OMNIGENT_MCP_HARNESSES = frozenset(
         "claude-native",
         "codex-native",
         "cursor-native",
-        "goose-native",
         "hermes-native",
         "kiro-native",
         "qwen-native",

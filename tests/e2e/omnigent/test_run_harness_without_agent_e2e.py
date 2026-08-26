@@ -173,7 +173,7 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     ``HARNESS_QWEN_GATEWAY_AUTH_COMMAND`` instead. Its live round-trip is
     covered by the dedicated ``test_per_harness_qwen.py`` suite.
 
-    ``goose`` (headless ACP) is excluded for the same reason as ``qwen``: it
+    ``goose`` (ACP) is excluded for the same reason as ``qwen``: it
     authenticates from Goose's own config (``goose configure``), not the shared
     gateway/profile probe wiring, so ``_build_goose_spawn_env`` emits no
     ``HARNESS_GOOSE_GATEWAY*`` vars for this matrix to drive. Its live round-trip
@@ -184,24 +184,20 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     registers in the ``acp:`` config block, so there is nothing for this
     binary-less no-agent matrix to probe.
 
-    ``goose-native`` is excluded for the same reason as ``claude-native`` /
-    ``cursor-native``: it is a terminal-first TUI launched via ``omni goose``
-    (tmux pane + bridge dir), not ``omnigent run --harness goose-native``.
-
     ``antigravity-native`` is excluded for the union of both reasons above: it
     is a terminal-first TUI launched via ``omnigent antigravity`` (runner-owned
     agy tmux pane + bridge dir), not ``omnigent run --harness antigravity-native``,
     AND it is Gemini-native (agy authenticates via Google OAuth, not the shared
     Databricks gateway/profile probe wiring this matrix drives).
 
-    ``qwen-native`` is excluded for the same reason as ``goose-native`` /
+    ``qwen-native`` is excluded for the same reason as ``claude-native`` /
     ``cursor-native``: it is a terminal-first TUI launched via ``omni qwen``
     (tmux pane + bridge dir, driving qwen's ``--input-file`` / ``--json-file``),
     not ``omnigent run --harness qwen-native``. Its coverage is the dedicated
     qwen-native bridge/executor/forwarder unit tests.
 
-    ``kiro-native`` is excluded for the same reason as ``goose-native`` /
-    ``qwen-native`` / ``cursor-native``: it is a terminal-first TUI launched via
+    ``kiro-native`` is excluded for the same reason as ``qwen-native`` /
+    ``cursor-native``: it is a terminal-first TUI launched via
     ``omni kiro`` (tmux pane + bridge dir), not ``omnigent run --harness
     kiro-native``. Its coverage is the dedicated kiro-native bridge/executor/
     forwarder unit tests plus the ``test_native_kiro_render_parity`` e2e_ui suite.
@@ -211,8 +207,8 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     authenticates through ``kimi login`` (OAuth or a Moonshot API key), not the
     shared Databricks gateway/profile probe wiring this matrix drives.
 
-    ``kimi-native`` is excluded for the same reason as ``goose-native`` /
-    ``qwen-native`` / ``kiro-native``: it is a terminal-first TUI launched via
+    ``kimi-native`` is excluded for the same reason as ``qwen-native`` /
+    ``kiro-native``: it is a terminal-first TUI launched via
     ``omni kimi`` (tmux pane + bridge dir), not ``omnigent run --harness
     kimi-native``. Its coverage is the dedicated kimi-native bridge/executor/
     forwarder/approval unit tests plus the Kimi picker e2e_ui suite.
@@ -248,7 +244,6 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "qwen",
         "qwen-native",
         "goose",
-        "goose-native",
         "kiro-native",
         "kimi",
         "kimi-native",

@@ -60,7 +60,6 @@ PI_NATIVE_TERMINAL_ROLE = "pi-native"
 OPENCODE_NATIVE_TERMINAL_ROLE = "opencode-native"
 CURSOR_NATIVE_TERMINAL_ROLE = "cursor-native"
 KIRO_NATIVE_TERMINAL_ROLE = "kiro-native"
-GOOSE_NATIVE_TERMINAL_ROLE = "goose-native"
 # Role marker for the runner-owned native Antigravity (agy) TUI terminal.
 # A generic terminal launched with ``terminal=antigravity`` shares the same
 # public resource id, so the ensure path uses this private marker to tell a
@@ -1164,9 +1163,6 @@ class SessionResourceRegistry:
             # status source. Without this the web "Working…" badge never clears.
             CURSOR_NATIVE_TERMINAL_ROLE,
             KIRO_NATIVE_TERMINAL_ROLE,
-            # goose-native injects then returns (its forwarder only mirrors the
-            # transcript, not status), so the PTY watcher is its status source too.
-            GOOSE_NATIVE_TERMINAL_ROLE,
             # qwen-native appends then returns (its forwarder only mirrors the
             # JSON event transcript, not status), so the PTY watcher is its
             # status source too.

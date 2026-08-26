@@ -9,7 +9,7 @@ that input file, which qwen's ``RemoteInputWatcher`` routes through the same
 terminal-originated; the embedded terminal renders it live and
 :mod:`omnigent.qwen_native_forwarder` mirrors the JSON event stream.
 
-Unlike goose-/cursor-native (tmux ``send-keys``), injection here is an atomic
+Unlike cursor-/hermes-native (tmux ``send-keys``), injection here is an atomic
 file append — no settle-detection, paste-commit polling, or draft-clearing. See
 ``docs/QWEN_NATIVE_DESIGN.md``.
 """
@@ -159,7 +159,7 @@ def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
     Text blocks are extracted directly. Image/file blocks carrying a base64 data
     URI are materialized to the bridge dir and referenced by absolute path
     (``[Attached: <path>]``) so qwen can open them with its tools — otherwise
-    web-UI attachments are silently dropped. Mirrors goose-/cursor-native.
+    web-UI attachments are silently dropped. Mirrors cursor-/hermes-native.
     """
     if isinstance(content, str):
         return content

@@ -3345,7 +3345,7 @@ async def test_events_stop_session_on_kiro_native_kills_tmux_and_publishes_idle(
 ) -> None:
     """stop_session on a kiro-native session kills the tmux pane and clears the spinner.
 
-    Mirrors the goose/claude-native stop path: route to
+    Mirrors the hermes/claude-native stop path: route to
     ``kiro_native_bridge.kill_session`` and enqueue exactly one
     ``session.status: idle`` (kiro-cli has no Stop hook on a hard kill).
     """

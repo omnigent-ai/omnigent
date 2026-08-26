@@ -1,6 +1,6 @@
 """Unit tests for the omni qwen CLI-side helpers (no server needed).
 
-Mirrors ``tests/test_goose_native.py`` and adds qwen-specific pure helpers
+Mirrors ``tests/test_hermes_native.py`` and adds qwen-specific pure helpers
 (agent-spec materialization, terminal-payload decoding, direct-tmux preflight).
 """
 

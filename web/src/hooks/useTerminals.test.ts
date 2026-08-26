@@ -703,12 +703,6 @@ describe("inventoryTerminals", () => {
     session: "main",
     running: true,
   };
-  const goosePane: TerminalInfo = {
-    id: "terminal_goose_main",
-    name: "goose",
-    session: "main",
-    running: true,
-  };
   const qwenPane: TerminalInfo = {
     id: "terminal_qwen_main",
     name: "qwen",
@@ -761,20 +755,11 @@ describe("inventoryTerminals", () => {
     expect(inventoryTerminals([kiroPane, bash], true)).toEqual([bash]);
   });
 
-  it("drops the goose vendor pane for native Goose sessions", () => {
-    // Regression: terminal_goose_main was missing from AGENT_TERMINAL_IDS, so
-    // the goose TUI pane leaked into the Shells inventory and (via isShellView)
-    // opened as a plain shell while hiding the Chat/Terminal pill — same failure
-    // mode as the pi/cursor panes above.
-    expect(inventoryTerminals([goosePane, bash], true)).toEqual([bash]);
-    expect(isAgentTerminalKey("terminal:terminal_goose_main")).toBe(true);
-  });
-
   it("drops the qwen vendor pane for native Qwen sessions", () => {
     // Regression: terminal_qwen_main was missing from AGENT_TERMINAL_IDS, so
     // clicking Terminal opened the qwen TUI pane as a plain shell (shell-header
     // chrome) while hiding the Chat/Terminal pill via isShellView — same failure
-    // mode as the pi/cursor/goose panes above.
+    // mode as the pi/cursor panes above.
     expect(inventoryTerminals([qwenPane, bash], true)).toEqual([bash]);
     expect(isAgentTerminalKey("terminal:terminal_qwen_main")).toBe(true);
   });
@@ -791,7 +776,7 @@ describe("inventoryTerminals", () => {
     // Regression: terminal_hermes_main was missing from AGENT_TERMINAL_IDS, so
     // the hermes TUI pane leaked into the Shells inventory and (via isShellView)
     // opened as a plain shell while hiding the Chat/Terminal pill — same failure
-    // mode as the pi/cursor/goose/qwen panes above.
+    // mode as the pi/cursor/qwen panes above.
     expect(inventoryTerminals([hermesPane, bash], true)).toEqual([bash]);
     expect(isAgentTerminalKey("terminal:terminal_hermes_main")).toBe(true);
   });
@@ -801,7 +786,7 @@ describe("inventoryTerminals", () => {
     // AGENT_TERMINAL_IDS, so the agy TUI pane leaked into the Shells inventory
     // and (via isShellView) hid the Chat/Terminal pill in Terminal view —
     // stranding the user with no way back to Chat. Same failure mode as the
-    // pi/cursor/goose/qwen panes above.
+    // pi/cursor/qwen panes above.
     expect(inventoryTerminals([antigravityPane, bash], true)).toEqual([bash]);
     expect(isAgentTerminalKey("terminal:terminal_antigravity_main")).toBe(true);
   });
@@ -846,9 +831,8 @@ describe("isAgentTerminalKey", () => {
     expect(isAgentTerminalKey("terminal:terminal_pi_main")).toBe(true);
     // cursor-native: same regression class as pi above.
     expect(isAgentTerminalKey("terminal:terminal_cursor_main")).toBe(true);
-    // kiro-/goose-/qwen-native: same regression class as cursor/pi above.
+    // kiro-/qwen-native: same regression class as cursor/pi above.
     expect(isAgentTerminalKey("terminal:terminal_kiro_main")).toBe(true);
-    expect(isAgentTerminalKey("terminal:terminal_goose_main")).toBe(true);
     expect(isAgentTerminalKey("terminal:terminal_qwen_main")).toBe(true);
   });
 

@@ -301,7 +301,7 @@ export interface ConversationState {
   isNativeTerminalSession: boolean;
   /**
    * Whether this is a native-terminal wrapper whose model is chosen inside the
-   * vendor TUI (qwen/goose/cursor/pi/opencode) rather than through an Omnigent
+   * vendor TUI (qwen/cursor/pi/opencode) rather than through an Omnigent
    * model picker. The composer status line hides its model/effort label for
    * these — Omnigent's bound `llmModel` is just an unused default (it would
    * otherwise read e.g. "claude-sonnet-4-6" on a Qwen session). claude-/codex-
@@ -2942,7 +2942,7 @@ function sessionBindingPatch(
   return {
     isNativeTerminalSession: isNativeWrapper(wrapper),
     // Native wrapper whose model lives in the vendor TUI (no Omnigent picker):
-    // qwen/goose/cursor/pi/opencode. nativeModelFamilyForSession is non-null
+    // qwen/cursor/pi/opencode. nativeModelFamilyForSession is non-null
     // only for claude-/codex-native, which keep the composer model label.
     nativeVendorOwnsModel:
       isNativeWrapper(wrapper) && nativeModelFamilyForSession(session) === null,

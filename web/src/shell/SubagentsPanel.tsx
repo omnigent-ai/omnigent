@@ -311,7 +311,6 @@ function brandChildIcon(child: ChildSessionInfo): AgentRowIcon | null {
   if (nativeAgent?.iconKind === "cursor") return CursorIcon;
   if (nativeAgent?.iconKind === "kiro") return KiroIcon;
   if (nativeAgent?.iconKind === "antigravity") return AntigravityIcon;
-  if (nativeAgent?.iconKind === "goose") return GooseIcon;
   if (nativeAgent?.iconKind === "kimi") return KimiIcon;
   if (nativeAgent?.iconKind === "hermes") return HermesIcon;
   // Exact match — substring checks would false-match names like "pipeline".

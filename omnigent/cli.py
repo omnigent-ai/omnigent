@@ -5810,6 +5810,39 @@ def debby(run_args: tuple[str, ...]) -> None:
     _run_bundled_agent("debby", run_args)
 
 
+@cli.command(
+    context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
+@click.argument("run_args", nargs=-1, type=click.UNPROCESSED)
+def goose(run_args: tuple[str, ...]) -> None:
+    # Param docs live in comments — Click uses the docstring for --help.
+    # :param run_args: Pass-through args for ``run``.
+    """Launch Goose with Omnigent.
+
+    Shorthand for ``omnigent run --harness goose``. Goose runs over the Agent
+    Client Protocol (``goose acp``) with no terminal pane, so Omnigent
+    policies, cost budgets and sandboxing apply to its tool calls. All ``run``
+    options are accepted and forwarded.
+
+    \b
+    Examples:
+      omnigent goose
+      omnigent goose -p "review the last commit"
+      omnigent goose --resume conv_abc123
+    """
+    # Re-dispatch through ``run``'s own parser so every ``run`` flag works
+    # unchanged without redeclaring its options; see :func:`_run_bundled_agent`
+    # for the prog_name / standalone_mode rationale, which applies verbatim.
+    run.main(
+        args=["--harness", "goose", *run_args],
+        prog_name="omnigent run",
+        standalone_mode=False,
+    )
+
+
 @cli.command()
 @click.argument("target", required=False, metavar="[CONV_ID]")
 @click.option(
@@ -6988,12 +7021,6 @@ _NATIVE_TERMINAL_DISPATCH_SPECS: dict[str, _NativeTerminalDispatchSpec] = {
         args_param="extra_args",
         model_strategy="first_class",
         prompt_param="prompt",
-    ),
-    "goose": _NativeTerminalDispatchSpec(
-        module="omnigent.goose_native",
-        function="run_goose_native",
-        args_param="extra_args",
-        model_strategy="explicit_passthrough",
     ),
     "antigravity": _NativeTerminalDispatchSpec(
         module="omnigent.antigravity_native",

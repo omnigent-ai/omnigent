@@ -4092,33 +4092,33 @@ def test_redirect_native_resume_covers_every_native_agent(
     """Every native wrapper redirects — the seam closed the old 6-of-11 gap.
 
     The hand-written dispatch only covered claude/codex/pi/kiro/cursor/kimi, so a
-    goose/hermes/antigravity/qwen/opencode resume fell through to the Omnigent
-    REPL and double-posted. Routing through the provider seam covers all of them;
-    goose stands in for the formerly-uncovered set here.
+    hermes/antigravity/qwen/opencode resume fell through to the Omnigent REPL
+    and double-posted. Routing through the provider seam covers all of them;
+    hermes stands in for the formerly-uncovered set here.
     """
-    from omnigent._wrapper_labels import GOOSE_NATIVE_WRAPPER_VALUE
+    from omnigent._wrapper_labels import HERMES_NATIVE_WRAPPER_VALUE
 
     monkeypatch.setattr(
         chat_module,
         "_wrapper_label_for_conversation",
-        lambda **_kw: GOOSE_NATIVE_WRAPPER_VALUE,
+        lambda **_kw: HERMES_NATIVE_WRAPPER_VALUE,
     )
     captured: dict[str, object] = {}
     monkeypatch.setattr(
-        "omnigent.goose_native.run_goose_native",
+        "omnigent.hermes_native.run_hermes_native",
         lambda **kwargs: captured.update(kwargs),
     )
 
     handled = chat_module._redirect_native_resume_if_needed(
         base_url="https://example.com",
-        conversation_id="conv_goose",
+        conversation_id="conv_hermes",
         auto_open_conversation=False,
     )
 
     assert handled is True
     assert captured == {
         "server": "https://example.com",
-        "session_id": "conv_goose",
+        "session_id": "conv_hermes",
         "extra_args": (),
         "auto_open_conversation": False,
     }

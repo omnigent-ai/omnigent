@@ -20,7 +20,7 @@ three properties:
 
 Gating
 ------
-Like goose-native, Hermes authenticates from its own config (``hermes setup`` /
+Like qwen-native, Hermes authenticates from its own config (``hermes setup`` /
 ``hermes model`` → ``~/.hermes/config.yaml``), which CI does not provision. The
 suite **skips** when ``hermes``/``tmux`` are absent or no Hermes config is
 present, and runs for real where Hermes is configured.

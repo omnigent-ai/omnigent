@@ -7,7 +7,7 @@ turn merely queues the latest user message into the bridge inbox for that
 extension to consume. The "LLM" is the out-of-process Pi TUI, so the happy
 path is verified by mocking the bridge sink (``enqueue_user_message``) and
 asserting the executor queues the right text and yields ``TurnComplete`` —
-the same shape the peer native ``test_goose_native_executor.py`` uses.
+the same shape the peer native ``test_qwen_native_executor.py`` uses.
 """
 
 from __future__ import annotations

@@ -2,7 +2,7 @@
 
 ``omnigent qwen`` launches Qwen Code's interactive TUI (``qwen``) inside an
 Omnigent-runner-owned tmux terminal and attaches the local TTY — the qwen analog
-of ``omnigent goose`` / ``omnigent cursor``. The runner spawns the process (see
+of ``omnigent hermes`` / ``omnigent cursor``. The runner spawns the process (see
 :func:`omnigent.runner.app._auto_create_qwen_terminal`), pointing qwen at the
 bridge dir's ``--input-file`` / ``--json-file`` so web-UI turns and the
 transcript mirror flow through files; this module owns the CLI-side
@@ -11,7 +11,7 @@ and the direct tmux attach.
 
 Auth is qwen's own configuration (OpenAI-compatible env vars, or the interactive
 ``/auth`` command persisted under ``~/.qwen``); no Omnigent-managed key is
-required. Like goose there is no extension bridge — the runner sets up the
+required. Like hermes there is no extension bridge — the runner sets up the
 terminal environment and the dual-output / input-file flags directly.
 """
 
@@ -97,7 +97,7 @@ class PreparedQwenTerminal:
         was reused (the live-reattach path: prior session intact).
     :param cold_resumed: ``True`` when resuming an existing Omnigent session whose
         terminal had already exited, so a *fresh* ``qwen`` TUI was launched.
-        Mirrors goose-native: ``cold_resumed`` and ``reattached`` are mutually
+        Mirrors hermes-native: ``cold_resumed`` and ``reattached`` are mutually
         exclusive (the cold-resume path leaves ``reattached`` False).
     """
 

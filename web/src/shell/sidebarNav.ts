@@ -117,7 +117,6 @@ export type ConversationIconKind =
   | "pi"
   | "cursor"
   | "kiro"
-  | "goose"
   | "antigravity"
   | "qwen"
   | "kimi"

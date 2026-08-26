@@ -20,7 +20,6 @@ from omnigent._wrapper_labels import (
     CLAUDE_NATIVE_WRAPPER_VALUE,
     CODEX_NATIVE_WRAPPER_VALUE,
     CURSOR_NATIVE_WRAPPER_VALUE,
-    GOOSE_NATIVE_WRAPPER_VALUE,
     HERMES_NATIVE_WRAPPER_VALUE,
     KIMI_NATIVE_WRAPPER_VALUE,
     KIRO_NATIVE_WRAPPER_VALUE,
@@ -199,15 +198,6 @@ KIRO_NATIVE_CODING_AGENT = NativeCodingAgent(
     terminal_name="kiro",
 )
 
-GOOSE_NATIVE_CODING_AGENT = NativeCodingAgent(
-    key="goose",
-    display_name="Goose",
-    agent_name="goose-native-ui",
-    harness="goose-native",
-    wrapper_label=GOOSE_NATIVE_WRAPPER_VALUE,
-    terminal_name="goose",
-)
-
 ANTIGRAVITY_NATIVE_CODING_AGENT = NativeCodingAgent(
     key="antigravity",
     display_name="Antigravity",
@@ -290,7 +280,6 @@ _BUILTIN_NATIVE_PROVIDERS: tuple[NativeHarnessProvider, ...] = tuple(
         OPENCODE_NATIVE_CODING_AGENT,
         CURSOR_NATIVE_CODING_AGENT,
         KIRO_NATIVE_CODING_AGENT,
-        GOOSE_NATIVE_CODING_AGENT,
         ANTIGRAVITY_NATIVE_CODING_AGENT,
         QWEN_NATIVE_CODING_AGENT,
         KIMI_NATIVE_CODING_AGENT,
@@ -417,20 +406,6 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         streaming=True,
         fork_history=_FH.NONE,
         shell_tool_name="run_command",
-        shell_tool_prompt=_SHELL_PROMPT,
-    ),
-    "goose-native": _C(
-        _IM.NATIVE_TUI,
-        _EL.APPROVAL_MIRROR,
-        _RS.WARM_REATTACH,
-        _EF.NONE,
-        _MF.MULTI,
-        _AU.OWN_AUTH,
-        subagents=False,
-        interrupt=True,
-        streaming=True,
-        fork_history=_FH.NONE,
-        shell_tool_name="developer__shell",
         shell_tool_prompt=_SHELL_PROMPT,
     ),
     # streaming=False is LIVE-VERIFIED: a bench run observed 0 text deltas.
@@ -675,7 +650,6 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "cursor",
             "cursor-native",
             "goose",
-            "goose-native",
             "hermes",
             "hermes-native",
             "kimi",
@@ -710,7 +684,6 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "cursor": "omnigent.inner.cursor_harness",
         "cursor-native": "omnigent.inner.cursor_native_harness",
         "goose": "omnigent.inner.goose_harness",
-        "goose-native": "omnigent.inner.goose_native_harness",
         "hermes": "omnigent.inner.hermes_harness",
         "hermes-native": "omnigent.inner.hermes_native_harness",
         "kimi": "omnigent.inner.kimi_harness",
@@ -730,10 +703,14 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "claude": "claude-sdk",
         "github-copilot": "copilot",
         "google-antigravity": "antigravity",
+        # Goose is ACP-only. The native TUI wrap was removed in 0.9.0 because
+        # Goose exposes no pre-tool hook, so Omnigent policies could not gate
+        # its tool calls; both native spellings now land on the ACP harness.
+        "goose-native": "goose",
         "kimi-code": "kimi",
         "native-agy": "antigravity-native",
         "native-antigravity": "antigravity-native",
-        "native-goose": "goose-native",
+        "native-goose": "goose",
         "native-hermes": "hermes-native",
         "native-kimi": "kimi-native",
         "native-kiro": "kiro-native",
@@ -751,7 +728,6 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "claude-native",
             "codex-native",
             "cursor-native",
-            "goose-native",
             "hermes-native",
             "kimi-native",
             "kiro-native",
@@ -760,7 +736,6 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "native-claude",
             "native-codex",
             "native-cursor",
-            "native-goose",
             "native-hermes",
             "native-kimi",
             "native-kiro",
@@ -779,7 +754,6 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         OPENCODE_NATIVE_CODING_AGENT,
         CURSOR_NATIVE_CODING_AGENT,
         KIRO_NATIVE_CODING_AGENT,
-        GOOSE_NATIVE_CODING_AGENT,
         ANTIGRAVITY_NATIVE_CODING_AGENT,
         QWEN_NATIVE_CODING_AGENT,
         KIMI_NATIVE_CODING_AGENT,
@@ -829,6 +803,9 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "codex": "Codex",
         "copilot": "Copilot",
         "cursor": "Cursor",
+        # Goose reaches the picker as a plain harness row: it has no native
+        # wrapper to surface it through ``native_agents``.
+        "goose": "Goose",
         "hermes": "Hermes",
         # openai-agents is intentionally omitted from the picker catalog: it
         # stays a valid harness for YAML specs (and the credential-free

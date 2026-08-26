@@ -6,7 +6,7 @@ the latest user message into that same tmux pane (bracketed paste + Enter), so t
 message appears in the running Hermes TUI (and, since the web UI embeds the pane,
 in both surfaces). Output is terminal-originated; the embedded terminal renders it
 live and the forwarder mirrors the transcript. Mirrors
-:class:`omnigent.inner.goose_native_executor.GooseNativeExecutor`.
+:class:`omnigent.inner.qwen_native_executor.QwenNativeExecutor`.
 """
 
 from __future__ import annotations
@@ -129,7 +129,7 @@ def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
     Text blocks are extracted directly. Image/file blocks carrying a base64 data
     URI are materialized to the bridge dir and referenced by absolute path
     (``[Attached: <path>]``) so Hermes can open them with its tools — otherwise
-    web-UI attachments are silently dropped. Mirrors goose-/cursor-native.
+    web-UI attachments are silently dropped. Mirrors qwen-/cursor-native.
     """
     if isinstance(content, str):
         return content

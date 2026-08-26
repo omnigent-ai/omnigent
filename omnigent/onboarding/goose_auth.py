@@ -26,7 +26,7 @@ from pathlib import Path
 
 from omnigent.onboarding.harness_install import GOOSE_KEY, harness_cli_installed
 
-#: Override for the goose binary path (mirrors omnigent.goose_native).
+#: Override for the goose binary path (see omnigent.harness_startup_config).
 _GOOSE_PATH_ENV = "OMNIGENT_GOOSE_PATH"
 #: ``goose info -v`` is local-only (no network), so a short timeout is ample.
 _INFO_TIMEOUT_S = 10.0

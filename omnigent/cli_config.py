@@ -2212,9 +2212,7 @@ def _manage_goose_harness() -> None:
     does not store a key through Omnigent. A missing CLI gates the drill-in
     (nothing to configure for a harness you can't run); Goose ships out-of-band
     (brew / curl, no npm package), so we show its install hint rather than
-    auto-installing. Serves both ``goose-native`` (TUI) and the headless
-    ``goose`` (ACP) harness — both launch the same ``goose`` binary and read the
-    same config.
+    auto-installing. Serves the ``goose`` harness, which drives ``goose acp``.
 
     :returns: None. Side effects: may launch the interactive ``goose configure``.
     """

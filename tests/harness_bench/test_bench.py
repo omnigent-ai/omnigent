@@ -959,7 +959,7 @@ async def test_native_provisioning_http_error_becomes_provisioning_error(
 ) -> None:
     """An HTTP failure in native provisioning surfaces as a ProvisioningError.
 
-    goose-native's terminal-ensure can 500 (the vendor cannot start a thread) —
+    A native terminal-ensure can 500 (the vendor cannot start a thread) —
     an environment/server-state gap, not a bench bug. __aenter__ must convert
     the raw httpx error into a ProvisioningError so run_harness logs it quietly
     (one INFO line) instead of dumping a traceback.

@@ -244,7 +244,6 @@ _EXPECTED_BUILTIN_AGENT_IDS = {
     "opencode-native-ui": "cf65137fc096a61a6434956c92093549",
     "cursor-native-ui": "a5fac3a24c1961af2dbb1cafe0a81425",
     "kiro-native-ui": "cc8fef6623a8792be9c039cf2673ce93",
-    "goose-native-ui": "93dd98c4a79bd26a1dd5dc592ee38afb",
     "antigravity-native-ui": "db097e89797b66fb7e30699813ae09d2",
     "qwen-native-ui": "2cffe181a2fc6cf417a49e1cf8b28d77",
     "kimi-native-ui": "9e7d109e7da66e8b5ed4ec3ecb54cef1",
@@ -257,7 +256,7 @@ def test_native_seed_ids_are_byte_stable() -> None:
 
     Guards the redeploy-safety invariant the seeding loop must preserve: the
     id is a hash of the agent name, so the set of names AND their ids must not
-    drift when the 11 hand-written seed helpers collapse into one loop.
+    drift when the hand-written seed helpers collapse into one loop.
     """
     from omnigent.db.utils import builtin_agent_id
     from omnigent.native_coding_agents import NATIVE_CODING_AGENTS

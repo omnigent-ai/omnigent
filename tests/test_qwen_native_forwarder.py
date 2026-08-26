@@ -1,6 +1,6 @@
 """Unit tests for the qwen-native bridge + forwarder (the file-based core).
 
-These cover the logic that diverges from goose-native: appending JSONL commands
+These cover the logic that diverges from hermes-native: appending JSONL commands
 to qwen's ``--input-file`` and parsing its ``--json-file`` stream-json events.
 The event shapes are pinned to ``qwen`` v0.18.1 (see ``docs/QWEN_NATIVE_DESIGN.md``).
 """

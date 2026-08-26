@@ -18,7 +18,7 @@
 //
 // Hence two predicates: forkTargetCarriesHistory (rebuild ∪ preamble ∪ SDK)
 // and switchTargetCarriesHistory (rebuild ∪ SDK — no preamble). Native
-// harnesses with no carry path (kiro/kimi/goose) are offered by neither; an
+// harnesses with no carry path (kiro/kimi) are offered by neither; an
 // unclassifiable harness (catalog harness=null) is conservatively dropped.
 
 /** Provider family a harness consumes, or null when unknown. */
@@ -61,7 +61,7 @@ export function harnessFamily(
  * subset of Python `NATIVE_HARNESSES` (`omnigent/harness_aliases.py`) that the
  * server gates in `_FORK_HISTORY_NATIVE_HARNESSES` /
  * `_CURSOR_FORK_HISTORY_HARNESSES` (`server/routes/sessions.py`). A native
- * harness that always starts fresh (e.g. goose-native) is intentionally absent
+ * harness that always starts fresh (e.g. kiro-native) is intentionally absent
  * so the picker doesn't promise history it would drop. All native-antigravity
  * spellings are included (the in-process `antigravity` SDK harness is NOT
  * native); qwen-native rebuilds qwen's on-disk chat recording from the copied
@@ -126,7 +126,7 @@ const PREAMBLE_FORK_HARNESSES: ReadonlySet<string> = new Set([
  * replays the transcript as context). Conservatively false for an
  * unclassifiable harness (the catalog can report harness=null when the bundle
  * failed to load) and for native harnesses with no carry path
- * (kiro/kimi/goose).
+ * (kiro/kimi).
  *
  * NOTE: the SDK branch is `harnessFamily(h) !== null`, which also matches the
  * one native harness that has a single family today — antigravity-native

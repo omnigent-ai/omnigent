@@ -126,12 +126,6 @@ _CURSOR_NATIVE_HARNESSES: frozenset[str] = frozenset({"cursor-native", "native-c
 # auth backend and no Omnigent provider family, so readiness is binary presence.
 _KIRO_NATIVE_HARNESSES: frozenset[str] = frozenset({"kiro-native", "native-kiro"})
 
-# Native Goose harnesses. Boot the ``goose session`` TUI (``omni goose``) and
-# can't launch without the ``goose`` binary on ``PATH`` — gate on it, like the
-# other native CLI harnesses. Goose owns its own auth (``goose configure``), so
-# there is no SDK variant or key to gate on.
-_GOOSE_NATIVE_HARNESSES: frozenset[str] = frozenset({"goose-native", "native-goose"})
-
 # Native Kimi TUI harnesses (``omnigent kimi``). Like the other native CLIs,
 # they wrap the resident ``kimi`` binary and can't launch without it on
 # ``PATH`` — gate on it. Distinct from the bare ``kimi`` SDK surface
@@ -227,7 +221,7 @@ def _harness_availability_core(harness: str) -> HarnessAvailability:
         return _installer_only_availability(CURSOR_KEY)
     if canonical in _KIRO_NATIVE_HARNESSES:
         return _installer_only_availability(KIRO_KEY)
-    if canonical in _GOOSE_NATIVE_HARNESSES or canonical == GOOSE_KEY:
+    if canonical == GOOSE_KEY:
         return _installer_only_availability(GOOSE_KEY)
     if canonical in _HERMES_NATIVE_HARNESSES or canonical == HERMES_KEY:
         return _installer_only_availability(HERMES_KEY)
@@ -536,13 +530,12 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     spellings.update(_OPENCODE_HARNESSES)
     spellings.update(_CURSOR_NATIVE_HARNESSES)
     spellings.update(_KIRO_NATIVE_HARNESSES)
-    spellings.update(_GOOSE_NATIVE_HARNESSES)
     spellings.update(_KIMI_NATIVE_HARNESSES)
     spellings.update(_HERMES_NATIVE_HARNESSES)
     spellings.update(_QWEN_HARNESSES)
     spellings.add(CURSOR_KEY)
     spellings.add(KIMI_SURFACE)
-    spellings.add(GOOSE_KEY)  # headless Goose (``goose acp``) gates on the goose binary
+    spellings.add(GOOSE_KEY)  # Goose (``goose acp``) gates on the goose binary
     spellings.add(HERMES_KEY)  # Hermes Agent wraps the ``hermes`` CLI
     spellings.add(COPILOT_KEY)
     availability_cache: dict[tuple[str, ...], HarnessAvailability] = {}

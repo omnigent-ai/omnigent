@@ -130,7 +130,7 @@ describe("forkTargetCarriesHistory", () => {
   // preamble) and no single provider family — forking into them would start
   // fresh, so the fork picker must not offer them. (qwen-native DOES carry —
   // it rebuilds from items — so it is intentionally absent here.)
-  it.each([["kiro-native"], ["kimi-native"], ["goose-native"]])(
+  it.each([["kiro-native"], ["kimi-native"]])(
     "native target %s without a carry path does NOT carry on fork",
     (target) => {
       expect(forkTargetCarriesHistory(target)).toBe(false);
@@ -184,7 +184,7 @@ describe("switchTargetCarriesHistory", () => {
   );
 
   // Native harnesses with no carry path are offered by neither picker.
-  it.each([["kiro-native"], ["kimi-native"], ["goose-native"]])(
+  it.each([["kiro-native"], ["kimi-native"]])(
     "native target %s without a carry path does NOT carry on switch",
     (target) => {
       expect(switchTargetCarriesHistory(target)).toBe(false);

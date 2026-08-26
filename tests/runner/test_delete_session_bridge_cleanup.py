@@ -4,7 +4,7 @@ Each native session's bridge dir holds a per-conversation bridge token + MCP
 config (secret material). ``DELETE /v1/sessions/{id}`` closes the pane but
 historically never removed this SEPARATE dir, so token-bearing
 ``/tmp/omnigent-*`` (and ``~/.omnigent``) dirs accumulated even on a clean
-delete. The delete path must now ``rmtree`` it — for ALL 11 native families,
+delete. The delete path must now ``rmtree`` it — for ALL 10 native families,
 not just the original 5.
 """
 
@@ -31,9 +31,6 @@ from omnigent.codex_native_bridge import (
 from omnigent.cursor_native_bridge import (
     bridge_dir_for_session_id as cursor_bridge_dir,
 )
-from omnigent.goose_native_bridge import (
-    bridge_dir_for_session_id as goose_bridge_dir,
-)
 from omnigent.hermes_native_bridge import (
     bridge_dir_for_session_id as hermes_bridge_dir,
 )
@@ -58,13 +55,12 @@ from tests.runner.helpers import NullServerClient
 # One resolver per native family — the session_id-keyed dir each harness leaves
 # behind. _delete_native_bridge_dirs falls back to session_id for every family
 # (label-rotated ids resolve to the same dir under the NullServerClient stub),
-# so keying purely on session_id exercises the cleanup for all 11.
+# so keying purely on session_id exercises the cleanup for all 10.
 BRIDGE_DIR_RESOLVERS: dict[str, Callable[[str], Path]] = {
     "antigravity": antigravity_bridge_dir,
     "claude": claude_bridge_dir,
     "codex": codex_bridge_dir,
     "cursor": cursor_bridge_dir,
-    "goose": goose_bridge_dir,
     "hermes": hermes_bridge_dir,
     "kimi": kimi_bridge_dir,
     "kiro": kiro_bridge_dir,
@@ -115,8 +111,8 @@ async def test_cleanup_resources_removes_native_bridge_dir(
     Server-side session delete drives ``DELETE /v1/sessions/{id}/resources``
     (``cleanup_session_resources``), NOT the bare ``DELETE /v1/sessions/{id}``
     route — so the token-bearing bridge dir must be removed there too, else the
-    #1350 leak persists in real deletes. All 11 native families create such a
-    dir, so all 11 must be cleaned up.
+    #1350 leak persists in real deletes. All 10 native families create such a
+    dir, so all 10 must be cleaned up.
     """
     session_id = f"conv_{uuid.uuid4().hex}"
     bridge_dir = BRIDGE_DIR_RESOLVERS[family](session_id)
