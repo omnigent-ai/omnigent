@@ -10,7 +10,7 @@ There are three surfaces, all writing the same rows.
 
 **Web UI.** Open the `/tasks` page (sidebar: *Automations*, or the command palette: *Go to Automations*). The create dialog takes the schedule, the agent, the prompt, and optionally a model and reasoning effort. Each row shows a live relative next-run time and the status of the last run.
 
-**REST API.** `POST /v1/scheduled-tasks`. Required: `name`, `prompt`, `rrule`, `agent_id`. Optional: `timezone` (defaults to `UTC`), `model_override`, `reasoning_effort`, `workspace`, `host_id`. Unknown fields are rejected. The two optional targeting fields are not independent: sending a `workspace` without a `host_id` is a 400 (`host_id required when workspace is set`), because only a host can resolve a path. Sending neither is fine -- the fire resolves both.
+**REST API.** `POST /v1/scheduled-tasks`. Required: `name`, `prompt`, `rrule`, `agent_id`. Optional: `timezone` (defaults to `UTC`), `model_override`, `reasoning_effort`, `permission_mode`, `max_cost_usd`, `workspace`, `host_id`. Unknown fields are rejected. The two optional targeting fields are not independent: sending a `workspace` without a `host_id` is a 400 (`host_id required when workspace is set`), because only a host can resolve a path. Sending neither is fine -- the fire resolves both.
 
 ```jsonc
 {
@@ -18,11 +18,17 @@ There are three surfaces, all writing the same rows.
   "prompt": "Triage issues opened since yesterday and post a summary.",
   "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
   "agent_id": "ag_...",
-  "timezone": "Asia/Tokyo"
+  "timezone": "Asia/Tokyo",
+  "permission_mode": "acceptEdits",
+  "max_cost_usd": 2.00
 }
 ```
 
-**Agent tools.** An agent can manage automations itself with `sys_scheduled_task_create`, `sys_scheduled_task_list`, `sys_scheduled_task_update`, and `sys_scheduled_task_delete` -- so an agent can schedule its own follow-up work.
+`permission_mode` is available only for Claude Code (`claude-native`) agents. It accepts `default`, `auto`, `acceptEdits`, `plan`, `dontAsk`, or `bypassPermissions`; omitting it uses the agent default. Automations are unattended, so prompting modes such as `default` and `plan` can leave a run waiting for approval. Choose an auto-running mode only when its permission level is appropriate for the task.
+
+`max_cost_usd` is a positive per-firing budget. Each fired session gets its own cap, and model calls are blocked after that session reaches it. Omit the field for no cap.
+
+**Agent tools.** An agent can manage automations itself with `sys_scheduled_task_create`, `sys_scheduled_task_list`, `sys_scheduled_task_update`, and `sys_scheduled_task_delete` -- so an agent can schedule its own follow-up work. The create and update tools expose the same `permission_mode` and `max_cost_usd` controls.
 
 ## Schedules are RRULEs, not cron
 
@@ -53,7 +59,7 @@ Two timing caveats are worth knowing:
 
 1. **The row is re-read.** The armed timer is never trusted. A task deleted or paused between arming and firing is a no-op.
 2. **The launch target is resolved.** A task with no pinned `host_id` uses the owner's most-recently-active live host, chosen at fire time. A task with no pinned `workspace` starts the runner in that host's home directory, which is what makes chat-only, research, and MCP-only automations possible. A pinned host that is missing or offline -- or an owner with no live host at all -- records a **failed** run rather than a running one (`error_code` `host_offline`, `host_not_found`, or `no_online_host`).
-3. **A session is created**, bound to the task's agent and carrying the resolved workspace and host plus any `model_override` and `reasoning_effort`.
+3. **A session is created**, bound to the task's agent and carrying the resolved workspace and host plus any `model_override`, `reasoning_effort`, and supported `permission_mode`. If `max_cost_usd` is set, a per-session cost-budget policy is attached before the prompt is dispatched.
 4. **Ownership is granted.** The new session gets a `LEVEL_OWNER` grant for the task's owner (a reserved local user in single-user and OSS deployments). Without the grant the run would be invisible.
 5. **The runner launches and the prompt is dispatched**, so the agent actually works. A seeded prompt with no launched runner would just sit in history.
 6. **The run is recorded** in `scheduled_task_runs`, and `last_run_at` and `last_run_conversation_id` are stamped on the task.
@@ -75,7 +81,7 @@ Firing is fire-and-forget: the guard steps run synchronously so a dead fire cost
 
 ## Lifecycle
 
-A task is `active`, `paused`, or `deleted`. `PATCH /v1/scheduled-tasks/{id}` changes any stored field and can move a task between `active` and `paused`; it cannot set `deleted` (use `DELETE`), and it never accepts an explicit `null` for `workspace` or `host_id` -- the rejection is on the presence of the key, so it applies even to a task where that field is currently unset. Omitting a field leaves it unchanged; there is no way to clear one.
+A task is `active`, `paused`, or `deleted`. `PATCH /v1/scheduled-tasks/{id}` changes any stored field and can move a task between `active` and `paused`; it cannot set `deleted` (use `DELETE`). Omitting a field leaves it unchanged. Sending `permission_mode: null` clears the permission override, and `max_cost_usd: null` clears the cost cap. An explicit `null` for `workspace` or `host_id` is rejected -- the rejection is on the presence of the key, so it applies even to a task where that field is currently unset; there is no way to clear either one.
 
 `POST /v1/scheduled-tasks/{id}/run` fires a task immediately and returns 202. It does not disturb the recurring schedule, which makes it the way to test a new automation without waiting for its next occurrence.
 
@@ -91,7 +97,7 @@ A task is `active`, `paused`, or `deleted`. `PATCH /v1/scheduled-tasks/{id}` cha
 | `POST` | `/v1/scheduled-tasks/{id}/run` | Run now (202). |
 | `GET` | `/v1/scheduled-tasks/{id}/runs` | Run history. |
 
-A task response carries `id`, `name`, `prompt`, `rrule`, `owner_user_id`, `agent_id`, `timezone`, `created_at`, `model_override`, `reasoning_effort`, `workspace`, `host_id`, `state`, `last_run_at`, `last_run_status`, `last_run_conversation_id`, `next_run_at`, and `updated_at`.
+A task response carries `id`, `name`, `prompt`, `rrule`, `owner_user_id`, `agent_id`, `timezone`, `created_at`, `model_override`, `reasoning_effort`, `permission_mode`, `max_cost_usd`, `workspace`, `host_id`, `state`, `last_run_at`, `last_run_status`, `last_run_conversation_id`, `next_run_at`, and `updated_at`.
 
 ## Current limits
 
