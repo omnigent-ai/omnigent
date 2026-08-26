@@ -11,6 +11,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, patch
 
 import httpx
+import pytest
 import pytest_asyncio
 
 from omnigent.db.utils import generate_agent_id
@@ -251,6 +252,50 @@ async def test_delete_proceeds_when_stop_fails(
         assert resp.json()["deleted"] is True
     finally:
         sessions_module._session_status_cache.pop(session_id, None)
+
+
+async def test_delete_session_calls_full_runner_teardown(
+    client: httpx.AsyncClient,
+    session_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Server-side delete calls DELETE /v1/sessions/{id} on the runner.
+
+    The old code called DELETE /v1/sessions/{id}/resources — the partial
+    cleanup endpoint — which left session caches and the live comment relay
+    alive after deletion. Full runner teardown must be invoked instead so
+    nothing outlives the session.
+    """
+    deleted_paths: list[str] = []
+
+    def _capture(request: httpx.Request) -> httpx.Response:
+        if request.method == "DELETE":
+            deleted_paths.append(request.url.path)
+        return httpx.Response(200, json={"deleted": True})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_capture),
+        base_url="http://runner",
+    )
+
+    async def _get_runner(session_id: str) -> httpx.AsyncClient:
+        return fake_runner
+
+    monkeypatch.setattr(
+        sessions_module,
+        "_get_runner_client_for_resource_access",
+        _get_runner,
+    )
+    try:
+        resp = await client.delete(f"/v1/sessions/{session_id}")
+        assert resp.status_code == 200
+        assert resp.json()["deleted"] is True
+    finally:
+        await fake_runner.aclose()
+
+    assert deleted_paths == [f"/v1/sessions/{session_id}"], (
+        f"server-side delete should call full runner teardown, got: {deleted_paths}"
+    )
 
 
 # ── PATCH /v1/sessions/{id} ─────────────────────────────────────────

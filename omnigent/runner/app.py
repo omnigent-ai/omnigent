@@ -2098,6 +2098,21 @@ def create_runner_app(
     _session_tool_schemas: dict[str, list[_JsonObject]] = {}  # session_id → cached tool schemas
     _session_mcp_spec_hash: dict[str, str] = {}  # session_id → last MCP spec hash
     _session_comment_relays: dict[str, _CommentRelayBinding] = {}
+
+    # Process-lifetime monotonic fill-generation counter per session id.
+    # Incremented (never popped) at delete_session so a fill parked across a
+    # delete→recreate of the same id sees a changed generation and discards its
+    # result instead of publishing stale data into the new session.
+    _session_cache_generations: dict[str, int] = {}
+
+    def _session_cache_generation(session_id: str) -> int:
+        """Return (and materialize) the generation a cache fill starts under."""
+        return _session_cache_generations.setdefault(session_id, 0)
+
+    def _session_cache_generation_is_current(session_id: str, generation: int) -> bool:
+        """True only when the captured generation still matches — fill may write."""
+        return _session_cache_generations.get(session_id, 0) == generation
+
     _codex_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _pi_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _opencode_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
@@ -2521,6 +2536,7 @@ def create_runner_app(
         if cached is not None:
             return cached
         lock = _session_snapshot_locks.setdefault(session_id, asyncio.Lock())
+        generation = _session_cache_generation(session_id)
         async with lock:
             cached = _session_snapshot_cache.get(session_id)
             if cached is not None:
@@ -2566,17 +2582,20 @@ def create_runner_app(
                 agent_name=agent_name,
             )
             if snapshot.ok and snapshot.agent_id is not None:
-                _session_snapshot_cache[session_id] = snapshot
+                if _session_cache_generation_is_current(session_id, generation):
+                    _session_snapshot_cache[session_id] = snapshot
             return snapshot
 
     async def _session_workspace_value(session_id: str) -> str | None:
         if session_id not in _session_workspace_cache:
+            generation = _session_cache_generation(session_id)
             snapshot = await _session_snapshot(session_id)
             # A failed fetch carries no workspace. Memoizing its ``None``
             # would pin the session to the global workspace for its lifetime.
             if not snapshot.ok:
                 return None
-            _session_workspace_cache[session_id] = snapshot.workspace
+            if _session_cache_generation_is_current(session_id, generation):
+                _session_workspace_cache[session_id] = snapshot.workspace
         return _session_workspace_cache.get(session_id)
 
     async def _session_runtime_cwd(session_id: str) -> Path | None:
@@ -3552,6 +3571,13 @@ def create_runner_app(
         from omnigent.runner.tool_dispatch import forget_spawn_family
 
         forget_spawn_family(session_id)
+
+        # Increment before clearing caches so in-flight fills see a changed
+        # generation and discard rather than repopulating entries for a dead
+        # (or reborn) session.
+        _session_cache_generations[session_id] = (
+            _session_cache_generations.get(session_id, 0) + 1
+        )
 
         _session_spec_cache.pop(session_id, None)
         _session_harness_overrides.pop(session_id, None)
@@ -8797,6 +8823,7 @@ def create_runner_app(
             _session_spec_cache[session_id] = None
             return None
         lock = _session_spec_locks.setdefault(session_id, asyncio.Lock())
+        generation = _session_cache_generation(session_id)
         async with lock:
             if session_id in _session_spec_cache:
                 return _session_spec_cache[session_id]
@@ -8834,7 +8861,8 @@ def create_runner_app(
                         _warn_unresolved_sub_agent(session_id, sub_agent_name)
                     else:
                         spec_entry = sub_entry
-            _session_spec_cache[session_id] = spec_entry
+            if _session_cache_generation_is_current(session_id, generation):
+                _session_spec_cache[session_id] = spec_entry
             return spec_entry
 
     async def _resolve_session_agent_spec(session_id: str) -> AgentSpec | None:
