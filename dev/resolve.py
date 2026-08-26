@@ -103,14 +103,27 @@ def parse_ci_run_url(url: str) -> dict[str, str] | None:
     return {"org": m.group(1), "repo": m.group(2), "run_id": m.group(3)}
 
 
-def build_payload(*, session: str | None, ci_link: str | None, skip_push: bool = False) -> str:
-    """Normalize the two input modes into the agent's ``-p`` JSON payload.
+def build_payload(
+    *,
+    session: str | None,
+    ci_link: str | None,
+    bug_url: str | None = None,
+    skip_push: bool = False,
+    public: bool = False,
+) -> str:
+    """Normalize the input modes into the agent's ``-p`` JSON payload.
 
     Exactly one of ``session`` / ``ci_link`` must be provided. ``session`` is
     normalized to a bare id; ``ci_link`` is passed through verbatim (the agent
-    parses the run itself). ``skip_push`` is only added to the payload when true
-    (author mode then commits locally but neither pushes nor opens a PR). Raises
-    ``ValueError`` if neither or both inputs are given, or one is unparseable.
+    parses the run itself). ``bug_url`` is *optional and additive*: when given it
+    is the **authoritative** bug the agent must resolve — the ``session`` /
+    ``ci_link`` run is then used only to recover the reproduction test + verdict,
+    and the agent must not resolve a different bug it happens to find on a shared
+    server. ``skip_push`` is only added to the payload when true (author mode
+    then commits locally but neither pushes nor opens a PR). ``public`` is added
+    when true (the agent shares the session public-read at start). Raises
+    ``ValueError`` if neither or both of session/ci_link are given, or one is
+    unparseable.
     """
     if bool(session) == bool(ci_link):
         raise ValueError("provide exactly one of a session reference or --ci-link")
@@ -122,8 +135,12 @@ def build_payload(*, session: str | None, ci_link: str | None, skip_push: bool =
         if parse_ci_run_url(ci_link) is None:
             raise ValueError(f"not a GitHub Actions run URL: {ci_link!r}")
         payload = {"ci_link": ci_link.strip()}
+    if bug_url and bug_url.strip():
+        payload["bug_url"] = bug_url.strip()
     if skip_push:
         payload["skip_push"] = True
+    if public:
+        payload["public"] = True
     return json.dumps(payload)
 
 
@@ -230,6 +247,16 @@ def _parse_args() -> argparse.Namespace:
         "agent recovers the verdict and test from the run's artifacts.",
     )
     p.add_argument(
+        "--bug-url",
+        dest="bug_url",
+        default=None,
+        help="Authoritative bug the reproduction is for (a GitHub issue or Linear "
+        "ticket URL). Optional; when set, the agent resolves EXACTLY this bug and "
+        "uses the session/ci-link run only to recover the test + verdict — it must "
+        "not resolve a different bug it finds on a shared server. Prevents the "
+        "agent mis-identifying the bug when many repro sessions share one server.",
+    )
+    p.add_argument(
         "--server",
         default=None,
         help="Omnigent server URL to run against. Omit to use the local server "
@@ -250,6 +277,13 @@ def _parse_args() -> argparse.Namespace:
         help="Skip the pre-launch confirmation. The resolve-agent pushes, opens a "
         "PR, or comments on an existing PR, so this authorizes those outward "
         "actions up front.",
+    )
+    p.add_argument(
+        "--public",
+        action="store_true",
+        help="Share the resolve session public-read (anyone who can reach the "
+        "server) right after it starts. Off by default — useful when running "
+        "against a shared --server so the session is spectatable while it works.",
     )
     return p.parse_args()
 
@@ -291,7 +325,11 @@ def main() -> None:
 
     try:
         payload = build_payload(
-            session=args.session, ci_link=args.ci_link, skip_push=args.skip_push
+            session=args.session,
+            ci_link=args.ci_link,
+            bug_url=args.bug_url,
+            skip_push=args.skip_push,
+            public=args.public,
         )
     except ValueError as exc:
         _die(str(exc))

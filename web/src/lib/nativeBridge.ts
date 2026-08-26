@@ -156,9 +156,9 @@ interface ElectronDesktopApi extends NativeShellApi {
    * idle, so the web never shows a (duplicate) banner. Absent on older shells.
    */
   updates?: ElectronUpdateBridge;
-  /** Current server origin + recent servers, or null on a foreign page. */
+  /** Current server origin + managed/recent choices, or null on a foreign page. */
   getServerPicker?: () => Promise<ServerPickerInfo | null>;
-  /** Re-point this window to a previously-connected server URL. */
+  /** Re-point this window to a server URL returned by the picker. */
   switchServer?: (url: string) => Promise<void>;
   /** Return this window to the shell's "connect to server" setup page. */
   openServerSetup?: () => void;
@@ -288,6 +288,11 @@ export interface ElectronUpdateBridge {
 export interface ServerPickerInfo {
   /** Origin this window is connected to, e.g. `"http://localhost:8000"`. */
   currentOrigin: string;
+  /**
+   * Server URLs supplied through macOS Managed Preferences. Optional because a
+   * newer server-served SPA can run inside a desktop shell that predates MDM.
+   */
+  managedServers?: string[];
   /** Recently-connected server URLs, most recent first. */
   recentServers: string[];
   /**
@@ -674,8 +679,8 @@ export function onNativeInsets(callback: (insets: NativeInsets) => void): () => 
 }
 
 /**
- * Fetch the title-bar server picker data from the Electron shell: the
- * window's current server origin plus the recently-connected server list.
+ * Fetch server picker data from the Electron shell: the current origin plus
+ * organization-provided and recently-connected server lists.
  *
  * Resolves `null` outside the Electron shell, under a shell too old to
  * support the picker, or on a page the shell doesn't recognize as a
@@ -693,9 +698,9 @@ export async function getServerPicker(): Promise<ServerPickerInfo | null> {
 }
 
 /**
- * Ask the Electron shell to re-point this window to another
- * previously-connected server URL (one of `ServerPickerInfo.recentServers`).
- * The shell navigates the whole window, so on success this page unloads.
+ * Ask the Electron shell to re-point this window to another URL returned in
+ * `ServerPickerInfo.managedServers` or `recentServers`. The shell navigates the
+ * whole window, so on success this page unloads.
  */
 export async function switchServer(url: string): Promise<void> {
   const electron = electronApi();

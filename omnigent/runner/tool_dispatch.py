@@ -1624,9 +1624,32 @@ def _find_subagent_spec(sub_agent_name: str, agent_spec: AgentSpec | None) -> Ag
     """
     if agent_spec is None:
         return None
-    for sub_agent in agent_spec.sub_agents:
-        if sub_agent.name == sub_agent_name:
+    # Defensive access: resolvers hand us legacy / test spec objects that are
+    # only structurally AgentSpec-shaped, and ``_has_subagent`` routes its
+    # existence check through here, so a stub without ``sub_agents`` must miss
+    # rather than raise.
+    for sub_agent in getattr(agent_spec, "sub_agents", None) or []:
+        if getattr(sub_agent, "name", None) == sub_agent_name:
             return sub_agent
+    # Built-in web_fetch researcher: ``WebFetchTool.__init__`` appends
+    # ``__web_researcher`` to the owner's live ``sub_agents`` in memory but
+    # never serializes it, so it is absent from the runner's re-parsed spec.
+    # Reconstruct it deterministically -- the same pure builder the
+    # child-boot resolver (``workflow.py::_find_spec_by_name``) uses -- so
+    # this lookup and the dispatch gate agree the sub-agent exists. Without
+    # it, ``_has_subagent`` returns True while ``_subagent_harness`` /
+    # ``_subagent_allowed_harnesses`` (both routed through here) return
+    # ``None``, i.e. the gate and the spec lookup disagree about the same
+    # name. Reconstruction is gated inside the helper on the tree actually
+    # declaring ``web_fetch``, so a caller-supplied name cannot coerce an
+    # arbitrary parent into a shell-capable researcher.
+    from omnigent.tools.builtins.web_fetch import (
+        RESEARCHER_NAME,
+        reconstruct_researcher_spec,
+    )
+
+    if sub_agent_name == RESEARCHER_NAME:
+        return reconstruct_researcher_spec(agent_spec)
     return None
 
 
@@ -3327,11 +3350,12 @@ def _has_subagent(
     """
     if agent_spec is None:
         return False
-    # AP-style spec: sub_agents list
-    sub_agents = getattr(agent_spec, "sub_agents", None) or []
-    for sa in sub_agents:
-        if getattr(sa, "name", None) == sub_agent_name:
-            return True
+    # AP-style spec: sub_agents list, including the synthesized
+    # ``__web_researcher``. Routed through the single resolver so the gate
+    # and every downstream harness / allowlist lookup agree about whether a
+    # name exists (see :func:`_find_subagent_spec`).
+    if _find_subagent_spec(sub_agent_name, agent_spec) is not None:
+        return True
     # Omnigent inner loader: tools dict with AgentTool entries
     tools = getattr(agent_spec, "tools", None)
     if isinstance(tools, dict) and sub_agent_name in tools:

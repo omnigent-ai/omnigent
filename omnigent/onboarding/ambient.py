@@ -34,6 +34,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from omnigent.env_credentials import getenv_nonempty_with_omnigent_prefix
 from omnigent.onboarding import codex_auth_readiness
@@ -61,6 +62,20 @@ _OLLAMA_URL = f"http://{_OLLAMA_HOST}:{_OLLAMA_PORT}"
 # Timeout (seconds) for the Ollama TCP probe — short so setup stays snappy
 # when nothing is listening.
 _OLLAMA_PROBE_TIMEOUT = 0.25
+
+# Claude Code's enterprise "managed settings" chain, highest precedence first.
+# An enterprise install (the shape ``isaac configure claude`` writes) configures
+# Claude Code here and nowhere else: an ``env`` block pinning
+# ``ANTHROPIC_BASE_URL`` at a gateway plus a top-level ``apiKeyHelper`` that
+# prints the bearer token. Managed settings win at Claude Code's own launch, so
+# this file alone is a complete, working credential — but it belongs to Claude
+# Code, not omnigent: we reflect it (readiness + label), we never adopt it into
+# a ``providers:`` shape (see ``claude_managed_gateway``).
+CLAUDE_CODE_MANAGED_SETTINGS_PATHS: tuple[Path, ...] = (
+    Path("/Library/Application Support/ClaudeCode/managed-settings.json"),
+    Path("/etc/claude-code/managed-settings.json"),
+    Path(os.environ.get("PROGRAMDATA", "C:/ProgramData")) / "ClaudeCode" / "managed-settings.json",
+)
 
 # Maps each provider whose env key we surface to the served model family.
 # Providers absent here (or mapped to ``None``) are reported with
@@ -455,6 +470,81 @@ def claude_auth_has_credential(creds_path: Path) -> bool:
     return False
 
 
+def claude_managed_gateway(
+    paths: tuple[Path, ...] | None = None,
+) -> tuple[str | None, bool]:
+    """Read the credential Claude Code applies from its managed settings chain.
+
+    The single canonical parser for Claude Code's managed-settings credential,
+    shared by ambient detection, the readiness gate, and the Smart-Routing
+    gateway check (:func:`omnigent.claude_native.managed_claude_gateway_signal`
+    delegates here). A credential counts as delivered when the file carries a
+    top-level ``apiKeyHelper`` (a token-printing command) or a truthy
+    ``env.CLAUDE_CODE_USE_GATEWAY``.
+
+    The **first readable, object-shaped** file decides, matching Claude Code's
+    own precedence: a settings file that exists but pins no credential reports
+    "none" rather than falling through to a lower-precedence file it would
+    itself override.
+
+    :param paths: Settings files to read, highest precedence first; defaults to
+        :data:`CLAUDE_CODE_MANAGED_SETTINGS_PATHS`.
+    :returns: ``(base_url, has_credential)`` from the first readable file, or
+        ``(None, False)`` when none is present or parseable. ``base_url`` is the
+        gateway ``env.ANTHROPIC_BASE_URL`` (``None`` when unset — a helper alone
+        credentials api.anthropic.com); ``has_credential`` is whether Claude
+        Code has a usable credential to apply at launch.
+    """
+    for path in CLAUDE_CODE_MANAGED_SETTINGS_PATHS if paths is None else paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        raw_env = payload.get("env")
+        env = raw_env if isinstance(raw_env, dict) else {}
+        raw_base_url = env.get("ANTHROPIC_BASE_URL")
+        base_url = raw_base_url.strip() if isinstance(raw_base_url, str) else None
+        has_helper = bool(payload.get("apiKeyHelper"))
+        use_gateway = str(env.get("CLAUDE_CODE_USE_GATEWAY", "")).strip().lower() not in (
+            "",
+            "0",
+            "false",
+        )
+        return base_url or None, has_helper or use_gateway
+    return None, False
+
+
+def claude_managed_gateway_display_name(paths: tuple[Path, ...] | None = None) -> str | None:
+    """A human label for the managed-settings credential, when one is delivered.
+
+    Used by the setup / ``/model`` display layer to show the Claude credential
+    as its actual backing (e.g. ``"Databricks AI Gateway"``) rather than the
+    generic ``"Subscription"``. Purely a display derivation from live managed
+    settings — nothing is persisted.
+
+    :param paths: Settings files to read; defaults to
+        :data:`CLAUDE_CODE_MANAGED_SETTINGS_PATHS`.
+    :returns: ``"Databricks AI Gateway"`` for a recognized Databricks gateway,
+        the gateway host for another gateway, ``"Claude Code gateway"`` for a
+        credential with no pinned base URL, or ``None`` when no credential is
+        delivered.
+    """
+    base_url, has_credential = claude_managed_gateway(paths)
+    if not has_credential:
+        return None
+    if base_url is None:
+        return "Claude Code gateway"
+    # Lazy: the gateway-URL allowlist lives in its own module and is only
+    # needed once a base URL is actually present.
+    from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
+
+    if is_databricks_ai_gateway_url(base_url):
+        return "Databricks AI Gateway"
+    return urlsplit(base_url).hostname or "Claude Code gateway"
+
+
 def _claude_login_detected() -> bool:
     """Return whether a usable Claude Code subscription login is present.
 
@@ -640,12 +730,27 @@ def _detect_providers_now() -> list[DetectedProvider]:
             )
         )
 
-    # 2. Claude CLI login. Like codex (below), existence alone is not enough —
-    #    an empty / logged-out ``.credentials.json`` carries no usable login.
-    #    On macOS the credential lives in the Keychain rather than the file, so
-    #    detection falls back to the CLI's own status check there. See
-    #    ``_claude_login_detected`` / ``claude_auth_has_credential``.
-    if _claude_login_detected():
+    # 2. Claude Code credential. Prefer the managed-settings gateway — read
+    #    straight from the enterprise settings file (no subprocess, works on
+    #    Linux where there is no Keychain, and it is what Claude Code actually
+    #    applies at launch). Fall back to a CLI login otherwise (which on macOS
+    #    reads the Keychain via ``claude auth status``). Either way it is
+    #    surfaced as a ``subscription``: the credential lives in Claude Code's
+    #    own files and Claude Code applies it itself, so omnigent must NOT adopt
+    #    a gateway/cli-config provider shape for it — native routing defers to
+    #    Claude Code's settings (a subscription resolves to "no override"), and
+    #    the in-process SDK falls back to its own auth. Persisting a new shape
+    #    here is exactly what a released/stale runner's parser rejects.
+    if claude_managed_gateway()[1]:
+        detected.append(
+            DetectedProvider(
+                name="claude",
+                kind=SUBSCRIPTION_KIND,
+                family=ANTHROPIC_FAMILY,
+                source="Claude Code managed settings",
+            )
+        )
+    elif _claude_login_detected():
         detected.append(
             DetectedProvider(
                 name="claude",

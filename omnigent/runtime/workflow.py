@@ -2929,7 +2929,8 @@ def _find_spec_by_name(
     The owning node need not be the root: a nested sub-agent may own
     ``web_fetch`` while the handed-in root does not. The gate locates the
     ``web_fetch`` owner via a root-first pre-order walk
-    (:func:`_find_web_fetch_owner`) and reconstructs from THAT owner, not the
+    (:func:`omnigent.tools.builtins.web_fetch.find_web_fetch_owner`) and
+    reconstructs from THAT owner, not the
     root, so the researcher inherits the owner's LLM and sandbox/egress
     boundary (``build_researcher_spec`` derives both from its argument). When
     several nodes own ``web_fetch`` the first pre-order owner wins; this is a
@@ -2956,35 +2957,13 @@ def _find_spec_by_name(
     # so reconstruct from the owner (root-first pre-order) — never the root —
     # to inherit the owner's LLM and sandbox/egress boundary. Imported lazily
     # to keep the tools layer off this module's import path.
-    from omnigent.tools.builtins.web_fetch import RESEARCHER_NAME
+    from omnigent.tools.builtins.web_fetch import (
+        RESEARCHER_NAME,
+        reconstruct_researcher_spec,
+    )
 
     if name == RESEARCHER_NAME:
-        owner = _find_web_fetch_owner(spec)
-        if owner is not None:
-            from omnigent.tools.builtins.web_fetch import build_researcher_spec
-
-            return build_researcher_spec(owner)
-    return None
-
-
-def _find_web_fetch_owner(spec: AgentSpec) -> AgentSpec | None:
-    """
-    Find the first node owning the ``web_fetch`` builtin, root-first.
-
-    Pre-order DFS (root, then children left-to-right), mirroring
-    :func:`_search_sub_agent_tree`. The ``web_fetch`` owner is the node whose
-    ``tools.builtins`` carries an entry named ``web_fetch``; that node's spec
-    is the correct parent for ``build_researcher_spec`` (its LLM + sandbox).
-
-    :param spec: The agent spec whose sub-tree to search.
-    :returns: The first node (root-first) owning ``web_fetch``, or ``None``.
-    """
-    if any(entry.name == "web_fetch" for entry in spec.tools.builtins):
-        return spec
-    for sa in spec.sub_agents:
-        owner = _find_web_fetch_owner(sa)
-        if owner is not None:
-            return owner
+        return reconstruct_researcher_spec(spec)
     return None
 
 

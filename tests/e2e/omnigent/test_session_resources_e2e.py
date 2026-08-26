@@ -561,7 +561,7 @@ def test_direct_attach_e2e(
             # bridge seeds the current pane and echoes typed input, so
             # typing into the REPL composer must come back as output.
             async with websockets.connect(
-                f"{direct_url}&transport=control",
+                direct_url,
                 origin=base_url,
             ) as ws:
                 await ws.send(json.dumps({"type": "resize", "cols": 100, "rows": 30}))

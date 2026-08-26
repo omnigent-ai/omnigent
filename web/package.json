@@ -9,6 +9,8 @@
     "build:embed": "vite build --config vite.embed.config.ts",
     "type-check": "tsc -b",
     "preview": "vite preview",
+    "storybook": "storybook dev -p 6006 --no-open",
+    "build:storybook": "storybook build --output-dir storybook-static",
     "lint": "oxlint --deny-warnings --report-unused-disable-directives .",
     "lint:fix": "oxlint --fix .",
     "format": "prettier --write .",
@@ -100,6 +102,7 @@
     "zustand": "^5.0.12"
   },
   "devDependencies": {
+    "@storybook/react-vite": "^10.5.9",
     "@tailwindcss/vite": "^4.2.4",
     "@testing-library/dom": "^10.4.1",
     "@testing-library/jest-dom": "^6.9.1",
@@ -117,6 +120,7 @@
     "oxlint": "^1.62.0",
     "postcss": "^8.5.18",
     "prettier": "^3.8.3",
+    "storybook": "^10.5.9",
     "tailwindcss": "^4.2.4",
     "typescript": "~6.0.2",
     "vite": "^8.0.10",

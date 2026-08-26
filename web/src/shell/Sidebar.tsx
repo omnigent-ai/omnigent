@@ -2529,7 +2529,8 @@ function SectionGroup({
   collapsed: boolean;
   onToggleCollapsed: () => void;
   /** Optional control overlaid at the group header's right edge (e.g. the
-      "collapse all projects" toggle). Hover/focus-revealed on desktop. */
+      "collapse all projects" toggle). Always shown without hover support and
+      hover/focus-revealed on hover-capable desktop displays. */
   headerAction?: ReactNode;
   /** Optional content rendered directly under the header, above the children
       (and shown even when collapsed) — e.g. the bulk-selection action bar. */
@@ -2546,14 +2547,15 @@ function SectionGroup({
           onToggleCollapsed={onToggleCollapsed}
         />
         {headerAction && (
-          // Always visible on mobile (no hover there, and the "New project"
-          // control lives here — the only way to create a project). On desktop
-          // it's hover/keyboard-focus-revealed: a group-level control is a
-          // pointer convenience there. Reveal on :focus-visible (keyboard) — NOT
+          // Always visible without hover support (no hover on phones or touch
+          // tablets, and the "New project" control lives here — the only way to
+          // create a project). On hover-capable desktop displays it's
+          // hover/keyboard-focus-revealed: a group-level control is a pointer
+          // convenience there. Reveal on :focus-visible (keyboard) — NOT
           // :focus-within — so clicking the button with the mouse doesn't leave
           // it stuck visible: React reuses the same node when it swaps
           // expand↔revert, so the clicked button keeps focus afterward.
-          <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center transition-opacity md:opacity-0 md:has-[:focus-visible]:opacity-100 md:group-has-[[data-state=open]]/header:opacity-100 md:group-hover/header:opacity-100">
+          <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center transition-opacity [@media(hover:hover)]:md:opacity-0 [@media(hover:hover)]:md:has-[:focus-visible]:opacity-100 [@media(hover:hover)]:md:group-has-[[data-state=open]]/header:opacity-100 [@media(hover:hover)]:md:group-hover/header:opacity-100">
             {headerAction}
           </div>
         )}

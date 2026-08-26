@@ -99,40 +99,6 @@ describe("terminalInfoFromResource", () => {
     expect(info).toBeNull();
   });
 
-  it("lifts metadata.terminal_transport, defaulting to undefined for unknown values", () => {
-    const control = terminalInfoFromResource({
-      id: "terminal_bash_s1",
-      type: "terminal",
-      name: "bash:s1",
-      metadata: { terminal_transport: "control" },
-    });
-    expect(control?.transport).toBe("control");
-
-    const pty = terminalInfoFromResource({
-      id: "terminal_bash_s1",
-      type: "terminal",
-      name: "bash:s1",
-      metadata: { terminal_transport: "pty" },
-    });
-    expect(pty?.transport).toBe("pty");
-
-    // Absent or unrecognized → undefined (frontend treats as legacy PTY).
-    const legacy = terminalInfoFromResource({
-      id: "terminal_bash_s1",
-      type: "terminal",
-      name: "bash:s1",
-      metadata: {},
-    });
-    expect(legacy?.transport).toBeUndefined();
-    const junk = terminalInfoFromResource({
-      id: "terminal_bash_s1",
-      type: "terminal",
-      name: "bash:s1",
-      metadata: { terminal_transport: "garbage" },
-    });
-    expect(junk?.transport).toBeUndefined();
-  });
-
   it("lifts metadata.direct_attach_url only for loopback ws:// URLs", () => {
     const direct = terminalInfoFromResource({
       id: "terminal_bash_s1",
@@ -169,10 +135,8 @@ describe("direct attach URL helpers", () => {
 
   it("withAttachParams appends per-attach params after the token", () => {
     const base = "ws://127.0.0.1:54321/v1/x/attach?token=t";
-    expect(withAttachParams(base, false, undefined)).toBe(base);
-    expect(withAttachParams(base, true, undefined)).toBe(`${base}&read_only=true`);
-    expect(withAttachParams(base, false, "control")).toBe(`${base}&transport=control`);
-    expect(withAttachParams(base, true, "pty")).toBe(`${base}&read_only=true&transport=pty`);
+    expect(withAttachParams(base, false)).toBe(base);
+    expect(withAttachParams(base, true)).toBe(`${base}&read_only=true`);
   });
 
   it("directProbeUrl swaps the path for /probe and keeps the token", () => {
