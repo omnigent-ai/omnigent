@@ -467,6 +467,15 @@
   background: var(--sidebar);
 }
 
+/* A desktop peek floats over the chat instead of pushing it aside, so its
+ * gradient layers need an opaque base rather than the translucent card color. */
+:root:not(.dark):not([data-theme]) .conversations-sidebar.is-peek,
+:root:not(.dark)[data-theme] .conversations-sidebar.is-peek,
+.dark:not([data-theme]) .conversations-sidebar.is-peek,
+.dark[data-theme] .conversations-sidebar.is-peek {
+  background-color: var(--card-solid);
+}
+
 /* Edge treatment is mode-specific but palette-independent. */
 html:not(.dark) .conversations-sidebar:not(.is-peek) {
   border-right: none;
@@ -828,10 +837,10 @@ aside[aria-label="Workspace"][data-maximized] {
   /* Leading-edge shadow so the drawer reads as a native layer lifted above the
      chat while it slides, instead of a flat sheet. Scoped to the open/dragging
      state via `:not([data-collapsed])` (the sidebar sets `data-collapsed` only
-     when closed) so the full-bleed overlay doesn't cast a sliver along the
-     screen's left edge while parked off-screen. It's visible only mid-slide and
-     mid-drag — fully open the drawer covers the viewport, so its right edge (and
-     the shadow) sit past the screen. iOS-only: the web overlay is unchanged. */
+     when closed) so the drawer doesn't cast a sliver along the screen's left
+     edge while parked off-screen. The drawer stops short of the right edge, so
+     the shadow stays visible while open, separating it from the strip of chat
+     behind. iOS-only: the web overlay is unchanged. */
   :is([data-ios-native], [data-android-native]) .conversations-sidebar:not([data-collapsed]) {
     box-shadow: 8px 0 28px -6px rgb(0 0 0 / 0.22);
   }
@@ -930,8 +939,7 @@ aside[aria-label="Workspace"][data-maximized] {
       [data-testid="file-viewer"],
       [data-testid="files-panel-drawer"],
       [data-testid="terminals-panel"],
-      [data-testid="subagents-panel-drawer"],
-      [data-testid="todos-panel-drawer"]
+      .mobile-panel-drawer
     ) {
     padding-top: var(--omnigent-safe-top);
     padding-bottom: var(--omnigent-safe-bottom);
@@ -941,6 +949,49 @@ aside[aria-label="Workspace"][data-maximized] {
 @media (width < 48rem) and (prefers-reduced-motion: reduce) {
   [data-ios-native] .conversations-sidebar {
     transition-duration: 1ms;
+  }
+}
+
+/* Liquid glass for the mobile sidebar's two floating chips (Search at the top
+ * of the header row, Settings over the bottom of the session list) — the iOS
+ * control idiom.
+ *
+ * The rim, the specular top edge, and the drop shadow do the work, not the
+ * blur: the surface behind these chips is the sidebar's own near-flat card, so
+ * blurring it alone would leave nothing to see. The blur earns its keep on the
+ * Settings chip, which floats over the scrolling session list and frosts the
+ * row titles passing under it.
+ *
+ * Scoped to `width < 48rem` so the class is inert on desktop, where the same
+ * two icons are flat ghost buttons in the header row. Both chips share it so
+ * they can't drift apart again.
+ *
+ * Backdrop sampling stops at the sidebar: the `.conversations-sidebar` carries
+ * a translate for its slide, which makes it a backdrop root, so the chips frost
+ * the drawer's own content rather than the chat behind it — which is what we
+ * want. If WebKit drops the filter (it does, once a Radix popper opens — see
+ * `max-md:bg-card-solid` on the sidebar), the fill and rim still read as a
+ * chip. */
+@media (width < 48rem) {
+  .sidebar-glass-chip {
+    /* -webkit- must come BEFORE the unprefixed property: LightningCSS (vite
+     * build) collapses the pair and keeps only the last declaration. */
+    -webkit-backdrop-filter: blur(20px) saturate(180%);
+    backdrop-filter: blur(20px) saturate(180%);
+    background-color: rgba(255, 255, 255, 0.6);
+    border: 1px solid rgba(0, 0, 0, 0.06);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.8),
+      0 1px 2px rgba(0, 0, 0, 0.05),
+      0 6px 16px rgba(0, 0, 0, 0.07);
+  }
+
+  .dark .sidebar-glass-chip {
+    background-color: rgba(255, 255, 255, 0.1);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.12),
+      0 2px 10px rgba(0, 0, 0, 0.45);
   }
 }
 /* Share button — glassy pink effect (both modes). The vertical
@@ -992,6 +1043,7 @@ aside[aria-label="Workspace"][data-maximized] {
    * removes it — widening the layout viewport and every fixed-position
    * overlay with it. Scoped via :has so login/register/setup pages (outside
    * the shell) keep default document scrolling. */
+  html:has(.app-shell),
   body:has(.app-shell) {
     overflow: hidden;
   }

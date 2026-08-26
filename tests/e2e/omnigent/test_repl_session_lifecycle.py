@@ -178,6 +178,8 @@ def _repl_env(
     :returns: Environment dict for ``pexpect.spawn``.
     """
     env = dict(base_env)
+    # This process uses its per-test HOME for daemon state and logs.
+    env.pop("OMNIGENT_DATA_DIR", None)
     env["HOME"] = str(home)
     env["TERM"] = "xterm-256color"
     env["LINES"] = "40"

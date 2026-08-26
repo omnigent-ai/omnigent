@@ -245,12 +245,14 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         min_version=_CURSOR_MIN_VERSION,
     ),
     # Kimi Code CLI ships a single-binary ``kimi`` via a curl installer (no
-    # npm). ``kimi login`` is the interactive provider login (OAuth or a
-    # Moonshot API key). ``status_args`` is intentionally ``None``: kimi has
-    # no first-class "am I logged in?" exit-code probe — login state is
-    # inspected file-based via ``kimi_auth.kimi_login_detected`` instead. With
-    # ``None`` the login path runs every time the operator asks for it
-    # (interactive, so they can cancel if already authenticated).
+    # npm). ``kimi login`` is the interactive OAuth device flow (membership);
+    # pay-per-use users instead set a Kimi API key in
+    # ``~/.kimi-code/config.toml``. ``status_args`` is intentionally ``None``:
+    # kimi has no first-class "am I logged in?" exit-code probe — readiness is
+    # inspected file-based via ``kimi_auth.kimi_auth_configured`` instead (login
+    # credential OR configured API key). With ``None`` the login path runs every
+    # time the operator asks for it (interactive, so they can cancel if already
+    # authenticated).
     # ``logout_args`` is ``None`` because kimi has no ``kimi logout`` subcommand
     # (verified against kimi CLI v0.29.1 — ``kimi logout`` errors "unknown
     # command"), so ``harness_logout`` is a no-op for it (same as Qwen / agy).
@@ -337,12 +339,13 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     "native-cursor": CURSOR_KEY,
     "kiro-native": KIRO_KEY,
     "native-kiro": KIRO_KEY,
-    # The native agy TUI bridge wraps the ``agy`` CLI; both spellings map to
-    # the Gemini family's install spec. (The in-process ``antigravity`` SDK
-    # harness is deliberately absent — like the other SDK harnesses it needs no
-    # CLI binary.)
+    # The native agy TUI bridge wraps the ``agy`` CLI. The in-process
+    # ``antigravity`` SDK harness is deliberately absent because it needs no
+    # CLI binary.
     "antigravity-native": GEMINI_FAMILY,
     "native-antigravity": GEMINI_FAMILY,
+    "agy-native": GEMINI_FAMILY,
+    "native-agy": GEMINI_FAMILY,
     "goose-native": GOOSE_KEY,
     "native-goose": GOOSE_KEY,
     # Headless Goose (``harness: goose``, drives ``goose acp``) wraps the same

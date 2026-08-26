@@ -503,10 +503,11 @@ def test_sys_terminal_send_keys_drives_interactive(
     is the calls are scripted rather than chosen by a real LLM, so this
     does not prove a model would *decide* to drive the REPL with two
     sends — only that the server-side send/Enter/REPL plumbing works
-    when it does. Three reads (extra model round-trips) give the cold
-    ``python3`` interpreter time to boot and evaluate before capture;
-    the old e2e leaned on real-LLM "wait briefly" pauses for the same
-    reason.
+    when it does. Mock ``delay`` pauses before the second send and each
+    read give the cold ``python3`` interpreter real wall-clock time to
+    boot and evaluate before capture; the old e2e leaned on real-LLM
+    "wait briefly" pauses for the same reason, and back-to-back mock
+    responses on a loaded CI runner reintroduced the race the delays fix.
     """
     session_id, model_name = terminal_session
     term = {"terminal": "bash", "session": "pyrepl"}
@@ -527,10 +528,19 @@ def test_sys_terminal_send_keys_drives_interactive(
         [
             _call("sys_terminal_launch", term),
             _call("sys_terminal_send", {**term, "text": "python3", "keys": "Enter"}),
-            _call("sys_terminal_send", {**term, "text": "print(2+2)", "keys": "Enter"}),
-            _call("sys_terminal_read", term),
-            _call("sys_terminal_read", term),
-            _call("sys_terminal_read", term),
+            # Give the cold ``python3`` interpreter real wall-clock time to
+            # finish booting its REPL before the second send lands, and for
+            # each read to land after the REPL has evaluated. The mock owns
+            # these pauses (``delay``) so a loaded CI runner can't fire the
+            # scripted calls back-to-back faster than the subprocess reacts —
+            # the root of the ``'4' missing`` flake.
+            {
+                **_call("sys_terminal_send", {**term, "text": "print(2+2)", "keys": "Enter"}),
+                "delay": 1.5,
+            },
+            {**_call("sys_terminal_read", term), "delay": 1.5},
+            {**_call("sys_terminal_read", term), "delay": 1.0},
+            {**_call("sys_terminal_read", term), "delay": 1.0},
             {"text": "done"},
         ],
         key=model_name,

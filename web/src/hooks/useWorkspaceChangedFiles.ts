@@ -357,8 +357,11 @@ async function fetchWorkspaceAllFiles(
   location = "",
 ): Promise<WorkspaceAllFilesResult> {
   const segment = browseLocationSegment(location);
+  const params = new URLSearchParams({ limit: "1000", order: "asc" });
+  const base = browseLocationBase(location);
+  if (base) params.set("base", base);
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem${segment ? `/${segment}` : ""}?limit=1000&order=asc`,
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem${segment ? `/${segment}` : ""}?${params}`,
   );
   if (res.status === 404) {
     return { available: false, data: [] };
@@ -438,12 +441,29 @@ export function useWorkspaceAllFiles(
  * @returns The encoded path segment to append to a filesystem route.
  */
 export function browseLocationSegment(location: string): string {
-  if (location === "" || location === "/") {
-    return location === "/" ? "%2F" : "";
-  }
-  const absolute = location.startsWith("/");
-  const encoded = location.replace(/^\//, "").split("/").map(encodeURIComponent).join("/");
-  return absolute ? `%2F${encoded}` : encoded;
+  if (location === "" || location === "/") return "";
+  // A per-segment-encoded path with LITERAL slash separators and NO leading
+  // "%2F" — for BOTH workspace-relative and host-absolute locations. An
+  // absolute location's leading slash is stripped here and re-added by the
+  // server, exactly as the host filesystem endpoint does; its base is named
+  // out of band via `?base=host` (see `browseLocationBase`). A "%2F" leading
+  // marker would decode to a "//" that reverse proxies — the Databricks Apps
+  // front door among them — merge back to a single "/", silently turning an
+  // absolute path into a workspace-relative one and listing a nonexistent
+  // path under the workspace.
+  return location.replace(/^\//, "").split("/").map(encodeURIComponent).join("/");
+}
+
+/**
+ * The `base` query value naming how a browse location's `{path}` is rooted:
+ * `"host"` for an absolute path on the host, `null` for a workspace-relative
+ * one (the default, omitted from the URL).
+ *
+ * @param location Browse location, ``""`` for the workspace root.
+ * @returns ``"host"`` when absolute, else ``null``.
+ */
+export function browseLocationBase(location: string): "host" | null {
+  return location.startsWith("/") ? "host" : null;
 }
 
 /**
@@ -500,6 +520,8 @@ async function fetchWorkspaceFileSearch(
   if (include) params.set("include", include);
   if (exclude) params.set("exclude", exclude);
   const segment = browseLocationSegment(location);
+  const base = browseLocationBase(location);
+  if (base) params.set("base", base);
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/search${segment ? `/${segment}` : ""}?${params}`,
   );
@@ -564,8 +586,11 @@ async function fetchWorkspaceDirectory(
 ): Promise<WorkspaceFile[]> {
   const target = joinBrowseLocation(location, dirPath);
   const encodedPath = browseLocationSegment(target);
+  const params = new URLSearchParams({ limit: "1000", order: "asc" });
+  const base = browseLocationBase(target);
+  if (base) params.set("base", base);
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem/${encodedPath}?limit=1000&order=asc`,
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem/${encodedPath}?${params}`,
   );
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   // The tree addresses children relative to the location it is rooted at, one

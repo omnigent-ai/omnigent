@@ -3302,3 +3302,126 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
         assert "spec" not in captured, "a refused launch must not start a terminal"
 
     await fake_client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("freshness", ["fresh", "stale"])
+async def test_auto_create_claude_terminal_default_pin_requires_a_fresh_catalog(
+    freshness: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A Default launch pins the stored default only while the entry is fresh.
+
+    The store never forgets an entry, so its ``isDefault`` row can outlive
+    the model it names (a retirement or an entitlement change); pinning it
+    as ``--model`` then hard-fails every Default launch on the host. A
+    stale entry defers to the CLI's own default — no ``--model`` at all —
+    while the store re-probes in the background.
+    """
+    import os
+    import time
+
+    from omnigent import model_catalog_store
+    from omnigent.claude_native import claude_catalog_fingerprint
+    from tests.runner.conftest import REAL_CLAUDE_LAUNCH_CATALOG
+
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+
+    async def _no_op_forwarder(**kwargs: Any) -> None:
+        del kwargs
+
+    monkeypatch.setattr(
+        "omnigent.claude_native_forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+    # The real store-backed resolver, against the conftest-isolated store
+    # dir; the background re-probe is stubbed so no real CLI ever runs.
+    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG)
+    refreshed = [{"id": "sonnet", "model": "claude-sonnet-5", "isDefault": True}]
+
+    async def _fake_probe_catalog(config: object) -> list[dict[str, object]]:
+        del config
+        return refreshed
+
+    monkeypatch.setattr("omnigent.claude_native.claude_model_catalog", _fake_probe_catalog)
+    fingerprint = claude_catalog_fingerprint(None)
+    model_catalog_store.write_catalog(
+        "claude-native",
+        fingerprint,
+        [
+            {"id": "opus", "model": "claude-opus-5", "displayName": "Opus 5"},
+            {
+                "id": "claude-3-5-sonnet-20241022",
+                "model": "claude-3-5-sonnet-20241022",
+                "displayName": "Claude 3.5 Sonnet",
+                "isDefault": True,
+            },
+        ],
+    )
+    if freshness == "stale":
+        path = model_catalog_store.catalog_path("claude-native", fingerprint)
+        old = time.time() - (model_catalog_store.CATALOG_STALE_AFTER_S + 60)
+        os.utime(path, (old, old))
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        """Captures the launched terminal spec."""
+
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            """Record the spec and return a terminal resource view."""
+            del terminal_name, session_key
+            captured["spec"] = spec
+            return SessionResourceView(
+                id="terminal_claude_main",
+                type="terminal",
+                session_id=session_id,
+                name="claude:main",
+                metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+            )
+
+    def _handle_request(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"labels": {}})
+
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server",
+        transport=httpx.MockTransport(_handle_request),
+    )
+
+    async def _resolve() -> None:
+        return None
+
+    await _auto_create_claude_terminal(
+        "9b1d2c3e4f5a6b7c8d9e0f1a2b3c4d5e",
+        _FakeResourceRegistry(),
+        lambda _sid, _evt: None,
+        server_client=fake_client,
+        resolve_launch_config=_resolve,
+    )
+    args = captured["spec"].args
+    if freshness == "fresh":
+        assert args[args.index("--model") + 1] == "claude-3-5-sonnet-20241022"
+    else:
+        assert "--model" not in args, f"a stale default was still pinned: {args}"
+        task = model_catalog_store._inflight.get(("claude-native", fingerprint))
+        if task is not None:
+            await task
+        # The background re-probe healed the store for the next launch.
+        assert model_catalog_store.read_catalog("claude-native", fingerprint) == refreshed
+
+    await fake_client.aclose()

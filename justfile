@@ -67,21 +67,31 @@ run-android:
 android-reverse:
     cd web/android && ./gradlew reverseProxy
 
-# --- Electron desktop app ---
+# --- Web ---
 
 _ensure-web:
     cd web && test -d node_modules || pnpm install
+
+[group('web')]
+storybook: _ensure-web
+    pnpm --filter web run storybook
+
+[group('web')]
+storybook-build: _ensure-web
+    pnpm --filter web run build:storybook
+
+# --- Electron desktop app ---
 
 _ensure-electron:
     cd web/electron && test -d node_modules || pnpm install
 
 [group('electron')]
 electron-dev: _ensure-web _ensure-electron
-    pnpm --filter web/electron run dev
+    pnpm --filter ./web/electron run dev
 
 [group('electron')]
 electron-build: _ensure-web _ensure-electron
-    pnpm --filter web/electron run build
+    pnpm --filter ./web/electron run build
 
 # --- Lint ---
 

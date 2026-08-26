@@ -27,6 +27,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from omnigent._platform import resolve_repo_symlink
 from omnigent.db.db_models import InvalidUuidError
+from omnigent.debug_logging import set_current_user_id
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_plugins import (
     NativeHarnessProvider,
@@ -43,7 +44,7 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-from omnigent.server import session_live_state
+from omnigent.server import session_live_state, shutdown_state
 from omnigent.server.auth import AuthProvider, SharingMode
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
@@ -1486,6 +1487,18 @@ def create_app(
         set_request_session_id_for_access_log(
             session_match.group(1) if session_match else None,
         )
+        # Bind the request's authenticated user so debug-log records emitted
+        # while handling it are attributed. Request-scoped: each request runs in
+        # its own task/context, so concurrent users never see each other's id.
+        # Best-effort — attribution must never fail a request. The raw identity
+        # (incl. the "local" single-user sentinel) is kept; it is a meaningful
+        # queryable value in the debug table.
+        try:
+            set_current_user_id(
+                auth_provider.get_user_id(request) if auth_provider is not None else None
+            )
+        except Exception:  # noqa: BLE001 — attribution is best-effort
+            set_current_user_id(None)
 
         failed = False
         status_code: int | None = None
@@ -2383,6 +2396,11 @@ def create_app(
         :func:`_mark_runner_sessions_offline`, which fails only the
         interrupted turns and stamps the disconnect cause.
 
+        A server that is itself shutting down skips the marking too: it
+        closed the tunnel, and the runner cannot re-register with a
+        process that stopped listening — the replacement server re-adopts
+        it on reconnect (:mod:`omnigent.server.shutdown_state`).
+
         :param runner_id: The disconnected runner's id.
         """
         from omnigent.server.routes.sessions import (
@@ -2392,6 +2410,12 @@ def create_app(
         from omnigent.server.schemas import ErrorDetail
 
         await asyncio.sleep(RUNNER_DISCONNECT_GRACE_S)
+        if shutdown_state.server_shutting_down():
+            _logger.info(
+                "Runner %s dropped because this server is shutting down; skipping offline-marking",
+                runner_id,
+            )
+            return
         if tunnel_registry.get(runner_id) is not None:
             _logger.info(
                 "Runner %s reconnected within the disconnect grace; skipping offline-marking",
@@ -2752,6 +2776,7 @@ def create_app(
                     account_store,
                     admin_list,
                     permission_store,
+                    device_grant_store,
                 ),
                 prefix="/auth",
                 tags=["auth"],

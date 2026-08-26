@@ -321,6 +321,28 @@ describe("useFileContent gating", () => {
     );
   });
 
+  it("fetches an absolute file path by its bare path plus base=host", async () => {
+    // A file opened while browsing OUTSIDE the workspace has an absolute path.
+    // It must be requested WITHOUT a leading "%2F" (which a reverse proxy such
+    // as the Databricks Apps front door would merge away) and named
+    // `base=host` -- otherwise it is looked up by its bare name under the
+    // workspace root and 404s (the regression this covers).
+    onlineMock.mockReturnValue(true);
+    hostOnlineMock.mockReturnValue(true);
+    stubChatStore();
+
+    render(
+      <Wrap>
+        <Probe id="conv_abs" path="/tmp/dbexec.log" />
+      </Wrap>,
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/v1/sessions/conv_abs/resources/environments/default/filesystem/tmp/dbexec.log?base=host",
+    );
+  });
+
   it("does not fetch when path is null", async () => {
     onlineMock.mockReturnValue(true);
     stubChatStore();

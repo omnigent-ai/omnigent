@@ -34,10 +34,10 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
-
-import tomllib
+from urllib.parse import urlsplit
 
 from omnigent.env_credentials import getenv_nonempty_with_omnigent_prefix
+from omnigent.onboarding import codex_auth_readiness
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 from omnigent.onboarding.providers import PROVIDER_ENV_VARS
 
@@ -54,15 +54,6 @@ SUBSCRIPTION_KIND: DetectedKind = "subscription"
 LOCAL_KIND: DetectedKind = "local"
 CLI_CONFIG_KIND: DetectedKind = "cli-config"
 
-# Codex's built-in model provider ids (openai/codex,
-# ``codex-rs/model-provider-info/src/lib.rs``). A ``model_provider`` set to
-# one of these is not a *custom* provider: ``openai`` is the subscription /
-# API-key path (covered by the auth.json detection), ``ollama`` / ``lmstudio``
-# are local servers (ollama is covered by the TCP-probe detection), and
-# ``amazon-bedrock`` resolves auth from the AWS environment — none of them is
-# a config-defined credential this detection should adopt.
-_CODEX_BUILTIN_PROVIDERS = frozenset({"openai", "amazon-bedrock", "ollama", "lmstudio"})
-
 # Ollama's default OpenAI-compatible endpoint.
 _OLLAMA_HOST = "localhost"
 _OLLAMA_PORT = 11434
@@ -71,6 +62,20 @@ _OLLAMA_URL = f"http://{_OLLAMA_HOST}:{_OLLAMA_PORT}"
 # Timeout (seconds) for the Ollama TCP probe — short so setup stays snappy
 # when nothing is listening.
 _OLLAMA_PROBE_TIMEOUT = 0.25
+
+# Claude Code's enterprise "managed settings" chain, highest precedence first.
+# An enterprise install (the shape ``isaac configure claude`` writes) configures
+# Claude Code here and nowhere else: an ``env`` block pinning
+# ``ANTHROPIC_BASE_URL`` at a gateway plus a top-level ``apiKeyHelper`` that
+# prints the bearer token. Managed settings win at Claude Code's own launch, so
+# this file alone is a complete, working credential — but it belongs to Claude
+# Code, not omnigent: we reflect it (readiness + label), we never adopt it into
+# a ``providers:`` shape (see ``claude_managed_gateway``).
+CLAUDE_CODE_MANAGED_SETTINGS_PATHS: tuple[Path, ...] = (
+    Path("/Library/Application Support/ClaudeCode/managed-settings.json"),
+    Path("/etc/claude-code/managed-settings.json"),
+    Path(os.environ.get("PROGRAMDATA", "C:/ProgramData")) / "ClaudeCode" / "managed-settings.json",
+)
 
 # Maps each provider whose env key we surface to the served model family.
 # Providers absent here (or mapped to ``None``) are reported with
@@ -233,92 +238,6 @@ class CodexConfigProvider:
     display_name: str
 
 
-def _provider_table_has_self_contained_auth(table: dict[str, object]) -> bool:
-    """Return whether a Codex ``[model_providers.X]`` table carries its own auth.
-
-    "Self-contained" means the Codex CLI can authenticate against the
-    provider from the config table alone — no ``auth.json`` login and no
-    environment variable that omnigents would have to thread into the codex
-    subprocess. Mirrors Codex's own provider auth fields (``openai/codex``,
-    ``codex-rs/model-provider-info/src/lib.rs``):
-
-    - ``[X.auth]`` — a token-printing command (``command`` + ``args``), the
-      shape ``isaac configure codex`` writes (``jq`` reading a cached
-      Databricks Model Serving token);
-    - ``experimental_bearer_token`` — an inline static bearer token;
-    - ``[X.aws]`` — AWS SigV4 request signing (Bedrock-style);
-    - ``http_headers`` containing an ``Authorization`` header — a static
-      auth header.
-
-    Deliberately **excluded** (each with a reason):
-
-    - ``env_key`` / ``env_http_headers`` — auth via an environment
-      variable. The codex executor launches the CLI with a scrubbed
-      environment (``_clean_codex_env``), so an arbitrary env var would not
-      reach the subprocess and the provider would 401 at run time despite
-      detecting as "configured". Supporting these needs an env-passthrough
-      design first.
-    - ``requires_openai_auth = true`` — the provider rides the ChatGPT
-      login, which is exactly the ``auth.json`` subscription detection's
-      territory (checked separately by the caller).
-
-    :param table: The raw ``[model_providers.X]`` mapping parsed from
-        ``config.toml``, e.g. ``{"name": "Databricks AI Gateway",
-        "base_url": "...", "auth": {"command": "jq", ...}}``.
-    :returns: ``True`` when the table carries self-contained auth.
-    """
-    auth = table.get("auth")
-    if isinstance(auth, dict):
-        command = auth.get("command")
-        if isinstance(command, str) and command.strip():
-            return True
-    bearer = table.get("experimental_bearer_token")
-    if isinstance(bearer, str) and bearer.strip():
-        return True
-    if isinstance(table.get("aws"), dict):
-        return True
-    headers = table.get("http_headers")
-    if isinstance(headers, dict):
-        for key, value in headers.items():
-            if (
-                isinstance(key, str)
-                and key.lower() == "authorization"
-                and isinstance(value, str)
-                and value.strip()
-            ):
-                return True
-    return False
-
-
-def _effective_codex_model_provider(config: dict[str, object]) -> str | None:
-    """Resolve the effective default ``model_provider`` id from a Codex config.
-
-    Mirrors Codex's own profile-merge resolution (``openai/codex``,
-    ``codex-rs/core/src/config``): the active profile's ``model_provider``
-    (top-level ``profile = "name"`` selecting ``[profiles.name]``) wins over
-    the top-level ``model_provider``.
-
-    :param config: The parsed ``config.toml`` mapping, e.g.
-        ``{"model_provider": "Databricks", "model_providers": {...}}``.
-    :returns: The effective provider id, e.g. ``"Databricks"``, or ``None``
-        when neither the active profile nor the top level sets one (Codex
-        then defaults to the built-in ``openai`` provider).
-    """
-    provider_id: object = config.get("model_provider")
-    active_profile = config.get("profile")
-    if isinstance(active_profile, str) and active_profile.strip():
-        profiles = config.get("profiles")
-        if isinstance(profiles, dict):
-            profile_table = profiles.get(active_profile)
-            if isinstance(profile_table, dict) and isinstance(
-                profile_table.get("model_provider"), str
-            ):
-                provider_id = profile_table["model_provider"]
-    if isinstance(provider_id, str) and provider_id.strip():
-        return provider_id
-    return None
-
-
 def codex_config_custom_provider(config_path: Path) -> CodexConfigProvider | None:
     """Detect a custom, auth-carrying default model provider in a Codex config.
 
@@ -331,7 +250,8 @@ def codex_config_custom_provider(config_path: Path) -> CodexConfigProvider | Non
 
     A config counts when its **effective default provider** is a custom
     (non-built-in) ``[model_providers.X]`` table with self-contained auth
-    (see :func:`_provider_table_has_self_contained_auth`). The effective
+    (see :func:`codex_auth_readiness.provider_table_has_self_contained_auth`).
+    The effective
     provider mirrors Codex's own resolution (``openai/codex``,
     ``codex-rs/core/src/config``): the active profile's ``model_provider``
     (top-level ``profile = "name"`` selecting ``[profiles.name]``) wins
@@ -349,19 +269,13 @@ def codex_config_custom_provider(config_path: Path) -> CodexConfigProvider | Non
         malformed, the effective provider is built-in or unset, its table
         is absent, or the table carries no self-contained auth.
     """
-    try:
-        raw = config_path.read_bytes()
-    except OSError:
-        # Missing or unreadable file — nothing configured.
-        return None
-    try:
-        config = tomllib.loads(raw.decode("utf-8"))
-    except (tomllib.TOMLDecodeError, UnicodeDecodeError):
-        # Malformed TOML — treat as not configured rather than crash setup.
+    config = codex_auth_readiness.load_codex_config(config_path)
+    if config is None:
+        # Missing, unreadable, or malformed — treat as not configured.
         return None
 
-    provider_id = _effective_codex_model_provider(config)
-    if provider_id is None or provider_id in _CODEX_BUILTIN_PROVIDERS:
+    provider_id = codex_auth_readiness.effective_codex_model_provider(config)
+    if provider_id is None or provider_id in codex_auth_readiness.CODEX_BUILTIN_PROVIDERS:
         return None
 
     providers = config.get("model_providers")
@@ -376,7 +290,7 @@ def codex_config_custom_provider(config_path: Path) -> CodexConfigProvider | Non
         # Rides the ChatGPT login — the auth.json subscription detection's
         # territory, not a config-defined credential.
         return None
-    if not _provider_table_has_self_contained_auth(table):
+    if not codex_auth_readiness.provider_table_has_self_contained_auth(table):
         return None
 
     name = table.get("name")
@@ -430,13 +344,8 @@ def codex_config_provider_transport(
         missing / malformed, the table is absent, or it declares no
         ``base_url``.
     """
-    try:
-        raw = config_path.read_bytes()
-    except OSError:
-        return None
-    try:
-        config = tomllib.loads(raw.decode("utf-8"))
-    except (tomllib.TOMLDecodeError, UnicodeDecodeError):
+    config = codex_auth_readiness.load_codex_config(config_path)
+    if config is None:
         return None
 
     providers = config.get("model_providers")
@@ -559,6 +468,81 @@ def claude_auth_has_credential(creds_path: Path) -> bool:
     if isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool):
         return expires_at > time.time() * 1000
     return False
+
+
+def claude_managed_gateway(
+    paths: tuple[Path, ...] | None = None,
+) -> tuple[str | None, bool]:
+    """Read the credential Claude Code applies from its managed settings chain.
+
+    The single canonical parser for Claude Code's managed-settings credential,
+    shared by ambient detection, the readiness gate, and the Smart-Routing
+    gateway check (:func:`omnigent.claude_native.managed_claude_gateway_signal`
+    delegates here). A credential counts as delivered when the file carries a
+    top-level ``apiKeyHelper`` (a token-printing command) or a truthy
+    ``env.CLAUDE_CODE_USE_GATEWAY``.
+
+    The **first readable, object-shaped** file decides, matching Claude Code's
+    own precedence: a settings file that exists but pins no credential reports
+    "none" rather than falling through to a lower-precedence file it would
+    itself override.
+
+    :param paths: Settings files to read, highest precedence first; defaults to
+        :data:`CLAUDE_CODE_MANAGED_SETTINGS_PATHS`.
+    :returns: ``(base_url, has_credential)`` from the first readable file, or
+        ``(None, False)`` when none is present or parseable. ``base_url`` is the
+        gateway ``env.ANTHROPIC_BASE_URL`` (``None`` when unset — a helper alone
+        credentials api.anthropic.com); ``has_credential`` is whether Claude
+        Code has a usable credential to apply at launch.
+    """
+    for path in CLAUDE_CODE_MANAGED_SETTINGS_PATHS if paths is None else paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        raw_env = payload.get("env")
+        env = raw_env if isinstance(raw_env, dict) else {}
+        raw_base_url = env.get("ANTHROPIC_BASE_URL")
+        base_url = raw_base_url.strip() if isinstance(raw_base_url, str) else None
+        has_helper = bool(payload.get("apiKeyHelper"))
+        use_gateway = str(env.get("CLAUDE_CODE_USE_GATEWAY", "")).strip().lower() not in (
+            "",
+            "0",
+            "false",
+        )
+        return base_url or None, has_helper or use_gateway
+    return None, False
+
+
+def claude_managed_gateway_display_name(paths: tuple[Path, ...] | None = None) -> str | None:
+    """A human label for the managed-settings credential, when one is delivered.
+
+    Used by the setup / ``/model`` display layer to show the Claude credential
+    as its actual backing (e.g. ``"Databricks AI Gateway"``) rather than the
+    generic ``"Subscription"``. Purely a display derivation from live managed
+    settings — nothing is persisted.
+
+    :param paths: Settings files to read; defaults to
+        :data:`CLAUDE_CODE_MANAGED_SETTINGS_PATHS`.
+    :returns: ``"Databricks AI Gateway"`` for a recognized Databricks gateway,
+        the gateway host for another gateway, ``"Claude Code gateway"`` for a
+        credential with no pinned base URL, or ``None`` when no credential is
+        delivered.
+    """
+    base_url, has_credential = claude_managed_gateway(paths)
+    if not has_credential:
+        return None
+    if base_url is None:
+        return "Claude Code gateway"
+    # Lazy: the gateway-URL allowlist lives in its own module and is only
+    # needed once a base URL is actually present.
+    from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
+
+    if is_databricks_ai_gateway_url(base_url):
+        return "Databricks AI Gateway"
+    return urlsplit(base_url).hostname or "Claude Code gateway"
 
 
 def _claude_login_detected() -> bool:
@@ -746,12 +730,27 @@ def _detect_providers_now() -> list[DetectedProvider]:
             )
         )
 
-    # 2. Claude CLI login. Like codex (below), existence alone is not enough —
-    #    an empty / logged-out ``.credentials.json`` carries no usable login.
-    #    On macOS the credential lives in the Keychain rather than the file, so
-    #    detection falls back to the CLI's own status check there. See
-    #    ``_claude_login_detected`` / ``claude_auth_has_credential``.
-    if _claude_login_detected():
+    # 2. Claude Code credential. Prefer the managed-settings gateway — read
+    #    straight from the enterprise settings file (no subprocess, works on
+    #    Linux where there is no Keychain, and it is what Claude Code actually
+    #    applies at launch). Fall back to a CLI login otherwise (which on macOS
+    #    reads the Keychain via ``claude auth status``). Either way it is
+    #    surfaced as a ``subscription``: the credential lives in Claude Code's
+    #    own files and Claude Code applies it itself, so omnigent must NOT adopt
+    #    a gateway/cli-config provider shape for it — native routing defers to
+    #    Claude Code's settings (a subscription resolves to "no override"), and
+    #    the in-process SDK falls back to its own auth. Persisting a new shape
+    #    here is exactly what a released/stale runner's parser rejects.
+    if claude_managed_gateway()[1]:
+        detected.append(
+            DetectedProvider(
+                name="claude",
+                kind=SUBSCRIPTION_KIND,
+                family=ANTHROPIC_FAMILY,
+                source="Claude Code managed settings",
+            )
+        )
+    elif _claude_login_detected():
         detected.append(
             DetectedProvider(
                 name="claude",

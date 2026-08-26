@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useSessionAgent } from "@/hooks/useAgents";
@@ -438,6 +438,9 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     // Launches the first declared shell and opens the created terminal's tab.
     expect(mutate).toHaveBeenCalledWith("zsh", expect.any(Object));
     expect(openTerminalTab).toHaveBeenCalledWith("terminal:terminal_zsh_s1");
+
+    // The menu closes on its own after the launch.
+    await waitFor(() => expect(screen.queryByRole("menuitem", { name: /shell/i })).toBeNull());
   });
 
   it("launches the default shell directly when several are declared (type selection is optional)", async () => {
@@ -466,6 +469,14 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     // Launches the default (first-declared) shell without a further pick.
     expect(mutate).toHaveBeenCalledWith("zsh", expect.any(Object));
     expect(openTerminalTab).toHaveBeenCalledWith("terminal:terminal_zsh_s1");
+
+    // The menu closes on its own — the submenu trigger's preventDefault would
+    // otherwise leave it stuck open, needing a second click to dismiss.
+    await waitFor(() => expect(screen.queryByRole("menuitem", { name: /shell/i })).toBeNull());
+
+    // Focus is not restored to the "+" trigger on close — that focus return is
+    // what re-opened its tooltip for a frame (the visible flash after launch).
+    expect(screen.getByRole("button", { name: "Open new" })).not.toHaveFocus();
   });
 
   it("remembers the picked shell type as the new default (persisted + check-marked)", async () => {

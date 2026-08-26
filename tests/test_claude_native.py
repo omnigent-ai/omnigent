@@ -35,7 +35,7 @@ from omnigent.databricks_model_discovery import DatabricksClaudeCatalog
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.runtime import tool_result_replay as trc
 from omnigent.spec import load_omnigent_yaml
-from omnigent.terminals.ws_bridge import (
+from omnigent.terminals.ws_common import (
     WS_CLOSE_TERMINAL_DETACHED,
     WS_CLOSE_TERMINAL_NOT_FOUND,
 )
@@ -7754,6 +7754,8 @@ def test_resolve_native_claude_config_ambient_key(
     """
     monkeypatch.delenv("CLAUDE_CODE_USE_GATEWAY", raising=False)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-ambient")
+    # The default-endpoint assertion must not inherit an ambient gateway URL.
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
 
     cfg = claude_native.resolve_native_claude_config(spec=None)
     assert cfg is not None
@@ -7768,6 +7770,8 @@ def test_resolve_native_claude_config_ambient_prefixed_key(
     """A prefixed Anthropic key routes native Claude without raw env exposure."""
     monkeypatch.delenv("CLAUDE_CODE_USE_GATEWAY", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    # The default-endpoint assertion must not inherit an ambient gateway URL.
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
     monkeypatch.setenv("OMNIGENT_ANTHROPIC_API_KEY", "sk-ant-prefixed")
 
     cfg = claude_native.resolve_native_claude_config(spec=None)
