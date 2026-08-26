@@ -176,8 +176,25 @@ async function spawnServer(tmpDir) {
     env: { ...process.env, PYTHONPATH: REPO_ROOT },
     stdio: ["ignore", mockOut, mockOut],
   });
+  // A bad PYTHON (ENOENT) fires 'error' async; surface it as a rejection rather
+  // than an uncaught event that crashes the runner. Record it so the health
+  // wait can report it instead of a bare timeout.
+  let mockSpawnError = null;
+  mockProc.on("error", (err) => {
+    mockSpawnError = err;
+  });
   const mockUrl = `http://127.0.0.1:${mockPort}`;
-  await waitForHealthy(`${mockUrl}/stats`, "mock LLM server", mockLog);
+  try {
+    await waitForHealthy(`${mockUrl}/stats`, "mock LLM server", mockLog);
+  } catch (err) {
+    if (mockProc.exitCode === null) mockProc.kill("SIGTERM");
+    try {
+      fs.closeSync(mockOut);
+    } catch {
+      /* already closed */
+    }
+    throw mockSpawnError ?? err;
+  }
 
   const serverOut = fs.openSync(serverLog, "w");
   // Strip ambient runner/host env so a nested runner (if the journey starts a
@@ -218,6 +235,10 @@ async function spawnServer(tmpDir) {
       stdio: ["ignore", serverOut, serverOut],
     },
   );
+  let serverSpawnError = null;
+  serverProc.on("error", (err) => {
+    serverSpawnError = err;
+  });
   const serverUrl = `http://127.0.0.1:${serverPort}`;
 
   const close = async () => {
@@ -244,7 +265,7 @@ async function spawnServer(tmpDir) {
     await waitForHealthy(`${serverUrl}/health`, "omnigent server", serverLog);
   } catch (err) {
     await close();
-    throw err;
+    throw serverSpawnError ?? err;
   }
   return { serverUrl, close };
 }
@@ -284,39 +305,59 @@ async function launchDesktop(opts) {
     // endpoint; a version override keeps the app off the update path.
     env: { ...process.env, OMNIGENT_DESKTOP_VERSION_OVERRIDE: "999.0.0" },
   });
-  const window = await electronApp.firstWindow();
+  // If firstWindow() throws after launch() succeeded, close the app here so the
+  // Electron process isn't orphaned (the caller never got a handle to close).
+  let window;
+  try {
+    window = await electronApp.firstWindow();
+  } catch (err) {
+    await electronApp.close().catch(() => {});
+    throw err;
+  }
   return { electronApp, window, userDataDir };
 }
 
 /**
  * After the Electron app has closed (which flushes the video), rename the
- * recorded clip to a stable name at `recordDir`'s root. Playwright writes one
- * `page@<hash>.webm` per page context under `recordDir`; the shell window is
- * the largest, so pick that and move it to `<name>.webm` (dropping the rest, so
- * the same footage isn't collected twice). Returns the final path, or null when
- * no video was produced.
+ * recorded clip(s) to stable names at `recordDir`'s root. Playwright writes one
+ * `page@<hash>.webm` per page context (the shell window, plus any OAuth popup /
+ * in-window IdP `WebContentsView`). ALL clips are kept — the subject of a
+ * popup/IdP bug is the popup, which is often shorter/smaller than the main
+ * window, so we must not delete by size. Only the raw `page@<hash>.webm` names
+ * (the ones the CURRENT launch produced) are renamed; already-named clips from
+ * a prior `saveRecording` are left alone, so calling twice is safe.
+ *
+ * The largest raw clip (usually the main window) becomes `<name>.webm`; any
+ * additional raw clips become `<name>-2.webm`, `<name>-3.webm`, … in
+ * descending-size order. When multiple clips exist, inspect each and point the
+ * handoff at the one that shows the failure (see e2e/README.md).
  *
  * Call this AFTER `electronApp.close()`.
  *
  * @param {string} recordDir The dir passed to `launchDesktop`.
  * @param {string} name Stable base name, e.g. `"before-connect"` (no suffix).
- * @returns {string | null} Absolute path to the renamed `.webm`, or null.
+ * @returns {string[]} Absolute paths of the saved `.webm`(s), largest first;
+ *   empty when no video was produced.
  */
 function saveRecording(recordDir, name) {
-  if (!fs.existsSync(recordDir)) return null;
-  const clips = fs
+  if (!fs.existsSync(recordDir)) return [];
+  // Only the raw per-context files this launch wrote; leave anything already
+  // renamed (from a prior call) untouched so repeat calls don't clobber.
+  const raw = fs
     .readdirSync(recordDir)
-    .filter((f) => f.endsWith(".webm"))
+    .filter((f) => f.startsWith("page@") && f.endsWith(".webm"))
     .map((f) => path.join(recordDir, f))
     .filter((p) => fs.statSync(p).isFile());
-  if (clips.length === 0) return null;
-  // The shell window's video is the largest; incidental contexts are tiny.
-  clips.sort((a, b) => fs.statSync(b).size - fs.statSync(a).size);
-  const [primary, ...rest] = clips;
-  const dest = path.join(recordDir, `${name}.webm`);
-  fs.renameSync(primary, dest);
-  for (const leftover of rest) fs.rmSync(leftover, { force: true });
-  return dest;
+  if (raw.length === 0) return [];
+  // Largest first so the primary (usually the main window) takes the bare name.
+  raw.sort((a, b) => fs.statSync(b).size - fs.statSync(a).size);
+  const saved = [];
+  raw.forEach((clip, i) => {
+    const dest = path.join(recordDir, i === 0 ? `${name}.webm` : `${name}-${i + 1}.webm`);
+    fs.renameSync(clip, dest);
+    saved.push(dest);
+  });
+  return saved;
 }
 
 module.exports = {

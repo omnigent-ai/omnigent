@@ -67,12 +67,17 @@ right interpreter with `OMNIGENT_PYTHON` when your `omnigent` lives in a venv:
 OMNIGENT_PYTHON=/path/to/.venv/bin/python node --test e2e/desktop_connect.e2e.js
 ```
 
-The recorded video lands in `e2e/recordings/<slug>/`. Playwright writes it as a
-raw `page@<hash>.webm`; call `saveRecording(recordDir, "<name>")` after
-`electronApp.close()` (as the reference test does) to rename it to a stable
-`<name>.webm` and drop the incidental extra contexts. As with every lane,
-recordings are workspace artifacts — leave them uncommitted; CI's artifact
-bundle collects them.
+The recorded video lands in `e2e/recordings/<slug>/`. Playwright writes one raw
+`page@<hash>.webm` per page context — the main shell window, plus any OAuth
+popup or in-window IdP view, which record separately. Call
+`saveRecording(recordDir, "<name>")` after `electronApp.close()` (as the
+reference test does) to rename **all** of them to stable names: the largest
+becomes `<name>.webm` and any others `<name>-2.webm`, `<name>-3.webm`, … It
+returns the list of saved paths. For a popup / IdP bug the subject is the popup
+clip (often the smaller one), so when there is more than one, inspect each and
+point the handoff at the one that shows the failure — don't assume the largest.
+As with every lane, recordings are workspace artifacts — leave them
+uncommitted; CI's artifact bundle collects them.
 
 ## Authoring a desktop reproduction
 
@@ -83,9 +88,11 @@ bundle collects them.
    reference does) and drive the setup page.
 3. Drive the real window to the failing state and assert on it. For a
    `reproduced` facet the assertion FAILS on the running build — the failing
-   run's video is the before-fix footage. Close the app in a `finally` so the
-   video is flushed even when the assertion fails.
-4. Call `saveRecording(RECORD_DIR, "before-<facet>")` (or `fixed-<facet>`)
-   after the app closes to name the clip, and write the journey `caption` for
-   the handoff, exactly as the other lanes do (see `dev/repro-agent/AGENTS.md`,
-   Step 4).
+   run's video is the before-fix footage.
+4. Close the app AND call `saveRecording` in the `finally` block (as the
+   reference test does), so the clip is named on the failing path too — a
+   `reproduced` facet's run throws, and if you name the clip after the
+   `try/finally` it never runs on the very path that produces the before-fix
+   footage. Use `saveRecording(RECORD_DIR, "before-<facet>")` (or
+   `fixed-<facet>`), then write the journey `caption` for the handoff exactly as
+   the other lanes do (see `dev/repro-agent/AGENTS.md`, Step 4).

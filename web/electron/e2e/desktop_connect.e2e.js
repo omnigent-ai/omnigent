@@ -48,7 +48,8 @@ describe(
     it("connects from the setup page and lands in the app shell", async () => {
       // Launch WITHOUT a pre-seeded server so the journey starts on the bundled
       // setup page — the connect flow is part of the desktop journey we film.
-      const { electronApp, window } = await launchDesktop({ recordDir: RECORD_DIR });
+      const { electronApp, window, userDataDir } = await launchDesktop({ recordDir: RECORD_DIR });
+      let saved;
       try {
         // 1. The bundled "connect to server" setup page is shown.
         const urlField = window.locator("#url");
@@ -66,14 +67,15 @@ describe(
         await landed.waitFor({ state: "visible", timeout: 20_000 });
         assert.ok(await landed.isVisible(), "app shell did not render after connect");
       } finally {
-        // Video is flushed on close; do it in finally so a failed assertion
-        // still yields footage of the failure.
+        // Video is flushed on close, so close and name the clip HERE — a
+        // `reproduced` facet's run FAILS (the primary repro use), and the
+        // before-fix footage must still be saved on that path, not just on
+        // pass. Rename to the stable name the repro-agent handoff points at.
         await electronApp.close();
+        saved = saveRecording(RECORD_DIR, "connect-journey");
+        fs.rmSync(userDataDir, { recursive: true, force: true });
       }
-      // Rename the raw page@<hash>.webm to a stable name at the record-dir
-      // root — the name a repro-agent handoff points at (before-/fixed-<facet>).
-      const clip = saveRecording(RECORD_DIR, "connect-journey");
-      assert.ok(clip, "no desktop recording was produced");
+      assert.ok(saved && saved.length > 0, "no desktop recording was produced");
     });
   },
 );
