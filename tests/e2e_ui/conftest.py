@@ -2232,6 +2232,47 @@ def _ui_defaults() -> None:
     expect.set_options(timeout=15_000)
 
 
+@pytest.fixture(autouse=True)
+def _record_video(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[None]:
+    """Capture a screen recording of the journey when recording is requested.
+
+    Most e2e_ui tests drive Playwright through ``async_playwright()`` directly
+    (``browser.new_page()`` / ``browser.new_context()``), not the
+    pytest-playwright ``page`` fixture, so ``pytest --video`` records nothing for
+    them. When ``OMNIGENT_E2E_RECORD_DIR`` is set, patch the async ``Browser``
+    methods to inject ``record_video_dir`` into every page/context they open, so
+    the rendered journey lands as a ``.webm`` regardless of how the test opened
+    the browser. A caller that already passes ``record_video_dir`` is left alone.
+    Playwright writes the file (a random hash name) when the context closes;
+    callers/harnesses pick it up from the directory. No-op when the env var is
+    unset, so ordinary runs are unaffected.
+    """
+    record_dir = os.environ.get("OMNIGENT_E2E_RECORD_DIR")
+    if not record_dir:
+        yield
+        return
+
+    from playwright.async_api import Browser as _AsyncBrowser
+
+    Path(record_dir).mkdir(parents=True, exist_ok=True)
+    _orig_new_page = _AsyncBrowser.new_page
+    _orig_new_context = _AsyncBrowser.new_context
+
+    async def _new_page(self: Any, *args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("record_video_dir", record_dir)
+        return await _orig_new_page(self, *args, **kwargs)
+
+    async def _new_context(self: Any, *args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("record_video_dir", record_dir)
+        return await _orig_new_context(self, *args, **kwargs)
+
+    monkeypatch.setattr(_AsyncBrowser, "new_page", _new_page)
+    monkeypatch.setattr(_AsyncBrowser, "new_context", _new_context)
+    yield
+
+
 @pytest.fixture
 def runner_id(live_server: str) -> str:
     """Token-bound id of the runner spawned by :func:`live_server`.

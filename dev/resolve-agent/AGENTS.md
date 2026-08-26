@@ -480,13 +480,29 @@ first, then re-run the SAME drivers with recording on against the fixed tree:
 
 ```bash
 pnpm --filter web install && pnpm --filter web run build   # once, up front
-pytest <test_path> --video on --screenshot on --output recordings/<slug>
+OMNIGENT_E2E_RECORD_DIR="$PWD/recordings/<slug>/raw" \
+  pytest <test_path> --screenshot on --output recordings/<slug>
 ```
 
-For `cli` facets, re-render `vhs recordings/<slug>/journey.tape`. pytest-playwright
-writes the video into a per-test subdir under `--output`; **move** it to a stable
-`recordings/<slug>/after-<facet>.<ext>` and delete the leftover subdir so the same
-footage isn't collected twice. For each after clip, write a `caption` describing
+**Record via `OMNIGENT_E2E_RECORD_DIR`, not `--video on`.** Most `tests/e2e_ui/`
+tests drive Playwright through `async_playwright()` + `browser.new_page()`
+directly — *not* the pytest-playwright `page` fixture — so the `--video on` flag
+records **nothing** for them (it only films the `page` fixture) and you'd get a
+false `recordings: []`. Setting `OMNIGENT_E2E_RECORD_DIR` makes the e2e_ui
+conftest inject `record_video_dir` into every page/context the test opens, so the
+journey is filmed no matter how the test opened the browser. Playwright writes the
+`.webm` (a random hash name) into that dir when the context closes. (If the repro
+test already hard-codes its own `record_video_dir` — repro-agent authors some
+tests that way — that explicit dir wins and the video lands there instead; check
+both locations.)
+
+For `cli` facets, re-render `vhs recordings/<slug>/journey.tape`. The video lands
+in `OMNIGENT_E2E_RECORD_DIR` under a hash name; **move** it to a stable
+`recordings/<slug>/after-<facet>.webm` and delete the leftover raw dir so the same
+footage isn't collected twice. If that dir has **no** `.webm` after the run, the
+recording genuinely didn't happen (the test errored before opening a page, or the
+fixture couldn't come online) — capture the reason per the omit rule below; never
+report an after-clip you didn't actually produce. For each after clip, write a `caption` describing
 **the actions that clip performs**, ending in the *correct* behavior (a passing
 run) — the same per-clip action-caption repro-agent writes, e.g. `"open the model
 picker → select the catalog → picker now shows friendly names"`. Carry each before
