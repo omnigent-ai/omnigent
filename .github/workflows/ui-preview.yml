@@ -340,9 +340,14 @@ jobs:
           | **Commit** | $COMMIT_SHA |
           | **Run** | ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} |
 
+          The preview serves the UI only. To drive a real session, connect your own host from your machine or sandbox:
+
+          \`\`\`sh
+          omnigent host --server ${APP_URL}
+          \`\`\`
+
           > [!NOTE]
           > This preview is only accessible to maintainers with workspace access.
-          > It serves the UI only -- connect your own host (\`omnigent run … --server <url>\`) to drive a real session.
           > The preview updates automatically when new commits are pushed."
 
           COMMENT_ID=$(gh api --paginate \

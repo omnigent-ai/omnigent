@@ -13,9 +13,10 @@ live session list -> sidebar render order -> window keydown handler ->
 client-side navigation to ``/c/{id}``.
 
 - ``test_ctrl_arrow_switches_session_from_focused_composer``: focus the
-  composer, leave a draft, press Ctrl+Down, and assert the route moved and the
-  draft survives the round trip. A regression that restored the editable-field
-  guard would stay put here.
+  composer, leave a draft, press Ctrl+Down, and assert the route moved, the
+  inactive row gains its draft indicator, and the draft survives the round
+  trip. A regression that restored the editable-field guard would stay put
+  here.
 - ``test_ctrl_arrow_still_switches_session_from_body_focus``: blur the
   composer so the keydown targets the body, press Ctrl+Down, and assert the
   route leaves the current session.
@@ -55,8 +56,11 @@ def test_ctrl_arrow_switches_session_from_focused_composer(
 
     page.goto(f"{base_url}/c/{session_a}")
 
-    expect(page.locator(f'a[href="/c/{session_a}"]')).to_be_visible(timeout=30_000)
+    session_a_link = page.locator(f'a[href="/c/{session_a}"]')
+    expect(session_a_link).to_be_visible(timeout=30_000)
     expect(page.locator(f'a[href="/c/{session_b}"]')).to_be_visible()
+    session_a_row = page.locator("li").filter(has=session_a_link)
+    draft_indicator = session_a_row.get_by_test_id("conversation-draft-indicator")
 
     # Focus the composer and leave an unsent draft — the exact condition the
     # editable-field guard used to suppress.
@@ -64,6 +68,9 @@ def test_ctrl_arrow_switches_session_from_focused_composer(
     expect(composer).to_be_visible()
     composer.click()
     composer.fill("an unsent draft that must survive the switch")
+    # The open composer already exposes its own content, so its active sidebar
+    # row does not need a redundant draft marker.
+    expect(draft_indicator).to_have_count(0)
 
     # ControlOrMeta maps to the real platform modifier (Cmd on macOS, Ctrl
     # elsewhere); CI runs Linux chromium, so this is Ctrl+Down.
@@ -75,6 +82,8 @@ def test_ctrl_arrow_switches_session_from_focused_composer(
     assert "/c/" in page.url and session_a not in page.url, (
         f"expected to switch to another session, still at {page.url}"
     )
+    expect(draft_indicator).to_be_visible()
+    expect(draft_indicator).to_have_accessible_name("Draft")
 
     # Drafts are per-session, so the composer we landed on is a different one;
     # stepping back restores the draft, proving the chord navigated rather than
@@ -84,6 +93,7 @@ def test_ctrl_arrow_switches_session_from_focused_composer(
     expect(page.get_by_placeholder(_COMPOSER)).to_have_value(
         "an unsent draft that must survive the switch"
     )
+    expect(draft_indicator).to_have_count(0)
 
 
 def test_ctrl_arrow_still_switches_session_from_body_focus(

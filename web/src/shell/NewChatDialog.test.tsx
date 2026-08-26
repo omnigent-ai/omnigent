@@ -2754,6 +2754,17 @@ describe("NewChatLandingScreen skill pills", () => {
     expect(screen.getByTestId("skill-pill-compare").textContent).toBe("/compare");
   });
 
+  it("lets the textarea and skill prompt inherit the app font family", () => {
+    mockAgents([debbyAgent()]);
+    renderLanding();
+
+    const localFontFamily = /(^|\s)font-(sans|serif|mono|\[)/;
+    for (const element of [input(), screen.getByText("Describe a task, or try a skill")]) {
+      expect(element.className).not.toMatch(localFontFamily);
+      expect(element.style.fontFamily).toBe("");
+    }
+  });
+
   it("hides pills for agents outside the allowlist even when they carry skills", () => {
     // Same skills, non-allowlisted name: no pill row. Fails if the gate
     // ever degrades to "any agent with skills", which would spam the

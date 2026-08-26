@@ -1811,6 +1811,7 @@ def test_cli_accounts_login_happy_path_stores_token(
         assert body == {
             "username": "alice",
             "password": "alice-pw-1234",
+            "issue_refresh": True,
         }
         return _FakeResponse(
             200,
@@ -1818,6 +1819,7 @@ def test_cli_accounts_login_happy_path_stores_token(
                 "token": "fake.jwt.token",
                 "user": {"id": "alice", "is_admin": False},
                 "expires_in": 8 * 3600,
+                "refresh_token": "fake.refresh.token",
             },
         )
 
@@ -1836,6 +1838,9 @@ def test_cli_accounts_login_happy_path_stores_token(
     assert "Logged in as alice" in result.output
     # The store_token side effect lands in ~/.omnigent/auth_tokens.json.
     assert cli_auth.load_token("http://localhost:8000") == "fake.jwt.token"
+    # The refresh token from /auth/login must also be persisted when present.
+    entry = cli_auth._load_entry("http://localhost:8000")
+    assert entry is not None and entry.get("refresh_token") == "fake.refresh.token"
 
 
 def test_cli_accounts_login_wrong_password_surfaces_clean_error(
@@ -2028,24 +2033,44 @@ def test_setup_is_single_use(accounts_app_needs_setup: TestClient) -> None:
 
 
 def test_browser_login_never_issues_refresh_token(accounts_app: TestClient) -> None:
-    """Regression test for P1 security: browser /auth/login must NEVER issue
-    a refresh_token, regardless of client input. Refresh grants are for
-    unattended flows (CLI/device); browser logins should never get long-lived
-    credentials that bypass session expiry.
-
-    This was broken when LoginRequest.issue_refresh was a client-controllable
-    bool — XSS or form-hijack could POST issue_refresh=true and obtain a
-    30-day unattended credential.
+    """Regression: browser /auth/login (no issue_refresh) must never return a
+    refresh_token. Gating is on the request field so the web form, which never
+    sends it, cannot receive long-lived unattended credentials under XSS or
+    form-hijack.
     """
     resp = accounts_app.post(
         "/auth/login",
         json={"username": "admin", "password": "admin-pw-12345"},
     )
     assert resp.status_code == 200, resp.text
+    assert "refresh_token" not in resp.json()
+
+
+def test_cli_login_with_issue_refresh_issues_grant(accounts_app: TestClient) -> None:
+    """``POST /auth/login`` with ``issue_refresh=True`` returns a usable refresh_token.
+
+    The CLI sends this flag; unattended hosts can renew past session-JWT expiry
+    via /oauth/token without a human re-running ``omnigent login``.
+    """
+    resp = accounts_app.post(
+        "/auth/login",
+        json={"username": "admin", "password": "admin-pw-12345", "issue_refresh": True},
+    )
+    assert resp.status_code == 200, resp.text
     body = resp.json()
 
-    # Browser login must NEVER include refresh_token in response.
-    assert "refresh_token" not in body, (
-        "Browser /auth/login returned refresh_token — violates the security "
-        "invariant that unattended credentials are issued only via CLI/device flows"
+    assert "token" in body
+    assert "refresh_token" in body
+    refresh_token = body["refresh_token"]
+    assert isinstance(refresh_token, str) and len(refresh_token) > 10
+
+    # The refresh token must be immediately usable at /oauth/token.
+    refresh_resp = accounts_app.post(
+        "/oauth/token",
+        data={"grant_type": "refresh_token", "refresh_token": refresh_token},
     )
+    assert refresh_resp.status_code == 200, refresh_resp.text
+    refresh_body = refresh_resp.json()
+    assert "access_token" in refresh_body
+    # Login grants don't rotate — same token is returned.
+    assert refresh_body["refresh_token"] == refresh_token

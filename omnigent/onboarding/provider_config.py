@@ -44,6 +44,7 @@ never ``gemini``.
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field, replace
 from typing import Literal
@@ -58,6 +59,8 @@ from omnigent.env_credentials import (
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.spec.parser import check_unresolved_env_vars
+
+_logger = logging.getLogger(__name__)
 
 # Family keys. ``anthropic`` is the Messages-API surface (Claude SDK,
 # native Claude); ``openai`` is the Responses/Chat surface (Codex,
@@ -123,13 +126,15 @@ GATEWAY_KIND = "gateway"
 LOCAL_KIND = "local"
 DATABRICKS_KIND: Literal["databricks"] = "databricks"
 CLI_CONFIG_KIND = "cli-config"
-
-# The CLIs whose own config file can define AND authenticate a provider, so an
-# omnigent entry only has to name it: codex via a ``[model_providers.X]`` table
-# in ``~/.codex/config.toml``, claude via a gateway ``env`` block + credential
-# helper in Claude Code's managed settings.
-CLI_CONFIG_CLIS = frozenset({"codex", "claude"})
 BEDROCK_KIND = "bedrock"
+
+# The CLIs whose own config file this build knows how to drive for a
+# ``cli-config`` provider. A ``cli-config`` entry naming any other CLI is a
+# shape from a newer build (or a stale entry a newer build wrote, e.g. a
+# ``cli: claude`` gateway): :func:`load_providers` SKIPS it with a warning
+# rather than raising, so one such entry cannot crash every turn's config
+# parse — the forward-compatibility gap that broke released runners.
+_CLI_CONFIG_RECOGNIZED_CLIS = frozenset({"codex"})
 _VALID_KINDS = (
     KEY_KIND,
     SUBSCRIPTION_KIND,
@@ -175,6 +180,7 @@ _HARNESS_FAMILY: dict[str, str] = {
     # Antigravity is Gemini-native but routes generic-provider traffic over
     # the OpenAI-compatible wire, so it consumes the ``openai`` family.
     "antigravity": OPENAI_FAMILY,
+    "agy": OPENAI_FAMILY,
     # NB: ``kimi`` is intentionally absent. Upstream Kimi Code CLI has no
     # per-spawn provider override flag, so Omnigent cannot thread a generic
     # provider through. Provider routing for kimi lives in ``~/.kimi/config.toml``
@@ -188,9 +194,11 @@ _HARNESS_FAMILY: dict[str, str] = {
     # (file-based, checked in :mod:`omnigent.onboarding.gemini_auth`) and the
     # detected GEMINI_API_KEY is adopted as a ``gemini``-family key, so the
     # native harness consumes the ``gemini`` family for onboarding / readiness.
-    # Both spellings are accepted, mirroring claude-native / native-claude.
+    # All spellings and aliases are accepted, mirroring claude-native / native-claude.
     "antigravity-native": GEMINI_FAMILY,
     "native-antigravity": GEMINI_FAMILY,
+    "agy-native": GEMINI_FAMILY,
+    "native-agy": GEMINI_FAMILY,
 }
 
 # Executor-type spellings that ``AgentSpec.harness_kind`` returns for SDK
@@ -312,14 +320,14 @@ class ProviderEntry:
         :meth:`family` rather than indexing :attr:`families` directly.
     :param cli: For ``kind="subscription"`` and ``kind="cli-config"``: the
         CLI whose login / config file carries auth, ``"claude"`` or
-        ``"codex"`` (see :data:`CLI_CONFIG_CLIS`). ``None`` otherwise.
+        ``"codex"`` (``cli-config`` supports only ``"codex"`` today).
+        ``None`` otherwise.
     :param profile: For ``kind="databricks"`` only: the Databricks profile
         name from ``~/.databrickscfg``, e.g. ``"oss"``. ``None`` otherwise.
-    :param model_provider: For a ``codex`` ``kind="cli-config"`` only: the
-        custom provider id in the CLI's config file that the launch pins,
-        i.e. the ``X`` in ``[model_providers.X]``, e.g. ``"Databricks"``.
-        ``None`` otherwise — a ``claude`` cli-config has no id to pin, since
-        Claude Code's settings chain names the endpoint directly.
+    :param model_provider: For ``kind="cli-config"`` only: the custom
+        provider id in the CLI's config file that the launch pins, i.e. the
+        ``X`` in ``[model_providers.X]``, e.g. ``"Databricks"``. ``None``
+        otherwise.
     :param display_name: For ``kind="cli-config"`` only: the provider's
         human display name (the table's ``name`` field, snapshotted at
         adoption), e.g. ``"Databricks AI Gateway"``. ``None`` otherwise and
@@ -821,54 +829,42 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
 
     if kind == CLI_CONFIG_KIND:
         cli_raw = raw.get("cli")
-        if not isinstance(cli_raw, str) or cli_raw not in CLI_CONFIG_CLIS:
+        # Only codex has a model_provider concept; a claude analog (e.g. an
+        # isaac-written settings.json) would be a different mechanism and a
+        # deliberate extension, not a value to silently accept here.
+        if cli_raw != "codex":
             raise OmnigentError(
-                f"provider {name!r}: kind 'cli-config' requires cli: 'codex' or "
-                "'claude' (the CLIs whose own config file defines and "
-                f"authenticates a provider), got {cli_raw!r}.",
+                f"provider {name!r}: kind 'cli-config' requires cli: 'codex' "
+                f"(the only CLI with config-file model providers), got {cli_raw!r}.",
                 code=ErrorCode.INVALID_INPUT,
             )
-        # Only codex names its provider: a ``[model_providers.X]`` table the
-        # launch pins by id. Claude Code's settings chain pins the endpoint
-        # directly, so there is no id to record and requiring one would reject a
-        # valid entry.
         model_provider_raw = raw.get("model_provider")
-        model_provider = (
-            model_provider_raw
-            if isinstance(model_provider_raw, str) and model_provider_raw
-            else None
-        )
-        if cli_raw == "codex" and model_provider is None:
+        if not isinstance(model_provider_raw, str) or not model_provider_raw:
             raise OmnigentError(
                 f"provider {name!r}: a 'model_provider' (the [model_providers.X] "
                 "id in ~/.codex/config.toml, e.g. 'Databricks') is required when "
-                "kind is 'cli-config' and cli is 'codex'.",
+                "kind is 'cli-config'.",
                 code=ErrorCode.INVALID_INPUT,
             )
         display_name_raw = raw.get("display_name")
-        # A cli-config provider serves exactly the surface its CLI drives, like
-        # that CLI's subscription: codex→openai, claude→anthropic.
-        served_family = OPENAI_FAMILY if cli_raw == "codex" else ANTHROPIC_FAMILY
         return ProviderEntry(
             name=name,
             kind=kind,
             cli=cli_raw,
-            model_provider=model_provider,
+            model_provider=model_provider_raw,
             display_name=display_name_raw if isinstance(display_name_raw, str) else None,
-            # A *codex* cli-config provider may ALSO claim the pi scope
-            # (``default: [openai, pi]``) because a Databricks AI Gateway is
-            # pi-consumable (Pi speaks its Anthropic surface natively). This is
-            # allowed structurally — without reading the ambient
-            # ~/.codex/config.toml at parse — so a user can pin pi→Databricks;
-            # whether the pinned provider is a *real* Databricks gateway is
-            # validated at pi launch, which falls back to Pi's own login when it
-            # is not (see :func:`_cli_config_serves_pi` and
-            # ``resolve_pi_native_provider``). A codex subscription stays
-            # pi-incapable (its ``default: pi`` is still rejected at parse), and
-            # so does a claude cli-config: pi reuses a pinned *codex* table, and
-            # Claude Code's managed credential is not readable outside its CLI.
+            # A codex cli-config provider serves the openai surface, like a codex
+            # subscription. It may ALSO claim the pi scope (``default: [openai,
+            # pi]``) because a Databricks AI Gateway is pi-consumable (Pi speaks
+            # its Anthropic surface natively). This is allowed structurally —
+            # without reading the ambient ~/.codex/config.toml at parse — so a
+            # user can pin pi→Databricks; whether the pinned provider is a *real*
+            # Databricks gateway is validated at pi launch, which falls back to
+            # Pi's own login when it is not (see :func:`_cli_config_serves_pi`
+            # and ``resolve_pi_native_provider``). A codex subscription stays
+            # pi-incapable (its ``default: pi`` is still rejected at parse).
             default_families=_parse_default_families(
-                name, default_raw, {served_family}, pi_capable=cli_raw == "codex"
+                name, default_raw, {OPENAI_FAMILY}, pi_capable=True
             ),
         )
 
@@ -971,6 +967,24 @@ def load_providers(config: dict[str, object]) -> dict[str, ProviderEntry]:
                 f"provider {str(name)!r} must be a mapping.",
                 code=ErrorCode.INVALID_INPUT,
             )
+        # Forward compatibility: a ``cli-config`` entry naming a CLI this build
+        # doesn't drive (e.g. a ``cli: claude`` gateway written by a newer
+        # build) is SKIPPED, not fatal. Raising here would propagate out of the
+        # whole parse and fail turn setup on every harness — the version-skew
+        # break that took down released runners. One unknown provider is
+        # ignored; the rest of the config still loads.
+        if (
+            raw.get("kind") == CLI_CONFIG_KIND
+            and raw.get("cli") not in _CLI_CONFIG_RECOGNIZED_CLIS
+        ):
+            _logger.warning(
+                "provider %r: ignoring cli-config entry for unrecognized cli %r "
+                "(a newer build may understand it; this build drives %s).",
+                str(name),
+                raw.get("cli"),
+                sorted(_CLI_CONFIG_RECOGNIZED_CLIS),
+            )
+            continue
         result[str(name)] = _parse_provider(str(name), raw)
     return result
 
@@ -1447,11 +1461,7 @@ def describe_active_credential(
             kind=provider.kind,
             family=None,
             model=model_override,
-            source=(
-                f"~/.codex/config.toml provider: {provider.model_provider}"
-                if provider.cli == "codex"
-                else "Claude Code managed settings gateway"
-            ),
+            source=f"~/.codex/config.toml provider: {provider.model_provider}",
             base_url=None,
         )
 

@@ -361,26 +361,26 @@ def _family_provider_configured(harness: str) -> bool:
 
 
 def _claude_managed_gateway_configured() -> bool:
-    """Whether Claude Code's own settings chain carries a gateway credential.
+    """Whether Claude Code's own settings chain carries a usable credential.
 
-    The structural half of Claude readiness, parallel to
-    :func:`_family_provider_configured` (which only sees omnigent's
-    ``providers:`` config). An enterprise install configures Claude Code
-    directly — a gateway ``env.ANTHROPIC_BASE_URL`` plus an ``apiKeyHelper`` in
+    The structural companion to :func:`_family_provider_configured` (which sees
+    only omnigent's ``providers:`` config). An enterprise install configures
+    Claude Code directly — a gateway ``ANTHROPIC_BASE_URL`` + ``apiKeyHelper`` in
     its managed settings — and Claude Code applies that at its own launch, so
-    the harness is genuinely usable with nothing in ``config.yaml``.
+    the harness is genuinely usable with nothing in ``config.yaml`` and no CLI
+    subscription login. Crediting it here is what stops an enterprise host from
+    reading "needs-auth" (the "Claude Code isn't configured on <host>" banner).
 
     Local, synchronous, side-effect free (one JSON file read) and never raises:
     any error fails to ``False`` so readiness falls through to the CLI status
     probe rather than crashing the refresh.
 
-    :returns: ``True`` when the settings chain pins a gateway AND delivers a
-        credential for it, else ``False``.
+    :returns: ``True`` when Claude Code's managed settings deliver a credential.
     """
     try:
-        from omnigent.onboarding.ambient import claude_config_detection
+        from omnigent.onboarding.ambient import claude_managed_gateway
 
-        return claude_config_detection() is not None
+        return claude_managed_gateway()[1]
     except Exception:
         _logger.debug("readiness: claude managed-settings check failed", exc_info=True)
         return False
@@ -431,24 +431,22 @@ def _cli_family_availability(canonical: str, install_key: str) -> HarnessAvailab
         from omnigent.onboarding.opencode_auth import opencode_auth_summary
 
         return True if opencode_auth_summary().has_provider else "needs-auth"
-    # claude / cursor: ready when EITHER an omnigent-managed provider serves the
-    # family (an API key / gateway the user set, incl. from the UI) OR the
-    # harness's own login is present (`claude auth status`, a subprocess — the
-    # same probe the setup wizard uses; runs off the event loop on the throttled
-    # readiness refresh). Checking the config first avoids the subprocess on the
-    # common key-configured path.
+    # claude: ready when EITHER an omnigent-managed provider serves the family
+    # (an API key / gateway the user set, incl. from the UI) OR the harness's
+    # own subscription login is present (`claude auth status`, a subprocess —
+    # the same probe the setup wizard uses; runs off the event loop on the
+    # throttled readiness refresh). Checking the config first avoids the
+    # subprocess on the common key-configured path.
     from omnigent.onboarding.harness_install import harness_cli_logged_in
 
     if _family_provider_configured(canonical):
         return True
-    # Claude Code's own settings chain can carry a complete gateway credential
-    # (an enterprise ``ANTHROPIC_BASE_URL`` + ``apiKeyHelper``) that omnigent's
-    # config knows nothing about, and that is what the launch actually routes
-    # through — Claude Code applies managed settings itself. Credit it here:
-    # the check is structural (one local file read, no subprocess), so an
-    # enterprise host reads ready without depending on the status probe
-    # resolving the CLI. Mirrors the codex path, which credits its own
-    # config.toml provider the same way.
+    # Claude Code's own managed settings can carry a complete gateway credential
+    # (enterprise ``ANTHROPIC_BASE_URL`` + ``apiKeyHelper``) that omnigent's
+    # config knows nothing about, and that is what a claude-native launch
+    # actually routes through. Credit it structurally (one local file read, no
+    # subprocess) before the status probe, so an enterprise host reads ready
+    # without depending on the probe resolving the CLI on PATH.
     if install_key == ANTHROPIC_FAMILY and _claude_managed_gateway_configured():
         return True
     return (

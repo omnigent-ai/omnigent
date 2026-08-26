@@ -8434,6 +8434,46 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
+  it("acks an optimistic user bubble when reconnect backfills its committed item", async () => {
+    const before = userMessage("ack_pre", "before the gap");
+    seedSession("conv_reconnect_ack", [before]);
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_reconnect_ack",
+      abortController: controller,
+      blocks: itemsToBlocks([before]),
+      pendingUserMessages: [
+        {
+          tempId: "pend_gap",
+          content: [{ type: "input_text", text: "only once" }],
+          posted: true,
+        },
+      ],
+    });
+
+    const loop = startStreamPump("conv_reconnect_ack", controller, setState, getState);
+    await drainAsync();
+    expect(sinks).toHaveLength(1);
+
+    const committed = userMessage("ack_gap", "only once");
+    const reply = assistantMessage("ack_gap", "the reply");
+    seedSessionItems("conv_reconnect_ack", [before, committed, reply]);
+    sinks[0]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+
+    const state = useChatStore.getState();
+    expect(state.pendingUserMessages).toEqual([]);
+    expect(state.blocks.map((b) => b.ctx.itemId)).toEqual([before.id, committed.id, reply.id]);
+
+    const last = sinks[1]!;
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
+    await loop;
+  });
+
   it("keeps a heartbeat-alive stream connected across many stall windows", async () => {
     seedSession("conv_hb", []);
     const sinks = routeStreamOpens();

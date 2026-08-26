@@ -18,7 +18,7 @@ import json
 import pytest
 
 from omnigent.runtime.harnesses import _HARNESS_MODULES
-from tests.harness_bench.bench import run_bench, run_harness
+from tests.harness_bench.bench import BenchMatrix, run_bench, run_harness
 from tests.harness_bench.driver import SdkInprocDriver
 from tests.harness_bench.manifest import OFFICIAL_PROFILES
 from tests.harness_bench.probes import ALL_PROBES
@@ -1008,3 +1008,73 @@ def test_full_server_skips_native_with_accurate_message() -> None:
     reason = FullServerDriver.unavailable(claude_native, databricks_profile="oss")
     assert reason is not None
     assert "native-tui" in reason and "sdk-inproc" not in reason
+
+
+@pytest.fixture
+def _no_gateway_creds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Present a box with no Databricks profile and no ambient OPENAI_* creds."""
+    import tests.harness_bench.runtime_env as runtime_env
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.setattr(runtime_env, "_profile_from_config", lambda: None)
+
+
+def test_live_runs_an_own_auth_native_without_gateway_creds(
+    _no_gateway_creds: None, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--live`` on an own_auth native must not be refused for missing creds.
+
+    A cursor/pi/kimi native logs its own model in through the vendor CLI, so the
+    run never reaches the gateway. ``NativeTuiDriver.unavailable`` already
+    waives the check for those; when the CLI's own gate does not, every
+    own_auth native is unreachable on a box with no Databricks or OpenAI
+    credentials — which is most contributors' boxes.
+    """
+    from tests.harness_bench.__main__ import main
+
+    reached: list[bool] = []
+
+    async def _fake_run_bench(*args: object, **kwargs: object) -> BenchMatrix:
+        reached.append(bool(kwargs.get("live")))
+        return BenchMatrix(reports=[])
+
+    monkeypatch.setattr("tests.harness_bench.__main__.run_bench", _fake_run_bench)
+
+    assert main(["--live", "--harness", "pi-native", "--dimension", "basic_turn"]) == 0
+    assert reached == [True]
+    assert "needs resolvable gateway creds" not in capsys.readouterr().err
+
+
+def test_live_is_still_refused_when_a_selected_harness_needs_the_gateway(
+    _no_gateway_creds: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The waiver is per-run, not blanket.
+
+    claude-native takes an Omnigent-supplied credential, so a selection that
+    names it — alone, or mixed with own_auth natives — still has to resolve the
+    gateway. Same for the SDK family, and for an own_auth native forced onto
+    full-server, where turns route through the server again.
+    """
+    from tests.harness_bench.__main__ import main
+
+    assert main(["--live", "--harness", "claude-native", "--dimension", "basic_turn"]) == 2
+    assert main(["--live", "--harness", "pi-native", "--harness", "claude-sdk"]) == 2
+    assert main(["--live", "--harness", "pi-native", "--transport", "full-server"]) == 2
+    assert capsys.readouterr().err.count("needs resolvable gateway creds") == 3
+
+
+def test_omitting_live_still_renders_declared_only_without_creds(
+    _no_gateway_creds: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The waiver must not turn a plain run into a surprise live one.
+
+    Auto-live is keyed on the gateway, so on a credential-less box a bare
+    invocation renders the declared matrix. Waiving the gateway for own_auth
+    natives here would silently start launching vendor CLIs for someone who
+    never asked to.
+    """
+    from tests.harness_bench.__main__ import main
+
+    assert main(["--harness", "pi-native", "--dimension", "basic_turn"]) == 0
+    assert "declared, not observed" in capsys.readouterr().out

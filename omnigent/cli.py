@@ -5,7 +5,6 @@ from __future__ import annotations
 import concurrent.futures
 import contextlib
 import copy
-import hashlib
 import json
 import logging
 import os
@@ -56,6 +55,18 @@ from omnigent.config import (
     load_local_config,
 )
 from omnigent.harness_aliases import canonicalize_harness
+from omnigent.host.daemon_lifecycle import (
+    daemon_record_path as _daemon_record_path_for,
+)
+from omnigent.host.daemon_lifecycle import (
+    daemon_registry_dir as _daemon_registry_dir_for,
+)
+from omnigent.host.daemon_lifecycle import (
+    normalize_daemon_target as _normalize_daemon_target_impl,
+)
+from omnigent.host.daemon_lifecycle import (
+    record_flock_is_held as _record_flock_is_held,
+)
 from omnigent.host.local_server import (
     _DEFAULT_LOCAL_PORT,
     _pid_alive,
@@ -1597,6 +1608,7 @@ def _print_version_callback(ctx: click.Context, _param: click.Parameter, value: 
 # decorated below.
 _HARNESS_COMMANDS: frozenset[str] = frozenset(
     {
+        "agy",
         "antigravity",
         "claude",
         "codex",
@@ -1624,7 +1636,7 @@ _ACCENT_RGB = (244, 59, 166)
 # object registered under a second name, e.g. ``update`` -> ``upgrade``).
 # Kept runnable/registered but omitted from the ``--help`` listing so the
 # alias isn't shown as a duplicate line.
-_ALIAS_COMMANDS: frozenset[str] = frozenset({"update"})
+_ALIAS_COMMANDS: frozenset[str] = frozenset({"update", "antigravity"})
 
 
 def _harness_extra_checks() -> dict[str, Callable[[], bool]]:
@@ -1636,12 +1648,10 @@ def _harness_extra_checks() -> dict[str, Callable[[], bool]]:
     The predicates use ``importlib.util.find_spec`` (no heavy import).
     Commands absent from this map are always listed.
     """
-    from omnigent.onboarding.antigravity_auth import antigravity_sdk_installed
     from omnigent.onboarding.cursor_auth import cursor_sdk_installed
 
     return {
         "cursor": cursor_sdk_installed,
-        "antigravity": antigravity_sdk_installed,
     }
 
 
@@ -1939,6 +1949,7 @@ def cli() -> None:
 # Keep in sync with ``@cli.command()`` decorations below.
 _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
     {
+        "agy",
         "antigravity",
         "attach",
         "claude",
@@ -2520,7 +2531,7 @@ def _normalize_daemon_target(server_url: str | None) -> str:
     :returns: ``"local"`` for local mode, otherwise the URL without a
         trailing slash.
     """
-    return _LOCAL_DAEMON_MARKER if not server_url else server_url.rstrip("/")
+    return _normalize_daemon_target_impl(server_url)
 
 
 def _daemon_host_online(record: _HostDaemonRecord, *, timeout_s: float = 2.0) -> bool:
@@ -2571,7 +2582,7 @@ def _daemon_registry_dir() -> Path:
     :returns: Registry directory path, e.g.
         ``Path("~/.omnigent/daemons")``.
     """
-    return _HOST_PID_PATH.parent / "daemons"
+    return _daemon_registry_dir_for(_HOST_PID_PATH.parent)
 
 
 def _daemon_record_path(target: str) -> Path:
@@ -2582,8 +2593,7 @@ def _daemon_record_path(target: str) -> Path:
         ``"https://example.databricksapps.com"`` or ``"local"``.
     :returns: JSON registry path for the target.
     """
-    digest = hashlib.sha256(target.encode("utf-8")).hexdigest()[:16]
-    return _daemon_registry_dir() / f"{digest}.json"
+    return _daemon_record_path_for(target, base_dir=_HOST_PID_PATH.parent)
 
 
 def _record_from_json(raw: _HostJsonObject) -> _HostDaemonRecord | None:
@@ -2870,11 +2880,32 @@ class _DaemonReuseDecision:
     config_changed: bool
 
 
+def _daemon_owner_is_live(record: _HostDaemonRecord, target: str) -> bool:
+    """Whether the daemon that wrote *record* is still alive.
+
+    A held record flock is a definitive live owner (the kernel drops it on
+    death), so it is the fast positive signal. When the lock is free or can't
+    be probed (no ``fcntl``, unreadable), fall back to whether the PID is
+    alive — so a daemon still mid-startup (hasn't grabbed the lock yet) is not
+    reaped. Reaping therefore requires both signals dead: a free lock and a
+    dead PID.
+
+    :param record: Existing daemon record for *target*.
+    :param target: Normalized daemon target, e.g. ``"local"``.
+    :returns: ``True`` if the daemon should be treated as alive.
+    """
+    if _record_flock_is_held(_daemon_record_path(target)) is True:
+        return True
+    return _pid_alive(record.pid)
+
+
 def _reuse_existing_daemon_record(target: str) -> _DaemonReuseDecision:
     """
     Decide whether an existing daemon for *target* can be reused.
 
-    Reuse requires more than a live PID: a daemon whose process is alive
+    Liveness is judged by the record's flock, falling back to a PID check (see
+    :func:`_daemon_owner_is_live`). Reuse requires more than a live owner: a
+    daemon whose process is alive
     but whose server tunnel is down (server restart, ungraceful death,
     flapping tunnel) is a zombie — the host reads ``offline`` and the
     caller would poll until timeout. And a daemon spawned under a
@@ -2897,7 +2928,7 @@ def _reuse_existing_daemon_record(target: str) -> _DaemonReuseDecision:
     existing = _find_daemon_record(target)
     if existing is None:
         return _DaemonReuseDecision(reuse=False, config_changed=False)
-    if not _pid_alive(existing.pid):
+    if not _daemon_owner_is_live(existing, target):
         _delete_daemon_record(existing)
         return _DaemonReuseDecision(reuse=False, config_changed=False)
 
@@ -3057,18 +3088,25 @@ def _live_daemon_conflict(record: _HostDaemonRecord) -> _HostDaemonRecord | None
     """
     Find a live daemon that already serves a foreground record target.
 
+    Liveness uses the record flock, falling back to a PID check (see
+    :func:`_daemon_owner_is_live`).
+
     :param record: Foreground daemon record this process wants to claim.
     :returns: Conflicting live record, or ``None``.
     """
     existing = _find_daemon_record(record.target)
-    if existing is not None and existing.pid != record.pid and _pid_alive(existing.pid):
+    if (
+        existing is not None
+        and existing.pid != record.pid
+        and _daemon_owner_is_live(existing, record.target)
+    ):
         return existing
     if record.mode == "server" and record.server_url is not None:
         local_record = _find_daemon_record(_LOCAL_DAEMON_MARKER)
         if (
             local_record is not None
             and local_record.pid != record.pid
-            and _pid_alive(local_record.pid)
+            and _daemon_owner_is_live(local_record, _LOCAL_DAEMON_MARKER)
             and local_record.resolved_server_url == record.server_url.rstrip("/")
         ):
             return local_record
@@ -7924,9 +7962,9 @@ class _HostGroup(click.Group):
     ``omnigent host <url>`` is shorthand for ``omnigent host
     --server <url>`` when ``<url>`` is URL-like or the empty local-mode
     marker. A leading positional token that matches a registered
-    management subcommand (``status``, ``stop``, ``stop-session``)
-    still dispatches to that subcommand, and other unknown tokens fall
-    through to Click's normal unknown-command error.
+    management subcommand (``enable``, ``disable``, ``status``, ``stop``,
+    ``stop-session``) still dispatches to that subcommand, and other unknown
+    tokens fall through to Click's normal unknown-command error.
     """
 
     def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
@@ -8118,6 +8156,35 @@ def _confirm_background_host_registered(record: _HostDaemonRecord) -> None:
         time.sleep(0.2)
 
 
+def _stdin_is_tty() -> bool:
+    """Return whether stdin is an interactive terminal."""
+    return sys.stdin.isatty()
+
+
+def _maybe_open_host_web_ui(
+    server_url: str,
+    *,
+    non_interactive: bool,
+    cfg: dict[str, Any] | None = None,  # type: ignore[explicit-any]
+) -> None:
+    """Open the host web UI when interactive and enabled."""
+    if non_interactive or not _stdin_is_tty():
+        return
+    if cfg is None:
+        cfg = _load_effective_config()
+    if _resolve_auto_open_conversation_setting(cfg) is False:
+        return
+    from omnigent.conversation_browser import display_server_url, open_conversation_url
+
+    web_url = display_server_url(server_url)
+    try:
+        opened = open_conversation_url(web_url)
+    except OSError:
+        opened = False
+    if not opened:
+        click.echo(f"Open the Omnigent web UI: {web_url}", err=True)
+
+
 def _run_background_host(
     server: str | None,
     *,
@@ -8195,6 +8262,7 @@ def _run_background_host(
     click.echo()
     click.echo(_cli_style("Stop it with:", dim=True))
     click.echo(f"  {_cli_style(stop_command, bold=True)}")
+    _maybe_open_host_web_ui(server_url, non_interactive=non_interactive)
 
 
 def _echo_host_field(label: str, value: str) -> None:
@@ -8267,10 +8335,13 @@ def host(
       omnigent host --server https://omnigent-app.databricksapps.com
       omnigent host ""   # spawn + connect to a local server
       omnigent host --background   # spawn detached, return immediately
+      omnigent host enable   # install and start a per-user system service
+      omnigent host disable  # stop and remove the per-user system service
 
     The server URL may be given positionally (``omnigent host
     <url>``) or via ``--server <url>``. A leading ``status``, ``stop``,
-    or ``stop-session`` token still runs that management subcommand.
+    ``enable``, ``disable``, or ``stop-session`` token still runs that
+    management subcommand.
 
     When the target server is Databricks-fronted and you are not signed
     in, ``host`` runs the same flow ``omnigent login`` would before
@@ -8292,6 +8363,7 @@ def host(
     """
     ctx.ensure_object(dict)
     ctx.obj["server"] = server
+    ctx.obj["non_interactive"] = non_interactive
     if ctx.invoked_subcommand is not None:
         return
     # Kept before the config fallback below: `--background` echoes a `host
@@ -8350,7 +8422,8 @@ def host(
         # (or a headless invocation) fails loud with the command to run.
         if remote_mode:
             _ensure_databricks_server_auth(server, non_interactive=non_interactive)
-        run_host_process(server_url=server)
+        _maybe_open_host_web_ui(server, non_interactive=non_interactive, cfg=cfg)
+        run_host_process(server_url=server, daemon_target=target)
         stopped_cleanly = True
     except KeyboardInterrupt:
         # Ctrl-C is the normal way to stop the foreground daemon — swallow it
@@ -9235,6 +9308,76 @@ def _echo_daemon_payloads(payloads: list[_HostPayload]) -> None:
             )
             console.print(f"  [red]error={_host_markup(message)}[/red]")
         _add_host_payload_sessions_table(console, payload)
+
+
+@host.command("enable")
+@click.option("--server", default=None, help="Server target for the persistent service.")
+@click.option(
+    "--non-interactive",
+    is_flag=True,
+    default=False,
+    help="Do not launch browser sign-in while preparing the service.",
+)
+@click.pass_context
+def host_enable(
+    ctx: click.Context,
+    server: str | None,
+    non_interactive: bool,
+) -> None:
+    """Install and start the host as a per-user system service.
+
+    :param ctx: Click context carrying group-level options.
+    :param server: Optional server target; empty selects local mode.
+    :param non_interactive: Fail instead of launching browser sign-in.
+    """
+    if server is None:
+        server = _host_group_option(ctx, "server")
+    resolved_server = _resolve_host_server(server)
+    group_obj = ctx.obj if isinstance(ctx.obj, dict) else {}
+    non_interactive = non_interactive or bool(group_obj.get("non_interactive"))
+    if resolved_server:
+        _ensure_databricks_server_auth(
+            resolved_server,
+            non_interactive=non_interactive or not _stdin_is_tty(),
+        )
+
+    target = _normalize_daemon_target(resolved_server)
+    record = _find_daemon_record(target)
+    if record is not None:
+        _terminate_daemon(record, force=False)
+
+    from omnigent.host.service import HostServiceError, enable_user_host_service
+
+    try:
+        service = enable_user_host_service(
+            resolved_server,
+            environment=_build_host_daemon_env(server_url=resolved_server),
+        )
+    except HostServiceError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    click.echo(f"Enabled the Omnigent host user service for {target}.")
+    click.echo(f"Service definition: {_display_path(service.path)}")
+    if service.log_path is not None:
+        click.echo(f"Service output: {_display_path(service.log_path)}")
+
+
+@host.command("disable")
+def host_disable() -> None:
+    """Stop and remove the current user's host system service."""
+    from omnigent.host.service import HostServiceError, disable_user_host_service
+
+    try:
+        service = disable_user_host_service()
+    except HostServiceError as exc:
+        raise click.ClickException(str(exc)) from exc
+    # Service managers stop with SIGTERM, which can leave the foreground
+    # daemon's registry record behind after the process has exited.
+    for record in _list_daemon_records():
+        if not _pid_alive(record.pid):
+            _delete_daemon_record(record)
+    click.echo("Disabled the Omnigent host user service.")
+    click.echo(f"Removed service definition: {_display_path(service.path)}")
 
 
 @host.command("status")
@@ -11430,7 +11573,7 @@ def _accounts_login(server: str) -> None:
     try:
         resp = _httpx.post(
             f"{server}/auth/login",
-            json={"username": username, "password": password},
+            json={"username": username, "password": password, "issue_refresh": True},
             timeout=10.0,
         )
     except _httpx.HTTPError as exc:

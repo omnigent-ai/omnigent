@@ -60,14 +60,15 @@ export interface TerminalFirstContextValue {
   /** Switch view. `"terminal"` opens the terminal surface. */
   setView: (view: TerminalFirstView) => void;
   /**
-   * True when the agent terminal exists and is reachable. User shells do not
-   * enable the Terminal-view toggle; they open through the workspace rail.
+   * True when the agent terminal exists and is reachable. This controls
+   * background pre-warming, not whether the Terminal view can be selected;
+   * user shells open separately through the workspace rail.
    */
   terminalsAvailable: boolean;
   /**
-   * True while the terminal is coming up but not yet openable — drives the
-   * spinner on the "Terminal" pill so it reads as "loading" rather than a
-   * permanently greyed-out button. The single pill-facing "loading" signal:
+   * True while the terminal is coming up but its PTY is not available — drives
+   * the spinner on the selectable "Terminal" segment. The single pill-facing
+   * "loading" signal:
    * AppShell folds the two underlying sources into it, since neither alone
    * covers the whole launch:
    *
@@ -78,7 +79,7 @@ export interface TerminalFirstContextValue {
    *     (`terminalPending` SSE), which covers the window after it connects.
    *
    * Always false once `terminalsAvailable` is true, and for an idle stopped
-   * session (a greyed button, not "loading").
+   * session. The view remains selectable in every state.
    */
   terminalStartingUp: boolean;
 }

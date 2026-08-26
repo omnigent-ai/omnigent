@@ -44,6 +44,14 @@ from omnigent.onboarding.provider_config import (
         ("qwen", OPENAI_FAMILY),
         ("qwen-native", OPENAI_FAMILY),
         ("native-qwen", OPENAI_FAMILY),
+        # Antigravity SDK harness and aliases consume OpenAI family.
+        ("antigravity", OPENAI_FAMILY),
+        ("agy", OPENAI_FAMILY),
+        # Antigravity native CLI harness and aliases consume Gemini family.
+        ("antigravity-native", GEMINI_FAMILY),
+        ("native-antigravity", GEMINI_FAMILY),
+        ("agy-native", GEMINI_FAMILY),
+        ("native-agy", GEMINI_FAMILY),
         # An unknown harness has no family (caller falls back / shows nothing).
         ("some-unknown-harness", None),
     ],
@@ -671,14 +679,12 @@ def test_parse_cli_config_entry() -> None:
 @pytest.mark.parametrize(
     "body,message_fragment",
     [
-        # Only codex and claude carry a config-file credential; any other CLI
-        # is a typo, not a silently-accepted value.
-        (
-            {"kind": "cli-config", "cli": "gemini", "model_provider": "X"},
-            "requires cli: 'codex' or 'claude'",
-        ),
-        # For codex the pin target is the entry's whole point — fail loud
-        # without it. (Claude has no id to pin, so it is optional there.)
+        # A `cli: codex` cli-config is recognized, so a missing model_provider
+        # (its whole point) is a real error and must fail loud. (An unrecognized
+        # cli like `claude` is instead SKIPPED by load_providers for forward
+        # compatibility — see
+        # test_load_providers_skips_unrecognized_cli_config_cli_without_raising —
+        # so it is intentionally NOT in this "fails loud" list.)
         ({"kind": "cli-config", "cli": "codex"}, "'model_provider'"),
     ],
 )
@@ -892,82 +898,91 @@ def test_provider_credential_env_vars_empty_for_keychain_and_auth_command() -> N
     assert provider_credential_env_vars(config) == frozenset()
 
 
-def test_parse_claude_cli_config_entry_without_model_provider() -> None:
-    """A claude cli-config entry parses with no ``model_provider``.
+def test_load_providers_skips_unrecognized_cli_config_cli_without_raising() -> None:
+    """A `cli-config` entry naming an unknown CLI is skipped, not fatal.
 
-    Claude Code's settings pin the endpoint directly, so there is no
-    ``[model_providers.X]`` id. Requiring one (as codex does) would reject the
-    enterprise Claude credential outright — the parse-level half of the bug.
+    This is the version-skew guard: the first attempt persisted a
+    `cli: claude` cli-config entry that OLDER runners' parser rejected, and
+    because `load_providers` had no per-entry isolation, that single entry
+    raised and crashed turn setup for EVERY harness. Now such an entry is
+    dropped with a warning and the rest of the config still loads.
     """
     from omnigent.onboarding.provider_config import load_providers
 
-    entries = load_providers(
+    config = {
+        "providers": {
+            # The poison pill a newer build might write / that the reverted
+            # build left in the field.
+            "claude-databricks": {
+                "kind": "cli-config",
+                "cli": "claude",
+                "display_name": "Databricks AI Gateway",
+                "default": True,
+            },
+            "openai": {
+                "kind": "key",
+                "openai": {"api_key": "sk-x", "base_url": "https://api.openai.com/v1"},
+            },
+        }
+    }
+    parsed = load_providers(config)  # must NOT raise
+    assert set(parsed) == {"openai"}
+    assert "claude-databricks" not in parsed
+
+
+def test_load_providers_still_accepts_codex_cli_config() -> None:
+    """The recognized `cli: codex` cli-config still parses (no over-broad skip)."""
+    from omnigent.onboarding.provider_config import load_providers
+
+    parsed = load_providers(
         {
             "providers": {
-                "claude-databricks": {
+                "codex-databricks": {
                     "kind": "cli-config",
-                    "cli": "claude",
-                    "display_name": "Databricks AI Gateway",
+                    "cli": "codex",
+                    "model_provider": "Databricks",
                 }
             }
         }
     )
-    entry = entries["claude-databricks"]
-    assert (entry.kind, entry.cli, entry.model_provider) == ("cli-config", "claude", None)
-    assert entry.display_name == "Databricks AI Gateway"
+    assert parsed["codex-databricks"].cli == "codex"
+    assert parsed["codex-databricks"].model_provider == "Databricks"
 
 
-def test_claude_cli_config_serves_only_anthropic() -> None:
-    """A claude cli-config serves the anthropic surface and NOT pi.
+def test_load_providers_still_raises_on_malformed_known_shape() -> None:
+    """Resilience is targeted: a malformed KNOWN shape still fails loud.
 
-    Pi reuses a pinned *codex* ``[model_providers.X]`` table; Claude Code's
-    managed credential is not readable outside its own CLI, so claiming the pi
-    scope would strand a pi launch. Failure means pi could auto-default to a
-    credential it cannot use.
-    """
-    from omnigent.onboarding.provider_config import (
-        ANTHROPIC_FAMILY,
-        load_providers,
-        provider_families,
-    )
-
-    entry = load_providers({"providers": {"c": {"kind": "cli-config", "cli": "claude"}}})["c"]
-    assert provider_families(entry) == frozenset({ANTHROPIC_FAMILY})
-
-
-def test_claude_cli_config_rejects_pi_default_scope() -> None:
-    """``default: pi`` on a claude cli-config is a loud config error.
-
-    Same guard the codex *subscription* has: a scope the credential cannot serve
-    must fail at parse rather than at launch.
+    Skipping is only for an unrecognized cli-config CLI (a newer-build shape).
+    A recognized shape with a real error (a `key` provider configuring no
+    family) must still raise so user typos aren't silently dropped.
     """
     from omnigent.errors import OmnigentError
     from omnigent.onboarding.provider_config import load_providers
 
     with pytest.raises(OmnigentError):
-        load_providers(
-            {"providers": {"c": {"kind": "cli-config", "cli": "claude", "default": "pi"}}}
-        )
+        load_providers({"providers": {"bad": {"kind": "key"}}})
 
 
-def test_claude_cli_config_resolves_for_claude_harness() -> None:
-    """A default claude cli-config resolves as the claude harness's provider.
+def test_claude_sdk_resolution_survives_stray_cli_config_claude_entry() -> None:
+    """The EXACT reverted failure: claude-sdk resolution over a poisoned config.
 
-    The routing half: ``default_provider_for_harness`` must hand the native /
-    SDK Claude launch this entry so the harness counts as configured.
+    The revert stack was `_build_claude_sdk_spawn_env` →
+    `_resolve_provider_for_build` → `default_provider_for_harness("claude-sdk")`
+    → `load_providers` → raise. With resilience the stray entry is skipped, so
+    resolution returns the next usable anthropic default (or None) instead of
+    crashing every claude-sdk turn.
     """
-    from omnigent.onboarding.provider_config import (
-        default_provider_for_harness,
-        load_providers,
-    )
+    from omnigent.onboarding.provider_config import default_provider_for_harness
 
     config = {
         "providers": {
-            "claude-databricks": {"kind": "cli-config", "cli": "claude", "default": True}
+            "claude-databricks": {"kind": "cli-config", "cli": "claude", "default": True},
+            "vendor-anthropic": {
+                "kind": "key",
+                "default": "anthropic",
+                "anthropic": {"api_key": "sk-x", "base_url": "https://api.anthropic.com"},
+            },
         }
     }
-    # Sanity: the entry itself parses and claims the anthropic default.
-    assert load_providers(config)["claude-databricks"].default is True
-    for harness in ("claude-sdk", "claude-native"):
-        entry = default_provider_for_harness(config, harness)
-        assert entry is not None and entry.name == "claude-databricks", harness
+    entry = default_provider_for_harness(config, "claude-sdk")  # must NOT raise
+    assert entry is not None and entry.name == "vendor-anthropic"

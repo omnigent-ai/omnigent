@@ -22,8 +22,7 @@ import { AlertTriangleIcon, MessageSquareOffIcon } from "lucide-react";
 import { normalizeResolvedTheme } from "@/components/theme/themeMode";
 import {
   codeFontFamilyForEditor,
-  readCodeFontFamily,
-  readCodeFontSizePx,
+  readCodeFont,
   subscribeCodeFont,
 } from "@/lib/codeFontPreferences";
 import type { Comment } from "@/hooks/useComments";
@@ -450,8 +449,9 @@ function MonacoCodeEditorInner({
     path,
   });
 
-  const options = useMemo<EditorOptions>(
-    () => ({
+  const options = useMemo<EditorOptions>(() => {
+    const font = readCodeFont();
+    return {
       readOnly: !canEdit,
       minimap: { enabled: false },
       scrollBeyondLastLine: false,
@@ -459,25 +459,26 @@ function MonacoCodeEditorInner({
       // changes arrive via updateOptions in the effect below. An unset family
       // resolves to the shared mono stack, so the editor matches the terminal
       // rather than falling back to Monaco's own platform default.
-      fontSize: readCodeFontSizePx(),
-      fontFamily: codeFontFamilyForEditor(readCodeFontFamily()),
+      fontSize: font.sizePx,
+      fontFamily: codeFontFamilyForEditor(font.family),
+      fontWeight: String(font.weight),
       automaticLayout: true,
       renderLineHighlight: canEdit ? "line" : "none",
       // Read-only buffers still allow selection + copy; just hide the caret.
       cursorStyle: canEdit ? "line" : "underline-thin",
-    }),
-    [canEdit],
-  );
+    };
+  }, [canEdit]);
 
   // Apply live code-font changes to the mounted editor. Monaco is a fixed-pixel
   // widget with no CSS-variable path like the chrome font, so the new
-  // size/family must be pushed imperatively; the options memo seeds the initial
+  // options must be pushed imperatively; the options memo seeds the initial
   // value at creation.
   useEffect(() => {
     return subscribeCodeFont((font) => {
       editorInstanceRef.current?.updateOptions({
         fontSize: font.sizePx,
         fontFamily: codeFontFamilyForEditor(font.family),
+        fontWeight: String(font.weight),
       });
     });
   }, []);

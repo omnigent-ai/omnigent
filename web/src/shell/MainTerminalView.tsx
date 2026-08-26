@@ -13,9 +13,10 @@
 // single header row (identity + close X). There is no tab strip here —
 // shells are opened and created from the rail's tab strip ("+" menu).
 
-import { TerminalIcon, XIcon } from "lucide-react";
+import { Loader2Icon, TerminalIcon, XIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { TerminalView } from "@/components/blocks/TerminalView";
+import { Button } from "@/components/ui/button";
 import {
   AGENT_TERMINAL_IDS,
   findAgentTerminal,
@@ -54,6 +55,10 @@ interface MainTerminalViewProps {
    * instead. Default false (owner / single-user).
    */
   readOnly?: boolean;
+  /** Known runner-tunnel state for the active session. */
+  runnerOnline?: boolean;
+  /** Relaunch or reconnect the session without replaying user input. */
+  onResume?: () => void | Promise<void>;
   /**
    * Exposes the outer terminal surface so the iOS native shell can show its
    * server switcher only while this surface is actually frontmost.
@@ -66,6 +71,8 @@ export function MainTerminalView({
   initialTerminalKey,
   visible = true,
   readOnly = false,
+  runnerOnline,
+  onResume,
   onSurfaceElement,
 }: MainTerminalViewProps) {
   const { terminals } = useTerminals(conversationId);
@@ -81,6 +88,28 @@ export function MainTerminalView({
   const [activeKey, setActiveKey] = useState(initialTerminalKey || "");
   const { getStatus, setTerminalConnectionState, markTerminalActive } =
     useTerminalStatuses(terminals);
+  const [resumePending, setResumePending] = useState(false);
+  const [resumeError, setResumeError] = useState<string | null>(null);
+  const runnerOffline = runnerOnline === false;
+  // Resource cleanup can beat the health poll when a session is stopped. An
+  // empty, non-starting inventory is therefore resumable even before liveness
+  // has caught up and explicitly reported the runner offline.
+  const resumeAvailable =
+    onResume !== undefined &&
+    (runnerOffline || (terminals.length === 0 && terminalFirstCtx?.terminalStartingUp !== true));
+  const handleResume = useCallback(async () => {
+    if (!onResume) return;
+    setResumeError(null);
+    setResumePending(true);
+    try {
+      await onResume();
+    } catch (error) {
+      setResumeError(resumeErrorText(error));
+      throw error;
+    } finally {
+      setResumePending(false);
+    }
+  }, [onResume]);
   // No manual keyboard padding here: this view is flow content inside the
   // app-shell, which useIOSViewportLock sizes to the visual viewport, so the
   // terminal already sits above the keyboard. (Fixed overlays like the mobile
@@ -156,9 +185,32 @@ export function MainTerminalView({
     >
       <div className="flex min-h-0 w-full flex-1 flex-col overflow-hidden rounded-lg border border-border bg-card p-3 shadow-sm">
         {activeTerminal === null ? (
-          <div className="flex flex-1 items-center justify-center text-muted-foreground text-ui">
-            {terminals.length === 0 ? "No terminals available." : "Agent terminal unavailable."}
-          </div>
+          resumeAvailable ? (
+            <div className="flex flex-1 flex-col items-center justify-center gap-3 px-6 text-center">
+              <div className="space-y-1">
+                <p className="font-medium text-foreground text-ui">The harness is not running.</p>
+                <p className="text-muted-foreground text-sm">
+                  Resume the session to reconnect the terminal.
+                </p>
+              </div>
+              <Button
+                type="button"
+                size="sm"
+                variant="secondary"
+                disabled={resumePending}
+                onClick={() => void handleResume().catch(() => {})}
+                componentId="diagnostics.main-terminal.resume"
+              >
+                {resumePending && <Loader2Icon className="size-3.5 animate-spin" aria-hidden />}
+                {resumePending ? "Resuming…" : "Resume session"}
+              </Button>
+              {resumeError && <p className="text-destructive text-sm">{resumeError}</p>}
+            </div>
+          ) : (
+            <div className="flex flex-1 items-center justify-center text-muted-foreground text-ui">
+              {terminals.length === 0 ? "No terminals available." : "Agent terminal unavailable."}
+            </div>
+          )
         ) : (
           <>
             {isShellView && activeTerminal && (
@@ -196,9 +248,10 @@ export function MainTerminalView({
                     sessionId={conversationId}
                     terminalId={activeTerminal.id}
                     readOnly={readOnly}
-                    transport={activeTerminal.transport}
                     active={visible}
                     directAttachUrl={activeTerminal.directAttachUrl}
+                    onResume={runnerOffline && onResume ? handleResume : undefined}
+                    resumePending={resumePending}
                     onStateChange={(state) => {
                       setTerminalConnectionState(activeTerminal.id, state);
                     }}
@@ -212,4 +265,9 @@ export function MainTerminalView({
       </div>
     </div>
   );
+}
+
+function resumeErrorText(error: unknown): string {
+  if (error instanceof Error && error.message) return `Couldn't resume session: ${error.message}`;
+  return "Couldn't resume session.";
 }

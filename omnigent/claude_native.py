@@ -24,10 +24,6 @@ import uuid
 
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.llms.adapters._content import redact_binary_payloads
-from omnigent.onboarding.ambient import (
-    CLAUDE_CODE_MANAGED_SETTINGS_PATHS,
-    claude_managed_gateway,
-)
 from omnigent.runtime.tool_result_replay import (
     blocks_from_parsed_list,
     image_payloads_in_blocks,
@@ -138,7 +134,7 @@ from omnigent.native_terminal import (
 from omnigent.native_terminal import (
     terminal_attach_url as _attach_url,
 )
-from omnigent.terminals.ws_bridge import (
+from omnigent.terminals.ws_common import (
     WS_CLOSE_TERMINAL_DETACHED,
     WS_CLOSE_TERMINAL_NOT_FOUND,
 )
@@ -259,10 +255,23 @@ _SESSION_LABELS = {
 }
 _CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 # Test override for the managed-settings chain. ``None`` means "use the ambient
-# detector's chain", which is the single canonical definition — binding a *copy*
-# here would leave two independently-isolatable sources of the same host state,
-# so a fixture that neutralized one would silently miss this reader.
+# detector's chain" — the single canonical definition (``ambient`` owns both the
+# path list and the parser). Binding a *copy* here would create a second source
+# of host state that a test fixture could neutralize independently of the other,
+# so both readers below resolve through ``_managed_settings_paths`` at call time.
 _CLAUDE_CODE_MANAGED_SETTINGS_PATHS: tuple[Path, ...] | None = None
+
+
+def _managed_settings_paths() -> tuple[Path, ...]:
+    """The Claude Code managed-settings chain to read (ambient's, or a test override)."""
+    override = _CLAUDE_CODE_MANAGED_SETTINGS_PATHS
+    if override is not None:
+        return override
+    from omnigent.onboarding.ambient import CLAUDE_CODE_MANAGED_SETTINGS_PATHS
+
+    return CLAUDE_CODE_MANAGED_SETTINGS_PATHS
+
+
 _CLAUDE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _RESUME_ACTION_SWITCH = "switch"
 _RESUME_ACTION_MOVE = "move"
@@ -356,7 +365,7 @@ class PreparedClaudeTerminal:
         when the runner did not advertise a socket. Drives the
         same-machine direct ``tmux attach`` fast path; a remote
         runner's socket won't exist locally, so the attach falls back
-        to the WebSocket PTY bridge.
+        to the WebSocket terminal bridge.
     :param tmux_target: tmux ``-t`` target for the terminal pane,
         e.g. ``"main"``. ``None`` when unavailable. Paired with
         ``tmux_socket`` for the direct attach.
@@ -630,20 +639,6 @@ def _claude_model_display_name(tier: str, model_id: str) -> str:
     return f"{family} {'.'.join(version_parts)}" if version_parts else family
 
 
-def _managed_settings_paths() -> tuple[Path, ...]:
-    """The Claude Code managed-settings chain to read.
-
-    Resolved at call time so the ambient detector stays the single definition of
-    the chain (and the single place tests neutralize it), while a test that needs
-    to point *this* module somewhere specific can still set
-    :data:`_CLAUDE_CODE_MANAGED_SETTINGS_PATHS`.
-
-    :returns: The override when one is set, else the canonical ambient chain.
-    """
-    override = _CLAUDE_CODE_MANAGED_SETTINGS_PATHS
-    return CLAUDE_CODE_MANAGED_SETTINGS_PATHS if override is None else override
-
-
 def _managed_claude_model_config() -> ClaudeNativeUcodeConfig | None:
     """Read the model overrides Claude Code applies from managed settings."""
     allowed_env = {
@@ -684,6 +679,8 @@ def managed_claude_gateway_signal() -> tuple[str | None, bool]:
     :returns: ``(base_url, has_credential)`` from the first readable managed
         settings file, or ``(None, False)`` when none is present or parseable.
     """
+    from omnigent.onboarding.ambient import claude_managed_gateway
+
     return claude_managed_gateway(_managed_settings_paths())
 
 
@@ -2908,7 +2905,6 @@ def _native_claude_config_from_entry(
     """
     from omnigent.onboarding.provider_config import (
         BEDROCK_KIND,
-        CLI_CONFIG_KIND,
         DATABRICKS_KIND,
         GATEWAY_KIND,
         KEY_KIND,
@@ -2922,15 +2918,6 @@ def _native_claude_config_from_entry(
     if entry.kind == DATABRICKS_KIND:
         _logger.info("native-claude routing: Databricks ucode profile %r", entry.profile)
         return _ucode_config_for_profile(entry.profile, refresh_models=refresh_models)
-    if entry.kind == CLI_CONFIG_KIND:
-        # The endpoint AND its credential live in Claude Code's own settings
-        # chain, which the CLI applies at its own launch — returning None is
-        # what routes through them, so omnigent must not override anything.
-        _logger.info(
-            "native-claude routing: Claude Code's own settings (cli-config provider %r)",
-            entry.name,
-        )
-        return None
     _logger.info("native-claude routing: Claude CLI login (subscription provider %r)", entry.name)
     return None
 
@@ -3252,7 +3239,7 @@ def _can_attach_direct_tmux(prepared: PreparedClaudeTerminal) -> bool:
     socket exists on this host (so the runner shares this machine), and
     ``tmux`` is on PATH. This is the same-machine fast path: it wires the
     local TTY straight to the runner's tmux pane instead of relaying
-    every keystroke over the WebSocket PTY bridge. A remote runner's
+    every keystroke over the WebSocket terminal bridge. A remote runner's
     socket won't exist locally, so this returns ``False`` and the caller
     falls back to the WebSocket attach. Mirrors the Codex wrapper's
     :func:`omnigent.codex_native._can_attach_direct_tmux`.
@@ -3295,7 +3282,7 @@ async def _attach_direct_tmux(
         outlives the attach (user detached), else
         :attr:`_AttachOutcome.EXITED`.
     """
-    from omnigent.terminals.ws_bridge import _check_pane_dead_definitive, _tmux_session_alive
+    from omnigent.terminals.ws_common import _check_pane_dead_definitive, _tmux_session_alive
 
     startup_profiler = startup_profiler or StartupProfiler(name="omnigent claude", enabled=False)
     env = dict(os.environ)
@@ -3677,8 +3664,8 @@ async def _is_terminal_resource_gone(
     a clean tmux exit because Claude quit (the wrapper should stop).
     The runner's terminal-attach route emits close code ``4404`` when
     the resource is already marked stopped before attach, but a
-    teardown that races attach can produce a code-``1000`` close from
-    the PTY bridge instead. This GET disambiguates the two states.
+    teardown that races attach can produce a code-``1000`` bridge close.
+    This GET disambiguates the two states.
 
     HTTP / connection errors are treated as "not gone" so a server
     that's still bouncing (probe also fails) keeps the wrapper in the
@@ -3770,10 +3757,9 @@ def _is_terminal_detached_close(exc: ConnectionClosed) -> bool:
     """
     Return whether *exc* indicates the user detached from tmux.
 
-    The runner's PTY bridge closes the attach WebSocket with code
-    ``WS_CLOSE_TERMINAL_DETACHED`` (``4405``) when the ``tmux attach``
-    child exits but ``has-session`` confirms the session is still
-    alive — i.e. the user pressed the tmux detach key. Unlike a 4404
+    The runner's terminal bridge closes the attach WebSocket with code
+    ``WS_CLOSE_TERMINAL_DETACHED`` (``4405``) when the control client exits but
+    the tmux pane remains alive. Unlike a 4404
     (terminal gone), this must NOT end the session: the runner keeps
     running so the web UI stays connected.
 
@@ -4156,7 +4142,7 @@ def _run_with_remote_server(
     creates/resolves the session, persists the pass-through args, waits
     for the daemon-spawned runner + its auto-created terminal, and
     attaches (directly to the runner's tmux when it is local, else over
-    the WebSocket PTY bridge). See designs/NATIVE_RUNNER_SERVER_LAUNCH.md.
+    the WebSocket terminal bridge). See designs/NATIVE_RUNNER_SERVER_LAUNCH.md.
 
     :param base_url: Remote Omnigent server base URL without a trailing
         slash, e.g. ``"https://example.databricks.com"``.
@@ -5558,7 +5544,7 @@ async def _read_claude_terminal_tmux(
 
     Lets the caller decide whether to attach to the runner's tmux
     directly (same machine, low latency) instead of relaying over the
-    WebSocket PTY bridge. Best-effort: any lookup failure, non-200, or
+    WebSocket terminal bridge. Best-effort: any lookup failure, non-200, or
     missing metadata yields ``(None, None)``, which callers treat as
     "not locally attachable" and fall back to the WebSocket path.
 

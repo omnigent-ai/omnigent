@@ -40,9 +40,9 @@ function originOf(url: string): string | null {
  * Server picker for the Electron desktop shell, pinned to the sidebar's bottom.
  *
  * A sidebar row (server glyph + current host + an upward chevron) that opens a
- * menu of recently-connected servers — selecting one re-points the whole window
- * via the shell — plus "Connect to new server…", which returns the window to
- * the shell's setup page.
+ * menu of organization-provided and recently-connected servers — selecting one
+ * re-points the whole window via the shell — plus "Connect to new server…",
+ * which returns the window to the shell's setup page.
  *
  * This deliberately lives at the bottom of the sidebar rather than in the
  * window's title bar. The macOS shell hides the native title bar (titleBarStyle
@@ -77,16 +77,28 @@ export function SidebarServerPicker() {
 
   if (!info) return null;
 
-  // The current server leads the list even when the recents file was edited
-  // out from under us; recents matching the current origin collapse into it.
-  const others = info.recentServers.filter((url) => originOf(url) !== info.currentOrigin);
+  const managed = Array.isArray(info.managedServers) ? info.managedServers : [];
+  const managedOrigins = new Set(managed.map(originOf).filter((origin) => origin !== null));
+  const currentIsManaged = managedOrigins.has(info.currentOrigin);
+  // The current server leads its section even when settings were edited out
+  // from under us. Managed origins are not repeated under Recents.
+  const recentOthers = info.recentServers.filter((url) => {
+    const origin = originOf(url);
+    return origin !== info.currentOrigin && (origin === null || !managedOrigins.has(origin));
+  });
   const currentHost = hostOf(info.currentOrigin);
 
   return (
     // shrink-0 keeps the row at its natural height so the scrolling session
     // list above (flex-1) gives up space instead of squashing it.
     <div className="shrink-0 px-2 pt-1 pb-2" data-testid="sidebar-server-picker-row">
-      <DropdownMenu>
+      <DropdownMenu
+        onOpenChange={(open) => {
+          // Re-read when opened so a newly applied/removed MDM profile appears
+          // without restarting the server-served SPA.
+          if (open) void getServerPicker().then(setInfo);
+        }}
+      >
         <DropdownMenuTrigger asChild>
           <Button
             type="button"
@@ -113,18 +125,55 @@ export function SidebarServerPicker() {
         {/* side="top" — the trigger sits at the bottom of the window, so the
             menu must grow upward rather than off-screen. */}
         <DropdownMenuContent side="top" align="start" className="min-w-56">
-          <DropdownMenuLabel className="text-muted-foreground">Recents</DropdownMenuLabel>
-          <DropdownMenuItem disabled className="gap-2 opacity-100">
-            <CheckIcon className="size-4 shrink-0" />
-            <span className="truncate font-medium">{currentHost}</span>
-          </DropdownMenuItem>
-          {others.map((url) => (
-            <DropdownMenuItem key={url} className="gap-2" onSelect={() => void switchServer(url)}>
-              {/* Spacer aligns hosts under the current-server check. */}
-              <span className="size-4 shrink-0" aria-hidden="true" />
-              <span className="truncate">{hostOf(url)}</span>
-            </DropdownMenuItem>
-          ))}
+          {managed.length > 0 ? (
+            <>
+              <DropdownMenuLabel className="text-muted-foreground">
+                Provided by your organization
+              </DropdownMenuLabel>
+              {managed.map((url) => {
+                const isCurrent = originOf(url) === info.currentOrigin;
+                return (
+                  <DropdownMenuItem
+                    key={url}
+                    disabled={isCurrent}
+                    className={cn("gap-2", isCurrent && "opacity-100")}
+                    onSelect={isCurrent ? undefined : () => void switchServer(url)}
+                  >
+                    {isCurrent ? (
+                      <CheckIcon className="size-4 shrink-0" />
+                    ) : (
+                      <span className="size-4 shrink-0" aria-hidden="true" />
+                    )}
+                    <span className={cn("truncate", isCurrent && "font-medium")}>
+                      {hostOf(url)}
+                    </span>
+                  </DropdownMenuItem>
+                );
+              })}
+            </>
+          ) : null}
+          {!currentIsManaged || recentOthers.length > 0 ? (
+            <>
+              {managed.length > 0 ? <DropdownMenuSeparator /> : null}
+              <DropdownMenuLabel className="text-muted-foreground">Recents</DropdownMenuLabel>
+              {!currentIsManaged ? (
+                <DropdownMenuItem disabled className="gap-2 opacity-100">
+                  <CheckIcon className="size-4 shrink-0" />
+                  <span className="truncate font-medium">{currentHost}</span>
+                </DropdownMenuItem>
+              ) : null}
+              {recentOthers.map((url) => (
+                <DropdownMenuItem
+                  key={url}
+                  className="gap-2"
+                  onSelect={() => void switchServer(url)}
+                >
+                  <span className="size-4 shrink-0" aria-hidden="true" />
+                  <span className="truncate">{hostOf(url)}</span>
+                </DropdownMenuItem>
+              ))}
+            </>
+          ) : null}
           <DropdownMenuSeparator />
           <DropdownMenuItem className="gap-2" onSelect={() => openServerSetup()}>
             <PlusIcon className="size-4 shrink-0" />

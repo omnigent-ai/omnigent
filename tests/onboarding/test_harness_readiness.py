@@ -335,9 +335,11 @@ def test_configured_harness_map_covers_all_spellings(
         # Native Kimi (``omnigent kimi``) — gates on the kimi CLI.
         "kimi-native",
         "native-kimi",
-        # Native Antigravity (agy) CLI-wrapping harness, both spellings.
+        # Native Antigravity (agy) CLI-wrapping harness, both spellings and aliases.
         "antigravity-native",
         "native-antigravity",
+        "agy-native",
+        "native-agy",
         # Native OpenCode harness + its user-facing aliases.
         "opencode-native",
         "native-opencode",
@@ -649,18 +651,16 @@ def test_antigravity_native_requires_credential(
     assert harness_is_configured("native-antigravity") is True
 
 
-def test_claude_ready_via_managed_settings_gateway_without_cli_login(
+def test_claude_ready_via_managed_gateway_without_provider_or_cli_login(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Claude reads ready from its own managed-settings gateway alone.
 
-    The enterprise state (``isaac configure claude``): nothing in omnigent's
-    config, no subscription login, but Claude Code's managed settings pin an AI
-    Gateway + ``apiKeyHelper`` and the CLI applies them at its own launch. The
-    check is structural, so it must NOT depend on the ``claude auth status``
-    subprocess — which is exactly what used to fail here, reporting
-    ``needs-auth`` and surfacing as "Claude Code isn't configured on <host>"
-    with nothing in setup able to fix it.
+    The enterprise state (`isaac configure claude`): nothing in omnigent's
+    config, no subscription login the probe can see, but Claude Code's managed
+    settings pin an AI Gateway + apiKeyHelper and the CLI applies them itself.
+    This is the exact "Claude Code isn't configured on <host>" dead end — the
+    structural check must go green WITHOUT the `claude auth status` subprocess.
     """
     import json
 
@@ -670,16 +670,14 @@ def test_claude_ready_via_managed_settings_gateway_without_cli_login(
     monkeypatch.setattr(
         "omnigent.onboarding.harness_readiness._family_provider_configured", lambda _h: False
     )
-    # The fragile probe stays broken; readiness must not need it.
+    # The subprocess probe stays broken; readiness must not depend on it.
     monkeypatch.setattr(hi, "harness_cli_logged_in", lambda key, **_kw: False)
     settings = tmp_path / "managed-settings.json"
     settings.write_text(
         json.dumps(
             {
                 "env": {
-                    "ANTHROPIC_BASE_URL": (
-                        "https://dbc-test.cloud.databricks.com/ai-gateway/anthropic"
-                    )
+                    "ANTHROPIC_BASE_URL": "https://dbc.cloud.databricks.com/ai-gateway/anthropic"
                 },
                 "apiKeyHelper": "print-token",
             }
@@ -692,17 +690,14 @@ def test_claude_ready_via_managed_settings_gateway_without_cli_login(
     assert result["native-claude"] is True
 
 
-def test_claude_managed_settings_without_credential_still_needs_auth(
+def test_claude_needs_auth_without_gateway_provider_or_login(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A managed gateway with no credential does NOT make Claude read ready.
+    """No managed gateway + no provider + no login → still `needs-auth`.
 
-    A bare ``ANTHROPIC_BASE_URL`` is not something omnigent can authenticate
-    against, so crediting it would turn a real "finish setup" prompt into a
-    launch that dies on its first turn.
+    Guards the structural check from going green on nothing: an absent settings
+    file must not credit a credential that isn't there.
     """
-    import json
-
     from omnigent.onboarding import ambient
 
     _all_clis_installed(monkeypatch)
@@ -710,12 +705,6 @@ def test_claude_managed_settings_without_credential_still_needs_auth(
         "omnigent.onboarding.harness_readiness._family_provider_configured", lambda _h: False
     )
     monkeypatch.setattr(hi, "harness_cli_logged_in", lambda key, **_kw: False)
-    settings = tmp_path / "managed-settings.json"
-    settings.write_text(
-        json.dumps(
-            {"env": {"ANTHROPIC_BASE_URL": "https://dbc-t.cloud.databricks.com/ai-gateway/a"}}
-        )
-    )
-    monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (settings,))
+    monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (tmp_path / "absent.json",))
 
     assert configured_harness_map()["claude-native"] == "needs-auth"

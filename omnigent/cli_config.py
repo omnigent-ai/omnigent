@@ -544,32 +544,6 @@ def _family_credential_label(  # type: ignore[explicit-any]  # config is a yaml-
     return f"{base} ({hint})" if hint else base
 
 
-def _cli_config_source_label(cli: str | None) -> str:
-    """Name the config file a ``cli-config`` detection's credential lives in.
-
-    :param cli: The detection's ``cli`` — ``"codex"`` or ``"claude"``.
-    :returns: A short menu-label fragment, e.g. ``"Codex config"``.
-    """
-    return "Claude Code settings" if cli == "claude" else "Codex config"
-
-
-def _cli_config_source_description(det: DetectedProvider) -> str:
-    """Describe where a ``cli-config`` detection's credential comes from.
-
-    :param det: A ``kind="cli-config"`` detection.
-    :returns: One sentence for the add menu's description column.
-    """
-    if det.cli == "claude":
-        return (
-            "Use the AI Gateway your Claude Code managed settings pin and "
-            "authenticate; Claude Code applies them itself at launch."
-        )
-    return (
-        f"Use the {str(det.model_provider)!r} provider your ~/.codex/config.toml "
-        "defines and authenticates."
-    )
-
-
 def _configure_harness_add(family: str | None = None) -> str | None:
     """Run the interactive ``add a provider`` flow and persist the entry.
 
@@ -633,23 +607,18 @@ def _configure_harness_add(family: str | None = None) -> str | None:
     # the common cases, a preset provider/cli. When entered from a specific
     # harness, the menu is scoped to that harness's surface.
     options = add_menu_options_for_family(family) if family is not None else add_menu_options()
-    # A provider defined by the harness CLI's own config — isaac's Databricks AI
-    # Gateway in ~/.codex/config.toml (codex) or in Claude Code's managed
-    # settings (claude) — that is not currently configured gets its own add
-    # option. This is the only way back after Remove — removal dismisses the
-    # detection so it stops auto-adopting, and there is nothing to type/paste
-    # here (the credential lives in that file).
+    # A custom provider defined by the user's own ~/.codex/config.toml
+    # (e.g. isaac's Databricks AI Gateway) that is not currently configured
+    # gets its own add option. This is the only way back after Remove —
+    # removal dismisses the detection so it stops auto-adopting, and there
+    # is nothing to type/paste here (the credential lives in that file).
     cli_config_dets: list[DetectedProvider] = []
-    if family in (None, OPENAI_FAMILY, ANTHROPIC_FAMILY):
+    if family in (None, OPENAI_FAMILY):
         configured_names = set(load_providers(_load_global_config()))
         cli_config_dets = [
             d
             for d in detect_providers()
-            if d.kind == CLI_CONFIG_KIND
-            and d.name not in configured_names
-            # On a harness-scoped page, offer only that harness's own config
-            # credential — a codex table can't drive Claude, or vice versa.
-            and (family is None or d.family == family)
+            if d.kind == CLI_CONFIG_KIND and d.name not in configured_names
         ]
     # Base options first, then one row per detected config provider — the
     # selection index maps back into cli_config_dets below.
@@ -657,8 +626,11 @@ def _configure_harness_add(family: str | None = None) -> str | None:
     options = options + [
         AddOption(
             label=f"\N{GEAR}\N{VARIATION SELECTOR-16} {d.display_name or d.name} — "
-            f"from your {_cli_config_source_label(d.cli)}",
-            description=_cli_config_source_description(d),
+            "from your Codex config",
+            description=(
+                f"Use the {str(d.model_provider)!r} provider your ~/.codex/config.toml "
+                "defines and authenticates."
+            ),
             kind=CLI_CONFIG_KIND,
         )
         for d in cli_config_dets
@@ -685,16 +657,12 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         # One detected-config row was appended per cli_config_dets entry, in
         # order, after the base options — map the selection back to its
         # detection. Nothing to prompt for: the provider definition AND its
-        # credential live in the CLI's own config file; the entry only names it.
+        # credential live in ~/.codex/config.toml; the entry only pins it.
         det = cli_config_dets[choice - base_option_count]
-        if det.cli is None:  # always set on cli-config detections
-            raise click.ClickException("internal: cli-config detection missing cli")
-        if det.cli == "codex" and det.model_provider is None:
-            raise click.ClickException(
-                "internal: codex cli-config detection missing model_provider"
-            )
+        if det.model_provider is None:  # always set on cli-config detections
+            raise click.ClickException("internal: cli-config detection missing model_provider")
         name = det.name
-        entry = build_cli_config_provider_entry(det.cli, det.model_provider, det.display_name)
+        entry = build_cli_config_provider_entry("codex", det.model_provider, det.display_name)
         # Re-adding is the user saying "I want this auto-detected credential
         # after all" — drop any standing dismissal so it behaves like an
         # ordinary detection again (e.g. re-adopts after a config self-heal).
@@ -1180,6 +1148,22 @@ def _promote_global_auth_to_provider() -> str | None:
     return name
 
 
+def _claude_managed_gateway_label() -> str | None:
+    """Display label for a Claude credential backed by Claude Code's managed gateway.
+
+    When Claude Code's own settings deliver a gateway credential (enterprise
+    ``ANTHROPIC_BASE_URL`` + ``apiKeyHelper``), the Claude "subscription" the
+    machine really carries is that gateway, so setup names it as such (e.g.
+    ``"Databricks AI Gateway"``) instead of the generic ``"Subscription"``.
+    Purely a display derivation from live managed settings — nothing persisted.
+
+    :returns: The gateway label, or ``None`` when no managed credential is present.
+    """
+    from omnigent.onboarding.ambient import claude_managed_gateway_display_name
+
+    return claude_managed_gateway_display_name()
+
+
 def _compact_credential_label(det: DetectedProvider) -> str:
     """A short, brand-qualified label for an auto-configured credential.
 
@@ -1200,6 +1184,12 @@ def _compact_credential_label(det: DetectedProvider) -> str:
     from omnigent.onboarding.configure_models import credential_label
 
     if det.kind == SUBSCRIPTION_KIND:
+        # A Claude login whose real backing is Claude Code's managed-settings
+        # gateway names that gateway, so the callout matches Codex-Databricks.
+        if det.name == "claude":
+            gateway = _claude_managed_gateway_label()
+            if gateway is not None:
+                return gateway
         # Fallback to the raw CLI name is unreachable for today's detections
         # (see _CLI_LOGIN_BRAND) but keeps an added CLI readable, not crashing.
         brand = _CLI_LOGIN_BRAND.get(det.name, det.name)
@@ -1316,7 +1306,17 @@ def _credential_label(name: str, entry: ProviderEntry) -> str:
     :returns: A human label, e.g. ``"Anthropic API Key"`` or ``"Databricks (oss)"``.
     """
     from omnigent.onboarding.configure_models import credential_label
+    from omnigent.onboarding.provider_config import SUBSCRIPTION_KIND
 
+    # A Claude subscription whose real backing is Claude Code's managed-settings
+    # gateway reads as that gateway (e.g. "Databricks AI Gateway") rather than
+    # the generic "Subscription", so the credential the user recognizes is named
+    # — the Claude analogue of the "Codex-Databricks" row. Display only; the
+    # persisted entry stays a plain subscription (no new shape on disk).
+    if entry.kind == SUBSCRIPTION_KIND and entry.cli == "claude":
+        gateway = _claude_managed_gateway_label()
+        if gateway is not None:
+            return gateway
     return credential_label(
         entry.kind, name, profile=entry.profile, display_name=entry.display_name
     )

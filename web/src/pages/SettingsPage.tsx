@@ -10,7 +10,7 @@
  * Sections:
  *
  * - **Appearance** — theme mode (System / Light / Dark), terminal theme,
- *   Workspace panel default for new chats, and UI/code font controls.
+ *   default transcript view, Workspace panel default, and UI/code font controls.
  * - **Git** — Git behavior, e.g. the default base branch pre-filled when
  *   naming a new worktree branch in the composer.
  * - **Keyboard shortcuts** — the full shortcuts reference, shown inline.
@@ -45,6 +45,7 @@ import {
   KeyRoundIcon,
   LaptopMinimalIcon,
   LogOutIcon,
+  MessagesSquareIcon,
   MinusIcon,
   MonitorIcon,
   MoonIcon,
@@ -52,6 +53,7 @@ import {
   PanelRightIcon,
   PlusIcon,
   SunIcon,
+  TerminalIcon,
   Trash2Icon,
   UserCogIcon,
 } from "lucide-react";
@@ -120,10 +122,15 @@ import {
   CODE_FONT_SIZE_MAX,
   CODE_FONT_SIZE_MIN,
   CODE_FONT_SIZE_STEP,
+  CODE_FONT_WEIGHT_DEFAULT,
+  CODE_FONT_WEIGHT_HEAVIER,
+  CODE_FONT_WEIGHT_NORMAL,
   readCodeFontFamily,
   readCodeFontSizePx,
+  readCodeFontWeight,
   writeCodeFontFamily,
   writeCodeFontSizePx,
+  writeCodeFontWeight,
 } from "@/lib/codeFontPreferences";
 import {
   readTerminalThemeMode,
@@ -137,6 +144,12 @@ import {
   writeWorkspacePanelDefault,
   type WorkspacePanelDefault,
 } from "@/lib/workspacePanelPreferences";
+import {
+  readTranscriptViewDefault,
+  TRANSCRIPT_VIEW_DEFAULT,
+  writeTranscriptViewDefault,
+  type TranscriptViewDefault,
+} from "@/lib/transcriptViewPreferences";
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import {
   DEFAULT_HIDE_UNCONFIGURED_HARNESSES,
@@ -274,6 +287,15 @@ const terminalThemeCards: { mode: TerminalThemeMode; label: string; icon: typeof
   { mode: "auto", label: "Match app", icon: MonitorIcon },
   { mode: "light", label: "Light", icon: SunIcon },
   { mode: "dark", label: "Dark", icon: MoonIcon },
+];
+
+const transcriptViewCards: {
+  value: TranscriptViewDefault;
+  label: string;
+  icon: typeof MessagesSquareIcon;
+}[] = [
+  { value: "chat", label: "Chat", icon: MessagesSquareIcon },
+  { value: "terminal", label: "Terminal", icon: TerminalIcon },
 ];
 
 const workspacePanelCards: {
@@ -545,6 +567,37 @@ function TerminalThemeControl() {
         items={terminalThemeCards.map((card) => ({
           value: card.mode,
           testId: `terminal-theme-${card.mode}`,
+          body: iconCardBody(card.icon, card.label),
+        }))}
+      />
+    </ThemeSubsection>
+  );
+}
+
+/** Default surface for terminal-first transcripts without a per-tab choice. */
+function TranscriptViewDefaultControl() {
+  const [value, setValue] = useState(() => readTranscriptViewDefault());
+  const labelId = useId();
+  const choose = useCallback((next: TranscriptViewDefault) => {
+    setValue(next);
+    writeTranscriptViewDefault(next);
+  }, []);
+  return (
+    <ThemeSubsection
+      labelId={labelId}
+      title="Default transcript view"
+      helper="Choose whether terminal-backed chats open in Chat or Terminal view. A view selected in a chat is remembered for the current tab."
+    >
+      <CardRadioGroup<TranscriptViewDefault>
+        labelledBy={labelId}
+        value={value}
+        onSelect={choose}
+        componentId="settings.appearance.transcript_view"
+        className="grid grid-cols-2 gap-3"
+        cardClassName="items-center gap-2 p-4"
+        items={transcriptViewCards.map((card) => ({
+          value: card.value,
+          testId: `transcript-view-default-${card.value}`,
           body: iconCardBody(card.icon, card.label),
         }))}
       />
@@ -863,6 +916,8 @@ function AppearanceSection() {
     writeCustomTheme(DEFAULT_CUSTOM_THEME);
     applyCustomTheme(DEFAULT_CUSTOM_THEME);
 
+    writeTranscriptViewDefault(TRANSCRIPT_VIEW_DEFAULT);
+
     writeWorkspacePanelDefault(WORKSPACE_PANEL_DEFAULT);
 
     writeHideUnconfiguredHarnesses(DEFAULT_HIDE_UNCONFIGURED_HARNESSES);
@@ -872,6 +927,7 @@ function AppearanceSection() {
 
     writeCodeFontSizePx(CODE_FONT_SIZE_DEFAULT);
     writeCodeFontFamily(CODE_FONT_FAMILY_DEFAULT);
+    writeCodeFontWeight(CODE_FONT_WEIGHT_DEFAULT);
 
     // Remove the persisted keys so this device has no appearance overrides at
     // all. Some write helpers already remove the key for the default value;
@@ -884,9 +940,11 @@ function AppearanceSection() {
           "omnigent:ui-font-family",
           "omnigent:code-font-size",
           "omnigent:code-font-family",
+          "omnigent:code-font-weight",
           "omnigent:terminal-theme",
           "omnigent:ui-theme-palette",
           "omnigent:custom-theme",
+          "omnigent:default-transcript-view",
           "omnigent:default-workspace-panel",
           "omnigent:hide-unconfigured-harnesses",
         ]) {
@@ -929,6 +987,8 @@ function AppearanceSection() {
 
         {!isEmbedded && <ColorThemeControl />}
 
+        <TranscriptViewDefaultControl />
+
         <WorkspacePanelDefaultControl />
 
         <HideUnconfiguredHarnessesControl />
@@ -937,16 +997,18 @@ function AppearanceSection() {
 
         <UiFontFamilyControl />
 
-        {/* Code font (Monaco + xterm) sits as its own two rows — labelled in full
-            ("Code font size" / "Code font family") rather than under a shared
+        {/* Code font (Monaco + xterm) sits as its own rows — labelled in full
+            ("Code font size" / "Code font family" / "Code font weight") rather than under a shared
             heading — so each control reads unambiguously next to the UI-font rows
             above and it's clear these don't scale the surrounding chrome. */}
         <UiCodeFontSizeControl />
 
         <UiCodeFontFamilyControl />
+
+        <UiCodeFontWeightControl />
       </div>
 
-      <div className="flex items-center justify-end">
+      <div className="mt-4 flex items-center justify-end">
         <Dialog open={isResetDialogOpen} onOpenChange={setIsResetDialogOpen}>
           <DialogTrigger asChild>
             <Button
@@ -1365,6 +1427,35 @@ function UiCodeFontFamilyControl() {
           onChange={(e) => update(e.target.value)}
         />
       </div>
+    </div>
+  );
+}
+
+/** Font weight preset shared by Monaco and xterm code surfaces. */
+function UiCodeFontWeightControl() {
+  const [heavier, setHeavier] = useState(() => readCodeFontWeight() === CODE_FONT_WEIGHT_HEAVIER);
+
+  const toggle = (enabled: boolean) => {
+    setHeavier(enabled);
+    writeCodeFontWeight(enabled ? CODE_FONT_WEIGHT_HEAVIER : CODE_FONT_WEIGHT_NORMAL);
+  };
+
+  return (
+    <div className="flex items-center justify-between gap-6" data-testid="code-font-weight-control">
+      <div className="min-w-0 flex-1">
+        <span className="text-ui font-medium">Heavier code font</span>
+        <span className="block text-sm text-muted-foreground">
+          Use a slightly heavier font weight in the code editor and terminal.
+        </span>
+      </div>
+      <Switch
+        aria-label="Use heavier code text"
+        checked={heavier}
+        onCheckedChange={toggle}
+        data-testid="heavier-code-text-toggle"
+        className="shrink-0"
+        componentId="settings.appearance.heavier_code_text"
+      />
     </div>
   );
 }

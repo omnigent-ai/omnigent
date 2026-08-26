@@ -140,6 +140,7 @@ import {
   rankMentionEntries,
 } from "@/lib/composerMentions";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
+import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 // Re-exported so existing tests importing these from "./ChatPage" keep working
 // after the pure helpers moved to the shared lib.
 export { detectMentionAt, mentionMarkerFor };
@@ -675,47 +676,6 @@ function truncateTitle(raw: string, max = 60): string {
   const cut = lastSpace > max - 10 ? lastSpace : slice.length;
   return slice.slice(0, cut).join("").trimEnd() + "…";
 }
-
-// Per-session draft storage — module-level so it survives the Composer
-// unmount/remount that happens during the loading gate between session
-// switches (ChatPage returns <HydratingPlaceholder /> while
-// loadingConversation is true, which unmounts the entire chat surface).
-// Text drafts are also persisted to sessionStorage so they survive page
-// refreshes; File objects can't be serialized, so only text round-trips.
-const SESSION_DRAFTS_KEY = "omnigent.sessionDrafts";
-
-function loadDraftsFromStorage(): Map<string, { text: string; files: File[] }> {
-  try {
-    const raw = window.sessionStorage.getItem(SESSION_DRAFTS_KEY);
-    if (!raw) return new Map();
-    const entries = JSON.parse(raw) as Record<string, string>;
-    const map = new Map<string, { text: string; files: File[] }>();
-    for (const [id, text] of Object.entries(entries)) {
-      if (text) map.set(id, { text, files: [] });
-    }
-    return map;
-  } catch {
-    return new Map();
-  }
-}
-
-function saveDraftsToStorage(drafts: Map<string, { text: string; files: File[] }>): void {
-  try {
-    const obj: Record<string, string> = {};
-    for (const [id, draft] of drafts) {
-      if (draft.text) obj[id] = draft.text;
-    }
-    if (Object.keys(obj).length === 0) {
-      window.sessionStorage.removeItem(SESSION_DRAFTS_KEY);
-    } else {
-      window.sessionStorage.setItem(SESSION_DRAFTS_KEY, JSON.stringify(obj));
-    }
-  } catch {
-    // Storage full or unavailable — drafts still work in-memory.
-  }
-}
-
-const sessionDrafts = loadDraftsFromStorage();
 
 /**
  * Single component that drives the chat surface. Streaming + history
@@ -1607,9 +1567,8 @@ interface MainAgentSurfaceProps {
    *  Never includes child-session activity and never gates Stop/Interrupt. */
   showsWorking: boolean;
   /**
-   * Strict runner-tunnel liveness, used only to gate the inline terminal
-   * view (the PTY dies the moment the runner tunnel drops). The reconnect
-   * affordances key off `liveness` instead.
+   * Strict runner-tunnel liveness. The terminal view remains selectable when
+   * this is false and uses it to show the stopped-harness resume state.
    */
   runnerOnline: boolean | undefined;
   /** Derived open-session liveness — drives the reconnect hint/banner. */
@@ -1731,7 +1690,7 @@ export interface WarmTerminalEntry {
 /**
  * How many sessions' terminal surfaces stay warm at once (the active one
  * included). Each warm surface holds a WebSocket + a runner-side
- * ``tmux attach``, a WebGL context (browsers cap those per page; losing
+ * tmux control client, a WebGL context (browsers cap those per page; losing
  * one falls back to xterm's DOM renderer), and keeps parsing any output
  * its TUI streams while hidden — so the cache is bounded rather than
  * unbounded, but sized to cover a working set of sessions, not just a
@@ -2064,6 +2023,17 @@ function MainAgentSurface({
     mountTerminal && conversationId
       ? updateWarmTerminalSurfaces(warmTerminals, conversationId, terminalReadOnly)
       : warmTerminals;
+  const handleTerminalResume = useCallback(async () => {
+    if (!conversationId) throw new Error("Session is not available");
+    if (liveness.kind === "host_offline" || liveness.kind === "local_stranded") {
+      onShowReconnectHelp();
+      return;
+    }
+    const result = await retrySession(conversationId);
+    if (!result.recovered) {
+      throw new Error("The session is already connected; no recovery was performed");
+    }
+  }, [conversationId, liveness.kind, onShowReconnectHelp]);
   const terminalSurfaces = renderedTerminals.map((entry) => {
     const isActive = mountTerminal && entry.conversationId === conversationId;
     const isShown = isActive && showTerminal;
@@ -2077,6 +2047,8 @@ function MainAgentSurface({
           conversationId={entry.conversationId}
           initialTerminalKey={isActive ? terminalFirst?.terminalViewKey : null}
           visible={isShown}
+          runnerOnline={isActive ? runnerOnline : undefined}
+          onResume={isActive ? handleTerminalResume : undefined}
           onSurfaceElement={isActive ? setTerminalSurfaceEl : undefined}
           readOnly={entry.readOnly}
         />
@@ -3217,7 +3189,6 @@ export function ConnectionIndicator({
     terminalFirst?.isTerminalFirst === true &&
     !terminalFirst.isShellView &&
     sandboxStatus?.stage !== "failed" &&
-    !unreachable &&
     !keyboardVisible &&
     surfaceFrontmost;
   useNativeChatTerminalBar(terminalFirst, nativeBarVisible);
@@ -3242,32 +3213,51 @@ export function ConnectionIndicator({
     // `local_stranded` keeps the banner everywhere (no host, hence no badge).
     const composerOnScreen = !(terminalFirst?.isTerminalFirst && terminalFirst.view === "terminal");
     if (liveness.kind === "host_offline" && composerOnScreen) {
-      return null;
+      return nativeBarVisible ? (
+        <div
+          aria-hidden
+          className={cn(
+            "omnigent-native-bottom-spacer",
+            terminalFirst?.view === "chat" && "omnigent-native-bottom-spacer--chat",
+          )}
+        />
+      ) : null;
     }
     return (
-      <div className={cn("mx-auto mb-4 flex w-full justify-center px-6", CHAT_COLUMN_WIDTH)}>
-        {/* Reconnect affordance styled as the destructive error pill (never
-            raw red text). Keeps its own click → reconnect dialog rather than
-            the ErrorBanner's async Retry, since some states need the picker. */}
-        <button
-          type="button"
-          data-testid="disconnected-indicator"
-          onClick={onShowReconnectHelp}
-          className="flex items-center gap-2 rounded-[12px] px-4 py-2 text-sm text-destructive transition-[filter] hover:brightness-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
-          style={{
-            background:
-              "color-mix(in srgb, var(--destructive) 4%, var(--app-shell-bg, var(--background)))",
-            border: "1px solid color-mix(in srgb, var(--destructive) 32%, transparent)",
-          }}
-        >
-          <WifiOffIcon className="size-3.5 shrink-0" />
-          <span>
-            {liveness.kind === "host_offline"
-              ? "Host is offline — click to reconnect"
-              : "Agent disconnected — click to reconnect"}
-          </span>
-        </button>
-      </div>
+      <>
+        <div className={cn("mx-auto mb-4 flex w-full justify-center px-6", CHAT_COLUMN_WIDTH)}>
+          {/* Reconnect affordance styled as the destructive error pill (never
+              raw red text). Keeps its own click → reconnect dialog rather than
+              the ErrorBanner's async Retry, since some states need the picker. */}
+          <button
+            type="button"
+            data-testid="disconnected-indicator"
+            onClick={onShowReconnectHelp}
+            className="flex items-center gap-2 rounded-[12px] px-4 py-2 text-sm text-destructive transition-[filter] hover:brightness-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+            style={{
+              background:
+                "color-mix(in srgb, var(--destructive) 4%, var(--app-shell-bg, var(--background)))",
+              border: "1px solid color-mix(in srgb, var(--destructive) 32%, transparent)",
+            }}
+          >
+            <WifiOffIcon className="size-3.5 shrink-0" />
+            <span>
+              {liveness.kind === "host_offline"
+                ? "Host is offline — click to reconnect"
+                : "Agent disconnected — click to reconnect"}
+            </span>
+          </button>
+        </div>
+        {nativeBarVisible && (
+          <div
+            aria-hidden
+            className={cn(
+              "omnigent-native-bottom-spacer",
+              terminalFirst?.view === "chat" && "omnigent-native-bottom-spacer--chat",
+            )}
+          />
+        )}
+      </>
     );
   }
 
@@ -3496,7 +3486,7 @@ function useNativeChatTerminalBar(
 ): void {
   const native = isIOSShell();
   const view = ctx?.view ?? "chat";
-  const terminalsAvailable = ctx?.terminalsAvailable ?? false;
+  const terminalEnabled = ctx?.isTerminalFirst === true;
   const terminalStartingUp = ctx?.terminalStartingUp ?? false;
 
   // Keep `setView` reachable from the subscribe-once effect without
@@ -3509,11 +3499,11 @@ function useNativeChatTerminalBar(
     if (!native) return;
     setNativeViewMode({
       mode: view,
-      terminalEnabled: terminalsAvailable,
+      terminalEnabled,
       terminalStartingUp,
       visible,
     });
-  }, [native, view, terminalsAvailable, terminalStartingUp, visible]);
+  }, [native, view, terminalEnabled, terminalStartingUp, visible]);
 
   // Belt-and-suspenders: hide the bar if the host component ever unmounts.
   useEffect(() => {
@@ -4809,9 +4799,8 @@ export function Composer({
   );
 
   // Preserve unsent text + file attachments per session so switching
-  // tabs and coming back restores the draft. The drafts map lives at
-  // module scope (not useRef) because Composer unmounts during the
-  // loading gate between session switches.
+  // tabs and coming back restores the draft. The shared draft store also lets
+  // the sidebar surface which sessions have unfinished composer content.
   const conversationId = useChatStore((s) => s.conversationId);
   const queuedMessages = useChatStore((s) => s.queuedMessages);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
@@ -4884,7 +4873,7 @@ export function Composer({
   }, []);
 
   useEffect(() => {
-    const restored = conversationId ? sessionDrafts.get(conversationId) : undefined;
+    const restored = conversationId ? getSessionDraft(conversationId) : undefined;
     setValue(restored?.text ?? "");
     setFiles(restored?.files ?? []);
     dirtyRef.current = false;
@@ -4897,16 +4886,19 @@ export function Composer({
 
     return () => {
       if (!conversationId || !dirtyRef.current) return;
-      const text = valueRef.current;
-      const draftFiles = filesRef.current;
-      if (text || draftFiles.length > 0) {
-        sessionDrafts.set(conversationId, { text, files: draftFiles });
-      } else {
-        sessionDrafts.delete(conversationId);
-      }
-      saveDraftsToStorage(sessionDrafts);
+      setSessionDraft(conversationId, {
+        text: valueRef.current,
+        files: filesRef.current,
+      });
     };
   }, [conversationId]);
+
+  // Publish edits as they happen so the open sidebar updates immediately,
+  // rather than only learning about a draft when this composer unmounts.
+  useEffect(() => {
+    if (!conversationId || settledConversationId !== conversationId || !dirtyRef.current) return;
+    setSessionDraft(conversationId, { text: value, files });
+  }, [conversationId, settledConversationId, value, files]);
 
   // Adding a reply quote (via the floating "Reply" button) should drop the
   // caret straight into the composer so the user can type immediately. Only
