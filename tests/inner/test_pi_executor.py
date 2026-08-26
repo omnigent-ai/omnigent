@@ -3462,6 +3462,7 @@ def test_build_models_json_registers_selected_catalog_alias_once() -> None:
             "id": selected_model,
             "input": ["text", "image"],
             "contextWindow": 200_000,
+            "reasoning": True,
         }
     ]
 

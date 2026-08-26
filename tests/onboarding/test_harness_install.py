@@ -1300,7 +1300,7 @@ def test_ui_setup_steps_generic_for_non_installable() -> None:
         (hi.KIMI_KEY, "0.7.0", None),
         (ANTHROPIC_FAMILY, "2.1.161", None),
         (OPENAI_FAMILY, "0.137.0", None),
-        (hi.PI_KEY, "0.79.0", None),
+        (hi.PI_KEY, "0.84.2", None),
         (hi.QWEN_KEY, "0.18.1", None),
         (hi.GOOSE_KEY, "1.38.0", None),
         (hi.HERMES_KEY, "0.17.0", None),

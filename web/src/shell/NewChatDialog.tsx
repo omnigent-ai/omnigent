@@ -1685,7 +1685,8 @@ function HarnessConfigModal({
     } else if (hasModelPicker) {
       setPickedModel(draftModel);
       setPickedEffort(draftEffort);
-      if (entryHarness) writeHarnessOption(entryHarness, { model: draftModel, effort: draftEffort });
+      if (entryHarness)
+        writeHarnessOption(entryHarness, { model: draftModel, effort: draftEffort });
     } else if (hasApproval) {
       if (isCodex) setPickedModel(draftModel);
       setApprovalMode(draftApproval);
