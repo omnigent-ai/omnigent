@@ -138,12 +138,16 @@ def _split_pi_native_model_selection(selection: str | None) -> tuple[str, str] |
     return None
 
 
-class _PiProviderCompat(TypedDict):
+class _PiProviderCompat(TypedDict, total=False):
     supportsDeveloperRole: bool
     supportsStore: bool
     supportsStrictMode: bool
     supportsReasoningEffort: bool
     supportsUsageInStreaming: bool
+    # Pi 0.84.2+: send thinking.type.adaptive + output_config.effort instead
+    # of thinking.type.enabled + budget_tokens. Required for claude-4+ / claude-5
+    # models which no longer accept thinking.type.enabled.
+    forceAdaptiveThinking: bool
 
 
 class _PiProviderPayload(TypedDict):
@@ -314,13 +318,16 @@ class PiProviderConfig:
             surface = self._fallback_surface()
             if not self._primary_claude_only:
                 # The primary's api came from the model's own family.
-                models.append(
+                base: _PiModelEntry = (
                     {"id": self.model, "input": ["text", "image"]}
                     if self.extra_models
                     else {"id": self.model}
                 )
+                if self.api == "anthropic-messages":
+                    base["reasoning"] = True
+                models.append(base)
             elif surface is DatabricksPiSurface.ANTHROPIC:
-                models.append({"id": self.model, "input": ["text", "image"]})
+                models.append({"id": self.model, "input": ["text", "image"], "reasoning": True})
             elif surface is not None:
                 self._register_on_surface(additional, surface)
             else:
@@ -341,6 +348,12 @@ class PiProviderConfig:
         }
         if self.auth_header:
             provider["authHeader"] = True
+        # Claude 4+ / Claude 5 models require thinking.type.adaptive (not
+        # thinking.type.enabled). Pi 0.84.2+ sends adaptive when forceAdaptiveThinking
+        # is set in the compat block; reasoning:true on the model entry enables Pi's
+        # thinking level controls.
+        if self.api == "anthropic-messages":
+            provider["compat"] = {"forceAdaptiveThinking": True}
         providers = {self.provider_id: provider}
         providers.update(additional)
         return {"providers": providers}
