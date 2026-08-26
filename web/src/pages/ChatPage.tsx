@@ -224,6 +224,7 @@ import {
 } from "@/lib/claudePermissionMode";
 import { isCodexNativeSession } from "@/lib/codexPlanMode";
 import { getCliServerUrl } from "@/lib/host";
+import { useOmnigentAnalytics } from "@/lib/analyticsEmit";
 import { SessionImage } from "@/components/SessionImage";
 import { GoalControl, GoalStatusPill, useGoalState, type Goal } from "@/components/goal";
 import { copyText } from "@/lib/clipboard";
@@ -4748,6 +4749,9 @@ export function Composer({
   // Nonce bumped when bare "/model" is submitted; opens the AgentPicker
   // dropdown instead of sending (see submit()).
   const [pickerOpenNonce, setPickerOpenNonce] = useState(0);
+  // Enter-key sends bypass the send Button's onClick (a textarea Enter doesn't
+  // submit the form), so mirror the Button's componentId telemetry here.
+  const { trackClick } = useOmnigentAnalytics();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   // Declared after textareaRef so dictation can place the caret after the
@@ -5481,6 +5485,7 @@ export function Composer({
       // ``mentionListingPending``); swallow Enter so the in-progress "@dir/"
       // token isn't sent as a chat message. The menu reopens when entries land.
       if (mentionListingPending) return;
+      trackClick("chat.composer.send", "button");
       submit();
       return;
     }
