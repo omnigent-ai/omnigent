@@ -60,12 +60,16 @@ from fastapi import WebSocket, WebSocketDisconnect
 from omnigent.inner.terminal_clipboard import MAX_CLIPBOARD_BYTES
 from omnigent.terminals.query_replies import tmux_answered_queries
 from omnigent.terminals.ws_common import (
+    _OUTPUT_GAP_RESYNC,
+    _OUTPUT_QUEUE_MAX_BYTES,
     WS_CLOSE_INTERNAL_ERROR,
     WS_CLOSE_TERMINAL_DETACHED,
     WS_CLOSE_TERMINAL_NOT_FOUND,
+    _ByteBoundedOutputQueue,
     _check_pane_dead_definitive,
     _coalesce_limit_after_input,
     _forward_terminal_to_ws,
+    _GapRepainter,
     _monotonic,
     _tmux_session_alive,
 )
@@ -110,6 +114,9 @@ _CONTROL_READ_CHUNK: Final[int] = 256 * 1024
 # doesn't enforce a line limit, but the 64 KiB default would still bound a
 # single read; raise it so a large burst can be pulled in one wakeup.
 _CONTROL_STDOUT_BUFFER_LIMIT: Final[int] = 16 * 1024 * 1024
+# A control line that outgrows the stream budget is discarded whole and
+# reported to the output queue so its gap recovery can repaint the screen.
+_CONTROL_MAX_LINE_BYTES: Final[int] = _CONTROL_STDOUT_BUFFER_LIMIT
 
 # Terminal type declared for the control-mode attach client. The real renderer
 # is the browser's xterm.js, an xterm-256color-class emulator, so this is
@@ -144,10 +151,59 @@ _CLIPBOARD_MAX_BYTES: Final[int] = MAX_CLIPBOARD_BYTES
 _CLIPBOARD_READ_TIMEOUT_S: Final[float] = 2.0
 # Pane capture commands must not outlive a detached terminal bridge.
 _TMUX_CAPTURE_TIMEOUT_S: Final[float] = 5.0
+_SNAPSHOT_CAPTURE_MAX_ATTEMPTS: Final[int] = 3
+_SNAPSHOT_CAPTURE_RETRY_BASE_S: Final[float] = 0.25
+# Keep a plain UTF-8 cell capture comfortably inside the snapshot byte budget.
+_TERMINAL_MAX_COLS: Final[int] = 1000
+_TERMINAL_MAX_ROWS: Final[int] = 1000
 # A copy-mode commit follows the initiating key or mouse release immediately.
 # Correlating the notification with this client's recent input prevents one
 # attached browser from overwriting every other viewer's local clipboard.
 _CLIPBOARD_RECENT_INPUT_WINDOW_S: Final[float] = 5.0
+
+
+async def _parse_control_stream(
+    stdout: asyncio.StreamReader,
+    handle_line: Callable[[bytes], bool],
+    on_discard: Callable[[int], None] | None = None,
+) -> None:
+    """Parse raw control-stream reads without buffering oversized lines."""
+    buffer = b""
+    discarding = False
+    while True:
+        data = await stdout.read(_CONTROL_READ_CHUNK)
+        if not data:
+            return
+        buffer += data
+        if discarding:
+            _, newline, buffer = buffer.partition(b"\n")
+            if newline:
+                discarding = False
+            else:
+                buffer = b""
+        *lines, buffer = buffer.split(b"\n")
+        for raw_line in lines:
+            if len(raw_line) > _CONTROL_MAX_LINE_BYTES:
+                _logger.warning(
+                    "control line exceeded %d bytes; discarding it whole",
+                    _CONTROL_MAX_LINE_BYTES,
+                )
+                if on_discard is not None:
+                    on_discard(len(raw_line))
+                continue
+            if not handle_line(raw_line.rstrip(b"\r")):
+                return
+        if len(buffer) > _CONTROL_MAX_LINE_BYTES:
+            _logger.warning(
+                "control line exceeded %d bytes; discarding it whole",
+                _CONTROL_MAX_LINE_BYTES,
+            )
+            if on_discard is not None:
+                on_discard(len(buffer))
+            buffer = b""
+            discarding = True
+        # Buffered reads may never suspend while a pane is flooding output.
+        await asyncio.sleep(0)
 
 
 def unescape_control_output(value: bytes) -> bytes:
@@ -272,10 +328,20 @@ class _WindowNameFilter:
         return b""
 
 
+class _CaptureOutputTooLargeError(RuntimeError):
+    """A bounded tmux subprocess produced more bytes than allowed."""
+
+
+class _PaneCaptureTooLargeError(RuntimeError):
+    """No safe pane-capture representation fits the delivery budget."""
+
+
 async def _communicate_tmux_process(
     proc: asyncio.subprocess.Process,
+    *,
+    max_stdout_bytes: int | None = None,
 ) -> tuple[bytes, bytes] | None:
-    """Bound tmux output collection and reap the process on interruption."""
+    """Collect tmux output with timeout and optional byte bounds."""
 
     async def _kill_and_reap() -> None:
         with contextlib.suppress(ProcessLookupError):
@@ -284,6 +350,20 @@ async def _communicate_tmux_process(
             await asyncio.wait_for(proc.wait(), timeout=_TMUX_CAPTURE_TIMEOUT_S)
 
     try:
+        if max_stdout_bytes is not None:
+            assert proc.stdout is not None
+            try:
+                stdout = await asyncio.wait_for(
+                    proc.stdout.readexactly(max_stdout_bytes + 1),
+                    timeout=_TMUX_CAPTURE_TIMEOUT_S,
+                )
+            except asyncio.IncompleteReadError as exc:
+                stdout = exc.partial
+            else:
+                await _kill_and_reap()
+                raise _CaptureOutputTooLargeError
+            await asyncio.wait_for(proc.wait(), timeout=_TMUX_CAPTURE_TIMEOUT_S)
+            return stdout, b""
         return await asyncio.wait_for(
             proc.communicate(),
             timeout=_TMUX_CAPTURE_TIMEOUT_S,
@@ -389,7 +469,14 @@ def _hex_send_keys_commands(target: str, data: bytes) -> list[bytes]:
     return commands
 
 
-async def _run_tmux_capture(socket_path: str, tmux_target: str) -> bytes | None:
+async def _run_tmux_capture(
+    socket_path: str,
+    tmux_target: str,
+    *,
+    include_history: bool = True,
+    max_bytes: int | None = None,
+    reset_modes: bool = False,
+) -> bytes | None:
     """Capture the current pane screen (with escapes) to seed the browser view.
 
     A control client only receives ``%output`` produced after it attaches, so
@@ -438,50 +525,88 @@ async def _run_tmux_capture(socket_path: str, tmux_target: str) -> bytes | None:
 
     :param socket_path: tmux server socket path.
     :param tmux_target: The ``-t`` target, e.g. ``"main"``.
+    :param include_history: Include primary-screen scrollback for an initial seed.
+    :param max_bytes: Maximum rendered capture size. Oversized escaped captures
+        retry without history and then without styling before failing loudly.
+    :param reset_modes: Reset live-client modes before restoring pane metadata.
     :returns: The captured bytes to write into xterm, or ``None`` on failure
         (the caller proceeds without a seed rather than aborting the attach).
+    :raises _PaneCaptureTooLargeError: If no capture variant fits *max_bytes*.
     """
     tmux = shutil.which("tmux")
     if tmux is None:
         return None
     meta = await _capture_pane_metadata(tmux, socket_path, tmux_target)
+    if reset_modes and meta is None:
+        # A repair without metadata can repaint cells but cannot heal lost mode
+        # transitions. Let the caller retry the complete capture instead.
+        return None
     # Only extend the capture into history when on the primary screen; on the
     # alternate screen ``-S -`` leaks stale primary history (see docstring).
-    # ``-J`` joins soft-wrapped rows into logical lines (see docstring).
-    capture_args = ["capture-pane", "-e", "-p", "-J", "-t", tmux_target]
-    if meta is not None and not meta.alternate_on:
-        capture_args += ["-S", "-"]
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            tmux,
-            "-S",
-            socket_path,
-            *capture_args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-    except (OSError, ValueError):
-        return None
-    result = await _communicate_tmux_process(proc)
-    if result is None:
-        return None
-    stdout, _ = result
-    if proc.returncode != 0:
-        return None
-    # ``capture-pane -p`` emits one LF per row — INCLUDING a trailing LF after
-    # the final row. Writing that trailing separator paints the last row and
-    # then advances the cursor past it, which on a full-height pane scrolls the
-    # whole screen up by one line (the "extra line" / off-by-one). Strip the
-    # single trailing newline so the last row is painted with no line break
-    # after it; the cursor-restore escape then lands on the correct row.
-    body = stdout[:-1] if stdout.endswith(b"\n") else stdout
-    # Normalize the remaining bare-LF row separators to CRLF (see docstring) and
-    # paint onto a cleared screen from the home cursor so the seed can't
-    # staircase.
-    normalized = _CAPTURE_ROW_SEP_RE.sub(b"\r\n", body)
-    cursor = _cursor_restore_escape(meta)
-    prelude, postlude = _mode_restore_escapes(meta)
-    return prelude + b"\x1b[H\x1b[2J" + normalized + cursor + postlude
+    history = include_history and meta is not None and not meta.alternate_on
+    variants = [(history, True)]
+    if max_bytes is not None:
+        if history:
+            variants.append((False, True))
+        variants.append((False, False))
+
+    for capture_history, preserve_escapes in variants:
+        capture_args = ["capture-pane"]
+        capture_args.append("-J")
+        if preserve_escapes:
+            capture_args.append("-e")
+        capture_args += ["-p", "-t", tmux_target]
+        if capture_history:
+            capture_args += ["-S", "-"]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                tmux,
+                "-S",
+                socket_path,
+                *capture_args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        except (OSError, ValueError):
+            return None
+        try:
+            result = await _communicate_tmux_process(proc, max_stdout_bytes=max_bytes)
+        except _CaptureOutputTooLargeError:
+            continue
+        if result is None:
+            return None
+        stdout, _ = result
+        if proc.returncode != 0:
+            return None
+        # The final LF would scroll a full-height pane before cursor restore.
+        body = stdout[:-1] if stdout.endswith(b"\n") else stdout
+        normalized = _CAPTURE_ROW_SEP_RE.sub(b"\r\n", body)
+        cursor = _cursor_restore_escape(meta)
+        prelude, postlude = _mode_restore_escapes(meta, reset=reset_modes)
+        rendered = prelude + b"\x1b[H\x1b[2J" + normalized + cursor + postlude
+        if max_bytes is None or len(rendered) <= max_bytes:
+            return rendered
+
+    assert max_bytes is not None
+    raise _PaneCaptureTooLargeError(
+        f"pane capture for target {tmux_target!r} exceeds {max_bytes} bytes"
+    )
+
+
+async def _capture_pane_snapshot(
+    socket_path: str,
+    tmux_target: str,
+    *,
+    max_bytes: int = _OUTPUT_QUEUE_MAX_BYTES - len(_OUTPUT_GAP_RESYNC),
+) -> bytes | None:
+    """Capture the visible pane as a bounded full-screen repaint."""
+    return await _run_tmux_capture(
+        socket_path,
+        tmux_target,
+        include_history=False,
+        max_bytes=max_bytes,
+        reset_modes=True,
+    )
 
 
 @dataclass(frozen=True)
@@ -521,7 +646,16 @@ class _PaneMetadata:
     bracket_paste: bool = False
 
 
-def _mode_restore_escapes(meta: _PaneMetadata | None) -> tuple[bytes, bytes]:
+_LIVE_MODE_RESET: Final[bytes] = (
+    b"\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1l"
+)
+
+
+def _mode_restore_escapes(
+    meta: _PaneMetadata | None,
+    *,
+    reset: bool = False,
+) -> tuple[bytes, bytes]:
     """Build the DECSET escapes that restore the pane program's screen modes.
 
     ``capture-pane`` replays cell contents only — the mode-set sequences the
@@ -549,15 +683,19 @@ def _mode_restore_escapes(meta: _PaneMetadata | None) -> tuple[bytes, bytes]:
       tmux >= 3.7; older tmux expands it empty, degrading to no replay
       (the pre-replay behavior).
 
-    Only enables are emitted: every attach starts a fresh xterm whose modes
-    default off, so disables would be no-ops.
+    Initial seeds emit enables only because a fresh xterm defaults these modes
+    off. Repair snapshots target a live xterm and pass ``reset=True`` so lost
+    exits from alternate-screen, mouse, or DECCKM modes are healed first.
 
     :param meta: Pane metadata, or ``None`` (no modes restored).
+    :param reset: Unconditionally disable tracked live-client modes first.
     :returns: ``(prelude, postlude)`` byte strings, either possibly empty.
     """
     if meta is None:
         return b"", b""
-    prelude = b"\x1b[?1049h" if meta.alternate_on else b""
+    prelude = _LIVE_MODE_RESET if reset else b""
+    if meta.alternate_on:
+        prelude += b"\x1b[?1049h"
     postlude = b""
     if meta.mouse_standard:
         postlude += b"\x1b[?1000h"
@@ -663,6 +801,8 @@ async def bridge_tmux_control_to_websocket(
     socket_path: str,
     tmux_target: str,
     read_only: bool,
+    session_id: str | None = None,
+    terminal_id: str | None = None,
     on_client_interaction: Callable[[], None] | None = None,
     reader_done: asyncio.Event | None = None,
     forward_done: asyncio.Event | None = None,
@@ -678,6 +818,8 @@ async def bridge_tmux_control_to_websocket(
     :param tmux_target: The ``-t`` target string identifying the session.
     :param read_only: When ``True``, drop inbound binary input frames and
         attach with ``ignore-size`` so the viewer can't resize the pane.
+    :param session_id: Session identity used in queue-loss diagnostics.
+    :param terminal_id: Terminal resource identity used in diagnostics.
     :param on_client_interaction: Optional callback fired on every client
         interaction (connect, disconnect, each input/resize frame) so the
         idle watcher can discount client-driven repaints.
@@ -710,10 +852,28 @@ async def bridge_tmux_control_to_websocket(
         with contextlib.suppress(RuntimeError, WebSocketDisconnect):
             await websocket.send_text(message)
 
-    # Seed the browser terminal with the current screen BEFORE attaching so no
-    # pre-attach content is missing. Failure is non-fatal — a live pane redraw
-    # will repaint it shortly.
-    seed = await _run_tmux_capture(socket_path, tmux_target)
+    # Seed before attaching so no pre-attach content is missing. Ordinary
+    # capture failure remains non-fatal; an irreducibly oversized seed closes
+    # loudly because delivering it safely is impossible.
+    identity = (
+        f"session={session_id or 'unknown'} "
+        f"terminal={terminal_id or tmux_target} target={tmux_target} "
+        f"socket={socket_path} client={id(websocket):x}"
+    )
+    try:
+        seed = await _run_tmux_capture(
+            socket_path,
+            tmux_target,
+            max_bytes=_OUTPUT_QUEUE_MAX_BYTES,
+        )
+    except _PaneCaptureTooLargeError:
+        _logger.error("initial terminal capture cannot fit for %s", identity, exc_info=True)
+        with contextlib.suppress(RuntimeError):
+            await websocket.close(
+                code=WS_CLOSE_INTERNAL_ERROR,
+                reason="terminal snapshot too large",
+            )
+        return
     if seed:
         with contextlib.suppress(RuntimeError, WebSocketDisconnect):
             await websocket.send_bytes(seed)
@@ -756,7 +916,8 @@ async def bridge_tmux_control_to_websocket(
     # (``None`` = EOF sentinel). The forwarder coalesces everything queued into
     # one bounded ``send_bytes``, so when the browser send lags tmux's firehose
     # a backlog of tiny per-line payloads collapses into a few large frames.
-    output_chunks: asyncio.Queue[bytes | None] = asyncio.Queue()
+    output_chunks = _ByteBoundedOutputQueue()
+    output_chunks.identity = identity
     # Drops window-name escapes before they reach xterm.js (see _WindowNameFilter).
     window_name_filter = _WindowNameFilter()
     # Keep at most the newest pending clipboard buffer plus the EOF sentinel.
@@ -802,12 +963,50 @@ async def bridge_tmux_control_to_websocket(
 
     async def _emit_pane_snapshot() -> None:
         """Re-emit the visible pane after output was dropped."""
-        snapshot = await _capture_pane_snapshot(socket_path, tmux_target)
-        if snapshot is not None:
-            output_chunks.put_snapshot_nowait(snapshot)
+        max_snapshot_bytes = output_chunks.max_bytes - len(_OUTPUT_GAP_RESYNC)
+        if max_snapshot_bytes <= 0 or output_chunks.max_items < 2:
+            raise _PaneCaptureTooLargeError(
+                f"terminal output queue cannot retain a repair snapshot for {identity}"
+            )
+        for attempt in range(1, _SNAPSHOT_CAPTURE_MAX_ATTEMPTS + 1):
+            snapshot = await _capture_pane_snapshot(
+                socket_path,
+                tmux_target,
+                max_bytes=max_snapshot_bytes,
+            )
+            if snapshot is not None:
+                if output_chunks.put_snapshot_nowait(snapshot):
+                    return
+                raise _PaneCaptureTooLargeError(
+                    f"terminal repair snapshot was not retained for {identity}"
+                )
+            if attempt < _SNAPSHOT_CAPTURE_MAX_ATTEMPTS:
+                delay = _SNAPSHOT_CAPTURE_RETRY_BASE_S * (2 ** (attempt - 1))
+                _logger.warning(
+                    "terminal gap snapshot capture failed for %s (attempt %d/%d); "
+                    "retrying in %.2fs",
+                    identity,
+                    attempt,
+                    _SNAPSHOT_CAPTURE_MAX_ATTEMPTS,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+            else:
+                _logger.warning(
+                    "terminal gap snapshot capture failed for %s (attempt %d/%d); "
+                    "retries exhausted",
+                    identity,
+                    attempt,
+                    _SNAPSHOT_CAPTURE_MAX_ATTEMPTS,
+                )
+        raise RuntimeError(f"terminal gap snapshot capture failed for {identity}")
 
     repainter = _GapRepainter(_emit_pane_snapshot)
     output_chunks.on_drop = repainter.request
+    repaint_failure_task = asyncio.create_task(
+        repainter.wait_failed(), name="tmux-control-repaint-failure"
+    )
+
     def _handle_control_line(line: bytes) -> bool:
         """Route one protocol line; return ``True`` to keep reading.
 
@@ -859,19 +1058,14 @@ async def bridge_tmux_control_to_websocket(
         after any bytes the window-name filter still holds, so the forwarder
         terminates.
         """
-        buffer = b""
         try:
-            while True:
-                data = await stdout.read(_CONTROL_READ_CHUNK)
-                if not data:
-                    # tmux control client closed its stdout — server/session gone.
-                    return
-                buffer += data
-                # Parse all COMPLETE lines; keep any trailing partial for next read.
-                *lines, buffer = buffer.split(b"\n")
-                for raw_line in lines:
-                    if not _handle_control_line(raw_line.rstrip(b"\r")):
-                        return
+            await _parse_control_stream(
+                stdout,
+                _handle_control_line,
+                on_discard=output_chunks.record_dropped_output,
+            )
+            with contextlib.suppress(Exception):
+                await repainter.flush(_FORWARD_DRAIN_TIMEOUT_S)
         finally:
             tail = window_name_filter.finish()
             if tail:
@@ -945,6 +1139,20 @@ async def bridge_tmux_control_to_websocket(
                             rows = int(ctl["rows"])
                         except (KeyError, TypeError, ValueError):
                             continue
+                        if cols <= 0 or rows <= 0:
+                            continue
+                        bounded_cols = min(cols, _TERMINAL_MAX_COLS)
+                        bounded_rows = min(rows, _TERMINAL_MAX_ROWS)
+                        if (bounded_cols, bounded_rows) != (cols, rows):
+                            _logger.warning(
+                                "terminal resize capped for %s from %dx%d to %dx%d",
+                                identity,
+                                cols,
+                                rows,
+                                bounded_cols,
+                                bounded_rows,
+                            )
+                        cols, rows = bounded_cols, bounded_rows
                         await _send_command(f"refresh-client -C {cols}x{rows}\n".encode())
                 elif data is not None and not read_only:
                     # Stamp before sending so the next %output (the echo) takes
@@ -987,14 +1195,17 @@ async def bridge_tmux_control_to_websocket(
     # window-close) — the signal the close-code logic keys on. The forwarder
     # finishing is downstream (it drains, then sees the EOF sentinel).
     control_ended_first = False
+    repair_failed = False
     try:
         # The clipboard task is intentionally not a FIRST_COMPLETED trigger: it
         # may finish after the reader's EOF sentinel, but the reader itself is
         # the authoritative control-side completion signal.
         done, pending = await asyncio.wait(
-            {read_task, forward_task, ws_task}, return_when=asyncio.FIRST_COMPLETED
+            {read_task, forward_task, ws_task, repaint_failure_task},
+            return_when=asyncio.FIRST_COMPLETED,
         )
         control_ended_first = read_task in done
+        repair_failed = repaint_failure_task in done
         # When the reader finished first it already queued every remaining
         # %output plus the None EOF sentinel, so the forwarder will drain the
         # backlog and exit on its own. Await it (bounded) BEFORE cancelling so a
@@ -1026,7 +1237,13 @@ async def bridge_tmux_control_to_websocket(
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
-        for task in {read_task, forward_task, clipboard_task, ws_task}:
+        for task in {
+            read_task,
+            forward_task,
+            clipboard_task,
+            ws_task,
+            repaint_failure_task,
+        }:
             if task.done() and not task.cancelled():
                 exc = task.exception()
                 if exc is not None:
@@ -1034,7 +1251,13 @@ async def bridge_tmux_control_to_websocket(
     finally:
         # Outer route cancellation can bypass the normal post-wait cleanup.
         # Always stop and join every child task before detaching the tmux client.
-        bridge_tasks = {read_task, forward_task, clipboard_task, ws_task}
+        bridge_tasks = {
+            read_task,
+            forward_task,
+            clipboard_task,
+            ws_task,
+            repaint_failure_task,
+        }
         for task in bridge_tasks:
             if not task.done():
                 task.cancel()
@@ -1043,6 +1266,7 @@ async def bridge_tmux_control_to_websocket(
             if isinstance(result, Exception):
                 _logger.warning("control-attach: bridge task failed during teardown: %r", result)
         await repainter.cancel()
+        output_chunks.log_drop_summary()
         # Detach reflows the pane back to remaining clients — stamp it.
         if on_client_interaction is not None:
             on_client_interaction()
@@ -1058,7 +1282,12 @@ async def bridge_tmux_control_to_websocket(
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(proc.wait(), timeout=2.0)
         with contextlib.suppress(*_WS_CLOSE_EXPECTED_ERRORS):
-            if control_ended_first:
+            if repair_failed:
+                await websocket.close(
+                    code=WS_CLOSE_INTERNAL_ERROR,
+                    reason="terminal repaint failed",
+                )
+            elif control_ended_first:
                 # The control client ended: distinguish a genuine session-gone
                 # (%exit with a dead/absent pane) from a mere detach. Reuse the
                 # Use the shared pane-dead probe for a single source of truth.
