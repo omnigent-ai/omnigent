@@ -505,6 +505,68 @@ def _forget_service(service: HostService) -> None:
         ) from exc
 
 
+def _normalized_target(server_url: str | None) -> str:
+    """Return the service target key used by daemon records and definitions."""
+    return server_url.rstrip("/") if server_url else "local"
+
+
+def user_host_service_owns_target(
+    status: HostServiceStatus,
+    server_url: str | None,
+) -> bool:
+    """Return whether an installed generated service owns the requested target."""
+    return (
+        status.supported
+        and status.installed
+        and status.definition_error is None
+        and status.configured_target == _normalized_target(server_url)
+    )
+
+
+def start_user_host_service(server_url: str | None) -> HostServiceStatus:
+    """Start an installed service for *server_url* without changing autostart."""
+    status = user_host_service_status()
+    if not user_host_service_owns_target(status, server_url):
+        raise HostServiceError(
+            f"The installed host service does not own {_normalized_target(server_url)!r}."
+        )
+    if status.manager_state == "running":
+        return status
+    if status.manager_state == "unavailable":
+        raise HostServiceError(status.manager_error or "The user service manager is unavailable.")
+
+    service = _service_for_current_platform()
+    if service.kind == "launchd":
+        domain = f"gui/{os.getuid()}"
+        _run_best_effort(["launchctl", "bootout", f"{domain}/{service.label}"])
+        _run_checked(["launchctl", "bootstrap", domain, str(service.path)])
+    else:
+        _run_checked(["systemctl", "--user", "daemon-reload"])
+        _run_checked(["systemctl", "--user", "start", service.label])
+    return user_host_service_status()
+
+
+def stop_user_host_service(server_url: str | None) -> HostServiceStatus:
+    """Stop an installed service for *server_url* without removing autostart."""
+    status = user_host_service_status()
+    if not user_host_service_owns_target(status, server_url):
+        raise HostServiceError(
+            f"The installed host service does not own {_normalized_target(server_url)!r}."
+        )
+    if status.manager_state == "unavailable":
+        raise HostServiceError(status.manager_error or "The user service manager is unavailable.")
+
+    service = _service_for_current_platform()
+    if service.kind == "launchd":
+        target = f"gui/{os.getuid()}/{service.label}"
+        _run_best_effort(["launchctl", "bootout", target])
+        if _run_best_effort(["launchctl", "print", target]).returncode == 0:
+            raise HostServiceError(f"launchd service {service.label!r} is still running.")
+    else:
+        _run_checked(["systemctl", "--user", "stop", service.label])
+    return user_host_service_status()
+
+
 def enable_user_host_service(
     server_url: str | None,
     *,

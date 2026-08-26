@@ -1387,6 +1387,60 @@ def test_host_stop_stops_sessions_before_daemon(
     assert "sessions_stopped=1" in result.output
 
 
+def test_host_stop_disarms_service_after_sessions_before_daemon(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A managed service is stopped only after its live sessions can shut down."""
+    from omnigent.host.service import HostServiceStatus
+
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+    )
+    events: list[str] = []
+    monkeypatch.setattr(
+        cli,
+        "_stop_daemon_sessions",
+        lambda record, *, force: events.append("sessions") or 1,
+    )
+    monkeypatch.setattr(
+        "omnigent.host.service.user_host_service_status",
+        lambda: HostServiceStatus(
+            supported=True,
+            kind="systemd_user",
+            path=tmp_path / "omnigent-host.service",
+            label="omnigent-host.service",
+            installed=True,
+            configured_target="https://server.example.com",
+            manager_state="running",
+            enabled=True,
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_stop_enabled_host_service",
+        lambda server: events.append("service") or True,
+    )
+    monkeypatch.setattr(
+        cli,
+        "_terminate_daemon",
+        lambda record, *, force: events.append("daemon"),
+    )
+
+    result = CliRunner().invoke(
+        cli_group,
+        ["host", "stop", "--server", "https://server.example.com"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert events == ["sessions", "service", "daemon"]
+    assert "Autostart remains enabled" in result.output
+
+
 def test_host_stop_daemon_only_skips_session_stop(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
