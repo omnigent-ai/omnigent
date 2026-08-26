@@ -3939,6 +3939,7 @@ function AssistantBubble({
   // element — the hover footer's timestamp/actions belong to assistant text,
   // not to the error.
   const errorOnly = hasError && !markdownText;
+  const spansFullColumn = isWide || hasError;
 
   return (
     <>
@@ -3946,14 +3947,14 @@ function AssistantBubble({
         from="assistant"
         data-testid="message-bubble"
         data-role="assistant"
-        className={isWide ? "max-w-full" : "max-w-3xl"}
+        className={spansFullColumn ? "max-w-full" : "max-w-3xl"}
       >
         {/* A fold-only bubble takes w-full at the ordinary max-w-3xl cap
             rather than shrink-wrapping to the summary row's ~110px, which
             collapsed the row's trailing hairline (a flex-1 span) to zero
             and stopped its click target short of the column. Keeping the
             cap lands the hairline where an answered turn's does. */}
-        <MessageContent className={isWide || foldOnly || hasError ? "w-full" : undefined}>
+        <MessageContent className={spansFullColumn || foldOnly ? "w-full" : undefined}>
           <BlockRenderer
             items={bubble.items}
             sessionStatus={sessionStatus}
