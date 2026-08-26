@@ -8,12 +8,11 @@
 //
 // A palette is applied as a `data-theme` attribute on <html>, so it composes
 // with the mode class: `:root:not(.dark)[data-theme="github"]` is GitHub-light
-// and `.dark[data-theme="github"]` is GitHub-dark (see the palette blocks in
-// index.css). The default "omni" palette carries no CSS overrides — it falls
-// through to the base `:root` / `.dark` tokens — so selecting it just restores
-// the brand look. Everything is expressed through the existing CSS custom
-// properties (--background, --primary, --sidebar, …), so a palette re-skins the
-// whole app without any component knowing a theme changed.
+// and `.dark[data-theme="github"]` is GitHub-dark. The default "omni" palette
+// carries no data attribute, so selecting it restores the brand look. Everything
+// is expressed through the existing CSS custom properties (--background,
+// --primary, --sidebar, …), so a palette re-skins the whole app without any
+// component knowing a theme changed.
 //
 // Mirrors lib/uiFontPreferences.ts: a read/write pair backed by localStorage
 // plus a single `apply*` function that owns the DOM side-effect, called at boot
@@ -92,6 +91,44 @@ export interface PaletteTokens {
   shellBackground: string;
 }
 
+export const PALETTE_TOKEN_CSS_NAMES = {
+  background: "background",
+  foreground: "foreground",
+  card: "card",
+  cardSolid: "card-solid",
+  cardForeground: "card-foreground",
+  tray: "tray",
+  popover: "popover",
+  popoverForeground: "popover-foreground",
+  primary: "primary",
+  primaryForeground: "primary-foreground",
+  secondary: "secondary",
+  secondaryForeground: "secondary-foreground",
+  muted: "muted",
+  mutedForeground: "muted-foreground",
+  codeBackground: "code-bg",
+  accent: "accent",
+  accentForeground: "accent-foreground",
+  border: "border",
+  borderStrong: "border-strong",
+  buttonBorder: "button-border",
+  input: "input",
+  ring: "ring",
+  brandAccent: "brand-accent",
+  sidebar: "sidebar",
+  sidebarForeground: "sidebar-foreground",
+  sidebarPrimary: "sidebar-primary",
+  sidebarPrimaryForeground: "sidebar-primary-foreground",
+  sidebarAccent: "sidebar-accent",
+  sidebarAccentForeground: "sidebar-accent-foreground",
+  sidebarBorder: "sidebar-border",
+  sidebarRing: "sidebar-ring",
+  sidebarActive: "sidebar-active",
+  sidebarActiveForeground: "sidebar-active-foreground",
+  sidebarBackground: "sidebar-background",
+  shellBackground: "shell-background",
+} as const satisfies Record<keyof PaletteTokens, string>;
+
 type PaletteTokenInput = Pick<
   PaletteTokens,
   | "background"
@@ -154,9 +191,7 @@ export interface PaletteMeta {
   };
 }
 
-// Swatch colors are a hand-picked summary of each palette's CSS block — enough
-// to render a faithful mini-preview without parsing the stylesheet. Keep these
-// in sync with the matching `[data-theme]` block in index.css.
+// Swatch colors are a hand-picked summary used for mini-previews.
 export const PALETTES: readonly PaletteMeta[] = [
   {
     id: "omni",
@@ -572,10 +607,9 @@ export function writeThemePalette(palette: ThemeSelection): void {
 
 /**
  * Apply the palette to the DOM by setting `data-theme` on the document root.
- * The `[data-theme]` blocks in index.css re-point the color tokens; the default
- * "omni" palette has no block, so it removes the attribute and the base
- * `:root` / `.dark` tokens take over. This is the single source of the DOM
- * side-effect and composes with next-themes' `.dark` class untouched.
+ * The generated `[data-theme]` blocks re-point the color tokens; the default
+ * "omni" palette removes the attribute. This composes with next-themes' `.dark`
+ * class untouched.
  */
 export function applyThemePalette(palette: ThemeSelection): void {
   if (typeof document === "undefined") return;

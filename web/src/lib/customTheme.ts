@@ -1,5 +1,6 @@
 import {
   isThemePalette,
+  PALETTE_TOKEN_CSS_NAMES,
   PALETTES,
   type PaletteMeta,
   type PaletteSwatch,
@@ -470,44 +471,6 @@ export function customThemeSwatches(theme: CustomTheme): {
   };
 }
 
-const TOKEN_MAP = {
-  background: "background",
-  foreground: "foreground",
-  card: "card",
-  cardSolid: "card-solid",
-  cardForeground: "card-foreground",
-  tray: "tray",
-  popover: "popover",
-  popoverForeground: "popover-foreground",
-  primary: "primary",
-  primaryForeground: "primary-foreground",
-  secondary: "secondary",
-  secondaryForeground: "secondary-foreground",
-  muted: "muted",
-  mutedForeground: "muted-foreground",
-  codeBackground: "code-bg",
-  accent: "accent",
-  accentForeground: "accent-foreground",
-  border: "border",
-  borderStrong: "border-strong",
-  buttonBorder: "button-border",
-  input: "input",
-  ring: "ring",
-  brandAccent: "brand-accent",
-  sidebar: "sidebar",
-  sidebarForeground: "sidebar-foreground",
-  sidebarPrimary: "sidebar-primary",
-  sidebarPrimaryForeground: "sidebar-primary-foreground",
-  sidebarAccent: "sidebar-accent",
-  sidebarAccentForeground: "sidebar-accent-foreground",
-  sidebarBorder: "sidebar-border",
-  sidebarRing: "sidebar-ring",
-  sidebarActive: "sidebar-active",
-  sidebarActiveForeground: "sidebar-active-foreground",
-  sidebarBackground: "sidebar-background",
-  shellBackground: "shell-background",
-} as const;
-
 export function applyCustomTheme(theme: CustomTheme): void {
   if (typeof document === "undefined") return;
   const normalized = normalizeTheme(theme) ?? DEFAULT_CUSTOM_THEME;
@@ -518,9 +481,9 @@ export function applyCustomTheme(theme: CustomTheme): void {
     normalized.translucentSidebar,
   );
   for (const mode of ["light", "dark"] as const) {
-    for (const [key, token] of Object.entries(TOKEN_MAP) as [
+    for (const [key, token] of Object.entries(PALETTE_TOKEN_CSS_NAMES) as [
       keyof DerivedThemeVariant,
-      (typeof TOKEN_MAP)[keyof typeof TOKEN_MAP],
+      (typeof PALETTE_TOKEN_CSS_NAMES)[keyof typeof PALETTE_TOKEN_CSS_NAMES],
     ][]) {
       style.setProperty(`--custom-${mode}-${token}`, variants[mode][key]);
     }

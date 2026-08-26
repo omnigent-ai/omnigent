@@ -11,7 +11,9 @@ import { UI_FONT_SIZE_DEFAULT, UI_FONT_SIZE_MAX, UI_FONT_SIZE_MIN } from "./lib/
 
 // Relative to the vitest root (web/) — import.meta.url is not a file://
 // URL inside vitest's module graph, so it can't locate the file.
-const cssSource = readFileSync("src/index.css", "utf8");
+const indexCssSource = readFileSync("src/index.css", "utf8");
+const generatedPaletteCssSource = readFileSync("src/themePalettes.generated.css", "utf8");
+const cssSource = `${generatedPaletteCssSource}\n${indexCssSource}`;
 
 /* Regression test for the "transparent dropdown in prod" bug.
  *
@@ -253,9 +255,6 @@ describe("index.css sidebar canvas", () => {
   const omniDarkRule = cssSource.match(
     /\.dark:not\(\[data-theme\]\) \.conversations-sidebar \{[^}]*\}/,
   )?.[0];
-  const paletteRule = cssSource.match(
-    /:root:not\(\.dark\)\[data-theme\] \.conversations-sidebar,[^{]*\.dark\[data-theme\] \.conversations-sidebar \{[^}]*\}/,
-  )?.[0];
   const lightEdgeRule = cssSource.match(
     /html:not\(\.dark\) \.conversations-sidebar(?::not\(\.is-peek\))? \{[^}]*\}/,
   )?.[0];
@@ -264,13 +263,8 @@ describe("index.css sidebar canvas", () => {
     /:root:not\(\.dark\):not\(\[data-theme\]\) \.conversations-sidebar\.is-peek,[\s\S]*?\.dark\[data-theme\] \.conversations-sidebar\.is-peek \{[^}]*\}/,
   )?.[0];
 
-  it("uses the specified left-to-right gradient for Omnigent light only", () => {
-    expect(omniLightRule).toContain("background: #fffefe");
-    expect(omniLightRule).toContain(
-      "background: -webkit-linear-gradient(to right, #fffefe, #fcf6fa)",
-    );
-    expect(omniLightRule).toContain("background: linear-gradient(to right, #fffefe, #fcf6fa)");
-    expect(paletteRule).toContain("background: var(--sidebar)");
+  it("uses the specified left-to-right gradient for Omnigent light", () => {
+    expect(omniLightRule).toContain("background: linear-gradient(90deg, #fffefe, #fcf6fa)");
   });
 
   it("removes the dot-grid layer from both modes", () => {
@@ -453,14 +447,10 @@ describe("index.css mobile sidebar opacity", () => {
   it("declares it after the per-theme canvas rules so it wins the cascade", () => {
     // Matching specificity — the shorthand in the theme rules would otherwise
     // keep background-color transparent.
-    const light = cssSource.indexOf(":root:not(.dark):not([data-theme]) .conversations-sidebar {");
-    const dark = cssSource.indexOf(".dark:not([data-theme]) .conversations-sidebar {");
-    const palette = cssSource.indexOf(":root:not(.dark)[data-theme] .conversations-sidebar,");
+    const palette = generatedPaletteCssSource.lastIndexOf(".conversations-sidebar {");
     const mobile = cssSource.indexOf(mobileRule!);
-    expect(light).toBeGreaterThan(-1);
-    expect(dark).toBeGreaterThan(-1);
     expect(palette).toBeGreaterThan(-1);
-    expect(mobile).toBeGreaterThan(Math.max(light, dark, palette));
+    expect(mobile).toBeGreaterThan(palette);
     // Every palette/mode selector must be covered, or one can go transparent.
     expect(mobileRule).toContain(":root:not(.dark):not([data-theme]) .conversations-sidebar");
     expect(mobileRule).toContain(":root:not(.dark)[data-theme] .conversations-sidebar");

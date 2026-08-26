@@ -129,6 +129,15 @@ def _pick_palette(page: Page, name: str) -> None:
     page.get_by_role("option", name=name).click()
 
 
+def _preset_palette_names(page: Page) -> list[str]:
+    _color_theme_select(page).click()
+    options = page.locator('[data-testid^="palette-"]:not([data-testid="palette-custom"])')
+    expect(options.first).to_be_visible()
+    names = [name.strip() for name in options.all_inner_texts()]
+    page.keyboard.press("Escape")
+    return names
+
+
 def _open_appearance(page: Page, base_url: str) -> None:
     """Navigate to the Settings Appearance section, wait for the color-theme dropdown."""
     page.goto(f"{base_url}/settings/appearance")
@@ -278,7 +287,7 @@ def test_contrast_round_trip_restores_preset_tokens(
 
     for mode in ["Light", "Dark"]:
         _theme_radiogroup(page).get_by_role("radio", name=mode).click()
-        for palette in ["Omnigent", "Dracula", "GitHub", "Catppuccin", "Gruvbox", "Nord"]:
+        for palette in _preset_palette_names(page):
             _pick_palette(page, palette)
             before = _computed_theme_tokens(page)
             _set_contrast(page, 53)
