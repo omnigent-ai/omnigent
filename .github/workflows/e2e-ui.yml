@@ -1,7 +1,7 @@
 name: E2E UI Tests
 
 # Runs the Playwright UI suite against a freshly built web SPA, split across
-# a 3-shard matrix. The whole suite (including the native Claude/Codex/Cursor
+# a 4-shard matrix. The whole suite (including the native Claude/Codex/Cursor
 # render-parity tests) runs against the in-process mock LLM and needs NO
 # secrets, so it runs on ALL PRs -- same-repo AND fork -- directly, like ci.yml.
 # (The native_*_mock_session fixtures use the real gateway only when LLM_API_KEY
@@ -86,7 +86,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
-          NUM_SHARDS: "3"
+          NUM_SHARDS: "4"
         run: bash .github/scripts/ci/e2e-shard-matrix.sh
 
   # Build the Codex-parity sidecar ONCE and publish the binary. The
@@ -152,7 +152,7 @@ jobs:
     strategy:
       # One red shard shouldn't cancel siblings -- we want every shard's signal.
       fail-fast: false
-      max-parallel: 3
+      max-parallel: 4
       # Shards from `setup`; [] when skipped. Shard check names live in
       # merge-ready/required.sh -- keep in sync with NUM_SHARDS above.
       matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
