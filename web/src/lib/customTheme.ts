@@ -442,22 +442,28 @@ export function customThemeSwatches(theme: CustomTheme): {
   light: PaletteSwatch;
   dark: PaletteSwatch;
 } {
-  const variants = deriveCustomTheme(theme);
+  const normalized = normalizeTheme(theme) ?? DEFAULT_CUSTOM_THEME;
+  const palette =
+    PALETTES.find((candidate) => candidate.id === normalized.basePalette) ?? PALETTES[0];
+  const reference = generateCustomTheme(createCustomThemeFromPalette(palette));
+  const current = generateCustomTheme({ ...normalized, translucentSidebar: false });
+
+  const swatch = (
+    base: PaletteSwatch,
+    referenceVariant: GeneratedThemeVariant,
+    currentVariant: GeneratedThemeVariant,
+  ): PaletteSwatch => ({
+    bg: rebaseColor(base.bg, referenceVariant.background, currentVariant.background),
+    card: rebaseColor(base.card, referenceVariant.cardSolid, currentVariant.cardSolid),
+    accent:
+      currentVariant.primary === referenceVariant.primary ? base.accent : currentVariant.primary,
+    border: rebaseColor(base.border, referenceVariant.border, currentVariant.border),
+    text: rebaseColor(base.text, referenceVariant.foreground, currentVariant.foreground),
+  });
+
   return {
-    light: {
-      bg: variants.light.background,
-      card: variants.light.cardSolid,
-      accent: variants.light.primary,
-      border: variants.light.border,
-      text: variants.light.foreground,
-    },
-    dark: {
-      bg: variants.dark.background,
-      card: variants.dark.cardSolid,
-      accent: variants.dark.primary,
-      border: variants.dark.border,
-      text: variants.dark.foreground,
-    },
+    light: swatch(palette.light, reference.light, current.light),
+    dark: swatch(palette.dark, reference.dark, current.dark),
   };
 }
 

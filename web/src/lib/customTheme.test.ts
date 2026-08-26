@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   applyCustomTheme,
   createCustomThemeFromPalette,
+  customThemeSwatches,
   DEFAULT_CUSTOM_THEME,
   deriveCustomTheme,
   readCustomTheme,
@@ -108,6 +109,25 @@ describe("customTheme", () => {
     expect(adjusted.light).not.toEqual(palette.tokens.light);
     expect(adjusted.dark).not.toEqual(palette.tokens.dark);
     expect(deriveCustomTheme({ ...theme, contrast: 50 })).toEqual(palette.tokens);
+  });
+
+  it.each(PALETTES)("keeps the exact $label preview at contrast 50", (palette) => {
+    const swatches = customThemeSwatches(createCustomThemeFromPalette(palette));
+
+    expect(swatches).toEqual({ light: palette.light, dark: palette.dark });
+  });
+
+  it("shows explicitly customized accents in the preview", () => {
+    const palette = PALETTES.find((candidate) => candidate.id === "omni")!;
+    const theme = createCustomThemeFromPalette(palette);
+    const swatches = customThemeSwatches({
+      ...theme,
+      accent: "#2563eb",
+      darkAccent: "#2563eb",
+    });
+
+    expect(swatches.light.accent).toBe("#2563eb");
+    expect(swatches.dark.accent).toBe("#2563eb");
   });
 
   it("derives readable light and dark variants from the same configuration", () => {
