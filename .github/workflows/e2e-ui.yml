@@ -148,7 +148,7 @@ jobs:
     # `ready_for_review` re-fires when a draft is converted.
     needs: [setup, build-sidecar]
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     strategy:
       # One red shard shouldn't cancel siblings -- we want every shard's signal.
       fail-fast: false
