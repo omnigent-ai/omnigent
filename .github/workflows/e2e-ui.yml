@@ -296,8 +296,12 @@ jobs:
           # pytest_collection_modifyitems in tests/e2e_ui/conftest.py), which
           # evens out wall-clock better than pytest-shard's hash-bucketing.
           # --group is 1-indexed, so map the 0-indexed shard_id with +1.
+          # --durations surfaces the slowest test phases (setup/call/teardown)
+          # at the end of each shard's log so we can see where the wall-clock
+          # goes and rebalance; the 1s floor keeps trivial phases out.
           uv run pytest tests/e2e_ui \
             -v --tb=long --showlocals --log-level=INFO -r a \
+            --durations=25 --durations-min=1.0 \
             --ui-skip-build \
             --splits="$NUM_SHARDS" \
             --group="$((SHARD_ID + 1))" \
