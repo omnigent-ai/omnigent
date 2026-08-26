@@ -488,6 +488,121 @@ async def test_runner_resolves_harness_from_fallback_when_no_agent_id(
         assert "event: response.created" in response.text
 
 
+@pytest.mark.asyncio
+async def test_resolve_harness_config_raises_when_spec_resolver_returns_none() -> None:
+    """_resolve_harness_config raises RuntimeError when spec_resolver is wired
+    but returns no spec, instead of silently falling back to runner-test-default.
+
+    The fallback is only valid when no spec_resolver is configured (test mode).
+    A production runner that has a spec_resolver must never silently spawn the
+    test harness — the caller's ``except RuntimeError`` will surface a clean
+    error instead of leaving the session in a broken/hung state.
+
+    :returns: None.
+    """
+
+    async def _resolver_returning_none(
+        agent_id: str, session_id: str | None = None
+    ) -> AgentSpec | None:
+        """
+        Always return None to simulate an agent that cannot be resolved.
+
+        :param agent_id: Ignored.
+        :param session_id: Ignored.
+        :returns: None.
+        """
+        return None
+
+    with pytest.raises(RuntimeError, match="No agent spec found for agent_id="):
+        await _resolve_harness_config(
+            agent_id="ag_missing",
+            spec_resolver=_resolver_returning_none,
+            session_id="conv_x",
+        )
+
+
+@pytest.mark.asyncio
+async def test_resolve_harness_config_raises_when_agent_id_missing_with_spec_resolver() -> None:
+    """_resolve_harness_config raises when spec_resolver is set but agent_id is absent.
+
+    A production runner with a spec_resolver requires agent_id to select the
+    right harness. If it's missing the runner must fail loudly so the problem
+    surfaces immediately rather than spawning the test-only harness and hanging.
+
+    :returns: None.
+    """
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """
+        Return a valid spec — should never be reached in this test.
+
+        :param agent_id: Agent id.
+        :param session_id: Session id.
+        :returns: A minimal agent spec.
+        """
+        return AgentSpec(
+            spec_version=1,
+            name="x",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        )
+
+    with pytest.raises(RuntimeError, match="agent_id is missing"):
+        await _resolve_harness_config(
+            agent_id=None,
+            spec_resolver=_resolver,
+            session_id="conv_x",
+        )
+
+
+@pytest.mark.asyncio
+async def test_create_session_returns_400_when_spec_resolver_returns_none(
+    started_manager: HarnessProcessManager,
+) -> None:
+    """POST /v1/sessions returns 400 no_agent_spec when spec_resolver returns no spec.
+
+    When the server sends a session-create request with an agent_id that
+    doesn't map to any registered agent, the runner must return a clear 400
+    rather than silently proceeding with the test-only harness (which would
+    either fail with a 503 or, worse, appear to succeed and then hang on the
+    first turn because no real LLM is configured for it).
+
+    :param started_manager: A real HarnessProcessManager fixture.
+    :returns: None.
+    """
+
+    async def _resolver_returning_none(
+        agent_id: str, session_id: str | None = None
+    ) -> AgentSpec | None:
+        """
+        Always return None to simulate an unregistered agent.
+
+        :param agent_id: Ignored.
+        :param session_id: Ignored.
+        :returns: None.
+        """
+        return None
+
+    app = create_runner_app(
+        process_manager=started_manager,
+        spec_resolver=_resolver_returning_none,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        response = await http.post(
+            "/v1/sessions",
+            json={"session_id": "conv_bad_agent", "agent_id": "ag_unregistered"},
+        )
+
+    assert response.status_code == 400, (
+        f"Expected 400 no_agent_spec; got {response.status_code}: {response.text!r}. "
+        "Without the safeguard the runner falls back to runner-test-default and "
+        "returns 503 (unregistered harness) or silently spawns a test harness."
+    )
+    body = response.json()
+    assert body["error"] == "no_agent_spec"
+    assert "ag_unregistered" in body["detail"]
+
+
 class _RecordingProcessManager:
     """
     Process manager stub that records the harness name get_client saw.

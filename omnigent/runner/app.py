@@ -2947,6 +2947,21 @@ def create_runner_app(
                 )
             _session_spec_cache[session_id] = spec_entry
         else:
+            if spec_resolver is not None:
+                # spec_resolver was configured but returned no spec for this
+                # agent_id. Return a clear 400 rather than silently proceeding
+                # with the test-only harness and leaving the session in a
+                # broken/unrunnable state.
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "no_agent_spec",
+                        "detail": (
+                            f"No agent spec found for agent_id={agent_id!r}. "
+                            "Ensure the agent is registered before creating a session."
+                        ),
+                    },
+                )
             harness_name = "runner-test-default"
             spawn_env = None
 
@@ -9984,7 +9999,10 @@ async def _resolve_harness_config(
         so the spawn-env advertises the child's bundle rather than the
         parent's. ``None`` for top-level sessions.
     :param cwd: Runtime working directory for harnesses that need it.
-    :returns: ``(harness, spawn_env)``; a default for unresolved specs.
+    :returns: ``(harness, spawn_env)`` derived from the resolved spec.
+    :raises RuntimeError: When a spec_resolver is configured but the spec
+        cannot be resolved. Callers catch this to surface a clean error
+        rather than spawning an invalid harness subprocess.
     """
     if agent_id and spec_resolver:
         spec_entry = await spec_resolver(agent_id, session_id)
@@ -10020,7 +10038,21 @@ async def _resolve_harness_config(
             )
             return harness, spawn_env
 
-    # Fallback for tests that register a custom harness in _HARNESS_MODULES.
+    if spec_resolver is not None:
+        # spec_resolver is configured but either agent_id was not provided or
+        # the resolver returned no spec. Fail loud rather than silently falling
+        # through to the test-only harness and spawning a broken subprocess.
+        if not agent_id:
+            raise RuntimeError(
+                "Cannot select a harness: agent_id is missing and a spec_resolver "
+                "is configured. Ensure agent_id is forwarded in the turn body."
+            )
+        raise RuntimeError(
+            f"No agent spec found for agent_id={agent_id!r}; cannot select a harness."
+        )
+
+    # Fallback for tests that register a custom harness in _HARNESS_MODULES
+    # (spec_resolver is None in the test runner).
     return "runner-test-default", None
 
 
