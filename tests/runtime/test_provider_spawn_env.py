@@ -20,8 +20,8 @@ subprocess spawn, no real CLI.
 
 from __future__ import annotations
 
-import logging
 import json
+import logging
 import stat
 from pathlib import Path
 from types import SimpleNamespace

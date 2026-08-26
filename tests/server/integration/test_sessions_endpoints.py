@@ -8955,7 +8955,7 @@ async def test_external_codex_subagent_start_mints_child_session(
 
     :param client: The test HTTP client.
     """
-    agent = await create_test_agent(client)
+    agent = await create_test_agent(client, include_llm=False)
     parent = await _create_session(
         client,
         agent["id"],
@@ -8963,7 +8963,7 @@ async def test_external_codex_subagent_start_mints_child_session(
     )
     effort_response = await client.patch(
         f"/v1/sessions/{parent['id']}",
-        json={"reasoning_effort": "max"},
+        json={"reasoning_effort": "max", "model_override": "gpt-5.6-luna"},
     )
     assert effort_response.status_code == 200, effort_response.text
 
@@ -8992,6 +8992,7 @@ async def test_external_codex_subagent_start_mints_child_session(
     child = next((c for c in children if c["id"] == child_id), None)
     assert child is not None, "Child session must appear in child_sessions listing"
     assert child["reasoning_effort"] == "max"
+    assert child["llm_model"] == "gpt-5.6-luna"
 
     # tool is derived from agent_nickname → agent_role → "Codex".
     assert child["tool"] == "auth-auditor", (
@@ -9016,7 +9017,7 @@ async def test_external_codex_subagent_start_surfaces_parent_effort_for_legacy_c
     client: httpx.AsyncClient,
 ) -> None:
     """Native child projections recover the parent effort for old rows."""
-    agent = await create_test_agent(client)
+    agent = await create_test_agent(client, include_llm=False)
     parent = await _create_session(
         client,
         agent["id"],
@@ -9034,17 +9035,19 @@ async def test_external_codex_subagent_start_surfaces_parent_effort_for_legacy_c
 
     effort_response = await client.patch(
         f"/v1/sessions/{parent['id']}",
-        json={"reasoning_effort": "max"},
+        json={"reasoning_effort": "max", "model_override": "gpt-5.6-luna"},
     )
     assert effort_response.status_code == 200, effort_response.text
 
     child_snapshot = await client.get(f"/v1/sessions/{child_id}")
     assert child_snapshot.status_code == 200, child_snapshot.text
     assert child_snapshot.json()["reasoning_effort"] == "max"
+    assert child_snapshot.json()["llm_model"] == "gpt-5.6-luna"
 
     children = (await client.get(f"/v1/sessions/{parent['id']}/child_sessions")).json()["data"]
     child = next(c for c in children if c["id"] == child_id)
     assert child["reasoning_effort"] == "max"
+    assert child["llm_model"] == "gpt-5.6-luna"
 
 
 async def test_external_codex_subagent_start_is_idempotent_and_upserts_labels(
@@ -9716,14 +9719,14 @@ async def test_create_child_session_duplicate_title_returns_409(
 async def test_child_session_inherits_parent_reasoning_effort(
     client: httpx.AsyncClient,
 ) -> None:
-    """A child without an explicit effort inherits its parent's setting."""
-    agent = await create_test_agent(client)
+    """A child without settings inherits the parent's effort and model."""
+    agent = await create_test_agent(client, include_llm=False)
     parent = await _create_session(client, agent["id"], title="reasoning-parent")
     parent_id = parent["id"]
 
     updated = await client.patch(
         f"/v1/sessions/{parent_id}",
-        json={"reasoning_effort": "high"},
+        json={"reasoning_effort": "high", "model_override": "gpt-5.6-luna"},
     )
     assert updated.status_code == 200, updated.text
 
@@ -9737,3 +9740,18 @@ async def test_child_session_inherits_parent_reasoning_effort(
     )
     assert child.status_code == 201, child.text
     assert child.json()["reasoning_effort"] == "high"
+    assert child.json()["model_override"] is None
+    assert child.json()["llm_model"] == "gpt-5.6-luna"
+
+    explicit_child = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent_id,
+            "title": "explicit-child-model",
+            "model_override": "child-model",
+        },
+    )
+    assert explicit_child.status_code == 201, explicit_child.text
+    assert explicit_child.json()["model_override"] == "child-model"
+    assert explicit_child.json()["llm_model"] == "child-model"

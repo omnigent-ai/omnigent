@@ -8646,6 +8646,7 @@ async def _child_session_summaries_from_conversations(
     parent_session_id: str,
     conv_store: ConversationStore,
     parent_reasoning_effort: str | None = None,
+    parent_model: str | None = None,
 ) -> list[ChildSessionSummary]:
     """
     Build child summaries with one batched message-preview lookup.
@@ -8663,6 +8664,8 @@ async def _child_session_summaries_from_conversations(
     :param conv_store: Conversation store used for the batched message read.
     :param parent_reasoning_effort: Parent’s persisted effort, used as a
         display fallback for older native child rows.
+    :param parent_model: Parent’s effective model, used as a display fallback
+        for older child rows whose native wrapper/spec exposes no model.
     :returns: One :class:`ChildSessionSummary` per input child, preserving
         input order.
     """
@@ -8684,6 +8687,7 @@ async def _child_session_summaries_from_conversations(
             parent_session_id,
             previews.get(child.id),
             parent_reasoning_effort,
+            parent_model,
         )
         for child in children
     ]
@@ -9324,16 +9328,23 @@ async def _get_session_snapshot(
     if conv is None:
         raise _session_not_found()
     reasoning_effort_override: str | None = None
-    if (
-        conv.reasoning_effort is None
-        and _is_codex_native_subagent(conv)
-        and conv.parent_conversation_id is not None
+    parent_model: str | None = None
+    parent_conv: Conversation | None = None
+    if conv.parent_conversation_id is not None and (
+        conv.model_override is None
+        or (conv.reasoning_effort is None and _is_codex_native_subagent(conv))
     ):
         parent_conv = await asyncio.to_thread(
             conv_store.get_conversation, conv.parent_conversation_id
         )
         if parent_conv is not None:
-            reasoning_effort_override = parent_conv.reasoning_effort
+            if conv.reasoning_effort is None and _is_codex_native_subagent(conv):
+                reasoning_effort_override = parent_conv.reasoning_effort
+            if conv.model_override is None:
+                # Native wrappers do not carry a useful spec model. Reuse the
+                # parent's latest harness report when available, otherwise
+                # its explicit request, so legacy children remain truthful.
+                parent_model = parent_conv.reported_model or parent_conv.model_override
     # Return the most recent committed items while preserving the
     # SessionResponse contract that ``items`` is chronological. The
     # store's default page is the oldest 100 (``order="asc"``), which
@@ -9498,6 +9509,13 @@ async def _get_session_snapshot(
     # from this).
     if conv.reported_model:
         llm_model = conv.reported_model
+    elif conv.model_override is not None:
+        # A native wrapper may have no spec model and may not have emitted its
+        # first harness report yet. The persisted request is still the model
+        # the child will launch with until the report arrives.
+        llm_model = conv.model_override
+    elif llm_model is None and parent_model is not None:
+        llm_model = parent_model
     # Skills are runner-owned: the bound runner discovers them against its
     # own filesystem (bundled skills + host skills under the session's
     # workspace and ``~/.claude/skills/``) — the host where the harness

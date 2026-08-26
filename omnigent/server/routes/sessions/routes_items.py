@@ -195,6 +195,7 @@ def register_items_routes(
             session_id,
             conversation_store,
             parent.reasoning_effort,
+            parent.reported_model or parent.model_override,
         )
         return PaginatedList(
             data=data,

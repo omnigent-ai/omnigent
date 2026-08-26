@@ -9071,6 +9071,7 @@ def _child_session_summary_from_conversation(
     parent_session_id: str,
     last_message_preview: str | None,
     parent_reasoning_effort: str | None = None,
+    parent_model: str | None = None,
 ) -> ChildSessionSummary:
     """
     Build a :class:`ChildSessionSummary` from a child conversation.
@@ -9102,6 +9103,8 @@ def _child_session_summary_from_conversation(
     :param parent_reasoning_effort: Parent’s persisted effort, used as a
         display fallback for older native child rows created before native
         child inheritance was persisted.
+    :param parent_model: Parent’s effective model, used as a display fallback
+        for older child rows whose native wrapper/spec exposes no model.
     :returns: A populated :class:`ChildSessionSummary`.
     """
     display_title = title_without_closed_marker(conv.title)
@@ -9158,6 +9161,11 @@ def _child_session_summary_from_conversation(
     reasoning_effort = conv.reasoning_effort
     if reasoning_effort is None and _is_codex_native_subagent(conv):
         reasoning_effort = parent_reasoning_effort
+    llm_model = conv.reported_model or _child_llm_model_from_conversation(conv)
+    if llm_model is None and conv.model_override is not None:
+        llm_model = conv.model_override
+    if llm_model is None:
+        llm_model = parent_model
     return ChildSessionSummary(
         id=conv.id,
         parent_session_id=parent_session_id,
@@ -9188,7 +9196,7 @@ def _child_session_summary_from_conversation(
         # conversation label rather than a new column.
         routed_model=conv.model_override if routing_decision_id is not None else None,
         model_override=conv.model_override,
-        llm_model=_child_llm_model_from_conversation(conv),
+        llm_model=llm_model,
         reasoning_effort=reasoning_effort,
         routing_decision_id=routing_decision_id,
     )

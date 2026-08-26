@@ -2073,6 +2073,7 @@ def register_events_routes(
                     session_id,
                     conversation_store,
                     conv.reasoning_effort,
+                    conv.reported_model or conv.model_override,
                 )
                 for summary in summaries:
                     events.append(
