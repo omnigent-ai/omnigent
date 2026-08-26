@@ -36,19 +36,19 @@ backend — no real provider creds.
 
 ## Prerequisites
 
-This lane needs two heavy deps that are deliberately **not** in the web-test CI
-path (they'd bloat the fast unit-test job):
+`electron` and `playwright` are `web/electron` devDependencies (Playwright is
+the one with the `_electron` API). The fast `web-test` CI job installs with
+`--filter web`, so it never pulls them — only a `web/electron` install does:
 
 ```bash
 # From the repo root, once:
 pnpm --filter web run build          # build the SPA the server serves
-cd web/electron && pnpm install      # brings in electron
-pnpm add -D playwright               # Playwright core (has _electron)
+cd web/electron && pnpm install      # brings in electron + playwright
 ```
 
 On a headless CI box, wrap the run in `xvfb-run` so Electron has a display.
-The harness skips cleanly (not fails) when `electron` or `playwright` are
-absent, so a checkout without them stays green.
+The harness still skips cleanly (not fails) when `electron` or `playwright`
+are absent (e.g. a `--filter web`-only checkout), so those runs stay green.
 
 ## Running
 
@@ -60,7 +60,17 @@ node --test e2e/desktop_connect.e2e.js
 xvfb-run -a node --test e2e/desktop_connect.e2e.js
 ```
 
-The recorded video lands in `e2e/recordings/<slug>/`. As with every lane,
+`spawnServer` runs `omnigent server` via `python3` by default; point it at the
+right interpreter with `OMNIGENT_PYTHON` when your `omnigent` lives in a venv:
+
+```bash
+OMNIGENT_PYTHON=/path/to/.venv/bin/python node --test e2e/desktop_connect.e2e.js
+```
+
+The recorded video lands in `e2e/recordings/<slug>/`. Playwright writes it as a
+raw `page@<hash>.webm`; call `saveRecording(recordDir, "<name>")` after
+`electronApp.close()` (as the reference test does) to rename it to a stable
+`<name>.webm` and drop the incidental extra contexts. As with every lane,
 recordings are workspace artifacts — leave them uncommitted; CI's artifact
 bundle collects them.
 
@@ -75,6 +85,7 @@ bundle collects them.
    `reproduced` facet the assertion FAILS on the running build — the failing
    run's video is the before-fix footage. Close the app in a `finally` so the
    video is flushed even when the assertion fails.
-4. Move the emitted `*.webm` to a stable `before-`/`fixed-<facet>.webm` name,
-   and write the journey `caption` for the handoff, exactly as the other lanes
-   do (see `dev/repro-agent/AGENTS.md`, Step 4).
+4. Call `saveRecording(RECORD_DIR, "before-<facet>")` (or `fixed-<facet>`)
+   after the app closes to name the clip, and write the journey `caption` for
+   the handoff, exactly as the other lanes do (see `dev/repro-agent/AGENTS.md`,
+   Step 4).

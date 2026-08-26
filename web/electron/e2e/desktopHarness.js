@@ -46,11 +46,21 @@ const MOCK_LLM_SERVER = path.join(
 /** The Python interpreter used to run the server + mock (override for venvs). */
 const PYTHON = process.env.OMNIGENT_PYTHON || "python3";
 
-/** A minimal agent spec, mirroring conftest's _TEST_AGENT_YAML. */
+/** A minimal agent spec, mirroring conftest's _TEST_AGENT_YAML. The
+ * ``executor.harness`` is required (the spec loader rejects the spec without
+ * it), so keep the shape in sync with the Python suite's fixture. */
 const TEST_AGENT_YAML = `name: hello_world
-description: A minimal agent for desktop e2e recording.
-instructions: You are a helpful assistant. Keep replies short.
-model: gpt-4o
+prompt: You are a friendly assistant. Say hello and answer questions.
+
+executor:
+  model: gpt-4o-mini
+  harness: openai-agents
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none
 `;
 
 const HEALTH_TIMEOUT_MS = 30_000;
@@ -278,6 +288,37 @@ async function launchDesktop(opts) {
   return { electronApp, window, userDataDir };
 }
 
+/**
+ * After the Electron app has closed (which flushes the video), rename the
+ * recorded clip to a stable name at `recordDir`'s root. Playwright writes one
+ * `page@<hash>.webm` per page context under `recordDir`; the shell window is
+ * the largest, so pick that and move it to `<name>.webm` (dropping the rest, so
+ * the same footage isn't collected twice). Returns the final path, or null when
+ * no video was produced.
+ *
+ * Call this AFTER `electronApp.close()`.
+ *
+ * @param {string} recordDir The dir passed to `launchDesktop`.
+ * @param {string} name Stable base name, e.g. `"before-connect"` (no suffix).
+ * @returns {string | null} Absolute path to the renamed `.webm`, or null.
+ */
+function saveRecording(recordDir, name) {
+  if (!fs.existsSync(recordDir)) return null;
+  const clips = fs
+    .readdirSync(recordDir)
+    .filter((f) => f.endsWith(".webm"))
+    .map((f) => path.join(recordDir, f))
+    .filter((p) => fs.statSync(p).isFile());
+  if (clips.length === 0) return null;
+  // The shell window's video is the largest; incidental contexts are tiny.
+  clips.sort((a, b) => fs.statSync(b).size - fs.statSync(a).size);
+  const [primary, ...rest] = clips;
+  const dest = path.join(recordDir, `${name}.webm`);
+  fs.renameSync(primary, dest);
+  for (const leftover of rest) fs.rmSync(leftover, { force: true });
+  return dest;
+}
+
 module.exports = {
   APP_ROOT,
   REPO_ROOT,
@@ -286,4 +327,5 @@ module.exports = {
   findFreePort,
   spawnServer,
   launchDesktop,
+  saveRecording,
 };

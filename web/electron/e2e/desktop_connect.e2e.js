@@ -18,7 +18,12 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
-const { desktopDepsAvailable, spawnServer, launchDesktop } = require("./desktopHarness");
+const {
+  desktopDepsAvailable,
+  spawnServer,
+  launchDesktop,
+  saveRecording,
+} = require("./desktopHarness");
 
 const deps = desktopDepsAvailable();
 const RECORD_DIR = path.join(__dirname, "recordings", "desktop-connect");
@@ -54,15 +59,21 @@ describe(
         await window.locator("#connect").click();
 
         // 3. The server's SPA takes over the window — the app shell renders.
-        //    (Landing page varies; the sidebar brand is always present.)
-        const brand = window.locator('[data-testid="sidebar-brand"]');
-        await brand.waitFor({ state: "visible", timeout: 20_000 });
-        assert.ok(await brand.isVisible(), "app shell did not render after connect");
+        //    Key on the home composer heading, reliably visible on the desktop
+        //    layout (the sidebar brand collapses into the macOS title-bar row
+        //    and reads as hidden there).
+        const landed = window.getByText("What should we build?");
+        await landed.waitFor({ state: "visible", timeout: 20_000 });
+        assert.ok(await landed.isVisible(), "app shell did not render after connect");
       } finally {
         // Video is flushed on close; do it in finally so a failed assertion
         // still yields footage of the failure.
         await electronApp.close();
       }
+      // Rename the raw page@<hash>.webm to a stable name at the record-dir
+      // root — the name a repro-agent handoff points at (before-/fixed-<facet>).
+      const clip = saveRecording(RECORD_DIR, "connect-journey");
+      assert.ok(clip, "no desktop recording was produced");
     });
   },
 );
