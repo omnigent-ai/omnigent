@@ -8,6 +8,8 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
+import { clearSessionDrafts, hasSessionDraft } from "@/lib/sessionDrafts";
+import { setOmnigentHostConfig } from "@/lib/host";
 
 // Composer reads workspace files via a TanStack query hook (for "@"-file
 // mentions). These slash-command tests don't exercise that, so stub the hook
@@ -112,6 +114,28 @@ function renderWithTooltips(ui: ReactElement) {
   return render(<TooltipProvider>{ui}</TooltipProvider>);
 }
 
+describe("Composer session drafts", () => {
+  beforeEach(() => {
+    clearSessionDrafts();
+    useChatStore.setState({ conversationId: "conv_draft" });
+  });
+
+  afterEach(() => {
+    cleanup();
+    clearSessionDrafts();
+  });
+
+  it("publishes unfinished text for the sidebar and clears it after send", async () => {
+    render(<Composer {...composerProps()} />);
+
+    fireEvent.change(textarea(), { target: { value: "unfinished message" } });
+    await waitFor(() => expect(hasSessionDraft("conv_draft")).toBe(true));
+
+    fireEvent.submit(textarea().closest("form")!);
+    await waitFor(() => expect(hasSessionDraft("conv_draft")).toBe(false));
+  });
+});
+
 describe("Composer growth layout", () => {
   afterEach(() => {
     cleanup();
@@ -145,6 +169,18 @@ describe("Composer growth layout", () => {
 
     expect(ta.style.height).toBe("200px");
     expect(form?.style.marginTop).toBe("");
+  });
+
+  it("keeps long drafts scrollable without showing a native scrollbar", () => {
+    render(<Composer {...composerProps()} />);
+
+    const ta = textarea();
+    expect(ta).toHaveClass(
+      "overflow-y-auto",
+      "[scrollbar-width:none]",
+      "[&::-webkit-scrollbar]:hidden",
+    );
+    expect(ta.parentElement).toHaveClass("overflow-hidden");
   });
 });
 
@@ -211,6 +247,7 @@ describe("Composer slash-command menu", () => {
   afterEach(() => {
     cleanup();
     vi.restoreAllMocks();
+    setOmnigentHostConfig({});
   });
 
   it("highlights the first match as soon as the menu opens", () => {
@@ -276,14 +313,35 @@ describe("Composer slash-command menu", () => {
     expect(activeRow()).toBeNull();
   });
 
-  it("Enter sends a normal (non-slash) message", () => {
+  it("Enter sends a normal (non-slash) message and reports the send to analytics", () => {
     const onSend = vi.fn();
+    const analytics = vi.fn();
+    setOmnigentHostConfig({ analytics });
     render(<Composer {...composerProps({ onSend })} />);
     const ta = textarea();
     fireEvent.change(ta, { target: { value: "hello there" } });
 
     fireEvent.keyDown(ta, { key: "Enter" });
     expect(onSend).toHaveBeenCalledWith("hello there", undefined);
+    // Enter-key sends must emit the same telemetry as clicking Send.
+    expect(analytics).toHaveBeenCalledWith({
+      type: "click",
+      componentId: "chat.composer.send",
+      componentKind: "button",
+    });
+  });
+
+  it("Enter on an empty composer neither sends nor reports a send", () => {
+    const onSend = vi.fn();
+    const analytics = vi.fn();
+    setOmnigentHostConfig({ analytics });
+    render(<Composer {...composerProps({ onSend })} />);
+
+    // Empty draft: the Send button is disabled, so a click can't fire the
+    // event — the guarded Enter path must not fire it either.
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(onSend).not.toHaveBeenCalled();
+    expect(analytics).not.toHaveBeenCalled();
   });
 
   it("does not send when Enter confirms active IME composition", () => {

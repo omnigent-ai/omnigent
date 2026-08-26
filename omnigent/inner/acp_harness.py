@@ -53,6 +53,7 @@ import os
 from fastapi import FastAPI
 
 from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
+from omnigent.inner.acp_extension import NO_ACP_EXTENSION, AcpExtension
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import Executor
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
@@ -124,8 +125,12 @@ def _resolve_os_env() -> OSEnvSpec:
     )
 
 
-def _build_acp_executor() -> Executor:
-    """Construct an :class:`AcpExecutor` from env-var config (lazily, on first turn)."""
+def _build_acp_executor(extension: AcpExtension = NO_ACP_EXTENSION) -> Executor:
+    """Construct an :class:`AcpExecutor` from env-var config (lazily, on first turn).
+
+    :param extension: Vendor behavior to inject, from the calling wrap. Defaults
+        to protocol-only for the generic ``acp`` harness.
+    """
     command = os.environ.get(_ENV_COMMAND, "").strip()
     if not command:
         raise RuntimeError(
@@ -152,16 +157,25 @@ def _build_acp_executor() -> Executor:
         permission_mode=permission_mode,
         inject_system_prompt=inject_system_prompt,
     )
-    return AcpExecutor(config=config, cwd=cwd, os_env=_resolve_os_env())
+    return AcpExecutor(config=config, cwd=cwd, os_env=_resolve_os_env(), extension=extension)
 
 
-def create_app() -> FastAPI:
+def create_app(extension: AcpExtension = NO_ACP_EXTENSION) -> FastAPI:
     """Build the generic ACP harness's FastAPI app (required entry point).
 
     The wrapped :class:`AcpExecutor` is constructed lazily on the first turn, so
     a missing command / absent agent binary surfaces as a request-time error
     rather than an app-boot crash.
+
+    :param extension: Vendor behavior for the agent this process drives. A
+        vendor's own wrap calls this with its extension (see
+        :mod:`omnigent.inner.devin.harness`); the runner calls it with no
+        argument for ``harness: acp`` and for a builtin ACP CLI row that declares
+        no vendor behavior.
+    :returns: The app the runner serves.
     """
     label = os.environ.get(_ENV_NAME, "").strip() or "ACP agent"
-    adapter = ExecutorAdapter(executor_factory=_build_acp_executor, harness_label=label)
+    adapter = ExecutorAdapter(
+        executor_factory=lambda: _build_acp_executor(extension), harness_label=label
+    )
     return adapter.build()

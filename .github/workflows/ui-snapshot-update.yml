@@ -112,26 +112,29 @@ jobs:
       # No "playwright install": the pinned image ships matching Chromium + deps
       # under $PLAYWRIGHT_BROWSERS_PATH (/ms-playwright).
 
-      - name: Build web SPA
+      - name: Build web SPA + Storybook
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: |
           pnpm install --frozen-lockfile --filter web
           pnpm --filter web run build
+          pnpm --filter web run build:storybook
 
-      - name: Compare the baselines (no --update-snapshots)
+      - name: Compare and verify the regenerated baselines
         # Deliberately NOT --update-snapshots: that rewrites EVERY PNG, churning
-        # baselines that already pass (a sub-threshold re-render still changes the
-        # bytes). In plain compare mode the plugin leaves passing baselines
-        # untouched and rewrites only the drift: under GitHub Actions it updates a
-        # mismatching baseline IN PLACE (and creates a MISSING one) under
-        # snapshots/, so the tree below already holds exactly the changed PNGs.
-        # The run "fails" by design on any drift, so don't gate on its exit code.
+        # baselines that already pass. Under GitHub Actions, plain compare mode
+        # updates only drifting/missing PNGs in place. The first run may therefore
+        # fail by design. The second must pass, distinguishing expected baseline
+        # updates from Storybook/index/server/render failures.
         run: |
           uv run pytest tests/e2e_ui/visual -m visual \
             -v --tb=long --log-level=INFO -r a \
             -p no:rerunfailures \
             --ui-skip-build || true
+          uv run pytest tests/e2e_ui/visual -m visual \
+            -v --tb=long --log-level=INFO -r a \
+            -p no:rerunfailures \
+            --ui-skip-build
 
       # Tar the snapshots tree (paths intact) so the commit job can restore it
       # wholesale. Only genuinely-changed/created PNGs differ from the committed

@@ -160,10 +160,7 @@ from omnigent.server.schemas import (
 from omnigent.spec.skill_sources import SkillSourceContext, resolve_harness_skills
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
 from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
-from omnigent.terminals.ws_bridge import (
-    WS_CLOSE_TERMINAL_NOT_FOUND,
-    bridge_tmux_pty_to_websocket,
-)
+from omnigent.terminals.ws_common import WS_CLOSE_TERMINAL_NOT_FOUND
 from omnigent.tools.builtins.load_skill import (
     find_skill_by_name,
     format_skill_meta_text,
@@ -641,6 +638,188 @@ async def _evaluate_policy_via_omnigent(
     )
     if on_delivery_failure is not None:
         await on_delivery_failure(conversation_id)
+
+
+# Bounded wait for a sub-agent's start edge to mint its child session before the
+# completion edge records the outcome. The mint POST carries its own timeout, so
+# this only guards the unexpected case where the start task never resolves.
+_SUBAGENT_MINT_WAIT_S: float = 30.0
+
+
+async def _mint_acp_subagent_child(
+    client: httpx.AsyncClient,
+    *,
+    parent_id: str,
+    child_key: str,
+    title: str,
+    task: str,
+    child_id_future: asyncio.Future[str],
+) -> None:
+    """Mint a child session for a harness-reported sub-agent (the start edge).
+
+    POSTs ``external_acp_subagent_start`` — idempotent on ``child_key``
+    server-side — then seeds the child's transcript with the delegated task as a
+    user message, so opening the row shows what the sub-agent was asked to do
+    instead of an empty chat. Resolves ``child_id_future`` with the child id so
+    the completion edge can address it.
+
+    Deliberately NOT the native ``external_subagent_start`` path: that one stamps
+    a claude-native wrapper label, which makes the UI title the child "Claude
+    Code" regardless of the real harness. The ACP path leaves the wrapper unset so
+    the child inherits its parent's harness identity (e.g. Devin).
+
+    Best-effort: a failure resolves the future with the exception (so the
+    completion edge fails fast rather than hanging) and is logged, never raised
+    into the turn.
+
+    :param client: Omnigent HTTP client for the runner subprocess.
+    :param parent_id: The parent conversation the sub-agent belongs to.
+    :param child_key: Stable sub-agent id; the idempotency + correlation key.
+    :param title: Row label for the child, e.g. ``"mathutils"``.
+    :param task: The delegated instruction, seeded as the child's first message.
+    :param child_id_future: Resolved with the minted child session id.
+    """
+    try:
+        resp = await client.post(
+            f"/v1/sessions/{parent_id}/events",
+            json={
+                "type": "external_acp_subagent_start",
+                "data": {
+                    "subagent_id": child_key,
+                    "title": title or child_key,
+                    "description": task,
+                },
+            },
+        )
+        resp.raise_for_status()
+        payload = resp.json() if resp.content else {}
+        child_id = payload.get("child_session_id") if isinstance(payload, dict) else None
+        if not (isinstance(child_id, str) and child_id):
+            raise ValueError("external_acp_subagent_start returned no child_session_id")
+        if not child_id_future.done():
+            child_id_future.set_result(child_id)
+    except Exception as exc:  # noqa: BLE001 — surfacing a sub-agent must never break the turn
+        _logger.warning("acp sub-agent child mint failed (child_key=%s): %s", child_key, exc)
+        if not child_id_future.done():
+            child_id_future.set_exception(exc)
+        return
+    # Seed the child's chat with its task. Separate from the mint so a transcript
+    # failure still leaves a working row (the panel entry already exists).
+    if task:
+        await _post_acp_subagent_message(
+            client, child_id=child_id, child_key=child_key, role="user", text=task
+        )
+
+
+async def _post_acp_subagent_message(
+    client: httpx.AsyncClient,
+    *,
+    child_id: str,
+    child_key: str,
+    role: str,
+    text: str,
+    agent: str | None = None,
+) -> None:
+    """Append one message to an ACP sub-agent's child transcript.
+
+    Uses the existing ``external_conversation_item`` bridge (the same path the
+    native forwarders use for sub-agent transcripts), so the child conversation
+    renders normally when opened. Best-effort and never raised into the turn.
+
+    :param client: Omnigent HTTP client for the runner subprocess.
+    :param child_id: The child session to append to.
+    :param child_key: Sub-agent id, used for the response id and log context.
+    :param role: ``"user"`` (the delegated task) or ``"assistant"`` (its result).
+    :param text: Message text.
+    :param agent: Author name for an ``"assistant"`` message (ignored for
+        ``"user"``). ``MessageData`` requires a non-empty ``agent`` on assistant
+        messages, so this falls back to *child_key* when unset.
+    """
+    block_type = "input_text" if role == "user" else "output_text"
+    item_data: dict[str, object] = {
+        "role": role,
+        "content": [{"type": block_type, "text": text}],
+    }
+    if role == "assistant":
+        # MessageData rejects an assistant message with no ``agent`` (its
+        # ``check_agent_for_assistant`` validator), so an assistant item that
+        # omits it 400s and the summary silently never lands. Mirror codex's
+        # assistant transcript post, which sets ``agent`` for this exact reason.
+        item_data["agent"] = agent or child_key
+    try:
+        resp = await client.post(
+            f"/v1/sessions/{child_id}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "message",
+                    "item_data": item_data,
+                    "response_id": f"resp_acpsub_{child_key}",
+                },
+            },
+        )
+        resp.raise_for_status()
+    except Exception as exc:  # noqa: BLE001 — transcript is best-effort
+        _logger.warning("acp sub-agent %s message failed (child_key=%s): %s", role, child_key, exc)
+
+
+async def _complete_acp_subagent_child(
+    client: httpx.AsyncClient,
+    *,
+    child_key: str,
+    ok: bool,
+    summary: str,
+    child_id_future: asyncio.Future[str],
+    title: str = "",
+) -> None:
+    """Record a harness-reported sub-agent's outcome on its child session (end edge).
+
+    Waits (bounded) for the start edge to mint the child, then marks the child's
+    status (``idle`` on success, ``failed`` otherwise) with the summary attached
+    as its output. Best-effort: a missing or failed mint is logged and skipped,
+    never raised into the turn.
+
+    :param client: Omnigent HTTP client for the runner subprocess.
+    :param child_key: Stable sub-agent id, matching the start edge.
+    :param ok: Whether the sub-agent reported success.
+    :param summary: The sub-agent's closing summary, attached as the child output.
+    :param child_id_future: Future the start edge resolves with the child id.
+    :param title: The sub-agent's display name, used as the summary message's
+        author; falls back to *child_key* when empty.
+    """
+    from omnigent._native_post_delivery import post_external_session_status
+
+    try:
+        child_id = await asyncio.wait_for(
+            asyncio.shield(child_id_future), timeout=_SUBAGENT_MINT_WAIT_S
+        )
+    except Exception as exc:  # noqa: BLE001 — includes the start edge's own mint failure
+        _logger.warning(
+            "acp sub-agent child unavailable for completion (child_key=%s): %s", child_key, exc
+        )
+        return
+    # The sub-agent's closing summary is the only account of its work the agent
+    # reports, so it goes in the child's transcript, not just the status edge.
+    if summary:
+        await _post_acp_subagent_message(
+            client,
+            child_id=child_id,
+            child_key=child_key,
+            role="assistant",
+            text=summary,
+            agent=title or child_key,
+        )
+    try:
+        await post_external_session_status(
+            client,
+            session_id=child_id,
+            status="idle" if ok else "failed",
+            output=summary or None,
+        )
+    except Exception as exc:  # noqa: BLE001 — a status edge failure must not break the turn
+        _logger.warning(
+            "acp sub-agent completion status failed (child_key=%s): %s", child_key, exc
+        )
 
 
 def _response_body_preview(resp: object, *, limit: int = 500) -> str:
@@ -2050,6 +2229,10 @@ def create_runner_app(
     _session_spec_locks: dict[str, asyncio.Lock] = {}  # session_id → spec resolution lock
     _session_init_tasks: dict[tuple[str, str, str | None], asyncio.Task[JSONResponse]] = {}
     _session_init_envelopes: dict[str, tuple[float, RunnerSessionInitEnvelope]] = {}
+    # session_id → canonical reasoning effort, seeded from the session-init
+    # snapshot and updated by ``effort_change``. In-process harnesses learn the
+    # effort only from the forwarded turn body, which is built field by field.
+    _session_reasoning_effort: dict[str, str] = {}
     _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
     _session_cursor_model_names: dict[str, dict[str, str]] = {}
@@ -2453,17 +2636,19 @@ def create_runner_app(
                 "session_id": event.session_id,
             },
         )
-        # A codex TUI pane that exits on its own (crash / OOM / host recycle)
-        # never runs the DELETE-session cleanup, so its per-session app-server
-        # + forwarder would linger with no TUI. Tear them down here; no-op for
-        # any session without a registered codex app-server.
+        # Auxiliary terminals do not own the session control plane. In
+        # particular, losing Codex's streamable TUI must not cancel an active
+        # app-server turn; the native-terminal ensure path can recreate it.
+        if event.lifecycle != TerminalLifecycle.REQUIRED:
+            return
+
+        # A required terminal exit ends the session. Tear down any registered
+        # Codex app-server alongside it; this is a no-op for other harnesses.
         _teardown_task = asyncio.create_task(
             _native_runtime.teardown_codex_native_app_server(event.session_id)
         )
         _teardown_task.add_done_callback(_background_tasks.discard)
         _background_tasks.add(_teardown_task)
-        if event.lifecycle != TerminalLifecycle.REQUIRED:
-            return
 
         if event.terminal_name in ("qwen", "antigravity") and event.session_key == "main":
             _publish_event(event.session_id, {"type": "session.status", "status": "idle"})
@@ -2475,6 +2660,13 @@ def create_runner_app(
             return
 
         error = _build_required_terminal_error(event)
+        _logger.error(
+            "required terminal %s exited; failing turn for %s: %s",
+            event.terminal_name,
+            event.session_id,
+            error.get("message"),
+            extra={"session_id": event.session_id},
+        )
         _publish_event(
             event.session_id,
             {
@@ -2604,6 +2796,8 @@ def create_runner_app(
         _session_workspace_cache[session_id] = snapshot.workspace
         if envelope.sub_agent_name:
             _session_sub_agent_names[session_id] = envelope.sub_agent_name
+        if snapshot.reasoning_effort:
+            _session_reasoning_effort[session_id] = snapshot.reasoning_effort
         _session_init_envelopes[session_id] = (time.monotonic(), envelope)
         return _SessionInitContext(envelope=envelope)
 
@@ -3551,6 +3745,7 @@ def create_runner_app(
         _session_snapshot_cache.pop(session_id, None)
         _session_snapshot_locks.pop(session_id, None)
         _session_init_envelopes.pop(session_id, None)
+        _session_reasoning_effort.pop(session_id, None)
         _session_spec_locks.pop(session_id, None)
         _session_fs_registries.pop(session_id, None)
         _session_agent_ids.pop(session_id, None)
@@ -4089,6 +4284,16 @@ def create_runner_app(
         event: _JsonObject = {"type": "session.status", "status": status}
         if error is not None:
             event["error"] = error
+        if status == "failed":
+            # Canonical broken-turn signal: every failed turn shown in the UI
+            # funnels through here, so log once at ERROR for the dashboard.
+            _logger.error(
+                "turn surfaced to UI as failed for %s (harness=%s): %s",
+                conv_id,
+                harness,
+                error,
+                extra={"session_id": conv_id},
+            )
         _publish_event(conv_id, event)
 
     def _is_native_harness(conv_id: str) -> bool:
@@ -4341,6 +4546,41 @@ def create_runner_app(
                 exc_info=True,
                 extra={"session_id": runner_primary_session_id()},
             )
+
+    async def _handle_pi_native_effort_change(
+        conv_id: str,
+        effort: str | None,
+    ) -> Response:
+        from omnigent.pi_native_bridge import (
+            bridge_dir_for_session_id,
+            enqueue_thinking_level_change,
+        )
+        from omnigent.reasoning_effort import to_pi_thinking_level
+
+        if effort is None or not effort.strip():
+            return Response(status_code=204)
+        thinking = to_pi_thinking_level(effort)
+        try:
+            await asyncio.to_thread(
+                enqueue_thinking_level_change,
+                bridge_dir_for_session_id(conv_id),
+                thinking,
+            )
+        except OSError as exc:
+            _logger.warning(
+                "Pi-native effort change failed for session=%s",
+                conv_id,
+                exc_info=True,
+                extra={"session_id": conv_id},
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "pi_native_effort_failed",
+                    "detail": _client_safe_error_detail(exc, context="pi-native effort change"),
+                },
+            )
+        return Response(status_code=204)
 
     async def _handle_pi_native_model_change(
         conv_id: str,
@@ -6028,6 +6268,25 @@ def create_runner_app(
             if _active_turns.get(conv) is _own_task and _own_task is not None:
                 _on_proxy_stream_end(conv)
 
+    def _turn_reasoning(conv: str, msg_body: _JsonObject) -> _JsonObject | None:
+        """Reasoning block to forward on a turn, or ``None`` when unset.
+
+        An explicit per-event value wins; otherwise the session's remembered
+        effort (session-init snapshot or a later ``effort_change``) applies, so
+        an in-process harness sees the same effort a native TUI got on its argv.
+
+        :param conv: Session/conversation id.
+        :param msg_body: The dispatched message body.
+        :returns: ``{"effort": "<level>"}`` or ``None``.
+        """
+        raw = msg_body.get("reasoning")
+        if isinstance(raw, dict):
+            effort = raw.get("effort")
+            if isinstance(effort, str) and effort:
+                return {"effort": effort}
+        remembered = _session_reasoning_effort.get(conv)
+        return {"effort": remembered} if remembered else None
+
     async def _run_turn_bg_setup_and_stream(
         msg_body: _JsonObject,
         conv: str,
@@ -6176,6 +6435,31 @@ def create_runner_app(
                 _model_override,
                 extra={"session_id": conv},
             )
+        # Resolve the effort for this turn — an explicit per-event value, else
+        # the session's remembered one — then deliver only what this harness can
+        # accept. The persisted effort is validated at create against the union
+        # vocabulary, so a value that is legal there ("none" on an
+        # Anthropic-family harness) can still be foreign here, and the executors
+        # reject an unsupported value by failing the turn. The native launch path
+        # filters the same way (see native/orchestration.py's ``--effort``
+        # guard); an unknown harness is passed through rather than dropped, since
+        # a plugin harness may accept efforts this registry has never heard of.
+        _reasoning = _turn_reasoning(conv, msg_body)
+        if _reasoning is not None:
+            from omnigent.reasoning_effort import efforts_for_harness, format_supported
+
+            _effort = _reasoning["effort"]
+            _supported = efforts_for_harness(harness_name)
+            if _supported is None or _effort in _supported:
+                harness_body["reasoning"] = _reasoning
+            else:
+                _logger.warning(
+                    "_run_turn_bg: conv=%s dropping reasoning effort %r — harness %s accepts %s",
+                    conv,
+                    _effort,
+                    harness_name,
+                    format_supported(_supported) if _supported else "no effort override",
+                )
         if _session_histories[conv]:
             harness_body["content"] = _session_histories[conv]
         else:
@@ -6645,6 +6929,12 @@ def create_runner_app(
                     timeout=None,
                 ) as harness_resp:
                     if harness_resp.status_code != 200:
+                        _logger.error(
+                            "harness rejected turn delivery for %s with status %d",
+                            conv_id,
+                            harness_resp.status_code,
+                            extra={"session_id": conv_id},
+                        )
                         _fail_status = {
                             "type": "response.failed",
                             "error": {
@@ -6665,6 +6955,12 @@ def create_runner_app(
                     _omnigent_task_id = cast(str | None, body.get("task_id"))
                     _buffer = ""
                     _dispatch_tasks: list[_asyncio.Task[object]] = []
+                    # Sub-agent start edge → minted child id, so the completion
+                    # edge can address the child it created. Per-stream.
+                    _subagent_child_futures: dict[str, _asyncio.Future[str]] = {}
+                    # Sub-agent start edge → its title, so the completion edge can
+                    # author the summary message (assistant messages need one).
+                    _subagent_titles: dict[str, str] = {}
                     _text_acc: list[str] = []
                     _stream_failed_error: _JsonObject | None = None
                     async for chunk in harness_resp.aiter_text():
@@ -6916,6 +7212,53 @@ def create_runner_app(
                                     )
                                     continue
 
+                                if _evt_type == "subagent.started":
+                                    # A harness reported spawning a sub-agent; mint
+                                    # a child session so it shows in the Subagents
+                                    # panel. Swallowed (never relayed to clients).
+                                    _sa_key = event.get("child_key", "")
+                                    if isinstance(_sa_key, str) and _sa_key:
+                                        _sa_start_future: _asyncio.Future[str] = (
+                                            _asyncio.get_running_loop().create_future()
+                                        )
+                                        _subagent_child_futures[_sa_key] = _sa_start_future
+                                        _subagent_titles[_sa_key] = event.get("title", "")
+                                        _dispatch_tasks.append(
+                                            _asyncio.create_task(
+                                                _mint_acp_subagent_child(
+                                                    server_client,
+                                                    parent_id=conv_id,
+                                                    child_key=_sa_key,
+                                                    title=event.get("title", ""),
+                                                    task=event.get("task", ""),
+                                                    child_id_future=_sa_start_future,
+                                                )
+                                            )
+                                        )
+                                    continue
+
+                                if _evt_type == "subagent.completed":
+                                    _sa_done_key = event.get("child_key", "")
+                                    _sa_done_future = (
+                                        _subagent_child_futures.get(_sa_done_key)
+                                        if isinstance(_sa_done_key, str)
+                                        else None
+                                    )
+                                    if _sa_done_future is not None:
+                                        _dispatch_tasks.append(
+                                            _asyncio.create_task(
+                                                _complete_acp_subagent_child(
+                                                    server_client,
+                                                    child_key=_sa_done_key,
+                                                    ok=bool(event.get("ok", True)),
+                                                    summary=event.get("summary", ""),
+                                                    child_id_future=_sa_done_future,
+                                                    title=_subagent_titles.get(_sa_done_key, ""),
+                                                )
+                                            )
+                                        )
+                                    continue
+
                             if event is None:
                                 yield raw_sse_bytes
                                 continue
@@ -6952,11 +7295,10 @@ def create_runner_app(
                 yield _response_failed_event(_error)
 
             except (httpx.HTTPError, RuntimeError) as exc:
-                _logger.warning(
+                _logger.exception(
                     "proxy stream connection error for %s: %s",
                     conv_id,
                     exc,
-                    exc_info=True,
                     extra={"session_id": conv_id},
                 )
                 _error = {
@@ -7224,20 +7566,31 @@ def create_runner_app(
 
         if body_type == "effort_change":
             harness = _session_harness_name(conversation_id)
-            if harness in ("claude-native", "codex-native"):
-                effort = body.get("effort") if isinstance(body, dict) else None
-                if effort is not None and not isinstance(effort, str):
-                    return JSONResponse(
-                        status_code=400,
-                        content={
-                            "error": "invalid_input",
-                            "detail": "Body 'effort' must be a string or null",
-                        },
-                    )
+            effort = body.get("effort") if isinstance(body, dict) else None
+            if effort is not None and not isinstance(effort, str):
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "invalid_input",
+                        "detail": "Body 'effort' must be a string or null",
+                    },
+                )
+            # In-process harnesses apply the effort on their next turn, from the
+            # forwarded turn body (see ``_turn_reasoning``).
+            if effort:
+                _session_reasoning_effort[conversation_id] = effort
+            else:
+                _session_reasoning_effort.pop(conversation_id, None)
+            if harness in ("claude-native", "codex-native", "pi-native"):
                 if harness == "codex-native":
                     return await _handle_codex_native_settings_update(
                         conversation_id,
                         {"effort": effort},
+                    )
+                if harness == "pi-native":
+                    return await _handle_pi_native_effort_change(
+                        conversation_id,
+                        effort,
                     )
                 return await _handle_claude_native_effort_change(
                     conversation_id,
@@ -7960,9 +8313,6 @@ def create_runner_app(
             # same dead instance we just probed.
             current = terminal_registry.get(conv_id, terminal_name, "main")
             if current is instance:
-                # is_alive() set instance.running=False as a side effect;
-                # restore it so close() issues tmux kill-server.
-                instance.running = True
                 try:
                     await terminal_registry.close(conv_id, terminal_name, "main")
                 except asyncio.CancelledError:
@@ -8183,7 +8533,6 @@ def create_runner_app(
         session_id: str,
         terminal_id: str,
         read_only: bool = Query(default=False),
-        transport: str | None = Query(default=None),
     ) -> None:
         await websocket.accept()
         entry = resolve_terminal_entry_by_resource_id(
@@ -8218,32 +8567,13 @@ def create_runner_app(
         )
         _COST_POPUP_REPOP_TASKS.add(_repop_task)
         _repop_task.add_done_callback(_COST_POPUP_REPOP_TASKS.discard)
-        from omnigent.inner.terminal import (
-            TERMINAL_TRANSPORT_CONTROL,
-            resolve_terminal_transport,
+        await bridge_tmux_control_to_websocket(
+            websocket,
+            socket_path=str(entry.instance.socket_path),
+            tmux_target=entry.instance.tmux_target,
+            read_only=read_only,
+            on_client_interaction=entry.instance.note_client_interaction,
         )
-
-        resolved_transport = resolve_terminal_transport(
-            override=transport,
-            spec_transport=entry.instance.terminal_transport,
-        )
-        if resolved_transport == TERMINAL_TRANSPORT_CONTROL:
-            await bridge_tmux_control_to_websocket(
-                websocket,
-                socket_path=str(entry.instance.socket_path),
-                tmux_target=entry.instance.tmux_target,
-                read_only=read_only,
-                on_client_interaction=entry.instance.note_client_interaction,
-            )
-        else:
-            await bridge_tmux_pty_to_websocket(
-                websocket,
-                socket_path=str(entry.instance.socket_path),
-                tmux_target=entry.instance.tmux_target,
-                read_only=read_only,
-                on_client_interaction=entry.instance.note_client_interaction,
-                allow_osc52_clipboard=not entry.instance.tmux_allow_passthrough,
-            )
 
     # Reused by the loopback direct-attach listener (see
     # ``omnigent.runner.direct_attach``): same attach handler served on a
@@ -9497,7 +9827,12 @@ def create_runner_app(
                             },
                         },
                     )
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
+                    _logger.exception(
+                        "MCP tool dispatch failed for %s",
+                        tool_name,
+                        extra={"session_id": session_id},
+                    )
                     return JSONResponse(
                         status_code=200,
                         content={
@@ -9551,7 +9886,12 @@ def create_runner_app(
                         publish_event=_publish_event,
                         filesystem_registry=filesystem_registry,
                     )
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
+                    _logger.exception(
+                        "MCP tool dispatch failed for %s",
+                        tool_name,
+                        extra={"session_id": session_id},
+                    )
                     return JSONResponse(
                         status_code=200,
                         content={

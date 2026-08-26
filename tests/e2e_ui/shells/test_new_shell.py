@@ -39,6 +39,7 @@ import re
 import time
 from pathlib import Path
 
+import httpx
 from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import open_right_rail
@@ -139,6 +140,47 @@ def test_new_shell_accepts_typed_command(page: Page, terminal_session: tuple[str
     # "terminal session ended". A regression that drops user input or kills
     # the PTY on first keystroke would flip this out of ``connected``.
     expect(terminal_view).to_have_attribute("data-state", "connected")
+
+
+def test_empty_terminal_view_remains_selectable_and_resumable(
+    page: Page, terminal_session: tuple[str, str]
+) -> None:
+    """A stopped terminal-first session exposes its resume state in Terminal."""
+    base_url, session_id = terminal_session
+
+    # Hide terminal resources and their live updates to model the observable
+    # state immediately after stopping a session. Resource cleanup can arrive
+    # before the health poll reports the runner offline, so the UI must infer
+    # that an empty, non-starting inventory is resumable on its own.
+    terminal_list = re.compile(rf"/v1/sessions/{re.escape(session_id)}/resources/terminals\?.*")
+    page.route(
+        terminal_list,
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body='{"data":[],"first_id":null,"last_id":null,"has_more":false}',
+        ),
+    )
+    page.route(f"**/v1/sessions/{session_id}/stream*", lambda route: route.abort())
+
+    terminal_first = httpx.patch(
+        f"{base_url}/v1/sessions/{session_id}",
+        json={"labels": {"omnigent.ui": "terminal"}},
+        timeout=10.0,
+    )
+    terminal_first.raise_for_status()
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    terminal_button = page.get_by_test_id("view-mode-terminal")
+    expect(terminal_button).to_be_enabled()
+    terminal_button.click()
+    expect(terminal_button).to_have_attribute("aria-pressed", "true")
+
+    terminal_view = page.locator('[data-testid="main-terminal-view"][data-visible="true"]')
+    expect(terminal_view).to_be_visible()
+    expect(terminal_view).to_contain_text("The harness is not running.")
+    expect(terminal_view.get_by_role("button", name="Resume session")).to_be_enabled()
 
 
 def test_shell_wheel_scroll_reaches_mouse_tracking_program(

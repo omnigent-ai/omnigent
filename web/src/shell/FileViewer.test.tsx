@@ -46,15 +46,22 @@ vi.mock("./CommentsPanel", () => ({
   // Expose each comment as a button so tests can trigger onClickComment.
   CommentsPanel: ({
     onClickComment,
+    onAddressAll,
     comments,
+    addressedComments,
+    activeSelection,
   }: {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     onClickComment?: (comment: any) => void;
+    onAddressAll?: () => void;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     comments?: any[];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    addressedComments?: any[];
+    activeSelection?: { comment_id?: string } | null;
   }) => (
-    <div data-testid="comments-panel">
-      {comments?.map((c: { id: string }) => (
+    <div data-testid="comments-panel" data-active-comment-id={activeSelection?.comment_id ?? ""}>
+      {[...(comments ?? []), ...(addressedComments ?? [])].map((c: { id: string }) => (
         <button
           key={c.id}
           type="button"
@@ -62,6 +69,7 @@ vi.mock("./CommentsPanel", () => ({
           onClick={() => onClickComment?.(c)}
         />
       ))}
+      <button type="button" aria-label="address all comments" onClick={onAddressAll} />
     </div>
   ),
 }));
@@ -142,6 +150,7 @@ vi.mock("@/store/chatStore", () => ({
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
 import { useComments } from "@/hooks/useComments";
+import { useOptionalCommentSender } from "@/hooks/CommentSenderContext";
 import { useFileDiff } from "@/hooks/useFileDiff";
 import { getSeenCommentIds } from "@/hooks/useSeenComments";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
@@ -151,12 +160,13 @@ import { writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import type { ChangedSort } from "./FlatFileList";
 
 const useCommentsMock = vi.mocked(useComments);
+const useOptionalCommentSenderMock = vi.mocked(useOptionalCommentSender);
 
 function makeCommentsQuery(data: Comment[] | undefined) {
   return { data } as ReturnType<typeof useComments>;
 }
 
-function makeComment(id: string): Comment {
+function makeComment(id: string, status: Comment["status"] = "draft"): Comment {
   return {
     id,
     conversation_id: "conv_1",
@@ -164,7 +174,7 @@ function makeComment(id: string): Comment {
     start_index: 0,
     end_index: 5,
     body: "test comment",
-    status: "draft",
+    status,
     created_at: 0,
     updated_at: 0,
     anchor_content: "hello",
@@ -240,6 +250,7 @@ function renderViewer(props: RenderProps = {}) {
 
 beforeEach(() => {
   useCommentsMock.mockReset();
+  useOptionalCommentSenderMock.mockReturnValue(null);
   // FileViewer persists global view preferences (diff/layout/preview) to
   // localStorage. Clear it between tests so a preference written by one test
   // can't leak into another that asserts the hardcoded defaults.
@@ -735,6 +746,39 @@ describe("FileViewer URL sync — comment param (write)", () => {
     // URL must reflect the NEW selection, not accumulate both.
     expect(screen.getByTestId("url-params").textContent).toContain("comment=c2");
     expect(screen.getByTestId("url-params").textContent).not.toContain("comment=c1");
+  });
+
+  it("does not write an addressed card selection to the URL", () => {
+    const open = makeComment("c1");
+    const addressed = makeComment("c2", "addressed");
+    useCommentsMock.mockReturnValue(makeCommentsQuery([open, addressed]));
+
+    renderViewer({ open: true, path: "file1.py" });
+    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+    fireEvent.click(screen.getByRole("button", { name: "comment c1" }));
+    expect(screen.getByTestId("url-params").textContent).toContain("comment=c1");
+
+    fireEvent.click(screen.getByRole("button", { name: "comment c2" }));
+
+    expect(screen.getByTestId("url-params").textContent).not.toContain("comment=");
+    expect(screen.getByTestId("comments-panel")).toHaveAttribute("data-active-comment-id", "c2");
+  });
+});
+
+describe("FileViewer addressed selection", () => {
+  it("keeps the selected comment active while Address All moves it", () => {
+    const mutate = vi.fn();
+    useOptionalCommentSenderMock.mockReturnValue({ mutate, isPending: false });
+    const comment = makeComment("c1");
+    useCommentsMock.mockReturnValue(makeCommentsQuery([comment]));
+
+    renderViewer({ open: true, path: "file1.py" });
+    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+    fireEvent.click(screen.getByRole("button", { name: "comment c1" }));
+    fireEvent.click(screen.getByRole("button", { name: "address all comments" }));
+
+    expect(mutate).toHaveBeenCalledWith({ comment_ids: ["c1"] });
+    expect(screen.getByTestId("comments-panel")).toHaveAttribute("data-active-comment-id", "c1");
   });
 });
 

@@ -2475,6 +2475,34 @@ def test_populate_codex_home_config_symlinks_auth_and_config(tmp_path: Path) -> 
     assert (target / "config.toml").read_text() == '[default]\nmodel = "gpt-5.4"'
 
 
+def test_populate_codex_home_config_symlinks_remote_mcp_oauth(tmp_path: Path) -> None:
+    """``.credentials.json`` and its lock dir are symlinked, not left behind.
+
+    Codex keeps OAuth tokens for remote (``url =``) MCP servers in
+    ``.credentials.json``, guarded across processes by
+    ``mcp-oauth-locks/``. A private home missing them starts those servers
+    unauthenticated while ``command =`` (stdio) servers still work.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "config.toml").write_text('[mcp_servers.linear]\nurl = "https://x/mcp"')
+    (source / ".credentials.json").write_text('{"linear|abc": {"access_token": "t"}}')
+    (source / "mcp-oauth-locks").mkdir()
+    (source / "mcp-oauth-locks" / "file-store.lock").write_text("")
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    # Symlinked (not copied) so a refresh in either direction is shared.
+    assert (target / ".credentials.json").is_symlink()
+    assert (target / ".credentials.json").read_text() == '{"linear|abc": {"access_token": "t"}}'
+    assert (target / "mcp-oauth-locks").is_symlink()
+    assert (target / "mcp-oauth-locks" / "file-store.lock").is_file()
+
+
 def test_populate_codex_home_config_symlinks_plugins_cache(tmp_path: Path) -> None:
     """``plugins/cache`` is symlinked to the shared home to dedupe it.
 

@@ -346,6 +346,33 @@ describe("quick pin/unpin hover button", () => {
     }
   });
 
+  it("keeps the Projects group-header actions visible without hover, hover-revealed on desktop", () => {
+    // The "New project" (+) button is the only way to create a project, so its
+    // group-header wrapper must stay visible wherever hover is unavailable —
+    // phones AND touch tablets at `md`+ widths — rather than fade out like the
+    // desktop-only session-header controls. jsdom doesn't evaluate media
+    // queries, so assert the responsive classes: base `flex` (shown at every
+    // breakpoint) with the fade + hover/focus reveals gated on hover
+    // capability, not just the `md` width.
+    mocks.projects = ["Sprint 42"];
+    renderSidebar();
+
+    const wrapper = screen.getByTestId("new-project").closest(".transition-opacity");
+    expect(wrapper).not.toBeNull();
+    // Visible without hover: base display is `flex`, never `hidden`, and the
+    // fade is not applied by viewport width alone.
+    expect(wrapper).toHaveClass("flex");
+    expect(wrapper).not.toHaveClass("hidden");
+    expect(wrapper).not.toHaveClass("md:opacity-0");
+    // Hover-capable desktop: fades out until the header is hovered / focused /
+    // a menu opens.
+    expect(wrapper).toHaveClass(
+      "[@media(hover:hover)]:md:opacity-0",
+      "[@media(hover:hover)]:md:group-hover/header:opacity-100",
+      "[@media(hover:hover)]:md:has-[:focus-visible]:opacity-100",
+    );
+  });
+
   it("hides the Projects list-actions kebab when there are no projects", () => {
     // With no projects, the kebab has nothing to offer (no expand/collapse, no
     // sessions to select) and would open empty — so it's hidden entirely,
@@ -452,6 +479,19 @@ describe("quick pin/unpin hover button", () => {
     // classes actually take effect), rather than a block (which would not).
     expect(quickButton).toHaveClass("md:inline-flex");
     expect(quickButton).not.toHaveClass("md:block");
+  });
+
+  it("drops the row kebab on mobile, revealing it only from md up", () => {
+    // The per-row "..." menu is desktop-only: on mobile the chat page's own
+    // header menu covers these per-session actions, so the row kebab is hidden
+    // (`hidden`) and only surfaces from `md` up (`md:inline-flex`). It reveals
+    // like the quick-pin button — flex, not block — so its glyph stays
+    // centered.
+    renderSidebar();
+
+    const kebab = screen.getByTestId("conversation-actions");
+    expect(kebab).toHaveClass("hidden", "md:inline-flex");
+    expect(kebab).not.toHaveClass("md:block");
   });
 });
 

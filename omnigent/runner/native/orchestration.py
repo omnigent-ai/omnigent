@@ -200,21 +200,17 @@ async def teardown_codex_native_app_server(session_id: str) -> None:
     """
     Tear down a host-spawned codex-native session's app-server subprocess.
 
-    Only the ``DELETE /v1/sessions`` teardown runs the full native cleanup;
-    the codex TUI pane can also disappear on its own — the idle pane reaper
-    closes the tmux pane after the idle window, and an unexpected TUI exit
-    (crash / OOM / host recycle) evicts it — neither of which cancels the
-    forwarder. Left alone, the per-session ``codex app-server`` (and its
-    forwarder) survives with no TUI, so long-lived multi-session runners
-    (e.g. Polly, which dispatches every ``codex`` sub-agent this way)
-    accumulate orphaned ``codex`` processes.
+    ``DELETE /v1/sessions``, runner shutdown, and the idle pane reaper use
+    this helper for full native cleanup. An unexpected auxiliary-TUI exit
+    deliberately leaves the app-server running so an active response is not
+    cancelled; the next native-terminal ensure can recreate the TUI.
 
     Cancelling the forwarder closes the app-server via the forwarder's own
     ``finally`` (see :func:`_codex_discover_thread_and_forward`); the pop
     below is the belt-and-suspenders close for the discovery-failed case
     where no forwarder ever adopted the server. No-op for a session that
     has no registered codex app-server, so this is safe to call from the
-    shared pane-teardown paths regardless of harness.
+    required-session teardown paths regardless of harness.
 
     :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
     :returns: None.
@@ -502,6 +498,9 @@ class _PiNativeLaunchConfig:
     :param model_override: Persisted per-session ``/model`` override, e.g.
         ``"claude-4.6-sonnet-medium"``; ``None`` when unset. Consumed by the
         cursor-native launch (``--model``), ignored by pi-native.
+    :param reasoning_effort: Persisted per-session effort, e.g. ``"high"``.
+        Consumed by the pi-native launch as ``--thinking``; ``None`` leaves
+        Pi's model default in place.
     """
 
     workspace: Path
@@ -512,6 +511,7 @@ class _PiNativeLaunchConfig:
     fork_source_external_id: str | None = None
     fork_carry_history: bool = False
     model_override: str | None = None
+    reasoning_effort: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -920,6 +920,7 @@ async def _pi_native_launch_config(
             raise RuntimeError(
                 f"Invalid model_override for session {session_id!r}: {exc}"
             ) from exc
+    reasoning_effort = snapshot.get("reasoning_effort")
     return _PiNativeLaunchConfig(
         workspace=_pi_session_workspace(session_workspace),
         server_url=os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767").rstrip("/"),
@@ -929,6 +930,9 @@ async def _pi_native_launch_config(
         fork_source_external_id=fork_source_external_id,
         fork_carry_history=fork_carry_history,
         model_override=model_override,
+        reasoning_effort=reasoning_effort
+        if isinstance(reasoning_effort, str) and reasoning_effort
+        else None,
     )
 
 
@@ -2183,17 +2187,23 @@ async def _auto_create_pi_terminal(
         spec_model = launch_config.model_override or _pi_native_model_from_spec(agent_spec)
         provider = resolve_pi_native_provider(model=spec_model)
         if provider is not None:
-            cred_env, cred_args = pi_native_provider_launch(
+            launch = pi_native_provider_launch(
                 bridge_dir / "pi-agent",
                 provider,
+                launch_config.reasoning_effort,
                 selection=spec_model,
             )
-            pi_env.update(cred_env)
-            pi_args.extend(cred_args)
+            pi_env.update(launch.env)
+            pi_args.extend(launch.args)
             # An unroutable model leaves Pi unable to select it, which looks
             # like a silent hang; prefer that notice over the credential one
-            # since it names the model the user actually picked.
-            credential_warning = provider.unroutable_model_warning() or provider.credential_warning
+            # since it names the model the user actually picked. An effort that
+            # could not be honoured is the least urgent of the three.
+            credential_warning = (
+                provider.unroutable_model_warning()
+                or provider.credential_warning
+                or launch.effort_warning
+            )
     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
     # and ``parent_os_env`` below, launch_required_terminal falls back to
@@ -3806,9 +3816,15 @@ async def _auto_create_codex_terminal(
     ):
         from dataclasses import replace as _dataclass_replace
 
-        from omnigent.codex_native_app_server import codex_launch_catalog
+        from omnigent.codex_native_app_server import (
+            codex_launch_catalog,
+            codex_launch_catalog_is_stale,
+        )
         from omnigent.model_catalog_store import catalog_contains, default_row
 
+        # Read staleness BEFORE the fetch — the fetch kicks the background
+        # re-probe, which could land between the two reads.
+        _codex_catalog_was_stale = await codex_launch_catalog_is_stale()
         _codex_catalog = await codex_launch_catalog(codex_path=_codex_cli_path)
         if launch_config.model_override and _codex_catalog:
             if not catalog_contains(_codex_catalog, launch_config.model_override):
@@ -3818,14 +3834,23 @@ async def _auto_create_codex_terminal(
                     "pick. Pick again from the model menu."
                 )
         if _codex_launch.model is None and _codex_launch.profile is None and _codex_catalog:
-            _catalog_default = default_row(_codex_catalog)
-            _default_id = (
-                str(_catalog_default.get("id") or _catalog_default.get("model") or "") or None
-                if _catalog_default is not None
-                else None
-            )
-            if _default_id:
-                _codex_launch = _dataclass_replace(_codex_launch, model=_default_id)
+            # Same staleness rule as the claude branch: never convert a stale
+            # entry's default into an explicit model pin.
+            if _codex_catalog_was_stale:
+                _logger.info(
+                    "codex catalog for session=%s is stale; deferring the Default "
+                    "launch to codex's own default model",
+                    session_id,
+                )
+            else:
+                _catalog_default = default_row(_codex_catalog)
+                _default_id = (
+                    str(_catalog_default.get("id") or _catalog_default.get("model") or "") or None
+                    if _catalog_default is not None
+                    else None
+                )
+                if _default_id:
+                    _codex_launch = _dataclass_replace(_codex_launch, model=_default_id)
     # Cancel any surviving forwarder first so its teardown closes the OLD app-server,
     # not the one registered below — and so it can't mirror alongside the new one.
     await _cancel_auto_forwarder_task(session_id)
@@ -6554,11 +6579,20 @@ async def _auto_create_claude_terminal(
     # or to resolve a Default launch that would otherwise pass no ``--model``
     # and leave the model to invisible CLI-private state.
     if session_model_override or launch_model is None:
-        from omnigent.claude_native import claude_catalog_serves_model, claude_launch_catalog
+        from omnigent.claude_native import (
+            claude_catalog_serves_model,
+            claude_launch_catalog,
+            claude_launch_catalog_is_stale,
+        )
         from omnigent.model_catalog_store import default_row
 
         launch_catalog: list[dict[str, object]] | None = None
+        launch_catalog_was_stale = False
         try:
+            # Read staleness BEFORE the fetch: the fetch itself kicks the
+            # background re-probe, which could land between the two reads and
+            # make a same-launch check call yesterday's rows fresh.
+            launch_catalog_was_stale = claude_launch_catalog_is_stale(claude_config)
             launch_catalog = await claude_launch_catalog(claude_config)
         except Exception:  # noqa: BLE001 — no catalog means no validation/default
             _logger.warning(
@@ -6584,11 +6618,25 @@ async def _auto_create_claude_terminal(
                     "Pick again from the model menu."
                 )
         if launch_model is None and launch_catalog:
-            catalog_default = default_row(launch_catalog)
-            if catalog_default is not None:
-                launch_model = (
-                    str(catalog_default.get("model") or catalog_default.get("id") or "") or None
+            # A stale entry's default is yesterday's answer: pinning it as
+            # ``--model`` turns a provider-side retirement or entitlement
+            # change into a hard launch failure. Launch bare instead — the
+            # CLI's own default is servable by construction, and the
+            # harness's ``reported_model`` records what it actually ran —
+            # while the store's background re-probe converges the catalog.
+            if launch_catalog_was_stale:
+                _logger.info(
+                    "claude catalog for session=%s is stale; deferring the Default "
+                    "launch to the CLI's own default model",
+                    session_id,
                 )
+            else:
+                catalog_default = default_row(launch_catalog)
+                if catalog_default is not None:
+                    launch_model = (
+                        str(catalog_default.get("model") or catalog_default.get("id") or "")
+                        or None
+                    )
     # Give an exact launch model (a Smart Routing pick is resolved before the
     # terminal exists) a spelling of its own in the picker, so a later
     # ``/model`` can return to it instead of stepping onto whatever the family

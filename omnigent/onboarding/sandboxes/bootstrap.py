@@ -504,7 +504,9 @@ def login_app_oauth_in_sandbox(
             "The in-sandbox login needs the server URL — pass --server, or --no-auth to skip."
         )
 
-    click.echo(f"▸ Logging sandbox '{sandbox_id}' in to {server_url}")
+    from omnigent.server_url import display_server_url
+
+    click.echo(f"▸ Logging sandbox '{sandbox_id}' in to {display_server_url(server_url)}")
     if workspace is not None:
         # Reset ~/.databrickscfg to exactly one [DEFAULT] entry shaped
         # like what `databricks auth login` itself writes (host +
@@ -669,7 +671,12 @@ def connect_sandbox_host(
         config.yaml (usually ``socket.gethostname()``).
     :raises click.ClickException: If the remote command exits non-zero.
     """
-    click.echo(f"▸ Registering sandbox '{sandbox_id}' as a host with {server_url}")
+    from omnigent.server_url import display_server_url
+
+    click.echo(
+        f"▸ Registering sandbox '{sandbox_id}' as a host with {display_server_url(server_url)}"
+    )
+    # The executed command keeps the wire URL — it must work verbatim in-sandbox.
     if host_name is not None:
         set_sandbox_host_name(launcher, sandbox_id, host_name)
     click.echo("  → running `omnigent host` in the sandbox (Ctrl-C to detach)")

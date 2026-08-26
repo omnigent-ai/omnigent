@@ -1106,10 +1106,10 @@ def test_help_hides_update_alias_but_keeps_it_runnable() -> None:
 def test_help_hides_extras_gated_harness_when_sdk_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """cursor/antigravity drop out of the harness list; a notice replaces them."""
+    """cursor/agy drop out of the harness list; a notice replaces them."""
     monkeypatch.setattr(
         "omnigent.cli._harness_extra_checks",
-        lambda: {"cursor": lambda: False, "antigravity": lambda: False},
+        lambda: {"cursor": lambda: False, "agy": lambda: False},
     )
 
     result = CliRunner().invoke(cli, ["--help"])
@@ -1127,17 +1127,17 @@ def test_help_hides_extras_gated_harness_when_sdk_missing(
 def test_help_shows_extras_gated_harness_when_sdk_installed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """cursor/antigravity appear in --help once their extra is importable."""
+    """cursor/agy appear in --help once their extra is importable."""
     monkeypatch.setattr(
         "omnigent.cli._harness_extra_checks",
-        lambda: {"cursor": lambda: True, "antigravity": lambda: True},
+        lambda: {"cursor": lambda: True, "agy": lambda: True},
     )
 
     result = CliRunner().invoke(cli, ["--help"])
 
     assert result.exit_code == 0, result.output
     assert "cursor" in result.output
-    assert "antigravity" in result.output
+    assert "agy" in result.output
     assert "Some harnesses need an optional extra" not in result.output
 
 
@@ -5796,6 +5796,19 @@ def test_click_subcommands_allowlist_covers_registered_commands() -> None:
     )
 
 
+def test_agy_cli_alias_registered_and_in_subcommands() -> None:
+    """``omni agy`` is registered on the cli group, prioritized in harnesses list."""
+    from omnigent.cli import _ALIAS_COMMANDS, _CLICK_SUBCOMMANDS, _HARNESS_COMMANDS, cli
+
+    assert "agy" in cli.commands
+    assert "antigravity" in cli.commands
+    assert cli.commands["agy"].callback is cli.commands["antigravity"].callback
+    assert "agy" in _CLICK_SUBCOMMANDS
+    assert "agy" in _HARNESS_COMMANDS
+    assert "antigravity" in _ALIAS_COMMANDS
+    assert "agy" not in _ALIAS_COMMANDS
+
+
 # ── first-run smart defaults (omnigent run) ──────────
 
 
@@ -6756,10 +6769,13 @@ def test_manage_kimi_harness_back_does_not_login(
 
     monkeypatch.setattr(hi, "harness_cli_installed", lambda key: True)
     monkeypatch.setattr(it, "console", Mock())
+    # The drill-in seeds its status line from the auth probe; pin it so the test
+    # stays hermetic instead of reading the dev machine's real ~/.kimi-code.
+    monkeypatch.setattr("omnigent.onboarding.kimi_auth.kimi_auth_configured", lambda: False)
     login = Mock()
     monkeypatch.setattr(hi, "harness_login", login)
-    # rows = [Sign in, Show auth options, ← Back]; pick Back (2). There is no
-    # "Sign out" row — kimi has no ``kimi logout`` subcommand.
+    # rows = [Sign in with membership, Set up pay-per-use (API key), ← Back];
+    # pick Back (2). There is no "Sign out" row — kimi has no ``kimi logout``.
     monkeypatch.setattr(it, "select", lambda *a, **k: 2)
 
     _manage_kimi_harness()
@@ -6780,6 +6796,8 @@ def test_manage_kimi_harness_has_no_sign_out_row(
 
     monkeypatch.setattr(hi, "harness_cli_installed", lambda key: True)
     monkeypatch.setattr(it, "console", Mock())
+    # Pin the auth probe so the status-line seed doesn't read real local state.
+    monkeypatch.setattr("omnigent.onboarding.kimi_auth.kimi_auth_configured", lambda: False)
     monkeypatch.setattr(hi, "harness_login", Mock())
     captured: list[str] = []
 
@@ -6806,6 +6824,8 @@ def test_manage_kimi_harness_login_runs_kimi_login(
 
     monkeypatch.setattr(hi, "harness_cli_installed", lambda key: True)
     monkeypatch.setattr(it, "console", Mock())
+    # Pin the auth probe (seed + post-login) so the test stays hermetic.
+    monkeypatch.setattr("omnigent.onboarding.kimi_auth.kimi_auth_configured", lambda: False)
     login = Mock(return_value=False)  # kimi has no status probe; return is ignored
     monkeypatch.setattr(hi, "harness_login", login)
     # First iteration: Sign in (0); second: ← Back (2) to exit the loop.

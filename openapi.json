@@ -1803,11 +1803,19 @@
         "type": "object"
       },
       "FailedEvent": {
-        "description": "Terminal event for a turn that ended with an error.\n\nCarries the final\n`omnigent.server.schemas.ResponseObject` whose\n`error` field describes the failure.",
+        "description": "Terminal event for a turn that ended with an error.\n\nCarries a `omnigent.server.schemas.FailedResponseObject`\nwhose `error` field describes the failure. Response metadata may\nbe absent when the failure occurs before response allocation.",
         "properties": {
           "response": {
-            "$ref": "#/components/schemas/ResponseObject",
-            "description": "The final response object with `status=\"failed\"` and `error` populated."
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ResponseObject"
+              },
+              {
+                "$ref": "#/components/schemas/FailedResponseObject"
+              }
+            ],
+            "description": "The failure response object with `status=\"failed\"` and `error` populated.",
+            "title": "Response"
           },
           "sequence_number": {
             "anyOf": [
@@ -1833,6 +1841,190 @@
           "response"
         ],
         "title": "FailedEvent",
+        "type": "object"
+      },
+      "FailedResponseObject": {
+        "description": "Response payload for failures raised before response allocation.\n\nTransport and setup failures can terminate a turn before the harness has\nassigned the metadata required by `ResponseObject`. The remaining\nfields mirror that model so fully allocated failures retain their complete\nwire representation.",
+        "properties": {
+          "background": {
+            "default": false,
+            "description": "Whether the response was created as a background task.",
+            "title": "Background",
+            "type": "boolean"
+          },
+          "completed_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Unix epoch timestamp of completion, or `None`.",
+            "title": "Completed At"
+          },
+          "conversation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ConversationRef"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Reference to the owning conversation, or `None`."
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Unix epoch timestamp of creation, or `None` when the response failed before creation.",
+            "title": "Created At"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ErrorDetail"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Error details describing the failure, or `None`."
+          },
+          "id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Unique response identifier, e.g. `\"resp_abc123\"`, or `None` when allocation did not complete.",
+            "title": "Id"
+          },
+          "incomplete_details": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/IncompleteDetails"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Incomplete-response details, or `None`."
+          },
+          "instructions": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Per-request instructions override, or `None`.",
+            "title": "Instructions"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Agent name that produced the response, e.g. `\"research-agent\"`, or `None` when resolution did not complete.",
+            "title": "Model"
+          },
+          "object": {
+            "default": "response",
+            "description": "Fixed resource type, always `\"response\"`.",
+            "title": "Object",
+            "type": "string"
+          },
+          "output": {
+            "description": "Heterogeneous serialized output items accumulated before failure.",
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Output",
+            "type": "array"
+          },
+          "previous_response_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "ID of the prior response, or `None`.",
+            "title": "Previous Response Id"
+          },
+          "reasoning": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Reasoning configuration, or `None`.",
+            "title": "Reasoning"
+          },
+          "status": {
+            "description": "Lifecycle status, normally `\"failed\"`.",
+            "title": "Status",
+            "type": "string"
+          },
+          "store": {
+            "default": true,
+            "description": "Whether the response is persisted.",
+            "title": "Store",
+            "type": "boolean"
+          },
+          "usage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Usage"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Token usage statistics, or `None` when unavailable."
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "FailedResponseObject",
         "type": "object"
       },
       "FunctionCallData": {

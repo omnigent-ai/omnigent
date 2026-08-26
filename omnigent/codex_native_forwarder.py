@@ -1036,6 +1036,14 @@ class _CodexTurnStatusEdge:
     error: _CodexTerminalError | None = None
 
 
+@dataclass(frozen=True)
+class _PreparedTerminalTurn:
+    """Terminal control-state result retained while output delivery drains."""
+
+    handled: bool
+    edge: _CodexTurnStatusEdge | None
+
+
 # Codex ``item/completed`` item types that represent a built-in tool call.
 # Each maps to a builder that extracts a normalized :class:`_CodexToolCall`.
 # ``_TOOL_ITEM_BUILDERS`` is populated after the builders are defined.
@@ -3252,6 +3260,15 @@ async def _handle_terminal_turn_boundary(
     :param forwarder_state: Optional Plan-mode prompt state.
     :returns: None.
     """
+    # Reconcile control state before any network-backed output flush. Transcript
+    # and status posts retain their original order below, but a slow consumer
+    # can no longer leave a completed Codex turn steerable in bridge state.
+    terminal = _prepare_terminal_turn_event(
+        bridge_dir,
+        method,
+        params,
+        forwarder_state=forwarder_state,
+    )
     if delta_coalescer is not None:
         await delta_coalescer.flush()
     # Safety net: if a compaction was reported in progress but Codex never
@@ -3274,14 +3291,9 @@ async def _handle_terminal_turn_boundary(
         params=params,
         forwarder_state=forwarder_state,
     )
-    handled = await _handle_terminal_turn_event(
-        client,
-        session_id,
-        bridge_dir,
-        method,
-        params,
-        forwarder_state=forwarder_state,
-    )
+    handled = terminal.handled
+    if terminal.edge is not None:
+        await _post_turn_status_edge(client, session_id, terminal.edge)
     if handled:
         await elicitation_tracker.resolve_by_terminal_turn_event(
             client,
@@ -4169,27 +4181,22 @@ def _turn_started_status_edge(
     )
 
 
-async def _handle_terminal_turn_event(
-    client: httpx.AsyncClient,
-    session_id: str,
+def _prepare_terminal_turn_event(
     bridge_dir: Path,
     method: str,
     params: _JsonObject,
     *,
     forwarder_state: _CodexForwarderState | None = None,
-) -> bool:
+) -> _PreparedTerminalTurn:
     """
-    Handle a terminal-observed Codex turn completion/failure event.
+    Reconcile a terminal Codex turn and retain its later status post.
 
-    :param client: HTTP client for Omnigent event posts.
-    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param bridge_dir: Native Codex bridge directory.
     :param method: Codex method, e.g. ``"turn/completed"``.
     :param params: Codex turn event params.
     :param forwarder_state: Optional connection state used to suppress a
         terminal boundary whose standalone error was already surfaced.
-    :returns: ``True`` when the terminal event belonged to the active turn
-        and its lifecycle was handled, ``False`` when it was stale.
+    :returns: Whether the event was handled and its optional status edge.
     """
     terminal_turn_id = _terminal_turn_id_from_params(params)
     if (
@@ -4204,7 +4211,7 @@ async def _handle_terminal_turn_event(
             method,
             terminal_turn_id,
         )
-        return True
+        return _PreparedTerminalTurn(handled=True, edge=None)
     edge = _terminal_turn_status_edge(bridge_dir, method, params)
     if edge is None:
         _logger.info(
@@ -4212,9 +4219,8 @@ async def _handle_terminal_turn_event(
             method,
             terminal_turn_id,
         )
-        return False
-    await _post_turn_status_edge(client, session_id, edge)
-    return True
+        return _PreparedTerminalTurn(handled=False, edge=None)
+    return _PreparedTerminalTurn(handled=True, edge=edge)
 
 
 def _terminal_turn_status_edge(

@@ -429,12 +429,17 @@ async def serve_tunnel(
                 # fresh token each attempt, so the session survives
                 # once credentials become valid again.
                 if not ever_connected and login_redirect_streak >= _LOGIN_REDIRECT_FATAL_ATTEMPTS:
+                    # Show the display form (workspace /omnigent URL, ?o=
+                    # when known), not the internal API mount; it round-trips
+                    # through `omnigent login` to the same server.
+                    from omnigent.server_url import display_server_url
+
                     raise RuntimeError(
                         f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
                         f"(redirect to non-WebSocket URL {redirect_url} "
                         f"persisted across {login_redirect_streak} attempts); "
                         "the server likely requires auth — "
-                        f"run `omnigent login {server_url}` or "
+                        f"run `omnigent login {display_server_url(server_url)}` or "
                         "`omnigent setup` to configure credentials"
                     ) from exc
                 retry_reason = (
@@ -449,11 +454,20 @@ async def serve_tunnel(
                         not ever_connected
                         and http_auth_rejection_streak >= _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
                     ):
-                        login_hint = (
-                            f"run `databricks auth login --host {server_url}` to re-authenticate"
-                            if server_url
-                            else "check remote server authentication"
-                        )
+                        if server_url:
+                            # `omnigent login` detects the fronting workspace
+                            # itself — unlike a raw `databricks auth login
+                            # --host`, which would need the workspace host,
+                            # not the server URL (for workspace-hosted
+                            # servers the API mount is the wrong --host).
+                            from omnigent.server_url import display_server_url
+
+                            login_hint = (
+                                f"run `omnigent login {display_server_url(server_url)}` "
+                                "to re-authenticate"
+                            )
+                        else:
+                            login_hint = "check remote server authentication"
                         raise RuntimeError(
                             f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
                             f"(HTTP {http_status} persisted across "
