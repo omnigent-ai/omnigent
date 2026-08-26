@@ -341,6 +341,17 @@ class PiProviderConfig:
         }
         if self.auth_header:
             provider["authHeader"] = True
+        # anthropic-messages providers support extended thinking; Pi gates the
+        # thinking level controls on this compat flag and silently falls back to
+        # off when it is absent or false.
+        if self.api == "anthropic-messages":
+            provider["compat"] = {
+                "supportsDeveloperRole": False,
+                "supportsStore": False,
+                "supportsStrictMode": False,
+                "supportsReasoningEffort": True,
+                "supportsUsageInStreaming": False,
+            }
         providers = {self.provider_id: provider}
         providers.update(additional)
         return {"providers": providers}
