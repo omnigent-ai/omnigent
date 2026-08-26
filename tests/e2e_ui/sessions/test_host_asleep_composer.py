@@ -32,6 +32,8 @@ from urllib.parse import urlparse
 
 from playwright.sync_api import Page, Route, expect
 
+from tests.e2e_ui.conftest import fetch_with_retry
+
 _ASLEEP_PLACEHOLDER = (
     "Current session's host is offline. "
     "Next message will resume the sandbox host which can take minutes"
@@ -56,7 +58,7 @@ def _force_host_asleep(page: Page, session_id: str) -> None:
         if request.method != "GET" or urlparse(request.url).path != f"/v1/sessions/{session_id}":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         payload["host_id"] = payload.get("host_id") or _FAKE_HOST_ID
         payload["host_resumable"] = True
@@ -75,7 +77,7 @@ def _force_host_asleep(page: Page, session_id: str) -> None:
         if request.method != "GET" or urlparse(request.url).path != "/v1/sessions":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         rows = payload.get("data") if isinstance(payload, dict) else None
         if isinstance(rows, list):
@@ -93,7 +95,7 @@ def _force_host_asleep(page: Page, session_id: str) -> None:
         if request.method != "GET" or urlparse(request.url).path != "/health":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         offline = {"runner_online": False, "host_online": False}
         # Plural shape used by the open-session fallback poll:

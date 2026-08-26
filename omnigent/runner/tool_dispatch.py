@@ -51,6 +51,7 @@ from omnigent._wrapper_labels import (
     CLAUDE_NATIVE_WRAPPER_VALUE,
     CODEX_NATIVE_WRAPPER_VALUE,
 )
+from omnigent.debug_logging import runner_primary_session_id
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.model_override import (
     harness_supports_model_override,
@@ -594,7 +595,10 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
         finally:
             _os_env.close()
     except Exception:  # noqa: BLE001 — OS env setup is best-effort for schema only
-        _logger.debug("Could not create OSEnvironment for native relay OS tool schemas")
+        _logger.debug(
+            "Could not create OSEnvironment for native relay OS tool schemas",
+            extra={"session_id": runner_primary_session_id()},
+        )
 
     return schemas
 
@@ -946,7 +950,11 @@ async def _execute_local_python_tool(
         )
         return await asyncio.to_thread(manager.call_tool, tool_name, args, ctx)
     except Exception as exc:
-        _logger.exception("runner local Python tool dispatch failed for %s", tool_name)
+        _logger.exception(
+            "runner local Python tool dispatch failed for %s",
+            tool_name,
+            extra={"session_id": conversation_id},
+        )
         return f"Error: {type(exc).__name__}: {exc}"
     finally:
         manager.shutdown()
@@ -1414,6 +1422,58 @@ def _subagent_model_from_args(args: _JsonObject) -> str | None:
     return validate_model_override(raw_model)
 
 
+def _subagent_reasoning_effort_from_args(args: _JsonObject) -> str | None:
+    """
+    Extract the optional ``reasoning_effort`` from
+    ``sys_session_send`` args.
+
+    :param args: Decoded tool arguments, e.g.
+        ``{"args": {"input": "fix the bug", "reasoning_effort": "high"}}``.
+    :returns: The requested effort, or ``None`` when absent.
+    :raises ValueError: If ``reasoning_effort`` is present but is not a
+        non-empty string.
+    """
+    raw_message = args.get("args")
+    if not isinstance(raw_message, dict):
+        return None
+    raw_effort = raw_message.get("reasoning_effort")
+    if raw_effort is None:
+        return None
+    if not isinstance(raw_effort, str) or not raw_effort:
+        raise ValueError("'reasoning_effort' must be a non-empty string when provided")
+    return raw_effort
+
+
+def _validate_subagent_reasoning_effort(effort: str, harness: str | None) -> str:
+    """
+    Validate *effort* against the child harness's declared effort family.
+
+    A harness whose family is ``NONE`` has no effort plumbing, and an
+    unrecognized one cannot be checked at all — the caller asked for this
+    explicitly, so reject rather than accept-and-drop. (Delivery of a
+    persisted effort takes the opposite tack and filters quietly; see the
+    reasoning guard in :mod:`omnigent.runner.app`.)
+
+    :param effort: Requested effort, e.g. ``"high"``.
+    :param harness: Resolved child harness, e.g. ``"claude-native"``.
+    :returns: The canonical effort that harness accepts.
+    :raises ValueError: If the harness supports no effort override, or
+        the value falls outside its vocabulary.
+    """
+    from omnigent.reasoning_effort import efforts_for_harness, validate_effort
+
+    canonical = canonicalize_harness(harness) if harness is not None else None
+    supported = efforts_for_harness(harness)
+    if not supported:
+        raise ValueError(
+            f"harness {canonical or harness or 'unknown'!r} does not support "
+            "a reasoning-effort override"
+        )
+    validated = validate_effort(effort, canonical or harness or "unknown", supported)
+    assert validated is not None
+    return validated
+
+
 def _subagent_file_ids_from_args(args: _JsonObject) -> list[str]:
     """
     Extract the optional ``file_ids`` from ``sys_session_send`` args.
@@ -1616,9 +1676,32 @@ def _find_subagent_spec(sub_agent_name: str, agent_spec: AgentSpec | None) -> Ag
     """
     if agent_spec is None:
         return None
-    for sub_agent in agent_spec.sub_agents:
-        if sub_agent.name == sub_agent_name:
+    # Defensive access: resolvers hand us legacy / test spec objects that are
+    # only structurally AgentSpec-shaped, and ``_has_subagent`` routes its
+    # existence check through here, so a stub without ``sub_agents`` must miss
+    # rather than raise.
+    for sub_agent in getattr(agent_spec, "sub_agents", None) or []:
+        if getattr(sub_agent, "name", None) == sub_agent_name:
             return sub_agent
+    # Built-in web_fetch researcher: ``WebFetchTool.__init__`` appends
+    # ``__web_researcher`` to the owner's live ``sub_agents`` in memory but
+    # never serializes it, so it is absent from the runner's re-parsed spec.
+    # Reconstruct it deterministically -- the same pure builder the
+    # child-boot resolver (``workflow.py::_find_spec_by_name``) uses -- so
+    # this lookup and the dispatch gate agree the sub-agent exists. Without
+    # it, ``_has_subagent`` returns True while ``_subagent_harness`` /
+    # ``_subagent_allowed_harnesses`` (both routed through here) return
+    # ``None``, i.e. the gate and the spec lookup disagree about the same
+    # name. Reconstruction is gated inside the helper on the tree actually
+    # declaring ``web_fetch``, so a caller-supplied name cannot coerce an
+    # arbitrary parent into a shell-capable researcher.
+    from omnigent.tools.builtins.web_fetch import (
+        RESEARCHER_NAME,
+        reconstruct_researcher_spec,
+    )
+
+    if sub_agent_name == RESEARCHER_NAME:
+        return reconstruct_researcher_spec(agent_spec)
     return None
 
 
@@ -1800,6 +1883,7 @@ def _normalize_subagent_model(
             sub_agent_name,
             harness,
             provider.kind,
+            extra={"session_id": runner_primary_session_id()},
         )
     return normalized
 
@@ -1881,6 +1965,11 @@ async def _execute_subagent_tool(
         return f"Error: sys_session_send invalid 'model': {exc}"
 
     try:
+        reasoning_effort = _subagent_reasoning_effort_from_args(args)
+    except ValueError as exc:
+        return f"Error: sys_session_send invalid 'reasoning_effort': {exc}"
+
+    try:
         file_ids = _subagent_file_ids_from_args(args)
     except ValueError as exc:
         return f"Error: sys_session_send invalid 'file_ids': {exc}"
@@ -1925,6 +2014,12 @@ async def _execute_subagent_tool(
                 "Error: sys_session_send 'harness' applies only when a "
                 "sub-agent session is first created; it cannot change an "
                 "existing session. Re-send without 'harness' to continue "
+                f"session {target_session_id!r}."
+            )
+        if reasoning_effort is not None:
+            return (
+                "Error: sys_session_send 'reasoning_effort' applies only when a "
+                "sub-agent session is first created; it cannot change an existing "
                 f"session {target_session_id!r}."
             )
         if cost_budget is not None:
@@ -2027,6 +2122,14 @@ async def _execute_subagent_tool(
                 "continue it, or sys_session_close it first to spawn a "
                 "fresh session with the requested files."
             )
+        if reasoning_effort is not None:
+            return (
+                f"Error: sys_session_send 'reasoning_effort' applies only when a "
+                f"sub-agent session is first created; {sub_agent_name!r} title "
+                f"{session_name!r} already exists as {child_session_id}. Re-send "
+                "without 'reasoning_effort' to continue it, or "
+                "sys_session_close it first to spawn a fresh session."
+            )
         if cost_budget is not None:
             return (
                 f"Error: sys_session_send 'cost_budget' applies only when a "
@@ -2057,6 +2160,7 @@ async def _execute_subagent_tool(
                 "after completion."
             )
     else:
+        _auto_ordinal = False
         if not session_name:
             # No title hint — auto-generate a structured session name
             # (e.g. "researcher-1"). Recover ordinals from existing
@@ -2083,6 +2187,7 @@ async def _execute_subagent_tool(
                 str(sub_agent_name),
             )
             session_name = f"{sub_agent_name}-{ordinal}"
+            _auto_ordinal = True
         child_harness = _subagent_harness(str(sub_agent_name), agent_spec)
         # Apply an allowlisted per-dispatch harness override. The sub-agent
         # spec must explicitly opt in via executor.config.allowed_harnesses,
@@ -2185,7 +2290,50 @@ async def _execute_subagent_tool(
                 agent_spec=agent_spec,
                 harness=child_harness,
             )
-        resp = await server_client.post("/v1/sessions", json=create_body, timeout=30.0)
+        # A dispatch that names no effort inherits the sub-agent spec's
+        # ``executor.reasoning_effort``, so a worker's default is declared
+        # once in its config instead of depending on the orchestrator
+        # remembering to pass it on every dispatch.
+        effective_effort = reasoning_effort
+        effort_source = "sys_session_send"
+        if effective_effort is None:
+            sub_spec = _find_subagent_spec(sub_agent_name, agent_spec)
+            # ``getattr``: sub-specs also arrive as structural stubs that
+            # carry only the fields a caller needed.
+            spec_effort = getattr(getattr(sub_spec, "executor", None), "reasoning_effort", None)
+            if isinstance(spec_effort, str) and spec_effort:
+                effective_effort = spec_effort
+                effort_source = f"sub-agent {sub_agent_name!r} spec"
+        if effective_effort is not None:
+            try:
+                create_body["reasoning_effort"] = _validate_subagent_reasoning_effort(
+                    effective_effort,
+                    child_harness,
+                )
+            except ValueError as exc:
+                return f"Error: invalid 'reasoning_effort' from {effort_source}: {exc}"
+
+        # Best-effort retry for auto-ordinal name collisions: a 409 means
+        # another runner (or a restart race) already created a child with
+        # this ordinal. Bump and retry. Not watertight — the server's
+        # (parent, title) check is SELECT-then-INSERT with no DB unique
+        # constraint, so truly concurrent creates can still race past it.
+        _max_ordinal_retries = 5 if _auto_ordinal else 0
+        for _ordinal_attempt in range(_max_ordinal_retries + 1):
+            resp = await server_client.post("/v1/sessions", json=create_body, timeout=30.0)
+            if (
+                resp.status_code == 409
+                and _auto_ordinal
+                and _ordinal_attempt < _max_ordinal_retries
+            ):
+                ordinal = _runner_app.next_subagent_ordinal(
+                    conversation_id,
+                    str(sub_agent_name),
+                )
+                session_name = f"{sub_agent_name}-{ordinal}"
+                create_body["title"] = f"{sub_agent_name}:{session_name}"
+                continue
+            break
         if resp.status_code >= 400:
             return f"Error: failed to create child session: {resp.status_code} {resp.text[:200]}"
         child_data = _string_object_dict(resp.json())
@@ -2509,15 +2657,23 @@ def _build_session_create_body(
     title: object,
     message: object,
     model: object = None,
+    reasoning_effort: object = None,
 ) -> _JsonObject:
     """
     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
 
     ``parent_session_id`` is hard-forced to ``conversation_id`` — this is
     what makes the write child-only (an orchestrator cannot create a
-    top-level or sibling session). A non-empty ``title``, ``message``, and
-    ``model`` are included when provided; the message becomes the child's
-    first queued user turn via ``initial_items``.
+    top-level or sibling session). A non-empty ``title``, ``message``,
+    ``model``, and ``reasoning_effort`` are included when provided; the
+    message becomes the child's first queued user turn via
+    ``initial_items``.
+
+    ``model`` and ``reasoning_effort`` are passed through unvalidated:
+    this path never resolves the child's harness (the agent is named by
+    id and resolved server-side), so neither can be checked against the
+    harness's capabilities here. The server validates both against their
+    vocabularies at create.
 
     :param agent_id: The existing agent to launch, e.g. ``"ag_abc123"``.
     :param conversation_id: The caller's session id — the forced parent.
@@ -2527,6 +2683,8 @@ def _build_session_create_body(
         non-empty string.
     :param model: Optional model override, e.g. ``"databricks-glm-5-2"``;
         written as ``model_override`` on the session.
+    :param reasoning_effort: Optional reasoning level, e.g. ``"high"``;
+        written as ``reasoning_effort`` on the session.
     :returns: The JSON request body.
     """
     body: _JsonObject = {
@@ -2537,6 +2695,8 @@ def _build_session_create_body(
         body["title"] = title
     if isinstance(model, str) and model:
         body["model_override"] = model
+    if isinstance(reasoning_effort, str) and reasoning_effort:
+        body["reasoning_effort"] = reasoning_effort
     if isinstance(message, str) and message:
         body["initial_items"] = [
             {
@@ -2676,6 +2836,18 @@ async def _execute_session_create(
             }
         )
     if has_config_path:
+        # The multipart create carries only the config bundle, so an effort
+        # passed here would never reach the child. Refuse instead of dropping it.
+        if args.get("reasoning_effort") is not None:
+            return json.dumps(
+                {
+                    "error": (
+                        "sys_session_create 'reasoning_effort' is supported only "
+                        "with 'agent_id'; the 'config_path' create cannot carry "
+                        "it. Set the effort in the config you upload instead."
+                    )
+                }
+            )
         return await _session_create_from_config_path(
             str(config_path),
             args,
@@ -2691,6 +2863,7 @@ async def _execute_session_create(
         args.get("title"),
         args.get("message"),
         model=args.get("model"),
+        reasoning_effort=args.get("reasoning_effort"),
     )
     try:
         resp = await server_client.post("/v1/sessions", json=body, timeout=30.0)
@@ -3295,11 +3468,12 @@ def _has_subagent(
     """
     if agent_spec is None:
         return False
-    # AP-style spec: sub_agents list
-    sub_agents = getattr(agent_spec, "sub_agents", None) or []
-    for sa in sub_agents:
-        if getattr(sa, "name", None) == sub_agent_name:
-            return True
+    # AP-style spec: sub_agents list, including the synthesized
+    # ``__web_researcher``. Routed through the single resolver so the gate
+    # and every downstream harness / allowlist lookup agree about whether a
+    # name exists (see :func:`_find_subagent_spec`).
+    if _find_subagent_spec(sub_agent_name, agent_spec) is not None:
+        return True
     # Omnigent inner loader: tools dict with AgentTool entries
     tools = getattr(agent_spec, "tools", None)
     if isinstance(tools, dict) and sub_agent_name in tools:
@@ -3411,6 +3585,7 @@ async def _timer_loop(
                     timer_id,
                     conversation_id,
                     exc_info=True,
+                    extra={"session_id": conversation_id},
                 )
             if not repeat:
                 break
@@ -3714,6 +3889,7 @@ _SCHEDULED_TASK_CREATE_FIELDS = (
     "timezone",
     "model_override",
     "reasoning_effort",
+    "permission_mode",
     "workspace",
     "host_id",
 )
@@ -3725,6 +3901,7 @@ _SCHEDULED_TASK_UPDATE_FIELDS = (
     "timezone",
     "model_override",
     "reasoning_effort",
+    "permission_mode",
     "workspace",
     "host_id",
     "state",
@@ -4975,6 +5152,7 @@ async def _collect_sub_agents(
                 "sys_session_list sibling enrichment failed for parent %s",
                 parent_id,
                 exc_info=True,
+                extra={"session_id": conversation_id},
             )
     return result
 
@@ -5678,7 +5856,12 @@ async def execute_tool(
             output = await _execute_uc_function_tool(tool_name, args, agent_spec=agent_spec)
         else:
             output = await _execute_spec_callable_tool(tool_name, args, agent_spec=agent_spec)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
+        _logger.exception(
+            "tool %s failed",
+            tool_name,
+            extra={"session_id": conversation_id},
+        )
         output = f"Error: {type(exc).__name__}: {exc}"
 
     return output
@@ -5841,6 +6024,7 @@ async def dispatch_tool_locally(
             tool_name,
             call_id,
             exc,
+            extra={"session_id": conversation_id},
         )
 
     return output
@@ -6074,7 +6258,11 @@ async def _execute_os_env_tool(
         else:
             return f"Error: {tool_name} not implemented"
     except Exception as exc:
-        _logger.exception("runner OSEnvironment dispatch failed for %s", tool_name)
+        _logger.exception(
+            "runner OSEnvironment dispatch failed for %s",
+            tool_name,
+            extra={"session_id": conversation_id},
+        )
         return json.dumps({"error": str(exc)})
     finally:
         if os_env is not None:
@@ -6516,6 +6704,7 @@ async def _publish_terminal_created_event(
                 conversation_id,
                 terminal_name,
                 session_key,
+                extra={"session_id": conversation_id},
             )
             return
         resource = session_resource_view_to_dict(view)
@@ -6841,6 +7030,7 @@ async def _post_subagent_policy_verdict(
             "Sub-agent inbox TOOL_RESULT policy evaluation failed for parent=%s child=%s",
             conversation_id,
             _subagent_child_id(payload),
+            extra={"session_id": conversation_id},
         )
         return None
     if resp.status_code >= 400:
@@ -6850,6 +7040,7 @@ async def _post_subagent_policy_verdict(
             conversation_id,
             resp.status_code,
             resp.text,
+            extra={"session_id": conversation_id},
         )
         return None
     try:
@@ -6858,6 +7049,7 @@ async def _post_subagent_policy_verdict(
         _logger.warning(
             "Sub-agent inbox TOOL_RESULT policy evaluation returned non-JSON for parent=%s",
             conversation_id,
+            extra={"session_id": conversation_id},
         )
         return None
 
@@ -6888,6 +7080,7 @@ def _apply_subagent_policy_verdict(
             _logger.warning(
                 "Sub-agent inbox TOOL_RESULT policy data must be str; got %s",
                 type(transformed).__name__,
+                extra={"session_id": runner_primary_session_id()},
             )
         return _SubagentInboxEvaluation(
             {
@@ -6898,6 +7091,7 @@ def _apply_subagent_policy_verdict(
     _logger.warning(
         "Sub-agent inbox TOOL_RESULT policy evaluation returned unknown result=%r",
         result,
+        extra={"session_id": runner_primary_session_id()},
     )
     return _SubagentInboxEvaluation(
         _subagent_policy_failure_payload(payload),
@@ -7007,6 +7201,7 @@ async def _drain_inbox(
                     "malformed terminal-idle inbox item ignored: %s",
                     exc,
                     exc_info=True,
+                    extra={"session_id": conversation_id},
                 )
                 items.append(f"[System: malformed terminal_idle inbox item ignored — {exc}]")
             continue
@@ -7075,12 +7270,14 @@ async def _evaluate_async_tool_call_policy(
             "async PHASE_TOOL_CALL policy evaluate returned %d for %s; denying",
             resp.status_code,
             evaluation_id,
+            extra={"session_id": conversation_id},
         )
     except Exception:  # noqa: BLE001
         _logger.warning(
             "async PHASE_TOOL_CALL policy evaluate failed for %s; denying",
             evaluation_id,
             exc_info=True,
+            extra={"session_id": conversation_id},
         )
     return False
 
@@ -7234,7 +7431,8 @@ def _spawn_async_tool(
                 }
             )
             raise
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
+            _logger.exception("async tool %s failed", target_tool)
             session_inbox.put_nowait(
                 {
                     "handle_id": handle_id,

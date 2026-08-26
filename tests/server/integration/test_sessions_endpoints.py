@@ -3794,6 +3794,148 @@ async def test_post_external_session_status_idle_forwards_persisted_assistant_ou
     ]
 
 
+async def test_post_external_session_status_failed_forwards_persisted_assistant_output(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A ``failed`` edge with no wire ``output`` carries the persisted error text.
+
+    claude-native's ``StopFailure`` edge posts no ``output``, but the
+    harness's own explanation (its last assistant message, e.g. "There's an
+    issue with the selected model (…)") is already persisted. The handler
+    must attach it so the parent inbox shows it instead of the generic
+    "Error: native sub-agent turn failed", and surface it as the session's
+    typed error under the harness-neutral ``native_turn_error`` code.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    detail = (
+        "There's an issue with the selected model (claude-3-5-sonnet-20241022). "
+        "It may not exist or you may not have access to it."
+    )
+    forwarded: list[dict[str, Any]] = []
+    published: list[tuple[str, dict[str, Any]]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """
+        Capture forwarded runner events.
+
+        :param request: Request sent to the fake runner.
+        :returns: Accepted response.
+        """
+        forwarded.append({"path": request.url.path, "body": json.loads(request.content)})
+        return httpx.Response(204)
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+
+    async def _fake_get_runner_client(
+        session_id: str,
+        runner_router: object,
+    ) -> httpx.AsyncClient:
+        """
+        Resolve the session to the fake runner client.
+
+        :param session_id: Session id being routed.
+        :param runner_router: Real app runner router, unused here.
+        :returns: The fake runner client.
+        """
+        del session_id, runner_router
+        return fake_runner
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda session_id, event: published.append((session_id, event)),
+    )
+    try:
+        agent = await create_test_agent(client, sub_agents=[{"name": "worker"}])
+        parent = await _create_session(client, agent["id"])
+        child_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "parent_session_id": parent["id"],
+                "sub_agent_name": "worker",
+                "title": "worker:native",
+            },
+        )
+        assert child_resp.status_code == 201, child_resp.text
+        child = child_resp.json()
+
+        item_resp = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "message",
+                    "response_id": "resp_native_failed",
+                    "source_id": "src_native_failed",
+                    "item_data": {
+                        "role": "assistant",
+                        "agent": "claude-native-ui",
+                        "content": [{"type": "output_text", "text": detail}],
+                    },
+                },
+            },
+        )
+        assert item_resp.status_code == 202, item_resp.text
+
+        forwarded.clear()
+        status_resp = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={"type": "external_session_status", "data": {"status": "failed"}},
+        )
+    finally:
+        await fake_runner.aclose()
+
+    assert status_resp.status_code == 202, status_resp.text
+    assert forwarded, "the failed edge was never forwarded to the runner"
+    assert forwarded[0]["body"]["data"] == {"status": "failed", "output": detail}
+    failed_events = [ev for _sid, ev in published if ev.get("status") == "failed"]
+    assert failed_events, f"no failed status was published: {published}"
+    error = failed_events[0]["error"]
+    assert error is not None
+    assert error["code"] == "native_turn_error"
+    assert "selected model" in error["message"]
+
+
+async def test_post_external_session_status_failed_keeps_wire_output_and_codex_code(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A forwarder-sent ``output`` stays verbatim under codex's error code.
+
+    The store-side enrichment must never clobber a detail the forwarder
+    attached itself, and a wire-carried detail keeps the ``codex_turn_error``
+    code existing clients already see.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda session_id, event: published.append((session_id, event)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_session_status",
+            "data": {"status": "failed", "output": "You've hit your usage limit."},
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    error = published[0][1]["error"]
+    assert error is not None
+    assert error["code"] == "codex_turn_error"
+    assert error["message"] == "You've hit your usage limit."
+
+
 async def test_post_external_session_status_propagates_runner_delivery_failure(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -9296,3 +9438,33 @@ async def test_message_forward_rejection_surfaces_failed_with_reason(
         assert "harness_spawn_failed" in last_error["message"], last_error
     finally:
         await fake_runner.aclose()
+
+
+async def test_create_child_session_duplicate_title_returns_409(
+    client: httpx.AsyncClient,
+) -> None:
+    """POST /v1/sessions returns 409 when a child with the same title already exists."""
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+
+    resp1 = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent["id"],
+            "title": "researcher:researcher-1",
+        },
+    )
+    assert resp1.status_code == 201, resp1.text
+
+    resp2 = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent["id"],
+            "title": "researcher:researcher-1",
+        },
+    )
+    assert resp2.status_code == 409, (
+        f"expected 409 on duplicate child title, got {resp2.status_code}: {resp2.text}"
+    )

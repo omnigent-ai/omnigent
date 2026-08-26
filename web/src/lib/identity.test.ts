@@ -339,3 +339,108 @@ describe("getCurrentAuthorId", () => {
     expect(getCurrentAuthorId()).toBeNull();
   });
 });
+
+// The login redirect is a once-per-document side effect. An unauthenticated
+// page load produces a BURST of 401s (the shell mounts ~8 ungated queries) and
+// every one reaches the redirect branch in `authenticatedFetch`. Re-assigning
+// `location.href` per failure piled up navigations to a page the browser was
+// already headed to; these tests pin it at exactly one.
+describe("login redirect", () => {
+  const ORIGIN = "https://app.example.com";
+  let hrefWrites: string[];
+  let originalLocation: Location;
+
+  function stubLocation(pathname: string, search: string) {
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: {
+        origin: ORIGIN,
+        pathname,
+        search,
+        set href(value: string) {
+          hrefWrites.push(value);
+        },
+        get href() {
+          return hrefWrites[hrefWrites.length - 1] ?? `${ORIGIN}${pathname}`;
+        },
+      },
+    });
+  }
+
+  beforeEach(() => {
+    // The slice-key tests above `vi.doMock("./host")` with a truthy `fetcher`,
+    // and doMock registrations outlive `vi.resetModules()`. Left in place, the
+    // embedded-host guard short-circuits the entire 401 redirect branch and
+    // these tests pass no matter what the code does. Same for ./sessionHost,
+    // and for the workspace env stub that turns on slice-key routing.
+    vi.doUnmock("./host");
+    vi.doUnmock("./sessionHost");
+    vi.unstubAllEnvs();
+
+    hrefWrites = [];
+    originalLocation = window.location;
+    stubLocation("/", "");
+  });
+
+  afterEach(() => {
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: originalLocation,
+    });
+  });
+
+  it("redirects once for a whole burst of 401s", async () => {
+    // /v1/me 401s with a login page (accounts / OIDC), then eight queries land
+    // 401 behind it — the shape of a real logged-out page load.
+    fetchMock.mockResolvedValue(
+      mockJsonResponse({ user_id: null, login_url: "/login" }, { ok: false, status: 401 }),
+    );
+    const { resolveIdentity, authenticatedFetch, isLoginRedirectPending } =
+      await import("./identity");
+
+    await resolveIdentity();
+    await Promise.all(
+      Array.from({ length: 8 }, () => authenticatedFetch("/v1/sessions?limit=100")),
+    );
+
+    expect(hrefWrites).toEqual(["/login?return_to=%2F"]);
+    expect(isLoginRedirectPending()).toBe(true);
+  });
+
+  it("preserves the originating path in return_to", async () => {
+    stubLocation("/c/abc", "?tab=diff");
+    fetchMock.mockResolvedValue(
+      mockJsonResponse({ user_id: null, login_url: "/auth/login" }, { ok: false, status: 401 }),
+    );
+    const { resolveIdentity } = await import("./identity");
+
+    await resolveIdentity();
+
+    expect(hrefWrites).toEqual(["/auth/login?return_to=%2Fc%2Fabc%3Ftab%3Ddiff"]);
+  });
+
+  it("never redirects in header mode, where there is no login page", async () => {
+    // login_url null → the proxy owns identity, so a stray 401 must surface to
+    // the caller instead of bouncing the user to a phantom form.
+    fetchMock.mockResolvedValue(mockJsonResponse({ user_id: null }, { ok: false, status: 401 }));
+    const { resolveIdentity, authenticatedFetch, isLoginRedirectPending } =
+      await import("./identity");
+
+    await resolveIdentity();
+    const res = await authenticatedFetch("/v1/hosts");
+
+    expect(hrefWrites).toEqual([]);
+    expect(isLoginRedirectPending()).toBe(false);
+    expect(res.status).toBe(401);
+  });
+
+  it("reports no pending redirect for an authenticated load", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ user_id: "alice" }));
+    const { resolveIdentity, isLoginRedirectPending } = await import("./identity");
+
+    await resolveIdentity();
+
+    expect(isLoginRedirectPending()).toBe(false);
+    expect(hrefWrites).toEqual([]);
+  });
+});

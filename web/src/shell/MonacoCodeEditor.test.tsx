@@ -21,13 +21,17 @@ import type { ActiveSelection, SaveStatus } from "./codeViewerHelpers";
 // need the props, not a real DOM editor).
 const h = vi.hoisted(() => ({
   editorProps: null as {
-    options?: { readOnly?: boolean };
+    options?: { readOnly?: boolean; fontWeight?: string };
     theme?: string;
     language?: string;
   } | null,
 }));
 vi.mock("@monaco-editor/react", () => ({
-  Editor: (props: { options?: { readOnly?: boolean }; theme?: string; language?: string }) => {
+  Editor: (props: {
+    options?: { readOnly?: boolean; fontWeight?: string };
+    theme?: string;
+    language?: string;
+  }) => {
     h.editorProps = props;
     return null;
   },
@@ -153,6 +157,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  localStorage.clear();
 });
 
 // ── buildCommentDecorations (offset → range bridge) ─────────────────────────────
@@ -276,6 +281,14 @@ describe("MonacoCodeEditor read-only / truncated gating", () => {
     // what tells the user editing is disabled to prevent data loss.
     if (banner) expect(screen.getByText(/too large to load fully/)).toBeDefined();
     else expect(screen.queryByText(/too large to load fully/)).toBeNull();
+  });
+
+  it("applies the stored code font weight when Monaco is created", async () => {
+    localStorage.setItem("omnigent:code-font-weight", "600");
+    renderEditor();
+
+    await waitFor(() => expect(h.editorProps).not.toBeNull());
+    expect(h.editorProps?.options?.fontWeight).toBe("500");
   });
 });
 

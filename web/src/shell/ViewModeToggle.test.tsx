@@ -125,20 +125,25 @@ describe("ViewModeToggle", () => {
     expect(await screen.findByRole("tooltip")).toHaveTextContent("Chat view");
   });
 
-  it("disables the Terminal segment and shows a spinner while the terminal is coming up", () => {
-    renderToggle(makeCtx({ terminalsAvailable: false, terminalStartingUp: true }));
+  it("keeps the Terminal segment usable and shows a spinner while the terminal is coming up", () => {
+    const setView = vi.fn();
+    renderToggle(makeCtx({ setView, terminalsAvailable: false, terminalStartingUp: true }));
     const terminal = terminalSegment();
-    expect(terminal).toBeDisabled();
-    // The name carries the reason, so the disabled state explains itself.
+    expect(terminal).toBeEnabled();
     expect(terminal).toHaveAccessibleName(/starting up/i);
     expect(terminal.querySelector(".animate-spin")).not.toBeNull();
+    fireEvent.click(terminal);
+    expect(setView).toHaveBeenCalledWith("terminal");
   });
 
-  it("disables the Terminal segment WITHOUT a spinner when no terminal exists and none is coming up", () => {
-    renderToggle(makeCtx({ terminalsAvailable: false, terminalStartingUp: false }));
+  it("keeps the Terminal segment usable when the runner is offline", () => {
+    const setView = vi.fn();
+    renderToggle(makeCtx({ setView, terminalsAvailable: false, terminalStartingUp: false }));
     const terminal = terminalSegment();
-    expect(terminal).toBeDisabled();
+    expect(terminal).toBeEnabled();
     expect(terminal.querySelector(".animate-spin")).toBeNull();
+    fireEvent.click(terminal);
+    expect(setView).toHaveBeenCalledWith("terminal");
   });
 
   it("leaves the Chat segment usable while the terminal is unavailable", () => {

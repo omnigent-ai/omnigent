@@ -57,6 +57,35 @@ class FakeAgentStore:
         return self.agents.get(agent_id)
 
 
+class _FakeExecutor:
+    def __init__(self, harness: str) -> None:
+        # Mirrors AgentSpec.executor: a canonical harness in ``config['harness']``
+        # (falls back to ``type``). The permission-mode injection reads this to
+        # confirm a claude-native agent before adding ``--permission-mode``.
+        self.type = harness
+        self.config = {"harness": harness}
+
+
+class _FakeSpec:
+    def __init__(self, harness: str) -> None:
+        self.executor = _FakeExecutor(harness)
+
+
+class _FakeLoadedAgent:
+    def __init__(self, harness: str) -> None:
+        self.spec = _FakeSpec(harness)
+
+
+class FakeAgentCache:
+    """Resolves an agent id to a spec with a fixed harness (for launch gating)."""
+
+    def __init__(self, harness: str = "claude-native") -> None:
+        self._harness = harness
+
+    def load(self, agent_id: str, bundle_location: str, **_: Any) -> _FakeLoadedAgent:
+        return _FakeLoadedAgent(self._harness)
+
+
 class FakeScheduledTaskStore:
     """Records update/create_run calls and serves get() from a dict."""
 
@@ -368,6 +397,84 @@ async def test_active_creates_session_grant_and_run() -> None:
     assert len(store.runs) == 1
     assert any("last_run_at" in u for u in store.updates)
     assert any("last_run_conversation_id" in u for u in store.updates)
+
+
+def _claude_agent_deps(
+    store: FakeScheduledTaskStore, conv_store: FakeConversationStore, *, harness: str
+) -> FireDeps:
+    """Deps whose agent ``ag_1`` resolves to *harness* (for launch-arg gating)."""
+    return _deps(
+        store,
+        permission_store=FakePermissionStore(),
+        conversation_store=conv_store,
+        agent_store=FakeAgentStore({"ag_1": _FakeAgent("ag_1", bundle_location="ag_1/hash")}),
+        agent_cache=FakeAgentCache(harness=harness),
+    )
+
+
+@pytest.mark.asyncio
+async def test_permission_mode_becomes_terminal_launch_args() -> None:
+    """A Claude task's permission_mode fires as the runner's --permission-mode args."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(permission_mode="acceptEdits")})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _claude_agent_deps(store, conv_store, harness="claude-native"),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert len(conv_store.created) == 1
+    assert conv_store.created[0]["terminal_launch_args"] == ["--permission-mode", "acceptEdits"]
+
+
+@pytest.mark.asyncio
+async def test_unset_permission_mode_sends_no_launch_args() -> None:
+    """No permission_mode → no terminal_launch_args (agent default applies)."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _claude_agent_deps(store, conv_store, harness="claude-native"),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert len(conv_store.created) == 1
+    assert conv_store.created[0]["terminal_launch_args"] is None
+
+
+@pytest.mark.asyncio
+async def test_permission_mode_omitted_for_non_claude_agent() -> None:
+    """A mis-stamped non-Claude row degrades to no --permission-mode flag.
+
+    The injection is harness-gated fail-safe: even if a permission_mode somehow
+    persisted on a codex/cursor task, the fire must NOT inject the unknown flag
+    (which would break the launch) — it launches with the agent's own default.
+    """
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(permission_mode="bypassPermissions")})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _claude_agent_deps(store, conv_store, harness="codex-native"),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert len(conv_store.created) == 1
+    assert conv_store.created[0]["terminal_launch_args"] is None
 
 
 @pytest.mark.asyncio

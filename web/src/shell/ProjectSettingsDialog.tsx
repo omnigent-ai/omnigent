@@ -339,7 +339,7 @@ export function ProjectSettingsDialog({
                       className="fixed inset-0 z-10 cursor-default"
                       onClick={() => setWorkspaceOpen(false)}
                     />
-                    <div className="absolute top-full right-0 left-0 z-20 mt-1 rounded-[12px] border border-border bg-popover p-2 shadow-menu [&>[data-testid=workspace-picker]]:border-0">
+                    <div className="absolute top-full right-0 left-0 z-20 mt-1 rounded-[12px] border border-border bg-popover p-2 shadow-menu dark:border-white/10 dark:backdrop-blur-xl dark:backdrop-saturate-150 [&>[data-testid=workspace-picker]]:border-0">
                       <WorkspacePicker
                         hostId={browsableHostId}
                         initialPath={isNavigablePath(workspace) ? workspace : undefined}

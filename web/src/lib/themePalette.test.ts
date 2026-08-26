@@ -96,6 +96,8 @@ describe("themePalette", () => {
       expect(palette.label.length).toBeGreaterThan(0);
       expect(palette.light.bg).toMatch(/^#|rgb/);
       expect(palette.dark.bg).toMatch(/^#|rgb/);
+      expect(palette.tokens.light.shellBackground.length).toBeGreaterThan(0);
+      expect(palette.tokens.dark.shellBackground.length).toBeGreaterThan(0);
     }
   });
 });

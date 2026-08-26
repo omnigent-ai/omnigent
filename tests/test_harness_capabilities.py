@@ -97,6 +97,17 @@ def test_p0_bench_harnesses_declare_interrupt_and_streaming() -> None:
         assert caps[harness].streaming is True, harness
 
 
+def test_pi_harnesses_declare_the_pi_effort_family() -> None:
+    """Both pi harnesses advertise pi's 7-level ladder, not "no effort knob"."""
+    from omnigent.reasoning_effort import EFFORT_VALUES, PI_EFFORTS
+
+    caps = harness_capabilities()
+    for harness in ("pi", "pi-native"):
+        assert caps[harness].effort is EffortFamily.PI, harness
+        assert caps[harness].as_dict()["effort"] == "pi", harness
+    assert PI_EFFORTS == EFFORT_VALUES
+
+
 def test_optional_bench_capabilities_default_to_unknown() -> None:
     capability = HarnessCapabilities(
         IntegrationMode.SDK_IN_PROCESS,

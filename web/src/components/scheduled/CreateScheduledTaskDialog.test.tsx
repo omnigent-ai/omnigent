@@ -186,6 +186,7 @@ function scheduledTask(overrides: Partial<ScheduledTasksApiModule.ScheduledTask>
     updatedAt: 2,
     modelOverride: null,
     reasoningEffort: null,
+    permissionMode: null,
     workspace: null,
     hostId: null,
     state: "active",
@@ -685,15 +686,19 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
     // Pick an effort.
     fireEvent.keyDown(screen.getByTestId("task-effort-trigger"), { key: "Enter" });
     fireEvent.click(await screen.findByRole("option", { name: "High" }));
+    // Pick a permission mode.
+    fireEvent.keyDown(screen.getByTestId("task-permission-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Accept edits" }));
 
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
     const arg = mutateAsync.mock.calls[0][0];
     expect(arg.modelOverride).toBe("opus");
     expect(arg.reasoningEffort).toBe("high");
+    expect(arg.permissionMode).toBe("acceptEdits");
   });
 
-  it("omits model + effort on create when both are left at Default", async () => {
+  it("omits model + effort + permission on create when left at Default", async () => {
     renderDialog();
     fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "N" } });
     fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "P" } });
@@ -702,9 +707,10 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
     const arg = mutateAsync.mock.calls[0][0];
     expect(arg).not.toHaveProperty("modelOverride");
     expect(arg).not.toHaveProperty("reasoningEffort");
+    expect(arg).not.toHaveProperty("permissionMode");
   });
 
-  it("prefills model + effort in edit mode from the loaded task", async () => {
+  it("prefills model + effort + permission in edit mode from the loaded task", async () => {
     render(
       <CreateScheduledTaskDialog
         open
@@ -713,15 +719,17 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
           agentId: "ag_claude_native",
           modelOverride: "sonnet",
           reasoningEffort: "medium",
+          permissionMode: "acceptEdits",
         })}
       />,
     );
     // Prefilled selections surface as the trigger's shown value.
     expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Sonnet");
     expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("Medium");
+    expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Accept edits");
   });
 
-  it("threads model + effort through update on edit, nulling a cleared override", async () => {
+  it("threads model + effort + permission through update on edit, nulling a cleared override", async () => {
     render(
       <CreateScheduledTaskDialog
         open
@@ -730,19 +738,21 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
           agentId: "ag_claude_native",
           modelOverride: "opus",
           reasoningEffort: "high",
+          permissionMode: "plan",
         })}
       />,
     );
-    // Reset the model back to Default; leave effort at "high".
+    // Reset the model back to Default; leave effort + permission untouched.
     fireEvent.keyDown(screen.getByTestId("task-model-trigger"), { key: "Enter" });
     fireEvent.click(await screen.findByRole("option", { name: "Default" }));
 
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
     const { input } = updateMutateAsync.mock.calls[0][0];
-    // Cleared model → null; untouched effort → the prefilled value.
+    // Cleared model → null; untouched effort + permission → the prefilled values.
     expect(input.modelOverride).toBeNull();
     expect(input.reasoningEffort).toBe("high");
+    expect(input.permissionMode).toBe("plan");
   });
 });
 

@@ -4,7 +4,12 @@ import { MemoryRouter, useNavigate } from "react-router-dom";
 import type { ReactNode } from "react";
 
 import { setOmnigentHostConfig, type OmnigentAnalyticsEvent } from "@/lib/host";
-import { emitOmnigentAnalytics, useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
+import {
+  emitOmnigentAnalytics,
+  emitInteractionPhase,
+  useOmnigentAnalytics,
+  useOmnigentPageView,
+} from "@/lib/analytics";
 
 afterEach(() => {
   // Reset the module-singleton host config between tests. The empty-config
@@ -29,9 +34,83 @@ describe("emitOmnigentAnalytics", () => {
     emitOmnigentAnalytics(event);
     expect(analytics).toHaveBeenCalledExactlyOnceWith(event);
   });
+
+  it("swallows a throwing host sink so it can't break the primary action", () => {
+    // The wrappers emit BEFORE running the caller's handler, so a sink that
+    // throws must not propagate up and suppress the user's action.
+    setOmnigentHostConfig({
+      analytics: () => {
+        throw new Error("host sink blew up");
+      },
+    });
+    expect(() => emitOmnigentAnalytics({ type: "click", componentId: "x" })).not.toThrow();
+  });
+});
+
+describe("emitInteractionPhase", () => {
+  it("is a no-op when no host sink is configured", () => {
+    expect(() =>
+      emitInteractionPhase({
+        interactionId: "run_1",
+        interactionKind: "agent_run",
+        phase: "start",
+      }),
+    ).not.toThrow();
+  });
+
+  it("forwards a start phase, then a complete phase carrying status and duration", () => {
+    const analytics = vi.fn();
+    setOmnigentHostConfig({ analytics });
+
+    emitInteractionPhase({ interactionId: "run_1", interactionKind: "agent_run", phase: "start" });
+    expect(analytics).toHaveBeenLastCalledWith({
+      type: "interaction_phase",
+      interactionId: "run_1",
+      interactionKind: "agent_run",
+      phase: "start",
+    });
+
+    emitInteractionPhase({
+      interactionId: "run_1",
+      interactionKind: "agent_run",
+      phase: "complete",
+      status: "success",
+      durationMs: 1234,
+    });
+    expect(analytics).toHaveBeenLastCalledWith({
+      type: "interaction_phase",
+      interactionId: "run_1",
+      interactionKind: "agent_run",
+      phase: "complete",
+      status: "success",
+      durationMs: 1234,
+    });
+  });
 });
 
 describe("useOmnigentAnalytics", () => {
+  it("forwards trackInteraction to the host sink", () => {
+    const analytics = vi.fn();
+    setOmnigentHostConfig({ analytics });
+    const { result } = renderHook(() => useOmnigentAnalytics());
+
+    result.current.trackInteraction({
+      interactionId: "call_1",
+      interactionKind: "tool_call",
+      phase: "complete",
+      name: "shell",
+      durationMs: 42,
+    });
+    expect(analytics).toHaveBeenCalledExactlyOnceWith({
+      type: "interaction_phase",
+      interactionId: "call_1",
+      interactionKind: "tool_call",
+      phase: "complete",
+      name: "shell",
+      durationMs: 42,
+    });
+  });
+
   it("redacts field values by default and forwards only when declared PII-free", () => {
     const analytics = vi.fn();
     setOmnigentHostConfig({ analytics });

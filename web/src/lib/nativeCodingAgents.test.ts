@@ -66,12 +66,13 @@ describe("nativeCodingAgentForHarness", () => {
     expect(nativeCodingAgentForHarness("antigravity-native")?.key).toBe("antigravity");
   });
 
-  // Same reversed-alias contract as native-pi: `native-antigravity` must
-  // fold to the canonical antigravity-native spec.
-  it("folds the reversed native-antigravity alias to the antigravity-native spec", () => {
-    expect(nativeCodingAgentForHarness("native-antigravity")).toBe(
-      nativeCodingAgentForHarness("antigravity-native"),
-    );
+  // Same reversed-alias and shortcut contract: `native-antigravity`, `agy-native`,
+  // and `native-agy` must fold to the canonical antigravity-native spec.
+  it("folds antigravity native aliases to the antigravity-native spec", () => {
+    const canonical = nativeCodingAgentForHarness("antigravity-native");
+    expect(nativeCodingAgentForHarness("native-antigravity")).toBe(canonical);
+    expect(nativeCodingAgentForHarness("agy-native")).toBe(canonical);
+    expect(nativeCodingAgentForHarness("native-agy")).toBe(canonical);
   });
 
   // agy's only pre-emptive control is the all-or-nothing bypass, so it must
@@ -105,7 +106,11 @@ describe("nativeWrapperLabelsForAgent", () => {
     });
   });
 
-  it("stamps terminal-first labels for a native-antigravity agent", () => {
+  it("stamps terminal-first labels for an agy-native / native-antigravity agent", () => {
+    expect(nativeWrapperLabelsForAgent({ name: "my-agy", harness: "agy-native" })).toEqual({
+      [UI_MODE_LABEL_KEY]: UI_MODE_TERMINAL_VALUE,
+      [WRAPPER_LABEL_KEY]: "antigravity-native-ui",
+    });
     expect(nativeWrapperLabelsForAgent({ name: "my-agy", harness: "native-antigravity" })).toEqual({
       [UI_MODE_LABEL_KEY]: UI_MODE_TERMINAL_VALUE,
       [WRAPPER_LABEL_KEY]: "antigravity-native-ui",

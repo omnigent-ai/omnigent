@@ -27,7 +27,7 @@ import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, NotRequired, TypeAlias, TypedDict, TypeGuard
+from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypeAlias, TypedDict, TypeGuard
 from urllib.parse import urlparse
 
 from omnigent import model_catalog
@@ -58,6 +58,13 @@ from omnigent.pi_model_compatibility import (
     enrich_databricks_model_catalog,
     pi_model_json_entry,
     unsupported_in_pi,
+)
+from omnigent.reasoning_effort import (
+    EFFORT_CLEAR_VALUES,
+    PI_EFFORTS,
+    PI_THINKING_OFF,
+    to_pi_thinking_level,
+    validate_effort,
 )
 from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 
@@ -131,12 +138,16 @@ def _split_pi_native_model_selection(selection: str | None) -> tuple[str, str] |
     return None
 
 
-class _PiProviderCompat(TypedDict):
+class _PiProviderCompat(TypedDict, total=False):
     supportsDeveloperRole: bool
     supportsStore: bool
     supportsStrictMode: bool
     supportsReasoningEffort: bool
     supportsUsageInStreaming: bool
+    # Pi 0.84.2+: send thinking.type.adaptive + output_config.effort instead
+    # of thinking.type.enabled + budget_tokens. Required for claude-4+ / claude-5
+    # models which no longer accept thinking.type.enabled.
+    forceAdaptiveThinking: bool
 
 
 class _PiProviderPayload(TypedDict):
@@ -307,13 +318,16 @@ class PiProviderConfig:
             surface = self._fallback_surface()
             if not self._primary_claude_only:
                 # The primary's api came from the model's own family.
-                models.append(
+                base: _PiModelEntry = (
                     {"id": self.model, "input": ["text", "image"]}
                     if self.extra_models
                     else {"id": self.model}
                 )
+                if self.api == "anthropic-messages":
+                    base["reasoning"] = True
+                models.append(base)
             elif surface is DatabricksPiSurface.ANTHROPIC:
-                models.append({"id": self.model, "input": ["text", "image"]})
+                models.append({"id": self.model, "input": ["text", "image"], "reasoning": True})
             elif surface is not None:
                 self._register_on_surface(additional, surface)
             else:
@@ -334,6 +348,12 @@ class PiProviderConfig:
         }
         if self.auth_header:
             provider["authHeader"] = True
+        # Claude 4+ / Claude 5 models require thinking.type.adaptive (not
+        # thinking.type.enabled). Pi 0.84.2+ sends adaptive when forceAdaptiveThinking
+        # is set in the compat block; reasoning:true on the model entry enables Pi's
+        # thinking level controls.
+        if self.api == "anthropic-messages":
+            provider["compat"] = {"forceAdaptiveThinking": True}
         providers = {self.provider_id: provider}
         providers.update(additional)
         return {"providers": providers}
@@ -1117,20 +1137,37 @@ def write_pi_models_config(
     return models_path
 
 
+class PiNativeLaunch(NamedTuple):
+    """Env, CLI args and any effort notice for a managed pi-native launch.
+
+    :param env: Env vars to merge into the terminal spec.
+    :param args: ``--provider``/``--model``/``--thinking`` args to append.
+    :param effort_warning: User-facing notice when the requested effort could
+        not be honoured; ``None`` otherwise.
+    """
+
+    env: dict[str, str]
+    args: list[str]
+    effort_warning: str | None = None
+
+
 def pi_native_provider_launch(
     agent_dir: Path,
     provider: PiProviderConfig,
+    reasoning_effort: str | None = None,
     *,
     selection: str | None = None,
-) -> tuple[dict[str, str], list[str]]:
+) -> PiNativeLaunch:
     """Write the managed config and return the launch env + CLI args for Pi.
 
     :param agent_dir: The managed Pi config dir for this session.
     :param provider: The resolved provider config.
+    :param reasoning_effort: Canonical omnigent effort for the session, e.g.
+        ``"high"``. Passed as ``--thinking`` on the primary provider; ignored
+        (with a warning) on a gateway-routed model, whose thinking must stay
+        off for text to surface.
     :param selection: Optional picker value used to select a generated provider.
-    :returns: ``(env, args)`` — the env vars to merge into the terminal spec
-        (relocating Pi's config dir) and the ``--provider``/``--model`` args to
-        append to the Pi command.
+    :returns: The launch env, CLI args and any effort warning.
     """
     # Render once and reuse: rendering logs how an uncataloged model was routed,
     # and this function both writes the config and reads it back for --provider.
@@ -1181,6 +1218,17 @@ def pi_native_provider_launch(
         f"{model_provider_id}/{selected_model}" if "/" in selected_model else selected_model
     )
     args = ["--provider", model_provider_id, "--model", model_arg]
+    thinking: str | None = None
+    effort_warning: str | None = None
+    if reasoning_effort and reasoning_effort not in EFFORT_CLEAR_VALUES:
+        try:
+            effort = validate_effort(reasoning_effort, "pi", PI_EFFORTS)
+        except ValueError as exc:
+            effort = None
+            effort_warning = str(exc)
+            _LOGGER.warning("pi-native: %s", exc)
+        if effort is not None:
+            thinking = to_pi_thinking_level(effort)
     # For non-Claude models on openai-completions/responses, disable thinking.
     # Gemini and other Databricks models return reasoning_tokens in their
     # responses; Pi's TUI mode applies thinking even with defaultThinkingLevel:null
@@ -1188,5 +1236,13 @@ def pi_native_provider_launch(
     # content to the extension. Explicitly passing --thinking off ensures the
     # completions handler doesn't activate the thinking path.
     if model_provider_id != provider.provider_id:
-        args.extend(["--thinking", "off"])
-    return env, args
+        args.extend(["--thinking", PI_THINKING_OFF])
+        if thinking is not None and thinking != PI_THINKING_OFF:
+            effort_warning = (
+                f"effort ignored for gateway-routed model {provider.model}: "
+                "thinking disabled to keep text surfacing"
+            )
+            _LOGGER.warning("pi-native: %s", effort_warning)
+    elif thinking is not None:
+        args.extend(["--thinking", thinking])
+    return PiNativeLaunch(env=env, args=args, effort_warning=effort_warning)

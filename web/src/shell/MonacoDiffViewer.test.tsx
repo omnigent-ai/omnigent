@@ -18,6 +18,7 @@ const h = vi.hoisted(() => ({
       hideUnchangedRegions?: { enabled?: boolean };
       ignoreTrimWhitespace?: boolean;
       diffWordWrap?: "on" | "off";
+      fontWeight?: string;
     };
   } | null,
   onMount: null as DiffOnMount | null,
@@ -113,6 +114,7 @@ describe("MonacoDiffViewer", () => {
     // Long unchanged runs collapse into expandable bands (only changed hunks
     // + context are shown), matching the previous diff view.
     expect(h.diffProps?.options?.hideUnchangedRegions?.enabled).toBe(true);
+    expect(h.diffProps?.options?.fontWeight).toBe("400");
   });
 
   it.each([
@@ -277,6 +279,7 @@ describe("MonacoDiffViewer", () => {
     expect(updateOptions).toHaveBeenCalledWith({
       fontSize: 20,
       fontFamily: codeFontFamilyForEditor(""),
+      fontWeight: "400",
     });
   });
 });

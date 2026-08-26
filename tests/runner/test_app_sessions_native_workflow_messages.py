@@ -873,6 +873,82 @@ async def test_forwarded_model_override_reaches_the_harness() -> None:
 
 
 @pytest.mark.asyncio
+async def test_forwarded_reasoning_effort_reaches_the_harness() -> None:
+    """The turn's reasoning effort rides the forwarded message to the harness.
+
+    ``_run_turn_bg`` builds the harness body field by field, so an effort that
+    is not threaded never becomes ``ExecutorConfig.extra["reasoning_effort"]``
+    and in-process harnesses (pi among them) run at the model default while the
+    session row claims otherwise — the background-turn half of #3536. The
+    server-side half (sending the persisted effort per event) stays with that
+    issue; here an in-band value and a prior ``effort_change`` are threaded.
+    """
+    hc = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+        ]
+    )
+    pm = _FakeProcessManager(hc)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    session = "ee1f2b3c4d5e6f708192a3b4c5d6e7f8"
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{session}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "hi"}],
+                "harness": "pi",
+                "reasoning": {"effort": "high"},
+            },
+        )
+        assert resp.status_code == 202
+        for _ in range(200):
+            if hc.posted_bodies:
+                break
+            await asyncio.sleep(0.01)
+
+        assert hc.posted_bodies, "harness never received a turn"
+        assert hc.posted_bodies[0].get("reasoning") == {"effort": "high"}, (
+            "the effort was dropped between the runner's message intake and the "
+            f"harness body: {hc.posted_bodies[0].keys()}"
+        )
+
+        # A mid-session /effort change is remembered, so the next turn carries
+        # it without the client repeating it in-band.
+        effort_resp = await client.post(
+            f"/v1/sessions/{session}/events",
+            json={"type": "effort_change", "effort": "low"},
+        )
+        assert effort_resp.status_code == 204
+        hc.posted_bodies.clear()
+        resp = await client.post(
+            f"/v1/sessions/{session}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "again"}],
+                "harness": "pi",
+            },
+        )
+        assert resp.status_code == 202
+        for _ in range(200):
+            if hc.posted_bodies:
+                break
+            await asyncio.sleep(0.01)
+
+    assert hc.posted_bodies, "harness never received the second turn"
+    assert hc.posted_bodies[0].get("reasoning") == {"effort": "low"}
+
+
+@pytest.mark.asyncio
 async def test_buffered_continuation_skips_transient_idle() -> None:
     """End-of-turn `idle` is suppressed when a buffered message will start a new turn."""
     import asyncio as _aio

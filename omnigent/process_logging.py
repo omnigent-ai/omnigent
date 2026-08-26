@@ -413,8 +413,35 @@ def configure_process_logging(
             for handler in handlers:
                 _add_handler_once(logger, handler)
 
+    # Mirror the file handler's reach with the optional debug-log upload sink,
+    # so it captures the same records this process writes to disk.
+    from omnigent.debug_logging import attach_debug_log_sink
+
+    sink_targets = _debug_sink_target_loggers(logger_names, root=root)
+    attach_debug_log_sink(sink_targets, source=destination, level=resolved_level)
+
     logging.captureWarnings(True)
     return path
+
+
+def _debug_sink_target_loggers(logger_names: Sequence[str], *, root: bool) -> list[logging.Logger]:
+    """Loggers the debug-log sink must attach to, mirroring the file handler.
+
+    The sink has to sit wherever a record is actually handled. A package logger
+    with ``propagate=False`` (e.g. ``omnigent`` under the CLI diagnostics setup)
+    never reaches root, so a root-only sink would miss every record logged under
+    it. This matches the file-handler placement in
+    :func:`configure_process_logging` exactly, so the sink captures the same
+    records the process writes to disk.
+    """
+    targets: list[logging.Logger] = []
+    if root:
+        targets.append(logging.getLogger())
+    for name in logger_names:
+        logger = logging.getLogger(name)
+        if not logger.propagate or not root:
+            targets.append(logger)
+    return targets
 
 
 def _add_handler_once(logger: logging.Logger, handler: logging.Handler) -> None:
