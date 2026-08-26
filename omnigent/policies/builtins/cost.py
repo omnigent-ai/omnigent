@@ -1022,29 +1022,26 @@ def user_period_cost_budget(
 
     def _read_period_approved(event: PolicyEvent) -> float:
         """
-        Read the highest approved checkpoint from today's daily record.
+        Read the highest approved checkpoint across all days in the period.
 
-        Period approval state is stored in today's daily record. Finds
-        today's record in the list and returns its ``ask_approved_usd``.
+        Period approval state is stored in daily records. Returns the maximum
+        ``ask_approved_usd`` value across all records in the period.
         """
-        from omnigent.db.utils import now_epoch
-        from omnigent.runtime.policies.builder import _utc_day
+        from contextlib import suppress
 
         context = event.get("context") or {}
         daily_records = context.get(context_key) or []
         if not isinstance(daily_records, list):
             return 0.0
 
-        today = _utc_day(now_epoch())
+        max_approved = 0.0
         for record in daily_records:
-            if isinstance(record, dict) and record.get("day_utc") == today:
+            if isinstance(record, dict):
                 raw = record.get("ask_approved_usd")
                 if raw is not None:
-                    try:
-                        return float(raw)
-                    except (TypeError, ValueError):
-                        return 0.0
-        return 0.0
+                    with suppress(TypeError, ValueError):
+                        max_approved = max(max_approved, float(raw))
+        return max_approved
 
     def _read_period_owner(event: PolicyEvent) -> str | None:
         """
