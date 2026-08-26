@@ -1,7 +1,7 @@
 """add harness column to user_daily_cost
 
 Revision ID: zb1a2b3c4d5e
-Revises: za1b2c3d4e5f
+Revises: e5d9bc8ac650
 Create Date: 2026-08-21 00:00:00.000000
 
 Adds a ``harness`` column to ``user_daily_cost`` to enable optional per-harness
@@ -28,7 +28,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "zb1a2b3c4d5e"
-down_revision: str | None = "za1b2c3d4e5f"
+down_revision: str | None = "e5d9bc8ac650"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
