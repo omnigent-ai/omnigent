@@ -11,8 +11,8 @@
  *
  * - **Appearance** — theme mode (System / Light / Dark), terminal theme,
  *   default transcript view, Workspace panel default, and UI/code font controls.
- * - **Git** — Git behavior, e.g. the default base branch pre-filled when
- *   naming a new worktree branch in the composer.
+ * - **Git** — Git behavior: the global "always use a random worktree" default
+ *   and the default base branch pre-filled when naming a new worktree branch.
  * - **Keyboard shortcuts** — the full shortcuts reference, shown inline.
  * - **Account** — only when the accounts auth provider is active. Absorbs
  *   the old sidebar AccountMenu: signed-in identity, change password, and
@@ -152,6 +152,7 @@ import {
   type TranscriptViewDefault,
 } from "@/lib/transcriptViewPreferences";
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
+import { readAlwaysUseWorktree, writeAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
 import {
   DEFAULT_HIDE_UNCONFIGURED_HARNESSES,
   readHideUnconfiguredHarnesses,
@@ -1057,9 +1058,46 @@ function GitSection() {
   return (
     <Section title="Git" description="Configure how Omnigent works with Git.">
       <div className="flex flex-col gap-8">
+        <AlwaysUseWorktreeControl />
         <DefaultBaseBranchControl />
       </div>
     </Section>
+  );
+}
+
+/**
+ * Global default: start every new session in a git workspace in a fresh
+ * randomly-named worktree, regardless of which folder the composer lands in.
+ * Per-project "Random worktree" settings override this in either direction —
+ * this only decides the default for workspaces a project hasn't set a choice on.
+ */
+function AlwaysUseWorktreeControl() {
+  const [value, setValue] = useState(() => readAlwaysUseWorktree());
+  const labelId = useId();
+  const toggle = useCallback((next: boolean) => {
+    setValue(next);
+    writeAlwaysUseWorktree(next);
+  }, []);
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <div className="flex min-w-0 flex-1 flex-col">
+        <span id={labelId} className="text-ui font-medium">
+          Always use a random worktree
+        </span>
+        <span className="text-ui text-muted-foreground">
+          Start new sessions in a fresh randomly-named git worktree in any git workspace. A
+          project's own Random worktree setting overrides this.
+        </span>
+      </div>
+      <Switch
+        aria-labelledby={labelId}
+        checked={value}
+        onCheckedChange={toggle}
+        data-testid="settings-always-use-worktree-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.git.always_use_worktree"
+      />
+    </div>
   );
 }
 
