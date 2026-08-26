@@ -187,8 +187,12 @@ the verdict you will give each facet (Step 2), record where a user *sees* the
 failure: `web` (the web SPA), `terminal` (a TUI or shell pane rendered inside
 the app — a native-harness pane, an embedded shell), `cli` (a command-line
 surface outside the app: the `omnigent` CLI, the REPL, a host daemon's output),
-or `desktop` (a failure in the Electron desktop shell itself — the setup/connect
-page, a native dialog, the window/popup policy — not the SPA it hosts).
+`desktop` (a failure in the Electron desktop shell itself — the setup/connect
+page, a native dialog, the window/popup policy — not the SPA it hosts), or
+`mobile` (a failure a user hits on the iOS/Android app — most are the SPA
+behaving differently at a phone viewport or under touch, filmed on the web lane
+at a mobile device profile; a few are native-chrome only — safe-area insets, the
+system-browser OIDC hop, the native setup screen).
 The surface picks the kind of test you author (Step 3) and the recorder that
 captures it (Step 4).
 
@@ -327,9 +331,9 @@ saved under `recordings/<slug>/` in your workspace:
   behaving correctly on the running build (e.g. `recordings/1234/fixed-picker.webm`).
 
 `not_reproduced` and `needs_more_info` facets have nothing to film — skip them.
-A `web` / `terminal` / `cli` / `desktop` facet is expected to yield a recording:
-reproduce it on that surface and film it. Only an `api` facet (a failure no user
-observes on any surface) legitimately has no recording.
+A `web` / `terminal` / `cli` / `desktop` / `mobile` facet is expected to yield a
+recording: reproduce it on that surface and film it. Only an `api` facet (a
+failure no user observes on any surface) legitimately has no recording.
 
 **Record exactly the verdict-appropriate clip per facet — nothing else.** One
 recording per `reproduced` facet (`kind: "before"`) and one per `already_fixed`
@@ -509,6 +513,33 @@ cause is named from what you observed rather than guessed.
   **skips** cleanly when they're absent, so if they can't be installed here keep
   `recordings: []` and name the missing dep in `evidence` (a real environment
   limit, not a `not_reproduced`). See `web/electron/e2e/README.md`.
+- **`mobile` facets** — the iOS/Android apps are thin native shells that load the
+  *same* server-served SPA in a WebView, so almost every mobile bug is a web-UI
+  journey that only misbehaves at a phone viewport or under touch (Enter vs.
+  newline on a small composer, a control that overflows off-screen, a
+  touch-scroll that doesn't take). Film these on the **web lane at a mobile device
+  profile** — pytest-playwright ships Playwright's device registry, so add
+  `--device` to the same recorder invocation and the whole context becomes mobile
+  (phone viewport, `is_mobile`, touch, a mobile user-agent), video included:
+
+  ```bash
+  pytest <test_path> --device "iPhone 13" --video on --screenshot on --output recordings/<slug>
+  ```
+
+  Pick a device whose form factor matches the report (`"iPhone 13"`,
+  `"Pixel 7"`, an `... landscape` variant). Everything else about the `web` lane
+  applies unchanged (build the SPA first, strip the runner env, move
+  `video.webm` to `before-`/`fixed-<facet>.webm`). Author the test itself with
+  touch/tap interactions where the journey needs them. Stamp the facet `mobile`
+  (it's a mobile-surface bug) even though the recorder is the browser at a phone
+  profile — the surface is where the *user* sees it, not the tool that films it.
+
+  A **small minority** of mobile bugs live in native chrome the WebView profile
+  can't show — iOS safe-area / Dynamic Island insets, the system-browser OIDC
+  hop, the native setup screen. Those need a real simulator/emulator screen
+  recording, which no CI path provisions today; keep `recordings: []` for such a
+  facet and name the missing device toolchain in `evidence` (a real environment
+  limit, not a `not_reproduced`). The authored test still ships.
 
 A recording must end on the outcome the user observes — the failure (wrong screen
 state, bad output, error) for a `before` recording, or the correct end state for a
@@ -581,7 +612,7 @@ Field meanings:
   `already_fixed`).
 - `facets` — an array of the per-sub-symptom breakdown from Steps 1–2, each an
   object with `symptom`, its own `verdict` (same four literals), its `surface`
-  (`web` / `terminal` / `cli` / `desktop` / `api`, from Step 1), and one line of
+  (`web` / `terminal` / `cli` / `desktop` / `mobile` / `api`, from Step 1), and one line of
   `evidence`. Always a list, even for a single-symptom bug (then it's one
   element). This is what stops a partially-landed fix from being averaged into a
   misleading single verdict.
