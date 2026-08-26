@@ -18,9 +18,7 @@ import {
   isUnexpectedTerminalClose,
   loadWebglRenderer,
   openTerminalLink,
-  parseOsc52Clipboard,
   parseTerminalClipboardMessage,
-  parseTerminalOsc52Capability,
   sgrWheelReports,
   terminalTheme,
   terminalKeyEventPayload,
@@ -139,14 +137,6 @@ describe("tmux clipboard parsing", () => {
     expect(decodeTerminalClipboardBase64("")).toBeNull();
   });
 
-  it("accepts tmux OSC 52 writes but rejects reads and other selections", () => {
-    const encoded = utf8Base64("copied");
-    expect(parseOsc52Clipboard(`;${encoded}`)).toBe("copied");
-    expect(parseOsc52Clipboard(`c;${encoded}`)).toBe("copied");
-    expect(parseOsc52Clipboard("c;?")).toBeNull();
-    expect(parseOsc52Clipboard(`p;${encoded}`)).toBeNull();
-  });
-
   it("accepts only the clipboard-write websocket schema", () => {
     const encoded = utf8Base64("from control mode");
     expect(
@@ -158,12 +148,6 @@ describe("tmux clipboard parsing", () => {
       parseTerminalClipboardMessage(JSON.stringify({ type: "resize", data: encoded })),
     ).toBeNull();
     expect(parseTerminalClipboardMessage("not json")).toBeNull();
-    expect(
-      parseTerminalOsc52Capability(
-        JSON.stringify({ type: "osc52-clipboard-capability", enabled: true }),
-      ),
-    ).toBe(true);
-    expect(parseTerminalOsc52Capability(JSON.stringify({ type: "resize" }))).toBeNull();
   });
 
   it("requires positive, recent input timing", () => {
@@ -512,7 +496,6 @@ describe("TerminalSession", () => {
     onInput?: () => void,
     clipboardEnabled = true,
     onClipboardRequest?: (text: string) => void,
-    controlMode = false,
   ) {
     const states: ConnectionState[] = [];
     const container = document.createElement("div");
@@ -524,7 +507,6 @@ describe("TerminalSession", () => {
       false,
       onActivity,
       onInput,
-      controlMode,
       clipboardEnabled,
       onClipboardRequest,
     );
@@ -582,7 +564,7 @@ describe("TerminalSession", () => {
   });
 
   it("writes inbound binary frames through xterm's ordered queue and fires onActivity", () => {
-    // WHY: ArrayBuffer message frames are raw PTY bytes — they must reach the
+    // WHY: ArrayBuffer message frames are raw pane bytes — they must reach the
     // terminal through xterm's ordered public write queue and trigger the
     // best-effort activity signal. Bypassing that queue can replay already-
     // parsed ANSI chunks and corrupt cursor state.
@@ -606,36 +588,19 @@ describe("TerminalSession", () => {
     session.dispose();
   });
 
-  it("handles PTY OSC 52 but does not trust raw control-mode pane OSC", async () => {
+  it("does not trust raw pane OSC 52 clipboard writes", async () => {
     vi.spyOn(performance, "now").mockReturnValue(10_000);
-    const ptyClipboard = vi.fn();
-    const pty = makeSession(undefined, undefined, true, ptyClipboard);
-    (pty.session as unknown as { lastUserInputAt: number }).lastUserInputAt = 9000;
-    const sequence = `\x1b]52;;${btoa("from pty")}\x07`;
-    const ptyTerm = (pty.session as unknown as { term: Terminal }).term;
-    ptyTerm.focus();
-    pty.socket.emit("message", {
-      data: JSON.stringify({ type: "osc52-clipboard-capability", enabled: true }),
-    });
-    await new Promise<void>((resolve) => {
-      ptyTerm.write(sequence, resolve);
-    });
-    expect(ptyClipboard).toHaveBeenCalledWith("from pty");
-    pty.session.dispose();
+    const onClipboardRequest = vi.fn();
+    const { session } = makeSession(undefined, undefined, true, onClipboardRequest);
+    (session as unknown as { lastUserInputAt: number }).lastUserInputAt = 9000;
+    const term = (session as unknown as { term: Terminal }).term;
 
-    const controlClipboard = vi.fn();
-    const control = makeSession(undefined, undefined, true, controlClipboard, true);
-    (control.session as unknown as { lastUserInputAt: number }).lastUserInputAt = 9000;
-    const controlTerm = (control.session as unknown as { term: Terminal }).term;
-    controlTerm.focus();
-    control.socket.emit("message", {
-      data: JSON.stringify({ type: "osc52-clipboard-capability", enabled: true }),
-    });
     await new Promise<void>((resolve) => {
-      controlTerm.write(sequence, resolve);
+      term.write(`\x1b]52;;${btoa("pane output")}\x07`, resolve);
     });
-    expect(controlClipboard).not.toHaveBeenCalled();
-    control.session.dispose();
+
+    expect(onClipboardRequest).not.toHaveBeenCalled();
+    session.dispose();
   });
 
   it("forwards validated clipboard frames only after recent input", () => {

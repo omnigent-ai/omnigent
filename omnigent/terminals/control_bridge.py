@@ -1,8 +1,6 @@
 """Shared tmux control-mode (``tmux -C``) ↔ WebSocket bridge.
 
-Alternative transport to :mod:`omnigent.terminals.ws_bridge`. Where the PTY
-bridge forks a full ``tmux attach`` client and streams the rendered screen,
-this bridge attaches a *control-mode* client and consumes tmux's line protocol:
+The bridge attaches a control-mode client and consumes tmux's line protocol:
 
 - ``%output <pane-id> <octal-escaped-bytes>`` — the raw bytes the program in a
   pane just produced, forwarded to the browser xterm.js as binary frames. The
@@ -28,21 +26,14 @@ Design notes learned from the protocol (see ``control_bridge`` spike):
   the client exits; the hex channel is byte-exact for ESC sequences, control
   chars, and UTF-8 multibyte alike.
 
-The browser-facing terminal stream matches the PTY bridge (binary frames out =
-raw pane bytes; text frames in = JSON ``{"type":"resize",...}``; binary frames
-in = input bytes). Control mode additionally sends a typed text JSON frame when
-tmux reports a copied paste buffer, because its outer-client OSC 52 is not part
-of ``%output``. Both remain interchangeable behind the same ``/attach`` URL.
+The browser-facing stream uses binary frames for raw pane bytes, text JSON
+frames for resize controls, and binary frames for input. A typed text JSON
+frame carries tmux clipboard updates because outer-client OSC 52 is absent from
+``%output``.
 
-Known limitation vs the PTY bridge: tmux's own overlays (``display-popup``,
-copy-mode, status line) are NOT delivered to a control-mode client, so the
-native cost-approval popup (:mod:`omnigent.native_cost_popup`) does not render
-in a control-mode browser terminal. That popup is a secondary convenience for
-users working in a real native TTY; the web ApprovalCard (SSE-driven) remains
-the primary approval surface and is unaffected. The harnesses' own input,
-paste, and readiness logic run tmux commands directly against the socket
-(``send-keys``/``load-buffer``/``capture-pane``) and are independent of the
-attach transport, so they behave identically under either bridge.
+Tmux's own overlays (``display-popup``, copy-mode, status line) are not delivered
+to control clients. The native cost-approval popup remains available to users
+working in a real native TTY, while the web ApprovalCard is the browser surface.
 """
 
 from __future__ import annotations
@@ -60,23 +51,15 @@ from typing import Final
 
 from fastapi import WebSocket, WebSocketDisconnect
 
-# Reuse the PTY bridge's application close codes AND its coalescing forwarder so
-# both transports speak the same dialect to the frontend and merge burst output
-# the same way (see ws_bridge for the authoritative definitions).
-# ``_forward_pty_to_ws`` is queue-driven and transport-agnostic — it drains
-# everything already queued into one bounded ``send_bytes`` — so the control
-# reader can feed it decoded ``%output`` payloads exactly like the PTY reader
-# feeds raw PTY reads. Under a burst the browser send lags tmux's firehose, a
-# backlog forms, and the forwarder collapses thousands of tiny per-line frames
-# into a few large ones. ``_coalesce_limit_after_input`` keeps the frame right
-# after a keystroke small so the echo stays on xterm's synchronous paint path.
-from omnigent.terminals.ws_bridge import (
+from omnigent.terminals.ws_common import (
     WS_CLOSE_INTERNAL_ERROR,
     WS_CLOSE_TERMINAL_DETACHED,
     WS_CLOSE_TERMINAL_NOT_FOUND,
+    _check_pane_dead_definitive,
     _coalesce_limit_after_input,
-    _forward_pty_to_ws,
+    _forward_terminal_to_ws,
     _monotonic,
+    _tmux_session_alive,
 )
 
 _logger = logging.getLogger(__name__)
@@ -495,12 +478,9 @@ async def bridge_tmux_control_to_websocket(
 ) -> None:
     """Bridge a tmux control-mode client to an already-accepted *websocket*.
 
-    Drop-in alternative to
-    :func:`omnigent.terminals.ws_bridge.bridge_tmux_pty_to_websocket` with the
-    same signature and terminal byte stream. Control mode additionally emits
-    server-to-browser clipboard JSON frames. Caller must have called
-    ``websocket.accept()``. On exit (any branch) the control client is torn
-    down and the websocket closed best-effort with the shared 4404/4405 codes.
+    Caller must have called ``websocket.accept()``. On exit the control client
+    is torn down and the websocket closed best-effort with the shared
+    4404/4405 codes.
 
     :param websocket: An accepted FastAPI :class:`WebSocket`.
     :param socket_path: Filesystem path to the tmux server socket.
@@ -509,8 +489,7 @@ async def bridge_tmux_control_to_websocket(
         binary input frames at the application layer (defense in depth).
     :param on_client_interaction: Optional callback fired on every client
         interaction (connect, disconnect, each input/resize frame) so the
-        idle watcher can discount client-driven repaints. See the PTY bridge
-        for the full rationale.
+        idle watcher can discount client-driven repaints.
     :param reader_done: Optional test-only event set once the reader has queued
         the full backlog and the ``None`` EOF sentinel, letting a test await the
         reader draining tmux instead of sleeping. Inert (never awaited) when
@@ -577,8 +556,8 @@ async def bridge_tmux_control_to_websocket(
     # websocket. Serialize sends so ASGI never sees concurrent send calls.
     ws_send_lock = asyncio.Lock()
     # Monotonic stamp of the last forwarded browser input; the forwarder reads
-    # it to shrink the frame cap right after a keystroke (keeps the echo on
-    # xterm's synchronous paint path — see the PTY bridge) and clipboard
+    # it to shrink the frame cap right after a keystroke (keeping the echo on
+    # xterm's synchronous paint path) and clipboard
     # forwarding uses it to identify which attached client initiated a copy.
     last_client_input_at: float | None = None
 
@@ -764,7 +743,7 @@ async def bridge_tmux_control_to_websocket(
     # queued payloads into bounded WebSocket frames; ws task drives input.
     read_task = asyncio.create_task(_read_control(), name="tmux-control-read")
     forward_task = asyncio.create_task(
-        _forward_pty_to_ws(
+        _forward_terminal_to_ws(
             websocket,
             output_chunks,
             max_coalesce_bytes=_current_ws_coalesce_limit,
@@ -855,12 +834,7 @@ async def bridge_tmux_control_to_websocket(
             if control_ended_first:
                 # The control client ended: distinguish a genuine session-gone
                 # (%exit with a dead/absent pane) from a mere detach. Reuse the
-                # PTY bridge's pane-dead probe for a single source of truth.
-                from omnigent.terminals.ws_bridge import (
-                    _check_pane_dead_definitive,
-                    _tmux_session_alive,
-                )
-
+                # Use the shared pane-dead probe for a single source of truth.
                 pane_dead = await _check_pane_dead_definitive(socket_path, tmux_target)
                 if pane_dead is True or (
                     pane_dead is None and not await _tmux_session_alive(socket_path, tmux_target)

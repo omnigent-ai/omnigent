@@ -2,10 +2,8 @@
 
 The pre-commit fixer rewrites every ``source = { registry = "<url>" }``
 in ``uv.lock`` to public PyPI so a developer's local index/proxy never
-leaks into the committed lockfile, and strips wheel/sdist ``size``
-fields (served by pypi.org but not by proxy indexes) so re-locks from
-either side agree on one canonical form. These tests pin that contract:
-arbitrary registry URLs are normalized, size fields are dropped,
+leaks into the committed lockfile. These tests pin that contract:
+arbitrary registry URLs are normalized, artifact metadata and
 non-registry sources are left alone, the fixer is idempotent, and
 ``main`` signals modifications via its exit code (1 = changed → commit
 aborts and re-stages; 0 = clean).
@@ -171,44 +169,15 @@ def test_main_check_flag_position_independent(tmp_path: Path) -> None:
     assert _MOD.main([str(lock), "--check"]) == 0
 
 
-# A registry file entry as uv writes it when the index serves sizes (pypi.org).
-_SIZED_ENTRY = (
-    'sdist = { url = "https://files.pythonhosted.org/packages/ab/cd/pkg.tar.gz", '
-    'hash = "sha256:aaaa", size = 116543, upload-time = "2026-01-28T10:17:05.322Z" }\n'
-)
-
-
-def test_normalize_text_strips_size_fields() -> None:
-    """``size`` metadata is dropped; url, hash, and upload-time survive."""
-    result = _MOD.normalize_text(_SIZED_ENTRY)
-    assert "size = " not in result
-    assert 'hash = "sha256:aaaa", upload-time = "2026-01-28T10:17:05.322Z"' in result
-
-
-def test_normalize_text_strips_size_field_without_upload_time() -> None:
-    """A trailing ``size`` with no ``upload-time`` after it is also stripped."""
-    url = "https://files.pythonhosted.org/packages/ab/cd/p.whl"
-    text = f'    {{ url = "{url}", hash = "sha256:bb", size = 7 }},\n'
-    assert _MOD.normalize_text(text) == f'    {{ url = "{url}", hash = "sha256:bb" }},\n'
-
-
-def test_non_canonical_entries_flags_size_fields() -> None:
-    """Size fields are reported as one summary offender so ``--check`` fails."""
-    assert _MOD.non_canonical_entries(_SIZED_ENTRY * 2) == ["size field on 2 file entries"]
-
-
-def test_main_check_fails_on_size_fields(tmp_path: Path) -> None:
-    """``--check`` returns 1 for a lockfile carrying size metadata, without writing."""
-    lock = tmp_path / "uv.lock"
-    lock.write_text(_SIZED_ENTRY)
-    assert _MOD.main(["--check", str(lock)]) == 1
-    assert lock.read_text() == _SIZED_ENTRY
-
-
-def test_main_strips_size_fields_and_returns_one(tmp_path: Path) -> None:
-    """Fix mode strips sizes in place, returns 1, and is idempotent after."""
-    lock = tmp_path / "uv.lock"
-    lock.write_text(_SIZED_ENTRY)
-    assert _MOD.main([str(lock)]) == 1
-    assert "size = " not in lock.read_text()
-    assert _MOD.main([str(lock)]) == 0
+def test_normalize_text_preserves_artifact_metadata() -> None:
+    """File sizes, hashes, and upload times survive URL normalization."""
+    proxy = "https://pypi-proxy.cloud.databricks.com"
+    text = (
+        f'sdist = {{ url = "{proxy}/packages/ab/cd/pkg.tar.gz", '
+        'hash = "sha256:aaaa", size = 116543, upload-time = "2026-01-28T10:17:05.322Z" }\n'
+    )
+    assert _MOD.normalize_text(text) == (
+        'sdist = { url = "https://files.pythonhosted.org/packages/ab/cd/pkg.tar.gz", '
+        'hash = "sha256:aaaa", size = 116543, upload-time = "2026-01-28T10:17:05.322Z" }\n'
+    )
+    assert _MOD.non_canonical_entries(_MOD.normalize_text(text)) == []

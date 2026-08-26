@@ -95,14 +95,6 @@ interface TerminalViewProps {
   /** Whether the optional resume action is currently in flight. */
   resumePending?: boolean;
   /**
-   * Web-attach transport for this terminal (``"control"`` / ``"pty"``),
-   * from the terminal resource's ``metadata.terminal_transport``. Control
-   * mode gives browser xterm ownership of scrollback; PTY mode attaches a
-   * tmux client. When set, it is also forwarded to the server as
-   * ``?transport=`` so the attach matches the behavior the UI renders for.
-   */
-  transport?: "control" | "pty";
-  /**
    * False while the surface is mounted but hidden (a pre-warmed attach
    * kept alive behind the chat view). The session stays connected either
    * way; on the hidden→visible edge the terminal takes keyboard focus —
@@ -130,13 +122,9 @@ export function TerminalView({
   onInput,
   onResume,
   resumePending = false,
-  transport,
   active = true,
   directAttachUrl,
 }: TerminalViewProps) {
-  // Control mode forwards raw pane output and uses typed clipboard messages;
-  // PTY mode attaches a tmux client and accepts trusted tmux OSC 52 writes.
-  const controlMode = transport === "control";
   const [state, setState] = useState<ConnectionState>({ kind: "connecting" });
   const [connectAttempt, setConnectAttempt] = useState(0);
   const [resumeError, setResumeError] = useState<string | null>(null);
@@ -567,10 +555,8 @@ export function TerminalView({
           const h = getSessionHost(sessionId);
           return h && !isHostKeyless(h) ? h : undefined;
         })();
-        const relayUrl = buildAttachUrl(sessionId, terminalId, readOnly, computedHostId, transport);
-        const directUrl = directAttachUrl
-          ? withAttachParams(directAttachUrl, readOnly, transport)
-          : undefined;
+        const relayUrl = buildAttachUrl(sessionId, terminalId, readOnly, computedHostId);
+        const directUrl = directAttachUrl ? withAttachParams(directAttachUrl, readOnly) : undefined;
         // Never keep the user waiting on the direct path: this resolves
         // direct only when the loopback listener is already known
         // reachable; otherwise it returns the relay URL immediately.
@@ -583,7 +569,6 @@ export function TerminalView({
           isDarkRef.current,
           notifyActivity,
           notifyInput,
-          controlMode,
           !readOnly && activeRef.current,
           notifyClipboardRequest,
         );
@@ -613,9 +598,7 @@ export function TerminalView({
       sessionId,
       terminalId,
       readOnly,
-      transport,
       directAttachUrl,
-      controlMode,
       notifyState,
       notifyActivity,
       notifyInput,
@@ -854,10 +837,6 @@ function resumeErrorText(error: unknown): string {
  *     e.g. ``"terminal_bash_s1"``.
  * :param readOnly: If true, requests a read-only attach. Forwarded
  *     to the server as ``?read_only=true``.
- * :param transport: Optional per-attach transport override
- *     (``"control"`` / ``"pty"``), forwarded as ``?transport=``. Lets a
- *     terminal be A/B'd against the other mode side by side; ``undefined``
- *     lets the server pick from the terminal spec / global default.
  * :returns: The path-and-query portion of the WS URL, e.g.
  *     ``"/v1/sessions/.../resources/terminals/.../attach"``.
  */
@@ -866,7 +845,6 @@ export function buildAttachPath(
   terminalId: string,
   readOnly: boolean,
   hostId?: string,
-  transport?: string,
 ): string {
   const path =
     `/v1/sessions/${encodeURIComponent(sessionId)}` +
@@ -880,7 +858,6 @@ export function buildAttachPath(
   const params = new URLSearchParams();
   if (readOnly) params.set("read_only", "true");
   if (hostId) params.set("omnigent_slice_key", hostId);
-  if (transport) params.set("transport", transport);
   const qs = params.toString();
   return qs ? `${path}?${qs}` : path;
 }
@@ -897,7 +874,6 @@ export function buildAttachPath(
  * :param readOnly: If true, requests a read-only attach.
  * :param hostId: The session's host_id, forwarded as the routing key
  *     ``?omnigent_slice_key=``.
- * :param transport: Optional per-attach transport override.
  * :returns: The fully-qualified ``ws(s)://`` URL.
  */
 function buildAttachUrl(
@@ -905,9 +881,8 @@ function buildAttachUrl(
   terminalId: string,
   readOnly: boolean,
   hostId?: string,
-  transport?: string,
 ): string {
   // Delegates origin/prefix resolution to the embed host when present
   // (standalone falls back to the current page's origin).
-  return resolveWebSocketUrl(buildAttachPath(sessionId, terminalId, readOnly, hostId, transport));
+  return resolveWebSocketUrl(buildAttachPath(sessionId, terminalId, readOnly, hostId));
 }

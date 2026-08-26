@@ -4,7 +4,7 @@
 terminal-first program, mirroring ``omnigent codex`` / ``omnigent claude``.
 It creates or binds an Omnigent session, launches ``agy`` in a runner-owned
 tmux terminal resource, then attaches the local TTY (directly to the
-runner's tmux when same-machine, else over the WebSocket PTY bridge).
+runner's tmux when same-machine, else over the WebSocket terminal bridge).
 
 The RPC read driver (Task 12+) replaced the retired transcript-tail forwarder:
 the reader mirrors agy's steps over connect-RPC, and web turns are delivered via
@@ -1066,7 +1066,7 @@ async def _attach_terminal(
     Attach to the prepared agy terminal, tearing it down on real exit.
 
     Prefers a direct local tmux attach when the runner shares this host;
-    otherwise relays over the WebSocket PTY bridge with reconnect. On a
+    otherwise relays over the WebSocket terminal bridge with reconnect. On a
     real exit (not a tmux detach) the AP-side terminal resource is
     best-effort closed, unless this invocation reattached to a terminal
     another launcher owns.
@@ -1377,7 +1377,7 @@ async def _attach_direct_tmux(socket_path: Path, tmux_target: str) -> _AttachOut
         outlives the attach (user detached), else
         :attr:`_AttachOutcome.EXITED`.
     """
-    from omnigent.terminals.ws_bridge import _tmux_session_alive
+    from omnigent.terminals.ws_common import _tmux_session_alive
 
     env = os.environ.copy()
     env.pop("TMUX", None)

@@ -134,7 +134,7 @@ from omnigent.native_terminal import (
 from omnigent.native_terminal import (
     terminal_attach_url as _attach_url,
 )
-from omnigent.terminals.ws_bridge import (
+from omnigent.terminals.ws_common import (
     WS_CLOSE_TERMINAL_DETACHED,
     WS_CLOSE_TERMINAL_NOT_FOUND,
 )
@@ -365,7 +365,7 @@ class PreparedClaudeTerminal:
         when the runner did not advertise a socket. Drives the
         same-machine direct ``tmux attach`` fast path; a remote
         runner's socket won't exist locally, so the attach falls back
-        to the WebSocket PTY bridge.
+        to the WebSocket terminal bridge.
     :param tmux_target: tmux ``-t`` target for the terminal pane,
         e.g. ``"main"``. ``None`` when unavailable. Paired with
         ``tmux_socket`` for the direct attach.
@@ -3239,7 +3239,7 @@ def _can_attach_direct_tmux(prepared: PreparedClaudeTerminal) -> bool:
     socket exists on this host (so the runner shares this machine), and
     ``tmux`` is on PATH. This is the same-machine fast path: it wires the
     local TTY straight to the runner's tmux pane instead of relaying
-    every keystroke over the WebSocket PTY bridge. A remote runner's
+    every keystroke over the WebSocket terminal bridge. A remote runner's
     socket won't exist locally, so this returns ``False`` and the caller
     falls back to the WebSocket attach. Mirrors the Codex wrapper's
     :func:`omnigent.codex_native._can_attach_direct_tmux`.
@@ -3282,7 +3282,7 @@ async def _attach_direct_tmux(
         outlives the attach (user detached), else
         :attr:`_AttachOutcome.EXITED`.
     """
-    from omnigent.terminals.ws_bridge import _check_pane_dead_definitive, _tmux_session_alive
+    from omnigent.terminals.ws_common import _check_pane_dead_definitive, _tmux_session_alive
 
     startup_profiler = startup_profiler or StartupProfiler(name="omnigent claude", enabled=False)
     env = dict(os.environ)
@@ -3664,8 +3664,8 @@ async def _is_terminal_resource_gone(
     a clean tmux exit because Claude quit (the wrapper should stop).
     The runner's terminal-attach route emits close code ``4404`` when
     the resource is already marked stopped before attach, but a
-    teardown that races attach can produce a code-``1000`` close from
-    the PTY bridge instead. This GET disambiguates the two states.
+    teardown that races attach can produce a code-``1000`` bridge close.
+    This GET disambiguates the two states.
 
     HTTP / connection errors are treated as "not gone" so a server
     that's still bouncing (probe also fails) keeps the wrapper in the
@@ -3757,10 +3757,9 @@ def _is_terminal_detached_close(exc: ConnectionClosed) -> bool:
     """
     Return whether *exc* indicates the user detached from tmux.
 
-    The runner's PTY bridge closes the attach WebSocket with code
-    ``WS_CLOSE_TERMINAL_DETACHED`` (``4405``) when the ``tmux attach``
-    child exits but ``has-session`` confirms the session is still
-    alive — i.e. the user pressed the tmux detach key. Unlike a 4404
+    The runner's terminal bridge closes the attach WebSocket with code
+    ``WS_CLOSE_TERMINAL_DETACHED`` (``4405``) when the control client exits but
+    the tmux pane remains alive. Unlike a 4404
     (terminal gone), this must NOT end the session: the runner keeps
     running so the web UI stays connected.
 
@@ -4143,7 +4142,7 @@ def _run_with_remote_server(
     creates/resolves the session, persists the pass-through args, waits
     for the daemon-spawned runner + its auto-created terminal, and
     attaches (directly to the runner's tmux when it is local, else over
-    the WebSocket PTY bridge). See designs/NATIVE_RUNNER_SERVER_LAUNCH.md.
+    the WebSocket terminal bridge). See designs/NATIVE_RUNNER_SERVER_LAUNCH.md.
 
     :param base_url: Remote Omnigent server base URL without a trailing
         slash, e.g. ``"https://example.databricks.com"``.
@@ -5545,7 +5544,7 @@ async def _read_claude_terminal_tmux(
 
     Lets the caller decide whether to attach to the runner's tmux
     directly (same machine, low latency) instead of relaying over the
-    WebSocket PTY bridge. Best-effort: any lookup failure, non-200, or
+    WebSocket terminal bridge. Best-effort: any lookup failure, non-200, or
     missing metadata yields ``(None, None)``, which callers treat as
     "not locally attachable" and fall back to the WebSocket path.
 

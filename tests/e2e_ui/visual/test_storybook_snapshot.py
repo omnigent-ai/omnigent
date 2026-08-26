@@ -19,7 +19,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Page, Route, expect
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _STORYBOOK_ROOT = _REPO_ROOT / "web" / "storybook-static"
@@ -113,12 +113,32 @@ def test_story_matches_baseline(
 ) -> None:
     """Render one tagged story in isolation and compare its pixels."""
     page = snapshot_page
+    unexpected_requests: list[str] = []
+
+    def reject_external_request(route: Route) -> None:
+        if route.request.url.startswith(f"{storybook_server}/"):
+            route.continue_()
+            return
+        unexpected_requests.append(route.request.url)
+        route.abort()
+
+    page.route("**/*", reject_external_request)
     story_id = quote(story.id, safe="")
     page.goto(f"{storybook_server}/iframe.html?id={story_id}&viewMode=story")
 
     root = page.locator("#storybook-root")
     surface = root.locator(":scope > :not(script)").first
     expect(surface).to_be_visible(timeout=30_000)
+    page.wait_for_function(
+        "(id) => document.documentElement.dataset.storybookStoryId === id",
+        arg=story.id,
+        timeout=30_000,
+    )
+    html = page.locator("html")
+    story_status = html.get_attribute("data-storybook-story-status")
+    play_error = html.get_attribute("data-storybook-play-error")
+    assert story_status == "success", f"Storybook story finished with status {story_status!r}"
+    assert play_error is None, "Storybook play function threw an exception"
 
     # Freeze motion so spinners, transitions, and delayed mascot animation do
     # not encode capture timing into the baseline.
@@ -127,10 +147,32 @@ def test_story_matches_baseline(
             "*, *::before, *::after { animation: none !important; transition: none !important; }"
         )
     )
+    shared_code_blocks = page.locator('[data-code-highlighted="false"]')
+    if shared_code_blocks.count() > 0:
+        page.wait_for_function(
+            """() => Array.from(document.querySelectorAll('[data-code-highlighted]'))
+                .every((block) => block.getAttribute('data-code-highlighted') === 'true')""",
+            timeout=30_000,
+        )
+
+    code_blocks = page.locator('[data-streamdown="code-block-body"]')
+    if code_blocks.count() > 0:
+        page.wait_for_function(
+            """() => {
+                const spans = Array.from(document.querySelectorAll(
+                    '[data-streamdown="code-block-body"] span[style*="--sdm-c"]'
+                ));
+                return spans.length > 1 &&
+                    new Set(spans.map((span) => getComputedStyle(span).color)).size > 1;
+            }""",
+            timeout=30_000,
+        )
+
     settle_for_snapshot(page)
     page.evaluate(
         "() => new Promise((resolve) => "
         "requestAnimationFrame(() => requestAnimationFrame(resolve)))"
     )
 
+    assert not unexpected_requests, f"Story made external requests: {unexpected_requests}"
     assert_snapshot(surface)
