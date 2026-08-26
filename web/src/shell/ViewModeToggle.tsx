@@ -30,6 +30,9 @@ export function ViewModeToggle() {
       role="group"
       aria-label="Switch between chat and terminal"
       data-testid="view-mode-toggle"
+      // Lets the mobile header pill inset itself only when this segmented
+      // track is present — see MOBILE_GLASS_PILL.
+      data-slot="view-mode-toggle"
       // Inset track: p-0.5 around two size-6 segments lands the control at
       // 32px tall, matching the header's other controls.
       className="flex items-center gap-0.5 rounded-[var(--radius-lg)] bg-muted/60 p-0.5"
