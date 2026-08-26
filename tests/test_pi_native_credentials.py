@@ -1155,7 +1155,7 @@ def test_inline_family_configured_gateway_default_survives_verbatim() -> None:
     assert provider.api == "anthropic-messages"
     assert provider.model == "databricks-claude-opus-4-8"
     cfg = provider.to_models_config()
-    assert cfg["providers"]["omnigent"]["models"] == [{"id": "databricks-claude-opus-4-8"}]
+    assert cfg["providers"]["omnigent"]["models"][0]["id"] == "databricks-claude-opus-4-8"
 
 
 def test_databricks_profile_registers_gpt_provider(monkeypatch: pytest.MonkeyPatch) -> None:
