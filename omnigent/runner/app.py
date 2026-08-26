@@ -426,6 +426,19 @@ _WAKE_POST_RETRY_MAX_DELAY_S = 4.0
 # classification): everything else in 4xx is a permanent client-side rejection.
 _WAKE_POST_TRANSIENT_4XX = frozenset({408, 409, 425, 429})
 
+# Bounded retry budget for the primary model-stream relay (``proxy_stream``).
+# A dead-channel drop (see ``_DEAD_HARNESS_CHANNEL_ERRORS``) on the harness
+# response stream — e.g. an ``httpx.ReadError`` seconds into a turn — otherwise
+# terminates the turn as failed with the generic "Harness stream connection
+# error" and no retry, even though the gateway serves the same stream fine to a
+# fresh client. Re-drive the turn, but ONLY while it has produced no observable
+# output yet (no ``response.created``, no locally dispatched work): once the
+# model has started emitting, a re-POST would double the response, so we fail as
+# before. Mirrors the policy-verdict-delivery path's dead-channel retry.
+_STREAM_RELAY_MAX_ATTEMPTS = 3
+_STREAM_RELAY_RETRY_BASE_DELAY_S = 0.5
+_STREAM_RELAY_RETRY_MAX_DELAY_S = 4.0
+
 # Cadence for ``session.heartbeat`` keepalive events on the runner's
 # ``GET /v1/sessions/{id}/stream`` endpoint. Between turns the event
 # queue is idle — without periodic bytes, an intermediate proxy (e.g.
@@ -7007,7 +7020,16 @@ def create_runner_app(
             event_body = _wrap_as_message_event(body)
             _inject_mcp_schemas(event_body, _mcp_schemas)
             _response_id: str | None = None
-            try:
+            # Hoisted so the terminal handler can gate the dead-channel retry:
+            # a re-POST is only safe before ``response.created``, before any
+            # locally dispatched work (tool calls, policy evals), and before any
+            # byte has been yielded downstream — re-driving must never duplicate
+            # frames the client already saw.
+            _dispatch_tasks: list[_asyncio.Task[object]] = []
+            _yielded_any = False
+
+            async def _run_stream_attempt() -> AsyncIterator[bytes]:
+                nonlocal _response_id, _dispatch_tasks, _yielded_any
                 async with client.stream(
                     "POST",
                     f"/v1/sessions/{conv_id}/events",
@@ -7040,7 +7062,7 @@ def create_runner_app(
 
                     _omnigent_task_id = cast(str | None, body.get("task_id"))
                     _buffer = ""
-                    _dispatch_tasks: list[_asyncio.Task[object]] = []
+                    _dispatch_tasks = []
                     # Sub-agent start edge → minted child id, so the completion
                     # edge can address the child it created. Per-stream.
                     _subagent_child_futures: dict[str, _asyncio.Future[str]] = {}
@@ -7380,6 +7402,7 @@ def create_runner_app(
                                     continue
 
                             if event is None:
+                                _yielded_any = True
                                 yield raw_sse_bytes
                                 continue
                             if not _defer_publish and event.get("type") != "response.created":
@@ -7387,6 +7410,7 @@ def create_runner_app(
                             if dispatch is not None and event.get(_RUNNER_DISPATCHED_FIELD):
                                 pass
                             else:
+                                _yielded_any = True
                                 yield raw_sse_bytes
 
                     if _dispatch_tasks:
@@ -7396,44 +7420,84 @@ def create_runner_app(
                         conv_id, error=_stream_failed_error, owner_response_id=_response_id
                     )
 
-            except _ContextWindowOverflow as overflow:
-                _error = {
-                    "code": "context_length_exceeded",
-                    "message": (
-                        f"Context window exceeded: {overflow.actual_tokens} tokens "
-                        f"> {overflow.max_tokens} max"
-                    ),
-                    "type": "_ContextWindowOverflow",
-                }
-                _overflow_fail = {
-                    "type": "response.failed",
-                    "response": {"status": "failed", "error": _error},
-                    "error": _error,
-                }
-                _publish_event(conv_id, _overflow_fail)
-                _on_proxy_stream_end(conv_id, error=_error, owner_response_id=_response_id)
-                yield _response_failed_event(_error)
+            for _attempt in range(_STREAM_RELAY_MAX_ATTEMPTS):
+                _response_id = None
+                _dispatch_tasks = []
+                _yielded_any = False
+                try:
+                    async for _out in _run_stream_attempt():
+                        yield _out
+                    return
 
-            except (httpx.HTTPError, RuntimeError) as exc:
-                _logger.exception(
-                    "proxy stream connection error for %s: %s",
-                    conv_id,
-                    exc,
-                    extra={"session_id": conv_id},
-                )
-                _error = {
-                    "code": "connection_error",
-                    "message": "Harness stream connection error.",
-                    "type": type(exc).__name__,
-                }
-                _http_fail = {
-                    "type": "response.failed",
-                    "response": {"status": "failed", "error": _error},
-                    "error": _error,
-                }
-                _publish_event(conv_id, _http_fail)
-                _on_proxy_stream_end(conv_id, error=_error, owner_response_id=_response_id)
-                yield _response_failed_event(_error)
+                except _ContextWindowOverflow as overflow:
+                    _error = {
+                        "code": "context_length_exceeded",
+                        "message": (
+                            f"Context window exceeded: {overflow.actual_tokens} tokens "
+                            f"> {overflow.max_tokens} max"
+                        ),
+                        "type": "_ContextWindowOverflow",
+                    }
+                    _overflow_fail = {
+                        "type": "response.failed",
+                        "response": {"status": "failed", "error": _error},
+                        "error": _error,
+                    }
+                    _publish_event(conv_id, _overflow_fail)
+                    _on_proxy_stream_end(conv_id, error=_error, owner_response_id=_response_id)
+                    yield _response_failed_event(_error)
+                    return
+
+                except (httpx.HTTPError, RuntimeError) as exc:
+                    # A dead harness channel (e.g. httpx.ReadError) that drops the
+                    # stream before the turn produced any output is safe to
+                    # re-drive: no response.created was seen and no local dispatch
+                    # is pending, so a re-POST cannot double the response. Retry
+                    # within budget; on exhaustion or once output has started,
+                    # fail with the generic connection error as before.
+                    if (
+                        isinstance(exc, _DEAD_HARNESS_CHANNEL_ERRORS)
+                        and _response_id is None
+                        and not _dispatch_tasks
+                        and not _yielded_any
+                        and _attempt + 1 < _STREAM_RELAY_MAX_ATTEMPTS
+                    ):
+                        _logger.warning(
+                            "proxy stream dead channel before first output for %s "
+                            "(attempt %d/%d); re-driving turn: %s",
+                            conv_id,
+                            _attempt + 1,
+                            _STREAM_RELAY_MAX_ATTEMPTS,
+                            exc,
+                            extra={"session_id": conv_id},
+                        )
+                        await _asyncio.sleep(
+                            min(
+                                _STREAM_RELAY_RETRY_BASE_DELAY_S * (2**_attempt),
+                                _STREAM_RELAY_RETRY_MAX_DELAY_S,
+                            )
+                        )
+                        continue
+                    _logger.exception(
+                        "proxy stream connection error for %s: %s",
+                        conv_id,
+                        exc,
+                        extra={"session_id": conv_id},
+                    )
+                    _error = {
+                        "code": "connection_error",
+                        "message": "Harness stream connection error.",
+                        "type": type(exc).__name__,
+                    }
+                    _http_fail = {
+                        "type": "response.failed",
+                        "response": {"status": "failed", "error": _error},
+                        "error": _error,
+                    }
+                    _publish_event(conv_id, _http_fail)
+                    _on_proxy_stream_end(conv_id, error=_error, owner_response_id=_response_id)
+                    yield _response_failed_event(_error)
+                    return
 
         return StreamingResponse(
             proxy_stream(),

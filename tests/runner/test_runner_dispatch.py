@@ -5047,6 +5047,223 @@ async def test_scaffold_subagent_defers_terminal_delivery_while_continuation_buf
     assert entry.delivered is True
 
 
+class _MaybeFailingHarnessStream:
+    """Fake harness stream that can drop mid-``aiter_text`` with a dead-channel error.
+
+    Yields the first ``fail_after`` scripted chunks, then either raises
+    ``httpx.ReadError`` (simulating the gateway relay dropping the SSE
+    connection) or streams the remaining chunks to completion.
+
+    :param chunks: SSE chunks to stream when the attempt succeeds.
+    :param should_fail: Whether this attempt raises instead of finishing.
+    :param fail_after: Number of leading chunks to emit before raising.
+    """
+
+    def __init__(self, chunks: list[str], should_fail: bool, fail_after: int) -> None:
+        """Store the per-attempt script and failure shape.
+
+        :param chunks: SSE chunks to stream when the attempt succeeds.
+        :param should_fail: Whether this attempt raises instead of finishing.
+        :param fail_after: Number of leading chunks to emit before raising.
+        """
+        self._chunks = chunks
+        self._should_fail = should_fail
+        self._fail_after = fail_after
+        self.status_code = 200
+
+    async def __aenter__(self) -> _MaybeFailingHarnessStream:
+        """Enter the stream context.
+
+        :returns: This stream.
+        """
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        """Exit without suppressing exceptions.
+
+        :param exc_type: Exception type from the context, if any.
+        :param exc: Exception value from the context, if any.
+        :param tb: Traceback from the context, if any.
+        :returns: None.
+        """
+        del exc_type, exc, tb
+
+    async def aiter_text(self) -> AsyncIterator[str]:
+        """Stream chunks, optionally dropping the channel mid-flight.
+
+        :returns: Async iterator of SSE chunks.
+        :raises httpx.ReadError: When this attempt is scripted to fail.
+        """
+        for index, chunk in enumerate(self._chunks):
+            if self._should_fail and index >= self._fail_after:
+                raise httpx.ReadError("harness stream dropped")
+            yield chunk
+        if self._should_fail:
+            raise httpx.ReadError("harness stream dropped")
+
+
+class _DeadChannelThenOkClient:
+    """Harness client whose first N stream attempts drop, then succeed.
+
+    Records ``attempts`` so a test can assert whether the runner re-drove
+    the turn. Each attempt that is scripted to fail raises ``httpx.ReadError``
+    from ``aiter_text`` after emitting ``fail_after`` chunks.
+
+    :param chunks: SSE chunks streamed on a successful attempt.
+    :param fail_times: Number of leading attempts that drop the channel.
+    :param fail_after: Chunks emitted before a failing attempt raises.
+    """
+
+    def __init__(self, chunks: list[str], fail_times: int, fail_after: int = 0) -> None:
+        """Store the script and how many attempts drop.
+
+        :param chunks: SSE chunks streamed on a successful attempt.
+        :param fail_times: Number of leading attempts that drop the channel.
+        :param fail_after: Chunks emitted before a failing attempt raises.
+        """
+        self._chunks = chunks
+        self._fail_times = fail_times
+        self._fail_after = fail_after
+        self.attempts = 0
+
+    def stream(
+        self,
+        method: str,
+        url: str,
+        *,
+        json: dict[str, object],
+        timeout: float | None,
+    ) -> _MaybeFailingHarnessStream:
+        """Return the next attempt's stream, failing the first ``fail_times``.
+
+        :param method: HTTP method (ignored).
+        :param url: Harness endpoint path (ignored).
+        :param json: JSON body (ignored).
+        :param timeout: Request timeout (ignored).
+        :returns: A maybe-failing stream for this attempt.
+        """
+        del method, url, json, timeout
+        self.attempts += 1
+        should_fail = self.attempts <= self._fail_times
+        return _MaybeFailingHarnessStream(self._chunks, should_fail, self._fail_after)
+
+
+@pytest.mark.asyncio
+async def test_proxy_stream_retries_dead_channel_before_any_output() -> None:
+    """A dead-channel drop before ``response.created`` re-drives the turn.
+
+    Reproduces the ``Harness stream connection error`` failure: the harness
+    response stream raises ``httpx.ReadError`` seconds into the turn, before
+    any model output, and the turn used to terminate as failed with no retry.
+    The first attempt drops immediately; the runner must re-POST and stream the
+    second attempt's turn to a clean ``response.completed`` — no
+    ``connection_error`` reaches the client.
+    """
+    client = _DeadChannelThenOkClient(_sse_text_turn("RECOVERED"), fail_times=1)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(client)),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        response = await http.post(
+            "/v1/sessions/conv_dead_channel_retry/events?stream=true",
+            json={
+                "type": "message",
+                "role": "user",
+                "harness": _TEST_HARNESS_NAME,
+                "agent_id": "ag_retry",
+                "model": "x",
+                "content": [{"type": "input_text", "text": "hi"}],
+            },
+        )
+
+    assert response.status_code == 200
+    # The turn re-drove: attempt 1 dropped, attempt 2 streamed the real turn.
+    assert client.attempts == 2
+    assert "event: response.completed" in response.text
+    assert "RECOVERED" in response.text
+    # The generic terminal failure must NOT be surfaced — the retry absorbed it.
+    assert "connection_error" not in response.text
+    assert "Harness stream connection error" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_proxy_stream_no_retry_after_output_started() -> None:
+    """A dead-channel drop AFTER ``response.created`` fails without re-driving.
+
+    Once the model turn has begun emitting, a re-POST would double the
+    response, so the retry gate must not fire: the runner surfaces the generic
+    ``connection_error`` failure and calls the harness exactly once.
+    """
+    # fail_after=1 → emit response.created (sets _response_id) then drop.
+    client = _DeadChannelThenOkClient(
+        _sse_text_turn("SHOULD_NOT_REPLAY"), fail_times=1, fail_after=1
+    )
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(client)),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        response = await http.post(
+            "/v1/sessions/conv_dead_channel_no_retry/events?stream=true",
+            json={
+                "type": "message",
+                "role": "user",
+                "harness": _TEST_HARNESS_NAME,
+                "agent_id": "ag_no_retry",
+                "model": "x",
+                "content": [{"type": "input_text", "text": "hi"}],
+            },
+        )
+
+    assert response.status_code == 200
+    # No re-drive once output started: the harness was invoked exactly once.
+    assert client.attempts == 1
+    assert "event: response.created" in response.text
+    assert "connection_error" in response.text
+    # The second attempt's script must never have replayed.
+    assert "SHOULD_NOT_REPLAY" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_proxy_stream_fails_after_retry_budget_exhausted() -> None:
+    """Persistent dead-channel drops fail with the generic error after the budget.
+
+    Every attempt drops before any output, so the runner exhausts
+    ``_STREAM_RELAY_MAX_ATTEMPTS`` and then surfaces the generic
+    ``connection_error`` failure rather than retrying forever.
+    """
+    from omnigent.runner import app as runner_app
+
+    client = _DeadChannelThenOkClient(_sse_text_turn("NEVER"), fail_times=99)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(client)),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        response = await http.post(
+            "/v1/sessions/conv_dead_channel_exhausted/events?stream=true",
+            json={
+                "type": "message",
+                "role": "user",
+                "harness": _TEST_HARNESS_NAME,
+                "agent_id": "ag_exhausted",
+                "model": "x",
+                "content": [{"type": "input_text", "text": "hi"}],
+            },
+        )
+
+    assert response.status_code == 200
+    assert client.attempts == runner_app._STREAM_RELAY_MAX_ATTEMPTS
+    assert "connection_error" in response.text
+    assert "NEVER" not in response.text
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("status", "policy_response", "expected_output", "blocked_output"),
