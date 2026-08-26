@@ -1234,6 +1234,36 @@ describe("Composer claude-native permission mode", () => {
   });
 });
 
+describe("Composer codex-native permission mode", () => {
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+    useChatStore.setState({ codexApprovalMode: "default" });
+  });
+
+  it("shows a bypass-launched session's real stance without enabling live bypass", async () => {
+    useChatStore.setState({ conversationId: "conv_test", codexApprovalMode: "bypass" });
+
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showClaudePermissionMode: true,
+          modelPickerKind: "codex",
+        })}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("composer-config-gear"));
+
+    const picker = await screen.findByTestId("composer-config-codex-approval-mode");
+    expect(picker).toHaveTextContent("Bypass approvals & sandbox");
+    fireEvent.click(picker);
+
+    const bypass = screen.getByRole("option", { name: "Bypass approvals & sandbox" });
+    expect(bypass).toHaveAttribute("aria-disabled", "true");
+    expect(screen.getAllByRole("option")).toHaveLength(4);
+  });
+});
+
 describe("slashCommandMatches", () => {
   it("matches the leaf segment after a namespace prefix", () => {
     expect(slashCommandMatches("/superpowers:using-superpowers", "using-superpowers")).toBe(true);

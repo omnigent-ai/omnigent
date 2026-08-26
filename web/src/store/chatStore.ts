@@ -111,6 +111,7 @@ import { uploadFile } from "@/lib/filesApi";
 import type { ActiveResponse } from "./types";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { claudePermissionModeFromSession } from "@/lib/claudePermissionMode";
+import { codexApprovalModeFromSession } from "@/lib/codexApprovalMode";
 import { codexPlanModeFromSession } from "@/lib/codexPlanMode";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { getOmnigentHostConfig, type OmnigentInteractionStatus } from "@/lib/host";
@@ -380,6 +381,7 @@ export interface ConversationState {
    * composer hides the picker rather than showing a guessed mode.
    */
   claudePermissionMode: string;
+  codexApprovalMode: string;
   /**
    * True when older items exist before the loaded history window. Binds
    * hydrate only the most recent page (see `fetchSessionItemsPage`);
@@ -765,6 +767,7 @@ export interface ChatActions {
    * No-ops when there is no active conversation.
    */
   setClaudePermissionMode: (mode: string) => Promise<void>;
+  setCodexApprovalMode: (mode: string) => Promise<void>;
   /**
    * Fetch the next page of older messages and prepend them to `blocks`.
    *
@@ -1311,6 +1314,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   subagentRoutingOverride: null,
   codexPlanMode: false,
   claudePermissionMode: "",
+  codexApprovalMode: "default",
   hasMoreHistory: false,
   loadingMoreHistory: false,
   oldestItemId: null,
@@ -2322,6 +2326,21 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
+  setCodexApprovalMode: async (mode) => {
+    const { conversationId } = get();
+    if (!conversationId) return;
+    const previous = get().codexApprovalMode;
+    const patchSet = setterFor(conversationId);
+    patchSet({ codexApprovalMode: mode });
+    try {
+      const session = await updateSession(conversationId, { codexApprovalMode: mode });
+      patchSet({ codexApprovalMode: codexApprovalModeFromSession(session) });
+    } catch (err) {
+      patchSet({ codexApprovalMode: previous });
+      throw err;
+    }
+  },
+
   loadMoreHistory: async () => {
     const { conversationId, oldestItemId, loadingMoreHistory, hasMoreHistory, historyGeneration } =
       get();
@@ -2930,6 +2949,7 @@ function sessionBindingPatch(
   | "subagentRoutingOverride"
   | "codexPlanMode"
   | "claudePermissionMode"
+  | "codexApprovalMode"
   | "contextWindow"
   | "gitBranch"
   | "skills"
@@ -2959,6 +2979,7 @@ function sessionBindingPatch(
     claudePermissionMode: isNativeWrapper(wrapper)
       ? (claudePermissionModeFromSession(session) ?? "")
       : "",
+    codexApprovalMode: codexApprovalModeFromSession(session),
     contextWindow: session.contextWindow ?? null,
     gitBranch: session.gitBranch ?? null,
     skills: session.skills ?? [],

@@ -867,7 +867,7 @@ describe("NewChatLandingScreen create flow", () => {
     );
   });
 
-  it("persists Codex bypass so the next session shows it instead of Default", async () => {
+  it("persists Codex bypass so the next new session shows it", async () => {
     setAgents([agent({ id: "ag_codex", name: "codex-native-ui", display_name: "Codex" })]);
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
       ok: true,

@@ -279,6 +279,7 @@ from omnigent.spec.types import (
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
+    CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     PINNED_LABEL_KEY,
     ConversationNotFoundError,
     NameAlreadyExistsError,
@@ -2518,13 +2519,25 @@ async def _persist_external_codex_approval_mode_change(
             f"invalid terminal_launch_args: {exc}",
             code=ErrorCode.INVALID_INPUT,
         ) from exc
-    if conv.terminal_launch_args == terminal_launch_args:
+    args_changed = conv.terminal_launch_args != terminal_launch_args
+    bypass_enabled = conv.labels.get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == "1"
+    if not args_changed and not bypass_enabled:
         return
-    await asyncio.to_thread(
-        conversation_store.update_conversation,
-        session_id,
-        terminal_launch_args=terminal_launch_args,
-    )
+    if args_changed:
+        await asyncio.to_thread(
+            conversation_store.update_conversation,
+            session_id,
+            terminal_launch_args=terminal_launch_args,
+        )
+    # The app-server event describes Codex's settings after they took effect.
+    # Clear a launch-only bypass directive even when the merged args are
+    # unchanged, or the next restart would re-arm full bypass.
+    if bypass_enabled:
+        await asyncio.to_thread(
+            conversation_store.delete_label,
+            session_id,
+            CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+        )
 
 
 def _merge_codex_permission_launch_args(
@@ -9772,6 +9785,7 @@ __all__ = [
     "_mcp_input_required_response",
     "_mcp_ok_response",
     "_mcp_tool_result",
+    "_merge_codex_permission_launch_args",
     "_merge_pending_file_blocks",
     "_message_text",
     "_model_options_from_wire",

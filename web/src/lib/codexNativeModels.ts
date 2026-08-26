@@ -77,7 +77,8 @@ export function isCodexNativeModel(
  * Codex's ``isDefault`` is a static property of its bundled catalog, not the
  * model a session launched with, so it cannot stand in for an unresolved
  * model — it would offer levels the running model rejects. An unknown model
- * yields no levels and the caller hides the picker until the model resolves.
+ * yields no levels; callers can still render a Default-only picker while the
+ * model resolves.
  *
  * @param options - Codex model options from the session snapshot.
  * @param currentModel - Active override or bound model id.

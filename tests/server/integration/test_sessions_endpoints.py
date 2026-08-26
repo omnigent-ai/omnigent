@@ -31,6 +31,7 @@ from omnigent.server.routes._sessions.helpers import (
     _RunnerForwardResult,
 )
 from omnigent.spec.types import SkillSpec
+from omnigent.stores.conversation_store import CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -6678,6 +6679,37 @@ async def test_post_external_codex_approval_mode_change_preserves_other_args(
     ]
 
 
+async def test_post_external_codex_approval_mode_change_clears_launch_bypass(
+    client: httpx.AsyncClient,
+) -> None:
+    """An observed Codex preset disarms launch bypass for the next restart."""
+    agent = await create_test_agent(client)
+    args = ["--sandbox", "read-only", "--ask-for-approval", "on-request"]
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={
+            "omnigent.ui": "terminal",
+            "omnigent.wrapper": "codex-native-ui",
+            CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1",
+        },
+        terminal_launch_args=args,
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_codex_approval_mode_change",
+            "data": {"terminal_launch_args": args},
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["terminal_launch_args"] == args
+    assert CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY not in snapshot["labels"]
+
+
 def _model_change_notes(published: list[tuple[str, dict[str, Any]]]) -> list[str]:
     """
     Extract ``[System: ...]`` model-change note texts from published events.
@@ -8198,6 +8230,68 @@ async def test_patch_collaboration_mode_rejects_non_codex_session(
 
     assert resp.status_code == 400, resp.text
     assert "collaboration_mode is only supported" in resp.text
+
+
+async def test_patch_codex_approval_mode_clears_launch_bypass(
+    client: httpx.AsyncClient,
+) -> None:
+    """A successful live Codex permission switch disarms restart bypass."""
+    from omnigent.runtime import set_runner_client
+
+    captured: list[_ForwardedEffort] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            captured.append(
+                _ForwardedEffort(
+                    url=str(request.url),
+                    body=json.loads(request.content) if request.content else None,
+                )
+            )
+        return httpx.Response(204)
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+    set_runner_client(fake_runner)
+    try:
+        agent = await create_test_agent(client)
+        session = await _create_session(
+            client,
+            agent["id"],
+            labels={
+                "omnigent.ui": "terminal",
+                "omnigent.wrapper": "codex-native-ui",
+                CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1",
+            },
+        )
+        captured.clear()
+
+        resp = await client.patch(
+            f"/v1/sessions/{session['id']}",
+            json={"codex_approval_mode": "read-only"},
+        )
+    finally:
+        await fake_runner.aclose()
+        set_runner_client(None)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["terminal_launch_args"] == [
+        "--sandbox",
+        "read-only",
+        "--ask-for-approval",
+        "on-request",
+    ]
+    assert CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY not in resp.json()["labels"]
+    approval_forwards = [
+        event for event in captured if event.url.endswith(f"/v1/sessions/{session['id']}/events")
+    ]
+    assert len(approval_forwards) == 1, captured
+    assert approval_forwards[0].body == {
+        "type": "codex_approval_mode_change",
+        "mode": "read-only",
+    }
 
 
 async def test_patch_permission_mode_persists_label_and_forwards_event(

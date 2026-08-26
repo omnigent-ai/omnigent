@@ -163,6 +163,13 @@ import {
   CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE,
   CLAUDE_NATIVE_PERMISSION_MODES,
 } from "@/lib/claudePermissionMode";
+import {
+  CODEX_NATIVE_APPROVAL_MODES,
+  CODEX_NATIVE_BYPASS_APPROVAL_OPTION,
+  CODEX_NATIVE_BYPASS_APPROVAL_VALUE,
+  CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+  CODEX_NATIVE_DEFAULT_APPROVAL_MODE,
+} from "@/lib/codexApprovalMode";
 import { useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
 import {
   controlHost,
@@ -318,61 +325,6 @@ const CURSOR_NATIVE_EXEC_MODES: {
   },
 ];
 
-// Codex approval presets matching the `/permissions` TUI popup.
-// Each preset bundles a sandbox profile + approval policy, mirroring
-// codex-rs/utils/approval-presets/src/lib.rs. "default" is the auto
-// preset (workspace-write + on-request) and sends no flags so the
-// runner uses Codex's built-in default.
-// Keep in sync with `codex --help` and
-// https://developers.openai.com/codex/agent-approvals-security
-const CODEX_NATIVE_DEFAULT_APPROVAL_MODE = "default";
-const CODEX_NATIVE_APPROVAL_MODES: {
-  value: string;
-  label: string;
-  description: string;
-  args: string[];
-}[] = [
-  {
-    value: "default",
-    label: "Default",
-    description: "Read/edit/run in workspace; approval for external edits or network",
-    args: [],
-  },
-  {
-    value: "full-access",
-    label: "Full access",
-    description: "Edit any file and access the internet without approval",
-    args: ["--sandbox", "danger-full-access", "--ask-for-approval", "never"],
-  },
-  {
-    value: "read-only",
-    label: "Read only",
-    description: "Read files only; approval required for edits, commands, or network",
-    args: ["--sandbox", "read-only", "--ask-for-approval", "on-request"],
-  },
-];
-
-// Conversation-label key for the DANGEROUS codex full-bypass opt-in. When
-// set to "1" the runner launches Codex with
-// `--dangerously-bypass-approvals-and-sandbox` (no approval prompts, no
-// command sandbox) — see omnigent.stores.conversation_store
-// CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY. Stored as a label (cheap thread
-// metadata) so it survives reload. Mutually exclusive in spirit with the
-// approval-mode presets above: when bypass is on the runner strips any
-// `--sandbox` / `--ask-for-approval` flags those presets would emit.
-const CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox";
-// Bypass is the most-permissive Codex approval stance — presented as a 4th
-// option in the Codex approval dropdown (Codex only; OpenCode shares the
-// presets above but has no bypass). It rides as a conversation label, not
-// terminal_launch_args, so its `args` are empty and it's handled specially.
-const CODEX_NATIVE_BYPASS_APPROVAL_VALUE = "bypass";
-const CODEX_NATIVE_BYPASS_APPROVAL_OPTION = {
-  value: CODEX_NATIVE_BYPASS_APPROVAL_VALUE,
-  label: "Bypass approvals & sandbox",
-  description: "Runs Codex with no approval prompts and no command sandbox",
-  args: [] as string[],
-};
-
 function createdHarnessOptions({
   harness,
   supportsPermissionMode,
@@ -414,7 +366,10 @@ function createdHarnessOptions({
     options.mode = permissionMode;
     options.effort = pickedEffort;
   } else if (supportsApprovalMode) {
-    options.mode = bypassSandbox ? CODEX_NATIVE_BYPASS_APPROVAL_VALUE : approvalMode;
+    options.mode =
+      harness === "codex-native" && bypassSandbox
+        ? CODEX_NATIVE_BYPASS_APPROVAL_VALUE
+        : approvalMode;
   } else if (supportsCursorMode) {
     options.mode = cursorExecMode;
   } else if (supportsAgySkipPermissions) {
@@ -955,8 +910,8 @@ function PickerSectionHeader({ children }: { children: ReactNode }) {
  * agents like Polly & Debby, plus custom user agents) and "Harnesses" (the
  * native terminal CLIs — Claude Code, Codex, Cursor, …). **Level 2** is a
  * per-entry submenu of that entry's run-config knobs: model / effort /
- * permission mode for Claude Code, approval mode (+ bypass) for Codex,
- * approval mode for OpenCode, execution mode for Cursor, and the brain-harness
+ * permission mode for Claude Code, permission presets for Codex/OpenCode,
+ * execution mode for Cursor, and the brain-harness
  * override for bundle agents. Entries with no knobs are plain selectable rows.
  *
  * Holds no state of its own — the selected agent and every knob live in
@@ -1490,7 +1445,7 @@ function SearchableModelPicker({
  * Harness-configuration modal opened from the composer's gear icon. Shows the
  * selected agent's run-config knobs — Claude: model / effort / permissions;
  * Pi: model;
- * Codex/OpenCode: approval mode (+ Codex's dangerous full-bypass opt-in);
+ * Codex/OpenCode: permissions;
  * Cursor: exec mode; bundle agents: brain-harness override. On the fully-auto
  * harness the router owns harness and model, so every harness-specific knob
  * drops out — a bundle agent keeps its brain-harness row (the pick lives there
@@ -1545,9 +1500,9 @@ function HarnessConfigModal({
   smartRoutingEligible: boolean;
   permissionMode: string;
   approvalMode: string;
+  bypassSandbox: boolean;
   cursorExecMode: string;
   agySkipMode: string;
-  bypassSandbox: boolean;
   pickedModel: string;
   claudeModelOptions: readonly Pick<NativeModelOption, "id" | "displayName" | "isDefault">[];
   claudeModelsLoading: boolean;
@@ -1856,19 +1811,17 @@ function HarnessConfigModal({
                   )}
                 </RoutingModelSelect>
               </ConfigRow>
-              <ConfigRow label="Approval" description="What the agent can do without asking">
+              <ConfigRow label="Permissions" description="How much Codex asks before acting">
                 <DescribedSelect
-                  // Codex adds the DANGEROUS full-bypass as a 4th option; when
-                  // armed the select shows it (draftBypass wins over the preset).
                   value={
                     isCodex && draftBypass ? CODEX_NATIVE_BYPASS_APPROVAL_VALUE : draftApproval
                   }
-                  onValueChange={(v) => {
-                    if (v === CODEX_NATIVE_BYPASS_APPROVAL_VALUE) {
+                  onValueChange={(value) => {
+                    if (value === CODEX_NATIVE_BYPASS_APPROVAL_VALUE) {
                       setDraftBypass(true);
                     } else {
                       setDraftBypass(false);
-                      setDraftApproval(v);
+                      setDraftApproval(value);
                     }
                   }}
                   options={
@@ -1877,7 +1830,7 @@ function HarnessConfigModal({
                       : CODEX_NATIVE_APPROVAL_MODES
                   }
                   testId="new-chat-landing-config-approval"
-                  ariaLabel="Approval"
+                  ariaLabel="Permissions"
                   componentId="new_chat.config.approval"
                 />
               </ConfigRow>
@@ -2390,11 +2343,6 @@ export function NewChatLandingScreen() {
   const [approvalMode, setApprovalMode] = useState<string>(
     () => landingDraft?.approvalMode ?? CODEX_NATIVE_DEFAULT_APPROVAL_MODE,
   );
-  // DANGEROUS codex full-bypass opt-in (Codex only). OFF by default and only
-  // flippable on after the user types the confirmation phrase, so it can
-  // never be enabled by an accidental click. Persisted as a conversation
-  // label so it survives reload. When on, a persistent red banner warns and
-  // the runner ignores the approval-mode preset's flags.
   const [bypassSandbox, setBypassSandbox] = useState<boolean>(
     () => landingDraft?.bypassSandbox ?? false,
   );
@@ -2971,10 +2919,6 @@ export function NewChatLandingScreen() {
       : [];
     if (supportsApprovalMode) {
       const isCodex = nativeCodingAgentForAvailableAgent(selectedAgent)?.harness === "codex-native";
-      // Bypass is the most-permissive Approval choice, not a separate knob — so
-      // mirror the modal's single Approval control: when armed, the Approval row
-      // reads "Bypass approvals & sandbox" rather than the underlying preset
-      // (which would misleadingly imply approvals are still at e.g. "Default").
       const approvalValue =
         isCodex && bypassSandbox
           ? CODEX_NATIVE_BYPASS_APPROVAL_OPTION.label
@@ -2992,7 +2936,7 @@ export function NewChatLandingScreen() {
                   : defaultModelLabel(codexModelOptions),
               },
             ];
-      return [...modelRows, { label: "Approval", value: approvalValue }];
+      return [...modelRows, { label: "Permissions", value: approvalValue }];
     }
     if (supportsCursorMode) {
       const modeValue =
@@ -3034,12 +2978,8 @@ export function NewChatLandingScreen() {
     agySkipMode,
     pickedHarness,
   ]);
-  // Reset per-agent-instance run-config that must not carry across an agent
-  // change. The DANGEROUS Codex bypass re-opts-in per context (matching the
-  // store's fork / agent-switch behavior; CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY
-  // is instance-scoped). Smart routing likewise clears: switching to an agent
-  // whose modal has no routing control (or isn't routable) would otherwise
-  // leave it stuck "on" with no UI to turn it off.
+  // Bypass is a per-agent launch opt-in, so an actual agent change disarms it.
+  // Routing also resets because the next agent may have no control to clear it.
   //
   // Only reset on an ACTUAL agent change — not the initial resolution (null →
   // first id, or a persisted/draft pick resolving on mount), which would wipe a
@@ -3891,12 +3831,10 @@ export function NewChatLandingScreen() {
       // tells the UI to render the terminal wrapper, and `omnigent.wrapper`
       // selects which CLI bridge the runner launches — the values are the
       // registered wrapper ids the runner keys off, not the display name. The
-      // DANGEROUS codex full-bypass opt-in rides along as an extra label (only
-      // when the toggle is armed for a codex-native agent) so the runner
-      // launches with --dangerously-bypass-approvals-and-sandbox and the choice
-      // survives reload.
+      // launch-only Codex bypass rides as a label that the runner converts to
+      // `--dangerously-bypass-approvals-and-sandbox`.
       const baseLabels =
-        agentSupportsApprovalMode && bypassSandbox
+        nativeAgent?.harness === "codex-native" && bypassSandbox
           ? { ...(nativeLabels ?? {}), [CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY]: "1" }
           : nativeLabels;
       // When filing into a project, stamp its legacy `omni_project` label at
@@ -3995,8 +3933,8 @@ export function NewChatLandingScreen() {
                       ? { branch_name: trimmedBranch, existing_worktree: true }
                       : undefined,
                 }),
-            // Native-wrapper labels + codex bypass + the born-filed project
-            // label (see `createLabels` above).
+            // Native-wrapper labels + Codex launch-only bypass + the born-filed
+            // project label (see `createLabels` above).
             // Smart Routing sends none of these: the bound agent is only a
             // placeholder, so the placeholder's wrapper labels, launch args and
             // model would all describe a CLI the router may not pick. The
@@ -4540,8 +4478,8 @@ export function NewChatLandingScreen() {
               <div className="flex items-center gap-0.5 md:gap-2">
                 <div className="flex items-center rounded-lg transition-colors has-[button:not(:disabled)]:hover:bg-muted dark:has-[button:not(:disabled)]:hover:bg-muted/50 has-aria-expanded:bg-muted dark:has-aria-expanded:bg-muted/50 [&>button]:bg-transparent!">
                   {/* Agent / harness picker — selects the agent or harness only.
-                    Its run-config knobs (model / effort / permission mode for
-                    Claude Code, approval mode for Codex/OpenCode, exec mode for
+                    Its run-config knobs (model / effort / permissions for
+                    Claude Code, permissions for Codex/OpenCode, exec mode for
                     Cursor, brain-harness override for bundle agents) live in the
                     gear-icon config modal beside it. */}
                   <AgentHarnessPicker

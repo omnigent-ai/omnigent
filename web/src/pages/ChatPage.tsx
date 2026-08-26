@@ -222,6 +222,11 @@ import {
   claudePermissionModeLabel,
   isClaudeNativeSession,
 } from "@/lib/claudePermissionMode";
+import {
+  CODEX_NATIVE_APPROVAL_MODES,
+  CODEX_NATIVE_BYPASS_APPROVAL_OPTION,
+  CODEX_NATIVE_BYPASS_APPROVAL_VALUE,
+} from "@/lib/codexApprovalMode";
 import { isCodexNativeSession } from "@/lib/codexPlanMode";
 import { getCliServerUrl } from "@/lib/host";
 import { SessionImage } from "@/components/SessionImage";
@@ -1311,7 +1316,11 @@ export function ChatPage() {
     codexModelOptions,
     llmModel ?? selectedModel,
   );
-  const showEffort = shouldShowEffortPicker(capabilitySource) && effortLevels.length > 0;
+  // Render the control from the session capability immediately. Codex's
+  // model-specific ladder can arrive seconds later (or fail to probe); until
+  // then the Select still has its useful Default row and fills in place when
+  // metadata lands.
+  const showEffort = shouldShowEffortPicker(capabilitySource);
 
   // When inside a session, only show the bound agent — the session is
   // tied 1:1 to its runner and can't be reassigned. Show all agents on
@@ -1362,7 +1371,7 @@ export function ChatPage() {
       modelPickerKind={modelPickerKind}
       codexModelOptions={codexModelOptions}
       showCodexPlanMode={shouldShowCodexPlanModeControl(capabilitySource)}
-      showClaudePermissionMode={shouldShowClaudePermissionModeControl(capabilitySource)}
+      showClaudePermissionMode={shouldShowNativePermissionModeControl(capabilitySource)}
       showGoalControl={shouldShowGoalControl(capabilitySource)}
       showClaudeGoalControl={shouldShowPollyClaudeGoalControl(activeSession)}
       showPollyCodexGoalControl={shouldShowPollyCodexGoalControl(activeSession)}
@@ -6342,19 +6351,18 @@ export function shouldShowCodexPlanModeControl(
 }
 
 /**
- * True when the claude-native permission-mode picker should be visible.
+ * True when a native coding session exposes a live permission picker.
  *
- * Claude-native sessions only: the switch drives Claude Code's own
- * shift+tab cycle, which no other harness has.
+ * Claude uses its shift+tab cycle; Codex applies thread settings directly.
  *
  * :param conv: Session-like object carrying `labels`; a missing session
  *     or missing labels fails closed.
- * :returns: True only for sessions running the claude-native wrapper.
+ * :returns: True for Claude- or Codex-native sessions.
  */
-export function shouldShowClaudePermissionModeControl(
+export function shouldShowNativePermissionModeControl(
   conv: { labels?: Record<string, string | null> | null } | null | undefined,
 ): boolean {
-  return isClaudeNativeSession(conv);
+  return isClaudeNativeSession(conv) || isCodexNativeSession(conv);
 }
 
 /**
@@ -6406,10 +6414,9 @@ const SUBAGENT_ROUTING_DESCRIPTION = "Model routing for subagents this session s
  * In-session run-config modal opened from the composer's gear icon. The
  * live-committing analogue of the new-session ``HarnessConfigModal``: only the
  * knobs switchable mid-session appear — Model (which folds Smart Routing in as
- * an option where a dropdown exists), Effort, and Subagent routing. A session's
- * own Smart Routing is otherwise a create-time choice, and
- * permission/approval/cursor modes are launch-time only (no in-session state to
- * read or write), so they are intentionally absent.
+ * an option where a dropdown exists), Effort, native permission presets, and
+ * Subagent routing. A session's own Smart Routing and cursor mode remain
+ * create-time choices.
  *
  * Like the new-session modal, changes are drafted locally and only applied on
  * Save (through the store setters ``setModel`` / ``setEffort`` /
@@ -6443,6 +6450,7 @@ function SessionConfigModal({
 }) {
   const selectedEffort = useSessionEffort();
   const claudePermissionMode = useChatStore((s) => s.claudePermissionMode);
+  const codexApprovalMode = useChatStore((s) => s.codexApprovalMode);
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const subagentRoutingOverride = useChatStore((s) => s.subagentRoutingOverride);
   const conversationId = useChatStore((s) => s.conversationId);
@@ -6473,6 +6481,7 @@ function SessionConfigModal({
   const [draftEffort, setDraftEffort] = useState<string | null>(selectedEffort);
   const [draftRoutingOn, setDraftRoutingOn] = useState(liveRoutingOn);
   const [draftPermissionMode, setDraftPermissionMode] = useState(claudePermissionMode);
+  const [draftCodexApprovalMode, setDraftCodexApprovalMode] = useState(codexApprovalMode);
   // The sub-agent row is stored as a PICK, not a pre-seeded draft:
   // `undefined` means "untouched", so the row mirrors the live stored value for
   // as long as the user hasn't chosen anything. A draft seeded once per open
@@ -6488,6 +6497,7 @@ function SessionConfigModal({
     setDraftEffort(selectedEffort);
     setDraftRoutingOn(liveRoutingOn);
     setDraftPermissionMode(claudePermissionMode);
+    setDraftCodexApprovalMode(codexApprovalMode);
     setPickedSubagentRouting(undefined);
     // Nothing pushes a routing-switch change to the client (no SSE event, and
     // the session query never goes stale), so re-read them here — otherwise the
@@ -6596,8 +6606,12 @@ function SessionConfigModal({
           await store.setEffort(draftEffort);
         // Same pane as /model + /effort, so this must stay in the awaited
         // sequence rather than firing concurrently.
-        if (showClaudePermissionMode && draftPermissionMode !== claudePermissionMode)
-          await store.setClaudePermissionMode(draftPermissionMode);
+        if (showClaudePermissionMode) {
+          if (modelPickerKind === "codex" && draftCodexApprovalMode !== codexApprovalMode)
+            await store.setCodexApprovalMode(draftCodexApprovalMode);
+          else if (modelPickerKind !== "codex" && draftPermissionMode !== claudePermissionMode)
+            await store.setClaudePermissionMode(draftPermissionMode);
+        }
         // Sub-agent routing is independent of this session's own model — a
         // plain PATCH with no slash-command injection, so ordering is free.
         // Only an explicit pick is written, and only when it still differs from
@@ -6737,6 +6751,47 @@ function SessionConfigModal({
                         <span>{mode.label}</span>
                         <span className="text-muted-foreground text-xs">{mode.description}</span>
                       </span>
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </ConfigRow>
+          )}
+          {showClaudePermissionMode && modelPickerKind === "codex" && (
+            <ConfigRow
+              label="Permissions"
+              description={
+                codexApprovalMode === CODEX_NATIVE_BYPASS_APPROVAL_VALUE
+                  ? "Currently bypassing approvals and sandbox; choose another mode to leave bypass"
+                  : "How much Codex asks before acting"
+              }
+            >
+              <Select
+                value={draftCodexApprovalMode}
+                onValueChange={setDraftCodexApprovalMode}
+                componentId="chat.composer.codex_approval_mode"
+                valueHasNoPii
+              >
+                <SelectTrigger
+                  className="w-full"
+                  data-testid="composer-config-codex-approval-mode"
+                  aria-label="Permissions"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent position="popper" align="start">
+                  {codexApprovalMode === CODEX_NATIVE_BYPASS_APPROVAL_VALUE && (
+                    <SelectItem
+                      value={CODEX_NATIVE_BYPASS_APPROVAL_VALUE}
+                      data-approval-mode={CODEX_NATIVE_BYPASS_APPROVAL_VALUE}
+                      disabled
+                    >
+                      {CODEX_NATIVE_BYPASS_APPROVAL_OPTION.label}
+                    </SelectItem>
+                  )}
+                  {CODEX_NATIVE_APPROVAL_MODES.map((mode) => (
+                    <SelectItem key={mode.value} value={mode.value} data-approval-mode={mode.value}>
+                      {mode.label}
                     </SelectItem>
                   ))}
                 </SelectContent>

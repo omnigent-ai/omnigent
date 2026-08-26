@@ -192,6 +192,8 @@ _EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE: str = "external_codex_approval_mode_c
 
 _CODEX_NATIVE_COLLABORATION_MODES: frozenset[str] = frozenset({"default", "plan"})
 
+_CODEX_NATIVE_APPROVAL_MODES: frozenset[str] = frozenset({"default", "full-access", "read-only"})
+
 
 # Current permission mode of a live claude-native session.
 # ``terminal_launch_args`` records only the launch mode, so this label is what
