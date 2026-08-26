@@ -528,7 +528,7 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     const trigger = screen.getByRole("button", { name: "Conversation actions" });
     expect(title).toHaveClass("min-w-0", "truncate");
     expect(title.parentElement).toBe(trigger.parentElement);
-    expect(trigger.closest("nav.conversation-breadcrumb")).toHaveClass("group/breadcrumb");
+    expect(trigger.closest("nav.conversation-breadcrumb")).not.toHaveClass("group/breadcrumb");
     expect(title.compareDocumentPosition(trigger) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 

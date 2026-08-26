@@ -64,7 +64,7 @@ export function ConversationBreadcrumb({
     <nav
       aria-label="Conversation"
       className={cn(
-        "conversation-breadcrumb group/breadcrumb flex min-w-0 items-center gap-1.5 text-ui",
+        "conversation-breadcrumb flex min-w-0 items-center gap-1.5 text-ui",
         className,
       )}
     >
