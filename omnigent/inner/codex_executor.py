@@ -43,7 +43,7 @@ from omnigent.codex_model_vocabulary import (
     EXTENDED_MODEL_DEFAULT_EFFORT,
     EXTENDED_MODEL_EFFORTS,
 )
-from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
+from omnigent.inner.agent_env import clean_agent_env, config_passthrough, declared_passthrough
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, CODEX_DEFAULT_MODEL
 from omnigent.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
@@ -494,7 +494,7 @@ def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
             *_CODEX_OMNIGENT_LAUNCH_ENV_VARS,
         ),
         deny_exact=_CODEX_ENV_DENY_EXACT,
-        extra_allowed=extra_allow,
+        extra_allowed=(*config_passthrough(), *extra_allow),
     )
 
 

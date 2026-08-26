@@ -280,3 +280,103 @@ def test_acp_agent_declaration_passes_only_what_it_names(hostile_env, monkeypatc
     assert env.get("XAI_API_KEY") == "declared-and-wanted"
     for name in CANARY_SECRETS:
         assert name not in env, name
+
+
+# ---------------------------------------------------------------------------
+# config_passthrough — host/project-level allowlist that flows to every
+# harness subprocess without requiring per-spec repetition (#5442).
+# ---------------------------------------------------------------------------
+
+
+def test_config_passthrough_empty_when_no_config():
+    """Injectable form: empty dicts on both sides → empty tuple."""
+    from omnigent.inner.agent_env import config_passthrough
+
+    assert config_passthrough(global_cfg={}, local_cfg={}) == ()
+
+
+def test_config_passthrough_unions_global_and_project():
+    """Project names are honoured on top of global ones; both flow through."""
+    from omnigent.inner.agent_env import config_passthrough
+
+    g = {"env_passthrough": ["FOO"]}
+    loc = {"env_passthrough": ["BAR", "FOO"]}
+    assert config_passthrough(global_cfg=g, local_cfg=loc) == ("BAR", "FOO")
+
+
+def test_config_passthrough_flows_into_clean_agent_env(hostile_env, monkeypatch):
+    """A name in project config reaches the spawned env without a per-spec entry.
+
+    This is the core promise of #5442: a project declares an ambient var once
+    at the host/project level, and every harness sees it — no per-spec
+    repetition, no code changes.
+    """
+    from omnigent.inner.agent_env import clean_agent_env, config_passthrough
+
+    src = {**hostile_env, "TAVILY_API_KEY": "value-from-ambient-env"}
+    names = config_passthrough(
+        global_cfg={"env_passthrough": ["TAVILY_API_KEY"]},
+        local_cfg={},
+    )
+    env = clean_agent_env(extra_allowed=names, source=src)
+
+    assert env.get("TAVILY_API_KEY") == "value-from-ambient-env"
+    # The ambient allowlist is names-only: it does not open the gate for other
+    # secrets on the host.
+    for name in CANARY_SECRETS:
+        if name != "TAVILY_API_KEY":
+            assert name not in env, name
+
+
+def test_config_passthrough_does_not_forward_values_not_in_env(monkeypatch):
+    """Name-only allowlist: naming a var in config does NOT inject its value.
+
+    If the omnigent process's own environment does not hold the name, the
+    filter has nothing to forward — a config file cannot magically produce a
+    secret value it does not have.
+    """
+    from omnigent.inner.agent_env import clean_agent_env, config_passthrough
+
+    monkeypatch.setattr("os.environ", {"HOME": "/home/x", "PATH": "/usr/bin"})
+    names = config_passthrough(
+        global_cfg={"env_passthrough": ["NOT_IN_ENV_ANYWHERE"]},
+        local_cfg={},
+    )
+    env = clean_agent_env(extra_allowed=names)
+
+    assert "NOT_IN_ENV_ANYWHERE" not in env
+
+
+def test_config_passthrough_unions_with_per_spec_declaration(hostile_env, monkeypatch):
+    """Spec's own ``env_passthrough`` unions on top of the config-level one.
+
+    Both surfaces stay valid: the config-level allowlist covers the common
+    ambient vars (project-wide), and the per-spec field still opts in agent-
+    specific auth variables (per-agent). Neither replaces the other.
+    """
+    from omnigent.inner.agent_env import clean_agent_env, config_passthrough, declared_passthrough
+
+    class _Sandbox:
+        env_passthrough = ("SPEC_ONLY_VAR",)
+
+    class _OsEnv:
+        sandbox = _Sandbox()
+
+    src = {
+        **hostile_env,
+        "CONFIG_ONLY_VAR": "from-project-config",
+        "SPEC_ONLY_VAR": "from-agent-spec",
+    }
+    env = clean_agent_env(
+        extra_allowed=(
+            *config_passthrough(
+                global_cfg={"env_passthrough": ["CONFIG_ONLY_VAR"]},
+                local_cfg={},
+            ),
+            *declared_passthrough(_OsEnv()),
+        ),
+        source=src,
+    )
+
+    assert env.get("CONFIG_ONLY_VAR") == "from-project-config"
+    assert env.get("SPEC_ONLY_VAR") == "from-agent-spec"

@@ -50,7 +50,7 @@ from typing import Any, NotRequired, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse as _urlparse
 
 from omnigent import model_catalog
-from omnigent.inner.agent_env import clean_agent_env
+from omnigent.inner.agent_env import clean_agent_env, config_passthrough
 from omnigent.inner.native_attachments import parse_data_uri
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.json_types import JsonValue
@@ -957,13 +957,17 @@ def _clean_pi_env(extra_allowed: Sequence[str] | None = None) -> dict[str, str]:
 
     :param extra_allowed: Extra exact names to pass through, e.g. the spec's
         ``os_env.sandbox.env_passthrough`` entries. ``None`` means no extras.
+        These are unioned on top of the host/project-level ``env_passthrough``
+        pulled from :func:`omnigent.inner.agent_env.config_passthrough`, which
+        provides the same allowlist to every harness without repeating it in
+        each spec.
     :returns: Filtered environment dict, ready to extend with the executor's
         own variables (``PI_CODING_AGENT_DIR``, ...).
     """
     return clean_agent_env(
         allow_prefixes=_PI_ENV_ALLOW_PREFIXES,
         allow_exact=_PI_ENV_ALLOW_EXACT,
-        extra_allowed=extra_allowed or (),
+        extra_allowed=(*config_passthrough(), *(extra_allowed or ())),
     )
 
 

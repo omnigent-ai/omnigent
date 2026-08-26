@@ -108,6 +108,33 @@ def clean_agent_env(
     }
 
 
+def config_passthrough(
+    global_cfg: object | None = None,
+    local_cfg: object | None = None,
+) -> tuple[str, ...]:
+    """Env-var names declared in the host/project config for all harnesses.
+
+    Reads ``env_passthrough`` from both the global config
+    (``~/.omnigent/config.yaml``) and the project config
+    (``.omnigent/config.yaml``) and returns their union.  This is the
+    project/global-level escape hatch described in the :mod:`omnigent.config`
+    documentation: a name listed here is admitted into *every* harness
+    subprocess without requiring the same entry to be repeated in each agent
+    spec's ``os_env.sandbox.env_passthrough``.
+
+    :param global_cfg: Pre-loaded global config dict; if ``None``, loads from
+        the default global path.  Injectable for tests.
+    :param local_cfg: Pre-loaded project config dict; if ``None``, loads from
+        ``.omnigent/config.yaml`` relative to the current directory.
+        Injectable for tests.
+    :returns: Sorted tuple of unique variable names from both config files,
+        possibly empty.
+    """
+    from omnigent.config import env_passthrough_names
+
+    return env_passthrough_names(global_cfg=global_cfg, local_cfg=local_cfg)
+
+
 def declared_passthrough(os_env: object | None) -> tuple[str, ...]:
     """Env-var names the spec declared for passthrough.
 

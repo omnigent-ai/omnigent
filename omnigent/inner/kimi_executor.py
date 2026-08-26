@@ -65,7 +65,7 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from pathlib import Path
 
 from omnigent.harness_startup_config import resolve_harness_path
-from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
+from omnigent.inner.agent_env import clean_agent_env, config_passthrough, declared_passthrough
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
     EnqueuedContent,
@@ -245,7 +245,7 @@ class KimiExecutor(Executor):
         # while no longer handing the CLI every other provider's key (#3445).
         return clean_agent_env(
             allow_prefixes=("KIMI_", "MOONSHOT_"),
-            extra_allowed=declared_passthrough(self._os_env),
+            extra_allowed=(*config_passthrough(), *declared_passthrough(self._os_env)),
         )
 
     def _sandbox_launch_path(self, spawn_env_names: Sequence[str]) -> str:
