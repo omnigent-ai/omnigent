@@ -529,8 +529,9 @@ def test_pi_gateway_routing_log_reports_the_resolved_base_url(
     line = next(
         rec.getMessage() for rec in caplog.records if "gateway routing" in rec.getMessage()
     )
-    assert "base_url=None" not in line
-    assert "anthropic.example.com" in line
+    # Compare against the env value itself: the line must carry the plural
+    # key's URLs, not just some host substring.
+    assert f"base_url={env['HARNESS_PI_GATEWAY_BASE_URLS']}" in line
 
 
 def test_pi_threads_generic_openai_wire_api(config_home: Path) -> None:
