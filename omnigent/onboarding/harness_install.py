@@ -88,7 +88,9 @@ KIRO_KEY = "kiro"
 # - codex: native policy hook requires >= 0.129.0
 #   (`omnigent/codex_native_app_server.py`).
 # - pi: non-interactive ``--approve`` override requires >= 0.79.0
-#   (``omnigent/pi_native.py``).
+#   (``omnigent/pi_native.py``). Adaptive thinking (thinking.type.adaptive
+#   for claude-4+/claude-5) requires >= 0.84.2
+#   (``omnigent/pi_native_credentials.py``).
 # - qwen: ``--input-file`` / ``--json-file`` bridge verified on v0.18.1
 #   (``omnigent/qwen_native_forwarder.py`` / ``docs/QWEN_NATIVE_DESIGN.md``).
 # - goose: SQLite forwarder schema verified on Goose 1.38.0
@@ -116,7 +118,7 @@ KIRO_KEY = "kiro"
 #   semver version with the build date alongside it
 #   (``Hermes Agent v0.19.1 (2026.7.30)``), so the floor is that semver.
 _CODEX_MIN_VERSION = "0.137.0"
-_PI_MIN_VERSION = "0.79.0"
+_PI_MIN_VERSION = "0.84.2"
 _QWEN_MIN_VERSION = "0.18.1"
 _GOOSE_MIN_VERSION = "1.38.0"
 _HERMES_MIN_VERSION = "0.17.0"
@@ -245,12 +247,14 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         min_version=_CURSOR_MIN_VERSION,
     ),
     # Kimi Code CLI ships a single-binary ``kimi`` via a curl installer (no
-    # npm). ``kimi login`` is the interactive provider login (OAuth or a
-    # Moonshot API key). ``status_args`` is intentionally ``None``: kimi has
-    # no first-class "am I logged in?" exit-code probe — login state is
-    # inspected file-based via ``kimi_auth.kimi_login_detected`` instead. With
-    # ``None`` the login path runs every time the operator asks for it
-    # (interactive, so they can cancel if already authenticated).
+    # npm). ``kimi login`` is the interactive OAuth device flow (membership);
+    # pay-per-use users instead set a Kimi API key in
+    # ``~/.kimi-code/config.toml``. ``status_args`` is intentionally ``None``:
+    # kimi has no first-class "am I logged in?" exit-code probe — readiness is
+    # inspected file-based via ``kimi_auth.kimi_auth_configured`` instead (login
+    # credential OR configured API key). With ``None`` the login path runs every
+    # time the operator asks for it (interactive, so they can cancel if already
+    # authenticated).
     # ``logout_args`` is ``None`` because kimi has no ``kimi logout`` subcommand
     # (verified against kimi CLI v0.29.1 — ``kimi logout`` errors "unknown
     # command"), so ``harness_logout`` is a no-op for it (same as Qwen / agy).
@@ -337,12 +341,13 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     "native-cursor": CURSOR_KEY,
     "kiro-native": KIRO_KEY,
     "native-kiro": KIRO_KEY,
-    # The native agy TUI bridge wraps the ``agy`` CLI; both spellings map to
-    # the Gemini family's install spec. (The in-process ``antigravity`` SDK
-    # harness is deliberately absent — like the other SDK harnesses it needs no
-    # CLI binary.)
+    # The native agy TUI bridge wraps the ``agy`` CLI. The in-process
+    # ``antigravity`` SDK harness is deliberately absent because it needs no
+    # CLI binary.
     "antigravity-native": GEMINI_FAMILY,
     "native-antigravity": GEMINI_FAMILY,
+    "agy-native": GEMINI_FAMILY,
+    "native-agy": GEMINI_FAMILY,
     "goose-native": GOOSE_KEY,
     "native-goose": GOOSE_KEY,
     # Headless Goose (``harness: goose``, drives ``goose acp``) wraps the same

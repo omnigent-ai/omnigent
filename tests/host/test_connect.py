@@ -685,6 +685,7 @@ async def test_handle_launch_prints_exact_runner_log_path(
     tmp (no write to the developer's real ``~/.omnigent``).
     """
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / ".omnigent"))
     host = _make_host_process()
     workspace = tmp_path / "project"
     workspace.mkdir()
@@ -954,6 +955,7 @@ async def test_handle_launch_immediate_exit_reports_exit_code_and_log_tail(
     can surface the cause to the user verbatim.
     """
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / ".omnigent"))
     host = _make_host_process()
     workspace = tmp_path / "project"
     workspace.mkdir()
@@ -3813,6 +3815,7 @@ def test_run_host_process_announces_session_log_dir_on_start(
     advertised dir resolves under tmp.
     """
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / ".omnigent"))
     # A single CancelledError ends the connect loop cleanly (no fatal exit),
     # so run_host_process returns after printing the startup banner.
     _patch_connect(monkeypatch, _ConnectSpy([asyncio.CancelledError()]))

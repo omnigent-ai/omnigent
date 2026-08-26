@@ -37,6 +37,7 @@ from omnigent.harness_plugins import (
 from omnigent.runner.routing import RunnerRouter
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.schemas import (
+    BackgroundTaskInfo,
     McpServerStartup,
     SandboxStatus,
     ServerStreamEvent,
@@ -142,6 +143,21 @@ _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE: str = "external_reasoning_effort_change"
 
 
 _EXTERNAL_SUBAGENT_START_TYPE: str = "external_subagent_start"
+
+
+_EXTERNAL_ACP_SUBAGENT_START_TYPE: str = "external_acp_subagent_start"
+
+
+# Stable id an ACP agent gave the sub-agent it spawned (Devin's ``agentId``);
+# the idempotency key for the child row. Unlike the native families there is no
+# ``omnigent.wrapper`` value: an ACP sub-agent runs the SAME harness as its
+# parent, so leaving the wrapper unset lets the child's harness resolve to the
+# parent's (e.g. ``devin``) and the UI label it accordingly, instead of
+# mislabeling it as another vendor.
+_ACP_SUBAGENT_ID_LABEL_KEY = "omnigent.acp.subagent_id"
+
+
+_ACP_SUBAGENT_DESCRIPTION_LABEL_KEY = "omnigent.acp.subagent_description"
 
 
 _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE = "claude-code-native-ui-subagent"
@@ -442,6 +458,7 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_SESSION_TITLE_TYPE,
     _EXTERNAL_SESSION_TODOS_TYPE,
     _EXTERNAL_SUBAGENT_START_TYPE,
+    _EXTERNAL_ACP_SUBAGENT_START_TYPE,
     _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
     _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE,
     _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
@@ -462,6 +479,12 @@ _session_active_response_cache: dict[str, str] = {}
 
 
 _session_background_task_count_cache: dict[str, int] = {}
+
+
+# Per-shell detail behind the tally above, kept sticky in lockstep with it (see
+# ``_publish_status``) so a reload/reconnect can restore it. Absent when the
+# count cache is absent, or when a runner reported only the count with no detail.
+_session_background_tasks_cache: dict[str, list[BackgroundTaskInfo]] = {}
 
 
 _read_last_seen: dict[str, dict[str, int]] = {}
@@ -960,6 +983,7 @@ __all__ = [
     "_server_runner_router",
     "_session_active_response_cache",
     "_session_background_task_count_cache",
+    "_session_background_tasks_cache",
     "_session_mcp_startup_cache",
     "_session_sandbox_status_cache",
     "_session_status_cache",

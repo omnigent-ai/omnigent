@@ -1,7 +1,7 @@
 {
   "name": "omnigent-desktop-electron",
   "productName": "Omnigent",
-  "version": "0.11.0-dev.0",
+  "version": "0.12.0-dev.0",
   "description": "Omnigent desktop shell (Electron edition) — a thin native wrapper around the server-served web UI.",
   "private": true,
   "main": "src/main.js",
@@ -34,7 +34,8 @@
   },
   "devDependencies": {
     "electron": "^42.3.2",
-    "electron-builder": "^26.0.0"
+    "electron-builder": "^26.0.0",
+    "playwright": "^1.62.1"
   },
   "build": {
     "appId": "ai.omnigent.desktop",

@@ -24,6 +24,45 @@ variables:
   features:
     description: "Comma-separated deployment-wide release features."
     default: ""
+  # OTel plumbing is gated on these three complex variables so a workspace
+  # without an OTel collector / UC OTel tables can deploy cleanly. deploy.py
+  # --no-otel selects the `prod-no-otel` target, which overrides them; the
+  # defaults below keep the tracer on exactly as before.
+  app_command:
+    type: complex
+    description: >
+      App entrypoint. Default runs under opentelemetry-instrument so the
+      Databricks Apps platform OTLP endpoint is auto-instrumented. --no-otel
+      overrides this with ["python", "app.py"] (no instrumentation).
+    default: ["opentelemetry-instrument", "python", "app.py"]
+  app_env:
+    type: complex
+    description: >
+      The app's full env list. Default forces the OTel tracer on
+      (OTEL_TRACES_SAMPLER=always_on); --no-otel overrides with the same list
+      minus the sampler, so no exporter is configured (otherwise spans export
+      to localhost:4317 and fail DEADLINE_EXCEEDED when no collector present).
+    default:
+      - name: AP_LAKEBASE_ENDPOINT
+        value_from: postgres
+      - name: AP_ARTIFACT_VOLUME_PATH
+        value_from: artifact_volume
+      - name: OTEL_TRACES_SAMPLER
+        value: 'always_on'
+      - name: OMNIGENT_FEATURES
+        value: "${var.features}"
+  otel_export_destinations:
+    type: complex
+    description: >
+      Databricks Apps platform OTel export destinations (UC tables). Default
+      routes logs/metrics/traces to <otel_table_schema>.otel_*; --no-otel
+      overrides with an empty list (no export). Requires a workspace with a
+      custom storage location — the export API rejects default-storage tables.
+    default:
+      - unity_catalog:
+          logs_table: ${var.otel_table_schema}.otel_logs
+          metrics_table: ${var.otel_table_schema}.otel_metrics
+          traces_table: ${var.otel_table_schema}.otel_spans
 
 resources:
   apps:
@@ -39,16 +78,8 @@ resources:
       # set it out-of-band via apps.create_update in deploy.py before
       # the bundle deploy runs.
       config:
-        command: ["opentelemetry-instrument", "python", "app.py"]
-        env:
-          - name: AP_LAKEBASE_ENDPOINT
-            value_from: postgres
-          - name: AP_ARTIFACT_VOLUME_PATH
-            value_from: artifact_volume
-          - name: OTEL_TRACES_SAMPLER
-            value: 'always_on'
-          - name: OMNIGENT_FEATURES
-            value: "${var.features}"
+        command: ${var.app_command}
+        env: ${var.app_env}
       resources:
         - name: postgres
           postgres:
@@ -61,29 +92,53 @@ resources:
             securable_type: VOLUME
             permission: WRITE_VOLUME
 
+# Reusable workspace block so a target and its no-OTel variant share one
+# host/root_path definition (host must be literal — DAB reads it before
+# resolving vars — so it can't be a ${var.}). To deploy to a different
+# workspace, edit this one anchor.
+.prod_workspace: &prod_workspace
+  host: https://example.databricks.com   # ← your workspace URL
+  # Isolate state per app so one bundle can deploy multiple apps.
+  root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${var.app_name}
+
 targets:
-  # One target per workspace. workspace.host must be literal (DAB reads it
-  # before resolving vars). deploy.py selects via --target. To deploy to a
-  # different workspace, add another target block here and pass
-  # `deploy.py --target <name>`.
+  # One target per workspace. deploy.py selects via --target. `prod` keeps the
+  # OTel tracer on; `prod-no-otel` (below) is the same workspace/state with the
+  # OTel variables overridden off — deploy.py --no-otel selects it. To deploy
+  # to a different workspace, edit the &prod_workspace anchor above.
   prod:
     mode: production
-    workspace:
-      host: https://example.databricks.com   # ← your workspace URL
-      # Isolate state per app so one bundle can deploy multiple apps.
-      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${var.app_name}
+    workspace: *prod_workspace
     resources:
       apps:
         omnigent:
-          # Optional: Databricks Apps platform OTel export. The platform
-          # auto-injects OTEL_EXPORTER_OTLP_ENDPOINT into the app container
-          # so any OTLP emitter (including telemetry.init() in src/app.py)
-          # routes to the configured UC tables. The export API rejects tables
-          # in default storage ("Cannot export App telemetry to tables in
-          # default storage"), so this requires a workspace with a custom
-          # storage location — drop this block if yours has none.
-          telemetry_export_destinations:
-            - unity_catalog:
-                logs_table: ${var.otel_table_schema}.otel_logs
-                metrics_table: ${var.otel_table_schema}.otel_metrics
-                traces_table: ${var.otel_table_schema}.otel_spans
+          # Databricks Apps platform OTel export. The platform auto-injects
+          # OTEL_EXPORTER_OTLP_ENDPOINT into the app container so any OTLP
+          # emitter (including telemetry.init() in src/app.py) routes to the
+          # configured UC tables. Gated on ${var.otel_export_destinations} so
+          # --no-otel drops it (empty list). The export API rejects tables in
+          # default storage, so this requires a workspace with a custom
+          # storage location — use --no-otel if yours has none.
+          telemetry_export_destinations: ${var.otel_export_destinations}
+
+  # No-OTel variant of `prod`: same workspace + Terraform state (shared
+  # root_path), but overrides the OTel complex variables so the app runs
+  # uninstrumented (`python app.py`, no OTEL_TRACES_SAMPLER, no platform
+  # export). Use for workspaces with no OTel collector / UC OTel tables —
+  # otherwise span exports fail DEADLINE_EXCEEDED to localhost:4317.
+  # Selected by deploy.py --no-otel.
+  prod-no-otel:
+    mode: production
+    workspace: *prod_workspace
+    # Target overrides assign values directly (docs: "Set a variable's value" →
+    # `variables: <name>: <value>`), not nested variable declarations.
+    variables:
+      app_command: ["python", "app.py"]
+      app_env:
+        - name: AP_LAKEBASE_ENDPOINT
+          value_from: postgres
+        - name: AP_ARTIFACT_VOLUME_PATH
+          value_from: artifact_volume
+        - name: OMNIGENT_FEATURES
+          value: "${var.features}"
+      otel_export_destinations: []

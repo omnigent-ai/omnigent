@@ -262,6 +262,42 @@ class CompactionComplete(ExecutorEvent):
 
 
 @dataclass
+class SubAgentStarted(ExecutorEvent):
+    """A sub-agent the harness agent spawned has begun.
+
+    Surfaced so the runner can mint an Omnigent child session (the web
+    "Subagents" panel lists one row per child). ACP has no standardized
+    sub-agent signal, so a per-dialect ``AcpSubAgentSource`` normalizes an
+    agent's own reporting (e.g. Devin's ``cognition.ai/subagent_*`` ``_meta``)
+    into this event — see :mod:`omnigent.inner.acp_subagents`.
+
+    :param child_key: Stable, per-turn-unique id for the sub-agent, used both to
+        correlate the later :class:`SubAgentCompleted` and as the idempotency
+        key when the child session is minted.
+    :param title: Short human label for the row, e.g. ``"mathutils"``.
+    :param task: The instruction the sub-agent was given, shown on the row.
+    """
+
+    child_key: str
+    title: str
+    task: str = ""
+
+
+@dataclass
+class SubAgentCompleted(ExecutorEvent):
+    """A previously-started sub-agent finished. See :class:`SubAgentStarted`.
+
+    :param child_key: Matches the :attr:`SubAgentStarted.child_key`.
+    :param ok: Whether the sub-agent reported success.
+    :param summary: The sub-agent's closing summary, shown on the child row.
+    """
+
+    child_key: str
+    ok: bool = True
+    summary: str = ""
+
+
+@dataclass
 class TurnCancelled(ExecutorEvent):
     """The current assistant turn was cancelled before completion."""
 

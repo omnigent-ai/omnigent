@@ -41,7 +41,7 @@ function describe(state: SessionState): Visual {
         kind: state.kind,
         ariaLabel: "Session running",
         tooltip: "Session running",
-        render: () => <RunningDot className="size-2.5" />,
+        render: () => <RunningDot className="size-3" />,
       };
     case "starting":
       // Same spinner as running — the session is coming up, not yet working.
@@ -49,7 +49,7 @@ function describe(state: SessionState): Visual {
         kind: state.kind,
         ariaLabel: "Session starting up",
         tooltip: "Session starting up",
-        render: () => <RunningDot className="size-2.5" />,
+        render: () => <RunningDot className="size-3" />,
       };
     case "unseen":
       // Solid brand-pink dot — distinguished from the running indicator,

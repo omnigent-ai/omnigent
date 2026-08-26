@@ -20,10 +20,13 @@ from omnigent.reasoning_effort import (
     CODEX_NATIVE_EFFORTS,
     DEFAULT_MODEL_EFFORT_CAPS,
     EFFORT_VALUES,
+    PI_EFFORTS,
     ModelEffortCaps,
     clamp_effort_for_model,
     effort_for_model_switch,
     model_effort_caps,
+    nearest_pi_thinking_level,
+    to_pi_thinking_level,
     validate_effort,
 )
 
@@ -187,3 +190,72 @@ def test_routing_settings_effort_caps_reach_the_clamp() -> None:
         assert clamp_effort_for_model("xhigh", "system.ai.glm-5-2") == "xhigh"
     # Outside that deployment the frozen default is back.
     assert clamp_effort_for_model("xhigh", "system.ai.glm-5-2") == "medium"
+
+
+def test_pi_ladder_is_the_full_canonical_set() -> None:
+    """pi accepts every canonical effort, so nothing is rejected at validation."""
+    assert PI_EFFORTS == EFFORT_VALUES
+    for effort in sorted(EFFORT_VALUES):
+        assert validate_effort(effort, "pi", PI_EFFORTS) == effort
+    with pytest.raises(ValueError):
+        validate_effort("turbo", "pi", PI_EFFORTS)
+
+
+def test_pi_thinking_level_translates_none_to_off() -> None:
+    """Canonical ``none`` is pi's ``off``; the rest are spelled identically."""
+    assert to_pi_thinking_level("none") == "off"
+    for effort in ("minimal", "low", "medium", "high", "xhigh", "max"):
+        assert to_pi_thinking_level(effort) == effort
+    # ``off`` stays a clear-to-default sentinel on the omnigent side, so it is
+    # never handed to the translator — validation rejects it first.
+    with pytest.raises(ValueError):
+        validate_effort("off", "pi", PI_EFFORTS)
+
+
+def test_pi_thinking_level_clamps_ultra_to_max() -> None:
+    """``ultra`` is not in pi's ladder; it clamps to ``max`` (the top rung)."""
+    assert to_pi_thinking_level("ultra") == "max"
+
+
+def test_nearest_pi_thinking_level_clamps_to_reported_levels() -> None:
+    """An unsupported rung clamps to the closest one pi reports, ties downward."""
+    assert nearest_pi_thinking_level("high", ["off", "low", "high"]) == "high"
+    assert nearest_pi_thinking_level("xhigh", ["off", "low", "high"]) == "high"
+    assert nearest_pi_thinking_level("max", ["off", "minimal"]) == "minimal"
+    # medium is equidistant from low and high → the lower rung wins.
+    assert nearest_pi_thinking_level("medium", ["low", "high"]) == "low"
+    # Nothing reported (or an unknown rung) → the caller leaves the level alone.
+    assert nearest_pi_thinking_level("high", []) is None
+    assert nearest_pi_thinking_level("bogus", ["low"]) is None
+
+
+def test_efforts_for_harness_distinguishes_unsupported_from_unknown() -> None:
+    """The three outcomes are distinct, and the last two must not be conflated.
+
+    A harness with no effort plumbing returns an empty set (callers should
+    refuse or filter), while a harness absent from the capability registry
+    returns ``None`` (callers cannot classify it, so a filter must pass the
+    value through rather than drop what a plugin harness might accept).
+    """
+    from omnigent.reasoning_effort import GEMINI_EFFORTS, efforts_for_harness
+
+    assert efforts_for_harness("claude-sdk") == ANTHROPIC_EFFORTS
+    assert efforts_for_harness("claude-native") == ANTHROPIC_EFFORTS
+    assert efforts_for_harness("antigravity-native") == GEMINI_EFFORTS
+    # pi declares its own family, so it resolves to a real vocabulary.
+    assert efforts_for_harness("pi") == PI_EFFORTS
+    assert efforts_for_harness("pi-native") == PI_EFFORTS
+    # Known, but declared EffortFamily.NONE.
+    assert efforts_for_harness("opencode-native") == frozenset()
+    # Not in the registry at all — unclassifiable, not unsupported.
+    assert efforts_for_harness("some-plugin-harness") is None
+    assert efforts_for_harness(None) is None
+
+
+def test_efforts_for_harness_resolves_aliases() -> None:
+    """An alias resolves to the same vocabulary as its canonical name."""
+    from omnigent.harness_aliases import canonicalize_harness
+    from omnigent.reasoning_effort import efforts_for_harness
+
+    canonical = canonicalize_harness("claude-code") or "claude-code"
+    assert efforts_for_harness("claude-code") == efforts_for_harness(canonical)

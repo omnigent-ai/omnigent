@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
+import tempfile
 import time
 from collections.abc import Generator
 from pathlib import Path
@@ -14,6 +16,11 @@ try:
     import resource as _resource  # POSIX-only; absent on Windows.
 except ImportError:
     _resource = None  # type: ignore[assignment]
+
+# Establish test data isolation before importing any Omnigent modules. This
+# deliberately replaces ambient state; subprocesses inherit the safe override.
+_TEST_OMNIGENT_DATA_DIR = Path(tempfile.mkdtemp(prefix="omnigent-pytest-")).resolve()
+os.environ["OMNIGENT_DATA_DIR"] = str(_TEST_OMNIGENT_DATA_DIR)
 
 # Skip the synchronous api.litellm.ai/model_catalog HTTP fallback during
 # tests. Hardened CI runners can't reach the public internet, so every
@@ -54,9 +61,9 @@ os.environ.setdefault("OMNIGENT_AUTH_PROVIDER", "header")
 # monkeypatch.delenv-ing this var.
 os.environ.setdefault("OMNIGENT_LOCAL_SINGLE_USER", "1")
 
-from omnigent.db.utils import _engine_cache, _engine_lock, get_or_create_engine
-from omnigent.runtime.filesystem_registry import GitFilesystemRegistry
-from tests import _model_pools
+from omnigent.db.utils import _engine_cache, _engine_lock, get_or_create_engine  # noqa: E402
+from omnigent.runtime.filesystem_registry import GitFilesystemRegistry  # noqa: E402
+from tests import _model_pools  # noqa: E402
 
 pytest_plugins = ["tests._token_usage"]
 
@@ -122,6 +129,7 @@ def _run_test_environment_guardrails(config: pytest.Config) -> None:
 
 def pytest_unconfigure(config: pytest.Config) -> None:
     """Clean up per-session resources."""
+    shutil.rmtree(_TEST_OMNIGENT_DATA_DIR, ignore_errors=True)
 
 
 # Per-worker progress logger: fsync'd START/END lines so a
@@ -355,6 +363,49 @@ def _isolate_codex_native_state(
     """
     state_dir = tmp_path_factory.mktemp("codex-native-state")
     monkeypatch.setenv("OMNIGENT_CODEX_NATIVE_STATE_DIR", str(state_dir))
+
+
+@pytest.fixture()
+def claude_managed_settings() -> None:
+    """Opt back in to the host's real Claude Code managed-settings chain.
+
+    Request this alongside a test that must read the machine's actual
+    ``managed-settings.json``; :func:`_isolate_claude_managed_settings` then
+    leaves the path list alone.
+
+    :returns: None.
+    """
+
+
+@pytest.fixture(autouse=True)
+def _isolate_claude_managed_settings(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep the host's Claude Code managed settings out of ambient detection.
+
+    ``omnigent.onboarding.ambient`` reads Claude Code's enterprise managed
+    settings to detect a gateway the CLI authenticates itself. Those paths are
+    **absolute and machine-global** (``/Library/Application Support/ClaudeCode/…``,
+    ``/etc/claude-code/…``), so unlike ``~/.claude`` they are NOT redirected by
+    a test's tmp ``$HOME`` — a developer's or CI runner's real enterprise install
+    would otherwise add a phantom Claude credential to every detection assertion.
+    ``claude_native`` resolves this same tuple at call time, so neutralizing it
+    here covers its Smart-Routing gateway check and managed model overrides too.
+
+    ``autouse=True`` because the alternative leaves us one missed test away from
+    host-dependent failures that reproduce only on configured machines. Tests
+    that exercise the detection pass an explicit ``paths=`` argument (the readers
+    take one) or request :func:`claude_managed_settings`.
+
+    :param request: Pytest request, inspected for the opt-in fixture.
+    :param monkeypatch: Pytest monkeypatch fixture; restores the tuple at
+        teardown.
+    :returns: None.
+    """
+    if "claude_managed_settings" in request.fixturenames:
+        return
+    monkeypatch.setattr("omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
 
 
 @pytest.fixture()

@@ -60,6 +60,8 @@ from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
+from omnigent.inner.acp_extension import NO_ACP_EXTENSION, AcpExtension
+from omnigent.inner.acp_subagents import SubAgentStart, read_subagent_events
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
@@ -69,6 +71,8 @@ from omnigent.inner.executor import (
     ExecutorEvent,
     Message,
     ReasoningChunk,
+    SubAgentCompleted,
+    SubAgentStarted,
     TextChunk,
     ToolCallComplete,
     ToolCallRequest,
@@ -195,6 +199,16 @@ class AcpAgentConfig:
         it skips the human approval card for a request no policy had an opinion
         on, matching claude-sdk's ``can_use_tool`` gate. Policy still runs in
         every mode, so a DENY still blocks and an explicit ASK still prompts.
+    :param inject_system_prompt: Fold the Omnigent system prompt into the first
+        ACP turn (ACP has no dedicated system-prompt field). On by default. Set
+        to ``False`` for agents like Pi forks (``omp``) that fully own their own
+        system prompt: those agents prepend Omnigent's text to the user message,
+        which can confuse their internal Claude model into emitting XML tool-call
+        fragments (``</function></tool_call>``) when there is no MCP relay
+        backing the described tools. Disabling injection leaves the first turn as
+        plain user content and lets the agent's own system prompt take effect
+        unmodified. When ``omnigent_mcp`` is ``False`` and the agent manages its
+        own context, setting this to ``False`` is strongly recommended.
     """
 
     command: str
@@ -205,6 +219,7 @@ class AcpAgentConfig:
     omnigent_mcp: bool = True
     env_passthrough: tuple[str, ...] = ()
     permission_mode: str = "auto"
+    inject_system_prompt: bool = True
 
 
 class _AcpRequestError(Exception):
@@ -288,6 +303,8 @@ class AcpExecutor(Executor):
         config: AcpAgentConfig,
         cwd: str | None = None,
         os_env: OSEnvSpec | None = None,
+        *,
+        extension: AcpExtension = NO_ACP_EXTENSION,
     ) -> None:
         """Initialize the generic ACP executor.
 
@@ -297,8 +314,13 @@ class AcpExecutor(Executor):
         :param os_env: Environment / sandbox spec. When its ``sandbox`` is not
             ``"none"``, the whole agent process tree is wrapped in the platform
             sandbox (bwrap/seatbelt) at spawn — see :meth:`_sandbox_launch_path`.
+        :param extension: Vendor behavior for the agent being driven, injected by
+            that vendor's harness wrap (e.g.
+            :mod:`omnigent.inner.devin.harness`). The default is protocol-only,
+            so the generic ``acp`` harness reads no vendor field.
         """
         self._config = config
+        self._extension = extension
         self._cwd = cwd or os.getcwd()
         self._os_env = os_env
         # Advertise ``clientCapabilities.fs`` so the agent delegates file
@@ -1215,6 +1237,20 @@ class AcpExecutor(Executor):
         elif update_type == _UPDATE_CONFIG_OPTION:
             self._note_config_options(update.get("configOptions"))
 
+        # Sub-agent lifecycle rides on these updates in a per-agent dialect, so
+        # only the sources this agent's extension supplies can recognize it —
+        # none for a generic ACP agent. The runner mints a child session per
+        # start so the "Subagents" panel lists it.
+        for sub in read_subagent_events(update, self._extension.subagent_sources):
+            if isinstance(sub, SubAgentStart):
+                events.append(
+                    SubAgentStarted(child_key=sub.child_key, title=sub.title, task=sub.task)
+                )
+            else:
+                events.append(
+                    SubAgentCompleted(child_key=sub.child_key, ok=sub.ok, summary=sub.summary)
+                )
+
         return events
 
     def _note_config_options(self, options: object) -> str | None:
@@ -1324,9 +1360,13 @@ class AcpExecutor(Executor):
 
         ``tools`` (Omnigent's builtin tool schemas) are captured for the Omnigent
         MCP relay set up at ``session/new`` — the agent still runs its OWN tools.
+        When ``omnigent_mcp`` is ``False`` the relay is disabled, so the schemas
+        serve no purpose and are discarded immediately rather than stored.
         """
-        # Captured before the (lazy) session so the MCP relay can advertise them.
-        self._omnigent_tools = tools or []
+        # Only keep builtin tools when the relay is enabled — they exist solely
+        # to back the MCP relay. Storing them when the relay is disabled would
+        # let stale data accidentally reach the session/prompt path (#4917).
+        self._omnigent_tools = (tools or []) if self._config.omnigent_mcp else []
         try:
             if self._proc is None or self._proc.returncode is not None:
                 await self._start_process()
@@ -1377,9 +1417,14 @@ class AcpExecutor(Executor):
             history_prefix = self._history_prefix(messages[:latest_user_idx])
             user_text = f"{history_prefix}\n\nuser: {user_text}" if user_text else history_prefix
 
-        # ACP has no system-prompt field, so fold it into the first turn.
+        # ACP has no system-prompt field. When inject_system_prompt is enabled
+        # (the default), fold the Omnigent system prompt into the first turn so
+        # the agent's model sees the spec instructions. When disabled (e.g. for
+        # Pi forks like omp that fully own their own system prompt), skip the
+        # injection to avoid prepending text that confuses the agent's internal
+        # Claude model into emitting XML tool-call fragments (#4917).
         if fresh_session:
-            if system_prompt:
+            if system_prompt and self._config.inject_system_prompt:
                 user_text = f"{system_prompt}\n\n{user_text}" if user_text else system_prompt
             self._system_prompt_sent = True
 
@@ -1426,7 +1471,8 @@ class AcpExecutor(Executor):
             if fut.done() and self._queue.empty():
                 try:
                     response = fut.result()
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
+                    logger.exception("ACP process response retrieval failed")
                     self._session_id = None
                     self._system_prompt_sent = False
                     yield ExecutorError(message=f"ACP process error: {exc}", retryable=True)

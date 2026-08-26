@@ -191,6 +191,27 @@ def native_vendor(harness: str) -> NativeVendor | None:
     )
 
 
+def requires_gateway(profile: BenchProfile) -> bool:
+    """
+    Whether running *profile* needs OpenAI-compatible gateway credentials.
+
+    An own_auth vendor logs its own model in through its CLI, so the resolved
+    creds are never consumed — ``_provision`` only routes a model through the
+    gateway ``when not vendor.own_auth``. Requiring them anyway skips every
+    own_auth native for a contributor with no Databricks or OpenAI account.
+
+    Callers outside this module use it too, so the rule lives in one place: a
+    second copy is a second thing to update when a vendor's auth model changes.
+
+    :param profile: The harness under test.
+    :returns: ``True`` unless the profile is a native-tui harness whose vendor
+        authenticates itself. Anything this module does not recognise needs the
+        gateway, since that is the safe answer.
+    """
+    vendor = native_vendor(profile.harness)
+    return vendor is None or not vendor.own_auth
+
+
 class NativeTuiDriver:
     """Drive a native-tui harness through a live server + host daemon.
 
@@ -223,11 +244,8 @@ class NativeTuiDriver:
         vendor = native_vendor(profile.harness)
         if vendor is None:
             return f"{profile.harness!r} is not a native-tui harness"
-        # An own_auth vendor logs its own model in, so it needs no gateway creds
-        # to run — only the vendor CLI. Requiring them would wrongly skip every
-        # own_auth native for a contributor with no Databricks/OpenAI gateway.
         creds_skip = bench_creds_skip_reason(
-            databricks_profile, require_gateway=not vendor.own_auth
+            databricks_profile, require_gateway=requires_gateway(profile)
         )
         if creds_skip is not None:
             return creds_skip

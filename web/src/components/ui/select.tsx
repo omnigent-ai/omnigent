@@ -5,10 +5,29 @@ import * as SelectPrimitive from "radix-ui/select";
 
 import { getEmbedRoot } from "@/lib/host";
 import { cn } from "@/lib/utils";
+import { useOmnigentAnalytics } from "@/lib/analytics";
 import { ChevronDownIcon, CheckIcon, ChevronUpIcon } from "lucide-react";
 
-function Select({ ...props }: React.ComponentProps<typeof SelectPrimitive.Root>) {
-  return <SelectPrimitive.Root data-slot="select" {...props} />;
+function Select({
+  componentId,
+  valueHasNoPii,
+  onValueChange,
+  ...props
+}: React.ComponentProps<typeof SelectPrimitive.Root> & {
+  // Opt-in analytics id. When set, a selection reports to the host sink (see
+  // `lib/analytics.ts`). The value is redacted by default; set `valueHasNoPii`
+  // ONLY when the option set is bounded/enumerable (never for a free-text value).
+  componentId?: string;
+  valueHasNoPii?: boolean;
+}) {
+  const { trackValueChange } = useOmnigentAnalytics();
+  const handleValueChange = componentId
+    ? (value: string) => {
+        trackValueChange(componentId, "select", value, { valueHasNoPii });
+        onValueChange?.(value);
+      }
+    : onValueChange;
+  return <SelectPrimitive.Root data-slot="select" onValueChange={handleValueChange} {...props} />;
 }
 
 function SelectGroup({ className, ...props }: React.ComponentProps<typeof SelectPrimitive.Group>) {

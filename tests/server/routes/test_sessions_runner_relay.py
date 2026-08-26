@@ -1265,3 +1265,57 @@ async def test_mark_runner_sessions_offline_only_fails_interrupted_turns(
         sessions_module._intentional_stop_sessions.discard(session_id)
         sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
+async def test_relay_does_not_fail_turn_during_server_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A stream drop while THIS server is shutting down leaves the turn alone.
+
+    Shutdown closes the runner tunnels, which drops every relay stream; the
+    runner itself is alive and reconnects to the replacement server. The
+    give-up path must publish no ``failed`` status and persist no
+    ``runner_disconnected`` labels for that self-inflicted loss.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server import shutdown_state
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        0.0,
+    )
+    sessions_module._runner_relay_tasks.clear()
+    gate = asyncio.Event()
+    fake_runner = _TunnelCloseRunnerClient(gate)
+    store = _RecordingLabelStore(live_status="running")
+    session_id = "5b1e2d7c9a4f4e0b8c3d2a1f6e7d8c9b"
+    sessions_module._session_status_cache[session_id] = "running"
+    shutdown_state.mark_server_shutting_down()
+
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            "runner_server_shutdown",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=store,  # type: ignore[arg-type]
+        )
+        assert handle is not None
+        gate.set()
+        await asyncio.wait_for(handle.task, timeout=2.0)
+
+        assert session_id not in store.labels, "shutdown-time drop persisted failure labels"
+        assert sessions_module._session_status_cache.get(session_id) == "running"
+    finally:
+        shutdown_state.reset_for_tests()
+        gate.set()
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=1.0)
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)

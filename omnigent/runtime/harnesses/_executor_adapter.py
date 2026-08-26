@@ -31,6 +31,8 @@ from omnigent.inner.executor import (
     ExecutorEvent,
     Message,
     ReasoningChunk,
+    SubAgentCompleted,
+    SubAgentStarted,
     TextChunk,
     ToolCallComplete,
     ToolCallRequest,
@@ -774,6 +776,28 @@ class ExecutorAdapter(HarnessApp):
                     summary=event.summary,
                     summary_model=event.model,
                     compacted_messages=event.compacted_messages,
+                )
+            )
+        elif isinstance(event, SubAgentStarted):
+            from omnigent.server.schemas import SubagentStartedEvent
+
+            ctx.emit(
+                SubagentStartedEvent(
+                    type="subagent.started",
+                    child_key=event.child_key,
+                    title=event.title,
+                    task=event.task,
+                )
+            )
+        elif isinstance(event, SubAgentCompleted):
+            from omnigent.server.schemas import SubagentCompletedEvent
+
+            ctx.emit(
+                SubagentCompletedEvent(
+                    type="subagent.completed",
+                    child_key=event.child_key,
+                    ok=event.ok,
+                    summary=event.summary,
                 )
             )
         # ExecutorError handled by the caller (re-raises so the

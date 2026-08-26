@@ -209,6 +209,8 @@ const HARNESS_ALIASES: Record<string, string> = {
   "native-cursor": "cursor-native",
   "native-kiro": "kiro-native",
   "native-antigravity": "antigravity-native",
+  "agy-native": "antigravity-native",
+  "native-agy": "antigravity-native",
   "native-goose": "goose-native",
   "native-qwen": "qwen-native",
   "native-kimi": "kimi-native",

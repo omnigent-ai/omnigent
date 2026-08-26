@@ -1390,6 +1390,10 @@ class SqlScheduledTask(OmnigentBase):
         ``"claude-opus-4-7"``. ``None`` means use the agent default.
     :param reasoning_effort: Per-task reasoning-effort hint, e.g. ``"high"``.
         ``None`` means use the agent default.
+    :param permission_mode: Per-task permission mode for native coding harnesses
+        that support one (Claude Code), e.g. ``"acceptEdits"``. The fire path
+        turns it into the runner's ``--permission-mode`` launch arg. ``None``
+        means use the agent default.
     :param workspace: Absolute path on disk where a fired session's runner
         should start (the source repo / working dir). ``None`` when unset.
     :param base_branch: Git base ref a firing branches FROM when it creates a
@@ -1455,6 +1459,10 @@ class SqlScheduledTask(OmnigentBase):
     # mirror the matching conversations.* override columns.
     model_override: Mapped[str | None] = mapped_column(String(128), nullable=True)
     reasoning_effort: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Per-task permission mode for native coding harnesses that carry one
+    # (Claude Code). The fire path converts it to the runner's
+    # ``--permission-mode`` launch arg. NULL = use the agent default.
+    permission_mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
     # Per-firing cost budget in USD. When set, the fire path attaches a
     # cost_budget policy to each spawned session. NULL = no per-firing cap.
     max_cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)

@@ -146,8 +146,12 @@ def _print_ready_banner(provider: str, sandbox_id: str, server_url: str) -> None
     ui.console.print()
     ui.success("Sandbox ready.")
     ui.console.print()
+    from omnigent.server_url import display_server_url
+
     ui.kv("Sandbox", f"{sandbox_id}  (provider: {provider})")
-    ui.kv("Server", server_url)
+    # Display form (workspace /omnigent URL); the suggested command below
+    # keeps the wire URL — both round-trip, but the command is what runs.
+    ui.kv("Server", display_server_url(server_url))
     ui.console.print()
     click.echo("To register the sandbox as a host with your server:")
     click.echo(
