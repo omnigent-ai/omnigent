@@ -657,29 +657,37 @@ async def _mint_acp_subagent_child(
 ) -> None:
     """Mint a child session for a harness-reported sub-agent (the start edge).
 
-    POSTs ``external_subagent_start`` — idempotent on ``child_key`` server-side —
-    and resolves ``child_id_future`` with the returned child id so the completion
-    edge can address the child. Best-effort: a failure resolves the future with
-    the exception (so the completion edge fails fast rather than hanging) and is
-    logged, never raised into the turn.
+    POSTs ``external_acp_subagent_start`` — idempotent on ``child_key``
+    server-side — then seeds the child's transcript with the delegated task as a
+    user message, so opening the row shows what the sub-agent was asked to do
+    instead of an empty chat. Resolves ``child_id_future`` with the child id so
+    the completion edge can address it.
+
+    Deliberately NOT the native ``external_subagent_start`` path: that one stamps
+    a claude-native wrapper label, which makes the UI title the child "Claude
+    Code" regardless of the real harness. The ACP path leaves the wrapper unset so
+    the child inherits its parent's harness identity (e.g. Devin).
+
+    Best-effort: a failure resolves the future with the exception (so the
+    completion edge fails fast rather than hanging) and is logged, never raised
+    into the turn.
 
     :param client: Omnigent HTTP client for the runner subprocess.
     :param parent_id: The parent conversation the sub-agent belongs to.
     :param child_key: Stable sub-agent id; the idempotency + correlation key.
-    :param title: Row label, forwarded as ``agent_type``.
-    :param task: The delegated instruction, forwarded as ``description``.
+    :param title: Row label for the child, e.g. ``"mathutils"``.
+    :param task: The delegated instruction, seeded as the child's first message.
     :param child_id_future: Resolved with the minted child session id.
     """
     try:
         resp = await client.post(
             f"/v1/sessions/{parent_id}/events",
             json={
-                "type": "external_subagent_start",
+                "type": "external_acp_subagent_start",
                 "data": {
                     "subagent_id": child_key,
-                    "agent_type": title or child_key,
+                    "title": title or child_key,
                     "description": task,
-                    "tool_use_id": child_key,
                 },
             },
         )
@@ -687,13 +695,58 @@ async def _mint_acp_subagent_child(
         payload = resp.json() if resp.content else {}
         child_id = payload.get("child_session_id") if isinstance(payload, dict) else None
         if not (isinstance(child_id, str) and child_id):
-            raise ValueError("external_subagent_start returned no child_session_id")
+            raise ValueError("external_acp_subagent_start returned no child_session_id")
         if not child_id_future.done():
             child_id_future.set_result(child_id)
     except Exception as exc:  # noqa: BLE001 — surfacing a sub-agent must never break the turn
         _logger.warning("acp sub-agent child mint failed (child_key=%s): %s", child_key, exc)
         if not child_id_future.done():
             child_id_future.set_exception(exc)
+        return
+    # Seed the child's chat with its task. Separate from the mint so a transcript
+    # failure still leaves a working row (the panel entry already exists).
+    if task:
+        await _post_acp_subagent_message(
+            client, child_id=child_id, child_key=child_key, role="user", text=task
+        )
+
+
+async def _post_acp_subagent_message(
+    client: httpx.AsyncClient,
+    *,
+    child_id: str,
+    child_key: str,
+    role: str,
+    text: str,
+) -> None:
+    """Append one message to an ACP sub-agent's child transcript.
+
+    Uses the existing ``external_conversation_item`` bridge (the same path the
+    native forwarders use for sub-agent transcripts), so the child conversation
+    renders normally when opened. Best-effort and never raised into the turn.
+
+    :param client: Omnigent HTTP client for the runner subprocess.
+    :param child_id: The child session to append to.
+    :param child_key: Sub-agent id, used for the response id and log context.
+    :param role: ``"user"`` (the delegated task) or ``"assistant"`` (its result).
+    :param text: Message text.
+    """
+    block_type = "input_text" if role == "user" else "output_text"
+    try:
+        resp = await client.post(
+            f"/v1/sessions/{child_id}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "message",
+                    "item_data": {"role": role, "content": [{"type": block_type, "text": text}]},
+                    "response_id": f"resp_acpsub_{child_key}",
+                },
+            },
+        )
+        resp.raise_for_status()
+    except Exception as exc:  # noqa: BLE001 — transcript is best-effort
+        _logger.warning("acp sub-agent %s message failed (child_key=%s): %s", role, child_key, exc)
 
 
 async def _complete_acp_subagent_child(
@@ -728,6 +781,12 @@ async def _complete_acp_subagent_child(
             "acp sub-agent child unavailable for completion (child_key=%s): %s", child_key, exc
         )
         return
+    # The sub-agent's closing summary is the only account of its work the agent
+    # reports, so it goes in the child's transcript, not just the status edge.
+    if summary:
+        await _post_acp_subagent_message(
+            client, child_id=child_id, child_key=child_key, role="assistant", text=summary
+        )
     try:
         await post_external_session_status(
             client,
