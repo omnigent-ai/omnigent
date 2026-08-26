@@ -1932,6 +1932,8 @@ aside[aria-label="Workspace"][data-maximized] {
   --sidebar-accent-foreground: var(--custom-light-sidebar-accent-foreground);
   --sidebar-border: var(--custom-light-sidebar-border);
   --sidebar-ring: var(--custom-light-sidebar-ring);
+  --sidebar-active: var(--custom-light-sidebar-active);
+  --sidebar-active-foreground: var(--custom-light-sidebar-active-foreground);
 }
 .dark[data-theme="custom"] {
   --background: var(--custom-dark-background);
@@ -1965,6 +1967,8 @@ aside[aria-label="Workspace"][data-maximized] {
   --sidebar-accent-foreground: var(--custom-dark-sidebar-accent-foreground);
   --sidebar-border: var(--custom-dark-sidebar-border);
   --sidebar-ring: var(--custom-dark-sidebar-ring);
+  --sidebar-active: var(--custom-dark-sidebar-active);
+  --sidebar-active-foreground: var(--custom-dark-sidebar-active-foreground);
 }
 :root:not(.dark)[data-theme="custom"] .app-shell {
   background: var(--custom-light-shell-background);

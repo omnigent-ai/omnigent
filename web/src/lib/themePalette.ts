@@ -86,6 +86,8 @@ export interface PaletteTokens {
   sidebarAccentForeground: string;
   sidebarBorder: string;
   sidebarRing: string;
+  sidebarActive: string;
+  sidebarActiveForeground: string;
   shellBackground: string;
 }
 
@@ -128,6 +130,8 @@ function paletteTokens(tokens: PaletteTokenInput): PaletteTokens {
     sidebarAccentForeground: tokens.accentForeground,
     sidebarBorder: tokens.border,
     sidebarRing: tokens.ring,
+    sidebarActive: "color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar))",
+    sidebarActiveForeground: "var(--sidebar-foreground)",
     ...tokens,
   };
 }
@@ -187,6 +191,8 @@ export const PALETTES: readonly PaletteMeta[] = [
         sidebar: "#fdfafa",
         sidebarPrimary: "#2272b4",
         sidebarRing: "#2272b4",
+        sidebarActive: "rgba(240, 1, 150, 0.1)",
+        sidebarActiveForeground: "#651249",
         shellBackground: "var(--background)",
       }),
       dark: paletteTokens({
@@ -216,6 +222,8 @@ export const PALETTES: readonly PaletteMeta[] = [
         sidebarAccentForeground: "oklch(0.965 0.003 240)",
         sidebarBorder: "oklch(0.28 0.005 240)",
         sidebarRing: "oklch(0.92 0.003 240 / 0.4)",
+        sidebarActive: "rgba(240, 1, 150, 0.15)",
+        sidebarActiveForeground: "#f472b6",
         shellBackground:
           "radial-gradient(rgba(100, 40, 180, 0.12), transparent 50%), radial-gradient(at 80% 20%, rgba(80, 30, 140, 0.08), transparent 45%), linear-gradient(145deg, #1a0e2d, #0e1418, #130e1b)",
       }),

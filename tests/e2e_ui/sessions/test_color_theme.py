@@ -52,6 +52,8 @@ def _computed_theme_tokens(page: Page) -> dict[str, str]:
         "border",
         "ring",
         "brand-accent",
+        "sidebar-active",
+        "sidebar-active-foreground",
     ]
     return page.evaluate(
         "names => { const probe = document.createElement('div'); "

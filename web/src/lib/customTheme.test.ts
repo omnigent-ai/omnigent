@@ -111,6 +111,16 @@ describe("customTheme", () => {
     expect(deriveCustomTheme({ ...theme, contrast: 50 })).toEqual(palette.tokens);
   });
 
+  it("keeps Omnigent's selected-session colors after contrast changes", () => {
+    const theme = createCustomThemeFromPalette(PALETTES[0]);
+    const variants = deriveCustomTheme({ ...theme, contrast: 53 });
+
+    expect(variants.light.sidebarActive).toBe("rgba(240, 1, 150, 0.1)");
+    expect(variants.light.sidebarActiveForeground).toBe("#651249");
+    expect(variants.dark.sidebarActive).toBe("rgba(240, 1, 150, 0.15)");
+    expect(variants.dark.sidebarActiveForeground).toBe("#f472b6");
+  });
+
   it.each(PALETTES)("keeps the exact $label preview at contrast 50", (palette) => {
     const swatches = customThemeSwatches(createCustomThemeFromPalette(palette));
 

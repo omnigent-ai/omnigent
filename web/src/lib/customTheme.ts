@@ -408,6 +408,8 @@ function rebaseVariant(
     ),
     sidebarBorder: rebaseColor(base.sidebarBorder, reference.border, current.border),
     sidebarRing: primaryChanged ? primary : base.sidebarRing,
+    sidebarActive: base.sidebarActive,
+    sidebarActiveForeground: base.sidebarActiveForeground,
     shellBackground: base.shellBackground,
   };
 }
@@ -499,6 +501,8 @@ const TOKEN_MAP = {
   sidebarAccentForeground: "sidebar-accent-foreground",
   sidebarBorder: "sidebar-border",
   sidebarRing: "sidebar-ring",
+  sidebarActive: "sidebar-active",
+  sidebarActiveForeground: "sidebar-active-foreground",
   shellBackground: "shell-background",
 } as const;
 
