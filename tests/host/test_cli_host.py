@@ -319,6 +319,82 @@ def test_host_enable_subcommand_installs_user_service(
     assert "Enabled the Omnigent host user service for local" in result.output
 
 
+def test_host_enable_reports_persistent_target_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second persistent target is explicit instead of silently replacing the first."""
+    from omnigent.host.service import HostService, HostServiceStatus
+
+    service_path = tmp_path / "omnigent-host.service"
+    monkeypatch.setattr("omnigent.cli._ensure_databricks_server_auth", lambda *args, **kw: None)
+    monkeypatch.setattr("omnigent.cli._find_daemon_record", lambda target: None)
+    monkeypatch.setattr("omnigent.cli._build_host_daemon_env", lambda **kw: {})
+    monkeypatch.setattr(
+        "omnigent.host.service.user_host_service_status",
+        lambda **kw: HostServiceStatus(
+            supported=True,
+            kind="systemd_user",
+            path=service_path,
+            label=service_path.name,
+            installed=True,
+            configured_target="https://old.example.com",
+        ),
+    )
+    monkeypatch.setattr(
+        "omnigent.host.service.enable_user_host_service",
+        lambda *args, **kw: HostService(
+            kind="systemd_user",
+            path=service_path,
+            label=service_path.name,
+        ),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["host", "enable", "--server", "https://new.example.com"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert (
+        "Replaced the persistent host service target https://old.example.com "
+        "with https://new.example.com."
+    ) in result.output
+
+
+def test_host_status_json_includes_user_service(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Service-manager state is independent from daemon registry rows."""
+    from omnigent.host.service import HostServiceStatus
+
+    monkeypatch.setattr("omnigent.cli._selected_daemon_records", lambda **kw: [])
+    monkeypatch.setattr(
+        "omnigent.host.service.user_host_service_status",
+        lambda: HostServiceStatus(
+            supported=True,
+            kind="systemd_user",
+            path=tmp_path / "omnigent-host.service",
+            label="omnigent-host.service",
+            installed=True,
+            configured_target="local",
+            manager_state="stopped",
+            enabled=True,
+            log="journalctl --user -u omnigent-host.service",
+        ),
+    )
+
+    result = CliRunner().invoke(cli, ["host", "status", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["service"]["configured_target"] == "local"
+    assert payload["service"]["manager_state"] == "stopped"
+    assert payload["service"]["enabled"] is True
+    assert payload["daemons"] == []
+
+
 def test_host_disable_subcommand_removes_user_service(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
