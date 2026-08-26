@@ -60,7 +60,7 @@ from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
-from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
+from omnigent.inner.agent_env import clean_agent_env, config_passthrough, declared_passthrough
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
     Executor,
@@ -611,6 +611,7 @@ class AcpExecutor(Executor):
             allow_prefixes=(),
             extra_allowed=(
                 *getattr(config, "env_passthrough", ()),
+                *config_passthrough(),
                 *declared_passthrough(self._os_env),
             ),
         )

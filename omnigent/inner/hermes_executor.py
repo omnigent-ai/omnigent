@@ -48,7 +48,7 @@ import tempfile
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
+from omnigent.inner.agent_env import clean_agent_env, config_passthrough, declared_passthrough
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
     Executor,
@@ -465,7 +465,7 @@ class HermesExecutor(Executor):
         """
         proc_env = clean_agent_env(
             allow_prefixes=("HERMES_",),
-            extra_allowed=declared_passthrough(self._os_env),
+            extra_allowed=(*config_passthrough(), *declared_passthrough(self._os_env)),
         )
         if self._hermes_home is not None:
             proc_env["HERMES_HOME"] = str(self._hermes_home)

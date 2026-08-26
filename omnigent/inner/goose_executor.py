@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
-from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
+from omnigent.inner.agent_env import clean_agent_env, config_passthrough, declared_passthrough
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
     Executor,
@@ -323,7 +323,7 @@ class GooseExecutor(Executor):
         """
         env = clean_agent_env(
             allow_prefixes=("GOOSE_",),
-            extra_allowed=declared_passthrough(self._os_env),
+            extra_allowed=(*config_passthrough(), *declared_passthrough(self._os_env)),
         )
         env.update(self._provider_env())
         return env

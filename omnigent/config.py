@@ -93,7 +93,50 @@ def load_effective_config() -> _Config:
     return _merge_effective_config(load_global_config(), load_local_config())
 
 
+def env_passthrough_names(
+    global_cfg: _Config | None = None,
+    local_cfg: _Config | None = None,
+) -> tuple[str, ...]:
+    """Return the union of env-var names declared in global and project config.
+
+    Reads ``env_passthrough`` from the global config (``~/.omnigent/config.yaml``)
+    and the project config (``.omnigent/config.yaml``), then returns their union
+    as a sorted tuple of unique names.  Project-level names are honoured on top of
+    global ones; neither set removes names declared by the other.
+
+    This is the documented *config-level* escape hatch: a name listed here is
+    admitted into every harness subprocess on top of :data:`BASE_ALLOW_EXACT`,
+    without requiring the same entry to be repeated in every agent spec's
+    ``os_env.sandbox.env_passthrough``.  Per-spec declarations continue to work
+    and union on top of this set at spawn time.
+
+    The function only forwards *names*; it never reads or forwards *values*.
+    Values are read from the omnigent process's own environment at spawn time by
+    :func:`omnigent.inner.agent_env.clean_agent_env`, exactly as the per-spec
+    field works today.
+
+    :param global_cfg: Pre-loaded global config dict; if ``None``, loads from
+        the default global path.
+    :param local_cfg: Pre-loaded project config dict; if ``None``, loads from
+        ``.omnigent/config.yaml`` relative to the current directory.
+    :returns: Sorted tuple of unique variable names, possibly empty.
+    """
+    g = global_cfg if global_cfg is not None else load_global_config()
+    lc = local_cfg if local_cfg is not None else load_local_config()
+
+    def _names(cfg: _Config) -> list[str]:
+        raw = cfg.get("env_passthrough")
+        if not raw:
+            return []
+        if isinstance(raw, list):
+            return [str(n) for n in raw if n]
+        return []
+
+    return tuple(sorted(set(_names(g)) | set(_names(lc))))
+
+
 __all__ = [
+    "env_passthrough_names",
     "global_config_path",
     "load_effective_config",
     "load_global_config",
