@@ -4348,6 +4348,48 @@ def create_runner_app(
                 extra={"session_id": runner_primary_session_id()},
             )
 
+    async def _handle_pi_native_effort_change(
+        conv_id: str,
+        effort: str | None,
+    ) -> Response:
+        from omnigent.pi_native_bridge import (
+            bridge_dir_for_session_id,
+            enqueue_thinking_level_change,
+        )
+        from omnigent.reasoning_effort import (
+            PI_THINKING_LADDER,
+            PI_THINKING_OFF,
+            to_pi_thinking_level,
+        )
+
+        if effort is None or not effort.strip():
+            return Response(status_code=204)
+        thinking = to_pi_thinking_level(effort)
+        # ``ultra`` is not in Pi's ladder; clamp to the top rung.
+        if thinking not in PI_THINKING_LADDER and thinking != PI_THINKING_OFF:
+            thinking = PI_THINKING_LADDER[-1]
+        try:
+            await asyncio.to_thread(
+                enqueue_thinking_level_change,
+                bridge_dir_for_session_id(conv_id),
+                thinking,
+            )
+        except OSError as exc:
+            _logger.warning(
+                "Pi-native effort change failed for session=%s",
+                conv_id,
+                exc_info=True,
+                extra={"session_id": conv_id},
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "pi_native_effort_failed",
+                    "detail": _client_safe_error_detail(exc, context="pi-native effort change"),
+                },
+            )
+        return Response(status_code=204)
+
     async def _handle_pi_native_model_change(
         conv_id: str,
         model: str | None,
@@ -7289,11 +7331,16 @@ def create_runner_app(
                 _session_reasoning_effort[conversation_id] = effort
             else:
                 _session_reasoning_effort.pop(conversation_id, None)
-            if harness in ("claude-native", "codex-native"):
+            if harness in ("claude-native", "codex-native", "pi-native"):
                 if harness == "codex-native":
                     return await _handle_codex_native_settings_update(
                         conversation_id,
                         {"effort": effort},
+                    )
+                if harness == "pi-native":
+                    return await _handle_pi_native_effort_change(
+                        conversation_id,
+                        effort,
                     )
                 return await _handle_claude_native_effort_change(
                     conversation_id,
