@@ -501,12 +501,14 @@ cause is named from what you observed rather than guessed.
   actual window. Pass `serverUrl` to `launchDesktop` when the failure is *past*
   connect (boot straight into the shell); omit it to film the connect/setup/
   fallback flow itself. Run with `node --test e2e/desktop_<slug>.e2e.js` from
-  `web/electron` (wrap in `xvfb-run -a` on a headless box), after building the
-  SPA. This lane needs `electron` + `playwright` on disk (neither is in the
-  web-test CI path); the harness **skips** cleanly when they're absent, so if
-  they can't be installed here keep `recordings: []` and name the missing dep in
-  `evidence` (a real environment limit, not a `not_reproduced`). See
-  `web/electron/e2e/README.md`.
+  `web/electron`, after building the SPA. On a headless box wrap it in
+  `xvfb-run -a` and set `OMNIGENT_PW_NO_SANDBOX=1` so Electron's Chromium starts
+  (the repro-agent CI sets both for you, and points `OMNIGENT_PYTHON` at the
+  venv the harness spawns the server with). This lane needs `electron` +
+  `playwright` on disk (neither is in the fast `web-test` CI path); the harness
+  **skips** cleanly when they're absent, so if they can't be installed here keep
+  `recordings: []` and name the missing dep in `evidence` (a real environment
+  limit, not a `not_reproduced`). See `web/electron/e2e/README.md`.
 
 A recording must end on the outcome the user observes — the failure (wrong screen
 state, bad output, error) for a `before` recording, or the correct end state for a
