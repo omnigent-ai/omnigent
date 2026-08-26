@@ -201,13 +201,22 @@ Determine the number now so Step 3 and the maintainer handoff can use it:
 
 - If `bug_url` is a **GitHub issue** in this repo, `closing_issue_number` is its
   number.
-- If `bug_url` is a **Linear ticket**, look for a mirrored GitHub issue: search
-  `gh issue list --repo <repo> --state open --search "<bug title / OMNI key>"`
-  (Linear bugs are often mirrored to a GitHub issue with the same title). If you
-  find one that is clearly the same bug, that is `closing_issue_number`.
-- If neither yields a GitHub issue, there is **no** `closing_issue_number` — the
-  PR body must **not** use a closing keyword against the Linear URL. Reference the
-  Linear ticket in prose instead (e.g. "Resolves OMNI-1234 (Linear)").
+- If `bug_url` is a **Linear ticket**, look for a mirrored GitHub issue. **Search
+  by the ticket's descriptive title/keywords, not the OMNI key** — the mirror
+  almost never contains the `OMNI-####` string (it's the *same bug reworded*, not a
+  cross-link), so an OMNI-key search returns nothing and is not evidence the mirror
+  is absent. Read the Linear ticket's title first, then search on its distinctive
+  phrase across **all** states:
+  `gh issue list --repo <repo> --state all --search "<distinctive words from the title>"`.
+  Try more than one phrasing before giving up (e.g. for "new-session picker offers
+  agents that cannot launch": `"picker offers agents that cannot launch"`, then
+  `"session picker launch"`). If you find an issue that is clearly the same bug,
+  that is `closing_issue_number` — regardless of whether it names the ticket.
+- Only after those title searches genuinely come up empty is there **no**
+  `closing_issue_number`. Then the PR body must **not** use a closing keyword
+  against the Linear URL — reference the ticket in prose instead
+  (e.g. "Resolves OMNI-1234 (Linear)"). Do not claim "no mirror exists" off a
+  single OMNI-key search that found nothing.
 
 Record the chosen `closing_issue_number` (or its absence) — you reuse it in the
 PR body (Step 3.4) and the maintainer handoff (Step 4.5).
