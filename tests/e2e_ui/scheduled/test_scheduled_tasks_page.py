@@ -139,7 +139,7 @@ def _pick_minute(page: Page, minute: int) -> None:
     expect(popover_content).to_have_attribute("data-state", "open")
     page.get_by_test_id(f"schedule-minute-{minute:02d}").click()
     # Dismiss the picker so its floating position stops churning the layout.
-    name_input.click()
+    name_input.click(force=True)
     expect(popover_content).to_have_count(0)
 
 
