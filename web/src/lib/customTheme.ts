@@ -410,6 +410,7 @@ function rebaseVariant(
     sidebarRing: primaryChanged ? primary : base.sidebarRing,
     sidebarActive: base.sidebarActive,
     sidebarActiveForeground: base.sidebarActiveForeground,
+    sidebarBackground: base.sidebarBackground,
     shellBackground: base.shellBackground,
   };
 }
@@ -503,6 +504,7 @@ const TOKEN_MAP = {
   sidebarRing: "sidebar-ring",
   sidebarActive: "sidebar-active",
   sidebarActiveForeground: "sidebar-active-foreground",
+  sidebarBackground: "sidebar-background",
   shellBackground: "shell-background",
 } as const;
 

@@ -88,6 +88,7 @@ export interface PaletteTokens {
   sidebarRing: string;
   sidebarActive: string;
   sidebarActiveForeground: string;
+  sidebarBackground: string;
   shellBackground: string;
 }
 
@@ -132,6 +133,7 @@ function paletteTokens(tokens: PaletteTokenInput): PaletteTokens {
     sidebarRing: tokens.ring,
     sidebarActive: "color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar))",
     sidebarActiveForeground: "var(--sidebar-foreground)",
+    sidebarBackground: "var(--sidebar)",
     ...tokens,
   };
 }
@@ -193,6 +195,7 @@ export const PALETTES: readonly PaletteMeta[] = [
         sidebarRing: "#2272b4",
         sidebarActive: "rgba(240, 1, 150, 0.1)",
         sidebarActiveForeground: "#651249",
+        sidebarBackground: "linear-gradient(90deg, #fffefe, #fcf6fa)",
         shellBackground: "var(--background)",
       }),
       dark: paletteTokens({
@@ -204,6 +207,7 @@ export const PALETTES: readonly PaletteMeta[] = [
         primary: "#e8ecf0",
         primaryForeground: "#11171c",
         secondary: "#1f272d",
+        secondaryForeground: "#e8ecf0",
         muted: "color-mix(in srgb, #92a4b3 15%, #262f36)",
         mutedForeground: "#92a4b3",
         codeBackground: "oklch(0.38 0.005 240)",
@@ -224,6 +228,8 @@ export const PALETTES: readonly PaletteMeta[] = [
         sidebarRing: "oklch(0.92 0.003 240 / 0.4)",
         sidebarActive: "rgba(240, 1, 150, 0.15)",
         sidebarActiveForeground: "#f472b6",
+        sidebarBackground:
+          "linear-gradient(transparent 35%, rgba(92, 48, 108, 0.2)), linear-gradient(135deg, rgba(255, 255, 255, 0.04), transparent 60%)",
         shellBackground:
           "radial-gradient(rgba(100, 40, 180, 0.12), transparent 50%), radial-gradient(at 80% 20%, rgba(80, 30, 140, 0.08), transparent 45%), linear-gradient(145deg, #1a0e2d, #0e1418, #130e1b)",
       }),

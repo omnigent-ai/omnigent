@@ -54,8 +54,33 @@ def _computed_theme_tokens(page: Page) -> dict[str, str]:
         "brand-accent",
         "sidebar-active",
         "sidebar-active-foreground",
+        "foreground",
+        "card-solid",
+        "card-foreground",
+        "tray",
+        "popover",
+        "popover-foreground",
+        "primary",
+        "primary-foreground",
+        "secondary",
+        "secondary-foreground",
+        "muted",
+        "muted-foreground",
+        "code-bg",
+        "accent",
+        "accent-foreground",
+        "border-strong",
+        "button-border",
+        "input",
+        "sidebar-foreground",
+        "sidebar-primary",
+        "sidebar-primary-foreground",
+        "sidebar-accent",
+        "sidebar-accent-foreground",
+        "sidebar-border",
+        "sidebar-ring",
     ]
-    return page.evaluate(
+    colors = page.evaluate(
         "names => { const probe = document.createElement('div'); "
         "const canvas = document.createElement('canvas'); canvas.width = canvas.height = 1; "
         "const context = canvas.getContext('2d'); document.body.append(probe); "
@@ -66,6 +91,13 @@ def _computed_theme_tokens(page: Page) -> dict[str, str]:
         "})); probe.remove(); return values; }",
         names,
     )
+    backgrounds = page.evaluate(
+        "() => Object.fromEntries([['shell', document.querySelector('.app-shell')], "
+        "['conversation-sidebar', document.querySelector('.conversations-sidebar')]]"
+        ".map(([name, element]) => { const style = getComputedStyle(element); "
+        "return [name, `${style.backgroundColor}|${style.backgroundImage}`]; }))"
+    )
+    return {**colors, **backgrounds}
 
 
 def _set_contrast(page: Page, value: int) -> None:

@@ -1976,6 +1976,12 @@ aside[aria-label="Workspace"][data-maximized] {
 .dark[data-theme="custom"] .app-shell {
   background: var(--custom-dark-shell-background);
 }
+:root:not(.dark)[data-theme="custom"] .conversations-sidebar {
+  background: var(--custom-light-sidebar-background);
+}
+.dark[data-theme="custom"] .conversations-sidebar {
+  background: var(--custom-dark-sidebar-background);
+}
 .theme-contrast-range {
   appearance: none;
   height: 0.375rem;
@@ -2020,12 +2026,12 @@ aside[aria-label="Workspace"][data-maximized] {
 @media (min-width: 48rem) {
   :root:not(.dark)[data-theme="custom"][data-custom-translucent-sidebar]
     :is(.conversations-sidebar, aside[aria-label="Workspace"]:not([data-maximized])) {
-    background-color: var(--custom-light-sidebar);
+    background: var(--custom-light-sidebar);
     backdrop-filter: blur(20px) saturate(1.12);
   }
   .dark[data-theme="custom"][data-custom-translucent-sidebar]
     :is(.conversations-sidebar, aside[aria-label="Workspace"]:not([data-maximized])) {
-    background-color: var(--custom-dark-sidebar);
+    background: var(--custom-dark-sidebar);
     backdrop-filter: blur(20px) saturate(1.12);
   }
   :root[data-theme="custom"][data-custom-translucent-sidebar]
