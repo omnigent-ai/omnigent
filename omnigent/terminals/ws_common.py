@@ -51,10 +51,12 @@ class _ByteBoundedOutputQueue(asyncio.Queue[bytes | None]):
         self,
         max_bytes: int = _OUTPUT_QUEUE_MAX_BYTES,
         max_items: int = _OUTPUT_QUEUE_MAX_ITEMS,
+        identity: str = "unknown terminal",
     ) -> None:
         super().__init__()
         self.max_bytes = max_bytes
         self.max_items = max_items
+        self.identity = identity
         self.queued_bytes = 0
         self.dropped_chunks = 0
         self.dropped_bytes = 0
@@ -83,7 +85,9 @@ class _ByteBoundedOutputQueue(asyncio.Queue[bytes | None]):
             self._warned_at = now
             _logger.warning(
                 "terminal output queue saturated or producer shed output "
-                "(%d bytes / %d chunks queued); %d chunks (%d bytes) dropped so far",
+                "for %s (%d bytes / %d chunks queued); %d chunks (%d bytes) "
+                "dropped so far",
+                self.identity,
                 self.queued_bytes,
                 self.qsize(),
                 self.dropped_chunks,
@@ -110,14 +114,14 @@ class _ByteBoundedOutputQueue(asyncio.Queue[bytes | None]):
         self._in_gap = False
         super().put_nowait(item)
 
-    def put_snapshot_nowait(self, snapshot: bytes) -> None:
-        """Prioritize a full repaint by evicting stale queued output."""
+    def put_snapshot_nowait(self, snapshot: bytes) -> bool:
+        """Prioritize a full repaint, returning whether it was retained."""
         while True:
             gap_bytes = len(_OUTPUT_GAP_RESYNC) if self._in_gap else 0
             added_items = 2 if self._in_gap else 1
             if gap_bytes + len(snapshot) > self.max_bytes or added_items > self.max_items:
                 self.record_dropped_output(len(snapshot), request_repaint=False)
-                return
+                return False
             if (
                 self.queued_bytes + gap_bytes + len(snapshot) <= self.max_bytes
                 and self.qsize() + added_items <= self.max_items
@@ -126,13 +130,27 @@ class _ByteBoundedOutputQueue(asyncio.Queue[bytes | None]):
                     super().put_nowait(_OUTPUT_GAP_RESYNC)
                 self._in_gap = False
                 super().put_nowait(snapshot)
-                return
+                return True
             discarded = self.get_nowait()
             if discarded is None:
                 super().put_nowait(None)
-                return
+                return False
             # The snapshot being inserted heals these priority evictions.
             self.record_dropped_output(len(discarded), request_repaint=False)
+
+    def log_drop_summary(self) -> None:
+        """Log final loss counters for this attached client."""
+        if self.dropped_chunks == 0:
+            return
+        _logger.warning(
+            "terminal output queue closed for %s; %d chunks (%d bytes) dropped; "
+            "%d bytes / %d chunks remain queued",
+            self.identity,
+            self.dropped_chunks,
+            self.dropped_bytes,
+            self.queued_bytes,
+            self.qsize(),
+        )
 
 
 class _GapRepainter:
@@ -149,9 +167,13 @@ class _GapRepainter:
         self._last_started_at: float | None = None
         self._capturing = False
         self._trailing = False
+        self._failure: BaseException | None = None
+        self._failed = asyncio.Event()
 
     def request(self) -> None:
         """Schedule at most one active repaint and one trailing repaint."""
+        if self._failure is not None:
+            return
         if self._task is not None and not self._task.done():
             if self._capturing:
                 self._trailing = True
@@ -170,13 +192,21 @@ class _GapRepainter:
         self._last_started_at = _monotonic()
         try:
             await self._repaint()
-        except Exception:
-            _logger.debug("gap repaint failed", exc_info=True)
+        except Exception as exc:
+            self._failure = exc
+            self._trailing = False
+            self._failed.set()
+            _logger.error("terminal gap repaint failed permanently", exc_info=True)
+            return
         finally:
             self._capturing = False
         if self._trailing:
             self._trailing = False
             self._task = asyncio.create_task(self._run(self._cooldown()))
+
+    async def wait_failed(self) -> None:
+        """Wait until repaint recovery has failed irrecoverably."""
+        await self._failed.wait()
 
     async def flush(self, timeout_s: float) -> None:
         """Wait briefly for pending repaint output to land before EOF."""
