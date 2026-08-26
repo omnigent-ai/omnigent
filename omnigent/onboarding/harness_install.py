@@ -88,7 +88,9 @@ KIRO_KEY = "kiro"
 # - codex: native policy hook requires >= 0.129.0
 #   (`omnigent/codex_native_app_server.py`).
 # - pi: non-interactive ``--approve`` override requires >= 0.79.0
-#   (``omnigent/pi_native.py``).
+#   (``omnigent/pi_native.py``). Adaptive thinking (thinking.type.adaptive
+#   for claude-4+/claude-5) requires >= 0.84.2
+#   (``omnigent/pi_native_credentials.py``).
 # - qwen: ``--input-file`` / ``--json-file`` bridge verified on v0.18.1
 #   (``omnigent/qwen_native_forwarder.py`` / ``docs/QWEN_NATIVE_DESIGN.md``).
 # - goose: SQLite forwarder schema verified on Goose 1.38.0
@@ -116,7 +118,7 @@ KIRO_KEY = "kiro"
 #   semver version with the build date alongside it
 #   (``Hermes Agent v0.19.1 (2026.7.30)``), so the floor is that semver.
 _CODEX_MIN_VERSION = "0.137.0"
-_PI_MIN_VERSION = "0.79.0"
+_PI_MIN_VERSION = "0.84.2"
 _QWEN_MIN_VERSION = "0.18.1"
 _GOOSE_MIN_VERSION = "1.38.0"
 _HERMES_MIN_VERSION = "0.17.0"
