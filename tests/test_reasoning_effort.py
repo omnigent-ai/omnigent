@@ -212,6 +212,11 @@ def test_pi_thinking_level_translates_none_to_off() -> None:
         validate_effort("off", "pi", PI_EFFORTS)
 
 
+def test_pi_thinking_level_clamps_ultra_to_max() -> None:
+    """``ultra`` is not in pi's ladder; it clamps to ``max`` (the top rung)."""
+    assert to_pi_thinking_level("ultra") == "max"
+
+
 def test_nearest_pi_thinking_level_clamps_to_reported_levels() -> None:
     """An unsupported rung clamps to the closest one pi reports, ties downward."""
     assert nearest_pi_thinking_level("high", ["off", "low", "high"]) == "high"

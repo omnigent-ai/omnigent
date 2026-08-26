@@ -50,13 +50,18 @@ PI_THINKING_OFF = "off"
 def to_pi_thinking_level(effort: str) -> str:
     """Translate a canonical effort to pi's ``--thinking`` / RPC level.
 
-    Only ``none`` differs between the two ladders (pi calls it ``off``);
-    every other value is spelled identically.
+    ``none`` maps to pi's ``off``; ``ultra`` (not in pi's ladder) clamps to
+    ``max`` (the highest rung pi advertises); every other value is identical.
 
     :param effort: A canonical effort from :data:`PI_EFFORTS`.
     :returns: The ``ThinkingLevel`` string pi accepts.
     """
-    return PI_THINKING_OFF if effort == "none" else effort
+    if effort == "none":
+        return PI_THINKING_OFF
+    # PI_THINKING_LADDER is resolved at call time (defined later in this module).
+    if effort not in PI_THINKING_LADDER:
+        return PI_THINKING_LADDER[-1]  # clamp ultra → max (pi's highest rung)
+    return effort
 
 
 #: pi's ladder ascending, in pi's spelling. Index distance here is what

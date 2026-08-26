@@ -4356,18 +4356,11 @@ def create_runner_app(
             bridge_dir_for_session_id,
             enqueue_thinking_level_change,
         )
-        from omnigent.reasoning_effort import (
-            PI_THINKING_LADDER,
-            PI_THINKING_OFF,
-            to_pi_thinking_level,
-        )
+        from omnigent.reasoning_effort import to_pi_thinking_level
 
         if effort is None or not effort.strip():
             return Response(status_code=204)
         thinking = to_pi_thinking_level(effort)
-        # ``ultra`` is not in Pi's ladder; clamp to the top rung.
-        if thinking not in PI_THINKING_LADDER and thinking != PI_THINKING_OFF:
-            thinking = PI_THINKING_LADDER[-1]
         try:
             await asyncio.to_thread(
                 enqueue_thinking_level_change,
