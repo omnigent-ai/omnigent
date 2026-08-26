@@ -228,14 +228,34 @@ reproduction test is your objective instrument.
    cause** or only mask the symptom? Does it miss facets or obvious adjacent edge
    cases? Does it introduce a regression in the surrounding code (run the touched
    area's tests)?
-5. **Report on the existing PR.** Post your findings as a review comment on that
-   PR (`gh pr comment` / `gh pr review`) with the fail→pass (or fail→still-fails)
-   result and any diff concerns, and record its `pr_url` in your output. The
-   `outcome` reflects what you found (`fixed` when the PR resolves every live facet
-   and the diff is sound; `partially_fixed` / `not_fixed` otherwise, with
-   specifics). **Default to commenting, not competing** — if the PR is close and
-   its approach is sound, review it and let the author iterate; don't open a rival
-   PR over fixable nits.
+5. **Report on the existing PR.** Post your fail→pass (or fail→still-fails) result
+   and any diff concerns now as a `gh pr comment` / `gh pr review --comment`, and
+   record its `pr_url` in your output. The `outcome` reflects what you found
+   (`fixed` when the PR resolves every live facet and the diff is sound;
+   `partially_fixed` / `not_fixed` otherwise, with specifics). **Default to
+   commenting, not competing** — if the PR is close and its approach is sound,
+   review it and let the author iterate; don't open a rival PR over fixable nits.
+
+   The **review verdict (approve / request-changes)** comes at the *end*, after
+   Step 4 settles (4.5) — because whether you end up pushing to the PR is decided
+   there. When you get to it, submit the final review this way:
+
+   **Match the review verdict to what you found — and approve when you're a clean,
+   independent reviewer.** You are a `[bot]`, so your review never satisfies the
+   merge gate (a human maintainer's approval is always required); it's an
+   *indicator* for that maintainer. Choose:
+   - **`fixed` and you never pushed to or authored this code** (pure reviewer: the
+     repro test passes against the PR as-is, CI green, Polly clean, no fix from you
+     was needed) → submit an **approving** review: `gh pr review <pr> --approve
+     --body '…'`. A genuine independent verification — the "someone checked it, take
+     your pass" signal a maintainer wants. Note in the body that it's an automated
+     reviewer's approval and a maintainer's approval is still required to merge.
+   - **`not_fixed` / `partially_fixed`** → `gh pr review <pr> --request-changes
+     --body '…'` naming what still fails.
+   - **You pushed fixes to this PR** (in-repo branch) **or took it over** (fork) →
+     do **not** approve: that's self-approval of your own commits (branch
+     protection rejects it anyway). Leave a `--comment` review and let a human
+     approve.
 6. **Then drive it to landable — go to Step 4.** Once you've kept the PR as the
    fix (the sound-PR default), it gets the **same landing treatment as a PR you
    authored**: `ui-preview`, green CI, a clean Polly review, a copy-paste
@@ -546,8 +566,10 @@ can land a fix depends on where its branch lives:
     - Set `mode: "authored_fix"`, record the fork PR's number in `reviewed_pr_url`,
       and drive **your** PR through the rest of Step 4 (you can push to it).
   - **If the fork PR needs no fix** (repro passes against it, CI green, review
-    clean) → there's nothing to push, so keep it: comment your findings + the
-    try-it-out command, tag the maintainer. No takeover needed.
+    clean) → there's nothing to push, so keep it. Since you're a pure independent
+    reviewer here, **submit an approving review** (2A.5) with the findings + the
+    try-it-out command, then tag the maintainer. No takeover needed. (The approval
+    is a bot indicator — the maintainer's approval still merges it.)
 
 Throughout, address the PR you're landing by its number `<pr>`. This whole step is
 a **bounded loop** — cap it at **~6 fix→(push-or-takeover)→re-check rounds**. If
@@ -740,14 +762,23 @@ you post. Keep the `validation_prompt` handoff field as the bare prompt text (th
 part inside `-p '…'`), so the workflow can reuse it; the assembled command lives in
 the PR body and the maintainer comment.
 
-### 4.5 — Tag the maintainer to review
+### 4.5 — Submit the final review verdict, then tag the maintainer
 
-When CI is green (4.2) **and** the automated review is clean (4.3), hand the PR to
-a human — the **same maintainer the issue is assigned to** — on **both paths** (a
-PR you authored and an existing PR you reviewed and kept). This applies only when
-`bug_url` is a GitHub issue (Step 1's caveat: it may be some other link). Derive
-`<issue-number>` from `bug_url`, read the issue's assignee, and request their
-review:
+When CI is green (4.2) **and** the automated review is clean (4.3), you're done
+iterating — now record your verdict and hand off to a human.
+
+**First, submit your final review** per the verdict rule in 2A.5 (review path
+only): **approve** when you were a pure reviewer and the PR is `fixed` (you pushed
+nothing); **request-changes** when it's `not_fixed` / `partially_fixed`; a plain
+**comment** when you pushed to or took over the code (no self-approval). On the
+author path, there's no self-review — your own PR just gets tagged. Remember: a bot
+approval is only an indicator; a human maintainer's approval is always what merges.
+
+**Then hand the PR to a human** — the **same maintainer the issue is assigned to**
+— on **both paths** (a PR you authored and an existing PR you reviewed and kept).
+This applies only when `bug_url` is a GitHub issue (Step 1's caveat: it may be some
+other link). Derive `<issue-number>` from `bug_url`, read the issue's assignee, and
+request their review:
 
 ```
 gh issue view <issue-number> --json assignees --jq '.assignees[].login'
