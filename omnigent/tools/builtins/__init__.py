@@ -357,7 +357,7 @@ def any_skill_has_resources(
     :param skills: The agent's skill list, e.g.
         ``[SkillSpec(name="code-review", ...)]``.
     :returns: ``True`` if at least one skill has a
-        ``skill_dir`` with files in references/, scripts/,
-        or assets/.
+        ``skill_dir`` with files beside SKILL.md, or in
+        references/, scripts/, or assets/.
     """
     return any(list_skill_resources(s) for s in skills)

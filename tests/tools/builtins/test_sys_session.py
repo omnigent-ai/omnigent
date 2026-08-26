@@ -308,7 +308,11 @@ def test_peek_schema_required_fields_and_no_extra_props() -> None:
     params = schema["function"]["parameters"]
     assert params["required"] == ["conversation_id"]
     assert params["additionalProperties"] is False
-    assert set(params["properties"].keys()) == {"conversation_id", "tail_items"}
+    assert set(params["properties"].keys()) == {
+        "conversation_id",
+        "tail_items",
+        "content_max_chars",
+    }
 
 
 def test_peek_schema_tail_items_bounds() -> None:
@@ -326,6 +330,16 @@ def test_peek_schema_tail_items_bounds() -> None:
     assert tail_schema["type"] == "integer"
     assert tail_schema["minimum"] == 1
     assert tail_schema["maximum"] == _HISTORY_MAX_TAIL
+
+
+def test_peek_schema_content_limit_is_bounded() -> None:
+    """History can request a larger item without making the limit unbounded."""
+    content_schema = SysSessionGetHistoryTool().get_schema()["function"]["parameters"][
+        "properties"
+    ]["content_max_chars"]
+    assert content_schema["type"] == "integer"
+    assert content_schema["minimum"] == 1
+    assert content_schema["maximum"] == 12000
 
 
 def test_close_schema_required_fields_and_no_extra_props() -> None:
@@ -379,6 +393,154 @@ def test_peek_returns_items_chronological(session_fixture: _Fixture) -> None:
     assert items[0]["content"] == "find the auth bug"
     assert items[1]["role"] == "assistant"
     assert items[1]["content"] == "looking at handlers.py"
+
+
+_HISTORY_CONTENT_SCENARIOS = [
+    pytest.param(3000, 4000, "R" * 3000, id="raised-limit"),
+    pytest.param(3000, None, "R" * 2000 + " [truncated]", id="default-limit"),
+    pytest.param(13000, 50000, "R" * 12000 + " [truncated]", id="ceiling"),
+    # No stored item is needed because validation rejects before projection.
+    pytest.param(None, 0, "content_max_chars must be >= 1", id="non-positive"),
+]
+
+
+@pytest.mark.parametrize(
+    ("content_length", "content_max_chars", "expected"),
+    _HISTORY_CONTENT_SCENARIOS,
+)
+def test_peek_content_limit_scenario(
+    session_fixture: _Fixture,
+    content_length: int | None,
+    content_max_chars: int | None,
+    expected: str,
+) -> None:
+    """Apply one history content-limit scenario through the in-process tool."""
+    content = "R" * content_length if content_length is not None else None
+    arguments: dict[str, object] = {"conversation_id": session_fixture.child_conv_id}
+    if content is not None:
+        arguments["tail_items"] = 1
+    if content_max_chars is not None:
+        arguments["content_max_chars"] = content_max_chars
+
+    if content is not None:
+        session_fixture.conv_store.append(
+            session_fixture.child_conv_id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id="resp_content_limit",
+                    data=MessageData(
+                        role="assistant",
+                        content=[{"type": "output_text", "text": content}],
+                        agent="researcher",
+                    ),
+                )
+            ],
+        )
+
+    payload = json.loads(
+        SysSessionGetHistoryTool().invoke(json.dumps(arguments), session_fixture.ctx)
+    )
+    actual = payload["error"] if "error" in payload else payload["items"][0]["content"]
+    assert actual == expected
+
+
+# These coercion cases cover the helper imported by the runner REST dispatcher.
+# The runner suite repeats only the four path-level scenarios, not these cases.
+
+
+def test_peek_rejects_boolean_content_limit(session_fixture: _Fixture) -> None:
+    """Boolean content limits do not pass as integers."""
+    raw = SysSessionGetHistoryTool().invoke(
+        json.dumps(
+            {
+                "conversation_id": session_fixture.child_conv_id,
+                "content_max_chars": True,
+            }
+        ),
+        session_fixture.ctx,
+    )
+
+    assert json.loads(raw)["error"] == "content_max_chars must be a whole number, got True"
+
+
+def test_peek_rejects_fractional_float_content_limit(session_fixture: _Fixture) -> None:
+    """Fractional float content limits are rejected instead of truncated."""
+    raw = SysSessionGetHistoryTool().invoke(
+        json.dumps(
+            {
+                "conversation_id": session_fixture.child_conv_id,
+                "content_max_chars": 1.5,
+            }
+        ),
+        session_fixture.ctx,
+    )
+
+    assert json.loads(raw)["error"] == "content_max_chars must be a whole number, got 1.5"
+
+
+def test_peek_accepts_integral_float_content_limit(session_fixture: _Fixture) -> None:
+    """An integral float applies its exact effective content limit."""
+    content = "abcdefghij"
+    session_fixture.conv_store.append(
+        session_fixture.child_conv_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_integral_float_limit",
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": content}],
+                    agent="researcher",
+                ),
+            )
+        ],
+    )
+
+    raw = SysSessionGetHistoryTool().invoke(
+        json.dumps(
+            {
+                "conversation_id": session_fixture.child_conv_id,
+                "tail_items": 1,
+                "content_max_chars": 5.0,
+            }
+        ),
+        session_fixture.ctx,
+    )
+
+    assert json.loads(raw)["items"][0]["content"] == "abcde [truncated]"
+
+
+def test_peek_combined_limits_preserve_total_prompt_bound(session_fixture: _Fixture) -> None:
+    """The per-item override scales down when a large tail is requested."""
+    long_review = "R" * 3000
+    session_fixture.conv_store.append(
+        session_fixture.child_conv_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_bounded_review",
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": long_review}],
+                    agent="researcher",
+                ),
+            )
+        ],
+    )
+
+    raw = SysSessionGetHistoryTool().invoke(
+        json.dumps(
+            {
+                "conversation_id": session_fixture.child_conv_id,
+                "tail_items": _HISTORY_MAX_TAIL,
+                "content_max_chars": 12000,
+            }
+        ),
+        session_fixture.ctx,
+    )
+    content = json.loads(raw)["items"][-1]["content"]
+    assert content == long_review[:2000] + " [truncated]"
 
 
 def test_peek_surfaces_pending_elicitation_after_stored_items(

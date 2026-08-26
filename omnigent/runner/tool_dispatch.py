@@ -93,6 +93,8 @@ from omnigent.tools.builtins.spawn import (
     _ACTIVITY_MAX_CHARS,
     _CLOSED_TITLE_INFIX,
     _HISTORY_DEFAULT_TAIL,
+    _bound_history_content_chars,
+    _clamp_history_content_chars,
     _clamp_tail_items,
 )
 from omnigent.tools.builtins.sys_terminal import (
@@ -473,6 +475,10 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     # Memory builtins are relayed to native harnesses too — unlike web_search,
     # native harnesses have no built-in long-term memory of their own.
     | _HINDSIGHT_TOOLS
+    # Skills ride the relay for the same reason memory does: ``load_skill`` is
+    # what discovers host-scope skills (``.agents/skills`` and friends), and a
+    # native session's only tool surface is this relay.
+    | _SKILL_TOOLS
 )
 
 
@@ -4019,19 +4025,24 @@ def _parse_session_title(raw_title: str | None) -> _ParsedTitle:
     return _ParsedTitle(agent=head, title=tail)
 
 
-def _truncate_activity(text: str | None) -> str | None:
+def _truncate_activity(
+    text: str | None,
+    *,
+    max_chars: int = _ACTIVITY_MAX_CHARS,
+) -> str | None:
     """
-    Truncate text to ``_ACTIVITY_MAX_CHARS`` to bound peek prompt size.
+    Truncate text to ``max_chars`` to bound peek prompt size.
 
     :param text: The text to truncate, or ``None``.
+    :param max_chars: Maximum characters retained before the marker.
     :returns: The (possibly truncated) text, or ``None`` when the input
         is ``None``.
     """
     if text is None:
         return None
-    if len(text) <= _ACTIVITY_MAX_CHARS:
+    if len(text) <= max_chars:
         return text
-    return text[:_ACTIVITY_MAX_CHARS] + " [truncated]"
+    return text[:max_chars] + " [truncated]"
 
 
 def _text_from_api_content(content: object) -> str:
@@ -4052,7 +4063,11 @@ def _text_from_api_content(content: object) -> str:
     return " ".join(parts)
 
 
-def _project_api_item(item: _JsonObject) -> _JsonObject:
+def _project_api_item(
+    item: _JsonObject,
+    *,
+    max_chars: int = _ACTIVITY_MAX_CHARS,
+) -> _JsonObject:
     """
     Project a REST API conversation item into the compact peek shape.
 
@@ -4063,6 +4078,7 @@ def _project_api_item(item: _JsonObject) -> _JsonObject:
     the same as the in-process tool's.
 
     :param item: One API item dict from the items endpoint.
+    :param max_chars: Maximum characters retained in each content field.
     :returns: A compact dict — ``{type, tool, args}`` for tool calls,
         ``{type, output}`` for tool results, ``{type, role, text}`` for
         messages.
@@ -4072,17 +4088,26 @@ def _project_api_item(item: _JsonObject) -> _JsonObject:
         return {
             "type": "function_call",
             "tool": _optional_string(item.get("name")),
-            "args": _truncate_activity(_optional_string(item.get("arguments"))),
+            "args": _truncate_activity(
+                _optional_string(item.get("arguments")),
+                max_chars=max_chars,
+            ),
         }
     if itype == "function_call_output":
         output = item.get("output")
         rendered = output if isinstance(output, str) else json.dumps(output)
-        return {"type": "function_call_output", "output": _truncate_activity(rendered)}
+        return {
+            "type": "function_call_output",
+            "output": _truncate_activity(rendered, max_chars=max_chars),
+        }
     if itype == "message":
         return {
             "type": "message",
             "role": _optional_string(item.get("role")),
-            "text": _truncate_activity(_text_from_api_content(item.get("content"))),
+            "text": _truncate_activity(
+                _text_from_api_content(item.get("content")),
+                max_chars=max_chars,
+            ),
         }
     return {"type": itype}
 
@@ -5326,7 +5351,7 @@ async def _session_get_history_via_rest(
     may read).
 
     :param args: Parsed tool arguments; requires ``conversation_id``,
-        optional ``tail_items``.
+        optional ``tail_items`` and ``content_max_chars``.
     :param server_client: HTTP client pointed at the Omnigent server.
     :returns: JSON peek result, or a JSON error object.
     """
@@ -5338,6 +5363,15 @@ async def _session_get_history_via_rest(
     tail_items = _clamp_tail_items(args.get("tail_items", _HISTORY_DEFAULT_TAIL))
     if isinstance(tail_items, str):
         return tail_items
+    content_max_chars = _clamp_history_content_chars(
+        args.get("content_max_chars", _ACTIVITY_MAX_CHARS),
+    )
+    if isinstance(content_max_chars, str):
+        return content_max_chars
+    content_max_chars = _bound_history_content_chars(
+        tail_items=tail_items,
+        content_max_chars=content_max_chars,
+    )
     try:
         resp = await server_client.get(
             f"/v1/sessions/{target_id}/items",
@@ -5355,7 +5389,9 @@ async def _session_get_history_via_rest(
     data: list[_JsonObject] = resp.json().get("data", [])
     # ``order="desc"`` returns newest-first; reverse to chronological so
     # the LLM reads top-to-bottom (matches the in-process peek).
-    items: list[_JsonObject] = [_project_api_item(it) for it in reversed(data)]
+    items: list[_JsonObject] = [
+        _project_api_item(it, max_chars=content_max_chars) for it in reversed(data)
+    ]
     meta = await _fetch_peek_meta(target_id, server_client)
     # A parked elicitation never lands in the conversation store (it
     # lives only in the Omnigent server's pending-elicitations index, replayed
@@ -7771,9 +7807,9 @@ def _execute_skill_tool(
     """
     Runner-local handler for ``load_skill`` and ``read_skill_file``.
 
-    Instantiates the tool with the agent spec's bundled skills
-    plus host-scope discovery from the runner workspace, then
-    invokes it.
+    Both tools are built from one registry — the agent spec's bundled
+    skills merged with host-scope discovery from the runner workspace —
+    so anything ``load_skill`` can load, ``read_skill_file`` can read.
 
     :param tool_name: ``"load_skill"`` or ``"read_skill_file"``.
     :param args: Parsed JSON arguments from the LLM.
@@ -7793,15 +7829,14 @@ def _execute_skill_tool(
     # agent's own bundle to ship a skills/ directory.
     bundled_skills = _inject_orchestrator_skills(bundled_skills, agent_spec)
 
-    tool: Tool
-    if tool_name == "load_skill":
-        tool = LoadSkillTool(
-            bundled_skills,
-            agent_root=runner_workspace,
-            skills_filter=skills_filter,
-        )
-    else:
-        tool = ReadSkillFileTool(bundled_skills)
+    # Both tools must resolve the same registry: a skill load_skill can load
+    # from host scope must have its files readable too.
+    load_tool = LoadSkillTool(
+        bundled_skills,
+        agent_root=runner_workspace,
+        skills_filter=skills_filter,
+    )
+    tool: Tool = load_tool if tool_name == "load_skill" else ReadSkillFileTool(load_tool.skills)
 
     arguments_json = json.dumps(args)
     from omnigent.tools.base import ToolContext

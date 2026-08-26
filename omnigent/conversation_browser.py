@@ -9,13 +9,10 @@ import urllib.parse
 import webbrowser
 from collections.abc import Callable
 
-# The workspace-hosted API mount (routing-relevant shape) lives in cli_auth
-# next to the header builder that keys off it; the browser-link helpers below
-# only need it to map the API base onto the UI mount. The UI mount is a
-# browser-link concern, so it stays here.
-from omnigent.cli_auth import WORKSPACE_API_PATH
-
-WORKSPACE_UI_PATH = "/omnigent"
+# The server-URL shape (API mount, UI mount, display mapping) lives in
+# ``omnigent.server_url`` — the one representation of a server URL. The
+# helpers below only borrow it to build browser links.
+from omnigent.server_url import WORKSPACE_UI_PATH, ServerUrl
 
 # Client-side SPA route for one conversation (see web/src/App.tsx's
 # ``c/:conversationId``). ``conversation_url`` appends it; ``strip_conversation_path``
@@ -50,32 +47,6 @@ def strip_conversation_path(url: str) -> str:
     )
 
 
-def display_server_url(base_url: str) -> str:
-    """
-    Map an Omnigent server base URL to the user-facing form to show.
-
-    Databricks workspace-hosted servers are connected to on the API proxy
-    mount (``https://<ws>/api/2.0/omnigent``), but the URL a user
-    recognizes — and that the web UI lives on — is the workspace SPA mount
-    (``https://<ws>/omnigent``). Rewrites the API path to the UI path for
-    those (dropping any ``?o=<org>`` query), so the startup banner shows
-    the clean ``/omnigent`` URL instead of the internal API path. Every
-    other URL (local ``http://127.0.0.1:<port>``, a custom remote) is
-    returned unchanged apart from a trailing-slash trim.
-
-    :param base_url: Omnigent server base URL, e.g.
-        ``"https://example.databricks.com/api/2.0/omnigent"`` or
-        ``"http://127.0.0.1:6767"``.
-    :returns: The display URL, e.g.
-        ``"https://example.databricks.com/omnigent"`` or
-        ``"http://127.0.0.1:6767"``.
-    """
-    parsed = urllib.parse.urlsplit(base_url.rstrip("/"))
-    if parsed.path == WORKSPACE_API_PATH:
-        return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, WORKSPACE_UI_PATH, "", ""))
-    return base_url.rstrip("/")
-
-
 def conversation_url(base_url: str, conversation_id: str) -> str:
     """
     Build the browser URL for an Omnigent conversation.
@@ -92,17 +63,15 @@ def conversation_url(base_url: str, conversation_id: str) -> str:
     :returns: Browser URL, e.g. ``"http://127.0.0.1:6767/c/conv_abc123"``.
     """
     encoded_id = urllib.parse.quote(conversation_id, safe="")
-    parsed = urllib.parse.urlsplit(base_url.rstrip("/"))
-    if parsed.path == WORKSPACE_API_PATH:
-        from omnigent.cli_auth import load_databricks_org_id
-
-        org_id = load_databricks_org_id(base_url)
+    server = ServerUrl.from_api_base(base_url)
+    if server.is_workspace_hosted:
+        parsed = urllib.parse.urlsplit(server.api_base)
         return urllib.parse.urlunsplit(
             (
                 parsed.scheme,
                 parsed.netloc,
                 f"{WORKSPACE_UI_PATH}/c/{encoded_id}",
-                urllib.parse.urlencode({"o": org_id}) if org_id else "",
+                urllib.parse.urlencode({"o": server.org_id}) if server.org_id else "",
                 "",
             )
         )

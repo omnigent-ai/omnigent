@@ -23,6 +23,7 @@ from omnigent.process_logging import (
     child_logging_popen_kwargs,
     configure_process_logging,
     current_process_log_path,
+    process_log_dir_reference,
     process_log_reference,
     terminal_stream_handler,
     terminal_supports_color,
@@ -214,6 +215,29 @@ def test_process_log_reference_falls_back_to_the_destination_dir(
     monkeypatch.setenv(DATA_DIR_ENV_VAR, str(tmp_path / "data"))
 
     assert process_log_reference("runner") == f"{tmp_path / 'data' / 'logs' / 'runner'}/"
+
+
+def test_process_log_dir_reference_follows_the_data_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The directory pointer tracks ``OMNIGENT_DATA_DIR``.
+
+    Unlike :func:`process_log_reference` this never substitutes the caller's
+    own log file, so a message about another process names that process's
+    tree even when this one has a captured log.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Pytest temp dir, used as the runtime data dir.
+    """
+    monkeypatch.setattr(
+        "omnigent.process_logging._current_process_log_path",
+        tmp_path / "mine" / "cli.log",
+    )
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "elsewhere")
+    monkeypatch.setenv(DATA_DIR_ENV_VAR, str(tmp_path / "data"))
+
+    assert process_log_dir_reference("host") == f"{tmp_path / 'data' / 'logs' / 'host'}/"
 
 
 def test_configure_process_logging_publishes_its_log_path(

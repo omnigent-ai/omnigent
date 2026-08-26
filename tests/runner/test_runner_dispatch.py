@@ -5943,6 +5943,75 @@ async def test_session_peek_returns_chronological_projected_items() -> None:
     ]
 
 
+_REST_HISTORY_CONTENT_SCENARIOS = [
+    pytest.param(3000, 4000, "R" * 3000, id="raised-limit"),
+    pytest.param(3000, None, "R" * 2000 + " [truncated]", id="default-limit"),
+    pytest.param(13000, 50000, "R" * 12000 + " [truncated]", id="ceiling"),
+    # No REST request is expected because validation rejects before the GET.
+    pytest.param(None, 0, "content_max_chars must be >= 1", id="non-positive"),
+]
+
+
+@pytest.mark.parametrize(
+    ("content_length", "content_max_chars", "expected"),
+    _REST_HISTORY_CONTENT_SCENARIOS,
+)
+@pytest.mark.asyncio
+async def test_session_peek_rest_content_limit_scenario(
+    content_length: int | None,
+    content_max_chars: int | None,
+    expected: str,
+) -> None:
+    """Apply one history content-limit scenario through runner REST dispatch."""
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    content = "R" * content_length if content_length is not None else None
+    arguments: dict[str, object] = {"conversation_id": "conv_target"}
+    if content is not None:
+        arguments["tail_items"] = 1
+    if content_max_chars is not None:
+        arguments["content_max_chars"] = content_max_chars
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if content is None:
+            pytest.fail("REST request should not run for rejected arguments")
+        if request.url.path == "/v1/sessions/conv_target/items":
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "i1",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": content}],
+                        }
+                    ],
+                },
+            )
+        if request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(200, json={"id": "conv_target", "title": "researcher:auth"})
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        payload = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_get_history",
+                json.dumps(arguments),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+
+    if "error" in payload:
+        actual = payload["error"]
+    else:
+        assert payload["title"] == "auth"
+        actual = payload["items"][0]["text"]
+    assert actual == expected
+
+
 @pytest.mark.asyncio
 async def test_session_peek_appends_pending_elicitation_from_snapshot() -> None:
     """
