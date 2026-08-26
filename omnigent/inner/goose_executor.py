@@ -1196,7 +1196,8 @@ class GooseExecutor(Executor):
             if fut.done() and self._queue.empty():
                 try:
                     response = fut.result()
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
+                    logger.exception("goose process response retrieval failed")
                     self._session_id = None
                     self._system_prompt_sent = False
                     yield ExecutorError(message=f"goose process error: {exc}", retryable=True)
