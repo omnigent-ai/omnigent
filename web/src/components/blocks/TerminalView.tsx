@@ -95,16 +95,6 @@ interface TerminalViewProps {
   /** Whether the optional resume action is currently in flight. */
   resumePending?: boolean;
   /**
-   * Web-attach transport for this terminal (``"control"`` / ``"pty"``),
-   * from the terminal resource's ``metadata.terminal_transport``. Control
-   * mode gives the browser xterm native scrollback + selection, so the
-   * mouse/selection workarounds and the hint bar are dropped. ``undefined``
-   * (or ``"pty"``) keeps the legacy PTY behavior. When set, it is also
-   * forwarded to the server as ``?transport=`` so the attach matches the
-   * behavior the UI renders for.
-   */
-  transport?: "control" | "pty";
-  /**
    * False while the surface is mounted but hidden (a pre-warmed attach
    * kept alive behind the chat view). The session stays connected either
    * way; on the hidden→visible edge the terminal takes keyboard focus —
@@ -132,13 +122,9 @@ export function TerminalView({
   onInput,
   onResume,
   resumePending = false,
-  transport,
   active = true,
   directAttachUrl,
 }: TerminalViewProps) {
-  // Control mode: xterm owns the buffer + mouse, so plain drag selects and
-  // the normal copy gesture works — no forced-selection modifier, no hint bar.
-  const controlMode = transport === "control";
   const [state, setState] = useState<ConnectionState>({ kind: "connecting" });
   const [connectAttempt, setConnectAttempt] = useState(0);
   const [resumeError, setResumeError] = useState<string | null>(null);
@@ -569,10 +555,8 @@ export function TerminalView({
           const h = getSessionHost(sessionId);
           return h && !isHostKeyless(h) ? h : undefined;
         })();
-        const relayUrl = buildAttachUrl(sessionId, terminalId, readOnly, computedHostId, transport);
-        const directUrl = directAttachUrl
-          ? withAttachParams(directAttachUrl, readOnly, transport)
-          : undefined;
+        const relayUrl = buildAttachUrl(sessionId, terminalId, readOnly, computedHostId);
+        const directUrl = directAttachUrl ? withAttachParams(directAttachUrl, readOnly) : undefined;
         // Never keep the user waiting on the direct path: this resolves
         // direct only when the loopback listener is already known
         // reachable; otherwise it returns the relay URL immediately.
@@ -585,7 +569,6 @@ export function TerminalView({
           isDarkRef.current,
           notifyActivity,
           notifyInput,
-          controlMode,
           !readOnly && activeRef.current,
           notifyClipboardRequest,
         );
@@ -615,9 +598,7 @@ export function TerminalView({
       sessionId,
       terminalId,
       readOnly,
-      transport,
       directAttachUrl,
-      controlMode,
       notifyState,
       notifyActivity,
       notifyInput,
@@ -667,7 +648,7 @@ export function TerminalView({
   // disconnected still lands on reconnect.
   useEffect(() => {
     return subscribeCodeFont((font) => {
-      sessionRef.current?.setFont(font.sizePx, font.family);
+      sessionRef.current?.setFont(font);
     });
   }, []);
 
@@ -763,20 +744,6 @@ export function TerminalView({
       <div className="min-h-0 flex-1 overflow-hidden p-1">
         <div key={connectAttempt} ref={attachSession} className="h-full w-full overflow-hidden" />
       </div>
-      {/* PTY transport only: the attached tmux session runs with `mouse on`,
-          so a plain click-drag is captured by tmux (copy-mode) instead of
-          making a browser selection — the user can't select-and-copy without a
-          platform-specific modifier, and there's no other discoverable cue, so
-          surface it as a persistent hint. Control mode gives xterm native
-          selection, so the hint is unnecessary and omitted. */}
-      {!controlMode && (
-        <div
-          data-testid="terminal-selection-hint"
-          className="shrink-0 select-none px-2 py-1 text-[10px] text-muted-foreground/70"
-        >
-          {selectionHintText(isMacPlatform())}
-        </div>
-      )}
       {state.kind !== "connected" && (
         <StatusOverlay
           state={state}
@@ -788,50 +755,6 @@ export function TerminalView({
       )}
     </div>
   );
-}
-
-/**
- * Detect whether the current browser is running on macOS.
- *
- * Used to pick the correct text-selection modifier and copy shortcut
- * for the terminal hint: macOS bypasses tmux mouse capture with Option
- * and copies with Command, while other platforms use Shift.
- *
- * Prefers the modern ``navigator.userAgentData.platform`` and falls
- * back to the deprecated-but-universal ``navigator.platform``.
- *
- * :returns: ``true`` on macOS, ``false`` elsewhere (and in any
- *     non-browser context where ``navigator`` is undefined).
- */
-export function isMacPlatform(): boolean {
-  if (typeof navigator === "undefined") return false;
-  const uaData = (navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData;
-  const platform = uaData?.platform ?? navigator.platform ?? "";
-  return /mac/i.test(platform);
-}
-
-/**
- * Build the persistent selection/copy hint shown under the terminal.
- *
- * The attached tmux session captures plain mouse drags for its own
- * copy-mode, so the user must hold a modifier to make a native browser
- * selection (xterm's ``shouldForceSelection``: Option on macOS, Shift
- * elsewhere). Copying the selection is wired in
- * {@link TerminalSession} via a ``copy`` listener, so on macOS ``Cmd+C``
- * copies; on other platforms ``Ctrl+C`` stays SIGINT, so we point users
- * at right-click → Copy (the cross-platform copy gesture) instead.
- *
- * Pure helper — exported for direct unit testing.
- *
- * :param isMac: Whether the browser is on macOS, e.g. from
- *     :func:`isMacPlatform`.
- * :returns: The hint string to render, e.g.
- *     ``"Hold ⌥ and drag to select · ⌘C to copy"``.
- */
-export function selectionHintText(isMac: boolean): string {
-  return isMac
-    ? "Hold ⌥ and drag to select · ⌘C to copy"
-    : "Hold Shift and drag to select · right-click to copy";
 }
 
 function StatusOverlay({
@@ -914,10 +837,6 @@ function resumeErrorText(error: unknown): string {
  *     e.g. ``"terminal_bash_s1"``.
  * :param readOnly: If true, requests a read-only attach. Forwarded
  *     to the server as ``?read_only=true``.
- * :param transport: Optional per-attach transport override
- *     (``"control"`` / ``"pty"``), forwarded as ``?transport=``. Lets a
- *     terminal be A/B'd against the other mode side by side; ``undefined``
- *     lets the server pick from the terminal spec / global default.
  * :returns: The path-and-query portion of the WS URL, e.g.
  *     ``"/v1/sessions/.../resources/terminals/.../attach"``.
  */
@@ -926,7 +845,6 @@ export function buildAttachPath(
   terminalId: string,
   readOnly: boolean,
   hostId?: string,
-  transport?: string,
 ): string {
   const path =
     `/v1/sessions/${encodeURIComponent(sessionId)}` +
@@ -940,7 +858,6 @@ export function buildAttachPath(
   const params = new URLSearchParams();
   if (readOnly) params.set("read_only", "true");
   if (hostId) params.set("omnigent_slice_key", hostId);
-  if (transport) params.set("transport", transport);
   const qs = params.toString();
   return qs ? `${path}?${qs}` : path;
 }
@@ -957,7 +874,6 @@ export function buildAttachPath(
  * :param readOnly: If true, requests a read-only attach.
  * :param hostId: The session's host_id, forwarded as the routing key
  *     ``?omnigent_slice_key=``.
- * :param transport: Optional per-attach transport override.
  * :returns: The fully-qualified ``ws(s)://`` URL.
  */
 function buildAttachUrl(
@@ -965,9 +881,8 @@ function buildAttachUrl(
   terminalId: string,
   readOnly: boolean,
   hostId?: string,
-  transport?: string,
 ): string {
   // Delegates origin/prefix resolution to the embed host when present
   // (standalone falls back to the current page's origin).
-  return resolveWebSocketUrl(buildAttachPath(sessionId, terminalId, readOnly, hostId, transport));
+  return resolveWebSocketUrl(buildAttachPath(sessionId, terminalId, readOnly, hostId));
 }

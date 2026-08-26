@@ -524,7 +524,6 @@ function RailTerminalView({
         sessionId={conversationId}
         terminalId={terminal.id}
         readOnly={readOnly}
-        transport={terminal.transport}
         directAttachUrl={terminal.directAttachUrl}
         onStateChange={(state) => setTerminalConnectionState(terminal.id, state)}
         onActivity={() => markTerminalActive(terminal.id)}

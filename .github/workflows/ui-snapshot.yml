@@ -164,14 +164,15 @@ jobs:
       # + system deps under $PLAYWRIGHT_BROWSERS_PATH (/ms-playwright), so the
       # uv-synced playwright 1.60.0 finds them with no download.
 
-      - name: Build web SPA
-        # Build BEFORE pytest: Vite's emptyOutDir clobbers the static dir, so
-        # never run it alongside the live server.
+      - name: Build web SPA + Storybook
+        # Build BEFORE pytest: Vite's emptyOutDir clobbers the SPA static dir,
+        # and the component snapshot test reads Storybook's generated index.
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: |
           pnpm install --frozen-lockfile --filter web
           pnpm --filter web run build
+          pnpm --filter web run build:storybook
 
       - name: Compare (PR) or regenerate (dispatch) the visual snapshots
         id: snapshot

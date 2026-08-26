@@ -106,7 +106,6 @@ def test_terminal_clipboard_prompt_and_session_grant(
                                 "terminal_name": "bash",
                                 "session_key": "clipboard-e2e",
                                 "running": True,
-                                "terminal_transport": "control",
                             },
                         }
                     ],

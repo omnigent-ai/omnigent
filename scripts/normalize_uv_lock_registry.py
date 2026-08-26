@@ -1,4 +1,4 @@
-"""Normalize ``uv.lock`` to the public PyPI index and canonical file metadata.
+"""Normalize package indexes in ``uv.lock`` to public PyPI.
 
 Local ``uv`` runs resolve against whatever index is configured on the
 developer's machine (e.g. the Databricks PyPI proxy via ``UV_INDEX_URL``
@@ -9,12 +9,6 @@ PyPI (``https://pypi.org/simple``) so the lock is reproducible for
 contributors who don't have the proxy — CI already pins
 ``UV_INDEX_URL: https://pypi.org/simple`` for the same reason.
 
-The index also leaks through file metadata: pypi.org serves a size for
-every wheel/sdist while proxy indexes may not, so each re-lock adds or
-strips ``size = N`` across thousands of lines depending on which index
-resolved it. The canonical form omits ``size`` (the hash is the
-integrity check), so re-locks from either side stop ping-ponging.
-
 This is a pre-commit *fixer*: it rewrites the lockfile in place and
 exits non-zero when it changed anything, so the commit aborts and the
 developer re-stages the normalized lockfile (mirroring
@@ -22,7 +16,7 @@ developer re-stages the normalized lockfile (mirroring
 touched; ``git`` / ``path`` / ``editable`` sources are left alone.
 
 Pass ``--check`` to validate without writing: it exits non-zero (and
-names the offending entries) when a file is *not* already canonical, but
+names the offending URLs) when a file is *not* already canonical, but
 leaves it untouched. CI runs this mode against the committed lockfile
 *before* any ``uv`` command — a plain ``uv run pre-commit`` can't catch a
 committed proxy URL, because ``uv`` re-syncs the working tree to CI's
@@ -59,18 +53,12 @@ _DIRECT_URL_RE = re.compile(
     r'(url = ")(https?://(?!files\.pythonhosted\.org)[^"]+?/packages/)([^"]*")'
 )
 
-# Matches the optional file-size field after a wheel/sdist hash, e.g.
-#   hash = "sha256:...", size = 116543, upload-time = "..."
-# pypi.org's index serves sizes, proxy indexes may not; canonical form omits them.
-_SIZE_RE = re.compile(r'(hash = "[^"]+"), size = \d+')
-
 
 def non_canonical_entries(text: str) -> list[str]:
-    """Return the non-canonical registry URLs, direct-URL hosts, and size fields in *text*.
+    """Return the non-canonical registry URLs and direct-URL hosts in *text*.
 
     :param text: Full contents of a ``uv.lock`` file.
-    :returns: Each non-canonical URL, in order, with duplicates preserved,
-        plus one summary entry when ``size`` fields are present.
+    :returns: Each non-canonical URL, in order, with duplicates preserved.
     """
     bad: list[str] = [
         m.group(1)
@@ -78,21 +66,17 @@ def non_canonical_entries(text: str) -> list[str]:
         if m.group(1) != _CANONICAL_INDEX
     ]
     bad += [m.group(2) for m in _DIRECT_URL_RE.finditer(text)]
-    sizes = len(_SIZE_RE.findall(text))
-    if sizes:
-        bad.append(f"size field on {sizes} file entr{'y' if sizes == 1 else 'ies'}")
     return bad
 
 
 def normalize_text(text: str) -> str:
-    """Return *text* with URLs rewritten to canonical hosts and ``size`` fields dropped.
+    """Return *text* with registry and distribution URLs rewritten to canonical hosts.
 
     :param text: Full contents of a ``uv.lock`` file.
     :returns: The normalized text.
     """
     text = _REGISTRY_RE.sub(rf"\g<1>{_CANONICAL_INDEX}\g<2>", text)
-    text = _DIRECT_URL_RE.sub(rf"\g<1>{_CANONICAL_FILES_HOST}/packages/\g<3>", text)
-    return _SIZE_RE.sub(r"\1", text)
+    return _DIRECT_URL_RE.sub(rf"\g<1>{_CANONICAL_FILES_HOST}/packages/\g<3>", text)
 
 
 def main(argv: list[str]) -> int:
@@ -116,8 +100,8 @@ def main(argv: list[str]) -> int:
                 ok = False
                 unique = sorted(set(offenders))
                 print(
-                    f"{name}: {len(offenders)} non-canonical entry(s) "
-                    f"(expected {_CANONICAL_INDEX}, no size fields): {', '.join(unique)}"
+                    f"{name}: {len(offenders)} non-canonical registry source(s) "
+                    f"(expected {_CANONICAL_INDEX}): {', '.join(unique)}"
                 )
                 print(
                     "Fix with: python scripts/normalize_uv_lock_registry.py "
@@ -132,7 +116,7 @@ def main(argv: list[str]) -> int:
         normalized = normalize_text(original)
         if normalized != original:
             path.write_text(normalized)
-            print(f"{name}: normalized to canonical form ({_CANONICAL_INDEX}, no size fields)")
+            print(f"{name}: normalized package index to {_CANONICAL_INDEX}")
             changed = True
     return 1 if changed else 0
 
