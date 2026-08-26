@@ -3388,7 +3388,10 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
             f"HTTP {probe.status_code}). Run `{login_cmd}` and retry."
         )
     click.echo(f"Not signed in to {display} — running `{login_cmd}` first.")
-    _databricks_login(server, workspace_host, org_id=org_id)
+    # Login selector comes from the URL, not the stored org_id used above: on a
+    # single-tenant host a replayed ?o= makes `databricks auth login --host` skip
+    # workspace_id resolution, so the grant isn't workspace-bound (matches `login`).
+    _databricks_login(server, workspace_host, org_id=_org_id_from_url(server))
 
 
 def _ensure_backend(server: str | None) -> str:
