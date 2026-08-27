@@ -118,6 +118,13 @@ _logger = logging.getLogger(__name__)
 _EventPublisher = Callable[[str, _JsonObject], None]
 
 
+class _UnsetLocalToolWorkdir:
+    """Sentinel distinguishing legacy fallback from an explicit no-bundle root."""
+
+
+_UNSET_LOCAL_TOOL_WORKDIR = _UnsetLocalToolWorkdir()
+
+
 class _DynamicCallable(Protocol):
     """Callable loaded from an agent spec's dotted Python path."""
 
@@ -938,19 +945,16 @@ async def _execute_local_python_tool(
     task_id: str | None,
     agent_id: str | None,
     runner_workspace: Path | None,
+    local_tool_workdir: Path | None,
 ) -> str:
     if agent_spec is None:
         return f"Error: {tool_name} not in local dispatch table (no agent spec)"
-    manager = ToolManager(agent_spec, workdir=runner_workspace)
+    manager = ToolManager(agent_spec, workdir=local_tool_workdir)
     try:
-        workspace = None
-        if runner_workspace is not None and conversation_id is not None:
-            workspace = runner_workspace / conversation_id
-            workspace.mkdir(parents=True, exist_ok=True)
         ctx = ToolContext(
             task_id=task_id or conversation_id or "runner-local-tool",
             agent_id=agent_id or agent_spec.name or "runner-agent",
-            workspace=workspace,
+            workspace=runner_workspace,
             conversation_id=conversation_id,
         )
         return await asyncio.to_thread(manager.call_tool, tool_name, args, ctx)
@@ -5720,6 +5724,7 @@ async def execute_tool(
     agent_id: str | None = None,
     agent_name: str | None = None,
     runner_workspace: Path | None = None,
+    local_tool_workdir: Path | None | _UnsetLocalToolWorkdir = _UNSET_LOCAL_TOOL_WORKDIR,
     mcp_manager: RunnerMcpManager | None = None,
     session_inbox: asyncio.Queue[_JsonObject] | None = None,
     session_async_tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] | None = None,
@@ -5757,7 +5762,6 @@ async def execute_tool(
     if error is not None:
         return json.dumps({"error": error})
     assert args is not None
-
     try:
         if mcp_manager is not None:
             # All MCP tool calls are routed through the AP server's
@@ -5823,6 +5827,7 @@ async def execute_tool(
                 agent_id=agent_id,
                 agent_name=agent_name,
                 runner_workspace=runner_workspace,
+                local_tool_workdir=local_tool_workdir,
                 mcp_manager=mcp_manager,
                 filesystem_registry=filesystem_registry,
             )
@@ -5974,6 +5979,11 @@ async def execute_tool(
                 task_id=task_id,
                 agent_id=agent_id,
                 runner_workspace=runner_workspace,
+                local_tool_workdir=(
+                    runner_workspace
+                    if local_tool_workdir is _UNSET_LOCAL_TOOL_WORKDIR
+                    else cast(Path | None, local_tool_workdir)
+                ),
             )
         elif _is_uc_function_tool(tool_name, agent_spec):
             output = await _execute_uc_function_tool(tool_name, args, agent_spec=agent_spec)
@@ -6061,6 +6071,7 @@ async def dispatch_tool_locally(
     agent_id: str | None = None,
     agent_name: str | None = None,
     runner_workspace: Path | None = None,
+    local_tool_workdir: Path | None | _UnsetLocalToolWorkdir = _UNSET_LOCAL_TOOL_WORKDIR,
     mcp_manager: RunnerMcpManager | None = None,
     session_inbox: asyncio.Queue[_JsonObject] | None = None,
     session_async_tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] | None = None,
@@ -6101,6 +6112,7 @@ async def dispatch_tool_locally(
         agent_id=agent_id,
         agent_name=agent_name,
         runner_workspace=runner_workspace,
+        local_tool_workdir=local_tool_workdir,
         mcp_manager=mcp_manager,
         session_inbox=session_inbox,
         session_async_tasks=session_async_tasks,
@@ -6921,6 +6933,7 @@ async def _execute_async_inbox_tool(
     agent_id: str | None,
     agent_name: str | None,
     runner_workspace: Path | None,
+    local_tool_workdir: Path | None | _UnsetLocalToolWorkdir,
     mcp_manager: RunnerMcpManager | None,
     filesystem_registry: FilesystemRegistry | None = None,
     harness_client: httpx.AsyncClient | None = None,
@@ -6967,6 +6980,7 @@ async def _execute_async_inbox_tool(
             agent_id=agent_id,
             agent_name=agent_name,
             runner_workspace=runner_workspace,
+            local_tool_workdir=local_tool_workdir,
             mcp_manager=mcp_manager,
             filesystem_registry=filesystem_registry,
         )
@@ -7421,6 +7435,7 @@ def _spawn_async_tool(
     runner_workspace: Path | None,
     mcp_manager: RunnerMcpManager | None,
     filesystem_registry: FilesystemRegistry | None = None,
+    local_tool_workdir: Path | None | _UnsetLocalToolWorkdir = _UNSET_LOCAL_TOOL_WORKDIR,
 ) -> str:
     """
     Spawn a tool as a background asyncio.Task.
@@ -7505,6 +7520,7 @@ def _spawn_async_tool(
                 agent_id=agent_id,
                 agent_name=agent_name,
                 runner_workspace=runner_workspace,
+                local_tool_workdir=local_tool_workdir,
                 mcp_manager=mcp_manager,
                 session_inbox=session_inbox if target_tool in _TERMINAL_TOOLS else None,
                 filesystem_registry=filesystem_registry,
