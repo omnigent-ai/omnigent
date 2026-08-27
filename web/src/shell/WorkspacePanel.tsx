@@ -34,7 +34,7 @@ import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import { terminalTabKey, useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
 import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import { FilesPanel } from "./FilesPanel";
-import { FileViewer } from "./FileViewer";
+import { LazyFileViewer } from "./LazyFileViewer";
 import type { ChangedSort } from "./FlatFileList";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { useTerminalStatuses } from "./useTerminalStatuses";
@@ -920,7 +920,7 @@ export function WorkspacePanel({
             readOnly={!isOwnerLevel(permissionLevel)}
           />
         ) : selectedFilePath !== null ? (
-          <FileViewer
+          <LazyFileViewer
             frameless
             open
             conversationId={conversationId}
