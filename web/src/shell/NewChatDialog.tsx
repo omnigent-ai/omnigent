@@ -101,7 +101,7 @@ import {
   rankedSlashCommandNames,
   SlashCommandMenu,
 } from "@/components/SlashCommandMenu";
-import { setPendingInitialPrompt } from "@/store/chatStore";
+import { beginCreateSessionTiming, setPendingInitialPrompt } from "@/store/chatStore";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
@@ -4200,6 +4200,10 @@ export function NewChatLandingScreen() {
           return;
         }
         data = { id: created.id };
+        // Time create_session (created → first AI message), split by host. New
+        // Chat is the only create path that can produce a managed sandbox; the
+        // stream pump completes/settles the span once the session runs.
+        beginCreateSessionTiming(created.id, sandboxSelected ? "sandbox" : "computer");
       }
       // Persist the configuration that actually launched. Modal Save updates
       // storage eagerly so an immediate Send cannot observe stale state; this

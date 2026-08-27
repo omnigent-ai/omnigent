@@ -2772,18 +2772,11 @@ async function ensureBoundSession(
     // missed). Bind the stream FIRST, then post the first message.
     const session = await createSession(agentId, []);
     sessionId = session.id;
-    // Open the create_session CUJ span now (session just created) and complete it
-    // on this session's first `response_start` (see the pump below): the span is
-    // "created → first AI message". Host kind is baked into the interaction kind so
-    // the host names/segments sandbox vs computer without a queryable sub-dimension.
-    const createHostKind = session.sandboxStatus != null ? "sandbox" : "computer";
-    createSessionPending.set(
-      sessionId,
-      startTimedInteraction(
-        createHostKind === "sandbox" ? "create_session_sandbox" : "create_session_computer",
-        sessionId,
-      ),
-    );
+    // Open the create_session CUJ span (see `beginCreateSessionTiming`); the pump
+    // completes it on the session's first AI message. This path sends no host
+    // params, so the server always makes an external ("computer") session —
+    // managed sandboxes are created by the New Chat dialog, which times itself.
+    beginCreateSessionTiming(sessionId, "computer");
     // Claim the send chain for this id NOW, while it is still private to this
     // call. Everything below publishes it (the store write, the navigate
     // callback, the sidebar invalidation) and awaits network work, so a send
@@ -4201,6 +4194,16 @@ export async function startStreamPump(
     if (get().abortController === controller) {
       set({ abortController: null });
     }
+    // The session's streaming is over (aborted / switched away / gave up).
+    // Reconnects stay inside the loop above, so reaching here is a true terminal.
+    // If a create_session span is still open, its first AI message never arrived —
+    // settle it as a failure so it neither leaks nor is completed later as a stale,
+    // inflated success.
+    const pendingCreate = createSessionPending.get(id);
+    if (pendingCreate) {
+      createSessionPending.delete(id);
+      pendingCreate.fail();
+    }
   }
   /* eslint-enable no-await-in-loop */
 }
@@ -4566,13 +4569,35 @@ function revivePendingElicitationBlock(set: Setter, elicitationId: string): void
 // reopening an old conversation never re-emits.
 const runStartTimes = new Map<string, number>();
 const toolStartTimes = new Map<string, number>();
-// create_session CUJ: an open interaction per brand-new session, keyed by
-// session id. Opened right after the session is created (in `ensureBoundSession`)
-// and completed on that session's FIRST `response_start` below — i.e. the span is
-// "session created → first AI message", the part that varies by host (bind /
-// sandbox launch / time-to-first-token). The create POST itself is excluded (it's
-// small and measurable from backend traces).
+// create_session CUJ: an open interaction per brand-new session, keyed by session
+// id. Opened at create time (see `beginCreateSessionTiming`), completed on that
+// session's FIRST painted assistant content in the pump below ("first AI message"),
+// and settled as a failure on pump exit if that content never arrives. The span is
+// "session created → first AI message", the part that varies by host (bind / sandbox
+// launch / time-to-first-token); the create POST itself is excluded (small and
+// measurable from backend traces).
 const createSessionPending = new Map<string, TimedInteraction>();
+
+/**
+ * Open the create_session span for a brand-new session, keyed by `sessionId`.
+ * Called from both create paths: the send/landing-composer path (always a
+ * `"computer"` external session) and the New Chat dialog (`"sandbox"` when the
+ * user picked a managed sandbox, else `"computer"`). Host kind is baked into the
+ * interaction kind so the host can segment sandbox vs computer without a queryable
+ * sub-dimension. The pump settles it (complete on first content, fail on exit).
+ */
+export function beginCreateSessionTiming(
+  sessionId: string,
+  hostKind: "sandbox" | "computer",
+): void {
+  createSessionPending.set(
+    sessionId,
+    startTimedInteraction(
+      hostKind === "sandbox" ? "create_session_sandbox" : "create_session_computer",
+      sessionId,
+    ),
+  );
+}
 
 function mapRunStatus(state: string): OmnigentInteractionStatus {
   switch (state) {
@@ -4684,14 +4709,6 @@ export async function pumpStreamEvents(
             interactionKind: "agent_run",
             phase: "start",
           });
-        }
-        // First response for a brand-new session = the create_session CUJ's end
-        // ("first AI message"). `id` is this pump's session id; the map only holds
-        // freshly-created sessions, and the delete makes this fire once.
-        const pendingCreate = createSessionPending.get(id);
-        if (pendingCreate) {
-          createSessionPending.delete(id);
-          pendingCreate.complete();
         }
         continue;
       }
@@ -4846,6 +4863,15 @@ export async function pumpStreamEvents(
             durationMs: Date.now() - runStart,
           });
         }
+        // A create_session span still open at a response terminal means this
+        // response ended without ever painting content — no "first AI message" —
+        // so settle it as a failure (and clear it so a later turn can't complete a
+        // stale span). The success path already deleted it at first content.
+        const pendingCreate = createSessionPending.get(id);
+        if (pendingCreate) {
+          createSessionPending.delete(id);
+          pendingCreate.fail();
+        }
         // Turn over: drop any provisional preview never finalized by a
         // committed item (e.g. an interrupt where the partial item lands
         // after this event, or a stream drop). Normal messages already
@@ -4905,6 +4931,16 @@ export async function pumpStreamEvents(
         // user sees the first token without waiting a frame.
         paintedFirstContent = true;
         flush();
+        // First painted content of a brand-new session = the "first AI message"
+        // that ends the create_session CUJ (`response_start` above is only run
+        // acknowledgement, before any output). `id` is this pump's session id; the
+        // map holds only freshly-created sessions and the delete makes this fire
+        // once — later responses find nothing.
+        const pendingCreate = createSessionPending.get(id);
+        if (pendingCreate) {
+          createSessionPending.delete(id);
+          pendingCreate.complete();
+        }
       } else {
         scheduler.schedule(() => flush());
       }
