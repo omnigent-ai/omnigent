@@ -215,12 +215,15 @@ def _request_event(elicitation_id: str, message: str | None = None) -> dict[str,
     return event
 
 
-def _resolved_event(elicitation_id: str) -> dict[str, Any]:
+def _resolved_event(elicitation_id: str, action: str | None = None) -> dict[str, Any]:
     """Build a ``response.elicitation_resolved`` event dict."""
-    return {
+    event: dict[str, Any] = {
         "type": "response.elicitation_resolved",
         "elicitation_id": elicitation_id,
     }
+    if action is not None:
+        event["action"] = action
+    return event
 
 
 async def _wait_for_calls(
@@ -545,6 +548,102 @@ async def test_resolution_notice_follows_delivered_wake(
     assert "result will arrive in your inbox" in resolution.notice
     # Arm released: a later re-block of the same id can wake again.
     assert not elicitation_armed(notifier, "elicit_geo")
+
+
+@pytest.mark.asyncio
+async def test_resolution_notice_states_decline_verdict(
+    conv_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    A declined block's resolution notice names the decline verbatim.
+
+    The fabricated-approval bug: the gate was DECLINED but a bare
+    "resolved" notice let the parent agent narrate "Approved" into the
+    durable transcript. The verdict must ride the notice itself, in
+    words an agent cannot misread.
+    """
+    parent = conv_store.create_conversation(kind="default", title="parent")
+    child = conv_store.create_conversation(
+        kind="sub_agent", title="codex:gate", parent_conversation_id=parent.id
+    )
+    dispatch = _RecordingDispatch()
+    notifier = SubagentBlockNotifier(
+        conversation_store=conv_store,
+        wake_dispatch=dispatch,
+        loop=asyncio.get_event_loop(),
+    )
+
+    notifier.observe(child.id, _request_event("elicit_shell"))
+    await _wait_for_calls(dispatch, expected=1)
+    notifier.observe(child.id, _resolved_event("elicit_shell", action="decline"))
+    await _wait_for_calls(dispatch, expected=2)
+
+    resolution = dispatch.calls[1]
+    assert "(action: decline — NOT approved)" in resolution.notice
+
+
+@pytest.mark.asyncio
+async def test_resolution_notice_states_accept_verdict(
+    conv_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    An accepted block's resolution notice records the acceptance.
+    """
+    parent = conv_store.create_conversation(kind="default", title="parent")
+    child = conv_store.create_conversation(
+        kind="sub_agent", title="codex:ok", parent_conversation_id=parent.id
+    )
+    dispatch = _RecordingDispatch()
+    notifier = SubagentBlockNotifier(
+        conversation_store=conv_store,
+        wake_dispatch=dispatch,
+        loop=asyncio.get_event_loop(),
+    )
+
+    notifier.observe(child.id, _request_event("elicit_ok"))
+    await _wait_for_calls(dispatch, expected=1)
+    notifier.observe(child.id, _resolved_event("elicit_ok", action="accept"))
+    await _wait_for_calls(dispatch, expected=2)
+
+    resolution = dispatch.calls[1]
+    assert "(action: accept)" in resolution.notice
+    assert "NOT approved" not in resolution.notice
+
+
+@pytest.mark.asyncio
+async def test_resolution_notice_without_verdict_says_not_approved(
+    conv_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    A resolution with no recorded verdict cannot be read as approval.
+
+    Timeouts, severed waits, and older runners publish resolved events
+    without ``action``; the notice must state the fail-closed reading
+    instead of leaving the agent to guess — silence here is exactly how
+    the fabricated narration happened. A malformed action value is
+    treated the same way as a missing one.
+    """
+    parent = conv_store.create_conversation(kind="default", title="parent")
+    child = conv_store.create_conversation(
+        kind="sub_agent", title="codex:no-verdict", parent_conversation_id=parent.id
+    )
+    for action in (None, "maybe"):
+        dispatch = _RecordingDispatch()
+        notifier = SubagentBlockNotifier(
+            conversation_store=conv_store,
+            wake_dispatch=dispatch,
+            loop=asyncio.get_event_loop(),
+        )
+        elicitation_id = "elicit_no_verdict" if action is None else "elicit_bad_verdict"
+
+        notifier.observe(child.id, _request_event(elicitation_id))
+        await _wait_for_calls(dispatch, expected=1)
+        notifier.observe(child.id, _resolved_event(elicitation_id, action=action))
+        await _wait_for_calls(dispatch, expected=2)
+
+        resolution = dispatch.calls[1]
+        assert "no human verdict recorded" in resolution.notice
+        assert "NOT approved" in resolution.notice
 
 
 class _ResolveDuringDispatch:

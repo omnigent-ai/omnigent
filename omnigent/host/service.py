@@ -94,7 +94,8 @@ def _launchd_payload(
         "ThrottleInterval": 10,
         "StandardOutPath": str(service.log_path),
         "StandardErrorPath": str(service.log_path),
-        "ProcessType": "Background",
+        # No ProcessType: the default (Standard) keeps runner/harness children
+        # out of the background QoS band, which would starve their deadlines.
     }
     return plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=True)
 

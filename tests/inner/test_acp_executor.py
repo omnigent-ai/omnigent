@@ -30,6 +30,9 @@ from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
     ExecutorError,
     ReasoningChunk,
+    SubAgentCompleted,
+    SubAgentStarted,
+    SubAgentToolCall,
     TextChunk,
     ToolCallComplete,
     ToolCallRequest,
@@ -351,6 +354,124 @@ def test_in_progress_tool_update_emits_nothing() -> None:
         )
         == []
     )
+
+
+# ---------------------------------------------------------------------------
+# Sub-agent surfacing (extension-supplied dialect -> normalized events)
+# ---------------------------------------------------------------------------
+
+
+class _FakeSubAgentDialect:
+    """An invented dialect, so this generic suite names no vendor."""
+
+    def read(self, update: dict[str, object]) -> tuple[object, ...]:
+        """Return start / activity / end for ``acme.dev/{spawn,work,done}``."""
+        from omnigent.inner.acp_subagents import SubAgentActivity, SubAgentEnd, SubAgentStart
+
+        if isinstance(update.get("acme.dev/spawn"), dict):
+            return (SubAgentStart(child_key="w1", title="worker", task="do a thing"),)
+        if isinstance(update.get("acme.dev/work"), dict):
+            return (
+                SubAgentActivity(
+                    child_key="w1", call_id="c9", name="Wrote out.txt", args={"path": "out.txt"}
+                ),
+            )
+        if isinstance(update.get("acme.dev/done"), dict):
+            return (SubAgentEnd(child_key="w1", ok=True, summary="done"),)
+        return ()
+
+
+def _extended_executor() -> AcpExecutor:
+    """An executor whose extension supplies one dialect (a vendor's wrap does this)."""
+    from omnigent.inner.acp_extension import AcpExtension
+
+    return AcpExecutor(
+        AcpAgentConfig(command="x"),
+        extension=AcpExtension(name="acme", subagent_sources=(_FakeSubAgentDialect(),)),
+    )
+
+
+def test_handle_session_update_emits_subagent_started() -> None:
+    """An extension-recognized start becomes a ``SubAgentStarted`` event.
+
+    The executor half of the seam: the runner turns this event into a child
+    session, so if it stops firing the "Subagents" panel goes empty.
+    """
+    events = _extended_executor()._handle_session_update(
+        {"sessionUpdate": "tool_call_update", "acme.dev/spawn": {"id": "w1"}}
+    )
+    assert [e for e in events if isinstance(e, SubAgentStarted)] == [
+        SubAgentStarted(child_key="w1", title="worker", task="do a thing")
+    ]
+
+
+def test_handle_session_update_emits_subagent_completed() -> None:
+    """An extension-recognized end becomes a ``SubAgentCompleted`` event."""
+    events = _extended_executor()._handle_session_update(
+        {"sessionUpdate": "tool_call_update", "acme.dev/done": {"id": "w1"}}
+    )
+    assert [e for e in events if isinstance(e, SubAgentCompleted)] == [
+        SubAgentCompleted(child_key="w1", ok=True, summary="done")
+    ]
+
+
+def test_generic_executor_does_no_subagent_scanning() -> None:
+    """With no extension, the executor is inert even for a dialect-shaped frame.
+
+    **What breaks if this fails**: every ACP agent — Grok, a user's own
+    ``acp:<slug>`` — gets some other vendor's dialect run against its frames,
+    which is the coupling the extension seam exists to prevent. The default must
+    read no vendor field at all.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))  # generic acp harness
+    for frame in (
+        {"sessionUpdate": "tool_call_update", "acme.dev/spawn": {"id": "w1"}},
+        {"sessionUpdate": "tool_call_update", "_meta": {"cognition.ai/subagent_started": {}}},
+        {"sessionUpdate": "agent_message_chunk", "content": {"text": "hi"}},
+    ):
+        events = ex._handle_session_update(frame)
+        assert not any(isinstance(e, (SubAgentStarted, SubAgentCompleted)) for e in events), frame
+
+
+def test_tool_cards_still_render_alongside_the_scan() -> None:
+    """An ordinary (unclaimed) tool_call still produces a parent card."""
+    events = _extended_executor()._handle_session_update(
+        {"sessionUpdate": "tool_call", "toolCallId": "c1", "title": "Ran ls", "kind": "execute"}
+    )
+    assert [type(e) for e in events] == [ToolCallRequest]
+
+
+def test_handle_session_update_routes_activity_to_the_child() -> None:
+    """A claimed tool call becomes a ``SubAgentToolCall``, not a parent card.
+
+    **What breaks if this fails**: the sub-agent's own work renders in the parent
+    stream (or nowhere) instead of the child transcript — the exact gap this
+    change closes.
+    """
+    events = _extended_executor()._handle_session_update(
+        {"sessionUpdate": "tool_call", "toolCallId": "c9", "acme.dev/work": {"any": 1}}
+    )
+    assert events == [
+        SubAgentToolCall(
+            child_key="w1", call_id="c9", name="Wrote out.txt", args={"path": "out.txt"}
+        )
+    ]
+    # The frame is claimed, so it does NOT also emit a parent tool card.
+    assert not any(isinstance(e, ToolCallRequest) for e in events)
+
+
+def test_claimed_completion_frame_emits_no_spurious_parent_card() -> None:
+    """A claimed ``tool_call_update`` doesn't also close a parent tool card.
+
+    The sub-agent's completion rides a ``tool_call_update`` whose id was never an
+    originating ``tool_call``; without the short-circuit the terminal-status
+    branch would emit a stray ``ToolCallComplete(name="tool")`` in the parent.
+    """
+    events = _extended_executor()._handle_session_update(
+        {"sessionUpdate": "tool_call_update", "status": "completed", "acme.dev/done": {"id": "w1"}}
+    )
+    assert [type(e) for e in events] == [SubAgentCompleted]
+    assert not any(isinstance(e, ToolCallComplete) for e in events)
 
 
 # ---------------------------------------------------------------------------

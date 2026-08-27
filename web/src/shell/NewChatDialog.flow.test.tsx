@@ -116,6 +116,9 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof UseConversationsModule>()),
   useProjects: () => ({ data: [] }),
+  // Same reason as useProjects above: the landing reads useConversations for
+  // hasNoSessions, so stub it to avoid an authenticatedFetch skewing calls[0].
+  useConversations: () => ({ data: undefined }),
 }));
 // Dynamic harness-label fetching is covered separately. Keep it synchronous
 // here so exact create-POST call-count assertions only observe the POST.

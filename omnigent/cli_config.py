@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any
 
 import click
 
+from omnigent.cli_invocation import cli_invocation
 from omnigent.inner import ui
 from omnigent.onboarding.ucode_setup import (
     build_ucode_configure_command,
@@ -3356,7 +3357,8 @@ def _print_opencode_auth_help() -> None:
         "    • Databricks gateway: set an agent ``profile`` (configured under Claude / Codex);\n"
         "      Omnigent synthesizes opencode's per-session provider config from it.\n"
         "  Omnigent stores no OpenCode credential of its own.\n"
-        "  [dim]Tip:[/dim] 'Set default model' picks which model `omni opencode` launches on\n"
+        f"  [dim]Tip:[/dim] 'Set default model' picks which model "
+        f"`{cli_invocation(name='omni')} opencode` launches on\n"
         "  (otherwise OpenCode uses its built-in default, opencode/big-pickle)."
     )
 

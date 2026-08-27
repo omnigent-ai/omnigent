@@ -498,6 +498,9 @@ class _PiNativeLaunchConfig:
     :param model_override: Persisted per-session ``/model`` override, e.g.
         ``"claude-4.6-sonnet-medium"``; ``None`` when unset. Consumed by the
         cursor-native launch (``--model``), ignored by pi-native.
+    :param reasoning_effort: Persisted per-session effort, e.g. ``"high"``.
+        Consumed by the pi-native launch as ``--thinking``; ``None`` leaves
+        Pi's model default in place.
     """
 
     workspace: Path
@@ -508,6 +511,7 @@ class _PiNativeLaunchConfig:
     fork_source_external_id: str | None = None
     fork_carry_history: bool = False
     model_override: str | None = None
+    reasoning_effort: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -916,6 +920,7 @@ async def _pi_native_launch_config(
             raise RuntimeError(
                 f"Invalid model_override for session {session_id!r}: {exc}"
             ) from exc
+    reasoning_effort = snapshot.get("reasoning_effort")
     return _PiNativeLaunchConfig(
         workspace=_pi_session_workspace(session_workspace),
         server_url=os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767").rstrip("/"),
@@ -925,6 +930,9 @@ async def _pi_native_launch_config(
         fork_source_external_id=fork_source_external_id,
         fork_carry_history=fork_carry_history,
         model_override=model_override,
+        reasoning_effort=reasoning_effort
+        if isinstance(reasoning_effort, str) and reasoning_effort
+        else None,
     )
 
 
@@ -2179,17 +2187,23 @@ async def _auto_create_pi_terminal(
         spec_model = launch_config.model_override or _pi_native_model_from_spec(agent_spec)
         provider = resolve_pi_native_provider(model=spec_model)
         if provider is not None:
-            cred_env, cred_args = pi_native_provider_launch(
+            launch = pi_native_provider_launch(
                 bridge_dir / "pi-agent",
                 provider,
+                launch_config.reasoning_effort,
                 selection=spec_model,
             )
-            pi_env.update(cred_env)
-            pi_args.extend(cred_args)
+            pi_env.update(launch.env)
+            pi_args.extend(launch.args)
             # An unroutable model leaves Pi unable to select it, which looks
             # like a silent hang; prefer that notice over the credential one
-            # since it names the model the user actually picked.
-            credential_warning = provider.unroutable_model_warning() or provider.credential_warning
+            # since it names the model the user actually picked. An effort that
+            # could not be honoured is the least urgent of the three.
+            credential_warning = (
+                provider.unroutable_model_warning()
+                or provider.credential_warning
+                or launch.effort_warning
+            )
     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
     # and ``parent_os_env`` below, launch_required_terminal falls back to

@@ -105,6 +105,7 @@ from omnigent.claude_native_state import (
     redirect_launch_state,
     write_launch_state,
 )
+from omnigent.cli_invocation import cli_invocation
 from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.host.daemon_launch import (
@@ -2510,7 +2511,7 @@ def _ucode_config_for_profile(
     if agent_state is None:
         raise click.ClickException(
             f"ucode state for profile {profile!r} does not include a Claude agent entry. "
-            "Run `omnigent setup --internal-beta` to refresh ucode configuration."
+            f"Run `{cli_invocation()} setup --internal-beta` to refresh ucode configuration."
         )
 
     base_url = agent_state.env.get(_UCODE_CLAUDE_BASE_URL_ENV) or agent_state.base_url
@@ -2520,12 +2521,12 @@ def _ucode_config_for_profile(
         raise click.ClickException(
             f"ucode state for profile {profile!r} is missing Claude base URL "
             f"({_UCODE_CLAUDE_BASE_URL_ENV} / base_url). "
-            "Run `omnigent setup --internal-beta` to refresh ucode configuration."
+            f"Run `{cli_invocation()} setup --internal-beta` to refresh ucode configuration."
         )
     if not agent_state.auth_command:
         raise click.ClickException(
             f"ucode state for profile {profile!r} is missing Claude auth_command. "
-            "Run `omnigent setup --internal-beta` to refresh ucode configuration."
+            f"Run `{cli_invocation()} setup --internal-beta` to refresh ucode configuration."
         )
 
     refresh_interval_ms = (
@@ -4554,7 +4555,7 @@ async def _fetch_claude_session_labels(
     if resp.status_code == 404:
         raise click.ClickException(
             f"Conversation {session_id!r} not found on the server. "
-            "Run `omnigent claude` (no --resume) to start a new session.",
+            f"Run `{cli_invocation()} claude` (no --resume) to start a new session.",
         )
     if resp.status_code >= 400:
         raise click.ClickException(
@@ -4598,7 +4599,7 @@ async def _resolve_cold_resume_args(
     if resp.status_code == 404:
         raise click.ClickException(
             f"Conversation {session_id!r} not found on the server. "
-            "Run `omnigent claude` (no --resume) to start a new session.",
+            f"Run `{cli_invocation()} claude` (no --resume) to start a new session.",
         )
     if resp.status_code >= 400:
         raise click.ClickException(
@@ -4616,7 +4617,7 @@ async def _resolve_cold_resume_args(
     if wrapper != _WRAPPER_LABEL_VALUE:
         raise click.ClickException(
             f"Conversation {session_id!r} is not a claude-native session "
-            f"(wrapper={wrapper!r}). Use `omnigent run --resume "
+            f"(wrapper={wrapper!r}). Use `{cli_invocation()} run --resume "
             f"{session_id}` to resume it through the right runtime.",
         )
     external_session_id = payload.get("external_session_id")

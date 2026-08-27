@@ -97,6 +97,7 @@ import { conversationDisplayLabel } from "@/shell/sidebarNav";
 import { absoluteTime } from "@/lib/relativeTime";
 import { useNavigate } from "@/lib/routing";
 import { useSettingsRoute } from "@/shell/settingsNav";
+import { ImportSessionsPanel } from "@/shell/ImportSessionsPanel";
 import {
   normalizeResolvedTheme,
   normalizeThemeMode,
@@ -246,6 +247,7 @@ export function SettingsPage() {
       {section === "appearance" && <AppearanceSection />}
       {section === "git" && <GitSection />}
       {section === "shortcuts" && <ShortcutsSection />}
+      {section === "import" && <ImportSection />}
       {section === "account" && hasAuthSession && <AccountSection />}
       {section === "archived" && <ArchivedSection />}
       {section === "cli" && isElectronShell() && <LocalCliSection />}
@@ -2039,6 +2041,17 @@ function dateGroupLabel(timestampSec: number, now: Date = new Date()): string {
   if (date >= sevenDaysAgo) return "Previous 7 days";
   if (date >= thirtyDaysAgo) return "Previous 30 days";
   return date.toLocaleDateString(undefined, { month: "long", year: "numeric" });
+}
+
+function ImportSection() {
+  return (
+    <Section
+      title="Import sessions"
+      description="Pull your recent local chats from a machine you're running into Omnigent. Sessions already imported are skipped."
+    >
+      <ImportSessionsPanel />
+    </Section>
+  );
 }
 
 function ArchivedSection() {

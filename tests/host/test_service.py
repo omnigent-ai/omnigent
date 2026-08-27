@@ -51,6 +51,7 @@ def test_enable_launchd_user_service(tmp_path: Path, monkeypatch: pytest.MonkeyP
     ]
     assert payload["EnvironmentVariables"]["PATH"] == "/usr/bin:/bin"
     assert payload["KeepAlive"] == {"SuccessfulExit": False}
+    assert "ProcessType" not in payload
     assert calls == [
         ["launchctl", "bootout", "gui/501/ai.omnigent.host"],
         [

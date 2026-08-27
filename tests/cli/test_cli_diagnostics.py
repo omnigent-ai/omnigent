@@ -269,6 +269,22 @@ def test_stale_host_hint_recommends_generic_stop_command(
     assert "omnigent setup" not in hint
 
 
+def test_stale_host_hint_names_configured_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Under a wrapper deployment the hint suggests the wrapper, not naked `omnigent`."""
+    terminal_stderr = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", terminal_stderr)
+    monkeypatch.setenv("OMNIGENT_WRAPPER_COMMAND", "isaac omni")
+
+    cli_diagnostics.print_stale_host_hint()
+
+    hint = terminal_stderr.getvalue()
+    assert "`isaac omni stop`" in hint
+    # The naked binary token must not be suggested when it would be refused.
+    assert "`omnigent stop`" not in hint
+
+
 def test_redirect_stderr_to_log_retargets_existing_logging_stderr_handlers(
     isolated_cli_diagnostics: None,
     monkeypatch: pytest.MonkeyPatch,

@@ -276,7 +276,7 @@ export function InboxPage() {
                     trackClick("inbox.approval.toggle_expanded", "button");
                     setExpandedOverrides((prev) => ({ ...prev, [elicitationId]: !expanded }));
                   }}
-                  className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                  className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
                 >
                   <ChevronDownIcon
                     className={cn(

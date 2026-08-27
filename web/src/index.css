@@ -468,6 +468,7 @@ aside[aria-label="Workspace"][data-maximized] {
 
 /* Popovers/menus — same glass treatment */
 .dark [data-slot="popover-content"],
+.dark [data-slot="select-content"],
 .dark [role="menu"],
 .dark [data-radix-popper-content-wrapper] > * {
   /* -webkit- before unprefixed — see comment on the bg-card rule above. */

@@ -3661,6 +3661,39 @@ function captureElicitationIdsByStatus(blocks: AnyBlock[]): {
   return { pending, autoResolved };
 }
 
+function blockWallClockS(block: AnyBlock): number | undefined {
+  return block.ctx.createdAtS ?? block.ctx.clientCreatedAtS;
+}
+
+/** Merge preserved itemless history back into a freshly loaded item window. */
+function mergeReconnectWindow(windowBlocks: AnyBlock[], tail: AnyBlock[]): AnyBlock[] {
+  const anchored: AnyBlock[] = [];
+  const liveTail: AnyBlock[] = [];
+  for (const block of tail) {
+    if (
+      block.ctx.itemId === null &&
+      (block.type === "elicitation" || block.type === "error") &&
+      blockWallClockS(block) !== undefined
+    ) {
+      anchored.push(block);
+    } else {
+      liveTail.push(block);
+    }
+  }
+
+  const merged = [...windowBlocks];
+  for (const block of anchored) {
+    const createdAtS = blockWallClockS(block)!;
+    const insertAt = merged.findIndex((candidate) => {
+      const candidateCreatedAtS = blockWallClockS(candidate);
+      return candidateCreatedAtS !== undefined && candidateCreatedAtS > createdAtS;
+    });
+    if (insertAt === -1) merged.push(block);
+    else merged.splice(insertAt, 0, block);
+  }
+  return [...merged, ...liveTail];
+}
+
 /**
  * Reconnect fallback when the disconnect gap outran the incremental
  * backfill cap: replace the history window wholesale from one fresh window
@@ -3672,10 +3705,11 @@ function captureElicitationIdsByStatus(blocks: AnyBlock[]): {
  * reachable via scroll-up, since `oldestItemId` / `hasMoreHistory` are
  * reset alongside) while the live tail the reconnected pump has already
  * delivered — newly committed items plus the active turn's replayed
- * in-flight ephemera — is kept after the window, along with
- * elicitation/error blocks (never items, so the fresh fetch can't
- * recreate them). Elicitation cards are then reconciled against the
- * snapshot's pending list (see `reconcileElicitationBlocks`).
+ * in-flight ephemera — is kept after the window. Itemless elicitation/error
+ * blocks cannot be recreated by the fetch, but they may be older than the
+ * fresh items, so wall-clock-stamped ones are merged back chronologically
+ * instead of blindly appended. Elicitation cards are then reconciled against
+ * the snapshot's pending list (see `reconcileElicitationBlocks`).
  */
 async function rehydrateWindowOnReconnect(
   id: string,
@@ -3708,7 +3742,10 @@ async function rehydrateWindowOnReconnect(
       tail.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
     );
     const windowBlocks = freshBlocks.filter((b) => !b.ctx.itemId || !tailIds.has(b.ctx.itemId));
-    const merged = [...windowBlocks, ...withoutRebuiltUserInputCards(tail, windowBlocks)];
+    const merged = mergeReconnectWindow(
+      windowBlocks,
+      withoutRebuiltUserInputCards(tail, windowBlocks),
+    );
     return {
       ...reconnectStatusPatch(session, s),
       blocks:

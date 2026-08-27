@@ -19,6 +19,10 @@ from omnigent.host.frames import (
     HostFsResultFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
+    HostImportedLocalSession,
+    HostImportLocalDoneFrame,
+    HostImportLocalFrame,
+    HostImportLocalSessionFrame,
     HostInstallHarnessFrame,
     HostInstallHarnessResultFrame,
     HostLaunchRunnerFrame,
@@ -44,6 +48,65 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
 )
+
+
+def test_import_local_frames_round_trip() -> None:
+    """Request, per-session, and done frames survive the tunnel (title + source)."""
+    request = decode_host_frame(
+        encode_host_frame(HostImportLocalFrame(request_id="req_imp", source="claude", limit=3))
+    )
+    assert request == HostImportLocalFrame(request_id="req_imp", source="claude", limit=3)
+
+    session = decode_host_frame(
+        encode_host_frame(
+            HostImportLocalSessionFrame(
+                request_id="req_imp",
+                total=2,
+                session=HostImportedLocalSession(
+                    external_session_id="s1",
+                    workspace="/repo",
+                    items=[{"type": "message", "response_id": "r", "data": {}}],
+                    title="My renamed thread",
+                    source="claude",
+                ),
+            )
+        )
+    )
+    assert isinstance(session, HostImportLocalSessionFrame)
+    assert session.total == 2
+    assert session.session.external_session_id == "s1"
+    assert session.session.title == "My renamed thread"
+    assert session.session.source == "claude"
+
+    # A session with no title round-trips as null (not an error).
+    null_title = decode_host_frame(
+        encode_host_frame(
+            HostImportLocalSessionFrame(
+                request_id="req_imp",
+                total=2,
+                session=HostImportedLocalSession(
+                    external_session_id="s2", workspace=None, items=[], title=None, source="codex"
+                ),
+            )
+        )
+    )
+    assert isinstance(null_title, HostImportLocalSessionFrame)
+    assert null_title.session.title is None
+
+    done = decode_host_frame(
+        encode_host_frame(HostImportLocalDoneFrame(request_id="req_imp", status="ok"))
+    )
+    assert isinstance(done, HostImportLocalDoneFrame)
+    assert done.status == "ok" and done.error is None
+    assert done.failed == 0
+
+    # The done frame carries the host-side unreadable count so the server's
+    # tally covers sessions that never produced a frame.
+    done_failed = decode_host_frame(
+        encode_host_frame(HostImportLocalDoneFrame(request_id="req_imp", status="ok", failed=2))
+    )
+    assert isinstance(done_failed, HostImportLocalDoneFrame)
+    assert done_failed.failed == 2
 
 
 def test_model_options_frames_round_trip() -> None:

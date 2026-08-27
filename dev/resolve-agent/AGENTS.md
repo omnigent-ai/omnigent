@@ -257,9 +257,10 @@ reproduction test is your objective instrument.
    to your handoff `recordings`. This is **not** gated on the repro handoff
    carrying footage — you have the test and the journey, which is all the recorder
    needs, so produce the after-clip whether or not any before-clip was recovered.
-   Use the same commands (and SPA-up-front sequencing) as 2B.5's record step,
-   saving to `recordings/<slug>/after-<facet>.<ext>` with a `caption` for what the
-   clip shows. A passing run's footage is the "after" half (the bug resolved); a
+   Use the same lanes as 2B.5 — see [`dev/recording-lanes.md`](../recording-lanes.md)
+   (build the SPA first, record via `OMNIGENT_E2E_RECORD_DIR`, per-surface `web` /
+   `mobile` / `terminal` / `cli` / `desktop` mechanics) — saving to
+   `recordings/<slug>/after-<facet>.<ext>` with a `caption` for what the clip shows. A passing run's footage is the "after" half (the bug resolved); a
    failing run's footage shows the PR author exactly what still breaks — either
    way you record it. When the handoff *does* carry a before clip, carry it
    through **and** produce the after; when it carries none, still produce the
@@ -452,72 +453,34 @@ diff touches env-derived defaults; note it in the handoff (`hermetic_check`).
 If any live facet can't be made to pass with a real fix, say so honestly rather
 than shipping a hollow green.
 
-**Record the journey on the fixed tree — always, whether or not the upstream run
-left any footage.** The after-fix clip is *yours* to produce: you have the
-reproduction test at `test_path` and the journey, which is everything the
-recorder needs. Do **not** gate this on the repro handoff carrying `recordings` —
-a missing before-clip is common (the repro run may have skipped recording, or its
-worktree/artifacts are gone) and is **not** a reason to skip the after-clip. You
-drive the recorder off the test you already recovered, not off an upstream file.
+**Record the after-fix journey — always, whether or not the upstream run left any
+footage.** The after-fix clip is *yours* to produce: you have the reproduction
+test at `test_path` and the journey, which is everything the recorder needs. Do
+**not** gate this on the repro handoff carrying `recordings` — a missing
+before-clip is common (the repro run may have skipped recording, or its
+worktree/artifacts are gone) and is **not** a reason to skip the after-clip.
 
-If the repro handoff *does* carry `recordings` — before-fix footage plus the
-drivers that produced it (each entry is `{surface, kind, path, format, caption}`;
-the before clip's `kind` is `"before"` for a `reproduced` facet or `"fixed"` for
-an `already_fixed` one) — recover those files the same way you recovered the test
-(the repro session's `workspace` under `recordings/<slug>/`, or the CI run's
-artifact bundle) and carry them through as the "before" half. When it carries
-none, produce the after-clip anyway and note in the handoff that no before-clip
-was available upstream.
+**See [`dev/recording-lanes.md`](../recording-lanes.md) for the full how-to** —
+standing the recorder's server up (build the SPA first, strip leaked runner env),
+recording via `OMNIGENT_E2E_RECORD_DIR` (not the no-op `--video on`), and the
+per-surface mechanics for `web` / `mobile` / `terminal` / `cli` / `desktop`, plus the
+empty-recordings and caption rules. This step states only *which clip resolve
+produces*:
 
-For a `web`/`terminal` facet, **build the SPA up front — before you run the
-recorder, not during it.** The `tests/e2e_ui/` server serves the SPA from
-`omnigent/server/static/web-ui/`, which starts empty in your checkout. The suite
-*can* build it lazily on first boot, but that build pins the machine's cores
-while the spawned runner is trying to tunnel, so on a busy CI box the runner
-misses its online deadline and the fixture reports `online: false` — a false
-"environment failure" that is really the build starving the boot. So build it
-first, then re-run the SAME drivers with recording on against the fixed tree:
-
-```bash
-pnpm --filter web install && pnpm --filter web run build   # once, up front
-OMNIGENT_E2E_RECORD_DIR="$PWD/recordings/<slug>/raw" \
-  pytest <test_path> --screenshot on --output recordings/<slug>
-```
-
-**Record via `OMNIGENT_E2E_RECORD_DIR`, not `--video on`.** Most `tests/e2e_ui/`
-tests drive Playwright through `async_playwright()` + `browser.new_page()`
-directly — *not* the pytest-playwright `page` fixture — so the `--video on` flag
-records **nothing** for them (it only films the `page` fixture) and you'd get a
-false `recordings: []`. Setting `OMNIGENT_E2E_RECORD_DIR` makes the e2e_ui
-conftest inject `record_video_dir` into every page/context the test opens, so the
-journey is filmed no matter how the test opened the browser. Playwright writes the
-`.webm` (a random hash name) into that dir when the context closes. (If the repro
-test already hard-codes its own `record_video_dir` — repro-agent authors some
-tests that way — that explicit dir wins and the video lands there instead; check
-both locations.)
-
-For `cli` facets, re-render `vhs recordings/<slug>/journey.tape`. The video lands
-in `OMNIGENT_E2E_RECORD_DIR` under a hash name; **move** it to a stable
-`recordings/<slug>/after-<facet>.webm` and delete the leftover raw dir so the same
-footage isn't collected twice. If that dir has **no** `.webm` after the run, the
-recording genuinely didn't happen (the test errored before opening a page, or the
-fixture couldn't come online) — capture the reason per the omit rule below; never
-report an after-clip you didn't actually produce. For each after clip, write a `caption` describing
-**the actions that clip performs**, ending in the *correct* behavior (a passing
-run) — the same per-clip action-caption repro-agent writes, e.g. `"open the model
-picker → select the catalog → picker now shows friendly names"`. Carry each before
-clip's `caption` through unchanged (when a before clip exists). The after clip is
-the human-visible half of your fail→pass proof; it goes in the PR's Demo section
-(Step 3) and the handoff (`recordings`), and you produce it on **every** author
-run. The only reasons to omit it are genuine, environmental, and must be stated:
-the recorder **tooling is missing** (no vhs/ffmpeg for `cli`, no chromium/SPA for
-`web`/`terminal`), or the spawned runner **won't reach `online: true`** after the
-SPA is built — then capture the fixture's `runner.log` tail and note it in the
-handoff (`recordings: []` with the reason), reporting only what you observed. A
-**missing upstream before-clip is not** such a reason — record the after-clip
-regardless. Best-effort in the sense that a real environmental block degrades to a
-note; it never blocks the fix, and it is never skipped merely because the repro
-run left no footage.
+- After the fix, re-run the recovered test on the fixed tree so it **PASSES**; that
+  passing run is the **after-fix clip** (`kind: "after"`) — the human-visible half
+  of your fail→pass proof. Move it to a stable `recordings/<slug>/after-<facet>.<ext>`.
+- If the repro handoff carried a **before** clip (recover it from the repro
+  session's `workspace` or the CI artifact bundle), carry it through unchanged
+  alongside your after clip; when it carried none, produce the after clip anyway and
+  note that no before-clip was available upstream — a missing upstream before-clip
+  is **never** a reason to omit the after clip.
+- You produce the after clip on **every** run (author path and review path — on the
+  review path, film the reviewed PR head). It goes in the PR's Demo section (Step 3)
+  and the handoff (`recordings`). Omit it **only** for the genuine environmental
+  blockers named in `dev/recording-lanes.md` (tooling missing, server won't come
+  online, `api`-surface facet with nothing to film) — and then say which, with the
+  evidence; never report an after-clip you didn't actually produce.
 
 ### 2B.6 — Get an independent cross-vendor review before you open the PR
 

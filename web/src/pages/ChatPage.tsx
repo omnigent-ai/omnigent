@@ -29,6 +29,7 @@ import {
   SettingsIcon,
   SquareIcon,
   SquareTerminalIcon,
+  UnplugIcon,
   WifiOffIcon,
   XIcon,
 } from "lucide-react";
@@ -2058,6 +2059,7 @@ function MainAgentSurface({
           <ConnectionIndicator
             liveness={liveness}
             onShowReconnectHelp={onShowReconnectHelp}
+            onAttach={isActive && !entry.readOnly ? handleTerminalResume : undefined}
             surfaceFrontmost={surfaceFrontmost}
           />
         )}
@@ -2316,6 +2318,7 @@ function MainAgentSurface({
           <ConnectionIndicator
             liveness={liveness}
             onShowReconnectHelp={onShowReconnectHelp}
+            onAttach={terminalReadOnly ? undefined : handleTerminalResume}
             surfaceFrontmost={surfaceFrontmost}
           />
         </>
@@ -3160,15 +3163,57 @@ export function SandboxFailedIndicator({ status }: { status: SandboxStatus }) {
 export function ConnectionIndicator({
   liveness,
   onShowReconnectHelp,
+  onAttach,
   surfaceFrontmost = true,
 }: {
   liveness: SessionLiveness;
   onShowReconnectHelp: () => void;
+  /**
+   * Direct attach action for a downed-but-wakeable runner (`runner_asleep`).
+   * Reconnects/relaunches the runner via `retry_session` without sending a
+   * message. Absent for non-owners (who can't relaunch); then the state stays
+   * on the send-a-message path with no banner.
+   */
+  onAttach?: () => void | Promise<void>;
   // Whether the chat/terminal surface is frontmost (not under a drawer). Gates
   // the native iOS bar so it doesn't float over an opened sidebar/panel.
   surfaceFrontmost?: boolean;
 }) {
   const terminalFirst = useTerminalFirst();
+  const [attaching, setAttaching] = useState(false);
+  const [attachError, setAttachError] = useState<string | null>(null);
+  // Safety timer that re-enables Attach if liveness never clears (a genuinely
+  // failed relaunch), so the button doesn't get stuck pending. Longer than the
+  // runner-health poll so a normal recovery unmounts the banner first.
+  const attachSettleTimer = useRef<number | null>(null);
+  const handleAttach = useCallback(async () => {
+    if (!onAttach) return;
+    setAttachError(null);
+    setAttaching(true);
+    try {
+      await onAttach();
+      // Stay pending until the liveness poll confirms the runner is back and
+      // this banner unmounts. Re-enabling the instant retry_session returns
+      // (well before the poll refresh) flips the label back to "Attach" over a
+      // still-shown banner — it reads as a no-op and invites a redundant click.
+      if (attachSettleTimer.current) window.clearTimeout(attachSettleTimer.current);
+      attachSettleTimer.current = window.setTimeout(() => setAttaching(false), 12_000);
+    } catch (error) {
+      setAttachError(error instanceof Error && error.message ? error.message : "Couldn't attach.");
+      setAttaching(false);
+    }
+  }, [onAttach]);
+  // Recovery (or any move off runner_asleep) resets pending/error so a later
+  // disconnect starts clean; the cleanup also clears the timer on unmount.
+  useEffect(() => {
+    if (liveness.kind !== "runner_asleep") {
+      setAttaching(false);
+      setAttachError(null);
+    }
+    return () => {
+      if (attachSettleTimer.current) window.clearTimeout(attachSettleTimer.current);
+    };
+  }, [liveness.kind]);
   const keyboardVisible = useIOSNativeKeyboardVisible(
     terminalFirst?.isTerminalFirst === true,
     terminalFirst?.view === "chat",
@@ -3260,6 +3305,42 @@ export function ConnectionIndicator({
           />
         )}
       </>
+    );
+  }
+
+  // Runner down but the host is up: the runner relaunches on the next message,
+  // but offer a direct Attach so the user recovers without sending one. Only
+  // where the composer is on screen (the terminal-first *terminal* view is
+  // owned by the PTY overlay, which carries its own Resume) and only for owners
+  // (onAttach is undefined otherwise, leaving the silent send-to-wake path).
+  const composerOnScreen = !(terminalFirst?.isTerminalFirst && terminalFirst.view === "terminal");
+  if (liveness.kind === "runner_asleep" && onAttach && composerOnScreen) {
+    return (
+      <div
+        data-testid="runner-asleep-indicator"
+        className={cn(
+          "mx-auto mb-4 flex w-full flex-wrap items-center justify-center gap-x-2 gap-y-1 px-6",
+          CHAT_COLUMN_WIDTH,
+        )}
+      >
+        <span className="flex items-center gap-1.5 text-muted-foreground text-sm">
+          <UnplugIcon className="size-3.5 shrink-0" />
+          Agent disconnected
+        </span>
+        <Button
+          type="button"
+          size="xs"
+          variant="secondary"
+          onClick={handleAttach}
+          disabled={attaching}
+          componentId="diagnostics.session.attach"
+        >
+          {attaching ? "Attaching…" : "Attach"}
+        </Button>
+        {attachError && (
+          <span className="basis-full text-center text-destructive text-sm">{attachError}</span>
+        )}
+      </div>
     );
   }
 
@@ -3950,7 +4031,7 @@ function AssistantBubble({
         data-testid="message-bubble"
         data-role="assistant"
         className={
-          spansFullColumn ? "max-w-full" : "max-w-3xl min-[2561px]:max-w-[clamp(56rem,28vw,64rem)]"
+          spansFullColumn ? "max-w-full" : "max-w-3xl min-[2561px]:max-w-[clamp(56rem,30vw,64rem)]"
         }
       >
         {/* A fold-only bubble takes w-full at the ordinary max-w-3xl cap
@@ -6240,6 +6321,17 @@ const EFFORT_LEVELS = ["low", "medium", "high"] as const;
 /** Anthropic-side efforts for claude-native sessions (matches ANTHROPIC_EFFORTS in reasoning_effort.py). */
 const CLAUDE_NATIVE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 
+/** Pi thinking ladder (matches PI_EFFORTS in reasoning_effort.py; ``ultra`` aliases to ``max`` on Pi so omitted). */
+const PI_NATIVE_EFFORT_LEVELS = [
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+] as const;
+
 type NativeModelPickerKind = "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi";
 
 type LabelSource = { labels?: Record<string, string | null> | null } | null | undefined;
@@ -6282,6 +6374,8 @@ export function effortLevelsForConv(
       return CLAUDE_NATIVE_EFFORT_LEVELS;
     case "codex-native-ui":
       return codexEffortLevelsForModel(codexModelOptions, currentModel);
+    case "pi-native-ui":
+      return PI_NATIVE_EFFORT_LEVELS;
     default:
       return EFFORT_LEVELS;
   }

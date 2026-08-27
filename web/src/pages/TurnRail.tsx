@@ -353,7 +353,7 @@ export function TurnRail({
               // Matches the hover zone, so any spot that shows the preview also
               // navigates on click. Dash anchored left (justify-start) so the
               // hover-widen grows rightward without nudging the button box.
-              className="group flex h-2.5 w-4 shrink-0 items-center justify-start"
+              className="group flex h-2.5 w-5 shrink-0 cursor-pointer items-center justify-start"
             >
               {/* Dash: subtle by default; black for on-screen turns (or the
                   hovered one); wider only on hover. Transitions keep the color

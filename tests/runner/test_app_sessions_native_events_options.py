@@ -201,12 +201,12 @@ async def test_events_effort_change_on_non_native_session_is_204_noop(
     """
     Non-native sessions accept effort_change and 204 without side effects.
 
-    In-process harnesses (default / claude-sdk / openai-agents / codex)
-    re-read the persisted ``reasoning_effort`` from store on each
-    turn, so they need no runtime notification when it changes. The
-    Omnigent server still POSTs ``effort_change`` to ``/events`` for every
-    PATCH (it's harness-agnostic), so the runner must accept the
-    event and 204 — never reach the slash-command injector, never
+    In-process harnesses (default / claude-sdk / openai-agents / codex / pi)
+    get the new effort on their next turn, from the ``reasoning`` block the
+    runner threads onto the forwarded body — so the event needs no injection
+    and no immediate forward. The Omnigent server POSTs ``effort_change`` to
+    ``/events`` for every PATCH (it's harness-agnostic), so the runner must
+    accept the event and 204 — never reach the slash-command injector, never
     forward to the harness scaffold.
     """
     from omnigent.spec.types import ExecutorSpec

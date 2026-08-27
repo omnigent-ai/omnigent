@@ -23,6 +23,7 @@ from fastapi import (
 from fastapi.responses import Response
 from pydantic import ValidationError
 
+from omnigent.cli_invocation import cli_invocation
 from omnigent.db.utils import generate_agent_id, generate_task_id
 from omnigent.debug_logging import debug_event
 from omnigent.entities import (
@@ -430,6 +431,9 @@ async def _publish_and_wait_for_harness_elicitation(
     # severed wait instead defers the clear so a hook retry can re-park.
     published_request = False
     settled = False
+    # MCP verdict when a real web verdict settles the wait, so the
+    # finally's resolved fan-out carries it (None = severed / terminal).
+    settled_action: str | None = None
     try:
         tombstone = _consume_pre_resolved_harness_elicitation(session_id, elicitation_id)
         if tombstone is not None:
@@ -494,7 +498,9 @@ async def _publish_and_wait_for_harness_elicitation(
         # honoring a verdict that lands in the same tick as a disconnect.
         if future in done and future.exception() is None:
             settled = True
-            return future.result()
+            verdict = future.result()
+            settled_action = getattr(verdict, "action", None)
+            return verdict
         settled = parked.resolved_elsewhere.is_set()
         return None
     finally:
@@ -514,13 +520,14 @@ async def _publish_and_wait_for_harness_elicitation(
                 conversation_store,
             )
         elif published_request:
-            _publish_elicitation_resolved(session_id, elicitation_id)
+            _publish_elicitation_resolved(session_id, elicitation_id, action=settled_action)
             if conversation_store is not None:
                 await asyncio.to_thread(
                     _publish_elicitation_resolved_to_ancestors,
                     conversation_store,
                     session_id,
                     elicitation_id,
+                    settled_action,
                 )
 
 
@@ -1244,9 +1251,19 @@ def _accumulate_session_usage(
             cost_delta = float(provider_cost)
             priced = True
         else:
-            from omnigent.llms.context_window import compute_llm_cost, fetch_model_pricing
+            from omnigent.llms.context_window import (
+                compute_llm_cost,
+                fetch_model_pricing_with_provider,
+            )
+            from omnigent.onboarding.provider_config import load_config
 
-            pricing = fetch_model_pricing(llm_model)
+            # Load provider config to check for custom pricing
+            provider_config = load_config()
+            # Resolve harness from conversation (agent spec + overrides)
+            harness = _resolve_harness(conv) if conv else None
+            pricing = fetch_model_pricing_with_provider(
+                llm_model, provider_config=provider_config, harness=harness
+            )
             priced = pricing is not None
             if pricing is not None:
                 # Cache-aware: usage_obj carries cache_read/cache_creation
@@ -1430,9 +1447,19 @@ def _persist_native_cumulative_usage(
         current["total_cost_usd"] = max(old_cost, float(cost))
     elif has_tokens:
         if isinstance(model_name, str) and model_name:
-            from omnigent.llms.context_window import compute_llm_cost, fetch_model_pricing
+            from omnigent.llms.context_window import (
+                compute_llm_cost,
+                fetch_model_pricing_with_provider,
+            )
+            from omnigent.onboarding.provider_config import load_config
 
-            pricing = fetch_model_pricing(model_name)
+            # Load provider config to check for custom pricing
+            provider_config = load_config()
+            # Resolve harness from conversation (agent spec + overrides)
+            harness = _resolve_harness(conv) if conv else None
+            pricing = fetch_model_pricing_with_provider(
+                model_name, provider_config=provider_config, harness=harness
+            )
             if pricing is not None:
                 # SET (cumulative) — price the running token totals.
                 # ``current`` carries the cache-read split when the harness
@@ -1763,14 +1790,17 @@ async def _resolve_elicitation(
     # Fan-out for every other subscribed client (other tabs, REPL
     # TUI). Idempotent vs. the runner's own ``wait_for_user_approval``
     # finally / harness hook finally — those also publish for the id.
+    # The verdict rides along so the parent-side resolution notice
+    # states how the gate was answered instead of a bare "resolved".
     if isinstance(elicitation_id, str) and elicitation_id:
-        _publish_elicitation_resolved(session_id, elicitation_id)
+        _publish_elicitation_resolved(session_id, elicitation_id, action=data.get("action"))
         if conversation_store is not None:
             await asyncio.to_thread(
                 _publish_elicitation_resolved_to_ancestors,
                 conversation_store,
                 session_id,
                 elicitation_id,
+                data.get("action"),
             )
     # Runner-side elicitations (policy approvals, scaffold dispatch)
     # resolve when the canonical approval event reaches the runner.
@@ -3966,7 +3996,8 @@ async def _persist_host_launch_failure_turn(
             # the code, but the banner must stay actionable if a
             # third-party host omits it.
             else (
-                "the agent's harness is not configured on the selected host — run `omnigent setup`"
+                f"the agent's harness is not configured on the selected host — "
+                f"run `{cli_invocation()} setup`"
             )
         ),
     )
@@ -5107,6 +5138,11 @@ async def _forward_event_to_runner(
     # ────────────────────────────────────────────────────────────────
     if effective_runner_override is not None:
         runner_body["model_override"] = effective_runner_override
+    # Forward the persisted create-time effort on every downward event, like
+    # model_override above. Safe and idempotent: the runner reads the body as a
+    # raw dict (extra keys ignored) and the value never changes after create.
+    if conv.reasoning_effort is not None:
+        runner_body["reasoning"] = {"effort": conv.reasoning_effort}
     # Per-session brain-harness override — create-time only, so no
     # per-event value exists; the persisted column is the source.
     # _routed_harness is non-None when the child routing path resolved one
@@ -6391,6 +6427,7 @@ async def _relay_runner_stream_once(
                                 conversation_store,
                                 session_id,
                                 elicitation_id,
+                                event.get("action"),
                             )
                         continue
                     session_stream.publish(session_id, event)
@@ -7274,7 +7311,7 @@ def _ungatewayed_auto_routing_error(ungatewayed: Sequence[str]) -> str:
         f"{verb} not AI-Gateway-backed, so the workspace router's picks would not be "
         "reachable, and this server has no built-in routing model to fall back on. Pick a "
         "harness directly, configure a server `llm:` block, or point the harness at the "
-        "workspace AI Gateway (`omnigent configure harnesses`)."
+        f"workspace AI Gateway (`{cli_invocation()} configure harnesses`)."
     )
 
 
@@ -7293,7 +7330,7 @@ def _ungatewayed_model_routing_error(harness: str) -> str:
         "picks would not be reachable from the pane, and this server has no built-in routing "
         'model to fall back on. Create the session without cost_control_mode_override="on", '
         "configure a server `llm:` block, or point the harness at the workspace AI Gateway "
-        "(`omnigent configure harnesses`)."
+        f"(`{cli_invocation()} configure harnesses`)."
     )
 
 

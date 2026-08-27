@@ -115,6 +115,9 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   // Empty projects list → no ?project= name resolves to an id, so the project
   // prefill stays inert and the generic host/workspace defaults under test apply.
   useProjects: () => ({ data: [] }),
+  // The landing reads useConversations for hasNoSessions; stub it so it doesn't
+  // fire an authenticatedFetch that skews create-POST call assertions.
+  useConversations: () => ({ data: undefined }),
 }));
 // The harness-label catalog is not under test here. Keep it synchronous so
 // create-session fetch assertions only observe the POST/PATCH calls they own.

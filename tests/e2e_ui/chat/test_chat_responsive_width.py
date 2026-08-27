@@ -17,7 +17,7 @@ _TABLE_MARKER = "Responsive table width marker"
     [
         pytest.param(1920, 768, 736, id="desktop"),
         pytest.param(2400, 896, 768, id="wide-desktop"),
-        pytest.param(3440, 1376, 963.2, id="ultrawide"),
+        pytest.param(3200, 1280, 960, id="fluid-ultrawide"),
         pytest.param(4096, 1600, 1024, id="4k"),
     ],
 )

@@ -14,5 +14,13 @@ export const MOBILE_GLASS_SURFACE =
  * A control cluster's floating pill. No padding of its own so a single
  * ``size="icon"`` child stays exactly 40px — the sidebar toggle and the
  * session kebab must read as the same size.
+ *
+ * The exception is the Chat/Terminal track (ViewModeToggle): it paints its
+ * own background out to its edge, so with no padding it collides with the
+ * pill's border while an icon-only neighbour still clears it by the slack
+ * inside its 40px box. Inset the leading edge by that slack — only when the
+ * track is present — so ink sits 12px from either end. Assumes the track is
+ * the cluster's leading child on mobile; a control added ahead of it would
+ * take the inset instead.
  */
-export const MOBILE_GLASS_PILL = `${MOBILE_GLASS_SURFACE} max-md:rounded-full`;
+export const MOBILE_GLASS_PILL = `${MOBILE_GLASS_SURFACE} max-md:rounded-full max-md:has-data-[slot=view-mode-toggle]:pl-1.5`;

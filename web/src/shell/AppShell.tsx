@@ -1304,11 +1304,12 @@ export function AppShell() {
     onToggleRight: toggleRightPanel,
   });
 
-  // ⌘K (Ctrl+K) toggles the command palette. Disabled embedded, where ⌘K is the
-  // host page's. Bound here where the palette's open-state lives.
+  // ⌘K (Ctrl+K) toggles the command palette. Bound capture-phase, so in the
+  // embedded build we claim the chord ahead of any host-page ⌘K listener.
+  // Bound here where the palette's open-state lives.
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const isEmbedded = useIsEmbedded();
-  useCommandPaletteHotkey(() => setCommandPaletteOpen((prev) => !prev), !isEmbedded);
+  useCommandPaletteHotkey(() => setCommandPaletteOpen((prev) => !prev));
   useNewSessionHotkey(!isEmbedded);
 
   // Mobile back button: close the open file and return to the files/changes
