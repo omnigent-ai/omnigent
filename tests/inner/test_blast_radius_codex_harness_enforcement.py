@@ -152,9 +152,7 @@ def test_blast_radius_denies_force_push_on_gated_harnesses() -> None:
     assert bash_action == "deny", (
         f"claude-native Bash force-push must be DENIED (got {bash_action!r})"
     )
-    assert sys_action == "deny", (
-        f"sys_os_shell force-push must be DENIED (got {sys_action!r})"
-    )
+    assert sys_action == "deny", f"sys_os_shell force-push must be DENIED (got {sys_action!r})"
 
 
 def test_blast_radius_denies_force_push_on_direct_codex_harness() -> None:
