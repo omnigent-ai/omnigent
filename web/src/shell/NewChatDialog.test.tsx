@@ -990,13 +990,23 @@ describe("NewChatLandingScreen", () => {
     await waitFor(() => expect(chip).toHaveTextContent("machine-2"));
   });
 
-  it("falls back after a fresh host list confirms the remembered host is gone", async () => {
+  it("does not silently replace an unavailable remembered host", async () => {
     localStorage.setItem("omnigent:last-host-choice", "host_2");
     mockHosts([host("online", 1)], { isFetching: false });
     renderLanding();
 
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip")).not.toHaveTextContent("Choose host"),
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveTextContent("Choose host"),
+    );
+  });
+
+  it("does not replace an unavailable remembered host with the managed sandbox", async () => {
+    localStorage.setItem("omnigent:last-host-choice", "host_2");
+    mockHosts([host("online", 1)], { isFetching: false });
+    renderLanding({ managed_sandboxes_enabled: true });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveTextContent("Choose host"),
     );
   });
 

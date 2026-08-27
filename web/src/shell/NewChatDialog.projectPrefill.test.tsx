@@ -15,7 +15,7 @@ import { useProjectConfig, useProjects } from "@/hooks/useConversations";
 import type { ProjectConfig } from "@/lib/projectsApi";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import type { HostWorktree } from "@/hooks/useHostWorktrees";
-import { NewChatLandingScreen } from "./NewChatDialog";
+import { NewChatLandingScreen, resetLandingDraft } from "./NewChatDialog";
 
 // A `?project=` visit prefills the composer from the project's STORED config
 // (host / working directory / agent / worktree). A field the config leaves
@@ -153,6 +153,9 @@ async function submitAndReadBody(): Promise<Record<string, unknown>> {
 beforeEach(() => {
   navigateMock.mockReset();
   vi.mocked(authenticatedFetch).mockReset();
+  // The landing draft is module-scoped and survives unmount by design; clear it
+  // so a case that never submits can't leak its state into the next test.
+  resetLandingDraft();
   searchParams = new URLSearchParams("project=Alpha");
   localStorage.clear();
   // A recent on the host that the generic seeding would use when the config
@@ -398,6 +401,32 @@ describe("NewChatLandingScreen project prefill", () => {
     expect(body.git).toBeUndefined();
   });
 
+  it("retracts a config-opted-in worktree branch when the project config drops it (re-opened after edit)", async () => {
+    // The composer stays mounted across a pencil re-open; a stored config that
+    // opts in seeds a `worktree-xxxx` branch. If the user edits the project to
+    // turn the worktree default off and re-opens, the previously-seeded branch
+    // must be retracted rather than lingering (the seed effect only fills an
+    // empty branch and never clears on its own).
+    setProjectConfig({ host_id: "host_1", workspace: REPO, use_worktree: true });
+    const rerender = renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
+    );
+
+    // Config now explicitly opts out; re-open the same project. The reseed clears
+    // the composer, so the seed effect re-evaluates against the new (off) config
+    // and the previously-seeded worktree branch must not come back.
+    setProjectConfig({ host_id: "host_1", workspace: REPO, use_worktree: false });
+    rerender(<NewChatLandingScreen />);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
+    );
+    const body = await submitAndReadBody();
+    expect(body.workspace).toBe(REPO);
+    expect(body.git).toBeUndefined();
+  });
+
   it("still seeds the recent workspace when the worktree probe errors", async () => {
     // A non-400 failure from /worktrees leaves the hook's data undefined for
     // good. The seed must fall back to the candidate as-is (treat the probe
@@ -420,6 +449,136 @@ describe("NewChatLandingScreen project prefill", () => {
     const body = await submitAndReadBody();
     // Seeded the recent path as-is; no redirect, no fabricated fork.
     expect(body.workspace).toBe(LINKED_WORKTREE);
+    expect(body.git).toBeUndefined();
+  });
+});
+
+// The user-global "always use a worktree" default (Settings › Git, stored in
+// localStorage) makes new sessions in any git workspace start in a fresh
+// worktree. Precedence: a project's explicit `use_worktree` (true OR false)
+// wins; an unset project falls through to this global default. These cases pin
+// the full global × project matrix.
+const ALWAYS_WORKTREE_KEY = "omnigent:always-use-worktree";
+
+describe("NewChatLandingScreen global always-use-worktree default", () => {
+  // The branch chip's label reflects the branch field ("Worktree" when empty),
+  // so it lets a test observe the seeded/retracted branch without opening the
+  // popover the actual input lives in.
+  function branchLabel(): string {
+    return screen.getByTestId("new-chat-landing-branch-chip").textContent ?? "";
+  }
+
+  it("seeds a worktree in a plain (non-project) git workspace when the global default is on", async () => {
+    // A plain visit with no project. The recent workspace is a git repo, so the
+    // global default alone drives the worktree seed.
+    searchParams = new URLSearchParams("");
+    localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [REPO] }));
+    localStorage.setItem(ALWAYS_WORKTREE_KEY, "true");
+    renderLanding();
+
+    await waitFor(() => expect(branchLabel()).toMatch(/^worktree-[0-9a-f]{8}$/));
+    const body = await submitAndReadBody();
+    expect(body.workspace).toBe(REPO);
+    expect((body.git as { branch_name: string }).branch_name).toMatch(/^worktree-[0-9a-f]{8}$/);
+  });
+
+  it("does NOT seed a worktree in a plain git workspace when the global default is off", async () => {
+    searchParams = new URLSearchParams("");
+    localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [REPO] }));
+    // Global default unset (off).
+    renderLanding();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
+    );
+    const body = await submitAndReadBody();
+    expect(body.workspace).toBe(REPO);
+    expect(body.git).toBeUndefined();
+  });
+
+  it("applies the global default to a project whose config leaves use_worktree unset", async () => {
+    // Project config sets host/workspace but no worktree preference → falls
+    // through to the global default (on).
+    localStorage.setItem(ALWAYS_WORKTREE_KEY, "true");
+    setProjectConfig({ host_id: "host_1", workspace: REPO });
+    renderLanding();
+
+    await waitFor(() => expect(branchLabel()).toMatch(/^worktree-[0-9a-f]{8}$/));
+    const body = await submitAndReadBody();
+    expect(body.workspace).toBe(REPO);
+    expect((body.git as { branch_name: string }).branch_name).toMatch(/^worktree-[0-9a-f]{8}$/);
+  });
+
+  it("lets a project's explicit opt-out win over the global default (global on, project false)", async () => {
+    // A project that stored `use_worktree: false` overrides the global on — no
+    // worktree despite the global default.
+    localStorage.setItem(ALWAYS_WORKTREE_KEY, "true");
+    setProjectConfig({ host_id: "host_1", workspace: REPO, use_worktree: false });
+    renderLanding();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
+    );
+    const body = await submitAndReadBody();
+    expect(body.workspace).toBe(REPO);
+    expect(body.git).toBeUndefined();
+  });
+
+  it("lets a project's explicit opt-in win over the global default (global off, project true)", async () => {
+    // Global default off, but a project that stored `use_worktree: true` still
+    // gets a worktree.
+    // Global default unset (off).
+    setProjectConfig({ host_id: "host_1", workspace: REPO, use_worktree: true });
+    renderLanding();
+
+    await waitFor(() => expect(branchLabel()).toMatch(/^worktree-[0-9a-f]{8}$/));
+    const body = await submitAndReadBody();
+    expect(body.workspace).toBe(REPO);
+    expect((body.git as { branch_name: string }).branch_name).toMatch(/^worktree-[0-9a-f]{8}$/);
+  });
+
+  it("does not seed a worktree for a non-git workspace even when the global default is on", async () => {
+    // The global default only applies to git repos — RECENT_WORKSPACE is not a
+    // git repo (no is_main worktree), so nothing is seeded.
+    searchParams = new URLSearchParams("");
+    localStorage.setItem(ALWAYS_WORKTREE_KEY, "true");
+    // RECENT_WORKSPACE (the default recent) is not the git REPO.
+    renderLanding();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).not.toBe(""),
+    );
+    const body = await submitAndReadBody();
+    expect(body.workspace).toBe(RECENT_WORKSPACE);
+    expect(body.git).toBeUndefined();
+  });
+
+  it("retracts a globally-seeded worktree branch after the default is turned off and the composer remounts", async () => {
+    // The reported bug: the composer preserves its state across unmount (module-
+    // scoped draft) — e.g. a trip to Settings to flip the toggle — and remounts
+    // from it. A branch the global default auto-seeded must not survive once the
+    // default is off; it should retract to a plain launch on the next mount.
+    searchParams = new URLSearchParams("");
+    localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [REPO] }));
+    localStorage.setItem(ALWAYS_WORKTREE_KEY, "true");
+
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    function Wrapper({ children }: { children: ReactNode }) {
+      return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+    }
+    const first = render(<NewChatLandingScreen />, { wrapper: Wrapper });
+    await waitFor(() => expect(branchLabel()).toMatch(/^worktree-[0-9a-f]{8}$/));
+
+    // Leave the composer (draft preserved), turn the global default off, come
+    // back. The remount reads the preserved `worktree-xxxx` branch, and the
+    // retraction effect must clear it now that the default is off.
+    first.unmount();
+    localStorage.removeItem(ALWAYS_WORKTREE_KEY);
+    render(<NewChatLandingScreen />, { wrapper: Wrapper });
+
+    await waitFor(() => expect(branchLabel()).toContain("Worktree"));
+    const body = await submitAndReadBody();
+    expect(body.workspace).toBe(REPO);
     expect(body.git).toBeUndefined();
   });
 });

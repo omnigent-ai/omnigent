@@ -122,10 +122,14 @@ the review gate after the fact.
    second vendor is configured it skips and says so.
 7. *(author path)* **Drives the open PR to a landable state** — a bounded loop:
    - Labels **every** PR **`ui-preview`** (not just frontend fixes) to request a
-     live app deploy, waits for the preview URL, and posts a comment with how to
-     connect a runner to it (`omnigent run --server <url>`) to validate the fix
-     directly. (The workflow only deploys for `OWNER`/`MEMBER`/`COLLABORATOR`
-     authors; the agent degrades gracefully when no preview appears.)
+     live app deploy — but only **after** CI is green and the Polly review is
+     clean for the current commit, never up front, since the label triggers a
+     `pull_request_target` deploy of the PR's code. Then waits for the
+     preview URL and posts a comment with how to connect a runner to it
+     (`omnigent run --server <url>`) to validate the fix directly. (The workflow
+     deploys for any labelled non-draft PR, forks included — the label is the
+     trust boundary, and only a maintainer-privileged identity can apply it; the
+     agent degrades gracefully when no preview appears.)
    - Watches CI (`gh pr checks --watch`); when a check fails it reads the log,
      fixes its own regressions, and pushes — while leaving pre-existing/flaky/infra
      failures alone (and saying so).

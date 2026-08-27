@@ -1791,3 +1791,51 @@ describe("sanitizeInitialPrompt", () => {
     expect(sanitizeInitialPrompt(input)).toBe(expected);
   });
 });
+
+describe("create-session input on touch-primary devices", () => {
+  it("Enter inserts a newline instead of submitting when the pointer is coarse", async () => {
+    // Phones have no practical Shift+Enter, so an Enter-submit in the
+    // create-session composer was an unrecoverable accidental send. On
+    // coarse-pointer devices the composer must let Enter fall through to the
+    // textarea's native newline; sending stays an explicit tap.
+    const matchMediaSpy = vi.spyOn(window, "matchMedia").mockImplementation((query: string) =>
+      query.includes("pointer: coarse")
+        ? ({
+            matches: true,
+            media: query,
+            onchange: null,
+            addListener: () => {},
+            removeListener: () => {},
+            addEventListener: () => {},
+            removeEventListener: () => {},
+            dispatchEvent: () => false,
+          } as MediaQueryList)
+        : ({
+            matches: false,
+            media: query,
+            onchange: null,
+            addListener: () => {},
+            removeListener: () => {},
+            addEventListener: () => {},
+            removeEventListener: () => {},
+            dispatchEvent: () => false,
+          } as MediaQueryList),
+    );
+
+    try {
+      renderLanding();
+      await waitForWorkspaceSeed();
+      const input = screen.getByTestId("new-chat-landing-input");
+      fireEvent.change(input, { target: { value: "first line of a long prompt" } });
+
+      fireEvent.keyDown(input, { key: "Enter" });
+
+      // No session was created and no navigation happened: Enter was not
+      // intercepted, so the composer still holds the user's draft.
+      expect(authenticatedFetch).not.toHaveBeenCalled();
+      expect(navigateMock).not.toHaveBeenCalled();
+    } finally {
+      matchMediaSpy.mockRestore();
+    }
+  });
+});

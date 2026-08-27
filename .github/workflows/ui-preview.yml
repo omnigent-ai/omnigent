@@ -9,10 +9,25 @@ name: UI Preview
 # a label needs Triage+ on the repo, so an outside contributor cannot self-label
 # their fork PR -- only a maintainer (or a trusted bot acting after checks pass)
 # can. The build/deploy jobs run on `pull_request_target` (base-repo context,
-# with secrets) once labelled. NOTE: the label vouches for the PR as labelled; a
-# later push (`synchronize`) re-runs with the label still attached, so gate the
-# secret-bearing deploy behind a protected Environment / "require approval for
-# outside collaborators" if you need per-commit re-approval.
+# with secrets) once labelled.
+#
+# TOCTOU hardening. A label vouches for the PR *as it was at label time*, but a
+# later push (`synchronize`) re-fires this workflow with the label still
+# attached -- so an attacker could label-bait a benign fork PR and then push
+# malicious code that deploys without re-review. Two guards close this:
+#   1. The build checks out the PR's *head SHA* (immutable), never the live
+#      `refs/pull/<n>/merge` ref that silently re-points to whatever was last
+#      pushed -- so a run only ever builds one specific, inspectable commit.
+#   2. For FORK PRs the secret-bearing `deploy` job runs in the protected
+#      `ui-preview-fork` Environment, which requires a human reviewer to approve
+#      *each* run -- so every new commit on a labelled fork PR waits for a fresh
+#      approval before it can deploy. Same-repo PRs (maintainer + resolve-agent
+#      bot branches, which outside contributors cannot push to) are trusted and
+#      deploy without the gate.
+# Repo-settings prerequisite: create an Environment named `ui-preview-fork`
+# (Settings -> Environments) with "Required reviewers" set to the maintainer
+# team. Without it the gate is a no-op (the job just runs), so it must be
+# configured for guard #2 to take effect. See .github/ui-preview/README.md.
 
 on:
   push:
@@ -98,14 +113,19 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           persist-credentials: false
-          # For PRs, check out the merge ref so the preview reflects what the UI
-          # will look like after merge. For push events, falls back to github.sha.
-          ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.sha }}
+          # Pin to the PR's HEAD SHA, not the live `refs/pull/<n>/merge` ref.
+          # The merge ref silently re-points to whatever commit was last pushed,
+          # so building it would re-trust the label against unreviewed code on
+          # every `synchronize`. A fixed head SHA builds one specific,
+          # inspectable commit -- the deploy Environment gate below is what
+          # forces re-approval when a fork PR gets a new commit. For push events
+          # (no PR) fall back to the pushed sha.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           # checkout v7 blocks fork PR checkout on `pull_request_target` by
           # default; opt in since this job builds the preview from fork code.
-          # Safe: it has no secrets (only `contents: read`), and the
-          # `ui-preview` label gate above restricts it to PRs a maintainer (or a
-          # trusted bot) has labelled -- an outside contributor cannot self-label.
+          # Safe: it has no secrets (only `contents: read`), the `ui-preview`
+          # label gate above restricts it to labelled PRs (an outside
+          # contributor cannot self-label), and we build a pinned head SHA.
           allow-unsafe-pr-checkout: true
 
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
@@ -205,6 +225,16 @@ jobs:
 
   deploy:
     needs: build
+    # Gate the secret-bearing deploy behind a protected Environment for FORK PRs
+    # only: a labelled fork PR that gets a new commit must wait for a human
+    # reviewer to approve this run before it can deploy with Databricks
+    # OAuth-M2M creds. Same-repo PRs (maintainer + resolve-agent bot branches,
+    # which outside contributors can't push to) and `push` to main are trusted
+    # and skip the gate. `environment` must be a static string, so select it with
+    # a conditional: `ui-preview-fork` (protected -> requires approval) for forks,
+    # empty (no gate) otherwise. The Environment's "Required reviewers" rule is
+    # configured in repo Settings; see the header note.
+    environment: ${{ (github.event.pull_request.head.repo.fork && 'ui-preview-fork') || '' }}
     # Use ubuntu-latest. If the Databricks workspace IP-allowlists, register a
     # static-IP runner and switch `runs-on` to it.
     runs-on: ubuntu-latest

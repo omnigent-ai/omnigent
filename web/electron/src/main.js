@@ -1068,6 +1068,61 @@ function loadServerUrl(win, serverUrl, routePath) {
 }
 
 /**
+ * Wire server-load failure fallbacks for a shell window.
+ *
+ * @param {BrowserWindow} win
+ */
+function registerNavigationFallbacks(win) {
+  // Server unreachable / DNS failure / TLS error → fall back to the setup
+  // page with the failure shown, instead of stranding the user on Chromium's
+  // raw error surface with no way back. The saved server_url is left intact:
+  // the server may simply be down, and Connect retries it.
+  win.webContents.on(
+    "did-fail-load",
+    (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+      if (!isMainFrame) return;
+      if (errorCode === ERR_ABORTED) return;
+      // A failure report for a URL the window is no longer pinned to (the
+      // window was re-pointed while the failing load was in flight) must
+      // not yank the window off its new destination.
+      const failedOrigin = originOf(validatedURL ?? "");
+      if (failedOrigin !== windows.get(win)?.origin) return;
+      const params = new URLSearchParams({
+        error: `${errorDescription || "load failed"} (${errorCode})`,
+        // The failure often happens on a deep SPA route (e.g. /chat/…);
+        // prefill the setup form with just the server origin — that's what
+        // the user connects to — not the full path that happened to fail.
+        url: failedOrigin ? failedOrigin + "/" : (validatedURL ?? ""),
+      });
+      if (windows.get(win)?.ephemeral) params.set("ephemeral", "1");
+      pinWindow(win, null); // back on the setup page → no trusted origin
+      void win.loadFile(SETUP_PAGE, { search: params.toString() });
+    },
+  );
+
+  // HTTP 4xx/5xx commits as a successful navigation in Chromium (empty body
+  // → black window), so did-fail-load never fires. did-navigate is
+  // main-frame-only and carries httpResponseCode; reuse the setup-page
+  // fallback so the user sees the status and can change server / retry.
+  win.webContents.on("did-navigate", (_event, url, httpResponseCode, httpStatusText) => {
+    if (httpResponseCode < 400) return;
+    const state = windows.get(win);
+    const failedOrigin = originOf(url ?? "");
+    if (failedOrigin !== state?.origin) return;
+    const status = httpStatusText
+      ? `${httpResponseCode} ${httpStatusText}`
+      : `HTTP ${httpResponseCode}`;
+    const params = new URLSearchParams({
+      error: status,
+      url: state.serverUrl ?? url ?? "",
+    });
+    if (state.ephemeral) params.set("ephemeral", "1");
+    pinWindow(win, null);
+    void win.loadFile(SETUP_PAGE, { search: params.toString() });
+  });
+}
+
+/**
  * Create a shell window and load a destination, in priority order:
  *   1. `opts.path` joined onto `opts.serverUrl` (a deep link opening a
  *      specific conversation on a specific server).
@@ -1261,32 +1316,7 @@ function createWindow(targetUrl, opts = {}) {
   // Fires only for window.open the handler above allowed (OAuth popups).
   win.webContents.on("did-create-window", (child) => hardenOauthPopup(child));
 
-  // Server unreachable / DNS failure / TLS error → fall back to the setup
-  // page with the failure shown, instead of stranding the user on Chromium's
-  // raw error surface with no way back. The saved server_url is left intact:
-  // the server may simply be down, and Connect retries it.
-  win.webContents.on(
-    "did-fail-load",
-    (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
-      if (!isMainFrame) return;
-      if (errorCode === ERR_ABORTED) return;
-      // A failure report for a URL the window is no longer pinned to (the
-      // window was re-pointed while the failing load was in flight) must
-      // not yank the window off its new destination.
-      const failedOrigin = originOf(validatedURL ?? "");
-      if (failedOrigin !== windows.get(win)?.origin) return;
-      const params = new URLSearchParams({
-        error: `${errorDescription || "load failed"} (${errorCode})`,
-        // The failure often happens on a deep SPA route (e.g. /chat/…);
-        // prefill the setup form with just the server origin — that's what
-        // the user connects to — not the full path that happened to fail.
-        url: failedOrigin ? failedOrigin + "/" : (validatedURL ?? ""),
-      });
-      if (windows.get(win)?.ephemeral) params.set("ephemeral", "1");
-      pinWindow(win, null); // back on the setup page → no trusted origin
-      void win.loadFile(SETUP_PAGE, { search: params.toString() });
-    },
-  );
+  registerNavigationFallbacks(win);
 
   // Databricks workspace-hosted Omnigent renders inside the workspace's
   // top-nav chrome (the SPA is a workspace page). On a dedicated desktop

@@ -4080,11 +4080,22 @@ async def _auto_create_codex_terminal(
     # never by editing config.toml here.
     # Passed only for auto-harness sessions so a pinned or plain codex launch
     # keeps main's kwargs exactly.
-    routed_spawn_extras: dict[str, str] = {}
+    _codex_routing_note: str | None = None
     if launch_config.auto_harness:
         from omnigent.inner.hook_scripts.subagent_router import smart_routing_spawn_note
 
-        routed_spawn_extras["developer_instructions"] = smart_routing_spawn_note("codex-native")
+        _codex_routing_note = smart_routing_spawn_note("codex-native")
+    _codex_developer_instructions = (
+        "\n\n".join(
+            x
+            for x in [
+                _native_startup_raw_instructions_from_spec(agent_spec),
+                _codex_routing_note,
+            ]
+            if x
+        )
+        or None
+    )
     app_server = build_codex_native_server(
         socket_path=socket_path,
         codex_home=codex_home,
@@ -4096,11 +4107,11 @@ async def _auto_create_codex_terminal(
         ap_server_url=launch_config.policy_server_url,
         ap_auth_headers=policy_headers,
         bypass_sandbox=launch_config.bypass_sandbox,
+        developer_instructions=_codex_developer_instructions,
         # Codex can show project-trust and legacy-model migration prompts before
         # creating a thread. This TUI runs detached for the web UI, so persist
         # the runner-owned acknowledgements in the private session config.
         trust_project=True,
-        **routed_spawn_extras,
     )
     # Generate routing hooks.json (and bypass codex's hook-trust prompt): the
     # app-server reads the endpoint out of its own process env at start, and
@@ -5399,6 +5410,33 @@ def _claude_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) 
     return model
 
 
+def _native_startup_raw_instructions_from_spec(
+    agent_spec: AgentSpec | ResolvedSpec | None,
+) -> str | None:
+    """Read raw author instructions for a native harness's startup-additive channel.
+
+    Shared by claude-native's ``--append-system-prompt`` and codex-native's
+    ``developer_instructions``. Returns the verbatim ``AgentSpec.instructions``
+    text only — never the fully framework-composed per-turn string. Terminal
+    launch is not tied to any one turn, while the composed string is
+    assembled per conversation for the turn about to run (late-bound
+    framework text like ``SHARED_SESSION_AUTHORSHIP_INSTRUCTION`` is
+    selected per conversation), so a startup channel carrying one turn's
+    composition would address every later turn with it.
+
+    :param agent_spec: Agent spec object, or a resolved wrapper carrying a
+        ``spec`` attribute. ``None`` means no spec was available.
+    :returns: The original resolved instructions text, or ``None`` when
+        absent/whitespace-only.
+    """
+    from omnigent.runtime.prompt import raw_author_instructions
+
+    spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    if spec is None:
+        return None
+    return raw_author_instructions(spec)
+
+
 def _cursor_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> str | None:
     """
     Read the cursor-agent model id to launch the native TUI with, from a spec.
@@ -6542,6 +6580,7 @@ async def _auto_create_claude_terminal(
     # provider selection just like the in-process claude-sdk harness and the
     # CLI path.
     claude_config: ClaudeNativeUcodeConfig | None = None
+    _launch_config_resolution_failed = False
     try:
         if resolve_launch_config is not None:
             claude_config = await resolve_launch_config()
@@ -6561,6 +6600,8 @@ async def _auto_create_claude_terminal(
             exc_info=True,
             extra={"session_id": session_id},
         )
+        _launch_config_resolution_failed = True
+    # A transient resolver failure must not be cached as "no provider configured".
     # A routed session's turn-1 ``/model`` can only reach ids this launch env
     # spells, so point the family aliases at the router's frozen arms before the
     # launch model is derived from them.
@@ -6646,7 +6687,7 @@ async def _auto_create_claude_terminal(
     # no gain — nothing later re-picks the launch model there.
     if launch_metadata.routing_enabled:
         claude_config = claude_config_with_launch_model_pinned(claude_config, launch_model)
-    if record_launch_config is not None:
+    if record_launch_config is not None and not _launch_config_resolution_failed:
         record_launch_config(session_id, claude_config)
     # Persist the vocabulary + launch model onto the bridge so mid-session
     # ``/model`` conversion reads THIS session's pins, not the runner's
@@ -6736,7 +6777,12 @@ async def _auto_create_claude_terminal(
         skills_filter=skills_filter,
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
         subagent_router_dir=subagent_router_dir,
-        append_system_prompt=routed_spawn_note,
+        append_system_prompt="\n\n".join(
+            x
+            for x in [_native_startup_raw_instructions_from_spec(agent_spec), routed_spawn_note]
+            if x
+        )
+        or None,
         allowed_tools=routed_spawn_tools,
         # The route-turn hook is registered only when this session can
         # actually route; otherwise every submit would pay its round trip.

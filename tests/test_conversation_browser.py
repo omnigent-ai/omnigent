@@ -286,3 +286,44 @@ def test_strip_conversation_path_inverts_conversation_url(
     link = browser.conversation_url(base, "conv_abc123")
     assert link == f"{base}/c/conv_abc123"
     assert browser.strip_conversation_path(link) == base
+
+
+def test_announce_conversation_url_echo_sink() -> None:
+    """The announcement emits one stable, greppable line and returns the URL.
+
+    A headless CI wrapper scrapes this line to surface the session link the
+    moment the session exists (before the turn finishes), so the prefix and
+    the ``<prefix><url>`` shape are a contract with that scraper.
+
+    :returns: None.
+    """
+    captured: list[str] = []
+    url = browser.announce_conversation_url(
+        base_url="http://127.0.0.1:6767",
+        conversation_id="conv_abc123",
+        echo=captured.append,
+    )
+    assert url == "http://127.0.0.1:6767/c/conv_abc123"
+    assert captured == [
+        f"{browser.SESSION_URL_ANNOUNCE_PREFIX}http://127.0.0.1:6767/c/conv_abc123"
+    ]
+
+
+def test_announce_conversation_url_defaults_to_stderr(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """With no echo sink the line goes to stderr, never stdout.
+
+    A one-shot ``-p`` run prints only the final answer to stdout; the session
+    announcement must not intermix with it, so it defaults to stderr.
+
+    :param capsys: Pytest capture fixture.
+    :returns: None.
+    """
+    browser.announce_conversation_url(
+        base_url="http://127.0.0.1:6767",
+        conversation_id="x",
+    )
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert err.strip() == f"{browser.SESSION_URL_ANNOUNCE_PREFIX}http://127.0.0.1:6767/c/x"

@@ -47,7 +47,10 @@ from omnigent._wrapper_labels import (
     WRAPPER_LABEL_KEY as _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
 )
 from omnigent.cli_invocation import cli_invocation
-from omnigent.conversation_browser import open_conversation_link_if_enabled
+from omnigent.conversation_browser import (
+    announce_conversation_url,
+    open_conversation_link_if_enabled,
+)
 from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.inner import _proc
@@ -259,6 +262,36 @@ class _SessionToolAdapter:
             iteration=0,
         )
         return self.tool_handler.execute(legacy_info)
+
+
+def _on_session_known(
+    *,
+    base_url: str,
+    session_id: str,
+    auto_open_conversation: bool,
+) -> None:
+    """Announce (and optionally open) the conversation URL at session start.
+
+    Called the moment the session id is known — before the turn runs — so a
+    headless wrapper can surface the session link immediately. Always prints
+    the stable ``Omnigent session: <url>`` line; additionally opens the
+    browser when the user opted in.
+
+    :param base_url: Omnigent server base URL.
+    :param session_id: The freshly created/resumed conversation id.
+    :param auto_open_conversation: Whether to also open the browser link.
+    """
+    announce_conversation_url(
+        base_url=base_url,
+        conversation_id=session_id,
+        echo=lambda message: click.echo(message, err=True),
+    )
+    open_conversation_link_if_enabled(
+        base_url=base_url,
+        conversation_id=session_id,
+        enabled=auto_open_conversation,
+        warn=lambda message: click.echo(message, err=True),
+    )
 
 
 def run_chat(
@@ -4026,11 +4059,10 @@ def _run_repl(
                 used_families=used_families,
                 attach_only=attach_only,
                 on_session_start=(
-                    lambda session_id: open_conversation_link_if_enabled(
+                    lambda session_id: _on_session_known(
                         base_url=base_url,
-                        conversation_id=session_id,
-                        enabled=auto_open_conversation,
-                        warn=lambda message: click.echo(message, err=True),
+                        session_id=session_id,
+                        auto_open_conversation=auto_open_conversation,
                     )
                 ),
             )
@@ -4093,11 +4125,10 @@ def _run_one_shot(
                 runner_id=runner_id,
                 resume_conversation_id=resume_conversation_id,
                 on_session_ready=(
-                    lambda session_id: open_conversation_link_if_enabled(
+                    lambda session_id: _on_session_known(
                         base_url=base_url,
-                        conversation_id=session_id,
-                        enabled=auto_open_conversation,
-                        warn=lambda message: click.echo(message, err=True),
+                        session_id=session_id,
+                        auto_open_conversation=auto_open_conversation,
                     )
                 ),
             )

@@ -59,7 +59,13 @@ from omnigent.harness_aliases import (
     native_terminal_name,
 )
 from omnigent.harness_availability import CODEX_CANONICAL_HARNESSES
-from omnigent.harness_plugins import load_object, model_env_keys, spawn_env_builders
+from omnigent.harness_capabilities import InstructionDelivery
+from omnigent.harness_plugins import (
+    harness_capabilities,
+    load_object,
+    model_env_keys,
+    spawn_env_builders,
+)
 from omnigent.inner.native_attachments import has_unresolved_file_id, resolve_file_id_block
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.llms.summarize import (
@@ -153,6 +159,11 @@ from omnigent.runner.subagent_routing import (
     session_routing_class,
 )
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
+from omnigent.runtime.prompt import (
+    build_instructions,
+    build_instructions_nullable,
+    raw_author_instructions,
+)
 from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
     BackgroundSessionTitleResponse,
@@ -1121,6 +1132,37 @@ class TurnDispatch:
     agent_version: int | None = None
     spawn_env: dict[str, str] | None = None
     client_side_tool_names: frozenset[str] = frozenset()
+
+
+@dataclasses.dataclass
+class InstructionComposition:
+    """Runner-local, never-serialized view of this turn's instruction state.
+
+    Computed once inside ``_stream_message_to_harness`` (the point where the
+    background and direct-stream dispatch paths converge) and consumed
+    in-process by the single delivery-gap warn check and by delivery
+    channels (opencode-native, hermes) that must not leak the fabricated
+    ``"You are a helpful assistant."`` fallback. Never attached to
+    ``TurnDispatch``, ``MessageEvent``, ``CreateResponseRequest``, or
+    ``ExecutorConfig`` — the wire shape is unchanged from today.
+
+    :param authored_present: Whether ``AgentSpec.instructions`` is
+        non-empty/non-whitespace, resolved pre-composition.
+    :param composed: The meaningful composed text (author + applicable
+        framework instructions), or ``None`` if there is truly nothing.
+    """
+
+    authored_present: bool
+    composed: str | None
+
+
+# Harnesses whose executor reads the wire ``instructions`` field itself and
+# needs the gated ``InstructionComposition.composed`` value there instead of
+# the default fallback-including composed-per-turn string — opencode-native
+# via its NativePrompt.system_prompt; hermes via HermesExecutor.run_turn's
+# system_prompt param. See the harness-conditional swap in
+# _stream_message_to_harness.
+_GATED_COMPOSED_INSTRUCTION_HARNESSES = frozenset({"opencode-native", "hermes"})
 
 
 def _wrap_as_message_event(body: _JsonObject) -> _JsonObject:
@@ -2363,9 +2405,32 @@ def create_runner_app(
 
     _session_agent_ids = _session_agent_ids_ref  # shared with module-level get_session_agent_id
     _session_sub_agent_names: dict[str, str] = {}
+    # Tracks whether the sub-agent was successfully resolved on session create.
+    # True = child spec is cached; False = parent kept as fallback after miss.
+    # Absent = session has no sub_agent_name or create has not completed.
+    _session_sub_agent_resolved: dict[str, bool] = {}
+    # Per-conversation set of (harness, InstructionDelivery) pairs already
+    # warned about. Keyed by conversation so a session that switches harnesses
+    # warns again for the new pair rather than inheriting the old one's silence.
+    _instruction_delivery_warned: dict[str, set[tuple[str, InstructionDelivery]]] = {}
     _session_tool_schemas: dict[str, list[_JsonObject]] = {}  # session_id → cached tool schemas
     _session_mcp_spec_hash: dict[str, str] = {}  # session_id → last MCP spec hash
     _session_comment_relays: dict[str, _CommentRelayBinding] = {}
+
+    # Process-lifetime monotonic fill-generation counter per session id.
+    # Incremented (never popped) at delete_session so a fill parked across a
+    # delete→recreate of the same id sees a changed generation and discards its
+    # result instead of publishing stale data into the new session.
+    _session_cache_generations: dict[str, int] = {}
+
+    def _session_cache_generation(session_id: str) -> int:
+        """Return (and materialize) the generation a cache fill starts under."""
+        return _session_cache_generations.setdefault(session_id, 0)
+
+    def _session_cache_generation_is_current(session_id: str, generation: int) -> bool:
+        """True only when the captured generation still matches — fill may write."""
+        return _session_cache_generations.get(session_id, 0) == generation
+
     _codex_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _pi_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _opencode_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
@@ -2789,6 +2854,7 @@ def create_runner_app(
         if cached is not None:
             return cached
         lock = _session_snapshot_locks.setdefault(session_id, asyncio.Lock())
+        generation = _session_cache_generation(session_id)
         async with lock:
             cached = _session_snapshot_cache.get(session_id)
             if cached is not None:
@@ -2834,17 +2900,20 @@ def create_runner_app(
                 agent_name=agent_name,
             )
             if snapshot.ok and snapshot.agent_id is not None:
-                _session_snapshot_cache[session_id] = snapshot
+                if _session_cache_generation_is_current(session_id, generation):
+                    _session_snapshot_cache[session_id] = snapshot
             return snapshot
 
     async def _session_workspace_value(session_id: str) -> str | None:
         if session_id not in _session_workspace_cache:
+            generation = _session_cache_generation(session_id)
             snapshot = await _session_snapshot(session_id)
             # A failed fetch carries no workspace. Memoizing its ``None``
             # would pin the session to the global workspace for its lifetime.
             if not snapshot.ok:
                 return None
-            _session_workspace_cache[session_id] = snapshot.workspace
+            if _session_cache_generation_is_current(session_id, generation):
+                _session_workspace_cache[session_id] = snapshot.workspace
         return _session_workspace_cache.get(session_id)
 
     async def _session_runtime_cwd(session_id: str) -> Path | None:
@@ -3187,9 +3256,11 @@ def create_runner_app(
                 )
                 if _sub_entry is None:
                     _warn_unresolved_sub_agent(session_id, _sa_name_assign)
+                    _session_sub_agent_resolved[session_id] = False
                 else:
                     spec_entry = _sub_entry
                     spec = _unwrap_resolved_spec(_sub_entry)
+                    _session_sub_agent_resolved[session_id] = True
             harness_name = spec.executor.config.get("harness") or spec.executor.type
             harness_name = canonicalize_harness(harness_name) or harness_name
 
@@ -3836,6 +3907,11 @@ def create_runner_app(
 
         forget_spawn_family(session_id)
 
+        # Increment before clearing caches so in-flight fills see a changed
+        # generation and discard rather than repopulating entries for a dead
+        # (or reborn) session.
+        _session_cache_generations[session_id] = _session_cache_generations.get(session_id, 0) + 1
+
         _session_spec_cache.pop(session_id, None)
         _session_harness_overrides.pop(session_id, None)
         _session_skills_cache.pop(session_id, None)
@@ -3851,6 +3927,8 @@ def create_runner_app(
         _session_fs_registries.pop(session_id, None)
         _session_agent_ids.pop(session_id, None)
         _session_tool_schemas.pop(session_id, None)
+        _instruction_delivery_warned.pop(session_id, None)
+        _session_sub_agent_resolved.pop(session_id, None)
         if _binding := _session_comment_relays.pop(session_id, None):
             _binding.relay.close()
         _session_histories.pop(session_id, None)
@@ -4565,6 +4643,30 @@ def create_runner_app(
                     "detail": "Codex-native plan-mode update requires a current model.",
                 },
             )
+        from omnigent.codex_native_bridge import (
+            DeveloperInstructionsReadState,
+            read_codex_config_developer_instructions_state_from_home,
+        )
+
+        _di_read = read_codex_config_developer_instructions_state_from_home(Path(state.codex_home))
+        if _di_read.state is DeveloperInstructionsReadState.UNREADABLE:
+            _logger.warning(
+                "Codex-native plan-mode update skipped for %s: developer_instructions "
+                "config unreadable — refusing to guess and risk wiping live state.",
+                conv_id,
+                extra={"session_id": conv_id},
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "codex_native_settings_update_failed",
+                    "detail": (
+                        "Codex-native plan-mode update requires reading the current "
+                        "developer_instructions config; it could not be read."
+                    ),
+                },
+            )
+        developer_instructions = _di_read.value
         return await _handle_codex_native_settings_update(
             conv_id,
             {
@@ -4573,7 +4675,7 @@ def create_runner_app(
                     "settings": {
                         "model": model,
                         "reasoning_effort": effort,
-                        "developer_instructions": None,
+                        "developer_instructions": developer_instructions,
                     },
                 },
             },
@@ -6406,15 +6508,7 @@ def create_runner_app(
                 _dispatched_agent_id,
                 extra={"session_id": conv},
             )
-            _session_spec_cache.pop(conv, None)
-            _session_harness_overrides.pop(conv, None)
-            _session_skills_cache.pop(conv, None)
-            _session_cursor_model_names.pop(conv, None)
-            _drop_session_claude_launch_config(conv)
-            _session_tool_schemas.pop(conv, None)
-            _session_snapshot_cache.pop(conv, None)
-            if process_manager is not None:
-                await process_manager.release(conv)
+            await _invalidate_session_agent_state(conv, _dispatched_agent_id)
         if _dispatched_agent_id:
             _session_agent_ids[conv] = _dispatched_agent_id
 
@@ -6462,9 +6556,8 @@ def create_runner_app(
         if _sa_name and cached_spec is not None:
             sub_entry = _native_runtime._resolve_sub_agent_spec_entry(cached_spec_entry, _sa_name)
             if sub_entry is None:
-                # Suppress if the cache already holds the child spec (prior turn
-                # or POST /v1/sessions already swapped it in).
-                if cached_spec.name != _sa_name:
+                # Warn unless the child was confirmed resolved (True = already cached).
+                if _session_sub_agent_resolved.get(conv) is not True:
                     _warn_unresolved_sub_agent(conv, _sa_name)
             else:
                 cached_spec_entry = sub_entry
@@ -6493,6 +6586,7 @@ def create_runner_app(
             _session_histories[conv] = (
                 [] if is_native_harness(harness_name) else await _load_history_as_input(conv)
             )
+        _raw_per_request_instructions = cast(str | None, msg_body.get("instructions"))
         if cached_spec is not None:
             spawn_env = _build_spawn_env_from_spec(
                 cached_spec,
@@ -6502,9 +6596,43 @@ def create_runner_app(
                 model_override=cast(str | None, msg_body.get("model_override")),
                 session_id=conv,
             )
-            from omnigent.runtime.prompt import build_instructions
-
-            instructions = build_instructions(cached_spec, None, [])
+            # Gated harnesses use nullable to avoid the fallback literal.
+            _authored_bg = raw_author_instructions(cached_spec) is not None
+            if harness_name in _GATED_COMPOSED_INSTRUCTION_HARNESSES:
+                instructions = build_instructions_nullable(
+                    cached_spec, _raw_per_request_instructions, []
+                )
+            else:
+                instructions = build_instructions(
+                    cached_spec,
+                    _raw_per_request_instructions,
+                    [],
+                )
+            # Warn once per (conversation, harness, delivery) if the agent has
+            # authored instructions but the harness can't deliver them.
+            if _authored_bg and harness_name:
+                _bg_caps = harness_capabilities().get(harness_name)
+                _bg_delivery = (
+                    _bg_caps.instruction_delivery
+                    if _bg_caps is not None
+                    else InstructionDelivery.UNKNOWN
+                )
+                _bg_warn_key = (harness_name, _bg_delivery)
+                if _bg_warn_key not in _instruction_delivery_warned.get(conv, ()):
+                    _instruction_delivery_warned.setdefault(conv, set()).add(_bg_warn_key)
+                    if _bg_delivery in (
+                        InstructionDelivery.NOT_DELIVERED,
+                        InstructionDelivery.UNKNOWN,
+                    ):
+                        _logger.warning(
+                            "agent instructions not delivered for session=%s "
+                            "harness=%s delivery=%s — authored instructions "
+                            "accepted but have no delivery channel on this harness.",
+                            conv,
+                            harness_name,
+                            _bg_delivery.value,
+                            extra={"session_id": conv},
+                        )
 
         ctx = TurnDispatch(
             agent_id=_dispatched_agent_id,
@@ -6814,6 +6942,13 @@ def create_runner_app(
             dispatch.spawn_env if dispatch else cast(dict[str, str] | None, body.get("spawn_env"))
         )
         _note_session_harness_override(conv_id, cast(str | None, body.get("harness_override")))
+        # Shared agent-switch invalidation for both dispatch paths.
+        _ds_agent_id = dispatch.agent_id if dispatch else cast(str | None, body.get("agent_id"))
+        _ds_prior = _session_agent_ids.get(conv_id)
+        if _ds_agent_id and _ds_prior is not None and _ds_prior != _ds_agent_id:
+            await _invalidate_session_agent_state(conv_id, _ds_agent_id)
+        if _ds_agent_id:
+            _session_agent_ids[conv_id] = _ds_agent_id
         startup_envelope = _fresh_session_init_envelope(conv_id)
         startup_labels = startup_envelope.snapshot.labels if startup_envelope is not None else None
         if not harness_name:
@@ -7019,7 +7154,67 @@ def create_runner_app(
                 yield _response_failed_event({"message": _err_msg, "type": _err_type})
                 return
 
-            event_body = _wrap_as_message_event(body)
+            # Compose instructions for direct-stream turns (dispatch is None;
+            # background path pre-composes).
+            _instr_body = body
+            if dispatch is None:
+                with contextlib.suppress(OmnigentError, httpx.HTTPError, RuntimeError, ValueError):
+                    _instr_entry_ds = await _resolve_session_spec_entry(conv_id)
+                    _instr_spec_ds = _unwrap_resolved_spec(_instr_entry_ds)
+                    if _instr_spec_ds is not None:
+                        _per_req_instr = cast(str | None, body.get("instructions"))
+                        _authored_ds = raw_author_instructions(_instr_spec_ds) is not None
+                        _ic_ds = InstructionComposition(
+                            authored_present=_authored_ds,
+                            composed=build_instructions_nullable(
+                                _instr_spec_ds, _per_req_instr, []
+                            ),
+                        )
+                        # Gated harnesses get nullable — skip the fallback literal.
+                        if harness_name in _GATED_COMPOSED_INSTRUCTION_HARNESSES:
+                            _instr_val = _ic_ds.composed
+                            if _instr_val is not None:
+                                _instr_body = {**body, "instructions": _instr_val}
+                        elif _ic_ds.composed is not None:
+                            _instr_body = {
+                                **body,
+                                "instructions": build_instructions(
+                                    _instr_spec_ds, _per_req_instr, []
+                                ),
+                            }
+                        if _authored_ds and harness_name:
+                            _ds_caps = harness_capabilities().get(harness_name)
+                            _ds_delivery = (
+                                _ds_caps.instruction_delivery
+                                if _ds_caps is not None
+                                else InstructionDelivery.UNKNOWN
+                            )
+                            _ds_warn_key = (harness_name, _ds_delivery)
+                            _already_warned_ds = _ds_warn_key in _instruction_delivery_warned.get(
+                                conv_id, ()
+                            )
+                            if not _already_warned_ds:
+                                _instruction_delivery_warned.setdefault(conv_id, set()).add(
+                                    _ds_warn_key
+                                )
+                                if _ds_delivery in (
+                                    InstructionDelivery.NOT_DELIVERED,
+                                    InstructionDelivery.UNKNOWN,
+                                ):
+                                    _logger.warning(
+                                        "agent instructions not delivered for session=%s "
+                                        "harness=%s delivery=%s — authored instructions "
+                                        "accepted but have no delivery channel on this harness.",
+                                        conv_id,
+                                        harness_name,
+                                        _ds_delivery.value,
+                                        extra={"session_id": conv_id},
+                                    )
+            # Re-warn on every turn when session-create established a miss.
+            _ds_sa = _session_sub_agent_names.get(conv_id)
+            if _ds_sa and _session_sub_agent_resolved.get(conv_id) is False:
+                _warn_unresolved_sub_agent(conv_id, _ds_sa)
+            event_body = _wrap_as_message_event(_instr_body)
             _inject_mcp_schemas(event_body, _mcp_schemas)
             _response_id: str | None = None
             try:
@@ -9167,6 +9362,7 @@ def create_runner_app(
             _session_spec_cache[session_id] = None
             return None
         lock = _session_spec_locks.setdefault(session_id, asyncio.Lock())
+        generation = _session_cache_generation(session_id)
         async with lock:
             if session_id in _session_spec_cache:
                 return _session_spec_cache[session_id]
@@ -9202,9 +9398,12 @@ def create_runner_app(
                     )
                     if sub_entry is None:
                         _warn_unresolved_sub_agent(session_id, sub_agent_name)
+                        _session_sub_agent_resolved[session_id] = False
                     else:
                         spec_entry = sub_entry
-            _session_spec_cache[session_id] = spec_entry
+                        _session_sub_agent_resolved[session_id] = True
+            if _session_cache_generation_is_current(session_id, generation):
+                _session_spec_cache[session_id] = spec_entry
             return spec_entry
 
     async def _resolve_session_agent_spec(session_id: str) -> AgentSpec | None:
@@ -9723,15 +9922,32 @@ def create_runner_app(
 
     def _clear_session_agent_caches(session_id: str, agent_id: str | None = None) -> None:
         _session_spec_cache.pop(session_id, None)
+        _session_agent_ids.pop(session_id, None)
         _session_harness_overrides.pop(session_id, None)
+        # Bump so any in-flight fill discards its write rather than reinstating it.
+        _session_cache_generations[session_id] = _session_cache_generations.get(session_id, 0) + 1
+        _session_snapshot_cache.pop(session_id, None)
         _session_skills_cache.pop(session_id, None)
         _session_cursor_model_names.pop(session_id, None)
         _drop_session_claude_launch_config(session_id)
         _session_tool_schemas.pop(session_id, None)
         _session_mcp_spec_hash.pop(session_id, None)
-        _session_snapshot_cache.pop(session_id, None)
+        _instruction_delivery_warned.pop(session_id, None)
+        _session_sub_agent_resolved.pop(session_id, None)
         if agent_id:
             _spec_cache.pop(agent_id, None)
+
+    async def _invalidate_session_agent_state(session_id: str, new_agent_id: str | None) -> None:
+        """Clear all agent-derived caches and release the harness subprocess.
+
+        Both dispatch paths (background ``_run_turn_bg_setup_and_stream`` and
+        direct-stream ``_stream_message_to_harness``) call this shared routine
+        on an in-conversation agent switch, so the eviction scope cannot
+        diverge between the two paths.
+        """
+        _clear_session_agent_caches(session_id, new_agent_id)
+        if process_manager is not None:
+            await process_manager.release(session_id)
 
     @app.delete("/v1/sessions/{session_id}/resources")
     async def cleanup_session_resources(
@@ -9839,13 +10055,7 @@ def create_runner_app(
             spec_entry = _session_spec_cache.get(session_id)
             spec = _unwrap_resolved_spec(spec_entry)
             if spec is None and spec_resolver is not None:
-                agent_id = _session_agent_ids.get(session_id)
-                if agent_id:
-                    try:
-                        resolved = await spec_resolver(agent_id, session_id)
-                        spec = _unwrap_resolved_spec(resolved)
-                    except Exception:  # noqa: BLE001
-                        pass
+                spec = await _resolve_session_agent_spec_or_none(session_id)
             if spec is None:
                 return JSONResponse(
                     status_code=200,
@@ -9907,13 +10117,7 @@ def create_runner_app(
                 spec_entry = _session_spec_cache.get(session_id)
                 spec = _unwrap_resolved_spec(spec_entry)
                 if spec is None and spec_resolver is not None:
-                    _agent_id = _session_agent_ids.get(session_id)
-                    if _agent_id:
-                        try:
-                            resolved = await spec_resolver(_agent_id, session_id)
-                            spec = _unwrap_resolved_spec(resolved)
-                        except Exception:  # noqa: BLE001
-                            pass
+                    spec = await _resolve_session_agent_spec_or_none(session_id)
                 if spec is None:
                     return JSONResponse(
                         status_code=200,
@@ -9984,14 +10188,12 @@ def create_runner_app(
                 spec_workdir = _resolved_workdir_for_spec(spec_entry, runner_workspace)
                 spec = _unwrap_resolved_spec(spec_entry)
                 if spec is None and spec_resolver is not None:
-                    _agent_id = _session_agent_ids.get(session_id)
-                    if _agent_id:
-                        try:
-                            resolved = await spec_resolver(_agent_id, session_id)
-                            spec_workdir = _resolved_workdir_for_spec(resolved, runner_workspace)
-                            spec = _unwrap_resolved_spec(resolved)
-                        except Exception:  # noqa: BLE001
-                            pass
+                    try:
+                        resolved_entry = await _resolve_session_spec_entry(session_id)
+                        spec_workdir = _resolved_workdir_for_spec(resolved_entry, runner_workspace)
+                        spec = _unwrap_resolved_spec(resolved_entry)
+                    except (OmnigentError, httpx.HTTPError, RuntimeError):
+                        pass
                 _agent_id_local = _session_agent_ids.get(session_id)
                 dispatch_workspace = (
                     # A resolved entry with no bundle dir gets no workspace at

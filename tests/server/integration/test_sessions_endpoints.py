@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -5373,6 +5374,129 @@ async def test_accumulate_session_usage_provider_cost_prices_uncatalogued_model(
     usage = _read_session_usage(db_uri, session["id"])
     assert usage.get("total_cost_usd") == pytest.approx(0.0042)
     assert usage["by_model"]["grok-4.3"]["total_cost_usd"] == pytest.approx(0.0042)
+
+
+async def test_accumulate_session_usage_rejects_negative_provider_cost(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A negative reported ``cost_usd`` is not trusted; the catalog estimate is used instead.
+
+    The relay applies the reported cost as an additive delta, so a negative
+    value would subtract from the cumulative total. Since the cost-budget gate
+    reads that total for relay sessions, a runner could otherwise report a
+    negative cost to drive its recorded spend down and slip under the cap. A
+    negative report must fall through to the (non-negative) catalog estimate.
+    """
+    from omnigent.server.routes import sessions as sessions_routes
+
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: ModelPricing(input_per_token=1e-3, output_per_token=2e-3),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    sessions_routes._accumulate_session_usage(
+        {
+            "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 500,
+                "model": "harness-model",
+                "cost_usd": -100.0,
+            }
+        },
+        session["id"],
+        SqlAlchemyConversationStore(db_uri),
+    )
+    usage = _read_session_usage(db_uri, session["id"])
+    # Catalog charges 1000*1e-3 + 500*2e-3 = 2.0; the forged negative is ignored.
+    assert usage.get("total_cost_usd") == pytest.approx(2.0)
+    assert usage["by_model"]["harness-model"]["total_cost_usd"] == pytest.approx(2.0)
+
+
+async def test_accumulate_session_usage_negative_cost_cannot_reset_running_total(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A negative report on an uncatalogued model can't claw back prior spend.
+
+    With no catalog pricing, a rejected negative ``cost_usd`` leaves the turn
+    unpriced, so the previously accumulated ``total_cost_usd`` (the value the
+    cost-budget gate reads) is unchanged — never driven toward zero / negative.
+    """
+    from omnigent.server.routes import sessions as sessions_routes
+
+    store = SqlAlchemyConversationStore(db_uri)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    # First, an honest priced turn establishes a positive running total.
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: None,  # catalog can't price anything
+    )
+    sessions_routes._accumulate_session_usage(
+        {"usage": {"input_tokens": 10, "output_tokens": 2, "model": "grok-4.3", "cost_usd": 5.0}},
+        session["id"],
+        store,
+    )
+    assert _read_session_usage(db_uri, session["id"]).get("total_cost_usd") == pytest.approx(5.0)
+
+    # A forged negative report must not subtract from the running total.
+    sessions_routes._accumulate_session_usage(
+        {
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "model": "grok-4.3",
+                "cost_usd": -50.0,
+            }
+        },
+        session["id"],
+        store,
+    )
+    assert _read_session_usage(db_uri, session["id"]).get("total_cost_usd") == pytest.approx(5.0)
+
+
+async def test_accumulate_session_usage_rejects_non_finite_provider_cost(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A NaN / infinite reported ``cost_usd`` is rejected in favour of the catalog estimate.
+
+    A non-finite value poisons every downstream sum (and JSON round-trips as
+    ``NaN``), so it must never be trusted as the authoritative cost.
+    """
+    from omnigent.server.routes import sessions as sessions_routes
+
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: ModelPricing(input_per_token=1e-3, output_per_token=2e-3),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    for bad_cost in (float("nan"), float("inf"), float("-inf")):
+        sessions_routes._accumulate_session_usage(
+            {
+                "usage": {
+                    "input_tokens": 1000,
+                    "output_tokens": 500,
+                    "model": "harness-model",
+                    "cost_usd": bad_cost,
+                }
+            },
+            session["id"],
+            SqlAlchemyConversationStore(db_uri),
+        )
+    usage = _read_session_usage(db_uri, session["id"])
+    # Three turns, each catalog-priced at 2.0 (the non-finite reports ignored).
+    assert usage.get("total_cost_usd") == pytest.approx(6.0)
+    assert math.isfinite(usage["total_cost_usd"])
 
 
 async def test_accumulate_session_usage_unpriced_without_usage_model(

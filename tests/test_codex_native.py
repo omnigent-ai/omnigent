@@ -4591,7 +4591,15 @@ def test_forwarder_starts_default_turn_from_plan_implementation_prompt(
         ),
     )
     fake_client = _FakeCodexAppServerClient()
-    forwarder_state = codex_native_forwarder._CodexForwarderState(model="mock-model")
+    forwarder_state = codex_native_forwarder._CodexForwarderState(
+        model="mock-model",
+        # A confirmed (config-read or live-notification) ABSENT read, the
+        # way a real forwarder session would have it by the time a plan
+        # prompt is answered — distinct from the never-yet-confirmed default,
+        # which now makes _default_collaboration_mode refuse to build a
+        # payload at all.
+        developer_instructions_known=True,
+    )
 
     async def fake_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
         """
@@ -4701,7 +4709,12 @@ def test_forwarder_starts_fresh_thread_from_clear_context_plan_prompt(
         ),
     )
     fake_client = _FakeCodexAppServerClient()
-    forwarder_state = codex_native_forwarder._CodexForwarderState(model="mock-model")
+    forwarder_state = codex_native_forwarder._CodexForwarderState(
+        model="mock-model",
+        # See the sibling default-turn test above: a confirmed read is a
+        # precondition for _default_collaboration_mode to build a payload.
+        developer_instructions_known=True,
+    )
 
     async def fake_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
         """
@@ -4791,6 +4804,107 @@ def test_forwarder_starts_fresh_thread_from_clear_context_plan_prompt(
     assert state is not None
     assert state.thread_id == "thread_fresh"
     assert state.active_turn_id == "turn_fresh"
+
+
+def test_clear_context_plan_implementation_refuses_before_creating_thread_when_unconfirmed(
+    tmp_path: Path,
+) -> None:
+    """
+    The clear-context plan-implementation flow must validate the
+    model/developer_instructions gate BEFORE creating (and switching to) a
+    new Codex thread — not after.
+
+    Regression: the old code only checked ``forwarder_state.model`` up
+    front, then unconditionally created a fresh thread and recorded it as
+    the bridge's active thread, and only THEN (inside
+    ``_start_plan_implementation_turn``) checked
+    ``developer_instructions_known`` and bailed. With never-confirmed
+    developer_instructions (``developer_instructions_known=False``, e.g.
+    every config.toml read so far has been UNREADABLE), that ordering let
+    a bare ``thread/start`` through, switched the bridge to the new (now
+    orphaned) empty thread, and silently never started the implementation
+    turn — the user's "clear context and implement" choice would appear
+    accepted but do nothing. Asserts NO ``thread/start`` (or any
+    other) request reaches Codex, and the bridge state's thread_id is
+    unchanged.
+    """
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_123",
+        ),
+    )
+    fake_client = _FakeCodexAppServerClient()
+    # developer_instructions_known defaults to False — never confirmed.
+    forwarder_state = codex_native_forwarder._CodexForwarderState(model="mock-model")
+
+    async def fake_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        fake_client.requests.append((method, params))
+        if method == "thread/start":
+            return {"result": {"thread": {"id": "thread_fresh"}}}
+        return {"result": {"turn": {"id": "turn_fresh"}}}
+
+    fake_client.request = fake_request  # type: ignore[method-assign]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/events"):
+            return httpx.Response(202, json={"queued": False})
+        return httpx.Response(
+            200,
+            json={
+                "answers": {
+                    "plan_implementation": {"answers": ["Yes, clear context and implement"]}
+                }
+            },
+        )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            for event in [
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread_123",
+                        "turnId": "turn_123",
+                        "item": {
+                            "type": "plan",
+                            "id": "item_plan",
+                            "text": "- do the work",
+                        },
+                    },
+                },
+                _completed_event("turn_123"),
+            ]:
+                await codex_native_forwarder._handle_event(
+                    client,
+                    session_id="conv_123",
+                    bridge_dir=tmp_path,
+                    usage_coalescer=_usage_coalescer(client),
+                    elicitation_tracker=_elicitation_tracker(),
+                    event=event,
+                    codex_client=fake_client,  # type: ignore[arg-type]
+                    forwarder_state=forwarder_state,
+                )
+
+    asyncio.run(run())
+
+    assert fake_client.requests == [], (
+        f"No Codex app-server request should have been issued when "
+        f"developer_instructions_known is False; got {fake_client.requests!r}."
+    )
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.thread_id == "thread_123", (
+        "Bridge state's active thread must be unchanged — no orphaned "
+        "empty thread switch on a refused gate."
+    )
 
 
 def test_forwarder_sends_codex_command_approval_response_to_app_server(
@@ -7690,6 +7804,216 @@ def test_run_with_local_server_records_fresh_session_before_attach(
     )
 
     assert order == ["prepare", "record:conv_fresh", "attach"]
+
+
+def test_wrapper_spec_raw_instructions_resolves_prompt(tmp_path: Path) -> None:
+    """The ``omnigent codex`` wrapper's own materialized spec is resolvable.
+
+    Its ``prompt`` field is real ``AgentSpec.instructions`` content, not
+    framework-composed text, so it must reach ``developer_instructions``
+    like any other codex-native author instructions.
+    """
+    spec_path = codex_native._materialize_codex_agent_spec(tmp_path, model=None)
+    result = codex_native._wrapper_spec_raw_instructions(spec_path)
+    assert result is not None
+    assert "Codex is running in the session terminal" in result
+
+
+def test_wrapper_spec_raw_instructions_degrades_on_malformed_spec(tmp_path: Path) -> None:
+    """A malformed wrapper spec must not block the terminal launch."""
+    bad_spec = tmp_path / "bad.yaml"
+    bad_spec.write_text("not: [valid, agent, spec")
+    assert codex_native._wrapper_spec_raw_instructions(bad_spec) is None
+
+
+@pytest.mark.asyncio
+async def test_prepare_codex_terminal_fresh_session_passes_developer_instructions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Direct-wrapper fresh launch passes raw author instructions through to
+    ``build_codex_native_server`` as ``developer_instructions``.
+
+    The direct-wrapper call site in ``_prepare_codex_terminal``
+    (``codex_native.py``), where the CLI-launched path can discard the value
+    while the managed-host path still receives it.
+    """
+    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "codex-bridge")
+
+    async def _fake_create_session(_client: object, _bundle: bytes, *, bridge_id: str) -> str:
+        del _client, _bundle, bridge_id
+        return "conv_fresh_di"
+
+    captured: dict[str, Any] = {}
+
+    class _Sentinel(Exception):
+        pass
+
+    def _fake_build_codex_native_server(**kwargs: object) -> object:
+        captured.update(kwargs)
+        raise _Sentinel
+
+    monkeypatch.setattr(codex_native, "_create_codex_session", _fake_create_session)
+    monkeypatch.setattr(codex_native, "build_codex_native_server", _fake_build_codex_native_server)
+
+    with pytest.raises(_Sentinel):
+        await codex_native._prepare_codex_terminal(
+            base_url="http://test",
+            headers={},
+            session_id=None,
+            runner_id=None,
+            session_bundle=b"fake-bundle",
+            codex_args=(),
+            command="codex",
+            model=None,
+            developer_instructions="Be a concise, careful coding assistant.",
+        )
+
+    assert captured.get("developer_instructions") == "Be a concise, careful coding assistant."
+
+
+def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fresh(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    The real outer call site (``_run_with_local_server``) threads the
+    wrapper spec's raw instructions all the way into ``_prepare_codex_terminal``
+    on a FRESH session — with ``_prepare_codex_terminal`` itself REAL, not
+    faked. Only ``build_codex_native_server`` — one level further in — is
+    faked (and made to raise immediately after capturing its kwargs), to
+    observe what the real ``_prepare_codex_terminal`` call actually
+    forwards, without needing to fake the rest of the app-server lifecycle.
+    """
+    spec_path = codex_native._materialize_codex_agent_spec(tmp_path, model=None)
+
+    class _Proc:
+        def poll(self) -> None:
+            return None
+
+    def fake_start_server(*args: object, **kwargs: object) -> Any:
+        del args, kwargs
+        return SimpleNamespace(proc=_Proc(), runner_id="runner_local", log_path=None)
+
+    async def _fake_create_session(_client: object, _bundle: bytes, *, bridge_id: str) -> str:
+        del _client, _bundle, bridge_id
+        return "conv_fresh_wiring"
+
+    captured: dict[str, Any] = {}
+
+    class _Sentinel(Exception):
+        pass
+
+    def _fake_build_codex_native_server(**kwargs: object) -> object:
+        captured.update(kwargs)
+        raise _Sentinel
+
+    monkeypatch.setattr("omnigent.chat._find_free_port", lambda: 12401)
+    monkeypatch.setattr("omnigent.chat._start_local_server", fake_start_server)
+    monkeypatch.setattr("omnigent.chat._stop_local_server", lambda server: None)
+    monkeypatch.setattr("omnigent.chat._wait_for_server", lambda *a, **k: None)
+    monkeypatch.setattr("omnigent.chat._bundle_agent", lambda path: b"bundle")
+    monkeypatch.setattr(codex_native, "_resolve_session_id_for_resume", lambda **kwargs: None)
+    monkeypatch.setattr(codex_native, "_create_codex_session", _fake_create_session)
+    monkeypatch.setattr(codex_native, "build_codex_native_server", _fake_build_codex_native_server)
+
+    with pytest.raises(_Sentinel):
+        codex_native._run_with_local_server(
+            spec_path,
+            session_id=None,
+            resume_picker=False,
+            codex_args=(),
+            command="codex",
+            model=None,
+            prompt=None,
+            auto_open_conversation=False,
+        )
+
+    assert captured.get("developer_instructions") is not None
+    assert "Codex is running in the session terminal" in captured["developer_instructions"]
+
+
+def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_resume(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Same as the fresh-session sibling, but for an existing session id
+    (``resolved_session_id is not None`` — the RESUME branch of
+    ``_prepare_codex_terminal``, e.g. cold-resume with no live terminal).
+    """
+    spec_path = codex_native._materialize_codex_agent_spec(tmp_path, model=None)
+
+    class _Proc:
+        def poll(self) -> None:
+            return None
+
+    def fake_start_server(*args: object, **kwargs: object) -> Any:
+        del args, kwargs
+        return SimpleNamespace(proc=_Proc(), runner_id="runner_local", log_path=None)
+
+    async def _fake_fetch_codex_session(_client: object, _session_id: str) -> dict[str, Any]:
+        del _client, _session_id
+        return {
+            "labels": {codex_native._WRAPPER_LABEL_KEY: codex_native._WRAPPER_LABEL_VALUE},
+            "external_session_id": "019e96aa-0be2-7343-8d3b-6f914d60936b",
+        }
+
+    async def _fake_find_running_codex_terminal(_client: object, _session_id: str) -> None:
+        del _client, _session_id
+        return
+
+    async def _fake_ensure_local_codex_resume_rollout(*args: object, **kwargs: object) -> Path:
+        del args, kwargs
+        return tmp_path / "rollout.jsonl"
+
+    captured: dict[str, Any] = {}
+
+    class _Sentinel(Exception):
+        pass
+
+    def _fake_build_codex_native_server(**kwargs: object) -> object:
+        captured.update(kwargs)
+        raise _Sentinel
+
+    monkeypatch.setattr("omnigent.chat._find_free_port", lambda: 12402)
+    monkeypatch.setattr("omnigent.chat._start_local_server", fake_start_server)
+    monkeypatch.setattr("omnigent.chat._stop_local_server", lambda server: None)
+    monkeypatch.setattr("omnigent.chat._wait_for_server", lambda *a, **k: None)
+    monkeypatch.setattr(
+        codex_native,
+        "_resolve_session_id_for_resume",
+        lambda **kwargs: "conv_resume_wiring",
+    )
+    monkeypatch.setattr(
+        codex_native, "_align_working_directory_with_session", lambda session_id: None
+    )
+    monkeypatch.setattr(codex_native, "_fetch_codex_session", _fake_fetch_codex_session)
+    monkeypatch.setattr(
+        codex_native, "_find_running_codex_terminal", _fake_find_running_codex_terminal
+    )
+    monkeypatch.setattr(
+        codex_native,
+        "_ensure_local_codex_resume_rollout",
+        _fake_ensure_local_codex_resume_rollout,
+    )
+    monkeypatch.setattr(codex_native, "build_codex_native_server", _fake_build_codex_native_server)
+
+    with pytest.raises(_Sentinel):
+        codex_native._run_with_local_server(
+            spec_path,
+            session_id="conv_resume_wiring",
+            resume_picker=False,
+            codex_args=(),
+            command="codex",
+            model=None,
+            prompt=None,
+            auto_open_conversation=False,
+        )
+
+    assert captured.get("developer_instructions") is not None
+    assert "Codex is running in the session terminal" in captured["developer_instructions"]
 
 
 @pytest.mark.asyncio

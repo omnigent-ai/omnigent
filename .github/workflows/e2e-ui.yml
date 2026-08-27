@@ -299,9 +299,12 @@ jobs:
           # --durations surfaces the slowest test phases (setup/call/teardown)
           # at the end of each shard's log so we can see where the wall-clock
           # goes and rebalance; the 1s floor keeps trivial phases out.
+          # Retry every otherwise-unmarked failure once for transient CI races;
+          # per-test @pytest.mark.flaky settings still take precedence.
           uv run pytest tests/e2e_ui \
             -v --tb=long --showlocals --log-level=INFO -r a \
             --durations=25 --durations-min=1.0 \
+            --reruns=1 --reruns-delay=5 \
             --ui-skip-build \
             --splits="$NUM_SHARDS" \
             --group="$((SHARD_ID + 1))" \

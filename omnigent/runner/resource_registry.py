@@ -1073,7 +1073,10 @@ class SessionResourceRegistry:
         if self._terminal_registry is None:
             raise RuntimeError("Terminal registry not configured")
         if not getattr(instance, "running", False) or not await instance.is_alive():
-            await self._terminal_registry.close(session_id, terminal_name, session_key)
+            # Close by instance, not key — a successor may hold the key now.
+            await self._terminal_registry.close(
+                session_id, terminal_name, session_key, expected=instance
+            )
             raise RuntimeError(
                 f"terminal {terminal_name}:{session_key} is not running for session {session_id}"
             )
@@ -1437,9 +1440,12 @@ class SessionResourceRegistry:
         # or never observed → boot failure) stays a failure.
         session_was_idle = self._take_session_status_memo(session_id) == "idle"
 
+        superseded_by: TerminalInstance | None = None
         if self._terminal_registry is not None:
             try:
-                await self._terminal_registry.close(session_id, terminal_name, session_key)
+                await self._terminal_registry.close(
+                    session_id, terminal_name, session_key, expected=instance
+                )
             except Exception:
                 _logger.exception(
                     "Error evicting exited terminal: session=%s terminal=%s:%s",
@@ -1447,9 +1453,20 @@ class SessionResourceRegistry:
                     terminal_name,
                     session_key,
                 )
+            else:
+                current = self._terminal_registry.get(session_id, terminal_name, session_key)
+                if current is not None and instance is not None and current is not instance:
+                    superseded_by = current
 
         publisher = self._terminal_exit_publisher
-        if publisher is not None:
+        if superseded_by is not None:
+            _logger.info(
+                "Skipping exit event for superseded terminal: session=%s terminal=%s:%s",
+                session_id,
+                terminal_name,
+                session_key,
+            )
+        elif publisher is not None:
             publisher(
                 TerminalExitEvent(
                     session_id=session_id,

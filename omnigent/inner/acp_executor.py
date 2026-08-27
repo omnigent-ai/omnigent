@@ -392,6 +392,9 @@ class AcpExecutor(Executor):
         # :meth:`close`). ``_omnigent_tools`` is captured each turn for the relay.
         self._mcp = OmnigentAcpMcp(label=config.name)
         self._omnigent_tools: list[ToolSpec] = []
+        # Tool names the agent can use to reach the Omnigent MCP bridge, snapshotted
+        # from what session/new advertised. Empty means nothing is a bridge call.
+        self._bridge_tool_aliases: frozenset[str] = frozenset()
 
     # ------------------------------------------------------------------
     # Low-level ACP transport
@@ -693,17 +696,10 @@ class AcpExecutor(Executor):
 
         params: _AcpJsonObject = {
             "cwd": self._cwd,
-            # ACP requires this field even when no per-session MCP servers are
-            # configured. Keep it empty when Omnigent MCP is disabled.
-            "mcpServers": [],
+            # ACP requires this field even with no per-session MCP servers; the
+            # helper returns [] when Omnigent MCP is disabled.
+            "mcpServers": self._session_mcp_servers(),
         }
-        if self._config.omnigent_mcp:
-            params["mcpServers"] = self._mcp.session_new_servers(
-                tools=self._omnigent_tools,
-                tool_executor=getattr(self, "_tool_executor", None),
-                loop=asyncio.get_event_loop(),
-                enabled=True,
-            )
         client_id: str | None = None
         if self._config.session_id_mode == "client":
             client_id = secrets.token_urlsafe(16)
@@ -725,6 +721,39 @@ class AcpExecutor(Executor):
             )
         self._session_id = session_id
         return self._session_id
+
+    def _session_mcp_servers(self) -> list[_AcpJsonObject]:
+        """Build ``session/new.mcpServers`` and snapshot the bridge aliases.
+
+        Relay creation and tool-call classification happen here together so they
+        cannot drift apart. No entries means no aliases, so with Omnigent MCP
+        disabled every call classifies as agent-native.
+        """
+        mcp_servers: list[_AcpJsonObject] = []
+        if self._config.omnigent_mcp:
+            mcp_servers = self._mcp.session_new_servers(
+                tools=self._omnigent_tools,
+                tool_executor=getattr(self, "_tool_executor", None),
+                loop=asyncio.get_event_loop(),
+                enabled=True,
+            )
+        servers = {str(s.get("name", "")) for s in mcp_servers if isinstance(s, dict)}
+        servers.discard("")
+        tools = {
+            name
+            for name in (spec.get("name") for spec in (self._omnigent_tools or []))
+            if isinstance(name, str) and name
+        }
+        # Agents name a bridged tool one of several ways; accept every shape we have
+        # seen, plus the bare name for agents that report it unprefixed.
+        aliases = set(tools) if servers else set()
+        for server in servers:
+            for tool in tools:
+                aliases.update(
+                    (f"mcp_{server}_{tool}", f"mcp__{server}__{tool}", f"{server}__{tool}")
+                )
+        self._bridge_tool_aliases = frozenset(aliases)
+        return mcp_servers
 
     # ------------------------------------------------------------------
     # Server-initiated requests (agent → client)
@@ -1178,6 +1207,39 @@ class AcpExecutor(Executor):
                 out[omni_key] = value
         return out or None
 
+    def _is_bridge_tool_call(self, name: str, update: _AcpJsonObject) -> bool:
+        """True when this tool call reaches Omnigent through the MCP bridge.
+
+        Candidates are the reported name plus the machine names some agents carry
+        beside a humanized title. An unrecognized shape reads as agent-native,
+        which may duplicate a card but cannot corrupt dispatch correlation.
+        """
+        if not self._bridge_tool_aliases:
+            return False
+        raw = update.get("rawInput")
+        raw_tool = str(raw.get("tool", "")) if isinstance(raw, dict) else ""
+        # Goose reports the machine name under ``_meta.goose.toolCall.toolName``;
+        # older builds used the flatter ``_meta.goose.toolName``. Read both.
+        meta = update.get("_meta")
+        goose = meta.get("goose") if isinstance(meta, dict) else None
+        meta_tool = ""
+        if isinstance(goose, dict):
+            inner = goose.get("toolCall")
+            meta_tool = str(
+                (inner.get("toolName", "") if isinstance(inner, dict) else "")
+                or goose.get("toolName", "")
+            )
+        candidates = {c for c in (name, raw_tool, meta_tool) if c}
+        return not self._bridge_tool_aliases.isdisjoint(candidates)
+
+    def _reset_session_state(self) -> None:
+        """Forget state that is only valid for the current ACP session."""
+        self._session_id = None
+        self._system_prompt_sent = False
+        self._tool_names.clear()
+        self._tool_inputs.clear()
+        self._bridge_tool_aliases = frozenset()
+
     def _handle_session_update(self, update: _AcpJsonObject) -> list[ExecutorEvent]:
         """Translate one ``session/update`` payload into ExecutorEvents.
 
@@ -1236,9 +1298,13 @@ class AcpExecutor(Executor):
             if isinstance(call_id, str) and call_id:
                 self._tool_names[call_id] = str(name)
                 self._tool_inputs[call_id] = args
-                events.append(
-                    ToolCallRequest(name=str(name), args=args, metadata={"call_id": call_id})
-                )
+                metadata: _AcpJsonObject = {"call_id": call_id}
+                # An agent-native tool ran inside the agent's own loop and never
+                # round-trips Omnigent dispatch. Leaving its id in the correlation
+                # queue would mis-pair the next bridge completion.
+                if not self._is_bridge_tool_call(str(name), update):
+                    metadata["internally_executed"] = True
+                events.append(ToolCallRequest(name=str(name), args=args, metadata=metadata))
         elif update_type == _UPDATE_TOOL_CALL_UPDATE:
             call_id = update.get("toolCallId")
             status = update.get("status")
@@ -1490,15 +1556,13 @@ class AcpExecutor(Executor):
                     response = fut.result()
                 except Exception as exc:
                     logger.exception("ACP process response retrieval failed")
-                    self._session_id = None
-                    self._system_prompt_sent = False
+                    self._reset_session_state()
                     yield ExecutorError(message=f"ACP process error: {exc}", retryable=True)
                     return
                 if "error" in response:
                     error_msg = response["error"].get("message", "Unknown ACP error")
                     if "Session not found" in error_msg:
-                        self._session_id = None
-                        self._system_prompt_sent = False
+                        self._reset_session_state()
                     yield ExecutorError(message=error_msg, retryable=True)
                     return
                 result = response.get("result", {}) if isinstance(response, dict) else {}
@@ -1557,6 +1621,7 @@ class AcpExecutor(Executor):
 
     async def close(self) -> None:
         """Terminate the agent subprocess and clean up."""
+        self._reset_session_state()
         # Tear down the Omnigent MCP relay HTTP server + its bridge dir first.
         with contextlib.suppress(Exception):
             self._mcp.close()

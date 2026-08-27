@@ -17,6 +17,7 @@ from omnigent.harness_capabilities import (
     Elicitation,
     ForkHistory,
     HarnessCapabilities,
+    InstructionDelivery,
     IntegrationMode,
     ModelFamily,
     Resume,
@@ -144,6 +145,7 @@ def test_optional_bench_capabilities_default_to_unknown() -> None:
     assert capability.fork_history is ForkHistory.NONE
     assert capability.shell_tool_name is None
     assert capability.shell_tool_prompt is None
+    assert capability.instruction_delivery is InstructionDelivery.UNKNOWN
     assert capability.as_dict() == {
         "integration_mode": "sdk-in-process",
         "elicitation": "none",
@@ -161,6 +163,7 @@ def test_optional_bench_capabilities_default_to_unknown() -> None:
         "fork_history": "none",
         "shell_tool_name": None,
         "shell_tool_prompt": None,
+        "instruction_delivery": "unknown",
     }
 
 
@@ -354,3 +357,20 @@ def test_native_tui_harnesses_declare_shell_tool_provocation() -> None:
         assert capability.shell_tool_name, harness
         assert capability.shell_tool_prompt, harness
         assert "omnigent-bench-ok" in capability.shell_tool_prompt, harness
+
+
+def test_every_canonical_harness_declares_instruction_delivery() -> None:
+    caps = harness_capabilities()
+    for harness in valid_harnesses():
+        assert caps[harness].instruction_delivery is not InstructionDelivery.UNKNOWN, harness
+
+
+def test_hermes_and_hermes_native_deliver_differently() -> None:
+    caps = harness_capabilities()
+    assert caps["hermes"].instruction_delivery is InstructionDelivery.FIRST_USER_PREFIX
+    assert caps["hermes-native"].instruction_delivery is InstructionDelivery.NOT_DELIVERED
+
+
+def test_kiro_native_is_not_delivered() -> None:
+    caps = harness_capabilities()
+    assert caps["kiro-native"].instruction_delivery is InstructionDelivery.NOT_DELIVERED
