@@ -4649,6 +4649,7 @@ def _tool_relay_handler_factory(
             # Heavy policy imports stay off this module's import path (hook
             # subprocesses import it); the relay runs inside the runner
             # process where these modules are already loaded.
+            from omnigent.native_policy_gate import may_skip_policy_call, record_gate
             from omnigent.native_policy_hook import (
                 evaluation_response_to_hook_output,
                 fail_closed_hook_output,
@@ -4662,6 +4663,18 @@ def _tool_relay_handler_factory(
                 return
             eval_request = hook_payload_to_evaluation_request(hook_event, payload)
             if eval_request is None:
+                self._respond_hook_output(None)
+                return
+            # This request blocks the harness. When the server has already told
+            # us this session has no policy that could fire, answer "no
+            # opinion" here instead of spending a round trip to be told the
+            # same thing again — that is two round trips per tool call, which
+            # is seconds a turn from another region. The gate clears the moment
+            # a policy is added (and expires regardless), so a governed session
+            # never takes this path.
+            if bridge_dir is not None and may_skip_policy_call(
+                bridge_dir, tool_name=payload.get("tool_name")
+            ):
                 self._respond_hook_output(None)
                 return
             context = eval_request["event"]["context"]
@@ -4703,6 +4716,14 @@ def _tool_relay_handler_factory(
             if not isinstance(verdict, dict) or not verdict.get("result"):
                 self._respond_hook_output(fail_closed_hook_output(hook_event, last_error))
                 return
+            if bridge_dir is not None:
+                # Absence of ``gate`` clears any record, so a session that
+                # gained a policy stops skipping on the very next event.
+                record_gate(
+                    bridge_dir,
+                    verdict.get("gate"),
+                    session_id=session_id,
+                )
             self._respond_hook_output(evaluation_response_to_hook_output(hook_event, verdict))
 
         def _handle_policy_evaluate(self, payload: _JsonObject) -> None:

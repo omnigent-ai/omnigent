@@ -32,6 +32,7 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
+from omnigent.native_policy_gate import GATE_TTL_S
 from omnigent.runtime import get_caps, session_stream
 from omnigent.runtime.caps import RuntimeCaps
 from omnigent.server.routes import sessions as sessions_routes
@@ -308,6 +309,72 @@ async def test_tool_call_allow_when_no_matching_policy(
     # No policies → ALLOW (the default engine result).
     assert body["result"] == "POLICY_ACTION_ALLOW"
     assert "reason" not in body
+
+
+async def test_ungoverned_session_reports_the_no_policy_gate(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    An ungoverned session's ALLOW carries the posture, not just the verdict.
+
+    This hook blocks the harness on a round trip, twice per tool call, so a
+    client in another region spends seconds a turn being told repeatedly
+    that nothing is configured. Reporting the posture lets it answer the
+    next hooks itself. Fails if the field is missing (the client keeps
+    paying the wire) or malformed (it would keep asking anyway, since only
+    ``no_policies: true`` licenses a skip).
+    """
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=_tool_call_request("Read"),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["result"] == "POLICY_ACTION_ALLOW"
+    assert body["gate"] == {"no_policies": True, "ttl_s": GATE_TTL_S}
+
+
+async def test_governed_session_never_reports_the_gate(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A session with a policy withholds the gate, even when it ALLOWs.
+
+    The client treats a missing field as "keep asking", so this is what
+    keeps every governed session round-tripping. Fails if a policy that
+    happens to allow a tool advertises the empty posture — the session
+    would then skip its own enforcement for the rest of the gate's life.
+    """
+    allow_policy = FunctionPolicySpec(
+        name="admin__deny_bash",
+        on=None,
+        function=FunctionRef(path=f"{__name__}._deny_bash_tool"),
+    )
+    original_caps = get_caps()
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_caps",
+        lambda: RuntimeCaps(
+            execution_timeout=original_caps.execution_timeout,
+            default_policies=[allow_policy],
+        ),
+    )
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    # ``Read`` is allowed by that policy, so the verdict matches the
+    # ungoverned case above — only the gate distinguishes them.
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=_tool_call_request("Read"),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["result"] == "POLICY_ACTION_ALLOW"
+    assert "gate" not in body
 
 
 async def test_tool_call_deny_with_default_policy(

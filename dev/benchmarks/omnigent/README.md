@@ -62,6 +62,12 @@ see *Network* below).
 | `add_comment` | `POST /v1/sessions/{id}/comments` — create a review comment | write path |
 | `list_projects` | `GET /v1/sessions/projects` — sidebar project list (dual-read union) | project count |
 | `list_project_sessions` | `GET /v1/sessions?project=` — a project folder's sessions (dual-read filter) | sessions/project |
+| `native_policy_hooks_per_turn` | `POST /v1/sessions/{id}/policies/evaluate` × 17 — one 8-tool turn's blocking policy hooks on a session with no policies | round-trip count |
+
+`native_policy_hooks_per_turn` prices the hooks the local policy gate elides
+(see docs/POLICIES.md). Unlike the forwarder journeys, this latency is *agent*
+time: the harness is blocked on each of these. At `--network-delay-ms 100` the
+turn costs ~1.8s of pure waiting; with the gate live it costs one request.
 
 Read journeys target a **pre-seeded** session when the DB has a corpus; against
 an empty DB they self-seed a small fallback session over HTTP (the

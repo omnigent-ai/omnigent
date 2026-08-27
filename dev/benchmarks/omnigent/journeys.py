@@ -789,6 +789,48 @@ async def _measure_policy_evaluate(env: BenchEnvironment, ctx: JourneyContext) -
     resp.raise_for_status()
 
 
+# ── native policy hooks (blocking, per tool call) ────────────────────────────
+
+# Tool calls in the modelled turn. A native harness fires the policy hook on
+# ``UserPromptSubmit`` once and on ``PreToolUse``/``PostToolUse`` per tool, and
+# the harness is *blocked* on each — so this journey's wall clock is agent time
+# the user waits through, not background lag.
+_POLICY_HOOK_TOOL_CALLS = 8
+
+# One op is 17 requests, so the default 100 iterations would make this journey
+# alone dominate the CI leg (and add tail noise to the journeys after it). It
+# exists to price round trips, which a handful of samples establishes.
+_POLICY_HOOK_MAX_ITERATIONS = 20
+
+_POLICY_TOOL_RESULT_PAYLOAD = {
+    "event": {
+        "type": "PHASE_TOOL_RESULT",
+        "data": {"result": "a.py b.py"},
+        "request_data": {"name": "Bash", "arguments": {}},
+    }
+}
+_POLICY_REQUEST_PAYLOAD = {
+    "event": {"type": "PHASE_REQUEST", "data": {"text": "list the files"}},
+}
+
+
+async def _measure_policy_hooks_per_turn(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    """Fire one turn's worth of blocking policy hooks against an ungoverned session."""
+    session_id = cast(str, ctx)  # _setup_target_session
+    assert env.client is not None
+    url = f"/v1/sessions/{session_id}/policies/evaluate"
+    for payload in (
+        _POLICY_REQUEST_PAYLOAD,
+        *(
+            payload
+            for _ in range(_POLICY_HOOK_TOOL_CALLS)
+            for payload in (_POLICY_EVALUATE_PAYLOAD, _POLICY_TOOL_RESULT_PAYLOAD)
+        ),
+    ):
+        resp = await env.client.post(url, json=payload)
+        resp.raise_for_status()
+
+
 # ── CLI startup (omnigent polly against the local bench server) ──────────────
 
 # Signal that the REPL is ready — the last spinner message before the prompt.
@@ -1014,6 +1056,19 @@ ALL_JOURNEYS: dict[str, Journey] = {
             concurrency_safe=True,
             description="POST /v1/sessions/{id}/policies/evaluate — PreToolUse hook "
             "(single tree scan, preloaded conversation row, caches warm).",
+        ),
+        Journey(
+            name="native_policy_hooks_per_turn",
+            kind="latency",
+            measure=_measure_policy_hooks_per_turn,
+            setup=_setup_target_session,
+            concurrency_safe=True,
+            max_iterations=_POLICY_HOOK_MAX_ITERATIONS,
+            description=(
+                f"POST /v1/sessions/{{id}}/policies/evaluate × "
+                f"{1 + 2 * _POLICY_HOOK_TOOL_CALLS} — one turn's blocking policy hooks on "
+                "a session with no policies. This is what the local policy gate elides."
+            ),
         ),
         # Runner (full-turn) journeys — with_runner=True, openai-agents, mock LLM.
         Journey(

@@ -17,6 +17,7 @@ from fastapi.responses import Response
 from omnigent.codex_native_elicitation import codex_elicitation_id
 from omnigent.entities import Conversation
 from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
+from omnigent.native_policy_gate import GATE_TTL_S
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
     get_agent_cache,
@@ -759,8 +760,24 @@ def register_hooks_routes(
             phase=phase,
             tool_name=data.get("name") if isinstance(data, dict) else None,
         ):
+            # Tell the caller the posture, not just the verdict. This hook
+            # blocks the harness on a round trip, so a client an ocean away
+            # spends seconds per turn being told repeatedly that nothing is
+            # configured. ``gate`` licenses it to answer the next hooks itself
+            # until the gate is cleared or expires — see
+            # :mod:`omnigent.native_policy_gate`. Only reported on this
+            # phase-independent empty case: ``any_policies_apply`` above was
+            # asked about *this* phase and tool, so re-ask without them.
+            body: dict[str, Any] = {"result": "POLICY_ACTION_ALLOW"}
+            if not any_policies_apply(
+                spec=loaded.spec,
+                conversation_id=session_id,
+                default_policies=_caps.default_policies,
+                policy_store=get_policy_store(),
+            ):
+                body["gate"] = {"no_policies": True, "ttl_s": GATE_TTL_S}
             return Response(
-                content=json.dumps({"result": "POLICY_ACTION_ALLOW"}),
+                content=json.dumps(body),
                 media_type="application/json",
             )
 

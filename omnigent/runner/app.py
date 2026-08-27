@@ -8017,6 +8017,16 @@ def create_runner_app(
                 )
             return Response(status_code=204)
 
+        if body_type == "policy_gate_changed":
+            # The session's policy set changed, so any locally recorded "no
+            # policy can fire" gate is stale and the next harness hook must ask
+            # the server again. Harness-agnostic and always 204: a session whose
+            # gate this runner never recorded simply lets it expire.
+            from omnigent.native_policy_gate import clear_gate_for_session
+
+            clear_gate_for_session(conversation_id)
+            return Response(status_code=204)
+
         codex_goal_response = await codex_goal_runner.handle_event(
             conversation_id,
             body_type,

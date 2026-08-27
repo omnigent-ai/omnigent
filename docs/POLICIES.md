@@ -151,6 +151,37 @@ Session-level policies let you customize agent behavior for your current task. T
 
 Session policies evaluate before agent spec and admin policies, so they can enforce stricter rules or add additional gates for your specific workflow.
 
+### How enforcement performs on a native harness
+
+A native harness (`omnigent claude`, `omnigent codex`, ...) enforces policies
+through a command hook that fires before every tool call, after every tool
+result, and on every prompt. Each firing asks the server for a verdict and
+**blocks the harness** until it answers, so on a server across an ocean a
+tool-heavy turn can spend seconds of its wall clock waiting on those round
+trips.
+
+When a session has no policies at all -- no agent guardrails, no server-wide
+defaults, no session policies -- the verdict cannot be anything but "allow", and
+the server says so: its response reports that nothing can fire, and the harness
+answers the next hooks itself without asking again. Adding a session policy revokes
+that, as does switching the session to another agent (the server notifies the
+runner in both cases), and the permission lapses on its own within 10 seconds
+regardless.
+
+That 10-second expiry, not the notification, is the bound worth reasoning about.
+The notification travels over the session's runner tunnel, which lives on one
+server replica, and policy mutations are not routed to that replica -- so on a
+multi-replica deployment a mutation handled elsewhere cannot reach the runner and
+expiry is what applies. A change to a *server-wide default* policy is looser
+still: the server's own default-policy cache is itself up to 30 seconds stale,
+and the two windows are sequential.
+
+A session that has any policy never takes this path at all: every hook is
+evaluated server-side, as before.
+
+Set `OMNIGENT_NATIVE_POLICY_GATE=0` in the harness's environment to disable it
+and send every hook to the server.
+
 ---
 
 ## Builtin policies
