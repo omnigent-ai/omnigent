@@ -53,6 +53,23 @@ The scoring configuration and component map are public in
 [`default_scoring.json`](.github/triage_v2/src/issue_prioritization/default_scoring.json)
 and [`areas.json`](.github/areas.json).
 
+## Response times and inactive issues
+
+Priority determines the order in which maintainers consider work; it does not
+set a response, review, or resolution deadline. We do not currently guarantee a
+specific response time for issues or pull requests.
+
+Issues with no activity for 30 days are marked `stale` and close after another
+14 days without activity. New activity restarts that inactivity window. Issues
+labeled `pinned`, `security`, or `bug` are exempt.
+
+If an issue is labeled `needs-info`, a comment from its author clears the label
+and triggers another triage pass. Without an author response, the normal stale
+policy applies unless the issue also has one of the exempt labels above.
+
+Pull requests waiting for an author response follow the separate 7-day policy
+described under [Review state labels](#review-state-labels).
+
 ## Development setup
 
 This is a Python package with an optional frontend under `web/`. Use
