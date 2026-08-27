@@ -43,7 +43,7 @@ absent. Where a gap has a tracking PR it is named; those are expanded under
 | Elicitation / ASK | ✓ | sse-permission; the agent's **own** scopes render on the card (#5053) |
 | Headless / unattended | ✓ | `permission_mode: bypassPermissions` runs without parking on a card (#5056) |
 | **Sub-agents surface in the UI** | ✓ | Devin's parallel sub-agents appear as child sessions, labelled "Devin" (#5489) |
-| Sub-agent transcript depth | ~ | Child chat shows the **task + summary**, not the nested tool calls — [follow-up](#sub-agent-transcript-depth) |
+| Sub-agent transcript depth | ✓ | Child chat shows the sub-agent's nested tool calls, routed via `cognition.ai/subagent_context` (#5575), and they persist across reload (#5583) |
 | Policy on edits / MCP tools | ~ | Shell is gated; file edits (under *accept-edits*) and the agent's own MCP tools are not — #4707 |
 | Shell **execution** | ~ | Devin executes its shell; Omnigent gates but does not run it (no terminal takeover) — #4701 |
 | Cost / token budget | ~ | `cachedReadTokens` dropped; no budget primitive — #4704 |
@@ -52,7 +52,7 @@ absent. Where a gap has a tracking PR it is named; those are expanded under
 | Fork history | ✗ | No fork; no PR yet |
 | Steering (mid-turn) / live queue | ✗ | ACP has no mid-turn message path — interrupt + re-prompt only |
 | Un-lent MCP detection | ✗ | Devin can load its own MCP servers, bypassing policy — #4706 |
-| Sub-agent write to the task dir | ✗ | Sub-agents are sandboxed to a different env root than the task dir — [follow-up](#sub-agent-sandbox-root) |
+| Sub-agent write to the task dir | ✗ | **Devin's own isolation model**, not a seam gap: sub-agents run under a different env root than the task dir — [detail](#sub-agent-sandbox-root) |
 
 **Where Devin is ahead of the native harnesses:** it is genuinely multi-model
 (vs Claude- or GPT-locked natives), and it supports ASK-capable elicitation (vs
@@ -330,7 +330,8 @@ vendor" — erode with one convenient import, so they are asserted mechanically:
 ## Follow-ups
 
 The roadmap, roughly in priority order. Each is additive and capability-gated per
-the constraint above. Items with an open PR are named; the rest have no PR yet.
+the constraint above. Items with an open PR are named; the rest have no PR yet. A
+couple have shipped since this doc first landed — kept below, marked, as history.
 
 ### Tool mediation — run the shell in Omnigent (#4701, open)
 
@@ -374,17 +375,24 @@ per-harness price table that goes stale.
 
 ### Sub-agent transcript depth
 
-The child chat shows the task + summary, not the nested tool calls the sub-agent
-ran. Devin tags those (`cognition.ai/subagent_context` carries the owning
-`parentAgentId`), so routing them into the child is a clean follow-up to #5489 — no
-PR yet.
+**Shipped in #5575 (routing) and #5583 (persistence).** Was: the child chat showed
+only the task + summary, not the nested tool calls the sub-agent ran. Devin tags those
+frames with `cognition.ai/subagent_context` (carrying the owning `parentAgentId`);
+#5575 reads them and routes each into the child transcript as its own tool card, and
+#5583 gives those observed cards a durable `completed` re-emission so they survive a
+reload. Kept here as history — no longer open.
 
 ### Sub-agent sandbox root
 
-Observed while capturing frames: Devin's sub-agents were sandboxed to a different
-env root than the task directory, so their `write` tool was denied and Devin fell
-back to writing files itself via `exec`. A real Devin-sub-agent gap, distinct from
-the surfacing work — no PR yet.
+**Devin's own isolation model, not an Omnigent seam gap.** Observed while capturing
+frames: Devin's sub-agents run under a different env root than the task directory
+(e.g. `tmp.tmvzH5OXHu` vs the task's `tmp.nAW8FoCJcT`), so a sub-agent's `write` to
+the task dir is denied and Devin falls back to writing files itself via `exec`. The
+sub-agent's `request_scope` can't cross into the parent task's root — that is Devin's
+sandbox architecture, not something the `AcpExtension` seam can or should fix from
+Omnigent's side. There is no Omnigent PR because there is no Omnigent-side gap; if it
+ever needs addressing it belongs upstream in Devin (or a future ACP scope-negotiation
+primitive).
 
 ### No PR yet — deeper protocol gaps
 
