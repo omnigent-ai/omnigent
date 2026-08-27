@@ -50,10 +50,9 @@ def _get_project_config(base_url: str, project_id: str) -> dict:
 
 def _open_project_settings(page: Page, project: str) -> None:
     """Open the folder kebab → "Project settings" for *project*."""
-    header = page.get_by_role("button", name=project, exact=True)
-    expect(header).to_be_visible()
-    header.hover()
-    page.get_by_role("button", name=f"Project actions for {project}").click()
+    actions = page.get_by_role("button", name=f"Project actions for {project}", exact=True)
+    expect(actions).to_be_visible()
+    actions.click()
     page.get_by_test_id("project-settings").click()
     # The dialog's Save button confirms the editor mounted + the config fetch
     # settled (Save is disabled while loading).
