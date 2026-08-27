@@ -28,7 +28,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, Route, expect
 
-from tests.e2e_ui.conftest import configure_mock_llm, seed_committed_turn
+from tests.e2e_ui.conftest import configure_mock_llm, fetch_with_retry, seed_committed_turn
 
 # Unique marker so the copied-transcript assertion can't match
 # UI chrome or another test's message.
@@ -299,7 +299,7 @@ def test_clone_worktree_source_prefills_repo_and_validates_directory(
         if route.request.method != "GET":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         body = response.json()
         body["host_id"] = _WT_HOST_ID
         body["workspace"] = _WT_DIR

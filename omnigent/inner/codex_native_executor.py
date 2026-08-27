@@ -424,7 +424,8 @@ class CodexNativeExecutor(Executor):
                         input_items=input_items,
                         settings_overrides=settings_overrides,
                     )
-                except Exception as exc:  # noqa: BLE001 - converted into a harness error event.
+                except Exception as exc:
+                    _logger.exception("Codex native turn injection failed")
                     error_msg = f"Codex native executor error: {exc}"
                     # Name the servers a still-unsettled MCP startup is
                     # blocked on — the most common cause of an injection

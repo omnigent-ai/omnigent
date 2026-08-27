@@ -50,6 +50,7 @@ from packaging.version import InvalidVersion, Version
 
 from omnigent._platform import resolve_cli_binary
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+from omnigent.cli_invocation import cli_invocation
 from omnigent.harness_install_spec import HarnessInstallSpec, SetupStep
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 from omnigent.opencode_native_client import (
@@ -88,7 +89,9 @@ KIRO_KEY = "kiro"
 # - codex: native policy hook requires >= 0.129.0
 #   (`omnigent/codex_native_app_server.py`).
 # - pi: non-interactive ``--approve`` override requires >= 0.79.0
-#   (``omnigent/pi_native.py``).
+#   (``omnigent/pi_native.py``). Adaptive thinking (thinking.type.adaptive
+#   for claude-4+/claude-5) requires >= 0.84.2
+#   (``omnigent/pi_native_credentials.py``).
 # - qwen: ``--input-file`` / ``--json-file`` bridge verified on v0.18.1
 #   (``omnigent/qwen_native_forwarder.py`` / ``docs/QWEN_NATIVE_DESIGN.md``).
 # - goose: SQLite forwarder schema verified on Goose 1.38.0
@@ -116,7 +119,7 @@ KIRO_KEY = "kiro"
 #   semver version with the build date alongside it
 #   (``Hermes Agent v0.19.1 (2026.7.30)``), so the floor is that semver.
 _CODEX_MIN_VERSION = "0.137.0"
-_PI_MIN_VERSION = "0.79.0"
+_PI_MIN_VERSION = "0.84.2"
 _QWEN_MIN_VERSION = "0.18.1"
 _GOOSE_MIN_VERSION = "1.38.0"
 _HERMES_MIN_VERSION = "0.17.0"
@@ -339,12 +342,13 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     "native-cursor": CURSOR_KEY,
     "kiro-native": KIRO_KEY,
     "native-kiro": KIRO_KEY,
-    # The native agy TUI bridge wraps the ``agy`` CLI; both spellings map to
-    # the Gemini family's install spec. (The in-process ``antigravity`` SDK
-    # harness is deliberately absent — like the other SDK harnesses it needs no
-    # CLI binary.)
+    # The native agy TUI bridge wraps the ``agy`` CLI. The in-process
+    # ``antigravity`` SDK harness is deliberately absent because it needs no
+    # CLI binary.
     "antigravity-native": GEMINI_FAMILY,
     "native-antigravity": GEMINI_FAMILY,
+    "agy-native": GEMINI_FAMILY,
+    "native-agy": GEMINI_FAMILY,
     "goose-native": GOOSE_KEY,
     "native-goose": GOOSE_KEY,
     # Headless Goose (``harness: goose``, drives ``goose acp``) wraps the same
@@ -694,7 +698,10 @@ def harness_setup_hint(harness: str | None) -> str:
         elif spec.auth_hint:
             login = f", then {spec.auth_hint}"
         return f"install the {spec.binary} CLI on that machine with `{spec.install_hint}`{login}"
-    return "run `omni setup` on that machine to install the CLI and set a default credential"
+    return (
+        f"run `{cli_invocation(name='omni')} setup` on that machine to install "
+        "the CLI and set a default credential"
+    )
 
 
 _VERSION_RE = re.compile(r"(\d+\.\d+\.\d+(?:[-.][0-9A-Za-z]+)*)")

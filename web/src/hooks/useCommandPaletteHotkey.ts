@@ -47,8 +47,8 @@ function focusOwnsHotkey(e: globalThis.KeyboardEvent): boolean {
  * Bind ⌘/Ctrl+K to toggle the command palette. Bind ONCE.
  *
  * @param onToggle Flip the palette open/closed.
- * @param enabled  Pass `false` to disable the hotkey (e.g. embedded mode, where
- *   ⌘K belongs to the host page). Defaults to enabled.
+ * @param enabled  Pass `false` to disable the hotkey (e.g. embedded in a real
+ *   host page, where ⌘K belongs to the host). Defaults to enabled.
  */
 export function useCommandPaletteHotkey(onToggle: () => void, enabled = true): void {
   // Held in a ref so the bound handler always calls the latest closure without
@@ -71,7 +71,12 @@ export function useCommandPaletteHotkey(onToggle: () => void, enabled = true): v
       e.stopPropagation();
       latest.current();
     };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
+    // Capture phase: the desktop shell renders the embed build over a
+    // CSS-hidden host page whose own ⌘K listener would otherwise also fire.
+    // Binding at the propagation root lets stopPropagation keep the chord
+    // from reaching those listeners; focusOwnsHotkey bails BEFORE stopping
+    // propagation, so Monaco/terminal chords still flow to their surfaces.
+    window.addEventListener("keydown", handler, true);
+    return () => window.removeEventListener("keydown", handler, true);
   }, [enabled]);
 }

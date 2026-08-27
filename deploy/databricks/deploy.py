@@ -892,6 +892,32 @@ def _profile_arg(args: argparse.Namespace) -> list[str]:
     return ["--profile", args.profile] if args.profile else []
 
 
+# Credential-shaped fragments the CLI can echo back inside an error: a token in
+# a config dump, an Authorization header in a transport error. A grant warning is
+# diagnostic only, so scrub these before it reaches a deploy log or CI transcript.
+# The key half deliberately allows surrounding word characters so an
+# underscore-prefixed env name (DATABRICKS_TOKEN=..., DATABRICKS_CLIENT_SECRET=...)
+# is caught too — a plain \b would not match after the underscore.
+_SECRET_ECHO_RE = re.compile(
+    r"(?i)(bearer\s+|[\w.-]*(?:token|password|passwd|secret|credential|authorization"
+    r"|api[_-]?key)[\w.-]*\s*[=:]\s*)(?:bearer\s+)?\S+"
+)
+
+
+def _grant_failure_detail(exc: subprocess.CalledProcessError) -> str:
+    """Bounded, secret-scrubbed one-line summary of a failed grant subprocess.
+
+    Falls back to the return code when the CLI said nothing on stderr.
+    """
+    first_line = next(
+        (line.strip() for line in (exc.stderr or "").splitlines() if line.strip()),
+        "",
+    )
+    if not first_line:
+        return f"rc={exc.returncode}"
+    return _SECRET_ECHO_RE.sub(r"\1<redacted>", first_line)[:200]
+
+
 def _ensure_app_sp_uc_traversal(
     args: argparse.Namespace,
     app_sp: str | None,
@@ -901,6 +927,14 @@ def _ensure_app_sp_uc_traversal(
     Apps' ``uc_securable`` only grants the leaf (WRITE_VOLUME); the
     SP can boot but 403s on first volume read if the parent catalog
     doesn't grant USE to ``account users``. Idempotent.
+
+    A grant that cannot be applied is warned about, not fatal: the SP often
+    already has traversal by group inheritance, and a deployer without MANAGE
+    on a shared catalog cannot add it. Aborting the deploy there fails a
+    workspace that would have booted fine, and the app-boot smoke check later
+    in :func:`main` is the real gate on whether traversal actually works.
+    With ``--no-smoke-check``, this warning is the only post-grant signal that
+    traversal may still be unavailable.
     """
     if not app_sp:
         _log("app SP not resolved yet; skipping UC traversal grants")
@@ -920,21 +954,24 @@ def _ensure_app_sp_uc_traversal(
     ):
         _log(f"granting {priv} on {kind} {fqn} → app SP {app_sp}")
         payload = _json.dumps({"changes": [{"principal": app_sp, "add": [priv]}]})
-        subprocess.run(
-            [
-                "databricks",
-                "grants",
-                "update",
-                kind,
-                fqn,
-                *_profile_arg(args),
-                "--json",
-                payload,
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        try:
+            subprocess.run(
+                [
+                    "databricks",
+                    "grants",
+                    "update",
+                    kind,
+                    fqn,
+                    *_profile_arg(args),
+                    "--json",
+                    payload,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            _log(f"warning: {priv} grant on {fqn} failed ({_grant_failure_detail(exc)})")
 
 
 def main() -> int:

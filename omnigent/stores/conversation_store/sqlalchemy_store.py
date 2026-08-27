@@ -109,6 +109,12 @@ _logger = logging.getLogger(__name__)
 # ``SEARCH_FETCH_TIMEOUT_MS`` so the browser gives up first on the happy path.
 _SEARCH_STATEMENT_TIMEOUT_MS = 15_000
 
+# How many co-located sessions ``has_other_live_session_in_workspace`` will
+# name before it stops looking. Real directories hold one or two sessions; the
+# bound keeps the archived-filter query's ``IN`` list small and caps the work a
+# pathological directory can impose on a delete. Hitting it answers "in use".
+_WORKSPACE_SHARER_SCAN_LIMIT = 32
+
 
 class _RowCountResult(Protocol):
     rowcount: int
@@ -3946,6 +3952,58 @@ class SqlAlchemyConversationStore(ConversationStore):
         if conv is None:
             raise LookupError(f"conversation not found: {conversation_id!r}")
         return conv
+
+    def has_other_live_session_in_workspace(
+        self,
+        *,
+        host_id: str,
+        workspace: str,
+        exclude_conversation_id: str,
+    ) -> bool:
+        """
+        Is another non-archived conversation sitting in this ``(host_id, workspace)``?
+        See the protocol docstring for the semantics.
+
+        Two queries, not one: ``host_id`` / ``workspace`` live on the metadata
+        table (Omnigent DB) while ``archived`` lives on ``conversations`` (AP
+        DB, which may be a separate engine), so they cannot be joined. They
+        are ordered so the overwhelmingly common answer — nothing else is in
+        the directory — costs a single indexed query and returns before the AP
+        DB is touched at all.
+        """
+        with self._session("check_workspace_used_by_other_session") as meta_sess:
+            candidate_ids = list(
+                meta_sess.scalars(
+                    select(SqlConversationMetadata.id)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.host_id == host_id,
+                        SqlConversationMetadata.workspace == workspace,
+                        SqlConversationMetadata.id != exclude_conversation_id,
+                    )
+                    .limit(_WORKSPACE_SHARER_SCAN_LIMIT)
+                )
+            )
+        if not candidate_ids:
+            return False
+        if len(candidate_ids) >= _WORKSPACE_SHARER_SCAN_LIMIT:
+            # More sharers than we bound the scan to. "In use" is the safe
+            # answer: a wrong "free" deletes a directory out from under a
+            # running session, while a wrong "in use" only leaves it behind.
+            return True
+        with self._conv_session("check_workspace_sharers_are_archived") as conv_sess:
+            return (
+                conv_sess.scalar(
+                    select(SqlConversation.id)
+                    .where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.id.in_(candidate_ids),
+                        SqlConversation.archived.is_(False),
+                    )
+                    .limit(1)
+                )
+                is not None
+            )
 
     async def delete_conversation(self, conversation_id: str) -> bool:
         """

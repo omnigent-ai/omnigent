@@ -40,21 +40,17 @@ Tracks pending work and known limitations for the Qwen Code harness
   catalog, so without it they fell back to the wrong 128K default
   (qwen3-coder-plus is 1M). A spec's `executor.context_window` still overrides;
   unrecognized qwen models keep the 128K fallback.
-- **In-session model selection (`/model`).** Switching models mid-session
-  works. The model is fixed in the `qwen --acp` subprocess env
-  (`HARNESS_QWEN_MODEL`) at spawn, so on a `/model` change the runner's
-  `HarnessProcessManager` respawns the harness with the new value — a fresh
-  `QwenExecutor` then opens a new `session/new` carrying the new model. Context
-  survives the respawn because the first turn of the new session replays the
-  prior conversation (see History replay below).
+- **In-session model selection (`/model`).** The requested model is applied to
+  the live ACP session with the standard `session/set_config_option` method and
+  Qwen's advertised `model` config option. The transcript stays in the existing
+  session; `session/new.model` is not used.
 - **History replay on a fresh ACP session.** When the `qwen --acp` subprocess
-  is (re)spawned — first turn, a `/model` switch, or a `Session not found`
+  is (re)spawned — first turn, a process restart, or a `Session not found`
   reset — qwen holds none of the earlier conversation (it lived in the dead
   process). `run_turn` normally sends only the latest user turn, so the first
   turn of any fresh session folds the prior transcript into the prompt as a
   labeled `Conversation so far:` block (`_history_prefix`), mirroring
-  `ClaudeSDKExecutor._build_prompt`. Keeps a mid-conversation model switch from
-  dropping the thread. (Same fix applied to the goose ACP harness.)
+  `ClaudeSDKExecutor._build_prompt`. (Same fix applied to the goose ACP harness.)
 - **OS sandbox.** When the spec's `os_env.sandbox` is not `none`, the whole
   `qwen` process tree is wrapped in the platform sandbox (bwrap / seatbelt) at
   spawn (`_sandbox_launch_path`), confining qwen's own file/shell tools to the
@@ -304,8 +300,10 @@ comments; this is the *what*, not the *how*.)
 
 - [ ] **More attachment types.** Text files and images now reach the agent;
   still unsupported are binary documents (PDF, etc.) and audio input.
-- [ ] **Session resilience:** cancel a turn mid-flight, recover when the `qwen`
-  subprocess crashes, and resume a session across separate runs.
+- [ ] **Session resilience:** recover when the `qwen` subprocess crashes and
+  resume an ACP session across separate runs. Mid-turn cancellation now sends
+  Qwen's ACP `session/cancel` notification after session setup, with SIGTERM as
+  the fallback before setup or when the notification cannot be sent.
   - *Done in this pass:* dead qwen-native terminals now recreate on attach
     instead of failing 4404, so the embedded pane recovers after a crash or
     deferred-start failure.
@@ -348,7 +346,9 @@ leaves `login_args` / `logout_args` / `status_args` unset so
 
 ### ACP constraints
 
-- Qwen runs its own tools internally (not yet bridged — see Pending work).
+- Qwen runs its own tools internally. ACP `tool_call` / `tool_call_update`
+  notifications are forwarded as informational tool request/completion events,
+  and `agent_thought_chunk` is forwarded as reasoning output.
 - Qwen assigns its own `sessionId`; ours is a hint.
 - ACP has no system-prompt field, so the spec `prompt:` is folded into the
   first user turn.

@@ -180,8 +180,9 @@ class SysScheduledTaskUpdateTool(Tool):
         """:returns: Human-readable description of the tool."""
         return (
             "Update a scheduled task's mutable fields. Only the fields you pass "
-            "change; omit the rest. Pass state='paused' to stop it firing "
-            "without deleting it, or state='active' to resume."
+            "change; omit the rest. Pass agent_id to switch which agent/harness "
+            "it runs. Pass state='paused' to stop it firing without deleting it, "
+            "or state='active' to resume."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -201,6 +202,16 @@ class SysScheduledTaskUpdateTool(Tool):
                         "name": {"type": "string", "description": "New task name."},
                         "prompt": {"type": "string", "description": "New prompt."},
                         "rrule": {"type": "string", "description": _RRULE_DESC},
+                        "agent_id": {
+                            "type": "string",
+                            "description": (
+                                "Rebind the task to a different agent, switching the "
+                                "harness its future firings run (e.g. Cursor to Pi) — "
+                                "from sys_agent_list. Past runs keep the agent they "
+                                "ran. Model, effort, and permission mode do not carry "
+                                "across a switch: resend any you want set."
+                            ),
+                        },
                         "timezone": {"type": "string", "description": "New IANA timezone."},
                         "model_override": {"type": "string", "description": "New model override."},
                         "reasoning_effort": {

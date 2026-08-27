@@ -1,5 +1,5 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
 import type { Bubble } from "@/lib/renderItems";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
@@ -112,14 +112,50 @@ describe("ConnectionIndicator", () => {
   it.each<SessionLiveness>([{ kind: "online" }, { kind: "runner_asleep" }, { kind: "unknown" }])(
     "renders nothing for the reachable/sidebar-owned state %o",
     (liveness) => {
-      // WHY: online/asleep/unknown surface their status in the sidebar or keep
-      // the composer open — this band stays empty for them.
+      // WHY: online/unknown surface status in the sidebar; runner_asleep with no
+      // attach action (non-owner) keeps the silent send-to-wake path — this band
+      // stays empty for all three when no onAttach is supplied.
       const { container } = render(
         <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />,
       );
       expect(container).toBeEmptyDOMElement();
     },
   );
+
+  it("offers a direct Attach for a runner_asleep session when an owner attach action is supplied", () => {
+    // WHY: the runner is down but the host is up — an owner can relaunch it in
+    // place, so we surface an Attach button instead of only nudging them to send
+    // a message (the customer's downed-agent recovery without a chat message).
+    const onAttach = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ConnectionIndicator
+        liveness={{ kind: "runner_asleep" }}
+        onShowReconnectHelp={onShowReconnectHelp}
+        onAttach={onAttach}
+      />,
+    );
+    const banner = screen.getByTestId("runner-asleep-indicator");
+    expect(banner).toHaveTextContent(/Agent disconnected/);
+    fireEvent.click(screen.getByRole("button", { name: "Attach" }));
+    expect(onAttach).toHaveBeenCalledTimes(1);
+  });
+
+  it("holds the Attach button pending after a click so a recovering banner reads as busy", async () => {
+    // WHY: retry_session returns well before the runner-health poll clears the
+    // banner. Re-enabling the instant it returns flips the label back to "Attach"
+    // over a still-shown banner, which reads as a no-op and invites a re-click —
+    // so the button stays disabled/"Attaching…" until liveness moves off asleep.
+    const onAttach = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ConnectionIndicator
+        liveness={{ kind: "runner_asleep" }}
+        onShowReconnectHelp={onShowReconnectHelp}
+        onAttach={onAttach}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Attach" }));
+    expect(await screen.findByRole("button", { name: /Attaching/ })).toBeDisabled();
+  });
 });
 
 describe("RunnerStartingIndicator", () => {
@@ -243,6 +279,7 @@ describe("BubbleView dispatch", () => {
 
     const bubble = screen.getByTestId("message-bubble");
     expect(screen.getByTestId("error-pill")).toBeInTheDocument();
+    expect(bubble).toHaveClass("max-w-full");
     expect(bubble.firstElementChild).toHaveClass("w-full");
     expect(screen.queryByTestId("message-timestamp")).not.toBeInTheDocument();
   });
@@ -262,6 +299,7 @@ describe("BubbleView dispatch", () => {
 
     const bubble = screen.getByTestId("message-bubble");
     expect(screen.getByTestId("error-pill")).toBeInTheDocument();
+    expect(bubble).toHaveClass("max-w-full");
     expect(bubble.firstElementChild).toHaveClass("w-full");
     expect(screen.getByTestId("message-timestamp")).toBeInTheDocument();
   });
@@ -356,7 +394,7 @@ describe("BubbleView dispatch", () => {
     // under an answered turn.
     render(<BubbleView bubble={foldOnlyBubble([toolItem("c4")])} />);
     const bubble = screen.getByTestId("message-bubble");
-    expect(bubble).toHaveClass("max-w-3xl");
+    expect(bubble).toHaveClass("max-w-3xl", "min-[2561px]:max-w-[clamp(56rem,30vw,64rem)]");
     expect(bubble.firstElementChild).toHaveClass("w-full");
     expect(bubble.firstElementChild).not.toHaveClass("w-fit");
   });

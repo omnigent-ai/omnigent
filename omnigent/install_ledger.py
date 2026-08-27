@@ -500,7 +500,8 @@ def observed_launch_agents(*, deep: bool) -> list[LaunchAgentEntry]:
                     confidence="high",
                 )
             )
-    systemd_dir = Path.home() / ".config" / "systemd" / "user"
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    systemd_dir = config_home / "systemd" / "user"
     if systemd_dir.is_dir():
         for path in sorted(systemd_dir.glob("*omnigent*.service")):
             entries.append(
@@ -640,3 +641,52 @@ def write_install_ledger_from_env() -> InstallLedger:
             )
     write_ledger(ledger)
     return ledger
+
+
+def _touch_ledger(ledger: InstallLedger) -> None:
+    """Refresh timestamps after a direct ledger mutation."""
+    now = utc_now()
+    ledger.updated_at = now
+    ledger.last_validated_at = now
+    ledger.generator["wrote_at"] = now
+
+
+def record_launch_agent(entry: LaunchAgentEntry) -> None:
+    """Record or replace one service-manager artifact for uninstall."""
+    real_path = ledger_path()
+    real = load_ledger(real_path)
+    if real is not None and real.ledger_source == "installer":
+        ledger = real
+        destination = real_path
+    else:
+        destination = backfill_ledger_path()
+        ledger = load_ledger(destination)
+        if ledger is None:
+            ledger = new_ledger(source="backfill", strategy="service-enable", deep=True)
+
+    ledger.entries.launch_agents = [
+        current
+        for current in ledger.entries.launch_agents
+        if not (current.kind == entry.kind and current.label == entry.label)
+    ]
+    ledger.entries.launch_agents.append(entry)
+    _touch_ledger(ledger)
+    write_ledger(ledger, path=destination)
+
+
+def remove_launch_agent(*, kind: str, label: str) -> None:
+    """Remove a service-manager artifact from all valid install ledgers."""
+    for path in (ledger_path(), backfill_ledger_path()):
+        ledger = load_ledger(path)
+        if ledger is None:
+            continue
+        remaining = [
+            entry
+            for entry in ledger.entries.launch_agents
+            if not (entry.kind == kind and entry.label == label)
+        ]
+        if len(remaining) == len(ledger.entries.launch_agents):
+            continue
+        ledger.entries.launch_agents = remaining
+        _touch_ledger(ledger)
+        write_ledger(ledger, path=path)

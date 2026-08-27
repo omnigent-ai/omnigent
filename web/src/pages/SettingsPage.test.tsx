@@ -348,7 +348,7 @@ describe("SettingsPage", () => {
 
     fireEvent.click(screen.getByTestId("custom-theme-accent-trigger"));
     const accent = screen.getByTestId("custom-theme-accent-input") as HTMLInputElement;
-    expect(accent.value).toBe("#0969DA");
+    expect(accent.value).toBe("#1F883D");
     fireEvent.change(accent, { target: { value: "#2563eb" } });
 
     expect(select.value).toBe("custom");
@@ -357,10 +357,51 @@ describe("SettingsPage", () => {
     expect(JSON.parse(localStorage.getItem("omnigent:custom-theme") ?? "null")).toMatchObject({
       basePalette: "github",
       accent: "#2563eb",
+      darkAccent: "#2563eb",
     });
     expect(document.documentElement.style.getPropertyValue("--custom-light-primary")).toBe(
       "#2563eb",
     );
+  });
+
+  it("keeps the preset primary color when contrast creates a custom theme", () => {
+    renderPage("/settings/appearance");
+    fireEvent.change(screen.getByTestId("color-theme-select"), {
+      target: { value: "github" },
+    });
+
+    fireEvent.change(screen.getByTestId("custom-theme-contrast"), {
+      target: { value: "68" },
+    });
+
+    expect(document.documentElement.getAttribute("data-theme")).toBe("custom");
+    expect(document.documentElement.style.getPropertyValue("--custom-light-primary")).toBe(
+      "#1f883d",
+    );
+    expect(document.documentElement.style.getPropertyValue("--custom-dark-primary")).toBe(
+      "#238636",
+    );
+    expect(document.documentElement.style.getPropertyValue("--custom-dark-background")).toBe(
+      "#0d1117",
+    );
+  });
+
+  it("restores Dracula surfaces when contrast returns to 50", () => {
+    renderPage("/settings/appearance");
+    fireEvent.change(screen.getByTestId("color-theme-select"), {
+      target: { value: "dracula" },
+    });
+
+    const contrast = screen.getByTestId("custom-theme-contrast");
+    fireEvent.change(contrast, { target: { value: "53" } });
+    fireEvent.change(contrast, { target: { value: "50" } });
+
+    const style = document.documentElement.style;
+    expect(style.getPropertyValue("--custom-light-background")).toBe("#f7f5fd");
+    expect(style.getPropertyValue("--custom-light-card")).toBe("#ffffff");
+    expect(style.getPropertyValue("--custom-light-sidebar")).toBe("#f3f0fa");
+    expect(style.getPropertyValue("--custom-light-border")).toBe("#e6e0f2");
+    expect(style.getPropertyValue("--custom-light-brand-accent")).toBe("#d6409f");
   });
 
   it("persists the shared contrast and translucent-sidebar controls", () => {
@@ -371,6 +412,9 @@ describe("SettingsPage", () => {
     });
     fireEvent.click(screen.getByTestId("custom-theme-translucent-sidebar"));
 
+    expect(screen.getByTestId("custom-theme-contrast")).toHaveStyle({
+      "--range-progress": "68%",
+    });
     expect(screen.getByTestId("color-theme-select")).toHaveValue("custom");
     expect(screen.getByTestId("custom-theme-contrast-value")).toHaveTextContent("68");
     expect(JSON.parse(localStorage.getItem("omnigent:custom-theme") ?? "null")).toMatchObject({
@@ -489,6 +533,7 @@ describe("SettingsPage", () => {
     fireEvent.change(screen.getByTestId("code-font-family-input") as HTMLInputElement, {
       target: { value: "Fira Code" },
     });
+    fireEvent.click(screen.getByTestId("heavier-code-text-toggle"));
 
     // Sanity: the non-default choices were persisted.
     expect(localStorage.getItem("omnigent:terminal-theme")).toBe("dark");
@@ -496,6 +541,7 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("github"));
     expect(localStorage.getItem("omnigent:ui-font-size")).toBe("15");
     expect(localStorage.getItem("omnigent:code-font-size")).toBe("15");
+    expect(localStorage.getItem("omnigent:code-font-weight")).toBe("500");
 
     // Open the confirmation dialog and confirm the reset.
     fireEvent.click(screen.getByTestId("reset-appearance-button"));
@@ -513,6 +559,7 @@ describe("SettingsPage", () => {
     expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe("");
     expect(localStorage.getItem("omnigent:ui-font-size")).toBeNull();
     expect(localStorage.getItem("omnigent:code-font-size")).toBeNull();
+    expect(localStorage.getItem("omnigent:code-font-weight")).toBeNull();
 
     // Color theme is back to Omnigent.
     expect((screen.getByTestId("color-theme-select") as HTMLSelectElement).value).toBe("omni");
@@ -661,6 +708,28 @@ describe("SettingsPage", () => {
     // Reset clears the field and the stored key.
     expect(input.value).toBe("");
     expect(localStorage.getItem("omnigent:code-font-family")).toBeNull();
+  });
+
+  it("shows and persists the code font weight", () => {
+    localStorage.clear();
+    renderPage("/settings/appearance");
+    const toggle = screen.getByTestId("heavier-code-text-toggle");
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+    expect(localStorage.getItem("omnigent:code-font-weight")).toBe("500");
+  });
+
+  it("maps legacy font weights to the supported presets", () => {
+    localStorage.setItem("omnigent:code-font-weight", "900");
+    renderPage("/settings/appearance");
+    expect(screen.getByTestId("heavier-code-text-toggle")).toHaveAttribute("aria-checked", "true");
+
+    cleanup();
+    localStorage.setItem("omnigent:code-font-weight", "100");
+    renderPage("/settings/appearance");
+    expect(screen.getByTestId("heavier-code-text-toggle")).toHaveAttribute("aria-checked", "false");
   });
 
   it("defaults bare /settings to Account when a login session exists, else Appearance", async () => {

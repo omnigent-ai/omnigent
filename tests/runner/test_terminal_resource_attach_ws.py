@@ -2,11 +2,9 @@
 ``WS /v1/sessions/{id}/resources/terminals/{terminal_id}/attach`` endpoint.
 
 The endpoint resolves the opaque terminal resource id back to the
-runner-local registry entry and bridges PTY bytes to the
-browser-facing WebSocket via ``tmux attach``. These tests pin the
-route boundary and registry lookup; the actual PTY bridge is
-exercised by stubbing the bridge spawn boundary or PTY fd (the
-bridge logic itself is unit-tested elsewhere via the shared helper).
+runner-local registry entry and bridges tmux control-mode output to the
+browser-facing WebSocket. These tests pin the route boundary and registry
+lookup while stubbing the control bridge itself.
 """
 
 from __future__ import annotations
@@ -63,172 +61,75 @@ def _seed_registry(
     slot[(instance.name, instance.session_key)] = instance
 
 
-def _patch_attach_spawn(
+def _patch_control_attach(
     monkeypatch: pytest.MonkeyPatch,
-    on_spawn: Callable[[str, list[str], dict[str, str]], None],
+    on_attach: Callable[[str, str, bool], None],
 ) -> None:
-    """Patch tmux attach spawn at the bridge boundary."""
+    """Patch the control bridge at the runner route boundary."""
 
-    def fake_fork_exec(tmux_path: str, argv: list[str], env: dict[str, str]) -> object:
-        on_spawn(tmux_path, argv, env)
-        raise RuntimeError("child exited")
+    async def fake_control(
+        websocket: object,
+        *,
+        socket_path: str,
+        tmux_target: str,
+        read_only: bool,
+        on_client_interaction: object = None,
+    ) -> None:
+        del websocket, on_client_interaction
+        on_attach(socket_path, tmux_target, read_only)
+        raise RuntimeError("bridge stopped")
 
-    monkeypatch.setattr("omnigent.terminals.ws_bridge._fork_exec_pty", fake_fork_exec)
+    monkeypatch.setattr(
+        "omnigent.runner.app.bridge_tmux_control_to_websocket",
+        fake_control,
+    )
 
 
-def test_runner_resource_attach_spawns_tmux_for_running_terminal(
+def test_runner_resource_attach_ignores_obsolete_transport_query(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    With a running registry entry, the runner spawns ``tmux attach``
-    against the entry's local socket path.
-
-    Intercepts the bridge's tmux attach spawn helper to capture argv
-    and child env, then raises so the websocket route unwinds without
-    touching a real PTY or tmux process.
-
-    :param tmp_path: Pytest tmp directory.
-    :param monkeypatch: Pytest monkeypatch fixture.
-    """
+    """A stale PTY query is ignored and the terminal uses control mode."""
     registry = TerminalRegistry()
     instance = _make_running_instance("bash", "s1", tmp_path)
     _seed_registry(registry, "conv_abc", instance)
-
     app = create_runner_app(
         terminal_registry=registry,
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
+    calls: list[tuple[str, str, bool]] = []
+    _patch_control_attach(monkeypatch, lambda *args: calls.append(args))
 
-    # argv (list) and the child env (dict) land under separate keys.
-    captured: dict[str, object] = {}
-
-    def record_spawn(_path: str, argv: list[str], env: dict[str, str]) -> None:
-        captured["argv"] = argv
-        captured["env"] = env
-
-    _patch_attach_spawn(monkeypatch, record_spawn)
-
-    with pytest.raises(RuntimeError, match="child exited"):
+    with pytest.raises(RuntimeError, match="bridge stopped"):
         with TestClient(app).websocket_connect(
-            # ``?transport=pty`` pins this to the PTY bridge (the one that forks
-            # tmux attach) independent of the global control-mode default.
             "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach?transport=pty"
         ):
             pass
 
-    # ``-r`` is absent (read_only defaulted to false) and the local
-    # socket path from the registry is what's threaded in.
-    assert captured["argv"][0] == "tmux"
-    assert "-r" not in captured["argv"], (
-        f"Expected no -r without read_only, got argv={captured['argv']!r}"
-    )
-    assert str(tmp_path / "bash-s1.sock") in captured["argv"]
-    # The attach client always advertises the web terminal's real type;
-    # inheriting the ambient TERM broke headless (sandbox) hosts.
-    assert captured["env"]["TERM"] == "xterm-256color"
+    assert calls == [(str(tmp_path / "bash-s1.sock"), "main", False)]
 
 
-def test_runner_resource_attach_passes_read_only_to_tmux(
+def test_runner_resource_attach_passes_read_only_to_control_bridge(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``?read_only=true`` propagates as ``tmux attach -r``.
-
-    :param tmp_path: Pytest tmp directory.
-    :param monkeypatch: Pytest monkeypatch fixture.
-    """
+    """``?read_only=true`` reaches the control bridge."""
     registry = TerminalRegistry()
-    _seed_registry(
-        registry,
-        "conv_abc",
-        _make_running_instance("bash", "s1", tmp_path),
-    )
+    _seed_registry(registry, "conv_abc", _make_running_instance("bash", "s1", tmp_path))
     app = create_runner_app(
         terminal_registry=registry,
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
+    calls: list[tuple[str, str, bool]] = []
+    _patch_control_attach(monkeypatch, lambda *args: calls.append(args))
 
-    # argv (list) and the child env (dict) land under separate keys.
-    captured: dict[str, object] = {}
-
-    def record_spawn(_path: str, argv: list[str], env: dict[str, str]) -> None:
-        captured["argv"] = argv
-        captured["env"] = env
-
-    _patch_attach_spawn(monkeypatch, record_spawn)
-
-    with pytest.raises(RuntimeError, match="child exited"):
+    with pytest.raises(RuntimeError, match="bridge stopped"):
         with TestClient(app).websocket_connect(
-            "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach"
-            "?read_only=true&transport=pty"
+            "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach?read_only=true"
         ):
             pass
 
-    assert "-r" in captured["argv"], (
-        f"Expected -r with read_only=true, got argv={captured['argv']!r}"
-    )
-
-
-def test_runner_resource_attach_selects_control_bridge_on_transport_query(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``?transport=control`` dispatches to the control-mode bridge, not the PTY one.
-
-    The route selects one bridge and gives PTY attaches the explicit OSC 52
-    trust capability. Patch each to record which was invoked and close the
-    socket cleanly, then assert on the selection per query.
-
-    :param tmp_path: Pytest tmp directory.
-    :param monkeypatch: Pytest monkeypatch fixture.
-    """
-    registry = TerminalRegistry()
-    instance = _make_running_instance("bash", "s1", tmp_path)
-    _seed_registry(registry, "conv_abc", instance)
-    app = create_runner_app(
-        terminal_registry=registry,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
-
-    calls: list[str] = []
-
-    async def fake_control(websocket, **_kwargs):  # type: ignore[no-untyped-def]
-        calls.append("control")
-        await websocket.close()
-
-    async def fake_pty(websocket, **kwargs):  # type: ignore[no-untyped-def]
-        calls.append(f"pty:{kwargs.get('allow_osc52_clipboard')}")
-        await websocket.close()
-
-    monkeypatch.setattr("omnigent.runner.app.bridge_tmux_control_to_websocket", fake_control)
-    monkeypatch.setattr("omnigent.runner.app.bridge_tmux_pty_to_websocket", fake_pty)
-    # Point config resolution at an empty scratch dir so the no-query case is
-    # deterministic regardless of the developer's real ~/.omnigent/config.yaml.
-    # With no terminal.transport configured, control mode is the product default.
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-
-    base = "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach"
-    client = TestClient(app)
-    with contextlib.suppress(WebSocketDisconnect):
-        with client.websocket_connect(f"{base}?transport=control"):
-            pass
-    with contextlib.suppress(WebSocketDisconnect):
-        with client.websocket_connect(f"{base}?transport=pty"):
-            pass
-    with contextlib.suppress(WebSocketDisconnect):
-        with client.websocket_connect(base):  # no query → control default
-            pass
-    # Passthrough can carry pane-crafted OSC 52 around tmux's external-only
-    # clipboard policy, so PTY attaches must explicitly disable browser OSC 52.
-    instance.tmux_allow_passthrough = True
-    with contextlib.suppress(WebSocketDisconnect):
-        with client.websocket_connect(f"{base}?transport=pty"):
-            pass
-
-    assert calls == ["control", "pty:True", "control", "pty:False"], (
-        f"transport query did not select the expected bridge: {calls!r}"
-    )
+    assert calls == [(str(tmp_path / "bash-s1.sock"), "main", True)]
 
 
 def test_runner_resource_attach_unknown_terminal_closes_4404(tmp_path: Path) -> None:
@@ -414,18 +315,17 @@ def test_runner_resource_attach_recreates_dead_repl_terminal(
 
     monkeypatch.setattr("omnigent.runner.app._auto_create_repl_terminal", fake_auto_create)
 
-    attach_argvs: list[list[str]] = []
+    attach_sockets: list[str] = []
 
-    def record_spawn(_path: str, argv: list[str], _env: dict[str, str]) -> None:
-        """Capture the tmux attach argv instead of spawning."""
-        attach_argvs.append(argv)
+    def record_attach(socket_path: str, _target: str, _read_only: bool) -> None:
+        attach_sockets.append(socket_path)
 
-    _patch_attach_spawn(monkeypatch, record_spawn)
+    _patch_control_attach(monkeypatch, record_attach)
 
     # First attach: dead pane → recreate → bridge the fresh pane.
-    with pytest.raises(RuntimeError, match="child exited"):
+    with pytest.raises(RuntimeError, match="bridge stopped"):
         with TestClient(app).websocket_connect(
-            "/v1/sessions/conv_abc/resources/terminals/terminal_tui_main/attach?transport=pty"
+            "/v1/sessions/conv_abc/resources/terminals/terminal_tui_main/attach"
         ):
             pass
 
@@ -436,7 +336,7 @@ def test_runner_resource_attach_recreates_dead_repl_terminal(
     # The bridge attached the FRESH pane's socket. The stale socket
     # here would mean the route bridged the dead instance it was
     # supposed to replace.
-    assert str(fresh_dir / "tui-main.sock") in attach_argvs[0]
+    assert attach_sockets[0] == str(fresh_dir / "tui-main.sock")
     # The stale entry was evicted: the registry now resolves the
     # (tui, main) key to the recreated instance. The stale instance
     # surviving would leak its activity watcher and scratch dir.
@@ -445,14 +345,14 @@ def test_runner_resource_attach_recreates_dead_repl_terminal(
     # Second attach: the fresh pane is live → bridge it directly. A
     # second auto-create call would mean the route recreates
     # unconditionally, killing the user's running REPL on every attach.
-    with pytest.raises(RuntimeError, match="child exited"):
+    with pytest.raises(RuntimeError, match="bridge stopped"):
         with TestClient(app).websocket_connect(
-            "/v1/sessions/conv_abc/resources/terminals/terminal_tui_main/attach?transport=pty"
+            "/v1/sessions/conv_abc/resources/terminals/terminal_tui_main/attach"
         ):
             pass
 
     assert auto_create_sessions == ["conv_abc"]
-    assert str(fresh_dir / "tui-main.sock") in attach_argvs[1]
+    assert attach_sockets[1] == str(fresh_dir / "tui-main.sock")
 
 
 def test_runner_resource_attach_recreates_dead_qwen_terminal(
@@ -535,32 +435,31 @@ def test_runner_resource_attach_recreates_dead_qwen_terminal(
 
     monkeypatch.setattr("omnigent.runner.app._auto_create_qwen_terminal", fake_auto_create)
 
-    attach_argvs: list[list[str]] = []
+    attach_sockets: list[str] = []
 
-    def record_spawn(_path: str, argv: list[str], _env: dict[str, str]) -> None:
-        """Capture the tmux attach argv instead of spawning."""
-        attach_argvs.append(argv)
+    def record_attach(socket_path: str, _target: str, _read_only: bool) -> None:
+        attach_sockets.append(socket_path)
 
-    _patch_attach_spawn(monkeypatch, record_spawn)
+    _patch_control_attach(monkeypatch, record_attach)
 
-    with pytest.raises(RuntimeError, match="child exited"):
+    with pytest.raises(RuntimeError, match="bridge stopped"):
         with TestClient(app).websocket_connect(
-            "/v1/sessions/conv_abc/resources/terminals/terminal_qwen_main/attach?transport=pty"
+            "/v1/sessions/conv_abc/resources/terminals/terminal_qwen_main/attach"
         ):
             pass
 
     assert auto_create_sessions == ["conv_abc"]
-    assert str(fresh_dir / "qwen-main.sock") in attach_argvs[0]
+    assert attach_sockets[0] == str(fresh_dir / "qwen-main.sock")
     assert registry.get("conv_abc", "qwen", "main") is fresh
 
-    with pytest.raises(RuntimeError, match="child exited"):
+    with pytest.raises(RuntimeError, match="bridge stopped"):
         with TestClient(app).websocket_connect(
-            "/v1/sessions/conv_abc/resources/terminals/terminal_qwen_main/attach?transport=pty"
+            "/v1/sessions/conv_abc/resources/terminals/terminal_qwen_main/attach"
         ):
             pass
 
     assert auto_create_sessions == ["conv_abc"]
-    assert str(fresh_dir / "qwen-main.sock") in attach_argvs[1]
+    assert attach_sockets[1] == str(fresh_dir / "qwen-main.sock")
 
 
 def test_runner_resource_attach_dead_non_repl_terminal_keeps_4404(
@@ -643,88 +542,11 @@ def test_runner_resource_attach_without_registry_closes_4404() -> None:
     assert exc_info.value.code == 4404
 
 
-def test_runner_resource_attach_closes_4404_when_pty_ends(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """PTY EOF mid-attach surfaces as 4404, not as a normal close.
-
-    Models the user-reported failure mode: claude exits / tmux dies
-    while the browser (or ``omnigent claude --server``) is attached.
-    Without the dedicated close code, the client's reconnect loop in
-    ``omnigent/claude_native.py`` interprets the close as a transient
-    bounce and spins forever on "Claude session connection closed by
-    server; reconnecting...". The fix has the bridge close with the
-    same ``WS_CLOSE_TERMINAL_NOT_FOUND`` (4404) it already uses for
-    the pre-attach lookup-miss case so the client's existing
-    4404-handling exits the loop cleanly.
-
-    Drives the parent branch of ``pty.fork`` with a socketpair as a
-    stand-in for the PTY master fd. Closing the test-side socket
-    triggers an EOF read on the bridge side, which ends ``_pty_to_ws``
-    first and routes the close through the 4404 branch.
-
-    :param tmp_path: Pytest tmp directory.
-    :param monkeypatch: Pytest monkeypatch fixture.
-    """
-    import socket
-
-    registry = TerminalRegistry()
-    _seed_registry(registry, "conv_abc", _make_running_instance("bash", "s1", tmp_path))
-    app = create_runner_app(
-        terminal_registry=registry,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
-
-    pty_side, bridge_side = socket.socketpair()
-    # Address the bridge_side socket via its fd — the bridge reads
-    # with ``os.read(master_fd, ...)`` and registers it with
-    # ``loop.add_reader``, both of which accept any readable fd.
-    bridge_fd = bridge_side.fileno()
-
-    def fake_fork() -> tuple[int, int]:
-        # Parent branch: positive (deliberately invalid) pid plus the
-        # socketpair fd as the PTY master. ``os.kill`` / ``os.waitpid``
-        # in the bridge's finally are wrapped in ``contextlib.suppress``,
-        # but monkey-patch ``os.kill`` here anyway to be safe in case
-        # the bogus pid coincidentally maps to a live process the test
-        # runner does not own.
-        return 999_999, bridge_fd
-
-    monkeypatch.setattr("omnigent.terminals.ws_bridge.pty.fork", fake_fork)
-    monkeypatch.setattr("omnigent.terminals.ws_bridge.os.kill", lambda *_args, **_kw: None)
-
-    try:
-        with TestClient(app).websocket_connect(
-            "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach"
-        ) as ws:
-            # Simulate claude exiting inside tmux: the PTY read side
-            # hits EOF as soon as the other end of the pair closes.
-            pty_side.close()
-            with pytest.raises(WebSocketDisconnect) as exc_info:
-                ws.receive_bytes()
-    finally:
-        # ``pty_side`` is already closed; ``bridge_side`` was closed
-        # by the bridge's ``os.close(master_fd)`` finally. Wrapping
-        # the cleanup keeps the test green even if the bridge's
-        # close ordering changes.
-        with contextlib.suppress(OSError):
-            pty_side.close()
-        with contextlib.suppress(OSError):
-            bridge_side.close()
-
-    assert exc_info.value.code == 4404, (
-        f"Expected 4404 close code on PTY EOF, got {exc_info.value.code}. "
-        "Without 4404, the client's reconnect loop will spin on 'Claude "
-        "session connection closed by server; reconnecting...' indefinitely."
-    )
-
-
 # ── Loopback direct-attach listener (runner/direct_attach.py) ─────────
 
 
 def _make_direct_app(
-    events: list[tuple[str, str, bool, str | None]],
+    events: list[tuple[str, str, bool]],
 ) -> FastAPI:
     """A direct-attach app whose attach handler records its arguments.
 
@@ -738,9 +560,8 @@ def _make_direct_app(
         session_id: str,
         terminal_id: str,
         read_only: bool = False,
-        transport: str | None = None,
     ) -> None:
-        events.append((session_id, terminal_id, read_only, transport))
+        events.append((session_id, terminal_id, read_only))
         await websocket.accept()  # type: ignore[attr-defined]
         await websocket.close()  # type: ignore[attr-defined]
 
@@ -797,7 +618,7 @@ def test_direct_attach_probe_accepts_loopback_dev_origin(origin: str) -> None:
     ],
 )
 def test_direct_attach_rejects_missing_or_wrong_token(path: str) -> None:
-    events: list[tuple[str, str, bool, str | None]] = []
+    events: list[tuple[str, str, bool]] = []
     app = _make_direct_app(events)
     with pytest.raises(WebSocketDisconnect) as exc_info:
         with TestClient(app).websocket_connect(path):
@@ -817,7 +638,7 @@ def test_direct_attach_rejects_missing_or_wrong_token(path: str) -> None:
 )
 def test_direct_attach_rejects_foreign_origin_despite_valid_token(origin: str) -> None:
     """A DNS-rebinding-style page presents its own origin — refused."""
-    events: list[tuple[str, str, bool, str | None]] = []
+    events: list[tuple[str, str, bool]] = []
     app = _make_direct_app(events)
     with pytest.raises(WebSocketDisconnect) as exc_info:
         with TestClient(app).websocket_connect(
@@ -830,17 +651,17 @@ def test_direct_attach_rejects_foreign_origin_despite_valid_token(origin: str) -
 
 
 def test_direct_attach_forwards_attach_params_to_handler() -> None:
-    """The attach wrapper hands session/terminal/query through unchanged."""
-    events: list[tuple[str, str, bool, str | None]] = []
+    """The attach wrapper hands session/terminal/read-only through unchanged."""
+    events: list[tuple[str, str, bool]] = []
     app = _make_direct_app(events)
     with contextlib.suppress(WebSocketDisconnect):
         with TestClient(app).websocket_connect(
             "/v1/sessions/conv1/resources/terminals/terminal_bash_s1/attach"
-            "?token=sekret-token&read_only=true&transport=control",
+            "?token=sekret-token&read_only=true",
             headers={"origin": "https://app.example"},
         ):
             pass
-    assert events == [("conv1", "terminal_bash_s1", True, "control")]
+    assert events == [("conv1", "terminal_bash_s1", True)]
 
 
 def test_allowed_origin_for_server_strips_path_and_keeps_port() -> None:
@@ -858,7 +679,7 @@ async def test_direct_attach_listener_serves_probe_on_loopback() -> None:
     """The uvicorn listener binds 127.0.0.1:0 and answers the probe route."""
     import websockets
 
-    events: list[tuple[str, str, bool, str | None]] = []
+    events: list[tuple[str, str, bool]] = []
     listener = await start_direct_attach_listener(_make_direct_app(events))
     assert listener is not None, "listener failed to start on loopback"
     try:

@@ -66,6 +66,10 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof UseConversationsModule>()),
   useProjects: vi.fn(),
   useProjectConfig: vi.fn(),
+  // The landing reads useConversations to decide hasNoSessions (the empty-state
+  // import affordance); stub it so it doesn't fire an authenticatedFetch that
+  // lands at mock.calls[0] and skews these create-POST call assertions.
+  useConversations: () => ({ data: undefined }),
 }));
 vi.mock("@/lib/agentLabels", async (importOriginal) => ({
   ...(await importOriginal<typeof AgentLabelsModule>()),

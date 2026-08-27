@@ -1196,7 +1196,9 @@ export function AppShell() {
   // dwell-to-peek would only work on a button the user can no longer see.
   // Same 400ms as ChatHeader: a quick pass-over must not open the card.
   const titleBarPeekTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const titleBarPeekRequest = useRef(0);
   const cancelTitleBarPeek = useCallback(() => {
+    titleBarPeekRequest.current += 1;
     if (titleBarPeekTimer.current) {
       clearTimeout(titleBarPeekTimer.current);
       titleBarPeekTimer.current = null;
@@ -1204,7 +1206,10 @@ export function AppShell() {
   }, []);
   const armTitleBarPeek = useCallback(() => {
     cancelTitleBarPeek();
+    const request = titleBarPeekRequest.current;
     titleBarPeekTimer.current = setTimeout(() => {
+      titleBarPeekTimer.current = null;
+      if (titleBarPeekRequest.current !== request) return;
       setSidebarPeek(true);
       setSidebarOpen(false);
     }, 400);
@@ -1299,11 +1304,12 @@ export function AppShell() {
     onToggleRight: toggleRightPanel,
   });
 
-  // ⌘K (Ctrl+K) toggles the command palette. Disabled embedded, where ⌘K is the
-  // host page's. Bound here where the palette's open-state lives.
+  // ⌘K (Ctrl+K) toggles the command palette. Bound capture-phase, so in the
+  // embedded build we claim the chord ahead of any host-page ⌘K listener.
+  // Bound here where the palette's open-state lives.
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const isEmbedded = useIsEmbedded();
-  useCommandPaletteHotkey(() => setCommandPaletteOpen((prev) => !prev), !isEmbedded);
+  useCommandPaletteHotkey(() => setCommandPaletteOpen((prev) => !prev));
   useNewSessionHotkey(!isEmbedded);
 
   // Mobile back button: close the open file and return to the files/changes
@@ -1738,6 +1744,7 @@ export function AppShell() {
                   // icon/tooltip lied until the sidebar was really open.
                   expanded={sidebarOpen}
                   onToggle={() => {
+                    cancelTitleBarPeek();
                     // Mirrors the ⌘⌥[ hotkey: a peeking sidebar counts as open,
                     // so toggling from peek pins it open rather than collapsing.
                     if (sidebarOpen) {
@@ -1754,6 +1761,7 @@ export function AppShell() {
                   // Only meaningful while collapsed — peeking or open, there is
                   // nothing to peek at.
                   onTogglePointerEnter={sidebarOpen || sidebarPeek ? undefined : armTitleBarPeek}
+                  onTogglePointerDown={cancelTitleBarPeek}
                   onTogglePointerLeave={cancelTitleBarPeek}
                 />
               </div>

@@ -662,6 +662,8 @@ def _parse_executor(
     )
     raw_model = raw.get("model")
     model: str | None = str(raw_model) if raw_model is not None else None
+    raw_effort = raw.get("reasoning_effort")
+    reasoning_effort: str | None = str(raw_effort) if raw_effort is not None else None
     # Parse ``executor.connection:`` — same shape as ``llm.connection:``
     # (a flat dict of string key-value pairs with optional ${VAR}
     # expansion). Lifted from the ``executor:`` block so connection
@@ -682,6 +684,7 @@ def _parse_executor(
         profile=profile,
         config=config,
         model=model,
+        reasoning_effort=reasoning_effort,
         connection=connection,
         context_window=context_window,
         auth=auth,

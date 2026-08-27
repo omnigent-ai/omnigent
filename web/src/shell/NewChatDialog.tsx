@@ -55,6 +55,7 @@ import {
 } from "@/components/ui/command";
 import {
   CLAUDE_NATIVE_EFFORTS,
+  PI_NATIVE_EFFORTS,
   ConfigRow,
   DescribedSelect,
   EFFORT_SELECT_NONE,
@@ -191,6 +192,7 @@ import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation } from "@/hooks/useConversations";
 import type { NativeModelOption } from "@/lib/types";
 import {
+  useConversations,
   useProjectConfig,
   useProjects,
   moveConversationToProject,
@@ -221,7 +223,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { AgentRowTooltip } from "@/components/AgentHoverCard";
 import { CreateAgentDialog } from "./CreateAgentDialog";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
-import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
+import { createBundledSession, importLocalSessions, launchRunner } from "@/lib/sessionsApi";
 
 // Hidden from the new-session picker only. `nessie` is superseded by polly.
 // `kimi` / `kimi-code` are the headless SDK harness (kept for sub-agent / `run
@@ -380,6 +382,7 @@ function createdHarnessOptions({
   supportsCursorMode,
   supportsAgySkipPermissions,
   supportsModelPicker,
+  supportsEffortPicker,
   permissionMode,
   approvalMode,
   bypassSandbox,
@@ -396,6 +399,7 @@ function createdHarnessOptions({
   supportsCursorMode: boolean;
   supportsAgySkipPermissions: boolean;
   supportsModelPicker: boolean;
+  supportsEffortPicker: boolean;
   permissionMode: string;
   approvalMode: string;
   bypassSandbox: boolean;
@@ -410,6 +414,7 @@ function createdHarnessOptions({
 
   const options: HarnessOptions = {};
   if (supportsModelPicker) options.model = pickedModel;
+  if (supportsEffortPicker && !supportsPermissionMode) options.effort = pickedEffort;
   if (supportsPermissionMode) {
     options.mode = permissionMode;
     options.effort = pickedEffort;
@@ -1680,7 +1685,9 @@ function HarnessConfigModal({
       }
     } else if (hasModelPicker) {
       setPickedModel(draftModel);
-      if (entryHarness) writeHarnessOption(entryHarness, { model: draftModel });
+      setPickedEffort(draftEffort);
+      if (entryHarness)
+        writeHarnessOption(entryHarness, { model: draftModel, effort: draftEffort });
     } else if (hasApproval) {
       if (isCodex) setPickedModel(draftModel);
       setApprovalMode(draftApproval);
@@ -1750,14 +1757,42 @@ function HarnessConfigModal({
 
         <div className="flex flex-col gap-5 py-1">
           {!autoRouting && hasModelPicker && !hasPermission && (
-            <ConfigRow label="Model" description="Underlying LLM" controlClassName="sm:w-80">
-              <SearchableModelPicker
-                value={modelValue}
-                options={piModelOptions}
-                loading={piModelsLoading}
-                onValueChange={onModelChange}
-              />
-            </ConfigRow>
+            <>
+              <ConfigRow label="Model" description="Underlying LLM" controlClassName="sm:w-80">
+                <SearchableModelPicker
+                  value={modelValue}
+                  options={piModelOptions}
+                  loading={piModelsLoading}
+                  onValueChange={onModelChange}
+                />
+              </ConfigRow>
+              <ConfigRow label="Thinking level" description="Reasoning depth vs. speed">
+                <Select
+                  value={draftEffort || EFFORT_SELECT_NONE}
+                  onValueChange={(v) => setDraftEffort(v === EFFORT_SELECT_NONE ? "" : v)}
+                >
+                  <SelectTrigger
+                    className="w-full cursor-pointer"
+                    data-testid="new-chat-landing-config-pi-effort"
+                    aria-label="Thinking level"
+                  >
+                    <SelectValue placeholder={EFFORT_UNAVAILABLE_PLACEHOLDER} />
+                  </SelectTrigger>
+                  <SelectContent
+                    position="popper"
+                    align="start"
+                    className="w-(--radix-select-trigger-width) [&_[data-slot=select-item]]:pl-2.5"
+                  >
+                    <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
+                    {PI_NATIVE_EFFORTS.map((e) => (
+                      <SelectItem key={e.value} value={e.value}>
+                        {e.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </ConfigRow>
+            </>
           )}
 
           {!autoRouting && hasPermission && (
@@ -2065,11 +2100,19 @@ export function resetLandingDraft(): void {
   landingDraft = null;
 }
 
+// Sessions the empty-landing one-click import pulls (most recent, across all
+// harnesses). Named in the button so the count is explicit before clicking.
+const LANDING_QUICK_IMPORT_LIMIT = 25;
+
 export function NewChatLandingScreen() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const queryClient = useQueryClient();
   const isMobileViewport = useIsMobileViewport();
+  // Single send-telemetry point (see handleCreate). Emitting there rather than
+  // via the Start button's componentId covers Enter-key sends too, which never
+  // submit the form and would otherwise bypass the Button entirely.
+  const { trackClick } = useOmnigentAnalytics();
   // No session here, so there is nothing to switch between: assert the iOS
   // shell's native Chat/Terminal bar is hidden. ChatPage's own bar is driven by
   // the session surface and hides itself on unmount, but that is the only thing
@@ -2091,7 +2134,34 @@ export function NewChatLandingScreen() {
   const { data: agents } = useAvailableAgents();
   // refetchOnFocus: returning from a terminal `omni setup` must clear the
   // readiness badge even if the live push was missed while the tab was hidden.
-  const { data: hosts, isLoading: hostsLoading } = useHosts({ refetchOnFocus: true });
+  const {
+    data: hosts,
+    isLoading: hostsLoading,
+    isFetching: hostsFetching,
+  } = useHosts({ refetchOnFocus: true });
+
+  // Offer an import affordance on the empty landing: a brand-new user with no
+  // Omnigent sessions can pull in their existing local CLI history. Same query
+  // key ChatPage already holds, so this reuses the cache. Wait for data before
+  // deciding so the button doesn't flash for returning users.
+  const { data: conversationsData } = useConversations("", true);
+  const hasNoSessions =
+    conversationsData !== undefined &&
+    conversationsData.pages.every((page) => page.data.length === 0);
+  // One-click quick import for the empty landing: pull the recent sessions
+  // across every harness on the caller's online machine.
+  const [quickImporting, setQuickImporting] = useState(false);
+  const [quickImportError, setQuickImportError] = useState<string | null>(null);
+  const [quickImportedCount, setQuickImportedCount] = useState<number | null>(null);
+  // The server persists each session as its frame arrives, so refresh the
+  // sidebar list every 5s while importing — sessions show up as they land.
+  useEffect(() => {
+    if (!quickImporting) return;
+    const id = setInterval(() => {
+      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+    }, 5000);
+    return () => clearInterval(id);
+  }, [quickImporting, queryClient]);
 
   const agentList = useMemo(
     () =>
@@ -2678,7 +2748,11 @@ export function NewChatLandingScreen() {
         setSelectedHostId(stored.host_id);
         return;
       }
-      // Stored host is gone or offline — fall through to the default.
+      // Cached data can omit the remembered host while a fresh list is already
+      // in flight. Let that refresh settle before using the normal fallback.
+      if (hostsFetching) return;
+      // The fresh list confirms the stored host is gone or offline — fall
+      // through to the default.
     }
 
     if (managedSandboxesEnabled) {
@@ -2691,6 +2765,7 @@ export function NewChatLandingScreen() {
   }, [
     hosts,
     hostsLoading,
+    hostsFetching,
     selectedHostId,
     sandboxSelected,
     managedSandboxesEnabled,
@@ -2866,6 +2941,30 @@ export function NewChatLandingScreen() {
   // model / effort), which are harness-specific. null for non-native agents,
   // which have no knobs to remember.
   const selectedHost = allHosts.find((h) => h.host_id === selectedHostId);
+
+  // Empty-landing one-click: import the last LANDING_QUICK_IMPORT_LIMIT sessions
+  // across all harnesses from the caller's online machine (prefer the selected
+  // one). With no online
+  // host there's nothing to read from, so send them to the Settings import
+  // section for the granular picker + its "start a host" guidance.
+  const handleQuickImport = async (): Promise<void> => {
+    const host = selectedHost?.status === "online" ? selectedHost : onlineHosts[0];
+    if (host === undefined) {
+      navigate("/settings/import");
+      return;
+    }
+    setQuickImporting(true);
+    setQuickImportError(null);
+    try {
+      const result = await importLocalSessions(host.host_id, "all", LANDING_QUICK_IMPORT_LIMIT);
+      setQuickImportedCount(result.imported);
+      await queryClient.invalidateQueries({ queryKey: ["conversations"] });
+    } catch (e) {
+      setQuickImportError(e instanceof Error ? e.message : "Import failed. Try again.");
+    } finally {
+      setQuickImporting(false);
+    }
+  };
   // Warn-only readiness signal for the agent picker: only meaningful when
   // a connected host is selected (a sandbox provisions its own tooling).
   // Selection stays allowed — the host re-checks at launch and the create
@@ -3073,6 +3172,11 @@ export function NewChatLandingScreen() {
       setPickedModel(
         stored.model != null && piModelOptions.some((model) => model.id === stored.model)
           ? stored.model
+          : "",
+      );
+      setPickedEffort(
+        stored.effort != null && PI_NATIVE_EFFORTS.some((e) => e.value === stored.effort)
+          ? stored.effort
           : "",
       );
     }
@@ -3818,6 +3922,10 @@ export function NewChatLandingScreen() {
     // and form-submit paths that call this directly can't create a session with
     // a blank message, host, agent, or workspace.
     if (!canSubmit) return;
+    // A create is actually happening: report it for pointer clicks (via the
+    // form submit) and Enter-key sends alike. After the guard so guarded no-ops
+    // don't emit, matching the disabled Start button.
+    trackClick("new_chat.start_session", "button");
     setCreating(true);
     setCreateError(null);
     // The draft is spent from the moment it is submitted: it belongs to the
@@ -4021,7 +4129,7 @@ export function NewChatLandingScreen() {
             reasoning_effort:
               !smartRoutingHarnessSelected &&
               !routingOwnsModel &&
-              agentSupportsPermissionMode &&
+              (agentSupportsPermissionMode || selectedNativeHarness === "pi-native") &&
               pickedEffort
                 ? pickedEffort
                 : undefined,
@@ -4087,6 +4195,7 @@ export function NewChatLandingScreen() {
           supportsCursorMode: agentSupportsCursorMode,
           supportsAgySkipPermissions: agentSupportsAgySkip,
           supportsModelPicker: agentSupportsModelPicker || nativeAgent?.harness === "codex-native",
+          supportsEffortPicker: selectedNativeHarness === "pi-native",
           permissionMode,
           approvalMode,
           bypassSandbox,
@@ -4669,7 +4778,6 @@ export function NewChatLandingScreen() {
                           aria-busy={creating}
                           data-testid="new-chat-landing-submit"
                           className="size-8 rounded-lg bg-foreground disabled:bg-muted disabled:text-muted-foreground transition-opacity hover:opacity-80 disabled:opacity-100 "
-                          componentId="new_chat.start_session"
                         >
                           {creating ? (
                             <Loader2Icon className="size-4 animate-spin" />
@@ -5239,6 +5347,39 @@ export function NewChatLandingScreen() {
             </p>
           )}
         </div>
+        {hasNoSessions ? (
+          <div className="flex flex-col items-center gap-2">
+            <Button
+              variant="outline"
+              loading={quickImporting}
+              onClick={() => void handleQuickImport()}
+              data-testid="landing-quick-import"
+            >
+              Import your {LANDING_QUICK_IMPORT_LIMIT} most recent sessions
+            </Button>
+            {quickImportedCount !== null ? (
+              <p
+                className="text-sm text-muted-foreground"
+                data-testid="landing-quick-import-result"
+              >
+                Imported {quickImportedCount} session{quickImportedCount === 1 ? "" : "s"}.
+              </p>
+            ) : quickImportError !== null ? (
+              <p className="text-sm text-destructive" data-testid="landing-quick-import-error">
+                {quickImportError}
+              </p>
+            ) : (
+              <button
+                type="button"
+                onClick={() => navigate("/settings/import")}
+                className="text-xs text-muted-foreground underline underline-offset-2 transition-colors hover:text-foreground hover:no-underline"
+                data-testid="landing-import-sessions"
+              >
+                Choose what to import
+              </button>
+            )}
+          </div>
+        ) : null}
       </div>
 
       {poweredBy ? (

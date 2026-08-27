@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from omnigent.onboarding.provider_config import ProviderEntry
     from omnigent.spec.types import AgentSpec
 
+from omnigent.cli_invocation import cli_invocation
 from omnigent.codex_model_vocabulary import codex_spawn_model
 from omnigent.codex_native_bridge import write_policy_hook_config
 from omnigent.codex_native_process_registry import (
@@ -2834,8 +2835,8 @@ def resolve_native_codex_launch(
             summary=(
                 "Codex CLI login (no provider configured for the codex harness, no "
                 "Databricks profile) — the TUI likely renders the ChatGPT sign-in "
-                "screen and never starts a thread; run `omnigent setup` to route through "
-                "a provider"
+                f"screen and never starts a thread; run `{cli_invocation()} setup` "
+                "to route through a provider"
             ),
         )
     if entry.kind == SUBSCRIPTION_KIND:

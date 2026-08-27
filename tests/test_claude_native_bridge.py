@@ -7000,6 +7000,51 @@ def test_compute_transcript_cumulative_cost_sums_priced_messages(
     assert cost == pytest.approx(110.0)
 
 
+def test_compute_transcript_cumulative_cost_refreshes_changed_custom_pricing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Changing provider pricing invalidates the transcript pricing memo."""
+
+    def provider_config(input_per_million: float) -> dict[str, Any]:
+        return {
+            "providers": {
+                "anthropic-local": {
+                    "kind": "local",
+                    "default": True,
+                    "anthropic": {
+                        "base_url": "http://anthropic.local/v1",
+                        "api_key": "test",
+                        "pricing": {
+                            "input_per_million": input_per_million,
+                            "output_per_million": 0.0,
+                        },
+                    },
+                }
+            }
+        }
+
+    active_config = provider_config(1.0)
+    monkeypatch.setattr(
+        "omnigent.onboarding.provider_config.load_config",
+        lambda: active_config,
+    )
+    claude_native_bridge._TRANSCRIPT_PRICING_CACHE.clear()
+    path = tmp_path / "transcript.jsonl"
+    _write_transcript_jsonl(
+        path,
+        [_assistant_entry(model="self-hosted", input_tokens=1_000_000, output_tokens=0)],
+    )
+
+    assert claude_native_bridge.compute_transcript_cumulative_cost(
+        path, include_sidechains=True
+    ) == pytest.approx(1.0)
+
+    active_config = provider_config(2.0)
+    assert claude_native_bridge.compute_transcript_cumulative_cost(
+        path, include_sidechains=True
+    ) == pytest.approx(2.0)
+
+
 def test_compute_transcript_cumulative_cost_excludes_parent_sidechains(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

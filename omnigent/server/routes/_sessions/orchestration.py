@@ -23,6 +23,7 @@ from fastapi import (
 from fastapi.responses import Response
 from pydantic import ValidationError
 
+from omnigent.cli_invocation import cli_invocation
 from omnigent.db.utils import generate_agent_id, generate_task_id
 from omnigent.debug_logging import debug_event
 from omnigent.entities import (
@@ -345,7 +346,9 @@ from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.telemetry import emit as _tel_emit
+from omnigent.telemetry.events import NativeSessionUsageEvent as _TelNativeSessionUsageEvent
 from omnigent.telemetry.events import SessionCreatedEvent as _TelSessionCreatedEvent
+from omnigent.telemetry.events import TurnEndEvent as _TelTurnEndEvent
 from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
 from omnigent.telemetry.surface import classify_surface as _classify_surface
 
@@ -428,6 +431,9 @@ async def _publish_and_wait_for_harness_elicitation(
     # severed wait instead defers the clear so a hook retry can re-park.
     published_request = False
     settled = False
+    # MCP verdict when a real web verdict settles the wait, so the
+    # finally's resolved fan-out carries it (None = severed / terminal).
+    settled_action: str | None = None
     try:
         tombstone = _consume_pre_resolved_harness_elicitation(session_id, elicitation_id)
         if tombstone is not None:
@@ -492,7 +498,9 @@ async def _publish_and_wait_for_harness_elicitation(
         # honoring a verdict that lands in the same tick as a disconnect.
         if future in done and future.exception() is None:
             settled = True
-            return future.result()
+            verdict = future.result()
+            settled_action = getattr(verdict, "action", None)
+            return verdict
         settled = parked.resolved_elsewhere.is_set()
         return None
     finally:
@@ -512,13 +520,14 @@ async def _publish_and_wait_for_harness_elicitation(
                 conversation_store,
             )
         elif published_request:
-            _publish_elicitation_resolved(session_id, elicitation_id)
+            _publish_elicitation_resolved(session_id, elicitation_id, action=settled_action)
             if conversation_store is not None:
                 await asyncio.to_thread(
                     _publish_elicitation_resolved_to_ancestors,
                     conversation_store,
                     session_id,
                     elicitation_id,
+                    settled_action,
                 )
 
 
@@ -1242,9 +1251,19 @@ def _accumulate_session_usage(
             cost_delta = float(provider_cost)
             priced = True
         else:
-            from omnigent.llms.context_window import compute_llm_cost, fetch_model_pricing
+            from omnigent.llms.context_window import (
+                compute_llm_cost,
+                fetch_model_pricing_with_provider,
+            )
+            from omnigent.onboarding.provider_config import load_config
 
-            pricing = fetch_model_pricing(llm_model)
+            # Load provider config to check for custom pricing
+            provider_config = load_config()
+            # Resolve harness from conversation (agent spec + overrides)
+            harness = _resolve_harness(conv) if conv else None
+            pricing = fetch_model_pricing_with_provider(
+                llm_model, provider_config=provider_config, harness=harness
+            )
             priced = pricing is not None
             if pricing is not None:
                 # Cache-aware: usage_obj carries cache_read/cache_creation
@@ -1428,9 +1447,19 @@ def _persist_native_cumulative_usage(
         current["total_cost_usd"] = max(old_cost, float(cost))
     elif has_tokens:
         if isinstance(model_name, str) and model_name:
-            from omnigent.llms.context_window import compute_llm_cost, fetch_model_pricing
+            from omnigent.llms.context_window import (
+                compute_llm_cost,
+                fetch_model_pricing_with_provider,
+            )
+            from omnigent.onboarding.provider_config import load_config
 
-            pricing = fetch_model_pricing(model_name)
+            # Load provider config to check for custom pricing
+            provider_config = load_config()
+            # Resolve harness from conversation (agent spec + overrides)
+            harness = _resolve_harness(conv) if conv else None
+            pricing = fetch_model_pricing_with_provider(
+                model_name, provider_config=provider_config, harness=harness
+            )
             if pricing is not None:
                 # SET (cumulative) — price the running token totals.
                 # ``current`` carries the cache-read split when the harness
@@ -1537,7 +1566,21 @@ async def _persist_external_session_usage(
         body.data,
         conversation_store,
     )
-
+    _n_in = body.data.get("cumulative_input_tokens")
+    _n_out = body.data.get("cumulative_output_tokens")
+    _n_cost = body.data.get("cumulative_cost_usd")
+    _n_model: str | None = body.data.get("model") or None
+    if _n_in is not None or _n_out is not None or _n_cost is not None:
+        _tel_emit(
+            _TelNativeSessionUsageEvent(
+                installation_id=_get_installation_id(),
+                session_id=session_id,
+                input_tokens=int(_n_in) if _n_in is not None else None,
+                output_tokens=int(_n_out) if _n_out is not None else None,
+                cost_usd=(float(_n_cost) if isinstance(_n_cost, (int, float)) else None),
+                model=_n_model,
+            )
+        )
     label_updates: dict[str, str] = {}
     if raw_tokens is not None:
         label_updates[_LAST_CONTEXT_TOKENS_LABEL_KEY] = str(raw_tokens)
@@ -1747,14 +1790,17 @@ async def _resolve_elicitation(
     # Fan-out for every other subscribed client (other tabs, REPL
     # TUI). Idempotent vs. the runner's own ``wait_for_user_approval``
     # finally / harness hook finally — those also publish for the id.
+    # The verdict rides along so the parent-side resolution notice
+    # states how the gate was answered instead of a bare "resolved".
     if isinstance(elicitation_id, str) and elicitation_id:
-        _publish_elicitation_resolved(session_id, elicitation_id)
+        _publish_elicitation_resolved(session_id, elicitation_id, action=data.get("action"))
         if conversation_store is not None:
             await asyncio.to_thread(
                 _publish_elicitation_resolved_to_ancestors,
                 conversation_store,
                 session_id,
                 elicitation_id,
+                data.get("action"),
             )
     # Runner-side elicitations (policy approvals, scaffold dispatch)
     # resolve when the canonical approval event reaches the runner.
@@ -3950,7 +3996,8 @@ async def _persist_host_launch_failure_turn(
             # the code, but the banner must stay actionable if a
             # third-party host omits it.
             else (
-                "the agent's harness is not configured on the selected host — run `omnigent setup`"
+                f"the agent's harness is not configured on the selected host — "
+                f"run `{cli_invocation()} setup`"
             )
         ),
     )
@@ -5091,6 +5138,11 @@ async def _forward_event_to_runner(
     # ────────────────────────────────────────────────────────────────
     if effective_runner_override is not None:
         runner_body["model_override"] = effective_runner_override
+    # Forward the persisted create-time effort on every downward event, like
+    # model_override above. Safe and idempotent: the runner reads the body as a
+    # raw dict (extra keys ignored) and the value never changes after create.
+    if conv.reasoning_effort is not None:
+        runner_body["reasoning"] = {"effort": conv.reasoning_effort}
     # Per-session brain-harness override — create-time only, so no
     # per-event value exists; the persisted column is the source.
     # _routed_harness is non-None when the child routing path resolved one
@@ -5902,6 +5954,9 @@ async def _relay_runner_stream_once(
     # Model/agent label from the turn header, stamped on text segments
     # flushed at tool-call boundaries (the boundary event carries no model).
     current_model: str | None = None
+    # Wall-clock time when the current turn's response.in_progress arrived,
+    # used to compute per-turn latency in TurnEndEvent.
+    _turn_start_s: float | None = None
     # Map tool call_id → response_id so a function_call_output that
     # arrives after a new response.in_progress (different response_id)
     # still pairs with its matching function_call. Without this, the
@@ -6052,6 +6107,7 @@ async def _relay_runner_stream_once(
                     # Track the turn's response_id from lifecycle
                     # events so persisted items share one id.
                     if evt_type == "response.in_progress":
+                        _turn_start_s = time.monotonic()
                         resp_obj = event.get("response", {})
                         _rid = resp_obj.get("id")
                         if isinstance(_rid, str) and _rid:
@@ -6252,47 +6308,81 @@ async def _relay_runner_stream_once(
                             session_id,
                             conversation_store,
                         )
-                        # Push the server-computed cost AND token breakdown
-                        # to the web client's session indicator, rolled up
-                        # over the spawn subtree. The session's own event
-                        # carries its SUBTREE total (this conversation + its
-                        # sub-agents), and each ancestor gets its own subtree
-                        # total on its own stream — so a supervisor's badge
-                        # includes its sub-agents and a parent updates live
-                        # when a relay sub-agent spends. Mirrors the native
-                        # path (_persist_external_session_usage); the roll-up
-                        # was wired for native only, but relay agents (e.g.
-                        # claude-sdk) need it too. Cost is included only when
-                        # priced; the token breakdown rides along whenever any
-                        # bucket is recorded (so an unpriced session still
-                        # surfaces tokens). context_tokens/window already ride
-                        # on the response.completed event. Threaded: store
-                        # reads + SSE fan-out.
-                        _subtree_usage = await asyncio.to_thread(
-                            load_session_usage,
-                            session_id,
-                            conversation_store,
+                    if evt_type in _TERMINAL_RESPONSE_EVENT_TYPES:
+                        _turn_status = evt_type.split(".", 1)[1]  # "completed" etc.
+                        _latency_ms: float | None = None
+                        if _turn_start_s is not None:
+                            _latency_ms = (time.monotonic() - _turn_start_s) * 1000
+                        _turn_start_s = None
+                        _resp_usage = (
+                            event.get("response", {}).get("usage") or {}
+                            if evt_type == "response.completed"
+                            else {}
                         )
-                        _subtree_cost = _priced_cost_for_display(_subtree_usage)
-                        _usage_by_model = _usage_by_model_for_display(_subtree_usage)
-                        if _subtree_cost is not None or _usage_by_model is not None:
-                            _usage_payload: dict[str, Any] = {
-                                "type": "session.usage",
-                                "conversation_id": session_id,
-                            }
-                            if _subtree_cost is not None:
-                                _usage_payload["total_cost_usd"] = _subtree_cost
-                            if _usage_by_model is not None:
-                                _usage_payload["usage_by_model"] = _usage_by_model
-                            session_stream.publish(
-                                session_id,
-                                SessionUsageEvent(**_usage_payload).model_dump(exclude_none=True),
+                        _turn_in = _resp_usage.get("input_tokens")
+                        _turn_out = _resp_usage.get("output_tokens")
+                        _turn_cost = _resp_usage.get("cost_usd")
+                        _turn_model: str | None = _resp_usage.get("model") or current_model or None
+                        _tel_emit(
+                            _TelTurnEndEvent(
+                                installation_id=_get_installation_id(),
+                                session_id=session_id,
+                                status=_turn_status,
+                                latency_ms=_latency_ms,
+                                model=_turn_model,
+                                input_tokens=(int(_turn_in) if _turn_in is not None else None),
+                                output_tokens=(int(_turn_out) if _turn_out is not None else None),
+                                cost_usd=(
+                                    float(_turn_cost)
+                                    if isinstance(_turn_cost, (int, float))
+                                    else None
+                                ),
                             )
-                            await asyncio.to_thread(
-                                _publish_subtree_cost_to_ancestors,
+                        )
+                        if evt_type == "response.completed":
+                            # Push the server-computed cost AND token breakdown
+                            # to the web client's session indicator, rolled up
+                            # over the spawn subtree. The session's own event
+                            # carries its SUBTREE total (this conversation + its
+                            # sub-agents), and each ancestor gets its own subtree
+                            # total on its own stream — so a supervisor's badge
+                            # includes its sub-agents and a parent updates live
+                            # when a relay sub-agent spends. Mirrors the native
+                            # path (_persist_external_session_usage); the roll-up
+                            # was wired for native only, but relay agents (e.g.
+                            # claude-sdk) need it too. Cost is included only when
+                            # priced; the token breakdown rides along whenever any
+                            # bucket is recorded (so an unpriced session still
+                            # surfaces tokens). context_tokens/window already ride
+                            # on the response.completed event. Threaded: store
+                            # reads + SSE fan-out.
+                            _subtree_usage = await asyncio.to_thread(
+                                load_session_usage,
+                                session_id,
                                 conversation_store,
-                                session_id,
                             )
+                            _subtree_cost = _priced_cost_for_display(_subtree_usage)
+                            _usage_by_model = _usage_by_model_for_display(_subtree_usage)
+                            if _subtree_cost is not None or _usage_by_model is not None:
+                                _usage_payload: dict[str, Any] = {
+                                    "type": "session.usage",
+                                    "conversation_id": session_id,
+                                }
+                                if _subtree_cost is not None:
+                                    _usage_payload["total_cost_usd"] = _subtree_cost
+                                if _usage_by_model is not None:
+                                    _usage_payload["usage_by_model"] = _usage_by_model
+                                session_stream.publish(
+                                    session_id,
+                                    SessionUsageEvent(**_usage_payload).model_dump(
+                                        exclude_none=True
+                                    ),
+                                )
+                                await asyncio.to_thread(
+                                    _publish_subtree_cost_to_ancestors,
+                                    conversation_store,
+                                    session_id,
+                                )
 
                     # Reset the turn-scoped response_id on any
                     # terminal event so it doesn't leak to the
@@ -6337,6 +6427,7 @@ async def _relay_runner_stream_once(
                                 conversation_store,
                                 session_id,
                                 elicitation_id,
+                                event.get("action"),
                             )
                         continue
                     session_stream.publish(session_id, event)
@@ -7220,7 +7311,7 @@ def _ungatewayed_auto_routing_error(ungatewayed: Sequence[str]) -> str:
         f"{verb} not AI-Gateway-backed, so the workspace router's picks would not be "
         "reachable, and this server has no built-in routing model to fall back on. Pick a "
         "harness directly, configure a server `llm:` block, or point the harness at the "
-        "workspace AI Gateway (`omnigent configure harnesses`)."
+        f"workspace AI Gateway (`{cli_invocation()} configure harnesses`)."
     )
 
 
@@ -7239,7 +7330,7 @@ def _ungatewayed_model_routing_error(harness: str) -> str:
         "picks would not be reachable from the pane, and this server has no built-in routing "
         'model to fall back on. Create the session without cost_control_mode_override="on", '
         "configure a server `llm:` block, or point the harness at the workspace AI Gateway "
-        "(`omnigent configure harnesses`)."
+        f"(`{cli_invocation()} configure harnesses`)."
     )
 
 

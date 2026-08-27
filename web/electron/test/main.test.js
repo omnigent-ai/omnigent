@@ -22,6 +22,7 @@ const path = require("node:path");
 
 const mainSource = readFileSync(path.join(__dirname, "../src/main.js"), "utf8");
 const preloadSource = readFileSync(path.join(__dirname, "../src/preload.js"), "utf8");
+const setupSource = readFileSync(path.join(__dirname, "../setup/index.html"), "utf8");
 
 // Strip block comments, then line comments (leaving `://` in URLs intact).
 const liveCode = mainSource.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
@@ -39,6 +40,45 @@ describe("setup clipboard IPC wiring", () => {
       liveCode,
       /ipcMain\.handle\("omnigent:copy-setup-text",[\s\S]{0,200}!isSetupPageSender\(event\)[\s\S]{0,300}clipboard\.writeText\(text\)/,
     );
+  });
+});
+
+describe("managed server preference wiring", () => {
+  it("exposes managed servers only through the setup-page bridge", () => {
+    assert.match(
+      preloadSource,
+      /getManagedServers:\s*\(\)\s*=>\s*ipcRenderer\.invoke\("omnigent:get-managed-servers"\)/,
+    );
+    assert.match(
+      liveCode,
+      /ipcMain\.handle\("omnigent:get-managed-servers"[\s\S]{0,180}!isSetupPageSender\(event\)[\s\S]{0,180}return managedServerUrls\(\)/,
+    );
+  });
+
+  it("preserves a managed path while still expanding bare workspace roots", () => {
+    assert.match(
+      liveCode,
+      /managedTarget\s*\?\?\s*normalizeUrl\(url\)[\s\S]{0,120}await expandDatabricksWorkspaceUrl\(normalized\)/,
+    );
+  });
+
+  it("returns managed choices in the connected-server picker", () => {
+    assert.match(
+      liveCode,
+      /ipcMain\.handle\("omnigent:get-server-picker"[\s\S]{0,500}managedServers[\s\S]{0,100}recentServers:\s*recents/,
+    );
+  });
+
+  it("allows switching only to a recent or currently managed target", () => {
+    assert.match(
+      liveCode,
+      /ipcMain\.handle\("omnigent:switch-server"[\s\S]{0,500}knownRecent[\s\S]{0,200}managedServerUrls\(\)\.includes\(url\)[\s\S]{0,150}!knownRecent\s*&&\s*!knownManaged/,
+    );
+  });
+
+  it("renders organization-provided servers separately on setup", () => {
+    assert.match(setupSource, /Provided by your organization/);
+    assert.match(setupSource, /setup\s*\.getManagedServers\(\)/);
   });
 });
 
@@ -204,10 +244,10 @@ describe("recent-server startup wiring (src/main.js)", () => {
     );
   });
 
-  it("normalizes persisted targets before returning setup-page recents", () => {
+  it("normalizes persisted targets and excludes managed origins from setup recents", () => {
     assert.match(
       liveCode,
-      /ipcMain\.handle\("omnigent:get-recent-servers"[\s\S]{0,300}return normalizeRecentServers\(loadSettings\(\)\.recent_servers\)/,
+      /ipcMain\.handle\("omnigent:get-recent-servers"[\s\S]{0,400}excludingManagedServers\(\s*normalizeRecentServers\(loadSettings\(\)\.recent_servers\),\s*managed/,
     );
   });
 });

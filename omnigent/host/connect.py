@@ -27,6 +27,7 @@ import websockets.asyncio.client
 from websockets.exceptions import ConnectionClosed, InvalidStatus, InvalidURI
 
 from omnigent._platform import IS_POSIX, WINDOWS_ENV_PASSTHROUGH
+from omnigent.cli_invocation import cli_invocation
 from omnigent.debug_logging import PRIMARY_SESSION_ID_ENV_VAR, USER_ID_ENV_VAR
 from omnigent.env_credentials import env_names_with_omnigent_prefix
 from omnigent.gateway_inference import gateway_inference_map
@@ -48,6 +49,10 @@ from omnigent.host.frames import (
     HostFsResultFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
+    HostImportedLocalSession,
+    HostImportLocalDoneFrame,
+    HostImportLocalFrame,
+    HostImportLocalSessionFrame,
     HostInstallHarnessFrame,
     HostInstallHarnessResultFrame,
     HostLaunchRunnerFrame,
@@ -1196,6 +1201,20 @@ class HostProcess:
         host_part = base.split("://", 1)[1] if "://" in base else base
         return f"{scheme}://{host_part}/v1/hosts/{self._identity.host_id}/tunnel"
 
+    def _login_hint_url(self) -> str:
+        """The server URL to show in ``omnigent login`` remedy hints.
+
+        The display form (the workspace ``/omnigent`` URL with ``?o=``
+        when known) rather than the internal API mount — it reads right
+        and round-trips through ``omnigent login`` to the same server.
+
+        :returns: The display URL, e.g.
+            ``"https://ws.databricks.com/omnigent?o=123"``.
+        """
+        from omnigent.server_url import display_server_url
+
+        return display_server_url(self._server_url)
+
     def _credentials_fix_hint(self) -> str:
         """Build the remedy for a credential failure.
 
@@ -1205,7 +1224,7 @@ class HostProcess:
             command, e.g. ``"Run `omnigent login <url>` ..."``.
         """
         return (
-            f"Run `omnigent login {self._server_url}` to authenticate (it "
+            f"Run `{cli_invocation()} login {self._login_hint_url()}` to authenticate (it "
             "detects Databricks-fronted servers and logs in to the right "
             "workspace), or check your ambient Databricks credentials."
         )
@@ -1227,7 +1246,7 @@ class HostProcess:
         """
         return (
             "If this server uses Omnigent accounts or OIDC login, run "
-            f"`omnigent login {self._server_url}` to authenticate."
+            f"`{cli_invocation()} login {self._login_hint_url()}` to authenticate."
         )
 
     def _fatal_upgrade_error(self, exc: InvalidURI | InvalidStatus) -> HostConnectError | None:
@@ -1326,7 +1345,7 @@ class HostProcess:
                         f"{self._auth_retry_streak} times in a row — this is no "
                         "longer a transient network blip. If it persists, the "
                         "stored credential is likely no longer valid: run "
-                        f"`omnigent login {self._server_url}` and restart the "
+                        f"`{cli_invocation()} login {self._login_hint_url()}` and restart the "
                         "host. Still retrying."
                     )
                     _logger.warning("%s", escalated)
@@ -1361,11 +1380,12 @@ class HostProcess:
             from omnigent.cli_auth import stored_token_status
 
             if stored_token_status(self._server_url) == "expired":
+                login_url = self._login_hint_url()
                 return HostConnectError(
                     "Connection refused (HTTP 403): your stored login "
-                    f"session for {self._server_url} has EXPIRED, so the "
+                    f"session for {login_url} has EXPIRED, so the "
                     "tunnel was dialed without credentials. Run `omnigent "
-                    f"login {self._server_url}` to re-authenticate, then "
+                    f"login {login_url}` to re-authenticate, then "
                     "restart the host."
                 )
             return HostConnectError(
@@ -1913,6 +1933,113 @@ class HostProcess:
             type=entry_type,
             canonical_path=canonical,
         )
+
+    async def _handle_import_local(
+        self, ws: websockets.asyncio.client.ClientConnection, frame: HostImportLocalFrame
+    ) -> None:
+        """Stream the host's recent local transcripts, one frame per session.
+
+        The host owns the session files (``~/.claude`` etc.). It enumerates the
+        targets ("all" merges every harness into one global recency order, top
+        ``limit`` total), then reads + normalizes each and sends it immediately
+        (``host.import_local_session``) so a large batch never rides in one frame
+        and the server persists as each arrives. A terminal ``host.import_local_done``
+        closes the stream. Sessions that fail to load are skipped; a single-harness
+        enumeration failure fails the request.
+        """
+
+        def _targets() -> tuple[list[tuple[str, str]], str | None]:
+            from omnigent.session_import.local import (
+                list_recent_local_session_ids,
+                list_recent_sessions_across_harnesses,
+            )
+            from omnigent.session_import.models import ImportSource, SessionImportNotFoundError
+
+            if frame.source == "all":
+                return list(list_recent_sessions_across_harnesses(limit=frame.limit)), None
+            source = cast(ImportSource, frame.source)
+            try:
+                ids = list_recent_local_session_ids(source, limit=frame.limit)
+            except SessionImportNotFoundError:
+                return [], None
+            except (OSError, ValueError, TypeError) as exc:
+                return [], str(exc)
+            return [(source, sid) for sid in ids], None
+
+        def _load(source: str, session_id: str) -> HostImportedLocalSession | None:
+            from omnigent.session_import.local import load_local_session
+            from omnigent.session_import.models import ImportSource, SessionImportNotFoundError
+
+            try:
+                local = load_local_session(cast(ImportSource, source), session_id)
+            except (SessionImportNotFoundError, OSError, ValueError, TypeError):
+                return None
+            return HostImportedLocalSession(
+                external_session_id=local.external_session_id,
+                workspace=local.workspace,
+                items=[
+                    {
+                        "type": item.type,
+                        "response_id": item.response_id,
+                        "data": item.data.model_dump(mode="json", exclude_none=True),
+                    }
+                    for item in local.items
+                ],
+                title=local.title,
+                source=local.source,
+            )
+
+        try:
+            targets, enum_error = await asyncio.to_thread(_targets)
+            if enum_error is not None:
+                await ws.send(
+                    encode_host_frame(
+                        HostImportLocalDoneFrame(
+                            request_id=frame.request_id, status="failed", error=enum_error
+                        )
+                    )
+                )
+                return
+
+            # Oldest first so the server imports newest last → newest sits atop the sidebar.
+            ordered = list(reversed(targets))
+            total = len(ordered)
+            load_failed = 0
+            for source, session_id in ordered:
+                session = await asyncio.to_thread(_load, source, session_id)
+                if session is None:
+                    # Unreadable/corrupt transcript: no frame to send, but report
+                    # it on the done frame so the server's counts stay honest.
+                    load_failed += 1
+                    continue
+                await ws.send(
+                    encode_host_frame(
+                        HostImportLocalSessionFrame(
+                            request_id=frame.request_id, total=total, session=session
+                        )
+                    )
+                )
+            await ws.send(
+                encode_host_frame(
+                    HostImportLocalDoneFrame(
+                        request_id=frame.request_id, status="ok", failed=load_failed
+                    )
+                )
+            )
+        except ConnectionClosed:
+            raise  # tunnel died mid-stream; _run_frame_handler owns recovery
+        except Exception as exc:
+            # Send a terminal failure so the server fails fast instead of waiting
+            # out its per-frame timeout on an unanswered request.
+            _logger.exception("import_local handler failed for source=%r", frame.source)
+            with contextlib.suppress(Exception):
+                await ws.send(
+                    encode_host_frame(
+                        HostImportLocalDoneFrame(
+                            request_id=frame.request_id, status="failed", error=str(exc)
+                        )
+                    )
+                )
 
     def _handle_list_dir(self, frame: HostListDirFrame) -> HostListDirResultFrame:
         """Handle a ``host.list_dir`` request from the server.
@@ -2887,7 +3014,7 @@ class HostProcess:
                                 f"{self._refused_streak} consecutive connection "
                                 "attempts — nothing is listening on that local "
                                 "address anymore. Start the server, then run "
-                                "`omnigent host` again."
+                                f"`{cli_invocation()} host` again."
                             ) from exc
                     else:
                         self._refused_streak = 0
@@ -3558,6 +3685,10 @@ class HostProcess:
                     error=f"model options resolution crashed for {frame.harness!r}",
                 )
             await ws.send(encode_host_frame(options_result))
+        elif isinstance(frame, HostImportLocalFrame):
+            # Streams one host.import_local_session per session (reads run off the
+            # event loop inside), then a terminal host.import_local_done.
+            await self._handle_import_local(ws, frame)
 
 
 def run_host_process(
@@ -3599,7 +3730,13 @@ def run_host_process(
     identity = load_or_create_host_identity(path)
     if not path.exists():
         print(f"Auto-generated {path} ({identity.host_id}, name: {identity.name})")
-    print(f"Connecting to {server_url} as {identity.name!r} ({identity.host_id})")
+    # User-facing: the display form (workspace /omnigent URL with ?o= when
+    # known) — the API mount is an implementation detail.
+    from omnigent.server_url import display_server_url
+
+    print(
+        f"Connecting to {display_server_url(server_url)} as {identity.name!r} ({identity.host_id})"
+    )
     # Tell the user where logs land up front — `omnigent host` used to run
     # silently, so a stuck/quiet host gave no hint where to look. Session
     # work goes to per-runner files under the runner dir (the exact
@@ -3625,5 +3762,9 @@ def run_host_process(
         # instead of the old behavior of reconnecting silently forever.
         # The dedicated code (not a bare 1) tells a supervisor this can never
         # succeed, so it stops retrying instead of looping on a bad credential.
-        print(f"\n✗ Could not connect to {server_url}.\n{exc}", file=sys.stderr, flush=True)
+        print(
+            f"\n✗ Could not connect to {display_server_url(server_url)}.\n{exc}",
+            file=sys.stderr,
+            flush=True,
+        )
         raise SystemExit(HOST_FATAL_EXIT_CODE) from exc

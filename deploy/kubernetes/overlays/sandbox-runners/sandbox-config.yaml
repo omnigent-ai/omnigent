@@ -49,5 +49,6 @@ data:
         #   - claim_name: omnigent-datasets
         #     mount_path: /mnt/datasets
         #     read_only: true        # default true; set false only for claims meant as shared scratch
+        # pod_ready_timeout_s: 300   # Pod-start wait budget in seconds (default 90); raise when image pulls run long
         # in_cluster: true           # config source: true=in-cluster SA only, false=kubeconfig only, omit=try both
         # kubeconfig: /path/to/config  # out-of-cluster kubeconfig (env: OMNIGENT_KUBERNETES_KUBECONFIG)

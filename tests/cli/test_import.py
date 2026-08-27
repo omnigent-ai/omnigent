@@ -75,6 +75,7 @@ def test_import_command_loads_local_session_and_posts_normalized_items(tmp_path:
         "source": "claude",
         "external_session_id": session_id,
         "workspace": "/repo",
+        "title": None,
         "force": False,
         "items": [
             {
@@ -364,8 +365,65 @@ def test_import_command_limits_batch_size() -> None:
     """The CLI rejects batch sizes above the safety cap."""
     result = CliRunner().invoke(
         cli,
-        ["import", "--harness", "codex", "--last", "51"],
+        ["import", "--harness", "codex", "--last", "101"],
     )
 
     assert result.exit_code == 2
-    assert "51 is not in the range 1<=x<=50" in result.output
+    assert "101 is not in the range 1<=x<=100" in result.output
+
+
+def test_import_command_all_harnesses_requires_last() -> None:
+    """``--harness all`` with a single --session is a usage error."""
+    result = CliRunner().invoke(
+        cli,
+        ["import", "--harness", "all", "--session", "some-id"],
+    )
+
+    assert result.exit_code == 2
+    assert "--harness all requires --last" in result.output
+
+
+@respx.mock
+def test_import_command_all_harnesses_spans_sources() -> None:
+    """``--harness all --last`` imports the globally-recent targets across harnesses."""
+    from omnigent.entities import NewConversationItem, parse_item_data
+    from omnigent.session_import.models import LocalSessionImport
+
+    # The cross-harness selector already merged/ranked; the CLI just loads these.
+    def fake_across(*, limit: int) -> list[tuple[str, str]]:
+        return [("codex", "x1"), ("claude", "c1")]
+
+    def fake_load(source: str, session_id: str) -> LocalSessionImport:
+        item = NewConversationItem(
+            type="message",
+            response_id="r1",
+            data=parse_item_data(
+                "message",
+                {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            ),
+        )
+        return LocalSessionImport(
+            source=source,  # type: ignore[arg-type]
+            external_session_id=session_id,
+            workspace=None,
+            items=(item,),
+        )
+
+    route = respx.post(f"{_BASE}/v1/imports").mock(
+        return_value=httpx.Response(
+            201, json={"session_id": "x", "status": "imported", "item_count": 1}
+        )
+    )
+
+    with (
+        patch("omnigent.cli._resolve_attach_server", return_value=_BASE),
+        patch("omnigent.session_import.local.list_recent_sessions_across_harnesses", fake_across),
+        patch("omnigent.session_import.local.load_local_session", fake_load),
+    ):
+        result = CliRunner().invoke(cli, ["import", "--harness", "all", "--last", "5"])
+
+    assert result.exit_code == 0, result.output
+    # One POST per returned target, each tagged with its own source.
+    posted_sources = {json.loads(call.request.content)["source"] for call in route.calls}
+    assert posted_sources == {"claude", "codex"}
+    assert "Imported: 2" in result.output

@@ -1661,6 +1661,35 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def has_other_live_session_in_workspace(
+        self,
+        *,
+        host_id: str,
+        workspace: str,
+        exclude_conversation_id: str,
+    ) -> bool:
+        """
+        Is another non-archived conversation sitting in this ``(host_id, workspace)``?
+
+        Sessions routinely share one directory: a fork reusing the source's
+        worktree, or several sessions attached to the same existing worktree
+        via the picker. Worktree cleanup must not remove a directory a live
+        session still runs in, so this is the "is it in use?" gate.
+
+        Archived sessions do not count. They run nothing, so removing the
+        directory cannot wedge them, and counting them would mean a worktree
+        shared by two forks is never cleaned up once either is archived.
+
+        :param host_id: Host owning the worktree, e.g. ``"host_a1b2..."``.
+        :param workspace: Absolute worktree path, e.g. ``"/w/feature-login"``.
+        :param exclude_conversation_id: The conversation being deleted or
+            archived — its own row must not count as "another session".
+        :returns: ``True`` when at least one other live conversation
+            references the pair, else ``False``.
+        """
+        ...
+
+    @abstractmethod
     async def delete_conversation(self, conversation_id: str) -> bool:
         """
         Delete a conversation and all its items.

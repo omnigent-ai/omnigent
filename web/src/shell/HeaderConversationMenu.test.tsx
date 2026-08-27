@@ -101,6 +101,11 @@ describe("HeaderConversationMenu", () => {
     renderMenu();
     const trigger = screen.getByRole("button", { name: "Conversation actions" });
     expect(trigger).toHaveAttribute("aria-haspopup", "menu");
+    expect(trigger).not.toHaveClass("md:opacity-0");
+    expect(trigger).not.toHaveClass("md:group-hover/breadcrumb:opacity-100");
+    expect(trigger).not.toHaveClass("md:group-focus-within/breadcrumb:opacity-100");
+    expect(trigger).not.toHaveClass("data-[state=open]:opacity-100");
+    expect(trigger.querySelector("svg")).toHaveClass("lucide-ellipsis");
 
     openMenu();
     expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([

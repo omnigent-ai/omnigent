@@ -115,6 +115,9 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   // Empty projects list → no ?project= name resolves to an id, so the project
   // prefill stays inert and the generic host/workspace defaults under test apply.
   useProjects: () => ({ data: [] }),
+  // The landing reads useConversations for hasNoSessions; stub it so it doesn't
+  // fire an authenticatedFetch that skews create-POST call assertions.
+  useConversations: () => ({ data: undefined }),
 }));
 // The harness-label catalog is not under test here. Keep it synchronous so
 // create-session fetch assertions only observe the POST/PATCH calls they own.
@@ -676,9 +679,10 @@ function host(status: "online" | "offline", i = 1): Host {
   return { host_id: `host_${i}`, name: `machine-${i}`, owner: "me", status };
 }
 
-function mockHosts(hosts: Host[]) {
+function mockHosts(hosts: Host[], queryState: Partial<ReturnType<typeof useHosts>> = {}) {
   useHostsMock.mockReturnValue({
     data: hosts,
+    ...queryState,
   } as unknown as ReturnType<typeof useHosts>);
 }
 
@@ -964,6 +968,36 @@ describe("NewChatLandingScreen", () => {
     // "click New session in the sidebar" placeholder. If it regressed to
     // the placeholder, the composer input would be absent and this fails.
     expect(screen.getByTestId("new-chat-landing-input")).toBeTruthy();
+  });
+
+  it("does not replace a missing remembered host with the first cached host", async () => {
+    localStorage.setItem("omnigent:last-host-choice", "host_2");
+    // The shared query cache can render an older host list first while a
+    // background refresh is already fetching the continuously-live VM.
+    mockHosts([host("online", 1)], { isFetching: true });
+    renderLanding();
+
+    const chip = screen.getByTestId("new-chat-landing-host-chip");
+    await waitFor(() => expect(chip).toHaveTextContent("Choose host"));
+
+    // Model the fresh /v1/hosts response. Because the stale Mac never filled
+    // selectedHostId, the remembered VM can still win when it appears.
+    mockHosts([host("online", 1), host("online", 2)], { isFetching: false });
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "rerender" },
+    });
+
+    await waitFor(() => expect(chip).toHaveTextContent("machine-2"));
+  });
+
+  it("falls back after a fresh host list confirms the remembered host is gone", async () => {
+    localStorage.setItem("omnigent:last-host-choice", "host_2");
+    mockHosts([host("online", 1)], { isFetching: false });
+    renderLanding();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip")).not.toHaveTextContent("Choose host"),
+    );
   });
 
   it("uses a home-specific focus shadow without a resting shadow or focus border", () => {
@@ -1552,6 +1586,28 @@ describe("NewChatLandingScreen", () => {
     expect(body.model_override).toBe("databricks-gpt-5-6");
     expect(body.reasoning_effort).toBeUndefined();
     expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "codex-native", true);
+  });
+
+  it("reports start-session telemetry when a create is triggered with the Enter key", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    const analytics = vi.fn();
+    setOmnigentHostConfig({ analytics });
+    renderLanding();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "run the build" },
+    });
+    // Enter creates the session without going through the Start button, so the
+    // telemetry has to fire from handleCreate — not the Button's componentId.
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), { key: "Enter" });
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    expect(analytics).toHaveBeenCalledWith({
+      type: "click",
+      componentId: "new_chat.start_session",
+      componentKind: "button",
+    });
   });
 
   it("arms codex full bypass as a plain Approval option, with no warning banner", () => {

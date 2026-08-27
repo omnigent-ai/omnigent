@@ -20,6 +20,7 @@ subprocess spawn, no real CLI.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -502,6 +503,35 @@ def test_pi_uses_anthropic_global_default(config_home: Path) -> None:
     assert env["HARNESS_PI_GATEWAY_HOST"] == "https://anthropic.example.com"
     assert env["HARNESS_PI_GATEWAY_AUTH_COMMAND"] == "printf %s sk-ant-secret"
     assert env["HARNESS_PI_MODEL"] == "claude-default-model"
+
+
+def test_pi_gateway_routing_log_reports_the_resolved_base_url(
+    config_home: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    The runner's routing log reports pi's plural ``_BASE_URLS`` key.
+
+    pi's generic-provider path emits only ``HARNESS_PI_GATEWAY_BASE_URLS``
+    (per-family JSON), so a log that reads just the singular
+    ``HARNESS_PI_GATEWAY_BASE_URL`` says ``base_url=None`` on a run that
+    routed fine. Failure means that fallback is gone and the line is
+    misleading again.
+    """
+    from omnigent.runner.app import _build_spawn_env_from_spec
+
+    _write_config(config_home, _anthropic_default_config())
+
+    with caplog.at_level(logging.INFO, logger="omnigent.runner.app"):
+        env = _build_spawn_env_from_spec(_make_spec(harness="pi"), "pi")
+
+    assert env is not None
+    assert "HARNESS_PI_GATEWAY_BASE_URL" not in env  # only the plural key is set
+    line = next(
+        rec.getMessage() for rec in caplog.records if "gateway routing" in rec.getMessage()
+    )
+    # Compare against the env value itself: the line must carry the plural
+    # key's URLs, not just some host substring.
+    assert f"base_url={env['HARNESS_PI_GATEWAY_BASE_URLS']}" in line
 
 
 def test_pi_threads_generic_openai_wire_api(config_home: Path) -> None:

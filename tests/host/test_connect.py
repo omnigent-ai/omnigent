@@ -36,6 +36,7 @@ from omnigent.host.frames import (
     HostDetectCredentialsResultFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
+    HostImportLocalFrame,
     HostInstallHarnessFrame,
     HostInstallHarnessResultFrame,
     HostLaunchRunnerFrame,
@@ -4746,3 +4747,118 @@ def test_post_connect_auth_rejection_escalates_without_going_fatal(
     assert "omnigent login http://localhost:8000" in escalated
     assert "no longer a transient network blip" in escalated
     assert host._auth_retry_streak == _AUTH_REJECT_ESCALATE_ATTEMPTS
+
+
+async def test_handle_import_local_all_streams_a_frame_per_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``source="all"`` streams one session frame each (tagged), then a done frame."""
+    from omnigent.host.frames import (
+        HostImportLocalDoneFrame,
+        HostImportLocalSessionFrame,
+        decode_host_frame,
+    )
+
+    host = _make_host_process()
+
+    # The cross-harness selector already merged/ranked; the handler just loads.
+    def _fake_across(*, limit: int) -> list[tuple[str, str]]:
+        return [("claude", "c1"), ("codex", "x1")]
+
+    def _fake_load(source: str, session_id: str) -> SimpleNamespace:
+        item = SimpleNamespace(
+            type="message",
+            response_id="r1",
+            data=SimpleNamespace(model_dump=lambda **_kw: {"role": "user"}),
+        )
+        return SimpleNamespace(
+            external_session_id=session_id,
+            workspace="/repo",
+            items=[item],
+            title=f"{source} title",
+            source=source,
+        )
+
+    monkeypatch.setattr(
+        "omnigent.session_import.local.list_recent_sessions_across_harnesses", _fake_across
+    )
+    monkeypatch.setattr("omnigent.session_import.local.load_local_session", _fake_load)
+
+    sent: list[str] = []
+
+    class _FakeWs:
+        async def send(self, text: str) -> None:
+            sent.append(text)
+
+    await host._handle_import_local(
+        _FakeWs(),  # type: ignore[arg-type]
+        HostImportLocalFrame(request_id="req_all", source="all", limit=5),
+    )
+
+    frames = [decode_host_frame(text) for text in sent]
+    session_frames = [f for f in frames if isinstance(f, HostImportLocalSessionFrame)]
+    done_frames = [f for f in frames if isinstance(f, HostImportLocalDoneFrame)]
+
+    # One frame per session, each tagged with its own source + title + the total.
+    assert {
+        (f.session.external_session_id, f.session.source, f.session.title) for f in session_frames
+    } == {("c1", "claude", "claude title"), ("x1", "codex", "codex title")}
+    assert all(f.total == 2 for f in session_frames)
+    assert len(done_frames) == 1 and done_frames[0].status == "ok"
+
+
+async def test_handle_import_local_reports_unreadable_sessions_as_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session that fails to load sends no frame but is counted on the done frame."""
+    from omnigent.host.frames import (
+        HostImportLocalDoneFrame,
+        HostImportLocalSessionFrame,
+        decode_host_frame,
+    )
+
+    host = _make_host_process()
+
+    def _fake_across(*, limit: int) -> list[tuple[str, str]]:
+        return [("claude", "good"), ("claude", "corrupt")]
+
+    def _fake_load(source: str, session_id: str) -> SimpleNamespace:
+        if session_id == "corrupt":
+            raise ValueError("truncated transcript")
+        item = SimpleNamespace(
+            type="message",
+            response_id="r1",
+            data=SimpleNamespace(model_dump=lambda **_kw: {"role": "user"}),
+        )
+        return SimpleNamespace(
+            external_session_id=session_id,
+            workspace="/repo",
+            items=[item],
+            title="ok",
+            source=source,
+        )
+
+    monkeypatch.setattr(
+        "omnigent.session_import.local.list_recent_sessions_across_harnesses", _fake_across
+    )
+    monkeypatch.setattr("omnigent.session_import.local.load_local_session", _fake_load)
+
+    sent: list[str] = []
+
+    class _FakeWs:
+        async def send(self, text: str) -> None:
+            sent.append(text)
+
+    await host._handle_import_local(
+        _FakeWs(),  # type: ignore[arg-type]
+        HostImportLocalFrame(request_id="req_fail", source="all", limit=5),
+    )
+
+    frames = [decode_host_frame(text) for text in sent]
+    session_frames = [f for f in frames if isinstance(f, HostImportLocalSessionFrame)]
+    done_frames = [f for f in frames if isinstance(f, HostImportLocalDoneFrame)]
+
+    # Only the readable session got a frame; the corrupt one is counted, not sent.
+    assert [f.session.external_session_id for f in session_frames] == ["good"]
+    assert len(done_frames) == 1
+    assert done_frames[0].status == "ok" and done_frames[0].failed == 1

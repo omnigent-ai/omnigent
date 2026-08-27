@@ -69,6 +69,7 @@ function activePayload(content: string, sel: ActiveSelection | null) {
   return {
     anchor_content: sel.anchor_content,
     occ: anchorOccurrence(content, sel.anchor_content, sel.start_index),
+    comment_id: sel.comment_id,
   };
 }
 
@@ -124,13 +125,17 @@ export function HtmlCommentViewer({
         const existing =
           offsets &&
           commentsRef.current.find(
-            (c) => c.start_index === offsets.start_index && c.end_index === offsets.end_index,
+            (c) =>
+              c.status === "draft" &&
+              c.start_index === offsets.start_index &&
+              c.end_index === offsets.end_index,
           );
         if (existing) {
           onSetActiveSelectionRef.current({
             start_index: existing.start_index,
             end_index: existing.end_index,
             anchor_content: existing.anchor_content ?? "",
+            comment_id: existing.id,
           });
           setFloating(null);
           return;
@@ -150,6 +155,7 @@ export function HtmlCommentViewer({
             start_index: c.start_index,
             end_index: c.end_index,
             anchor_content: c.anchor_content ?? "",
+            comment_id: c.id,
           });
         }
         setFloating(null);

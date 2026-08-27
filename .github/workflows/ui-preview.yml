@@ -4,6 +4,15 @@ name: UI Preview
 # The preview is ephemeral (SQLite + local artifacts) and ships no LLM/runner --
 # Omnigent runs agent turns on a runner the reviewer connects from their own
 # machine. See .github/ui-preview/README.md.
+#
+# Fork PRs are supported: the `ui-preview` label is the trust boundary. Applying
+# a label needs Triage+ on the repo, so an outside contributor cannot self-label
+# their fork PR -- only a maintainer (or a trusted bot acting after checks pass)
+# can. The build/deploy jobs run on `pull_request_target` (base-repo context,
+# with secrets) once labelled. NOTE: the label vouches for the PR as labelled; a
+# later push (`synchronize`) re-runs with the label still attached, so gate the
+# secret-bearing deploy behind a protected Environment / "require approval for
+# outside collaborators" if you need per-commit re-approval.
 
 on:
   push:
@@ -41,7 +50,6 @@ jobs:
       && github.event.action != 'closed'
       && contains(github.event.pull_request.labels.*.name, 'ui-preview')
       && github.event.pull_request.draft == false
-      && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association)
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
@@ -81,7 +89,6 @@ jobs:
         github.event.action != 'closed'
         && contains(github.event.pull_request.labels.*.name, 'ui-preview')
         && github.event.pull_request.draft == false
-        && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association)
       )
     runs-on: ubuntu-latest
     permissions:
@@ -97,7 +104,8 @@ jobs:
           # checkout v7 blocks fork PR checkout on `pull_request_target` by
           # default; opt in since this job builds the preview from fork code.
           # Safe: it has no secrets (only `contents: read`), and the
-          # author_association guard above restricts it to OWNER/MEMBER/COLLABORATOR.
+          # `ui-preview` label gate above restricts it to PRs a maintainer (or a
+          # trusted bot) has labelled -- an outside contributor cannot self-label.
           allow-unsafe-pr-checkout: true
 
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
