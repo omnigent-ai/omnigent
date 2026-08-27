@@ -275,8 +275,10 @@ def validate_manifest(manifest: ExtensionManifest) -> None:
         _validate_relative_path(
             manifest.entrypoints.browser,
             "browser entrypoint",
-            suffixes=frozenset({".js", ".mjs"}),
+            suffixes=frozenset({".js"}),
         )
+        if manifest.entrypoints.browser != "dist/extension.js":
+            raise ExtensionValidationError("browser entrypoint must be dist/extension.js")
     if manifest.entrypoints.browser_css is not None:
         if manifest.entrypoints.browser is None:
             raise ExtensionValidationError(
@@ -287,6 +289,8 @@ def validate_manifest(manifest: ExtensionManifest) -> None:
             "browser CSS entrypoint",
             suffixes=frozenset({".css"}),
         )
+        if manifest.entrypoints.browser_css != "dist/extension.css":
+            raise ExtensionValidationError("browser CSS entrypoint must be dist/extension.css")
 
     invalid_permissions = sorted(
         repr(permission)
@@ -390,8 +394,30 @@ def _diagnostic_key(entry_point: Any, used: set[str]) -> str:
     return key
 
 
-def _load_community_manifests() -> tuple[list[tuple[str, ExtensionManifest]], dict[str, str]]:
-    candidates: list[tuple[str, ExtensionManifest]] = []
+def _entry_point_asset_package(entry_point: Any) -> str | None:
+    """Return the top-level package when its declaring distribution owns it."""
+    module = getattr(entry_point, "module", None)
+    if not isinstance(module, str) or not module:
+        value = getattr(entry_point, "value", None)
+        if not isinstance(value, str) or not value:
+            return None
+        module = value.partition(":")[0]
+    package = module.split(".", 1)[0]
+    if package == "omnigent":
+        return None
+
+    dist = getattr(entry_point, "dist", None)
+    files = getattr(dist, "files", None)
+    if files is None:
+        return None
+    owned_packages = {str(file).replace("\\", "/").split("/", 1)[0] for file in files}
+    return package if package in owned_packages else None
+
+
+def _load_community_manifests() -> tuple[
+    list[tuple[str, ExtensionManifest, str | None]], dict[str, str]
+]:
+    candidates: list[tuple[str, ExtensionManifest, str | None]] = []
     errors: dict[str, str] = {}
     used_keys: set[str] = set()
     for entry_point in _entry_points():
@@ -405,7 +431,7 @@ def _load_community_manifests() -> tuple[list[tuple[str, ExtensionManifest]], di
                 )
             validate_manifest(manifest)
             _validate_distribution_metadata(entry_point, manifest)
-            candidates.append((key, manifest))
+            candidates.append((key, manifest, _entry_point_asset_package(entry_point)))
         # Entry points are an external package boundary: one plugin may raise
         # any exception, and must not prevent healthy extensions from loading.
         except Exception as exc:  # noqa: BLE001
@@ -433,7 +459,7 @@ def _validate_builtin_collisions(builtins: tuple[ExtensionManifest, ...]) -> Non
 
 def _collision_errors(
     builtins: tuple[ExtensionManifest, ...],
-    candidates: list[tuple[str, ExtensionManifest]],
+    candidates: list[tuple[str, ExtensionManifest, str | None]],
 ) -> dict[str, str]:
     builtin_claims: dict[str, str] = {}
     for manifest in builtins:
@@ -441,7 +467,7 @@ def _collision_errors(
             builtin_claims[claim] = manifest.id
 
     community_claims: dict[str, list[str]] = defaultdict(list)
-    for owner, manifest in candidates:
+    for owner, manifest, _asset_package in candidates:
         for claim in _manifest_claims(manifest):
             community_claims[claim].append(owner)
 
@@ -476,11 +502,23 @@ def _build_plugin_state() -> ExtensionPluginState:
         load_errors[owner] = error
         _logger.warning("could not register extension entry point %s (%s)", owner, error)
 
-    accepted = [manifest for owner, manifest in candidates if owner not in collisions]
-    manifests = tuple(sorted((*builtins, *accepted), key=lambda item: item.id))
+    accepted = [
+        (manifest, asset_package)
+        for owner, manifest, asset_package in candidates
+        if owner not in collisions
+    ]
+    manifests = tuple(
+        sorted((*builtins, *(item[0] for item in accepted)), key=lambda item: item.id)
+    )
+    asset_packages = {
+        manifest.id: asset_package
+        for manifest, asset_package in accepted
+        if asset_package is not None
+    }
     return ExtensionPluginState(
         manifests=manifests,
         load_errors=dict(sorted(load_errors.items())),
+        asset_packages=dict(sorted(asset_packages.items())),
     )
 
 

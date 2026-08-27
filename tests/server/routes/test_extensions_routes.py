@@ -136,26 +136,10 @@ async def test_catalog_serializes_only_public_v1_contributions(catalog_app: Fast
                 "distribution": "omnigent-acme-review",
                 "version": "1.2.0",
                 "extension_api": 1,
-                "status": "enabled",
+                "status": "unavailable",
                 "permissions": ["navigation", "storage.user"],
-                "pages": [
-                    {
-                        "id": "acme.review.dashboard",
-                        "title": "Review dashboard",
-                        "route": "dashboard",
-                        "view": "review-dashboard",
-                    }
-                ],
-                "primary_navigation": [
-                    {
-                        "id": "acme.review.primary-nav",
-                        "label": "Code Review",
-                        "page": "acme.review.dashboard",
-                        "icon": "search",
-                        "order": 350,
-                        "when": None,
-                    }
-                ],
+                "pages": [],
+                "primary_navigation": [],
                 "browser": {
                     "declared": True,
                     "has_styles": True,
@@ -186,7 +170,7 @@ async def test_empty_catalog_on_core_only_install(db_uri: str, tmp_path: Path) -
 
 
 async def test_catalog_order_is_stable(db_uri: str, tmp_path: Path) -> None:
-    zeta = _manifest("zeta.review")
+    zeta = replace(_manifest("zeta.review"), entrypoints=ExtensionEntrypoints())
     alpha_page = PageContribution(
         id="acme.review.alpha",
         title="Alpha",
@@ -201,6 +185,7 @@ async def test_catalog_order_is_stable(db_uri: str, tmp_path: Path) -> None:
     )
     alpha = replace(
         _manifest(),
+        entrypoints=ExtensionEntrypoints(),
         pages=(*_manifest().pages, alpha_page),
         primary_navigation=(*_manifest().primary_navigation, alpha_nav),
     )
@@ -244,6 +229,13 @@ async def test_diagnostics_allows_single_user_mode(catalog_app: FastAPI) -> None
             "entry_point": "broken:entry",
             "status": "rejected",
             "error": "extension import failed",
+        }
+    ]
+    assert response.json()["asset_errors"] == [
+        {
+            "extension_id": "acme.review",
+            "status": "unresolved",
+            "error": "extension 'acme.review' has no verified asset package",
         }
     ]
 
@@ -375,6 +367,7 @@ def test_extension_routes_are_mounted_before_spa_fallback(
         "/v1/extensions",
         "/v1/extensions/diagnostics",
         "/v1/extensions/{extension_id}",
+        "/v1/extensions/{extension_id}/assets/{digest}/{asset_name}",
     }
     assert expected <= set(paths)
     spa_index = next(index for index, path in enumerate(paths) if path == "")

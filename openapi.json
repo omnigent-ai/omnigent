@@ -1867,8 +1867,33 @@
         "title": "ErrorEvent",
         "type": "object"
       },
+      "ExtensionAssetErrorResponse": {
+        "description": "Concise diagnostic for one unresolved browser bundle.",
+        "properties": {
+          "error": {
+            "title": "Error",
+            "type": "string"
+          },
+          "extension_id": {
+            "title": "Extension Id",
+            "type": "string"
+          },
+          "status": {
+            "const": "unresolved",
+            "default": "unresolved",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "extension_id",
+          "error"
+        ],
+        "title": "ExtensionAssetErrorResponse",
+        "type": "object"
+      },
       "ExtensionBrowserBundleResponse": {
-        "description": "Opaque browser-bundle availability metadata.\n\nAsset URLs and content digests are populated by the asset-serving layer in\nthe next stack PR. A declared bundle is not runnable until those fields are\npresent.",
+        "description": "Opaque browser-bundle availability and content-addressed asset URLs.",
         "properties": {
           "declared": {
             "title": "Declared",
@@ -1922,6 +1947,13 @@
       "ExtensionDiagnosticsResponse": {
         "description": "Administrator view of accepted and rejected extensions.",
         "properties": {
+          "asset_errors": {
+            "items": {
+              "$ref": "#/components/schemas/ExtensionAssetErrorResponse"
+            },
+            "title": "Asset Errors",
+            "type": "array"
+          },
           "extensions": {
             "items": {
               "$ref": "#/components/schemas/ExtensionResponse"
@@ -1945,7 +1977,8 @@
         },
         "required": [
           "extensions",
-          "load_errors"
+          "load_errors",
+          "asset_errors"
         ],
         "title": "ExtensionDiagnosticsResponse",
         "type": "object"
@@ -2132,8 +2165,10 @@
             "type": "array"
           },
           "status": {
-            "const": "enabled",
-            "default": "enabled",
+            "enum": [
+              "enabled",
+              "unavailable"
+            ],
             "title": "Status",
             "type": "string"
           },
@@ -2148,6 +2183,7 @@
           "distribution",
           "version",
           "extension_api",
+          "status",
           "permissions",
           "pages",
           "primary_navigation",
@@ -8740,6 +8776,80 @@
           }
         },
         "summary": "Get Extension",
+        "tags": [
+          "extensions"
+        ]
+      }
+    },
+    "/v1/extensions/{extension_id}/assets/{digest}/{asset_name}": {
+      "get": {
+        "description": "Return a declared asset only when its bundle digest still matches.",
+        "operationId": "get_extension_asset_v1_extensions__extension_id__assets__digest___asset_name__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "extension_id",
+            "required": true,
+            "schema": {
+              "title": "Extension Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "digest",
+            "required": true,
+            "schema": {
+              "title": "Digest",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "asset_name",
+            "required": true,
+            "schema": {
+              "title": "Asset Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              },
+              "text/css": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              },
+              "text/javascript": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Extension JavaScript or CSS asset"
+          },
+          "404": {
+            "description": "Extension asset not found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Extension Asset",
         "tags": [
           "extensions"
         ]
