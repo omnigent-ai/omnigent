@@ -92,6 +92,62 @@ def test_command_palette_opens_and_switches_session(
     expect(page.get_by_test_id("command-palette-input")).to_have_count(0)
 
 
+def test_command_palette_manages_the_active_session(
+    page: Page,
+    seeded_session_pair: tuple[str, str, str],
+) -> None:
+    """Rename and archive run directly; delete remains confirmation-gated."""
+    base_url, session_a, session_b = seeded_session_pair
+    _set_title(base_url, session_a, "e2e-palette-actions-a")
+    _set_title(base_url, session_b, "e2e-palette-actions-b")
+
+    page.goto(f"{base_url}/c/{session_a}")
+    expect(page.locator(f'a[href="/c/{session_a}"]')).to_be_visible(timeout=30_000)
+
+    page.keyboard.press("ControlOrMeta+k")
+    palette = page.get_by_role("dialog", name="Command palette")
+    expect(palette.get_by_text("Rename session", exact=True)).to_be_visible()
+    expect(palette.get_by_text("Archive session", exact=True)).to_be_visible()
+    expect(palette.get_by_text("Delete session", exact=True)).to_be_visible()
+
+    palette.get_by_text("Rename session", exact=True).click()
+    rename_input = page.get_by_role("textbox", name="Session name")
+    expect(rename_input).to_have_value("e2e-palette-actions-a")
+    rename_input.fill("e2e-palette-renamed")
+    page.get_by_role("button", name="Rename", exact=True).click()
+    expect(page.get_by_text("e2e-palette-renamed", exact=True).first).to_be_visible()
+
+    page.keyboard.press("ControlOrMeta+k")
+    page.get_by_role("dialog", name="Command palette").get_by_text(
+        "Archive session", exact=True
+    ).click()
+    expect(page).to_have_url(f"{base_url}/", timeout=10_000)
+    archived = httpx.get(f"{base_url}/v1/sessions/{session_a}", timeout=10.0)
+    archived.raise_for_status()
+    assert archived.json()["archived"] is True
+
+    # With no active session, lifecycle commands disappear entirely.
+    page.keyboard.press("ControlOrMeta+k")
+    landing_palette = page.get_by_role("dialog", name="Command palette")
+    expect(landing_palette.get_by_text("Rename session", exact=True)).to_have_count(0)
+    expect(landing_palette.get_by_text("Archive session", exact=True)).to_have_count(0)
+    expect(landing_palette.get_by_text("Delete session", exact=True)).to_have_count(0)
+    page.keyboard.press("Escape")
+
+    # Delete is never immediate: cancelling its confirmation preserves session B.
+    page.goto(f"{base_url}/c/{session_b}")
+    expect(page.locator(f'a[href="/c/{session_b}"]')).to_be_visible(timeout=30_000)
+    page.keyboard.press("ControlOrMeta+k")
+    page.get_by_role("dialog", name="Command palette").get_by_text(
+        "Delete session", exact=True
+    ).click()
+    expect(page.get_by_role("heading", name="Delete conversation?")).to_be_visible()
+    page.get_by_role("button", name="Cancel", exact=True).click()
+
+    preserved = httpx.get(f"{base_url}/v1/sessions/{session_b}", timeout=10.0)
+    assert preserved.status_code == 200
+
+
 def test_command_palette_chord_with_a_terminal_focused(
     page: Page,
     terminal_session: tuple[str, str],

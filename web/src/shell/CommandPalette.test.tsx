@@ -10,8 +10,14 @@ vi.mock("@/lib/routing", () => ({
 }));
 
 const useConversations = vi.fn();
+const archiveConversation = vi.fn();
+const renameConversation = vi.fn();
+const deleteConversation = vi.fn();
 vi.mock("@/hooks/useConversations", () => ({
   useConversations: (...args: unknown[]) => useConversations(...args),
+  useArchiveConversation: () => ({ mutate: archiveConversation }),
+  useRenameConversation: () => ({ mutate: renameConversation, isPending: false }),
+  useStopAndDeleteConversation: () => ({ mutate: deleteConversation, isPending: false }),
 }));
 
 function conv(
@@ -25,6 +31,19 @@ function conv(
 
 function setSessions(sessions: ReturnType<typeof conv>[], isFetching = false) {
   useConversations.mockReturnValue({ data: { pages: [{ data: sessions }] }, isFetching });
+}
+
+function activeConversation(archived = false) {
+  return {
+    id: "active-session",
+    object: "conversation" as const,
+    title: "Active session",
+    created_at: 1_700_000_000,
+    updated_at: 1_700_000_100,
+    labels: {},
+    permission_level: 3,
+    archived,
+  };
 }
 
 /** Find a session row by its full label text even when the highlighter has
@@ -41,13 +60,15 @@ function renderPalette(overrides: Partial<ComponentProps<typeof CommandPalette>>
     onToggleRightSidebar: vi.fn(),
     ...overrides,
   };
-  render(<CommandPalette {...props} />);
-  return props;
+  return { ...props, ...render(<CommandPalette {...props} />) };
 }
 
 beforeEach(() => {
   navigate.mockClear();
   useConversations.mockReset();
+  archiveConversation.mockReset();
+  renameConversation.mockReset();
+  deleteConversation.mockReset();
   setSessions([]);
 });
 afterEach(cleanup);
@@ -333,6 +354,80 @@ describe("CommandPalette — actions", () => {
 
     expect(screen.getByText("Go to Settings")).toBeTruthy();
     expect(screen.queryByText("New chat")).toBeNull();
+  });
+
+  it("lists session actions only for an owner-managed active session", () => {
+    renderPalette();
+
+    expect(screen.queryByText("Rename session")).toBeNull();
+    expect(screen.queryByText("Archive session")).toBeNull();
+    expect(screen.queryByText("Delete session")).toBeNull();
+
+    cleanup();
+    renderPalette({ activeConversation: activeConversation() });
+
+    expect(screen.getByText("Rename session")).toBeTruthy();
+    expect(screen.getByText("Archive session")).toBeTruthy();
+    expect(screen.getByText("Delete session")).toBeTruthy();
+  });
+
+  it("offers unarchive instead of archive for an archived session", () => {
+    renderPalette({ activeConversation: activeConversation(true) });
+
+    expect(screen.getByText("Unarchive session")).toBeTruthy();
+    expect(screen.queryByText("Archive session")).toBeNull();
+  });
+
+  it.each([
+    ["retitle", "Rename session"],
+    ["clean up", "Archive session"],
+    ["destroy", "Delete session"],
+  ])("finds session actions by the %s intent keyword", (query, label) => {
+    renderPalette({ activeConversation: activeConversation() });
+
+    fireEvent.change(screen.getByTestId("command-palette-input"), {
+      target: { value: query },
+    });
+
+    expect(screen.getByText(label)).toBeTruthy();
+  });
+
+  it("archives the active session with the shared action", () => {
+    const onOpenChange = vi.fn();
+    renderPalette({ activeConversation: activeConversation(), onOpenChange });
+
+    fireEvent.click(screen.getByText("Archive session"));
+
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+    expect(archiveConversation).toHaveBeenCalledWith(
+      { id: "active-session", archived: true },
+      expect.objectContaining({ onSuccess: expect.any(Function) }),
+    );
+  });
+
+  it("opens the shared rename dialog for the active session", () => {
+    renderPalette({ activeConversation: activeConversation() });
+
+    fireEvent.click(screen.getByText("Rename session"));
+    const input = screen.getByRole("textbox", { name: "Session name" });
+    expect(input).toHaveValue("Active session");
+
+    fireEvent.change(input, { target: { value: "Updated title" } });
+    fireEvent.click(screen.getByRole("button", { name: "Rename" }));
+    expect(renameConversation).toHaveBeenCalledWith({
+      id: "active-session",
+      title: "Updated title",
+    });
+  });
+
+  it("keeps delete behind the shared confirmation dialog", () => {
+    renderPalette({ activeConversation: activeConversation() });
+
+    fireEvent.click(screen.getByText("Delete session"));
+    expect(screen.getByRole("heading", { name: "Delete conversation?" })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(deleteConversation).not.toHaveBeenCalled();
   });
 });
 
