@@ -16,7 +16,7 @@ from typing import Annotated, Any, Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, Strict, field_validator, model_validator
 
-from omnigent.entities import ConversationItem
+from omnigent.entities import MAX_LLM_TITLE_CHARS, ConversationItem
 
 # ── Shared ──────────────────────────────────────────────────────
 
@@ -2204,7 +2204,7 @@ class UpdateSessionRequest(BaseModel):
 class AutomaticSessionRenameRequest(BaseModel):
     """Request body for the current-agent automatic rename endpoint."""
 
-    title: str = Field(min_length=2, max_length=60)
+    title: str = Field(min_length=2, max_length=MAX_LLM_TITLE_CHARS)
 
     model_config = ConfigDict(extra="forbid")
 
