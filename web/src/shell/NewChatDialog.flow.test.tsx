@@ -1798,31 +1798,29 @@ describe("create-session input on touch-primary devices", () => {
     // create-session composer was an unrecoverable accidental send. On
     // coarse-pointer devices the composer must let Enter fall through to the
     // textarea's native newline; sending stays an explicit tap.
-    const matchMediaSpy = vi
-      .spyOn(window, "matchMedia")
-      .mockImplementation((query: string) =>
-        query.includes("pointer: coarse")
-          ? ({
-              matches: true,
-              media: query,
-              onchange: null,
-              addListener: () => {},
-              removeListener: () => {},
-              addEventListener: () => {},
-              removeEventListener: () => {},
-              dispatchEvent: () => false,
-            } as MediaQueryList)
-          : ({
-              matches: false,
-              media: query,
-              onchange: null,
-              addListener: () => {},
-              removeListener: () => {},
-              addEventListener: () => {},
-              removeEventListener: () => {},
-              dispatchEvent: () => false,
-            } as MediaQueryList),
-      );
+    const matchMediaSpy = vi.spyOn(window, "matchMedia").mockImplementation((query: string) =>
+      query.includes("pointer: coarse")
+        ? ({
+            matches: true,
+            media: query,
+            onchange: null,
+            addListener: () => {},
+            removeListener: () => {},
+            addEventListener: () => {},
+            removeEventListener: () => {},
+            dispatchEvent: () => false,
+          } as MediaQueryList)
+        : ({
+            matches: false,
+            media: query,
+            onchange: null,
+            addListener: () => {},
+            removeListener: () => {},
+            addEventListener: () => {},
+            removeEventListener: () => {},
+            dispatchEvent: () => false,
+          } as MediaQueryList),
+    );
 
     try {
       renderLanding();
