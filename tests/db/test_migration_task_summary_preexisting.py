@@ -114,9 +114,7 @@ def test_upgrade_with_preexisting_task_summary_column(tmp_path: Path) -> None:
 
     with engine.connect() as conn:
         surviving = conn.execute(
-            sa.text(
-                f"SELECT task_summary FROM {_METADATA_TABLE} WHERE id = :id"
-            ),
+            sa.text(f"SELECT task_summary FROM {_METADATA_TABLE} WHERE id = :id"),
             {"id": row_id},
         ).scalar_one()
     assert surviving == "Investigate auth token refresh", "existing data must survive"
