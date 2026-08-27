@@ -37,10 +37,19 @@ from omnigent.entities.session_resources import (
     get_resource_by_id,
     resolve_terminal_entry_by_resource_id,
 )
+from omnigent.entities.turn_operation import (
+    TURN_OPERATION_ACTIVE_STATES,
+    TURN_OPERATION_STATES,
+    TURN_OPERATION_TERMINAL_STATES,
+    TurnOperation,
+)
 
 __all__ = [
     "DEFAULT_ENVIRONMENT_ID",
     "NON_CONTENT_ITEM_TYPES",
+    "TURN_OPERATION_ACTIVE_STATES",
+    "TURN_OPERATION_STATES",
+    "TURN_OPERATION_TERMINAL_STATES",
     "Account",
     "AccountToken",
     "Agent",
@@ -72,6 +81,7 @@ __all__ = [
     "SlashCommandData",
     "StoredFile",
     "TerminalCommandData",
+    "TurnOperation",
     "filter_resources_by_type",
     "get_resource_by_id",
     "parse_item_data",
