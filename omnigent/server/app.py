@@ -2283,7 +2283,10 @@ def create_app(
     # (designs/server-dictation.md). Availability is probed lazily, so
     # registering unconditionally is free for servers without the extra.
     app.include_router(
-        create_dictation_router(auth_provider=auth_provider),
+        create_dictation_router(
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        ),
         prefix="/v1",
         tags=["dictation"],
     )

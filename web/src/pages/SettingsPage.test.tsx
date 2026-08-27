@@ -4,12 +4,16 @@
 // Archived sessions list (which moved here out of the sidebar).
 
 import type { ReactNode } from "react";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import type { ElectronUpdateBridge, UpdateConfig, UpdateStatus } from "@/lib/nativeBridge";
+
+let originalMediaDevices: PropertyDescriptor | undefined;
+let deviceChangeHandler: (() => void) | undefined;
+const enumerateDevices = vi.fn();
 
 const mocks = vi.hoisted(() => ({
   setTheme: vi.fn(),
@@ -203,6 +207,19 @@ beforeEach(() => {
   mocks.projectNames = [];
   mocks.hasNextPage = false;
   delete (window as unknown as Record<string, unknown>).omnigentDesktop;
+  originalMediaDevices = Object.getOwnPropertyDescriptor(navigator, "mediaDevices");
+  deviceChangeHandler = undefined;
+  enumerateDevices.mockReset().mockResolvedValue([]);
+  Object.defineProperty(navigator, "mediaDevices", {
+    configurable: true,
+    value: {
+      enumerateDevices,
+      addEventListener: vi.fn((_type: string, handler: () => void) => {
+        deviceChangeHandler = handler;
+      }),
+      removeEventListener: vi.fn(),
+    },
+  });
 });
 afterEach(() => {
   cleanup();
@@ -218,6 +235,11 @@ afterEach(() => {
     if (property.startsWith("--custom-")) document.documentElement.style.removeProperty(property);
   }
   delete (window as unknown as Record<string, unknown>).omnigentDesktop;
+  if (originalMediaDevices) {
+    Object.defineProperty(navigator, "mediaDevices", originalMediaDevices);
+  } else {
+    delete (navigator as { mediaDevices?: unknown }).mediaDevices;
+  }
 });
 
 const DEFAULT_UPDATE_CONFIG: UpdateConfig = {
@@ -260,6 +282,126 @@ function installUpdateBridge(config: UpdateConfig = DEFAULT_UPDATE_CONFIG) {
 }
 
 describe("SettingsPage", () => {
+
+  it("renders and persists device-local dictation preferences with privacy limitations", async () => {
+    enumerateDevices.mockResolvedValue([
+      { kind: "audioinput", deviceId: "mic-1", label: "Studio Mic", groupId: "", toJSON() {} },
+      { kind: "videoinput", deviceId: "camera", label: "Camera", groupId: "", toJSON() {} },
+    ]);
+    renderPage("/settings/dictation");
+
+    expect(screen.getByRole("heading", { name: "Dictation" })).toBeInTheDocument();
+    expect(screen.getByText(/stay in this browser and are not synced/)).toBeInTheDocument();
+    expect(screen.getByText(/Browser never sends audio to Omnigent's server/)).toBeInTheDocument();
+    expect(screen.getByText(/relay it to a private dictation worker/)).toBeInTheDocument();
+    expect(screen.getByText(/do not let Omnigent select the microphone/)).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText("Studio Mic")).toBeInTheDocument());
+    expect(screen.queryByText("Camera")).toBeNull();
+
+    fireEvent.change(screen.getByTestId("dictation-path-select"), { target: { value: "server" } });
+    fireEvent.change(screen.getByLabelText("Browser recognition language"), {
+      target: { value: " fr-fr " },
+    });
+    fireEvent.blur(screen.getByLabelText("Browser recognition language"));
+    fireEvent.change(screen.getByTestId("dictation-microphone-select"), {
+      target: { value: "mic-1" },
+    });
+    expect(JSON.parse(localStorage.getItem("omnigent:dictation-preferences") ?? "null")).toEqual({
+      path: "server",
+      browserLanguage: "fr-FR",
+      microphoneDeviceId: "mic-1",
+    });
+    expect(screen.getByLabelText("Browser recognition language")).toHaveValue("fr-FR");
+  });
+
+  it("keeps partial language input editable and reverts invalid values on blur", () => {
+    renderPage("/settings/dictation");
+    const language = screen.getByLabelText("Browser recognition language");
+
+    fireEvent.change(language, { target: { value: "fr-" } });
+    expect(language).toHaveValue("fr-");
+    expect(localStorage.getItem("omnigent:dictation-preferences")).toBeNull();
+
+    fireEvent.blur(language);
+    expect(language).toHaveValue("en-US");
+    expect(language).toHaveAttribute("aria-invalid", "true");
+  });
+
+  it.each(["fr-FR", "not-a-locale-"])(
+    "cancels the language draft on Escape without persisting %s",
+    (draft) => {
+      renderPage("/settings/dictation");
+      const language = screen.getByLabelText("Browser recognition language");
+
+      fireEvent.change(language, { target: { value: draft } });
+      fireEvent.keyDown(language, { key: "Escape" });
+
+      expect(language).toHaveValue("en-US");
+      expect(language).not.toHaveAttribute("aria-invalid");
+      expect(localStorage.getItem("omnigent:dictation-preferences")).toBeNull();
+    },
+  );
+
+  it("filters empty, duplicate, and default microphone device ids", async () => {
+    enumerateDevices.mockResolvedValue([
+      { kind: "audioinput", deviceId: "", label: "Hidden Mic", groupId: "", toJSON() {} },
+      {
+        kind: "audioinput",
+        deviceId: "default",
+        label: "Browser Default",
+        groupId: "",
+        toJSON() {},
+      },
+      { kind: "audioinput", deviceId: "mic-1", label: "Studio Mic", groupId: "", toJSON() {} },
+      { kind: "audioinput", deviceId: "mic-1", label: "Duplicate Mic", groupId: "", toJSON() {} },
+    ]);
+    renderPage("/settings/dictation");
+
+    expect(await screen.findByText("Studio Mic")).toBeInTheDocument();
+    expect(screen.queryByText("Hidden Mic")).toBeNull();
+    expect(screen.queryByText("Browser Default")).toBeNull();
+    expect(screen.queryByText("Duplicate Mic")).toBeNull();
+    expect(screen.getAllByText("System default")).toHaveLength(1);
+  });
+
+  it("ignores an older device enumeration that resolves after a refresh", async () => {
+    let resolveInitial: ((devices: MediaDeviceInfo[]) => void) | undefined;
+    enumerateDevices
+      .mockReturnValueOnce(
+        new Promise<MediaDeviceInfo[]>((resolve) => {
+          resolveInitial = resolve;
+        }),
+      )
+      .mockResolvedValueOnce([
+        { kind: "audioinput", deviceId: "new", label: "New Mic", groupId: "", toJSON() {} },
+      ]);
+    renderPage("/settings/dictation");
+
+    await act(async () => deviceChangeHandler?.());
+    expect(await screen.findByText("New Mic")).toBeInTheDocument();
+    await act(async () =>
+      resolveInitial?.([
+        { kind: "audioinput", deviceId: "old", label: "Old Mic", groupId: "", toJSON() {} },
+      ]),
+    );
+
+    expect(screen.getByText("New Mic")).toBeInTheDocument();
+    expect(screen.queryByText("Old Mic")).toBeNull();
+  });
+
+  it("handles failed enumeration and refreshes audio inputs on devicechange", async () => {
+    enumerateDevices.mockRejectedValueOnce(new DOMException("blocked", "NotAllowedError"));
+    renderPage("/settings/dictation");
+    await waitFor(() => expect(enumerateDevices).toHaveBeenCalledTimes(1));
+    expect(screen.getByText("System default")).toBeInTheDocument();
+
+    enumerateDevices.mockResolvedValueOnce([
+      { kind: "audioinput", deviceId: "mic-2", label: "USB Mic", groupId: "", toJSON() {} },
+    ]);
+    await act(async () => deviceChangeHandler?.());
+    expect(await screen.findByText("USB Mic")).toBeInTheDocument();
+  });
+
   it("renders the Appearance section and applies a theme on card click", () => {
     renderPage("/settings/appearance");
     expect(screen.getByRole("heading", { name: "Appearance" })).toBeInTheDocument();

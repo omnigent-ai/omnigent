@@ -8135,6 +8135,30 @@
         "summary": "Branding Logo"
       }
     },
+    "/v1/dictation/status": {
+      "get": {
+        "description": "Return authenticated, sanitized operator diagnostics.",
+        "operationId": "dictation_status_v1_dictation_status_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Dictation Status V1 Dictation Status Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Dictation Status",
+        "tags": [
+          "dictation"
+        ]
+      }
+    },
     "/v1/harnesses": {
       "get": {
         "operationId": "list_harnesses_v1_harnesses_get",
