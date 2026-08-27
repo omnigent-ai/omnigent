@@ -86,9 +86,7 @@ def test_upgrade_with_preexisting_task_summary_column(tmp_path: Path) -> None:
     # The column already exists out of band, while the ledger is still behind.
     with engine.connect() as conn:
         conn.execute(
-            sa.text(
-                f"ALTER TABLE {_METADATA_TABLE} ADD COLUMN task_summary VARCHAR(128)"
-            )
+            sa.text(f"ALTER TABLE {_METADATA_TABLE} ADD COLUMN task_summary VARCHAR(128)")
         )
         conn.commit()
     assert _task_summary_present(engine), "precondition: column present pre-upgrade"
