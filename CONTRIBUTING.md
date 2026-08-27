@@ -56,7 +56,8 @@ and [`areas.json`](.github/areas.json).
 ## Response times and inactive issues
 
 Priority determines the order in which maintainers consider work; it does not
-set a response, review, or resolution deadline. We do not currently guarantee a
+set a response, review, or resolution deadline. We are working toward published
+response targets, but they are not yet an SLA. For now, we do not guarantee a
 specific response time for issues or pull requests.
 
 Issues with no activity for 30 days are marked `stale` and close after another
