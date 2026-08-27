@@ -6,8 +6,10 @@ when a PR changes the frontend (`web/`).
 
 ## How it works
 
-1. A maintainer adds the `ui-preview` label to a PR (the workflow is gated to
-   `OWNER`/`MEMBER`/`COLLABORATOR` authors).
+1. A maintainer adds the `ui-preview` label to a PR. The label — not the PR
+   author — is the gate: the workflow deploys any labelled non-draft PR, forks
+   included, and applying the label needs Triage+ on the repo, so an outside
+   contributor can't self-label their own PR.
 2. The [UI Preview workflow](../workflows/ui-preview.yml) builds the SPA + the
    Omnigent wheels and deploys them to an ephemeral Databricks App
    (`omnigent-ui-preview-pr-<N>`).
