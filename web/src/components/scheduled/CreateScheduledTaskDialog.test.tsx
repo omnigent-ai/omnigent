@@ -383,6 +383,53 @@ describe("CreateScheduledTaskDialog edit mode", () => {
     });
   });
 
+  it("keeps the task's settings when the pick lands back on its own agent", async () => {
+    // Switching away and back is not a rebind, so the stored model/effort/
+    // permission must survive it — the clear is only justified by a real switch.
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({
+          agentId: "ag_claude_native",
+          modelOverride: "opus",
+          reasoningEffort: "high",
+          permissionMode: "acceptEdits",
+        })}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("pick-agent-polly"));
+    fireEvent.click(screen.getByTestId("pick-harness-claude"));
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const { input } = updateMutateAsync.mock.calls[0][0];
+    expect(input).not.toHaveProperty("agentId");
+    expect(input.modelOverride).toBe("opus");
+    expect(input.reasoningEffort).toBe("high");
+    expect(input.permissionMode).toBe("acceptEdits");
+  });
+
+  it("keeps the task's settings when the current agent is re-picked", async () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({
+          agentId: "ag_claude_native",
+          permissionMode: "bypassPermissions",
+        })}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("pick-harness-claude"));
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const { input } = updateMutateAsync.mock.calls[0][0];
+    expect(input).not.toHaveProperty("agentId");
+    expect(input.permissionMode).toBe("bypassPermissions");
+  });
+
   it("blocks update when the existing RRULE cannot be represented by the form", () => {
     render(
       <CreateScheduledTaskDialog

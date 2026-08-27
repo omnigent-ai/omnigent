@@ -493,6 +493,50 @@ async def test_update_agent_switch_clears_the_old_harnesss_settings(
     assert got["reasoning_effort"] is None
 
 
+async def test_update_agent_switch_revalidates_workspace_against_the_new_agent(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A switch re-checks the pinned workspace against the TARGET agent.
+
+    The ``os_env`` boundary is per-agent, so a workspace validated for the old
+    harness proves nothing about the new one. The autouse fixture stubs the
+    validator, so capture the agent it receives to pin down WHICH agent the
+    boundary check runs against — asserting a 200 alone would pass even if the
+    route kept checking the old agent.
+    """
+    from omnigent.native_coding_agents import CODEX_NATIVE_AGENT_NAME
+
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+
+    seen: list[str] = []
+
+    async def _recording_validate(**kwargs: object) -> str:
+        agent = kwargs["agent"]
+        seen.append(getattr(agent, "id", ""))
+        workspace = kwargs["workspace"]
+        assert isinstance(workspace, str)
+        return workspace
+
+    monkeypatch.setattr(
+        scheduled_tasks_routes, "validate_existing_host_workspace", _recording_validate
+    )
+
+    target = builtin_agent_id(CODEX_NATIVE_AGENT_NAME)
+    patched = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created['id']}",
+        json={"agent_id": target},
+        headers=_headers(),
+    )
+    assert patched.status_code == 200, patched.text
+    # Ran once, against the agent being switched TO — not the one being left.
+    assert seen == [target], seen
+
+
 async def test_update_agent_switch_keeps_settings_resent_in_the_same_patch(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:

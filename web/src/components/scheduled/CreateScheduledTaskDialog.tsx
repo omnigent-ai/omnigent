@@ -128,12 +128,16 @@ export function CreateScheduledTaskDialog({
 
   function handleSelectAgent(agent: AvailableAgent) {
     setPickedAgentId(agent.id);
-    // Per-agent settings don't transfer across harnesses (a model id is
-    // provider-bound; permission mode is Claude-only), so drop them with the
-    // switch — mirroring the clear the server applies on a rebind.
-    setPickedModel("");
-    setPickedEffort("");
-    setPickedPermission("");
+    // Keep the per-agent settings in step with the pick: they don't transfer
+    // across harnesses (a model id is provider-bound; permission mode is
+    // Claude-only), so a switch drops them, mirroring the server's clear on a
+    // rebind. Landing back on the task's own agent is NOT a switch, so restore
+    // the values the dialog opened with — otherwise re-picking the current agent
+    // (or switching away and back) would wipe them with no rebind to justify it.
+    const backToOriginal = isEdit && agent.id === editingTask?.agentId;
+    setPickedModel(backToOriginal ? (editingTask?.modelOverride ?? "") : "");
+    setPickedEffort(backToOriginal ? (editingTask?.reasoningEffort ?? "") : "");
+    setPickedPermission(backToOriginal ? (editingTask?.permissionMode ?? "") : "");
   }
 
   // Model + effort are surfaced only for native coding agents that carry the
