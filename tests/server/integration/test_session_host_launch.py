@@ -654,6 +654,7 @@ async def test_inline_create_harness_not_configured_stays_lenient(
         "expected_error_code",
         "launch_error",
         "expected_fragments",
+        "wrapper_command",
     ),
     [
         (
@@ -661,24 +662,35 @@ async def test_inline_create_harness_not_configured_stays_lenient(
             HARNESS_NOT_CONFIGURED_ERROR_CODE,
             _HARNESS_REFUSAL,
             ("omnigent setup", "harness 'codex' is not configured"),
+            None,
+        ),
+        (
+            HARNESS_NOT_CONFIGURED_ERROR_CODE,
+            HARNESS_NOT_CONFIGURED_ERROR_CODE,
+            "",
+            ("isaac omni setup",),
+            "isaac omni",
         ),
         (
             WORKSPACE_MISSING_ERROR_CODE,
             WORKSPACE_MISSING_ERROR_CODE,
             "runner log tail: SECRET_TOKEN\nforged workspace failure",
             ("workspace path does not exist", "/work/repo"),
+            None,
         ),
         (
             None,
             WORKSPACE_MISSING_ERROR_CODE,
             "workspace path does not exist: /work/repo",
             ("workspace path does not exist", "/work/repo"),
+            None,
         ),
         (
             "runner_crashed",
             None,
             "runner log tail: private output",
             (),
+            None,
         ),
     ],
 )
@@ -691,6 +703,7 @@ async def test_message_relaunch_deterministic_failure_persists_error_turn(
     expected_error_code: str | None,
     launch_error: str,
     expected_fragments: tuple[str, ...],
+    wrapper_command: str | None,
 ) -> None:
     """A deterministic host relaunch refusal persists user msg + error.
 
@@ -710,6 +723,9 @@ async def test_message_relaunch_deterministic_failure_persists_error_turn(
     from omnigent.runtime import set_runner_client
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes.sessions import routes_events as routes_events_module
+
+    if wrapper_command is not None:
+        monkeypatch.setenv("OMNIGENT_WRAPPER_COMMAND", wrapper_command)
 
     # Grace=0 so the message takes the relaunch branch immediately instead
     # of waiting for the (never-connecting) create-bound runner.
