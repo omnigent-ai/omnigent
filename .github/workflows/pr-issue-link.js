@@ -291,6 +291,21 @@ module.exports = async ({ context, github, core }) => {
       }
     }
 
+    // Widens the sweep's window for a one-off manual run, so PRs older than a day
+    // can be brought into the rule without hand-labeling them (which would skip
+    // the nudge and start a clock nobody was warned about). EFFECTIVE_FROM still
+    // floors it, so this can never reach the pre-rule backlog.
+    let scanHours = HOURS_TO_SCAN;
+    const rawScanHours = process.env.SCAN_HOURS;
+    if (rawScanHours !== undefined && rawScanHours !== "") {
+      const parsed = Number(rawScanHours);
+      if (Number.isFinite(parsed) && parsed > 0) {
+        scanHours = parsed;
+      } else {
+        core.warning(`SCAN_HOURS=${rawScanHours} is not a positive number; using ${HOURS_TO_SCAN}.`);
+      }
+    }
+
     // One PR when an event names it, the whole window on the cron sweep. Only the
     // fetch differs: every decision below runs identically either way, so the
     // instant path and the sweep can never reach different verdicts.
@@ -312,7 +327,7 @@ module.exports = async ({ context, github, core }) => {
       }
       console.log(`Checking #${single} (enforce=${enforce})`);
     } else {
-      const windowStart = new Date(Date.now() - HOURS_TO_SCAN * MS_PER_HOUR);
+      const windowStart = new Date(Date.now() - scanHours * MS_PER_HOUR);
       // Never look further back than the effective date, whichever is later.
       const cutoff = new Date(
         Math.max(windowStart.getTime(), new Date(EFFECTIVE_FROM).getTime())

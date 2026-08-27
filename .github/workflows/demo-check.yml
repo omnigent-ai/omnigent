@@ -16,11 +16,31 @@ name: PR Hygiene
 # issue-link check closes only over its own label, only past the deadline the nudge
 # announced, and reversibly via `/reopen`. Never checks out or runs PR code -- they
 # read PR metadata via the API using only the default-branch script.
+#
+# Two dispatch inputs exist for one-off runs: `scan_hours` widens the issue-link
+# window so PRs older than a day can be brought into the rule (hand-labeling them
+# instead would skip the nudge and start a clock nobody was warned about), and
+# `enforce: false` dry-runs the whole sweep into the step summary. Both are empty
+# on the schedule, so cron behaviour is unchanged.
 
 on:
   schedule:
     - cron: "0 * * * *"
   workflow_dispatch:
+    inputs:
+      scan_hours:
+        description: >
+          Issue-link check only: widen the scan window, in hours, for a one-off
+          backfill over PRs older than a day. The effective date still floors it.
+          Leave blank for the usual 24 hours.
+        required: false
+      enforce:
+        description: >
+          Set to "false" to dry-run the whole sweep: every verdict lands in the
+          step summary and nothing is commented, labeled, or closed. Use this to
+          review a backfill before it touches anyone.
+        required: false
+        default: "true"
 
 defaults:
   run:
@@ -48,7 +68,10 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
           sparse-checkout: .github
+      # demo-check.js has no dry-run mode, so a dry run skips it rather than pass a
+      # flag it ignores. Nothing in the sweep writes when enforce is "false".
       - name: Demo check
+        if: inputs.enforce != 'false'
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
         with:
           retries: 3
@@ -70,7 +93,10 @@ jobs:
         if: always()
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
         env:
-          ENFORCE: "true"
+          # Inputs are empty on the cron schedule, so both fall back to the
+          # scheduled behaviour: enforcing, over the usual 24-hour window.
+          ENFORCE: ${{ inputs.enforce || 'true' }}
+          SCAN_HOURS: ${{ inputs.scan_hours }}
           CLOSE_ENFORCE: "false"
           LIMIT: "25"
         with:
@@ -86,7 +112,7 @@ jobs:
         if: always()
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
         env:
-          ENFORCE: "true"
+          ENFORCE: ${{ inputs.enforce || 'true' }}
         with:
           retries: 3
           script: |

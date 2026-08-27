@@ -295,6 +295,26 @@ for (const tracked of ["Bug fix", "Feature", "UI / frontend change"]) {
     assert.ok(asked >= floor, "scan cutoff never predates the effective date");
   }
 
+  // SCAN_HOURS widens the window for a one-off backfill, but never past the
+  // effective date: the pre-rule backlog stays unreachable however wide it is set.
+  {
+    const { queries } = await run([pr({ number: 190 })], { env: { SCAN_HOURS: "100000" } });
+    const floor = new Date(script.EFFECTIVE_FROM).getTime();
+    const asked = new Date(/created:>(\S+)/.exec(queries[0])[1]).getTime();
+    assert.strictEqual(asked, floor, "a wide window clamps to the effective date");
+  }
+
+  // A malformed SCAN_HOURS falls back to the default window rather than widening.
+  {
+    const { queries, warnings } = await run([pr({ number: 191 })], {
+      env: { SCAN_HOURS: "lots" },
+    });
+    const dayAgo = Date.now() - 25 * 60 * 60 * 1000;
+    const asked = new Date(/created:>(\S+)/.exec(queries[0])[1]).getTime();
+    assert.ok(asked > dayAgo, "malformed SCAN_HOURS keeps the 24-hour window");
+    assert.ok(warnings.some((w) => /SCAN_HOURS=lots/.test(w)));
+  }
+
   // Dry run (the default) must not comment or label.
   {
     const { commented, labeled } = await run([pr({ number: 20 })]);
