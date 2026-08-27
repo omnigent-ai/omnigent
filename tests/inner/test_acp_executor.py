@@ -250,7 +250,8 @@ def test_tool_call_and_update_emit_cards() -> None:
     assert len(started) == 1
     req = started[0]
     assert isinstance(req, ToolCallRequest)
-    assert req.name == "shell" and req.metadata == {"call_id": "c1"}
+    assert req.name == "shell"
+    assert req.metadata == {"call_id": "c1", "internally_executed": True}
     assert ex._tool_names["c1"] == "shell"
 
     done = ex._handle_session_update(
@@ -472,6 +473,161 @@ def test_claimed_completion_frame_emits_no_spurious_parent_card() -> None:
     )
     assert [type(e) for e in events] == [SubAgentCompleted]
     assert not any(isinstance(e, ToolCallComplete) for e in events)
+
+
+# ---------------------------------------------------------------------------
+# Agent-native vs MCP-bridge classification
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("update", "is_bridge"),
+    [
+        ({"title": "sys_session_get_info", "rawInput": {}}, True),
+        (
+            {"title": "Session info", "rawInput": {"tool": "mcp_omnigent_sys_session_get_info"}},
+            True,
+        ),
+        (
+            {"title": "Session info", "rawInput": {"tool": "mcp__omnigent__sys_session_get_info"}},
+            True,
+        ),
+        (
+            {
+                "title": "omnigent: sys session get info",
+                "rawInput": {"session_id": ""},
+                "_meta": {"goose": {"toolCall": {"toolName": "omnigent__sys_session_get_info"}}},
+            },
+            True,
+        ),
+        ({"title": "GitHub comments", "rawInput": {"tool": "github__list_comments"}}, False),
+        ({"title": "shell: git status", "rawInput": {"command": "git status"}}, False),
+    ],
+)
+def test_only_advertised_bridge_aliases_enter_dispatch_correlation(
+    update: dict[str, object], is_bridge: bool
+) -> None:
+    """A call the bridge never advertised must not claim a dispatch slot."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._bridge_tool_aliases = frozenset(
+        {
+            "sys_session_get_info",
+            "mcp_omnigent_sys_session_get_info",
+            "mcp__omnigent__sys_session_get_info",
+            "omnigent__sys_session_get_info",
+        }
+    )
+
+    event = ex._handle_session_update(
+        {"sessionUpdate": "tool_call", "toolCallId": "c1", **update}
+    )[0]
+
+    assert isinstance(event, ToolCallRequest)
+    assert ("internally_executed" not in event.metadata) is is_bridge
+
+
+def test_no_advertised_bridge_classifies_every_call_as_native() -> None:
+    """Tools alone are not enough: without a served relay there is no bridge."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._omnigent_tools = [{"name": "sys_session_get_info"}]
+
+    event = ex._handle_session_update(
+        {"sessionUpdate": "tool_call", "toolCallId": "c1", "title": "sys_session_get_info"}
+    )[0]
+
+    assert isinstance(event, ToolCallRequest)
+    assert event.metadata == {"call_id": "c1", "internally_executed": True}
+
+
+@pytest.mark.asyncio
+async def test_bridge_aliases_hold_until_the_session_resets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The agent keeps the tools sent at session/new, so classify against those."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._rpc = AsyncMock(return_value={"result": {"sessionId": "s1"}})  # type: ignore[method-assign]
+    monkeypatch.setattr(ex._mcp, "session_new_servers", lambda **_: [{"name": "omnigent"}])
+
+    ex._omnigent_tools = [{"name": "sys_session_get_info"}]
+    await ex._ensure_session()
+    ex._omnigent_tools = [{"name": "web_search"}]
+
+    assert "sys_session_get_info" in ex._bridge_tool_aliases
+    assert "web_search" not in ex._bridge_tool_aliases
+
+    ex._reset_session_state()
+    ex._rpc = AsyncMock(return_value={"result": {"sessionId": "s2"}})  # type: ignore[method-assign]
+    await ex._ensure_session()
+
+    assert "web_search" in ex._bridge_tool_aliases
+    assert "sys_session_get_info" not in ex._bridge_tool_aliases
+
+
+def test_session_reset_drops_in_flight_tool_state() -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "pending",
+            "title": "shell",
+            "rawInput": {"command": "sleep 10"},
+        }
+    )
+
+    ex._reset_session_state()
+
+    assert ex._tool_names == {}
+    assert ex._tool_inputs == {}
+    assert ex._bridge_tool_aliases == frozenset()
+
+
+class _RecordingCtx:
+    """Minimal ``TurnContext`` stand-in: the surface the adapter touches.
+
+    A typed stub rather than MagicMock, so a call to a method that does not
+    exist fails loud instead of silently returning another mock.
+    """
+
+    def __init__(self, response_id: str = "resp_acp") -> None:
+        self.response_id = response_id
+        self.emitted: list[object] = []
+
+    def emit(self, event: object) -> None:
+        self.emitted.append(event)
+
+
+@pytest.mark.asyncio
+async def test_native_call_before_a_bridge_call_keeps_each_call_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reported defect: a native call ahead of a bridge call stole its id."""
+    import omnigent.runtime.harnesses._executor_adapter as adapter_module
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._bridge_tool_aliases = frozenset({"sys_session_get_info"})
+    adapter = ExecutorAdapter(executor_factory=lambda: ex)
+    ctx = _RecordingCtx()
+    adapter._current_ctx = ctx  # type: ignore[assignment]
+    adapter._current_agent = "test-model"
+
+    for call_id, title in (("native-1", "terminal: date"), ("bridge-1", "sys_session_get_info")):
+        for event in ex._handle_session_update(
+            {"sessionUpdate": "tool_call", "toolCallId": call_id, "title": title, "rawInput": {}}
+        ):
+            adapter._translate_event(event, ctx)  # type: ignore[arg-type]
+
+    dispatched: dict[str, str] = {}
+
+    async def fake_bridge(*_args: object, call_id: str, **_kw: object) -> dict[str, object]:
+        dispatched["call_id"] = call_id
+        return {"ok": True}
+
+    monkeypatch.setattr(adapter_module, "_bridge_one_dispatch", fake_bridge)
+    await adapter._stable_tool_executor("sys_session_get_info", {})
+
+    assert dispatched["call_id"] == "bridge-1"
+    assert list(adapter._pending_mcp_call_ids) == []
 
 
 # ---------------------------------------------------------------------------
