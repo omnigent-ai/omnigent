@@ -162,3 +162,33 @@ def test_excerpt_keeps_the_tail_of_an_oversized_single_line() -> None:
     )
     assert len(excerpt) == 20
     assert excerpt.endswith("END")
+
+
+# ── wire limits ──────────────────────────────────────────
+
+
+def test_wire_limits_match_the_service_caps() -> None:
+    """
+    The request schemas and the service caps must agree.
+
+    The server builds an excerpt up to ``SIDE_QUESTION_MAX_EXCERPT_CHARS``
+    and posts it to the runner, where pydantic validates the field. If a
+    cap grows past the schema's ``max_length``, every side question fails
+    validation instead of returning an answer, so the two move together.
+    """
+    from omnigent.runner.side_questions.service import (
+        SIDE_QUESTION_MAX_EXCERPT_CHARS,
+        SIDE_QUESTION_MAX_QUESTION_CHARS,
+    )
+    from omnigent.server.schemas import (
+        RunnerSideQuestionRequest,
+        SessionSideQuestionRequest,
+    )
+
+    def _max_length(model: type, field: str) -> int:
+        constraints = model.model_fields[field].metadata  # type: ignore[attr-defined]
+        return next(c.max_length for c in constraints if hasattr(c, "max_length"))
+
+    assert _max_length(RunnerSideQuestionRequest, "excerpt") == SIDE_QUESTION_MAX_EXCERPT_CHARS
+    assert _max_length(RunnerSideQuestionRequest, "question") == SIDE_QUESTION_MAX_QUESTION_CHARS
+    assert _max_length(SessionSideQuestionRequest, "question") == SIDE_QUESTION_MAX_QUESTION_CHARS

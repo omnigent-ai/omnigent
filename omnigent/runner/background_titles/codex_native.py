@@ -14,7 +14,7 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
     return await run_isolated_codex_exec(
         background_title_prompt(context),
         model_override=context.model_override,
-        # Thread the spec so a title exec honors spec-level auth too (#2744).
+        # The spec may carry the only credential, so a title exec needs it too.
         session_spec=context.session_spec,
         temp_dir_prefix="omnigent-codex-title-",
     )

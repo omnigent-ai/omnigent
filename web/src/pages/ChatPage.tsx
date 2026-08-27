@@ -4711,7 +4711,16 @@ export function Composer({
    * Clears the input and error state on success (or sets an error on
    * bad usage). Returns ``true`` when the command was recognised.
    */
-  const executeSlashCommand = (cmd: string, arg: string): boolean => {
+  /**
+   * Run a built-in slash command.
+   *
+   * ``arg`` is the first whitespace-delimited token, which is all the
+   * single-token built-ins (``/effort high``, ``/model opus``) need.
+   * ``rest`` is everything after the command name, for commands whose
+   * argument is free text — ``/btw`` is the only one today. It defaults
+   * to ``arg`` so callers that have no remainder keep working.
+   */
+  const executeSlashCommand = (cmd: string, arg: string, rest: string = arg): boolean => {
     switch (cmd) {
       case "/compact":
         if (!showCompact) {
@@ -4784,7 +4793,8 @@ export function Composer({
         return true;
       }
       case "/btw": {
-        const question = arg.trim();
+        // A side question is free text, so it takes the whole remainder.
+        const question = rest.trim();
         if (!question) {
           setCommandError("Usage: /btw <your question>");
           return true;
@@ -4963,6 +4973,8 @@ export function Composer({
       const parts = trimmed.split(/\s+/);
       const cmd = parts[0].toLowerCase();
       const arg = parts[1] ?? "";
+      // Everything after the command name, for free-text arguments.
+      const rest = trimmed.slice(parts[0].length).trim();
       // Bare "/model" when the session has a switchable model (claude-native):
       // sent as plaintext it would open Claude's interactive selector inside the
       // vendor TUI, which the web UI can't render — the session just blocks. Open
@@ -4983,7 +4995,7 @@ export function Composer({
         return;
       }
       if (cmd in BUILTIN_SLASH_COMMANDS && cmd in slashCommands) {
-        executeSlashCommand(cmd, arg);
+        executeSlashCommand(cmd, arg, rest);
         return;
       }
       // Known skill on an in-process session: send a `slash_command` event

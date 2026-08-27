@@ -391,6 +391,7 @@ describe("Composer slash-command submit routing", () => {
   // the real action after each test so the mock can't bleed into later
   // tests in this file (zustand state is module-global).
   const realSetModel = useChatStore.getState().setModel;
+  const realAskSideQuestion = useChatStore.getState().askSideQuestion;
 
   beforeEach(() => {
     useChatStore.setState({
@@ -405,7 +406,11 @@ describe("Composer slash-command submit routing", () => {
   afterEach(() => {
     cleanup();
     vi.restoreAllMocks();
-    useChatStore.setState({ setModel: realSetModel, sessionHarness: null });
+    useChatStore.setState({
+      setModel: realSetModel,
+      sessionHarness: null,
+      askSideQuestion: realAskSideQuestion,
+    });
   });
 
   it("routes a known skill through onSendSlashCommand with parsed args", () => {
@@ -422,6 +427,32 @@ describe("Composer slash-command submit routing", () => {
     expect(onSendSlashCommand).toHaveBeenCalledWith("deslop", "fix the bug");
     // It's a slash_command event, NOT a plaintext message.
     expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("sends the whole /btw question, not just its first word", async () => {
+    // Built-ins historically took a single-token argument (``/effort high``),
+    // so the submit path passed only ``parts[1]``. A side question is free
+    // text: truncating it to "which" sends the harness a question nobody
+    // asked, and the answer reads as a non-sequitur.
+    const askSideQuestion = vi.fn().mockResolvedValue({ status: "answered" });
+    useChatStore.setState({ askSideQuestion });
+    render(<Composer {...composerProps()} />);
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "/btw which harness is this session on?" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+
+    expect(askSideQuestion).toHaveBeenCalledWith("which harness is this session on?");
+  });
+
+  it("reports usage for a bare /btw instead of asking an empty question", () => {
+    const askSideQuestion = vi.fn().mockResolvedValue({ status: "answered" });
+    useChatStore.setState({ askSideQuestion });
+    render(<Composer {...composerProps()} />);
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "/btw" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+
+    expect(askSideQuestion).not.toHaveBeenCalled();
   });
 
   it("routes a known skill whose args carry slashes (paths, URLs)", () => {

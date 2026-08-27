@@ -20,10 +20,8 @@ from omnigent.runner.isolated_inference import (
 if TYPE_CHECKING:
     from omnigent.spec.types import AgentSpec
 
-# The excerpt is the expensive half of the prompt and the half that grows
-# without bound, so it gets the cap. 24k characters is roughly 6k tokens —
-# enough recent context to answer "what were we doing", small enough to
-# stay cheap on a long session.
+# The excerpt is the half of the prompt that grows without bound, so it
+# takes the cap. 24k characters is roughly 6k tokens.
 SIDE_QUESTION_MAX_EXCERPT_CHARS = 24_000
 SIDE_QUESTION_MAX_QUESTION_CHARS = 4_000
 SIDE_QUESTION_MAX_OUTPUT_TOKENS = 1_024
