@@ -22,7 +22,7 @@ Codex executor surfaces its internally-executed shell as an *observational*
 :class:`ToolCallRequest` named ``"shell"`` with ``internally_executed=True``
 (``omnigent/inner/codex_executor.py::_codex_builtin_tool_request``). ``"shell"``
 is **not** in ``omnigent/policies/builtins/_shell.py::SHELL_TOOLS`` (which is
-``{sys_os_shell, Bash, bash, Shell, terminal, developer__shell}``), so when that
+``{sys_os_shell, Bash, bash, Shell, terminal, developer__shell, shell}``), so when that
 observed name is run through the exact runner-side gate the runner builds from
 the spec (:class:`omnigent.runner.policy.RunnerToolPolicyGate`), ``blast_radius``
 returns ALLOW for a ``git push --force``. (In production these
