@@ -4122,6 +4122,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
                 is not None
             )
+
     def restart_conversation(
         self,
         conversation_id: str,
