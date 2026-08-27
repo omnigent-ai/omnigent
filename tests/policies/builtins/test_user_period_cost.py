@@ -23,7 +23,7 @@ def _event(
     return {
         "type": "request",
         "context": {
-            "user_period_cost": period_cost or [],
+            "user_daily_cost": period_cost or [],
             "usage": usage or {},
             "model": model,
             "harness": harness,
@@ -325,7 +325,7 @@ class TestToolCallPhase:
         event = {
             "type": "tool_call",
             "context": {
-                "user_period_cost": [
+                "user_daily_cost": [
                     {
                         "cost_usd": 150.0,
                         "ask_approved_usd": 0.0,
@@ -351,7 +351,7 @@ class TestToolCallPhase:
         event = {
             "type": "response",  # Not gated
             "context": {
-                "user_period_cost": [
+                "user_daily_cost": [
                     {
                         "cost_usd": 150.0,
                         "ask_approved_usd": 0.0,
