@@ -803,10 +803,26 @@ class HarnessProcessManager:
                 await self._close_entry(entry)
                 entry = None
                 respawn_reason = "harness_respawn_agent_switch"
-            if entry is not None and harness not in _LIVE_MODEL_CONFIG_HARNESSES:
+            if (
+                entry is not None
+                and harness != "any"
+                and harness not in _LIVE_MODEL_CONFIG_HARNESSES
+            ):
                 # Most harnesses bake the model into the subprocess env. A
                 # later concrete model change must respawn them; ACP harnesses
                 # in the live-config set instead apply the request in-session.
+                #
+                # ``harness != "any"`` mirrors the harness-mismatch guard
+                # above: ``"any"`` is the harness-agnostic sentinel steering /
+                # cancel / interrupt callers pass to reach the live
+                # subprocess, not a real harness. Today ``_model_env_key("any")``
+                # resolves to a key no spawn-env builder ever sets, so
+                # ``requested_model`` is always ``None`` and this branch is a
+                # no-op for ``"any"`` by accident. Guard explicitly so a
+                # future change to the lookup key (e.g. resolving through
+                # ``entry.harness``) can't turn a harmless steering call into
+                # a respawn — or, past the ``entry is None`` check below, a
+                # ``NoLiveHarnessError`` crash.
                 requested_model = (env or {}).get(_model_env_key(harness))
                 if requested_model is not None and requested_model != entry.model:
                     _logger.info(
