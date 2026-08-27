@@ -33,14 +33,12 @@ def _clear_env(monkeypatch: pytest.MonkeyPatch) -> None:
         dl.ENDPOINT_ENV_VAR,
         dl.USER_ID_ENV_VAR,
         dl.PRIMARY_SESSION_ID_ENV_VAR,
-        dl.ORIGIN_WORKSPACE_ID_ENV_VAR,
-        dl.APP_NAME_ENV_VAR,
-        dl.SERVER_URL_ENV_VAR,
+        *dl.SERVER_URL_ENVS,
     ):
         monkeypatch.delenv(name, raising=False)
-    # _process_identity is a process constant and lru-cached; reset it between
-    # tests so one test's env can't leak through the cache into the next.
-    dl._process_identity.cache_clear()
+    # _server_url is a process constant and lru-cached; reset it between tests so
+    # one test's env can't leak through the cache into the next.
+    dl._server_url.cache_clear()
 
 
 def test_disabled_without_env() -> None:
@@ -112,8 +110,7 @@ def test_record_to_row_shape_and_coercions() -> None:
         "attributes",
         "log_id",
         "user_id",
-        "workspace_id",
-        "app_name",
+        "server_url",
     }
 
 
@@ -334,137 +331,59 @@ def test_attach_suppresses_handler_init_failure(
     assert dl._active_sink is None
 
 
-# ── origin workspace_id / app_name resolution ───────────────────────────────
+# ── server_url (origin deployment) resolution ────────────────────────────────
 
 
-def test_parse_app_host_basic() -> None:
-    assert dl._parse_databricks_app_host(
-        "https://omnigents-3272836215725701.aws.databricksapps.com/c/abc123"
-    ) == ("omnigents", "3272836215725701")
-
-
-def test_parse_app_host_hyphenated_app_name() -> None:
-    # The app name may contain hyphens; only the final numeric segment is the
-    # workspace id, so the split must be on the LAST hyphen.
-    assert dl._parse_databricks_app_host(
-        "https://my-cool-app-3272836215725701.aws.databricksapps.com"
-    ) == ("my-cool-app", "3272836215725701")
-
-
-def test_parse_app_host_non_apps_urls_yield_nothing() -> None:
-    # Managed service (dbc-<hash> host), localhost, a custom domain, and empty
-    # input carry no parseable Databricks Apps identity.
-    assert dl._parse_databricks_app_host(
-        "https://dbc-a5d4177a-49dc.cloud.databricks.com/omnigent"
-    ) == (None, None)
-    assert dl._parse_databricks_app_host("http://localhost:8000") == (None, None)
-    assert dl._parse_databricks_app_host("https://omnigent.example.com") == (None, None)
-    assert dl._parse_databricks_app_host(None) == (None, None)
-    assert dl._parse_databricks_app_host("") == (None, None)
-
-
-def test_parse_app_host_rejects_malformed_labels() -> None:
-    # A databricksapps host with no hyphen, or a non-numeric final segment, is
-    # not a valid <app_name>-<workspace_id> label.
-    assert dl._parse_databricks_app_host("https://noworkspaceid.aws.databricksapps.com") == (
-        None,
-        None,
-    )
-    assert dl._parse_databricks_app_host("https://app-notanumber.aws.databricksapps.com") == (
-        None,
-        None,
-    )
-
-
-def test_process_identity_from_databricks_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Databricks App: the platform-injected env is authoritative.
-    monkeypatch.setenv(dl.ORIGIN_WORKSPACE_ID_ENV_VAR, "111222333")
-    monkeypatch.setenv(dl.APP_NAME_ENV_VAR, "omnigents")
-    dl._process_identity.cache_clear()
-    assert dl._process_identity() == ("111222333", "omnigents")
-
-
-def test_process_identity_from_server_url(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Runner/host connected to a Databricks App: both parsed from the server URL.
+def test_server_url_from_runner_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The runner sets RUNNER_SERVER_URL; it's read verbatim.
     monkeypatch.setenv(
-        dl.SERVER_URL_ENV_VAR, "https://omnigents-3272836215725701.aws.databricksapps.com"
+        "RUNNER_SERVER_URL", "https://omnigents-3272836215725701.aws.databricksapps.com"
     )
-    dl._process_identity.cache_clear()
-    assert dl._process_identity() == ("3272836215725701", "omnigents")
+    dl._server_url.cache_clear()
+    assert dl._server_url() == "https://omnigents-3272836215725701.aws.databricksapps.com"
 
 
-def test_process_identity_env_beats_url(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Explicit DATABRICKS_* env wins over a (possibly divergent) URL parse.
-    monkeypatch.setenv(dl.ORIGIN_WORKSPACE_ID_ENV_VAR, "999")
-    monkeypatch.setenv(dl.APP_NAME_ENV_VAR, "envapp")
-    monkeypatch.setenv(dl.SERVER_URL_ENV_VAR, "https://urlapp-111.aws.databricksapps.com")
-    dl._process_identity.cache_clear()
-    assert dl._process_identity() == ("999", "envapp")
-
-
-def test_process_identity_managed_service_is_none(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Managed service: no DATABRICKS_* env and the server URL is a dbc-<hash> host,
-    # not an Apps URL. Identity arrives per-record, so the process constant is empty.
+def test_server_url_from_harness_hook_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Harness subprocesses see _OMNIGENT_SERVER_URL instead.
     monkeypatch.setenv(
-        dl.SERVER_URL_ENV_VAR, "https://dbc-a5d4177a-49dc.cloud.databricks.com/omnigent"
+        "_OMNIGENT_SERVER_URL", "https://dbc-a5d4177a-49dc.cloud.databricks.com/omnigent"
     )
-    dl._process_identity.cache_clear()
-    assert dl._process_identity() == (None, None)
+    dl._server_url.cache_clear()
+    assert dl._server_url() == "https://dbc-a5d4177a-49dc.cloud.databricks.com/omnigent"
 
 
-def test_process_identity_unset_is_none() -> None:
-    # OSS / local: nothing set anywhere.
-    dl._process_identity.cache_clear()
-    assert dl._process_identity() == (None, None)
+def test_server_url_prefers_runner_over_hook(monkeypatch: pytest.MonkeyPatch) -> None:
+    # RUNNER_SERVER_URL takes precedence when both are set.
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://runner.example.com")
+    monkeypatch.setenv("_OMNIGENT_SERVER_URL", "https://hook.example.com")
+    dl._server_url.cache_clear()
+    assert dl._server_url() == "https://runner.example.com"
 
 
-def test_record_to_row_prefers_record_workspace_id(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The managed service stamps record.workspace_id per request; it wins over
-    # the process-constant fallback.
-    monkeypatch.setenv(dl.ORIGIN_WORKSPACE_ID_ENV_VAR, "process999")
-    dl._process_identity.cache_clear()
-    record = logging.LogRecord("omnigent.server", logging.INFO, __file__, 1, "hi", (), None)
-    record.workspace_id = "perrequest111"
-    assert dl.record_to_row(record, source="server")["workspace_id"] == "perrequest111"
+def test_server_url_blank_is_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An empty/whitespace value is treated as unset (falls through to None).
+    monkeypatch.setenv("RUNNER_SERVER_URL", "   ")
+    dl._server_url.cache_clear()
+    assert dl._server_url() is None
 
 
-def test_record_to_row_blank_record_workspace_id_falls_back(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Outside a request the managed filter sets record.workspace_id = "" — an
-    # empty value must fall through to the process constant, not win.
-    monkeypatch.setenv(dl.ORIGIN_WORKSPACE_ID_ENV_VAR, "process999")
-    dl._process_identity.cache_clear()
-    record = logging.LogRecord("omnigent.server", logging.INFO, __file__, 1, "hi", (), None)
-    record.workspace_id = ""
-    assert dl.record_to_row(record, source="server")["workspace_id"] == "process999"
+def test_server_url_unset_is_none() -> None:
+    # Server process / OSS / local: nothing set → None.
+    dl._server_url.cache_clear()
+    assert dl._server_url() is None
 
 
-def test_record_to_row_origin_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Databricks App: both columns come from the process constant when the record
-    # carries none.
-    monkeypatch.setenv(dl.ORIGIN_WORKSPACE_ID_ENV_VAR, "3272836215725701")
-    monkeypatch.setenv(dl.APP_NAME_ENV_VAR, "omnigents")
-    dl._process_identity.cache_clear()
-    record = logging.LogRecord("omnigent.server", logging.INFO, __file__, 1, "hi", (), None)
-    row = dl.record_to_row(record, source="server")
-    assert row["workspace_id"] == "3272836215725701"
-    assert row["app_name"] == "omnigents"
+def test_record_to_row_server_url_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(
+        "RUNNER_SERVER_URL", "https://omnigents-3272836215725701.aws.databricksapps.com"
+    )
+    dl._server_url.cache_clear()
+    record = logging.LogRecord("omnigent.runner", logging.INFO, __file__, 1, "hi", (), None)
+    row = dl.record_to_row(record, source="runner")
+    assert row["server_url"] == "https://omnigents-3272836215725701.aws.databricksapps.com"
 
 
-def test_record_to_row_app_name_null_on_managed() -> None:
-    # Managed service: workspace_id arrives per-record, but there is no per-request
-    # app_name and no process constant, so app_name is null.
-    record = logging.LogRecord("omnigent.server", logging.INFO, __file__, 1, "hi", (), None)
-    record.workspace_id = "3272836215725701"
-    row = dl.record_to_row(record, source="server")
-    assert row["workspace_id"] == "3272836215725701"
-    assert row["app_name"] is None
-
-
-def test_record_to_row_origin_columns_null_on_oss() -> None:
-    # OSS / local: nothing set anywhere → both columns null.
+def test_record_to_row_server_url_null_when_unset() -> None:
     record = logging.LogRecord("omnigent", logging.INFO, __file__, 1, "hi", (), None)
-    row = dl.record_to_row(record, source="host")
-    assert row["workspace_id"] is None
-    assert row["app_name"] is None
+    row = dl.record_to_row(record, source="server")
+    assert row["server_url"] is None

@@ -58,15 +58,12 @@ PRIMARY_SESSION_ID_ENV_VAR = "OMNIGENT_RUNNER_PRIMARY_SESSION_ID"
 USER_ID_ENV_VAR = "OMNIGENT_USER_ID"
 _user_id_var: ContextVar[str | None] = ContextVar("omnigent_debug_user_id", default=None)
 
-# Origin deployment identity for the workspace_id/app_name columns. The
-# multi-tenant managed service stamps a per-request ``record.workspace_id`` (via
-# its logging ContextFilter), so the sink prefers that; the values below are the
-# process-constant fallback for single-tenant deployments -- the DATABRICKS_* env
-# a Databricks App injects, else parsed from the server URL a runner/host
-# connected to an App carries. All absent on OSS/local (columns stay null).
-ORIGIN_WORKSPACE_ID_ENV_VAR = "DATABRICKS_WORKSPACE_ID"
-APP_NAME_ENV_VAR = "DATABRICKS_APP_NAME"
-SERVER_URL_ENV_VAR = "RUNNER_SERVER_URL"
+# Origin deployment: the Omnigent server URL this process is bound to, logged so
+# an error dashboard can group by deployment. On Databricks Apps the URL already
+# embeds the workspace id + app name, so those can be split out at query time.
+# Read from the runner's ``RUNNER_SERVER_URL`` or a harness subprocess's
+# ``_OMNIGENT_SERVER_URL``; null on the server process itself and on OSS/local.
+SERVER_URL_ENVS = ("RUNNER_SERVER_URL", "_OMNIGENT_SERVER_URL")
 
 # Batching / delivery defaults.
 _BATCH_MAX_RECORDS = 100
@@ -234,53 +231,19 @@ def current_user_id() -> str | None:
     return _user_id_var.get() or os.environ.get(USER_ID_ENV_VAR) or None
 
 
-def _clean(value: object) -> str | None:
-    """Coerce a missing/blank record attribute to ``None`` so a fallback engages.
-
-    The managed service's logging filter sets ``record.workspace_id`` to ``""``
-    (present-but-empty) for records emitted outside a workspace-bound request, so
-    an empty value must fall through to the process-constant fallback, not win.
-    """
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
-
-
-def _parse_databricks_app_host(url: str | None) -> tuple[str | None, str | None]:
-    """Parse ``(app_name, workspace_id)`` from a Databricks Apps server URL.
-
-    Apps URLs are ``https://<app_name>-<workspace_id>.<region>.databricksapps.com``;
-    the app name may itself contain hyphens, so split on the last one and require a
-    numeric workspace-id suffix. ``(None, None)`` for any non-Apps URL -- the
-    managed service (``dbc-<hash>...``), localhost, or a custom domain.
-    """
-    if not url:
-        return None, None
-    host = urllib.parse.urlparse(url).hostname or ""
-    if not host.endswith(".databricksapps.com"):
-        return None, None
-    label = host.split(".", 1)[0]
-    app_name, sep, workspace_id = label.rpartition("-")
-    if not sep or not app_name or not workspace_id.isdigit():
-        return None, None
-    return app_name, workspace_id
-
-
 @functools.lru_cache(maxsize=1)
-def _process_identity() -> tuple[str | None, str | None]:
-    """Process-constant ``(workspace_id, app_name)`` for single-tenant deployments.
+def _server_url() -> str | None:
+    """The Omnigent server URL this process is bound to, or ``None``.
 
-    The fallback the sink applies when a record carries no per-request identity:
-    the ``DATABRICKS_*`` env a Databricks App injects, else the values parsed from
-    the server URL a runner/host connected to an App carries. ``(None, None)`` on
-    the managed service (which supplies identity per-record) and on OSS/local.
-    Cached: the environment is fixed for the process's life.
+    A process constant: the runner sets ``RUNNER_SERVER_URL`` and harness
+    subprocesses ``_OMNIGENT_SERVER_URL``. Null on the server process itself and
+    on OSS/local. Cached -- the environment is fixed for the process's life.
     """
-    url_app, url_ws = _parse_databricks_app_host(os.environ.get(SERVER_URL_ENV_VAR))
-    workspace_id = _clean(os.environ.get(ORIGIN_WORKSPACE_ID_ENV_VAR)) or url_ws
-    app_name = _clean(os.environ.get(APP_NAME_ENV_VAR)) or url_app
-    return workspace_id, app_name
+    for name in SERVER_URL_ENVS:
+        value = os.environ.get(name)
+        if value and value.strip():
+            return value.strip()
+    return None
 
 
 def debug_event(
@@ -339,13 +302,10 @@ def record_to_row(record: logging.LogRecord, source: str) -> dict[str, object]:
     the two shapes the ZeroBus JSON path requires for the ``TIMESTAMP`` and
     ``MAP<STRING,STRING>`` columns respectively.
 
-    ``workspace_id``/``app_name`` describe the record's origin deployment: the
-    managed service stamps ``record.workspace_id`` per request (so it wins),
-    while single-tenant deployments fall back to the process-constant
-    :func:`_process_identity`. ``app_name`` has no per-request source, so it is
-    null on the managed service.
+    ``server_url`` is the deployment the record originated from (see
+    :func:`_server_url`); on Databricks Apps that URL embeds the workspace id and
+    app name, so grouping or splitting can happen at query time.
     """
-    workspace_id, app_name = _process_identity()
     return {
         "session_id": getattr(record, "session_id", None),
         "turn_id": getattr(record, "turn_id", None),
@@ -362,8 +322,7 @@ def record_to_row(record: logging.LogRecord, source: str) -> dict[str, object]:
         "attributes": _attributes(record),
         "log_id": uuid.uuid4().hex,
         "user_id": getattr(record, "user_id", None) or current_user_id(),
-        "workspace_id": _clean(getattr(record, "workspace_id", None)) or workspace_id,
-        "app_name": _clean(getattr(record, "app_name", None)) or app_name,
+        "server_url": _server_url(),
     }
 
 
