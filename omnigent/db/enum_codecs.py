@@ -127,6 +127,20 @@ SCHEDULED_TASK_RUN_STATUS: dict[str, int] = {
     "skipped": 5,
 }
 
+# Durable public turn-operation lifecycle. ``dispatch_unknown`` is distinct
+# from ``dispatched``: it records a transport ambiguity that must be reconciled
+# with runner status before any automated redispatch.
+TURN_OPERATION_STATE: dict[str, int] = {
+    "accepted": 1,
+    "input_persisted": 2,
+    "dispatched": 3,
+    "dispatch_unknown": 4,
+    "succeeded": 5,
+    "failed": 6,
+    "cancelled": 7,
+    "timed_out": 8,
+}
+
 
 def _assert_item_type_codes_cover_data_classes() -> None:
     """
@@ -338,3 +352,13 @@ def encode_scheduled_task_run_status(name: str) -> int:
 def decode_scheduled_task_run_status(code: int) -> str:
     """Decode a ``scheduled_task_runs.status`` int code to its name."""
     return _decode(SCHEDULED_TASK_RUN_STATUS, code, field="scheduled_task_runs.status")
+
+
+def encode_turn_operation_state(name: str) -> int:
+    """Encode a ``turn_operations.state`` name to its int code."""
+    return _encode(TURN_OPERATION_STATE, name, field="turn_operations.state")
+
+
+def decode_turn_operation_state(code: int) -> str:
+    """Decode a ``turn_operations.state`` int code to its name."""
+    return _decode(TURN_OPERATION_STATE, code, field="turn_operations.state")
