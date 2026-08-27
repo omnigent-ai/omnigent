@@ -271,9 +271,7 @@ async def test_subagent_thread_still_ignored(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("thread_source", ["system", "vscode"])
-async def test_ephemeral_thread_variants_do_not_rotate(
-    tmp_path: Path, thread_source: str
-) -> None:
+async def test_ephemeral_thread_variants_do_not_rotate(tmp_path: Path, thread_source: str) -> None:
     """An ``ephemeral=true`` thread must not rotate regardless of source label.
 
     The report's event carries ``threadSource=system`` and ``source=vscode``;
