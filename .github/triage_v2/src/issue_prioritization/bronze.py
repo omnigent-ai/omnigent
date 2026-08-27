@@ -57,6 +57,7 @@ class BronzeIssue:
             area_keys=classification.area_keys,
             component_labels=classification.component_labels,
             classification_reasoning=classification.reasoning,
+            classification_content_hash=classification.content_hash,
             reported_type=classification.reported_type,
             evidence_kind=classification.evidence_kind,
             information_status=classification.information_status,

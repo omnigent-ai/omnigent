@@ -72,7 +72,12 @@ def test_dry_run_artifact_contains_complete_mutation_plan(tmp_path) -> None:
     VolumeArtifactSink(str(tmp_path), ScoringConfig.default()).write(run)
 
     payload = json.loads((tmp_path / "preview" / "mutations.json").read_text())
-    assert payload[0]["target"] == {"priority": "P1-high", "components": ["comp:db"]}
+    assert payload[0]["target"] == {
+        "priority": "P1-high",
+        "components": ["comp:db"],
+        "issue_type": None,
+        "needs_info": None,
+    }
     assert payload[0]["labels_add"] == ["P1-high", "comp:db"]
     assert payload[0]["labels_remove"] == ["P2-medium", "severity:S2"]
     assert "<!-- omnigent-issue-prioritization-v2" in payload[0]["comment"]

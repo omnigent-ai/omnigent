@@ -86,6 +86,14 @@ a reproduction heading when it contains an intermittent observation, controlled
 test, diagnostics, or concrete code-path analysis. These fields are diagnostic;
 by themselves they do not add `needs-info` or close an issue.
 
+On the event path, V2 uses the assessment to keep the Bug, Feature, or Docs
+label aligned with the classified content. An incomplete bug receives
+`needs-info` and the bot-owned triage comment becomes a request for the specific
+missing categories with a seven-day deadline. Author comments and issue-body
+edits run the classifier again; sufficient evidence removes `needs-info` and
+restores the normal assessment comment. Security issues are excluded from this
+lifecycle. V2 does not close issues; expiry is a separate rollout gate.
+
 ## Databricks dry-run
 
 The bundle defines a paused trigger on updates to `github_issues_bronze`. It

@@ -215,6 +215,8 @@ class VolumeArtifactSink:
                 "target": {
                     "priority": plan.target.priority,
                     "components": list(plan.target.components),
+                    "issue_type": plan.target.issue_type,
+                    "needs_info": plan.target.needs_info,
                 },
                 "labels_add": list(plan.labels_add),
                 "labels_remove": list(plan.labels_remove),
@@ -227,6 +229,7 @@ class VolumeArtifactSink:
                     ranked[plan.target.issue_number],
                     plan,
                     _planned_labels_after(ranked[plan.target.issue_number], plan),
+                    run.scored_at,
                 ),
             }
             for plan in run.mutations

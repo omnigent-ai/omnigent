@@ -32,7 +32,7 @@ name: Issue Triage
 
 on:
   issues:
-    types: [opened]
+    types: [opened, edited]
   workflow_call:
     inputs:
       issue_number:
@@ -819,14 +819,22 @@ jobs:
           if-no-files-found: ignore
 
   prioritize-v2:
-    name: Prioritize new issue with v2
+    name: Classify and prioritize issue with v2
     needs: triage
     if: >-
-      needs.triage.result == 'success' &&
-      github.event_name == 'issues' &&
-      github.event.action == 'opened' &&
+      always() &&
       vars.ISSUE_PRIORITIZATION_V2_ENABLED == 'true' &&
-      !endsWith(github.event.issue.user.login, '[bot]')
+      (
+        (
+          github.event_name == 'issues' &&
+          !endsWith(github.event.issue.user.login, '[bot]') &&
+          (
+            (github.event.action == 'opened' && needs.triage.result == 'success') ||
+            github.event.action == 'edited'
+          )
+        ) ||
+        (inputs.retriage && needs.triage.result == 'success')
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -860,7 +868,7 @@ jobs:
           : "${DATABRICKS_CLIENT_SECRET:?Set the DATABRICKS_CLIENT_SECRET repository secret}"
           : "${MODEL_ENDPOINT:?Set the ISSUE_PRIORITIZATION_V2_MODEL_ENDPOINT repository variable}"
           uv run --frozen --project .github/triage_v2 issue-priority-event \
-            --issue-number "${{ github.event.issue.number }}" \
+            --issue-number "${{ github.event.issue.number || inputs.issue_number }}" \
             --github-repo "${{ github.repository }}" \
             --model-endpoint "$MODEL_ENDPOINT" \
             --areas .github/areas.json \
@@ -874,7 +882,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
-          name: issue-priority-v2-${{ github.event.issue.number }}-${{ github.run_id }}
+          name: issue-priority-v2-${{ github.event.issue.number || inputs.issue_number }}-${{ github.run_id }}
           path: /tmp/issue-priority-v2
           retention-days: 30
           if-no-files-found: warn

@@ -274,7 +274,11 @@ def test_client_loads_a_live_open_issue() -> None:
         "reactions": {"+1": 3},
         "state": "open",
     }
-    client = GitHubClient("token", "org/repo", lambda method, path, body: payload)
+
+    def transport(method, path, body):
+        return [] if "/comments" in path else payload
+
+    client = GitHubClient("token", "org/repo", transport)
 
     issue = client.open_issue(7)
 
@@ -283,6 +287,33 @@ def test_client_loads_a_live_open_issue() -> None:
     assert issue.author == "community"
     assert issue.labels == ("bug",)
     assert issue.upvote_count == 3
+
+
+def test_client_includes_only_author_follow_up_comments() -> None:
+    payload = {
+        "number": 7,
+        "title": "Session fails",
+        "body": "Original report",
+        "html_url": "https://github.com/org/repo/issues/7",
+        "user": {"login": "community"},
+        "labels": [{"name": "Bug"}],
+        "created_at": "2026-08-06T00:00:00Z",
+        "state": "open",
+    }
+    comments = [
+        {"user": {"login": "maintainer"}, "body": "Could you share logs?"},
+        {"user": {"login": "community"}, "body": "The session ID is abc-123."},
+    ]
+
+    def transport(method, path, body):
+        return comments if "/comments" in path else payload
+
+    issue = GitHubClient("token", "org/repo", transport).open_issue(7)
+
+    assert issue is not None
+    assert "The session ID is abc-123." in issue.body
+    assert "Could you share logs?" not in issue.body
+    assert "Original report" in issue.body
 
 
 def test_client_ignores_closed_issues_and_pull_requests() -> None:

@@ -170,6 +170,7 @@ def write_event_status(
                 decision,
                 plan,
                 labels_after if labels_after is not None else _planned_labels_after(decision, plan),
+                run.scored_at,
             )
         },
         "applied_bot_state": (
@@ -218,6 +219,8 @@ def _mutation_payload(plan: MutationPlan) -> dict[str, object]:
         "target": {
             "priority": plan.target.priority,
             "components": list(plan.target.components),
+            "issue_type": plan.target.issue_type,
+            "needs_info": plan.target.needs_info,
         },
         "labels_add": list(plan.labels_add),
         "labels_remove": list(plan.labels_remove),
