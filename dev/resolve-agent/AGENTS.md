@@ -655,11 +655,37 @@ gh pr edit <pr> --add-label ui-preview
 ```
 
 Do this on **every** PR you're landing — the one you opened *and* an existing PR
-you're reviewing and keeping — right after you start Step 4 (so the deploy builds
-while CI runs), and **not only frontend fixes**. Even a backend-only fix can get a
-deployed app a reviewer connects a runner to and validates directly (see the
-live-validation prompt in 4.4), which is the point of standing the preview up. The
-label is only the request, though: the UI Preview workflow deploys **only for PRs
+you're reviewing and keeping — and **not only frontend fixes**. Even a backend-only
+fix can get a deployed app a reviewer connects a runner to and validates directly
+(see the live-validation prompt in 4.4), which is the point of standing the
+preview up.
+
+**Label only after the code is safe to deploy — never up front.**
+The `ui-preview` label is a trust signal: it triggers a `pull_request_target`
+build+deploy of the PR's code to a Databricks workspace, so applying it vouches
+that *this* code is safe to run there. Do **not** label at the start of Step 4 to
+"let the deploy build while CI runs." Apply the label once, on the current head
+commit, only **after** both gates below are green for that commit:
+  - the reproduction test and full CI pass (4.2), and
+  - the Polly review is clean — no unresolved blocking or security findings (4.3).
+
+How much this matters depends on **whose** PR you're landing:
+  - **A PR you authored** is a branch on `omnigent-ai/omnigent` itself — a
+    same-repo PR no outside contributor can push to, carrying code that already
+    came through your repro→fix→CI→Polly pipeline. Labeling it is low-risk;
+    waiting for green is just good hygiene (don't stand up a preview of a red PR).
+  - **A PR you're reviewing** may be a **fork** PR from an outside contributor.
+    Here the label is the real trust boundary: it green-lights deploying fork
+    code, so never apply it until the current head has passed CI and a clean
+    Polly review. And because an attacker can push a new commit *after* you label,
+    the fork deploy is backstopped by a human-approved Environment that re-gates
+    every commit — but that gate is a safety net, not a licence to label early.
+
+Whichever path, if you push (or the author pushes) a further commit after
+labelling, re-confirm CI + Polly on the new head before you rely on the preview.
+Never label a PR whose approach you're unsure of or whose review is still red.
+
+The label is only the request, though: the UI Preview workflow deploys **only for PRs
 authored by an `OWNER`/`MEMBER`/`COLLABORATOR`** (and only when the PR is not a
 draft). If the PR's author is a non-member (common for the community PRs you review
 on the review path), or you're running under a non-member identity, the label
