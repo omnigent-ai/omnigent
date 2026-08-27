@@ -413,6 +413,16 @@ omnigent login https://your-host    # sign in once; run / attach / host reuse th
 omnigent host  https://your-host    # new sessions can now run on this machine
 ```
 
+Keep the host available across terminal sessions with a per-user launchd or
+systemd service:
+
+```bash
+omni host enable --server https://your-host
+```
+
+See [Run the Omnigent host as a user service](docs/HOST_SERVICE.md) for status,
+stop/disable, logs, upgrades, and login/logout behavior.
+
 > [!TIP]
 > On your own network you don't need a deploy. Open your machine's LAN
 > address on your phone (e.g. `http://192.168.x.x:6767`).

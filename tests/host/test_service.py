@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import plistlib
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -522,6 +523,56 @@ def test_systemd_unit_escapes_specifiers_and_literal_dollars() -> None:
     assert (
         'ExecStart="/opt/$$tools/python" "--server" "https://example.com/%%h/$$target"'
     ) in unit
+
+
+def test_generated_systemd_unit_passes_native_verify(tmp_path: Path) -> None:
+    systemd_analyze = shutil.which("systemd-analyze")
+    if systemd_analyze is None:
+        pytest.skip("systemd-analyze is not installed")
+    path = tmp_path / "omnigent-host.service"
+    path.write_bytes(
+        service._systemd_unit(
+            command=[sys.executable, "-m", "omnigent.host.service_entry", "--local"],
+            environment={"HOME": str(tmp_path)},
+        )
+    )
+
+    result = subprocess.run(
+        [systemd_analyze, "verify", str(path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+
+
+def test_generated_launchd_plist_passes_native_lint(tmp_path: Path) -> None:
+    plutil = shutil.which("plutil")
+    if plutil is None:
+        pytest.skip("plutil is not installed")
+    installed = service.HostService(
+        kind="launchd",
+        path=tmp_path / "ai.omnigent.host.plist",
+        label="ai.omnigent.host",
+        log_path=tmp_path / "service.log",
+    )
+    installed.path.write_bytes(
+        service._launchd_payload(
+            installed,
+            command=[sys.executable, "-m", "omnigent.host.service_entry", "--local"],
+            environment={"HOME": str(tmp_path)},
+        )
+    )
+
+    result = subprocess.run(
+        [plutil, "-lint", str(installed.path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
 
 
 def test_disable_systemd_user_service(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
