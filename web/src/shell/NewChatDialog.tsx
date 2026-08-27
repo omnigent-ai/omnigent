@@ -4045,6 +4045,10 @@ export function NewChatLandingScreen() {
           bundle,
           metadata as Parameters<typeof createBundledSession>[1],
         );
+        // Time create_session for the custom-agent (bundled) path too — otherwise
+        // both sandbox and computer bundled creates emit nothing. Split by the
+        // picked host; the stream pump completes/settles the span.
+        beginCreateSessionTiming(data.id, sandboxSelected ? "sandbox" : "computer");
         // Launch the runner on the selected host. The multipart create
         // only stores DB rows — launchRunner binds + starts the runner.
         if (!sandboxSelected && selectedHostId && workspaceTrimmed) {

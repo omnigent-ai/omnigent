@@ -4694,6 +4694,21 @@ export async function pumpStreamEvents(
       if (controller.signal.aborted) return "aborted";
       if (isConversationDisposed(id)) return "switched";
 
+      // First genuine assistant output for a brand-new session ends the
+      // create_session CUJ ("first AI message"). Gate on assistant text/reasoning
+      // specifically — NOT "first painted block", which also covers the pre-
+      // `response_end` `error` block (would log a failed create as success) and a
+      // slash/skill `user_message` echo (would complete on the user's own command).
+      // `id` is this pump's session id; the delete makes it fire once, so later
+      // responses and duplicate chunks on reconnect find nothing.
+      if (block.type === "text_chunk" || block.type === "reasoning_chunk") {
+        const pendingCreate = createSessionPending.get(id);
+        if (pendingCreate) {
+          createSessionPending.delete(id);
+          pendingCreate.complete();
+        }
+      }
+
       if (block.type === "response_start") {
         // New response: force-flush whatever is buffered, then land the
         // marker + lifecycle in one commit. Reset the first-paint latch.
@@ -4931,16 +4946,6 @@ export async function pumpStreamEvents(
         // user sees the first token without waiting a frame.
         paintedFirstContent = true;
         flush();
-        // First painted content of a brand-new session = the "first AI message"
-        // that ends the create_session CUJ (`response_start` above is only run
-        // acknowledgement, before any output). `id` is this pump's session id; the
-        // map holds only freshly-created sessions and the delete makes this fire
-        // once — later responses find nothing.
-        const pendingCreate = createSessionPending.get(id);
-        if (pendingCreate) {
-          createSessionPending.delete(id);
-          pendingCreate.complete();
-        }
       } else {
         scheduler.schedule(() => flush());
       }
