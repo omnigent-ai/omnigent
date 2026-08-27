@@ -5499,6 +5499,132 @@ async def test_accumulate_session_usage_rejects_non_finite_provider_cost(
     assert math.isfinite(usage["total_cost_usd"])
 
 
+async def test_accumulate_session_usage_rejects_negative_token_count(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A forged negative ``input_tokens`` is coerced to 0, not priced as a negative.
+
+    The ``cost_usd`` guard only covers the harness-reported-cost fast path; the
+    catalog-pricing branch derives the cost delta from the token counts in the
+    same forgeable frame. ``compute_llm_cost`` multiplies without a lower bound,
+    so an unsanitised negative count would make the additive ``total_cost_usd``
+    delta negative — clawing back the running total the relay cost-budget gate
+    reads. The count must collapse to 0 and the turn price on what survives.
+    """
+    from omnigent.server.routes import sessions as sessions_routes
+
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: ModelPricing(input_per_token=1e-3, output_per_token=2e-3),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    sessions_routes._accumulate_session_usage(
+        {
+            "usage": {
+                "input_tokens": -100_000_000,
+                "output_tokens": 500,
+                "model": "harness-model",
+            }
+        },
+        session["id"],
+        SqlAlchemyConversationStore(db_uri),
+    )
+    usage = _read_session_usage(db_uri, session["id"])
+    # input collapses to 0; catalog charges only 500*2e-3 = 1.0 (never negative).
+    assert usage.get("total_cost_usd") == pytest.approx(1.0)
+    assert usage["by_model"]["harness-model"]["total_cost_usd"] == pytest.approx(1.0)
+    # The forged count is not persisted as a negative cumulative counter.
+    assert usage["input_tokens"] == 0
+    assert usage["output_tokens"] == 500
+
+
+async def test_accumulate_session_usage_negative_tokens_cannot_reset_running_total(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A forged negative token count can't subtract from a prior running total."""
+    from omnigent.server.routes import sessions as sessions_routes
+
+    store = SqlAlchemyConversationStore(db_uri)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    # An honest priced turn establishes a positive running total.
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: ModelPricing(input_per_token=1e-3, output_per_token=2e-3),
+    )
+    sessions_routes._accumulate_session_usage(
+        {"usage": {"input_tokens": 1000, "output_tokens": 500, "model": "grok-4.3"}},
+        session["id"],
+        store,
+    )
+    assert _read_session_usage(db_uri, session["id"]).get("total_cost_usd") == pytest.approx(2.0)
+
+    # A forged negative report must not drive the running total (or the token
+    # counters) down.
+    sessions_routes._accumulate_session_usage(
+        {
+            "usage": {
+                "input_tokens": -1_000_000_000,
+                "output_tokens": 0,
+                "model": "grok-4.3",
+            }
+        },
+        session["id"],
+        store,
+    )
+    usage = _read_session_usage(db_uri, session["id"])
+    assert usage.get("total_cost_usd") == pytest.approx(2.0)
+    assert usage["input_tokens"] == 1000
+
+
+async def test_accumulate_session_usage_rejects_non_finite_token_count(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A NaN / infinite token count never reaches the cost sum or the counters.
+
+    ``json.loads`` accepts bare ``NaN`` / ``Infinity``, so a runner can send a
+    non-finite token count. Left unsanitised it poisons ``total_cost_usd``
+    permanently (every ``cost > cap`` comparison is then ``False``) and the
+    stored token counters.
+    """
+    from omnigent.server.routes import sessions as sessions_routes
+
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: ModelPricing(input_per_token=1e-3, output_per_token=2e-3),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    for bad_tokens in (float("nan"), float("inf"), float("-inf")):
+        sessions_routes._accumulate_session_usage(
+            {
+                "usage": {
+                    "input_tokens": bad_tokens,
+                    "output_tokens": 500,
+                    "model": "harness-model",
+                }
+            },
+            session["id"],
+            SqlAlchemyConversationStore(db_uri),
+        )
+    usage = _read_session_usage(db_uri, session["id"])
+    # Three turns, each priced only on the finite 500 output tokens (1.0 each).
+    assert usage.get("total_cost_usd") == pytest.approx(3.0)
+    assert math.isfinite(usage["total_cost_usd"])
+    assert usage["input_tokens"] == 0
+    assert math.isfinite(usage["input_tokens"])
+
+
 async def test_accumulate_session_usage_unpriced_without_usage_model(
     client: httpx.AsyncClient,
     db_uri: str,

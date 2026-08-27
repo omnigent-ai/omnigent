@@ -1163,6 +1163,32 @@ def _build_session_response(
     )
 
 
+def _sane_relay_token_count(value: object) -> int:
+    """
+    Coerce a runner-reported token count to a trusted non-negative int.
+
+    Relay usage frames are POSTed under the session owner's own bearer
+    token, so a forged negative or non-finite count must never reach the
+    additive :meth:`ConversationStore.increment_session_usage` delta: a
+    negative would claw back the session's cumulative ``total_cost_usd``
+    (the figure the relay cost-budget gate reads, since relay sessions
+    never post ``policy_cost_usd``) and a ``NaN`` / ``inf`` would poison
+    every downstream sum. Anything that is not a finite, non-negative,
+    non-bool number collapses to ``0``; the turn is then priced on
+    whatever counts survive.
+
+    :param value: Raw ``usage`` field from the harness response, e.g.
+        ``1200``, ``-1``, or ``float("nan")``.
+    :returns: The value as a non-negative ``int``, or ``0`` when it is
+        missing / the wrong type / negative / non-finite.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    if not math.isfinite(value) or value < 0:
+        return 0
+    return int(value)
+
+
 def _accumulate_session_usage(
     resp_obj: dict[str, Any],
     session_id: str,
@@ -1205,14 +1231,19 @@ def _accumulate_session_usage(
     usage_obj = resp_obj.get("usage")
     if not isinstance(usage_obj, dict):
         return None
-    input_tokens = usage_obj.get("input_tokens", 0)
-    output_tokens = usage_obj.get("output_tokens", 0)
-    total_tokens = usage_obj.get("total_tokens", 0)
+    # Sanitize every runner-reported count: a forged negative / non-finite
+    # value here would otherwise flow into both the additive token counters
+    # and (via the catalog-pricing branch below) the additive cost delta.
+    input_tokens = _sane_relay_token_count(usage_obj.get("input_tokens", 0))
+    output_tokens = _sane_relay_token_count(usage_obj.get("output_tokens", 0))
+    total_tokens = _sane_relay_token_count(usage_obj.get("total_tokens", 0))
     if not any((input_tokens, output_tokens, total_tokens)):
         return None
 
-    cache_read_input_tokens = usage_obj.get("cache_read_input_tokens", 0)
-    cache_creation_input_tokens = usage_obj.get("cache_creation_input_tokens", 0)
+    cache_read_input_tokens = _sane_relay_token_count(usage_obj.get("cache_read_input_tokens", 0))
+    cache_creation_input_tokens = _sane_relay_token_count(
+        usage_obj.get("cache_creation_input_tokens", 0)
+    )
 
     # Load conversation metadata for pricing only (NOT for reading session_usage —
     # the atomic increment_session_usage call below handles that separately to
@@ -1271,10 +1302,20 @@ def _accumulate_session_usage(
             )
             priced = pricing is not None
             if pricing is not None:
-                # Cache-aware: usage_obj carries cache_read/cache_creation
-                # token counts when the harness reports them; compute_llm_cost
-                # prices them at their own (cheaper read / pricier write) rates.
-                cost_delta = compute_llm_cost(usage_obj, pricing)
+                # Cache-aware: price the sanitized cache-read / cache-creation
+                # token counts at their own (cheaper read / pricier write)
+                # rates. Pass the validated locals, not the raw response usage
+                # — a forged negative / non-finite count must not reach the
+                # cost sum (compute_llm_cost multiplies without a lower bound).
+                cost_delta = compute_llm_cost(
+                    {
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "cache_read_input_tokens": cache_read_input_tokens,
+                        "cache_creation_input_tokens": cache_creation_input_tokens,
+                    },
+                    pricing,
+                )
 
     # Build the delta dict and atomically apply it to the persisted
     # session_usage in a single DB transaction (SELECT FOR UPDATE on

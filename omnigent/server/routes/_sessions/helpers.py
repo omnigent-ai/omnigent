@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import math
 import re
 import secrets
 import time
@@ -2122,23 +2123,26 @@ def _coerce_cumulative_field(
 
     :param data: The ``external_session_usage`` event ``data`` dict.
     :param key: Field name, e.g. ``"cumulative_input_tokens"``.
-    :param numeric: When ``True`` accept any non-negative number (cost);
-        when ``False`` require a non-negative int (token counts).
+    :param numeric: When ``True`` accept any finite non-negative number
+        (cost); when ``False`` require a finite non-negative int (token
+        counts).
     :returns: The validated value, or ``None`` when the key is absent.
-    :raises OmnigentError: When present but the wrong type / negative.
+    :raises OmnigentError: When present but the wrong type / negative /
+        non-finite (``NaN`` / ``inf`` — which the monotonic ``max(old,
+        new)`` clamp downstream would otherwise latch permanently).
     """
     value = data.get(key)
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise OmnigentError(
-            f"external_session_usage data.{key} must be a non-negative "
+            f"external_session_usage data.{key} must be a finite non-negative "
             f"{'number' if numeric else 'int'}",
             code=ErrorCode.INVALID_INPUT,
         )
-    if (not numeric and not isinstance(value, int)) or value < 0:
+    if (not numeric and not isinstance(value, int)) or not math.isfinite(value) or value < 0:
         raise OmnigentError(
-            f"external_session_usage data.{key} must be a non-negative "
+            f"external_session_usage data.{key} must be a finite non-negative "
             f"{'number' if numeric else 'int'}",
             code=ErrorCode.INVALID_INPUT,
         )
