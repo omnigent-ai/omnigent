@@ -274,7 +274,15 @@ def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
     if tool in _all_os_tools:
         args = data.get("arguments", {})
         # Build a short preview of what the tool is doing.
-        if tool in ("sys_os_shell", "Bash", "bash", "Shell", "terminal", "developer__shell", "shell"):
+        if tool in (
+            "sys_os_shell",
+            "Bash",
+            "bash",
+            "Shell",
+            "terminal",
+            "developer__shell",
+            "shell",
+        ):
             preview = args.get("command", "") if isinstance(args, dict) else ""
         elif tool in ("Grep", "Glob", "search_files", "grep", "glob"):
             preview = args.get("pattern", "") if isinstance(args, dict) else ""

@@ -115,7 +115,12 @@ def test_direct_codex_internal_shell_maps_to_observed_shell_tool() -> None:
     is visible independently of the policy behavior.
     """
     request = _codex_builtin_tool_request(
-        {"id": "call_force_push", "type": "commandExecution", "command": _FORCE_PUSH, "cwd": "/repo"}
+        {
+            "id": "call_force_push",
+            "type": "commandExecution",
+            "command": _FORCE_PUSH,
+            "cwd": "/repo",
+        }
     )
     assert request is not None
     assert request.name == "shell"
@@ -144,8 +149,12 @@ def test_blast_radius_denies_force_push_on_gated_harnesses() -> None:
         )
 
     bash_action, sys_action = asyncio.run(_verdicts())
-    assert bash_action == "deny", f"claude-native Bash force-push must be DENIED (got {bash_action!r})"
-    assert sys_action == "deny", f"sys_os_shell force-push must be DENIED (got {sys_action!r})"
+    assert bash_action == "deny", (
+        f"claude-native Bash force-push must be DENIED (got {bash_action!r})"
+    )
+    assert sys_action == "deny", (
+        f"sys_os_shell force-push must be DENIED (got {sys_action!r})"
+    )
 
 
 def test_blast_radius_denies_force_push_on_direct_codex_harness() -> None:
