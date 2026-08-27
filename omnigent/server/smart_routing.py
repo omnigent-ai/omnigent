@@ -687,13 +687,14 @@ def _config_bearer(
         (auth failure degrades to unauthenticated rather than failing the turn).
     """
     try:
-        headers = config.authenticate()
+        from omnigent.databricks_auth_broker import token_for_config
+
+        token = token_for_config(config)
     except Exception:  # noqa: BLE001 — auth failure degrades to unauthenticated
         _logger.warning(
             "ExternalRoutingClient: could not resolve auth from %s", label, exc_info=True
         )
         return None
-    token = (dict(headers or {}).get("Authorization") or "").removeprefix("Bearer ").strip()
     if not token:
         return None
     return _bearer_auth(token)

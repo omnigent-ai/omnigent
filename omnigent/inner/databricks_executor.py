@@ -133,12 +133,15 @@ def _read_databrickscfg(profile: str | None = None) -> DatabricksCredentials | N
         # databricks-sdk should always be present (pinned in pyproject.toml),
         # but if it isn't we gracefully degrade to file reading.
         return _read_databrickscfg_file_fallback(profile)
+    from omnigent.databricks_auth_broker import token_for_config
 
     # ``None`` means "let the SDK decide" (env var / DEFAULT section).
     sdk_profile = profile or os.environ.get("DATABRICKS_CONFIG_PROFILE")
     try:
         cfg = Config(profile=sdk_profile)
-        headers = cfg.authenticate()
+        if not cfg.host:
+            return _read_databrickscfg_file_fallback(profile)
+        token = token_for_config(cfg, profile=sdk_profile)
     except ValueError as profile_exc:
         # ValueError is what Config raises for every user-facing resolution
         # failure (missing profile, malformed file, no credentials in env,
@@ -157,20 +160,21 @@ def _read_databrickscfg(profile: str | None = None) -> DatabricksCredentials | N
             )
             try:
                 cfg = Config()
-                headers = cfg.authenticate()
+                if not cfg.host:
+                    return _read_databrickscfg_file_fallback(profile)
+                token = token_for_config(cfg)
             except ValueError:
                 return _read_databrickscfg_file_fallback(profile)
         else:
             return _read_databrickscfg_file_fallback(profile)
 
     host = cfg.host
-    auth = headers.get("Authorization")
-    if not host or not auth or not auth.startswith("Bearer "):
+    if not host or not token:
         # Non-Bearer auth schemes (e.g. Basic) or missing host/auth are
         # treated as unresolved. None of our harnesses support non-Bearer
         # today.
         return None
-    return DatabricksCredentials(host=host, token=auth.removeprefix("Bearer "))
+    return DatabricksCredentials(host=host, token=token)
 
 
 def _read_databrickscfg_file_fallback(profile: str | None = None) -> DatabricksCredentials | None:
@@ -235,7 +239,7 @@ def databricks_bearer_token_command(
     profile: str | None = None,
     fallback_command: str | None = None,
 ) -> str:
-    """Build the shell command a harness runs to mint a workspace bearer token.
+    """Build a shell command that reads a broker-coordinated workspace token.
 
     The one definition of the generated helper, so the claude and codex
     harnesses cannot drift apart on which profile they authenticate as or how
@@ -248,56 +252,35 @@ def databricks_bearer_token_command(
     authenticating as *different* profiles for the same workspace, one of them
     re-authed and the other not.
 
-    **Refresh.** ``--force-refresh`` is attempted first: it renews a still-valid
-    cached token, which is what keeps a long gateway session from hitting a
-    mid-session 401. But it *fails* when the refresh token itself has gone
-    stale, and unconditionally forcing turned a perfectly usable cached access
-    token into a hard auth failure. So the forced attempt is speculative — its
-    output is captured and its stderr dropped — and an empty result falls back
-    to plain ``auth token``, which serves the cached token and renews it only
-    when it is near expiry. The fallback keeps its stderr so a genuine auth
-    failure is still visible. ``--force-refresh`` only exists in Databricks CLI
-    >= v0.296.0, so it stays behind the ``--help`` capability probe.
-
-    **Fallback command.** The named profile is the identity we *want*, but the
-    user may have authenticated under a different profile on the same host — a
-    config naming a credential-less profile would otherwise 401 every turn.
-    When the caller knows a token command that already worked (the one ucode
-    recorded, say), it runs last, once the named profile has yielded nothing.
+    All harnesses call the same Python broker used by the host and runner. The
+    old generated helper independently forced OAuth refreshes and was one of
+    the refresh-token collision paths this module exists to remove.
 
     :param host: Databricks workspace host, e.g.
         ``"https://example.databricks.com"``.
     :param profile: ``~/.databrickscfg`` profile name, e.g. ``"oss"``, or
         ``None`` to select the workspace by host.
-    :param fallback_command: Shell command printing a bearer token on stdout,
-        run only when the profile above yields an empty token.
+    :param fallback_command: Retained for source compatibility and ignored;
+        independent fallback refresh commands are intentionally forbidden.
     :returns: Shell command that prints a bearer token on stdout.
     """
-    selector = (
-        f"--profile {json.dumps(profile)}" if profile else f"--host {json.dumps(host.rstrip('/'))}"
-    )
-    mint = f"env -u DATABRICKS_CONFIG_PROFILE databricks auth token {selector}"
-    fallback = (
-        # ``eval`` on a quoted string: the recorded command is opaque shell,
-        # and inlining it bare would let its own quoting reshape this script.
-        f'if [ -z "$token" ]; then token=$(eval {shlex.quote(fallback_command)}); fi; '
-        if fallback_command
-        else ""
-    )
+    del fallback_command
+    import sys
+
+    args = [
+        sys.executable,
+        "-m",
+        "omnigent.databricks_auth_broker",
+        "--workspace-host",
+        host.rstrip("/"),
+    ]
+    args.extend(("--profile", profile) if profile else ("--host", host.rstrip("/")))
+    broker_command = shlex.join(args)
     return (
-        # An injected bearer wins: the runner already resolved one.
+        # An explicit test/CI bearer wins. Production helpers use the broker.
         'if [ -n "${DATABRICKS_BEARER:-}" ]; then '
         'printf "%s\\n" "$DATABRICKS_BEARER"; '
-        "else token=''; "
-        "if databricks auth token --help 2>&1 | grep -q force-refresh; then "
-        f"token=$({mint} --force-refresh --output json 2>/dev/null "
-        "| jq -r '.access_token // empty'); "
-        "fi; "
-        'if [ -z "$token" ]; then '
-        f"token=$({mint} --output json | jq -r '.access_token // empty'); "
-        "fi; "
-        f"{fallback}"
-        'printf "%s\\n" "$token"; fi'
+        f"else {broker_command}; fi"
     )
 
 
@@ -420,6 +403,7 @@ class _DatabricksBearerAuth(httpx.Auth):
         config: _DatabricksAuthConfig,
         profile_name: str | None = None,
         failure_message: str | None = None,
+        workspace_host: str | None = None,
     ) -> None:
         """
         :param config: Databricks SDK ``Config`` instance.
@@ -432,6 +416,17 @@ class _DatabricksBearerAuth(httpx.Auth):
         self._config = config
         self._profile_name = profile_name
         self._failure_message = failure_message
+        self._broker = None
+        resolved_host = workspace_host or getattr(config, "host", None)
+        if resolved_host:
+            from omnigent.databricks_auth_broker import DatabricksAuthBroker
+
+            self._broker = DatabricksAuthBroker(
+                config,
+                profile=profile_name,
+                workspace_host=resolved_host,
+                failure_message=failure_message,
+            )
 
     def _authenticate_headers(self) -> dict[str, str]:
         """
@@ -447,7 +442,9 @@ class _DatabricksBearerAuth(httpx.Auth):
             (expired refresh token, revoked credentials, etc.).
         """
         try:
-            return self._config.authenticate()
+            if self._broker is None:
+                raise DatabricksAuthError("Databricks authentication resolved no workspace host")
+            return {"Authorization": f"Bearer {self._broker.current_token()}"}
         except Exception as exc:
             if self._failure_message is not None:
                 raise DatabricksAuthError(self._failure_message) from exc
@@ -456,6 +453,11 @@ class _DatabricksBearerAuth(httpx.Auth):
                 f"Databricks authentication failed for profile {self._profile_name!r}. "
                 f"Run: databricks auth login{profile_flag}"
             ) from exc
+
+    def invalidate(self, rejected_token: str | None = None) -> None:
+        """Discard a rejected shared bearer so the broker can replace it."""
+        if self._broker is not None:
+            self._broker.invalidate(rejected_token)
 
     def current_token(self) -> str | None:
         """
@@ -489,7 +491,14 @@ class _DatabricksBearerAuth(httpx.Auth):
         auth_value = self._authenticate_headers().get("Authorization", "")
         if auth_value:
             request.headers["Authorization"] = auth_value
-        yield request
+        response = yield request
+        if self._broker is not None and response.status_code == 401:
+            rejected = auth_value.removeprefix("Bearer ") if auth_value else None
+            self._broker.invalidate(rejected)
+            retry_auth = self._authenticate_headers().get("Authorization", "")
+            if retry_auth:
+                request.headers["Authorization"] = retry_auth
+                yield request
 
 
 def _resolve_databricks_auth(
@@ -542,7 +551,6 @@ def _resolve_databricks_auth(
 
     try:
         cfg = Config(profile=sdk_profile)
-        cfg.authenticate()
     except ValueError:
         if profile is None and sdk_profile is not None:
             # Profile name came from the DATABRICKS_CONFIG_PROFILE env var,
@@ -562,7 +570,6 @@ def _resolve_databricks_auth(
             )
             try:
                 cfg = Config()
-                cfg.authenticate()
             except ValueError:
                 cfg = None
         else:
@@ -575,7 +582,13 @@ def _resolve_databricks_auth(
         ) from exc
 
     if cfg is not None and cfg.host:
-        return _DatabricksBearerAuth(cfg, profile_name=profile), cfg.host
+        auth = _DatabricksBearerAuth(
+            cfg,
+            profile_name=sdk_profile,
+            workspace_host=cfg.host,
+        )
+        auth.current_token()
+        return auth, cfg.host
 
     # SDK-based resolution failed (simple PAT profile, missing auth_type,
     # etc.). Fall back to reading ~/.databrickscfg directly — static PATs
@@ -589,7 +602,14 @@ def _resolve_databricks_auth(
                 "authenticate": lambda _self: {"Authorization": f"Bearer {creds.token}"},
             },
         )()
-        return _DatabricksBearerAuth(static_cfg, profile_name=profile), creds.host
+        return (
+            _DatabricksBearerAuth(
+                static_cfg,
+                profile_name=profile or os.environ.get("DATABRICKS_CONFIG_PROFILE"),
+                workspace_host=creds.host,
+            ),
+            creds.host,
+        )
 
     profile_flag = f" -p {profile}" if profile else ""
     raise DatabricksAuthError(
@@ -643,17 +663,29 @@ def _resolve_databricks_auth_for_host(host: str) -> tuple[_DatabricksBearerAuth,
     for profile_name in _databrickscfg_profiles_for_host(host):
         try:
             cfg = _sdk_config(profile=profile_name)
-            cfg.authenticate()
+            if not cfg.host:
+                continue
+            auth = _DatabricksBearerAuth(
+                cfg,
+                profile_name=profile_name,
+                workspace_host=cfg.host,
+            )
+            auth.current_token()
         except Exception:  # noqa: BLE001 — try the next matching profile
             logger.debug("profile %r matched host %s but did not authenticate", profile_name, host)
             continue
-        return _DatabricksBearerAuth(cfg, profile_name=profile_name), cfg.host or host
+        return auth, cfg.host or host
     try:
         host_cfg = _sdk_config(host=host, auth_type="databricks-cli")
-        host_cfg.authenticate()
+        auth = _DatabricksBearerAuth(
+            host_cfg,
+            failure_message=host_failure,
+            workspace_host=host,
+        )
+        auth.current_token()
     except Exception as exc:
         raise DatabricksAuthError(host_failure) from exc
-    return _DatabricksBearerAuth(host_cfg, failure_message=host_failure), host
+    return auth, host
 
 
 def _databrickscfg_profiles_for_host(host: str) -> list[str]:

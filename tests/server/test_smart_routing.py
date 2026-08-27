@@ -1049,8 +1049,8 @@ async def test_external_routing_client_sends_bearer_auth() -> None:
 
 
 @pytest.mark.asyncio
-async def test_external_routing_client_mints_fresh_token_per_call_from_profile() -> None:
-    """With a databricks_profile, each call re-authenticates (OAuth refresh)."""
+async def test_external_routing_client_reuses_broker_token_from_profile() -> None:
+    """With a Databricks profile, calls share the broker token."""
     import httpx
 
     from omnigent.server.smart_routing import ExternalRoutingClient
@@ -1072,6 +1072,9 @@ async def test_external_routing_client_mints_fresh_token_per_call_from_profile()
     # Stub the SDK Config so each authenticate() yields the next token — proving
     # the client re-resolves auth per call rather than caching a stale bearer.
     class _FakeConfig:
+        host = "https://host"
+        profile = "agent"
+
         def authenticate(self) -> dict[str, str]:
             return {"Authorization": next(tokens)}
 
@@ -1080,7 +1083,7 @@ async def test_external_routing_client_mints_fresh_token_per_call_from_profile()
     with _patch_httpx(httpx.MockTransport(handler)):
         await client.route("hi", {"h": ["m"]})
         await client.route("hi again", {"h": ["m"]})
-    assert captured == ["Bearer tok-1", "Bearer tok-2"]
+    assert captured == ["Bearer tok-1", "Bearer tok-1"]
 
 
 # ── Per-request auth: auth_provider and the ambient SDK chain ──────────────
@@ -1266,8 +1269,8 @@ async def test_ambient_credential_is_used_when_it_names_the_router_host() -> Non
     with _ambient_sdk(config), _patch_httpx(httpx.MockTransport(_auth_handler(captured))):
         await client.route("hi", {"h": ["m"]})
         await client.route("hi again", {"h": ["m"]})
-    # Re-authenticated per call, so an expiring OAuth token is refreshed.
-    assert captured == ["Bearer ambient-tok-1", "Bearer ambient-tok-2"]
+    # Both calls consume the same machine-wide publication.
+    assert captured == ["Bearer ambient-tok-1", "Bearer ambient-tok-1"]
 
 
 @pytest.mark.databricks

@@ -308,9 +308,20 @@ def _call_sdk_authenticate(profile: str | None) -> WorkspaceCreds | None:
 
     # ``None`` means "let the SDK decide" (env var / DEFAULT section).
     sdk_profile = profile or os.environ.get("DATABRICKS_CONFIG_PROFILE")
+    from omnigent.databricks_auth_broker import (
+        DatabricksAuthBroker,
+        DatabricksCredentialError,
+    )
+
     try:
         cfg = Config(profile=sdk_profile)
-        headers = cfg.authenticate()
+        if not cfg.host:
+            return None
+        token = DatabricksAuthBroker(
+            cfg,
+            profile=sdk_profile,
+            workspace_host=cfg.host,
+        ).current_token()
     except ValueError as exc:
         # INFO (not WARNING): expired tokens raise here. WARNING would
         # surface via root's lastResort handler to stderr, drowning the
@@ -323,15 +334,17 @@ def _call_sdk_authenticate(profile: str | None) -> WorkspaceCreds | None:
             exc_info=True,
         )
         return None
+    except DatabricksCredentialError as exc:
+        if "returned no bearer token" in str(exc):
+            return None
+        raise
 
     host = cfg.host
-    auth = headers.get("Authorization")
-    if not host or not auth or not auth.startswith("Bearer "):
-        # Non-Bearer auth schemes (Basic, etc.) are unsupported.
+    if not host:
         return None
     return WorkspaceCreds(
         host=_strip_trailing_slash(host),
-        token=auth.removeprefix("Bearer "),
+        token=token,
     )
 
 

@@ -611,6 +611,15 @@ def _make_auth_token_factory(
         except DatabricksAuthError:
             return None
 
+    def _invalidate_sdk_token() -> bool:
+        """Invalidate the rejected publication before the one allowed retry."""
+        if sdk_auth is None:
+            return False
+        sdk_auth.invalidate()
+        return True
+
+    _sdk_token.invalidate = _invalidate_sdk_token  # type: ignore[attr-defined]
+
     def _factory() -> str | None:
         """Return a fresh auth token.
 
@@ -651,6 +660,8 @@ def _make_auth_token_factory(
             if still_valid:
                 return still_valid
         return _sdk_token()
+
+    _factory.invalidate = _invalidate_sdk_token  # type: ignore[attr-defined]
 
     # Probe once to check if a user credential is available.
     try:
@@ -1602,7 +1613,7 @@ async def _run_tunnel_from_env() -> None:
                         allowed_origins=frozenset({allowed_origin}),
                     )
                 )
-        except Exception:  # noqa: BLE001 — optimization only; never block the tunnel
+        except Exception:  # noqa: BLE001 — optional listener must not crash the runner
             _logger.warning(
                 "direct-attach listener setup failed",
                 exc_info=True,

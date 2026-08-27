@@ -263,13 +263,8 @@ class _FakeConfig:
         return {"Authorization": f"Bearer {self._tokens[idx]}"}
 
 
-def test_databricks_provider_resolves_host_and_refreshes() -> None:
-    """The provider reads the host once and re-mints past the throttle window.
-
-    Within the throttle window ``resolve()`` returns the cached token
-    (one ``authenticate()`` call); once the window elapses it re-mints,
-    which is what keeps a long session alive across OAuth expiry.
-    """
+def test_databricks_provider_resolves_host_and_reuses_shared_opaque_token() -> None:
+    """Opaque tokens remain shared until Databricks rejects them."""
     fake = _FakeConfig("https://ws.cloud.databricks.com/", ["tok-1", "tok-2"])
     clock = {"now": 0.0}
     provider = DatabricksProfileTokenProvider(
@@ -285,9 +280,9 @@ def test_databricks_provider_resolves_host_and_refreshes() -> None:
     clock["now"] = 50.0  # still inside the window -> cached, no re-mint
     assert provider.resolve() == "tok-1"
     assert fake.authenticate_calls == 1
-    clock["now"] = 150.0  # past the window -> re-mint
-    assert provider.resolve() == "tok-2"
-    assert fake.authenticate_calls == 2
+    clock["now"] = 150.0
+    assert provider.resolve() == "tok-1"
+    assert fake.authenticate_calls == 1
 
 
 def test_databricks_provider_requires_host() -> None:

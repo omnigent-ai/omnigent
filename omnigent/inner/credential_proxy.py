@@ -406,20 +406,14 @@ def _databricks_authenticate(config: object) -> str:
         scheme.
     """
     try:
-        headers = config.authenticate()  # type: ignore[attr-defined]
+        from omnigent.databricks_auth_broker import token_for_config
+
+        return token_for_config(config)  # type: ignore[arg-type]
     except Exception as exc:
         raise OmnigentError(
             f"Databricks authentication failed: {exc}",
             code=ErrorCode.INVALID_INPUT,
         ) from exc
-    auth = (headers or {}).get("Authorization", "")
-    if not isinstance(auth, str) or not auth.startswith("Bearer "):
-        raise OmnigentError(
-            "Databricks authentication returned a non-Bearer scheme; only "
-            "Bearer tokens (PAT / OAuth) are supported by the credential proxy.",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    return auth.removeprefix("Bearer ").strip()
 
 
 def _prepare_databricks_runtime(

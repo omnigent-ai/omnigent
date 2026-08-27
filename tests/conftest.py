@@ -617,3 +617,14 @@ def lowered_idle_thresholds(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(terminal_module, "_IDLE_POLL_INTERVAL_SECONDS", 0.1)
     monkeypatch.setattr(terminal_module, "_IDLE_MARKER_SUBSTRINGS", [])
     monkeypatch.setattr(terminal_module, "_IDLE_MARKER_THRESHOLD_SECONDS", 0.4)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_databricks_auth_broker_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Never share broker credentials between tests or with the developer's home."""
+    monkeypatch.setattr(
+        "omnigent.databricks_auth_broker._state_root", lambda: tmp_path / "broker-state"
+    )
+    monkeypatch.setattr(
+        "omnigent.databricks_auth_broker._runtime_root", lambda: tmp_path / "broker-runtime"
+    )

@@ -109,15 +109,9 @@ def _resolve_databricks_token(profile: str) -> str:
 
     try:
         client = WorkspaceClient(profile=profile)
-        result = client.config.authenticate()
-        # SDK returns either a dict (newer versions) or a callable
-        # that produces headers (older versions).
-        headers: dict[str, str] = result if isinstance(result, dict) else result(None)
-        auth_header = headers.get("Authorization", "")
-        if auth_header.startswith("Bearer "):
-            return auth_header[len("Bearer ") :]
-        # Some auth flows return the token directly.
-        return auth_header
+        from omnigent.databricks_auth_broker import token_for_config
+
+        return token_for_config(client.config, profile=profile)
     except Exception as exc:
         raise RuntimeError(
             f"Failed to resolve Databricks token from profile {profile!r}: {exc}"

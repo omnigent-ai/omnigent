@@ -522,10 +522,9 @@ class TestConstructor(unittest.TestCase):
                 "https://example.cloud.databricks.com/ai-gateway/anthropic",
             )
             self.assertEqual(executor._extra_env["CLAUDE_CODE_API_KEY_HELPER_TTL_MS"], "900000")
-            self.assertIn(
-                'databricks auth token --host "https://example.cloud.databricks.com"',
-                executor._extra_env["OMNIGENT_CLAUDE_API_KEY_HELPER"],
-            )
+            helper = executor._extra_env["OMNIGENT_CLAUDE_API_KEY_HELPER"]
+            self.assertIn("omnigent.databricks_auth_broker", helper)
+            self.assertIn("--host https://example.cloud.databricks.com", helper)
             self.assertNotIn("ANTHROPIC_AUTH_TOKEN", executor._extra_env)
 
     def test_databricks_explicit_profile_selects_by_profile(self):
@@ -552,19 +551,12 @@ class TestConstructor(unittest.TestCase):
         ):
             executor = ClaudeSDKExecutor(gateway=True, databricks_profile="oss")
         helper = executor._extra_env["OMNIGENT_CLAUDE_API_KEY_HELPER"]
-        # Proves the selector is --profile, not --host. A regression to --host
-        # makes a two-profiles-one-host workspace yield an empty token → 401.
-        self.assertIn('databricks auth token --profile "oss"', helper)
+        # Proves the helper uses the shared broker with an unambiguous profile.
+        self.assertIn("omnigent.databricks_auth_broker", helper)
+        self.assertIn("--profile oss", helper)
         self.assertNotIn("--host", helper)
-        # `--force-refresh` only exists in Databricks CLI >= v0.296.0, so it
-        # stays behind a `--help` capability probe — an older CLI rejects the
-        # unknown flag and yields an empty token → silent 401.
-        self.assertIn("databricks auth token --help", helper)
-        # And even where it exists it is only ATTEMPTED: it fails outright on a
-        # stale refresh token, so an empty result must fall back to the cached
-        # token rather than turning a usable credential into an auth failure.
-        self.assertIn("--force-refresh", helper)
-        self.assertIn('if [ -z "$token" ]; then', helper)
+        self.assertNotIn("databricks auth token", helper)
+        self.assertNotIn("--force-refresh", helper)
 
     def test_databricks_flag_no_creds_raises(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
@@ -1239,10 +1231,9 @@ class TestResolveGatewayEnv(unittest.TestCase):
                 "https://example.databricks.com/ai-gateway/anthropic",
             )
             self.assertEqual(env["CLAUDE_CODE_API_KEY_HELPER_TTL_MS"], "900000")
-            self.assertIn(
-                'databricks auth token --host "https://example.databricks.com"',
-                env["OMNIGENT_CLAUDE_API_KEY_HELPER"],
-            )
+            helper = env["OMNIGENT_CLAUDE_API_KEY_HELPER"]
+            self.assertIn("omnigent.databricks_auth_broker", helper)
+            self.assertIn("--host https://example.databricks.com", helper)
             self.assertEqual(
                 env["ANTHROPIC_CUSTOM_HEADERS"],
                 "x-databricks-use-coding-agent-mode: true",

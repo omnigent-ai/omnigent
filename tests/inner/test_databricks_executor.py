@@ -16,9 +16,11 @@ import databricks.sdk.config as _sdk_config_mod
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from omnigent.inner.databricks_executor import (
+    DatabricksAuthError,
     DatabricksExecutor,
     _convert_messages,
     _convert_tools_to_openai,
+    _DatabricksBearerAuth,
 )
 from omnigent.inner.executor import (
     ExecutorConfig,
@@ -709,8 +711,6 @@ from pathlib import Path as _Path  # noqa: E402
 import pytest  # noqa: E402
 
 from omnigent.inner.databricks_executor import (  # noqa: E402
-    DatabricksAuthError,
-    _DatabricksBearerAuth,
     _read_databrickscfg,
     _read_databrickscfg_file_fallback,
     _read_databrickscfg_host,
@@ -980,7 +980,8 @@ def test_codex_executor_gateway_uses_host_only_oauth_profile(
 
     overrides = "\n".join(executor._codex_config_overrides)
     assert "https://oauth-host.example.com/ai-gateway/codex/v1" in overrides
-    assert 'databricks auth token --profile \\"oauth-profile\\"' in overrides
+    assert "omnigent.databricks_auth_broker" in overrides
+    assert "--profile oauth-profile" in overrides
 
 
 def test_read_databrickscfg_no_config_file_returns_none(
@@ -1446,13 +1447,8 @@ def test_resolve_databricks_auth_explicit_profile_not_found_raises(
     )
 
 
-def test_bearer_auth_injects_fresh_token_per_request():
-    """``_DatabricksBearerAuth`` calls ``Config.authenticate()`` per request.
-
-    Verifies that a fresh token is injected into each HTTP request,
-    and that different calls can return different tokens (simulating
-    OAuth refresh).
-    """
+def test_bearer_auth_reuses_broker_token_between_requests():
+    """Requests share the broker's published token instead of reminting."""
     import httpx
 
     from omnigent.inner.databricks_executor import _DatabricksBearerAuth
@@ -1460,6 +1456,8 @@ def test_bearer_auth_injects_fresh_token_per_request():
     call_count = 0
 
     class _RotatingConfig:
+        host = "https://failure.example.com"
+
         def authenticate(self):
             nonlocal call_count
             call_count += 1
@@ -1475,9 +1473,9 @@ def test_bearer_auth_injects_fresh_token_per_request():
     request2 = httpx.Request("GET", "https://example.com/v1/chat")
     gen2 = auth.auth_flow(request2)
     next(gen2)
-    assert request2.headers["Authorization"] == "Bearer tok-2"
+    assert request2.headers["Authorization"] == "Bearer tok-1"
 
-    assert call_count == 2
+    assert call_count == 1
 
 
 def test_bearer_auth_raises_on_expired_refresh_token():
@@ -1496,6 +1494,8 @@ def test_bearer_auth_raises_on_expired_refresh_token():
     )
 
     class _DeadConfig:
+        host = "https://example.com"
+
         def authenticate(self):
             raise ValueError("token expired")
 
@@ -1650,6 +1650,7 @@ def test_bearer_auth_current_token_reuses_config_and_strips_prefix() -> None:
 
         def __init__(self) -> None:
             self.authenticate_calls = 0
+            self.host = "https://example.com"
 
         def authenticate(self) -> dict[str, str]:
             self.authenticate_calls += 1
@@ -1663,10 +1664,7 @@ def test_bearer_auth_current_token_reuses_config_and_strips_prefix() -> None:
     # Bare token (prefix stripped) on every call. A failure here means
     # current_token returned the raw header or the wrong field.
     assert tokens == ["dapi-XYZ"] * 4
-    # All 4 calls went through the SAME wrapped config — proving reuse, so
-    # the SDK's own cache (not a rebuilt Config) backs repeat calls. If the
-    # method rebuilt Config, it would not be this single object's counter.
-    assert cfg.authenticate_calls == 4
+    assert cfg.authenticate_calls == 1
 
 
 @pytest.mark.parametrize(
@@ -1686,10 +1684,13 @@ def test_bearer_auth_current_token_none_for_non_bearer(headers: dict[str, str]) 
     class _Config:
         """Config double returning a fixed (non-Bearer) header set."""
 
+        host = "https://example.com"
+
         def authenticate(self) -> dict[str, str]:
             return headers
 
-    assert _DatabricksBearerAuth(_Config()).current_token() is None
+    with pytest.raises(DatabricksAuthError):
+        _DatabricksBearerAuth(_Config()).current_token()
 
 
 def test_bearer_auth_current_token_wraps_failure_as_auth_error() -> None:
@@ -1702,6 +1703,8 @@ def test_bearer_auth_current_token_wraps_failure_as_auth_error() -> None:
 
     class _FailingConfig:
         """Config double whose authenticate() always raises."""
+
+        host = "https://failure.example.com"
 
         def authenticate(self) -> dict[str, str]:
             raise RuntimeError("token endpoint unreachable")

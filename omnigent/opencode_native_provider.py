@@ -251,9 +251,10 @@ def _databricks_bearer_token(profile: str) -> str | None:
     try:
         from databricks.sdk.core import Config
 
-        headers = Config(profile=profile).authenticate() or {}
-        authz = headers.get("Authorization", "")
-        return authz.split(" ", 1)[1] if authz.lower().startswith("bearer ") else None
+        config = Config(profile=profile)
+        from omnigent.databricks_auth_broker import token_for_config
+
+        return token_for_config(config, profile=profile)
     except Exception as exc:  # noqa: BLE001 - SDK absent / bad profile / auth failure.
         _logger.info("opencode MCP databricks token resolve failed for %r: %r", profile, exc)
         return None
@@ -288,11 +289,9 @@ def resolve_databricks_gateway(
         host = (config.host or "").rstrip("/")
         if not host:
             return None
-        headers = config.authenticate() or {}
-        authz = headers.get("Authorization", "")
-        token = authz.split(" ", 1)[1] if authz.lower().startswith("bearer ") else ""
-        if not token:
-            return None
+        from omnigent.databricks_auth_broker import token_for_config
+
+        token = token_for_config(config, profile=profile, workspace_host=host)
     except Exception as exc:  # noqa: BLE001 - SDK absent / auth failure / bad profile.
         _logger.info("opencode Databricks gateway resolve failed for %r: %r", profile, exc)
         return None

@@ -230,32 +230,22 @@ class TestCodexExecutor(unittest.TestCase):
             "https://example-profile-workspace.cloud.databricks.com",
         )
         self.assertNotIn("DATABRICKS_TOKEN", executor._env)
-        # The fix: with an explicit profile, the bearer-token helper selects by
-        # --profile (unambiguous), never --host. A regression to --host makes a
-        # workspace with two profiles on one host return an empty token → 401.
+        # The helper selects the unambiguous profile through the shared broker.
         self.assertTrue(
             any(
-                "databricks auth token --profile" in override
+                "omnigent.databricks_auth_broker" in override
+                and "--profile test-profile" in override
                 for override in executor._codex_config_overrides
             )
         )
         self.assertFalse(
             any("--host" in override for override in executor._codex_config_overrides)
         )
-        # `--force-refresh` only exists in Databricks CLI >= v0.296.0, so it
-        # stays behind a `--help` capability probe — an older CLI rejects the
-        # unknown flag and yields an empty token → silent 401.
         auth_override = next(
-            o for o in executor._codex_config_overrides if "databricks auth token" in o
+            o for o in executor._codex_config_overrides if "omnigent.databricks_auth_broker" in o
         )
-        self.assertIn("databricks auth token --help", auth_override)
-        # And even where it exists it is only ATTEMPTED: it fails outright on a
-        # stale refresh token, so an empty result must fall back to the cached
-        # token rather than turning a usable credential into an auth failure.
-        self.assertIn("--force-refresh", auth_override)
-        # (the TOML fragment escapes the shell's quotes, so match on the test)
-        self.assertIn("if [ -z ", auth_override)
-        self.assertIn("$token", auth_override)
+        self.assertNotIn("databricks auth token", auth_override)
+        self.assertNotIn("--force-refresh", auth_override)
 
     def test_constructor_databricks_flag_with_host_override_skips_profile_lookup(self):
         with (

@@ -3020,6 +3020,7 @@ def test_databricks_token_auth_resolves_sdk_once(
             return {"Authorization": "Bearer tok-xyz"}
 
     cfg = _CountingConfig()
+    cfg.host = "https://ex.databricks.com"
     resolve_calls = {"n": 0}
 
     def _fake_resolve(
@@ -3053,9 +3054,8 @@ def test_databricks_token_auth_resolves_sdk_once(
         f"_resolve_databricks_auth called {resolve_calls['n']}x; expected 1 "
         f"(resolve-once-and-cache)."
     )
-    # authenticate() runs per request (4) — cheap in-memory SDK cache hits,
-    # NOT CLI shell-outs. That's the behavior the fix preserves.
-    assert cfg.authenticate_calls == 4
+    # One publication serves all four requests.
+    assert cfg.authenticate_calls == 1
 
 
 def test_databricks_token_auth_sets_org_header(monkeypatch: pytest.MonkeyPatch) -> None:

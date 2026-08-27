@@ -72,11 +72,12 @@ class DatabricksAdapter(OpenAICompatibleAdapter):
         if cfg is None:
             return None
         try:
-            headers = cfg.authenticate()
+            from omnigent.databricks_auth_broker import token_for_config
+
+            token = token_for_config(cfg, profile=profile)
         except Exception:
             # Token refresh or auth failure — fall back to configparser path.
             return None
-        token = (headers.get("Authorization") or "").removeprefix("Bearer ").strip()
         if not token or not cfg.host:
             return None
         return {

@@ -150,6 +150,8 @@ def test_make_auth_token_factory_returns_factory_when_databricks_creds_available
     class _Cfg:
         """Config double whose authenticate() yields a Bearer header."""
 
+        host = "https://ex.test"
+
         def authenticate(self) -> dict[str, str]:
             return {"Authorization": "Bearer fresh-token"}
 
@@ -2262,6 +2264,7 @@ def test_make_auth_token_factory_resolves_sdk_auth_once(
 
         def __init__(self) -> None:
             self.authenticate_calls = 0
+            self.host = "https://ex.databricks.com"
 
         def authenticate(self) -> dict[str, str]:
             self.authenticate_calls += 1
@@ -2298,12 +2301,8 @@ def test_make_auth_token_factory_resolves_sdk_auth_once(
         f"(resolve-once-and-cache). >1 means the per-request auth tax "
         f"regressed."
     )
-    # authenticate() runs once per token fetch: the factory's own probe (1)
-    # plus the 5 explicit calls = 6. These are cheap in-memory SDK cache
-    # hits, NOT CLI shell-outs — that's the behavior the fix preserves.
-    assert cfg.authenticate_calls == 6, (
-        f"Expected 6 authenticate() calls (probe + 5), got {cfg.authenticate_calls}."
-    )
+    # The broker publishes once; all later fetches read that publication.
+    assert cfg.authenticate_calls == 1
 
 
 @pytest.mark.parametrize(
