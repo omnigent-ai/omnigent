@@ -212,10 +212,10 @@ describe("CommandPalette — match preview", () => {
 });
 
 describe("CommandPalette — input", () => {
-  it("uses the sessions-first placeholder", () => {
+  it("uses the commands placeholder in commands mode", () => {
     renderPalette();
 
-    expect(screen.getByPlaceholderText("Search sessions or run a command")).toBeTruthy();
+    expect(screen.getByPlaceholderText("Run a command")).toBeTruthy();
   });
 });
 
@@ -278,7 +278,7 @@ describe("CommandPalette — mobile full-screen sheet", () => {
     try {
       setMobile(true);
       setSessions([conv("c1", "Fix the parser")]);
-      renderPalette();
+      renderSearch();
 
       fireEvent.change(screen.getByTestId("command-palette-input"), {
         target: { value: "deploy" },
