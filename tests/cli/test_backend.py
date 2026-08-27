@@ -185,16 +185,10 @@ def test_ensure_host_daemon_local_spawns_local_flag(
     assert (tmp_path / "host.pid").read_text().splitlines()[1] == "local"
 
 
-def test_ensure_host_daemon_local_inherits_data_dir_and_db_uri(
+def test_ensure_host_daemon_local_inherits_paths_but_not_database_credentials(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The local daemon inherits the runtime data-dir + DB URI vars.
-
-    In local mode the daemon owns the local Omnigent server, so it must resolve the
-    same config home, data dir, and DB URI the CLI assumes — otherwise the CLI
-    reads the local-server pidfile from one dir while the daemon writes it to
-    another and discovery times out.
-    """
+    """The local daemon keeps runtime paths without retaining a credential URI."""
     captured: dict[str, object] = {}
     _patch_daemon_spawn(monkeypatch, tmp_path, captured)
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "iso"))
@@ -205,18 +199,13 @@ def test_ensure_host_daemon_local_inherits_data_dir_and_db_uri(
     env = captured["env"]
     assert isinstance(env, dict)
     assert env["OMNIGENT_CONFIG_HOME"] == str(tmp_path / "iso")
-    assert env["OMNIGENT_DATABASE_URI"] == "postgresql://u:pw@h/db"
+    assert "OMNIGENT_DATABASE_URI" not in env
 
 
-def test_build_host_daemon_env_local_preserves_server_credentials(
+def test_build_host_daemon_env_local_strips_provider_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Local daemon env carries credentials needed by its Omnigent server.
-
-    The daemon's local server is the process that performs LLM calls, so
-    stripping ``OPENAI_*`` here makes default persistent ``omnigent run``
-    invocations hang or fail after booting a credential-less server.
-    """
+    """A local daemon does not retain model or database credentials."""
     monkeypatch.setenv("PATH", "/usr/bin")
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("OPENAI_BASE_URL", "https://example.databricks.com/serving-endpoints")
@@ -224,17 +213,24 @@ def test_build_host_daemon_env_local_preserves_server_credentials(
     monkeypatch.setenv("OMNIGENT_DATABASE_URI", "postgresql://u:pw@h/db")
     monkeypatch.setenv("GITHUB_TOKEN", "unrelated-github-secret")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "unrelated-aws-secret")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", "authorization=secret")
+    monkeypatch.setenv("MLFLOW_TRACKING_TOKEN", "mlflow-secret")
 
     env = _build_host_daemon_env(server_url=None)
     empty_string_env = _build_host_daemon_env(server_url="")
 
-    assert env["OPENAI_API_KEY"] == "test-key"
-    assert env["OPENAI_BASE_URL"] == "https://example.databricks.com/serving-endpoints"
-    assert env["ANTHROPIC_API_KEY"] == "test-anthropic-key"
-    assert env["OMNIGENT_DATABASE_URI"] == "postgresql://u:pw@h/db"
-    assert "GITHUB_TOKEN" not in env
-    assert "AWS_SECRET_ACCESS_KEY" not in env
-    assert empty_string_env["OPENAI_API_KEY"] == "test-key"
+    for name in (
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "ANTHROPIC_API_KEY",
+        "OMNIGENT_DATABASE_URI",
+        "GITHUB_TOKEN",
+        "AWS_SECRET_ACCESS_KEY",
+        "OTEL_EXPORTER_OTLP_HEADERS",
+        "MLFLOW_TRACKING_TOKEN",
+    ):
+        assert name not in env
+        assert name not in empty_string_env
 
 
 def test_build_host_daemon_env_local_forwards_bedrock_skip_auth(
@@ -272,28 +268,19 @@ def test_build_host_daemon_env_remote_strips_provider_credentials(
     assert "OPENAI_API_KEY" not in env
     assert "OPENAI_BASE_URL" not in env
     assert "ANTHROPIC_API_KEY" not in env
-    # Databricks auth is intentionally preserved for the daemon's server auth.
-    assert env["DATABRICKS_TOKEN"] == "test-databricks-token"
+    assert "DATABRICKS_TOKEN" not in env
 
 
-def test_build_host_daemon_env_remote_keeps_runner_env_passthrough(
+def test_build_host_daemon_env_remote_strips_runner_env_passthrough(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The operator env-forwarding control var survives the remote daemon hop.
-
-    ``OMNIGENT_RUNNER_ENV_PASSTHROUGH`` names extra env vars for the daemon to
-    forward on to runners. In ``--server`` mode the daemon env is allowlisted by
-    a prefix set that includes ``DATABRICKS_`` but *not* plain ``OMNIGENT_``, so
-    without an explicit allowlist entry the control var itself is stripped here —
-    and ``_build_runner_env`` never sees the names it lists, making the whole
-    passthrough a silent no-op remotely. It carries only var names, not secrets.
-    """
+    """The removed generic credential-passthrough mechanism does not reach the host."""
     monkeypatch.setenv("PATH", "/usr/bin")
     monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "MY_GATEWAY_TOKEN")
 
     env = _build_host_daemon_env(server_url="https://example.databricksapps.com")
 
-    assert env["OMNIGENT_RUNNER_ENV_PASSTHROUGH"] == "MY_GATEWAY_TOKEN"
+    assert "OMNIGENT_RUNNER_ENV_PASSTHROUGH" not in env
 
 
 def test_ensure_host_daemon_reuses_same_target(

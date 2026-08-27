@@ -78,11 +78,9 @@ def _spawn_host_daemon(
     host_id gets overwritten and never shows online. A unique name per test
     keeps each host its own row.
 
-    The daemon's environment carries ``OPENAI_BASE_URL`` and
-    ``OPENAI_API_KEY`` pointing at the mock LLM server.  The host
-    daemon forwards ``OPENAI_*`` to its runner subprocesses via
-    ``HARNESS_CREDENTIAL_ENV_VARS``, so the runner's openai-agents
-    executor hits the mock server.
+    The runner resolves an explicit mock provider from its isolated config at
+    harness launch. The long-lived host and generic runner environments never
+    receive the provider key.
 
     :param tmp_path: Per-test temp dir used as the daemon's ``HOME``.
     :param live_server: Server URL the daemon registers with, e.g.
@@ -99,7 +97,21 @@ def _spawn_host_daemon(
     host_name = f"e2e-host-{uuid.uuid4().hex[:12]}"
     (omni_dir / "config.yaml").write_text(
         yaml.safe_dump(
-            {"host": {"host_id": host_id, "name": host_name}},
+            {
+                "host": {"host_id": host_id, "name": host_name},
+                "providers": {
+                    "host-e2e-openai": {
+                        "kind": "key",
+                        "default": ["openai"],
+                        "openai": {
+                            "base_url": f"{mock_llm_server_url}/v1",
+                            "api_key": "mock-key",
+                            "wire_api": "responses",
+                            "models": {"default": "gpt-5.4"},
+                        },
+                    }
+                },
+            },
             default_flow_style=False,
             sort_keys=True,
         )
@@ -110,8 +122,6 @@ def _spawn_host_daemon(
     env = {
         **os.environ,
         "HOME": str(tmp_path),
-        "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
-        "OPENAI_API_KEY": "mock-key",
         PROCESS_LOG_FILE_ENV_VAR: str(daemon_log),
     }
     with open(daemon_log, "w") as log_fh:
@@ -178,6 +188,9 @@ def _write_smoke_agent_yaml(tmp_path: Path) -> Path:
                 "executor:",
                 "  harness: openai-agents",
                 "  model: gpt-5.4",
+                "  auth:",
+                "    type: provider",
+                "    name: host-e2e-openai",
                 "prompt: |",
                 "  You are a terse smoke-test assistant.",
                 "  Follow the user's instruction exactly.",
@@ -301,7 +314,6 @@ def test_host_name_only_config_generates_host_id(
     live_server: str,
     http_client: httpx.Client,
     tmp_path: Path,
-    mock_llm_server_url: str,
 ) -> None:
     """
     A config.yaml that names the host but omits host_id must register
@@ -326,8 +338,6 @@ def test_host_name_only_config_generates_host_id(
     env = {
         **os.environ,
         "HOME": str(tmp_path),
-        "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
-        "OPENAI_API_KEY": "mock-key",
         PROCESS_LOG_FILE_ENV_VAR: str(daemon_log),
     }
     with open(daemon_log, "w") as log_fh:
@@ -789,18 +799,15 @@ def test_host_death_kills_runners(
 #
 # Skipped when ``claude`` or ``tmux`` are absent from PATH — the test
 # launches a real Claude Code TUI in a tmux session via the host daemon.
-# All LLM calls hit the shared mock server: the daemon's environment
-# carries ``ANTHROPIC_BASE_URL`` pointing at the mock and
-# ``ANTHROPIC_API_KEY=mock-key``; both flow to the runner via the host's
-# ``HARNESS_CREDENTIAL_ENV_VARS`` allowlist.
+# All LLM calls hit the shared mock server through an explicit provider config
+# resolved when the harness launches; the host and generic runner retain no key.
 
 
 def _write_claude_native_agent_yaml(tmp_path: Path) -> Path:
     """Create a minimal ``claude-native`` agent dir for the host e2e.
 
-    No ``executor.auth`` — auth flows via ``ANTHROPIC_API_KEY`` /
-    ``ANTHROPIC_BASE_URL`` injected into the daemon's environment (and
-    therefore inherited by the runner's tmux session).
+    The named provider resolves at harness launch rather than through the host
+    or generic runner environment.
 
     :param tmp_path: Pytest temp directory.
     :returns: Path to the agent directory.
@@ -816,6 +823,9 @@ def _write_claude_native_agent_yaml(tmp_path: Path) -> Path:
                 "  You are a terse test assistant. Reply exactly as asked.",
                 "executor:",
                 "  harness: claude-native",
+                "  auth:",
+                "    type: provider",
+                "    name: host-e2e-anthropic",
                 "",
             ]
         )
@@ -863,10 +873,8 @@ def _spawn_host_daemon_for_mock_claude(
 ) -> _SpawnedHostDaemon:
     """Spawn an isolated host daemon wired to the mock Anthropic LLM.
 
-    Like :func:`_spawn_host_daemon` but sets ``ANTHROPIC_BASE_URL`` and
-    ``ANTHROPIC_API_KEY`` so the runner's Claude TUI hits the mock server
-    instead of prompting for OAuth. Both vars are in
-    ``HARNESS_CREDENTIAL_ENV_VARS`` and flow daemon→runner automatically.
+    Like :func:`_spawn_host_daemon` but configures an Anthropic provider that
+    the runner resolves only when launching Claude.
 
     The Anthropic SDK appends ``/v1/messages`` to ``ANTHROPIC_BASE_URL``,
     so the URL must NOT include ``/v1``.
@@ -885,7 +893,20 @@ def _spawn_host_daemon_for_mock_claude(
     host_name = f"e2e-host-{uuid.uuid4().hex[:12]}"
     (omni_dir / "config.yaml").write_text(
         yaml.safe_dump(
-            {"host": {"host_id": host_id, "name": host_name}},
+            {
+                "host": {"host_id": host_id, "name": host_name},
+                "providers": {
+                    "host-e2e-anthropic": {
+                        "kind": "key",
+                        "default": ["anthropic"],
+                        "anthropic": {
+                            "base_url": mock_llm_server_url,
+                            "api_key": "mock-key",
+                            "models": {"default": "claude-sonnet-4-5"},
+                        },
+                    }
+                },
+            },
             default_flow_style=False,
             sort_keys=True,
         )
@@ -894,12 +915,6 @@ def _spawn_host_daemon_for_mock_claude(
     env = {
         **os.environ,
         "HOME": str(tmp_path),
-        # ANTHROPIC_BASE_URL is in HARNESS_CREDENTIAL_ENV_VARS so it flows
-        # daemon→runner. The Anthropic SDK appends /v1/messages; omit /v1.
-        "ANTHROPIC_BASE_URL": mock_llm_server_url,
-        # ANTHROPIC_API_KEY bypasses the Claude CLI's OAuth login — no
-        # ~/.claude.json account is needed when an explicit API key is set.
-        "ANTHROPIC_API_KEY": "mock-key",
         # Suppress beta headers so the mock server doesn't reject them.
         "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
         PROCESS_LOG_FILE_ENV_VAR: str(daemon_log),

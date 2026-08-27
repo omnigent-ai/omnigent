@@ -146,6 +146,49 @@ def test_upgrade_runs_installer_and_drains_first(
     assert "Upgraded to v0.2.0" in result.output
 
 
+def test_upgrade_refreshes_local_host_service_after_success(
+    monkeypatch: pytest.MonkeyPatch, _wheel_install: None
+) -> None:
+    """A successful upgrade rewrites and restarts a stopped local service."""
+    from omnigent.host.service import HostService, HostServiceStatus
+
+    monkeypatch.setattr("omnigent.update_check.fetch_latest_version", lambda *_a, **_k: "0.2.0")
+    service_path = Path("/tmp/omnigent-host.service")
+    snapshot = HostServiceStatus(
+        supported=True,
+        kind="systemd_user",
+        path=service_path,
+        label=service_path.name,
+        installed=True,
+        configured_target="local",
+        manager_state="running",
+        enabled=True,
+    )
+    monkeypatch.setattr("omnigent.cli._capture_upgrade_host_service", lambda: snapshot)
+    monkeypatch.setattr("omnigent.cli._stop_local_server_and_daemon", lambda *, force: True)
+    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", lambda *_a, **_k: 0)
+    monkeypatch.setattr(
+        "omnigent.update_check._probe_installed_distribution", lambda: ("0.2.0", None)
+    )
+    monkeypatch.setattr(
+        "omnigent.cli._build_host_daemon_env",
+        lambda **kw: {"HOME": "/home/alice", "TERM": "xterm"},
+    )
+    refreshed: list[tuple[str | None, dict[str, str]]] = []
+
+    def _enable(server_url: str | None, *, environment: dict[str, str]) -> HostService:
+        refreshed.append((server_url, environment))
+        return HostService(kind="systemd_user", path=service_path, label=service_path.name)
+
+    monkeypatch.setattr("omnigent.host.service.enable_user_host_service", _enable)
+
+    result = CliRunner().invoke(cli, ["upgrade"])
+
+    assert result.exit_code == 0, result.output
+    assert refreshed == [(None, {"HOME": "/home/alice"})]
+    assert "Refreshed and restarted" in result.output
+
+
 def test_upgrade_force_skips_drain_and_force_stops(
     monkeypatch: pytest.MonkeyPatch, _wheel_install: None
 ) -> None:
@@ -184,6 +227,39 @@ def test_upgrade_install_failure_surfaces(
 
     assert result.exit_code != 0
     assert "exited with status 3" in result.output
+
+
+def test_upgrade_failure_restores_previously_running_local_service(
+    monkeypatch: pytest.MonkeyPatch, _wheel_install: None
+) -> None:
+    """A failed installer does not strand the service stopped for replacement."""
+    from omnigent.host.service import HostServiceStatus
+
+    monkeypatch.setattr("omnigent.update_check.fetch_latest_version", lambda *_a, **_k: "0.2.0")
+    snapshot = HostServiceStatus(
+        supported=True,
+        kind="systemd_user",
+        path=Path("/tmp/omnigent-host.service"),
+        label="omnigent-host.service",
+        installed=True,
+        configured_target="local",
+        manager_state="running",
+        enabled=True,
+    )
+    monkeypatch.setattr("omnigent.cli._capture_upgrade_host_service", lambda: snapshot)
+    monkeypatch.setattr("omnigent.cli._stop_local_server_and_daemon", lambda *, force: True)
+    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", lambda *_a, **_k: 3)
+    restored: list[str | None] = []
+    monkeypatch.setattr(
+        "omnigent.host.service.start_user_host_service",
+        lambda server: restored.append(server) or snapshot,
+    )
+
+    result = CliRunner().invoke(cli, ["upgrade"])
+
+    assert result.exit_code != 0
+    assert restored == [None]
+    assert "Restored the local host user service" in result.output
 
 
 def test_upgrade_index_unreachable(monkeypatch: pytest.MonkeyPatch, _wheel_install: None) -> None:

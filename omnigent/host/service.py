@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import platform
 import plistlib
@@ -10,7 +11,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, TypeAlias
@@ -49,6 +50,8 @@ class HostServiceStatus:
     installed: bool = False
     configured_target: str | None = None
     executable: str | None = None
+    executable_valid: bool | None = None
+    executable_error: str | None = None
     definition_error: str | None = None
     manager_state: HostServiceManagerState = "stopped"
     manager_pid: int | None = None
@@ -66,6 +69,8 @@ class HostServiceStatus:
             "installed": self.installed,
             "configured_target": self.configured_target,
             "executable": self.executable,
+            "executable_valid": self.executable_valid,
+            "executable_error": self.executable_error,
             "definition_error": self.definition_error,
             "manager_state": self.manager_state,
             "manager_pid": self.manager_pid,
@@ -135,6 +140,18 @@ def _read_systemd_definition(path: Path) -> tuple[str, str]:
         raise ValueError("systemd definition has no ExecStart command")
     command = [part.replace("$$", "$").replace("%%", "%") for part in shlex.split(exec_value)]
     return _service_command_details(command)
+
+
+def _validate_executable(executable: str) -> str | None:
+    """Return an actionable error when a configured Python is unusable."""
+    path = Path(executable)
+    if not path.is_absolute():
+        return "configured Python executable is not an absolute path"
+    if not path.is_file():
+        return f"configured Python executable does not exist: {path}"
+    if not os.access(path, os.X_OK):
+        return f"configured Python executable is not executable: {path}"
+    return None
 
 
 def _read_service_definition(service: HostService) -> tuple[str | None, str | None, str | None]:
@@ -273,6 +290,7 @@ def user_host_service_status(*, probe_manager: bool = True) -> HostServiceStatus
         )
 
     target, executable, definition_error = _read_service_definition(service)
+    executable_error = _validate_executable(executable) if executable is not None else None
     manager_state: HostServiceManagerState = "stopped"
     manager_pid: int | None = None
     enabled: bool | None = service.path.exists()
@@ -295,6 +313,8 @@ def user_host_service_status(*, probe_manager: bool = True) -> HostServiceStatus
         installed=service.path.exists(),
         configured_target=target,
         executable=executable,
+        executable_valid=None if executable is None else executable_error is None,
+        executable_error=executable_error,
         definition_error=definition_error,
         manager_state=manager_state,
         manager_pid=manager_pid,
@@ -442,35 +462,56 @@ def _restore_file(path: Path, previous: bytes | None) -> None:
         _atomic_write(path, previous)
 
 
-def _enable_launchd(service: HostService, content: bytes) -> None:
-    assert service.log_path is not None
-    service.log_path.parent.mkdir(parents=True, exist_ok=True)
-    previous = service.path.read_bytes() if service.path.exists() else None
+@dataclass(frozen=True)
+class _ServiceSnapshot:
+    """Definition and manager state captured before an enable transaction."""
+
+    content: bytes | None
+    status: HostServiceStatus
+
+
+def _snapshot_service(service: HostService) -> _ServiceSnapshot:
+    content = service.path.read_bytes() if service.path.exists() else None
+    return _ServiceSnapshot(content=content, status=user_host_service_status())
+
+
+def _activate_launchd(service: HostService) -> None:
     domain = f"gui/{os.getuid()}"
     _run_best_effort(["launchctl", "bootout", f"{domain}/{service.label}"])
-    _atomic_write(service.path, content)
-    try:
-        _run_checked(["launchctl", "bootstrap", domain, str(service.path)])
-    except HostServiceError:
-        _restore_file(service.path, previous)
-        if previous is not None:
+    _run_checked(["launchctl", "bootstrap", domain, str(service.path)])
+
+
+def _activate_systemd(service: HostService, *, changed: bool) -> None:
+    _run_checked(["systemctl", "--user", "daemon-reload"])
+    _run_checked(["systemctl", "--user", "enable", "--now", service.label])
+    if changed:
+        _run_checked(["systemctl", "--user", "restart", service.label])
+
+
+def _restore_service(service: HostService, snapshot: _ServiceSnapshot) -> None:
+    """Best-effort restore of the definition and prior manager state."""
+    if service.kind == "launchd":
+        domain = f"gui/{os.getuid()}"
+        _run_best_effort(["launchctl", "bootout", f"{domain}/{service.label}"])
+        _restore_file(service.path, snapshot.content)
+        if snapshot.content is not None and snapshot.status.manager_state == "running":
             _run_best_effort(["launchctl", "bootstrap", domain, str(service.path)])
-        raise
+        return
 
-
-def _enable_systemd(service: HostService, content: bytes) -> None:
-    previous = service.path.read_bytes() if service.path.exists() else None
-    changed = previous != content
-    _atomic_write(service.path, content)
-    try:
-        _run_checked(["systemctl", "--user", "daemon-reload"])
-        _run_checked(["systemctl", "--user", "enable", "--now", service.label])
-        if previous is not None and changed:
-            _run_checked(["systemctl", "--user", "restart", service.label])
-    except HostServiceError:
-        _restore_file(service.path, previous)
-        _run_best_effort(["systemctl", "--user", "daemon-reload"])
-        raise
+    if snapshot.content is None:
+        _run_best_effort(["systemctl", "--user", "disable", "--now", service.label])
+    else:
+        _run_best_effort(["systemctl", "--user", "stop", service.label])
+    _restore_file(service.path, snapshot.content)
+    _run_best_effort(["systemctl", "--user", "daemon-reload"])
+    if snapshot.content is None:
+        return
+    if snapshot.status.enabled:
+        _run_best_effort(["systemctl", "--user", "enable", service.label])
+    else:
+        _run_best_effort(["systemctl", "--user", "disable", service.label])
+    if snapshot.status.manager_state == "running":
+        _run_best_effort(["systemctl", "--user", "start", service.label])
 
 
 def _record_service(service: HostService) -> None:
@@ -571,22 +612,49 @@ def enable_user_host_service(
     server_url: str | None,
     *,
     environment: Mapping[str, str],
+    before_activate: Callable[[], None] | None = None,
+    on_rollback: Callable[[], None] | None = None,
 ) -> HostService:
-    """Install, enable, and start the current user's host service."""
+    """Transactionally install, enable, and start the user's host service."""
     service = _service_for_current_platform()
     command = _service_command(server_url)
+    executable_error = _validate_executable(command[0])
+    if executable_error is not None:
+        raise HostServiceError(executable_error)
     clean_environment = _clean_environment(environment)
+    snapshot = _snapshot_service(service)
     if service.kind == "launchd":
+        assert service.log_path is not None
+        service.log_path.parent.mkdir(parents=True, exist_ok=True)
         content = _launchd_payload(
             service,
             command=command,
             environment=clean_environment,
         )
-        _enable_launchd(service, content)
     else:
         content = _systemd_unit(command=command, environment=clean_environment)
-        _enable_systemd(service, content)
-    _record_service(service)
+
+    try:
+        _atomic_write(service.path, content)
+        if before_activate is not None:
+            before_activate()
+        if service.kind == "launchd":
+            _activate_launchd(service)
+        else:
+            _activate_systemd(
+                service,
+                changed=snapshot.content is not None and snapshot.content != content,
+            )
+        _record_service(service)
+    except Exception:
+        _restore_service(service, snapshot)
+        if snapshot.content is None:
+            with contextlib.suppress(Exception):
+                _forget_service(service)
+        if on_rollback is not None:
+            with contextlib.suppress(Exception):
+                on_rollback()
+        raise
     return service
 
 

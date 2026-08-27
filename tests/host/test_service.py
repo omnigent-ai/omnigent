@@ -266,7 +266,11 @@ def test_enable_launchd_user_service(tmp_path: Path, monkeypatch: pytest.MonkeyP
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "state"))
     monkeypatch.setattr(service.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(service.os, "getuid", lambda: 501)
-    monkeypatch.setattr(service.sys, "executable", "/opt/omnigent/bin/python")
+    python = tmp_path / "bin/python"
+    python.parent.mkdir()
+    python.write_text("#!/bin/sh\n")
+    python.chmod(0o700)
+    monkeypatch.setattr(service.sys, "executable", str(python))
     calls = _capture_runs(monkeypatch)
 
     installed = service.enable_user_host_service(
@@ -278,7 +282,7 @@ def test_enable_launchd_user_service(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert installed.path == tmp_path / "Library/LaunchAgents/ai.omnigent.host.plist"
     assert payload["Label"] == "ai.omnigent.host"
     assert payload["ProgramArguments"] == [
-        "/opt/omnigent/bin/python",
+        str(python),
         "-m",
         "omnigent.host.service_entry",
         "--server",
@@ -288,6 +292,8 @@ def test_enable_launchd_user_service(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert payload["KeepAlive"] == {"SuccessfulExit": False}
     assert "ProcessType" not in payload
     assert calls == [
+        ["launchctl", "print", "gui/501/ai.omnigent.host"],
+        ["launchctl", "print-disabled", "gui/501"],
         ["launchctl", "bootout", "gui/501/ai.omnigent.host"],
         [
             "launchctl",
@@ -322,7 +328,11 @@ def test_enable_systemd_user_service(tmp_path: Path, monkeypatch: pytest.MonkeyP
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
     monkeypatch.setattr(service.platform, "system", lambda: "Linux")
-    monkeypatch.setattr(service.sys, "executable", "/opt/omnigent/bin/python")
+    python = tmp_path / "bin/python"
+    python.parent.mkdir()
+    python.write_text("#!/bin/sh\n")
+    python.chmod(0o700)
+    monkeypatch.setattr(service.sys, "executable", str(python))
     calls = _capture_runs(monkeypatch)
 
     installed = service.enable_user_host_service(
@@ -333,15 +343,173 @@ def test_enable_systemd_user_service(tmp_path: Path, monkeypatch: pytest.MonkeyP
     unit = installed.path.read_text()
     assert installed.path == tmp_path / "xdg/systemd/user/omnigent-host.service"
     assert 'Environment="HOME=' in unit
-    assert (
-        'ExecStart="/opt/omnigent/bin/python" "-m" "omnigent.host.service_entry" "--local"'
-    ) in unit
+    assert f'ExecStart="{python}" "-m" "omnigent.host.service_entry" "--local"' in unit
     assert "Restart=on-failure" in unit
     assert "RestartPreventExitStatus=78 143" in unit
-    assert calls == [
+    assert calls[0][:4] == ["systemctl", "--user", "show", "omnigent-host.service"]
+    assert calls[1:] == [
         ["systemctl", "--user", "daemon-reload"],
         ["systemctl", "--user", "enable", "--now", "omnigent-host.service"],
     ]
+
+
+def test_enable_systemd_rolls_back_definition_and_callback_on_activation_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+    monkeypatch.setattr(service.platform, "system", lambda: "Linux")
+    python = tmp_path / "bin/python"
+    python.parent.mkdir()
+    python.write_text("#!/bin/sh\n")
+    python.chmod(0o700)
+    monkeypatch.setattr(service.sys, "executable", str(python))
+    path = tmp_path / ".config/systemd/user/omnigent-host.service"
+    monkeypatch.setattr(
+        service,
+        "user_host_service_status",
+        lambda: service.HostServiceStatus(
+            supported=True,
+            kind="systemd_user",
+            path=path,
+            label=path.name,
+            installed=False,
+            manager_state="stopped",
+        ),
+    )
+    checked: list[list[str]] = []
+
+    def _checked(args: list[str]) -> None:
+        checked.append(list(args))
+        if "enable" in args:
+            raise service.HostServiceError("activation failed")
+
+    rollback_calls: list[list[str]] = []
+    monkeypatch.setattr(service, "_run_checked", _checked)
+    monkeypatch.setattr(
+        service,
+        "_run_best_effort",
+        lambda args: (
+            rollback_calls.append(list(args)) or subprocess.CompletedProcess(args, 0, "", "")
+        ),
+    )
+    monkeypatch.setattr(service, "_record_service", lambda installed: None)
+    monkeypatch.setattr(service, "_forget_service", lambda installed: None)
+    retired: list[str] = []
+    restored: list[str] = []
+
+    with pytest.raises(service.HostServiceError, match="activation failed"):
+        service.enable_user_host_service(
+            None,
+            environment={"HOME": str(tmp_path)},
+            before_activate=lambda: retired.append("retired"),
+            on_rollback=lambda: restored.append("restored"),
+        )
+
+    assert retired == ["retired"]
+    assert restored == ["restored"]
+    assert not path.exists()
+    assert checked == [
+        ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "enable", "--now", "omnigent-host.service"],
+    ]
+    assert rollback_calls == [
+        ["systemctl", "--user", "disable", "--now", "omnigent-host.service"],
+        ["systemctl", "--user", "daemon-reload"],
+    ]
+
+
+def test_enable_systemd_restores_running_previous_service_on_ledger_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+    monkeypatch.setattr(service.platform, "system", lambda: "Linux")
+    old_python = tmp_path / "old/python"
+    old_python.parent.mkdir()
+    old_python.write_text("#!/bin/sh\n")
+    old_python.chmod(0o700)
+    new_python = tmp_path / "new/python"
+    new_python.parent.mkdir()
+    new_python.write_text("#!/bin/sh\n")
+    new_python.chmod(0o700)
+    monkeypatch.setattr(service.sys, "executable", str(new_python))
+    path = tmp_path / ".config/systemd/user/omnigent-host.service"
+    path.parent.mkdir(parents=True)
+    previous = service._systemd_unit(
+        command=[str(old_python), "-m", "omnigent.host.service_entry", "--local"],
+        environment={"HOME": str(tmp_path)},
+    )
+    path.write_bytes(previous)
+    monkeypatch.setattr(
+        service,
+        "user_host_service_status",
+        lambda: service.HostServiceStatus(
+            supported=True,
+            kind="systemd_user",
+            path=path,
+            label=path.name,
+            installed=True,
+            configured_target="local",
+            manager_state="running",
+            manager_pid=4242,
+            enabled=True,
+        ),
+    )
+    checked: list[list[str]] = []
+    rollback_calls: list[list[str]] = []
+    monkeypatch.setattr(service, "_run_checked", lambda args: checked.append(list(args)))
+    monkeypatch.setattr(
+        service,
+        "_run_best_effort",
+        lambda args: (
+            rollback_calls.append(list(args)) or subprocess.CompletedProcess(args, 0, "", "")
+        ),
+    )
+
+    def _fail_record(installed: service.HostService) -> None:
+        del installed
+        raise service.HostServiceError("ledger failed")
+
+    monkeypatch.setattr(service, "_record_service", _fail_record)
+
+    with pytest.raises(service.HostServiceError, match="ledger failed"):
+        service.enable_user_host_service(None, environment={"HOME": str(tmp_path)})
+
+    assert path.read_bytes() == previous
+    assert checked == [
+        ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "enable", "--now", "omnigent-host.service"],
+        ["systemctl", "--user", "restart", "omnigent-host.service"],
+    ]
+    assert rollback_calls == [
+        ["systemctl", "--user", "stop", "omnigent-host.service"],
+        ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "enable", "omnigent-host.service"],
+        ["systemctl", "--user", "start", "omnigent-host.service"],
+    ]
+
+
+def test_status_reports_missing_configured_executable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+    monkeypatch.setattr(service.platform, "system", lambda: "Linux")
+    installed = service._service_for_current_platform()
+    installed.path.parent.mkdir(parents=True)
+    missing = tmp_path / "removed/python"
+    installed.path.write_bytes(
+        service._systemd_unit(
+            command=[str(missing), "-m", "omnigent.host.service_entry", "--local"],
+            environment={},
+        )
+    )
+
+    status = service.user_host_service_status(probe_manager=False)
+
+    assert status.executable_valid is False
+    assert str(missing) in (status.executable_error or "")
 
 
 def test_systemd_unit_escapes_specifiers_and_literal_dollars() -> None:

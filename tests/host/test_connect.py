@@ -1893,13 +1893,9 @@ def test_handle_stat_expands_tilde(tmp_path: Path, monkeypatch) -> None:
 
 def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     """
-    A spawned runner inherits only allowlisted host env vars — process
-    essentials pass through, the host owner's NON-HARNESS secrets do
-    not — plus the runner wiring vars. Harness credentials
-    (HARNESS_CREDENTIAL_ENV_VARS) are the deliberate exception: the
-    host owner provisions those precisely so runners can use them.
-    Guards against unrelated host secrets (cloud creds, workspace
-    tokens) leaking into every runner subprocess.
+    A spawned runner inherits only non-secret allowlisted host values plus
+    runner wiring. Provider and harness credentials stay out of the generic
+    runner and are resolved only at the harness launch boundary.
     """
     base = {
         "PATH": "/usr/bin:/bin",
@@ -1922,6 +1918,10 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
         "OMNIGENT_LOG_LEVEL": "DEBUG",
         "OMNIGENT_LOG_TO_STDERR": "1",
         "OMNIGENT_LOG_TTY_FD": "9",
+        "OMNIGENT_DEBUG_LOG_CLIENT_SECRET": "debug-log-secret",
+        "OMNIGENT_RUNNER_ENV_PASSTHROUGH": "SOME_RANDOM_VAR",
+        "OTEL_EXPORTER_OTLP_HEADERS": "authorization=secret",
+        "MLFLOW_TRACKING_TOKEN": "mlflow-secret",
     }
 
     env = _build_runner_env(
@@ -1947,10 +1947,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     # falls back to the ~/.databrickscfg default and can read a different token
     # store than the host/daemon, failing to mint a token (runner tunnel 401).
     assert env["DATABRICKS_AUTH_STORAGE"] == "plaintext"
-    # Harness credentials forward — they exist FOR the runner's
-    # harnesses (laptop: exported keys; managed sandbox: the
-    # deployment's injected provider secrets).
-    assert env["ANTHROPIC_API_KEY"] == "sk-harness"
+    assert "ANTHROPIC_API_KEY" not in env
     # The sandbox-image environment descriptor forwards: Claude Code
     # needs it to allow --dangerously-skip-permissions under root in
     # sandbox containers. Only the baked host image ever sets it.
@@ -1984,6 +1981,10 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     # Non-harness secrets are stripped — the point of the allowlist.
     assert "DATABRICKS_TOKEN" not in env
     assert "AWS_SECRET_ACCESS_KEY" not in env
+    assert "OMNIGENT_DEBUG_LOG_CLIENT_SECRET" not in env
+    assert "OMNIGENT_RUNNER_ENV_PASSTHROUGH" not in env
+    assert "OTEL_EXPORTER_OTLP_HEADERS" not in env
+    assert "MLFLOW_TRACKING_TOKEN" not in env
     # Non-allowlisted vars are dropped (allowlist, not denylist).
     assert "SOME_RANDOM_VAR" not in env
     # Runner wiring is layered on.
@@ -1996,14 +1997,8 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     assert env[RUNNER_PARENT_PID_ENV_VAR] == "42"
 
 
-def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
-    """
-    Every var in HARNESS_CREDENTIAL_ENV_VARS forwards when present —
-    keys AND endpoint wiring (base URLs travel with their credentials
-    or gateway setups break in confusing ways). Absent vars are simply
-    not set rather than defaulted.
-    """
-    from omnigent.host.connect import HARNESS_CREDENTIAL_ENV_VARS
+def test_build_runner_env_strips_harness_credentials_and_endpoints() -> None:
+    """Generic runners never inherit provider credential material."""
 
     base = {
         "PATH": "/usr/bin",
@@ -2034,9 +2029,6 @@ def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
     for name in (
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_BASE_URL",
-        # The gateway model pin travels with the key/endpoint — without it a
-        # LiteLLM-style gateway session launches Claude Code model-less and
-        # the gateway rejects Claude Code's own default model.
         "ANTHROPIC_MODEL",
         "CLAUDE_CODE_OAUTH_TOKEN",
         "CODEX_ACCESS_TOKEN",
@@ -2045,22 +2037,15 @@ def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
         "GEMINI_API_KEY",
         "AWS_BEARER_TOKEN_BEDROCK",
         "ANTHROPIC_BEDROCK_BASE_URL",
+        "ANTHROPIC_AUTH_TOKEN",
     ):
-        # Pins each conventional name into the default set — dropping
-        # one breaks that harness's credentials on managed sandboxes.
-        assert name in HARNESS_CREDENTIAL_ENV_VARS
-        assert env[name] == base[name]
-    # ANTHROPIC_AUTH_TOKEN wasn't in base: present in the default set
-    # but never invented into the env.
-    assert "ANTHROPIC_AUTH_TOKEN" in HARNESS_CREDENTIAL_ENV_VARS
-    assert "ANTHROPIC_AUTH_TOKEN" not in env
-    # A secret not on the credential set / allowlist is not forwarded.
+        assert name not in env
+    # Unrelated secrets remain outside the non-secret allowlist too.
     assert "MY_UNRELATED_SECRET" not in env
 
 
-def test_build_runner_env_forwards_omnigent_prefixed_harness_credentials() -> None:
-    """Prefixed harness credential aliases forward without creating raw names."""
-    from omnigent.host.connect import HARNESS_CREDENTIAL_ENV_VARS
+def test_build_runner_env_strips_omnigent_prefixed_harness_credentials() -> None:
+    """Prefixed credential aliases do not bypass the runner boundary."""
 
     base = {
         "PATH": "/usr/bin",
@@ -2077,17 +2062,12 @@ def test_build_runner_env_forwards_omnigent_prefixed_harness_credentials() -> No
         parent_pid=42,
     )
 
-    assert "OMNIGENT_ANTHROPIC_API_KEY" in HARNESS_CREDENTIAL_ENV_VARS
-    assert env["OMNIGENT_ANTHROPIC_API_KEY"] == "sk-prefixed"
+    assert "OMNIGENT_ANTHROPIC_API_KEY" not in env
     assert "ANTHROPIC_API_KEY" not in env
 
 
-def test_build_runner_env_passthrough_extends_forwarded_set() -> None:
-    """
-    OMNIGENT_RUNNER_ENV_PASSTHROUGH names EXTRA vars to forward (for
-    `providers:`-config `env:` refs and custom gateway wiring) without
-    opening the allowlist to anything unnamed.
-    """
+def test_build_runner_env_strips_removed_passthrough_values() -> None:
+    """The legacy generic passthrough cannot inject credentials into runners."""
     base = {
         "PATH": "/usr/bin",
         "HOME": "/root",
@@ -2106,25 +2086,19 @@ def test_build_runner_env_passthrough_extends_forwarded_set() -> None:
         parent_pid=42,
     )
 
-    # Named extras forward (whitespace around commas tolerated).
-    assert env["MY_GATEWAY_TOKEN"] == "tok-123"
-    assert env["MY_GATEWAY_URL"] == "https://llm.internal.example.com"
-    # Anything unnamed stays behind the allowlist.
-    assert "UNLISTED_SECRET" not in env
+    for name in (
+        "OMNIGENT_RUNNER_ENV_PASSTHROUGH",
+        "MY_GATEWAY_TOKEN",
+        "MY_GATEWAY_URL",
+        "UNLISTED_SECRET",
+    ):
+        assert name not in env
 
 
-def test_build_runner_env_passthrough_survives_remote_daemon_hop(
+def test_credential_passthrough_is_absent_from_daemon_and_runner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """OMNIGENT_RUNNER_ENV_PASSTHROUGH forwards a named var through BOTH hops.
-
-    In ``--server`` mode the env crosses two strips: CLI→daemon
-    (``_build_host_daemon_env``) then daemon→runner (``_build_runner_env``). The
-    control var must survive the first hop or the second never sees the names it
-    lists. A named var travels via the ``DATABRICKS_`` prefix on the first hop and
-    the passthrough on the second, so it must reach the runner; an unnamed secret
-    must not.
-    """
+    """Neither host nor generic runner retains explicitly named credentials."""
     from omnigent.cli import _build_host_daemon_env
 
     monkeypatch.setenv("PATH", "/usr/bin")
@@ -2134,8 +2108,9 @@ def test_build_runner_env_passthrough_survives_remote_daemon_hop(
 
     server = "https://example.databricksapps.com"
     daemon_env = _build_host_daemon_env(server_url=server)
-    # The first hop must keep the control var (regression guard for the remote no-op).
-    assert daemon_env["OMNIGENT_RUNNER_ENV_PASSTHROUGH"] == "DATABRICKS_LINEAR_API_KEY"
+    assert "OMNIGENT_RUNNER_ENV_PASSTHROUGH" not in daemon_env
+    assert "DATABRICKS_LINEAR_API_KEY" not in daemon_env
+    assert "DATABRICKS_UNNAMED" not in daemon_env
 
     runner_env = _build_runner_env(
         daemon_env,
@@ -2146,8 +2121,7 @@ def test_build_runner_env_passthrough_survives_remote_daemon_hop(
         parent_pid=42,
     )
 
-    # The named var reaches the runner; an unnamed one does not.
-    assert runner_env["DATABRICKS_LINEAR_API_KEY"] == "lin-secret"
+    assert "DATABRICKS_LINEAR_API_KEY" not in runner_env
     assert "DATABRICKS_UNNAMED" not in runner_env
 
 

@@ -663,52 +663,14 @@ _SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S = int(
     )
 )
 
-_LOCAL_DAEMON_ENV_ALLOWLIST: frozenset[str] = frozenset(
+# Credentials must be resolved at the component that consumes them, not retained
+# by the long-lived host process. These names are otherwise part of the generic
+# runner allowlist for legacy runtime behavior, so exclude them at this boundary.
+_HOST_DAEMON_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
     {
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_AUTH_TOKEN",
-        "ANTHROPIC_BASE_URL",
-        "ANTHROPIC_BEDROCK_BASE_URL",
-        "AWS_BEARER_TOKEN_BEDROCK",
-        # M8 (security 2026-07-15): CLAUDE_CODE_OAUTH_TOKEN is listed in
-        # HARNESS_CREDENTIAL_ENV_VARS (connect.py) for forwarding host->runner,
-        # but _build_host_daemon_env (this file) only allows _RUNNER_ENV_ALLOWLIST
-        # + _LOCAL_DAEMON_ENV_ALLOWLIST. CLAUDE_CODE_OAUTH_TOKEN is in neither,
-        # so it is STRIPPED from the daemon env at launch. The daemon starts without it,
-        # so _build_runner_env has no token to forward even though HARNESS_CREDENTIAL_ENV_VARS
-        # includes it. Net effect: `claude setup-token` subscription auth never reaches
-        # the claude subprocess under the claude-sdk harness on macOS local (non-cloud) runs.
-        # Fix: add to the daemon allowlist so it survives the cli->daemon env strip.
-        # Security: it's a credential, same class as ANTHROPIC_API_KEY which is already here.
-        "CLAUDE_CODE_OAUTH_TOKEN",
-        "CLAUDE_CODE_USE_BEDROCK",
-        "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
-        "COHERE_API_KEY",
-        "DEEPSEEK_API_KEY",
-        "GEMINI_API_KEY",
-        "GOOGLE_API_KEY",
-        "GROQ_API_KEY",
-        "MISTRAL_API_KEY",
-        "OMNIGENT_DATABASE_URI",
-        "OPENAI_API_KEY",
-        "OPENAI_BASE_URL",
-        "OPENAI_ORG_ID",
-        "OPENAI_ORGANIZATION",
-        "OPENROUTER_API_KEY",
-        "PERPLEXITY_API_KEY",
-        "TOGETHER_API_KEY",
-        "VOYAGE_API_KEY",
-        "XAI_API_KEY",
+        "OMNIGENT_DEBUG_LOG_CLIENT_SECRET",
+        "OMNIGENT_DATABRICKS_EXTRA_HEADERS",
     }
-)
-_LOCAL_DAEMON_ENV_PREFIXES: tuple[str, ...] = (
-    "ANTHROPIC_DEFAULT_",
-    "AZURE_OPENAI_",
-    "DATABRICKS_",
-    "MLFLOW_",
-    "OTEL_",
-    "OMNIGENT_",
-    "OPENAI_",
 )
 _HOST_DAEMON_PROXY_ENV_ALLOWLIST: frozenset[str] = frozenset(
     {
@@ -3234,16 +3196,12 @@ def _build_host_daemon_env(
     """
     Build the environment for the background host daemon.
 
-    Remote daemons connect to an already-running Omnigent server, so they only
-    need process essentials, TLS trust, and Databricks auth. Local daemons
-    also start the local Omnigent server; that server is the user's local runtime
-    and must inherit Omnigent config plus provider credentials such as
-    ``OPENAI_API_KEY`` and ``OPENAI_BASE_URL``. Both modes are allowlisted:
-    local mode carries the runtime/provider vars needed by the local server,
-    but unrelated shell secrets are not inherited merely because the daemon
-    runs on the user's machine. Runners launched by the daemon still pass
-    through :func:`omnigent.host.connect._build_runner_env`, so these
-    local-server credentials do not leak into runner subprocesses.
+    Both local and remote daemons receive only process/runtime selectors, TLS
+    paths, locale/telemetry settings, and proxy configuration. Provider keys,
+    Databricks bearer credentials, database credentials, and custom passthrough
+    values are deliberately absent: the long-lived host is not a model-secret
+    boundary. Credential resolution belongs at the server or harness launch
+    boundary that consumes the secret.
 
     :param server_url: Omnigent server URL for remote mode, e.g.
         ``"https://example.databricksapps.com"``, or a falsey value
@@ -3255,30 +3213,25 @@ def _build_host_daemon_env(
         _RUNNER_ENV_ALLOWLIST_PREFIXES,
     )
 
-    if not server_url:
-        daemon_env_prefixes = (*_RUNNER_ENV_ALLOWLIST_PREFIXES, *_LOCAL_DAEMON_ENV_PREFIXES)
-        env = {
-            key: value
-            for key, value in os.environ.items()
-            if key in _RUNNER_ENV_ALLOWLIST
-            or key in _LOCAL_DAEMON_ENV_ALLOWLIST
+    del server_url  # Local and remote hosts share the same secret-free boundary.
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if (
+            key in _RUNNER_ENV_ALLOWLIST
             or key in _HOST_DAEMON_PROXY_ENV_ALLOWLIST
-            or key.startswith(daemon_env_prefixes)
-        }
-    else:
-        # Allowlist the remote daemon's environment (W8): pass process
-        # essentials + TLS trust + standard proxy selectors + the user's
-        # Databricks auth (the daemon authenticates to the server with it), but
-        # not unrelated provider secrets like ANTHROPIC_API_KEY / OPENAI_API_KEY.
-        daemon_env_prefixes = (*_RUNNER_ENV_ALLOWLIST_PREFIXES, "DATABRICKS_")
-        env = {
-            key: value
-            for key, value in os.environ.items()
-            if key in _RUNNER_ENV_ALLOWLIST
-            or key in _HOST_DAEMON_PROXY_ENV_ALLOWLIST
-            or key.startswith(daemon_env_prefixes)
-        }
-    return env
+            or key.startswith(_RUNNER_ENV_ALLOWLIST_PREFIXES)
+        )
+        and key not in _HOST_DAEMON_CREDENTIAL_ENV_VARS
+    }
+
+
+def _build_host_service_env(*, server_url: str | None) -> dict[str, str]:
+    """Build the persistent subset of the host daemon environment."""
+    environment = _build_host_daemon_env(server_url=server_url)
+    for ephemeral in ("TERM", "TERMINFO", "TERMINFO_DIRS"):
+        environment.pop(ephemeral, None)
+    return environment
 
 
 def _read_host_pid_file() -> tuple[int, str] | None:
@@ -4899,6 +4852,53 @@ def _wait_for_local_sessions_to_drain() -> None:
             last = count
 
 
+def _capture_upgrade_host_service() -> HostServiceStatus:
+    """Capture persistent host-service state before replacing the installation."""
+    from omnigent.host.service import user_host_service_status
+
+    return user_host_service_status()
+
+
+def _finish_upgrade_host_service(
+    snapshot: HostServiceStatus,
+    *,
+    succeeded: bool,
+) -> None:
+    """Restore a stopped service after failure or refresh it after success."""
+    if not snapshot.installed or snapshot.configured_target is None:
+        return
+    from omnigent.host.service import (
+        HostServiceError,
+        enable_user_host_service,
+        start_user_host_service,
+    )
+
+    if snapshot.configured_target != _LOCAL_DAEMON_MARKER:
+        if succeeded:
+            click.echo(
+                "The remote host service is still using its prior process environment. "
+                "Run `omnigent host enable` to restart it on the upgraded installation."
+            )
+        return
+    try:
+        if succeeded:
+            enable_user_host_service(
+                None,
+                environment=_build_host_service_env(server_url=None),
+            )
+            click.echo("Refreshed and restarted the local host user service.")
+        elif snapshot.manager_state == "running":
+            start_user_host_service(None)
+            click.echo("Restored the local host user service after the failed upgrade.")
+    except HostServiceError as exc:
+        action = "refresh" if succeeded else "restore"
+        click.echo(
+            f"Warning: could not {action} the host user service: {exc}. "
+            "Run `omnigent host enable` after checking the service status.",
+            err=True,
+        )
+
+
 def _drain_and_stop_local_server(*, force: bool) -> None:
     """Drain (or force-stop) the local server + daemon before an upgrade.
 
@@ -4995,14 +4995,17 @@ def _upgrade_vcs_install(
             f"No automatic upgrade command is known for this install. {suggestion.command}."
         )
 
+    service_snapshot = _capture_upgrade_host_service()
     _drain_and_stop_local_server(force=force)
 
     console = Console()
     code = _run_upgrade_command(suggestion.command, console)
     if code != 0:
+        _finish_upgrade_host_service(service_snapshot, succeeded=False)
         raise click.ClickException(
             _upgrade_failure_message(code, set(info.extras) | set(extra_overrides))
         )
+    _finish_upgrade_host_service(service_snapshot, succeeded=True)
 
     # Verify by commit, not exit code: a re-pull of a ref that hasn't moved (or
     # a pinned ref, or a cached reinstall) exits 0 without changing anything.
@@ -5141,14 +5144,17 @@ def _upgrade_to_nightly(
         )
         return
 
+    service_snapshot = _capture_upgrade_host_service()
     _drain_and_stop_local_server(force=force)
 
     console = Console()
     code = _run_upgrade_command(suggestion.command, console)
     if code != 0:
+        _finish_upgrade_host_service(service_snapshot, succeeded=False)
         raise click.ClickException(
             _upgrade_failure_message(code, set(info.extras) | set(extra_overrides))
         )
+    _finish_upgrade_host_service(service_snapshot, succeeded=True)
 
     # Same trust-the-disk verification as the release path: re-read the
     # version in a fresh subprocess instead of believing the exit code.
@@ -5410,14 +5416,17 @@ def upgrade(
         )
         return
 
+    service_snapshot = _capture_upgrade_host_service()
     _drain_and_stop_local_server(force=force)
 
     console = Console()
     code = _run_upgrade_command(suggestion.command, console)
     if code != 0:
+        _finish_upgrade_host_service(service_snapshot, succeeded=False)
         raise click.ClickException(
             _upgrade_failure_message(code, set(info.extras) | set(extra_overrides))
         )
+    _finish_upgrade_host_service(service_snapshot, succeeded=True)
 
     # Trust the installed version, not the installer's exit code. The running
     # process still has the OLD version loaded, so re-read it in a fresh
@@ -9484,6 +9493,8 @@ def _echo_host_service_status(status: HostServiceStatus) -> None:
     if status.log is not None:
         log = _display_path(Path(status.log)) if status.kind == "launchd" else status.log
         click.echo(f"  logs:    {log}")
+    if status.executable_error is not None:
+        click.echo(f"  executable error: {status.executable_error}", err=True)
     if status.definition_error is not None:
         click.echo(f"  definition error: {status.definition_error}", err=True)
     if status.manager_error is not None:
@@ -9528,18 +9539,34 @@ def host_enable(
 
     from omnigent.host.service import user_host_service_status
 
-    previous_service = user_host_service_status(probe_manager=False)
+    previous_service = user_host_service_status()
     target = _normalize_daemon_target(resolved_server)
     record = _find_daemon_record(target)
-    if record is not None:
-        _terminate_daemon(record, force=False)
+    retired_unmanaged_daemon = False
+    record_is_managed = (
+        record is not None
+        and previous_service.manager_state == "running"
+        and previous_service.manager_pid == record.pid
+    )
+
+    def _retire_unmanaged_daemon() -> None:
+        nonlocal retired_unmanaged_daemon
+        if record is not None and not record_is_managed:
+            _terminate_daemon(record, force=False)
+            retired_unmanaged_daemon = True
+
+    def _restore_unmanaged_daemon() -> None:
+        if retired_unmanaged_daemon:
+            _ensure_host_daemon(resolved_server)
 
     from omnigent.host.service import HostServiceError, enable_user_host_service
 
     try:
         service = enable_user_host_service(
             resolved_server,
-            environment=_build_host_daemon_env(server_url=resolved_server),
+            environment=_build_host_service_env(server_url=resolved_server),
+            before_activate=_retire_unmanaged_daemon,
+            on_rollback=_restore_unmanaged_daemon,
         )
     except HostServiceError as exc:
         raise click.ClickException(str(exc)) from exc

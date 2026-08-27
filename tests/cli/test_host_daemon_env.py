@@ -7,10 +7,7 @@ from typing import Final
 import pytest
 
 from omnigent.cli import _build_host_daemon_env
-from omnigent.host.connect import (
-    RUNNER_ENV_PASSTHROUGH_ENV_VAR,
-    _build_runner_env,
-)
+from omnigent.host.connect import _build_runner_env
 
 _REMOTE_SERVER_URL: Final = "https://example.databricksapps.com"
 _PROXY_ENV: Final = {
@@ -25,16 +22,12 @@ _PROXY_ENV: Final = {
 }
 
 
-@pytest.mark.parametrize(
-    ("server_url", "keeps_provider_secret"),
-    [(None, True), (_REMOTE_SERVER_URL, False)],
-)
-def test_host_daemon_env_preserves_proxy_vars_and_provider_secret_split(
+@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
+def test_host_daemon_env_preserves_proxy_vars_without_provider_secrets(
     monkeypatch: pytest.MonkeyPatch,
     server_url: str | None,
-    keeps_provider_secret: bool,
 ) -> None:
-    """Proxy selectors reach both daemon modes without widening provider secrets."""
+    """Proxy selectors reach both daemon modes without provider credentials."""
     # Given
     for name, value in _PROXY_ENV.items():
         monkeypatch.setenv(name, value)
@@ -47,7 +40,7 @@ def test_host_daemon_env_preserves_proxy_vars_and_provider_secret_split(
     # Then
     assert {name: env.get(name) for name in _PROXY_ENV} == _PROXY_ENV
     assert env["DATABRICKS_CONFIG_PROFILE"] == "corp"
-    assert ("OPENAI_API_KEY" in env) is keeps_provider_secret
+    assert "OPENAI_API_KEY" not in env
 
 
 def test_runner_env_excludes_proxy_vars_by_default() -> None:
@@ -69,14 +62,14 @@ def test_runner_env_excludes_proxy_vars_by_default() -> None:
     assert set(_PROXY_ENV).isdisjoint(env)
 
 
-def test_runner_env_explicit_proxy_passthrough_remains_available() -> None:
-    """Runner proxy forwarding remains opt-in through the existing passthrough."""
+def test_runner_env_removed_passthrough_does_not_forward_proxy_credentials() -> None:
+    """The removed generic passthrough cannot inject proxy values into runners."""
     # Given
     explicit_names = {"HTTPS_PROXY", "http_proxy"}
     base_env = {
         "PATH": "/usr/bin",
         **_PROXY_ENV,
-        RUNNER_ENV_PASSTHROUGH_ENV_VAR: ",".join(explicit_names),
+        "OMNIGENT_RUNNER_ENV_PASSTHROUGH": ",".join(explicit_names),
     }
 
     # When
@@ -90,10 +83,8 @@ def test_runner_env_explicit_proxy_passthrough_remains_available() -> None:
     )
 
     # Then
-    assert {name: env[name] for name in explicit_names} == {
-        name: _PROXY_ENV[name] for name in explicit_names
-    }
-    assert (set(_PROXY_ENV) - explicit_names).isdisjoint(env)
+    assert set(_PROXY_ENV).isdisjoint(env)
+    assert "OMNIGENT_RUNNER_ENV_PASSTHROUGH" not in env
 
 
 _CLAUDE_TOOL_SEARCH_ENV: Final = {

@@ -301,7 +301,9 @@ def test_host_enable_subcommand_installs_user_service(
         server_url: str | None,
         *,
         environment: dict[str, str],
+        **kwargs: object,
     ) -> HostService:
+        del kwargs
         captured.append((server_url, environment))
         return HostService(kind="systemd_user", path=service_path, label=service_path.name)
 
@@ -317,6 +319,91 @@ def test_host_enable_subcommand_installs_user_service(
     assert result.exit_code == 0, result.output
     assert captured == [(None, {"HOME": str(tmp_path)})]
     assert "Enabled the Omnigent host user service for local" in result.output
+
+
+def test_host_enable_restores_unmanaged_daemon_when_activation_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed service transaction restores the daemon it retired."""
+    from omnigent.cli import _HostDaemonRecord
+    from omnigent.host.service import HostServiceError, HostServiceStatus
+
+    record = _HostDaemonRecord(
+        pid=4242,
+        target="local",
+        mode="local",
+        server_url=None,
+        log_path=None,
+        started_at=1,
+    )
+    monkeypatch.setattr("omnigent.cli._find_daemon_record", lambda target: record)
+    monkeypatch.setattr("omnigent.cli._build_host_daemon_env", lambda **kw: {})
+    monkeypatch.setattr(
+        "omnigent.host.service.user_host_service_status",
+        lambda: HostServiceStatus(supported=True, manager_state="stopped"),
+    )
+    events: list[str] = []
+    monkeypatch.setattr(
+        "omnigent.cli._terminate_daemon",
+        lambda daemon, *, force: events.append("retired"),
+    )
+    monkeypatch.setattr(
+        "omnigent.cli._ensure_host_daemon",
+        lambda server: events.append("restored") or False,
+    )
+
+    def _fail_enable(
+        server_url: str | None,
+        *,
+        environment: dict[str, str],
+        before_activate: object,
+        on_rollback: object,
+    ) -> None:
+        del server_url, environment
+        assert callable(before_activate)
+        assert callable(on_rollback)
+        before_activate()
+        on_rollback()
+        raise HostServiceError("activation failed")
+
+    monkeypatch.setattr("omnigent.host.service.enable_user_host_service", _fail_enable)
+
+    result = CliRunner().invoke(cli, ["host", "enable", "--server", ""])
+
+    assert result.exit_code != 0
+    assert "activation failed" in result.output
+    assert events == ["retired", "restored"]
+
+
+def test_host_service_environment_excludes_credentials_and_terminal_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Persistent definitions retain runtime paths but no secret material."""
+    from omnigent.cli import _build_host_service_env
+
+    monkeypatch.setenv("HOME", "/home/alice")
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setenv("TERMINFO", "/tmp/terminfo")
+    monkeypatch.setenv("TERMINFO_DIRS", "/a:/b")
+    monkeypatch.setenv("OPENAI_API_KEY", "model-secret")
+    monkeypatch.setenv("DATABRICKS_TOKEN", "workspace-secret")
+    monkeypatch.setenv("OMNIGENT_DEBUG_LOG_CLIENT_SECRET", "logging-secret")
+
+    environment = _build_host_service_env(server_url=None)
+
+    assert environment["HOME"] == "/home/alice"
+    assert environment["PATH"] == "/usr/bin"
+    for name in (
+        "TERM",
+        "TERMINFO",
+        "TERMINFO_DIRS",
+        "OPENAI_API_KEY",
+        "DATABRICKS_TOKEN",
+        "OMNIGENT_DEBUG_LOG_CLIENT_SECRET",
+    ):
+        assert name not in environment
 
 
 def test_host_enable_reports_persistent_target_replacement(

@@ -28,7 +28,6 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus, InvalidURI
 
 from omnigent._platform import IS_POSIX, WINDOWS_ENV_PASSTHROUGH
 from omnigent.debug_logging import PRIMARY_SESSION_ID_ENV_VAR, USER_ID_ENV_VAR
-from omnigent.env_credentials import env_names_with_omnigent_prefix
 from omnigent.gateway_inference import gateway_inference_map
 from omnigent.harness_aliases import canonicalize_harness, is_claude_sdk_harness_name
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
@@ -458,14 +457,10 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "OMNIGENT_LOG_LEVEL",
         "OMNIGENT_LOG_TO_STDERR",
         LOG_TTY_FD_ENV_VAR,
-        # Debug-log sink config + creds (OMNI-4198). The runner uploads its OWN
-        # process logs to the debug-logs table, so it needs these — including the
-        # service-principal secret. That is the one deliberate exception to the
-        # "no secrets" rule: it is the app's SP creds for log upload (not a user
-        # secret), and the runner is a trusted child. Without them the runner's
-        # sink never arms and runner logs never reach the table.
+        # Debug-log sink routing is safe to propagate, but its client secret is
+        # resolved by the component that uploads logs rather than retained in
+        # the generic runner environment.
         "OMNIGENT_DEBUG_LOG_CLIENT_ID",
-        "OMNIGENT_DEBUG_LOG_CLIENT_SECRET",
         "OMNIGENT_DEBUG_LOG_WORKSPACE_URL",
         "OMNIGENT_DEBUG_LOG_ENDPOINT",
         # Secret-store backend selector. The CLI's `configure harnesses` stores
@@ -498,11 +493,9 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # trigger threshold. Not a secret — a plain integer.
         "AP_CONTEXT_WINDOW_OVERRIDE",
         # Claude Code's Bedrock-mode switch: a non-secret boolean flag that
-        # turns on AWS Bedrock / Bedrock-compatible gateway mode. The matching
-        # credential (AWS_BEARER_TOKEN_BEDROCK) and endpoint
-        # (ANTHROPIC_BEDROCK_BASE_URL) are NOT here: they are credentials and
-        # live in HARNESS_CREDENTIAL_ENV_VARS, mirroring ANTHROPIC_API_KEY /
-        # ANTHROPIC_BASE_URL. Safe to propagate: not a secret.
+        # turns on AWS Bedrock / Bedrock-compatible gateway mode. Credentials
+        # and endpoints are resolved at the harness launch boundary instead of
+        # entering the generic runner environment.
         "CLAUDE_CODE_USE_BEDROCK",
         # Claude Code's Bedrock-auth-skip switch: a non-secret boolean flag
         # that disables AWS SigV4 auth so Claude Code can talk to a LiteLLM
@@ -546,73 +539,14 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # host→runner intrinsically, so the setter need not also list it in
         # OMNIGENT_RUNNER_ENV_PASSTHROUGH.
         "OMNIGENT_DATABRICKS_EXTRA_HEADERS",
-        # The operator's env-forwarding control var itself. Without it here, the
-        # var is stripped before it reaches the daemon in --server mode (the
-        # remote daemon prefixes are DATABRICKS_ + LC_/MLFLOW_/OTEL_/OMNIGENT_OTEL_,
-        # not plain OMNIGENT_), so _build_runner_env never sees the names it lists
-        # and the whole passthrough is a no-op remotely. It carries only env var
-        # NAMES, not secrets, so allowlisting it leaks nothing on its own.
-        # (Literal, not RUNNER_ENV_PASSTHROUGH_ENV_VAR, which is defined below.)
-        "OMNIGENT_RUNNER_ENV_PASSTHROUGH",
     }
     # Windows system / profile constants (SYSTEMROOT is mandatory for Winsock,
     # USERPROFILE for Path.home(), etc.); a no-op on POSIX. See _platform.
     | set(WINDOWS_ENV_PASSTHROUGH)
 )
-# Allowed by prefix: locale family (``LC_*``), MLflow, and OpenTelemetry config —
-# both the standard ``OTEL_*`` vars and Omnigent's ``OMNIGENT_OTEL_*`` knobs
-# (capture-content, FastAPI toggle) so they reach the runner/harness too.
-_RUNNER_ENV_ALLOWLIST_PREFIXES: tuple[str, ...] = ("LC_", "MLFLOW_", "OTEL_", "OMNIGENT_OTEL_")
-
-# Harness credential / endpoint env vars forwarded host→runner when
-# present. These are the names the harnesses themselves resolve —
-# ANTHROPIC_* for claude-sdk / pi (claude-code also honors
-# ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL for gateways, and
-# ANTHROPIC_MODEL to pin a gateway-served model (must travel with the
-# key/endpoint, else native Claude launches with a default the gateway
-# rejects), AWS_BEARER_TOKEN_BEDROCK + ANTHROPIC_BEDROCK_BASE_URL for Bedrock mode,
-# and CLAUDE_CODE_OAUTH_TOKEN for `claude setup-token` subscription auth),
-# OPENAI_* for codex / openai-agents (CODEX_ACCESS_TOKEN is the codex
-# CLI's headless ChatGPT-workspace credential, minted in the ChatGPT
-# admin console — Business/Enterprise plans), GEMINI_API_KEY for the
-# gemini family. GIT_TOKEN / GIT_USERNAME feed the sandbox host
-# image's git credential helper (deploy/docker/Dockerfile `host`
-# target) so the agent's own fetch/push against a private repository
-# authenticates, not just the launch-time clone. Unlike the rest of
-# the host's environment, these are credentials the host owner sets
-# PRECISELY so their runners can use them (on a laptop: exported keys;
-# on a server-managed sandbox: the deployment's injected provider
-# secrets) — forwarding them is the intent, not a leak. Vars absent
-# from the host env are simply not set.
-_BASE_HARNESS_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
-    {
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_AUTH_TOKEN",
-        "ANTHROPIC_BASE_URL",
-        "ANTHROPIC_MODEL",
-        "ANTHROPIC_BEDROCK_BASE_URL",
-        "AWS_BEARER_TOKEN_BEDROCK",
-        "CLAUDE_CODE_OAUTH_TOKEN",
-        "CODEX_ACCESS_TOKEN",
-        "OPENAI_API_KEY",
-        "OPENAI_BASE_URL",
-        "GEMINI_API_KEY",
-        "GIT_TOKEN",
-        "GIT_USERNAME",
-    }
-)
-HARNESS_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
-    name
-    for canonical in _BASE_HARNESS_CREDENTIAL_ENV_VARS
-    for name in env_names_with_omnigent_prefix(canonical)
-)
-
-# Comma-separated EXTRA env var names to forward host→runner, beyond
-# HARNESS_CREDENTIAL_ENV_VARS — for provider wiring the defaults don't
-# cover (custom gateway vars, `providers:`-config `env:` refs, exotic
-# SDK knobs). Operator-controlled: the host owner names exactly what
-# their runners need; everything unnamed stays behind the allowlist.
-RUNNER_ENV_PASSTHROUGH_ENV_VAR: str = "OMNIGENT_RUNNER_ENV_PASSTHROUGH"
+# Only locale variables are safe as a prefix family. Telemetry/MLflow prefixes
+# may include bearer headers or tokens and must be resolved by their consumers.
+_RUNNER_ENV_ALLOWLIST_PREFIXES: tuple[str, ...] = ("LC_",)
 
 # HTTP statuses on the WebSocket upgrade that are worth retrying. Everything
 # else in the 4xx range is a permanent client error (auth, authorization,
@@ -669,11 +603,9 @@ def _build_runner_env(
     :data:`_RUNNER_ENV_ALLOWLIST`) so the host owner's secrets don't leak
     into runners, then layers on the runner wiring vars.
 
-    Harness credentials are the deliberate exception to the allowlist:
-    the names in :data:`HARNESS_CREDENTIAL_ENV_VARS` (plus any extras
-    the host owner lists in :data:`RUNNER_ENV_PASSTHROUGH_ENV_VAR`)
-    forward when present, so runners can authenticate to LLM providers
-    with the credentials the host owner provisioned for them.
+    Provider and harness credentials are deliberately excluded. They are
+    resolved at the harness launch boundary rather than retained by every
+    generic runner process.
 
     :param base_env: Host process environment to filter, e.g.
         ``os.environ``.
@@ -692,35 +624,10 @@ def _build_runner_env(
         at boot. ``None`` (unknown / older server) omits the stamp.
     :returns: The runner subprocess environment.
     """
-    extra_names = {
-        name.strip()
-        for name in base_env.get(RUNNER_ENV_PASSTHROUGH_ENV_VAR, "").split(",")
-        if name.strip()
-    }
-    # Forward env vars that the providers config references via
-    # ``api_key_ref: env:VAR`` or ``api_key: $VAR``. Without this, a user
-    # who configures a gateway provider with a custom env var (e.g.
-    # ``api_key_ref: env:MY_TOKEN``) would need to manually add it to
-    # OMNIGENT_RUNNER_ENV_PASSTHROUGH — their credential resolves fine in
-    # the CLI/daemon but silently drops before reaching the runner subprocess.
-    from omnigent.errors import OmnigentError as _OmnigentError
-
-    try:
-        from omnigent.onboarding.provider_config import (
-            load_config,
-            provider_credential_env_vars,
-        )
-
-        config_env_vars = provider_credential_env_vars(load_config())
-    except (OSError, _OmnigentError):
-        config_env_vars = frozenset()
-    forwarded = HARNESS_CREDENTIAL_ENV_VARS | extra_names | config_env_vars
     env = {
         key: value
         for key, value in base_env.items()
-        if key in _RUNNER_ENV_ALLOWLIST
-        or key.startswith(_RUNNER_ENV_ALLOWLIST_PREFIXES)
-        or key in forwarded
+        if key in _RUNNER_ENV_ALLOWLIST or key.startswith(_RUNNER_ENV_ALLOWLIST_PREFIXES)
     }
     env["RUNNER_SERVER_URL"] = server_url
     env[RUNNER_ID_ENV_VAR] = runner_id
