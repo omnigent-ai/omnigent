@@ -61,7 +61,12 @@ def _tool(
         "type": "tool_call",
         "target": "sys_os_shell",
         "data": {"name": "sys_os_shell", "arguments": {}},
-        "context": {"actor": {}, "user_daily_cost": [daily] if daily else [], "model": model, "harness": harness},
+        "context": {
+            "actor": {},
+            "user_daily_cost": [daily] if daily else [],
+            "model": model,
+            "harness": harness,
+        },
         "session_state": {},
     }
 
