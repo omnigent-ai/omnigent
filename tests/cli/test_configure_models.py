@@ -1699,7 +1699,8 @@ def test_overview_lists_all_harnesses_in_priority_order(isolated_config, monkeyp
         "Qwen Code",
         "Goose",
         # Builtin ACP CLI rows (ACP_CLI_HARNESSES) render after Goose, the other
-        # ACP-family builtin, and before the non-ACP harnesses.
+        # ACP-family builtin, sorted by id, before the non-ACP harnesses.
+        "Devin",
         "Grok Build",
         "Copilot",
         "Kiro",
@@ -1756,6 +1757,42 @@ def test_overview_lists_configured_acp_agents_as_rows(isolated_config, monkeypat
     assert "Add custom ACP agent" in names
     # Once agents exist, the single opaque "Custom ACP agent" row is gone.
     assert "Custom ACP agent" not in names
+
+
+def test_overview_shows_one_row_when_acp_agent_shadows_builtin(
+    isolated_config, monkeypatch
+) -> None:
+    """A configured agent named after a builtin ACP row replaces it, not doubles it.
+
+    "Devin" slugifies to ``devin``, which is also an ``ACP_CLI_HARNESSES`` id, so
+    both sources want a row. The configured one wins — it names the exact command,
+    which the fixed row argv cannot express — and the builtin is dropped so the
+    list never shows two identically labeled "Devin" rows from different sources.
+    """
+    from rich.text import Text
+
+    config_path = os.path.join(isolated_config, "config.yaml")
+    with open(config_path, "w") as f:
+        yaml.safe_dump(
+            {
+                "acp": {
+                    "agents": [{"name": "Devin", "command": "devin acp --model swe-1-7-medium"}]
+                }
+            },
+            f,
+        )
+    options, selectable, _descriptions, _compact, _max_visible = _capture_setup_overview(
+        monkeypatch
+    )
+    names = _overview_row_names(options, selectable)
+    assert names.count("Devin") == 1, f"expected exactly one Devin row, got {names}"
+    # A non-colliding builtin row is untouched.
+    assert "Grok Build" in names
+    # The surviving row is the user's: its status carries the configured command,
+    # not the builtin's "own auth" label.
+    # (the status is width-capped, so match its head rather than the full command)
+    devin_row = next(o for o in options if Text.from_markup(o).plain.startswith("Devin "))
+    assert "ACP · devin acp" in Text.from_markup(devin_row).plain
 
 
 def test_setup_reports_invalid_acp_omnigent_mcp(isolated_config) -> None:
@@ -1828,7 +1865,7 @@ def test_setup_imports_openclaw_agents(isolated_config) -> None:
         encoding="utf-8",
     )
 
-    stdin = "\n".join(["14", "", "", "q"]) + "\n"
+    stdin = "\n".join(["15", "", "", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
     assert result.exit_code == 0, result.output
@@ -1850,7 +1887,7 @@ def test_setup_imports_openclaw_agents_from_user_selected_path(isolated_config) 
         encoding="utf-8",
     )
 
-    stdin = "\n".join(["14", "", str(selected), "", "q"]) + "\n"
+    stdin = "\n".join(["15", "", str(selected), "", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
     assert result.exit_code == 0, result.output
@@ -1867,7 +1904,7 @@ def test_setup_rejects_user_selected_unrelated_file(isolated_config) -> None:
     selected = isolated_config / "package.json"
     selected.write_text('{"name": "unrelated"}', encoding="utf-8")
 
-    stdin = "\n".join(["14", "", str(selected), "2", "q"]) + "\n"
+    stdin = "\n".join(["15", "", str(selected), "2", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
     assert result.exit_code == 0, result.output
@@ -2058,13 +2095,14 @@ def test_overview_truncates_long_status_for_narrow_terminal(isolated_config, mon
         ("5", "_manage_hermes_harness"),
         ("8", "_manage_qwen_harness"),
         ("9", "_manage_goose_harness"),
-        # 10 is the builtin ACP CLI row (Grok Build); every row after it shifted
-        # down by one when that block landed.
+        # 10-11 are the builtin ACP CLI rows (Devin, Grok Build — sorted by id);
+        # every row after them shifted down by two when that block landed.
         ("10", "_show_acp_cli_harness"),
-        ("11", "_manage_copilot_harness"),
-        ("12", "_manage_kiro_harness"),
-        ("13", "_manage_kimi_harness"),
-        ("15", "_add_acp_agent"),
+        ("11", "_show_acp_cli_harness"),
+        ("12", "_manage_copilot_harness"),
+        ("13", "_manage_kiro_harness"),
+        ("14", "_manage_kimi_harness"),
+        ("16", "_add_acp_agent"),
     ],
 )
 def test_overview_dispatches_to_correct_manager(
@@ -2135,16 +2173,16 @@ def test_installed_native_cli_auth_unknown_rows_are_not_configured(
     (Hermes, like Goose, *does* have a config probe now — its ``model`` is read
     from ``~/.hermes/config.yaml`` — so its ready/unconfigured split is covered
     by ``test_overview_hermes_row_reflects_configured_model`` instead. Kimi now
-    has a file-based login probe too, so its signed-in split is covered by
-    ``test_overview_kimi_row_reflects_detected_login`` — here we pin the
-    not-signed-in case, so ``kimi_login_detected`` is forced ``False``.)
+    has a file-based login + API-key config probe too, so its signed-in split is
+    covered by ``test_overview_kimi_row_reflects_detected_login`` — here we pin
+    the not-configured case, so ``kimi_auth_configured`` is forced ``False``.)
     """
     monkeypatch.setattr(
         "omnigent.onboarding.harness_install.harness_cli_installed", lambda family: True
     )
-    # Kimi's row now consults a file-based login probe; force "no login" so the
-    # not-configured assertion is deterministic regardless of the dev machine.
-    monkeypatch.setattr("omnigent.onboarding.kimi_auth.kimi_login_detected", lambda: False)
+    # Kimi's row now consults a combined auth probe; force "not configured" so
+    # the assertion is deterministic regardless of the dev machine.
+    monkeypatch.setattr("omnigent.onboarding.kimi_auth.kimi_auth_configured", lambda: False)
     options, selectable, descriptions, _compact, _max_visible = _capture_setup_overview(
         monkeypatch
     )
@@ -2155,17 +2193,17 @@ def test_installed_native_cli_auth_unknown_rows_are_not_configured(
 
 
 def test_overview_kimi_row_reflects_detected_login(isolated_config, monkeypatch) -> None:
-    """An installed kimi with a detected ``kimi login`` renders green "Signed in".
+    """An installed kimi with detected auth renders green "Signed in".
 
     Bug fix: the kimi row was hardcoded to yellow "Not configured" whenever the
     CLI was installed, so a successful ``kimi login`` never showed. It now
-    consults the subprocess-free file probe ``kimi_login_detected`` and renders
-    a green ready row when a credential is present.
+    consults the combined auth probe ``kimi_auth_configured`` and renders a green
+    ready row when a login credential or a pay-per-use API key is present.
     """
     monkeypatch.setattr(
         "omnigent.onboarding.harness_install.harness_cli_installed", lambda family: True
     )
-    monkeypatch.setattr("omnigent.onboarding.kimi_auth.kimi_login_detected", lambda: True)
+    monkeypatch.setattr("omnigent.onboarding.kimi_auth.kimi_auth_configured", lambda: True)
     options, selectable, descriptions, _compact, _max_visible = _capture_setup_overview(
         monkeypatch
     )
@@ -2200,9 +2238,9 @@ def test_overview_descriptions_map_to_their_rows(isolated_config, monkeypatch) -
         lambda family: family != GEMINI_FAMILY,
     )
     monkeypatch.setattr("omnigent.onboarding.copilot_auth.copilot_sdk_installed", lambda: True)
-    # Kimi's row consults a file-based login probe; force "no login" so the
-    # "Sign in with `kimi login`" hint is asserted deterministically.
-    monkeypatch.setattr("omnigent.onboarding.kimi_auth.kimi_login_detected", lambda: False)
+    # Kimi's row consults a combined auth probe; force "not configured" so the
+    # hint is asserted deterministically.
+    monkeypatch.setattr("omnigent.onboarding.kimi_auth.kimi_auth_configured", lambda: False)
     monkeypatch.setattr(
         "omnigent.onboarding.opencode_auth.opencode_auth_summary",
         lambda: OpenCodeAuthSummary(installed=True, stored_providers=(), env_providers=()),
@@ -2237,7 +2275,11 @@ def test_overview_descriptions_map_to_their_rows(isolated_config, monkeypatch) -
     assert desc_by_name["Goose"] == "Open to run `goose configure`."
     assert desc_by_name["Copilot"] == "Open to add the GitHub token."
     assert desc_by_name["Kiro"] == "Sign in with `kiro-cli login`."
-    assert desc_by_name["Kimi Code"] == "Sign in with `kimi login`."
+    assert (
+        desc_by_name["Kimi Code"]
+        == "Sign in with `kimi login`, or (pay-per-use) set a Kimi API key in"
+        " `~/.kimi-code/config.toml`."
+    )
     assert desc_by_name["Quit"] == ""
 
 
@@ -3366,3 +3408,50 @@ def test_credential_label_bedrock_not_duplicated() -> None:
 
     assert credential_label(BEDROCK_KIND, "bedrock") == "AWS Bedrock"
     assert credential_label(BEDROCK_KIND, "nexus") == "AWS Bedrock (nexus)"
+
+
+def test_claude_subscription_relabeled_as_managed_gateway(tmp_path, monkeypatch) -> None:
+    """A Claude subscription backed by the managed gateway shows the gateway name.
+
+    Answers the "why don't we get a clean Claude-Databricks like Codex-Databricks"
+    gap: when Claude Code's managed settings deliver the gateway, both the
+    per-credential row label and the adoption callout name it "Databricks AI
+    Gateway" instead of the generic "Subscription". Display only — the entry is
+    a plain subscription (no new persisted shape). With no managed gateway the
+    label stays "Subscription".
+    """
+    import json
+
+    from omnigent.cli_config import _compact_credential_label, _credential_label
+    from omnigent.onboarding import ambient
+    from omnigent.onboarding.ambient import DetectedProvider
+    from omnigent.onboarding.provider_config import ProviderEntry
+
+    entry = ProviderEntry(name="claude", kind="subscription", cli="claude")
+    det = DetectedProvider(
+        name="claude",
+        kind="subscription",
+        family="anthropic",
+        source="Claude Code managed settings",
+    )
+
+    # No managed gateway → generic labels.
+    monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (tmp_path / "none.json",))
+    assert _credential_label("claude", entry) == "Subscription"
+    assert _compact_credential_label(det) == "Claude Subscription"
+
+    # Managed Databricks gateway present → both surfaces name it.
+    settings = tmp_path / "managed-settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://dbc.cloud.databricks.com/ai-gateway/anthropic"
+                },
+                "apiKeyHelper": "print-token",
+            }
+        )
+    )
+    monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (settings,))
+    assert _credential_label("claude", entry) == "Databricks AI Gateway"
+    assert _compact_credential_label(det) == "Databricks AI Gateway"

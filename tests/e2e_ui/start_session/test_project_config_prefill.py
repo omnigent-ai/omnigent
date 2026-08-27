@@ -605,3 +605,221 @@ async def _drive_fork_fresh(base_url: str, session_id: str) -> None:
             assert "existing_worktree" not in git, body
         finally:
             await browser.close()
+
+
+# A git repo whose main tree is the seeded workspace — the composer's worktree
+# probe reads this to decide the workspace is a git repo and can host a worktree.
+_GIT_REPO = "/work/omnigent"
+# The user-global "always use a worktree" preference key (Settings › Git),
+# mirrors STORAGE_KEY in web/src/lib/worktreeDefaultPreferences.ts.
+_ALWAYS_WORKTREE_KEY = "omnigent:always-use-worktree"
+
+
+def _git_repo_worktrees_body() -> str:
+    """``GET /v1/hosts/{id}/worktrees`` — a plain git repo (one main tree).
+
+    The composer only auto-seeds a worktree when the workspace is a git repo,
+    which it detects by a returned ``is_main`` entry."""
+    return json.dumps(
+        {
+            "object": "list",
+            "data": [
+                {"path": _GIT_REPO, "branch": "main", "is_main": True, "detached": False},
+            ],
+        }
+    )
+
+
+def _plain_config_body() -> str:
+    """``GET /v1/projects/{id}`` config that sets host/workspace but no worktree
+    preference — so the effective worktree default falls through to the global."""
+    return json.dumps(
+        {
+            "id": _PROJECT_ID,
+            "name": _PROJECT_NAME,
+            "config": {"host_id": _HOST_ID, "workspace": _GIT_REPO},
+        }
+    )
+
+
+def _worktree_off_config_body() -> str:
+    """``GET /v1/projects/{id}`` config that explicitly opts OUT of worktrees
+    (``use_worktree: false``) — this must win over a global default that is on."""
+    return json.dumps(
+        {
+            "id": _PROJECT_ID,
+            "name": _PROJECT_NAME,
+            "config": {"host_id": _HOST_ID, "workspace": _GIT_REPO, "use_worktree": False},
+        }
+    )
+
+
+async def _route_composer_stubs(
+    page,
+    *,
+    config_body: str,
+    create_bodies: list[dict[str, Any]],
+    session_id: str,
+) -> None:
+    """Wire the standard composer stubs (hosts/agents/projects/config/worktrees/
+    create). ``create_bodies`` captures the create POST — the thing under test."""
+
+    async def handle_hosts(route: Route) -> None:
+        await route.fulfill(status=200, content_type="application/json", body=_hosts_body())
+
+    async def handle_agents(route: Route) -> None:
+        await route.fulfill(status=200, content_type="application/json", body=_agents_body())
+
+    async def handle_projects_list(route: Route) -> None:
+        await route.fulfill(
+            status=200, content_type="application/json", body=_projects_list_body()
+        )
+
+    async def handle_project_config(route: Route) -> None:
+        await route.fulfill(status=200, content_type="application/json", body=config_body)
+
+    async def handle_worktrees(route: Route) -> None:
+        await route.fulfill(
+            status=200, content_type="application/json", body=_git_repo_worktrees_body()
+        )
+
+    async def handle_events(route: Route) -> None:
+        await route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"queued": True, "item_id": "ci_e2e"}),
+        )
+
+    async def handle_sessions(route: Route) -> None:
+        if route.request.method == "POST":
+            create_bodies.append(route.request.post_data_json)
+            await route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps({"id": session_id}),
+            )
+        else:
+            await route.continue_()
+
+    async def handle_agent_scan(route: Route) -> None:
+        await route.fulfill(
+            status=200, content_type="application/json", body=json.dumps({"data": []})
+        )
+
+    await page.route("**/v1/hosts", handle_hosts)
+    await page.route("**/v1/agents", handle_agents)
+    await page.route("**/v1/sessions/projects", handle_projects_list)
+    await page.route(_PROJECT_CFG_RE, handle_project_config)
+    await page.route(_WORKTREES_RE, handle_worktrees)
+    await page.route("**/v1/sessions/*/events", handle_events)
+    await page.route(_SESSIONS_RE, handle_sessions)
+    await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+
+def test_global_default_seeds_worktree_when_project_unset(
+    seeded_session: tuple[str, str],
+) -> None:
+    """The user-global "always use a worktree" default seeds a fresh worktree.
+
+    With the global default on and a project that leaves ``use_worktree`` unset,
+    a ``?project=`` visit into a git workspace auto-names a worktree branch and
+    the create posts ``git: {branch_name: worktree-<hex>}`` — the same behavior
+    the per-project toggle produces, now driven by the global default.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(
+        _drive_global_worktree(base_url, session_id, config_body=_plain_config_body())
+    )
+
+
+async def _drive_global_worktree(base_url: str, session_id: str, *, config_body: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _route_composer_stubs(
+                page, config_body=config_body, create_bodies=create_bodies, session_id=session_id
+            )
+
+            # Turn the global "always use a worktree" default on before load.
+            await page.add_init_script(
+                f"""window.localStorage.setItem("{_ALWAYS_WORKTREE_KEY}", "true");"""
+            )
+
+            await page.goto(f"{base_url}/?project={_PROJECT_NAME}")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            # The branch chip shows the auto-seeded worktree name — proof the
+            # global default drove a worktree seed for an unset project.
+            await expect(page.get_by_test_id("new-chat-landing-branch-chip")).to_contain_text(
+                re.compile(r"worktree-[0-9a-f]{8}"), timeout=15_000
+            )
+
+            await page.get_by_test_id("new-chat-landing-input").fill("start here")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["workspace"] == _GIT_REPO, body
+            git = body.get("git") or {}
+            assert re.fullmatch(r"worktree-[0-9a-f]{8}", git.get("branch_name", "")), body
+        finally:
+            await browser.close()
+
+
+def test_project_opt_out_wins_over_global_default(
+    seeded_session: tuple[str, str],
+) -> None:
+    """A project's explicit ``use_worktree: false`` beats a global default of on.
+
+    With the global default on but the project storing an explicit opt-out, the
+    composer must NOT seed a worktree: the branch chip stays blank ("Worktree")
+    and the create posts no ``git`` block (a plain launch in the workspace).
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_project_opt_out(base_url, session_id))
+
+
+async def _drive_project_opt_out(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _route_composer_stubs(
+                page,
+                config_body=_worktree_off_config_body(),
+                create_bodies=create_bodies,
+                session_id=session_id,
+            )
+
+            # Global default ON — the project's explicit false must still win.
+            await page.add_init_script(
+                f"""window.localStorage.setItem("{_ALWAYS_WORKTREE_KEY}", "true");"""
+            )
+
+            await page.goto(f"{base_url}/?project={_PROJECT_NAME}")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+            # Workspace settles first; then assert no worktree branch was seeded.
+            await expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_contain_text(
+                "omnigent", timeout=15_000
+            )
+            await expect(page.get_by_test_id("new-chat-landing-branch-chip")).to_contain_text(
+                "Worktree", timeout=15_000
+            )
+
+            await page.get_by_test_id("new-chat-landing-input").fill("start here")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["workspace"] == _GIT_REPO, body
+            # Explicit opt-out → a plain launch, no worktree.
+            assert body.get("git") is None, body
+        finally:
+            await browser.close()

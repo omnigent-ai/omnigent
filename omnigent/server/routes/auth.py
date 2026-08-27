@@ -30,6 +30,7 @@ from omnigent.server.auth import (
     _RESERVED_USERS,
     UnifiedAuthProvider,
 )
+from omnigent.server.device_grant_store import DeviceGrantStore
 from omnigent.server.oidc import (
     _GITHUB_EMAILS_ENDPOINT,
     derive_code_challenge,
@@ -37,6 +38,7 @@ from omnigent.server.oidc import (
     mint_session_cookie,
 )
 from omnigent.server.oidc_access import OidcAdmissionPolicy, resolve_allowed_domains_path
+from omnigent.server.routes.device_auth import issue_login_grant
 from omnigent.stores.permission_store import PermissionStore
 
 _logger = logging.getLogger(__name__)
@@ -67,11 +69,16 @@ class _CliTicket:
         fulfills the ticket. ``None`` while pending.
     :param user_id: The authenticated user's email, set when
         fulfilled. ``None`` while pending.
+    :param refresh_token: Login-issued refresh grant material, set at
+        fulfillment when a grant store is wired. ``None`` while pending
+        or when grants are unavailable. Handed to the CLI exactly once
+        by the poll response.
     """
 
     created_at: float = field(default_factory=time.time)
     token: str | None = None
     user_id: str | None = None
+    refresh_token: str | None = None
 
 
 def create_auth_router(
@@ -80,6 +87,7 @@ def create_auth_router(
     admin_list: AdminList,
     account_store: SqlAlchemyAccountStore | None = None,
     allowed_domains: frozenset[str] | None = None,
+    device_grant_store: DeviceGrantStore | None = None,
 ) -> APIRouter:
     """Create an :class:`APIRouter` with OIDC login/callback/logout routes.
 
@@ -100,6 +108,12 @@ def create_auth_router(
         ``allowed_domains:`` key, union'd with
         ``OMNIGENT_OIDC_ALLOWED_DOMAINS`` and the runtime-editable file
         in the admission policy.
+    :param device_grant_store: When set, a CLI-ticket login also issues
+        a refresh grant (see
+        :func:`omnigent.server.routes.device_auth.issue_login_grant`)
+        so hosts and CLIs can renew without a human re-running
+        ``omnigent login``. ``None`` keeps the legacy
+        session-JWT-only response.
     :returns: A FastAPI router with ``/login``, ``/callback``,
         ``/logout`` (and ``/invite`` when invites are enabled).
     """
@@ -367,6 +381,19 @@ def create_auth_router(
             ticket = _cli_tickets[ticket_id]
             ticket.token = session_jwt
             ticket.user_id = email
+            # A CLI login is a long-lived unattended credential holder
+            # (hosts especially) — issue a refresh grant so it can renew
+            # instead of dying at session-JWT expiry. Best-effort: a
+            # grant-store failure must not break login itself.
+            if device_grant_store is not None:
+                try:
+                    ticket.refresh_token = issue_login_grant(
+                        device_grant_store,
+                        user_id=email,
+                        cookie_secret=config.cookie_secret,
+                    )
+                except Exception:
+                    _logger.exception("cli-login: refresh grant issuance failed")
             # Return a simple HTML page — the CLI is polling
             # /auth/cli-poll and will pick up the token.
             import html as _html
@@ -560,15 +587,18 @@ def create_auth_router(
         # Fulfilled — return the token and clean up.
         token = ticket.token
         user_id = ticket.user_id
+        refresh_token = ticket.refresh_token
         del _cli_tickets[ticket_id]
-        return JSONResponse(
-            status_code=200,
-            content={
-                "token": token,
-                "user_id": user_id,
-                "expires_in": config.session_ttl_hours * 3600,
-            },
-        )
+        content: dict[str, object] = {
+            "token": token,
+            "user_id": user_id,
+            "expires_in": config.session_ttl_hours * 3600,
+        }
+        # Only present when a grant store is wired — old CLIs ignore the
+        # extra key, new CLIs against old servers see it absent.
+        if refresh_token is not None:
+            content["refresh_token"] = refresh_token
+        return JSONResponse(status_code=200, content=content)
 
     # ── Admin: read-only user list ────────────────────────────────
 

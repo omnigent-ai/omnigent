@@ -33,6 +33,7 @@ import re
 import uuid
 
 import httpx
+import pytest
 from playwright.sync_api import Browser, expect
 
 
@@ -207,6 +208,7 @@ def test_presence_circles_track_other_viewers(
         bob_ctx.close()
 
 
+@pytest.mark.nightly
 def test_presence_idle_greys_backgrounded_viewer(
     browser: Browser,
     seeded_session: tuple[str, str],

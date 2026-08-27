@@ -47,6 +47,8 @@ from urllib.parse import urlparse
 import pytest
 from playwright.sync_api import Page, Route, expect
 
+from tests.e2e_ui.conftest import fetch_with_retry
+
 _FAKE_HOST_ID = "host_test_badge"
 # Unix seconds well before now so an offline host is outside the startup grace
 # (STARTING_GRACE_S) and reads its real liveness, not `starting` — see
@@ -59,7 +61,7 @@ def _drop_routes(page: Page) -> Iterator[None]:
     """Drop this module's route handlers before the page closes.
 
     Every test here leaves a ``/health`` poll and snapshot refetches in flight.
-    A handler that calls ``route.fetch()`` as the page tears down raises
+    A handler that replays upstream as the page tears down raises
     ``TargetClosedError``, which surfaces as an error in the NEXT test's setup.
 
     :param page: Playwright page fixture.
@@ -105,7 +107,7 @@ def _patch_host_view(
         if request.method != "GET" or urlparse(request.url).path != f"/v1/sessions/{session_id}":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         payload["host_id"] = _FAKE_HOST_ID
         payload["host_resumable"] = host_resumable
@@ -132,7 +134,7 @@ def _patch_host_view(
         if request.method != "GET" or urlparse(request.url).path != "/v1/sessions":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         rows = payload.get("data") if isinstance(payload, dict) else None
         if isinstance(rows, list):
@@ -150,7 +152,7 @@ def _patch_host_view(
         if request.method != "GET" or urlparse(request.url).path != "/health":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         live = {"runner_online": runner_online, "host_online": host_online}
         if isinstance(payload.get("sessions"), dict):

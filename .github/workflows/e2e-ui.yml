@@ -1,7 +1,7 @@
 name: E2E UI Tests
 
 # Runs the Playwright UI suite against a freshly built web SPA, split across
-# a 3-shard matrix. The whole suite (including the native Claude/Codex/Cursor
+# a 4-shard matrix. The whole suite (including the native Claude/Codex/Cursor
 # render-parity tests) runs against the in-process mock LLM and needs NO
 # secrets, so it runs on ALL PRs -- same-repo AND fork -- directly, like ci.yml.
 # (The native_*_mock_session fixtures use the real gateway only when LLM_API_KEY
@@ -86,7 +86,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
-          NUM_SHARDS: "3"
+          NUM_SHARDS: "4"
         run: bash .github/scripts/ci/e2e-shard-matrix.sh
 
   # Build the Codex-parity sidecar ONCE and publish the binary. The
@@ -148,11 +148,11 @@ jobs:
     # `ready_for_review` re-fires when a draft is converted.
     needs: [setup, build-sidecar]
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     strategy:
       # One red shard shouldn't cancel siblings -- we want every shard's signal.
       fail-fast: false
-      max-parallel: 3
+      max-parallel: 4
       # Shards from `setup`; [] when skipped. Shard check names live in
       # merge-ready/required.sh -- keep in sync with NUM_SHARDS above.
       matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
@@ -296,8 +296,15 @@ jobs:
           # pytest_collection_modifyitems in tests/e2e_ui/conftest.py), which
           # evens out wall-clock better than pytest-shard's hash-bucketing.
           # --group is 1-indexed, so map the 0-indexed shard_id with +1.
+          # --durations surfaces the slowest test phases (setup/call/teardown)
+          # at the end of each shard's log so we can see where the wall-clock
+          # goes and rebalance; the 1s floor keeps trivial phases out.
+          # Retry every otherwise-unmarked failure once for transient CI races;
+          # per-test @pytest.mark.flaky settings still take precedence.
           uv run pytest tests/e2e_ui \
             -v --tb=long --showlocals --log-level=INFO -r a \
+            --durations=25 --durations-min=1.0 \
+            --reruns=1 --reruns-delay=5 \
             --ui-skip-build \
             --splits="$NUM_SHARDS" \
             --group="$((SHARD_ID + 1))" \

@@ -10,9 +10,9 @@
  * Sections:
  *
  * - **Appearance** — theme mode (System / Light / Dark), terminal theme,
- *   Workspace panel default for new chats, and UI/code font controls.
- * - **Git** — Git behavior, e.g. the default base branch pre-filled when
- *   naming a new worktree branch in the composer.
+ *   default transcript view, Workspace panel default, and UI/code font controls.
+ * - **Git** — Git behavior: the global "always use a random worktree" default
+ *   and the default base branch pre-filled when naming a new worktree branch.
  * - **Keyboard shortcuts** — the full shortcuts reference, shown inline.
  * - **Account** — only when the accounts auth provider is active. Absorbs
  *   the old sidebar AccountMenu: signed-in identity, change password, and
@@ -29,22 +29,22 @@
 
 import {
   lazy,
+  type CSSProperties,
   type ReactNode,
   Suspense,
   useCallback,
   useEffect,
   useId,
   useMemo,
-  useRef,
   useState,
 } from "react";
 import {
   ArchiveRestoreIcon,
   AlertTriangleIcon,
-  CheckIcon,
   KeyRoundIcon,
   LaptopMinimalIcon,
   LogOutIcon,
+  MessagesSquareIcon,
   MinusIcon,
   MonitorIcon,
   MoonIcon,
@@ -52,12 +52,19 @@ import {
   PanelRightIcon,
   PlusIcon,
   SunIcon,
+  TerminalIcon,
   Trash2Icon,
   UserCogIcon,
 } from "lucide-react";
 import { useTheme } from "next-themes";
 import { PageScroll } from "@/components/PageScroll";
 import { ThemeColorPicker } from "@/components/theme/ThemeColorPicker";
+import { CardRadioGroup } from "@/components/theme/CardRadioGroup";
+import {
+  ModePreview,
+  PaletteChip,
+  PaletteSwatchPreview,
+} from "@/components/theme/AppearancePreviews";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
@@ -82,7 +89,7 @@ import { KeyboardShortcutsList } from "@/components/KeyboardShortcutsDialog";
 import { changePassword, logout } from "@/lib/accountsApi";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { useOmnigentPageView } from "@/lib/analytics";
+import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import {
   type Conversation,
   useArchiveConversation,
@@ -94,6 +101,7 @@ import { conversationDisplayLabel } from "@/shell/sidebarNav";
 import { absoluteTime } from "@/lib/relativeTime";
 import { useNavigate } from "@/lib/routing";
 import { useSettingsRoute } from "@/shell/settingsNav";
+import { ImportSessionsPanel } from "@/shell/ImportSessionsPanel";
 import {
   normalizeResolvedTheme,
   normalizeThemeMode,
@@ -120,10 +128,15 @@ import {
   CODE_FONT_SIZE_MAX,
   CODE_FONT_SIZE_MIN,
   CODE_FONT_SIZE_STEP,
+  CODE_FONT_WEIGHT_DEFAULT,
+  CODE_FONT_WEIGHT_HEAVIER,
+  CODE_FONT_WEIGHT_NORMAL,
   readCodeFontFamily,
   readCodeFontSizePx,
+  readCodeFontWeight,
   writeCodeFontFamily,
   writeCodeFontSizePx,
+  writeCodeFontWeight,
 } from "@/lib/codeFontPreferences";
 import {
   readTerminalThemeMode,
@@ -137,7 +150,14 @@ import {
   writeWorkspacePanelDefault,
   type WorkspacePanelDefault,
 } from "@/lib/workspacePanelPreferences";
+import {
+  readTranscriptViewDefault,
+  TRANSCRIPT_VIEW_DEFAULT,
+  writeTranscriptViewDefault,
+  type TranscriptViewDefault,
+} from "@/lib/transcriptViewPreferences";
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
+import { readAlwaysUseWorktree, writeAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
 import {
   DEFAULT_HIDE_UNCONFIGURED_HARNESSES,
   readHideUnconfiguredHarnesses,
@@ -148,7 +168,6 @@ import {
   DEFAULT_PALETTE,
   isThemeSelection,
   PALETTES,
-  type PaletteSwatch,
   readThemePalette,
   type ThemeSelection,
   writeThemePalette,
@@ -231,6 +250,7 @@ export function SettingsPage() {
       {section === "appearance" && <AppearanceSection />}
       {section === "git" && <GitSection />}
       {section === "shortcuts" && <ShortcutsSection />}
+      {section === "import" && <ImportSection />}
       {section === "account" && hasAuthSession && <AccountSection />}
       {section === "archived" && <ArchivedSection />}
       {section === "cli" && isElectronShell() && <LocalCliSection />}
@@ -276,6 +296,15 @@ const terminalThemeCards: { mode: TerminalThemeMode; label: string; icon: typeof
   { mode: "dark", label: "Dark", icon: MoonIcon },
 ];
 
+const transcriptViewCards: {
+  value: TranscriptViewDefault;
+  label: string;
+  icon: typeof MessagesSquareIcon;
+}[] = [
+  { value: "chat", label: "Chat", icon: MessagesSquareIcon },
+  { value: "terminal", label: "Terminal", icon: TerminalIcon },
+];
+
 const workspacePanelCards: {
   value: WorkspacePanelDefault;
   label: string;
@@ -285,37 +314,6 @@ const workspacePanelCards: {
   { value: "collapsed", label: "Collapsed", icon: PanelRightCloseIcon },
 ];
 
-/**
- * Checkmark badge pinned to the top-right corner of a selected card. Shared by
- * every appearance radiogroup so "selected" reads identically everywhere.
- */
-function SelectedBadge() {
-  return (
-    <span
-      aria-hidden
-      className="absolute right-1.5 top-1.5 flex size-4 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-sm"
-    >
-      <CheckIcon className="size-3" />
-    </span>
-  );
-}
-
-/**
- * Shared card styling for the appearance radiogroups. Selected cards carry the
- * accent border + a subtle accent wash (paired with <SelectedBadge/>); the rest
- * highlight their border and lift on hover. focus-visible keeps the global
- * outline ring, so keyboard focus stays visually distinct from selection.
- */
-function themeCardClass(selected: boolean, layout?: string) {
-  return cn(
-    "relative flex flex-col rounded-lg border-2 transition-[color,background-color,border-color,box-shadow]",
-    selected
-      ? "border-primary bg-primary/5"
-      : "border-border hover:border-border-strong hover:bg-muted hover:shadow-sm",
-    layout,
-  );
-}
-
 /** Centered icon + label body shared by the Mode and Terminal theme cards. */
 function iconCardBody(Icon: typeof SunIcon, label: string) {
   return (
@@ -323,131 +321,6 @@ function iconCardBody(Icon: typeof SunIcon, label: string) {
       <Icon className="size-6 text-muted-foreground" />
       <span className="text-ui font-medium">{label}</span>
     </>
-  );
-}
-
-// Neutral light/dark window tones for the Mode preview tiles. These are about
-// light-vs-dark only (not the color theme), so they stay grayscale.
-const LIGHT_MODE_PREVIEW: PaletteSwatch = {
-  bg: "#e9ebee",
-  card: "#ffffff",
-  accent: "#aab2bd",
-  border: "#d7dbe0",
-  text: "#11171c",
-};
-const DARK_MODE_PREVIEW: PaletteSwatch = {
-  bg: "#0e1013",
-  card: "#232a33",
-  accent: "#5b6672",
-  border: "#2b333d",
-  text: "#e6edf3",
-};
-
-/**
- * Mini app-window mock for a Mode tile, reusing {@link PaletteSwatchPreview}. A
- * light or dark two-pane window; "system" shows one window split diagonally —
- * light on the near side, dark on the far — to signal "follow the OS".
- */
-function ModePreview({ variant }: { variant: ThemeMode }) {
-  if (variant === "light") return <PaletteSwatchPreview swatch={LIGHT_MODE_PREVIEW} />;
-  if (variant === "dark") return <PaletteSwatchPreview swatch={DARK_MODE_PREVIEW} />;
-  return (
-    <div className="relative h-16 w-full">
-      <PaletteSwatchPreview swatch={LIGHT_MODE_PREVIEW} />
-      <div
-        aria-hidden
-        className="absolute inset-0"
-        style={{ clipPath: "polygon(62% 0, 100% 0, 100% 100%, 38% 100%)" }}
-      >
-        <PaletteSwatchPreview swatch={DARK_MODE_PREVIEW} />
-      </div>
-    </div>
-  );
-}
-
-/** Small swatch chip (canvas + accent dot) for the color-theme dropdown. */
-function PaletteChip({ swatch }: { swatch: PaletteSwatch }) {
-  return (
-    <span
-      aria-hidden
-      className="flex size-5 shrink-0 items-center justify-center rounded-md border"
-      style={{ backgroundColor: swatch.bg, borderColor: swatch.border }}
-    >
-      <span className="size-2 rounded-full" style={{ backgroundColor: swatch.accent }} />
-    </span>
-  );
-}
-
-/** One option in a {@link CardRadioGroup}. */
-interface CardRadioOption<T extends string> {
-  value: T;
-  testId: string;
-  body: ReactNode;
-  /** Optional native tooltip (used for the palette blurbs). */
-  title?: string;
-}
-
-/**
- * Accessible card radiogroup shared by all three appearance pickers. Implements
- * the WAI-ARIA radiogroup pattern: a roving tabindex (only the selected card is
- * tabbable), arrow keys move selection within the group, and Enter/Space select
- * the focused card. `labelledBy` points at the subsection heading so the group's
- * accessible name matches its visible label.
- */
-function CardRadioGroup<T extends string>({
-  labelledBy,
-  value,
-  onSelect,
-  items,
-  className,
-  cardClassName,
-}: {
-  labelledBy: string;
-  value: T;
-  onSelect: (value: T) => void;
-  items: readonly CardRadioOption<T>[];
-  className?: string;
-  cardClassName?: string;
-}) {
-  // Keep a handle on each card so arrow-key navigation can move focus as it
-  // moves selection (selection-follows-focus, per the radiogroup pattern).
-  const refs = useRef(new Map<T, HTMLButtonElement | null>());
-
-  return (
-    <div role="radiogroup" aria-labelledby={labelledBy} className={className}>
-      {items.map((item, index) => {
-        const selected = item.value === value;
-        return (
-          <button
-            key={item.value}
-            ref={(el) => {
-              refs.current.set(item.value, el);
-            }}
-            type="button"
-            role="radio"
-            aria-checked={selected}
-            tabIndex={selected ? 0 : -1}
-            title={item.title}
-            data-testid={item.testId}
-            onClick={() => onSelect(item.value)}
-            onKeyDown={(event) => {
-              const forward = event.key === "ArrowRight" || event.key === "ArrowDown";
-              const backward = event.key === "ArrowLeft" || event.key === "ArrowUp";
-              if (!forward && !backward) return;
-              event.preventDefault();
-              const nextIndex = (index + (forward ? 1 : -1) + items.length) % items.length;
-              const next = items[nextIndex].value;
-              onSelect(next);
-              refs.current.get(next)?.focus();
-            }}
-            className={themeCardClass(selected, cardClassName)}
-          >
-            {selected && <SelectedBadge />}
-            {item.body}
-          </button>
-        );
-      })}
-    </div>
   );
 }
 
@@ -491,6 +364,7 @@ function ModeControl() {
         labelledBy={labelId}
         value={mode}
         onSelect={(next) => setTheme(next)}
+        componentId="settings.appearance.theme_mode"
         className="grid grid-cols-3 gap-3"
         cardClassName="gap-2 p-2"
         items={themeCards.map((card) => ({
@@ -526,11 +400,43 @@ function TerminalThemeControl() {
         labelledBy={labelId}
         value={mode}
         onSelect={choose}
+        componentId="settings.appearance.terminal_theme"
         className="grid grid-cols-3 gap-3"
         cardClassName="items-center gap-2 p-4"
         items={terminalThemeCards.map((card) => ({
           value: card.mode,
           testId: `terminal-theme-${card.mode}`,
+          body: iconCardBody(card.icon, card.label),
+        }))}
+      />
+    </ThemeSubsection>
+  );
+}
+
+/** Default surface for terminal-first transcripts without a per-tab choice. */
+function TranscriptViewDefaultControl() {
+  const [value, setValue] = useState(() => readTranscriptViewDefault());
+  const labelId = useId();
+  const choose = useCallback((next: TranscriptViewDefault) => {
+    setValue(next);
+    writeTranscriptViewDefault(next);
+  }, []);
+  return (
+    <ThemeSubsection
+      labelId={labelId}
+      title="Default transcript view"
+      helper="Choose whether terminal-backed chats open in Chat or Terminal view. A view selected in a chat is remembered for the current tab."
+    >
+      <CardRadioGroup<TranscriptViewDefault>
+        labelledBy={labelId}
+        value={value}
+        onSelect={choose}
+        componentId="settings.appearance.transcript_view"
+        className="grid grid-cols-2 gap-3"
+        cardClassName="items-center gap-2 p-4"
+        items={transcriptViewCards.map((card) => ({
+          value: card.value,
+          testId: `transcript-view-default-${card.value}`,
           body: iconCardBody(card.icon, card.label),
         }))}
       />
@@ -554,12 +460,13 @@ function WorkspacePanelDefaultControl() {
     <ThemeSubsection
       labelId={labelId}
       title="Workspace panel"
-      helper="Whether new chats open with the Files / Agents / Shells panel visible. Existing chats keep their last layout."
+      helper="Whether new chats open with the Files / Agents / Shells panel visible. Collapsing or expanding the panel updates this. Existing chats keep their last layout."
     >
       <CardRadioGroup<WorkspacePanelDefault>
         labelledBy={labelId}
         value={value}
         onSelect={choose}
+        componentId="settings.appearance.workspace_panel"
         className="grid grid-cols-2 gap-3"
         cardClassName="items-center gap-2 p-4"
         items={workspacePanelCards.map((card) => ({
@@ -653,6 +560,8 @@ function ColorThemeControl() {
             onValueChange={(next) => {
               if (isThemeSelection(next)) choose(next);
             }}
+            componentId="settings.appearance.color_theme"
+            valueHasNoPii
           >
             <SelectTrigger
               aria-labelledby={labelId}
@@ -688,7 +597,7 @@ function ColorThemeControl() {
             label="Accent"
             value={editableTheme.accent}
             testId="custom-theme-accent"
-            onChange={(accent) => updateCustomTheme({ accent })}
+            onChange={(accent) => updateCustomTheme({ accent, darkAccent: accent })}
           />
           <ThemeColorPicker
             label="Background tint"
@@ -713,7 +622,8 @@ function ColorThemeControl() {
                 aria-label="Theme contrast"
                 data-testid="custom-theme-contrast"
                 onChange={(event) => updateCustomTheme({ contrast: Number(event.target.value) })}
-                className="h-1.5 min-w-0 flex-1 cursor-pointer accent-primary"
+                className="theme-contrast-range min-w-0 flex-1 cursor-pointer"
+                style={{ "--range-progress": `${editableTheme.contrast}%` } as CSSProperties}
               />
               <output
                 htmlFor="custom-theme-contrast"
@@ -736,55 +646,12 @@ function ColorThemeControl() {
               checked={editableTheme.translucentSidebar}
               onCheckedChange={(translucentSidebar) => updateCustomTheme({ translucentSidebar })}
               data-testid="custom-theme-translucent-sidebar"
+              componentId="settings.appearance.translucent_sidebar"
             />
           </div>
         </div>
       </div>
     </ThemeSubsection>
-  );
-}
-
-/**
- * Miniature "app window" preview for a palette: a canvas with a small sidebar
- * and content card, a few text lines, and an accent chip — built purely from
- * the swatch colors so each palette reads at a glance.
- */
-function PaletteSwatchPreview({ swatch }: { swatch: PaletteSwatch }) {
-  return (
-    <div
-      aria-hidden
-      className="flex h-16 w-full gap-1.5 overflow-hidden rounded-lg p-1.5"
-      style={{ backgroundColor: swatch.bg, border: `1px solid ${swatch.border}` }}
-    >
-      <div
-        className="flex w-1/3 flex-col gap-1 rounded-md p-1"
-        style={{ backgroundColor: swatch.card, border: `1px solid ${swatch.border}` }}
-      >
-        <div className="size-1.5 rounded-full" style={{ backgroundColor: swatch.accent }} />
-        <div
-          className="h-1 w-4/5 rounded-full"
-          style={{ backgroundColor: swatch.text, opacity: 0.35 }}
-        />
-        <div
-          className="h-1 w-3/5 rounded-full"
-          style={{ backgroundColor: swatch.text, opacity: 0.25 }}
-        />
-      </div>
-      <div
-        className="flex flex-1 flex-col gap-1 rounded-md p-1.5"
-        style={{ backgroundColor: swatch.card, border: `1px solid ${swatch.border}` }}
-      >
-        <div
-          className="h-1 w-3/4 rounded-full"
-          style={{ backgroundColor: swatch.text, opacity: 0.5 }}
-        />
-        <div
-          className="h-1 w-1/2 rounded-full"
-          style={{ backgroundColor: swatch.text, opacity: 0.3 }}
-        />
-        <div className="mt-auto h-2.5 w-2/5 rounded" style={{ backgroundColor: swatch.accent }} />
-      </div>
-    </div>
   );
 }
 
@@ -818,6 +685,7 @@ function HideUnconfiguredHarnessesControl() {
         onCheckedChange={toggle}
         data-testid="hide-unconfigured-harnesses-toggle"
         className="mt-0.5 shrink-0"
+        componentId="settings.appearance.hide_unconfigured_harnesses"
       />
     </div>
   );
@@ -844,6 +712,8 @@ function AppearanceSection() {
     writeCustomTheme(DEFAULT_CUSTOM_THEME);
     applyCustomTheme(DEFAULT_CUSTOM_THEME);
 
+    writeTranscriptViewDefault(TRANSCRIPT_VIEW_DEFAULT);
+
     writeWorkspacePanelDefault(WORKSPACE_PANEL_DEFAULT);
 
     writeHideUnconfiguredHarnesses(DEFAULT_HIDE_UNCONFIGURED_HARNESSES);
@@ -853,6 +723,7 @@ function AppearanceSection() {
 
     writeCodeFontSizePx(CODE_FONT_SIZE_DEFAULT);
     writeCodeFontFamily(CODE_FONT_FAMILY_DEFAULT);
+    writeCodeFontWeight(CODE_FONT_WEIGHT_DEFAULT);
 
     // Remove the persisted keys so this device has no appearance overrides at
     // all. Some write helpers already remove the key for the default value;
@@ -865,9 +736,11 @@ function AppearanceSection() {
           "omnigent:ui-font-family",
           "omnigent:code-font-size",
           "omnigent:code-font-family",
+          "omnigent:code-font-weight",
           "omnigent:terminal-theme",
           "omnigent:ui-theme-palette",
           "omnigent:custom-theme",
+          "omnigent:default-transcript-view",
           "omnigent:default-workspace-panel",
           "omnigent:hide-unconfigured-harnesses",
         ]) {
@@ -910,6 +783,8 @@ function AppearanceSection() {
 
         {!isEmbedded && <ColorThemeControl />}
 
+        <TranscriptViewDefaultControl />
+
         <WorkspacePanelDefaultControl />
 
         <HideUnconfiguredHarnessesControl />
@@ -918,19 +793,26 @@ function AppearanceSection() {
 
         <UiFontFamilyControl />
 
-        {/* Code font (Monaco + xterm) sits as its own two rows — labelled in full
-            ("Code font size" / "Code font family") rather than under a shared
+        {/* Code font (Monaco + xterm) sits as its own rows — labelled in full
+            ("Code font size" / "Code font family" / "Code font weight") rather than under a shared
             heading — so each control reads unambiguously next to the UI-font rows
             above and it's clear these don't scale the surrounding chrome. */}
         <UiCodeFontSizeControl />
 
         <UiCodeFontFamilyControl />
+
+        <UiCodeFontWeightControl />
       </div>
 
-      <div className="flex items-center justify-end">
+      <div className="mt-4 flex items-center justify-end">
         <Dialog open={isResetDialogOpen} onOpenChange={setIsResetDialogOpen}>
           <DialogTrigger asChild>
-            <Button variant="outline" size="sm" data-testid="reset-appearance-button">
+            <Button
+              variant="outline"
+              size="sm"
+              data-testid="reset-appearance-button"
+              componentId="settings.appearance.open_reset_dialog"
+            >
               Reset to defaults
             </Button>
           </DialogTrigger>
@@ -952,6 +834,7 @@ function AppearanceSection() {
                 size="sm"
                 onClick={confirmResetAppearance}
                 data-testid="reset-appearance-confirm"
+                componentId="settings.appearance.reset"
               >
                 Reset
               </Button>
@@ -968,9 +851,46 @@ function GitSection() {
   return (
     <Section title="Git" description="Configure how Omnigent works with Git.">
       <div className="flex flex-col gap-8">
+        <AlwaysUseWorktreeControl />
         <DefaultBaseBranchControl />
       </div>
     </Section>
+  );
+}
+
+/**
+ * Global default: start every new session in a git workspace in a fresh
+ * randomly-named worktree, regardless of which folder the composer lands in.
+ * Per-project "Random worktree" settings override this in either direction —
+ * this only decides the default for workspaces a project hasn't set a choice on.
+ */
+function AlwaysUseWorktreeControl() {
+  const [value, setValue] = useState(() => readAlwaysUseWorktree());
+  const labelId = useId();
+  const toggle = useCallback((next: boolean) => {
+    setValue(next);
+    writeAlwaysUseWorktree(next);
+  }, []);
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <div className="flex min-w-0 flex-1 flex-col">
+        <span id={labelId} className="text-ui font-medium">
+          Always use a random worktree
+        </span>
+        <span className="text-ui text-muted-foreground">
+          Start new sessions in a fresh randomly-named git worktree in any git workspace. A
+          project's own Random worktree setting overrides this.
+        </span>
+      </div>
+      <Switch
+        aria-labelledby={labelId}
+        checked={value}
+        onCheckedChange={toggle}
+        data-testid="settings-always-use-worktree-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.git.always_use_worktree"
+      />
+    </div>
   );
 }
 
@@ -1007,6 +927,7 @@ function DefaultBaseBranchControl() {
         className="h-9 w-56 shrink-0"
         value={branch}
         onChange={(e) => update(e.target.value)}
+        componentId="settings.git.default_branch"
       />
     </div>
   );
@@ -1083,6 +1004,7 @@ function UiFontSizeControl() {
           testId="ui-font-size-dec"
           disabled={atMin}
           onClick={() => commit(px - UI_FONT_SIZE_STEP)}
+          componentId="settings.appearance.ui_font_decrease"
         >
           <MinusIcon className="ui-icon" />
         </StepperButton>
@@ -1109,6 +1031,7 @@ function UiFontSizeControl() {
           testId="ui-font-size-inc"
           disabled={atMax}
           onClick={() => commit(px + UI_FONT_SIZE_STEP)}
+          componentId="settings.appearance.ui_font_increase"
         >
           <PlusIcon className="ui-icon" />
         </StepperButton>
@@ -1159,6 +1082,7 @@ function UiFontFamilyControl() {
           disabled={isDefault}
           className={cn("h-9", isDefault && "invisible")}
           onClick={() => update(UI_FONT_FAMILY_DEFAULT)}
+          componentId="settings.appearance.ui_font_family_reset"
         >
           Reset
         </Button>
@@ -1247,6 +1171,7 @@ function UiCodeFontSizeControl() {
           testId="code-font-size-dec"
           disabled={atMin}
           onClick={() => commit(px - CODE_FONT_SIZE_STEP)}
+          componentId="settings.appearance.code_font_decrease"
         >
           <MinusIcon className="ui-icon" />
         </StepperButton>
@@ -1273,6 +1198,7 @@ function UiCodeFontSizeControl() {
           testId="code-font-size-inc"
           disabled={atMax}
           onClick={() => commit(px + CODE_FONT_SIZE_STEP)}
+          componentId="settings.appearance.code_font_increase"
         >
           <PlusIcon className="ui-icon" />
         </StepperButton>
@@ -1317,6 +1243,7 @@ function UiCodeFontFamilyControl() {
           disabled={isDefault}
           className={cn("h-9", isDefault && "invisible")}
           onClick={() => update(CODE_FONT_FAMILY_DEFAULT)}
+          componentId="settings.appearance.code_font_family_reset"
         >
           Reset
         </Button>
@@ -1337,27 +1264,62 @@ function UiCodeFontFamilyControl() {
   );
 }
 
+/** Font weight preset shared by Monaco and xterm code surfaces. */
+function UiCodeFontWeightControl() {
+  const [heavier, setHeavier] = useState(() => readCodeFontWeight() === CODE_FONT_WEIGHT_HEAVIER);
+
+  const toggle = (enabled: boolean) => {
+    setHeavier(enabled);
+    writeCodeFontWeight(enabled ? CODE_FONT_WEIGHT_HEAVIER : CODE_FONT_WEIGHT_NORMAL);
+  };
+
+  return (
+    <div className="flex items-center justify-between gap-6" data-testid="code-font-weight-control">
+      <div className="min-w-0 flex-1">
+        <span className="text-ui font-medium">Heavier code font</span>
+        <span className="block text-sm text-muted-foreground">
+          Use a slightly heavier font weight in the code editor and terminal.
+        </span>
+      </div>
+      <Switch
+        aria-label="Use heavier code text"
+        checked={heavier}
+        onCheckedChange={toggle}
+        data-testid="heavier-code-text-toggle"
+        className="shrink-0"
+        componentId="settings.appearance.heavier_code_text"
+      />
+    </div>
+  );
+}
+
 /** Flanking +/- segment of the font-size pill: square, ghost-hover, no border. */
 function StepperButton({
   label,
   testId,
   disabled,
   onClick,
+  componentId,
   children,
 }: {
   label: string;
   testId: string;
   disabled: boolean;
   onClick: () => void;
+  componentId?: string;
   children: ReactNode;
 }) {
+  const { trackClick } = useOmnigentAnalytics();
   return (
     <button
       type="button"
       aria-label={label}
       data-testid={testId}
       disabled={disabled}
-      onClick={onClick}
+      onClick={() => {
+        if (componentId) trackClick(componentId, "button");
+        onClick();
+      }}
       className={cn(
         "flex w-9 items-center justify-center text-muted-foreground transition-colors",
         "hover:bg-muted hover:text-foreground dark:hover:bg-muted/50",
@@ -1571,6 +1533,8 @@ function UpdatesSection() {
               value={config.mode}
               onValueChange={(value) => void persistConfig({ mode: value as UpdateMode })}
               disabled={saving}
+              componentId="settings.updates.mode"
+              valueHasNoPii
             >
               <SelectTrigger className="w-full max-w-md" data-testid="update-mode-select">
                 <SelectValue />
@@ -1597,11 +1561,16 @@ function UpdatesSection() {
               onCheckedChange={(checked) => void persistConfig({ autoInstall: checked })}
               disabled={saving}
               aria-label="Install downloaded updates on next quit"
+              componentId="settings.updates.auto_install"
             />
           </div>
 
           <div className="flex flex-wrap items-center gap-3">
-            <Button onClick={() => void onCheck()} loading={checking}>
+            <Button
+              onClick={() => void onCheck()}
+              loading={checking}
+              componentId="settings.updates.check_now"
+            >
               Check for updates now
             </Button>
             {saving && <span className="text-sm text-muted-foreground">Saving…</span>}
@@ -1727,6 +1696,7 @@ function AccountSection() {
                 resetPwForm();
                 setPwOpen(true);
               }}
+              componentId="settings.account.change_password"
             >
               <KeyRoundIcon className="size-4" /> Change password
             </Button>
@@ -1735,6 +1705,7 @@ function AccountSection() {
             variant="ghost"
             className="w-full justify-start gap-2"
             onClick={() => void onSignOut()}
+            componentId="settings.account.sign_out"
           >
             <LogOutIcon className="size-4" /> Sign out
           </Button>
@@ -1807,6 +1778,7 @@ function AccountSection() {
                   disabled={
                     pwBusy || oldPw.length === 0 || newPw.length === 0 || confirmPw.length === 0
                   }
+                  componentId="settings.account.update_password"
                 >
                   {pwBusy ? "Changing…" : "Change password"}
                 </Button>
@@ -1860,6 +1832,17 @@ function dateGroupLabel(timestampSec: number, now: Date = new Date()): string {
   if (date >= sevenDaysAgo) return "Previous 7 days";
   if (date >= thirtyDaysAgo) return "Previous 30 days";
   return date.toLocaleDateString(undefined, { month: "long", year: "numeric" });
+}
+
+function ImportSection() {
+  return (
+    <Section
+      title="Import sessions"
+      description="Pull your recent local chats from a machine you're running into Omnigent. Sessions already imported are skipped."
+    >
+      <ImportSessionsPanel />
+    </Section>
+  );
 }
 
 function ArchivedSection() {

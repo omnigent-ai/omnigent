@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import { CalendarIcon, Loader2Icon, TriangleAlertIcon } from "lucide-react";
+import { useOmnigentAnalytics } from "@/lib/analytics";
 import { PageScroll } from "@/components/PageScroll";
 import { CostTimelineChart } from "@/components/usage/CostTimelineChart";
 import { UsageBreakdownCharts } from "@/components/usage/UsageBreakdownCharts";
@@ -73,11 +74,13 @@ function filterSessions(
 
 export function UsagePage() {
   const { data, isLoading, isError, refetch } = useUsageReport();
+  const { trackClick } = useOmnigentAnalytics();
 
   const [rangeKey, setRangeKey] = useState<RangeKey>("30d");
   const [customStart, setCustomStart] = useState(() => daysAgoIso(30));
   const [customEnd, setCustomEnd] = useState(todayIso);
 
+  const today = todayIso();
   const { since, until } = rangeToWindow(rangeKey, customStart, customEnd);
 
   const filteredCosts = useMemo(
@@ -112,7 +115,10 @@ export function UsagePage() {
                     ? "bg-primary text-primary-foreground"
                     : "bg-muted text-muted-foreground hover:bg-muted/80",
                 )}
-                onClick={() => setRangeKey(key)}
+                onClick={() => {
+                  trackClick(`usage.range_${key}`, "button");
+                  setRangeKey(key);
+                }}
               >
                 {label}
               </button>
@@ -126,14 +132,25 @@ export function UsagePage() {
             <input
               type="date"
               value={customStart}
-              onChange={(e) => setCustomStart(e.target.value)}
+              max={customEnd < today ? customEnd : today}
+              onChange={(e) => {
+                const v = e.target.value;
+                setCustomStart(v);
+                if (v > customEnd) setCustomEnd(v);
+              }}
               className="rounded-md border border-border bg-background px-2 py-1 text-sm"
             />
             <span className="text-muted-foreground">to</span>
             <input
               type="date"
               value={customEnd}
-              onChange={(e) => setCustomEnd(e.target.value)}
+              min={customStart}
+              max={today}
+              onChange={(e) => {
+                const v = e.target.value;
+                setCustomEnd(v);
+                if (v < customStart) setCustomStart(v);
+              }}
               className="rounded-md border border-border bg-background px-2 py-1 text-sm"
             />
           </div>
@@ -149,7 +166,14 @@ export function UsagePage() {
           <div className="flex h-64 flex-col items-center justify-center gap-2 text-sm text-muted-foreground">
             <TriangleAlertIcon className="h-5 w-5" />
             <p>Failed to load usage data</p>
-            <button type="button" className="text-primary underline" onClick={() => refetch()}>
+            <button
+              type="button"
+              className="text-primary underline"
+              onClick={() => {
+                trackClick("usage.retry", "button");
+                void refetch();
+              }}
+            >
               Retry
             </button>
           </div>

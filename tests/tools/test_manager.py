@@ -192,6 +192,10 @@ def _make_spec(
         skills=skills or [],
         mcp_servers=mcp_servers or [],
         local_tools=local_tools or [],
+        # Without this, ``LoadSkillTool`` merges in host-scope skills from
+        # ~/.claude/skills and every .claude/skills above cwd, and these tests
+        # assert on whatever the developer happens to have installed.
+        skills_filter="none",
     )
 
 
@@ -299,11 +303,18 @@ def test_schemas_include_read_skill_file_with_resources(
 
 def test_schemas_exclude_read_skill_file_without_resources(
     skill_no_resources: SkillSpec,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     get_tool_schemas does NOT include read_skill_file when
     no skill has bundled resources.
     """
+    # Host-scope skill discovery falls back to cwd; run from an empty
+    # directory so this repo's own .claude/skills/ doesn't contribute
+    # resources to the check.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
     mgr = ToolManager(
         _make_spec([skill_no_resources]),
     )
@@ -312,12 +323,20 @@ def test_schemas_exclude_read_skill_file_without_resources(
     assert "read_skill_file" not in names
 
 
-def test_schemas_empty_when_no_skills() -> None:
+def test_schemas_empty_when_no_skills(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
     get_tool_schemas returns empty when agent has no skills,
     excluding the always-registered lifecycle tool
     (``sys_cancel_task``).
     """
+    # Host-scope skill discovery falls back to cwd; run from an empty
+    # directory so this repo's own .claude/skills/ doesn't contribute
+    # skills/resources to the check.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
     mgr = ToolManager(_make_spec([]))
     assert _non_lifecycle_schemas(mgr) == []
 
@@ -661,14 +680,14 @@ def test_agent_read_tools_registered_for_every_agent() -> None:
     assert "sys_agent_download" in names
     assert "sys_agent_list" in names
     # get/download require a session_id (an agent is only inspectable
-    # while running in some session); list takes no parameters.
+    # while running in some session); list exposes optional pagination.
     for tool_name in ("sys_agent_get", "sys_agent_download"):
         schema = next(s for s in mgr.get_tool_schemas() if s["function"]["name"] == tool_name)
         assert "session_id" in schema["function"]["parameters"]["required"]
     list_schema = next(
         s for s in mgr.get_tool_schemas() if s["function"]["name"] == "sys_agent_list"
     )
-    assert list_schema["function"]["parameters"]["properties"] == {}
+    assert set(list_schema["function"]["parameters"]["properties"]) == {"limit", "cursor"}
 
 
 # ── MCP integration ──────────────────────────────────────
@@ -779,7 +798,10 @@ def _make_client_side_spec(name: str) -> ClientSideToolSpec:
     )
 
 
-def test_client_tools_registered_in_schemas() -> None:
+def test_client_tools_registered_in_schemas(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
     Client-specified tools appear in get_tool_schemas() alongside
     built-in tools without calling start().
@@ -787,6 +809,11 @@ def test_client_tools_registered_in_schemas() -> None:
     A failure here means the LLM never sees client tools — the
     client_tool_specs constructor arg is not being wired up.
     """
+    # Host-scope skill discovery falls back to cwd; run from an empty
+    # directory so this repo's own .claude/skills/ doesn't contribute
+    # extra tool schemas to the count below.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
     spec = _make_spec()
     mgr = ToolManager(
         spec,
@@ -880,11 +907,19 @@ def test_client_tool_shadows_skill_tool(
     )
 
 
-def test_client_tools_none_equivalent_to_empty() -> None:
+def test_client_tools_none_equivalent_to_empty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
     Passing client_tool_specs=None and client_tool_specs=[] produce
     the same result: no client tools registered.
     """
+    # Host-scope skill discovery falls back to cwd; run from an empty
+    # directory so this repo's own .claude/skills/ doesn't contribute
+    # extra tool schemas to the empty-list check.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
     spec = _make_spec()
     mgr_none = ToolManager(spec, client_tool_specs=None)
     mgr_empty = ToolManager(spec, client_tool_specs=[])
@@ -1188,11 +1223,19 @@ def test_local_tools_registered_and_callable(
     )
 
 
-def test_local_tools_skipped_without_workdir() -> None:
+def test_local_tools_skipped_without_workdir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
     ToolManager with workdir=None skips local tool registration
     without error, even if spec has local_tools.
     """
+    # Host-scope skill discovery falls back to cwd (independent of
+    # workdir); run from an empty directory so this repo's own
+    # .claude/skills/ doesn't contribute extra tool schemas.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
     info = LocalToolInfo(
         name="some_tool",
         path="tools/python/some_tool.py",
@@ -1239,3 +1282,21 @@ def test_web_search_does_not_emit_web_search_preview_for_databricks_model() -> N
         f"databricks-gpt-5-4 — Databricks does not support this tool type "
         f"and rejects the request with HTTP 400. Got schema: {schema!r}"
     )
+
+
+def test_read_skill_file_registered_for_root_level_resources(tmp_path: Path) -> None:
+    """A skill whose only extra files sit beside SKILL.md still gets the tool."""
+    from omnigent.tools.builtins import any_skill_has_resources
+
+    skill_dir = tmp_path / "codebase-design"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("body")
+    (skill_dir / "DEEPENING.md").write_text("deepening")
+    skill = SkillSpec(
+        name="codebase-design",
+        description="Designs codebases.",
+        content="body",
+        skill_dir=skill_dir,
+    )
+
+    assert any_skill_has_resources([skill]) is True

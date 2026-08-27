@@ -714,6 +714,7 @@ from omnigent.inner.databricks_executor import (  # noqa: E402
     _read_databrickscfg,
     _read_databrickscfg_file_fallback,
     _read_databrickscfg_host,
+    databrickscfg_workspace_id_for_host,
 )
 
 _AUTH_ENV_VARS: tuple[str, ...] = (
@@ -1874,3 +1875,43 @@ def test_stream_ended_without_finish_reason_with_content_completes() -> None:
         assert turn_events[0].response == "partial"
 
     _run(_t())
+
+
+def test_databrickscfg_workspace_id_for_host_reads_matching_profile(
+    tmp_path: _Path, monkeypatch: pytest.MonkeyPatch, clean_databricks_env: None
+) -> None:
+    """The workspace id is read from the ~/.databrickscfg profile matching the host.
+
+    ``databricks auth login`` records the resolved workspace id per profile;
+    matching is scheme-insensitive and trailing-slash tolerant, so a bare-host
+    cfg entry matches an ``https://`` query.
+    """
+    cfg = tmp_path / "databrickscfg"
+    cfg.write_text(
+        textwrap.dedent(
+            """
+            [acme]
+            host = https://acme.databricks.com
+            workspace_id = 1965859176160743
+            auth_type = databricks-cli
+
+            [no-ws]
+            host = https://plain.databricks.com
+            auth_type = databricks-cli
+            """
+        ).lstrip()
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+
+    assert databrickscfg_workspace_id_for_host("https://acme.databricks.com") == "1965859176160743"
+    # A profile without the field, and an unknown host, both resolve to None.
+    assert databrickscfg_workspace_id_for_host("https://plain.databricks.com") is None
+    assert databrickscfg_workspace_id_for_host("https://other.databricks.com") is None
+
+
+def test_databrickscfg_workspace_id_for_host_missing_file_returns_none(
+    tmp_path: _Path, monkeypatch: pytest.MonkeyPatch, clean_databricks_env: None
+) -> None:
+    """A missing ~/.databrickscfg never raises — it resolves to None."""
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / "absent"))
+    assert databrickscfg_workspace_id_for_host("https://acme.databricks.com") is None

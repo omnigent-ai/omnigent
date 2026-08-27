@@ -10,16 +10,16 @@ import { Terminal } from "@xterm/xterm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   SHIFT_ENTER_CSI_U,
-  SYNC_ECHO_MAX_BYTES,
-  SYNC_ECHO_WINDOW_MS,
   TerminalSession,
   WHEEL_REPORTS_MAX_PER_EVENT,
   applyTerminalCopy,
+  decodeTerminalClipboardBase64,
+  hadRecentTerminalInput,
   isUnexpectedTerminalClose,
   loadWebglRenderer,
   openTerminalLink,
+  parseTerminalClipboardMessage,
   sgrWheelReports,
-  shouldEchoSynchronously,
   terminalTheme,
   terminalKeyEventPayload,
   type ConnectionState,
@@ -125,27 +125,36 @@ describe("applyTerminalCopy", () => {
   });
 });
 
-describe("shouldEchoSynchronously", () => {
-  it("takes the sync path for a small chunk right after a keystroke", () => {
-    // Echo/prompt-sized chunk arriving well within the window: paint it
-    // synchronously so the keystroke echo lands without a queued-write
-    // frame of latency.
-    expect(shouldEchoSynchronously(64, 10)).toBe(true);
+describe("tmux clipboard parsing", () => {
+  function utf8Base64(text: string): string {
+    const bytes = new TextEncoder().encode(text);
+    return btoa(String.fromCharCode(...bytes));
+  }
+
+  it("decodes bounded UTF-8 base64", () => {
+    expect(decodeTerminalClipboardBase64(utf8Base64("hello λ\nworld"))).toBe("hello λ\nworld");
+    expect(decodeTerminalClipboardBase64("not base64")).toBeNull();
+    expect(decodeTerminalClipboardBase64("")).toBeNull();
   });
 
-  it("stays async when the user hasn't typed recently", () => {
-    // Past the window, this is unsolicited output (an agent printing),
-    // not an echo — the async write queue is correct.
-    expect(shouldEchoSynchronously(64, SYNC_ECHO_WINDOW_MS)).toBe(false);
-    expect(shouldEchoSynchronously(64, SYNC_ECHO_WINDOW_MS + 1)).toBe(false);
+  it("accepts only the clipboard-write websocket schema", () => {
+    const encoded = utf8Base64("from control mode");
+    expect(
+      parseTerminalClipboardMessage(
+        JSON.stringify({ type: "clipboard-write", encoding: "base64", data: encoded }),
+      ),
+    ).toBe("from control mode");
+    expect(
+      parseTerminalClipboardMessage(JSON.stringify({ type: "resize", data: encoded })),
+    ).toBeNull();
+    expect(parseTerminalClipboardMessage("not json")).toBeNull();
   });
 
-  it("stays async for large chunks even right after a keystroke", () => {
-    // A big chunk is a flood/redraw, not an echo; keeping it on the async
-    // path stops one giant synchronous write from blocking the main
-    // thread mid-type.
-    expect(shouldEchoSynchronously(SYNC_ECHO_MAX_BYTES + 1, 10)).toBe(false);
-    expect(shouldEchoSynchronously(SYNC_ECHO_MAX_BYTES, 10)).toBe(true);
+  it("requires positive, recent input timing", () => {
+    expect(hadRecentTerminalInput(9000, 10_000)).toBe(true);
+    expect(hadRecentTerminalInput(0, 100)).toBe(false);
+    expect(hadRecentTerminalInput(1000, 10_000)).toBe(false);
+    expect(hadRecentTerminalInput(2000, 1000)).toBe(false);
   });
 });
 
@@ -234,6 +243,13 @@ describe("isUnexpectedTerminalClose", () => {
     expect(isUnexpectedTerminalClose(1006)).toBe(true);
     expect(isUnexpectedTerminalClose(1012)).toBe(true);
     expect(isUnexpectedTerminalClose(1013)).toBe(true);
+    // 1005 "no status" is the browser's other no-clean-close sentinel
+    // (mirror of 1006); a server redeploy behind an ingress surfaces as
+    // 1005. 1011/1014 are the proxy's server-error / bad-gateway codes
+    // while the backend restarts.
+    expect(isUnexpectedTerminalClose(1005)).toBe(true);
+    expect(isUnexpectedTerminalClose(1011)).toBe(true);
+    expect(isUnexpectedTerminalClose(1014)).toBe(true);
   });
 
   it("treats deliberate closes (normal, policy, app 4xxx) as terminal", () => {
@@ -475,7 +491,12 @@ describe("TerminalSession", () => {
     vi.restoreAllMocks();
   });
 
-  function makeSession(onActivity?: () => void, onInput?: () => void) {
+  function makeSession(
+    onActivity?: () => void,
+    onInput?: () => void,
+    clipboardEnabled = true,
+    onClipboardRequest?: (text: string) => void,
+  ) {
     const states: ConnectionState[] = [];
     const container = document.createElement("div");
     document.body.appendChild(container);
@@ -486,6 +507,8 @@ describe("TerminalSession", () => {
       false,
       onActivity,
       onInput,
+      clipboardEnabled,
+      onClipboardRequest,
     );
     return { session, states, container, socket: FakeWebSocket.instances.at(-1)! };
   }
@@ -540,15 +563,16 @@ describe("TerminalSession", () => {
     session.dispose();
   });
 
-  it("writes inbound binary frames to the terminal and fires onActivity", () => {
-    // WHY: ArrayBuffer message frames are raw PTY bytes — they must reach the
-    // terminal and trigger the best-effort activity signal. The throttle keys
-    // off performance.now(), so pin it past the 300ms window to make the first
-    // notification deterministic. Non-ArrayBuffer (text) frames are ignored so
-    // they aren't painted as output.
+  it("writes inbound binary frames through xterm's ordered queue and fires onActivity", () => {
+    // WHY: ArrayBuffer message frames are raw pane bytes — they must reach the
+    // terminal through xterm's ordered public write queue and trigger the
+    // best-effort activity signal. Bypassing that queue can replay already-
+    // parsed ANSI chunks and corrupt cursor state.
     vi.spyOn(performance, "now").mockReturnValue(10_000);
     const onActivity = vi.fn();
     const { socket, session } = makeSession(onActivity);
+    const term = (session as unknown as { term: Terminal }).term;
+    const writeSpy = vi.spyOn(term, "write");
 
     // Build the buffer from the global ArrayBuffer the source's
     // `instanceof ArrayBuffer` check sees — a TextEncoder's buffer comes from
@@ -556,10 +580,65 @@ describe("TerminalSession", () => {
     const data = new ArrayBuffer(5);
     new Uint8Array(data).set([104, 101, 108, 108, 111]); // "hello"
     socket.emit("message", { data });
+    expect(writeSpy).toHaveBeenCalledWith(expect.any(Uint8Array));
     expect(onActivity).toHaveBeenCalledTimes(1);
 
     socket.emit("message", { data: "text frame" });
     expect(onActivity).toHaveBeenCalledTimes(1); // unchanged — text ignored
+    session.dispose();
+  });
+
+  it("does not trust raw pane OSC 52 clipboard writes", async () => {
+    vi.spyOn(performance, "now").mockReturnValue(10_000);
+    const onClipboardRequest = vi.fn();
+    const { session } = makeSession(undefined, undefined, true, onClipboardRequest);
+    (session as unknown as { lastUserInputAt: number }).lastUserInputAt = 9000;
+    const term = (session as unknown as { term: Terminal }).term;
+
+    await new Promise<void>((resolve) => {
+      term.write(`\x1b]52;;${btoa("pane output")}\x07`, resolve);
+    });
+
+    expect(onClipboardRequest).not.toHaveBeenCalled();
+    session.dispose();
+  });
+
+  it("forwards validated clipboard frames only after recent input", () => {
+    vi.spyOn(performance, "now").mockReturnValue(10_000);
+    const onClipboardRequest = vi.fn();
+    const { socket, session } = makeSession(undefined, undefined, true, onClipboardRequest);
+    (session as unknown as { lastUserInputAt: number }).lastUserInputAt = 9000;
+    const encoded = btoa("copied text");
+
+    socket.emit("message", {
+      data: JSON.stringify({ type: "clipboard-write", encoding: "base64", data: encoded }),
+    });
+    expect(onClipboardRequest).toHaveBeenCalledWith("copied text");
+
+    (session as unknown as { lastUserInputAt: number }).lastUserInputAt = 1000;
+    socket.emit("message", {
+      data: JSON.stringify({ type: "clipboard-write", encoding: "base64", data: encoded }),
+    });
+    socket.emit("message", { data: '{"type":"unknown"}' });
+    expect(onClipboardRequest).toHaveBeenCalledTimes(1);
+    session.dispose();
+  });
+
+  it("does not forward clipboard frames when the surface is disabled", () => {
+    vi.spyOn(performance, "now").mockReturnValue(10_000);
+    const onClipboardRequest = vi.fn();
+    const { socket, session } = makeSession(undefined, undefined, false, onClipboardRequest);
+    (session as unknown as { lastUserInputAt: number }).lastUserInputAt = 9000;
+    (session as unknown as { term: Terminal }).term.focus();
+
+    socket.emit("message", {
+      data: JSON.stringify({
+        type: "clipboard-write",
+        encoding: "base64",
+        data: btoa("secret"),
+      }),
+    });
+    expect(onClipboardRequest).not.toHaveBeenCalled();
     session.dispose();
   });
 
@@ -581,10 +660,11 @@ describe("TerminalSession", () => {
     const { socket, session } = makeSession();
     const { term } = session as unknown as { term: Terminal };
 
-    // Socket-down (pre-open): setFont still applies the size and must not throw
-    // or send — sendResize no-ops until the WS opens, and the reconnect re-fits.
-    session.setFont(16, "");
+    // Socket-down (pre-open): setFont still applies the options and must not
+    // throw or send — sendResize no-ops until the WS opens.
+    session.setFont({ sizePx: 16, family: "", weight: 500 });
     expect(term.options.fontSize).toBe(16);
+    expect(term.options.fontWeight).toBe(500);
     expect(socket.sent).toHaveLength(0);
 
     // Once open, setFont refits the grid (sendResize) so the new glyph cell size
@@ -593,10 +673,12 @@ describe("TerminalSession", () => {
     socket.open();
     const before = socket;
     const sendResize = vi.spyOn(session as unknown as { sendResize: () => void }, "sendResize");
-    session.setFont(18, "Fira Code");
+    session.setFont({ sizePx: 18, family: "Fira Code", weight: 500 });
     expect(sendResize).toHaveBeenCalledTimes(1);
     expect(term.options.fontSize).toBe(18);
     expect(term.options.fontFamily).toContain("Fira Code");
+    expect(term.options.fontWeight).toBe(500);
+    expect(term.options.fontWeightBold).toBe(800);
     // Same socket instance, still open — a re-font never reconnects.
     expect(socket).toBe(before);
     expect(socket.closed).toBe(false);

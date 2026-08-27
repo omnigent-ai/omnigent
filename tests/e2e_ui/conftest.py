@@ -53,7 +53,7 @@ from typing import Any
 import filelock
 import httpx
 import pytest
-from playwright.sync_api import Locator, Page, expect
+from playwright.sync_api import APIResponse, Error, Locator, Page, Route, expect
 
 from tests._helpers.compat import apply_server_env, compat_server_cwd, server_executable
 from tests.codex_parity.helpers import ev_assistant_message, ev_completed, ev_response_created
@@ -68,6 +68,32 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _ALLOW_DEV_BASE_URL_ENV = "OMNIGENT_E2E_ALLOW_DEV_BASE_URL"
 _CODEX_GOAL_MIN_VERSION = (0, 139, 0)
 _PUBLIC_LOOPBACK_HOST = "omnigent-e2e-public.test"
+
+
+# A pooled connection the server closes as the replay goes out surfaces as one
+# of these; the request itself is fine on a retry.
+_TRANSIENT_FETCH_ERRORS = ("ECONNRESET", "socket hang up")
+
+
+def fetch_with_retry(route: Route, *, attempts: int = 3) -> APIResponse:
+    """Replay *route*'s request upstream, retrying a dropped connection.
+
+    Intercepting a request opts out of the browser's own connection handling,
+    which retries an idempotent GET when the server closes a pooled keep-alive
+    connection. Replaying by hand does not, so a reset fails the test on
+    something it never meant to assert.
+
+    :param route: Route whose request to replay upstream.
+    :param attempts: Total tries before the error surfaces.
+    :returns: The upstream response.
+    """
+    for _ in range(attempts - 1):
+        try:
+            return route.fetch()
+        except Error as exc:
+            if not any(marker in str(exc) for marker in _TRANSIENT_FETCH_ERRORS):
+                raise
+    return route.fetch()
 
 
 def open_right_rail(page: Page) -> None:
@@ -542,7 +568,10 @@ def configure_mock_llm(
     :param mock_url: Mock server base URL.
     :param responses: List of response configs. Keys:
         ``text``, ``tool_calls``, ``block``, ``stream``,
-        ``error``, ``status_code``.
+        ``error``, ``status_code``, ``delay``, ``truncate_after``
+        (emit only N SSE events then end the stream, dropping the
+        completion event — a mid-stream fault for exercising the SPA's
+        stream error/recovery UI).
     :param key: Queue key — typically the model name baked into the
         agent spec. Defaults to ``"default"`` (matches any model
         not assigned to a more specific queue).
@@ -694,8 +723,8 @@ def set_fallback_mock_llm(
     resp.raise_for_status()
 
 
-def _codex_cli_supports_goal_mode(codex_path: str) -> bool:
-    """Return whether the installed Codex CLI has app-server goal APIs."""
+def _codex_cli_supports_mocked_app_server(codex_path: str) -> bool:
+    """Return whether the Codex CLI supports the mocked app-server tests."""
     version = subprocess.run(
         [codex_path, "--version"],
         text=True,
@@ -708,6 +737,23 @@ def _codex_cli_supports_goal_mode(codex_path: str) -> bool:
     if not match:
         return False
     return tuple(int(part) for part in match.groups()) >= _CODEX_GOAL_MIN_VERSION
+
+
+def _write_codex_unknown_version_shim(directory: Path, codex_path: str) -> Path:
+    """Write a Codex shim whose version probe fails without blocking launches."""
+    shim = directory / "codex-unknown-version"
+    shim.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os\n"
+        "import sys\n"
+        "if sys.argv[1:] == ['--version']:\n"
+        "    print('codex-cli version unavailable')\n"
+        "    raise SystemExit(0)\n"
+        f"os.execv({codex_path!r}, [{codex_path!r}, *sys.argv[1:]])\n",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    return shim
 
 
 def _assert_service_worker_tombstone(build_output: Path) -> None:
@@ -2186,6 +2232,47 @@ def _ui_defaults() -> None:
     expect.set_options(timeout=15_000)
 
 
+@pytest.fixture(autouse=True)
+def _record_video(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[None]:
+    """Capture a screen recording of the journey when recording is requested.
+
+    Most e2e_ui tests drive Playwright through ``async_playwright()`` directly
+    (``browser.new_page()`` / ``browser.new_context()``), not the
+    pytest-playwright ``page`` fixture, so ``pytest --video`` records nothing for
+    them. When ``OMNIGENT_E2E_RECORD_DIR`` is set, patch the async ``Browser``
+    methods to inject ``record_video_dir`` into every page/context they open, so
+    the rendered journey lands as a ``.webm`` regardless of how the test opened
+    the browser. A caller that already passes ``record_video_dir`` is left alone.
+    Playwright writes the file (a random hash name) when the context closes;
+    callers/harnesses pick it up from the directory. No-op when the env var is
+    unset, so ordinary runs are unaffected.
+    """
+    record_dir = os.environ.get("OMNIGENT_E2E_RECORD_DIR")
+    if not record_dir:
+        yield
+        return
+
+    from playwright.async_api import Browser as _AsyncBrowser
+
+    Path(record_dir).mkdir(parents=True, exist_ok=True)
+    _orig_new_page = _AsyncBrowser.new_page
+    _orig_new_context = _AsyncBrowser.new_context
+
+    async def _new_page(self: Any, *args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("record_video_dir", record_dir)
+        return await _orig_new_page(self, *args, **kwargs)
+
+    async def _new_context(self: Any, *args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("record_video_dir", record_dir)
+        return await _orig_new_context(self, *args, **kwargs)
+
+    monkeypatch.setattr(_AsyncBrowser, "new_page", _new_page)
+    monkeypatch.setattr(_AsyncBrowser, "new_context", _new_context)
+    yield
+
+
 @pytest.fixture
 def runner_id(live_server: str) -> str:
     """Token-bound id of the runner spawned by :func:`live_server`.
@@ -2509,7 +2596,12 @@ def native_claude_plan_session(
                 respawned.wait(timeout=5)
 
 
-def _create_native_codex_session(base_url: str, runner_id: str) -> str:
+def _create_native_codex_session(
+    base_url: str,
+    runner_id: str,
+    *,
+    model: str | None = None,
+) -> str:
     """Register the ``codex-native`` wrapper agent and bind its session.
 
     Reuses the exact terminal-first spec ``omnigent codex`` ships
@@ -2526,10 +2618,12 @@ def _create_native_codex_session(base_url: str, runner_id: str) -> str:
     gateway auth from its own credentials, and pre-accepts the first-run
     trust/onboarding prompts — no CLI client required. ``model=None`` lets the
     configured provider's default model win (matching the seeded codex bundle
-    built via ``_build_native_bundle``).
+    built via ``_build_native_bundle``); tests can pin a specific catalog model
+    to exercise model-specific startup behavior.
 
     :param base_url: Spawned server base URL.
     :param runner_id: The token-bound runner id to bind.
+    :param model: Optional Codex model to pin in the wrapper spec.
     :returns: The new session/conversation id.
     """
     import json as _json
@@ -2544,7 +2638,7 @@ def _create_native_codex_session(base_url: str, runner_id: str) -> str:
     from omnigent.codex_native import _materialize_codex_agent_spec
 
     with tempfile.TemporaryDirectory() as _tmp:
-        spec_path = _materialize_codex_agent_spec(Path(_tmp), model=None)
+        spec_path = _materialize_codex_agent_spec(Path(_tmp), model=model)
         yaml_text = spec_path.read_text()
 
     buf = io.BytesIO()
@@ -2760,7 +2854,12 @@ class MockedCodexNativeSession:
     sidecar: CodexResponsesSidecar
 
 
-def _write_mock_codex_provider_config(config_home: Path, base_url: str) -> None:
+def _write_mock_codex_provider_config(
+    config_home: Path,
+    base_url: str,
+    *,
+    model: str = "mock-model",
+) -> None:
     """Write provider config that routes native Codex to the sidecar."""
     config_home.mkdir(parents=True, exist_ok=True)
     (config_home / "config.yaml").write_text(
@@ -2774,14 +2873,14 @@ providers:
       api_key: "sk-e2e-mock"
       wire_api: responses
       models:
-        default: mock-model
+        default: {model}
 """,
         encoding="utf-8",
     )
 
 
 @pytest.fixture
-def mocked_native_codex_goal_session(
+def mocked_native_codex_session(
     built_spa: None,
     tmp_path_factory: pytest.TempPathFactory,
     request: pytest.FixtureRequest,
@@ -2796,30 +2895,38 @@ def mocked_native_codex_goal_session(
     in the same shard.
     """
     if request.config.getoption("--ui-base-url"):
-        pytest.skip("mocked native Codex goal e2e requires an isolated spawned server")
+        pytest.skip("mocked native Codex e2e requires an isolated spawned server")
 
     codex_path = shutil.which("codex")
     if codex_path is None:
-        pytest.skip("codex CLI is required for mocked native Codex goal e2e")
-    if not _codex_cli_supports_goal_mode(codex_path):
-        pytest.skip("codex CLI >= 0.139.0 is required for app-server goal APIs")
+        pytest.skip("codex CLI is required for mocked native Codex e2e")
+    if not _codex_cli_supports_mocked_app_server(codex_path):
+        pytest.skip("codex CLI >= 0.139.0 is required for mocked app-server e2e")
+
+    fixture_param = getattr(request, "param", None)
+    model = fixture_param if isinstance(fixture_param, str) else "mock-model"
 
     try:
         sidecar_bin = build_sidecar_bin()
     except RuntimeError:
         pytest.skip("cargo is required for Codex parity sidecar")
 
-    server_tmp = tmp_path_factory.mktemp("e2e_ui_codex_goal_server")
-    sidecar = start_codex_responses_sidecar(
-        sidecar_bin,
-        server_tmp / "responses.json",
-        [
+    server_tmp = tmp_path_factory.mktemp("e2e_ui_mocked_codex_server")
+    responses = (
+        fixture_param
+        if isinstance(fixture_param, list)
+        else [
             [
                 ev_response_created("resp-goal-ui-bootstrap"),
                 ev_assistant_message("msg-goal-ui-bootstrap", "E2E_GOAL_BOOTSTRAP"),
                 ev_completed("resp-goal-ui-bootstrap"),
             ]
-        ],
+        ]
+    )
+    sidecar = start_codex_responses_sidecar(
+        sidecar_bin,
+        server_tmp / "responses.json",
+        responses,
     )
 
     config_home = server_tmp / "config-home"
@@ -2829,7 +2936,23 @@ def mocked_native_codex_goal_session(
     artifact_dir = server_tmp / "artifacts"
     for path in (source_codex_home, home_dir, state_dir, artifact_dir):
         path.mkdir(parents=True, exist_ok=True)
-    _write_mock_codex_provider_config(config_home, sidecar.base_url)
+    # Reproduce the intermittent production path deterministically: a user
+    # hook needs review while the runner's version probe is unparseable. The
+    # real Codex binary still handles every non-version invocation.
+    (source_codex_home / "hooks.json").write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "UserPromptSubmit": [
+                        {"hooks": [{"type": "command", "command": "/usr/bin/true"}]}
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    codex_shim = _write_codex_unknown_version_shim(server_tmp, codex_path)
+    _write_mock_codex_provider_config(config_home, sidecar.base_url, model=model)
 
     port = _find_free_port()
     log_path = server_tmp / "server.log"
@@ -2852,6 +2975,7 @@ def mocked_native_codex_goal_session(
         "OMNIGENT_CODEX_NATIVE_STATE_DIR": str(state_dir),
         "CODEX_HOME": str(source_codex_home),
         "HOME": str(home_dir),
+        "OMNIGENT_CODEX_PATH": str(codex_shim),
     }
     server_env = {
         **shared_env,
@@ -2940,7 +3064,7 @@ def mocked_native_codex_goal_session(
                 f"{runner_log_path.read_text()[-3000:] if runner_log_path.exists() else ''}"
             )
 
-        session_id = _create_native_codex_session(base_url, runner_id)
+        session_id = _create_native_codex_session(base_url, runner_id, model=model)
         yield MockedCodexNativeSession(base_url=base_url, session_id=session_id, sidecar=sidecar)
     finally:
         if session_id is not None:

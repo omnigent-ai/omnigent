@@ -24,6 +24,7 @@ import {
   AlertTriangleIcon,
   ArrowLeftIcon,
   CheckIcon,
+  ChevronDownIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
   CloudOffIcon,
@@ -477,14 +478,6 @@ function FileViewerBody({
     [isEditorDirty],
   );
 
-  const handleSetActiveSelection = (sel: ActiveSelection | null) => {
-    setActiveSelection(sel);
-    if (sel !== null) {
-      commentsInitializedRef.current = true;
-      setCommentsOpen(true);
-    }
-  };
-
   useEffect(
     () => () => {
       window.clearTimeout(linkCopiedTimerRef.current);
@@ -544,9 +537,24 @@ function FileViewerBody({
     [allComments, fileContent],
   );
 
+  const handleSetActiveSelection = (selection: ActiveSelection | null) => {
+    let nextSelection = selection;
+    if (selection && selection.comment_id == null) {
+      const comment = openComments.find(
+        (c) => c.start_index === selection.start_index && c.end_index === selection.end_index,
+      );
+      if (comment) nextSelection = { ...selection, comment_id: comment.id };
+    }
+    setActiveSelection(nextSelection);
+    if (selection !== null) {
+      commentsInitializedRef.current = true;
+      setCommentsOpen(true);
+    }
+  };
+
   // Apply the linked comment (from ?comment= URL param) once per lifecycle.
   // Waits for fileQuery.data so classifyAndRemapComments has run with real content,
-  // ensuring activeSelection uses remapped indices that match openComments.
+  // ensuring activeSelection uses remapped indices that match open comments.
   useEffect(() => {
     if (linkedCommentAppliedRef.current) return;
     const commentId = initialCommentIdRef.current;
@@ -560,6 +568,7 @@ function FileViewerBody({
       start_index: comment.start_index,
       end_index: comment.end_index,
       anchor_content: comment.anchor_content ?? "",
+      comment_id: comment.id,
     });
   }, [openComments]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -806,6 +815,8 @@ function FileViewerBody({
     key: string;
     /** Accessible name for the inline icon button. */
     label: string;
+    /** Text label for the inline icon button. */
+    textLabel?: string;
     /** Tooltip + dropdown row text; falls back to `label` when omitted. */
     tooltip?: string;
     icon: ReactNode;
@@ -876,6 +887,7 @@ function FileViewerBody({
     toolbarActions.push({
       key: "md-view-mode",
       label: `View mode: ${activeMode.label}`,
+      textLabel: activeMode.label,
       tooltip: "View mode",
       icon: activeMode.icon,
       options: modeOptions,
@@ -1091,11 +1103,13 @@ function FileViewerBody({
                   <Button
                     type="button"
                     variant="ghost"
-                    size="icon-sm"
+                    size={action.textLabel ? "sm" : "icon-sm"}
                     aria-label={action.label}
                     tabIndex={interactive ? undefined : -1}
                   >
                     {action.icon}
+                    {action.textLabel}
+                    <ChevronDownIcon />
                   </Button>
                 </DropdownMenuTrigger>
               </TooltipTrigger>
@@ -1107,7 +1121,7 @@ function FileViewerBody({
             {action.options.map((option) => (
               <DropdownMenuItem
                 key={option.key}
-                className={cn("whitespace-nowrap", option.active && "bg-muted dark:bg-muted/50")}
+                className={cn("whitespace-nowrap")}
                 onSelect={interactive ? option.onSelect : undefined}
               >
                 {option.icon}
@@ -1266,25 +1280,22 @@ function FileViewerBody({
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end" className="w-auto min-w-40">
                   {toolbarActions.map((action) =>
-                    action.options || action.menu ? (
-                      // Pickers and settings menus collapse to a nested submenu
-                      // of their items. Toggle items (keepOpen) prevent the
-                      // submenu from closing so several can be flipped in a row.
+                    action.options ? (
+                      // A mutually-exclusive picker (e.g. view mode) collapses to
+                      // a nested submenu so its "selected choice" semantics — one
+                      // highlighted option — stay intact.
                       <DropdownMenuSub key={action.key}>
                         <DropdownMenuSubTrigger className="whitespace-nowrap">
                           {action.icon}
                           {action.tooltip ?? action.label}
                         </DropdownMenuSubTrigger>
                         <DropdownMenuSubContent>
-                          {(action.options ?? action.menu ?? []).map((option) => (
+                          {action.options.map((option) => (
                             <DropdownMenuItem
                               key={option.key}
-                              // Settings-menu items lean on the check mark alone;
-                              // the mutually-exclusive picker also highlights the
-                              // active choice.
                               className={cn(
                                 "whitespace-nowrap",
-                                action.options && option.active && "bg-muted dark:bg-muted/50",
+                                option.active && "bg-muted dark:bg-muted/50",
                               )}
                               onSelect={(e) => {
                                 if (option.keepOpen) e.preventDefault();
@@ -1300,6 +1311,26 @@ function FileViewerBody({
                           ))}
                         </DropdownMenuSubContent>
                       </DropdownMenuSub>
+                    ) : action.menu ? (
+                      // The settings menu's items are already independent
+                      // toggles/actions, so flatten them straight into this "⋯"
+                      // overflow rather than nesting a "⋯"-in-"⋯" submenu.
+                      action.menu.map((option) => (
+                        <DropdownMenuItem
+                          key={option.key}
+                          className="whitespace-nowrap"
+                          onSelect={(e) => {
+                            if (option.keepOpen) e.preventDefault();
+                            option.onSelect();
+                          }}
+                        >
+                          {option.icon}
+                          {option.label}
+                          {option.active && !option.noActiveCheck && (
+                            <CheckIcon className="ml-auto size-4" />
+                          )}
+                        </DropdownMenuItem>
+                      ))
                     ) : (
                       <DropdownMenuItem
                         key={action.key}
@@ -1412,6 +1443,7 @@ function FileViewerBody({
               onDirtyChange={setIsEditorDirty}
               onSaveStatusChange={setSaveStatus}
               comments={openComments}
+              addressedComments={addressedComments}
               activeSelection={activeSelection}
               onSetActiveSelection={handleSetActiveSelection}
               pendingBodyRef={pendingBodyRef}
@@ -1448,20 +1480,21 @@ function FileViewerBody({
               if (!sender) return;
               const ids = openComments.map((c) => c.id);
               sender.mutate({ comment_ids: ids });
-              setActiveSelection(null);
             }}
             onClickComment={(comment) => {
               setActiveSelection({
                 start_index: comment.start_index,
                 end_index: comment.end_index,
                 anchor_content: comment.anchor_content ?? "",
+                comment_id: comment.id,
               });
               // Sync the selected comment into the URL so the address bar is
               // always shareable. AppShell clears this param when the viewer closes.
               setSearchParams(
                 (prev) => {
                   const next = new URLSearchParams(prev);
-                  next.set("comment", comment.id);
+                  if (comment.status === "draft") next.set("comment", comment.id);
+                  else next.delete("comment");
                   return next;
                 },
                 { replace: true },
@@ -1473,8 +1506,10 @@ function FileViewerBody({
               const deleted = [...openComments, ...addressedComments].find((c) => c.id === id);
               if (
                 deleted &&
-                activeSelection?.start_index === deleted.start_index &&
-                activeSelection?.end_index === deleted.end_index
+                (activeSelection?.comment_id === deleted.id ||
+                  (activeSelection?.comment_id == null &&
+                    activeSelection?.start_index === deleted.start_index &&
+                    activeSelection?.end_index === deleted.end_index))
               )
                 setActiveSelection(null);
             }}

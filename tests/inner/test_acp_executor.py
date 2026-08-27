@@ -30,6 +30,9 @@ from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
     ExecutorError,
     ReasoningChunk,
+    SubAgentCompleted,
+    SubAgentStarted,
+    SubAgentToolCall,
     TextChunk,
     ToolCallComplete,
     ToolCallRequest,
@@ -127,7 +130,8 @@ async def test_session_new_client_mode_generates_and_sends_id() -> None:
 
 
 def test_extract_tool_call_prefers_title() -> None:
-    name, args = AcpExecutor._extract_tool_call(
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    name, args = ex._extract_tool_call(
         {"toolCall": {"title": "shell", "kind": "execute", "rawInput": {"command": "ls"}}}
     )
     assert name == "shell"
@@ -135,9 +139,58 @@ def test_extract_tool_call_prefers_title() -> None:
 
 
 def test_extract_tool_call_falls_back_to_kind() -> None:
-    name, args = AcpExecutor._extract_tool_call({"toolCall": {"kind": "read"}})
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    name, args = ex._extract_tool_call({"toolCall": {"kind": "read"}})
     assert name == "read"
     assert args == {}
+
+
+def test_extract_tool_call_recovers_a_bare_permission_request() -> None:
+    """A request naming only ``toolCallId`` resolves via the originating tool_call.
+
+    An agent may ask permission without repeating the tool: Devin sends no
+    ``title`` / ``kind`` / ``rawInput``, only the id it already announced. The
+    ``tool_call`` update always arrives first, so its name and arguments are
+    still on hand.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "toolu_01",
+            "title": "Ran command",
+            "kind": "execute",
+            "rawInput": {"command": "rm -rf build"},
+        }
+    )
+    name, args = ex._extract_tool_call(
+        {
+            "toolCall": {
+                "toolCallId": "toolu_01",
+                "_meta": {"vendor/editableCommand": "rm -rf build"},
+            }
+        }
+    )
+    assert name == "Ran command"
+    assert args == {"command": "rm -rf build"}
+
+
+def test_extract_tool_call_prefers_the_request_over_the_cache() -> None:
+    """A request that carries its own title/rawInput wins; the cache is a fallback."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._handle_session_update(
+        {"sessionUpdate": "tool_call", "toolCallId": "c1", "title": "stale", "rawInput": {"a": 1}}
+    )
+    name, args = ex._extract_tool_call(
+        {"toolCall": {"toolCallId": "c1", "title": "shell", "rawInput": {"command": "ls"}}}
+    )
+    assert (name, args) == ("shell", {"command": "ls"})
+
+
+def test_extract_tool_call_unknown_id_degrades_to_tool() -> None:
+    """An id we never saw announced still yields the safe generic fallback."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    assert ex._extract_tool_call({"toolCall": {"toolCallId": "never-announced"}}) == ("tool", {})
 
 
 def test_permission_outcome_allow_prefers_once() -> None:
@@ -197,7 +250,8 @@ def test_tool_call_and_update_emit_cards() -> None:
     assert len(started) == 1
     req = started[0]
     assert isinstance(req, ToolCallRequest)
-    assert req.name == "shell" and req.metadata == {"call_id": "c1"}
+    assert req.name == "shell"
+    assert req.metadata == {"call_id": "c1", "internally_executed": True}
     assert ex._tool_names["c1"] == "shell"
 
     done = ex._handle_session_update(
@@ -209,6 +263,31 @@ def test_tool_call_and_update_emit_cards() -> None:
     assert comp.name == "shell" and comp.status is ToolCallStatus.SUCCESS
     assert comp.metadata == {"call_id": "c1"}
     assert "c1" not in ex._tool_names  # popped
+
+
+def test_tool_call_caches_release_on_completion() -> None:
+    """Both id-keyed caches drop the entry when the call closes.
+
+    They exist only to bridge a tool_call to its permission request and closing
+    update, so a long session must not accumulate one entry per tool call.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "c1",
+            "title": "shell",
+            "rawInput": {"command": "ls"},
+        }
+    )
+    assert ex._tool_names == {"c1": "shell"}
+    assert ex._tool_inputs == {"c1": {"command": "ls"}}
+
+    ex._handle_session_update(
+        {"sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "completed"}
+    )
+    assert ex._tool_names == {}
+    assert ex._tool_inputs == {}
 
 
 def test_tool_call_update_failed_maps_to_error() -> None:
@@ -279,6 +358,279 @@ def test_in_progress_tool_update_emits_nothing() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Sub-agent surfacing (extension-supplied dialect -> normalized events)
+# ---------------------------------------------------------------------------
+
+
+class _FakeSubAgentDialect:
+    """An invented dialect, so this generic suite names no vendor."""
+
+    def read(self, update: dict[str, object]) -> tuple[object, ...]:
+        """Return start / activity / end for ``acme.dev/{spawn,work,done}``."""
+        from omnigent.inner.acp_subagents import SubAgentActivity, SubAgentEnd, SubAgentStart
+
+        if isinstance(update.get("acme.dev/spawn"), dict):
+            return (SubAgentStart(child_key="w1", title="worker", task="do a thing"),)
+        if isinstance(update.get("acme.dev/work"), dict):
+            return (
+                SubAgentActivity(
+                    child_key="w1", call_id="c9", name="Wrote out.txt", args={"path": "out.txt"}
+                ),
+            )
+        if isinstance(update.get("acme.dev/done"), dict):
+            return (SubAgentEnd(child_key="w1", ok=True, summary="done"),)
+        return ()
+
+
+def _extended_executor() -> AcpExecutor:
+    """An executor whose extension supplies one dialect (a vendor's wrap does this)."""
+    from omnigent.inner.acp_extension import AcpExtension
+
+    return AcpExecutor(
+        AcpAgentConfig(command="x"),
+        extension=AcpExtension(name="acme", subagent_sources=(_FakeSubAgentDialect(),)),
+    )
+
+
+def test_handle_session_update_emits_subagent_started() -> None:
+    """An extension-recognized start becomes a ``SubAgentStarted`` event.
+
+    The executor half of the seam: the runner turns this event into a child
+    session, so if it stops firing the "Subagents" panel goes empty.
+    """
+    events = _extended_executor()._handle_session_update(
+        {"sessionUpdate": "tool_call_update", "acme.dev/spawn": {"id": "w1"}}
+    )
+    assert [e for e in events if isinstance(e, SubAgentStarted)] == [
+        SubAgentStarted(child_key="w1", title="worker", task="do a thing")
+    ]
+
+
+def test_handle_session_update_emits_subagent_completed() -> None:
+    """An extension-recognized end becomes a ``SubAgentCompleted`` event."""
+    events = _extended_executor()._handle_session_update(
+        {"sessionUpdate": "tool_call_update", "acme.dev/done": {"id": "w1"}}
+    )
+    assert [e for e in events if isinstance(e, SubAgentCompleted)] == [
+        SubAgentCompleted(child_key="w1", ok=True, summary="done")
+    ]
+
+
+def test_generic_executor_does_no_subagent_scanning() -> None:
+    """With no extension, the executor is inert even for a dialect-shaped frame.
+
+    **What breaks if this fails**: every ACP agent — Grok, a user's own
+    ``acp:<slug>`` — gets some other vendor's dialect run against its frames,
+    which is the coupling the extension seam exists to prevent. The default must
+    read no vendor field at all.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))  # generic acp harness
+    for frame in (
+        {"sessionUpdate": "tool_call_update", "acme.dev/spawn": {"id": "w1"}},
+        {"sessionUpdate": "tool_call_update", "_meta": {"cognition.ai/subagent_started": {}}},
+        {"sessionUpdate": "agent_message_chunk", "content": {"text": "hi"}},
+    ):
+        events = ex._handle_session_update(frame)
+        assert not any(isinstance(e, (SubAgentStarted, SubAgentCompleted)) for e in events), frame
+
+
+def test_tool_cards_still_render_alongside_the_scan() -> None:
+    """An ordinary (unclaimed) tool_call still produces a parent card."""
+    events = _extended_executor()._handle_session_update(
+        {"sessionUpdate": "tool_call", "toolCallId": "c1", "title": "Ran ls", "kind": "execute"}
+    )
+    assert [type(e) for e in events] == [ToolCallRequest]
+
+
+def test_handle_session_update_routes_activity_to_the_child() -> None:
+    """A claimed tool call becomes a ``SubAgentToolCall``, not a parent card.
+
+    **What breaks if this fails**: the sub-agent's own work renders in the parent
+    stream (or nowhere) instead of the child transcript — the exact gap this
+    change closes.
+    """
+    events = _extended_executor()._handle_session_update(
+        {"sessionUpdate": "tool_call", "toolCallId": "c9", "acme.dev/work": {"any": 1}}
+    )
+    assert events == [
+        SubAgentToolCall(
+            child_key="w1", call_id="c9", name="Wrote out.txt", args={"path": "out.txt"}
+        )
+    ]
+    # The frame is claimed, so it does NOT also emit a parent tool card.
+    assert not any(isinstance(e, ToolCallRequest) for e in events)
+
+
+def test_claimed_completion_frame_emits_no_spurious_parent_card() -> None:
+    """A claimed ``tool_call_update`` doesn't also close a parent tool card.
+
+    The sub-agent's completion rides a ``tool_call_update`` whose id was never an
+    originating ``tool_call``; without the short-circuit the terminal-status
+    branch would emit a stray ``ToolCallComplete(name="tool")`` in the parent.
+    """
+    events = _extended_executor()._handle_session_update(
+        {"sessionUpdate": "tool_call_update", "status": "completed", "acme.dev/done": {"id": "w1"}}
+    )
+    assert [type(e) for e in events] == [SubAgentCompleted]
+    assert not any(isinstance(e, ToolCallComplete) for e in events)
+
+
+# ---------------------------------------------------------------------------
+# Agent-native vs MCP-bridge classification
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("update", "is_bridge"),
+    [
+        ({"title": "sys_session_get_info", "rawInput": {}}, True),
+        (
+            {"title": "Session info", "rawInput": {"tool": "mcp_omnigent_sys_session_get_info"}},
+            True,
+        ),
+        (
+            {"title": "Session info", "rawInput": {"tool": "mcp__omnigent__sys_session_get_info"}},
+            True,
+        ),
+        (
+            {
+                "title": "omnigent: sys session get info",
+                "rawInput": {"session_id": ""},
+                "_meta": {"goose": {"toolCall": {"toolName": "omnigent__sys_session_get_info"}}},
+            },
+            True,
+        ),
+        ({"title": "GitHub comments", "rawInput": {"tool": "github__list_comments"}}, False),
+        ({"title": "shell: git status", "rawInput": {"command": "git status"}}, False),
+    ],
+)
+def test_only_advertised_bridge_aliases_enter_dispatch_correlation(
+    update: dict[str, object], is_bridge: bool
+) -> None:
+    """A call the bridge never advertised must not claim a dispatch slot."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._bridge_tool_aliases = frozenset(
+        {
+            "sys_session_get_info",
+            "mcp_omnigent_sys_session_get_info",
+            "mcp__omnigent__sys_session_get_info",
+            "omnigent__sys_session_get_info",
+        }
+    )
+
+    event = ex._handle_session_update(
+        {"sessionUpdate": "tool_call", "toolCallId": "c1", **update}
+    )[0]
+
+    assert isinstance(event, ToolCallRequest)
+    assert ("internally_executed" not in event.metadata) is is_bridge
+
+
+def test_no_advertised_bridge_classifies_every_call_as_native() -> None:
+    """Tools alone are not enough: without a served relay there is no bridge."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._omnigent_tools = [{"name": "sys_session_get_info"}]
+
+    event = ex._handle_session_update(
+        {"sessionUpdate": "tool_call", "toolCallId": "c1", "title": "sys_session_get_info"}
+    )[0]
+
+    assert isinstance(event, ToolCallRequest)
+    assert event.metadata == {"call_id": "c1", "internally_executed": True}
+
+
+@pytest.mark.asyncio
+async def test_bridge_aliases_hold_until_the_session_resets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The agent keeps the tools sent at session/new, so classify against those."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._rpc = AsyncMock(return_value={"result": {"sessionId": "s1"}})  # type: ignore[method-assign]
+    monkeypatch.setattr(ex._mcp, "session_new_servers", lambda **_: [{"name": "omnigent"}])
+
+    ex._omnigent_tools = [{"name": "sys_session_get_info"}]
+    await ex._ensure_session()
+    ex._omnigent_tools = [{"name": "web_search"}]
+
+    assert "sys_session_get_info" in ex._bridge_tool_aliases
+    assert "web_search" not in ex._bridge_tool_aliases
+
+    ex._reset_session_state()
+    ex._rpc = AsyncMock(return_value={"result": {"sessionId": "s2"}})  # type: ignore[method-assign]
+    await ex._ensure_session()
+
+    assert "web_search" in ex._bridge_tool_aliases
+    assert "sys_session_get_info" not in ex._bridge_tool_aliases
+
+
+def test_session_reset_drops_in_flight_tool_state() -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "pending",
+            "title": "shell",
+            "rawInput": {"command": "sleep 10"},
+        }
+    )
+
+    ex._reset_session_state()
+
+    assert ex._tool_names == {}
+    assert ex._tool_inputs == {}
+    assert ex._bridge_tool_aliases == frozenset()
+
+
+class _RecordingCtx:
+    """Minimal ``TurnContext`` stand-in: the surface the adapter touches.
+
+    A typed stub rather than MagicMock, so a call to a method that does not
+    exist fails loud instead of silently returning another mock.
+    """
+
+    def __init__(self, response_id: str = "resp_acp") -> None:
+        self.response_id = response_id
+        self.emitted: list[object] = []
+
+    def emit(self, event: object) -> None:
+        self.emitted.append(event)
+
+
+@pytest.mark.asyncio
+async def test_native_call_before_a_bridge_call_keeps_each_call_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reported defect: a native call ahead of a bridge call stole its id."""
+    import omnigent.runtime.harnesses._executor_adapter as adapter_module
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._bridge_tool_aliases = frozenset({"sys_session_get_info"})
+    adapter = ExecutorAdapter(executor_factory=lambda: ex)
+    ctx = _RecordingCtx()
+    adapter._current_ctx = ctx  # type: ignore[assignment]
+    adapter._current_agent = "test-model"
+
+    for call_id, title in (("native-1", "terminal: date"), ("bridge-1", "sys_session_get_info")):
+        for event in ex._handle_session_update(
+            {"sessionUpdate": "tool_call", "toolCallId": call_id, "title": title, "rawInput": {}}
+        ):
+            adapter._translate_event(event, ctx)  # type: ignore[arg-type]
+
+    dispatched: dict[str, str] = {}
+
+    async def fake_bridge(*_args: object, call_id: str, **_kw: object) -> dict[str, object]:
+        dispatched["call_id"] = call_id
+        return {"ok": True}
+
+    monkeypatch.setattr(adapter_module, "_bridge_one_dispatch", fake_bridge)
+    await adapter._stable_tool_executor("sys_session_get_info", {})
+
+    assert dispatched["call_id"] == "bridge-1"
+    assert list(adapter._pending_mcp_call_ids) == []
+
+
+# ---------------------------------------------------------------------------
 # Permission decision (policy + elicitation gates)
 # ---------------------------------------------------------------------------
 
@@ -286,7 +638,7 @@ def test_in_progress_tool_update_emits_nothing() -> None:
 @pytest.mark.asyncio
 async def test_decide_permission_allows_with_no_gates() -> None:
     ex = AcpExecutor(AcpAgentConfig(command="x"))
-    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) is True
+    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) == (True, None)
 
 
 @pytest.mark.asyncio
@@ -297,7 +649,7 @@ async def test_decide_permission_denies_on_policy_deny() -> None:
         action = "POLICY_ACTION_DENY"
 
     ex._policy_evaluator = AsyncMock(return_value=_V())
-    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) is False
+    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) == (False, None)
 
 
 @pytest.mark.asyncio
@@ -309,7 +661,7 @@ async def test_decide_permission_ask_defers_to_elicitation() -> None:
 
     ex._policy_evaluator = AsyncMock(return_value=_V())
     ex._elicitation_handler = AsyncMock(return_value=True)
-    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) is True
+    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) == (True, None)
     ex._elicitation_handler.assert_awaited_once()
 
 
@@ -321,7 +673,385 @@ async def test_decide_permission_ask_without_handler_fails_closed() -> None:
         action = "POLICY_ACTION_ASK"
 
     ex._policy_evaluator = AsyncMock(return_value=_V())
-    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) is False
+    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) == (False, None)
+
+
+def _seed_tool_call(ex: AcpExecutor) -> dict[str, object]:
+    """Announce a ``tool_call``, then return the bare permission params for it.
+
+    Mirrors the real frame order for an agent that asks permission without
+    repeating the tool: ``tool_call`` (with the name + command) → then
+    ``session/request_permission`` carrying only the id.
+    """
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "toolu_01",
+            "title": "Ran command",
+            "kind": "execute",
+            "rawInput": {"command": "rm -rf build"},
+        }
+    )
+    return {"toolCall": {"toolCallId": "toolu_01"}}
+
+
+@pytest.mark.asyncio
+async def test_decide_permission_policy_sees_the_real_tool_call() -> None:
+    """The TOOL_CALL policy is evaluated against the resolved name + arguments.
+
+    Rules gate on the tool name and then read its arguments (the destructive-shell
+    builtin reads ``arguments["command"]``), so a bare request evaluated as
+    ``{"name": "tool", "arguments": {}}`` matches nothing — a "deny ``rm -rf``"
+    policy would sit silent while the command ran.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    params = _seed_tool_call(ex)
+
+    class _V:
+        action = "POLICY_ACTION_DENY"
+
+    ex._policy_evaluator = AsyncMock(return_value=_V())
+    assert await ex._decide_permission(params) == (False, None)
+    ex._policy_evaluator.assert_awaited_once_with(
+        "PHASE_TOOL_CALL",
+        {"name": "Ran command", "arguments": {"command": "rm -rf build"}},
+    )
+
+
+@pytest.mark.asyncio
+async def test_decide_permission_card_names_the_tool() -> None:
+    """The approval card describes the call instead of an unnamed "tool".
+
+    The elicitation handler renders ``<tool_name>(<args>)``, so these two values
+    are literally what the user reads before approving.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    params = _seed_tool_call(ex)
+    ex._elicitation_handler = AsyncMock(return_value=True)
+
+    assert await ex._decide_permission(params) == (True, None)
+    ex._elicitation_handler.assert_awaited_once_with("Ran command", {"command": "rm -rf build"})
+
+
+# ---------------------------------------------------------------------------
+# Scoped approval: the agent's own permission options
+# ---------------------------------------------------------------------------
+
+
+def _agent_options() -> list[dict[str, str]]:
+    """Devin-shaped options: allow-once, two scoped always-allows, and a reject.
+
+    Order is the agent's own — narrowest first — and is preserved on the card so
+    the least-privilege choice leads.
+    """
+    return [
+        {"optionId": "allow_once", "name": "Allow", "kind": "allow_once"},
+        {
+            "optionId": "allow_session",
+            "name": "Yes, allow `ls` commands (this session)",
+            "kind": "allow_always",
+        },
+        {
+            "optionId": "allow_always_global",
+            "name": "Yes, always allow `ls` commands in all projects",
+            "kind": "allow_always",
+        },
+        {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"},
+    ]
+
+
+def test_acp_executor_accepts_the_choice_bridge() -> None:
+    """The attribute the adapter installs by name exists, and starts unwired.
+
+    The executor half of a cross-layer contract: the adapter gates its install on
+    this attribute (see ``tests/runtime/harnesses/test_executor_adapter.py``), so a
+    rename here would silently disable scoped approval.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    assert ex._elicitation_choice_handler is None
+
+
+@pytest.mark.asyncio
+async def test_decide_permission_offers_the_agents_own_scopes() -> None:
+    """The card gets every option the agent offered, in the agent's order.
+
+    **What breaks if this fails**: the user is back to Approve/Reject and each
+    grant is once-scoped, so the same command class re-prompts indefinitely.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    params = {
+        "toolCall": {"title": "shell", "rawInput": {"command": "ls"}},
+        "options": _agent_options(),
+    }
+    ex._elicitation_choice_handler = AsyncMock(
+        return_value="Yes, allow `ls` commands (this session)"
+    )
+
+    assert await ex._decide_permission(params) == (True, "allow_session")
+    ex._elicitation_choice_handler.assert_awaited_once_with(
+        "shell",
+        {"command": "ls"},
+        [
+            "Allow",
+            "Yes, allow `ls` commands (this session)",
+            "Yes, always allow `ls` commands in all projects",
+            "Reject",
+        ],
+    )
+
+
+@pytest.mark.asyncio
+async def test_scoped_choice_reaches_the_agent_as_that_option() -> None:
+    """End of the chain: the agent is told the exact scope the user picked.
+
+    Mirrors the call site (``_decide_permission`` then ``_permission_outcome``),
+    because the scope only takes effect if it survives into the reply — the agent
+    is what honors it and stops asking.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    params = {"toolCall": {"title": "shell"}, "options": _agent_options()}
+    ex._elicitation_choice_handler = AsyncMock(
+        return_value="Yes, allow `ls` commands (this session)"
+    )
+
+    allow, option_id = await ex._decide_permission(params)
+    assert ex._permission_outcome(params, allow=allow, option_id=option_id) == {
+        "outcome": {"outcome": "selected", "optionId": "allow_session"}
+    }
+
+
+@pytest.mark.asyncio
+async def test_decide_permission_choice_reject_denies() -> None:
+    """Picking the agent's own reject option denies, and names that option."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    params = {"toolCall": {"title": "shell"}, "options": _agent_options()}
+    ex._elicitation_choice_handler = AsyncMock(return_value="Reject")
+
+    assert await ex._decide_permission(params) == (False, "reject_once")
+
+
+@pytest.mark.asyncio
+async def test_decide_permission_choice_declined_denies() -> None:
+    """A dismissed / timed-out choice card denies, with no scope."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    params = {"toolCall": {"title": "shell"}, "options": _agent_options()}
+    ex._elicitation_choice_handler = AsyncMock(return_value=None)
+
+    assert await ex._decide_permission(params) == (False, None)
+
+
+@pytest.mark.asyncio
+async def test_decide_permission_choice_not_offered_denies() -> None:
+    """A label the agent never offered fails closed rather than guessing."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    params = {"toolCall": {"title": "shell"}, "options": _agent_options()}
+    ex._elicitation_choice_handler = AsyncMock(return_value="Yes, do whatever you like")
+
+    assert await ex._decide_permission(params) == (False, None)
+
+
+@pytest.mark.asyncio
+async def test_decide_permission_needs_a_reject_option_for_a_choice_card() -> None:
+    """Without a reject option the binary card is used instead.
+
+    A choice card replaces Approve/Reject with the agent's options, so offering
+    only allow-shaped ones would leave the user no way to say no.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    params = {
+        "toolCall": {"title": "shell"},
+        "options": [
+            {"optionId": "allow_once", "name": "Allow", "kind": "allow_once"},
+            {"optionId": "allow_session", "name": "Allow this session", "kind": "allow_always"},
+        ],
+    }
+    ex._elicitation_choice_handler = AsyncMock(return_value="Allow this session")
+    ex._elicitation_handler = AsyncMock(return_value=True)
+
+    assert await ex._decide_permission(params) == (True, None)
+    ex._elicitation_choice_handler.assert_not_awaited()
+    ex._elicitation_handler.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_decide_permission_falls_back_on_duplicate_labels() -> None:
+    """Two options sharing a label are ambiguous, since the reply names the label."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    params = {
+        "toolCall": {"title": "shell"},
+        "options": [
+            {"optionId": "a1", "name": "Allow", "kind": "allow_once"},
+            {"optionId": "a2", "name": "Allow", "kind": "allow_always"},
+            {"optionId": "r1", "name": "Reject", "kind": "reject_once"},
+        ],
+    }
+    ex._elicitation_choice_handler = AsyncMock(return_value="Allow")
+    ex._elicitation_handler = AsyncMock(return_value=True)
+
+    assert await ex._decide_permission(params) == (True, None)
+    ex._elicitation_choice_handler.assert_not_awaited()
+
+
+def test_permission_outcome_honors_a_chosen_scope() -> None:
+    """A user-picked option is echoed verbatim, overriding the once-scoped default."""
+    params = {"options": _agent_options()}
+    out = AcpExecutor._permission_outcome(params, allow=True, option_id="allow_session")
+    assert out == {"outcome": {"outcome": "selected", "optionId": "allow_session"}}
+
+
+def test_permission_outcome_ignores_an_unoffered_scope() -> None:
+    """An id the agent didn't offer is never echoed; the safe default applies.
+
+    Guards against sending the agent an option it can't honor — or a broader one
+    than it advertised — if a stale or hand-crafted id ever reaches here.
+    """
+    params = {"options": _agent_options()}
+    out = AcpExecutor._permission_outcome(params, allow=True, option_id="made_up")
+    assert out == {"outcome": {"outcome": "selected", "optionId": "allow_once"}}
+
+
+# ---------------------------------------------------------------------------
+# permission_mode (bypassPermissions)
+# ---------------------------------------------------------------------------
+
+
+def _bypass_executor() -> AcpExecutor:
+    """An executor whose spec opted out of approval cards."""
+    return AcpExecutor(AcpAgentConfig(command="x", permission_mode="bypassPermissions"))
+
+
+@pytest.mark.asyncio
+async def test_bypass_permissions_skips_the_card() -> None:
+    """``bypassPermissions`` allows a policy-silent call without prompting.
+
+    **What breaks if this fails**: a headless ACP worker (a polly sub-agent, a
+    scheduled task) parks on an approval card nobody is watching, so the turn
+    stalls rather than running unattended.
+    """
+    ex = _bypass_executor()
+    ex._elicitation_handler = AsyncMock(return_value=True)
+    ex._elicitation_choice_handler = AsyncMock(return_value="Allow")
+
+    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) == (True, None)
+    ex._elicitation_handler.assert_not_awaited()
+    ex._elicitation_choice_handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_bypass_permissions_still_denies_on_policy_deny() -> None:
+    """Policy runs in every mode, so a DENY still blocks under bypass.
+
+    This is the invariant that makes the mode safe to offer: it waives the
+    *human* gate, never the user's own rules.
+    """
+    ex = _bypass_executor()
+    ex._elicitation_handler = AsyncMock(return_value=True)
+
+    class _V:
+        action = "POLICY_ACTION_DENY"
+
+    ex._policy_evaluator = AsyncMock(return_value=_V())
+    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) == (False, None)
+
+
+@pytest.mark.asyncio
+async def test_bypass_permissions_still_prompts_on_policy_ask() -> None:
+    """A policy that says ASK outranks bypass — the user asked to be asked."""
+    ex = _bypass_executor()
+
+    class _V:
+        action = "POLICY_ACTION_ASK"
+
+    ex._policy_evaluator = AsyncMock(return_value=_V())
+    ex._elicitation_handler = AsyncMock(return_value=True)
+
+    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) == (True, None)
+    ex._elicitation_handler.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_default_permission_mode_still_asks() -> None:
+    """The ``auto`` default is unchanged: a policy-silent call still prompts.
+
+    **What breaks if this fails**: every ACP agent silently stops asking for
+    approval — the mode would be a default-off switch instead of an opt-in.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    assert ex._config.permission_mode == "auto"
+    ex._elicitation_handler = AsyncMock(return_value=True)
+
+    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) == (True, None)
+    ex._elicitation_handler.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_unrecognized_permission_mode_still_asks() -> None:
+    """Only the exact ``bypassPermissions`` waives the card; anything else prompts.
+
+    A typo (``"bypass"``) or a mode borrowed from another harness
+    (``"acceptEdits"``) must fail toward asking, not toward silence.
+    """
+    for mode in ("bypass", "acceptEdits", "default", ""):
+        ex = AcpExecutor(AcpAgentConfig(command="x", permission_mode=mode))
+        ex._elicitation_handler = AsyncMock(return_value=True)
+        assert await ex._decide_permission({"toolCall": {"title": "shell"}}) == (True, None), mode
+        assert ex._elicitation_handler.await_count == 1, mode
+
+
+@pytest.mark.asyncio
+async def test_bypass_never_sends_the_agents_own_bypass_option() -> None:
+    """Bypass answers each request; it never tells the agent to stop asking.
+
+    Devin offers ``switch_bypass`` ("switch to bypass mode"). Selecting it would
+    end the request stream, so omnigent would no longer see the agent's tool
+    calls and the TOOL_CALL policy could not gate them. The narrow
+    ``allow_once`` grant keeps every later call visible.
+    """
+    ex = _bypass_executor()
+    ex._elicitation_handler = AsyncMock(return_value=True)
+    params = {
+        "toolCall": {"title": "shell"},
+        "options": [
+            {"optionId": "allow_once", "name": "Allow", "kind": "allow_once"},
+            {
+                "optionId": "switch_bypass",
+                "name": "Yes, switch to bypass mode",
+                "kind": "allow_always",
+            },
+            {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"},
+        ],
+    }
+
+    allow, option_id = await ex._decide_permission(params)
+    assert ex._permission_outcome(params, allow=allow, option_id=option_id) == {
+        "outcome": {"outcome": "selected", "optionId": "allow_once"}
+    }
+
+
+def test_harness_wrap_reads_permission_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The wrap decodes the forwarded mode, closing spawn env → child config."""
+    from omnigent.inner import acp_harness
+
+    monkeypatch.setenv("HARNESS_ACP_COMMAND", "devin acp")
+    monkeypatch.setenv("HARNESS_ACP_PERMISSION_MODE", "bypassPermissions")
+    ex = acp_harness._build_acp_executor()
+    assert isinstance(ex, AcpExecutor)
+    assert ex._config.permission_mode == "bypassPermissions"
+    assert ex._bypass_permissions is True
+
+
+def test_harness_wrap_permission_mode_defaults_to_auto(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unset (or blank) var leaves the wrap prompting, as before this option."""
+    from omnigent.inner import acp_harness
+
+    monkeypatch.setenv("HARNESS_ACP_COMMAND", "devin acp")
+    monkeypatch.delenv("HARNESS_ACP_PERMISSION_MODE", raising=False)
+    assert acp_harness._build_acp_executor()._config.permission_mode == "auto"
+
+    monkeypatch.setenv("HARNESS_ACP_PERMISSION_MODE", "   ")
+    ex = acp_harness._build_acp_executor()
+    assert ex._config.permission_mode == "auto"
+    assert ex._bypass_permissions is False
 
 
 # ---------------------------------------------------------------------------
@@ -552,6 +1282,30 @@ def test_harness_wrap_builds_executor(monkeypatch: pytest.MonkeyPatch) -> None:
     assert ex._config.model == "gpt-5.3"
 
 
+def test_harness_wrap_reads_inject_system_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    """HARNESS_ACP_INJECT_SYSTEM_PROMPT=0 sets inject_system_prompt=False (#4917)."""
+    from omnigent.inner import acp_harness
+
+    monkeypatch.setenv("HARNESS_ACP_COMMAND", "omp acp")
+    monkeypatch.setenv("HARNESS_ACP_INJECT_SYSTEM_PROMPT", "0")
+    ex = acp_harness._build_acp_executor()
+    assert isinstance(ex, AcpExecutor)
+    assert ex._config.inject_system_prompt is False
+
+
+def test_harness_wrap_inject_system_prompt_defaults_to_true(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """inject_system_prompt defaults to True when env var is absent."""
+    from omnigent.inner import acp_harness
+
+    monkeypatch.setenv("HARNESS_ACP_COMMAND", "goose acp")
+    monkeypatch.delenv("HARNESS_ACP_INJECT_SYSTEM_PROMPT", raising=False)
+    ex = acp_harness._build_acp_executor()
+    assert isinstance(ex, AcpExecutor)
+    assert ex._config.inject_system_prompt is True
+
+
 def test_harness_wrap_reads_env_passthrough_names(monkeypatch: pytest.MonkeyPatch) -> None:
     """The wrap decodes the forwarded names, closing parent → child → spawn env."""
     from omnigent.inner import acp_harness
@@ -777,6 +1531,115 @@ async def test_acp_session_new_omnigent_mcp_disabled_per_agent() -> None:
     ex._rpc = fake_rpc  # type: ignore[assignment]
     await ex._ensure_session()
     assert captured["params"]["mcpServers"] == []
+
+
+def test_omnigent_tools_cleared_when_mcp_disabled() -> None:
+    """run_turn discards builtin tools when omnigent_mcp=False (#4917).
+
+    With the relay disabled, the tool schemas serve no purpose and must not be
+    stored — they could otherwise accidentally reach the session/prompt path.
+    Verified by pre-populating _omnigent_tools and running the capture logic
+    from the start of run_turn in isolation.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x", omnigent_mcp=False))
+    tools = [{"name": "load_skill"}, {"name": "sys_session_rename"}]
+
+    # Simulate the first few lines of run_turn: capture _omnigent_tools.
+    # When omnigent_mcp is False the assignment must yield an empty list.
+    ex._omnigent_tools = (tools or []) if ex._config.omnigent_mcp else []
+    assert ex._omnigent_tools == [], "tools must be discarded when omnigent_mcp=False"
+
+
+def test_omnigent_tools_kept_when_mcp_enabled() -> None:
+    """Sanity: _omnigent_tools is populated when omnigent_mcp=True."""
+    ex = AcpExecutor(AcpAgentConfig(command="x", omnigent_mcp=True))
+    tools = [{"name": "load_skill"}, {"name": "sys_session_rename"}]
+    ex._omnigent_tools = (tools or []) if ex._config.omnigent_mcp else []
+    assert ex._omnigent_tools == tools, "tools must be stored when omnigent_mcp=True"
+
+
+@pytest.mark.asyncio
+async def test_inject_system_prompt_false_skips_prepend(tmp_path: Path) -> None:
+    """inject_system_prompt=False prevents the spec's system prompt from being
+    folded into the first ACP user turn (#4917 — Pi-fork agents like omp).
+
+    Without this fix, Omnigent's system prompt is prepended to the user message
+    on the first turn.  For agents that fully own their own system prompt (Pi
+    forks), this confuses the internal Claude model into emitting XML tool-call
+    fragments (``</function></tool_call>``) when there is no MCP relay backing
+    the described tools.
+    """
+    agent_path = tmp_path / "prompt_echo_agent.py"
+    agent_path.write_text(
+        r"""
+import sys, json
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method", "")
+    if method == "initialize":
+        caps = {"promptCapabilities": {"image": False}}
+        send({"jsonrpc": "2.0", "id": mid,
+              "result": {"protocolVersion": 1, "agentCapabilities": caps}})
+    elif method == "session/new":
+        send({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "echo-1"}})
+    elif method == "session/prompt":
+        sid = msg.get("params", {}).get("sessionId", "echo-1")
+        # Echo back the text the client sent so the test can inspect it.
+        text = ""
+        for block in msg.get("params", {}).get("prompt", []):
+            if isinstance(block, dict) and block.get("type") == "text":
+                text += block.get("text", "")
+        send({"jsonrpc": "2.0", "method": "session/update",
+              "params": {"sessionId": sid,
+                         "update": {"sessionUpdate": "agent_message_chunk",
+                                    "content": {"type": "text", "text": text}}}})
+        send({"jsonrpc": "2.0", "id": mid,
+              "result": {"stopReason": "end_turn", "usage": {}}})
+"""
+    )
+    command = shlex.join([sys.executable, str(agent_path)])
+
+    # With injection enabled (default), the system prompt is prepended.
+    ex_inject = AcpExecutor(AcpAgentConfig(command=command, inject_system_prompt=True))
+    texts_inject: list[str] = []
+    try:
+        async for ev in ex_inject.run_turn(
+            [{"role": "user", "content": "hello"}], [], "SYSTEM_PROMPT_TEXT"
+        ):
+            if isinstance(ev, TextChunk):
+                texts_inject.append(ev.text)
+    finally:
+        await ex_inject.close()
+    combined_inject = "".join(texts_inject)
+    assert "SYSTEM_PROMPT_TEXT" in combined_inject, (
+        "system prompt should appear in the echoed first turn when inject_system_prompt=True"
+    )
+
+    # With injection disabled, the system prompt must NOT appear.
+    ex_no_inject = AcpExecutor(AcpAgentConfig(command=command, inject_system_prompt=False))
+    texts_no_inject: list[str] = []
+    try:
+        async for ev in ex_no_inject.run_turn(
+            [{"role": "user", "content": "hello"}], [], "SYSTEM_PROMPT_TEXT"
+        ):
+            if isinstance(ev, TextChunk):
+                texts_no_inject.append(ev.text)
+    finally:
+        await ex_no_inject.close()
+    combined_no_inject = "".join(texts_no_inject)
+    assert "SYSTEM_PROMPT_TEXT" not in combined_no_inject, (
+        "system prompt must not appear in the first turn when inject_system_prompt=False"
+    )
+    assert "hello" in combined_no_inject, "user message itself must still be sent"
 
 
 @pytest.mark.asyncio

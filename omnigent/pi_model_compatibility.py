@@ -75,6 +75,11 @@ def databricks_pi_surface_for_model(model_id: str) -> DatabricksPiSurface:
 # through the Responses API instead and do not need it.
 PI_REASONING_MODEL_FRAGMENTS: tuple[str, ...] = ("deepseek",)
 
+# Claude models support extended thinking; reasoning:true in the model entry
+# enables Pi's thinking level controls. Paired with forceAdaptiveThinking in the
+# provider compat block so Pi sends thinking.type.adaptive (required by claude-4+).
+PI_CLAUDE_THINKING_MODEL_FRAGMENTS: tuple[str, ...] = ("claude",)
+
 
 class PiModelEntry(TypedDict):
     """One model as Pi's ``models.json`` declares it."""
@@ -120,7 +125,9 @@ def pi_model_json_entry(model: ModelEntry) -> PiModelEntry:
         entry["contextWindow"] = model.metadata.context_window
     if model.metadata.max_output_tokens is not None:
         entry["maxTokens"] = model.metadata.max_output_tokens
-    if pi_model_is_reasoning(model.id):
+    if pi_model_is_reasoning(model.id) or any(
+        fragment in model.id.lower() for fragment in PI_CLAUDE_THINKING_MODEL_FRAGMENTS
+    ):
         entry["reasoning"] = True
     return entry
 

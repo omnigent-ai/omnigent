@@ -20,6 +20,7 @@ Tool categories:
 from __future__ import annotations
 
 import asyncio
+import base64
 import dataclasses
 import json
 import logging
@@ -50,6 +51,7 @@ from omnigent._wrapper_labels import (
     CLAUDE_NATIVE_WRAPPER_VALUE,
     CODEX_NATIVE_WRAPPER_VALUE,
 )
+from omnigent.debug_logging import runner_primary_session_id
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.model_override import (
     harness_supports_model_override,
@@ -91,6 +93,8 @@ from omnigent.tools.builtins.spawn import (
     _ACTIVITY_MAX_CHARS,
     _CLOSED_TITLE_INFIX,
     _HISTORY_DEFAULT_TAIL,
+    _bound_history_content_chars,
+    _clamp_history_content_chars,
     _clamp_tail_items,
 )
 from omnigent.tools.builtins.sys_terminal import (
@@ -471,6 +475,10 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     # Memory builtins are relayed to native harnesses too — unlike web_search,
     # native harnesses have no built-in long-term memory of their own.
     | _HINDSIGHT_TOOLS
+    # Skills ride the relay for the same reason memory does: ``load_skill`` is
+    # what discovers host-scope skills (``.agents/skills`` and friends), and a
+    # native session's only tool surface is this relay.
+    | _SKILL_TOOLS
 )
 
 
@@ -593,7 +601,10 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
         finally:
             _os_env.close()
     except Exception:  # noqa: BLE001 — OS env setup is best-effort for schema only
-        _logger.debug("Could not create OSEnvironment for native relay OS tool schemas")
+        _logger.debug(
+            "Could not create OSEnvironment for native relay OS tool schemas",
+            extra={"session_id": runner_primary_session_id()},
+        )
 
     return schemas
 
@@ -604,9 +615,239 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
 # sys_os_write, e.g. following the ``build-omnigent`` skill).
 _AGENT_CONFIG_SUBDIR = ".omnigent/agent-configs"
 
-# Broad page size for the sys_agent_list fan-out reads. Orchestrators want
-# the full launchable surface in one call, not a 20-row default page.
+# Broad internal page size for discovery fan-out reads.
 _AGENT_LIST_PAGE_LIMIT = 1000
+
+_DISCOVERY_LIST_MAX_LIMIT = 100
+# Match the existing default ceiling for ``sys_os_shell`` output. Discovery
+# tools stay below the same Omnigent-owned budget instead of guessing a
+# harness-specific limit.
+_DISCOVERY_LIST_OUTPUT_MAX_CHARS = 100_000
+_DISCOVERY_CURSOR_MAX_CHARS = 40_000
+_DISCOVERY_START = "start"
+_DISCOVERY_AT = "at"
+_DISCOVERY_END = "end"
+_DiscoveryState = tuple[str, str | None]
+
+
+def _discovery_list_window(
+    args: _JsonObject,
+    tool_name: str,
+    page_sections: tuple[str, ...],
+    filters: _JsonObject,
+) -> tuple[int | None, dict[str, _DiscoveryState], bool] | str:
+    """Validate discovery pagination and decode its opaque continuation cursor."""
+    limit = args.get("limit")
+    if "limit" in args and (
+        not isinstance(limit, int)
+        or isinstance(limit, bool)
+        or not 1 <= limit <= _DISCOVERY_LIST_MAX_LIMIT
+    ):
+        return json.dumps(
+            {
+                "error": (
+                    f"{tool_name}: 'limit' must be an integer between 1 and "
+                    f"{_DISCOVERY_LIST_MAX_LIMIT}"
+                )
+            }
+        )
+    cursor = args.get("cursor")
+    state: dict[str, _DiscoveryState] = dict.fromkeys(page_sections, (_DISCOVERY_START, None))
+    if cursor is None:
+        return cast(int | None, limit), state, False
+    if not isinstance(cursor, str) or not cursor:
+        return json.dumps({"error": f"{tool_name}: 'cursor' must be a non-empty string"})
+    if len(cursor) > _DISCOVERY_CURSOR_MAX_CHARS:
+        return json.dumps({"error": f"{tool_name}: pagination cursor is too long"})
+    try:
+        padding = "=" * (-len(cursor) % 4)
+        raw = base64.b64decode(cursor + padding, altchars=b"-_", validate=True)
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return json.dumps({"error": f"{tool_name}: invalid pagination cursor"})
+    if not isinstance(payload, dict) or set(payload) != {"v", "tool", "filters", "sections"}:
+        return json.dumps({"error": f"{tool_name}: invalid pagination cursor"})
+    if payload.get("v") != 1:
+        return json.dumps({"error": f"{tool_name}: invalid pagination cursor"})
+    if payload.get("tool") != tool_name:
+        return json.dumps({"error": f"{tool_name}: cursor was minted by a different tool"})
+    if payload.get("filters") != filters:
+        return json.dumps({"error": f"{tool_name}: cursor uses different filter arguments"})
+    sections = payload.get("sections")
+    if not isinstance(sections, dict) or set(sections) != set(page_sections):
+        return json.dumps({"error": f"{tool_name}: invalid pagination cursor"})
+    for name in state:
+        value = sections.get(name)
+        if not isinstance(value, list) or len(value) != 2:
+            return json.dumps({"error": f"{tool_name}: invalid pagination cursor"})
+        tag, position = value
+        if tag in {_DISCOVERY_START, _DISCOVERY_END}:
+            if position is not None:
+                return json.dumps({"error": f"{tool_name}: invalid pagination cursor"})
+        elif tag == _DISCOVERY_AT:
+            if not isinstance(position, str) or not position:
+                return json.dumps({"error": f"{tool_name}: invalid pagination cursor"})
+        else:
+            return json.dumps({"error": f"{tool_name}: invalid pagination cursor"})
+        state[name] = (tag, cast(str | None, position))
+    return cast(int | None, limit), state, True
+
+
+def _encode_discovery_cursor(
+    tool_name: str,
+    filters: _JsonObject,
+    state: dict[str, _DiscoveryState],
+) -> str | None:
+    """Serialize a discovery continuation cursor without exposing its shape."""
+    payload = json.dumps(
+        {
+            "v": 1,
+            "tool": tool_name,
+            "filters": filters,
+            "sections": {name: list(value) for name, value in state.items()},
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    cursor = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+    return cursor if len(cursor) <= _DISCOVERY_CURSOR_MAX_CHARS else None
+
+
+@dataclass(frozen=True)
+class _DiscoveryPage:
+    """Rows and continuation state from one discovery source."""
+
+    rows: list[_JsonObject]
+    has_more: bool
+    next_after: str | None = None
+    failed: bool = False
+
+
+def _parse_discovery_page(body: object) -> _DiscoveryPage:
+    """Validate the server envelope before trusting its continuation state."""
+    if not isinstance(body, dict):
+        return _DiscoveryPage([], False, failed=True)
+    data = body.get("data")
+    if not isinstance(data, list):
+        return _DiscoveryPage([], False, failed=True)
+    rows: list[_JsonObject] = []
+    for row in data:
+        if not isinstance(row, dict):
+            return _DiscoveryPage([], False, failed=True)
+        row_id = row.get("id")
+        if not isinstance(row_id, str) or not row_id:
+            return _DiscoveryPage([], False, failed=True)
+        rows.append(row)
+    has_more = body.get("has_more", False)
+    last_id = body.get("last_id")
+    if not isinstance(has_more, bool):
+        return _DiscoveryPage([], False, failed=True)
+    if last_id is not None and (not isinstance(last_id, str) or not last_id):
+        return _DiscoveryPage([], False, failed=True)
+    if has_more and last_id is None:
+        return _DiscoveryPage([], False, failed=True)
+    return _DiscoveryPage(rows, has_more, cast(str | None, last_id))
+
+
+def _bounded_discovery_result(
+    sections: dict[str, list[_JsonObject]],
+    *,
+    limit: int | None,
+    cursor_state: dict[str, _DiscoveryState],
+    continued: bool,
+    source_pages: dict[str, _DiscoveryPage],
+    page_sections: tuple[str, ...] | None = None,
+    tool_name: str,
+    filters: _JsonObject,
+) -> str:
+    """Keep a small legacy result intact, otherwise return a fitting page."""
+    complete = json.dumps(sections)
+    if (
+        limit is None
+        and not continued
+        and not any(page.failed for page in source_pages.values())
+        and not any(page.has_more for page in source_pages.values())
+        and len(complete) <= _DISCOVERY_LIST_OUTPUT_MAX_CHARS
+    ):
+        return complete
+
+    requested_limit = limit or _DISCOVERY_LIST_MAX_LIMIT
+    paged = page_sections or tuple(sections)
+
+    def _candidate(candidate_limit: int) -> str | None:
+        page = dict(sections)
+        has_more: dict[str, bool] = {}
+        next_state = dict(cursor_state)
+        for name in paged:
+            rows = sections[name]
+            page_rows = rows[:candidate_limit]
+            page[name] = page_rows
+            source_page = source_pages[name]
+            if source_page.failed:
+                # A failed read proves neither progress nor exhaustion. Keep
+                # the incoming position so the continuation retries it.
+                has_more[name] = True
+                continue
+            has_more[name] = len(rows) > candidate_limit or source_page.has_more
+            if not has_more[name]:
+                next_state[name] = (_DISCOVERY_END, None)
+            elif page_rows:
+                if name == "local_configs":
+                    position = _optional_string(page_rows[-1].get("path"))
+                else:
+                    identifier = "agent_id" if name == "builtins" else "session_id"
+                    position = _optional_string(page_rows[-1].get(identifier))
+                if position is not None:
+                    next_state[name] = (_DISCOVERY_AT, position)
+            elif source_page.has_more and source_page.next_after is not None:
+                next_state[name] = (_DISCOVERY_AT, source_page.next_after)
+        metadata: dict[str, object] = {
+            "limit": candidate_limit,
+            "has_more": has_more,
+        }
+        if any(has_more.values()):
+            cursor = _encode_discovery_cursor(tool_name, filters, next_state)
+            if cursor is None:
+                return None
+            metadata["next_cursor"] = cursor
+        return json.dumps({**page, "page": metadata})
+
+    # Cursor size depends on the last returned row, so serialized page size is
+    # not monotonic in the row limit. Check the bounded public range directly.
+    for candidate_limit in range(requested_limit, 0, -1):
+        candidate = _candidate(candidate_limit)
+        if candidate is not None and len(candidate) <= _DISCOVERY_LIST_OUTPUT_MAX_CHARS:
+            return candidate
+
+    empty_page = _candidate(0)
+    if empty_page is None:
+        return json.dumps(
+            {
+                "error": (
+                    f"Discovery continuation exceeds the {_DISCOVERY_CURSOR_MAX_CHARS}-character "
+                    "cursor limit."
+                )
+            }
+        )
+    if len(empty_page) > _DISCOVERY_LIST_OUTPUT_MAX_CHARS:
+        kind = "fixed_section"
+        oversized_sections = [
+            name for name, rows in sections.items() if name not in paged and rows
+        ]
+    else:
+        kind = "paginated_row"
+        oversized_sections = [name for name in paged if sections[name]]
+    return json.dumps(
+        {
+            "error": (
+                f"Discovery result exceeds the {_DISCOVERY_LIST_OUTPUT_MAX_CHARS}-character "
+                "output limit even at the smallest page."
+            ),
+            "page": {"has_more": {name: source_pages[name].has_more for name in paged}},
+            "oversized": {"kind": kind, "sections": oversized_sections},
+        }
+    )
+
 
 # Union of all locally-dispatched tools.
 _ALL_LOCAL_TOOLS = (
@@ -715,7 +956,11 @@ async def _execute_local_python_tool(
         )
         return await asyncio.to_thread(manager.call_tool, tool_name, args, ctx)
     except Exception as exc:
-        _logger.exception("runner local Python tool dispatch failed for %s", tool_name)
+        _logger.exception(
+            "runner local Python tool dispatch failed for %s",
+            tool_name,
+            extra={"session_id": conversation_id},
+        )
         return f"Error: {type(exc).__name__}: {exc}"
     finally:
         manager.shutdown()
@@ -1183,6 +1428,58 @@ def _subagent_model_from_args(args: _JsonObject) -> str | None:
     return validate_model_override(raw_model)
 
 
+def _subagent_reasoning_effort_from_args(args: _JsonObject) -> str | None:
+    """
+    Extract the optional ``reasoning_effort`` from
+    ``sys_session_send`` args.
+
+    :param args: Decoded tool arguments, e.g.
+        ``{"args": {"input": "fix the bug", "reasoning_effort": "high"}}``.
+    :returns: The requested effort, or ``None`` when absent.
+    :raises ValueError: If ``reasoning_effort`` is present but is not a
+        non-empty string.
+    """
+    raw_message = args.get("args")
+    if not isinstance(raw_message, dict):
+        return None
+    raw_effort = raw_message.get("reasoning_effort")
+    if raw_effort is None:
+        return None
+    if not isinstance(raw_effort, str) or not raw_effort:
+        raise ValueError("'reasoning_effort' must be a non-empty string when provided")
+    return raw_effort
+
+
+def _validate_subagent_reasoning_effort(effort: str, harness: str | None) -> str:
+    """
+    Validate *effort* against the child harness's declared effort family.
+
+    A harness whose family is ``NONE`` has no effort plumbing, and an
+    unrecognized one cannot be checked at all — the caller asked for this
+    explicitly, so reject rather than accept-and-drop. (Delivery of a
+    persisted effort takes the opposite tack and filters quietly; see the
+    reasoning guard in :mod:`omnigent.runner.app`.)
+
+    :param effort: Requested effort, e.g. ``"high"``.
+    :param harness: Resolved child harness, e.g. ``"claude-native"``.
+    :returns: The canonical effort that harness accepts.
+    :raises ValueError: If the harness supports no effort override, or
+        the value falls outside its vocabulary.
+    """
+    from omnigent.reasoning_effort import efforts_for_harness, validate_effort
+
+    canonical = canonicalize_harness(harness) if harness is not None else None
+    supported = efforts_for_harness(harness)
+    if not supported:
+        raise ValueError(
+            f"harness {canonical or harness or 'unknown'!r} does not support "
+            "a reasoning-effort override"
+        )
+    validated = validate_effort(effort, canonical or harness or "unknown", supported)
+    assert validated is not None
+    return validated
+
+
 def _subagent_file_ids_from_args(args: _JsonObject) -> list[str]:
     """
     Extract the optional ``file_ids`` from ``sys_session_send`` args.
@@ -1385,9 +1682,32 @@ def _find_subagent_spec(sub_agent_name: str, agent_spec: AgentSpec | None) -> Ag
     """
     if agent_spec is None:
         return None
-    for sub_agent in agent_spec.sub_agents:
-        if sub_agent.name == sub_agent_name:
+    # Defensive access: resolvers hand us legacy / test spec objects that are
+    # only structurally AgentSpec-shaped, and ``_has_subagent`` routes its
+    # existence check through here, so a stub without ``sub_agents`` must miss
+    # rather than raise.
+    for sub_agent in getattr(agent_spec, "sub_agents", None) or []:
+        if getattr(sub_agent, "name", None) == sub_agent_name:
             return sub_agent
+    # Built-in web_fetch researcher: ``WebFetchTool.__init__`` appends
+    # ``__web_researcher`` to the owner's live ``sub_agents`` in memory but
+    # never serializes it, so it is absent from the runner's re-parsed spec.
+    # Reconstruct it deterministically -- the same pure builder the
+    # child-boot resolver (``workflow.py::_find_spec_by_name``) uses -- so
+    # this lookup and the dispatch gate agree the sub-agent exists. Without
+    # it, ``_has_subagent`` returns True while ``_subagent_harness`` /
+    # ``_subagent_allowed_harnesses`` (both routed through here) return
+    # ``None``, i.e. the gate and the spec lookup disagree about the same
+    # name. Reconstruction is gated inside the helper on the tree actually
+    # declaring ``web_fetch``, so a caller-supplied name cannot coerce an
+    # arbitrary parent into a shell-capable researcher.
+    from omnigent.tools.builtins.web_fetch import (
+        RESEARCHER_NAME,
+        reconstruct_researcher_spec,
+    )
+
+    if sub_agent_name == RESEARCHER_NAME:
+        return reconstruct_researcher_spec(agent_spec)
     return None
 
 
@@ -1569,6 +1889,7 @@ def _normalize_subagent_model(
             sub_agent_name,
             harness,
             provider.kind,
+            extra={"session_id": runner_primary_session_id()},
         )
     return normalized
 
@@ -1650,6 +1971,11 @@ async def _execute_subagent_tool(
         return f"Error: sys_session_send invalid 'model': {exc}"
 
     try:
+        reasoning_effort = _subagent_reasoning_effort_from_args(args)
+    except ValueError as exc:
+        return f"Error: sys_session_send invalid 'reasoning_effort': {exc}"
+
+    try:
         file_ids = _subagent_file_ids_from_args(args)
     except ValueError as exc:
         return f"Error: sys_session_send invalid 'file_ids': {exc}"
@@ -1694,6 +2020,12 @@ async def _execute_subagent_tool(
                 "Error: sys_session_send 'harness' applies only when a "
                 "sub-agent session is first created; it cannot change an "
                 "existing session. Re-send without 'harness' to continue "
+                f"session {target_session_id!r}."
+            )
+        if reasoning_effort is not None:
+            return (
+                "Error: sys_session_send 'reasoning_effort' applies only when a "
+                "sub-agent session is first created; it cannot change an existing "
                 f"session {target_session_id!r}."
             )
         if cost_budget is not None:
@@ -1796,6 +2128,14 @@ async def _execute_subagent_tool(
                 "continue it, or sys_session_close it first to spawn a "
                 "fresh session with the requested files."
             )
+        if reasoning_effort is not None:
+            return (
+                f"Error: sys_session_send 'reasoning_effort' applies only when a "
+                f"sub-agent session is first created; {sub_agent_name!r} title "
+                f"{session_name!r} already exists as {child_session_id}. Re-send "
+                "without 'reasoning_effort' to continue it, or "
+                "sys_session_close it first to spawn a fresh session."
+            )
         if cost_budget is not None:
             return (
                 f"Error: sys_session_send 'cost_budget' applies only when a "
@@ -1826,6 +2166,7 @@ async def _execute_subagent_tool(
                 "after completion."
             )
     else:
+        _auto_ordinal = False
         if not session_name:
             # No title hint — auto-generate a structured session name
             # (e.g. "researcher-1"). Recover ordinals from existing
@@ -1852,6 +2193,7 @@ async def _execute_subagent_tool(
                 str(sub_agent_name),
             )
             session_name = f"{sub_agent_name}-{ordinal}"
+            _auto_ordinal = True
         child_harness = _subagent_harness(str(sub_agent_name), agent_spec)
         # Apply an allowlisted per-dispatch harness override. The sub-agent
         # spec must explicitly opt in via executor.config.allowed_harnesses,
@@ -1954,7 +2296,50 @@ async def _execute_subagent_tool(
                 agent_spec=agent_spec,
                 harness=child_harness,
             )
-        resp = await server_client.post("/v1/sessions", json=create_body, timeout=30.0)
+        # A dispatch that names no effort inherits the sub-agent spec's
+        # ``executor.reasoning_effort``, so a worker's default is declared
+        # once in its config instead of depending on the orchestrator
+        # remembering to pass it on every dispatch.
+        effective_effort = reasoning_effort
+        effort_source = "sys_session_send"
+        if effective_effort is None:
+            sub_spec = _find_subagent_spec(sub_agent_name, agent_spec)
+            # ``getattr``: sub-specs also arrive as structural stubs that
+            # carry only the fields a caller needed.
+            spec_effort = getattr(getattr(sub_spec, "executor", None), "reasoning_effort", None)
+            if isinstance(spec_effort, str) and spec_effort:
+                effective_effort = spec_effort
+                effort_source = f"sub-agent {sub_agent_name!r} spec"
+        if effective_effort is not None:
+            try:
+                create_body["reasoning_effort"] = _validate_subagent_reasoning_effort(
+                    effective_effort,
+                    child_harness,
+                )
+            except ValueError as exc:
+                return f"Error: invalid 'reasoning_effort' from {effort_source}: {exc}"
+
+        # Best-effort retry for auto-ordinal name collisions: a 409 means
+        # another runner (or a restart race) already created a child with
+        # this ordinal. Bump and retry. Not watertight — the server's
+        # (parent, title) check is SELECT-then-INSERT with no DB unique
+        # constraint, so truly concurrent creates can still race past it.
+        _max_ordinal_retries = 5 if _auto_ordinal else 0
+        for _ordinal_attempt in range(_max_ordinal_retries + 1):
+            resp = await server_client.post("/v1/sessions", json=create_body, timeout=30.0)
+            if (
+                resp.status_code == 409
+                and _auto_ordinal
+                and _ordinal_attempt < _max_ordinal_retries
+            ):
+                ordinal = _runner_app.next_subagent_ordinal(
+                    conversation_id,
+                    str(sub_agent_name),
+                )
+                session_name = f"{sub_agent_name}-{ordinal}"
+                create_body["title"] = f"{sub_agent_name}:{session_name}"
+                continue
+            break
         if resp.status_code >= 400:
             return f"Error: failed to create child session: {resp.status_code} {resp.text[:200]}"
         child_data = _string_object_dict(resp.json())
@@ -2278,15 +2663,23 @@ def _build_session_create_body(
     title: object,
     message: object,
     model: object = None,
+    reasoning_effort: object = None,
 ) -> _JsonObject:
     """
     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
 
     ``parent_session_id`` is hard-forced to ``conversation_id`` — this is
     what makes the write child-only (an orchestrator cannot create a
-    top-level or sibling session). A non-empty ``title``, ``message``, and
-    ``model`` are included when provided; the message becomes the child's
-    first queued user turn via ``initial_items``.
+    top-level or sibling session). A non-empty ``title``, ``message``,
+    ``model``, and ``reasoning_effort`` are included when provided; the
+    message becomes the child's first queued user turn via
+    ``initial_items``.
+
+    ``model`` and ``reasoning_effort`` are passed through unvalidated:
+    this path never resolves the child's harness (the agent is named by
+    id and resolved server-side), so neither can be checked against the
+    harness's capabilities here. The server validates both against their
+    vocabularies at create.
 
     :param agent_id: The existing agent to launch, e.g. ``"ag_abc123"``.
     :param conversation_id: The caller's session id — the forced parent.
@@ -2296,6 +2689,8 @@ def _build_session_create_body(
         non-empty string.
     :param model: Optional model override, e.g. ``"databricks-glm-5-2"``;
         written as ``model_override`` on the session.
+    :param reasoning_effort: Optional reasoning level, e.g. ``"high"``;
+        written as ``reasoning_effort`` on the session.
     :returns: The JSON request body.
     """
     body: _JsonObject = {
@@ -2306,6 +2701,8 @@ def _build_session_create_body(
         body["title"] = title
     if isinstance(model, str) and model:
         body["model_override"] = model
+    if isinstance(reasoning_effort, str) and reasoning_effort:
+        body["reasoning_effort"] = reasoning_effort
     if isinstance(message, str) and message:
         body["initial_items"] = [
             {
@@ -2445,6 +2842,18 @@ async def _execute_session_create(
             }
         )
     if has_config_path:
+        # The multipart create carries only the config bundle, so an effort
+        # passed here would never reach the child. Refuse instead of dropping it.
+        if args.get("reasoning_effort") is not None:
+            return json.dumps(
+                {
+                    "error": (
+                        "sys_session_create 'reasoning_effort' is supported only "
+                        "with 'agent_id'; the 'config_path' create cannot carry "
+                        "it. Set the effort in the config you upload instead."
+                    )
+                }
+            )
         return await _session_create_from_config_path(
             str(config_path),
             args,
@@ -2460,6 +2869,7 @@ async def _execute_session_create(
         args.get("title"),
         args.get("message"),
         model=args.get("model"),
+        reasoning_effort=args.get("reasoning_effort"),
     )
     try:
         resp = await server_client.post("/v1/sessions", json=body, timeout=30.0)
@@ -3064,11 +3474,12 @@ def _has_subagent(
     """
     if agent_spec is None:
         return False
-    # AP-style spec: sub_agents list
-    sub_agents = getattr(agent_spec, "sub_agents", None) or []
-    for sa in sub_agents:
-        if getattr(sa, "name", None) == sub_agent_name:
-            return True
+    # AP-style spec: sub_agents list, including the synthesized
+    # ``__web_researcher``. Routed through the single resolver so the gate
+    # and every downstream harness / allowlist lookup agree about whether a
+    # name exists (see :func:`_find_subagent_spec`).
+    if _find_subagent_spec(sub_agent_name, agent_spec) is not None:
+        return True
     # Omnigent inner loader: tools dict with AgentTool entries
     tools = getattr(agent_spec, "tools", None)
     if isinstance(tools, dict) and sub_agent_name in tools:
@@ -3180,6 +3591,7 @@ async def _timer_loop(
                     timer_id,
                     conversation_id,
                     exc_info=True,
+                    extra={"session_id": conversation_id},
                 )
             if not repeat:
                 break
@@ -3483,6 +3895,7 @@ _SCHEDULED_TASK_CREATE_FIELDS = (
     "timezone",
     "model_override",
     "reasoning_effort",
+    "permission_mode",
     "workspace",
     "host_id",
 )
@@ -3491,9 +3904,12 @@ _SCHEDULED_TASK_UPDATE_FIELDS = (
     "name",
     "prompt",
     "rrule",
+    "agent_id",
     "timezone",
     "model_override",
     "reasoning_effort",
+    "permission_mode",
+    "max_cost_usd",
     "workspace",
     "host_id",
     "state",
@@ -3611,19 +4027,24 @@ def _parse_session_title(raw_title: str | None) -> _ParsedTitle:
     return _ParsedTitle(agent=head, title=tail)
 
 
-def _truncate_activity(text: str | None) -> str | None:
+def _truncate_activity(
+    text: str | None,
+    *,
+    max_chars: int = _ACTIVITY_MAX_CHARS,
+) -> str | None:
     """
-    Truncate text to ``_ACTIVITY_MAX_CHARS`` to bound peek prompt size.
+    Truncate text to ``max_chars`` to bound peek prompt size.
 
     :param text: The text to truncate, or ``None``.
+    :param max_chars: Maximum characters retained before the marker.
     :returns: The (possibly truncated) text, or ``None`` when the input
         is ``None``.
     """
     if text is None:
         return None
-    if len(text) <= _ACTIVITY_MAX_CHARS:
+    if len(text) <= max_chars:
         return text
-    return text[:_ACTIVITY_MAX_CHARS] + " [truncated]"
+    return text[:max_chars] + " [truncated]"
 
 
 def _text_from_api_content(content: object) -> str:
@@ -3644,7 +4065,11 @@ def _text_from_api_content(content: object) -> str:
     return " ".join(parts)
 
 
-def _project_api_item(item: _JsonObject) -> _JsonObject:
+def _project_api_item(
+    item: _JsonObject,
+    *,
+    max_chars: int = _ACTIVITY_MAX_CHARS,
+) -> _JsonObject:
     """
     Project a REST API conversation item into the compact peek shape.
 
@@ -3655,6 +4080,7 @@ def _project_api_item(item: _JsonObject) -> _JsonObject:
     the same as the in-process tool's.
 
     :param item: One API item dict from the items endpoint.
+    :param max_chars: Maximum characters retained in each content field.
     :returns: A compact dict — ``{type, tool, args}`` for tool calls,
         ``{type, output}`` for tool results, ``{type, role, text}`` for
         messages.
@@ -3664,17 +4090,26 @@ def _project_api_item(item: _JsonObject) -> _JsonObject:
         return {
             "type": "function_call",
             "tool": _optional_string(item.get("name")),
-            "args": _truncate_activity(_optional_string(item.get("arguments"))),
+            "args": _truncate_activity(
+                _optional_string(item.get("arguments")),
+                max_chars=max_chars,
+            ),
         }
     if itype == "function_call_output":
         output = item.get("output")
         rendered = output if isinstance(output, str) else json.dumps(output)
-        return {"type": "function_call_output", "output": _truncate_activity(rendered)}
+        return {
+            "type": "function_call_output",
+            "output": _truncate_activity(rendered, max_chars=max_chars),
+        }
     if itype == "message":
         return {
             "type": "message",
             "role": _optional_string(item.get("role")),
-            "text": _truncate_activity(_text_from_api_content(item.get("content"))),
+            "text": _truncate_activity(
+                _text_from_api_content(item.get("content")),
+                max_chars=max_chars,
+            ),
         }
     return {"type": itype}
 
@@ -3738,7 +4173,24 @@ async def _execute_session_query_tool(
         return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
 
     if tool_name == "sys_session_list":
-        return await _session_list_via_rest(conversation_id, server_client, args.get("agent_name"))
+        agent_name = args.get("agent_name")
+        window = _discovery_list_window(
+            args,
+            tool_name,
+            ("sessions",),
+            {"agent_name": agent_name if isinstance(agent_name, str) and agent_name else None},
+        )
+        if isinstance(window, str):
+            return window
+        limit, cursor_state, continued = window
+        return await _session_list_via_rest(
+            conversation_id,
+            server_client,
+            agent_name,
+            limit=limit,
+            cursor_state=cursor_state,
+            continued=continued,
+        )
     if tool_name == "sys_session_get_history":
         return await _session_get_history_via_rest(args, server_client)
     if tool_name == "sys_session_get_info":
@@ -4051,11 +4503,23 @@ async def _execute_agent_tool(
     if server_client is None:
         return json.dumps({"error": f"{tool_name} requires server access"})
     if tool_name == "sys_agent_list":
+        window = _discovery_list_window(
+            args,
+            tool_name,
+            ("builtins", "session_agents", "local_configs"),
+            {},
+        )
+        if isinstance(window, str):
+            return window
+        limit, cursor_state, continued = window
         return await _agent_list_via_rest(
             server_client,
             agent_spec=agent_spec,
             conversation_id=conversation_id,
             runner_workspace=runner_workspace,
+            limit=limit,
+            cursor_state=cursor_state,
+            continued=continued,
         )
     session_id = args.get("session_id")
     if not isinstance(session_id, str) or not session_id:
@@ -4232,9 +4696,12 @@ async def _agent_download_via_rest(
 async def _agent_list_fetch(
     path: str,
     server_client: httpx.AsyncClient,
-) -> list[_JsonObject]:
+    *,
+    after: str | None,
+    limit: int,
+) -> _DiscoveryPage:
     """
-    Fetch one page of a paginated list endpoint, returning its ``data``.
+    Fetch one cursor page of a paginated list endpoint.
 
     Best-effort: returns ``[]`` on transport error or non-200 so a single
     failing source degrades ``sys_agent_list`` to "that section is empty"
@@ -4243,21 +4710,24 @@ async def _agent_list_fetch(
     :param path: The list endpoint path, e.g. ``"/v1/agents"`` or
         ``"/v1/sessions"``.
     :param server_client: HTTP client pointed at the Omnigent server.
-    :returns: The ``data`` list from the paginated response (possibly
-        empty).
+    :param after: Server cursor from the previous page, if any.
+    :param limit: Maximum number of source rows to fetch.
+    :returns: Rows and server continuation metadata.
     """
     try:
-        resp = await server_client.get(
-            path,
-            params={"limit": _AGENT_LIST_PAGE_LIMIT, "order": "desc"},
-            timeout=30.0,
-        )
+        params: dict[str, str | int] = {"limit": limit, "order": "desc"}
+        if after is not None:
+            params["after"] = after
+        resp = await server_client.get(path, params=params, timeout=30.0)
     except Exception:  # noqa: BLE001
-        return []
+        return _DiscoveryPage([], False, failed=True)
     if resp.status_code != 200:
-        return []
-    body = _string_object_dict(resp.json())
-    return _json_object_list(body.get("data")) if body is not None else []
+        return _DiscoveryPage([], False, failed=True)
+    try:
+        body = resp.json()
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return _DiscoveryPage([], False, failed=True)
+    return _parse_discovery_page(body)
 
 
 def _scan_local_agent_configs(configs_dir: Path) -> list[_JsonObject]:
@@ -4419,6 +4889,9 @@ async def _agent_list_via_rest(
     agent_spec: AgentSpec | None,
     conversation_id: str | None,
     runner_workspace: Path | None,
+    limit: int | None,
+    cursor_state: dict[str, _DiscoveryState],
+    continued: bool,
 ) -> str:
     """
     List launchable agents across built-ins, session-bound, and local.
@@ -4448,19 +4921,70 @@ async def _agent_list_via_rest(
         resolution of the local-config scan.
     :param conversation_id: The caller's session id, for os_env cwd.
     :param runner_workspace: The runner workspace, authoritative cwd.
-    :returns: JSON ``{builtins, session_agents, local_configs}``.
+    :param limit: Optional maximum rows returned from each source. When
+        omitted, the complete legacy result is preserved while it fits.
+    :param cursor_state: Opaque continuation positions for each source.
+    :returns: The legacy complete JSON result while it fits, otherwise a
+        bounded page with continuation metadata.
     """
-    builtins_raw = await _agent_list_fetch("/v1/agents", server_client)
-    sessions_raw = await _agent_list_fetch("/v1/sessions", server_client)
+    source_limit = limit or _AGENT_LIST_PAGE_LIMIT
+    builtins_page = (
+        _DiscoveryPage([], False)
+        if cursor_state["builtins"][0] == _DISCOVERY_END
+        else await _agent_list_fetch(
+            "/v1/agents",
+            server_client,
+            after=cursor_state["builtins"][1],
+            limit=source_limit,
+        )
+    )
+    sessions_page = (
+        _DiscoveryPage([], False)
+        if cursor_state["session_agents"][0] == _DISCOVERY_END
+        else await _agent_list_fetch(
+            "/v1/sessions",
+            server_client,
+            after=cursor_state["session_agents"][1],
+            limit=source_limit,
+        )
+    )
     spec = _effective_runner_os_env_spec(agent_spec, conversation_id, runner_workspace)
     assert spec.cwd is not None
     configs_dir = Path(spec.cwd) / _AGENT_CONFIG_SUBDIR
     local_configs = await asyncio.to_thread(_scan_local_agent_configs, configs_dir)
-    listing = _project_agent_list(builtins_raw, sessions_raw, local_configs)
+    local_state, local_after = cursor_state["local_configs"]
+    if local_state == _DISCOVERY_END:
+        remaining_configs = []
+    elif local_after is not None:
+        remaining_configs = [
+            row for row in local_configs if str(row.get("path", "")) > local_after
+        ]
+    else:
+        remaining_configs = local_configs
+    listing = _project_agent_list(
+        builtins_page.rows,
+        sessions_page.rows,
+        remaining_configs[:source_limit],
+    )
     listing["builtins"] = _in_spawn_family(
         listing["builtins"], await _spawn_family(server_client, conversation_id)
     )
-    return json.dumps(listing)
+    return _bounded_discovery_result(
+        listing,
+        limit=limit,
+        cursor_state=cursor_state,
+        continued=continued,
+        tool_name="sys_agent_list",
+        filters={},
+        source_pages={
+            "builtins": builtins_page,
+            "session_agents": sessions_page,
+            "local_configs": _DiscoveryPage(
+                listing["local_configs"],
+                len(listing["local_configs"]) < len(remaining_configs),
+            ),
+        },
+    )
 
 
 def _project_agent_list(
@@ -4511,6 +5035,10 @@ async def _session_list_via_rest(
     conversation_id: str,
     server_client: httpx.AsyncClient,
     agent_name: object = None,
+    *,
+    limit: int | None,
+    cursor_state: dict[str, _DiscoveryState],
+    continued: bool,
 ) -> str:
     """
     Return the two-view session list: ``sub_agents`` + global ``sessions``.
@@ -4528,11 +5056,33 @@ async def _session_list_via_rest(
     :param server_client: HTTP client pointed at the Omnigent server.
     :param agent_name: Optional agent-name filter for the global
         ``sessions`` view; ignored for ``sub_agents``.
-    :returns: JSON ``{"sub_agents": [...], "sessions": [...]}``.
+    :param limit: Optional maximum rows returned from the global sessions view. When
+        omitted, the complete legacy result is preserved while it fits.
+    :param cursor_state: Opaque continuation position for the global sessions view.
+    :returns: The legacy complete JSON result while it fits, otherwise a
+        bounded page with continuation metadata.
     """
     sub_agents = await _collect_sub_agents(conversation_id, server_client)
-    sessions = await _collect_global_sessions(server_client, agent_name)
-    return json.dumps({"sub_agents": sub_agents, "sessions": sessions})
+    sessions_page = (
+        _DiscoveryPage([], False)
+        if cursor_state["sessions"][0] == _DISCOVERY_END
+        else await _collect_global_sessions(
+            server_client,
+            agent_name,
+            after=cursor_state["sessions"][1],
+            limit=limit or _AGENT_LIST_PAGE_LIMIT,
+        )
+    )
+    return _bounded_discovery_result(
+        {"sub_agents": cast(list[_JsonObject], sub_agents), "sessions": sessions_page.rows},
+        limit=limit,
+        cursor_state=cursor_state,
+        continued=continued,
+        tool_name="sys_session_list",
+        filters={"agent_name": agent_name if isinstance(agent_name, str) and agent_name else None},
+        source_pages={"sessions": sessions_page},
+        page_sections=("sessions",),
+    )
 
 
 async def _rename_current_session_via_rest(
@@ -4629,6 +5179,7 @@ async def _collect_sub_agents(
                 "sys_session_list sibling enrichment failed for parent %s",
                 parent_id,
                 exc_info=True,
+                extra={"session_id": conversation_id},
             )
     return result
 
@@ -4668,7 +5219,10 @@ async def _resolve_runner_online_map(
 async def _collect_global_sessions(
     server_client: httpx.AsyncClient,
     agent_name: object,
-) -> list[_JsonObject]:
+    *,
+    after: str | None,
+    limit: int,
+) -> _DiscoveryPage:
     """
     Fetch the global session list via ``GET /v1/sessions``, with connectivity.
 
@@ -4683,38 +5237,50 @@ async def _collect_global_sessions(
     :param server_client: HTTP client pointed at the Omnigent server.
     :param agent_name: Optional agent-name filter; applied only when a
         non-empty string.
-    :returns: The projected global session entries.
+    :param after: Server cursor from the previous page, if any.
+    :param limit: Maximum number of source rows to fetch.
+    :returns: Projected global session entries and continuation metadata.
     """
-    params: dict[str, str | int] = {"limit": _AGENT_LIST_PAGE_LIMIT, "order": "desc"}
+    params: dict[str, str | int] = {"limit": limit, "order": "desc"}
     if isinstance(agent_name, str) and agent_name:
         params["agent_name"] = agent_name
+    if after is not None:
+        params["after"] = after
     try:
         resp = await server_client.get("/v1/sessions", params=params, timeout=30.0)
     except Exception:  # noqa: BLE001
-        return []
+        return _DiscoveryPage([], False, failed=True)
     if resp.status_code != 200:
-        return []
-    body = _string_object_dict(resp.json())
-    if body is None:
-        return []
-    rows = _json_object_list(body.get("data"))
+        return _DiscoveryPage([], False, failed=True)
+    try:
+        body = resp.json()
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return _DiscoveryPage([], False, failed=True)
+    page = _parse_discovery_page(body)
+    if page.failed:
+        return page
+    rows = page.rows
     online = await _resolve_runner_online_map(rows, server_client)
-    return [
-        {
-            "session_id": r.get("id"),
-            # Hide the internal ``-native-ui`` wrapper name (e.g.
-            # ``pi-native-ui`` -> ``Pi``) in the global listing too, matching
-            # ``sys_session_get_info``. The server-side ``agent_name`` filter
-            # above still receives the caller's raw argument unchanged.
-            "agent_name": public_agent_name(_optional_string(r.get("agent_name"))),
-            "title": r.get("title"),
-            "status": r.get("status"),
-            "runner_id": r.get("runner_id"),
-            "runner_online": online.get(_optional_string(r.get("runner_id")) or ""),
-            "parent_session_id": r.get("parent_session_id"),
-        }
-        for r in rows
-    ]
+    return _DiscoveryPage(
+        [
+            {
+                "session_id": r.get("id"),
+                # Hide the internal ``-native-ui`` wrapper name (e.g.
+                # ``pi-native-ui`` -> ``Pi``) in the global listing too, matching
+                # ``sys_session_get_info``. The server-side ``agent_name`` filter
+                # above still receives the caller's raw argument unchanged.
+                "agent_name": public_agent_name(_optional_string(r.get("agent_name"))),
+                "title": r.get("title"),
+                "status": r.get("status"),
+                "runner_id": r.get("runner_id"),
+                "runner_online": online.get(_optional_string(r.get("runner_id")) or ""),
+                "parent_session_id": r.get("parent_session_id"),
+            }
+            for r in rows
+        ],
+        page.has_more,
+        page.next_after,
+    )
 
 
 def _child_rows_to_entries(
@@ -4787,7 +5353,7 @@ async def _session_get_history_via_rest(
     may read).
 
     :param args: Parsed tool arguments; requires ``conversation_id``,
-        optional ``tail_items``.
+        optional ``tail_items`` and ``content_max_chars``.
     :param server_client: HTTP client pointed at the Omnigent server.
     :returns: JSON peek result, or a JSON error object.
     """
@@ -4799,6 +5365,15 @@ async def _session_get_history_via_rest(
     tail_items = _clamp_tail_items(args.get("tail_items", _HISTORY_DEFAULT_TAIL))
     if isinstance(tail_items, str):
         return tail_items
+    content_max_chars = _clamp_history_content_chars(
+        args.get("content_max_chars", _ACTIVITY_MAX_CHARS),
+    )
+    if isinstance(content_max_chars, str):
+        return content_max_chars
+    content_max_chars = _bound_history_content_chars(
+        tail_items=tail_items,
+        content_max_chars=content_max_chars,
+    )
     try:
         resp = await server_client.get(
             f"/v1/sessions/{target_id}/items",
@@ -4816,7 +5391,9 @@ async def _session_get_history_via_rest(
     data: list[_JsonObject] = resp.json().get("data", [])
     # ``order="desc"`` returns newest-first; reverse to chronological so
     # the LLM reads top-to-bottom (matches the in-process peek).
-    items: list[_JsonObject] = [_project_api_item(it) for it in reversed(data)]
+    items: list[_JsonObject] = [
+        _project_api_item(it, max_chars=content_max_chars) for it in reversed(data)
+    ]
     meta = await _fetch_peek_meta(target_id, server_client)
     # A parked elicitation never lands in the conversation store (it
     # lives only in the Omnigent server's pending-elicitations index, replayed
@@ -5317,7 +5894,12 @@ async def execute_tool(
             output = await _execute_uc_function_tool(tool_name, args, agent_spec=agent_spec)
         else:
             output = await _execute_spec_callable_tool(tool_name, args, agent_spec=agent_spec)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
+        _logger.exception(
+            "tool %s failed",
+            tool_name,
+            extra={"session_id": conversation_id},
+        )
         output = f"Error: {type(exc).__name__}: {exc}"
 
     return output
@@ -5480,6 +6062,7 @@ async def dispatch_tool_locally(
             tool_name,
             call_id,
             exc,
+            extra={"session_id": conversation_id},
         )
 
     return output
@@ -5713,7 +6296,11 @@ async def _execute_os_env_tool(
         else:
             return f"Error: {tool_name} not implemented"
     except Exception as exc:
-        _logger.exception("runner OSEnvironment dispatch failed for %s", tool_name)
+        _logger.exception(
+            "runner OSEnvironment dispatch failed for %s",
+            tool_name,
+            extra={"session_id": conversation_id},
+        )
         return json.dumps({"error": str(exc)})
     finally:
         if os_env is not None:
@@ -6155,6 +6742,7 @@ async def _publish_terminal_created_event(
                 conversation_id,
                 terminal_name,
                 session_key,
+                extra={"session_id": conversation_id},
             )
             return
         resource = session_resource_view_to_dict(view)
@@ -6480,6 +7068,7 @@ async def _post_subagent_policy_verdict(
             "Sub-agent inbox TOOL_RESULT policy evaluation failed for parent=%s child=%s",
             conversation_id,
             _subagent_child_id(payload),
+            extra={"session_id": conversation_id},
         )
         return None
     if resp.status_code >= 400:
@@ -6489,6 +7078,7 @@ async def _post_subagent_policy_verdict(
             conversation_id,
             resp.status_code,
             resp.text,
+            extra={"session_id": conversation_id},
         )
         return None
     try:
@@ -6497,6 +7087,7 @@ async def _post_subagent_policy_verdict(
         _logger.warning(
             "Sub-agent inbox TOOL_RESULT policy evaluation returned non-JSON for parent=%s",
             conversation_id,
+            extra={"session_id": conversation_id},
         )
         return None
 
@@ -6527,6 +7118,7 @@ def _apply_subagent_policy_verdict(
             _logger.warning(
                 "Sub-agent inbox TOOL_RESULT policy data must be str; got %s",
                 type(transformed).__name__,
+                extra={"session_id": runner_primary_session_id()},
             )
         return _SubagentInboxEvaluation(
             {
@@ -6537,6 +7129,7 @@ def _apply_subagent_policy_verdict(
     _logger.warning(
         "Sub-agent inbox TOOL_RESULT policy evaluation returned unknown result=%r",
         result,
+        extra={"session_id": runner_primary_session_id()},
     )
     return _SubagentInboxEvaluation(
         _subagent_policy_failure_payload(payload),
@@ -6646,6 +7239,7 @@ async def _drain_inbox(
                     "malformed terminal-idle inbox item ignored: %s",
                     exc,
                     exc_info=True,
+                    extra={"session_id": conversation_id},
                 )
                 items.append(f"[System: malformed terminal_idle inbox item ignored — {exc}]")
             continue
@@ -6714,12 +7308,14 @@ async def _evaluate_async_tool_call_policy(
             "async PHASE_TOOL_CALL policy evaluate returned %d for %s; denying",
             resp.status_code,
             evaluation_id,
+            extra={"session_id": conversation_id},
         )
     except Exception:  # noqa: BLE001
         _logger.warning(
             "async PHASE_TOOL_CALL policy evaluate failed for %s; denying",
             evaluation_id,
             exc_info=True,
+            extra={"session_id": conversation_id},
         )
     return False
 
@@ -6873,7 +7469,8 @@ def _spawn_async_tool(
                 }
             )
             raise
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
+            _logger.exception("async tool %s failed", target_tool)
             session_inbox.put_nowait(
                 {
                     "handle_id": handle_id,
@@ -6998,6 +7595,53 @@ async def _execute_task_lifecycle_tool(
     )
 
 
+async def _post_session_stop(server_client: httpx.AsyncClient, task_id: str) -> str | None:
+    """Hard-stop one claude-native child through the server."""
+    try:
+        resp = await server_client.post(
+            f"/v1/sessions/{task_id}/events",
+            json={"type": "stop_session", "data": {}},
+            timeout=30.0,
+        )
+    except httpx.HTTPError as exc:
+        return f"Error: sys_cancel_task stop_session failed: {type(exc).__name__}: {exc}"
+    if resp.status_code >= 400:
+        return (
+            f"Error: sys_cancel_task stop_session returned {resp.status_code}: {resp.text[:200]}"
+        )
+    return None
+
+
+async def _cancel_evicted_claude_native_subagent(
+    task_id: str,
+    *,
+    conversation_id: str,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    """Stop an owned claude-native child after its work entry was evicted."""
+    if server_client is None:
+        return "Error: sys_cancel_task requires server access for sub-agent tasks"
+    try:
+        resp = await server_client.get(f"/v1/sessions/{task_id}", timeout=10.0)
+    except httpx.HTTPError as exc:
+        return f"Error: sys_cancel_task lookup failed: {type(exc).__name__}: {exc}"
+    if resp.status_code != 200:
+        return f"Error: no in-flight task with task_id {task_id}"
+    snapshot = resp.json()
+    labels = snapshot.get("labels") if isinstance(snapshot, dict) else None
+    if (
+        not isinstance(snapshot, dict)
+        or snapshot.get("parent_session_id") != conversation_id
+        or not isinstance(labels, dict)
+        or labels.get(_SESSION_WRAPPER_LABEL_KEY) != CLAUDE_NATIVE_WRAPPER_VALUE
+    ):
+        return f"Error: no in-flight task with task_id {task_id}"
+    stop_error = await _post_session_stop(server_client, task_id)
+    if stop_error is not None:
+        return stop_error
+    return json.dumps({"cancelled": True, "task_id": task_id, "status": "cancelled"})
+
+
 async def _cancel_subagent_task(
     args: _JsonObject,
     *,
@@ -7040,14 +7684,22 @@ async def _cancel_subagent_task(
     if conversation_id is None:
         return "Error: sys_cancel_task requires conversation_id"
     entry = _runner_app.get_subagent_work(str(task_id))
-    if entry is None or entry.parent_session_id != conversation_id:
+    if entry is None:
+        return await _cancel_evicted_claude_native_subagent(
+            str(task_id),
+            conversation_id=conversation_id,
+            server_client=server_client,
+        )
+    if entry.parent_session_id != conversation_id:
         return f"Error: no in-flight task with task_id {task_id}"
     # A dispatched child sits in ``launching`` until its runtime emits a real
     # busy edge (see ``mark_subagent_work_started``). Cancellation must still
     # route to the child during that window — otherwise cancelling a slow-to-
-    # start sub-agent would silently no-op and leave it running. Only terminal
-    # states (``completed`` / ``failed`` / ``cancelled``) short-circuit here.
-    if entry.status not in ("launching", "running", "waiting"):
+    # start sub-agent would silently no-op and leave it running. A failed
+    # claude-native entry still falls through because its pane may be alive.
+    is_claude_native = entry.wrapper_label == CLAUDE_NATIVE_WRAPPER_VALUE
+    can_stop_failed_claude = is_claude_native and entry.status == "failed"
+    if entry.status not in ("launching", "running", "waiting") and not can_stop_failed_claude:
         return json.dumps(
             {
                 "cancelled": entry.status == "cancelled",
@@ -7060,9 +7712,7 @@ async def _cancel_subagent_task(
 
     # claude-native is the only harness with a runner-side hard-stop; every
     # other harness 204 no-ops on stop_session, so route them to interrupt.
-    event_type = (
-        "stop_session" if entry.wrapper_label == CLAUDE_NATIVE_WRAPPER_VALUE else "interrupt"
-    )
+    event_type = "stop_session" if is_claude_native else "interrupt"
 
     try:
         resp = await server_client.post(
@@ -7159,9 +7809,9 @@ def _execute_skill_tool(
     """
     Runner-local handler for ``load_skill`` and ``read_skill_file``.
 
-    Instantiates the tool with the agent spec's bundled skills
-    plus host-scope discovery from the runner workspace, then
-    invokes it.
+    Both tools are built from one registry — the agent spec's bundled
+    skills merged with host-scope discovery from the runner workspace —
+    so anything ``load_skill`` can load, ``read_skill_file`` can read.
 
     :param tool_name: ``"load_skill"`` or ``"read_skill_file"``.
     :param args: Parsed JSON arguments from the LLM.
@@ -7181,15 +7831,14 @@ def _execute_skill_tool(
     # agent's own bundle to ship a skills/ directory.
     bundled_skills = _inject_orchestrator_skills(bundled_skills, agent_spec)
 
-    tool: Tool
-    if tool_name == "load_skill":
-        tool = LoadSkillTool(
-            bundled_skills,
-            agent_root=runner_workspace,
-            skills_filter=skills_filter,
-        )
-    else:
-        tool = ReadSkillFileTool(bundled_skills)
+    # Both tools must resolve the same registry: a skill load_skill can load
+    # from host scope must have its files readable too.
+    load_tool = LoadSkillTool(
+        bundled_skills,
+        agent_root=runner_workspace,
+        skills_filter=skills_filter,
+    )
+    tool: Tool = load_tool if tool_name == "load_skill" else ReadSkillFileTool(load_tool.skills)
 
     arguments_json = json.dumps(args)
     from omnigent.tools.base import ToolContext

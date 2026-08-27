@@ -46,7 +46,6 @@ from cachetools import TTLCache
 from omnigent._platform import default_shell_argv
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.llms.anthropic_model_metadata import parse_anthropic_model_metadata
-from omnigent.model_fallbacks import StaticModelFallback, static_model_fallback
 from omnigent.model_metadata import (
     ModelCapability,
     ModelCostTier,
@@ -99,6 +98,15 @@ _LLM_NAME_TOKENS = ("claude", "gpt", "codex", "gemini", "llama", "qwen", "kimi")
 # Chat-capable endpoint tasks ("llm/v1/chat"); embeddings/rerankers don't match.
 _LLM_TASK_TOKENS = ("chat", "completion")
 
+# DATABRICKS-PATCH(model-services-scoped-listing): scope + page the Unity
+# Catalog model-services listing. Mirrors
+# ``databricks_model_discovery._MODEL_SERVICES_PARENT`` /
+# ``_MODEL_SERVICES_MAX_RESULTS`` — including the parameter *name*, so both
+# callers of this endpoint ask for a page size the API actually honors.
+_MODEL_SERVICES_PARENT = "schemas/system.ai"
+_MODEL_SERVICES_MAX_RESULTS = 100
+_MODEL_SERVICES_MAX_PAGES = 100
+
 _ProviderHarness: TypeAlias = Literal[
     "claude-sdk",
     "codex",
@@ -142,6 +150,8 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, _ProviderHarness] = {
     # mirroring the claude-native -> claude-sdk rule above.
     "antigravity-native": "antigravity",
     "native-antigravity": "antigravity",
+    "agy-native": "antigravity",
+    "native-agy": "antigravity",
 }
 
 # cursor-agent always routes through its own stored login — there is no
@@ -197,15 +207,12 @@ class ModelListing:
     :param models: The enumerated models, e.g.
         ``(ModelEntry(id="databricks-gpt-5-4", family="openai"),)``.
     :param note: Human-readable provenance / failure explanation.
-    :param static_fallback: Ownership metadata for a release-curated fallback;
-        ``None`` for live or empty listings.
     """
 
     source: str
     verified: bool
     models: tuple[ModelEntry, ...]
     note: str
-    static_fallback: StaticModelFallback | None = None
 
 
 @dataclass(frozen=True)
@@ -888,8 +895,7 @@ def _listing_payload(listing: ModelListing) -> _JsonObject:
     """Serialize a :class:`ModelListing` into the tool's JSON row shape.
 
     :param listing: The listing to serialize.
-    :returns: Row dict; ``context_window`` and ``static_fallback`` appear only
-        when known.
+    :returns: Row dict; ``context_window`` appears only when known.
     """
     models: list[_JsonObject] = []
     for entry in listing.models:
@@ -925,12 +931,6 @@ def _listing_payload(listing: ModelListing) -> _JsonObject:
         "models": models,
         "note": listing.note,
     }
-    if listing.static_fallback is not None:
-        payload["static_fallback"] = {
-            "owner": listing.static_fallback.owner,
-            "provenance": listing.static_fallback.provenance,
-            "discovery_gap": listing.static_fallback.discovery_gap,
-        }
     return payload
 
 
@@ -1052,23 +1052,24 @@ def _fetch_cursor_cli_listing(provider: ResolvedModelProvider) -> ModelListing:
 
 
 def _static_subscription_listing(provider: ResolvedModelProvider) -> ModelListing:
-    """Build the curated static listing for a subscription CLI login.
+    """Build the (empty) pre-launch listing for a subscription CLI login.
+
+    Subscription logins expose no model-listing API, and the curated
+    stand-ins this used to serve are gone — the live harness probes are the
+    source of truth, so a path that cannot probe reports nothing rather
+    than a plausible-but-stale list.
 
     :param provider: A ``kind="subscription"`` provider descriptor.
-    :returns: A ``source="static"`` listing with ``verified=False``.
+    :returns: A ``source="static"`` listing with no models.
     """
-    fallback = static_model_fallback(SUBSCRIPTION_KIND, provider.cli or "")
-    ids = fallback.model_ids if fallback is not None else ()
     return ModelListing(
         source="static",
         verified=False,
-        models=tuple(ModelEntry(id=i, family=model_family_token(i)) for i in ids),
+        models=(),
         note=(
-            f"curated aliases for the {provider.cli or 'unknown'} CLI login "
-            "(subscription logins expose no model-listing API; availability "
-            "depends on the logged-in plan)"
+            f"the {provider.cli or 'unknown'} CLI login exposes no model-listing "
+            "API before launch; the live listing comes from probing the harness"
         ),
-        static_fallback=fallback,
     )
 
 
@@ -1082,20 +1083,16 @@ def _static_cli_config_listing(provider: ResolvedModelProvider) -> ModelListing:
     resolve — not a "no credentials" preflight failure.
 
     :param provider: A ``kind="cli-config"`` provider descriptor.
-    :returns: A ``source="static"`` listing with ``verified=False``.
+    :returns: A ``source="static"`` listing with no models.
     """
-    fallback = static_model_fallback(CLI_CONFIG_KIND, provider.cli or "")
-    ids = fallback.model_ids if fallback is not None else ()
     return ModelListing(
         source="static",
         verified=False,
-        models=tuple(ModelEntry(id=i, family=model_family_token(i)) for i in ids),
+        models=(),
         note=(
-            f"curated ids for {provider.detail}; its credential lives in the "
-            "CLI's own config file and is resolved by the CLI at launch, so "
-            "it cannot be verified from here"
+            f"{provider.detail} enumerates its models only from the CLI's own "
+            "config at launch; the live listing comes from probing the harness"
         ),
-        static_fallback=fallback,
     )
 
 
@@ -1222,16 +1219,61 @@ def fetch_databricks_model_service_entries(
     :returns: LLM model-service entries with normalized wire metadata.
     :raises httpx.HTTPError: On transport or HTTP failures.
     """
+    # DATABRICKS-PATCH(model-services-scoped-listing)
+    # The listing must be scoped to the `system.ai` schema and paged. Unscoped,
+    # the endpoint walks the WHOLE metastore and returns one page of whatever
+    # schemas sort first — on a busy workspace that is a slice of unrelated user
+    # schemas with a `next_page_token` this call never followed, so a workspace
+    # serving 53 Databricks models reported 2 and zero Claude entries. Same
+    # scoping `databricks_model_discovery._list_model_service_ids` already uses.
+    services: list[object] = []
+    page_token: str | None = None
+    seen_tokens: set[str] = set()
     with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
-        resp = client.get(
-            f"{workspace_url.rstrip('/')}/api/2.1/unity-catalog/model-services",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        resp.raise_for_status()
-        payload = resp.json()
-    services = payload.get("model_services") if isinstance(payload, dict) else None
+        for _ in range(_MODEL_SERVICES_MAX_PAGES):
+            params = {
+                "parent": _MODEL_SERVICES_PARENT,
+                "max_results": str(_MODEL_SERVICES_MAX_RESULTS),
+            }
+            if page_token is not None:
+                params["page_token"] = page_token
+            resp = client.get(
+                f"{workspace_url.rstrip('/')}/api/2.1/unity-catalog/model-services",
+                headers={"Authorization": f"Bearer {token}"},
+                params=params,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            page = payload.get("model_services") if isinstance(payload, dict) else None
+            if isinstance(page, list):
+                services.extend(page)
+            raw_next = payload.get("next_page_token") if isinstance(payload, dict) else None
+            if not isinstance(raw_next, str) or not raw_next:
+                break
+            if raw_next in seen_tokens:
+                # A repeated token means the endpoint is looping. Keep the pages
+                # already collected instead of raising (which is what the
+                # sibling ``_list_model_service_ids`` does): every caller here
+                # treats an exception as "no listing" and falls back to the
+                # bundled catalog's retired ``databricks-`` ids, so failing loud
+                # would reintroduce the 501 this patch exists to remove. A
+                # partial ``system.ai`` list still launches.
+                _logger.warning(
+                    "Databricks model-services pagination repeated a page token; "
+                    "returning the %d entries collected so far",
+                    len(services),
+                )
+                break
+            seen_tokens.add(raw_next)
+            page_token = raw_next
+        else:
+            _logger.warning(
+                "Databricks model-services listing truncated after %d pages; "
+                "the model list may be incomplete",
+                _MODEL_SERVICES_MAX_PAGES,
+            )
     models: list[ModelEntry] = []
-    for service in services if isinstance(services, list) else []:
+    for service in services:
         if not isinstance(service, dict):
             continue
         raw_name = service.get("name")

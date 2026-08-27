@@ -18,6 +18,8 @@ import {
   type WorkspaceEnvironment,
   MAX_RUNNER_OFFLINE_RETRIES,
   RunnerOfflineError,
+  browseLocationBase,
+  browseLocationSegment,
   isRunnerUnavailable503,
   looksLikeWorkspaceFilePath,
   relativizeToWorkspace,
@@ -177,6 +179,11 @@ function DirectoryPathsProbe({
   useEffect(() => {
     if (query.isSuccess) onPaths(query.data.map((f) => f.path));
   }, [query.isSuccess, query.data, onPaths]);
+  return null;
+}
+
+function AllFilesProbeAt({ id, location }: { id: string; location: string }) {
+  useWorkspaceAllFiles(id, {}, location);
   return null;
 }
 
@@ -1127,5 +1134,75 @@ describe("browse-location listings normalize to paths relative to the location",
     await waitFor(() => expect(onPaths).toHaveBeenCalled());
 
     expect(onPaths).toHaveBeenLastCalledWith(["quarterly/q3.csv"]);
+  });
+});
+
+describe("browse-location wire form (survives a slash-merging proxy)", () => {
+  // The absolute/relative distinction must NOT ride on a leading "%2F" in the
+  // path: that decodes to a "//" which reverse proxies (the Databricks Apps
+  // front door) merge to a single "/", turning an absolute path into a
+  // workspace-relative one. Paths go out with literal slashes and no leading
+  // "%2F"; the base is named out of band via `?base=host`.
+  describe("browseLocationSegment", () => {
+    it.each([
+      ["", "", "root is empty"],
+      ["/", "", "filesystem root is empty (base names it)"],
+      ["src/app.ts", "src/app.ts", "relative path is bare"],
+      ["/Users/me", "Users/me", "absolute path drops its leading slash"],
+      ["/a/b/c", "a/b/c", "deep absolute path drops only the leading slash"],
+      ["/my docs/f", "my%20docs/f", "segments are still percent-encoded"],
+    ])("%s -> %s (%s)", (location, expected) => {
+      const seg = browseLocationSegment(location);
+      expect(seg, expected).toBe(expected);
+      expect(seg.includes("%2F"), "no %2F leading marker").toBe(false);
+    });
+  });
+
+  describe("browseLocationBase", () => {
+    it.each([
+      ["", null],
+      ["src/app.ts", null],
+      ["/", "host"],
+      ["/Users/me", "host"],
+    ])("%s -> %s", (location, expected) => {
+      expect(browseLocationBase(location)).toBe(expected);
+    });
+  });
+
+  it("requests an absolute location with a bare path plus base=host", async () => {
+    onlineMock.mockReturnValue(true);
+    fetchMock
+      .mockResolvedValueOnce(environmentResponse())
+      .mockResolvedValueOnce(jsonResponse({ object: "list", data: [], has_more: false }));
+
+    render(
+      <Wrap>
+        <AllFilesProbeAt id="conv_abs_url" location="/Users/me/reports" />
+      </Wrap>,
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+    const url = String(fetchMock.mock.calls[1][0]);
+    expect(url).toContain("/filesystem/Users/me/reports?");
+    expect(url).toContain("base=host");
+    expect(url.includes("%2F"), "no %2F in the absolute request").toBe(false);
+  });
+
+  it("requests a workspace-relative location with no base param", async () => {
+    onlineMock.mockReturnValue(true);
+    fetchMock
+      .mockResolvedValueOnce(environmentResponse())
+      .mockResolvedValueOnce(jsonResponse({ object: "list", data: [], has_more: false }));
+
+    render(
+      <Wrap>
+        <AllFilesProbeAt id="conv_rel_url" location="src/inner" />
+      </Wrap>,
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+    const url = String(fetchMock.mock.calls[1][0]);
+    expect(url).toContain("/filesystem/src/inner?");
+    expect(url).not.toContain("base=");
   });
 });

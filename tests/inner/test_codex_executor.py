@@ -14,16 +14,19 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from omnigent import _native_forwarder_health as native_forwarder_health
 from omnigent.codex_model_vocabulary import codex_spawn_model
 from omnigent.inner.codex_executor import (
     _TURN_EVENT_WARN_SECONDS,
     CodexExecutor,
     _build_initial_prompt,
+    _codex_builtin_tool_completion,
     _codex_cli_version,
     _CodexAppServerSession,
     _databricks_codex_config_overrides,
     _dynamic_tool_result_payload,
     _goal_objective_from_content,
+    _parse_codex_gateway_error,
     _prompt_for_turn,
     _provider_codex_config_overrides,
     _to_codex_input_items,
@@ -1912,6 +1915,154 @@ async def test_run_turn_method_error_emits_retryable_executor_error() -> None:
     assert "shell command crashed" in error_events[0].message
 
 
+async def test_run_turn_emits_correlated_codex_builtin_tool_events() -> None:
+    """Expose built-in shell and file items without re-executing either tool."""
+
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo",
+        cwd="/tmp/workspace",
+        env={},
+        tool_executor=None,
+    )
+    session.start = AsyncMock()
+    session._proc = _FakeProcess()
+    session.thread_id = "thread-1"
+    turn_started = asyncio.Event()
+
+    async def _start_turn(*_args: object, **_kwargs: object) -> dict[str, object]:
+        """Return the turn id and release the live event producer."""
+
+        turn_started.set()
+        return {"result": {"turn": {"id": "turn-1"}}}
+
+    session._request = AsyncMock(side_effect=_start_turn)
+
+    command_item = {
+        "id": "command-1",
+        "type": "commandExecution",
+        "command": "pwd",
+        "cwd": "/tmp/workspace",
+    }
+
+    async def _produce_live_events() -> None:
+        """Publish lifecycle notifications after ``turn/start`` returns."""
+
+        await turn_started.wait()
+        events = [
+            {
+                "method": "item/started",
+                "params": {"turnId": "turn-1", "item": command_item},
+            },
+            {
+                "method": "item/completed",
+                "params": {
+                    "turnId": "turn-1",
+                    "item": {
+                        **command_item,
+                        "aggregatedOutput": "/tmp/workspace\n",
+                        "exitCode": 0,
+                        "durationMs": 12,
+                    },
+                },
+            },
+            {
+                "method": "item/completed",
+                "params": {
+                    "turnId": "turn-1",
+                    "item": {
+                        "id": "file-1",
+                        "type": "fileChange",
+                        "status": "completed",
+                        "changes": [
+                            {"path": "/tmp/workspace/result.txt", "kind": {"type": "add"}}
+                        ],
+                    },
+                },
+            },
+            {
+                "method": "item/completed",
+                "params": {
+                    "turnId": "turn-1",
+                    "item": {
+                        "id": "message-1",
+                        "type": "agentMessage",
+                        "phase": "final_answer",
+                        "text": "done",
+                    },
+                },
+            },
+        ]
+        for event in events:
+            await session._events.put(event)
+
+    producer = asyncio.create_task(_produce_live_events())
+
+    events = [
+        event
+        async for event in session.run_turn(
+            messages=[{"role": "user", "content": "inspect and edit"}],
+            tools=[],
+            system_prompt="",
+            model="gpt-5.4-mini",
+            cwd=".",
+            sandbox="workspace-write",
+        )
+    ]
+    await producer
+
+    tool_events = [
+        event for event in events if isinstance(event, (ToolCallRequest, ToolCallComplete))
+    ]
+    assert [event.name for event in tool_events] == [
+        "shell",
+        "shell",
+        "shell",
+        "apply_patch",
+        "apply_patch",
+    ]
+    assert [event.metadata["call_id"] for event in tool_events] == [
+        "command-1",
+        "command-1",
+        "command-1",
+        "file-1",
+        "file-1",
+    ]
+    assert isinstance(tool_events[0], ToolCallRequest)
+    assert tool_events[0].args == {"command": "pwd", "cwd": "/tmp/workspace"}
+    assert tool_events[0].metadata["observed_call_completed"] is False
+    assert isinstance(tool_events[1], ToolCallRequest)
+    assert tool_events[1].metadata["observed_call_completed"] is True
+    assert isinstance(tool_events[2], ToolCallComplete)
+    assert tool_events[2].result == "/tmp/workspace\n"
+    assert tool_events[2].status is ToolCallStatus.SUCCESS
+    assert isinstance(tool_events[3], ToolCallRequest)
+    assert tool_events[3].args == {
+        "changes": [{"path": "/tmp/workspace/result.txt", "kind": {"type": "add"}}]
+    }
+    assert tool_events[3].metadata["observed_call_completed"] is True
+    assert isinstance(events[-1], TurnComplete)
+    assert events[-1].response == "done"
+
+
+def test_codex_builtin_command_completion_surfaces_nonzero_exit() -> None:
+    """Keep failed command output visibly distinguishable from success."""
+
+    completion = _codex_builtin_tool_completion(
+        {
+            "id": "command-failed",
+            "type": "commandExecution",
+            "command": "false",
+            "aggregatedOutput": "boom",
+            "exitCode": 3,
+        }
+    )
+
+    assert completion is not None
+    assert completion.status is ToolCallStatus.ERROR
+    assert completion.result == "boom\n[exit code: 3]"
+    assert completion.error == "Command exited with status 3."
+
+
 async def test_run_turn_refuses_to_adopt_stale_final_answer_event() -> None:
     """Adopt fallback must drop a stale final-answer item rather
     than adopt it as the new turn's response.
@@ -2471,6 +2622,34 @@ def test_populate_codex_home_config_symlinks_auth_and_config(tmp_path: Path) -> 
     assert not (target / "config.toml").is_symlink()
     assert (target / "config.toml").is_file()
     assert (target / "config.toml").read_text() == '[default]\nmodel = "gpt-5.4"'
+
+
+def test_populate_codex_home_config_symlinks_remote_mcp_oauth(tmp_path: Path) -> None:
+    """``.credentials.json`` and its lock dir are symlinked, not left behind.
+
+    Codex keeps OAuth tokens for remote (``url =``) MCP servers in
+    ``.credentials.json``, guarded across processes by
+    ``mcp-oauth-locks/``. A private home missing them starts those servers
+    unauthenticated while ``command =`` (stdio) servers still work.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "config.toml").write_text('[mcp_servers.linear]\nurl = "https://x/mcp"')
+    (source / ".credentials.json").write_text('{"linear|abc": {"access_token": "t"}}')
+    (source / "mcp-oauth-locks").mkdir()
+    (source / "mcp-oauth-locks" / "file-store.lock").write_text("")
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    # Symlinked (not copied) so a refresh in either direction is shared.
+    assert (target / ".credentials.json").is_symlink()
+    assert (target / ".credentials.json").read_text() == '{"linear|abc": {"access_token": "t"}}'
+    assert (target / "mcp-oauth-locks").is_symlink()
+    assert (target / "mcp-oauth-locks" / "file-store.lock").is_file()
 
 
 def test_populate_codex_home_config_symlinks_plugins_cache(tmp_path: Path) -> None:
@@ -3475,5 +3654,190 @@ def test_run_turn_defaults_to_a_codex_model_on_codexs_own_login():
         model = fake_session.calls[0]["model"]
         assert model == CODEX_DEFAULT_MODEL
         assert codex_spawn_model(model) == model, "not codex's own spelling"
+
+    _run(_t())
+
+
+# ── Gateway-auth error surfacing (issue: codex SDK head swallows 401s) ──────
+
+
+def test_parse_codex_gateway_error_extracts_status_and_url():
+    """The real ``unexpected status 401 … url: …`` stderr line is classified."""
+    line = (
+        'ERROR: unexpected status 401 Unauthorized: {"error_code":401,"message":'
+        '"Credential was not sent or was of an unsupported type for this API."}, '
+        "url: https://host/ai-gateway/codex/v1/responses"
+    )
+    error = _parse_codex_gateway_error(line)
+    assert error is not None
+    assert error.code == 401
+    assert error.reason == "Unauthorized"
+    assert error.url == "https://host/ai-gateway/codex/v1/responses"
+    assert error.fatal is True
+    detail = error.detail(model="databricks-gpt-5")
+    assert "401" in detail
+    assert "databricks-gpt-5" in detail
+    assert "ai-gateway/codex/v1/responses" in detail
+
+
+def test_parse_codex_gateway_error_ignores_ordinary_stderr():
+    """Ordinary stderr (including the retry lines) is not misclassified."""
+    assert _parse_codex_gateway_error("Reconnecting... 3/5") is None
+    assert _parse_codex_gateway_error("some unrelated log line") is None
+    assert _parse_codex_gateway_error("") is None
+
+
+def test_parse_codex_gateway_error_5xx_not_fatal():
+    """A 5xx is attributed but not treated as fast-fail (a retry might fix it)."""
+    error = _parse_codex_gateway_error(
+        "unexpected status 503 Service Unavailable: {}, url: https://h/x"
+    )
+    assert error is not None
+    assert error.code == 503
+    assert error.fatal is False
+    assert "auth likely" not in error.detail()
+
+
+def test_note_stderr_gateway_error_records_into_health_slot():
+    """A parsed gateway rejection is recorded where the idle watchdog reads it."""
+    native_forwarder_health.clear()
+    try:
+        session = _CodexAppServerSession(
+            codex_path="/bin/echo", cwd="/tmp/w", env={}, tool_executor=None
+        )
+        session._note_stderr_gateway_error(
+            "unexpected status 401 Unauthorized: {}, url: https://h/ai-gateway/codex/v1/responses"
+        )
+        detail = native_forwarder_health.recent_post_failure(60.0)
+        assert detail is not None
+        assert "gateway returned 401" in detail
+        assert "ai-gateway/codex/v1/responses" in detail
+    finally:
+        native_forwarder_health.clear()
+
+
+def test_fatal_gateway_arms_only_after_retries_exhausted():
+    """Fast-fail arms only when BOTH a 401 and a final ``Reconnecting N/N`` are seen."""
+    native_forwarder_health.clear()
+    try:
+        session = _CodexAppServerSession(
+            codex_path="/bin/echo", cwd="/tmp/w", env={}, tool_executor=None
+        )
+        # A 401 alone (retries not yet exhausted) must not arm fast-fail.
+        session._note_stderr_gateway_error("Reconnecting... 3/5")
+        session._note_stderr_gateway_error(
+            "unexpected status 401 Unauthorized: {}, url: https://h/x"
+        )
+        assert session._fatal_gateway_error is None
+        # The final retry line arms it.
+        session._note_stderr_gateway_error("Reconnecting... 5/5")
+        assert session._fatal_gateway_error is not None
+        assert session._fatal_gateway_error.code == 401
+    finally:
+        native_forwarder_health.clear()
+
+
+def test_app_server_run_turn_fails_fast_on_gateway_auth_error():
+    """An auth-class gateway rejection surfaces the real cause promptly as an
+    ExecutorError, instead of stalling to the generic idle-watchdog message."""
+
+    async def _t():
+        native_forwarder_health.clear()
+        session = _CodexAppServerSession(
+            codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
+        )
+        session.start = AsyncMock()
+        session._proc = _FakeProcess()
+        session._request = AsyncMock(
+            side_effect=[
+                {"result": {"thread": {"id": "thread-1"}}},
+                {"result": {"turn": {"id": "turn-1"}}},
+                {"result": {}},
+            ]
+        )
+
+        # The stderr loop would set this once the CLI exhausts its retries on a
+        # 401; simulate that arriving mid-wait (no turn events ever emitted).
+        async def _inject_gateway_error() -> None:
+            await asyncio.sleep(0.01)
+            session._note_stderr_gateway_error("Reconnecting... 5/5")
+            session._note_stderr_gateway_error(
+                "unexpected status 401 Unauthorized: {}, "
+                "url: https://h/ai-gateway/codex/v1/responses"
+            )
+
+        inject_task = asyncio.create_task(_inject_gateway_error())
+        events = [
+            event
+            async for event in session.run_turn(
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[],
+                system_prompt="Be helpful.",
+                model="databricks-gpt-5",
+                cwd=".",
+                sandbox="workspace-write",
+            )
+        ]
+        await inject_task
+
+        errors = [e for e in events if isinstance(e, ExecutorError)]
+        assert errors, f"expected an ExecutorError, got {events}"
+        message = errors[-1].message
+        assert "401" in message
+        assert "databricks-gpt-5" in message
+        assert "wedged LLM" not in message
+        assert errors[-1].retryable is False
+        session._request.assert_any_await(
+            "turn/interrupt",
+            {"threadId": "thread-1", "turnId": "turn-1"},
+        )
+        native_forwarder_health.clear()
+
+    _run(_t())
+
+
+def test_run_turn_clears_stale_gateway_error_at_turn_start():
+    """A new turn forgets a prior turn's fatal signal so it can't misfire."""
+
+    async def _t():
+        session = _CodexAppServerSession(
+            codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
+        )
+        session.start = AsyncMock()
+        session._proc = _FakeProcess()
+        session._request = AsyncMock(
+            side_effect=[
+                {"result": {"thread": {"id": "thread-1"}}},
+                {"result": {"turn": {"id": "turn-1"}}},
+            ]
+        )
+        # Pretend a prior turn left a fatal signal set.
+        session._fatal_gateway_error = _parse_codex_gateway_error(
+            "unexpected status 401 Unauthorized: {}, url: https://h/x"
+        )
+
+        async def _inject_turn_completed() -> None:
+            await asyncio.sleep(0.01)
+            session._events.put_nowait(
+                {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}}
+            )
+
+        inject_task = asyncio.create_task(_inject_turn_completed())
+        events = [
+            event
+            async for event in session.run_turn(
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[],
+                system_prompt="Be helpful.",
+                model="databricks-gpt-5",
+                cwd=".",
+                sandbox="workspace-write",
+            )
+        ]
+        await inject_task
+        # The stale signal was cleared at turn start, so the turn completes
+        # normally rather than fast-failing on it.
+        assert any(isinstance(e, TurnComplete) for e in events), events
+        assert not any(isinstance(e, ExecutorError) for e in events), events
 
     _run(_t())

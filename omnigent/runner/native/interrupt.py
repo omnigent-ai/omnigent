@@ -436,7 +436,11 @@ class NativeInterruptRunner:
         return Response(status_code=204)
 
     async def _claude_stop(self, conv_id: str) -> Response:
-        from omnigent.claude_native_bridge import bridge_dir_for_bridge_id, kill_session
+        from omnigent.claude_native_bridge import (
+            TmuxSessionNotAdvertised,
+            bridge_dir_for_bridge_id,
+            kill_session,
+        )
 
         bridge_id = await _claude_native_bridge_id_for_session(
             server_client=self._server_client,
@@ -445,6 +449,8 @@ class NativeInterruptRunner:
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
         try:
             await asyncio.to_thread(kill_session, bridge_dir, timeout_s=1.0)
+        except TmuxSessionNotAdvertised:
+            self._logger.debug("claude-native stop: no live tmux for %s", conv_id)
         except RuntimeError as exc:
             return JSONResponse(
                 status_code=503,

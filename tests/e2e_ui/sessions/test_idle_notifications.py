@@ -33,6 +33,7 @@ groups.
 
 from __future__ import annotations
 
+import pytest
 from playwright.sync_api import Page, expect
 
 # Records constructed notifications and makes visibility/focus controllable
@@ -284,6 +285,7 @@ def test_idle_notification_fires_when_backgrounded(
     assert first["options"]["tag"] == f"omnigent:session:{session_id}", notifs
 
 
+@pytest.mark.nightly
 def test_idle_notification_suppressed_when_foreground(
     page: Page,
     seeded_session: tuple[str, str],
@@ -319,6 +321,7 @@ def test_idle_notification_suppressed_when_foreground(
     assert page.evaluate("window.__notifs.length") == 0, "foreground transition must not notify"
 
 
+@pytest.mark.nightly
 def test_idle_notification_click_navigates_to_chat(
     page: Page,
     seeded_session: tuple[str, str],
@@ -374,6 +377,7 @@ def test_idle_notification_click_navigates_to_chat(
     page.wait_for_url(f"**/c/{session_id}", timeout=10_000)
 
 
+@pytest.mark.nightly
 def test_idle_notification_deferred_until_settle(
     page: Page,
     seeded_session: tuple[str, str],

@@ -14,14 +14,46 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from omnigent import claude_native, codex_native_app_server
 from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from omnigent.runner import create_runner_app
 from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.spec.types import AgentSpec, ExecutorSpec, MCPServerConfig
 from tests.runner.helpers import NullServerClient
 
+# The real store-backed catalog resolver, captured before the autouse fixture
+# below stubs it: a test that exercises the catalog path re-patches the module
+# attribute back to this. (An assignment, not an alias import, so lint
+# autofixes can't strip it as unused.)
+REAL_CLAUDE_LAUNCH_CATALOG = claude_native.claude_launch_catalog
+REAL_CODEX_LAUNCH_CATALOG = codex_native_app_server.codex_launch_catalog
+
 # Project root: two parents up from this conftest (tests/runner/ → repo root).
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.fixture(autouse=True)
+def _isolated_model_catalog_store(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """Keep launch-path catalog consults off the developer's machine.
+
+    The native launch paths consult the shared model-catalog store and, on
+    a miss, probe the REAL harness CLIs — which a unit test must never do
+    (a real ``claude`` boot takes ~6 s and writes the developer's real
+    ``~/.omnigent`` store). Redirect the store's directory seam per test
+    and stub both launch-catalog resolvers to "no catalog" (the
+    pre-catalog behavior); a test exercising catalogs re-patches them
+    explicitly.
+    """
+    store_dir = tmp_path_factory.mktemp("model_catalog_store")
+    monkeypatch.setattr("omnigent.model_catalog_store._data_dir", lambda: store_dir)
+
+    async def _no_catalog(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", _no_catalog)
+    monkeypatch.setattr("omnigent.codex_native_app_server.codex_launch_catalog", _no_catalog)
 
 
 @pytest.fixture(autouse=True)
@@ -218,6 +250,7 @@ class _FakeProcessManager:
         # idle reaper's guard is actually populated for a live turn.
         self.marked_in_flight: list[tuple[str, str]] = []
         self.cleared_in_flight: list[str] = []
+        self.activity_noted: list[str] = []
 
     async def get_client(
         self, conversation_id: str, harness: str, env: Any = None
@@ -234,6 +267,10 @@ class _FakeProcessManager:
     def has_active_turn(self, conversation_id: str) -> bool:
         """Check if a turn is marked active for this conversation."""
         return conversation_id in self._active_turns
+
+    def note_activity(self, conversation_id: str) -> None:
+        """Record an activity lease refresh for a conversation."""
+        self.activity_noted.append(conversation_id)
 
     def mark_turn_active(self, conversation_id: str) -> None:
         """Mark a conversation as having an active turn (test helper)."""
@@ -678,7 +715,14 @@ def _build_interrupt_app(
         function_call frames.
     :returns: ``(app, process_manager, harness_client)`` tuple.
     """
-    spec = AgentSpec(spec_version=1, name="t")
+    # Use the test-only harness so _build_spawn_env_from_spec returns None
+    # without reading provider config. Each test seeds _session_spec_cache via
+    # POST /v1/sessions before sending the turn.
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "runner-test-default"}),
+    )
     sse_frames = [
         _sse({"type": "response.created", "response": {"id": "resp_int"}}),
         _sse(

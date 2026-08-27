@@ -79,19 +79,82 @@ describe("useCommandPaletteHotkey", () => {
     expect(e.defaultPrevented).toBe(false);
   });
 
-  it("bails when focus sits inside a terminal or code editor", () => {
-    const onToggle = vi.fn();
-    renderHook(() => useCommandPaletteHotkey(onToggle));
-
-    const term = document.createElement("div");
-    term.className = "xterm";
+  /** Focus an input inside a container with `className`, e.g. "xterm". */
+  function focusInside(className: string): void {
+    const surface = document.createElement("div");
+    surface.className = className;
     const input = document.createElement("input");
-    term.appendChild(input);
-    document.body.appendChild(term);
+    surface.appendChild(input);
+    document.body.appendChild(surface);
     input.focus();
     expect(document.activeElement).toBe(input);
+  }
+
+  it("claims the chord in the capture phase, ahead of host-page listeners", () => {
+    // The desktop shell renders the embed build over a CSS-hidden host page
+    // with its own ⌘K listener; the chord must reach us, not them. Dispatch
+    // from a deep node so the event actually propagates (dispatching on
+    // window would never reach document listeners regardless).
+    const onToggle = vi.fn();
+    const hostListener = vi.fn();
+    renderHook(() => useCommandPaletteHotkey(onToggle));
+    document.addEventListener("keydown", hostListener);
+    const deep = document.createElement("div");
+    document.body.appendChild(deep);
+
+    deep.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "k", metaKey: true, bubbles: true, cancelable: true }),
+    );
+
+    expect(onToggle).toHaveBeenCalledTimes(1);
+    expect(hostListener).not.toHaveBeenCalled();
+    document.removeEventListener("keydown", hostListener);
+  });
+
+  it("lets the chord through to host-page listeners when a focused surface owns it", () => {
+    const onToggle = vi.fn();
+    const hostListener = vi.fn();
+    renderHook(() => useCommandPaletteHotkey(onToggle));
+    document.addEventListener("keydown", hostListener);
+    focusInside("monaco-editor");
+
+    // Dispatch from the focused input so the event propagates up to document.
+    document.activeElement?.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "k", metaKey: true, bubbles: true, cancelable: true }),
+    );
+
+    expect(onToggle).not.toHaveBeenCalled();
+    expect(hostListener).toHaveBeenCalledTimes(1);
+    document.removeEventListener("keydown", hostListener);
+  });
+
+  it("bails on Ctrl+K in a terminal — xterm sends it to the PTY as ^K", () => {
+    const onToggle = vi.fn();
+    renderHook(() => useCommandPaletteHotkey(onToggle));
+    focusInside("xterm");
+
+    press({ key: "k", ctrlKey: true });
+
+    expect(onToggle).not.toHaveBeenCalled();
+  });
+
+  it("claims Cmd+K in a terminal — xterm drops Cmd chords, so nothing owns it", () => {
+    const onToggle = vi.fn();
+    renderHook(() => useCommandPaletteHotkey(onToggle));
+    focusInside("xterm");
 
     press({ key: "k", metaKey: true });
+
+    expect(onToggle).toHaveBeenCalledTimes(1);
+  });
+
+  it("bails on both variants inside the code editor (⌘K is a chord prefix)", () => {
+    const onToggle = vi.fn();
+    renderHook(() => useCommandPaletteHotkey(onToggle));
+    focusInside("monaco-editor");
+
+    press({ key: "k", metaKey: true });
+    press({ key: "k", ctrlKey: true });
 
     expect(onToggle).not.toHaveBeenCalled();
   });

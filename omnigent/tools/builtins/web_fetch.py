@@ -248,6 +248,65 @@ def build_researcher_spec(parent_spec: AgentSpec) -> AgentSpec:
     )
 
 
+def find_web_fetch_owner(spec: AgentSpec) -> AgentSpec | None:
+    """
+    Find the first node owning the ``web_fetch`` builtin, root-first.
+
+    Pre-order DFS (root, then children left-to-right). The ``web_fetch``
+    owner is the node whose ``tools.builtins`` carries an entry named
+    ``web_fetch``; that node's spec is the correct parent for
+    :func:`build_researcher_spec` (its LLM + sandbox/egress boundary).
+
+    Attribute access is defensive (``getattr``) so the same walk is safe
+    over the runner's structural spec stubs, not only a typed
+    :class:`AgentSpec`.
+
+    :param spec: The agent spec whose sub-tree to search.
+    :returns: The first node (root-first) owning ``web_fetch``, or ``None``.
+    """
+    tools = getattr(spec, "tools", None)
+    builtins = getattr(tools, "builtins", None) or []
+    if any(getattr(entry, "name", None) == "web_fetch" for entry in builtins):
+        return spec
+    for sa in getattr(spec, "sub_agents", None) or []:
+        owner = find_web_fetch_owner(sa)
+        if owner is not None:
+            return owner
+    return None
+
+
+def reconstruct_researcher_spec(spec: AgentSpec) -> AgentSpec | None:
+    """
+    Rebuild the synthesized ``__web_researcher`` spec from ``spec``'s tree.
+
+    ``WebFetchTool.__init__`` appends the researcher to the owner's live
+    ``sub_agents`` list in memory but never serializes it, so every layer
+    that resolves sub-agent names from the persisted / re-parsed bundle
+    finds it missing. This is the single deterministic reconstruction those
+    layers share (the runner dispatch gate in
+    ``runner/tool_dispatch.py`` and the child-boot resolver
+    ``runtime/workflow.py::_find_spec_by_name``): it locates the
+    ``web_fetch`` owner (root-first, possibly nested) and rebuilds the
+    researcher from THAT owner via the same pure builder
+    :func:`build_researcher_spec`, so the child inherits the owner's LLM and
+    sandbox/egress boundary.
+
+    Gated on some node in the tree actually declaring the ``web_fetch``
+    builtin -- the sole reason the researcher exists. A tree without it has
+    no such child, so the name falls through to ``None`` rather than let a
+    caller-supplied name coerce an arbitrary parent into a shell-capable
+    researcher (:func:`build_researcher_spec` synthesizes an ``OSEnvSpec``).
+
+    :param spec: The root agent spec to reconstruct against.
+    :returns: The rebuilt ``__web_researcher`` spec, or ``None`` when no
+        node in the tree declares ``web_fetch``.
+    """
+    owner = find_web_fetch_owner(spec)
+    if owner is None:
+        return None
+    return build_researcher_spec(owner)
+
+
 class WebFetchTool(Tool):
     """
     Web research tool that spawns a sub-agent with a persistent shell.

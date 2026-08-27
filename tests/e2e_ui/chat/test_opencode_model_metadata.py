@@ -13,6 +13,8 @@ from urllib.parse import urlparse
 
 from playwright.sync_api import Page, Route, expect
 
+from tests.e2e_ui.conftest import fetch_with_retry
+
 # Launch-resolved default the runner booted opencode with.
 LAUNCH_MODEL = "openrouter/nemotron"
 # The model the user switched to inside the opencode TUI; the forwarder mirrored
@@ -48,7 +50,7 @@ def _patch_session_as_opencode_native(page: Page, session_id: str) -> list[dict]
 
         headers = {"content-type": "application/json"}
         if request.method == "GET":
-            response = route.fetch()
+            response = fetch_with_retry(route)
             payload = response.json()
             headers = {**response.headers, **headers}
         elif request.method == "PATCH":

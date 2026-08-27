@@ -514,9 +514,9 @@ function isProvisionalTrace(items: RenderItem[]): boolean {
 /**
  * Codex-style demarcation for a completed turn: the whole process
  * trace (narration, tool folds, reasoning) collapses behind one muted
- * "Worked for Xs" row with a hairline rule, so the final answer below
- * is unambiguously where reading starts. Expanding replays the trace
- * inline.
+ * "Worked for Xs" disclosure, so the final answer below is
+ * unambiguously where reading starts. Expanding replays the trace
+ * beside a compact vertical guide.
  *
  * `animateCollapse` marks the render where the fold appeared while the
  * user was watching. The fold then MOUNTS OPEN — showing exactly the
@@ -608,23 +608,28 @@ function TurnWorkedFold({
       data-testid="turn-worked-fold"
     >
       <div ref={rowRef} className={cn("turn-fold-row", animateCollapse && "turn-fold-row-enter")}>
-        <CollapsibleTrigger className="flex w-full cursor-pointer items-center gap-1 py-0.5 text-left text-muted-foreground text-sm transition-colors hover:text-foreground">
+        <CollapsibleTrigger className="flex cursor-pointer items-center gap-2 rounded-sm py-1 text-left text-muted-foreground text-chat outline-none transition-colors hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50">
           <span className="shrink-0">{label}</span>
-          <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-data-[state=open]/turn-fold:rotate-90" />
-          <span aria-hidden className="ml-1 flex-1 border-border border-t" />
+          <ChevronRightIcon className="size-2.5 shrink-0 transition-transform group-data-[state=open]/turn-fold:rotate-90" />
         </CollapsibleTrigger>
       </div>
       {/* Height animation lives in index.css (it needs Radix's measured
           --radix-collapsible-content-height) and is disabled under
           prefers-reduced-motion. */}
-      {/* No padding/border on the animated element: any chrome here is
-          height that appears before the collapse starts, i.e. the jolt
-          this animation exists to remove. Expanded spacing comes from
-          the row's hairline above and the message column's gap below. */}
+      {/* Keep pt-2/pl-4 and the vertical pin inside the collapsible
+          content so the spacing and guide shrink with its existing
+          height animation. */}
       <CollapsibleContent
         className={cn("turn-fold-content", userOpened && "turn-fold-content-instant")}
       >
-        <div className="flex flex-col gap-2">{children}</div>
+        <div className="relative flex flex-col gap-1 pt-2 pl-4">
+          <span
+            aria-hidden
+            className="absolute top-2 bottom-0 left-1 w-px bg-border"
+            data-testid="turn-worked-fold-pin-line"
+          />
+          {children}
+        </div>
       </CollapsibleContent>
     </Collapsible>
   );

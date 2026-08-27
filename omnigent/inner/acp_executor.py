@@ -60,6 +60,8 @@ from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
+from omnigent.inner.acp_extension import NO_ACP_EXTENSION, AcpExtension
+from omnigent.inner.acp_subagents import SubAgentActivity, SubAgentStart, read_subagent_events
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
@@ -69,6 +71,9 @@ from omnigent.inner.executor import (
     ExecutorEvent,
     Message,
     ReasoningChunk,
+    SubAgentCompleted,
+    SubAgentStarted,
+    SubAgentToolCall,
     TextChunk,
     ToolCallComplete,
     ToolCallRequest,
@@ -93,6 +98,11 @@ class _PolicyVerdict(Protocol):
 
 _PolicyEvaluator: TypeAlias = Callable[[str, _AcpJsonObject], Awaitable[_PolicyVerdict]]
 _ElicitationHandler: TypeAlias = Callable[[str, _AcpJsonObject], Awaitable[bool]]
+# Choice-aware elicitation: offers the agent's own permission options and returns
+# the chosen label (``None`` = declined). Optional; falls back to the yes/no form.
+_ElicitationChoiceHandler: TypeAlias = Callable[
+    [str, _AcpJsonObject, Sequence[str]], Awaitable[str | None]
+]
 _ToolExecutor: TypeAlias = Callable[[str, _AcpJsonObject], Awaitable[_AcpJsonObject]]
 
 # ACP error code an agent maps to a filesystem "not found" (ENOENT) when a
@@ -185,6 +195,21 @@ class AcpAgentConfig:
         the agent authenticates with — an agent that reads a variable must name
         it here (or in ``os_env.sandbox.env_passthrough``) or it starts
         unauthenticated. Names only; values come from the host environment.
+    :param permission_mode: Omnigent permission stance, e.g. ``"auto"``
+        (default) or ``"bypassPermissions"``. Only the latter changes anything:
+        it skips the human approval card for a request no policy had an opinion
+        on, matching claude-sdk's ``can_use_tool`` gate. Policy still runs in
+        every mode, so a DENY still blocks and an explicit ASK still prompts.
+    :param inject_system_prompt: Fold the Omnigent system prompt into the first
+        ACP turn (ACP has no dedicated system-prompt field). On by default. Set
+        to ``False`` for agents like Pi forks (``omp``) that fully own their own
+        system prompt: those agents prepend Omnigent's text to the user message,
+        which can confuse their internal Claude model into emitting XML tool-call
+        fragments (``</function></tool_call>``) when there is no MCP relay
+        backing the described tools. Disabling injection leaves the first turn as
+        plain user content and lets the agent's own system prompt take effect
+        unmodified. When ``omnigent_mcp`` is ``False`` and the agent manages its
+        own context, setting this to ``False`` is strongly recommended.
     """
 
     command: str
@@ -194,6 +219,8 @@ class AcpAgentConfig:
     send_model_in_session_new: bool = False
     omnigent_mcp: bool = True
     env_passthrough: tuple[str, ...] = ()
+    permission_mode: str = "auto"
+    inject_system_prompt: bool = True
 
 
 class _AcpRequestError(Exception):
@@ -277,6 +304,8 @@ class AcpExecutor(Executor):
         config: AcpAgentConfig,
         cwd: str | None = None,
         os_env: OSEnvSpec | None = None,
+        *,
+        extension: AcpExtension = NO_ACP_EXTENSION,
     ) -> None:
         """Initialize the generic ACP executor.
 
@@ -286,8 +315,13 @@ class AcpExecutor(Executor):
         :param os_env: Environment / sandbox spec. When its ``sandbox`` is not
             ``"none"``, the whole agent process tree is wrapped in the platform
             sandbox (bwrap/seatbelt) at spawn — see :meth:`_sandbox_launch_path`.
+        :param extension: Vendor behavior for the agent being driven, injected by
+            that vendor's harness wrap (e.g.
+            :mod:`omnigent.inner.devin.harness`). The default is protocol-only,
+            so the generic ``acp`` harness reads no vendor field.
         """
         self._config = config
+        self._extension = extension
         self._cwd = cwd or os.getcwd()
         self._os_env = os_env
         # Advertise ``clientCapabilities.fs`` so the agent delegates file
@@ -332,9 +366,11 @@ class AcpExecutor(Executor):
         self._image_supported: bool = False
         self._system_prompt_sent: bool = False
 
-        # ACP toolCallId → tool name, so a later tool_call_update can close the
-        # right tool card with the name from the originating tool_call.
+        # ACP toolCallId → tool name / rawInput from the originating tool_call, so
+        # a later tool_call_update can close the right tool card, and a permission
+        # request that names only the id can still say what is about to run.
         self._tool_names: dict[str, str] = {}
+        self._tool_inputs: dict[str, _AcpJsonObject] = {}
 
         # Context-window size (tokens) reported via ``usage_update``; surfaced by
         # :meth:`max_context_tokens` so the UI context meter fills.
@@ -346,6 +382,7 @@ class AcpExecutor(Executor):
         # wired (standalone / unit tests) → permission falls back to allow.
         self._policy_evaluator: _PolicyEvaluator | None = None
         self._elicitation_handler: _ElicitationHandler | None = None
+        self._elicitation_choice_handler: _ElicitationChoiceHandler | None = None
         # Adapter-injected tool-execution bridge (the same ``_tool_executor``
         # attribute the SDK harnesses use); backs the Omnigent MCP relay.
         self._tool_executor: _ToolExecutor | None = None
@@ -355,6 +392,9 @@ class AcpExecutor(Executor):
         # :meth:`close`). ``_omnigent_tools`` is captured each turn for the relay.
         self._mcp = OmnigentAcpMcp(label=config.name)
         self._omnigent_tools: list[ToolSpec] = []
+        # Tool names the agent can use to reach the Omnigent MCP bridge, snapshotted
+        # from what session/new advertised. Empty means nothing is a bridge call.
+        self._bridge_tool_aliases: frozenset[str] = frozenset()
 
     # ------------------------------------------------------------------
     # Low-level ACP transport
@@ -656,17 +696,10 @@ class AcpExecutor(Executor):
 
         params: _AcpJsonObject = {
             "cwd": self._cwd,
-            # ACP requires this field even when no per-session MCP servers are
-            # configured. Keep it empty when Omnigent MCP is disabled.
-            "mcpServers": [],
+            # ACP requires this field even with no per-session MCP servers; the
+            # helper returns [] when Omnigent MCP is disabled.
+            "mcpServers": self._session_mcp_servers(),
         }
-        if self._config.omnigent_mcp:
-            params["mcpServers"] = self._mcp.session_new_servers(
-                tools=self._omnigent_tools,
-                tool_executor=getattr(self, "_tool_executor", None),
-                loop=asyncio.get_event_loop(),
-                enabled=True,
-            )
         client_id: str | None = None
         if self._config.session_id_mode == "client":
             client_id = secrets.token_urlsafe(16)
@@ -688,6 +721,39 @@ class AcpExecutor(Executor):
             )
         self._session_id = session_id
         return self._session_id
+
+    def _session_mcp_servers(self) -> list[_AcpJsonObject]:
+        """Build ``session/new.mcpServers`` and snapshot the bridge aliases.
+
+        Relay creation and tool-call classification happen here together so they
+        cannot drift apart. No entries means no aliases, so with Omnigent MCP
+        disabled every call classifies as agent-native.
+        """
+        mcp_servers: list[_AcpJsonObject] = []
+        if self._config.omnigent_mcp:
+            mcp_servers = self._mcp.session_new_servers(
+                tools=self._omnigent_tools,
+                tool_executor=getattr(self, "_tool_executor", None),
+                loop=asyncio.get_event_loop(),
+                enabled=True,
+            )
+        servers = {str(s.get("name", "")) for s in mcp_servers if isinstance(s, dict)}
+        servers.discard("")
+        tools = {
+            name
+            for name in (spec.get("name") for spec in (self._omnigent_tools or []))
+            if isinstance(name, str) and name
+        }
+        # Agents name a bridged tool one of several ways; accept every shape we have
+        # seen, plus the bare name for agents that report it unprefixed.
+        aliases = set(tools) if servers else set()
+        for server in servers:
+            for tool in tools:
+                aliases.update(
+                    (f"mcp_{server}_{tool}", f"mcp__{server}__{tool}", f"{server}__{tool}")
+                )
+        self._bridge_tool_aliases = frozenset(aliases)
+        return mcp_servers
 
     # ------------------------------------------------------------------
     # Server-initiated requests (agent → client)
@@ -714,8 +780,8 @@ class AcpExecutor(Executor):
         error: _AcpJsonObject | None = None
         try:
             if method == _AGENT_REQUEST_REQUEST_PERMISSION:
-                allow = await self._decide_permission(params)
-                result = self._permission_outcome(params, allow=allow)
+                allow, option_id = await self._decide_permission(params)
+                result = self._permission_outcome(params, allow=allow, option_id=option_id)
             elif method == "fs/read_text_file" and self._fs_delegation:
                 result = await self._handle_fs_read(params)
             elif method == "fs/write_text_file" and self._fs_delegation:
@@ -798,40 +864,137 @@ class AcpExecutor(Executor):
     # Permission (session/request_permission) → policy + elicitation
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _extract_tool_call(params: _AcpJsonObject) -> tuple[str, _AcpJsonObject]:
+    def _extract_tool_call(self, params: _AcpJsonObject) -> tuple[str, _AcpJsonObject]:
         """Pull ``(tool_name, tool_input)`` from a ``session/request_permission``.
 
         ACP's ``toolCall`` carries a human ``title`` (e.g. ``"shell"``), a
-        ``kind`` (e.g. ``"execute"``), and a ``rawInput`` dict. We prefer the
-        title, else the kind. (Vendor-specific ``_meta`` tool names — e.g.
-        Goose's ``_meta.goose.toolCall.toolName`` — are not read here; ``title``
-        is the portable name every ACP agent supplies.)
+        ``kind`` (e.g. ``"execute"``), and a ``rawInput`` dict; prefer the title,
+        else the kind. An agent may instead send the request bare, carrying only
+        ``toolCallId``, so fall back to what the originating ``tool_call`` update
+        reported for that id — it always arrives first. Without that fallback a
+        bare request degrades to ``"tool"`` with no arguments, so the approval
+        card cannot say what is about to run and no TOOL_CALL policy rule can
+        match it (rules gate on the tool name, then read its arguments).
+
+        (Vendor-specific ``_meta`` tool names — e.g. Goose's
+        ``_meta.goose.toolCall.toolName`` — are not read here; ``title`` is the
+        portable name and ``toolCallId`` the portable correlation.)
         """
         tool_call = params.get("toolCall") or {}
-        name = tool_call.get("title") or tool_call.get("kind") or "tool"
+        call_id = tool_call.get("toolCallId")
+        call_id = call_id if isinstance(call_id, str) else None
+        name = (
+            tool_call.get("title")
+            or tool_call.get("kind")
+            or (self._tool_names.get(call_id) if call_id else None)
+            or "tool"
+        )
         args = tool_call.get("rawInput")
         if not isinstance(args, dict):
-            args = {}
+            cached = self._tool_inputs.get(call_id) if call_id else None
+            args = cached if isinstance(cached, dict) else {}
         return str(name), args
 
-    async def _decide_permission(self, params: _AcpJsonObject) -> bool:
-        """Decide allow/deny for a permission request — policy then elicitation.
+    @property
+    def _bypass_permissions(self) -> bool:
+        """Whether the user opted out of approval cards for this agent.
+
+        Mirrors :class:`~omnigent.inner.claude_sdk_executor.ClaudeSDKExecutor`'s
+        ``can_use_tool`` stance: ``"bypassPermissions"`` and nothing else, so the ``"auto"``
+        default keeps prompting. (Cursor also treats ``"auto"`` as no-prompt;
+        ACP agents ask only about actions they consider permission-worthy, so
+        silencing the default would drop meaningful prompts.)
+        """
+        return self._config.permission_mode == "bypassPermissions"
+
+    @staticmethod
+    def _permission_options(params: _AcpJsonObject) -> list[_AcpJsonObject]:
+        """The agent's offered options, each an ``{optionId, name, kind}`` dict."""
+        return [o for o in (params.get("options") or []) if isinstance(o, dict)]
+
+    def _scoped_options(self, params: _AcpJsonObject) -> list[tuple[str, _AcpJsonObject]] | None:
+        """Label the agent's options for a choice card, or ``None`` if unusable.
+
+        Unusable means: fewer than two options, a blank or duplicated label (the
+        reply names the label, so duplicates are ambiguous), or no ``reject_*``
+        option — a choice card replaces the Approve/Reject buttons, so without one
+        the user would have no way to say no.
+        """
+        labeled = [(str(o.get("name") or "").strip(), o) for o in self._permission_options(params)]
+        if len(labeled) < 2 or any(not name for name, _ in labeled):
+            return None
+        labels = [name for name, _ in labeled]
+        if len(set(labels)) != len(labels):
+            return None
+        if not any("reject" in str(o.get("kind", "")) for _, o in labeled):
+            return None
+        return labeled
+
+    async def _ask_user(
+        self, tool_name: str, tool_input: _AcpJsonObject, params: _AcpJsonObject
+    ) -> tuple[bool, str | None]:
+        """Route a permission request to the user; return ``(allowed, option_id)``.
+
+        Prefers the choice bridge, which puts the agent's *own* options on the
+        card: picking "allow this command for the session" is one click the agent
+        then honors itself, so the same command class stops re-prompting. Falls
+        back to the yes/no bridge, whose grant stays once-scoped.
+        """
+        choice_handler = self._elicitation_choice_handler
+        labeled = self._scoped_options(params) if choice_handler is not None else None
+        if choice_handler is not None and labeled is not None:
+            chosen = await choice_handler(tool_name, tool_input, [name for name, _ in labeled])
+            if chosen is None:
+                return False, None
+            picked = next((o for name, o in labeled if name == chosen), None)
+            if picked is None:
+                logger.warning(
+                    "acp permission choice %r was not offered; denying tool=%s", chosen, tool_name
+                )
+                return False, None
+            option_id = picked.get("optionId")
+            allowed = "allow" in str(picked.get("kind", ""))
+            logger.info(
+                "acp permission %s by user (scope=%s): tool=%s",
+                "allowed" if allowed else "denied",
+                option_id,
+                tool_name,
+            )
+            return allowed, (option_id if isinstance(option_id, str) else None)
+
+        handler = self._elicitation_handler
+        if handler is None:
+            return False, None
+        return bool(await handler(tool_name, tool_input)), None
+
+    async def _decide_permission(self, params: _AcpJsonObject) -> tuple[bool, str | None]:
+        """Decide a permission request — policy then elicitation.
 
         1. **TOOL_CALL policy** (:attr:`_policy_evaluator`): a hard
            ``POLICY_ACTION_DENY`` denies; ``POLICY_ACTION_ASK`` defers to
            elicitation (and **fails closed** when no handler is wired);
            ``ALLOW`` / unspecified falls through.
-        2. **Human-consent elicitation** (:attr:`_elicitation_handler`): routes
-           to the user via a web approval card and returns their accept/deny.
+        2. **Human-consent elicitation**: the agent's own options via
+           :attr:`_elicitation_choice_handler`, else a yes/no card via
+           :attr:`_elicitation_handler`. Skipped under
+           ``permission_mode="bypassPermissions"`` — but only for a request no
+           policy had an opinion on, so a DENY still blocks and a policy that
+           says ASK still prompts.
 
         When neither bridge is wired (standalone / unit tests), falls back to
         allow so direct use of the executor isn't blocked. In normal runner
         operation the adapter installs both, so destructive actions are gated.
+
+        :returns: ``(allowed, option_id)`` — *option_id* is the scope the user
+            picked from the agent's options, or ``None`` to let
+            :meth:`_permission_outcome` choose the narrowest grant.
         """
         tool_name, tool_input = self._extract_tool_call(params)
-        handler = getattr(self, "_elicitation_handler", None)
         policy_eval = getattr(self, "_policy_evaluator", None)
+        # Either bridge can carry the question to the user.
+        can_ask = (
+            self._elicitation_handler is not None or self._elicitation_choice_handler is not None
+        )
 
         if policy_eval is not None:
             action: str | None
@@ -845,45 +1008,47 @@ class AcpExecutor(Executor):
                 action = None
             if action == "POLICY_ACTION_DENY":
                 logger.info("acp permission denied by policy: tool=%s", tool_name)
-                return False
+                return False, None
             if action == "POLICY_ACTION_ASK":
-                if handler is None:
+                if not can_ask:
                     logger.warning(
                         "acp TOOL_CALL policy ASK with no elicitation handler; denying tool=%s",
                         tool_name,
                     )
-                    return False
-                allowed = bool(await handler(tool_name, tool_input))
-                logger.info(
-                    "acp permission %s by user (policy ASK): tool=%s",
-                    "allowed" if allowed else "denied",
-                    tool_name,
-                )
-                return allowed
+                    return False, None
+                return await self._ask_user(tool_name, tool_input, params)
             # ALLOW / UNSPECIFIED / unknown → fall through to elicitation.
 
-        if handler is not None:
-            allowed = bool(await handler(tool_name, tool_input))
-            logger.info(
-                "acp permission %s by user: tool=%s",
-                "allowed" if allowed else "denied",
-                tool_name,
-            )
-            return allowed
+        if can_ask and not self._bypass_permissions:
+            return await self._ask_user(tool_name, tool_input, params)
+        if can_ask:
+            # bypassPermissions: no policy had an opinion and the user asked not
+            # to be prompted. Logged at info so the audit trail still names what
+            # ran unreviewed. Answered per-request (never the agent's own bypass
+            # option) so every later call stays visible to policy.
+            logger.info("acp permission allowed (bypassPermissions): tool=%s", tool_name)
+            return True, None
 
         logger.debug("acp permission allowed (no policy/elicitation wired): tool=%s", tool_name)
-        return True
+        return True, None
 
     @staticmethod
-    def _permission_outcome(params: _AcpJsonObject, *, allow: bool) -> _AcpJsonObject:
-        """Map an allow/deny decision to an ACP permission ``outcome``.
+    def _permission_outcome(
+        params: _AcpJsonObject, *, allow: bool, option_id: str | None = None
+    ) -> _AcpJsonObject:
+        """Map a decision to an ACP permission ``outcome``.
 
-        On allow, prefer a once-scoped grant (``allow_once``) over
-        ``allow_always`` so we never persist a blanket "always allow". On deny,
-        pick a ``reject_*`` option, or ``cancelled`` when none is offered. The
-        agent's options carry both ``optionId`` and ``kind`` (e.g. ``allow_once``).
+        *option_id* is a scope the user picked from the agent's own options; it is
+        echoed only after confirming the agent offered it, so we never send an id
+        it doesn't know. Without one: on allow prefer a once-scoped grant
+        (``allow_once``) over ``allow_always``, so a blanket "always allow" is
+        only ever sent because the user chose it; on deny pick a ``reject_*``
+        option, or ``cancelled`` when none is offered. The agent's options carry
+        both ``optionId`` and ``kind`` (e.g. ``allow_once``).
         """
-        options = [o for o in (params.get("options") or []) if isinstance(o, dict)]
+        options = AcpExecutor._permission_options(params)
+        if option_id is not None and any(o.get("optionId") == option_id for o in options):
+            return {"outcome": {"outcome": "selected", "optionId": option_id}}
 
         def _pick(*kinds: str) -> _AcpJsonObject | None:
             for kind in kinds:
@@ -1042,6 +1207,39 @@ class AcpExecutor(Executor):
                 out[omni_key] = value
         return out or None
 
+    def _is_bridge_tool_call(self, name: str, update: _AcpJsonObject) -> bool:
+        """True when this tool call reaches Omnigent through the MCP bridge.
+
+        Candidates are the reported name plus the machine names some agents carry
+        beside a humanized title. An unrecognized shape reads as agent-native,
+        which may duplicate a card but cannot corrupt dispatch correlation.
+        """
+        if not self._bridge_tool_aliases:
+            return False
+        raw = update.get("rawInput")
+        raw_tool = str(raw.get("tool", "")) if isinstance(raw, dict) else ""
+        # Goose reports the machine name under ``_meta.goose.toolCall.toolName``;
+        # older builds used the flatter ``_meta.goose.toolName``. Read both.
+        meta = update.get("_meta")
+        goose = meta.get("goose") if isinstance(meta, dict) else None
+        meta_tool = ""
+        if isinstance(goose, dict):
+            inner = goose.get("toolCall")
+            meta_tool = str(
+                (inner.get("toolName", "") if isinstance(inner, dict) else "")
+                or goose.get("toolName", "")
+            )
+        candidates = {c for c in (name, raw_tool, meta_tool) if c}
+        return not self._bridge_tool_aliases.isdisjoint(candidates)
+
+    def _reset_session_state(self) -> None:
+        """Forget state that is only valid for the current ACP session."""
+        self._session_id = None
+        self._system_prompt_sent = False
+        self._tool_names.clear()
+        self._tool_inputs.clear()
+        self._bridge_tool_aliases = frozenset()
+
     def _handle_session_update(self, update: _AcpJsonObject) -> list[ExecutorEvent]:
         """Translate one ``session/update`` payload into ExecutorEvents.
 
@@ -1051,6 +1249,36 @@ class AcpExecutor(Executor):
         """
         update_type = update.get("sessionUpdate", "")
         events: list[ExecutorEvent] = []
+
+        # Sub-agent frames ride a per-agent dialect (Devin: cognition.ai/* on the
+        # ``_meta``); a source claims them. When one does, the frame belongs to a
+        # *child* session, not the parent stream — so emit the child-directed
+        # events and stop. The tool-card branches below would otherwise render the
+        # sub-agent's own work in the parent, and a lifecycle ``tool_call_update``
+        # (whose id was never an originating ``tool_call``) would close a spurious
+        # "tool" card there. Empty for a generic ACP agent (no sources), so this
+        # is a no-op for every non-Devin harness.
+        sub_events = read_subagent_events(update, self._extension.subagent_sources)
+        if sub_events:
+            for sub in sub_events:
+                if isinstance(sub, SubAgentStart):
+                    events.append(
+                        SubAgentStarted(child_key=sub.child_key, title=sub.title, task=sub.task)
+                    )
+                elif isinstance(sub, SubAgentActivity):
+                    events.append(
+                        SubAgentToolCall(
+                            child_key=sub.child_key,
+                            call_id=sub.call_id,
+                            name=sub.name,
+                            args=dict(sub.args),
+                        )
+                    )
+                else:  # SubAgentEnd
+                    events.append(
+                        SubAgentCompleted(child_key=sub.child_key, ok=sub.ok, summary=sub.summary)
+                    )
+            return events
 
         if update_type == _UPDATE_AGENT_MESSAGE_CHUNK:
             content = update.get("content", {})
@@ -1069,9 +1297,14 @@ class AcpExecutor(Executor):
             args = raw_input if isinstance(raw_input, dict) else {}
             if isinstance(call_id, str) and call_id:
                 self._tool_names[call_id] = str(name)
-                events.append(
-                    ToolCallRequest(name=str(name), args=args, metadata={"call_id": call_id})
-                )
+                self._tool_inputs[call_id] = args
+                metadata: _AcpJsonObject = {"call_id": call_id}
+                # An agent-native tool ran inside the agent's own loop and never
+                # round-trips Omnigent dispatch. Leaving its id in the correlation
+                # queue would mis-pair the next bridge completion.
+                if not self._is_bridge_tool_call(str(name), update):
+                    metadata["internally_executed"] = True
+                events.append(ToolCallRequest(name=str(name), args=args, metadata=metadata))
         elif update_type == _UPDATE_TOOL_CALL_UPDATE:
             call_id = update.get("toolCallId")
             status = update.get("status")
@@ -1080,6 +1313,7 @@ class AcpExecutor(Executor):
                 _TOOL_STATUS_FAILED,
             ):
                 name = self._tool_names.pop(call_id, "tool")
+                self._tool_inputs.pop(call_id, None)
                 events.append(
                     ToolCallComplete(
                         name=name,
@@ -1209,9 +1443,13 @@ class AcpExecutor(Executor):
 
         ``tools`` (Omnigent's builtin tool schemas) are captured for the Omnigent
         MCP relay set up at ``session/new`` — the agent still runs its OWN tools.
+        When ``omnigent_mcp`` is ``False`` the relay is disabled, so the schemas
+        serve no purpose and are discarded immediately rather than stored.
         """
-        # Captured before the (lazy) session so the MCP relay can advertise them.
-        self._omnigent_tools = tools or []
+        # Only keep builtin tools when the relay is enabled — they exist solely
+        # to back the MCP relay. Storing them when the relay is disabled would
+        # let stale data accidentally reach the session/prompt path (#4917).
+        self._omnigent_tools = (tools or []) if self._config.omnigent_mcp else []
         try:
             if self._proc is None or self._proc.returncode is not None:
                 await self._start_process()
@@ -1262,9 +1500,14 @@ class AcpExecutor(Executor):
             history_prefix = self._history_prefix(messages[:latest_user_idx])
             user_text = f"{history_prefix}\n\nuser: {user_text}" if user_text else history_prefix
 
-        # ACP has no system-prompt field, so fold it into the first turn.
+        # ACP has no system-prompt field. When inject_system_prompt is enabled
+        # (the default), fold the Omnigent system prompt into the first turn so
+        # the agent's model sees the spec instructions. When disabled (e.g. for
+        # Pi forks like omp that fully own their own system prompt), skip the
+        # injection to avoid prepending text that confuses the agent's internal
+        # Claude model into emitting XML tool-call fragments (#4917).
         if fresh_session:
-            if system_prompt:
+            if system_prompt and self._config.inject_system_prompt:
                 user_text = f"{system_prompt}\n\n{user_text}" if user_text else system_prompt
             self._system_prompt_sent = True
 
@@ -1311,16 +1554,15 @@ class AcpExecutor(Executor):
             if fut.done() and self._queue.empty():
                 try:
                     response = fut.result()
-                except Exception as exc:  # noqa: BLE001
-                    self._session_id = None
-                    self._system_prompt_sent = False
+                except Exception as exc:
+                    logger.exception("ACP process response retrieval failed")
+                    self._reset_session_state()
                     yield ExecutorError(message=f"ACP process error: {exc}", retryable=True)
                     return
                 if "error" in response:
                     error_msg = response["error"].get("message", "Unknown ACP error")
                     if "Session not found" in error_msg:
-                        self._session_id = None
-                        self._system_prompt_sent = False
+                        self._reset_session_state()
                     yield ExecutorError(message=error_msg, retryable=True)
                     return
                 result = response.get("result", {}) if isinstance(response, dict) else {}
@@ -1379,6 +1621,7 @@ class AcpExecutor(Executor):
 
     async def close(self) -> None:
         """Terminate the agent subprocess and clean up."""
+        self._reset_session_state()
         # Tear down the Omnigent MCP relay HTTP server + its bridge dir first.
         with contextlib.suppress(Exception):
             self._mcp.close()

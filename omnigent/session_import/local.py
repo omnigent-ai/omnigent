@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import subprocess
 from hashlib import sha256
 from pathlib import Path
+from typing import get_args
 
 from omnigent.claude_native_bridge import read_transcript_items_from_offset
 from omnigent.codex_native import _CODEX_THREAD_ID_RE, _find_codex_rollout
@@ -59,12 +61,16 @@ def _find_transcript(root: Path, session_id: str) -> Path | None:
     return max(matches, key=lambda path: path.stat().st_mtime) if matches else None
 
 
-def _recent_unique_session_ids(
+def _recent_unique_sessions_with_recency(
     candidates: list[tuple[Path, str]],
     *,
     limit: int,
-) -> tuple[str, ...]:
-    """Return unique session ids ordered from newest transcript to oldest."""
+) -> list[tuple[str, float]]:
+    """Return ``(session_id, recency)`` pairs, newest transcript first.
+
+    ``recency`` is the newest mtime seen for that id, kept so callers can merge
+    sessions across harnesses by a single global recency order.
+    """
     newest_by_id: dict[str, float] = {}
     for path, session_id in candidates:
         try:
@@ -77,7 +83,16 @@ def _recent_unique_session_ids(
         key=lambda session_id: (newest_by_id[session_id], session_id),
         reverse=True,
     )
-    return tuple(ordered[:limit])
+    return [(session_id, newest_by_id[session_id]) for session_id in ordered[:limit]]
+
+
+def _recent_unique_session_ids(
+    candidates: list[tuple[Path, str]],
+    *,
+    limit: int,
+) -> tuple[str, ...]:
+    """Return unique session ids ordered from newest transcript to oldest."""
+    return tuple(sid for sid, _ in _recent_unique_sessions_with_recency(candidates, limit=limit))
 
 
 def _pi_session_id_from_path(path: Path) -> str | None:
@@ -112,8 +127,14 @@ def _is_safe_opencode_import_session_id(session_id: str) -> bool:
 def _run_opencode_json(
     *arguments: str,
     opencode_path: str | None = None,
+    empty_ok: bool = False,
 ) -> object:
-    """Run one public OpenCode JSON command and decode stdout."""
+    """Run one public OpenCode JSON command and decode stdout.
+
+    With no sessions, ``session list`` prints nothing (exit 0) rather than
+    ``[]``; ``empty_ok`` treats that empty stdout as an empty result instead of
+    an "invalid JSON" error.
+    """
     try:
         cli = find_opencode_cli(opencode_path)
     except OpenCodeCliNotFoundError as exc:
@@ -132,6 +153,8 @@ def _run_opencode_json(
         detail = completed.stderr.strip().splitlines()
         suffix = f": {detail[-1]}" if detail else ""
         raise SessionImportNotFoundError(f"OpenCode command failed{suffix}")
+    if empty_ok and not completed.stdout.strip():
+        return []
     try:
         return json.loads(completed.stdout)
     except ValueError as exc:
@@ -152,12 +175,12 @@ def _qwen_session_locator(path: Path) -> str:
     return f"{project_digest}:{sha256(session_id.encode()).hexdigest()}"
 
 
-def list_recent_local_session_ids(
+def _recent_local_sessions_with_recency(
     source: ImportSource,
     *,
     limit: int,
-) -> tuple[str, ...]:
-    """List recent parent session ids for one local harness."""
+) -> list[tuple[str, float]]:
+    """List recent ``(session_id, recency)`` pairs for one local harness, newest first."""
     if source == "claude":
         configured_home = os.environ.get("CLAUDE_CONFIG_DIR")
         home = Path(configured_home).expanduser() if configured_home else Path.home() / ".claude"
@@ -167,14 +190,14 @@ def list_recent_local_session_ids(
             for path in root.rglob("*.jsonl")
             if "subagents" not in path.parts and path.is_file()
         ]
-        return _recent_unique_session_ids(candidates, limit=limit)
+        return _recent_unique_sessions_with_recency(candidates, limit=limit)
 
     if source == "qwen":
         configured_home = os.environ.get("QWEN_HOME")
         home = Path(configured_home).expanduser() if configured_home else Path.home() / ".qwen"
         paths = [path for path in (home / "projects").glob("*/chats/*.jsonl") if path.is_file()]
         candidates = [(path, _qwen_session_locator(path)) for path in paths]
-        return _recent_unique_session_ids(candidates, limit=limit)
+        return _recent_unique_sessions_with_recency(candidates, limit=limit)
 
     if source == "kiro":
         root = kiro_cli_sessions_dir()
@@ -183,7 +206,7 @@ def list_recent_local_session_ids(
             for path in root.glob("*.jsonl")
             if path.is_file() and path.with_suffix(".json").is_file()
         ]
-        return _recent_unique_session_ids(candidates, limit=limit)
+        return _recent_unique_sessions_with_recency(candidates, limit=limit)
 
     if source == "opencode":
         payload = _run_opencode_json(
@@ -192,6 +215,7 @@ def list_recent_local_session_ids(
             "--format",
             "json",
             "--pure",
+            empty_ok=True,
         )
         if not isinstance(payload, list):
             raise SessionImportNotFoundError("OpenCode returned an invalid session list")
@@ -212,7 +236,7 @@ def list_recent_local_session_ids(
             key=lambda session_id: (updated_by_id[session_id], session_id),
             reverse=True,
         )
-        return tuple(ordered[:limit])
+        return [(session_id, float(updated_by_id[session_id])) for session_id in ordered[:limit]]
 
     if source == "pi":
         configured_home = os.environ.get("PI_CODING_AGENT_DIR")
@@ -227,7 +251,7 @@ def list_recent_local_session_ids(
             for path in (home / "sessions").rglob("*.jsonl")
             if path.is_file() and (session_id := _pi_session_id_from_path(path)) is not None
         ]
-        return _recent_unique_session_ids(candidates, limit=limit)
+        return _recent_unique_sessions_with_recency(candidates, limit=limit)
 
     if source == "kimi":
         home = resolve_user_kimi_home()
@@ -236,7 +260,7 @@ def list_recent_local_session_ids(
             for path in (home / "sessions").glob("*/session_*/agents/main/wire.jsonl")
             if path.is_file()
         ]
-        return _recent_unique_session_ids(candidates, limit=limit)
+        return _recent_unique_sessions_with_recency(candidates, limit=limit)
 
     if source == "codex":
         configured_home = os.environ.get("CODEX_HOME")
@@ -255,9 +279,47 @@ def list_recent_local_session_ids(
             session_id = path.stem[-36:]
             if _CODEX_THREAD_ID_RE.fullmatch(session_id):
                 candidates.append((path, session_id))
-        return _recent_unique_session_ids(candidates, limit=limit)
+        return _recent_unique_sessions_with_recency(candidates, limit=limit)
 
     raise ValueError(f"Unsupported import source: {source}")
+
+
+def list_recent_local_session_ids(
+    source: ImportSource,
+    *,
+    limit: int,
+) -> tuple[str, ...]:
+    """List recent parent session ids for one local harness, newest first."""
+    return tuple(sid for sid, _ in _recent_local_sessions_with_recency(source, limit=limit))
+
+
+def _normalize_recency(recency: float) -> float:
+    """Fold millisecond timestamps to seconds so harnesses compare on one scale.
+
+    File-based harnesses use mtime (Unix seconds ~1.7e9); OpenCode reports
+    ``updated`` in epoch millis (~1.7e12). Without this a millis timestamp would
+    always outrank a seconds one in a cross-harness merge.
+    """
+    return recency / 1000.0 if recency > 1e12 else recency
+
+
+def list_recent_sessions_across_harnesses(*, limit: int) -> list[tuple[ImportSource, str]]:
+    """Return the ``limit`` most recent sessions across every harness, newest first.
+
+    Unlike calling :func:`list_recent_local_session_ids` per harness (which would
+    yield ``limit`` *each*), this merges all harnesses into one global recency
+    order and keeps the top ``limit`` — so "last N" means N total. A harness with
+    no history or an unavailable CLI is skipped.
+    """
+    scored: list[tuple[float, ImportSource, str]] = []
+    for source in get_args(ImportSource):
+        try:
+            recent = _recent_local_sessions_with_recency(source, limit=limit)
+        except (SessionImportNotFoundError, OSError, ValueError, TypeError):
+            continue
+        scored.extend((_normalize_recency(recency), source, sid) for sid, recency in recent)
+    scored.sort(key=lambda entry: (entry[0], entry[2]), reverse=True)
+    return [(source, sid) for _, source, sid in scored[:limit]]
 
 
 def _claude_workspace(transcript_path: Path) -> str | None:
@@ -274,6 +336,39 @@ def _claude_workspace(transcript_path: Path) -> str | None:
                 if cwd:
                     return cwd
     return None
+
+
+def _claude_native_title(transcript_path: Path) -> str | None:
+    """Return Claude Code's own session title, custom name over AI-generated.
+
+    Claude appends ``custom-title`` (user rename) and ``ai-title`` (generated)
+    lines to the JSONL as they change; the last of each wins. A user's rename
+    beats the AI title.
+    """
+    custom: str | None = None
+    ai: str | None = None
+    try:
+        with transcript_path.open(encoding="utf-8") as handle:
+            for line in handle:
+                if "-title" not in line:  # cheap prefilter; the type is custom-title / ai-title
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                if record.get("type") == "custom-title":
+                    value = record.get("customTitle")
+                    if isinstance(value, str) and value.strip():
+                        custom = value.strip()
+                elif record.get("type") == "ai-title":
+                    value = record.get("aiTitle")
+                    if isinstance(value, str) and value.strip():
+                        ai = value.strip()
+    except OSError:
+        return None
+    return custom or ai
 
 
 def load_claude_session(
@@ -312,6 +407,7 @@ def load_claude_session(
         external_session_id=session_id,
         workspace=_claude_workspace(transcript_path),
         items=items,
+        native_title=_claude_native_title(transcript_path),
     )
 
 
@@ -432,6 +528,71 @@ def _find_archived_codex_rollout(codex_home: Path, session_id: str) -> Path | No
     return max(matches, key=lambda path: path.stat().st_mtime) if matches else None
 
 
+def _codex_thread_name_from_index(home: Path, session_id: str) -> str | None:
+    """Return the user's thread rename from ``session_index.jsonl``, if any.
+
+    Renaming a Codex thread appends ``{id, thread_name, updated_at}`` here; it
+    is codex's authoritative rename store and, unlike ``threads.title`` in the
+    state DB, always reflects the rename. Last entry for the id wins.
+    """
+    index = home / "session_index.jsonl"
+    name: str | None = None
+    try:
+        with index.open(encoding="utf-8") as handle:
+            for line in handle:
+                if session_id not in line:  # cheap prefilter before JSON parse
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict) and record.get("id") == session_id:
+                    value = record.get("thread_name")
+                    if isinstance(value, str) and value.strip():
+                        name = value.strip()
+    except OSError:
+        return None
+    return name
+
+
+def _codex_native_title(home: Path, session_id: str) -> str | None:
+    """Return the user's custom Codex thread title, or None if auto-derived.
+
+    A rename lands in ``session_index.jsonl`` (``thread_name``) — the reliable
+    source — so check that first. As a fallback, ``state_<n>.sqlite``'s
+    ``threads.title`` holds the raw first user message until renamed, so only a
+    title that diverges from ``first_user_message`` is a real custom name;
+    otherwise the first-message synthesis is better.
+    """
+    indexed = _codex_thread_name_from_index(home, session_id)
+    if indexed:
+        return indexed
+
+    def _state_db_version(path: Path) -> int:
+        match = re.search(r"state_(\d+)\.sqlite$", path.name)
+        return int(match.group(1)) if match else -1
+
+    dbs = sorted(home.glob("state_*.sqlite"), key=_state_db_version, reverse=True)
+    for db in dbs:
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            try:
+                row = con.execute(
+                    "SELECT title, first_user_message FROM threads WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+            finally:
+                con.close()
+        except sqlite3.Error:
+            continue
+        if row is None:
+            continue
+        title = (row[0] or "").strip()
+        first_message = (row[1] or "").strip()
+        return title if title and title != first_message else None
+    return None
+
+
 def load_codex_session(
     session_id: str,
     *,
@@ -482,6 +643,7 @@ def load_codex_session(
         external_session_id=session_id,
         workspace=workspace,
         items=tuple(items),
+        native_title=_codex_native_title(home, session_id),
     )
 
 
@@ -1189,11 +1351,18 @@ def load_opencode_session(
         )
     workspace_value = info.get("directory") if isinstance(info, dict) else None
     workspace = workspace_value.strip() if isinstance(workspace_value, str) else None
+    # OpenCode auto-generates a session title (info.title); carry it as the
+    # native title instead of synthesizing from the first message.
+    title_value = info.get("title") if isinstance(info, dict) else None
+    native_title = (
+        title_value.strip() if isinstance(title_value, str) and title_value.strip() else None
+    )
     return LocalSessionImport(
         source="opencode",
         external_session_id=session_id,
         workspace=workspace or None,
         items=items,
+        native_title=native_title,
     )
 
 

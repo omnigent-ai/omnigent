@@ -127,6 +127,7 @@ def test_stale_banner_on_runner_crash(
     expect(indicator).to_contain_text("disconnected")
 
 
+@pytest.mark.nightly
 def test_silent_stream_stall_self_heals(
     page: Page,
     seeded_session: tuple[str, str],
