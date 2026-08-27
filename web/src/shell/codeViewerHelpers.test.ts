@@ -7,14 +7,34 @@ import {
   getModelFormat,
   isBinaryPath,
   isImageFile,
+  isExcalidrawPath,
   isModelFile,
   isNotebookPath,
   isPdfFile,
   lineOverlapsSelection,
   modelViewerTheme,
   openHtmlArtifactInNewTab,
+  parseExcalidrawScene,
   prepareHtmlPreviewDoc,
 } from "./codeViewerHelpers";
+
+describe("isExcalidrawPath", () => {
+  it("recognizes Excalidraw scene files case-insensitively", () => {
+    expect(isExcalidrawPath("architecture.excalidraw")).toBe(true);
+    expect(isExcalidrawPath("ARCHITECTURE.EXCALIDRAW")).toBe(true);
+    expect(isExcalidrawPath("architecture.json")).toBe(false);
+  });
+
+  it("parses a valid scene and rejects unrelated JSON", () => {
+    const scene = parseExcalidrawScene(
+      JSON.stringify({ type: "excalidraw", version: 2, elements: [], appState: {} }),
+    );
+    expect(scene.type).toBe("excalidraw");
+    expect(scene.elements).toEqual([]);
+    expect(() => parseExcalidrawScene('{"elements":[]}')).toThrow(/Expected an Excalidraw scene/);
+    expect(() => parseExcalidrawScene("not json")).toThrow();
+  });
+});
 
 // ---------------------------------------------------------------------------
 // detectLang — language matrix backing syntax highlighting

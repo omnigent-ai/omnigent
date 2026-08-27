@@ -61,6 +61,7 @@ import {
   getSelectionOffsets,
   indexToLine,
   isBinaryPath,
+  isExcalidrawPath,
   isImageFile,
   isModelFile,
   isNotebookPath,
@@ -91,6 +92,10 @@ const PdfViewer = lazy(() => import("./PdfViewer").then((m) => ({ default: m.Pdf
 // model file is actually opened so it stays out of the main bundle (same
 // lazy strategy as Monaco).
 const ModelViewer = lazy(() => import("./ModelViewer").then((m) => ({ default: m.ModelViewer })));
+
+const ExcalidrawViewer = lazy(() =>
+  import("./ExcalidrawViewer").then((m) => ({ default: m.ExcalidrawViewer })),
+);
 
 // ---------------------------------------------------------------------------
 // MarkdownPreview — read-only render of Markdown content via react-markdown + GFM
@@ -715,6 +720,19 @@ export function CodeViewer({
         }
       >
         <ModelViewer data={fileQuery.data} path={path} />
+      </Suspense>
+    );
+  }
+  if (fileQuery.data && viewMode === "preview" && isExcalidrawPath(path)) {
+    return (
+      <Suspense
+        fallback={
+          <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
+            Loading diagram…
+          </div>
+        }
+      >
+        <ExcalidrawViewer content={content} truncated={truncated} />
       </Suspense>
     );
   }

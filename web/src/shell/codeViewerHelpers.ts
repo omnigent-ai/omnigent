@@ -105,6 +105,32 @@ export function isNotebookPath(path: string): boolean {
   return path.toLowerCase().endsWith(".ipynb");
 }
 
+/** Excalidraw scene files are JSON documents with a dedicated visual preview. */
+export function isExcalidrawPath(path: string): boolean {
+  return path.toLowerCase().endsWith(".excalidraw");
+}
+
+export interface ExcalidrawScene {
+  type: "excalidraw";
+  elements: unknown[];
+  appState?: Record<string, unknown>;
+  files?: Record<string, unknown>;
+}
+
+/** Parse the minimum stable shape required by the Excalidraw scene loader. */
+export function parseExcalidrawScene(content: string): ExcalidrawScene {
+  const value: unknown = JSON.parse(content);
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    (value as { type?: unknown }).type !== "excalidraw" ||
+    !Array.isArray((value as { elements?: unknown }).elements)
+  ) {
+    throw new Error("Expected an Excalidraw scene with an elements array.");
+  }
+  return value as ExcalidrawScene;
+}
+
 // Image formats the browser can render directly via an <img> tag. SVG is
 // included but is only ever rendered through a blob URL (never inlined into
 // the DOM), so scripts embedded in it cannot execute.
@@ -318,6 +344,7 @@ export function detectLang(path: string): BundledLanguage | "text" {
     astro: "astro",
     json: "json",
     jsonc: "json",
+    excalidraw: "json",
     yaml: "yaml",
     yml: "yaml",
     toml: "toml",

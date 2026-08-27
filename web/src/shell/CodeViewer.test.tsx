@@ -38,6 +38,11 @@ vi.mock("./ModelViewer", () => ({
     <div data-testid="model-viewer-stub" data-path={path} />
   ),
 }));
+vi.mock("./ExcalidrawViewer", () => ({
+  ExcalidrawViewer: ({ content }: { content: string }) => (
+    <div data-testid="excalidraw-viewer-stub" data-content={content} />
+  ),
+}));
 
 import * as permissions from "@/hooks/usePermissions";
 
@@ -267,6 +272,25 @@ describe("CodeViewer truncated preview", () => {
   it("shows no banner in markdown preview when not truncated", () => {
     renderViewer("# full file", true, "notes.md", { viewMode: "preview", truncated: false });
     expect(screen.queryByText(/too large to load fully/)).toBeNull();
+  });
+});
+
+describe("CodeViewer Excalidraw preview", () => {
+  const scene = JSON.stringify({ type: "excalidraw", version: 2, elements: [], appState: {} });
+
+  it("routes .excalidraw preview mode to the diagram viewer", async () => {
+    renderViewer(scene, true, "architecture.excalidraw", { viewMode: "preview" });
+    expect(await screen.findByTestId("excalidraw-viewer-stub")).toHaveAttribute(
+      "data-content",
+      scene,
+    );
+    expect(screen.queryByTestId("monaco-editor-stub")).toBeNull();
+  });
+
+  it("keeps source mode available for .excalidraw files", async () => {
+    renderViewer(scene, true, "architecture.excalidraw", { viewMode: "source" });
+    expect(await screen.findByTestId("monaco-editor-stub")).toBeDefined();
+    expect(screen.queryByTestId("excalidraw-viewer-stub")).toBeNull();
   });
 });
 
