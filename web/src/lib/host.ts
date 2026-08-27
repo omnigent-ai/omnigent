@@ -40,10 +40,19 @@ export type OmnigentComponentKind =
  *   - `approval`       — a human-in-the-loop permission decision.
  *   - `list_sessions`  — loading the session list (user-initiated; not background polls).
  *   - `get_session`    — loading a single session the user opened / switched to.
- *   - `create_session` — creating a new session.
+ *   - `create_session_sandbox` / `create_session_computer` — a brand-new chat from
+ *     send to the first AI message, split by where the session runs (managed
+ *     sandbox vs the user's computer host); host kind is baked into the kind so
+ *     the host can name/segment the two without a queryable sub-dimension.
  */
 export type OmnigentInteractionKind =
-  "agent_run" | "tool_call" | "approval" | "list_sessions" | "get_session" | "create_session";
+  | "agent_run"
+  | "tool_call"
+  | "approval"
+  | "list_sessions"
+  | "get_session"
+  | "create_session_sandbox"
+  | "create_session_computer";
 
 /** Terminal outcome of an interaction, set on the `complete` phase. */
 export type OmnigentInteractionStatus = "success" | "failure" | "cancelled" | "timed_out";

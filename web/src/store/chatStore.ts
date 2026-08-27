@@ -116,7 +116,11 @@ import { getCurrentAuthorId } from "@/lib/identity";
 import { getOmnigentHostConfig, type OmnigentInteractionStatus } from "@/lib/host";
 // Routing-free emit primitive (not "@/lib/analytics", which pulls in useLocation
 // and would form a routing↔store import cycle).
-import { emitInteractionPhase, startTimedInteraction } from "@/lib/analyticsEmit";
+import {
+  emitInteractionPhase,
+  startTimedInteraction,
+  type TimedInteraction,
+} from "@/lib/analyticsEmit";
 import { getSessionHost } from "@/lib/sessionHost";
 import { isSystemUserContent } from "@/lib/systemMessage";
 import { isNativeWrapper } from "@/lib/nativeCodingAgents";
@@ -2766,16 +2770,20 @@ async function ensureBoundSession(
     // initial_items dispatch synchronously inside create_session,
     // before we can subscribe to /stream, so early events can be
     // missed). Bind the stream FIRST, then post the first message.
-    const createInteraction = startTimedInteraction("create_session");
-    let session: Session;
-    try {
-      session = await createSession(agentId, []);
-      createInteraction.complete();
-    } catch (error) {
-      createInteraction.fail();
-      throw error;
-    }
+    const session = await createSession(agentId, []);
     sessionId = session.id;
+    // Open the create_session CUJ span now (session just created) and complete it
+    // on this session's first `response_start` (see the pump below): the span is
+    // "created → first AI message". Host kind is baked into the interaction kind so
+    // the host names/segments sandbox vs computer without a queryable sub-dimension.
+    const createHostKind = session.sandboxStatus != null ? "sandbox" : "computer";
+    createSessionPending.set(
+      sessionId,
+      startTimedInteraction(
+        createHostKind === "sandbox" ? "create_session_sandbox" : "create_session_computer",
+        sessionId,
+      ),
+    );
     // Claim the send chain for this id NOW, while it is still private to this
     // call. Everything below publishes it (the store write, the navigate
     // callback, the sidebar invalidation) and awaits network work, so a send
@@ -4558,6 +4566,13 @@ function revivePendingElicitationBlock(set: Setter, elicitationId: string): void
 // reopening an old conversation never re-emits.
 const runStartTimes = new Map<string, number>();
 const toolStartTimes = new Map<string, number>();
+// create_session CUJ: an open interaction per brand-new session, keyed by
+// session id. Opened right after the session is created (in `ensureBoundSession`)
+// and completed on that session's FIRST `response_start` below — i.e. the span is
+// "session created → first AI message", the part that varies by host (bind /
+// sandbox launch / time-to-first-token). The create POST itself is excluded (it's
+// small and measurable from backend traces).
+const createSessionPending = new Map<string, TimedInteraction>();
 
 function mapRunStatus(state: string): OmnigentInteractionStatus {
   switch (state) {
@@ -4669,6 +4684,14 @@ export async function pumpStreamEvents(
             interactionKind: "agent_run",
             phase: "start",
           });
+        }
+        // First response for a brand-new session = the create_session CUJ's end
+        // ("first AI message"). `id` is this pump's session id; the map only holds
+        // freshly-created sessions, and the delete makes this fire once.
+        const pendingCreate = createSessionPending.get(id);
+        if (pendingCreate) {
+          createSessionPending.delete(id);
+          pendingCreate.complete();
         }
         continue;
       }
