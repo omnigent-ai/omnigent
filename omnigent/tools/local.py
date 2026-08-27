@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
+import inspect
 import json
 import logging
 import os
@@ -108,6 +109,7 @@ class LocalPythonTool(Tool):
         srt_available: bool,
         uv_available: bool,
         sandbox_enabled: bool = True,
+        uses_tool_state: bool = False,
     ) -> None:
         """
         Initialize from a discovered ``@tool`` function.
@@ -130,6 +132,7 @@ class LocalPythonTool(Tool):
         self._sandbox_enabled = sandbox_enabled
         self._srt_available = srt_available
         self._uv_available = uv_available
+        self._uses_tool_state = uses_tool_state
         # Live subprocesses from any in-flight ``invoke()`` — tracked
         # as a set guarded by a lock so ``cancel()`` can kill all of
         # them at once. A single ``self._proc`` would race when the
@@ -226,7 +229,7 @@ class LocalPythonTool(Tool):
         # the runner then refuses to inject and raises a clear error
         # if the tool asked for tool_state). See designs/TOOL_STATE.md.
         state_root: str | None = None
-        if ctx.workspace is not None:
+        if self._uses_tool_state and ctx.workspace is not None:
             state_dir = ctx.workspace / ".tool_state" / ctx.agent_id
             state_dir.mkdir(parents=True, exist_ok=True)
             state_root = str(state_dir)
@@ -692,7 +695,7 @@ def load_local_python_tools(
             module=module,
         )
 
-        for tool_name, metadata in functions:
+        for tool_name, metadata, uses_tool_state in functions:
             # Detect collision with another custom tool already discovered.
             existing = discovered.get(tool_name)
             if existing is not None:
@@ -715,6 +718,7 @@ def load_local_python_tools(
                 info=info,
                 metadata=metadata,
                 module_path=tool_path.resolve(),
+                uses_tool_state=uses_tool_state,
             )
 
     return [
@@ -726,6 +730,7 @@ def load_local_python_tools(
             srt_available=effective_srt,
             uv_available=effective_uv,
             sandbox_enabled=sandbox_enabled,
+            uses_tool_state=disc.uses_tool_state,
         )
         for disc in discovered.values()
     ]
@@ -745,17 +750,19 @@ class _DiscoveredTool:
     :param module_path: Resolved absolute path to the source file.
     """
 
-    __slots__ = ("info", "metadata", "module_path")
+    __slots__ = ("info", "metadata", "module_path", "uses_tool_state")
 
     def __init__(
         self,
         info: LocalToolInfo,
         metadata: ToolMetadata,
         module_path: Path,
+        uses_tool_state: bool,
     ) -> None:
         self.info = info
         self.metadata = metadata
         self.module_path = module_path
+        self.uses_tool_state = uses_tool_state
 
 
 def _scan_inline_metadata(info: LocalToolInfo, path: Path) -> None:
@@ -818,7 +825,7 @@ def _extract_decorated_functions(
     agent_name: str,
     tool_path: Path,
     module: ModuleType,
-) -> list[tuple[str, ToolMetadata]]:
+) -> list[tuple[str, ToolMetadata, bool]]:
     """
     Find every ``@tool``-decorated function defined in ``module``.
 
@@ -837,7 +844,7 @@ def _extract_decorated_functions(
     :raises LocalToolLoadError: If the module exports no
         ``@tool``-decorated functions.
     """
-    found: list[tuple[str, ToolMetadata]] = []
+    found: list[tuple[str, ToolMetadata, bool]] = []
     for value in module.__dict__.values():
         # Only consider objects defined in THIS module (not imports).
         # Re-imported decorated functions would otherwise be doubly
@@ -849,7 +856,8 @@ def _extract_decorated_functions(
         metadata = get_tool_metadata(value)
         if metadata is None:
             continue
-        found.append((metadata.name, metadata))
+        uses_tool_state = "tool_state" in inspect.signature(value).parameters
+        found.append((metadata.name, metadata, uses_tool_state))
 
     if found:
         return found

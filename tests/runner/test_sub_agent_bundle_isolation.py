@@ -509,11 +509,16 @@ async def test_top_level_bare_spec_still_dispatches_in_runner_workspace(
     _write_python_tool(workspace, "tools/python/bundle_tool.py")
     spec = _python_tool_spec("plain-agent", "tools/python/bundle_tool.py")
 
-    captured: list[Path | None] = []
+    captured: list[tuple[Path | None, Path | None]] = []
 
-    async def _fake_dispatch(*, runner_workspace: Path | None = None, **kwargs: Any) -> str:
+    async def _fake_dispatch(
+        *,
+        runner_workspace: Path | None = None,
+        local_tool_workdir: Path | None = None,
+        **kwargs: Any,
+    ) -> str:
         del kwargs
-        captured.append(runner_workspace)
+        captured.append((runner_workspace, local_tool_workdir))
         return "ok"
 
     monkeypatch.setattr(_tool_dispatch, "dispatch_tool_locally", _fake_dispatch)
@@ -568,11 +573,7 @@ async def test_top_level_bare_spec_still_dispatches_in_runner_workspace(
             await asyncio.sleep(0.05)
 
     assert captured, "the local tool was never dispatched"
-    assert captured[0] == workspace, (
-        f"a top-level bare spec dispatched against {captured[0]!r}; expected the "
-        f"runner workspace {workspace!r}. None here means the spec cache wrapped a "
-        "spec that never carried bundle information, so the fallback was lost."
-    )
+    assert captured[0] == (workspace, workspace)
 
 
 # ── /mcp/execute (sibling site) ───────────────────────────────
@@ -637,15 +638,22 @@ async def test_mcp_execute_spec_local_tool_honours_resolved_workdir(
     bundle_dir.mkdir()
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    session_workspace = tmp_path / "session-worktree"
+    session_workspace.mkdir()
     _write_python_tool(bundle_dir, "tools/python/bundle_tool.py")
     _write_python_tool(workspace, "tools/python/bundle_tool.py")
     spec = _python_tool_spec("probe-agent", "tools/python/bundle_tool.py")
 
-    captured: list[Path | None] = []
+    captured: list[tuple[Path | None, Path | None]] = []
 
-    async def _fake_execute_tool(*, runner_workspace: Path | None = None, **kwargs: Any) -> str:
+    async def _fake_execute_tool(
+        *,
+        runner_workspace: Path | None = None,
+        local_tool_workdir: Path | None = None,
+        **kwargs: Any,
+    ) -> str:
         del kwargs
-        captured.append(runner_workspace)
+        captured.append((runner_workspace, local_tool_workdir))
         return "ok"
 
     monkeypatch.setattr(_tool_dispatch, "execute_tool", _fake_execute_tool)
@@ -654,13 +662,26 @@ async def test_mcp_execute_spec_local_tool_honours_resolved_workdir(
         del agent_id, session_id
         return ResolvedSpec(spec=spec, workdir=bundle_dir if wrap_workdir else None)
 
+    class _WorkspaceServerClient(NullServerClient):
+        class _WorkspaceResponse(NullServerClient._Response):
+            def json(self) -> dict[str, Any]:
+                return {
+                    "workspace": str(session_workspace),
+                    "agent_id": "31ebfedf721b44dabd76f662cb70a400",
+                }
+
+        async def get(self, url: str, **kwargs: Any) -> NullServerClient._Response:
+            if url.startswith("/v1/sessions/"):
+                return self._WorkspaceResponse()
+            return await super().get(url, **kwargs)
+
     harness_client = _ScriptedHarnessClient(
         [_sse({"type": "response.completed", "response": {"id": "resp_1"}})]
     )
     app = create_runner_app(
         process_manager=_FakeProcessManager(harness_client),  # type: ignore[arg-type]
         spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
+        server_client=_WorkspaceServerClient(),  # type: ignore[arg-type]
         runner_workspace=workspace,
     )
 
@@ -669,8 +690,4 @@ async def test_mcp_execute_spec_local_tool_honours_resolved_workdir(
     assert resp.status_code == 200, resp.text
     assert captured, "the spec-local tool was never dispatched"
     expected = bundle_dir if wrap_workdir else None
-    assert captured[0] == expected, (
-        f"/mcp/execute dispatched the spec-local tool against {captured[0]!r}; "
-        f"expected {expected!r}. The runner workspace {workspace!r} means the "
-        "endpoint still falls back instead of honouring the resolved workdir."
-    )
+    assert captured[0] == (session_workspace.resolve(), expected)
