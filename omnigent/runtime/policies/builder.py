@@ -227,32 +227,35 @@ def _resolve_session_owner_cached(
 def _load_user_daily_cost(
     conversation_id: str,
     conversation_store: ConversationStore,
-) -> dict[str, float | str]:
+) -> list[dict[str, float | str | None]]:
     """
     Read the session owner's per-UTC-day cost rollup as the engine seed.
 
-    Resolves the owner (cached) and reads ``{cost_usd, ask_approved_usd}``
-    for today (UTC), tagged with the owner's ``user_id`` so the budget
-    policy can name whose spend tripped the gate. When the session has no
-    owner grant (single-user mode), returns zeros (and no ``user_id``) so
-    the per-user daily budget never trips — consistent with the write
-    path, which also no-ops without an owner.
+    Returns a single-element list containing today's cost state, formatted
+    consistently with period cost loading so both daily and period policies
+    can consume the same ``user_daily_cost`` context field.
 
     :param conversation_id: The session, e.g. ``"conv_abc123"``.
     :param conversation_store: Store for the owner + daily-cost lookups.
-    :returns: ``{"cost_usd": <float>, "ask_approved_usd": <float>,
-        "user_id": <owner>}``; ``user_id`` omitted in single-user mode.
+    :returns: Single-element list with today's cost state, or empty list
+        in single-user mode.
     """
     from omnigent.db.utils import now_epoch, utc_day
 
     owner = _resolve_session_owner_cached(conversation_id, conversation_store)
     if owner is None:
-        return {"cost_usd": 0.0, "ask_approved_usd": 0.0}
-    state: dict[str, float | str] = dict(
-        conversation_store.get_daily_cost_state(owner, utc_day(now_epoch()))
-    )
-    state["user_id"] = owner
-    return state
+        return []
+
+    today = utc_day(now_epoch())
+    # Use list_daily_cost_states to get today's record in the same format
+    # as period budgets, so both can consume the same context field
+    records = conversation_store.list_daily_cost_states(owner, today, harness=None)
+
+    # Tag each record with user_id
+    for record in records:
+        record["user_id"] = owner
+
+    return records
 
 
 def _utc_day(epoch: int) -> str:
@@ -739,7 +742,8 @@ def build_policy_engine(
         )
     initial_user_period_cost = None
     if period_requirements:
-        # Load the single period requirement (period, harness)
+        # Use only the first (and validated-to-be-only) period requirement.
+        # The validation above ensures len(period_requirements) <= 1.
         period, harness = period_requirements[0]
         initial_user_period_cost = _load_user_period_cost(
             conversation_id, conversation_store, period=period, harness=harness

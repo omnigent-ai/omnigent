@@ -112,8 +112,7 @@ class PolicyEngine:
         initial_session_state: dict[str, Any] | None = None,
         initial_usage: dict[str, float] | None = None,
         initial_subtree_usage: dict[str, float] | None = None,
-        initial_user_daily_cost: dict[str, float | str] | None = None,
-        initial_user_period_cost: list[dict[str, float | str | None]] | None = None,
+        initial_user_daily_cost: list[dict[str, float | str | None]] | None = None,
         token_pricing: ModelPricing | None = None,
         initial_model: str | None = None,
         conversation_store: ConversationStore,
@@ -153,17 +152,13 @@ class PolicyEngine:
         self._subtree_usage: dict[str, float] | None = (
             dict(initial_subtree_usage) if initial_subtree_usage is not None else None
         )
-        # The session owner's per-UTC-day cost rollup
-        # ({"cost_usd", "ask_approved_usd"}), seeded at build time ONLY
-        # when a policy needs it (per-user daily cost-budget configured).
-        # ``None`` → not needed → never injected, so no owner/daily lookup
-        # cost for sessions that don't use the daily policy.
+        # The session owner's daily cost records (list of
+        # {cost_usd, ask_approved_usd, day_utc, harness, user_id}), seeded
+        # at build time ONLY when a policy needs it (per-user daily or
+        # period cost-budget configured). For daily budgets, contains only
+        # today's record; for period budgets, contains all days in the period.
+        # ``None`` → not needed → never injected.
         self._user_daily_cost = initial_user_daily_cost
-        # The session owner's per-UTC-month cost rollup
-        # ({"cost_usd", "ask_approved_usd", "harness"}), seeded at build
-        # time ONLY when a policy needs it (per-user monthly cost-budget
-        # configured). ``None`` → not needed → never injected.
-        self._user_period_cost = initial_user_period_cost
         self._token_pricing = token_pricing
         self._model = initial_model
         self._store = conversation_store
@@ -350,7 +345,6 @@ class PolicyEngine:
         ctx = self._inject_usage(ctx)
         ctx = self._inject_subtree_usage(ctx)
         ctx = self._inject_user_daily_cost(ctx)
-        ctx = self._inject_user_period_cost(ctx)
         ctx = self._inject_model(ctx)
         ctx = self._inject_labels(ctx)
         ctx = self._inject_llm_client(ctx)
@@ -655,8 +649,7 @@ class PolicyEngine:
         owner = self._store.get_session_owner(self._conversation_id)
         if owner is None:
             return
-        # Extract period from the period cost context (just for in-memory tracking)
-        if self._user_period_cost is None:
+        if self._user_daily_cost is None:
             return
 
         # Write approval to today's daily record
@@ -668,7 +661,7 @@ class PolicyEngine:
         # Keep the in-memory snapshot current so any later evaluate() on
         # this engine sees the approval and doesn't re-ASK the checkpoint
         # the user just approved. Find today's record in the list.
-        for record in self._user_period_cost:
+        for record in self._user_daily_cost:
             if record.get("day_utc") == today:
                 record["ask_approved_usd"] = approved
                 break
@@ -776,12 +769,15 @@ class PolicyEngine:
         """
         Return a copy of *ctx* with ``user_daily_cost`` populated, when seeded.
 
-        Injects the session owner's per-UTC-day cost rollup (read once at
-        engine-build time) so the per-user daily cost-budget policy can
+        Injects the session owner's daily cost records (read once at
+        engine-build time) so daily and period cost-budget policies can
         read it via ``event["context"]["user_daily_cost"]`` without
-        re-querying the store. When the engine was built without it
-        (``None`` — no policy needs it), *ctx* is returned unchanged so
-        sessions that don't use the daily policy never carry it.
+        re-querying the store. For daily budgets, contains only today's
+        record; for period budgets, contains all days in the period.
+
+        When the engine was built without it (``None`` — no policy needs it),
+        *ctx* is returned unchanged so sessions that don't use cost policies
+        never carry it.
 
         :param ctx: Original :class:`EvaluationContext` from the caller.
         :returns: *ctx* unchanged when no daily-cost was seeded, else a
@@ -789,26 +785,7 @@ class PolicyEngine:
         """
         if self._user_daily_cost is None:
             return ctx
-        return replace(ctx, user_daily_cost=dict(self._user_daily_cost))
-
-    def _inject_user_period_cost(self, ctx: EvaluationContext) -> EvaluationContext:
-        """
-        Return a copy of *ctx* with ``user_period_cost`` populated, when seeded.
-
-        Injects the session owner's period cost rollup (list of daily records,
-        read once at engine-build time) so the per-user period cost-budget policy
-        can read it via ``event["context"]["user_period_cost"]`` without
-        re-querying the store. When the engine was built without it
-        (``None`` — no policy needs it), *ctx* is returned unchanged so
-        sessions that don't use the period policy never carry it.
-
-        :param ctx: Original :class:`EvaluationContext` from the caller.
-        :returns: *ctx* unchanged when no period-cost was seeded, else a
-            copy with ``user_period_cost`` set to a defensive copy.
-        """
-        if self._user_period_cost is None:
-            return ctx
-        return replace(ctx, user_period_cost=[dict(d) for d in self._user_period_cost])
+        return replace(ctx, user_daily_cost=[dict(d) for d in self._user_daily_cost])
 
     def _inject_model(self, ctx: EvaluationContext) -> EvaluationContext:
         """

@@ -998,6 +998,9 @@ def user_period_cost_budget(
         }
         period_label, period_noun = period_labels.get(period, (period, period))
 
+    # Shared context key for all cost policies (both daily and period)
+    context_key = "user_daily_cost"
+
     def _read_period_cost(event: PolicyEvent) -> float:
         """
         Aggregate daily cost records to compute the period total.
