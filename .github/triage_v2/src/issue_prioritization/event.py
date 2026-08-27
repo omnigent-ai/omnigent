@@ -148,10 +148,20 @@ def write_event_status(
         "content_hash": classification.content_hash,
         "classification": {
             "type": classification.issue_type.label,
+            "reported_type": (
+                classification.reported_type.label if classification.reported_type else None
+            ),
+            "type_label_mismatch": bool(
+                classification.reported_type
+                and classification.reported_type != classification.issue_type
+            ),
             "impact": classification.impact.value,
             "area_keys": list(classification.area_keys),
             "component_labels": list(classification.component_labels),
             "reasoning": classification.reasoning,
+            "evidence_kind": classification.evidence_kind.value,
+            "information_status": classification.information_status.value,
+            "missing_information": [item.value for item in classification.missing_information],
         },
         "score": _score_payload(decision),
         "mutation": _mutation_payload(plan),

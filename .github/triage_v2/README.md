@@ -78,6 +78,14 @@ The output includes the classification, score breakdown, proposed mutations,
 proposed bot comment, prompt input hash, and model endpoint, so a later
 Databricks importer can consume it without changing the event path.
 
+V2 classifies the issue type from the content independently of the submitted
+type label. Its artifacts expose both values and a `type_label_mismatch` flag.
+For bugs they also record `evidence_kind`, `information_status`, and the
+structured `missing_information` categories. A report can be sufficient without
+a reproduction heading when it contains an intermittent observation, controlled
+test, diagnostics, or concrete code-path analysis. These fields are diagnostic;
+by themselves they do not add `needs-info` or close an issue.
+
 ## Databricks dry-run
 
 The bundle defines a paused trigger on updates to `github_issues_bronze`. It

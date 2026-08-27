@@ -122,6 +122,9 @@ def test_event_artifact_contains_classification_and_mutation(tmp_path) -> None:
     assert payload["schema_version"] == 2
     assert payload["classification"]["impact"] == "high"
     assert payload["classification"]["reasoning"] == "Breaks session startup."
+    assert payload["classification"]["evidence_kind"] == "none"
+    assert payload["classification"]["information_status"] == "not_applicable"
+    assert payload["classification"]["missing_information"] == []
     assert payload["score"]["score"] == 72.0
     assert payload["mutation"]["target"]["priority"] == "P1-high"
     assert payload["model_endpoint"] == "test-endpoint"

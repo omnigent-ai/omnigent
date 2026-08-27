@@ -10,20 +10,29 @@ from issue_prioritization.bronze import BronzeIssue
 from issue_prioritization.classification import Classification
 from issue_prioritization.comments import build_triage_comment
 from issue_prioritization.config import ScoringConfig
-from issue_prioritization.domain import Impact, IssueType
+from issue_prioritization.domain import (
+    EvidenceKind,
+    Impact,
+    InformationStatus,
+    IssueType,
+    MissingInformation,
+)
 from issue_prioritization.mutations import BotState, MutationPlan
 from issue_prioritization.pipeline import PipelineRun
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+){2}$")
 _CLASSIFICATION_SCHEMA = """issue_number BIGINT, issue_type STRING, impact STRING,
 area_keys ARRAY<STRING>, component_labels ARRAY<STRING>, reasoning STRING,
-content_hash STRING"""
+content_hash STRING, reported_type STRING, evidence_kind STRING,
+information_status STRING, missing_information ARRAY<STRING>"""
 _SCORE_SCHEMA = """run_id STRING, mode STRING, regrade BOOLEAN,
 adopt_legacy_bot_priorities BOOLEAN, legacy_priorities_adopted BIGINT,
 scored_at TIMESTAMP, rank BIGINT, previous_rank BIGINT, rank_delta BIGINT,
 issue_number BIGINT, title STRING, url STRING, issue_type STRING, impact STRING,
 classification_reasoning STRING, score DOUBLE, upvote_count BIGINT, duplicate_count BIGINT,
 current_priority STRING, proposed_priority STRING,
+reported_type STRING, type_label_mismatch BOOLEAN, evidence_kind STRING,
+information_status STRING, missing_information ARRAY<STRING>,
 area_keys ARRAY<STRING>, component_labels ARRAY<STRING>, breakdown_json STRING,
 labels_add ARRAY<STRING>, labels_remove ARRAY<STRING>, mutation_blocked ARRAY<STRING>"""
 _BOT_STATE_SCHEMA = """issue_number BIGINT, priority STRING, components ARRAY<STRING>"""
@@ -58,18 +67,7 @@ class SparkClassificationRepository:
         if not self.spark.catalog.tableExists(self.table):
             return {}
         rows = self.spark.table(self.table).collect()
-        return {
-            int(row.issue_number): Classification(
-                issue_number=int(row.issue_number),
-                issue_type=IssueType.parse(row.issue_type),
-                impact=Impact.parse(_row_value(row, "impact", "severity")),
-                area_keys=tuple(row.area_keys or ()),
-                component_labels=tuple(row.component_labels or ()),
-                reasoning=str(row.reasoning or ""),
-                content_hash=str(row.content_hash),
-            )
-            for row in rows
-        }
+        return {int(row.issue_number): _classification_from_row(row) for row in rows}
 
     def upsert(self, classifications: list[Classification]) -> None:
         rows = [
@@ -81,6 +79,10 @@ class SparkClassificationRepository:
                 "component_labels": list(item.component_labels),
                 "reasoning": item.reasoning,
                 "content_hash": item.content_hash,
+                "reported_type": item.reported_type.label if item.reported_type else None,
+                "evidence_kind": item.evidence_kind.value,
+                "information_status": item.information_status.value,
+                "missing_information": [value.value for value in item.missing_information],
             }
             for item in classifications
         ]
@@ -89,6 +91,17 @@ class SparkClassificationRepository:
             frame.write.format("delta").mode("overwrite").saveAsTable(self.table)
             return
         schema = self.spark.table(self.table).schema
+        definitions = {
+            "reported_type": "STRING",
+            "evidence_kind": "STRING",
+            "information_status": "STRING",
+            "missing_information": "ARRAY<STRING>",
+        }
+        missing_columns = [name for name in definitions if name not in _field_names(schema)]
+        if missing_columns:
+            columns = ", ".join(f"{name} {definitions[name]}" for name in missing_columns)
+            self.spark.sql(f"ALTER TABLE {self.table} ADD COLUMNS ({columns})")
+            schema = self.spark.table(self.table).schema
         if "impact" not in _field_names(schema) and "severity" in _field_names(schema):
             rows = [
                 {
@@ -139,6 +152,13 @@ class SparkScoreSink:
                     "issue_type": issue.issue_type.label,
                     "impact": issue.impact.value,
                     "classification_reasoning": issue.classification_reasoning,
+                    "reported_type": issue.reported_type.label if issue.reported_type else None,
+                    "type_label_mismatch": bool(
+                        issue.reported_type and issue.reported_type != issue.issue_type
+                    ),
+                    "evidence_kind": issue.evidence_kind.value,
+                    "information_status": issue.information_status.value,
+                    "missing_information": [value.value for value in issue.missing_information],
                     "score": float(result.score),
                     "upvote_count": issue.upvote_count,
                     "duplicate_count": issue.duplicate_count,
@@ -184,6 +204,10 @@ class VolumeArtifactSink:
             "legacy_priorities_adopted": run.legacy_priorities_adopted,
             "scored_at": run.scored_at.isoformat(),
             "classifications_updated": run.classifications_updated,
+            "classification_failures": [
+                {"issue_number": failure.issue_number, "reason": failure.reason}
+                for failure in run.classification_failures
+            ],
         }
         mutations = [
             {
@@ -278,6 +302,32 @@ def _row_value(row: object, *names: str) -> object:
         if value is not None:
             return value
     raise ValueError(f"row does not contain any of {names}")
+
+
+def _classification_from_row(row: object) -> Classification:
+    required_fields = ("evidence_kind", "information_status", "missing_information")
+    needs_regrade = not hasattr(row, "reported_type") or any(
+        getattr(row, name, None) is None for name in required_fields
+    )
+    reported_type = getattr(row, "reported_type", None)
+    return Classification(
+        issue_number=int(row.issue_number),
+        issue_type=IssueType.parse(row.issue_type),
+        impact=Impact.parse(_row_value(row, "impact", "severity")),
+        area_keys=tuple(row.area_keys or ()),
+        component_labels=tuple(row.component_labels or ()),
+        reasoning=str(row.reasoning or ""),
+        content_hash="" if needs_regrade else str(row.content_hash),
+        reported_type=IssueType.parse(reported_type) if reported_type else None,
+        evidence_kind=EvidenceKind.parse(getattr(row, "evidence_kind", None) or EvidenceKind.NONE),
+        information_status=InformationStatus.parse(
+            getattr(row, "information_status", None) or InformationStatus.NOT_APPLICABLE
+        ),
+        missing_information=tuple(
+            MissingInformation.parse(item)
+            for item in (getattr(row, "missing_information", None) or ())
+        ),
+    )
 
 
 def _field_names(schema: object) -> set[str]:

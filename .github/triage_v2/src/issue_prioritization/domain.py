@@ -35,6 +35,50 @@ class IssueType(StrEnum):
         }[self]
 
 
+class EvidenceKind(StrEnum):
+    DIRECT_STEPS = "direct_steps"
+    OBSERVED_INTERMITTENT = "observed_intermittent"
+    CONTROLLED_TEST = "controlled_test"
+    DIAGNOSTIC_EVIDENCE = "diagnostic_evidence"
+    CODE_ANALYSIS = "code_analysis"
+    NONE = "none"
+
+    @classmethod
+    def parse(cls, value: object) -> EvidenceKind:
+        try:
+            return cls(str(value).strip().casefold())
+        except ValueError as exc:
+            raise ValueError(f"unsupported evidence kind: {value!r}") from exc
+
+
+class InformationStatus(StrEnum):
+    SUFFICIENT = "sufficient"
+    NEEDS_INFO = "needs_info"
+    NOT_APPLICABLE = "not_applicable"
+
+    @classmethod
+    def parse(cls, value: object) -> InformationStatus:
+        try:
+            return cls(str(value).strip().casefold())
+        except ValueError as exc:
+            raise ValueError(f"unsupported information status: {value!r}") from exc
+
+
+class MissingInformation(StrEnum):
+    TRIGGER = "trigger"
+    EXPECTED_BEHAVIOR = "expected_behavior"
+    OBSERVED_BEHAVIOR = "observed_behavior"
+    VERSION_OR_ENVIRONMENT = "version_or_environment"
+    DIAGNOSTIC_EVIDENCE = "diagnostic_evidence"
+
+    @classmethod
+    def parse(cls, value: object) -> MissingInformation:
+        try:
+            return cls(str(value).strip().casefold())
+        except ValueError as exc:
+            raise ValueError(f"unsupported missing information: {value!r}") from exc
+
+
 class Impact(StrEnum):
     CRITICAL = "critical"
     HIGH = "high"
@@ -91,6 +135,10 @@ class Issue:
     area_keys: tuple[str, ...] = ()
     component_labels: tuple[str, ...] = ()
     classification_reasoning: str = ""
+    reported_type: IssueType | None = None
+    evidence_kind: EvidenceKind = EvidenceKind.NONE
+    information_status: InformationStatus = InformationStatus.NOT_APPLICABLE
+    missing_information: tuple[MissingInformation, ...] = ()
     duplicate_count: int = 0
     upvote_count: int = 0
     current_priority: Priority | None = None
@@ -111,6 +159,16 @@ class Issue:
             component_labels=_string_tuple(value.get("component_labels", ())),
             classification_reasoning=str(
                 value.get("classification_reasoning", value.get("reasoning", ""))
+            ),
+            reported_type=(
+                IssueType.parse(value["reported_type"]) if value.get("reported_type") else None
+            ),
+            evidence_kind=EvidenceKind.parse(value.get("evidence_kind", EvidenceKind.NONE)),
+            information_status=InformationStatus.parse(
+                value.get("information_status", InformationStatus.NOT_APPLICABLE)
+            ),
+            missing_information=tuple(
+                MissingInformation.parse(item) for item in value.get("missing_information", ())
             ),
             duplicate_count=max(0, int(value.get("duplicate_count", 0))),
             upvote_count=max(0, int(value.get("upvote_count", 0))),
