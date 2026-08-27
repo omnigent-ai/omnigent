@@ -1020,6 +1020,7 @@ def _chat_with_server(
     progress: RunnerStartupProgress | None = None,
     attach_only: bool = False,
     attach_harness: str | None = None,
+    resume_created_this_run: bool = False,
 ) -> None:
     """
     Connect to a server URL and run a one-shot query or REPL.
@@ -1037,6 +1038,11 @@ def _chat_with_server(
     :param resume_conversation_id: When set, the REPL opens
         attached to this existing conversation on the remote
         server instead of creating a fresh one.
+    :param resume_created_this_run: When ``True``,
+        *resume_conversation_id* names a session this same startup
+        just created, so it cannot be a terminal-native wrapper
+        session and the redirect probe below is skipped. ``False``
+        (the default) is a genuine resume of a pre-existing session.
     :param fork_session_id: When set, fork this session before
         entering the REPL. The REPL opens attached to the fork.
     :param agent_name: Optional already-selected agent name,
@@ -1099,11 +1105,19 @@ def _chat_with_server(
     # into the native wrapper carrying ``--server`` through. Without
     # this, the REPL renders an empty chat on top of a
     # session whose state lives in a tmux terminal it can't see.
-    if resume_conversation_id is not None and _redirect_native_resume_if_needed(
-        base_url=base_url,
-        conversation_id=resume_conversation_id,
-        auto_open_conversation=auto_open_conversation,
-        progress=progress,
+    # A session this startup just created is skipped: the wrapper label is
+    # written by the native launchers, never by the path that got here, so
+    # the probe can only ever answer "no wrapper" — at the cost of a full
+    # round trip in the last stretch before the REPL paints.
+    if (
+        resume_conversation_id is not None
+        and not resume_created_this_run
+        and _redirect_native_resume_if_needed(
+            base_url=base_url,
+            conversation_id=resume_conversation_id,
+            auto_open_conversation=auto_open_conversation,
+            progress=progress,
+        )
     ):
         return
 
@@ -1475,10 +1489,13 @@ class _DaemonChatSession:
         ``"conv_abc123"``.
     :param runner_id: The daemon-spawned runner bound to the session, e.g.
         ``"runner_abc123"``.
+    :param fresh: Whether this startup created the session just now, as
+        opposed to resuming or forking an existing one.
     """
 
     session_id: str
     runner_id: str
+    fresh: bool = False
 
 
 _DAEMON_CHAT_HOST_ONLINE_TIMEOUT_S = 30.0
@@ -1617,7 +1634,8 @@ async def _prepare_chat_session_via_daemon(
         "Launching your agent…") as the host and runner come online, so a
         slow cold start is not silent. ``None`` (the default) runs without
         any progress updates.
-    :returns: The prepared session id + bound runner id.
+    :returns: The prepared session id + bound runner id, and whether the
+        session was created by this call.
     :raises click.ClickException: If the server is unreachable, or session
         create/fork or runner launch fails.
     """
@@ -1703,7 +1721,7 @@ async def _prepare_chat_session_via_daemon(
         # --server URL, or a proxy refusing the tunnel. These three are
         # siblings under TransportError, so each has to be named.
         raise click.ClickException(_unreachable_server_message(base_url)) from exc
-    return _DaemonChatSession(session_id=session_id, runner_id=runner_id)
+    return _DaemonChatSession(session_id=session_id, runner_id=runner_id, fresh=fresh_session)
 
 
 def _chat_via_daemon(
@@ -1855,6 +1873,7 @@ def _chat_via_daemon(
                 skills=all_skills or None,
                 auto_open_conversation=auto_open_conversation,
                 progress=progress,
+                resume_created_this_run=prepared.fresh,
             )
     finally:
         _cleanup_materialized_override_bundle(spec_path)

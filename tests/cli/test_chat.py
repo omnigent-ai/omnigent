@@ -1189,7 +1189,7 @@ def test_chat_via_daemon_hands_daemon_runner_to_chat_with_server(
 
     async def _fake_prepare(**kwargs: object) -> _DaemonChatSession:
         captured["prepare"] = kwargs
-        return _DaemonChatSession(session_id="conv_daemon", runner_id="runner_daemon")
+        return _DaemonChatSession(session_id="conv_daemon", runner_id="runner_daemon", fresh=True)
 
     def _fake_chat_with_server(
         server_url: str,
@@ -1200,6 +1200,7 @@ def test_chat_via_daemon_hands_daemon_runner_to_chat_with_server(
         resume_conversation_id: str | None = None,
         session_bundle: bytes | None = None,
         fork_session_id: str | None = None,
+        resume_created_this_run: bool = False,
         **kwargs: object,
     ) -> None:
         captured["chat"] = {
@@ -1209,6 +1210,7 @@ def test_chat_via_daemon_hands_daemon_runner_to_chat_with_server(
             "resume_conversation_id": resume_conversation_id,
             "session_bundle": session_bundle,
             "fork_session_id": fork_session_id,
+            "resume_created_this_run": resume_created_this_run,
         }
 
     monkeypatch.setattr(chat_module, "_bundle_agent", lambda _p: b"bundle-bytes")
@@ -1235,6 +1237,9 @@ def test_chat_via_daemon_hands_daemon_runner_to_chat_with_server(
     assert chat["resume_conversation_id"] == "conv_daemon"
     assert chat["runner_recover"] is None
     assert chat["fork_session_id"] is None
+    # A session the prep just created is flagged, so _chat_with_server skips
+    # the wrapper-label probe instead of re-reading the snapshot.
+    assert chat["resume_created_this_run"] is True
     # Bundle is still passed so the one-shot path takes its sessions branch.
     assert chat["session_bundle"] == b"bundle-bytes"
     # The prep was asked to create a fresh session (no resume/fork).
@@ -1337,6 +1342,8 @@ def test_prepare_chat_session_via_daemon_creates_fresh_and_launches(
     assert "fork" not in captured
     assert prepared.session_id == "conv_created"
     assert prepared.runner_id == "runner_daemon"
+    # ``fresh`` tells _chat_with_server it may skip the wrapper-label probe.
+    assert prepared.fresh is True
     # The runner is launched bound to the freshly-created session.
     assert captured["launch"] == {
         "host_id": "host_x",
@@ -1368,6 +1375,8 @@ def test_prepare_chat_session_via_daemon_resume_skips_create(
     assert "create" not in captured  # resume must not create a new session
     assert prepared.session_id == "conv_resume"
     assert prepared.runner_id == "runner_daemon"
+    # A pre-existing session may carry a wrapper label, so the probe stands.
+    assert prepared.fresh is False
     launch = captured["launch"]
     assert isinstance(launch, dict)
     assert launch["session_id"] == "conv_resume"
