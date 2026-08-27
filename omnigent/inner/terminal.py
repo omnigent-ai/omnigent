@@ -27,7 +27,8 @@ from omnigent.runner.identity import strip_runner_auth_secrets
 
 from . import _proc
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
-from .egress import EgressProxyHandle, apply_egress_env, start_egress_proxy
+from .egress import EgressProxyHandle
+from .native_sandbox import bootstrap_native_egress
 from .os_env import (
     OSEnvironment,
     _copy_tree,
@@ -37,7 +38,6 @@ from .sandbox import (
     SandboxPolicy,
     cleanup_private_tmpdir,
     create_exec_launcher,
-    create_private_tmpdir,
     resolve_sandbox,
     with_additional_write_roots,
     with_denied_unix_sockets,
@@ -1236,39 +1236,16 @@ class TerminalInstance:
             bind-mounts it inside the namespace.
         """
         assert self.egress_rules, "caller checked self.egress_rules"
-        self._egress_tmpdir = create_private_tmpdir()
-        # Add the scratch tmpdir to write_roots BEFORE encoding the
-        # policy into the launcher. Without this, bwrap won't bind
-        # the tmpdir into the namespace and the CA bundle /
-        # egress socket the launcher needs at activate time would
-        # be invisible.
-        sandbox = with_additional_write_roots(sandbox, [self._egress_tmpdir])
-        self._egress_handle = start_egress_proxy(
-            rules=self.egress_rules,
-            tmpdir=self._egress_tmpdir,
-            allow_private_destinations=self.egress_allow_private_destinations,
-            # Terminal path uses ``require_auth=False``: tmux closes
-            # inherited FDs before exec, so we have no out-of-band
-            # channel for a Proxy-Authorization token. Embedding the
-            # token in HTTP_PROXY (the alternative) would leak it via
-            # ``ps -E`` on every shell child anyway. The relay's
-            # other defenses (random ephemeral port, default-deny on
-            # private destinations, allow-list per :attr:`egress_rules`)
-            # still apply; see the controller's docstring for the
-            # full trade-off discussion.
-            require_auth=False,
-        )
-        apply_egress_env(
-            env,
-            relay_port=self._egress_handle.relay_port,
-            ca_bundle_path=self._egress_handle.ca_bundle_path,
-            auth_token=None,
-        )
-        return replace(
+        sandbox, self._egress_handle = bootstrap_native_egress(
             sandbox,
-            egress_relay_port=self._egress_handle.relay_port,
-            egress_socket_path=str(self._egress_handle.socket_path),
+            env,
+            egress_rules=self.egress_rules,
+            allow_private_destinations=self.egress_allow_private_destinations,
         )
+        # Retain the scratch tmpdir (the parent of the egress socket that
+        # ``bootstrap_native_egress`` minted) so ``close()`` can remove it.
+        self._egress_tmpdir = self._egress_handle.socket_path.parent
+        return sandbox
 
     async def close(self) -> None:
         """Kill the tmux session and clean up."""

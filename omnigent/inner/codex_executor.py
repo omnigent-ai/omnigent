@@ -57,6 +57,16 @@ from .databricks_executor import (
     _databricks_gateway_host,
 )
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
+from .egress import EgressProxyHandle
+from .native_sandbox import bootstrap_native_egress
+from .sandbox import (
+    cleanup_private_tmpdir,
+    create_exec_launcher,
+    get_backend,
+    resolve_sandbox,
+    with_additional_read_roots,
+    with_additional_write_roots,
+)
 from .executor import (
     Executor,
     ExecutorConfig,
@@ -2236,6 +2246,13 @@ class _CodexAppServerSession:
         self._fatal_gateway_error: _CodexGatewayError | None = None
         self._recent_events: list[CodexMessage] = []
         self._process_cwd: Path | None = None
+        # Set True at spawn when Codex is successfully wrapped in Omnigent's
+        # bwrap sandbox; drives ``sandbox="danger-full-access"`` per turn so
+        # Codex trusts the outer jail instead of nesting its own sandbox.
+        self._omnigent_sandbox_active = False
+        # Live handle for the per-session L7 egress proxy, when egress_rules are
+        # configured. Torn down in ``close()``.
+        self._egress_handle: EgressProxyHandle | None = None
         # Private CODEX_HOME so the subprocess never writes to the user's ~/.codex/.
         self._codex_home_dir: Path | None = None
         # Most recent ``thread/tokenUsage/updated`` payload's ``last``
@@ -2325,8 +2342,64 @@ class _CodexAppServerSession:
         # history) in a private temp directory rather than the user's ~/.codex/.
         # This prevents subagent sessions from polluting the user's Codex history.
         proc_env = {**self._env, "CODEX_HOME": str(self._codex_home_dir)}
+        # Run Codex inside Omnigent's bwrap sandbox (+ L7 egress proxy when
+        # ``egress_rules`` are set) so ``os_env.sandbox`` actually governs it
+        # — Codex spawns its own shell rather than routing through the sys_os
+        # helper, so without this the sandbox/egress never reach it. The wrap
+        # engages whenever a sandbox is configured (``type != none``),
+        # independent of egress (egress may be enforced at the host level).
+        # Network posture follows Omnigent's convention: direct network unless
+        # ``allow_network: false`` or ``egress_rules`` are set. When wrapped,
+        # Codex's own nested sandbox is disabled per turn (see ``run_turn``) so
+        # Omnigent's jail is the sole boundary.
+        codex_bin = self._codex_path
+        launcher_bin = codex_bin
+        self._omnigent_sandbox_active = False
+        spec = self._os_env_spec
+        if spec is not None and spec.sandbox is not None and spec.sandbox.type != "none":
+            cwd_path = Path(self._cwd or os.getcwd())
+            try:
+                policy = resolve_sandbox(spec, cwd_path)
+                if policy.active:
+                    # Codex writes its state under the temp CODEX_HOME, and the
+                    # `codex` launcher (a node script) must be readable in the jail.
+                    if self._codex_home_dir is not None:
+                        policy = with_additional_write_roots(
+                            policy, [Path(self._codex_home_dir)]
+                        )
+                    policy = with_additional_read_roots(
+                        policy, [Path(codex_bin).resolve().parent]
+                    )
+                    if spec.sandbox.egress_rules:
+                        policy, self._egress_handle = bootstrap_native_egress(
+                            policy,
+                            proc_env,
+                            egress_rules=spec.sandbox.egress_rules,
+                            allow_private_destinations=(
+                                spec.sandbox.egress_allow_private_destinations
+                            ),
+                        )
+                    # Fail fast if the sandbox can't wrap this binary (mirrors
+                    # the Claude SDK path) instead of discovering it post-spawn.
+                    get_backend(policy.backend_type).wrap_launcher_argv(
+                        [codex_bin, "app-server"], policy, cwd_path, target=codex_bin
+                    )
+                    launcher_bin = create_exec_launcher(codex_bin, policy)
+                    self._omnigent_sandbox_active = True
+            except OSError as exc:
+                logger.warning(
+                    "Omnigent sandbox cannot wrap Codex at %s (%s); running "
+                    "Codex unwrapped under its own sandbox.",
+                    codex_bin,
+                    exc,
+                )
+                self._omnigent_sandbox_active = False
+                if self._egress_handle is not None:
+                    self._egress_handle.stop()
+                    self._egress_handle = None
+                launcher_bin = codex_bin
         try:
-            argv = [self._codex_path, "app-server"]
+            argv = [launcher_bin, "app-server"]
             for override in self._codex_config_overrides:
                 argv.extend(["-c", override])
             self._proc = await _create_subprocess_exec(
@@ -2372,6 +2445,18 @@ class _CodexAppServerSession:
             raise
 
     async def close(self) -> None:
+        # Tear down the per-session egress proxy (if we started one) and its
+        # scratch tmpdir. Safe to run on either close() path below.
+        if self._egress_handle is not None:
+            try:
+                self._egress_handle.stop()
+            except Exception:  # noqa: BLE001 — best-effort proxy shutdown
+                logger.debug("egress proxy stop failed", exc_info=True)
+            try:
+                cleanup_private_tmpdir(self._egress_handle.socket_path.parent)
+            except Exception:  # noqa: BLE001 — best-effort tmpdir cleanup
+                logger.debug("egress tmpdir cleanup failed", exc_info=True)
+            self._egress_handle = None
         current_loop = asyncio.get_running_loop()
         if self._loop is not None and self._loop is not current_loop:
             if self._proc is not None and self._proc.returncode is None:
@@ -3619,7 +3704,13 @@ class CodexExecutor(Executor):
             effective_cwd=effective_cwd,
         )
         sandbox_mode = _sandbox_mode(self._os_env_spec)
-        if tools and sandbox_mode == "read-only":
+        if self._omnigent_sandbox_active:
+            # Codex is wrapped in Omnigent's bwrap jail (the real boundary), so
+            # disable Codex's own nested sandbox: a nested landlock/seccomp
+            # sandbox would either fail for lack of privileges inside bwrap or
+            # block the loopback egress relay.
+            sandbox_mode = "danger-full-access"
+        elif tools and sandbox_mode == "read-only":
             sandbox_mode = "workspace-write"
 
         try:
