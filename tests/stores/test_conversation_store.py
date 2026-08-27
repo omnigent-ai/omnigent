@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
+
 import pytest
 from sqlalchemy import event, text
 
@@ -1683,6 +1686,28 @@ async def test_delete_conversation(
     assert conversation_store.get_conversation(conv.id) is None
     assert conversation_store.list_items(conv.id).data == []
     assert await conversation_store.delete_conversation(conv.id) is False
+
+
+@pytest.mark.asyncio
+async def test_delete_conversation_does_not_block_event_loop(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_delete(_conversation_id: str) -> bool:
+        started.set()
+        return release.wait(timeout=1)
+
+    monkeypatch.setattr(conversation_store, "_delete_conversation_sync", blocking_delete)
+    delete_task = asyncio.create_task(conversation_store.delete_conversation("conv_test"))
+    try:
+        assert await asyncio.to_thread(started.wait, 1)
+        assert not delete_task.done()
+    finally:
+        release.set()
+    assert await delete_task is True
 
 
 @pytest.mark.asyncio
