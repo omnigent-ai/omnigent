@@ -112,7 +112,9 @@ class PolicyEngine:
         initial_session_state: dict[str, Any] | None = None,
         initial_usage: dict[str, float] | None = None,
         initial_subtree_usage: dict[str, float] | None = None,
-        initial_user_daily_cost: list[dict[str, float | str | None]] | list[DailyCostState] | None = None,
+        initial_user_daily_cost: list[dict[str, float | str | None]]
+        | list[DailyCostState]
+        | None = None,
         token_pricing: ModelPricing | None = None,
         initial_model: str | None = None,
         conversation_store: ConversationStore,
