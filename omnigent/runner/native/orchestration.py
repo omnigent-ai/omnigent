@@ -29,7 +29,11 @@ if TYPE_CHECKING:
     # Type-only import: the runner keeps codex deps out of its runtime import
     # graph (they are imported lazily inside the codex-native helpers).
     from omnigent.claude_native import ClaudeNativeUcodeConfig
-    from omnigent.codex_native_app_server import CodexAppServerClient, CodexNativeAppServer
+    from omnigent.codex_native_app_server import (
+        CodexAppServerClient,
+        CodexNativeAppServer,
+        CodexTraceLaunchProvenance,
+    )
     from omnigent.inner.datamodel import OSEnvSpec
     from omnigent.opencode_native_app_server import OpenCodeNativeServer
     from omnigent.opencode_native_client import OpenCodeClient, OpenCodeSession
@@ -4284,6 +4288,9 @@ async def _auto_create_codex_terminal(
                 codex_home=codex_home,
                 event_client=event_client,
                 routing_summary=_codex_launch.summary,
+                trace_launch_provenance=_codex_launch.trace_provenance,
+                requested_model=_codex_launch.model,
+                requested_effort=None,
                 subagent_router=_codex_router,
                 turn_router=_codex_turn_router,
             )
@@ -4293,6 +4300,9 @@ async def _auto_create_codex_terminal(
                 bridge_dir=bridge_dir,
                 codex_ws_url=codex_ws_url,
                 thread_id=launch_config.external_session_id,
+                trace_launch_provenance=_codex_launch.trace_provenance,
+                requested_model=_codex_launch.model,
+                requested_effort=None,
                 subagent_router=_codex_router,
                 turn_router=_codex_turn_router,
             )
@@ -4333,6 +4343,9 @@ async def _codex_discover_thread_and_forward(
     codex_home: Path,
     event_client: CodexAppServerClient,
     routing_summary: str,
+    trace_launch_provenance: CodexTraceLaunchProvenance | None = None,
+    requested_model: str | None = None,
+    requested_effort: str | None = None,
     subagent_router: SubagentRouter | None = None,
     turn_router: TurnRouter | None = None,
 ) -> None:
@@ -4470,6 +4483,9 @@ async def _codex_discover_thread_and_forward(
             thread_id=thread_id,
             client=event_client,
             auth=_RunnerDatabricksAuth(auth_factory),
+            trace_launch_provenance=trace_launch_provenance,
+            requested_model=requested_model,
+            requested_effort=requested_effort,
         )
     finally:
         # Tear down the listener and the per-session app-server whenever
@@ -4495,6 +4511,9 @@ async def _codex_forward_known_thread(
     bridge_dir: Path,
     codex_ws_url: str,
     thread_id: str,
+    trace_launch_provenance: CodexTraceLaunchProvenance | None = None,
+    requested_model: str | None = None,
+    requested_effort: str | None = None,
     subagent_router: SubagentRouter | None = None,
     turn_router: TurnRouter | None = None,
 ) -> None:
@@ -4534,6 +4553,9 @@ async def _codex_forward_known_thread(
             app_server_url=codex_ws_url,
             thread_id=thread_id,
             auth=_RunnerDatabricksAuth(auth_factory),
+            trace_launch_provenance=trace_launch_provenance,
+            requested_model=requested_model,
+            requested_effort=requested_effort,
         )
     finally:
         leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
