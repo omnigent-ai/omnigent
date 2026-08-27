@@ -293,6 +293,7 @@ def fetch_model_pricing_with_provider(
     model: str,
     provider_config: dict[str, Any] | None = None,
     harness: str | None = None,
+    provider_entry: Any | None = None,
 ) -> ModelPricing | None:
     """
     Fetch model pricing, checking provider config first then catalog.
@@ -330,42 +331,42 @@ def fetch_model_pricing_with_provider(
         lookup and falls through to catalog. SDK executors may pass
         executor-style spellings (``claude_sdk``, ``agents_sdk``) which are
         normalized internally.
+    :param provider_entry: The exact :class:`~omnigent.onboarding.provider_config.ProviderEntry`
+        for the session's actual provider. When supplied, the family-pricing
+        lookup uses this entry directly instead of re-resolving the default
+        provider via :func:`~omnigent.onboarding.provider_config.default_provider_for_harness`.
+        Callers that know which named provider a session was launched with
+        (e.g. via ``executor.auth: {type: provider, name: ...}``) should
+        pass it here so sessions on non-default providers are priced
+        correctly.
     :returns: A :class:`ModelPricing` (per-token rates), or ``None`` when
         pricing is unavailable.
-
-    .. note::
-        LIMITATION: This function uses ``default_provider_for_harness`` to
-        resolve the provider, which returns the DEFAULT provider for the given
-        harness, not necessarily the provider actually used by the session.
-        Sessions using named providers (via ``ProviderAuth``) that differ from
-        the default may be priced incorrectly. A future improvement should
-        thread the actual ``ProviderEntry`` from launch/session state instead
-        of re-resolving the default.
     """
     # Step 1: Check provider config custom pricing first (configured rates take precedence)
     # Canonicalize harness to handle SDK executor spellings (claude_sdk -> claude-sdk)
-    if provider_config is not None and harness is not None:
+    if harness is not None:
         from omnigent.harness_aliases import canonicalize_harness
 
         canonical_harness = canonicalize_harness(harness) or harness
-        # Lazy import to avoid circular dependency. provider_config imports
-        # this module at top level, so we import it only when needed here.
-        from omnigent.onboarding.provider_config import (
-            default_provider_for_harness,
-        )
 
         try:
-            provider = default_provider_for_harness(provider_config, canonical_harness)
-            if provider is not None:
-                # Determine which family (anthropic/openai) this harness uses
-                from omnigent.onboarding.provider_config import provider_family_for_harness
+            from omnigent.onboarding.provider_config import provider_family_for_harness
 
-                family_name = provider_family_for_harness(canonical_harness)
-                if family_name is not None:
-                    # Get the family config with custom pricing (if any)
+            family_name = provider_family_for_harness(canonical_harness)
+            if family_name is not None:
+                # Use the explicitly-supplied provider entry when the caller
+                # knows which provider the session actually ran on. Fall back
+                # to the config-default when none was supplied.
+                provider = provider_entry
+                if provider is None and provider_config is not None:
+                    from omnigent.onboarding.provider_config import (
+                        default_provider_for_harness,
+                    )
+
+                    provider = default_provider_for_harness(provider_config, canonical_harness)
+                if provider is not None:
                     family = provider.family(family_name)
                     if family is not None and family.pricing is not None:
-                        # Convert per-million prices to per-token
                         return ModelPricing(
                             input_per_token=family.pricing.input_per_million / 1_000_000,
                             output_per_token=family.pricing.output_per_million / 1_000_000,

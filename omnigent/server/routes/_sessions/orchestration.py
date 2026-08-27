@@ -1163,6 +1163,59 @@ def _build_session_response(
     )
 
 
+def _resolve_session_provider_entry(
+    conv: Any,
+) -> Any | None:
+    """Return the ProviderEntry for the session's actual named provider, if any.
+
+    When a session's agent declares ``executor.auth: {type: provider, name: X}``,
+    the pricing path must use provider X's configured rates rather than the
+    harness default's rates. This helper loads the agent spec via the agent
+    cache and returns the named entry when the auth is a ProviderAuth, else
+    None so the caller falls back to the default-provider lookup.
+
+    Errors are silenced and return None so a broken spec never breaks cost
+    accounting — the caller falls back to catalog or default-provider pricing.
+    """
+    if conv is None or not getattr(conv, "agent_id", None):
+        return None
+    try:
+        from omnigent.onboarding.provider_config import load_providers
+        from omnigent.runtime import get_agent_cache
+        from omnigent.runtime._globals import _agent_store
+        from omnigent.runtime.workflow import effective_config_with_detected
+        from omnigent.spec.types import ProviderAuth
+
+        agent_store = _agent_store
+        if agent_store is None:
+            return None
+        agent = agent_store.get(conv.agent_id)
+        if agent is None:
+            return None
+        agent_cache = get_agent_cache()
+        loaded = agent_cache.load(
+            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+        )
+        # For sub-agent sessions, use the sub-agent's own executor.
+        executor = loaded.spec.executor
+        if conv.sub_agent_name:
+            sub = next(
+                (s for s in loaded.spec.sub_agents if s.name == conv.sub_agent_name),
+                None,
+            )
+            if sub is not None:
+                executor = sub.executor
+        auth = executor.auth if executor else None
+        if not isinstance(auth, ProviderAuth):
+            return None
+        from omnigent.onboarding.provider_config import load_config
+
+        providers = load_providers(effective_config_with_detected(load_config()))
+        return providers.get(auth.name)
+    except Exception:  # noqa: BLE001 — broken spec must never break cost accounting
+        return None
+
+
 def _accumulate_session_usage(
     resp_obj: dict[str, Any],
     session_id: str,
@@ -1266,8 +1319,15 @@ def _accumulate_session_usage(
             provider_config = load_config()
             # Resolve harness from conversation (agent spec + overrides)
             harness = _resolve_harness(conv) if conv else None
+            # Resolve the actual provider the session was launched with so
+            # sessions on a non-default named provider are priced at their
+            # configured rate rather than the harness default's rate.
+            provider_entry = _resolve_session_provider_entry(conv)
             pricing = fetch_model_pricing_with_provider(
-                llm_model, provider_config=provider_config, harness=harness
+                llm_model,
+                provider_config=provider_config,
+                harness=harness,
+                provider_entry=provider_entry,
             )
             priced = pricing is not None
             if pricing is not None:
@@ -1462,8 +1522,14 @@ def _persist_native_cumulative_usage(
             provider_config = load_config()
             # Resolve harness from conversation (agent spec + overrides)
             harness = _resolve_harness(conv) if conv else None
+            # Resolve the actual named provider so non-default sessions are
+            # priced at their configured rate, not the harness default's rate.
+            provider_entry = _resolve_session_provider_entry(conv)
             pricing = fetch_model_pricing_with_provider(
-                model_name, provider_config=provider_config, harness=harness
+                model_name,
+                provider_config=provider_config,
+                harness=harness,
+                provider_entry=provider_entry,
             )
             if pricing is not None:
                 # SET (cumulative) — price the running token totals.
