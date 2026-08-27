@@ -28,7 +28,11 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus, InvalidURI
 
 from omnigent._platform import IS_POSIX, WINDOWS_ENV_PASSTHROUGH
 from omnigent.cli_invocation import cli_invocation
-from omnigent.debug_logging import PRIMARY_SESSION_ID_ENV_VAR, USER_ID_ENV_VAR
+from omnigent.debug_logging import (
+    ORIGIN_WORKSPACE_ID_ENV_VAR,
+    PRIMARY_SESSION_ID_ENV_VAR,
+    USER_ID_ENV_VAR,
+)
 from omnigent.env_credentials import env_names_with_omnigent_prefix
 from omnigent.gateway_inference import gateway_inference_map
 from omnigent.harness_aliases import canonicalize_harness, is_claude_sdk_harness_name
@@ -880,6 +884,20 @@ class HostProcess:
         # to OMNIGENT_USER_ID so host/runner debug-log rows carry it. None until
         # resolved, or on a single-user server / managed host where it is absent.
         self._owner_user_id: str | None = None
+        # The fronting Databricks workspace id for this server, resolved once from
+        # the server URL (its ?o= selector or the stored login record) — the same
+        # resolution the display URL uses, no extra network. Published to
+        # DATABRICKS_WORKSPACE_ID for the host's own debug-log rows and injected
+        # into every runner this host spawns; None on a non-Databricks server.
+        self._origin_workspace_id: str | None = None
+        try:
+            from omnigent.server_url import ServerUrl
+
+            self._origin_workspace_id = ServerUrl.from_api_base(self._server_url).org_id
+        except Exception:  # noqa: BLE001 — attribution is best-effort
+            self._origin_workspace_id = None
+        if self._origin_workspace_id:
+            os.environ[ORIGIN_WORKSPACE_ID_ENV_VAR] = self._origin_workspace_id
         # Set on the first accepted WS upgrade. Distinguishes a host that
         # never authenticated (login redirects / 401 / 403 turn fatal) from a
         # live host hit by a transient failure — a server restart or a dropped
@@ -1480,6 +1498,10 @@ class HostProcess:
         # attribution of runner-level log records.
         if self._owner_user_id:
             env[USER_ID_ENV_VAR] = self._owner_user_id
+        # The workspace id is resolved from the same server URL the runner dials,
+        # so hand it the already-resolved value rather than making it re-derive.
+        if self._origin_workspace_id:
+            env[ORIGIN_WORKSPACE_ID_ENV_VAR] = self._origin_workspace_id
 
         # Embed the session id so operators can find all logs for a session
         # with `omnigent debug logs --session <id>`. Cap at 32 chars to keep

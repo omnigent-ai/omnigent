@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import atexit
 import contextlib
-import functools
 import json
 import logging
 import os
@@ -267,15 +266,16 @@ def _parse_databricks_app_host(url: str | None) -> tuple[str | None, str | None]
     return app_name, workspace_id
 
 
-@functools.lru_cache(maxsize=1)
 def _process_identity() -> tuple[str | None, str | None]:
-    """Process-constant ``(workspace_id, app_name)`` for single-tenant deployments.
+    """Best-available ``(workspace_id, app_name)`` for single-tenant deployments.
 
     The fallback the sink applies when a record carries no per-request identity:
-    the ``DATABRICKS_*`` env a Databricks App injects, else the values parsed from
-    the server URL a runner/host connected to an App carries. ``(None, None)`` on
-    the managed service (which supplies identity per-record) and on OSS/local.
-    Cached: the environment is fixed for the process's life.
+    the ``DATABRICKS_*`` env (a Databricks App injects it; a host connected to a
+    managed service resolves its workspace id and publishes it there, and injects
+    it into each runner it spawns), else the values parsed from the server URL a
+    runner/host connected to an App carries. ``(None, None)`` on the managed
+    service (which supplies identity per-record) and on OSS/local. Read fresh per
+    call, not cached: the host resolves and sets the env after import.
     """
     url_app, url_ws = _parse_databricks_app_host(os.environ.get(SERVER_URL_ENV_VAR))
     workspace_id = _clean(os.environ.get(ORIGIN_WORKSPACE_ID_ENV_VAR)) or url_ws

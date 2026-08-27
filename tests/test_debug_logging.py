@@ -38,9 +38,6 @@ def _clear_env(monkeypatch: pytest.MonkeyPatch) -> None:
         dl.SERVER_URL_ENV_VAR,
     ):
         monkeypatch.delenv(name, raising=False)
-    # _process_identity is a process constant and lru-cached; reset it between
-    # tests so one test's env can't leak through the cache into the next.
-    dl._process_identity.cache_clear()
 
 
 def test_disabled_without_env() -> None:
@@ -380,7 +377,6 @@ def test_process_identity_from_databricks_env(monkeypatch: pytest.MonkeyPatch) -
     # Databricks App: the platform-injected env is authoritative.
     monkeypatch.setenv(dl.ORIGIN_WORKSPACE_ID_ENV_VAR, "111222333")
     monkeypatch.setenv(dl.APP_NAME_ENV_VAR, "omnigents")
-    dl._process_identity.cache_clear()
     assert dl._process_identity() == ("111222333", "omnigents")
 
 
@@ -389,7 +385,6 @@ def test_process_identity_from_server_url(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setenv(
         dl.SERVER_URL_ENV_VAR, "https://omnigents-3272836215725701.aws.databricksapps.com"
     )
-    dl._process_identity.cache_clear()
     assert dl._process_identity() == ("3272836215725701", "omnigents")
 
 
@@ -398,7 +393,6 @@ def test_process_identity_env_beats_url(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setenv(dl.ORIGIN_WORKSPACE_ID_ENV_VAR, "999")
     monkeypatch.setenv(dl.APP_NAME_ENV_VAR, "envapp")
     monkeypatch.setenv(dl.SERVER_URL_ENV_VAR, "https://urlapp-111.aws.databricksapps.com")
-    dl._process_identity.cache_clear()
     assert dl._process_identity() == ("999", "envapp")
 
 
@@ -408,13 +402,11 @@ def test_process_identity_managed_service_is_none(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setenv(
         dl.SERVER_URL_ENV_VAR, "https://dbc-a5d4177a-49dc.cloud.databricks.com/omnigent"
     )
-    dl._process_identity.cache_clear()
     assert dl._process_identity() == (None, None)
 
 
 def test_process_identity_unset_is_none() -> None:
     # OSS / local: nothing set anywhere.
-    dl._process_identity.cache_clear()
     assert dl._process_identity() == (None, None)
 
 
@@ -422,7 +414,6 @@ def test_record_to_row_prefers_record_workspace_id(monkeypatch: pytest.MonkeyPat
     # The managed service stamps record.workspace_id per request; it wins over
     # the process-constant fallback.
     monkeypatch.setenv(dl.ORIGIN_WORKSPACE_ID_ENV_VAR, "process999")
-    dl._process_identity.cache_clear()
     record = logging.LogRecord("omnigent.server", logging.INFO, __file__, 1, "hi", (), None)
     record.workspace_id = "perrequest111"
     assert dl.record_to_row(record, source="server")["workspace_id"] == "perrequest111"
@@ -434,7 +425,6 @@ def test_record_to_row_blank_record_workspace_id_falls_back(
     # Outside a request the managed filter sets record.workspace_id = "" — an
     # empty value must fall through to the process constant, not win.
     monkeypatch.setenv(dl.ORIGIN_WORKSPACE_ID_ENV_VAR, "process999")
-    dl._process_identity.cache_clear()
     record = logging.LogRecord("omnigent.server", logging.INFO, __file__, 1, "hi", (), None)
     record.workspace_id = ""
     assert dl.record_to_row(record, source="server")["workspace_id"] == "process999"
@@ -445,7 +435,6 @@ def test_record_to_row_origin_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     # carries none.
     monkeypatch.setenv(dl.ORIGIN_WORKSPACE_ID_ENV_VAR, "3272836215725701")
     monkeypatch.setenv(dl.APP_NAME_ENV_VAR, "omnigents")
-    dl._process_identity.cache_clear()
     record = logging.LogRecord("omnigent.server", logging.INFO, __file__, 1, "hi", (), None)
     row = dl.record_to_row(record, source="server")
     assert row["workspace_id"] == "3272836215725701"
