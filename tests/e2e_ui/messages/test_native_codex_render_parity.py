@@ -98,6 +98,11 @@ def _type_into_tui(page: Page, text: str) -> None:
     page.keyboard.press("Enter")
 
 
+# Boots a real Codex CLI; serialize across xdist workers (see the marker's
+# autouse fixture in tests/e2e_ui/conftest.py).
+pytestmark = pytest.mark.heavy_native_cli
+
+
 @pytest.mark.nightly
 @pytest.mark.timeout(300)
 def test_native_codex_message_render_parity(

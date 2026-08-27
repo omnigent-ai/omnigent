@@ -33,6 +33,10 @@ _TOOL_RESPONSES = [
 ]
 _NATIVE_CODEX_TIMEOUT_MS = 180_000
 
+# Boots a real Codex CLI; serialize across xdist workers (see the marker's
+# autouse fixture in tests/e2e_ui/conftest.py).
+pytestmark = pytest.mark.heavy_native_cli
+
 
 @pytest.mark.parametrize(
     "mocked_native_codex_session",

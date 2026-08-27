@@ -163,6 +163,21 @@ jobs:
         with:
           ref: ${{ github.event.inputs.branch || github.ref }}
 
+      - name: Add swap headroom for parallel workers
+        # ubuntu-latest has 2 cores / ~7 GB RAM. Running the suite under 2 xdist
+        # workers puts two full stacks (server + runner + mock LLM + headless
+        # Chromium, plus a real coding-agent CLI for the native tests) in memory
+        # at once, which overruns 7 GB and the OOM killer reaps a runner
+        # (exit -9), cascading into 503s. A large swapfile lets the transient
+        # peak spill to disk instead of OOM-killing; the working set still fits
+        # in RAM so the perf hit is limited to the rare overlap.
+        run: |
+          sudo fallocate -l 12G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -h
+
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
@@ -299,8 +314,20 @@ jobs:
           # --durations surfaces the slowest test phases (setup/call/teardown)
           # at the end of each shard's log so we can see where the wall-clock
           # goes and rebalance; the 1s floor keeps trivial phases out.
+          # -n 2 runs each shard's tests across 2 xdist workers in parallel.
+          # The suite is ~150 serial tests per shard, so halving the tail is
+          # the biggest per-runner win. Each worker gets its OWN session-scoped
+          # live_server/runner/mock-LLM/browser (separate processes, separate
+          # random ports), so the module-global _server_state and the
+          # server-killing tests (test_stale_stream) stay isolated per worker.
+          # --dist=loadscope keeps a test file on a single worker so the
+          # session-scoped live_server spawns once per file (not per worker
+          # churn), cutting server respawns and the memory they transiently
+          # cost. The heavy_native_cli filelock still caps real-CLI boots at
+          # one at a time across workers; the swapfile step absorbs the peak.
           uv run pytest tests/e2e_ui \
             -v --tb=long --showlocals --log-level=INFO -r a \
+            -n 2 --dist=loadscope \
             --durations=25 --durations-min=1.0 \
             --ui-skip-build \
             --splits="$NUM_SHARDS" \

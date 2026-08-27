@@ -36,6 +36,11 @@ def _goal_response(session_id: str, method: str, suffix: str = ""):
     return _matches
 
 
+# Boots a real Codex CLI; serialize across xdist workers (see the marker's
+# autouse fixture in tests/e2e_ui/conftest.py).
+pytestmark = pytest.mark.heavy_native_cli
+
+
 # Boots a real native Codex CLI and drives it via a prebuilt codex-parity
 # sidecar (CI supplies the binary through CODEX_PARITY_SIDECAR_BIN, so no
 # multi-minute cargo build runs here). timeout(300) matches the sibling

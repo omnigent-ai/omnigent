@@ -20,6 +20,10 @@ from tests.e2e_ui.messages.test_native_codex_render_parity import (
 _OLD_MODEL = "gpt-5.4"
 _TIMEOUT_MS = 60_000
 
+# Boots a real Codex CLI; serialize across xdist workers (see the marker's
+# autouse fixture in tests/e2e_ui/conftest.py).
+pytestmark = pytest.mark.heavy_native_cli
+
 
 @pytest.mark.timeout(180)
 @pytest.mark.parametrize("mocked_native_codex_session", [_OLD_MODEL], indirect=True)

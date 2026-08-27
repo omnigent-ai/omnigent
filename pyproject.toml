@@ -487,6 +487,7 @@ markers = [
     "live_model_flows: end-to-end model-flow CUJs (tests/e2e/omnigent/test_model_flows_live.py). Opt-in via OMNIGENT_E2E_MODEL_FLOWS=1: boots a real omnigent server + host from a checkout (OMNIGENT_E2E_MODEL_FLOWS_REPO overrides which one, enabling the red-on-main matrix) with real claude/codex logins, drives the real SPA in a browser, and asserts pane truth via tmux. Never runs in CI by accident; each landing PR runs it locally per docs/model-flows test plan.",
     "posix_only: test relies on POSIX-only behaviour (fork, PTY, tmux, Unix sockets, signals); auto-skipped on Windows by tests/conftest.py.",
     "windows_only: test relies on Windows-only behaviour (Job Objects, cmd.exe); auto-skipped on POSIX by tests/conftest.py.",
+    "heavy_native_cli: e2e_ui test that boots a real coding-agent CLI (Codex/Claude/Cursor). Serialized across xdist workers by a cross-process filelock (tests/e2e_ui/conftest.py) so two real-CLI boots never run at once on a CPU-starved CI runner; lighter tests keep filling the other worker.",
 ]
 # Visual snapshot baselines are committed here, keyed per-OS by the plugin
 # (e.g. test_empty_landing_matches_baseline[linux].png). Failure artifacts

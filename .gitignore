@@ -68,6 +68,10 @@ output/playwright/
 # tests/e2e_ui/visual/snapshots/ is committed.
 tests/e2e_ui/visual/snapshot_failures/
 
+# Cross-worker lock serializing heavy real-CLI e2e_ui tests under xdist.
+# Created at runtime by filelock; never committed.
+tests/e2e_ui/.heavy_native_cli.lock
+
 # Web build outputs. Regenerated on demand; never committed.
 omnigent/server/static/web-ui/
 web/storybook-static/

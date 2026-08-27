@@ -30,9 +30,17 @@ from __future__ import annotations
 import re
 from typing import Any
 
+import pytest
 from playwright.sync_api import Browser, BrowserContext, Page, expect
 
 from omnigent.server.dictation import FAKE_SCRIPT as _FAKE_SCRIPT
+
+# These tests drive a real-time audio → WebSocket → transcript pipeline, so
+# they are timing-sensitive: under the parallel e2e-ui run (pytest -n) a
+# CPU-contended worker can drop/delay audio frames and miss the transcript
+# assertion. Rerun on failure, matching the repo's convention for
+# timing/scheduling races (see other e2e_ui @pytest.mark.flaky uses).
+pytestmark = pytest.mark.flaky(reruns=2, reruns_delay=5)
 
 # The capability probe caches per page load; the worklet chunks audio at
 # 100 ms; CI machines are slow — a generous ceiling keeps this deflaked.

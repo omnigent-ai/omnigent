@@ -229,6 +229,10 @@ def _wait_marker_in_transcript(
     )
 
 
+# Per-test (not module-level): only the LIVE test boots a real cursor-agent
+# TUI and must serialize across xdist workers; the mirror test below needs no
+# live agent. See the marker's autouse fixture in tests/e2e_ui/conftest.py.
+@pytest.mark.heavy_native_cli
 @_requires_live_cursor
 @pytest.mark.timeout(900)
 def test_native_cursor_message_render_parity(
