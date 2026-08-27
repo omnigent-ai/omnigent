@@ -32,6 +32,7 @@ import type {
   SessionTitleEvent,
   SessionTodosEvent,
   SessionUsageEvent,
+  SideQuestion,
   SlashCommand,
   RoutingDecision,
   StreamEvent,
@@ -482,6 +483,55 @@ describe("response.output_item.done (error)", () => {
       itemId: "err_kiro",
       responseId: "resp_kiro_failed_input",
     });
+  });
+});
+
+describe("response.output_item.done (side_question)", () => {
+  it("lifts a /btw exchange off the wire", () => {
+    const out = parse("response.output_item.done", {
+      type: "response.output_item.done",
+      item: {
+        id: "sq_1",
+        type: "side_question",
+        status: "completed",
+        response_id: "resp_btw",
+        model: "claude-sdk",
+        question: "which harness is this?",
+        answer: "It runs on claude-native.",
+        created_by: "alice@example.com",
+      },
+    });
+    expect(out).toHaveLength(1);
+    const ev = out[0] as SideQuestion;
+    expect(ev.type).toBe("side_question");
+    expect(ev.question).toBe("which harness is this?");
+    expect(ev.answer).toBe("It runs on claude-native.");
+    expect(ev.agentName).toBe("claude-sdk");
+    expect(ev.createdBy).toBe("alice@example.com");
+    expect(ev.itemId).toBe("sq_1");
+    expect(ev.responseId).toBe("resp_btw");
+  });
+
+  it("drops a half-formed record rather than rendering a stub", () => {
+    // The question and answer are one record; an aside missing either
+    // half reads as a bug, so it never reaches the transcript.
+    for (const item of [
+      { question: "q", answer: "" },
+      { question: "", answer: "a" },
+    ]) {
+      const out = parse("response.output_item.done", {
+        type: "response.output_item.done",
+        item: {
+          id: "sq_bad",
+          type: "side_question",
+          status: "completed",
+          response_id: "resp_btw",
+          model: "claude-sdk",
+          ...item,
+        },
+      });
+      expect(out).toHaveLength(0);
+    }
   });
 });
 

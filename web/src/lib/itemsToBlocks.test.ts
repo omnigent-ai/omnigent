@@ -10,6 +10,7 @@ import type {
   ErrorBlock,
   NativeToolBlock,
   ReasoningBlock,
+  SideQuestionBlock,
   SlashCommandBlock,
   TextDone,
   ToolGroup,
@@ -526,6 +527,48 @@ describe("itemsToBlocks — native tools and compaction", () => {
     expect(slash!.output).toBe("oncall: file-bug subcommand started");
     expect(slash!.ctx.itemId).toBe("sc_1");
     expect(slash!.ctx.responseId).toBe("resp_slash");
+  });
+
+  it("side_question item → SideQuestionBlock carrying both halves", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "sq_1",
+        response_id: "resp_btw",
+        type: "side_question",
+        status: "completed",
+        question: "which harness is this?",
+        answer: "It runs on claude-native.",
+        model: "claude-sdk",
+      },
+    ];
+    const blocks = itemsToBlocks(items);
+    const aside = blocks.find((b): b is SideQuestionBlock => b.type === "side_question");
+    expect(aside).toBeDefined();
+    expect(aside!.question).toBe("which harness is this?");
+    expect(aside!.answer).toBe("It runs on claude-native.");
+    expect(aside!.ctx.itemId).toBe("sq_1");
+    expect(aside!.ctx.responseId).toBe("resp_btw");
+  });
+
+  it("a side question hydrates no user-echo bubble", () => {
+    // Unlike a skill receipt, a /btw ask is not a message the user
+    // sent to the agent — echoing it as a user bubble would put the
+    // question back in the conversation the feature keeps it out of.
+    const items: ConversationItem[] = [
+      {
+        id: "sq_1",
+        response_id: "resp_btw",
+        type: "side_question",
+        status: "completed",
+        question: "which harness?",
+        answer: "claude-native",
+        model: "claude-sdk",
+        created_by: "alice@example.com",
+      },
+    ];
+    const blocks = itemsToBlocks(items);
+    expect(blocks.filter((b) => b.type === "user_message")).toHaveLength(0);
+    expect(blocks.filter((b) => b.type === "side_question")).toHaveLength(1);
   });
 
   it("skill receipt also hydrates a user-echo bubble before the indicator", () => {

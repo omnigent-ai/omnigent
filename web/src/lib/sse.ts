@@ -59,6 +59,7 @@ import type {
   SessionMcpStartupEvent,
   SessionTerminalPendingEvent,
   SessionUsageEvent,
+  SideQuestion,
   SlashCommand,
   RoutingDecision,
   TerminalCommandEvent,
@@ -1185,6 +1186,25 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
       itemId,
       responseId,
     } satisfies SlashCommand;
+  }
+
+  if (itemType === "side_question") {
+    // Drop a half-formed frame rather than rendering an aside with no
+    // question or no answer — the pair is the whole record.
+    const question = typeof rec.question === "string" ? rec.question : "";
+    const answer = typeof rec.answer === "string" ? rec.answer : "";
+    if (!question || !answer) {
+      return null;
+    }
+    return {
+      type: "side_question",
+      question,
+      answer,
+      agentName: String(rec.model ?? ""),
+      ...(typeof rec.created_by === "string" ? { createdBy: rec.created_by } : {}),
+      itemId,
+      responseId,
+    } satisfies SideQuestion;
   }
 
   if (itemType === "routing_decision") {

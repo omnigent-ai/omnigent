@@ -225,7 +225,7 @@ async def test_background_title_resolves_synthetic_claude_policy_gate(
         resolve_harness_config,
     )
     monkeypatch.setattr(
-        "omnigent.runner.background_titles.sdk.BACKGROUND_TITLE_INFERENCE_TIMEOUT_SECONDS",
+        "omnigent.runner.background_titles.service.BACKGROUND_TITLE_INFERENCE_TIMEOUT_SECONDS",
         0.05,
     )
     app = create_runner_app(
@@ -900,7 +900,7 @@ async def test_background_title_timeout_releases_process(
         resolve_harness_config,
     )
     monkeypatch.setattr(
-        "omnigent.runner.background_titles.sdk.BACKGROUND_TITLE_INFERENCE_TIMEOUT_SECONDS",
+        "omnigent.runner.background_titles.service.BACKGROUND_TITLE_INFERENCE_TIMEOUT_SECONDS",
         0.01,
     )
     app = create_runner_app(

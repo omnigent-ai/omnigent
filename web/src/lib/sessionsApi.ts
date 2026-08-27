@@ -634,6 +634,45 @@ export async function forkSession(
 }
 
 /**
+ * Ask a `/btw` side question about a session:
+ * ``POST /v1/sessions/{id}/side-question``.
+ *
+ * Answered by a throwaway, tool-free process from the session's own
+ * context and stored as a `side_question` item — visible in the
+ * transcript, never included in the model's context on later turns.
+ * The item also arrives over the event stream, so callers usually just
+ * need the `status` here.
+ *
+ * @param sessionId - The session to ask about, e.g. ``"conv_abc123"``.
+ * @param question - The question typed after ``/btw``.
+ * @returns `status` (`"answered"` or `"unsupported"`) plus the answer
+ *   and the persisted item's id when answered.
+ * @throws Error carrying the server's failure detail (e.g. 503 when the
+ *   session has no running runner).
+ */
+export async function askSideQuestion(
+  sessionId: string,
+  question: string,
+): Promise<SideQuestionResult> {
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/side-question`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
+      body: JSON.stringify({ question }),
+    },
+  );
+  return await readJsonOrThrow<SideQuestionResult>(res);
+}
+
+/** Result of `POST /v1/sessions/{id}/side-question`. */
+export interface SideQuestionResult {
+  status: "answered" | "unsupported";
+  answer?: string | null;
+  item_id?: string | null;
+}
+
+/**
  * Switch an existing session in place to a different agent/harness:
  * ``POST /v1/sessions/{id}/switch-agent``.
  *

@@ -82,6 +82,18 @@ class BackgroundTitleGeneratorSpec:
 
 
 @dataclass(frozen=True)
+class SideQuestionGeneratorSpec:
+    """Lazy side-question generator registration for one harness.
+
+    Same two fields as :class:`BackgroundTitleGeneratorSpec` but a
+    separate registry: a harness can answer one and not the other.
+    """
+
+    generator: str
+    resolver_harness: str | None = None
+
+
+@dataclass(frozen=True)
 class NativeHarnessProvider:
     """Import paths for a native harness's lifecycle hooks.
 
@@ -128,6 +140,7 @@ class HarnessContribution:
     background_title_generators: dict[str, BackgroundTitleGeneratorSpec] = field(
         default_factory=dict
     )
+    side_question_generators: dict[str, SideQuestionGeneratorSpec] = field(default_factory=dict)
     missing_install_package: dict[str, str] = field(default_factory=dict)
     harness_labels: dict[str, str] = field(default_factory=dict)
     # Declared feature set per harness id ("what can this harness do?"). Sparse
@@ -849,6 +862,21 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "omnigent.runner.background_titles.codex_native:generate_background_title"
         ),
     },
+    side_question_generators={
+        "claude-sdk": SideQuestionGeneratorSpec(
+            "omnigent.runner.side_questions.sdk:generate_side_question_answer"
+        ),
+        "claude-native": SideQuestionGeneratorSpec(
+            "omnigent.runner.side_questions.claude_native:generate_side_question_answer",
+            resolver_harness="claude-sdk",
+        ),
+        "codex": SideQuestionGeneratorSpec(
+            "omnigent.runner.side_questions.sdk:generate_side_question_answer"
+        ),
+        "codex-native": SideQuestionGeneratorSpec(
+            "omnigent.runner.side_questions.codex_native:generate_side_question_answer"
+        ),
+    },
     harness_labels={
         "antigravity": "Antigravity",
         "claude-sdk": "Claude SDK",
@@ -1130,6 +1158,11 @@ def spawn_env_builders() -> dict[str, str]:
 def background_title_generators() -> dict[str, BackgroundTitleGeneratorSpec]:
     """Return harness-to-background-title-generator registrations."""
     return _merge_dict(lambda contribution: contribution.background_title_generators)
+
+
+def side_question_generators() -> dict[str, SideQuestionGeneratorSpec]:
+    """Return harness-to-side-question-generator registrations."""
+    return _merge_dict(lambda contribution: contribution.side_question_generators)
 
 
 def install_specs() -> dict[str, HarnessInstallSpec]:

@@ -104,6 +104,7 @@ def test_shipped_codes_are_stable() -> None:
         "routing_decision": 9,
         "slash_command": 10,
         "terminal_command": 11,
+        "side_question": 12,
     }
     assert ec.ITEM_STATUS == {"completed": 1, "in_progress": 2, "incomplete": 3, "failed": 4}
     assert ec.COMMENT_STATUS == {"draft": 1, "addressed": 2}

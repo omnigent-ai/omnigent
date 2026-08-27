@@ -23,6 +23,7 @@ import {
   type NativeToolBlock,
   type ReasoningBlock,
   type RoutingDecisionBlock,
+  type SideQuestionBlock,
   type SlashCommandBlock,
   type TerminalCommandBlock,
   type TextDone,
@@ -46,6 +47,7 @@ import {
   type NativeToolItem,
   type ReasoningItem,
   type RoutingDecisionItem,
+  type SideQuestionItem,
   type SlashCommandItem,
   type TerminalCommandItem,
   isCompactionItem,
@@ -56,6 +58,7 @@ import {
   isNativeToolItem,
   isReasoningItem,
   isRoutingDecisionItem,
+  isSideQuestionItem,
   isSlashCommandItem,
   isTerminalCommandItem,
 } from "./conversationItems";
@@ -251,6 +254,9 @@ function itemToBlock(item: ConversationItem): AnyBlock | null {
   if (isSlashCommandItem(item)) {
     return slashCommandToBlock(item);
   }
+  if (isSideQuestionItem(item)) {
+    return sideQuestionToBlock(item);
+  }
   if (isRoutingDecisionItem(item)) {
     return routingDecisionToBlock(item);
   }
@@ -435,6 +441,15 @@ function slashCommandToBlock(item: SlashCommandItem): SlashCommandBlock {
     name: item.name,
     arguments: item.arguments,
     output: typeof item.output === "string" ? item.output : null,
+  };
+}
+
+function sideQuestionToBlock(item: SideQuestionItem): SideQuestionBlock {
+  return {
+    type: "side_question",
+    ctx: ctxFor(item),
+    question: item.question,
+    answer: item.answer,
   };
 }
 

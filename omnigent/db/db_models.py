@@ -949,7 +949,7 @@ class SqlConversationItem(ConversationBase):
             text("position DESC"),
         ),
         CheckConstraint(
-            "type IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)",
+            "type IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)",
             name="ck_conversation_items_type",
         ),
         CheckConstraint("status IN (1, 2, 3, 4)", name="ck_conversation_items_status"),

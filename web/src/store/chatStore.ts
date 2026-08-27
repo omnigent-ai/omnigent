@@ -61,6 +61,7 @@ import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import {
   ApiError,
   approve as approveElicitation,
+  askSideQuestion as askSideQuestionApi,
   bindOnlyOnlineRunner,
   createSession,
   getSessionSlim,
@@ -70,6 +71,7 @@ import {
   openSessionStream,
   postEvent,
   type SessionItemsPage,
+  type SideQuestionResult,
   updateSession,
 } from "@/lib/sessionsApi";
 import type {
@@ -787,6 +789,15 @@ export interface ChatActions {
    * there is no active conversation.
    */
   compact: () => Promise<void>;
+  /**
+   * Ask a `/btw` side question about the active session.
+   *
+   * Resolves to the result so the composer can distinguish an answer
+   * from an "unsupported harness". The rendered aside arrives on its
+   * own over the event stream as a `side_question` item, so nothing is
+   * inserted into `blocks` here.
+   */
+  askSideQuestion: (question: string) => Promise<SideQuestionResult>;
   /**
    * Refetch runner-backed session state for the active conversation.
    *
@@ -2117,6 +2128,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const { conversationId } = get();
     if (!conversationId) return;
     await postEvent(conversationId, { type: "compact", data: {} });
+  },
+
+  askSideQuestion: async (question) => {
+    const { conversationId } = get();
+    if (!conversationId) {
+      throw new Error("No active session to ask about");
+    }
+    return await askSideQuestionApi(conversationId, question);
   },
 
   refreshSessionState: async (conversationId) => {

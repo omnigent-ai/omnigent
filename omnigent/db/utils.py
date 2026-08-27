@@ -764,6 +764,7 @@ _ITEM_TYPES: frozenset[str] = frozenset(
         "compaction",
         "native_tool",
         "resource_event",
+        "side_question",
         "slash_command",
         "terminal_command",
         "routing_decision",
@@ -1016,8 +1017,8 @@ def extract_search_text(item: NewConversationItem) -> str:
         ``type`` is one of ``"message"``, ``"function_call"``,
         ``"function_call_output"``, ``"reasoning"``,
         ``"compaction"``, ``"native_tool"``, ``"resource_event"``,
-        ``"slash_command"``, ``"terminal_command"``, or
-        ``"routing_decision"``.
+        ``"side_question"``, ``"slash_command"``,
+        ``"terminal_command"``, or ``"routing_decision"``.
     :returns: A single plain-text string suitable for FTS indexing.
     :raises ValueError: If *item.type* is not a recognised type.
     """
@@ -1076,6 +1077,10 @@ def extract_search_text(item: NewConversationItem) -> str:
         # Index model + rationale so FTS can find a router verdict by
         # the model it picked or its one-line explanation.
         return " ".join(part for part in (data.get("model"), data.get("rationale")) if part)
+    if item.type == "side_question":
+        # Index both halves — an aside is usually remembered by what was
+        # asked, but the answer is what makes it worth finding again.
+        return " ".join(part for part in (data["question"], data["answer"]) if part)
     raise ValueError(f"unknown item type: {item.type!r}")
 
 

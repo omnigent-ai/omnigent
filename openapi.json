@@ -1216,6 +1216,9 @@
                 "$ref": "#/components/schemas/RoutingDecisionData"
               },
               {
+                "$ref": "#/components/schemas/SideQuestionData"
+              },
+              {
                 "$ref": "#/components/schemas/SlashCommandData"
               },
               {
@@ -6180,6 +6183,67 @@
         "title": "SessionSandboxStatusEvent",
         "type": "object"
       },
+      "SessionSideQuestionRequest": {
+        "additionalProperties": false,
+        "description": "Public request to ask a `/btw` side question about a session.",
+        "properties": {
+          "question": {
+            "description": "The user's question, e.g. `\"which harness is this session on?\"`.",
+            "maxLength": 4000,
+            "minLength": 1,
+            "title": "Question",
+            "type": "string"
+          }
+        },
+        "required": [
+          "question"
+        ],
+        "title": "SessionSideQuestionRequest",
+        "type": "object"
+      },
+      "SessionSideQuestionResponse": {
+        "description": "Result of a side question.",
+        "properties": {
+          "answer": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The harness's reply. `None` when unsupported.",
+            "title": "Answer"
+          },
+          "item_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Id of the persisted `side_question` item, so a client can reconcile against the item it already received over the event stream. `None` when unsupported.",
+            "title": "Item Id"
+          },
+          "status": {
+            "description": "`\"answered\"` when the harness produced text; `\"unsupported\"` when the session's harness has no registered side-question generator. Callers render the latter as a plain \"not available here\" message rather than an error.",
+            "enum": [
+              "answered",
+              "unsupported"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "SessionSideQuestionResponse",
+        "type": "object"
+      },
       "SessionSkillsEvent": {
         "description": "Signal that a session's runner-owned skills have resolved.\n\nSkills are discovered against the bound runner's filesystem and\nfetched off the session-snapshot hot path: the snapshot kicks a\nsingle background fetch (`_load_runner_skills` in\n`omnigent/server/routes/sessions.py`) and serves `[]` until\nit lands. This event fires the moment that background fetch\npopulates the per-session skills cache, so a connected web client\ncan re-read the snapshot and fill its slash-command menu instead\nof waiting for the next bind.\n\nCarries no payload beyond the conversation id \u2014 it is a \"skills\nare ready, re-read the snapshot\" nudge, mirroring the\ninvalidate-then-refetch shape used by\n`SessionChangedFilesInvalidatedEvent`. The snapshot's\n`skills` field (now cache-backed) stays the source of truth.",
         "properties": {
@@ -6818,6 +6882,32 @@
           }
         },
         "title": "SetSharingRequest",
+        "type": "object"
+      },
+      "SideQuestionData": {
+        "description": "Data payload for a `/btw` side question \u2014 a question answered\nfrom the session's context whose exchange never re-enters it.\n\nListed in `NON_CONTENT_ITEM_TYPES` so the agent loop's\nhistory filter skips it: the aside stays in the transcript and\nsurvives reload, but the next turn's model never sees it. That\nfiltering is the whole point \u2014 a side question that leaked back\ninto history would just be a normal turn wearing different\nstyling.\n\nQuestion and answer share ONE item because the pair is atomic:\nan answer without its question is unreadable, so nothing should\nbe able to keep one and drop the other.\n\n**Parameters**\n\n- `agent` \u2014 Harness that answered, e.g. `\"claude-sdk\"`. Serialized as `\"model\"` for parity with other items.",
+        "properties": {
+          "answer": {
+            "description": "The harness's reply.",
+            "title": "Answer",
+            "type": "string"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "question": {
+            "description": "Verbatim text the user typed after `/btw`.",
+            "title": "Question",
+            "type": "string"
+          }
+        },
+        "required": [
+          "model",
+          "question",
+          "answer"
+        ],
+        "title": "SideQuestionData",
         "type": "object"
       },
       "SkillSummary": {
@@ -13200,6 +13290,60 @@
         "summary": "Get Session Resource",
         "tags": [
           "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/side-question": {
+      "post": {
+        "description": "Answer a question about this session without joining it.\n\nThe answer is produced by a throwaway, tool-free process on the\nsession's runner and persisted as a `side_question` item \u2014\nvisible in the transcript, filtered out of the model's history\non every later turn.\n\nEDIT is required rather than READ: answering spends the\nsession owner's runner and tokens, which a read-only viewer of\na shared session should not be able to do.\n\n**Parameters**\n\n- `body` \u2014 The question to ask.\n\n**Returns:** The answer plus the persisted item's id, or `status=\"unsupported\"` when the session's harness has no side-question generator.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session exists; 503 if it has no bound runner or the runner is unreachable / times out; 500 when the runner reports a failure.",
+        "operationId": "ask_session_side_question_v1_sessions__session_id__side_question_post",
+        "parameters": [
+          {
+            "description": "Session identifier, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionSideQuestionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionSideQuestionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Ask Session Side Question",
+        "tags": [
+          "sessions"
         ]
       }
     },

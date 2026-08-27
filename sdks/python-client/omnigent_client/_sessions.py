@@ -1129,6 +1129,36 @@ class SessionsNamespace:
             f"POST /v1/sessions/{source_session_id}/fork",
         )
 
+    async def side_question(self, session_id: str, question: str) -> dict[str, Any]:
+        """
+        Ask a side question about a session without joining it.
+
+        Calls ``POST /v1/sessions/{session_id}/side-question``. The
+        answer is produced by a throwaway, tool-free process and stored
+        as a ``side_question`` item: it shows in the transcript but is
+        never included in the model's context on later turns.
+
+        :param session_id: Session to ask about, e.g. ``"conv_abc123"``.
+        :param question: The question, e.g. ``"which harness is this
+            session on?"``.
+        :returns: Raw response dict matching the
+            ``SessionSideQuestionResponse`` shape: ``status``
+            (``"answered"`` or ``"unsupported"``), ``answer``, and
+            ``item_id``.
+        :raises OmnigentError: 404 if *session_id* does not exist; 403
+            without EDIT access; 503 if the session has no running
+            runner.
+        """
+        resp = await self._http.post(
+            f"{self._base}/v1/sessions/{session_id}/side-question",
+            json={"question": question},
+        )
+        raise_for_status(resp.status_code, response_body(resp))
+        return require_json_object(
+            resp,
+            f"POST /v1/sessions/{session_id}/side-question",
+        )
+
     async def compact(self, session_id: str) -> None:
         """
         Request explicit context compaction for a session.
