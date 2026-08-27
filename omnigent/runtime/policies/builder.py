@@ -316,7 +316,7 @@ def _load_user_period_cost(
     conversation_store: ConversationStore,
     period: str,
     harness: str | None = None,
-) -> list[dict[str, float | str | None]]:
+) -> list[DailyCostState]:
     """
     Read the session owner's daily cost records for the current period.
 
