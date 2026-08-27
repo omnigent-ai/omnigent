@@ -3575,9 +3575,7 @@ def create_runner_app(
         # Increment before clearing caches so in-flight fills see a changed
         # generation and discard rather than repopulating entries for a dead
         # (or reborn) session.
-        _session_cache_generations[session_id] = (
-            _session_cache_generations.get(session_id, 0) + 1
-        )
+        _session_cache_generations[session_id] = _session_cache_generations.get(session_id, 0) + 1
 
         _session_spec_cache.pop(session_id, None)
         _session_harness_overrides.pop(session_id, None)
