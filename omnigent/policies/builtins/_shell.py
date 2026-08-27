@@ -33,6 +33,7 @@ SHELL_TOOLS: frozenset[str] = frozenset(
         "Shell",  # Cursor
         "terminal",  # Hermes
         "developer__shell",  # Goose
+        "shell",  # codex in-process harness (commandExecution observed tool)
     }
 )
 
