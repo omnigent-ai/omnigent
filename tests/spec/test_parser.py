@@ -2878,6 +2878,87 @@ def test_parse_mcp_http_rejects_stdio_fields(agent_dir: Path) -> None:
         parse(agent_dir)
 
 
+def test_parse_mcp_stdio_tools_whitelist(agent_dir: Path) -> None:
+    """A per-server ``tools:`` whitelist on a sidecar stdio MCP propagates to
+    ``MCPServerConfig.tools`` (regression: the sidecar parsers dropped the
+    key entirely, so a restrictive allow-list in ``tools/mcp/*.yaml`` was a
+    silent no-op — the agent got every tool despite the YAML on disk saying
+    otherwise. Same allow-list, same bug class as the inline form fixed in
+    ``test_parse_inline_mcp_tools_whitelist``.)
+
+    :param agent_dir: Temporary agent directory fixture.
+    """
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "github",
+        "transport": "stdio",
+        "command": "npx",
+        "tools": ["search_issues", "get_pull_request"],
+    }
+    (mcp_dir / "github.yaml").write_text(yaml.dump(mcp_config))
+    spec = parse(agent_dir)
+    mcp = spec.mcp_servers[0]
+    assert mcp.tools == ["search_issues", "get_pull_request"]
+
+
+def test_parse_mcp_http_tools_whitelist(agent_dir: Path) -> None:
+    """Same regression as ``test_parse_mcp_stdio_tools_whitelist``, for the
+    sidecar HTTP transport.
+
+    :param agent_dir: Temporary agent directory fixture.
+    """
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "docs",
+        "transport": "http",
+        "url": "https://mcp.example.com/sse",
+        "tools": ["search_docs"],
+    }
+    (mcp_dir / "docs.yaml").write_text(yaml.dump(mcp_config))
+    spec = parse(agent_dir)
+    mcp = spec.mcp_servers[0]
+    assert mcp.tools == ["search_docs"]
+
+
+def test_parse_mcp_sidecar_tools_absent_is_none(agent_dir: Path) -> None:
+    """Omitting ``tools:`` on a sidecar MCP leaves the allow-list as ``None``
+    (expose all) — mirrors ``test_parse_inline_mcp_tools_absent_is_none``.
+
+    :param agent_dir: Temporary agent directory fixture.
+    """
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    (mcp_dir / "github.yaml").write_text(
+        yaml.dump({"name": "github", "transport": "stdio", "command": "npx"})
+    )
+    mcp = parse(agent_dir).mcp_servers[0]
+    assert mcp.tools is None
+
+
+def test_parse_mcp_sidecar_tools_non_list_raises(agent_dir: Path) -> None:
+    """A non-list ``tools:`` value on a sidecar MCP is a clear error, not a
+    silent type bug — mirrors ``test_parse_inline_mcp_tools_non_list_raises``.
+
+    :param agent_dir: Temporary agent directory fixture.
+    """
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    (mcp_dir / "github.yaml").write_text(
+        yaml.dump(
+            {
+                "name": "github",
+                "transport": "stdio",
+                "command": "npx",
+                "tools": "search_issues",
+            }
+        )
+    )
+    with pytest.raises(OmnigentError, match=r"'tools' must be a list"):
+        parse(agent_dir)
+
+
 def test_parse_mcp_unknown_transport_raises(agent_dir: Path) -> None:
     """
     ``transport: grpc`` or any other value fails loud with a
