@@ -103,6 +103,7 @@ import {
 } from "@/components/SlashCommandMenu";
 import { setPendingInitialPrompt } from "@/store/chatStore";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
+import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { CliCommandBlock } from "./CliCommandBlock";
 import { WorkspacePicker, isNavigablePath } from "./WorkspacePicker";
@@ -2111,6 +2112,7 @@ export function NewChatLandingScreen() {
   const [searchParams] = useSearchParams();
   const queryClient = useQueryClient();
   const isMobileViewport = useIsMobileViewport();
+  const isCoarsePointer = useIsCoarsePointer();
   // Single send-telemetry point (see handleCreate). Emitting there rather than
   // via the Start button's componentId covers Enter-key sends too, which never
   // submit the form and would otherwise bypass the Button entirely.
@@ -4489,8 +4491,11 @@ export function NewChatLandingScreen() {
                       return;
                     }
                   }
-                  // Enter sends; Shift+Enter inserts a newline.
-                  if (e.key === "Enter" && !e.shiftKey) {
+                  // Enter sends; Shift+Enter inserts a newline. On touch-primary
+                  // devices there is no practical Shift+Enter and an accidental
+                  // submit is unrecoverable, so Enter only inserts a newline and
+                  // sending stays an explicit tap on the send button.
+                  if (e.key === "Enter" && !e.shiftKey && !isCoarsePointer) {
                     e.preventDefault();
                     // The mention menu is briefly closed while its listing loads;
                     // swallow Enter so the in-progress "@dir/" token isn't sent.
