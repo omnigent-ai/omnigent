@@ -1,0 +1,91 @@
+# config_env_passthrough — demonstrates host/project-level env_passthrough
+#
+# Problem this solves
+# -------------------
+# Without host/project-level env_passthrough you must repeat the same
+# ``env_passthrough`` block in every agent spec:
+#
+#   os_env:
+#     sandbox:
+#       env_passthrough:
+#         - AWS_PROFILE
+#         - GITHUB_TOKEN     # <-- copy-pasted into every spec
+#
+# The new ``env_passthrough`` key in ~/.omnigent/config.yaml (host level)
+# or .omnigent/config.yaml (project level) declares the allowlist ONCE and
+# it flows into every harness subprocess automatically.
+#
+# Setup (one-time, host level)
+# ----------------------------
+# Add to ~/.omnigent/config.yaml:
+#
+#   env_passthrough:
+#     - AWS_PROFILE
+#     - GITHUB_TOKEN
+#
+# After that, EVERY agent run on this machine inherits those names — no
+# per-spec changes needed.
+#
+# Setup (project level)
+# ---------------------
+# Add the same block to .omnigent/config.yaml at the repo root.
+# Project-level names are MERGED with host-level names (union, no duplicates).
+#
+# Resolution order (lowest → highest priority)
+# --------------------------------------------
+#   BASE_ALLOW_EXACT (always-on defaults: PATH, HOME, USER, …)
+#     ∪ host-level  env_passthrough  (~/.omnigent/config.yaml)
+#     ∪ project-level env_passthrough (.omnigent/config.yaml)
+#     ∪ per-spec  os_env.sandbox.env_passthrough  (unchanged)
+#
+# Name-only allowlist
+# -------------------
+# The config only names variables; values are read from the LIVE environment
+# at subprocess spawn time (same behaviour as per-spec env_passthrough).
+# A config file cannot inject a value, only opt a name in.
+#
+# Usage
+# -----
+#   # 1. Export the variable you want the agent to see:
+#   export GITHUB_TOKEN=ghp_...
+#
+#   # 2. Declare it once in ~/.omnigent/config.yaml (or .omnigent/config.yaml):
+#   #      env_passthrough:
+#   #        - GITHUB_TOKEN
+#
+#   # 3. Run — no env_passthrough in the spec itself needed:
+#   omnigent run examples/config_env_passthrough.yaml \
+#       --profile <profile> \
+#       --prompt "Print the value of GITHUB_TOKEN with sys_os_shell."
+#
+# The agent should print the real token value, proving it was passed through
+# from the host config without an explicit per-spec declaration.
+
+name: config_env_passthrough_demo
+description: >-
+  Shows host/project-level env_passthrough: declare a variable allowlist once
+  in ~/.omnigent/config.yaml and it flows into every harness subprocess
+  automatically, without repeating env_passthrough in each agent spec.
+
+executor:
+  model: claude-sonnet-4-5
+  profile: default
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: native
+    # No env_passthrough block here — the allowlist comes entirely from
+    # ~/.omnigent/config.yaml or .omnigent/config.yaml.
+    #
+    # You CAN still add per-spec entries; they are merged with the
+    # config-level list. For example, to additionally pass MY_SECRET only
+    # for this agent:
+    #
+    #   env_passthrough:
+    #     - MY_SECRET
+
+prompt: |
+  You are a helpful assistant. When asked, use sys_os_shell to inspect
+  environment variables and report what you find.
