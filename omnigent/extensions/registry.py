@@ -143,6 +143,8 @@ def _validate_relative_path(
         or len(path.parts) > _MAX_ASSET_DEPTH
     ):
         raise ExtensionValidationError(f"{field_name} {value!r} is not a safe relative path")
+    if route and len(path.parts) != 1:
+        raise ExtensionValidationError(f"{field_name} must contain exactly one segment")
     segment_pattern = _ROUTE_SEGMENT_RE if route else _ASSET_SEGMENT_RE
     if any(not segment_pattern.fullmatch(part) for part in path.parts):
         if route:

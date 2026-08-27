@@ -465,12 +465,20 @@ def test_requires_css_suffix_for_browser_styles(monkeypatch: pytest.MonkeyPatch)
     )
 
 
+def test_rejects_multi_segment_page_route(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = replace(_manifest().pages[0], route="reports/daily")
+    manifest = replace(_manifest(), pages=(page,))
+    _install_entry_points(monkeypatch, _EntryPoint("review", manifest))
+
+    assert "exactly one segment" in registry.plugin_state().load_errors["review"]
+
+
 def test_rejects_unsafe_or_dynamic_route(monkeypatch: pytest.MonkeyPatch) -> None:
     page = replace(_manifest().pages[0], route="dashboard/:section")
     manifest = replace(_manifest(), pages=(page,))
     _install_entry_points(monkeypatch, _EntryPoint("review", manifest))
 
-    assert "unsupported route segment" in registry.plugin_state().load_errors["review"]
+    assert "exactly one segment" in registry.plugin_state().load_errors["review"]
 
 
 def test_rejects_contribution_outside_extension_namespace(
