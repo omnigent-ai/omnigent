@@ -367,7 +367,12 @@ your PR is, check that box under *Type of change* and no issue is needed.
 Anything that fixes a bug, adds a feature, or changes the UI needs an issue,
 even when it also touches docs or tests.
 
-A bot comments once on PRs that reference no issue. It never closes anything.
+A bot comments once on PRs that reference no issue and labels them `needs-issue`.
+Reference an issue and the label clears automatically. A PR still labeled
+`needs-issue` after **7 days** is closed, the same way and for the same reason as
+`waiting-on-author` below: to keep the review queue readable, not as a judgement
+on the change. It is reversible, so comment `/reopen` once you have added the
+reference.
 
 ### Review state labels
 
@@ -378,6 +383,10 @@ need to apply them.
 | --- | --- |
 | `waiting-on-author` | A maintainer has left feedback. The PR is in your court. |
 | `waiting-for-review` | You have responded. It is back in the reviewer's queue. |
+
+A third label, `needs-issue`, is separate from these two: it says the PR
+references no issue, not that anyone is waiting on a reply. See [Every PR needs an
+issue](#every-pr-needs-an-issue).
 
 A maintainer reviewing or commenting on your PR sets `waiting-on-author`. When
 you push a commit, comment, or reply to a review, that clears automatically and

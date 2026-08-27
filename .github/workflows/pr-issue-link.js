@@ -1,8 +1,18 @@
 // Scan PRs opened in the last 24 hours and flag any that don't link an issue.
 // Runs hourly from the demo-check sweep; the 24-hour window ensures every new PR
-// is checked even if it was opened just before a cron tick. A flagged PR gets one
-// comment and nothing else: no label (it would only add noise to the queue
-// maintainers filter) and no close.
+// is checked even if it was opened just before a cron tick.
+//
+// A flagged PR gets one comment and the `needs-issue` label. The label is the
+// whole state machine: it dedupes the comment, it is how a later sweep finds the
+// PR again (the 24-hour window cannot, and GitHub search cannot match a marker
+// hidden in a comment body), and its application time is the clock. A PR still
+// unlinked CLOSE_AFTER_DAYS after the label went on is closed, reversibly, with a
+// pointer at `/reopen`.
+//
+// The label is derived state, recomputed every run: a PR that should be flagged
+// gets it, a PR that should not has it removed. So linking the issue, ticking a
+// chore box, or converting to draft all clear it, and a PR that becomes flaggable
+// again starts a fresh clock rather than inheriting a stale one.
 //
 // Forward-only: nothing opened before EFFECTIVE_FROM is ever considered, so the
 // existing backlog is untouched no matter how the scan window is set.
@@ -30,15 +40,23 @@
 //     and a maintainer may hold write access without being listed in the file.
 
 const MS_PER_HOUR = 60 * 60 * 1000;
+const MS_PER_DAY = 24 * MS_PER_HOUR;
 const HOURS_TO_SCAN = 24;
+// Days a PR may sit labeled `needs-issue` before it is closed. Matches the
+// `waiting-on-author` window so contributors have one number to learn, and the
+// same `/reopen` escape hatch applies.
+const CLOSE_AFTER_DAYS = 7;
 // The rule applies going forward only. PRs opened before this date are the
 // backlog's problem, cleared by hand, and must never be flagged -- so the floor
 // is a constant here rather than something a wider scan window could reach past.
 const EFFECTIVE_FROM = "2026-08-05T00:00:00Z";
-// Dedupe on a hidden marker in the bot's own comment rather than a label: the
-// nudge is a one-shot message, and a label on top of it would add queue noise
-// maintainers have to filter past (same approach as reopen-notice.js).
+// Stamped on the bot's own comment for provenance (same approach as
+// reopen-notice.js). Dedupe is the label's job, not this marker's.
 const MARKER = "<!-- pr-issue-link -->";
+// Dedupe, search key, and close clock in one. See the header.
+const NEEDS_ISSUE_LABEL = "needs-issue";
+// The only unconditional opt-out, and it needs write access. Removing
+// `needs-issue` is not one: that label is recomputed every run.
 const OVERRIDE_LABEL = "skip-issue-check";
 // Same threshold pr-size.js uses for size/XS.
 const TRIVIAL_LINES = 9;
@@ -200,12 +218,26 @@ The only exceptions are changes with no user-visible behaviour: pure **Refactor 
 
 See [CONTRIBUTING.md](https://github.com/omnigent-ai/omnigent/blob/main/CONTRIBUTING.md#every-pr-needs-an-issue) for the full policy.
 
-_No action is taken beyond this comment._`;
+This PR is now labeled \`${NEEDS_ISSUE_LABEL}\`. **If no issue is referenced within ${CLOSE_AFTER_DAYS} days, it will be closed automatically** to keep the review queue readable. That is not a judgement on the change, and it is reversible: comment \`/reopen\` and the PR comes back. Referencing an issue clears the label, and the countdown with it.`;
+
+const closeMessage = (labeledAt) =>
+  `Closing this PR because it has been labeled \`${NEEDS_ISSUE_LABEL}\` for ${CLOSE_AFTER_DAYS} days without an issue reference.
+
+The label was applied on ${labeledAt}. This isn't a judgement on the merit of the PR -- it's how we keep the review queue readable.
+
+To continue: add \`Closes #123\` or \`Part of #123\` to the description, then comment \`/reopen\` and this PR comes back, as long as its source branch still exists. If the branch is gone, push it again and open a fresh PR referencing this one.
+
+See [CONTRIBUTING.md](https://github.com/omnigent-ai/omnigent/blob/main/CONTRIBUTING.md#every-pr-needs-an-issue) for the full policy.`;
 
 module.exports = async ({ context, github, core }) => {
   const { owner, repo } = context.repo;
   // Default to a dry run: enforcement is opt-in via the workflow env.
   const enforce = process.env.ENFORCE === "true";
+  // Closing is gated separately from commenting, so the close half can ship in a
+  // dry run (verdicts in the step summary, nothing touched) while the nudge stays
+  // live. Implies ENFORCE: nothing may be closed over a label a dry run only
+  // pretended to apply.
+  const closeEnforce = enforce && process.env.CLOSE_ENFORCE === "true";
   // Unset means unlimited; an explicit LIMIT=0 means flag nothing. A malformed
   // value flags nothing rather than everything -- this bounds how many
   // contributors one run may comment on, so the safe default is the low one.
@@ -240,6 +272,25 @@ module.exports = async ({ context, github, core }) => {
       core.warning(`Could not load .github/MAINTAINER: ${err.message}`);
     }
 
+    // Ensure the label exists before applying it, the same way demo-check.js does
+    // for needs-demo. Only when enforcing: a dry run creates nothing.
+    if (enforce) {
+      try {
+        await github.rest.issues.createLabel({
+          owner,
+          repo,
+          name: NEEDS_ISSUE_LABEL,
+          color: "d93f0b",
+          description: `PR references no issue; closed after ${CLOSE_AFTER_DAYS} days`,
+        });
+      } catch (err) {
+        // 422 = already exists; anything else is unexpected.
+        if (err.status !== 422) {
+          core.warning(`Could not create label '${NEEDS_ISSUE_LABEL}': ${err.message}`);
+        }
+      }
+    }
+
     // One PR when an event names it, the whole window on the cron sweep. Only the
     // fetch differs: every decision below runs identically either way, so the
     // instant path and the sweep can never reach different verdicts.
@@ -266,31 +317,86 @@ module.exports = async ({ context, github, core }) => {
       const cutoff = new Date(
         Math.max(windowStart.getTime(), new Date(EFFECTIVE_FROM).getTime())
       );
-      const cutoffString = cutoff.toISOString().replace(/\.\d{3}Z$/, "Z");
-      const searchQuery = `repo:${owner}/${repo} is:pr is:open created:>${cutoffString}`;
-      console.log(`Scanning PRs: ${searchQuery} (enforce=${enforce})`);
-
-      let cursor = null;
-      let hasNextPage = true;
-      while (hasNextPage) {
-        const response = await github.graphql(QUERY, { cursor, searchQuery });
-        const { remaining, resetAt } = response.rateLimit;
-        console.log(`Rate limit: ${remaining} remaining, resets at ${resetAt}`);
-        const { nodes, pageInfo } = response.search;
-        hasNextPage = pageInfo.hasNextPage;
-        cursor = pageInfo.endCursor;
-        allPRs.push(...nodes);
+      const stamp = (d) => d.toISOString().replace(/\.\d{3}Z$/, "Z");
+      const search = async (searchQuery) => {
+        console.log(`Scanning PRs: ${searchQuery} (enforce=${enforce})`);
+        const found = [];
+        let cursor = null;
+        let hasNextPage = true;
+        while (hasNextPage) {
+          const response = await github.graphql(QUERY, { cursor, searchQuery });
+          const { remaining, resetAt } = response.rateLimit;
+          console.log(`Rate limit: ${remaining} remaining, resets at ${resetAt}`);
+          const { nodes, pageInfo } = response.search;
+          hasNextPage = pageInfo.hasNextPage;
+          cursor = pageInfo.endCursor;
+          found.push(...nodes);
+        }
+        return found;
+      };
+      // Two passes: PRs new enough to flag, then every PR already flagged. The
+      // second is the only route back to a PR older than the window, which is what
+      // the close clock needs. The effective date still floors both.
+      const seen = new Set();
+      for (const searchQuery of [
+        `repo:${owner}/${repo} is:pr is:open created:>${stamp(cutoff)}`,
+        `repo:${owner}/${repo} is:pr is:open label:${NEEDS_ISSUE_LABEL} created:>${stamp(new Date(EFFECTIVE_FROM))}`,
+      ]) {
+        for (const pr of await search(searchQuery)) {
+          if (seen.has(pr.number)) continue;
+          seen.add(pr.number);
+          allPRs.push(pr);
+        }
       }
-      console.log(`Found ${allPRs.length} open PRs from the last ${HOURS_TO_SCAN} hours`);
+      console.log(`Found ${allPRs.length} open PRs to check`);
     }
+
+    const hasNeedsIssue = (pr) =>
+      (pr.labels?.nodes ?? []).some((l) => l.name === NEEDS_ISSUE_LABEL);
+
+    // The label is derived state, so drop it the moment a PR stops being flaggable.
+    // Returns the reason string, annotated with what it did, for the summary.
+    const clearLabel = async (pr, why) => {
+      if (!hasNeedsIssue(pr)) return why;
+      if (!enforce) return `${why}; would clear ${NEEDS_ISSUE_LABEL}`;
+      try {
+        await github.rest.issues.removeLabel({
+          owner,
+          repo,
+          issue_number: pr.number,
+          name: NEEDS_ISSUE_LABEL,
+        });
+        return `${why}; cleared ${NEEDS_ISSUE_LABEL}`;
+      } catch (err) {
+        core.warning(`Could not clear ${NEEDS_ISSUE_LABEL} from #${pr.number}: ${err.message}`);
+        return why;
+      }
+    };
+
+    // When the label last went on, which is when the clock started. Null when no
+    // such event exists: unverifiable is not grounds to close.
+    const labeledAt = async (number) => {
+      const events = await github.paginate(github.rest.issues.listEvents, {
+        owner,
+        repo,
+        issue_number: number,
+        per_page: 100,
+      });
+      const stamps = events
+        .filter((e) => e.event === "labeled" && e.label?.name === NEEDS_ISSUE_LABEL)
+        .map((e) => e.created_at)
+        .sort();
+      return stamps.length ? stamps[stamps.length - 1] : null;
+    };
 
     const verdicts = [];
     let flagged = 0;
+    let closed = 0;
 
     for (const pr of allPRs) {
       const exempt = exemptReason(pr, maintainers);
       if (exempt) {
-        verdicts.push({ pr: pr.number, verdict: "exempt", reason: exempt });
+        verdicts.push({ pr: pr.number, verdict: "exempt", reason: await clearLabel(pr, exempt) });
         continue;
       }
 
@@ -308,7 +414,8 @@ module.exports = async ({ context, github, core }) => {
         continue;
       }
       if (linkCount > 0) {
-        verdicts.push({ pr: pr.number, verdict: "ok", reason: `${linkCount} linked` });
+        const reason = await clearLabel(pr, `${linkCount} linked`);
+        verdicts.push({ pr: pr.number, verdict: "ok", reason });
         continue;
       }
 
@@ -323,11 +430,61 @@ module.exports = async ({ context, github, core }) => {
         }
       }
       if (tracked) {
-        verdicts.push({ pr: pr.number, verdict: "ok", reason: `references #${tracked}` });
+        const reason = await clearLabel(pr, `references #${tracked}`);
+        verdicts.push({ pr: pr.number, verdict: "ok", reason });
         continue;
       }
 
       const author = pr.author?.login ?? "contributor";
+
+      // Already flagged. Only these PRs pay for the timeline lookup, and the label
+      // is what dedupes the nudge, so an unflagged PR costs nothing extra.
+      if (hasNeedsIssue(pr)) {
+        const since = await labeledAt(pr.number);
+        if (!since) {
+          core.warning(
+            `#${pr.number} has ${NEEDS_ISSUE_LABEL} but no labeled event; not closing.`
+          );
+          verdicts.push({ pr: pr.number, verdict: "skip", reason: "no label timestamp" });
+          continue;
+        }
+        const days = Math.floor((Date.now() - new Date(since).getTime()) / MS_PER_DAY);
+        if (days < CLOSE_AFTER_DAYS) {
+          verdicts.push({
+            pr: pr.number,
+            verdict: "waiting",
+            reason: `day ${days} of ${CLOSE_AFTER_DAYS}`,
+          });
+          continue;
+        }
+        const overdue = `labeled ${days}d ago`;
+        if (!closeEnforce) {
+          verdicts.push({ pr: pr.number, verdict: "WOULD CLOSE", reason: overdue });
+          continue;
+        }
+        // LIMIT bounds closures the same way it bounds nudges: a mistake in the
+        // predicate must not reach the whole queue in one sweep.
+        if (closed >= limit) {
+          verdicts.push({ pr: pr.number, verdict: "deferred", reason: "close limit reached" });
+          continue;
+        }
+        verdicts.push({ pr: pr.number, verdict: "CLOSED", reason: overdue });
+        closed++;
+        // Comment first, so the explanation is already there when it closes.
+        await github.rest.issues.createComment({
+          owner,
+          repo,
+          issue_number: pr.number,
+          body: closeMessage(since.slice(0, 10)),
+        });
+        await github.rest.issues.update({
+          owner,
+          repo,
+          issue_number: pr.number,
+          state: "closed",
+        });
+        continue;
+      }
 
       // A dry run enumerates every verdict -- that's its whole point, so LIMIT
       // (which bounds how many contributors one enforcing run may touch) must
@@ -342,19 +499,6 @@ module.exports = async ({ context, github, core }) => {
         continue;
       }
 
-      // Only PRs about to be nudged pay for the comment lookup. Checked here
-      // rather than up front so the dry run doesn't spend a request per PR.
-      const comments = await github.paginate(github.rest.issues.listComments, {
-        owner,
-        repo,
-        issue_number: pr.number,
-        per_page: 100,
-      });
-      if (comments.some((c) => c.body?.includes(MARKER))) {
-        verdicts.push({ pr: pr.number, verdict: "skip", reason: "already nudged" });
-        continue;
-      }
-
       verdicts.push({ pr: pr.number, verdict: "FLAG", reason: `@${author}` });
       flagged++;
       await github.rest.issues.createComment({
@@ -363,6 +507,19 @@ module.exports = async ({ context, github, core }) => {
         issue_number: pr.number,
         body: `${MARKER}\n${message(author)}`,
       });
+      // The label is the clock, so it has to go on with the comment. Applied after
+      // it, so a failure here leaves an unflagged PR that the next run retries
+      // rather than a silent clock with no warning attached.
+      try {
+        await github.rest.issues.addLabels({
+          owner,
+          repo,
+          issue_number: pr.number,
+          labels: [NEEDS_ISSUE_LABEL],
+        });
+      } catch (err) {
+        core.warning(`Could not label #${pr.number} ${NEEDS_ISSUE_LABEL}: ${err.message}`);
+      }
     }
 
     const counts = verdicts.reduce((acc, v) => {
@@ -403,3 +560,5 @@ module.exports.assertedText = assertedText;
 module.exports.resolvesToOpenIssue = resolvesToOpenIssue;
 module.exports.MARKER = MARKER;
 module.exports.EFFECTIVE_FROM = EFFECTIVE_FROM;
+module.exports.NEEDS_ISSUE_LABEL = NEEDS_ISSUE_LABEL;
+module.exports.CLOSE_AFTER_DAYS = CLOSE_AFTER_DAYS;

@@ -5,15 +5,17 @@ name: PR Hygiene
 #   1. Demo check -- comment on PRs that check "Bug fix" / "Feature" /
 #      "UI / frontend change" but provide no demo (screenshot / video).
 #      See demo-check.js.
-#   2. Issue-link check -- comment on PRs that reference no issue. Forward-only:
+#   2. Issue-link check -- comment on PRs that reference no issue and label them
+#      `needs-issue`, then close one still unlinked 7 days later. Forward-only:
 #      nothing opened before its effective date is considered, so the backlog is
-#      untouched. Enforcing, capped at LIMIT comments per run. See
-#      pr-issue-link.js.
+#      untouched. Enforcing, capped at LIMIT comments and LIMIT closures per run.
+#      See pr-issue-link.js.
 #
-# Both skip drafts and PRs they've already flagged -- the demo check dedupes on
-# its `needs-demo` label, the issue-link check on a marker in its own comment.
-# Neither ever closes anything. Never checks out or runs PR code -- they read
-# PR metadata via the API using only the default-branch script.
+# Both skip drafts and PRs they've already flagged, each deduping on its own label
+# (`needs-demo`, `needs-issue`). The demo check never closes anything; the
+# issue-link check closes only over its own label, only past the deadline the nudge
+# announced, and reversibly via `/reopen`. Never checks out or runs PR code -- they
+# read PR metadata via the API using only the default-branch script.
 
 on:
   schedule:
@@ -53,15 +55,23 @@ jobs:
           script: |
             const script = require(".github/workflows/demo-check.js");
             await script({ context, github, core });
-      # LIMIT bounds how many contributors a single run may comment on, so a
-      # mistake in the wording or the predicate cannot reach the whole queue in one
-      # sweep. Setting ENFORCE back to "false" returns to a dry run, which
+      # LIMIT bounds how many contributors a single run may comment on or close, so
+      # a mistake in the wording or the predicate cannot reach the whole queue in
+      # one sweep. Setting ENFORCE back to "false" returns to a dry run, which
       # enumerates every verdict into the step summary and writes nothing.
+      #
+      # CLOSE_ENFORCE gates only the close half, so the nudge stays live while the
+      # closes are a dry run: the step summary lists every WOULD CLOSE verdict for
+      # review first. Flip it to "true" to start closing. Nothing can be closed
+      # before it has carried `needs-issue` for the full window, and every PR
+      # already nudged under the old wording (which promised no action would be
+      # taken) is re-nudged with the deadline before its clock starts.
       - name: Issue-link check
         if: always()
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
         env:
           ENFORCE: "true"
+          CLOSE_ENFORCE: "false"
           LIMIT: "25"
         with:
           retries: 3

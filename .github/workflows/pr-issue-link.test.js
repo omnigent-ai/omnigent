@@ -1,6 +1,7 @@
 // Local unit test for pr-issue-link.js -- mocks the GitHub client and runs the
 // real decision logic. No network. Covers the exemption predicates, the
-// authoritative per-PR link lookup, dedupe, and that a dry run touches nothing.
+// authoritative per-PR link lookup, the needs-issue label as dedupe and close
+// clock, and that a dry run touches nothing.
 
 const assert = require("assert");
 const path = require("path");
@@ -32,8 +33,15 @@ function pr({
   };
 }
 
+// Days ago as an ISO stamp, for the label clock.
+function daysAgo(n) {
+  return new Date(Date.now() - n * 24 * 60 * 60 * 1000).toISOString();
+}
+
 // Run the script over PR nodes. `linked` maps PR number -> closing-issue count.
-// `env` overrides process.env for the run.
+// `env` overrides process.env for the run. `labelNodes` are served to the
+// second (label:needs-issue) search pass; `labelEvents` maps PR number -> when
+// the label went on, which is the close clock.
 async function run(
   nodes,
   {
@@ -41,14 +49,18 @@ async function run(
     env = {},
     linkError = false,
     maintainers = [],
-    existingComments = {},
+    labelNodes = [],
+    labelEvents = {},
     issues = {},
   } = {}
 ) {
   const commented = [];
   const labeled = [];
+  const unlabeled = [];
+  const updated = [];
+  const createdLabels = [];
   const queries = [];
-  let searchCalls = 0;
+  const pages = {};
   const github = {
     repos: {},
     graphql: async (query, vars) => {
@@ -76,17 +88,26 @@ async function run(
           },
         };
       }
-      const done = searchCalls++ > 0;
+      // Two passes run per sweep: the 24-hour window, then label:needs-issue.
+      // Each serves its nodes on page 1 and an empty page 2, to exercise paging.
+      const pass = /label:/.test(vars.searchQuery ?? "") ? "label" : "window";
+      pages[pass] = (pages[pass] ?? 0) + 1;
+      const first = pages[pass] === 1;
       return {
         rateLimit: { remaining: 4999, resetAt: "n/a" },
         search: {
-          pageInfo: { hasNextPage: !done, endCursor: "c" },
-          nodes: done ? [] : nodes,
+          pageInfo: { hasNextPage: first, endCursor: "c" },
+          nodes: first ? (pass === "label" ? labelNodes : nodes) : [],
         },
       };
     },
-    paginate: async (_fn, { issue_number }) =>
-      (existingComments[issue_number] ?? []).map((body) => ({ body })),
+    paginate: async (fn, { issue_number }) => {
+      if (fn !== "listEvents") return [];
+      const at = labelEvents[issue_number];
+      return at
+        ? [{ event: "labeled", label: { name: script.NEEDS_ISSUE_LABEL }, created_at: at }]
+        : [];
+    },
     rest: {
       repos: {
         getContent: async () => ({
@@ -95,8 +116,12 @@ async function run(
       },
       issues: {
         listComments: "listComments",
+        listEvents: "listEvents",
         createComment: async ({ issue_number, body }) => commented.push({ issue_number, body }),
         addLabels: async ({ issue_number, labels: ls }) => labeled.push({ issue_number, labels: ls }),
+        removeLabel: async ({ issue_number, name }) => unlabeled.push({ issue_number, name }),
+        update: async ({ issue_number, state }) => updated.push({ issue_number, state }),
+        createLabel: async ({ name }) => createdLabels.push(name),
         // `issues` maps number -> "issue" | "pr" | undefined (404).
         get: async ({ issue_number }) => {
           const kind = issues[issue_number];
@@ -140,7 +165,7 @@ async function run(
     for (const k of Object.keys(env)) delete process.env[k];
     Object.assign(process.env, saved);
   }
-  return { commented, labeled, warnings, rows, queries };
+  return { commented, labeled, unlabeled, updated, createdLabels, warnings, rows, queries };
 }
 
 const ENFORCE = { ENFORCE: "true" };
@@ -284,13 +309,21 @@ for (const tracked of ["Bug fix", "Feature", "UI / frontend change"]) {
     assert.strictEqual(commented[0].issue_number, 21);
     assert.match(commented[0].body, /@alice/);
     assert.match(commented[0].body, /Closes #123/);
-    assert.ok(commented[0].body.startsWith(script.MARKER), "comment carries the dedupe marker");
+    assert.ok(commented[0].body.startsWith(script.MARKER), "comment carries the provenance marker");
     // House style: no em dashes in anything a contributor reads.
     assert.ok(!commented[0].body.includes("—"), "no em dashes in the nudge");
     // The exemption must not read as a free opt-out.
     assert.match(commented[0].body, /require an issue for every PR/);
     assert.match(commented[0].body, /even when it also touches docs or tests/);
-    assert.deepStrictEqual(labeled, [], "no label is applied");
+    // The close is a promise the comment has to make before the clock can run.
+    assert.match(commented[0].body, /will be closed automatically/);
+    assert.match(commented[0].body, new RegExp(`${script.CLOSE_AFTER_DAYS} days`));
+    assert.match(commented[0].body, /\/reopen/);
+    assert.deepStrictEqual(
+      labeled,
+      [{ issue_number: 21, labels: [script.NEEDS_ISSUE_LABEL] }],
+      "the nudge starts the clock by labeling"
+    );
   }
 
   // A non-closing reference to a real ISSUE satisfies the rule: a PR that only
@@ -413,23 +446,124 @@ for (const tracked of ["Bug fix", "Feature", "UI / frontend change"]) {
     assert.strictEqual(labeled.length, 0);
   }
 
-  // An already-nudged PR is never commented on twice: the hidden marker in the
-  // bot's own earlier comment is the dedupe.
+  // An already-labeled PR is never nudged twice: the label is the dedupe.
   {
-    const { commented } = await run([pr({ number: 23 })], {
+    const flagged = pr({ number: 23, labels: [script.NEEDS_ISSUE_LABEL] });
+    const { commented } = await run([flagged], {
       env: ENFORCE,
-      existingComments: { 23: [`${script.MARKER}\nplease link an issue`] },
+      labelEvents: { 23: daysAgo(1) },
     });
-    assert.strictEqual(commented.length, 0, "marker dedupes repeat runs");
+    assert.strictEqual(commented.length, 0, "the label dedupes repeat runs");
   }
 
-  // An unrelated human comment must not be mistaken for the nudge.
+  // Inside the window the PR is left alone, with the countdown reported.
   {
-    const { commented } = await run([pr({ number: 231 })], {
-      env: ENFORCE,
-      existingComments: { 231: ["lgtm"] },
+    const flagged = pr({ number: 230, labels: [script.NEEDS_ISSUE_LABEL] });
+    const { commented, updated, rows } = await run([flagged], {
+      env: { ...ENFORCE, CLOSE_ENFORCE: "true" },
+      labelEvents: { 230: daysAgo(script.CLOSE_AFTER_DAYS - 1) },
     });
-    assert.strictEqual(commented.length, 1, "only the marker suppresses the nudge");
+    assert.strictEqual(commented.length, 0, "not yet due");
+    assert.strictEqual(updated.length, 0, "not yet due");
+    assert.match(rows.find((r) => r[0] === "#230")[1], /waiting/);
+  }
+
+  // Past the window, CLOSE_ENFORCE off is a dry run: it reports, changes nothing.
+  {
+    const flagged = pr({ number: 232, labels: [script.NEEDS_ISSUE_LABEL] });
+    const { commented, updated, rows } = await run([flagged], {
+      env: ENFORCE,
+      labelEvents: { 232: daysAgo(script.CLOSE_AFTER_DAYS + 3) },
+    });
+    assert.strictEqual(updated.length, 0, "CLOSE_ENFORCE off must not close");
+    assert.strictEqual(commented.length, 0, "CLOSE_ENFORCE off must not comment");
+    assert.strictEqual(rows.find((r) => r[0] === "#232")[1], "WOULD CLOSE");
+  }
+
+  // Past the window with CLOSE_ENFORCE on: comment, then close.
+  {
+    const flagged = pr({ number: 233, labels: [script.NEEDS_ISSUE_LABEL] });
+    const { commented, updated } = await run([flagged], {
+      env: { ...ENFORCE, CLOSE_ENFORCE: "true" },
+      labelEvents: { 233: daysAgo(script.CLOSE_AFTER_DAYS) },
+    });
+    assert.deepStrictEqual(updated, [{ issue_number: 233, state: "closed" }]);
+    assert.strictEqual(commented.length, 1);
+    assert.match(commented[0].body, /\/reopen/, "the close is reversible, and says so");
+    assert.ok(!commented[0].body.includes("\u2014"), "no em dashes in the close notice");
+  }
+
+  // CLOSE_ENFORCE alone must never close: it only unlocks the enforcing path.
+  {
+    const flagged = pr({ number: 234, labels: [script.NEEDS_ISSUE_LABEL] });
+    const { updated, commented } = await run([flagged], {
+      env: { CLOSE_ENFORCE: "true" },
+      labelEvents: { 234: daysAgo(30) },
+    });
+    assert.strictEqual(updated.length, 0, "CLOSE_ENFORCE without ENFORCE is still a dry run");
+    assert.strictEqual(commented.length, 0);
+  }
+
+  // A label with no timestamp in the timeline must fail closed, never close.
+  {
+    const flagged = pr({ number: 235, labels: [script.NEEDS_ISSUE_LABEL] });
+    const { updated, warnings } = await run([flagged], {
+      env: { ...ENFORCE, CLOSE_ENFORCE: "true" },
+    });
+    assert.strictEqual(updated.length, 0, "no label timestamp is not grounds to close");
+    assert.ok(warnings.some((w) => /#235 has needs-issue but no labeled event/.test(w)));
+  }
+
+  // The label is derived state: linking the issue clears it and the countdown.
+  {
+    const flagged = pr({ number: 236, labels: [script.NEEDS_ISSUE_LABEL] });
+    const { unlabeled, updated } = await run([flagged], {
+      linked: { 236: 1 },
+      env: { ...ENFORCE, CLOSE_ENFORCE: "true" },
+      labelEvents: { 236: daysAgo(30) },
+    });
+    assert.deepStrictEqual(unlabeled, [
+      { issue_number: 236, name: script.NEEDS_ISSUE_LABEL },
+    ]);
+    assert.strictEqual(updated.length, 0, "a linked PR is never closed");
+  }
+
+  // Becoming exempt also clears it, so a draft's clock does not keep running.
+  {
+    const flagged = pr({ number: 237, draft: true, labels: [script.NEEDS_ISSUE_LABEL] });
+    const { unlabeled, updated } = await run([flagged], {
+      env: { ...ENFORCE, CLOSE_ENFORCE: "true" },
+      labelEvents: { 237: daysAgo(30) },
+    });
+    assert.deepStrictEqual(unlabeled, [
+      { issue_number: 237, name: script.NEEDS_ISSUE_LABEL },
+    ]);
+    assert.strictEqual(updated.length, 0, "an exempt PR is never closed");
+  }
+
+  // The label pass is what reaches a PR older than the 24-hour window.
+  {
+    const stale = pr({ number: 238, labels: [script.NEEDS_ISSUE_LABEL] });
+    const { updated, queries } = await run([], {
+      labelNodes: [stale],
+      env: { ...ENFORCE, CLOSE_ENFORCE: "true" },
+      labelEvents: { 238: daysAgo(20) },
+    });
+    assert.ok(
+      queries.some((q) => q.includes(`label:${script.NEEDS_ISSUE_LABEL}`)),
+      "a second search pass looks for already-flagged PRs"
+    );
+    assert.deepStrictEqual(updated, [{ issue_number: 238, state: "closed" }]);
+  }
+
+  // LIMIT caps closures the same way it caps nudges.
+  {
+    const overdue = [239, 240, 241].map((n) => pr({ number: n, labels: [script.NEEDS_ISSUE_LABEL] }));
+    const { updated } = await run(overdue, {
+      env: { ...ENFORCE, CLOSE_ENFORCE: "true", LIMIT: "2" },
+      labelEvents: { 239: daysAgo(10), 240: daysAgo(10), 241: daysAgo(10) },
+    });
+    assert.strictEqual(updated.length, 2, "LIMIT bounds closures per run");
   }
 
   // A failed link lookup must fail closed (skip), never flag.
