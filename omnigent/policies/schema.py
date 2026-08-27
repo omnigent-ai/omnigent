@@ -159,16 +159,13 @@ class EventContext(TypedDict, total=False):
     :param usage: Cumulative LLM token usage for the session.
     :param subtree_usage: Cumulative LLM usage for this conversation and
         its descendants. Present when subagent cost enforcement is enabled.
-    :param user_daily_cost: The session owner's per-UTC-day cost
-        rollup (``cost_usd`` / ``ask_approved_usd``). Present only when
-        the per-user daily cost-budget policy is configured; read via
-        ``event["context"]["user_daily_cost"]``.
-    :param user_period_cost: List of the session owner's daily cost
-        records for the current period. Each record contains ``cost_usd``,
-        ``ask_approved_usd``, ``day_utc``, and ``harness``. Present only
-        when the per-user period cost-budget policy is configured; read via
-        ``event["context"]["user_period_cost"]``. The policy function
-        aggregates these records to compute the period total.
+    :param user_daily_cost: List of the session owner's daily cost records.
+        Each record contains ``cost_usd``, ``ask_approved_usd``, ``day_utc``,
+        ``user_id``, and ``harness``. For daily budgets, this contains a single
+        record (today). For period budgets (week/month/quarter/year), this
+        contains all daily records in the period, which the policy aggregates
+        to compute the period total. Present only when a cost-budget policy
+        is configured; read via ``event["context"]["user_daily_cost"]``.
     :param model: The model the session is currently using —
         the conversation's ``model_override`` when set (e.g. via a
         mid-session ``/model`` change), else the agent spec's
@@ -192,8 +189,7 @@ class EventContext(TypedDict, total=False):
     actor: ActorContext
     usage: UsageContext
     subtree_usage: UsageContext
-    user_daily_cost: UserDailyCostContext
-    user_period_cost: list[UserDailyCostContext]
+    user_daily_cost: list[UserDailyCostContext]
     # ``str | None`` (not ``str``): the value is ``ctx.model``, which is
     # ``None`` when the engine could not determine a model — the dict carries
     # ``None``, it is not merely absent. Cost policies treat ``None`` as an
