@@ -553,3 +553,33 @@ export const ELICITATION_RESPONSE_PREFIX = "elicit_";
 export function answeredElicitationItemId(callItemId: string): string {
   return `${callItemId}:answer`;
 }
+
+// Memoized per `blocks` array identity.
+//
+// Zustand runs every subscriber's selector on every store update, and the
+// message list mounts one `AssistantBubble` per bubble — each of which needs
+// this flag. A plain `blocks.some(...)` selector therefore cost O(bubbles x
+// blocks) on every streaming token, since the common (no-pending) case scans
+// the whole array before returning false.
+//
+// The store replaces the `blocks` array identity whenever it changes, so a
+// WeakMap keyed on that array makes the first caller pay the scan and every
+// other caller in the same update O(1). Entries die with the array they key.
+const pendingElicitationByBlocks = new WeakMap<readonly AnyBlock[], boolean>();
+
+/**
+ * Whether any block is an elicitation still awaiting the user's verdict.
+ *
+ * A pending elicitation means the turn is parked on user input: the shimmer is
+ * suppressed and the "worked for" fold stays expanded.
+ *
+ * @param blocks The store's block list. Must be treated as immutable — the
+ *   result is cached against this exact array instance.
+ */
+export function hasPendingElicitation(blocks: readonly AnyBlock[]): boolean {
+  const cached = pendingElicitationByBlocks.get(blocks);
+  if (cached !== undefined) return cached;
+  const result = blocks.some((b) => b.type === "elicitation" && b.status === "pending");
+  pendingElicitationByBlocks.set(blocks, result);
+  return result;
+}
