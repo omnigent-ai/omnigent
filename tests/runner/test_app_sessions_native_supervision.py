@@ -1150,8 +1150,7 @@ def test_stop_after_completed_does_not_downgrade_status() -> None:
     delivered = session_inbox.get_nowait()
     assert delivered["task_id"] == child_id
     assert delivered["status"] == "completed", (
-        f"stop_session must not downgrade 'completed' to 'cancelled'; "
-        f"got {delivered['status']!r}"
+        f"stop_session must not downgrade 'completed' to 'cancelled'; got {delivered['status']!r}"
     )
     assert delivered["output"] == "Task done successfully."
 
@@ -1203,8 +1202,7 @@ def test_stop_after_failed_does_not_downgrade_status() -> None:
     assert session_inbox.qsize() == 1
     delivered = session_inbox.get_nowait()
     assert delivered["status"] == "failed", (
-        f"stop_session must not downgrade 'failed' to 'cancelled'; "
-        f"got {delivered['status']!r}"
+        f"stop_session must not downgrade 'failed' to 'cancelled'; got {delivered['status']!r}"
     )
     assert delivered["output"] == "Something went wrong."
 
