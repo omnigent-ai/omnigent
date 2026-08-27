@@ -12,6 +12,7 @@ export interface ExtensionIdentity {
 export interface ExtensionInitMessage extends ExtensionIdentity {
   source: typeof EXTENSION_RPC_SOURCE;
   type: "init";
+  capabilities: string[];
 }
 
 export interface ExtensionReadyMessage extends ExtensionIdentity {
@@ -29,6 +30,35 @@ export interface ExtensionErrorMessage extends ExtensionIdentity {
   source: typeof EXTENSION_RPC_SOURCE;
   type: "error";
   message: string;
+}
+
+export interface ExtensionRequestMessage extends ExtensionIdentity {
+  source: typeof EXTENSION_RPC_SOURCE;
+  type: "request";
+  requestId: string;
+  method: string;
+  params: unknown;
+}
+
+export interface ExtensionCancelMessage extends ExtensionIdentity {
+  source: typeof EXTENSION_RPC_SOURCE;
+  type: "cancel";
+  requestId: string;
+}
+
+export interface ExtensionResponseMessage extends ExtensionIdentity {
+  source: typeof EXTENSION_RPC_SOURCE;
+  type: "response";
+  requestId: string;
+  result?: unknown;
+  error?: { code: string; message: string };
+}
+
+export interface ExtensionEventMessage extends ExtensionIdentity {
+  source: typeof EXTENSION_RPC_SOURCE;
+  type: "event";
+  event: string;
+  value: unknown;
 }
 
 export interface ExtensionDisposeMessage extends ExtensionIdentity {

@@ -125,6 +125,78 @@ describe("ExtensionViewHost", () => {
     expect(screen.getByRole("alert")).toHaveTextContent("activation timed out");
   });
 
+  it("rejects prototype properties that are not registered host methods", async () => {
+    render(<ExtensionViewHost extension={extension} page={page} refresh={refresh} />);
+    await screen.findByTitle("Dashboard");
+    await waitFor(() => expect(FakeMessageChannel.latest).not.toBeNull());
+
+    act(() => {
+      FakeMessageChannel.latest!.port1.onmessage?.({
+        data: {
+          ...identity,
+          source: EXTENSION_RPC_SOURCE,
+          type: "request",
+          requestId: "prototype",
+          method: "constructor",
+          params: {},
+        },
+      } as MessageEvent<unknown>);
+    });
+
+    expect(FakeMessageChannel.latest!.port1.postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        requestId: "prototype",
+        error: { code: "MethodNotFound", message: "Host method is not available" },
+      }),
+    );
+  });
+
+  it("dispatches through the latest host method implementation", async () => {
+    const light = vi.fn(() => ({ theme: "light" }));
+    const dark = vi.fn(() => ({ theme: "dark" }));
+    const rendered = render(
+      <ExtensionViewHost
+        extension={extension}
+        page={page}
+        refresh={refresh}
+        methods={{ "theme.getCurrent": light }}
+      />,
+    );
+    await screen.findByTitle("Dashboard");
+    await waitFor(() => expect(FakeMessageChannel.latest).not.toBeNull());
+    rendered.rerender(
+      <ExtensionViewHost
+        extension={extension}
+        page={page}
+        refresh={refresh}
+        methods={{ "theme.getCurrent": dark }}
+      />,
+    );
+
+    act(() => {
+      FakeMessageChannel.latest!.port1.onmessage?.({
+        data: {
+          ...identity,
+          source: EXTENSION_RPC_SOURCE,
+          type: "request",
+          requestId: "theme",
+          method: "theme.getCurrent",
+          params: {},
+        },
+      } as MessageEvent<unknown>);
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(light).not.toHaveBeenCalled();
+    expect(dark).toHaveBeenCalledOnce();
+    expect(FakeMessageChannel.latest!.port1.postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ requestId: "theme", result: { theme: "dark" } }),
+    );
+  });
+
   it("cancels outstanding host calls and sends dispose on unmount", async () => {
     const captured: { signal?: AbortSignal } = {};
     const pending = vi.fn((_params: unknown, signal: AbortSignal) => {
@@ -152,6 +224,9 @@ describe("ExtensionViewHost", () => {
           params: {},
         },
       } as MessageEvent<unknown>);
+    });
+    await act(async () => {
+      await Promise.resolve();
     });
     expect(pending).toHaveBeenCalledOnce();
 
