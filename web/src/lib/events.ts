@@ -329,6 +329,26 @@ export interface SlashCommand {
 }
 
 /**
+ * Side question from `output_item.done` (type `side_question`).
+ * Lifted from `SideQuestionItem`; reducer produces a
+ * `SideQuestionBlock`. Display-only — the exchange never enters the
+ * model's history.
+ */
+export interface SideQuestion {
+  type: "side_question";
+  /** Verbatim text the user typed after `/btw`. */
+  question: string;
+  /** The harness's reply. */
+  answer: string;
+  /** Harness/agent name that answered. */
+  agentName: string;
+  /** Human author email when the server attributed one. */
+  createdBy?: string;
+  itemId: string;
+  responseId: string;
+}
+
+/**
  * Intelligent-model-router decision from `output_item.done`
  * (type `routing_decision`). Emitted by the runner's cost advisor at
  * turn start; the reducer produces a `RoutingDecisionBlock` rendered as
@@ -925,6 +945,7 @@ export type StreamEvent =
   | ToolOutputDelta
   | NativeToolCall
   | SlashCommand
+  | SideQuestion
   | RoutingDecision
   | TerminalCommandEvent
   | MessageDone

@@ -1345,22 +1345,27 @@ describe("buildSlashCommandWithArgsSet", () => {
     // ``/effort`` is the built-in that requires an arg; selecting it
     // from the menu fills "``/effort ``" rather than executing.
     expect(s.has("/effort")).toBe(true);
-    expect(s.size).toBe(1);
+    // Plus ``/btw``, which is ungated — a side question is nothing
+    // without its text, so it always fills rather than executing.
+    expect(s.has("/btw")).toBe(true);
+    expect(s.size).toBe(2);
   });
 
   it("omits /effort when effort controls are hidden", () => {
     const s = buildSlashCommandWithArgsSet([], false, false);
 
     expect(s.has("/effort")).toBe(false);
-    // No arg-fill commands remain when effort is hidden and no skills are loaded.
-    expect(s.size).toBe(0);
+    // Only the ungated ``/btw`` remains when effort is hidden and no
+    // skills are loaded.
+    expect(s).toEqual(new Set(["/btw"]));
   });
 
   it("includes /model as an arg-fill command only when model override is supported", () => {
     // showModel toggles /model independently of /effort: each built-in
     // is gated on its own capability flag.
     expect(buildSlashCommandWithArgsSet([], false, true).has("/model")).toBe(true);
-    expect(buildSlashCommandWithArgsSet([], false, true).size).toBe(1);
+    // ``/model`` plus the ungated ``/btw``.
+    expect(buildSlashCommandWithArgsSet([], false, true).size).toBe(2);
     expect(buildSlashCommandWithArgsSet([], false, false).has("/model")).toBe(false);
   });
 

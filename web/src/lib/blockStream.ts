@@ -26,6 +26,7 @@ import {
   type ResponseStartBlock,
   type RetryBlock,
   type RoutingDecisionBlock,
+  type SideQuestionBlock,
   type SlashCommandBlock,
   type TerminalCommandBlock,
   type TextChunk,
@@ -653,6 +654,18 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         arguments: event.arguments,
         output: event.output,
       } satisfies SlashCommandBlock;
+      return;
+    }
+
+    // ── Side question (/btw) ─────────────────────────
+    case "side_question": {
+      adoptResponseIdIfUnset(state, event.responseId);
+      yield {
+        type: "side_question",
+        ctx: ctx(state, event.itemId || null, event.responseId || null),
+        question: event.question,
+        answer: event.answer,
+      } satisfies SideQuestionBlock;
       return;
     }
 

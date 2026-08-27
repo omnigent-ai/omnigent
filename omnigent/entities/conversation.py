@@ -682,6 +682,33 @@ class SlashCommandData(BaseModel):
     output: str | None = None
 
 
+class SideQuestionData(BaseModel):
+    """
+    Data payload for a ``/btw`` side question — a question answered
+    from the session's context whose exchange never re-enters it.
+
+    Listed in :data:`NON_CONTENT_ITEM_TYPES` so the agent loop's
+    history filter skips it: the aside stays in the transcript and
+    survives reload, but the next turn's model never sees it. That
+    filtering is the whole point — a side question that leaked back
+    into history would just be a normal turn wearing different
+    styling.
+
+    Question and answer share ONE item because the pair is atomic:
+    an answer without its question is unreadable, so nothing should
+    be able to keep one and drop the other.
+
+    :param agent: Harness that answered, e.g. ``"claude-sdk"``.
+        Serialized as ``"model"`` for parity with other items.
+    :param question: Verbatim text the user typed after ``/btw``.
+    :param answer: The harness's reply.
+    """
+
+    agent: str = Field(serialization_alias="model")
+    question: str
+    answer: str
+
+
 ItemData = (
     MessageData
     | FunctionCallData
@@ -692,6 +719,7 @@ ItemData = (
     | NativeToolData
     | ResourceEventData
     | RoutingDecisionData
+    | SideQuestionData
     | SlashCommandData
     | TerminalCommandData
 )
@@ -706,6 +734,7 @@ ITEM_TYPE_TO_DATA_CLS: dict[str, type[BaseModel]] = {
     "native_tool": NativeToolData,
     "resource_event": ResourceEventData,
     "routing_decision": RoutingDecisionData,
+    "side_question": SideQuestionData,
     "slash_command": SlashCommandData,
     "terminal_command": TerminalCommandData,
 }
@@ -719,6 +748,7 @@ NON_CONTENT_ITEM_TYPES: frozenset[str] = frozenset(
         "error",
         "resource_event",
         "routing_decision",
+        "side_question",
         "slash_command",
         "terminal_command",
     }

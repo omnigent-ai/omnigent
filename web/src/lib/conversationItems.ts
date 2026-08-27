@@ -136,6 +136,22 @@ export interface SlashCommandItem extends BaseItem {
 }
 
 /**
+ * A `/btw` side question and its answer. Persisted so the aside
+ * survives reload and reaches the user's other devices, but listed in
+ * the server's `NON_CONTENT_ITEM_TYPES` so it never re-enters the
+ * model's context.
+ */
+export interface SideQuestionItem extends BaseItem {
+  type: "side_question";
+  /** Verbatim text the user typed after `/btw`. */
+  question: string;
+  /** The harness's reply. */
+  answer: string;
+  /** Harness/agent name — server alias for the `agent` field. */
+  model?: string;
+}
+
+/**
  * A runner-side terminal command (`!cmd`) observed in a Claude Code
  * embedded TUI transcript. Two items per invocation: one `kind="input"`
  * (the command text) and one `kind="output"` (stdout + stderr).
@@ -178,6 +194,7 @@ export type ConversationItem =
   | NativeToolItem
   | CompactionItem
   | SlashCommandItem
+  | SideQuestionItem
   | RoutingDecisionItem
   | TerminalCommandItem
   | (BaseItem & Record<string, unknown>);
@@ -212,6 +229,10 @@ export function isCompactionItem(item: ConversationItem): item is CompactionItem
 
 export function isSlashCommandItem(item: ConversationItem): item is SlashCommandItem {
   return item.type === "slash_command";
+}
+
+export function isSideQuestionItem(item: ConversationItem): item is SideQuestionItem {
+  return item.type === "side_question";
 }
 
 export function isRoutingDecisionItem(item: ConversationItem): item is RoutingDecisionItem {

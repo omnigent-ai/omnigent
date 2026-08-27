@@ -4726,7 +4726,7 @@ async def _cmd_help(
     # wall. Commands not listed in a group still render (under "Other"), so a
     # newly registered command is never silently hidden from /help.
     groups: list[tuple[str, list[str]]] = [
-        ("Chat", ["/new", "/clear", "/switch", "/fork", "/history", "/cancel"]),
+        ("Chat", ["/new", "/clear", "/switch", "/fork", "/btw", "/history", "/cancel"]),
         ("Context", ["/compact", "/context", "/model", "/effort"]),
         ("Display", ["/theme"]),
         ("Diagnostics", ["/logs", "/report"]),
@@ -6149,6 +6149,69 @@ async def _cmd_context(
             llm_model or agent_name,
         )
     _render_context_tree(agent_name, llm_model, message_tokens, context_window, host, fmt)
+
+
+@_cmd("/btw", "Ask a side question without adding it to the conversation")
+async def _cmd_btw(
+    arg: str,
+    session: _ReplSession,
+    client: OmnigentClient,
+    host: TerminalHost,
+    fmt: RichBlockFormatter,
+) -> None:
+    """Ask a question answered from this session's context, off the record.
+
+    The exchange is stored and shown, but filtered out of the model's
+    history — the next turn proceeds as if it never happened. Works
+    while a response is streaming, since it runs in its own process.
+
+    :param arg: The question typed after ``/btw``.
+    :param session: The active REPL session (needs ``session_id``).
+    :param client: Agent-plane HTTP client used to call the endpoint.
+    :param host: Terminal host for rendering output messages.
+    :param fmt: Rich block formatter for consistent styling.
+    """
+    from rich.markdown import Markdown
+    from rich.padding import Padding
+    from rich.text import Text
+
+    question = arg.strip()
+    if not question:
+        host.output(Text.from_markup(f"  [{fmt.muted}]Usage: /btw <your question>[/{fmt.muted}]"))
+        return
+
+    session_id = getattr(session, "session_id", None)
+    if session_id is None:
+        host.output(
+            Text.from_markup(
+                "  [bold red]/btw requires the sessions API (not available in legacy mode).[/]"
+            )
+        )
+        return
+
+    host.output(Text.from_markup(f"  [{fmt.muted}]btw: {question}[/{fmt.muted}]"))
+    try:
+        result = await client.sessions.side_question(session_id, question)
+    except Exception as exc:  # noqa: BLE001 — REPL UI boundary: render server errors inline
+        host.output(Text.from_markup(f"  [bold red]Side question failed: {exc}[/]"))
+        return
+
+    if result.get("status") != "answered":
+        host.output(
+            Text.from_markup(
+                f"  [{fmt.muted}]Side questions are not available for "
+                f"this session's harness.[/{fmt.muted}]"
+            )
+        )
+        return
+
+    answer = str(result.get("answer") or "")
+    # Same per-paragraph Markdown rendering as replayed assistant prose,
+    # so an aside reads like the rest of the transcript.
+    for paragraph in answer.split("\n\n"):
+        if not paragraph.strip():
+            continue
+        host.output(Padding(Markdown(paragraph, code_theme=fmt.code_theme), (0, 1, 0, 3)))
 
 
 @_cmd("/cancel", "Cancel the current response")

@@ -361,6 +361,7 @@ def test_non_content_item_types_complete() -> None:
         "error",
         "resource_event",
         "routing_decision",
+        "side_question",
         "slash_command",
         "terminal_command",
     }
@@ -385,6 +386,7 @@ def test_item_type_map_covers_all_types() -> None:
         "native_tool",
         "resource_event",
         "routing_decision",
+        "side_question",
         "slash_command",
         "terminal_command",
     }

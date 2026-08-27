@@ -85,6 +85,12 @@ export type RenderItem =
       output: string | null;
     }
   | {
+      kind: "side_question";
+      itemId: string | null;
+      question: string;
+      answer: string;
+    }
+  | {
       kind: "terminal_command";
       itemId: string | null;
       terminalKind: "input" | "output";
@@ -1446,6 +1452,17 @@ function buildAssistantItems(
         name: b.name,
         arguments: b.arguments,
         output: b.output,
+      });
+      i += 1;
+      continue;
+    }
+
+    if (b.type === "side_question") {
+      items.push({
+        kind: "side_question",
+        itemId: b.ctx.itemId,
+        question: b.question,
+        answer: b.answer,
       });
       i += 1;
       continue;

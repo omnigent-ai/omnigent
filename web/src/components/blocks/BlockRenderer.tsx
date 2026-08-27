@@ -37,6 +37,7 @@ import { cn } from "@/lib/utils";
 import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 import { ElicitationCard } from "./ApprovalCard";
 import { ReasoningView } from "./ReasoningView";
+import { SideQuestionCard } from "./SideQuestionCard";
 import { SlashCommandCard } from "./SlashCommandCard";
 import { SmartRoutingCard } from "./SmartRoutingCard";
 import { TerminalCommandCard } from "./TerminalCommandCard";
@@ -818,6 +819,8 @@ function renderItem(
           output={item.output}
         />
       );
+    case "side_question":
+      return <SideQuestionCard key={key} question={item.question} answer={item.answer} />;
     case "terminal_command":
       return (
         <TerminalCommandCard

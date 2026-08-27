@@ -11,6 +11,7 @@ import type {
   ReasoningBlock,
   ReasoningChunk,
   ResponseEndBlock,
+  SideQuestionBlock,
   SlashCommandBlock,
   TextChunk,
   TextDone,
@@ -160,6 +161,30 @@ describe("BlockStream — block ctx carries response_id and item_id", () => {
     for (const c of chunks) {
       expect(c.ctx.itemId).toBeNull();
     }
+  });
+
+  it("side_question emits one aside and no user-echo bubble", () => {
+    // The live funnel must match itemsToBlocks: a /btw ask is not a
+    // message to the agent, so unlike a skill receipt it grows no user
+    // bubble. Divergence here means the aside renders differently on
+    // reload than it did live.
+    const blocks = reduce([
+      {
+        type: "side_question",
+        question: "which harness is this?",
+        answer: "It runs on claude-native.",
+        agentName: "claude-sdk",
+        createdBy: "alice@example.com",
+        itemId: "sq_1",
+        responseId: "resp_btw",
+      },
+    ]);
+    expect(blockTypes(blocks)).toEqual(["side_question"]);
+    const aside = blocks[0] as SideQuestionBlock;
+    expect(aside.question).toBe("which harness is this?");
+    expect(aside.answer).toBe("It runs on claude-native.");
+    expect(aside.ctx.itemId).toBe("sq_1");
+    expect(aside.ctx.responseId).toBe("resp_btw");
   });
 
   it("slash_command kind='skill' emits a user-echo bubble before the SlashCommandBlock", () => {

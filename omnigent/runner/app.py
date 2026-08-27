@@ -150,6 +150,20 @@ from omnigent.runner.session_init_protocol import (
     RunnerSessionInitEnvelope,
     parse_runner_session_init_envelope,
 )
+from omnigent.runner.side_questions import (
+    SideQuestionContext,
+    SideQuestionHarnessError,
+)
+from omnigent.runner.side_questions import (
+    generate_side_question_answer as run_side_question,
+)
+from omnigent.runner.side_questions import (
+    generator_spec_for_harness as side_question_spec_for_harness,
+)
+from omnigent.runner.side_questions.service import (
+    SIDE_QUESTION_MAX_EXCERPT_CHARS,
+    SIDE_QUESTION_MAX_QUESTION_CHARS,
+)
 from omnigent.runner.subagent_routing import (
     PLAIN_SESSION,
     SessionRoutingClass,
@@ -167,6 +181,8 @@ from omnigent.runtime.prompt import (
 from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
     BackgroundSessionTitleResponse,
+    RunnerSideQuestionRequest,
+    RunnerSideQuestionResponse,
 )
 from omnigent.spec.skill_sources import SkillSourceContext, resolve_harness_skills
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
@@ -3180,6 +3196,112 @@ def create_runner_app(
             status="generated",
             title=" ".join(title.split()),
         )
+
+    @app.post(
+        "/v1/sessions/{conversation_id}/side-question",
+        response_model=RunnerSideQuestionResponse,
+    )
+    async def answer_session_side_question(
+        conversation_id: str,
+        body: RunnerSideQuestionRequest,
+    ) -> RunnerSideQuestionResponse | JSONResponse:
+        """Answer a ``/btw`` question in a throwaway process.
+
+        Resolves the session's harness the same way background titles
+        do, then runs one tool-free inference. Nothing here touches the
+        live session — the answer goes back to the server, which owns
+        persisting it.
+        """
+        if process_manager is None:
+            return JSONResponse(
+                status_code=501,
+                content={
+                    "error": "not_implemented",
+                    "detail": "Side questions require a HarnessProcessManager.",
+                },
+            )
+
+        sub_agent_name = body.sub_agent_name or await _recover_sub_agent_name(conversation_id)
+        resolver_agent_id = body.agent_id or _session_agent_ids.get(conversation_id)
+        resolver_cwd = await _session_runtime_cwd(conversation_id)
+        try:
+            effective_harness, spawn_env = await _resolve_harness_config(
+                agent_id=resolver_agent_id,
+                spec_resolver=spec_resolver,
+                session_id=conversation_id,
+                model_override=body.model_override,
+                harness_override=body.harness_override,
+                sub_agent_name=sub_agent_name,
+                cwd=resolver_cwd,
+            )
+            generator_spec = side_question_spec_for_harness(effective_harness)
+            if generator_spec is None:
+                return RunnerSideQuestionResponse(status="unsupported")
+            resolver_harness = generator_spec.resolver_harness or effective_harness
+            if resolver_harness != effective_harness:
+                resolved_harness, spawn_env = await _resolve_harness_config(
+                    agent_id=resolver_agent_id,
+                    spec_resolver=spec_resolver,
+                    session_id=conversation_id,
+                    model_override=body.model_override,
+                    harness_override=resolver_harness,
+                    sub_agent_name=sub_agent_name,
+                    cwd=resolver_cwd,
+                )
+                if resolved_harness != resolver_harness:
+                    return RunnerSideQuestionResponse(status="unsupported")
+        except (httpx.HTTPError, RuntimeError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "spec_resolver_failed",
+                    "detail": _client_safe_error_detail(exc, context="spec resolve"),
+                },
+            )
+
+        context = SideQuestionContext(
+            question=body.question[:SIDE_QUESTION_MAX_QUESTION_CHARS],
+            excerpt=body.excerpt[:SIDE_QUESTION_MAX_EXCERPT_CHARS],
+            harness=effective_harness,
+            spawn_env=dict(spawn_env or {}),
+            process_manager=process_manager,
+            cwd=resolver_cwd,
+            model_override=body.model_override,
+            session_spec=_unwrap_spec_entry(_session_spec_cache.get(conversation_id)),
+        )
+        try:
+            answer = await run_side_question(context)
+        except TimeoutError:
+            return JSONResponse(
+                status_code=504,
+                content={
+                    "error": "side_question_timeout",
+                    "detail": "Harness side question timed out.",
+                },
+            )
+        except SideQuestionHarnessError as exc:
+            return JSONResponse(
+                status_code=502,
+                content={"error": "side_question_failed", "detail": str(exc)},
+            )
+        except (ImportError, OSError, RuntimeError) as exc:
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "error": "side_question_failed",
+                    "detail": _client_safe_error_detail(exc, context="side question"),
+                },
+            )
+
+        if answer is None:
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "error": "side_question_failed",
+                    "detail": "Harness side question returned no text.",
+                },
+            )
+        return RunnerSideQuestionResponse(status="answered", answer=answer)
 
     async def _initialize_session(body: _JsonObject) -> JSONResponse:
         if process_manager is None:

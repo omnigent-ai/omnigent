@@ -374,7 +374,7 @@ describe("Composer slash-command menu", () => {
 
   it("ArrowDown moves the highlight to the next match", () => {
     // /compact is native-wrapper-only (#1139); render a native session so the
-    // first built-in is "/compact" and ArrowDown advances to "/context".
+    // first built-in is "/compact" and ArrowDown advances to "/btw".
     render(<Composer {...composerProps({ isNativeWrapper: true })} />);
     const ta = textarea();
     fireEvent.change(ta, { target: { value: "/" } });
@@ -382,7 +382,7 @@ describe("Composer slash-command menu", () => {
 
     fireEvent.keyDown(ta, { key: "ArrowDown" });
     // Second built-in entry.
-    expect(activeRow()?.textContent).toContain("/context");
+    expect(activeRow()?.textContent).toContain("/btw");
   });
 });
 

@@ -6,12 +6,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
 
-import httpx
-
 from omnigent.harness_plugins import (
     BackgroundTitleGeneratorSpec,
     background_title_generators,
     load_object,
+)
+from omnigent.runner.isolated_inference import (
+    IsolatedInferenceError,
+    IsolatedInferenceProcessManager,
+    IsolatedPrompt,
 )
 
 if TYPE_CHECKING:
@@ -27,24 +30,10 @@ BACKGROUND_TITLE_INSTRUCTIONS = (
 )
 
 
-class BackgroundTitleProcessManager(Protocol):
-    """Process-manager operations required by SDK title generators."""
-
-    async def get_client(
-        self,
-        conversation_id: str,
-        harness: str,
-        env: dict[str, str] | None = None,
-    ) -> httpx.AsyncClient:
-        pass
-
-    async def release(
-        self,
-        conversation_id: str,
-        *,
-        only_if_idle_cutoff: float | None = None,
-    ) -> None:
-        pass
+# Title generation runs on the shared isolated-inference mechanism, so it
+# needs exactly that protocol. Aliased rather than restated to keep the
+# two from drifting.
+BackgroundTitleProcessManager = IsolatedInferenceProcessManager
 
 
 @dataclass(frozen=True)
@@ -66,8 +55,19 @@ class BackgroundTitleGenerator(Protocol):
     async def __call__(self, context: BackgroundTitleContext) -> str | None: ...
 
 
-class BackgroundTitleHarnessError(RuntimeError):
+class BackgroundTitleHarnessError(IsolatedInferenceError):
     """A safe harness failure that can be returned by the runner endpoint."""
+
+
+def background_title_prompt(context: BackgroundTitleContext) -> IsolatedPrompt:
+    """Build the one-shot prompt every title generator asks."""
+    return IsolatedPrompt(
+        agent_label="session-title",
+        instructions=BACKGROUND_TITLE_INSTRUCTIONS,
+        prompt=f"<user_message>\n{context.prompt}\n</user_message>",
+        max_output_tokens=BACKGROUND_TITLE_MAX_OUTPUT_TOKENS,
+        timeout_seconds=BACKGROUND_TITLE_INFERENCE_TIMEOUT_SECONDS,
+    )
 
 
 def generator_spec_for_harness(harness: str) -> BackgroundTitleGeneratorSpec | None:

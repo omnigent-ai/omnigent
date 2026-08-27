@@ -185,6 +185,20 @@ export interface SlashCommandBlock {
 }
 
 /**
+ * A `/btw` side question and its answer. Rendered as a collapsed
+ * aside — the exchange is in the transcript but was never in the
+ * model's context, so it must not read like a normal turn.
+ */
+export interface SideQuestionBlock {
+  type: "side_question";
+  ctx: BlockContext;
+  /** Verbatim text the user typed after `/btw`. */
+  question: string;
+  /** The harness's reply. */
+  answer: string;
+}
+
+/**
  * Reconstruct the literal composer text a skill invocation came from,
  * e.g. `/review-pr 123 focus on auth`. A skill's `slash_command`
  * receipt is the only transcript record of the user's send (the typed
@@ -512,6 +526,7 @@ export type AnyBlock =
   | ToolResultBlock
   | NativeToolBlock
   | SlashCommandBlock
+  | SideQuestionBlock
   | RoutingDecisionBlock
   | TerminalCommandBlock
   | TextChunk

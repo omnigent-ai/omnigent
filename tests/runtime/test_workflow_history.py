@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from omnigent.entities import ConversationItem, MessageData, PagedList, SlashCommandData
+from omnigent.entities import (
+    ConversationItem,
+    MessageData,
+    PagedList,
+    SideQuestionData,
+    SlashCommandData,
+)
 from omnigent.entities.pagination import paginate_in_memory
 from omnigent.runtime.workflow import _load_initial_history
 
@@ -105,3 +111,56 @@ def test_load_initial_history_filters_visible_slash_command_but_keeps_meta_messa
     assert [item.id for item in loaded.items] == ["msg_meta", "msg_visible"]
     assert isinstance(loaded.items[0].data, MessageData)
     assert loaded.items[0].data.is_meta is True
+
+
+def test_load_initial_history_drops_side_questions() -> None:
+    """
+    A ``/btw`` exchange never reaches the model.
+
+    This is the whole contract of a side question: it is stored and
+    rendered, but the next turn must proceed as if it was never asked.
+    A regression here turns every aside into context the user is
+    silently paying for and the agent is silently acting on.
+    """
+    before = ConversationItem(
+        id="msg_before",
+        type="message",
+        status="completed",
+        response_id="turn_1",
+        created_at=1,
+        data=MessageData(
+            role="user",
+            content=[{"type": "input_text", "text": "refactor the parser"}],
+        ),
+    )
+    aside = ConversationItem(
+        id="sq_1",
+        type="side_question",
+        status="completed",
+        response_id="turn_btw",
+        created_at=2,
+        data=SideQuestionData(
+            agent="claude-sdk",
+            question="which harness is this?",
+            answer="claude-native",
+        ),
+    )
+    after = ConversationItem(
+        id="msg_after",
+        type="message",
+        status="completed",
+        response_id="turn_2",
+        created_at=3,
+        data=MessageData(
+            role="assistant",
+            agent="test-agent",
+            content=[{"type": "output_text", "text": "done"}],
+        ),
+    )
+
+    loaded = _load_initial_history(
+        _ConversationStore([before, aside, after]),  # type: ignore[arg-type]
+        "conv_123",
+    )
+
+    assert [item.id for item in loaded.items] == ["msg_before", "msg_after"]

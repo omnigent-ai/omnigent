@@ -3808,6 +3808,9 @@ export function buildSlashCommandWithArgsSet(
   showModel: boolean,
 ): Set<string> {
   const s = new Set<string>();
+  // /btw is nothing without its question, so selecting it from the menu
+  // fills in "/btw " and waits rather than firing an empty ask.
+  s.add("/btw");
   if (showEffort) s.add("/effort");
   if (showModel) s.add("/model");
   for (const skill of skills) s.add(`/${skill.name}`);
@@ -4777,6 +4780,33 @@ export function Composer({
           })
           .catch((err: unknown) => {
             setCommandError(err instanceof Error ? err.message : "Failed to set model");
+          });
+        return true;
+      }
+      case "/btw": {
+        const question = arg.trim();
+        if (!question) {
+          setCommandError("Usage: /btw <your question>");
+          return true;
+        }
+        dirtyRef.current = true;
+        setValue("");
+        setCommandError("Asking\u2026");
+        void useChatStore
+          .getState()
+          .askSideQuestion(question)
+          .then((result) => {
+            // The answer renders as its own `side_question` block from
+            // the event stream; the composer only reports the cases
+            // where nothing will show up there.
+            setCommandError(
+              result.status === "answered"
+                ? null
+                : "Side questions are not available for this session's harness.",
+            );
+          })
+          .catch((err: unknown) => {
+            setCommandError(err instanceof Error ? err.message : "Side question failed");
           });
         return true;
       }

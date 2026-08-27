@@ -2236,6 +2236,64 @@ class BackgroundSessionTitleResponse(BaseModel):
     title: str | None = None
 
 
+class SessionSideQuestionRequest(BaseModel):
+    """
+    Public request to ask a ``/btw`` side question about a session.
+
+    :param question: The user's question, e.g. ``"which harness is
+        this session on?"``.
+    """
+
+    question: str = Field(min_length=1, max_length=4_000)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class SessionSideQuestionResponse(BaseModel):
+    """
+    Result of a side question.
+
+    :param status: ``"answered"`` when the harness produced text;
+        ``"unsupported"`` when the session's harness has no registered
+        side-question generator. Callers render the latter as a plain
+        "not available here" message rather than an error.
+    :param answer: The harness's reply. ``None`` when unsupported.
+    :param item_id: Id of the persisted ``side_question`` item, so a
+        client can reconcile against the item it already received over
+        the event stream. ``None`` when unsupported.
+    """
+
+    status: Literal["answered", "unsupported"]
+    answer: str | None = None
+    item_id: str | None = None
+
+
+class RunnerSideQuestionRequest(BaseModel):
+    """
+    Private runner request for isolated side-question inference.
+
+    :param question: The user's question, forwarded verbatim.
+    :param excerpt: Transcript excerpt the server built and bounded;
+        the runner treats it as opaque prompt context.
+    """
+
+    question: str = Field(min_length=1, max_length=4_000)
+    excerpt: str = Field(default="", max_length=24_000)
+    agent_id: str | None = None
+    model_override: str | None = None
+    harness_override: str | None = None
+    sub_agent_name: str | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class RunnerSideQuestionResponse(BaseModel):
+    """Private runner result for side-question inference."""
+
+    status: Literal["answered", "unsupported"]
+    answer: str | None = None
+
+
 class CodexGoalObject(BaseModel):
     """
     Current Codex goal state for a Codex-native session.
