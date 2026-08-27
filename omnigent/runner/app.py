@@ -10765,6 +10765,11 @@ _HARNESS_MODEL_ENV_KEY: dict[str, str] = {
     "qwen": "HARNESS_QWEN_MODEL",
     "goose": "HARNESS_GOOSE_MODEL",
     "copilot": "HARNESS_COPILOT_MODEL",
+    # OpenCode reads ``HARNESS_OPENCODE_MODEL`` in
+    # :mod:`omnigent.inner.opencode_executor`; without this mapping a
+    # per-session ``/model`` override would silently drop on the
+    # opencode harness path.
+    "opencode": "HARNESS_OPENCODE_MODEL",
 }
 _HARNESS_MODEL_ENV_KEY = model_env_keys()
 
@@ -10884,6 +10889,7 @@ def _build_spawn_env_from_spec(
             _build_hermes_spawn_env,
             _build_kimi_spawn_env,
             _build_openai_agents_sdk_spawn_env,
+            _build_opencode_spawn_env,
             _build_pi_spawn_env,
             _build_qwen_spawn_env,
         )
@@ -10900,6 +10906,8 @@ def _build_spawn_env_from_spec(
             env = _build_cursor_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "antigravity":
             env = _build_antigravity_spawn_env(effective_spec)
+        elif harness == "opencode":
+            env = _build_opencode_spawn_env(effective_spec, workdir=workdir)
         elif harness == "kimi":
             env = _build_kimi_spawn_env(effective_spec, cwd=cwd)
         elif harness == "hermes":

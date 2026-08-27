@@ -937,6 +937,15 @@ def _pick_first_run_harness() -> _FirstRunPlan | None:
 
     if harness_cli_installed(KIMI_KEY):
         return _FirstRunPlan(harness="kimi", agent=None)
+    # OpenCode is multi-provider and stores its auth via ``opencode auth
+    # login`` rather than the ambient-detected provider config, so
+    # ``default_provider_for_harness`` can't gate it. Fall back to
+    # "binary installed" as the readiness proxy: the executor will fail
+    # loud at the first turn if no provider is actually configured.
+    from omnigent.onboarding.harness_install import OPENCODE_KEY, harness_cli_installed
+
+    if harness_cli_installed(OPENCODE_KEY):
+        return _FirstRunPlan(harness="opencode", agent=None)
     return None
 
 
@@ -6645,7 +6654,7 @@ def session_import(input_path: str, title: str | None, server: str | None) -> No
 # into a materialized copy of the spec before the server starts.
 _HARNESS_CHOICES_HELP = (
     "'claude' (alias for 'claude-sdk'), 'claude-sdk', 'codex', "
-    "'cursor', 'kimi', "
+    "'cursor', 'kimi', 'opencode', 'opencode-native', "
     "'openai-agents', 'open-responses', 'pi', 'antigravity', 'qwen', 'goose', or 'copilot'"
 )
 _HARNESS_HELP = f"Harness to use for a local agent: {_HARNESS_CHOICES_HELP}."
@@ -6703,6 +6712,10 @@ _DEFAULT_HARNESS_PROMPTS = {
     ),
     "goose": (
         "You are Goose, running through Omnigent. Help the user with software engineering tasks."
+    ),
+    "opencode": (
+        "You are OpenCode, running through Omnigent. "
+        "Help the user with software engineering tasks."
     ),
 }
 _DEFAULT_HARNESS_PROMPT = "You are a helpful coding agent running through Omnigent."

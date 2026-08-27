@@ -971,6 +971,7 @@ def _build_session_response(
     viewer_id: str | None = None,
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
+    reasoning_effort_override: str | None = None,
 ) -> SessionResponse:
     """
     Build a :class:`SessionResponse` from store-side entities.
@@ -1081,7 +1082,11 @@ def _build_session_response(
         runner_online=runner_online,
         host_online=host_online,
         host_resumable=host_resumable,
-        reasoning_effort=conv.reasoning_effort,
+        reasoning_effort=(
+            reasoning_effort_override
+            if reasoning_effort_override is not None
+            else conv.reasoning_effort
+        ),
         items=items,
         permission_level=permission_level,
         sub_agent_name=conv.sub_agent_name,
@@ -7990,6 +7995,14 @@ async def _create_session_from_existing_agent(
     # The persisted override reaches a native CLI as a ``--model`` argv
     # element at terminal launch, so reject shell-/flag-shaped values
     # before any row or worktree exists.
+    inherited_reasoning_effort = body.reasoning_effort
+    if body.parent_session_id is not None and inherited_reasoning_effort is None:
+        parent_for_effort = await asyncio.to_thread(
+            conversation_store.get_conversation, body.parent_session_id
+        )
+        if parent_for_effort is not None:
+            inherited_reasoning_effort = parent_for_effort.reasoning_effort
+
     model_override, reasoning_effort = validate_session_model_metadata(
         # Native Smart Routing bakes the routed model into the terminal launch;
         # the client sends none of its own on that path. A fixed-harness routed
@@ -7999,7 +8012,7 @@ async def _create_session_from_existing_agent(
             if _native_smart_routing
             else _fixed_routed_model or body.model_override
         ),
-        reasoning_effort=body.reasoning_effort,
+        reasoning_effort=inherited_reasoning_effort,
     )
 
     # Validated before any row exists so a bad value never creates an
@@ -8118,12 +8131,19 @@ async def _create_session_from_existing_agent(
         )
 
     # Inherit runner affinity from the parent session so the child
-    # is assigned to the same runner (sub-agent co-location).
+    # is assigned to the same runner (sub-agent co-location). Keep the
+    # workspace metadata aligned too: a child without it can be treated as
+    # a fresh checkout by downstream worker orchestration.
     inherited_runner_id: str | None = None
+    inherited_workspace: str | None = body.workspace
+    inherited_git_branch: str | None = None
     if body.parent_session_id is not None:
         parent_conv = conversation_store.get_conversation(body.parent_session_id)
         if parent_conv is not None:
             inherited_runner_id = parent_conv.runner_id
+            if body.host_id is None and body.workspace is None and body.git is None:
+                inherited_workspace = parent_conv.workspace
+                inherited_git_branch = parent_conv.git_branch
             # Defense-in-depth: don't inherit a runner the
             # caller doesn't own.
             if (
@@ -8142,12 +8162,12 @@ async def _create_session_from_existing_agent(
     # create_conversation so a bad workspace never produces a row.
     # With git worktree creation, the validated path is the source
     # repo; the worktree it produces becomes the stored workspace.
-    canonical_workspace: str | None = body.workspace
+    canonical_workspace: str | None = inherited_workspace
     if body.host_id is not None:
         canonical_workspace = await _validate_session_workspace(
             user_id=user_id,
             host_id=body.host_id,
-            workspace=body.workspace,
+            workspace=inherited_workspace,
             agent=agent,
             agent_cache=agent_cache,
             request=request,
@@ -8158,7 +8178,7 @@ async def _create_session_from_existing_agent(
     #    workspace and its branch is recorded.
     #  - bind (existing_worktree): workspace already IS the worktree;
     #    record its branch only, create nothing.
-    git_branch: str | None = None
+    git_branch: str | None = inherited_git_branch
     # Set to the created worktree path ONLY when Omnigent creates one.
     # Gates create-rollback: an existing worktree bound via
     # existing_worktree must never be force-removed on failure — it is
@@ -8632,6 +8652,8 @@ async def _child_session_summaries_from_conversations(
     children: list[Conversation],
     parent_session_id: str,
     conv_store: ConversationStore,
+    parent_reasoning_effort: str | None = None,
+    parent_model: str | None = None,
 ) -> list[ChildSessionSummary]:
     """
     Build child summaries with one batched message-preview lookup.
@@ -8647,6 +8669,10 @@ async def _child_session_summaries_from_conversations(
         ``list_conversations(kind="sub_agent")``.
     :param parent_session_id: Parent session id, e.g. ``"conv_parent987"``.
     :param conv_store: Conversation store used for the batched message read.
+    :param parent_reasoning_effort: Parent’s persisted effort, used as a
+        display fallback for older native child rows.
+    :param parent_model: Parent’s effective model, used as a display fallback
+        for older child rows whose native wrapper/spec exposes no model.
     :returns: One :class:`ChildSessionSummary` per input child, preserving
         input order.
     """
@@ -8667,6 +8693,8 @@ async def _child_session_summaries_from_conversations(
             child,
             parent_session_id,
             previews.get(child.id),
+            parent_reasoning_effort,
+            parent_model,
         )
         for child in children
     ]
@@ -9306,6 +9334,24 @@ async def _get_session_snapshot(
         conv = await asyncio.to_thread(conv_store.get_conversation, session_id)
     if conv is None:
         raise _session_not_found()
+    reasoning_effort_override: str | None = None
+    parent_model: str | None = None
+    parent_conv: Conversation | None = None
+    if conv.parent_conversation_id is not None and (
+        conv.model_override is None
+        or (conv.reasoning_effort is None and _is_codex_native_subagent(conv))
+    ):
+        parent_conv = await asyncio.to_thread(
+            conv_store.get_conversation, conv.parent_conversation_id
+        )
+        if parent_conv is not None:
+            if conv.reasoning_effort is None and _is_codex_native_subagent(conv):
+                reasoning_effort_override = parent_conv.reasoning_effort
+            if conv.model_override is None:
+                # Native wrappers do not carry a useful spec model. Reuse the
+                # parent's latest harness report when available, otherwise
+                # its explicit request, so legacy children remain truthful.
+                parent_model = parent_conv.reported_model or parent_conv.model_override
     # Return the most recent committed items while preserving the
     # SessionResponse contract that ``items`` is chronological. The
     # store's default page is the oldest 100 (``order="asc"``), which
@@ -9464,6 +9510,13 @@ async def _get_session_snapshot(
     # from this).
     if conv.reported_model:
         llm_model = conv.reported_model
+    elif conv.model_override is not None:
+        # A native wrapper may have no spec model and may not have emitted its
+        # first harness report yet. The persisted request is still the model
+        # the child will launch with until the report arrives.
+        llm_model = conv.model_override
+    elif llm_model is None and parent_model is not None:
+        llm_model = parent_model
     # Skills are runner-owned: the bound runner discovers them against its
     # own filesystem (bundled skills + host skills under the session's
     # workspace and ``~/.claude/skills/``) — the host where the harness
@@ -9536,6 +9589,7 @@ async def _get_session_snapshot(
             conv,
         ),
         subtree_usage=subtree_usage,
+        reasoning_effort_override=reasoning_effort_override,
         viewer_id=viewer_id,
         agent_store=agent_store,
         agent_cache=agent_cache,

@@ -89,6 +89,7 @@ def _seed_child(
     parent_id: str,
     title: str,
     agent_id: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> Conversation:
     """
     Create a child sub-agent conversation.
@@ -107,12 +108,18 @@ def _seed_child(
         the ``agent_id`` field in the summary).
     :returns: The created child :class:`Conversation`.
     """
-    return conv_store.create_conversation(
+    child = conv_store.create_conversation(
         kind="sub_agent",
         title=title,
         parent_conversation_id=parent_id,
         agent_id=agent_id,
     )
+    if reasoning_effort is not None:
+        child = conv_store.update_conversation(
+            child.id,
+            reasoning_effort=reasoning_effort,
+        )
+    return child
 
 
 # ── 404 ──────────────────────────────────────────────────
@@ -174,6 +181,11 @@ async def test_child_sessions_returns_seeded_child_with_full_shape(
     :param db_uri: Per-test SQLite database URI.
     """
     session = await _create_parent_session(client)
+    parent_update = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"model_override": "gpt-5.6-luna"},
+    )
+    assert parent_update.status_code == 200, parent_update.text
     conv_store = SqlAlchemyConversationStore(db_uri)
 
     child = _seed_child(
@@ -181,6 +193,7 @@ async def test_child_sessions_returns_seeded_child_with_full_shape(
         parent_id=session["id"],
         title="researcher:auth",
         agent_id=session["agent_id"],
+        reasoning_effort="high",
     )
 
     resp = await client.get(f"/v1/sessions/{session['id']}/child_sessions")
@@ -204,6 +217,13 @@ async def test_child_sessions_returns_seeded_child_with_full_shape(
 
     # agent_id comes from the conversation row (tasks table removed).
     assert row["agent_id"] == session["agent_id"]
+    assert row["reasoning_effort"] == "high"
+    # The child carries no override and was never routed, so its custom
+    # agent spec model remains in charge even when the parent has a model
+    # override (runtime stores are wired by the ``client`` fixture).
+    assert row["model_override"] is None
+    assert row["routed_model"] is None
+    assert row["llm_model"] == "test-agent"
     # agent_name and task fields are None (no tasks table).
     assert row["agent_name"] is None
     assert row["current_task_id"] is None
@@ -1632,11 +1652,21 @@ async def test_multipart_create_with_parent_links_child(
     the runner builds the orchestrator's handle from them.
     """
     parent = await _create_parent_session(client, agent_name="bundle-parent")
-    child_bundle = build_agent_bundle(name="bundle-child")
+    parent_update = await client.patch(
+        f"/v1/sessions/{parent['id']}",
+        json={"reasoning_effort": "high", "model_override": "gpt-5.6-luna"},
+    )
+    assert parent_update.status_code == 200, parent_update.text
+    child_bundle = build_agent_bundle(name="bundle-child", include_llm=False)
     resp = await client.post(
         "/v1/sessions",
         data={
-            "metadata": json.dumps({"parent_session_id": parent["id"], "title": "bundled helper"})
+            "metadata": json.dumps(
+                {
+                    "parent_session_id": parent["id"],
+                    "title": "bundled helper",
+                }
+            )
         },
         files={"bundle": ("agent.tar.gz", child_bundle, "application/gzip")},
     )
@@ -1654,6 +1684,9 @@ async def test_multipart_create_with_parent_links_child(
     # Parent linkage + agent binding traversed metadata → store → row.
     assert snap.json()["parent_session_id"] == parent["id"]
     assert snap.json()["agent_id"] == body["agent_id"]
+    assert snap.json()["model_override"] is None
+    assert snap.json()["llm_model"] == "gpt-5.6-luna"
+    assert snap.json()["reasoning_effort"] == "high"
 
     listing = await client.get(f"/v1/sessions/{parent['id']}/child_sessions")
     assert listing.status_code == 200, listing.text
@@ -1661,6 +1694,10 @@ async def test_multipart_create_with_parent_links_child(
     # kind="sub_agent" is what the child_sessions listing filters on —
     # absence here means the multipart path created a top-level row.
     assert child_id in listed_ids
+    listed_child = next(c for c in listing.json()["data"] if c["id"] == child_id)
+    assert listed_child["model_override"] is None
+    assert listed_child["llm_model"] == "gpt-5.6-luna"
+    assert listed_child["reasoning_effort"] == "high"
 
 
 async def test_multipart_create_with_unknown_parent_404s(

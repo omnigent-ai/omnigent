@@ -246,7 +246,7 @@ class AgentObject(BaseModel):
         phases. Empty list when the spec declares no policies
         or when the bundle cannot be loaded.
     :param skills: Skills bundled in the agent spec
-        (``skills/<dir>/SKILL.md``). Lets the Web UI's
+        (``skills/<name>/SKILL.md``). Lets the Web UI's
         new-session composer offer a slash-command menu before a
         session (and its runner) exists. Host-discovered skills
         are runner-owned, so they are NOT listed here — the
@@ -797,6 +797,16 @@ class ChildSessionSummary(BaseModel):
         child's ``model_override`` — the field intelligent routing writes
         when it picks a model for a spawned child. ``None`` when the child
         inherits the parent/spec model.
+    :param model_override: Explicit model pinned for this child, including
+        a model selected directly by the caller rather than by Smart Routing.
+        ``None`` when the child inherits the parent/spec model.
+    :param llm_model: The child's effective model resolved from its agent
+        spec (``executor.model``), e.g.
+        ``"opencode-go/deepseek-v4-flash"``. ``None`` when the child has
+        no agent binding or the spec cannot be loaded. Complements
+        :attr:`model_override` / :attr:`routed_model`, which stay ``None``
+        when the child runs the spec default — clients can surface this
+        field so the model label never depends on a pin existing.
     :param routing_decision_id: Identifier of the routing decision that
         produced :attr:`routed_model`, mirroring
         ``RoutingDecisionData.decision_id``. Read from the child's
@@ -824,6 +834,9 @@ class ChildSessionSummary(BaseModel):
     last_message_preview: str | None = None
     pending_elicitations_count: int = 0
     routed_model: str | None = None
+    model_override: str | None = None
+    llm_model: str | None = None
+    reasoning_effort: str | None = None
     routing_decision_id: str | None = None
 
 
@@ -1343,10 +1356,6 @@ class SessionCreateRequest(BaseModel):
         host launch flow (generate binding token, write runner_id,
         send launch frame). ``None`` for CLI-initiated sessions.
         Must be ``None`` when ``host_type`` is ``"managed"``.
-    :param sandbox_provider: Which configured sandbox provider to
-        provision on, e.g. ``"modal"`` — one of the names ``GET /v1/info``
-        reports in ``sandbox_providers``. Only valid with
-        ``host_type: "managed"``; ``None`` takes the server's first.
     :param workspace: Where the session works. For external hosts:
         an absolute path on the host where the runner should start,
         e.g. ``"/Users/corey/universe/src/foo"``. Required when
@@ -1439,7 +1448,6 @@ class SessionCreateRequest(BaseModel):
     sub_agent_name: str | None = None
     host_type: Literal["external", "managed"] = "external"
     host_id: str | None = None
-    sandbox_provider: str | None = None
     workspace: str | None = None
     git: SessionGitOptions | None = None
     terminal_launch_args: list[str] | None = None
@@ -1507,13 +1515,7 @@ class SessionCreateRequest(BaseModel):
                         "host_type 'managed' takes a git repository URL "
                         f"(optionally '#<branch>') as workspace: {exc}"
                     ) from exc
-            return self
-        if self.sandbox_provider is not None:
-            raise ValueError(
-                "sandbox_provider only applies to host_type 'managed' — "
-                "external hosts are not server-provisioned"
-            )
-        if self.workspace is not None and is_repo_workspace(self.workspace):
+        elif self.workspace is not None and is_repo_workspace(self.workspace):
             raise ValueError(
                 "a repository-URL workspace requires host_type 'managed' — "
                 "external hosts take an absolute path on the host"
@@ -1578,6 +1580,7 @@ class SessionCreateMetadata(BaseModel):
     title: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     reasoning_effort: str | None = None
+    model_override: str | None = None
     host_id: str | None = None
     workspace: str | None = None
     terminal_launch_args: list[str] | None = None
@@ -2638,7 +2641,6 @@ class UsageReport(BaseModel):
     cost_last_7d: float = 0.0
     cost_last_30d: float = 0.0
     total_cost_usd: float = 0.0
-    daily_costs: list[DailyCost] = Field(default_factory=list)
     sessions: list[SessionUsage] = Field(default_factory=list)
 
 

@@ -33,7 +33,7 @@ import {
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { useProjectConfig, useUpdateProjectConfig } from "@/hooks/useConversations";
-import { useAvailableAgents } from "@/hooks/useAvailableAgents";
+import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
 import { sortAgentsForDisplay } from "@/lib/agentGrouping";
 import { sandboxOptionLabel } from "@/lib/capabilities";
@@ -224,9 +224,13 @@ export function ProjectSettingsDialog({
 
   // Agent picker groups, mirroring the composer's split (native harness CLIs vs
   // SDK / bundle agents). The picker takes both lists and a selection.
+  // User-registered templates (builtin === false) stay in the agents group
+  // even when their harness matches a native harness id.
   const agentList = useMemo(() => sortAgentsForDisplay(agents ?? []), [agents]);
-  const harnessEntries = useMemo(() => agentList.filter(isNativeCodingAgent), [agentList]);
-  const agentEntries = useMemo(() => agentList.filter((a) => !isNativeCodingAgent(a)), [agentList]);
+  const isNativeHarnessRow = (a: AvailableAgent): boolean =>
+    isNativeCodingAgent(a) && a.builtin !== false;
+  const harnessEntries = useMemo(() => agentList.filter(isNativeHarnessRow), [agentList]);
+  const agentEntries = useMemo(() => agentList.filter((a) => !isNativeHarnessRow(a)), [agentList]);
   const selectedAgent = agentList.find((a) => a.id === agentId) ?? null;
   const agentLabel = selectedAgent ? selectedAgent.display_name : "No default";
   // The host the agent picker's readiness badges check against (its config

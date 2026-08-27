@@ -853,6 +853,85 @@ class _ContentCapturingHarnessClient:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("effort", ("high", "max", "ultra"))
+async def test_runner_background_forwards_reasoning_to_harness_body(effort: str) -> None:
+    """The background turn path preserves the inbound reasoning hint.
+
+    The server normally posts without ``?stream=true``, so the runner rebuilds
+    the harness body field by field. ``reasoning`` must survive that rebuild so
+    in-process executors receive the persisted session effort.
+    """
+    from omnigent.runner import app as runner_app
+
+    conv = "conv_background_reasoning"
+
+    def _server_handler(request: httpx.Request) -> httpx.Response:
+        """Return the minimal session snapshot and empty history."""
+        if request.method == "GET" and request.url.path == f"/v1/sessions/{conv}":
+            return httpx.Response(200, json={"id": conv, "agent_id": "ag_reasoning"})
+        if request.url.path.endswith("/items"):
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [],
+                    "first_id": None,
+                    "last_id": None,
+                    "has_more": False,
+                },
+            )
+        return httpx.Response(200, json={})
+
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    )
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Resolve a minimal spec for the background turn."""
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="reasoning-agent",
+            executor=ExecutorSpec(
+                type="omnigent",
+                config={"harness": "runner-test-resolved"},
+            ),
+        )
+
+    captured: dict[str, Any] = {}
+    reached = asyncio.Event()
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _ContentCapturingProcessManager(captured, reached),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=server_client,
+    )
+    runner_app._session_histories_ref.pop(conv, None)
+    try:
+        async with _runner_test_client(app) as http:
+            response = await http.post(
+                f"/v1/sessions/{conv}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "model": "x",
+                    "reasoning": {"effort": effort},
+                    "content": [{"type": "input_text", "text": "hello"}],
+                },
+            )
+            assert response.status_code == 202
+            await asyncio.wait_for(reached.wait(), timeout=10.0)
+    finally:
+        await server_client.aclose()
+        runner_app._session_histories_ref.pop(conv, None)
+
+    assert captured["body"]["reasoning"] == {"effort": effort}
+
+
+@pytest.mark.asyncio
 async def test_runner_reloads_full_history_on_cold_cache_after_restart() -> None:
     """A message to a cold session reloads prior history, not just itself.
 
@@ -3322,7 +3401,8 @@ async def test_sys_session_send_model_lands_in_child_create_body(
     model: str,
 ) -> None:
     """
-    A per-dispatch ``model`` reaches the child create as ``model_override``.
+    Per-dispatch ``model`` and ``reasoning_effort`` reach the child create
+    as session overrides.
 
     The server persists ``model_override`` on the child row, where the
     native launch paths read it as ``--model`` and the SDK harness path
@@ -3371,6 +3451,7 @@ async def test_sys_session_send_model_lands_in_child_create_body(
                         "args": {
                             "input": "fix the auth bug",
                             "model": model,
+                            "reasoning_effort": "high",
                         },
                     }
                 ),
@@ -3389,6 +3470,7 @@ async def test_sys_session_send_model_lands_in_child_create_body(
     # server persists and the harness launch consumes.
     assert len(create_bodies) == 1, "fresh named send must create exactly one child"
     assert create_bodies[0]["model_override"] == model
+    assert create_bodies[0]["reasoning_effort"] == "high"
     assert create_bodies[0]["sub_agent_name"] == "worker"
 
 
@@ -4240,6 +4322,246 @@ async def test_sys_session_send_by_id_rejects_closed_child(
     assert payload["conversation_id"] == "conv_closed"
     assert event_posts == 0
     assert registrations == []
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_by_id_unwedges_stale_local_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    By-id ``sys_session_send`` proceeds when the server snapshot says the
+    child is idle even if the runner-local work entry is stale.
+
+    A missed terminal status edge leaves the local work entry stuck in
+    ``running``, which previously rejected every later send with "already
+    has a launching or running turn" forever — the wedged-child bug that
+    forced orchestrators to abandon healthy sessions and create duplicates.
+    The server snapshot's ``status`` is authoritative; a stale local entry
+    must be reconciled, not treated as a live turn.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    event_posts = 0
+    registrations: list[str] = []
+
+    monkeypatch.setattr(
+        runner_app,
+        "register_child_session",
+        lambda child_id, **_kwargs: registrations.append(child_id),
+    )
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    runner_app.register_subagent_work(
+        parent_session_id="conv_parent",
+        child_session_id="conv_stale",
+        agent="researcher",
+        title="auth",
+    )
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal event_posts
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_stale":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_stale",
+                    "title": "researcher:auth",
+                    "parent_session_id": "conv_parent",
+                    "status": "idle",
+                },
+            )
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_stale/events":
+            event_posts += 1
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(
+                    {
+                        "session_id": "conv_stale",
+                        "args": "please continue",
+                    }
+                ),
+                server_client=server_client,
+                conversation_id="conv_parent",
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_stale")
+            runner_app._session_inboxes_ref.pop("conv_parent", None)
+
+    payload = json.loads(output)
+    assert payload["conversation_id"] == "conv_stale"
+    assert payload["status"] == "launching"
+    assert event_posts == 1, "stale local work must not block a send to an idle child"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_by_id_rejects_while_server_says_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    By-id ``sys_session_send`` still rejects a genuinely busy child.
+
+    The server snapshot's ``status: running`` is the authoritative busy
+    signal and must keep rejecting concurrent sends; only stale local
+    bookkeeping (server idle) is reconciled.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    event_posts = 0
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal event_posts
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_busy":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_busy",
+                    "title": "researcher:auth",
+                    "parent_session_id": "conv_parent",
+                    "status": "running",
+                },
+            )
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_busy/events":
+            event_posts += 1
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_send",
+            arguments=json.dumps(
+                {
+                    "session_id": "conv_busy",
+                    "args": "please continue",
+                }
+            ),
+            server_client=server_client,
+            conversation_id="conv_parent",
+            session_inbox=session_inbox,
+        )
+
+    assert "already running" in output
+    assert event_posts == 0
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_recovers_child_created_despite_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``sys_session_create`` recovers a child the server created even when
+    the create POST fails client-side.
+
+    The runner's POST can time out while the server keeps processing and
+    commits the child row (and queues the initial message). Previously the
+    tool returned ``{"error": "sys_session_create failed: "}`` (an empty
+    ``asyncio.TimeoutError`` message) for a session that actually exists,
+    so orchestrators retried and spawned duplicate children. The recovery
+    lookup must return the real child's handle instead.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    create_posts = 0
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal create_posts
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_posts += 1
+            raise httpx.ReadTimeout("timed out", request=request)
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_parent/child_sessions"
+        ):
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": "conv_recovered",
+                            "title": "auth",
+                            "agent_id": "ag_x",
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_x", "title": "auth", "message": "start"}),
+            server_client=server_client,
+            conversation_id="conv_parent",
+        )
+
+    handle = json.loads(output)
+    assert handle["conversation_id"] == "conv_recovered"
+    assert create_posts == 1
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_timeout_error_names_exception() -> None:
+    """
+    A create POST that genuinely fails reports the exception type, never
+    an empty message.
+
+    ``asyncio.TimeoutError`` stringifies to an empty string, so the old
+    ``f"sys_session_create failed: {exc}"`` produced an error with no
+    actionable detail and no hint that the child may still have been
+    created server-side.
+
+    :raises AssertionError: If the error message omits the exception type.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            raise httpx.ReadTimeout("timed out", request=request)
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_parent/child_sessions"
+        ):
+            return httpx.Response(200, json={"data": []})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_x", "title": "auth"}),
+            server_client=server_client,
+            conversation_id="conv_parent",
+        )
+
+    info = json.loads(output)
+    assert "ReadTimeout" in info["error"]
+    assert info["error"].endswith("timed out")
 
 
 @pytest.mark.asyncio
@@ -6822,7 +7144,13 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
         output = await execute_tool(
             tool_name="sys_session_create",
             arguments=json.dumps(
-                {"config_path": "helper.yaml", "title": "auth", "message": "start"}
+                {
+                    "config_path": "helper.yaml",
+                    "title": "auth",
+                    "message": "start",
+                    "model": "gpt-5.6-luna",
+                    "reasoning_effort": "high",
+                }
             ),
             server_client=server_client,
             conversation_id="conv_caller",
@@ -6835,7 +7163,12 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
         f"expected exactly one create POST, got {len(create_requests)}"
     )
     parts = _parse_multipart_create(create_requests[0])
-    assert parts["metadata"] == {"parent_session_id": "conv_caller", "title": "auth"}
+    assert parts["metadata"] == {
+        "parent_session_id": "conv_caller",
+        "title": "auth",
+        "model_override": "gpt-5.6-luna",
+        "reasoning_effort": "high",
+    }
 
     # The uploaded bundle is a gzipped tar holding the authored config
     # verbatim — proves the local file traversed materialize → tar.

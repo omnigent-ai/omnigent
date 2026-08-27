@@ -63,6 +63,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_plugins import (
     NativeCodingAgent,
 )
+from omnigent.model_override import validate_model_override
 from omnigent.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
@@ -105,7 +106,7 @@ from omnigent.server.managed_hosts import (
     ManagedHostLaunch,
     ManagedLaunch,
     ManagedLaunchTracker,
-    ManagedSandboxDeployment,
+    ManagedSandboxConfig,
     RepoWorkspace,
 )
 from omnigent.server.routes._auth_helpers import (
@@ -3440,6 +3441,23 @@ def _antigravity_subagent_labels_from_body(
     return labels
 
 
+async def _inherit_native_child_reasoning_effort(
+    child: Conversation,
+    parent_conv: Conversation,
+    conversation_store: ConversationStore,
+) -> Conversation:
+    """Persist a native child’s inherited parent reasoning effort."""
+    parent_effort = parent_conv.reasoning_effort
+    if child.reasoning_effort is not None or parent_effort is None:
+        return child
+    updated = await asyncio.to_thread(
+        conversation_store.update_conversation,
+        child.id,
+        reasoning_effort=parent_effort,
+    )
+    return updated or child
+
+
 async def _create_and_publish_antigravity_child(
     parent_id: str,
     parent_conv: Conversation,
@@ -3480,11 +3498,15 @@ async def _create_and_publish_antigravity_child(
         if existing is None:
             raise
         await asyncio.to_thread(conversation_store.set_labels, existing.id, labels)
+        existing = await _inherit_native_child_reasoning_effort(
+            existing, parent_conv, conversation_store
+        )
         # An orphaned row's creator died before publishing, so live clients have
         # never heard about this child; a duplicate publish in the race case is a
         # harmless extra cache invalidation.
         _publish_session_created(parent_id, existing.id, parent_conv.agent_id)
         return existing.id
+    child = await _inherit_native_child_reasoning_effort(child, parent_conv, conversation_store)
     await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
     _publish_session_created(parent_id, child.id, parent_conv.agent_id)
     return child.id
@@ -3717,6 +3739,9 @@ async def _create_and_publish_codex_child(
             )
         if existing is not None:
             await asyncio.to_thread(conversation_store.set_labels, existing.id, labels)
+            existing = await _inherit_native_child_reasoning_effort(
+                existing, parent_conv, conversation_store
+            )
             # An orphaned row's creator died before publishing
             # ``session.created``, so live clients have never heard about
             # this child — emit it now. In the concurrent-race case the
@@ -3725,6 +3750,7 @@ async def _create_and_publish_codex_child(
             _publish_session_created(parent_id, existing.id, parent_conv.agent_id)
             return existing.id
         raise
+    child = await _inherit_native_child_reasoning_effort(child, parent_conv, conversation_store)
     await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
     _publish_session_created(parent_id, child.id, parent_conv.agent_id)
     return child.id
@@ -4976,12 +5002,11 @@ async def _provision_managed_sandbox(
     *,
     session_id: str,
     owner: str,
-    sandbox_config: ManagedSandboxDeployment,
+    sandbox_config: ManagedSandboxConfig,
     repo: RepoWorkspace | None,
     tracker: ManagedLaunchTracker,
     host_store: HostStore,
     relaunch_host: Host | None,
-    provider: str | None = None,
     agent_name: str | None = None,
 ) -> ManagedHostLaunch | None:
     """
@@ -5000,9 +5025,6 @@ async def _provision_managed_sandbox(
     :param host_store: Persistent host registrations.
     :param relaunch_host: Existing host row for a relaunch, or
         ``None`` for a first launch.
-    :param provider: Requested sandbox provider for a first launch, or
-        ``None`` for the default. Ignored on a relaunch, which stays on
-        the host row's recorded provider.
     :param agent_name: Server-resolved built-in agent name the session
         runs, stamped as the runner Pod's ``omnigent.ai/agent`` classifier
         (Kubernetes only), or ``None`` to leave it unstamped.
@@ -5038,7 +5060,6 @@ async def _provision_managed_sandbox(
             owner=owner,
             host_store=host_store,
             repo=repo,
-            provider=provider,
             agent_name=agent_name,
             on_stage=_on_stage,
         )
@@ -5679,11 +5700,10 @@ async def _forward_session_change_to_runner(
 
 
 #: Forward budget for a control event the runner answers by driving the TUI.
-#: The claude-native slash-command injector's worst case is ~16s (1s tmux
-#: advertisement + 5s commit-poll + 10s submit-verify; the 4s dialog watch
-#: only runs after a fast verify), so the default 5s budget could time out on
-#: a legitimately-still-working injection and report a failure that did not
-#: happen.
+#: The claude-native ``/model`` and ``/effort`` injectors wait up to 1s for the
+#: tmux advertisement and then up to 4s for the confirmation dialog, so the
+#: default 5s budget could time out on a legitimately-still-working injection
+#: and report a failure that did not happen.
 _TUI_INJECT_FORWARD_TIMEOUT_S = 20.0
 
 
@@ -8021,10 +8041,20 @@ def _parse_session_create_metadata(metadata: str) -> SessionCreateMetadata:
             "session metadata",
             EFFORT_VALUES,
         )
+        model_override = (
+            validate_model_override(parsed.model_override)
+            if parsed.model_override is not None
+            else None
+        )
         # Bounds-check the native-terminal args; raises ValueError
         # (wrapped below) on a malformed or oversized list.
         _validate_terminal_launch_args(parsed.terminal_launch_args)
-        return parsed.model_copy(update={"reasoning_effort": reasoning_effort})
+        return parsed.model_copy(
+            update={
+                "reasoning_effort": reasoning_effort,
+                "model_override": model_override,
+            }
+        )
     except (ValidationError, ValueError) as exc:
         raise OmnigentError(
             f"invalid session metadata: {exc}",
@@ -8759,6 +8789,7 @@ def _persist_stored_session_bundle(
             title=metadata.title,
             labels=metadata.labels,
             reasoning_effort=metadata.reasoning_effort,
+            model_override=metadata.model_override,
             workspace=metadata.workspace,
             terminal_launch_args=metadata.terminal_launch_args,
             parent_conversation_id=metadata.parent_session_id,
@@ -8838,7 +8869,7 @@ async def _authorize_bundled_parent_and_inherit_runner(
     permission_store: PermissionStore | None,
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
-) -> str | None:
+) -> tuple[str | None, str | None]:
     """
     Authorize a bundled create's parent link and resolve runner affinity.
 
@@ -8858,8 +8889,9 @@ async def _authorize_bundled_parent_and_inherit_runner(
     :param conversation_store: Store for the parent-conversation read.
     :param runner_router: Router for the runner-ownership check;
         ``None`` skips it.
-    :returns: The inherited runner id, or ``None`` when the parent has
-        no runner binding or ownership disallows inheritance.
+    :returns: A tuple of the inherited runner id and reasoning effort. Each
+        value is ``None`` when the parent has no corresponding setting or
+        ownership disallows inheritance.
     :raises OmnigentError: 403/404 when the caller may not access the
         parent session.
     """
@@ -8875,13 +8907,13 @@ async def _authorize_bundled_parent_and_inherit_runner(
         parent_session_id,
     )
     if parent_conv is None:
-        return None
+        return None, None
     inherited_runner_id = parent_conv.runner_id
     if inherited_runner_id is not None and user_id is not None and runner_router is not None:
         runner_owner = runner_router.runner_owner(inherited_runner_id)
         if runner_owner is not None and runner_owner != user_id:
-            return None
-    return inherited_runner_id
+            inherited_runner_id = None
+    return inherited_runner_id, parent_conv.reasoning_effort
 
 
 async def _notify_runner_of_bundled_child(
@@ -9039,6 +9071,8 @@ def _child_session_summary_from_conversation(
     conv: Conversation,
     parent_session_id: str,
     last_message_preview: str | None,
+    parent_reasoning_effort: str | None = None,
+    parent_model: str | None = None,
 ) -> ChildSessionSummary:
     """
     Build a :class:`ChildSessionSummary` from a child conversation.
@@ -9067,6 +9101,11 @@ def _child_session_summary_from_conversation(
         be missing.
     :param last_message_preview: Preview text derived from a batched
         child-message lookup, or ``None`` when no visible message exists.
+    :param parent_reasoning_effort: Parent’s persisted effort, used as a
+        display fallback for older native child rows created before native
+        child inheritance was persisted.
+    :param parent_model: Parent’s effective model, used as a display fallback
+        for older child rows whose native wrapper/spec exposes no model.
     :returns: A populated :class:`ChildSessionSummary`.
     """
     display_title = title_without_closed_marker(conv.title)
@@ -9120,6 +9159,14 @@ def _child_session_summary_from_conversation(
             last_message_preview = collapsed[:_CHILD_PREVIEW_LIMIT] or None
 
     routing_decision_id = conv.labels.get(ROUTING_DECISION_LABEL_KEY)
+    reasoning_effort = conv.reasoning_effort
+    if reasoning_effort is None and _is_codex_native_subagent(conv):
+        reasoning_effort = parent_reasoning_effort
+    llm_model = conv.reported_model or _child_llm_model_from_conversation(conv)
+    if llm_model is None and conv.model_override is not None:
+        llm_model = conv.model_override
+    if llm_model is None:
+        llm_model = parent_model
     return ChildSessionSummary(
         id=conv.id,
         parent_session_id=parent_session_id,
@@ -9149,8 +9196,63 @@ def _child_session_summary_from_conversation(
         # two fields contradict each other. The decision is joined through a
         # conversation label rather than a new column.
         routed_model=conv.model_override if routing_decision_id is not None else None,
+        model_override=conv.model_override,
+        llm_model=llm_model,
+        reasoning_effort=reasoning_effort,
         routing_decision_id=routing_decision_id,
     )
+
+
+def _child_llm_model_from_conversation(conv: Conversation | None) -> str | None:
+    """
+    Resolve a child conversation's effective spec model.
+
+    Mirrors the session-snapshot resolver (``spec.executor.model`` with
+    ``sub_agent_name`` spec lookup) so the Agents rail reports the same
+    model the composer read-out shows for spec-defaulted children that
+    carry neither a ``model_override`` nor a routing pin — e.g. native
+    opencode sub-agents whose model comes from the parent profile.
+
+    :param conv: The child conversation, or ``None``.
+    :returns: The model id (e.g. ``"opencode-go/deepseek-v4-flash"``), or
+        ``None`` when the child has no resolvable agent spec.
+    """
+    if conv is None or conv.agent_id is None:
+        return None
+    try:
+        # Imported at call time like ``_resolve_llm_model`` so a facade or
+        # runtime patch is honored by this module's lazy-global lookups.
+        from omnigent.runtime import get_agent_cache
+        from omnigent.runtime._globals import _agent_store
+        from omnigent.runtime.workflow import _find_spec_by_name
+
+        if _agent_store is None:
+            return None
+        agent = _agent_store.get(conv.agent_id)
+        if agent is None or agent.bundle_location is None:
+            return None
+        loaded = get_agent_cache().load(
+            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+        )
+        spec = loaded.spec
+        if conv.sub_agent_name:
+            child_spec = _find_spec_by_name(spec, conv.sub_agent_name)
+            if child_spec is not None:
+                spec = child_spec
+        return spec.executor.model
+    except (
+        KeyError,
+        AttributeError,
+        ValueError,
+        ImportError,
+        OSError,
+        RuntimeError,
+        StatementError,
+    ):
+        # Best-effort display resolver like ``_resolve_llm_model``: an
+        # uninitialized runtime or missing bundle degrades to "model
+        # unknown" rather than failing the whole child list.
+        return None
 
 
 def _mcp_tool_result(rpc_id: int | str | None, text: str) -> Response:

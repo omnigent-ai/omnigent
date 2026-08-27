@@ -66,6 +66,11 @@ from omnigent.onboarding.provider_config import (
     load_config,
 )
 
+# Surface name for OpenCode in the readiness map. Mirrors :data:`PI_SURFACE`
+# — both are CLI-backed harnesses without a single provider family, so they
+# carry their own surface keys rather than living under
+# :data:`_HARNESS_FAMILY`.
+
 # In-process SDK harnesses: no CLI binary, credentials resolved at runtime
 # from ambient/spec sources the daemon can't see. Never gated. Includes both
 # the canonical ``openai-agents`` and the ``openai-agents-sdk`` spelling the
@@ -112,7 +117,7 @@ KIMI_SURFACE = "kimi"
 # Native OpenCode harness. Like pi, it wraps a CLI (``opencode``) with no
 # ``_HARNESS_FAMILY`` entry, so it must be gated explicitly or it would fail
 # open like an unknown harness.
-_OPENCODE_HARNESSES: frozenset[str] = frozenset({"opencode-native"})
+_OPENCODE_HARNESSES: frozenset[str] = frozenset({"opencode", "opencode-native"})
 
 # Native Cursor harnesses. These boot the ``cursor-agent`` TUI (``omni cursor``)
 # and so, like the other native CLI harnesses, can't launch without that binary
@@ -316,6 +321,7 @@ def _harness_availability_core(harness: str) -> HarnessAvailability:
 _AUTH_AWARE_NATIVE_HARNESSES: dict[str, str] = {
     "claude-native": "anthropic",
     "native-claude": "anthropic",
+    "opencode": OPENCODE_KEY,
     "opencode-native": OPENCODE_KEY,
     "cursor-native": CURSOR_KEY,
     "native-cursor": CURSOR_KEY,

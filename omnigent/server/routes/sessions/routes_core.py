@@ -618,13 +618,18 @@ def register_core_routes(
 
         inherited_runner_id: str | None = None
         if parsed_metadata.parent_session_id is not None:
-            inherited_runner_id = await _authorize_bundled_parent_and_inherit_runner(
+            (
+                inherited_runner_id,
+                inherited_reasoning_effort,
+            ) = await _authorize_bundled_parent_and_inherit_runner(
                 parsed_metadata.parent_session_id,
                 user_id=user_id,
                 permission_store=permission_store,
                 conversation_store=conversation_store,
                 runner_router=runner_router,
             )
+            if parsed_metadata.reasoning_effort is None:
+                parsed_metadata.reasoning_effort = inherited_reasoning_effort
 
         bundle_bytes = await bundle.read()
         result = await asyncio.to_thread(

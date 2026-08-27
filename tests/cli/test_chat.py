@@ -1766,6 +1766,8 @@ def test_apply_overrides_flat_harness_creates_no_config_for_single_file_yaml() -
         ("claude", "claude-sdk"),
         ("openai-agents-sdk", "openai-agents"),
         ("pi", "pi"),
+        ("opencode", "opencode"),
+        ("native-opencode", "opencode-native"),
     ],
 )
 def test_apply_overrides_canonicalizes_alias_into_spec_version_config(

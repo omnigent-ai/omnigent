@@ -159,6 +159,29 @@ async def test_child_inherits_parent_runner_affinity(
     assert snap.json()["parent_session_id"] == parent["id"]
 
 
+async def test_child_inherits_parent_workspace_metadata(
+    client: httpx.AsyncClient,
+) -> None:
+    """A child keeps the parent's active workspace metadata."""
+    agent = await create_test_agent(client, name="ctx-workspace-parent")
+    parent_resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "workspace": "/repo/current-branch"},
+    )
+    assert parent_resp.status_code == 201, parent_resp.text
+    parent = parent_resp.json()
+
+    child = await _create_child_session(
+        client,
+        parent_session_id=parent["id"],
+        agent_name="ctx-workspace-child",
+    )
+
+    snap = await client.get(f"/v1/sessions/{child['id']}")
+    assert snap.status_code == 200, snap.text
+    assert snap.json()["workspace"] == "/repo/current-branch"
+
+
 # ── Transcript isolation (no implicit history bleed) ─────
 
 

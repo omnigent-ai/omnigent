@@ -412,6 +412,17 @@ def test_omnigent_executor_accepts_antigravity_native_harness() -> None:
     assert result.valid, f"Expected valid spec, got errors: {result.errors}"
 
 
+@pytest.mark.parametrize("harness", ["opencode", "opencode-native"])
+def test_omnigent_executor_accepts_both_opencode_modes(harness: str) -> None:
+    """Headless ``opencode`` and explicit TUI ``opencode-native`` are valid."""
+    spec = _minimal_spec(
+        llm=LLMConfig(model="databricks-claude-sonnet-4-6"),
+        executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
+    )
+    result = validate(spec)
+    assert result.valid, f"Expected valid {harness!r} spec, got errors: {result.errors}"
+
+
 def test_omnigent_executor_rejects_missing_harness() -> None:
     """
     ``omnigent`` executor without ``config.harness`` is rejected.

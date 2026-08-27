@@ -48,6 +48,7 @@ def _stub_cli_fallback_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
         (OPENAI_FAMILY, "codex", "@openai/codex"),
         (hi.PI_KEY, "pi", "@earendil-works/pi-coding-agent"),
         (hi.QWEN_KEY, "qwen", "@qwen-code/qwen-code"),
+        (hi.OPENCODE_KEY, "opencode", "opencode-ai@~1.18.0"),
     ],
 )
 def test_install_spec_and_command(key: str, binary: str, package: str) -> None:
@@ -438,6 +439,7 @@ def test_unknown_key_has_no_spec_and_is_not_installed() -> None:
         ("claude-native", "claude"),
         ("codex-native", "codex"),
         ("pi", "pi"),
+        ("opencode", "opencode"),
         # Native Cursor wraps the cursor-agent CLI (distinct from the SDK
         # ``cursor`` harness, which needs no binary — see the test below).
         ("cursor-native", "cursor-agent"),
