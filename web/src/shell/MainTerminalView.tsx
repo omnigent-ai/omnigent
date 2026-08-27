@@ -91,12 +91,15 @@ export function MainTerminalView({
   const [resumePending, setResumePending] = useState(false);
   const [resumeError, setResumeError] = useState<string | null>(null);
   const runnerOffline = runnerOnline === false;
+  // A session whose terminal is coming up (fresh cold boot, relaunch, or
+  // server-side PTY creation) must never read as stopped — the health poll
+  // can report the runner down before the boot registers.
+  const startingUp = terminalFirstCtx?.terminalStartingUp === true;
   // Resource cleanup can beat the health poll when a session is stopped. An
   // empty, non-starting inventory is therefore resumable even before liveness
   // has caught up and explicitly reported the runner offline.
   const resumeAvailable =
-    onResume !== undefined &&
-    (runnerOffline || (terminals.length === 0 && terminalFirstCtx?.terminalStartingUp !== true));
+    onResume !== undefined && !startingUp && (runnerOffline || terminals.length === 0);
   const handleResume = useCallback(async () => {
     if (!onResume) return;
     setResumeError(null);
@@ -145,7 +148,12 @@ export function MainTerminalView({
     setActiveKey(agentTerminal ? terminalTabKey(agentTerminal) : "");
   }, [visible, terminals, agentTerminal]);
 
-  const activeTerminal = terminals.find((t) => terminalTabKey(t) === activeKey) ?? null;
+  // Selection normalizes in the effect above one commit after the PTY
+  // lands; fall back to the agent terminal synchronously so that commit
+  // never reads as an empty/stopped inventory.
+  const activeTerminal =
+    terminals.find((t) => terminalTabKey(t) === activeKey) ??
+    (terminals.length > 0 ? agentTerminal : null);
   // A user shell opened from the rail takes over the pane chrome-free:
   // a single header row naming the shell plus a close X — no agent tab
   // (the shell is not the agent). The Chat/Terminal pill is hidden in
@@ -185,7 +193,25 @@ export function MainTerminalView({
     >
       <div className="flex min-h-0 w-full flex-1 flex-col overflow-hidden rounded-lg border border-border bg-card p-3 shadow-sm">
         {activeTerminal === null ? (
-          resumeAvailable ? (
+          startingUp ? (
+            // Passive startup state: same centered geometry as the stopped
+            // state so the swap doesn't jump, and nothing actionable — the
+            // terminal connects on its own. role=status announces the wait.
+            <div
+              role="status"
+              aria-live="polite"
+              data-testid="terminal-starting-up"
+              className="flex flex-1 flex-col items-center justify-center gap-3 px-6 text-center"
+            >
+              <Loader2Icon className="size-7 animate-spin text-muted-foreground" aria-hidden />
+              <div className="space-y-1">
+                <p className="font-medium text-foreground text-ui">Starting up…</p>
+                <p className="text-muted-foreground text-sm">
+                  The terminal will connect automatically.
+                </p>
+              </div>
+            </div>
+          ) : resumeAvailable ? (
             <div className="flex flex-1 flex-col items-center justify-center gap-3 px-6 text-center">
               <div className="space-y-1">
                 <p className="font-medium text-foreground text-ui">The harness is not running.</p>
