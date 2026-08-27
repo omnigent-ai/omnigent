@@ -26,10 +26,15 @@ class _Distribution:
         name: str,
         version: str | None = None,
         files: tuple[str, ...] | None = None,
+        top_level: str | None = None,
     ) -> None:
         self.name = name
         self.version = version
         self.files = files
+        self._top_level = top_level
+
+    def read_text(self, filename: str) -> str | None:
+        return self._top_level if filename == "top_level.txt" else None
 
 
 class _EntryPoint:
@@ -42,12 +47,15 @@ class _EntryPoint:
         version: str | None = None,
         module: str | None = None,
         files: tuple[str, ...] | None = None,
+        top_level: str | None = None,
     ) -> None:
         self.name = name
         self._loader = loader
         self.module = module
         self.value = f"{module}:get_manifest" if module else ""
-        self.dist = _Distribution(distribution, version, files) if distribution else None
+        self.dist = (
+            _Distribution(distribution, version, files, top_level) if distribution else None
+        )
 
     def load(self) -> Callable[[], ExtensionManifest] | object:
         return self._loader
@@ -212,6 +220,25 @@ def test_records_verified_asset_package(monkeypatch: pytest.MonkeyPatch) -> None
     state = registry.plugin_state()
 
     assert state.asset_package(manifest.id) == "acme_review"
+
+
+def test_records_editable_asset_package_from_top_level_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = _manifest()
+    _install_entry_points(
+        monkeypatch,
+        _EntryPoint(
+            "review",
+            manifest,
+            distribution=manifest.distribution,
+            module="acme_review.plugin",
+            files=("__editable__.acme_review.pth",),
+            top_level="acme_review\n",
+        ),
+    )
+
+    assert registry.plugin_state().asset_package(manifest.id) == "acme_review"
 
 
 def test_does_not_record_unverified_or_core_asset_package(
