@@ -325,6 +325,32 @@ def test_client_ignores_closed_issues_and_pull_requests() -> None:
     assert client.open_issue(7) is None
 
 
+def test_client_lists_and_closes_labeled_open_issues() -> None:
+    calls = []
+    issue = {"number": 7, "state": "open", "labels": [{"name": "needs-info"}]}
+
+    def transport(method, path, body):
+        calls.append((method, path, body))
+        if path.startswith("/issues?"):
+            return [issue]
+        if method == "GET" and path == "/issues/7":
+            return issue
+        return {}
+
+    client = GitHubClient("token", "org/repo", transport)
+
+    assert client.open_issues_with_label("needs-info") == (issue,)
+    client.comment_on_issue(7, "Closing")
+    client.close_issue(7)
+
+    assert ("POST", "/issues/7/comments", {"body": "Closing"}) in calls
+    assert (
+        "PATCH",
+        "/issues/7",
+        {"state": "closed", "state_reason": "not_planned"},
+    ) in calls
+
+
 def test_client_strips_token_whitespace() -> None:
     client = GitHubClient(" token\n", "org/repo", lambda method, path, body: None)
 

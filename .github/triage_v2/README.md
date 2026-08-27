@@ -94,6 +94,19 @@ edits run the classifier again; sufficient evidence removes `needs-info` and
 restores the normal assessment comment. Security issues are excluded from this
 lifecycle. V2 does not close issues; expiry is a separate rollout gate.
 
+The same reusable V2 workflow handles new issues, body edits, and author
+comments. Legacy intake still owns duplicate detection, contributor routing,
+and initial assignment, but no longer writes type or `needs-info` when V2 is
+enabled. Author comments are evaluated with the label still attached, so a V2
+failure cannot strand an issue by removing `needs-info` too early.
+
+A daily expiry workflow previews bot-managed `needs-info` deadlines. Set
+`ISSUE_TRIAGE_CLOSE_NEEDS_INFO=true` only after reviewing those previews to let
+scheduled runs close eligible reports. It closes on the day after the displayed
+deadline, requires both Bug and `needs-info`, and excludes security/pinned
+issues, untrusted marker comments, and reports with a newer author response. A
+later author comment reopens the issue and runs V2 again.
+
 ## Databricks dry-run
 
 The bundle defines a paused trigger on updates to `github_issues_bronze`. It

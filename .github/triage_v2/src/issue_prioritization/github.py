@@ -72,18 +72,59 @@ class GitHubClient:
             )
 
     def issue_labels(self, issue_number: int) -> tuple[str, ...]:
-        value = self.transport("GET", f"/issues/{issue_number}", None)
-        if not isinstance(value, dict):
-            raise ValueError("GitHub issue response must be an object")
+        value = self.issue_data(issue_number)
         labels = value.get("labels", [])
         return tuple(
             str(label["name"]) for label in labels if isinstance(label, dict) and label.get("name")
         )
 
-    def open_issue(self, issue_number: int) -> BronzeIssue | None:
+    def issue_data(self, issue_number: int) -> dict[str, object]:
         value = self.transport("GET", f"/issues/{issue_number}", None)
         if not isinstance(value, dict):
             raise ValueError("GitHub issue response must be an object")
+        return value
+
+    def open_issues_with_label(self, label: str) -> tuple[dict[str, object], ...]:
+        issues = []
+        page = 1
+        while True:
+            path = f"/issues?state=open&labels={quote(label, safe='')}&per_page=100&page={page}"
+            value = self.transport("GET", path, None)
+            if not isinstance(value, list):
+                raise ValueError("GitHub issues response must be an array")
+            issues.extend(
+                issue for issue in value if isinstance(issue, dict) and "pull_request" not in issue
+            )
+            if len(value) < 100:
+                return tuple(issues)
+            page += 1
+
+    def issue_comments(self, issue_number: int) -> tuple[dict[str, object], ...]:
+        comments = []
+        page = 1
+        while True:
+            value = self.transport(
+                "GET", f"/issues/{issue_number}/comments?per_page=100&page={page}", None
+            )
+            if not isinstance(value, list):
+                raise ValueError("GitHub issue comments response must be an array")
+            comments.extend(comment for comment in value if isinstance(comment, dict))
+            if len(value) < 100:
+                return tuple(comments)
+            page += 1
+
+    def comment_on_issue(self, issue_number: int, body: str) -> None:
+        self.transport("POST", f"/issues/{issue_number}/comments", {"body": body})
+
+    def close_issue(self, issue_number: int) -> None:
+        self.transport(
+            "PATCH",
+            f"/issues/{issue_number}",
+            {"state": "closed", "state_reason": "not_planned"},
+        )
+
+    def open_issue(self, issue_number: int) -> BronzeIssue | None:
+        value = self.issue_data(issue_number)
         if value.get("state") != "open" or "pull_request" in value:
             return None
         author = value.get("user")
