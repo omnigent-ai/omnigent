@@ -46,7 +46,7 @@ from omnigent.spec.types import (
     Phase,
     PolicySpec,
 )
-from omnigent.stores.conversation_store import ConversationStore
+from omnigent.stores.conversation_store import ConversationStore, DailyCostState
 from omnigent.stores.policy_store import PolicyStore
 
 _logger = logging.getLogger(__name__)
@@ -227,7 +227,7 @@ def _resolve_session_owner_cached(
 def _load_user_daily_cost(
     conversation_id: str,
     conversation_store: ConversationStore,
-) -> list[dict[str, float | str | None]]:
+) -> list[DailyCostState]:
     """
     Read the session owner's per-UTC-day cost rollup as the engine seed.
 
@@ -249,13 +249,7 @@ def _load_user_daily_cost(
     today = utc_day(now_epoch())
     # Use list_daily_cost_states to get today's record in the same format
     # as period budgets, so both can consume the same context field
-    records = conversation_store.list_daily_cost_states(owner, today, harness=None)
-
-    # Tag each record with user_id
-    for record in records:
-        record["user_id"] = owner
-
-    return records
+    return conversation_store.list_daily_cost_states(owner, today, harness=None)
 
 
 def _utc_day(epoch: int) -> str:
@@ -376,16 +370,7 @@ def _load_user_period_cost(
     start_date = start.isoformat()
 
     # Query daily cost records for the period
-    daily_records = conversation_store.list_daily_cost_states(owner, start_date, harness)
-
-    # Tag each record with user_id
-    results: list[dict[str, float | str | None]] = []
-    for record in daily_records:
-        # Record already has cost_usd, ask_approved_usd, day_utc, harness
-        record["user_id"] = owner
-        results.append(record)
-
-    return results
+    return conversation_store.list_daily_cost_states(owner, start_date, harness)
 
 
 def any_policies_apply(
@@ -785,8 +770,9 @@ def build_policy_engine(
         initial_session_state=initial_session_state,
         initial_usage=initial_usage,
         initial_subtree_usage=initial_subtree_usage,
-        initial_user_daily_cost=initial_user_daily_cost,
-        initial_user_period_cost=initial_user_period_cost,
+        initial_user_daily_cost=(
+            initial_user_daily_cost if initial_user_daily_cost else initial_user_period_cost
+        ),
         token_pricing=token_pricing,
         initial_model=initial_model,
         conversation_store=conversation_store,

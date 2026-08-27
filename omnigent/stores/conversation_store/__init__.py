@@ -85,6 +85,7 @@ CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox"
 # and the web client mirrors the literal as ``PROJECT_LABEL_KEY``.
 PROJECT_LABEL_KEY = "omni_project"
 
+
 class DailyCostState(TypedDict):
     """Daily cost state record returned by list_daily_cost_states.
 

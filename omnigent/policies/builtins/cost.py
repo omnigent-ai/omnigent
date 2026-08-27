@@ -562,13 +562,18 @@ def _user_daily_cost_usd(event: PolicyEvent) -> float:
     """Read the session owner's per-UTC-day cost (USD) from a policy event.
 
     :param event: Policy event dict.
-    :returns: ``event["context"]["user_daily_cost"]["cost_usd"]`` as a
+    :returns: ``event["context"]["user_daily_cost"][0]["cost_usd"]`` as a
         float, or ``0.0`` when absent (engine didn't inject it — e.g. no
         owner / not priced), so the gate never trips on missing data.
     """
     context = event.get("context") or {}
-    daily = context.get("user_daily_cost") or {}
-    raw = daily.get("cost_usd", 0.0)
+    daily_records = context.get("user_daily_cost") or []
+    if not isinstance(daily_records, list) or not daily_records:
+        return 0.0
+    record = daily_records[0]
+    if not isinstance(record, dict):
+        return 0.0
+    raw = record.get("cost_usd", 0.0)
     try:
         return float(raw)
     except (TypeError, ValueError):
@@ -579,12 +584,17 @@ def _user_daily_ask_approved_usd(event: PolicyEvent) -> float:
     """Read the highest soft checkpoint the owner approved today (USD).
 
     :param event: Policy event dict.
-    :returns: ``event["context"]["user_daily_cost"]["ask_approved_usd"]``
+    :returns: ``event["context"]["user_daily_cost"][0]["ask_approved_usd"]``
         as a float, or ``0.0`` when absent / none approved yet.
     """
     context = event.get("context") or {}
-    daily = context.get("user_daily_cost") or {}
-    raw = daily.get("ask_approved_usd", 0.0)
+    daily_records = context.get("user_daily_cost") or []
+    if not isinstance(daily_records, list) or not daily_records:
+        return 0.0
+    record = daily_records[0]
+    if not isinstance(record, dict):
+        return 0.0
+    raw = record.get("ask_approved_usd", 0.0)
     try:
         return float(raw)
     except (TypeError, ValueError):
@@ -597,13 +607,18 @@ def _user_daily_owner(event: PolicyEvent) -> str | None:
     Used to name whose spend tripped the gate in the ASK / DENY message.
 
     :param event: Policy event dict.
-    :returns: ``event["context"]["user_daily_cost"]["user_id"]`` as a
+    :returns: ``event["context"]["user_daily_cost"][0]["user_id"]`` as a
         non-empty string, or ``None`` when absent (single-user mode / not
         injected) — callers fall back to an un-named phrasing.
     """
     context = event.get("context") or {}
-    daily = context.get("user_daily_cost") or {}
-    owner = daily.get("user_id")
+    daily_records = context.get("user_daily_cost") or []
+    if not isinstance(daily_records, list) or not daily_records:
+        return None
+    record = daily_records[0]
+    if not isinstance(record, dict):
+        return None
+    owner = record.get("user_id")
     return owner if isinstance(owner, str) and owner else None
 
 

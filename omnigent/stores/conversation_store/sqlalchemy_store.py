@@ -82,6 +82,7 @@ from omnigent.session_import.models import (
 from omnigent.stores.conversation_store import (
     _FORK_ONLY_DROPPED_LABEL_KEYS,
     _INSTANCE_SCOPED_LABEL_KEYS,
+    DailyCostState,
     FORK_CARRY_HISTORY_LABEL_KEY,
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
@@ -1708,7 +1709,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         user_id: str,
         since_day_utc: str,
         harness: str | None = None,
-    ) -> list[dict[str, float | str | None]]:
+    ) -> list[DailyCostState]:
         """
         Return daily cost states for a user from since_day_utc onward.
 

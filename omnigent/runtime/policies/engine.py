@@ -27,7 +27,7 @@ from omnigent.spec.types import (
     StateUpdate,
     StateUpdateAction,
 )
-from omnigent.stores.conversation_store import ConversationStore
+from omnigent.stores.conversation_store import ConversationStore, DailyCostState
 
 # Number of recent conversation items the engine fetches from
 # the conversation store and threads onto :class:`EvaluationContext`
@@ -112,7 +112,7 @@ class PolicyEngine:
         initial_session_state: dict[str, Any] | None = None,
         initial_usage: dict[str, float] | None = None,
         initial_subtree_usage: dict[str, float] | None = None,
-        initial_user_daily_cost: list[dict[str, float | str | None]] | None = None,
+        initial_user_daily_cost: list[dict[str, float | str | None]] | list[DailyCostState] | None = None,
         token_pricing: ModelPricing | None = None,
         initial_model: str | None = None,
         conversation_store: ConversationStore,
@@ -620,8 +620,8 @@ class PolicyEngine:
         # this engine sees the approval and doesn't re-ASK the checkpoint
         # the user just approved — mirroring how the session policy's
         # approval stays current via _apply_one(self._session_state, ...).
-        if self._user_daily_cost is not None:
-            self._user_daily_cost["ask_approved_usd"] = approved
+        if self._user_daily_cost and len(self._user_daily_cost) > 0:
+            self._user_daily_cost[0]["ask_approved_usd"] = approved
 
     def _record_user_period_ask_approved(self, value: Any) -> None:
         """
