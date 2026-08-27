@@ -111,9 +111,14 @@ export function InlineCliCode({ command }: { command: string }) {
  * {@link InlineCliCode}. Odd segments of the split are the code spans.
  */
 export function renderTextWithInlineCode(text: string) {
-  return text
-    .split("`")
-    .map((segment, i) =>
-      i % 2 === 1 ? <InlineCliCode key={i} command={segment} /> : <span key={i}>{segment}</span>,
+  return text.split("`").map((segment, i) => {
+    // Static text → keys are stable across renders; index disambiguates
+    // repeated segments (e.g. the same command mentioned twice).
+    const key = `${i}:${segment}`;
+    return i % 2 === 1 ? (
+      <InlineCliCode key={key} command={segment} />
+    ) : (
+      <span key={key}>{segment}</span>
     );
+  });
 }
