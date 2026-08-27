@@ -26,6 +26,7 @@ from urllib.parse import quote, urlsplit, urlunsplit
 from starlette.types import ASGIApp, Message, Scope
 from websockets.exceptions import ConnectionClosedOK, InvalidURI, WebSocketException
 
+from omnigent.cli_invocation import cli_invocation
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.runner.identity import (
     OMNIGENT_INTERNAL_WS_ORIGIN,
@@ -439,8 +440,8 @@ async def serve_tunnel(
                         f"(redirect to non-WebSocket URL {redirect_url} "
                         f"persisted across {login_redirect_streak} attempts); "
                         "the server likely requires auth — "
-                        f"run `omnigent login {display_server_url(server_url)}` or "
-                        "`omnigent setup` to configure credentials"
+                        f"run `{cli_invocation()} login {display_server_url(server_url)}` or "
+                        f"`{cli_invocation()} setup` to configure credentials"
                     ) from exc
                 retry_reason = (
                     f"login-page redirect during upgrade ({redirect_url}); "

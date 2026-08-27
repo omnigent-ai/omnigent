@@ -36,6 +36,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import cast
 
+from omnigent.cli_invocation import cli_invocation
 from omnigent.process_logging import (
     TerminalLogFormatter,
     effective_log_level,
@@ -412,8 +413,8 @@ def print_stale_host_hint() -> None:
     dest = getattr(sys.stderr, "_original_stderr", sys.stderr)
     print(
         "If this is a runner tunnel rejection (HTTP 401), stale host processes "
-        "may be the cause. Run `omnigent stop` to stop existing Omnigent host instances, "
-        "then try again.",
+        f"may be the cause. Run `{cli_invocation()} stop` to stop existing Omnigent "
+        "host instances, then try again.",
         file=dest,
     )
 

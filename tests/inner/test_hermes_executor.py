@@ -434,6 +434,163 @@ async def test_run_turn_resumes_existing_session(
         assert list(call_args)[resume_idx + 1] == "20260620_existing_sid"
 
 
+def _sent_message(call_args: tuple) -> str:
+    """Return the ``-q <message>`` argument value from captured argv."""
+    args = list(call_args)
+    return args[args.index("-q") + 1]
+
+
+@pytest.mark.asyncio
+async def test_run_turn_first_call_prefixes_composed_instructions_once(
+    executor: HermesExecutor,
+) -> None:
+    """A genuinely fresh session (no captured hermes_sid) prefixes exactly once."""
+    mock_process = MagicMock()
+    mock_process.returncode = 0
+    mock_process.communicate = AsyncMock(
+        return_value=(b"session_id: 20260620_fresh_sid\nHi there!", b"")
+    )
+
+    with patch.object(
+        asyncio,
+        "create_subprocess_exec",
+        new=AsyncMock(return_value=mock_process),
+    ) as mock_create:
+        events = []
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "Hello", "session_id": "fresh-key"}],
+            tools=[],
+            system_prompt="Be a concise assistant.",
+        ):
+            events.append(event)
+
+    call_args, _ = mock_create.call_args
+    assert _sent_message(call_args) == "Be a concise assistant.\n\nHello"
+
+
+@pytest.mark.asyncio
+async def test_run_turn_framework_only_sends_framework_text_without_fallback(
+    executor: HermesExecutor,
+) -> None:
+    """Framework-only instructions prefix alone — never fused with the fallback."""
+    mock_process = MagicMock()
+    mock_process.returncode = 0
+    mock_process.communicate = AsyncMock(
+        return_value=(b"session_id: 20260620_fw_sid\nHi there!", b"")
+    )
+
+    with patch.object(
+        asyncio,
+        "create_subprocess_exec",
+        new=AsyncMock(return_value=mock_process),
+    ) as mock_create:
+        events = []
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "Hello", "session_id": "fw-key"}],
+            tools=[],
+            system_prompt="Framework note only.",
+        ):
+            events.append(event)
+
+    call_args, _ = mock_create.call_args
+    sent = _sent_message(call_args)
+    assert sent == "Framework note only.\n\nHello"
+    assert "You are a helpful assistant." not in sent
+
+
+@pytest.mark.asyncio
+async def test_run_turn_neither_case_sends_no_prefix(
+    executor: HermesExecutor,
+) -> None:
+    """Genuinely nothing to compose → the user text goes through unprefixed."""
+    mock_process = MagicMock()
+    mock_process.returncode = 0
+    mock_process.communicate = AsyncMock(
+        return_value=(b"session_id: 20260620_none_sid\nHi there!", b"")
+    )
+
+    with patch.object(
+        asyncio,
+        "create_subprocess_exec",
+        new=AsyncMock(return_value=mock_process),
+    ) as mock_create:
+        events = []
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "Hello", "session_id": "none-key"}],
+            tools=[],
+            system_prompt="",
+        ):
+            events.append(event)
+
+    call_args, _ = mock_create.call_args
+    assert _sent_message(call_args) == "Hello"
+
+
+@pytest.mark.asyncio
+async def test_run_turn_resume_does_not_reprefix(
+    executor: HermesExecutor,
+) -> None:
+    """A captured session id suppresses re-prefixing, even with instructions."""
+    executor._session_map["resume-key"] = "20260620_existing_sid"
+    mock_process = MagicMock()
+    mock_process.returncode = 0
+    mock_process.communicate = AsyncMock(
+        return_value=(b"session_id: 20260620_existing_sid\nFollow-up", b"")
+    )
+
+    with patch.object(
+        asyncio,
+        "create_subprocess_exec",
+        new=AsyncMock(return_value=mock_process),
+    ) as mock_create:
+        events = []
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "Follow up", "session_id": "resume-key"}],
+            tools=[],
+            system_prompt="Be a concise assistant.",
+        ):
+            events.append(event)
+
+    call_args, _ = mock_create.call_args
+    assert _sent_message(call_args) == "Follow up"
+
+
+@pytest.mark.asyncio
+async def test_run_turn_simulated_restart_reprefixes(
+    executor: HermesExecutor,
+) -> None:
+    """A harness-subprocess restart (empty _session_map) re-prefixes on the next turn.
+
+    ``_session_map`` is in-memory only; if the harness process restarts
+    mid-conversation, the map is empty and Hermes genuinely starts a new
+    vendor session — re-prefixing on that restart is correct, not a bug.
+    """
+    # Simulate a captured session id that was lost on restart.
+    assert executor._hermes_session_id("restart-key") is None
+
+    mock_process = MagicMock()
+    mock_process.returncode = 0
+    mock_process.communicate = AsyncMock(
+        return_value=(b"session_id: 20260620_restarted_sid\nHi again!", b"")
+    )
+
+    with patch.object(
+        asyncio,
+        "create_subprocess_exec",
+        new=AsyncMock(return_value=mock_process),
+    ) as mock_create:
+        events = []
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "Hello again", "session_id": "restart-key"}],
+            tools=[],
+            system_prompt="Be a concise assistant.",
+        ):
+            events.append(event)
+
+    call_args, _ = mock_create.call_args
+    assert _sent_message(call_args) == "Be a concise assistant.\n\nHello again"
+
+
 @pytest.mark.asyncio
 async def test_run_turn_passes_model_from_config(
     executor: HermesExecutor,

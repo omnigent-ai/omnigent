@@ -1,7 +1,7 @@
 // Vitest cases for the MCP startup band's pure line formatters.
 import { describe, expect, it } from "vitest";
 
-import { mcpSettledNames, mcpStartingLine } from "./ChatPage";
+import { mcpSettledNames, mcpStartingLine } from "./ChatIndicators";
 
 describe("mcpStartingLine", () => {
   it("mirrors the Codex TUI header: caps the name list at three", () => {

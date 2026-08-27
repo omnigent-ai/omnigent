@@ -1102,3 +1102,141 @@ def test_host_native_session_round_trips_after_runner_death(
         except subprocess.TimeoutExpired:
             host_proc.kill()
             host_proc.wait()
+
+
+def test_host_retry_session_recovers_killed_runner(
+    live_server: str,
+    http_client: httpx.Client,
+    tmp_path: Path,
+    mock_llm_server_url: str,
+) -> None:
+    """``retry_session`` relaunches a host-bound runner without a user message.
+
+    The customer scenario: a host restart (or a killed runner) drops the runner
+    tunnel while the host stays up. The web UI reads that as ``runner_asleep``
+    and offers an Attach button that POSTs a ``retry_session`` event — no chat
+    message. This exercises the server primitive that button calls end to end
+    against a REAL host + server: with the runner dead and the host live,
+    ``retry_session`` relaunches the runner via the host
+    (``recovery: "runner_relaunched"``), and the recovered runner is usable.
+    """
+    marker_pre = "RETRY_PRE_KILL"
+    marker_post = "RETRY_POST_RECOVER"
+    configure_mock_llm(mock_llm_server_url, [{"text": marker_pre}, {"text": marker_post}])
+
+    daemon = _spawn_host_daemon(
+        tmp_path=tmp_path,
+        live_server=live_server,
+        mock_llm_server_url=mock_llm_server_url,
+    )
+    host_proc = daemon.proc
+    host_id = daemon.host_id
+
+    try:
+        _wait_for_host_online(http_client, host_id, timeout=30.0)
+
+        agent_name = upload_agent(http_client, _write_smoke_agent_yaml(tmp_path))
+        agent_id = lookup_agent_id(http_client, agent_name)
+        session_resp = http_client.post("/v1/sessions", json={"agent_id": agent_id})
+        session_resp.raise_for_status()
+        session_id = session_resp.json()["id"]
+
+        launch_resp = http_client.post(
+            f"/v1/hosts/{host_id}/runners",
+            json={"session_id": session_id, "workspace": str(tmp_path)},
+            timeout=60.0,
+        )
+        assert launch_resp.status_code == 200
+        runner_id = launch_resp.json()["runner_id"]
+
+        deadline = time.monotonic() + 30.0
+        runner_online = False
+        while time.monotonic() < deadline:
+            sr = http_client.get(f"/v1/runners/{runner_id}/status")
+            if sr.status_code == 200 and sr.json().get("online"):
+                runner_online = True
+                break
+            time.sleep(0.5)
+        assert runner_online, f"Runner {runner_id} never came online"
+        http_client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"runner_id": runner_id},
+        ).raise_for_status()
+
+        # Baseline: the host-bound session round-trips before the runner dies.
+        rid_pre = send_user_message_to_session(
+            http_client,
+            session_id=session_id,
+            content=f"Reply with exactly {marker_pre} and nothing else.",
+        )
+        body_pre = poll_session_until_terminal(
+            http_client,
+            session_id=session_id,
+            response_id=rid_pre,
+            timeout=120,
+        )
+        assert body_pre["status"] == "completed"
+        assert marker_pre in final_assistant_text(body_pre)
+
+        # Kill the RUNNER, not the host: the host stays online, so the session
+        # is now runner-down/host-up — the state the web's Attach button targets.
+        runner_pid = _runner_pid_from_daemon_log(daemon.daemon_log)
+        assert runner_pid is not None, (
+            "could not find the launched runner pid in the daemon log:\n"
+            f"{daemon.daemon_log.read_text()}"
+        )
+        os.kill(runner_pid, signal.SIGKILL)
+
+        # Wait until the server observes the runner tunnel gone, so retry_session
+        # exercises the relaunch path rather than the already-connected fast path.
+        deadline = time.monotonic() + 15.0
+        runner_offline = False
+        while time.monotonic() < deadline:
+            sr = http_client.get(f"/v1/runners/{runner_id}/status")
+            if sr.status_code == 200 and not sr.json().get("online"):
+                runner_offline = True
+                break
+            time.sleep(0.5)
+        assert runner_offline, f"Runner {runner_id} still online after SIGKILL"
+
+        # Precondition for host-relaunch: the host itself is still online.
+        hosts = http_client.get("/v1/hosts").json().get("hosts", [])
+        assert any(h["host_id"] == host_id and h["status"] == "online" for h in hosts), (
+            "host should stay online when only the runner is killed"
+        )
+
+        # retry_session: relaunch the runner via the host with NO user message.
+        retry_resp = http_client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "retry_session", "data": {}},
+            timeout=120.0,
+        )
+        assert retry_resp.status_code in (200, 202), retry_resp.text
+        recovery = retry_resp.json()
+        assert recovery.get("recovered") is True, recovery
+        assert recovery.get("recovery") == "runner_relaunched", recovery
+
+        # The relaunched runner is usable: a follow-up turn round-trips without
+        # a manual reconnect, proving recovery attached the forwarder + runner.
+        rid_post = send_user_message_to_session(
+            http_client,
+            session_id=session_id,
+            content=f"Reply with exactly {marker_post} and nothing else.",
+        )
+        body_post = poll_session_until_terminal(
+            http_client,
+            session_id=session_id,
+            response_id=rid_post,
+            timeout=120,
+        )
+        assert body_post["status"] == "completed"
+        assert marker_post in final_assistant_text(body_post)
+
+    finally:
+        if host_proc.poll() is None:
+            host_proc.send_signal(signal.SIGTERM)
+            try:
+                host_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                host_proc.kill()
+                host_proc.wait()

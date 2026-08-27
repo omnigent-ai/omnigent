@@ -145,6 +145,21 @@ _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE: str = "external_reasoning_effort_change"
 _EXTERNAL_SUBAGENT_START_TYPE: str = "external_subagent_start"
 
 
+_EXTERNAL_ACP_SUBAGENT_START_TYPE: str = "external_acp_subagent_start"
+
+
+# Stable id an ACP agent gave the sub-agent it spawned (Devin's ``agentId``);
+# the idempotency key for the child row. Unlike the native families there is no
+# ``omnigent.wrapper`` value: an ACP sub-agent runs the SAME harness as its
+# parent, so leaving the wrapper unset lets the child's harness resolve to the
+# parent's (e.g. ``devin``) and the UI label it accordingly, instead of
+# mislabeling it as another vendor.
+_ACP_SUBAGENT_ID_LABEL_KEY = "omnigent.acp.subagent_id"
+
+
+_ACP_SUBAGENT_DESCRIPTION_LABEL_KEY = "omnigent.acp.subagent_description"
+
+
 _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE = "claude-code-native-ui-subagent"
 
 
@@ -443,6 +458,7 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_SESSION_TITLE_TYPE,
     _EXTERNAL_SESSION_TODOS_TYPE,
     _EXTERNAL_SUBAGENT_START_TYPE,
+    _EXTERNAL_ACP_SUBAGENT_START_TYPE,
     _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
     _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE,
     _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,

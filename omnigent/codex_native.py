@@ -624,6 +624,37 @@ def _materialize_codex_agent_spec(
     return yaml_path
 
 
+def _wrapper_spec_raw_instructions(spec_path: Path) -> str | None:
+    """Resolve raw author instructions from the wrapper's agent spec.
+
+    Reuses :func:`omnigent.spec.load` (the same loader
+    :func:`~omnigent.cli._bundle` and the server use for both an agent-image
+    directory and a standalone single-file YAML) so the value matches exactly
+    what ``AgentSpec.instructions`` resolves to — including the
+    ``instructions:`` file precedence over ``prompt:`` — rather than
+    re-reading the raw YAML ad hoc.
+
+    :param spec_path: The generated/current wrapper agent spec (a
+        standalone YAML file or an agent-image directory).
+    :returns: The verbatim instructions text, or ``None`` if unresolvable
+        or absent/whitespace-only. Best-effort: a malformed spec must not
+        block the terminal launch, so load failures degrade to ``None``.
+    """
+    from omnigent.runtime.prompt import raw_author_instructions
+    from omnigent.spec import load as load_agent_spec
+
+    try:
+        spec = load_agent_spec(spec_path, expand_env=False)
+    except Exception:  # noqa: BLE001 — best-effort; never block the launch
+        _logger.warning(
+            "Could not resolve raw instructions from wrapper spec %s",
+            spec_path,
+            exc_info=True,
+        )
+        return None
+    return raw_author_instructions(spec)
+
+
 def _run_with_local_server(
     spec_path: Path,
     *,
@@ -691,6 +722,7 @@ def _run_with_local_server(
                     command=command,
                     model=model,
                     startup_progress=progress,
+                    developer_instructions=_wrapper_spec_raw_instructions(spec_path),
                 )
             if resolved_session_id is None:
                 _record_launch_for_fresh_session(prepared.session_id)
@@ -1099,6 +1131,7 @@ async def _prepare_codex_terminal(
     command: str,
     model: str | None,
     startup_progress: RunnerStartupProgress | None = None,
+    developer_instructions: str | None = None,
 ) -> PreparedCodexTerminal:
     """
     Create/bind a session, start app-server, and launch Codex TUI.
@@ -1113,6 +1146,10 @@ async def _prepare_codex_terminal(
     :param model: Optional model id.
     :param startup_progress: Optional user-visible progress renderer,
         e.g. a handle from :func:`runner_startup_progress`.
+    :param developer_instructions: Raw author instructions persisted into
+        Codex's private per-session config, applied on fresh launch and
+        cold resume only — the reattach branch below returns before this
+        is used, so it never relaunches or duplicates the value.
     :returns: Prepared terminal details.
     """
     timeout = httpx.Timeout(30.0, read=120.0)
@@ -1215,6 +1252,7 @@ async def _prepare_codex_terminal(
             bridge_dir=bridge_dir,
             ap_server_url=base_url,
             ap_auth_headers=headers,
+            developer_instructions=developer_instructions,
         )
         app_server.listen_url = codex_ws_url
         event_client: CodexAppServerClient | None = None

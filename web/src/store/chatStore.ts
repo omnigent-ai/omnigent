@@ -116,7 +116,7 @@ import { getCurrentAuthorId } from "@/lib/identity";
 import { getOmnigentHostConfig, type OmnigentInteractionStatus } from "@/lib/host";
 // Routing-free emit primitive (not "@/lib/analytics", which pulls in useLocation
 // and would form a routing↔store import cycle).
-import { emitInteractionPhase } from "@/lib/analyticsEmit";
+import { emitInteractionPhase, startTimedInteraction } from "@/lib/analyticsEmit";
 import { getSessionHost } from "@/lib/sessionHost";
 import { isSystemUserContent } from "@/lib/systemMessage";
 import { isNativeWrapper } from "@/lib/nativeCodingAgents";
@@ -2016,8 +2016,20 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
 
     // Cold entry: bind its stream and hydrate history. `hydratePending` replays
     // the snapshot's un-consumed native messages — correct here because a fresh
-    // entry has no live optimistic bubbles to overwrite.
-    await bindStream(conversationId, entrySetter(entry), entryGetter(entry), true);
+    // entry has no live optimistic bubbles to overwrite. This is the only path
+    // that loads a session on switch (a live/current one paints instantly and
+    // returned above), so time it as the get_session CUJ.
+    const getInteraction = startTimedInteraction("get_session", conversationId);
+    try {
+      await bindStream(conversationId, entrySetter(entry), entryGetter(entry), true);
+      // bindStream catches a snapshot failure into `conversationLoadError`
+      // instead of throwing, so read it to report the real outcome.
+      if (entry.getState().conversationLoadError !== null) getInteraction.fail();
+      else getInteraction.complete();
+    } catch (error) {
+      getInteraction.fail();
+      throw error;
+    }
   },
 
   submitApproval: async (elicitationId, action, content) => {
@@ -2754,7 +2766,15 @@ async function ensureBoundSession(
     // initial_items dispatch synchronously inside create_session,
     // before we can subscribe to /stream, so early events can be
     // missed). Bind the stream FIRST, then post the first message.
-    const session = await createSession(agentId, []);
+    const createInteraction = startTimedInteraction("create_session");
+    let session: Session;
+    try {
+      session = await createSession(agentId, []);
+      createInteraction.complete();
+    } catch (error) {
+      createInteraction.fail();
+      throw error;
+    }
     sessionId = session.id;
     // Claim the send chain for this id NOW, while it is still private to this
     // call. Everything below publishes it (the store write, the navigate
@@ -3661,6 +3681,39 @@ function captureElicitationIdsByStatus(blocks: AnyBlock[]): {
   return { pending, autoResolved };
 }
 
+function blockWallClockS(block: AnyBlock): number | undefined {
+  return block.ctx.createdAtS ?? block.ctx.clientCreatedAtS;
+}
+
+/** Merge preserved itemless history back into a freshly loaded item window. */
+function mergeReconnectWindow(windowBlocks: AnyBlock[], tail: AnyBlock[]): AnyBlock[] {
+  const anchored: AnyBlock[] = [];
+  const liveTail: AnyBlock[] = [];
+  for (const block of tail) {
+    if (
+      block.ctx.itemId === null &&
+      (block.type === "elicitation" || block.type === "error") &&
+      blockWallClockS(block) !== undefined
+    ) {
+      anchored.push(block);
+    } else {
+      liveTail.push(block);
+    }
+  }
+
+  const merged = [...windowBlocks];
+  for (const block of anchored) {
+    const createdAtS = blockWallClockS(block)!;
+    const insertAt = merged.findIndex((candidate) => {
+      const candidateCreatedAtS = blockWallClockS(candidate);
+      return candidateCreatedAtS !== undefined && candidateCreatedAtS > createdAtS;
+    });
+    if (insertAt === -1) merged.push(block);
+    else merged.splice(insertAt, 0, block);
+  }
+  return [...merged, ...liveTail];
+}
+
 /**
  * Reconnect fallback when the disconnect gap outran the incremental
  * backfill cap: replace the history window wholesale from one fresh window
@@ -3672,10 +3725,11 @@ function captureElicitationIdsByStatus(blocks: AnyBlock[]): {
  * reachable via scroll-up, since `oldestItemId` / `hasMoreHistory` are
  * reset alongside) while the live tail the reconnected pump has already
  * delivered — newly committed items plus the active turn's replayed
- * in-flight ephemera — is kept after the window, along with
- * elicitation/error blocks (never items, so the fresh fetch can't
- * recreate them). Elicitation cards are then reconciled against the
- * snapshot's pending list (see `reconcileElicitationBlocks`).
+ * in-flight ephemera — is kept after the window. Itemless elicitation/error
+ * blocks cannot be recreated by the fetch, but they may be older than the
+ * fresh items, so wall-clock-stamped ones are merged back chronologically
+ * instead of blindly appended. Elicitation cards are then reconciled against
+ * the snapshot's pending list (see `reconcileElicitationBlocks`).
  */
 async function rehydrateWindowOnReconnect(
   id: string,
@@ -3708,7 +3762,10 @@ async function rehydrateWindowOnReconnect(
       tail.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
     );
     const windowBlocks = freshBlocks.filter((b) => !b.ctx.itemId || !tailIds.has(b.ctx.itemId));
-    const merged = [...windowBlocks, ...withoutRebuiltUserInputCards(tail, windowBlocks)];
+    const merged = mergeReconnectWindow(
+      windowBlocks,
+      withoutRebuiltUserInputCards(tail, windowBlocks),
+    );
     return {
       ...reconnectStatusPatch(session, s),
       blocks:

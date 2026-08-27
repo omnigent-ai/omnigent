@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -895,6 +896,207 @@ async def test_external_subagent_start_mints_child_session(
     # Description is preserved on the row's labels for surfaces that
     # want it; the rail's row UI ignores ``session_name``.
     assert child["labels"]["omnigent.claude_native.description"] == "Trace the auth flow"
+
+
+async def test_external_acp_subagent_start_mints_child_without_a_vendor_wrapper(
+    client: httpx.AsyncClient,
+) -> None:
+    """An ACP sub-agent child carries no native wrapper label.
+
+    That absence is the fix: the UI resolves a child's displayed harness from its
+    ``omnigent.wrapper`` label first, so minting a Devin sub-agent through the
+    claude-native path (which stamps ``claude-code-native-ui-subagent``) titled it
+    **"Claude Code"**. With no wrapper value the child's harness resolves to the
+    parent's, and the UI labels it from the harness catalog instead.
+    """
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_acp_subagent_start",
+            "data": {
+                "subagent_id": "a0ac9364",
+                "title": "mathutils",
+                "description": "create mathutils.py plus tests",
+            },
+        },
+    )
+    assert resp.status_code in (200, 202), f"unexpected status {resp.status_code}: {resp.text}"
+    child_id = resp.json()["child_session_id"]
+
+    children = (await client.get(f"/v1/sessions/{parent['id']}/child_sessions")).json()["data"]
+    matching = [c for c in children if c["id"] == child_id]
+    assert len(matching) == 1, f"child {child_id} not in {children!r}"
+    child = matching[0]
+    assert child["parent_session_id"] == parent["id"]
+    assert child["kind"] == "sub_agent"
+    assert child["tool"] == "mathutils"
+    assert child["session_name"] == "a0ac9364"
+    # The ACP id + task are preserved for downstream surfaces...
+    assert child["labels"]["omnigent.acp.subagent_id"] == "a0ac9364"
+    assert child["labels"]["omnigent.acp.subagent_description"] == "create mathutils.py plus tests"
+    # ...and crucially NO vendor wrapper label is stamped.
+    assert "omnigent.wrapper" not in child["labels"], (
+        f"an ACP sub-agent must not claim a vendor wrapper identity: {child['labels']!r}"
+    )
+
+
+async def test_external_acp_subagent_start_is_idempotent_on_subagent_id(
+    client: httpx.AsyncClient,
+) -> None:
+    """A redelivery with the same ``subagent_id`` returns the same child.
+
+    The runner POSTs best-effort and an agent can re-announce a sub-agent, so a
+    retry must not mint a duplicate row in the panel.
+    """
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+    payload = {
+        "type": "external_acp_subagent_start",
+        "data": {"subagent_id": "dup1", "title": "worker", "description": "do a thing"},
+    }
+
+    first = await client.post(f"/v1/sessions/{parent['id']}/events", json=payload)
+    second = await client.post(f"/v1/sessions/{parent['id']}/events", json=payload)
+    assert first.json()["child_session_id"] == second.json()["child_session_id"]
+
+    children = (await client.get(f"/v1/sessions/{parent['id']}/child_sessions")).json()["data"]
+    assert len([c for c in children if c["labels"].get("omnigent.acp.subagent_id") == "dup1"]) == 1
+
+
+async def test_external_acp_subagent_start_allows_duplicate_titles(
+    client: httpx.AsyncClient,
+) -> None:
+    """Two sub-agents sharing a title both register (distinct ids).
+
+    An agent can label parallel sub-agents identically; the stable id keeps the
+    ``(parent, title)`` unique index from rejecting the second.
+    """
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+
+    ids = set()
+    for sub_id in ("s1", "s2"):
+        resp = await client.post(
+            f"/v1/sessions/{parent['id']}/events",
+            json={
+                "type": "external_acp_subagent_start",
+                "data": {"subagent_id": sub_id, "title": "worker", "description": "same task"},
+            },
+        )
+        assert resp.status_code in (200, 202), resp.text
+        ids.add(resp.json()["child_session_id"])
+    assert len(ids) == 2, "parallel sub-agents with the same title must get distinct children"
+
+
+async def test_acp_subagent_summary_needs_an_agent_to_persist(
+    client: httpx.AsyncClient,
+) -> None:
+    """An assistant message seeded into an ACP sub-agent child must carry ``agent``.
+
+    This is the server contract the runner's summary-seeding depends on, and the
+    root cause of the reported "sub-agent's response is missing from its chat"
+    bug: ``MessageData`` rejects an assistant message with no ``agent``, so an
+    item that omits it 400s and never persists (the runner posts best-effort and
+    swallows the rejection). With ``agent`` set — as the fix now sends — it
+    persists and appears in the child's items, exactly as the summary must.
+    """
+    import json
+
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+    mint = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_acp_subagent_start",
+            "data": {"subagent_id": "a0ac9364", "title": "mathutils", "description": "t"},
+        },
+    )
+    child_id = mint.json()["child_session_id"]
+
+    def _summary_event(*, with_agent: bool) -> dict[str, object]:
+        item_data: dict[str, object] = {
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "3 tests pass"}],
+        }
+        if with_agent:
+            item_data["agent"] = "mathutils"
+        return {
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": item_data,
+                "response_id": "resp_acpsub_a0ac9364",
+            },
+        }
+
+    # Without agent: rejected — the exact server response that silently hid the
+    # summary when the runner swallowed it.
+    missing = await client.post(
+        f"/v1/sessions/{child_id}/events", json=_summary_event(with_agent=False)
+    )
+    assert missing.status_code == 400, (
+        f"expected reject, got {missing.status_code}: {missing.text}"
+    )
+
+    # With agent (the fix): accepted and present in the child's transcript.
+    ok = await client.post(f"/v1/sessions/{child_id}/events", json=_summary_event(with_agent=True))
+    assert ok.status_code in (200, 202), ok.text
+
+    items = (await client.get(f"/v1/sessions/{child_id}/items")).json()["data"]
+    assert any(it.get("type") == "message" for it in items)
+    assert "3 tests pass" in json.dumps(items), (
+        f"summary not persisted into child items: {items!r}"
+    )
+
+
+async def test_acp_subagent_tool_call_persists_into_the_child(
+    client: httpx.AsyncClient,
+) -> None:
+    """A sub-agent's own tool call persists into its child as a ``function_call``.
+
+    The transcript-depth path: the runner appends each of the sub-agent's tool
+    calls to its child as a ``function_call`` item so opening the row shows the
+    work it did, not just the task and summary. ``FunctionCallData`` requires
+    ``agent`` / ``name`` / ``arguments`` / ``call_id``, so this pins that the
+    exact shape the runner sends is accepted and appears in the child's items.
+    """
+    import json
+
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+    mint = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_acp_subagent_start",
+            "data": {"subagent_id": "a0ac9364", "title": "mathutils", "description": "t"},
+        },
+    )
+    child_id = mint.json()["child_session_id"]
+
+    resp = await client.post(
+        f"/v1/sessions/{child_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "function_call",
+                "item_data": {
+                    "agent": "mathutils",
+                    "name": "Wrote mathutils.py",
+                    "arguments": '{"file_path": "mathutils.py"}',
+                    "call_id": "toolu_01",
+                },
+                "response_id": "resp_acpsub_a0ac9364",
+            },
+        },
+    )
+    assert resp.status_code in (200, 202), resp.text
+
+    items = (await client.get(f"/v1/sessions/{child_id}/items")).json()["data"]
+    assert any(it.get("type") == "function_call" for it in items), items
+    assert "Wrote mathutils.py" in json.dumps(items)
 
 
 async def test_external_subagent_start_handles_duplicate_agent_type_and_description(
@@ -5172,6 +5374,129 @@ async def test_accumulate_session_usage_provider_cost_prices_uncatalogued_model(
     usage = _read_session_usage(db_uri, session["id"])
     assert usage.get("total_cost_usd") == pytest.approx(0.0042)
     assert usage["by_model"]["grok-4.3"]["total_cost_usd"] == pytest.approx(0.0042)
+
+
+async def test_accumulate_session_usage_rejects_negative_provider_cost(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A negative reported ``cost_usd`` is not trusted; the catalog estimate is used instead.
+
+    The relay applies the reported cost as an additive delta, so a negative
+    value would subtract from the cumulative total. Since the cost-budget gate
+    reads that total for relay sessions, a runner could otherwise report a
+    negative cost to drive its recorded spend down and slip under the cap. A
+    negative report must fall through to the (non-negative) catalog estimate.
+    """
+    from omnigent.server.routes import sessions as sessions_routes
+
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: ModelPricing(input_per_token=1e-3, output_per_token=2e-3),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    sessions_routes._accumulate_session_usage(
+        {
+            "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 500,
+                "model": "harness-model",
+                "cost_usd": -100.0,
+            }
+        },
+        session["id"],
+        SqlAlchemyConversationStore(db_uri),
+    )
+    usage = _read_session_usage(db_uri, session["id"])
+    # Catalog charges 1000*1e-3 + 500*2e-3 = 2.0; the forged negative is ignored.
+    assert usage.get("total_cost_usd") == pytest.approx(2.0)
+    assert usage["by_model"]["harness-model"]["total_cost_usd"] == pytest.approx(2.0)
+
+
+async def test_accumulate_session_usage_negative_cost_cannot_reset_running_total(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A negative report on an uncatalogued model can't claw back prior spend.
+
+    With no catalog pricing, a rejected negative ``cost_usd`` leaves the turn
+    unpriced, so the previously accumulated ``total_cost_usd`` (the value the
+    cost-budget gate reads) is unchanged — never driven toward zero / negative.
+    """
+    from omnigent.server.routes import sessions as sessions_routes
+
+    store = SqlAlchemyConversationStore(db_uri)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    # First, an honest priced turn establishes a positive running total.
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: None,  # catalog can't price anything
+    )
+    sessions_routes._accumulate_session_usage(
+        {"usage": {"input_tokens": 10, "output_tokens": 2, "model": "grok-4.3", "cost_usd": 5.0}},
+        session["id"],
+        store,
+    )
+    assert _read_session_usage(db_uri, session["id"]).get("total_cost_usd") == pytest.approx(5.0)
+
+    # A forged negative report must not subtract from the running total.
+    sessions_routes._accumulate_session_usage(
+        {
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "model": "grok-4.3",
+                "cost_usd": -50.0,
+            }
+        },
+        session["id"],
+        store,
+    )
+    assert _read_session_usage(db_uri, session["id"]).get("total_cost_usd") == pytest.approx(5.0)
+
+
+async def test_accumulate_session_usage_rejects_non_finite_provider_cost(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A NaN / infinite reported ``cost_usd`` is rejected in favour of the catalog estimate.
+
+    A non-finite value poisons every downstream sum (and JSON round-trips as
+    ``NaN``), so it must never be trusted as the authoritative cost.
+    """
+    from omnigent.server.routes import sessions as sessions_routes
+
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: ModelPricing(input_per_token=1e-3, output_per_token=2e-3),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    for bad_cost in (float("nan"), float("inf"), float("-inf")):
+        sessions_routes._accumulate_session_usage(
+            {
+                "usage": {
+                    "input_tokens": 1000,
+                    "output_tokens": 500,
+                    "model": "harness-model",
+                    "cost_usd": bad_cost,
+                }
+            },
+            session["id"],
+            SqlAlchemyConversationStore(db_uri),
+        )
+    usage = _read_session_usage(db_uri, session["id"])
+    # Three turns, each catalog-priced at 2.0 (the non-finite reports ignored).
+    assert usage.get("total_cost_usd") == pytest.approx(6.0)
+    assert math.isfinite(usage["total_cost_usd"])
 
 
 async def test_accumulate_session_usage_unpriced_without_usage_model(

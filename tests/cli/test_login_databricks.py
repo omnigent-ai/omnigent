@@ -108,6 +108,8 @@ def _patch_login_env(
     fake_httpx: _FakeHttpx,
     sdk_installed: bool = True,
     cached_tokens: list[str | None] | None = None,
+    host_needs_selector: bool = False,
+    default_workspace_id: str | None = None,
 ) -> list[str]:
     """Patch the login command's collaborators for a scripted run.
 
@@ -118,6 +120,12 @@ def _patch_login_env(
         results, e.g. ``[None, "tok"]`` for "no cached grant, then a
         token after ``databricks auth login`` runs". Defaults to a
         cached token on first try.
+    :param host_needs_selector: What ``_databricks_host_needs_org_selector``
+        reports for the discovery-metadata check. Defaults to ``False`` so tests
+        never touch the real ``/.well-known/databricks-config`` endpoint.
+    :param default_workspace_id: What ``_databricks_default_workspace_id``
+        returns — the workspace the CLI recorded for the host. Defaults to
+        ``None`` so tests never read the developer's real ``~/.databrickscfg``.
     :returns: A list capturing each ``subprocess.run`` argv (the
         ``databricks auth login`` invocations).
     """
@@ -127,6 +135,13 @@ def _patch_login_env(
     # keeps each login test's scripted response sequence aligned with the
     # login body's own requests.
     monkeypatch.setattr(cli_mod, "_workspace_api_server_url", lambda server: server)
+    # Discovery-metadata + cfg reads are offline by default; account-host tests opt in.
+    monkeypatch.setattr(
+        cli_mod, "_databricks_host_needs_org_selector", lambda workspace_host: host_needs_selector
+    )
+    monkeypatch.setattr(
+        cli_mod, "_databricks_default_workspace_id", lambda workspace_host: default_workspace_id
+    )
     monkeypatch.setattr(
         "omnigent.onboarding.databricks_config.databricks_sdk_installed",
         lambda: sdk_installed,
@@ -217,6 +232,132 @@ def test_login_workspace_hosted_401_uses_url_host(
     assert result.exit_code == 0, result.output
     # Keyed by the full server URL (with the /api/2.0/omnigent path) and
     # pointing at the workspace host without the path.
+    assert load_databricks_workspace_host(_WORKSPACE_API_URL) == _WORKSPACE
+
+
+def test_login_account_host_inherits_cli_selected_workspace(
+    monkeypatch: pytest.MonkeyPatch, token_dir: Path
+) -> None:
+    """An account-acting host without ?o= inherits the workspace the CLI recorded.
+
+    Discovery metadata identifies ``isaac.databricks.com`` as account-acting (an
+    ``account_id`` but no ``workspace_id``). The ``databricks auth login`` flow
+    still resolves a workspace and records its id in the profile; the login reads
+    it back and routes the account token to it (``params o=…``), succeeding
+    unattended — and records the inherited id for later commands.
+    """
+    from omnigent.cli_auth import load_databricks_org_id, load_databricks_workspace_host
+
+    fake = _FakeHttpx(
+        responses=[
+            _response(
+                401,
+                headers={"www-authenticate": 'Bearer realm="DatabricksRealm"'},
+                body={"error_code": 401, "message": "Credential was not sent"},
+            ),
+            # Verify carrying the inherited selector: the workspace accepts it.
+            _response(200, body={"user_id": "alice@example.com"}),
+        ]
+    )
+    _patch_login_env(
+        monkeypatch,
+        fake_httpx=fake,
+        host_needs_selector=True,
+        default_workspace_id="1965859176160743",
+    )
+
+    result = CliRunner().invoke(cli_group, ["login", _WORKSPACE_API_URL])
+
+    assert result.exit_code == 0, result.output
+    # The inherited workspace routed the verify probe and was recorded.
+    assert fake.requests[-1]["params"] == {"o": "1965859176160743"}
+    assert "1965859176160743" in result.output
+    assert load_databricks_org_id(_WORKSPACE_API_URL) == "1965859176160743"
+    assert load_databricks_workspace_host(_WORKSPACE_API_URL) == _WORKSPACE
+
+
+@pytest.mark.parametrize(
+    ("account_id", "workspace_id", "expected"),
+    [
+        ("acc-1", None, True),  # account-acting host fronting many workspaces
+        ("acc-1", "1965859176160743", False),  # single workspace names its own id
+        (None, None, False),  # older regional host: inconclusive, don't block
+    ],
+)
+def test_databricks_host_needs_org_selector_reads_discovery_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    account_id: str | None,
+    workspace_id: str | None,
+    expected: bool,
+) -> None:
+    """Account-acting hosts (account id, no workspace id) need a ?o= selector.
+
+    The signal is the unauthenticated ``/.well-known/databricks-config``
+    document: a workspace id means a single workspace, its absence (with an
+    account id) means the host fronts many.
+    """
+    from types import SimpleNamespace
+
+    import databricks.sdk.oauth as sdk_oauth
+
+    monkeypatch.setattr(
+        sdk_oauth,
+        "get_host_metadata",
+        lambda host: SimpleNamespace(account_id=account_id, workspace_id=workspace_id),
+    )
+    assert cli_mod._databricks_host_needs_org_selector("https://host.example") is expected
+
+
+def test_databricks_host_needs_org_selector_swallows_discovery_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A discovery fetch failure never blocks login (returns False)."""
+    import databricks.sdk.oauth as sdk_oauth
+
+    def _boom(host: str) -> object:
+        raise ValueError("no route to host")
+
+    monkeypatch.setattr(sdk_oauth, "get_host_metadata", _boom)
+    assert cli_mod._databricks_host_needs_org_selector("https://host.example") is False
+
+
+def test_login_workspace_hosted_with_selector_binds_and_succeeds(
+    monkeypatch: pytest.MonkeyPatch, token_dir: Path
+) -> None:
+    """A workspace mount login carrying ?o=<id> threads the selector and succeeds.
+
+    The selector rides both the browser login (``--host …?o=<id>``, which
+    binds the grant to the workspace) and the verify probe (``params o=<id>``,
+    which routes to it), and is recorded for later commands.
+    """
+    from omnigent.cli_auth import load_databricks_org_id, load_databricks_workspace_host
+
+    fake = _FakeHttpx(
+        responses=[
+            _response(
+                401,
+                headers={"www-authenticate": 'Bearer realm="DatabricksRealm"'},
+                body={"error_code": 401, "message": "Credential was not sent"},
+            ),
+            _response(200, body={"user_id": "alice@example.com"}),
+        ]
+    )
+    login_calls = _patch_login_env(monkeypatch, fake_httpx=fake, cached_tokens=[None, "tok-fresh"])
+    # Mirror production normalization, which drops the ?o= query when expanding
+    # to the API mount (the selector travels separately). The default stub is
+    # identity, which would leave the query on the record key.
+    monkeypatch.setattr(cli_mod, "_workspace_api_server_url", lambda server: server.split("?")[0])
+
+    result = CliRunner().invoke(cli_group, ["login", f"{_WORKSPACE_API_URL}?o=1965859176160743"])
+
+    assert result.exit_code == 0, result.output
+    # Selector bound at login (--host …?o=…) and routed at verify (params o=…).
+    assert login_calls == [
+        f"auth login --host {_WORKSPACE}/?o=1965859176160743 --profile {_PROFILE}"
+    ]
+    assert fake.requests[-1]["params"] == {"o": "1965859176160743"}
+    # Recorded (keyed by the query-less mount) for later request routing.
+    assert load_databricks_org_id(_WORKSPACE_API_URL) == "1965859176160743"
     assert load_databricks_workspace_host(_WORKSPACE_API_URL) == _WORKSPACE
 
 

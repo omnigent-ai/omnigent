@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     # import annotations`` is in effect).
     from omnigent.inner.datamodel import OSEnvSpec
 
+from omnigent.cli_invocation import cli_invocation
 from omnigent.entities import (
     NON_CONTENT_ITEM_TYPES,
     CompactionData,
@@ -1045,7 +1046,7 @@ def _resolve_provider_for_build(
             raise OmnigentError(
                 f"executor.auth references provider {auth.name!r}, but no such provider is "
                 "configured under 'providers:' in ~/.omnigent/config.yaml. "
-                "Run `omnigent setup --no-internal-beta` to configure one.",
+                f"Run `{cli_invocation()} setup --no-internal-beta` to configure one.",
                 code=ErrorCode.INVALID_INPUT,
             )
         return entry
@@ -2912,34 +2913,9 @@ def _find_spec_by_name(
     child ``__web_researcher`` session boots by re-parsing the bundle
     fresh (``runner/_entry.py`` spec resolver), so the researcher is
     absent from the re-parsed tree and a plain search returns ``None``.
-    Every caller swaps to the resolved sub-spec only ``if ... is not
-    None`` and otherwise keeps the parent spec, which boots the child as
-    a full clone of the parent (runaway recursion via ``sys_session_send``
-    when the parent is a coordinator). To keep that fallback safe, the
-    researcher is reconstructed deterministically from the parent (the
-    same pure builder ``WebFetchTool`` uses) instead of returning ``None``,
-    but only when some node in the tree actually declares the ``web_fetch``
-    builtin. That builtin is the sole reason the researcher ever exists, so a
-    tree without it anywhere has no such child and the name falls through to
-    normal resolution (``None``). Reconstructing unconditionally would let a
-    caller-controlled ``sub_agent_name`` coerce any parent into a
-    shell-capable researcher (``build_researcher_spec`` synthesizes an
-    ``OSEnvSpec``), widening the parent's tool boundary.
+    The root is never matched against itself, even when ``spec.name == name``.
 
-    The owning node need not be the root: a nested sub-agent may own
-    ``web_fetch`` while the handed-in root does not. The gate locates the
-    ``web_fetch`` owner via a root-first pre-order walk
-    (:func:`omnigent.tools.builtins.web_fetch.find_web_fetch_owner`) and
-    reconstructs from THAT owner, not the
-    root, so the researcher inherits the owner's LLM and sandbox/egress
-    boundary (``build_researcher_spec`` derives both from its argument). When
-    several nodes own ``web_fetch`` the first pre-order owner wins; this is a
-    deliberate limitation tied to the ``__web_researcher`` name not being
-    unique per owner (plumbing an "effective parent" through every call site
-    is out of scope). The root-owner case is unchanged: the owner is the
-    root, so the output is identical to before.
-
-    :param spec: The root agent spec to search.
+    :param spec: The root agent spec to search under.
     :param name: The sub-agent name to find,
         e.g. ``"researcher"``.
     :returns: The matching sub-agent spec, the reconstructed

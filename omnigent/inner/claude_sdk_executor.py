@@ -44,6 +44,7 @@ from typing import Any, Protocol, TypeAlias, cast
 
 from omnigent import model_catalog
 from omnigent._platform import resolve_cli_binary, stable_user_id
+from omnigent.cli_invocation import cli_invocation
 from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
 from omnigent.inner import _proc
 from omnigent.inner.bundle_skills import ensure_bundle_plugin_manifest
@@ -1507,7 +1508,7 @@ class ClaudeSDKExecutor(Executor):
                 f"Model {model!r} is a Databricks-hosted model but gateway "
                 "routing is disabled (gateway=False). "
                 "Set executor.profile in the agent spec, or configure a "
-                "Databricks provider with `omnigent setup`, to route through "
+                f"Databricks provider with `{cli_invocation()} setup`, to route through "
                 "the Databricks Anthropic gateway."
             )
         self._cwd = cwd

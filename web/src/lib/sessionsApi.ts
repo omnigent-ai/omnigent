@@ -493,6 +493,57 @@ export async function createSession(
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
 }
 
+/** Local coding harnesses whose transcripts can be imported. */
+export type ImportSource = "claude" | "codex" | "kimi" | "kiro" | "opencode" | "pi" | "qwen";
+
+/** A specific harness, or "all" to import from every supported harness at once. */
+export type ImportSourceSelector = ImportSource | "all";
+
+/** One freshly imported session, for linking to it in the UI. */
+export interface ImportedSessionRef {
+  id: string;
+  /** null when the session had no native title and nothing to synthesize from. */
+  title: string | null;
+}
+
+/** Result of a batch local import (`POST /v1/imports/local`). */
+export interface LocalImportResult {
+  imported: number;
+  alreadyImported: number;
+  failed: number;
+  sessions: ImportedSessionRef[];
+}
+
+/**
+ * Import the caller's most recent local transcripts via `POST /v1/imports/local`.
+ * The chosen host reads + normalizes its own transcripts over the tunnel (the
+ * transcripts live on that machine, not the server); already-imported sessions
+ * are skipped. `source` is a specific harness or "all" for every harness at once.
+ */
+export async function importLocalSessions(
+  hostId: string,
+  source: ImportSourceSelector,
+  limit: number,
+): Promise<LocalImportResult> {
+  const res = await authenticatedFetch("/v1/imports/local", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
+    body: JSON.stringify({ host_id: hostId, source, limit }),
+  });
+  const wire = await readJsonOrThrow<{
+    imported: number;
+    already_imported: number;
+    failed: number;
+    sessions: { session_id: string; title: string | null }[];
+  }>(res);
+  return {
+    imported: wire.imported,
+    alreadyImported: wire.already_imported,
+    failed: wire.failed,
+    sessions: wire.sessions.map((s) => ({ id: s.session_id, title: s.title })),
+  };
+}
+
 /**
  * Create a session with an inline agent bundle via multipart
  * `POST /v1/sessions`.

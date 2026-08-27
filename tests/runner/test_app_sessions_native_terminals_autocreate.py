@@ -835,6 +835,89 @@ def test_agent_os_env_from_spec_unwraps_resolved_and_handles_none() -> None:
 
 
 @pytest.mark.asyncio
+async def test_auto_create_claude_terminal_passes_raw_instructions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Host-spawned launch emits ``--append-system-prompt`` with the agent's
+    raw author instructions.
+
+    The managed-host wiring in ``runner/native/orchestration.py``
+    (``augment_claude_args(..., append_system_prompt=
+    _native_startup_raw_instructions_from_spec(agent_spec))``), where
+    ``AgentSpec.instructions`` can become unreachable by claude-native.
+    Drives the real ``_auto_create_claude_terminal`` →
+    ``augment_claude_args`` integration rather than the helpers in isolation.
+    """
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+
+    async def _no_op_forwarder(**kwargs: Any) -> None:
+        del kwargs
+
+    monkeypatch.setattr(
+        "omnigent.claude_native_forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            del terminal_name, session_key
+            captured["spec"] = spec
+            return SessionResourceView(
+                id="terminal_claude_main",
+                type="terminal",
+                session_id=session_id,
+                name="claude:main",
+                metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+            )
+
+    def _handle_request(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"labels": {}})
+
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server",
+        transport=httpx.MockTransport(_handle_request),
+    )
+
+    session_id = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"
+    agent_spec = AgentSpec(
+        spec_version=1,
+        name="claude-agent",
+        instructions="Be a concise, careful coding assistant.",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    await _auto_create_claude_terminal(
+        session_id,
+        _FakeResourceRegistry(),
+        lambda _sid, _evt: None,
+        server_client=fake_client,
+        agent_spec=agent_spec,
+    )
+
+    args = captured["spec"].args
+    assert "--append-system-prompt" in args, f"missing --append-system-prompt in {args!r}"
+    idx = args.index("--append-system-prompt")
+    assert args[idx + 1] == "Be a concise, careful coding assistant."
+
+
+@pytest.mark.asyncio
 async def test_auto_create_claude_terminal_inherits_agent_sandbox(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1067,6 +1150,101 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
     settings = _load_claude_invocation_settings(spec.args)
     assert settings["apiKeyHelper"] == "printf %s sk-sentinel-do-not-use"
     assert recorded_configs == {"13efa494411f3ae60211e6be5635062a": ucode}
+
+    await fake_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_auto_create_claude_terminal_does_not_cache_transient_resolver_failure() -> None:
+    """
+    Stale-negative-cache scenario: a ``resolve_launch_config``
+    exception used to still be recorded via ``record_launch_config(session_id,
+    None)`` — indistinguishable, on the next
+    ``_resolve_session_claude_launch_config`` read, from "this agent
+    legitimately has no provider config" (presence-in-dict is the read
+    gate). A transient failure (secret momentarily unavailable, a network
+    blip resolving the ucode profile) would then permanently deny the
+    session a provider-backed Claude terminal for the rest of the process
+    lifetime. A resolver exception leaves the cache UNSET,
+    so a later successful resolution still gets recorded.
+    """
+    from omnigent.claude_native import ClaudeNativeUcodeConfig
+
+    class _FakeResourceRegistry:
+        """Records the launched terminal spec; returns a stub view."""
+
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            del terminal_name, session_key, spec, resource_role, parent_os_env
+            return SessionResourceView(
+                id="terminal_claude_main",
+                type="terminal",
+                session_id=session_id,
+                name="claude:main",
+                metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+            )
+
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server",
+        transport=httpx.MockTransport(
+            lambda req: httpx.Response(200, json={"labels": {}}),
+        ),
+    )
+    session_id = "conv_launch_config_retry"
+    recorded_configs: dict[str, ClaudeNativeUcodeConfig | None] = {}
+
+    async def _failing_resolve_launch_config() -> ClaudeNativeUcodeConfig | None:
+        raise RuntimeError("transient: secret temporarily unavailable")
+
+    await _auto_create_claude_terminal(
+        session_id,
+        _FakeResourceRegistry(),
+        lambda _sid, _evt: None,
+        server_client=fake_client,
+        resolve_launch_config=_failing_resolve_launch_config,
+        record_launch_config=recorded_configs.__setitem__,
+    )
+
+    assert session_id not in recorded_configs, (
+        f"A transient resolver failure must leave the launch-config cache "
+        f"UNSET so the next attempt re-resolves — got "
+        f"recorded_configs={recorded_configs!r}. Recording ``None`` here "
+        f"would permanently deny this session a provider-backed Claude "
+        f"terminal."
+    )
+
+    real_config = ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": "https://gw.example/anthropic"},
+        api_key_helper="databricks auth token --fake-helper",
+        model="databricks-claude-opus-4-7",
+    )
+
+    async def _succeeding_resolve_launch_config() -> ClaudeNativeUcodeConfig | None:
+        return real_config
+
+    await _auto_create_claude_terminal(
+        session_id,
+        _FakeResourceRegistry(),
+        lambda _sid, _evt: None,
+        server_client=fake_client,
+        resolve_launch_config=_succeeding_resolve_launch_config,
+        record_launch_config=recorded_configs.__setitem__,
+    )
+
+    assert recorded_configs == {session_id: real_config}, (
+        f"A later successful resolution must be recorded — got "
+        f"recorded_configs={recorded_configs!r}."
+    )
 
     await fake_client.aclose()
 

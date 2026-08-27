@@ -126,9 +126,12 @@ class ClaudeNativeExecutor(Executor):
         :param tools: Tool schemas from Omnigent. Ignored here;
             Claude-native output/tool activity is terminal-originated
             and mirrored from Claude's transcript.
-        :param system_prompt: System prompt from the agent spec. The
-            native Claude Code terminal controls its own prompt/settings,
-            so this is ignored.
+        :param system_prompt: Per-turn composed system prompt. Ignored here:
+            claude-native delivers raw author instructions once, at terminal
+            launch, via ``--append-system-prompt`` (see
+            ``omnigent.runner.native.orchestration`` and
+            ``omnigent.claude_native``) — not per-turn through this
+            parameter.
         :param config: Per-turn executor config. Only ``config.model``
             is used: when intelligent routing picks a model for this turn,
             it arrives here (adapter maps ``request.model_override`` →

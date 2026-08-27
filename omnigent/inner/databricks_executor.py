@@ -696,6 +696,40 @@ def _databrickscfg_profiles_for_host(host: str) -> list[str]:
     return matches
 
 
+def databrickscfg_workspace_id_for_host(host: str) -> str | None:
+    """Return the ``workspace_id`` the Databricks CLI recorded for *host*.
+
+    ``databricks auth login --host <host>`` resolves a workspace during login
+    (auto-selecting the only accessible one, or the one the user picks) and
+    writes its id into the matching ``~/.databrickscfg`` profile. On an
+    account-fronting host — one hostname over many workspaces — that recorded id
+    is the only trace of which workspace the login chose, and an account token
+    routes to it once the id is replayed as the ``?o=`` selector.
+
+    :param host: Workspace host to match, e.g.
+        ``"https://example.databricks.com"``.
+    :returns: The recorded workspace id, or ``None`` when the file is
+        missing/unparseable or no matching profile carries one.
+    """
+    import configparser
+    from pathlib import Path
+
+    cfg_path = Path(os.environ.get("DATABRICKS_CONFIG_FILE") or (Path.home() / ".databrickscfg"))
+    if not cfg_path.exists():
+        return None
+    config = configparser.ConfigParser()
+    try:
+        config.read(cfg_path)
+    except configparser.Error:
+        return None
+    for section in _databrickscfg_profiles_for_host(host):
+        values = config.defaults() if section == "DEFAULT" else config[section]
+        workspace_id = values.get("workspace_id")
+        if workspace_id:
+            return workspace_id
+    return None
+
+
 def _get_openai_client(profile: str | None = None) -> OpenAI:
     """Lazily import and construct the OpenAI client.
 

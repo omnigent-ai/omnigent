@@ -38,6 +38,7 @@ import { useHosts } from "@/hooks/useHosts";
 import { sortAgentsForDisplay } from "@/lib/agentGrouping";
 import { sandboxOptionLabel } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { readAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
 import { SANDBOX_HOST_CHOICE } from "@/lib/hostPreferences";
 import { isNativeCodingAgent } from "@/lib/nativeCodingAgents";
 import type { ProjectConfig } from "@/lib/projectsApi";
@@ -114,9 +115,11 @@ export function ProjectSettingsDialog({
   // the fetched config arrives); local until saved.
   const [hostId, setHostId] = useState<string>(NONE);
   const [workspace, setWorkspace] = useState("");
-  // Worktrees are opt-in: the toggle starts OFF and only an explicit ON is
-  // stored (as use_worktree:true), which the composer honors by creating a
-  // fresh worktree for new sessions in the project.
+  // Worktree default for the project. The toggle seeds from the project's
+  // stored value when set, else from the user-global "always use a worktree"
+  // default (Settings › Git). On save it stays "inherit" (stores nothing) while
+  // it matches the global default, and stores an explicit true/false only to
+  // override it — so a project can force a worktree on or opt out of a global on.
   const [useWorktree, setUseWorktree] = useState(false);
   // Base branch a new worktree forks from; blank stores no default (falls
   // through to the user-global default in Settings › Git). Only meaningful
@@ -165,7 +168,7 @@ export function ProjectSettingsDialog({
     const c: ProjectConfig = stored ?? {};
     setHostId(c.host_id ?? NONE);
     setWorkspace(c.workspace ?? "");
-    setUseWorktree(c.use_worktree ?? false);
+    setUseWorktree(c.use_worktree ?? readAlwaysUseWorktree());
     setBaseBranch(c.base_branch ?? "");
     setAgentId(c.agent_id ?? null);
     setWorkspaceOpen(false);
@@ -188,9 +191,10 @@ export function ProjectSettingsDialog({
       hostId !== NONE && hostId !== SANDBOX_HOST_CHOICE ? trimOrUndef(workspace) : undefined;
     if (ws) config.workspace = ws;
     if (agentId) config.agent_id = agentId;
-    // Worktrees are opt-in: only an explicit ON is stored (as use_worktree:true);
-    // leaving it OFF stores nothing, so an all-default dialog still clears to {}.
-    if (useWorktree) config.use_worktree = true;
+    // Store the worktree choice only when it overrides the user-global default;
+    // while it matches, leave the key unset so the project keeps inheriting
+    // (and an all-default dialog still clears to {}).
+    if (useWorktree !== readAlwaysUseWorktree()) config.use_worktree = useWorktree;
     // A base branch only forks a worktree, so it's only meaningful when the
     // worktree default is on — drop it otherwise so it can't linger as a stale,
     // invisible default after the toggle is turned off.
@@ -366,7 +370,7 @@ export function ProjectSettingsDialog({
 
           <Field
             label="Random worktree"
-            hint="Start each new session in a fresh randomly-named git worktree (vs. directly in the workspace)"
+            hint="Start each new session in a fresh randomly-named git worktree (vs. directly in the workspace). Overrides the global default in Settings › Git."
           >
             <div className="flex sm:justify-end">
               <Switch

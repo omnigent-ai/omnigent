@@ -50,6 +50,7 @@ from packaging.version import InvalidVersion, Version
 
 from omnigent._platform import resolve_cli_binary
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+from omnigent.cli_invocation import cli_invocation
 from omnigent.harness_install_spec import HarnessInstallSpec, SetupStep
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 from omnigent.opencode_native_client import (
@@ -697,7 +698,10 @@ def harness_setup_hint(harness: str | None) -> str:
         elif spec.auth_hint:
             login = f", then {spec.auth_hint}"
         return f"install the {spec.binary} CLI on that machine with `{spec.install_hint}`{login}"
-    return "run `omni setup` on that machine to install the CLI and set a default credential"
+    return (
+        f"run `{cli_invocation(name='omni')} setup` on that machine to install "
+        "the CLI and set a default credential"
+    )
 
 
 _VERSION_RE = re.compile(r"(\d+\.\d+\.\d+(?:[-.][0-9A-Za-z]+)*)")

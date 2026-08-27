@@ -379,6 +379,10 @@ class _FakeProcessManager:
         """Reaper in-flight clear — no-op for this stub (issue #1414)."""
         del conversation_id
 
+    async def release(self, conversation_id: str, **kwargs: object) -> None:
+        """Agent-switch subprocess release — no-op for this stub."""
+        del conversation_id, kwargs
+
 
 @pytest.fixture
 async def started_manager() -> AsyncIterator[HarnessProcessManager]:
@@ -486,6 +490,121 @@ async def test_runner_resolves_harness_from_fallback_when_no_agent_id(
         assert response.status_code == 200
         assert response.headers["content-type"].startswith("text/event-stream")
         assert "event: response.created" in response.text
+
+
+@pytest.mark.asyncio
+async def test_resolve_harness_config_raises_when_spec_resolver_returns_none() -> None:
+    """_resolve_harness_config raises RuntimeError when spec_resolver is wired
+    but returns no spec, instead of silently falling back to runner-test-default.
+
+    The fallback is only valid when no spec_resolver is configured (test mode).
+    A production runner that has a spec_resolver must never silently spawn the
+    test harness — the caller's ``except RuntimeError`` will surface a clean
+    error instead of leaving the session in a broken/hung state.
+
+    :returns: None.
+    """
+
+    async def _resolver_returning_none(
+        agent_id: str, session_id: str | None = None
+    ) -> AgentSpec | None:
+        """
+        Always return None to simulate an agent that cannot be resolved.
+
+        :param agent_id: Ignored.
+        :param session_id: Ignored.
+        :returns: None.
+        """
+        return None
+
+    with pytest.raises(RuntimeError, match="No agent spec found for agent_id="):
+        await _resolve_harness_config(
+            agent_id="ag_missing",
+            spec_resolver=_resolver_returning_none,
+            session_id="conv_x",
+        )
+
+
+@pytest.mark.asyncio
+async def test_resolve_harness_config_raises_when_agent_id_missing_with_spec_resolver() -> None:
+    """_resolve_harness_config raises when spec_resolver is set but agent_id is absent.
+
+    A production runner with a spec_resolver requires agent_id to select the
+    right harness. If it's missing the runner must fail loudly so the problem
+    surfaces immediately rather than spawning the test-only harness and hanging.
+
+    :returns: None.
+    """
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """
+        Return a valid spec — should never be reached in this test.
+
+        :param agent_id: Agent id.
+        :param session_id: Session id.
+        :returns: A minimal agent spec.
+        """
+        return AgentSpec(
+            spec_version=1,
+            name="x",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        )
+
+    with pytest.raises(RuntimeError, match="agent_id is missing"):
+        await _resolve_harness_config(
+            agent_id=None,
+            spec_resolver=_resolver,
+            session_id="conv_x",
+        )
+
+
+@pytest.mark.asyncio
+async def test_create_session_returns_400_when_spec_resolver_returns_none(
+    started_manager: HarnessProcessManager,
+) -> None:
+    """POST /v1/sessions returns 400 no_agent_spec when spec_resolver returns no spec.
+
+    When the server sends a session-create request with an agent_id that
+    doesn't map to any registered agent, the runner must return a clear 400
+    rather than silently proceeding with the test-only harness (which would
+    either fail with a 503 or, worse, appear to succeed and then hang on the
+    first turn because no real LLM is configured for it).
+
+    :param started_manager: A real HarnessProcessManager fixture.
+    :returns: None.
+    """
+
+    async def _resolver_returning_none(
+        agent_id: str, session_id: str | None = None
+    ) -> AgentSpec | None:
+        """
+        Always return None to simulate an unregistered agent.
+
+        :param agent_id: Ignored.
+        :param session_id: Ignored.
+        :returns: None.
+        """
+        return None
+
+    app = create_runner_app(
+        process_manager=started_manager,
+        spec_resolver=_resolver_returning_none,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        response = await http.post(
+            "/v1/sessions",
+            json={"session_id": "conv_bad_agent", "agent_id": "ag_unregistered"},
+        )
+
+    assert response.status_code == 400, (
+        f"Expected 400 no_agent_spec; got {response.status_code}: {response.text!r}. "
+        "Without the safeguard the runner falls back to runner-test-default and "
+        "returns 503 (unregistered harness) or silently spawns a test harness."
+    )
+    body = response.json()
+    assert body["error"] == "no_agent_spec"
+    assert "ag_unregistered" in body["detail"]
 
 
 class _RecordingProcessManager:
@@ -1289,334 +1408,6 @@ async def test_runner_cold_cache_uses_resolved_message_not_stored_file_id() -> N
     assert "file_id" not in flat, f"unresolved file_id present in forwarded history: {flat}"
 
 
-async def _reasoning_spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-    """
-    Resolve a minimal spec on a benign test harness.
-
-    :param agent_id: Agent id the runner resolved (unused).
-    :param session_id: Session id (unused).
-    :returns: A minimal spec whose harness is ``runner-test-resolved``.
-    """
-    del agent_id, session_id
-    return AgentSpec(
-        spec_version=1,
-        name="reasoning-agent",
-        executor=ExecutorSpec(
-            type="omnigent",
-            config={"harness": "runner-test-resolved"},
-        ),
-    )
-
-
-@pytest.mark.asyncio
-async def test_runner_background_turn_forwards_reasoning_to_harness() -> None:
-    """A ``reasoning`` field on the inbound body must reach the harness.
-
-    The background path (no ``?stream=true``) is the one the Omnigent
-    server posts to. It does not forward the inbound body: it rebuilds a
-    fresh ``harness_body`` field by field, so any field not threaded
-    through explicitly is dropped. ``reasoning`` was one of them, which
-    means a turn's reasoning effort could not reach an in-process harness
-    on that path even when the body carried it.
-
-    This asserts the field survives the rebuild, the same way ``model``
-    and the client half of ``tools`` are already taken off the inbound
-    body in that builder.
-    """
-    from omnigent.runner import app as runner_app
-
-    conv = "conv_reasoning_bg"
-    captured: dict[str, Any] = {}
-    reached = asyncio.Event()
-    app = create_runner_app(
-        process_manager=cast(
-            HarnessProcessManager,
-            _ContentCapturingProcessManager(captured, reached),
-        ),
-        spec_resolver=_reasoning_spec_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
-    runner_app._session_histories_ref.pop(conv, None)
-    try:
-        async with _runner_test_client(app) as http:
-            response = await http.post(
-                # No ``?stream=true`` → background turn, the production
-                # path the Omnigent server uses to forward session messages.
-                f"/v1/sessions/{conv}/events",
-                json={
-                    "type": "message",
-                    "role": "user",
-                    "agent_id": "ag_reasoning",
-                    "model": "x",
-                    "content": [{"type": "input_text", "text": "hi"}],
-                    "reasoning": {"effort": "high"},
-                },
-            )
-            assert response.status_code == 202
-            await asyncio.wait_for(reached.wait(), timeout=10.0)
-    finally:
-        runner_app._session_histories_ref.pop(conv, None)
-
-    body = captured["body"]
-    assert body.get("reasoning") == {"effort": "high"}, (
-        f"reasoning dropped from the rebuilt background-turn body: keys={sorted(body)}"
-    )
-
-
-@pytest.mark.asyncio
-async def test_runner_stream_turn_forwards_reasoning_to_harness() -> None:
-    """The ``?stream=true`` branch must keep carrying ``reasoning``.
-
-    That branch passes the inbound body through rather than rebuilding
-    it, so it already carries the field and this passes without the
-    accompanying fix. It is a drift guard, not coverage of a live path:
-    it fails if that branch is ever changed to rebuild the body the way
-    the background path does, which is exactly how the two paths came
-    apart in the first place. Note the stream branch has no production
-    caller today; the Omnigent server always posts without the query
-    parameter.
-    """
-    from omnigent.runner import app as runner_app
-
-    conv = "conv_reasoning_stream"
-    captured: dict[str, Any] = {}
-    reached = asyncio.Event()
-    app = create_runner_app(
-        process_manager=cast(
-            HarnessProcessManager,
-            _ContentCapturingProcessManager(captured, reached),
-        ),
-        spec_resolver=_reasoning_spec_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
-    runner_app._session_histories_ref.pop(conv, None)
-    try:
-        async with _runner_test_client(app) as http:
-            response = await http.post(
-                f"/v1/sessions/{conv}/events?stream=true",
-                json={
-                    "type": "message",
-                    "role": "user",
-                    "agent_id": "ag_reasoning",
-                    "model": "x",
-                    "content": [{"type": "input_text", "text": "hi"}],
-                    "reasoning": {"effort": "high"},
-                },
-            )
-            assert response.status_code == 200
-            await asyncio.wait_for(reached.wait(), timeout=10.0)
-    finally:
-        runner_app._session_histories_ref.pop(conv, None)
-
-    body = captured["body"]
-    assert body.get("reasoning") == {"effort": "high"}, (
-        f"reasoning lost on the passthrough branch: keys={sorted(body)}"
-    )
-
-
-@pytest.mark.asyncio
-async def test_runner_background_turn_normalises_reasoning_to_effort() -> None:
-    """Sibling keys are dropped rather than forwarded to the harness.
-
-    The harness scaffold types ``reasoning`` as ``dict[str, str]``, so a
-    caller that sends a non-string sibling alongside the effort — the
-    shape both the Anthropic and OpenAI reasoning objects use — would
-    fail the turn at decode. Forwarding a normalised object keeps a field
-    that is dropped today from becoming a hard failure.
-    """
-    from omnigent.runner import app as runner_app
-
-    conv = "conv_reasoning_sibling"
-    captured: dict[str, Any] = {}
-    reached = asyncio.Event()
-    app = create_runner_app(
-        process_manager=cast(
-            HarnessProcessManager,
-            _ContentCapturingProcessManager(captured, reached),
-        ),
-        spec_resolver=_reasoning_spec_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
-    runner_app._session_histories_ref.pop(conv, None)
-    try:
-        async with _runner_test_client(app) as http:
-            response = await http.post(
-                f"/v1/sessions/{conv}/events",
-                json={
-                    "type": "message",
-                    "role": "user",
-                    "agent_id": "ag_reasoning",
-                    "model": "x",
-                    "content": [{"type": "input_text", "text": "hi"}],
-                    "reasoning": {"effort": "high", "budget_tokens": 8000},
-                },
-            )
-            assert response.status_code == 202
-            await asyncio.wait_for(reached.wait(), timeout=10.0)
-    finally:
-        runner_app._session_histories_ref.pop(conv, None)
-
-    body = captured["body"]
-    assert body.get("reasoning") == {"effort": "high"}, (
-        f"non-string sibling forwarded to the harness: {body.get('reasoning')!r}"
-    )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "reasoning",
-    [
-        pytest.param(None, id="absent"),
-        pytest.param({}, id="empty-dict"),
-        pytest.param({"effort": ""}, id="empty-effort"),
-        pytest.param({"effort": None}, id="null-effort"),
-        pytest.param("high", id="bare-string"),
-    ],
-)
-async def test_runner_background_turn_omits_unusable_reasoning(
-    reasoning: object,
-) -> None:
-    """No ``reasoning`` key is invented from an absent or unusable value.
-
-    Effort is only meaningful when it is a non-empty string, so the
-    builder forwards nothing otherwise rather than handing the harness a
-    value it would have to interpret. This keeps a malformed field from
-    turning a silently dropped value into a failed turn, and pins that a
-    session with no effort set is left alone.
-
-    :param reasoning: Inbound ``reasoning`` value, or ``None`` to omit
-        the key entirely.
-    """
-    from omnigent.runner import app as runner_app
-
-    conv = "conv_reasoning_none"
-    captured: dict[str, Any] = {}
-    reached = asyncio.Event()
-    app = create_runner_app(
-        process_manager=cast(
-            HarnessProcessManager,
-            _ContentCapturingProcessManager(captured, reached),
-        ),
-        spec_resolver=_reasoning_spec_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
-    payload: dict[str, Any] = {
-        "type": "message",
-        "role": "user",
-        "agent_id": "ag_reasoning",
-        "model": "x",
-        "content": [{"type": "input_text", "text": "hi"}],
-    }
-    if reasoning is not None:
-        payload["reasoning"] = reasoning
-    runner_app._session_histories_ref.pop(conv, None)
-    try:
-        async with _runner_test_client(app) as http:
-            response = await http.post(f"/v1/sessions/{conv}/events", json=payload)
-            assert response.status_code == 202
-            await asyncio.wait_for(reached.wait(), timeout=10.0)
-    finally:
-        runner_app._session_histories_ref.pop(conv, None)
-
-    body = captured["body"]
-    assert "reasoning" not in body, (
-        f"invented a reasoning key from {reasoning!r}: {body.get('reasoning')!r}"
-    )
-
-
-async def _claude_sdk_spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-    """
-    Resolve a minimal spec on a harness with a known effort family.
-
-    :param agent_id: Agent id the runner resolved (unused).
-    :param session_id: Session id (unused).
-    :returns: A minimal spec whose harness is ``claude-sdk``
-        (``EffortFamily.ANTHROPIC``).
-    """
-    del agent_id, session_id
-    return AgentSpec(
-        spec_version=1,
-        name="reasoning-agent",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
-    )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("effort", "delivered"),
-    [
-        # In the Anthropic vocabulary → delivered untouched.
-        pytest.param("high", True, id="in-family"),
-        # Valid at session create (the union vocabulary) but foreign to
-        # this harness: the executor would reject it and fail the turn.
-        pytest.param("none", False, id="out-of-family"),
-        pytest.param("minimal", False, id="out-of-family-minimal"),
-    ],
-)
-async def test_runner_background_turn_filters_effort_by_harness_family(
-    effort: str,
-    delivered: bool,
-) -> None:
-    """An effort the target harness cannot accept is dropped, not delivered.
-
-    ``reasoning_effort`` is validated at session create against the union
-    vocabulary, so ``none`` / ``minimal`` persist happily on a session
-    whose harness is Anthropic-family. Once the field actually reaches the
-    executor it is re-validated against that family and an unsupported
-    value fails the whole turn — a session that merely *ignored* the
-    setting before would start erroring on every turn.
-
-    The native launch path already filters this way (it appends
-    ``--effort`` only for values in the harness's vocabulary), so this
-    keeps the two dispatch paths symmetric: explicit requests fail loud at
-    dispatch, replayed session state degrades quietly at delivery.
-
-    :param effort: Inbound effort value.
-    :param delivered: Whether it should survive to the harness body.
-    """
-    from omnigent.runner import app as runner_app
-
-    conv = "conv_reasoning_family"
-    captured: dict[str, Any] = {}
-    reached = asyncio.Event()
-    app = create_runner_app(
-        process_manager=cast(
-            HarnessProcessManager,
-            _ContentCapturingProcessManager(captured, reached),
-        ),
-        spec_resolver=_claude_sdk_spec_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
-    runner_app._session_histories_ref.pop(conv, None)
-    try:
-        async with _runner_test_client(app) as http:
-            response = await http.post(
-                f"/v1/sessions/{conv}/events",
-                json={
-                    "type": "message",
-                    "role": "user",
-                    "agent_id": "ag_reasoning",
-                    "model": "x",
-                    "content": [{"type": "input_text", "text": "hi"}],
-                    "reasoning": {"effort": effort},
-                },
-            )
-            assert response.status_code == 202
-            await asyncio.wait_for(reached.wait(), timeout=10.0)
-    finally:
-        runner_app._session_histories_ref.pop(conv, None)
-
-    body = captured["body"]
-    if delivered:
-        assert body.get("reasoning") == {"effort": effort}
-    else:
-        assert "reasoning" not in body, (
-            f"effort {effort!r} is outside claude-sdk's family but was "
-            f"delivered as {body.get('reasoning')!r} — the executor would "
-            "fail the turn"
-        )
-
-
 @pytest.mark.asyncio
 async def test_runner_post_returns_503_when_spec_resolver_fails(
     caplog: pytest.LogCaptureFixture,
@@ -1740,6 +1531,97 @@ async def test_runner_stream_emits_failed_when_tool_spec_resolver_fails() -> Non
     assert "stream spec resolver unavailable for ag_stream" not in response.text
 
 
+def test_direct_and_background_switch_sites_share_one_invalidation_routine() -> None:
+    """Both dispatch paths must call the shared `_invalidate_session_agent_state` helper."""
+    import inspect
+
+    import omnigent.runner.app as runner_app_mod
+
+    source = inspect.getsource(runner_app_mod)
+    direct_stream_start = source.index("async def _stream_message_to_harness(")
+    direct_stream_body = source[direct_stream_start : direct_stream_start + 4000]
+    background_start = source.index("async def _run_turn_bg_setup_and_stream(")
+    background_body = source[background_start : background_start + 4000]
+
+    assert "_invalidate_session_agent_state(" in direct_stream_body, (
+        "_stream_message_to_harness must call the shared "
+        "_invalidate_session_agent_state helper on its switch/provenance-"
+        "reject branch, not an inline cache-pop list of its own."
+    )
+    assert "_invalidate_session_agent_state(" in background_body, (
+        "_run_turn_bg_setup_and_stream must call the shared "
+        "_invalidate_session_agent_state helper on its switch/provenance-"
+        "reject branch, not an inline cache-pop list of its own."
+    )
+
+
+def test_agent_cache_reset_clears_the_agent_id_marker_too() -> None:
+    """`_clear_session_agent_caches` must pop `_session_agent_ids` with the other tagged caches."""
+    import inspect
+
+    import omnigent.runner.app as runner_app_mod
+
+    source = inspect.getsource(runner_app_mod)
+    start = source.index("def _clear_session_agent_caches(")
+    end = source.index("\n    async def _invalidate_session_agent_state(", start)
+    body = source[start:end]
+
+    assert "_session_agent_ids.pop(" in body, (
+        "_clear_session_agent_caches must pop _session_agent_ids(session_id) "
+        "so it doesn't outlive the caches it's supposed to describe."
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.asyncio
+class _RecordingHarnessClient:
+    """Fake harness client that records the event body posted to it."""
+
+    def __init__(self, chunks: list[str]) -> None:
+        self._chunks = chunks
+        self.posted_bodies: list[dict[str, Any]] = []
+
+    def stream(
+        self,
+        method: str,
+        url: str,
+        *,
+        json: dict[str, object],
+        timeout: float | None,
+    ) -> _FakeHarnessStream:
+        del method, url, timeout
+        self.posted_bodies.append(json)  # type: ignore[arg-type]
+        return _FakeHarnessStream(self._chunks)
+
+
+_INSTRUCTION_WARN_CHUNKS = [
+    'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_iw_1"}}\n\n',
+    (
+        "event: response.completed\ndata: "
+        '{"type":"response.completed","response":{"id":"resp_iw_1","status":"completed"}}\n\n'
+    ),
+]
+
+
+async def _post_stream_message(http: httpx.AsyncClient, conv: str, **body: Any) -> httpx.Response:
+    """POST a minimal ``?stream=true`` message body for the warn-site tests.
+
+    :param http: Test HTTP client bound to the runner app.
+    :param conv: Conversation id.
+    :param body: Extra fields merged into the message body (``harness``,
+        ``harness_override``, ``agent_id``, ...).
+    :returns: The runner's HTTP response.
+    """
+    payload: dict[str, Any] = {
+        "type": "message",
+        "role": "user",
+        "model": "x",
+        "content": [],
+        **body,
+    }
+    return await http.post(f"/v1/sessions/{conv}/events?stream=true", json=payload)
+
+
 def test_build_spawn_env_applies_model_override(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1820,6 +1702,8 @@ def test_build_spawn_env_routes_hermes(tmp_path: Path, monkeypatch: pytest.Monke
     assert overridden["HARNESS_HERMES_MODEL"] == "hermes-4-70b"
 
 
+@pytest.mark.asyncio
+@pytest.mark.asyncio
 @pytest.mark.asyncio
 async def test_resolve_harness_config_applies_harness_override(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -3423,29 +3307,6 @@ def _spec_with_subagent_harness(harness: str) -> SimpleNamespace:
     )
 
 
-def _spec_with_subagent_effort(harness: str, effort: str | None) -> SimpleNamespace:
-    """
-    Build a parent-spec stub whose ``worker`` declares a default effort.
-
-    :param harness: The sub-agent's declared harness, e.g.
-        ``"claude-native"``.
-    :param effort: The sub-agent's ``executor.reasoning_effort``.
-    :returns: A structural parent-spec stub for ``execute_tool``.
-    """
-    return SimpleNamespace(
-        sub_agents=[
-            SimpleNamespace(
-                name="worker",
-                executor=SimpleNamespace(
-                    type="omnigent",
-                    config={"harness": harness},
-                    reasoning_effort=effort,
-                ),
-            )
-        ]
-    )
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("harness", "model"),
@@ -3529,145 +3390,6 @@ async def test_sys_session_send_model_lands_in_child_create_body(
     assert len(create_bodies) == 1, "fresh named send must create exactly one child"
     assert create_bodies[0]["model_override"] == model
     assert create_bodies[0]["sub_agent_name"] == "worker"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("spec_effort", "dispatch_effort", "expected"),
-    [
-        # Nothing asked for: the worker's declared default applies.
-        pytest.param("high", None, "high", id="spec-default-applies"),
-        # An explicit dispatch value outranks the spec default.
-        pytest.param("high", "low", "low", id="dispatch-overrides-spec"),
-        # No default declared and none dispatched: nothing is persisted,
-        # so the harness keeps whatever default the host CLI carries.
-        pytest.param(None, None, None, id="neither"),
-    ],
-)
-async def test_sys_session_send_effort_precedence(
-    monkeypatch: pytest.MonkeyPatch,
-    spec_effort: str | None,
-    dispatch_effort: str | None,
-    expected: str | None,
-) -> None:
-    """
-    Dispatch effort beats the sub-agent spec's, which beats the host default.
-
-    Declaring the default once per worker is what keeps a fleet's effort
-    policy out of the orchestrator's prompt, where it depends on the model
-    remembering to pass an argument on every dispatch.
-
-    :param monkeypatch: Pytest monkeypatch fixture.
-    :param spec_effort: The worker spec's ``executor.reasoning_effort``.
-    :param dispatch_effort: Per-dispatch ``args.reasoning_effort``.
-    :param expected: Effort expected on the child create body, or
-        ``None`` when the key must be absent.
-    """
-    from omnigent.runner import app as runner_app
-    from omnigent.runner.tool_dispatch import execute_tool
-
-    create_bodies: list[dict[str, Any]] = []
-
-    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
-    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
-    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-
-    async def _server_handler(request: httpx.Request) -> httpx.Response:
-        """Serve fresh-create child lookup, create, and message POSTs."""
-        if (
-            request.method == "GET"
-            and request.url.path == "/v1/sessions/conv_parent_effort/child_sessions"
-        ):
-            return httpx.Response(200, json={"data": []})
-        if request.method == "POST" and request.url.path == "/v1/sessions":
-            create_bodies.append(json.loads(request.content))
-            return httpx.Response(201, json={"id": "conv_child_effort"})
-        if (
-            request.method == "POST"
-            and request.url.path == "/v1/sessions/conv_child_effort/events"
-        ):
-            return httpx.Response(202, json={"queued": True})
-        return httpx.Response(404, json={"error": str(request.url)})
-
-    send_args: dict[str, Any] = {"input": "fix the auth bug"}
-    if dispatch_effort is not None:
-        send_args["reasoning_effort"] = dispatch_effort
-
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(_server_handler),
-        base_url="http://server",
-    ) as server_client:
-        try:
-            output = await execute_tool(
-                tool_name="sys_session_send",
-                arguments=json.dumps({"agent": "worker", "title": "fix-auth", "args": send_args}),
-                server_client=server_client,
-                conversation_id="conv_parent_effort",
-                agent_spec=_spec_with_subagent_effort("claude-native", spec_effort),
-                session_inbox=session_inbox,
-            )
-        finally:
-            runner_app.unregister_subagent_work("conv_child_effort")
-            runner_app._session_inboxes_ref.pop("conv_parent_effort", None)
-
-    assert json.loads(output)["status"] == "launching"
-    assert len(create_bodies) == 1
-    assert create_bodies[0].get("reasoning_effort") == expected
-
-
-@pytest.mark.asyncio
-async def test_sys_session_send_rejects_out_of_family_spec_effort(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    A spec default the worker's harness cannot accept fails loud, naming the spec.
-
-    The spec value is applied on the caller's behalf, so the error has to
-    say where it came from — otherwise an operator reads "invalid
-    reasoning_effort" against a dispatch that never mentioned one.
-    """
-    from omnigent.runner import app as runner_app
-    from omnigent.runner.tool_dispatch import execute_tool
-
-    create_posts = 0
-
-    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
-    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
-    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-
-    async def _server_handler(request: httpx.Request) -> httpx.Response:
-        """Serve the child lookup; count any create that slips through."""
-        nonlocal create_posts
-        if (
-            request.method == "GET"
-            and request.url.path == "/v1/sessions/conv_parent_bad_effort/child_sessions"
-        ):
-            return httpx.Response(200, json={"data": []})
-        if request.method == "POST" and request.url.path == "/v1/sessions":
-            create_posts += 1
-            return httpx.Response(201, json={"id": "conv_child_bad_effort"})
-        return httpx.Response(404, json={"error": str(request.url)})
-
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(_server_handler),
-        base_url="http://server",
-    ) as server_client:
-        try:
-            output = await execute_tool(
-                tool_name="sys_session_send",
-                arguments=json.dumps({"agent": "worker", "title": "t", "args": {"input": "go"}}),
-                server_client=server_client,
-                conversation_id="conv_parent_bad_effort",
-                # "none" is a legal effort value, but not an Anthropic one.
-                agent_spec=_spec_with_subagent_effort("claude-native", "none"),
-                session_inbox=session_inbox,
-            )
-        finally:
-            runner_app._session_inboxes_ref.pop("conv_parent_bad_effort", None)
-
-    assert output.startswith("Error:"), output
-    assert "spec" in output, f"error must name the spec as the source: {output}"
-    assert create_posts == 0, "a rejected effort must not create the child"
 
 
 @pytest.mark.asyncio
@@ -6984,85 +6706,6 @@ async def test_sys_session_create_spawns_child_under_caller() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sys_session_create_persists_reasoning_effort() -> None:
-    """
-    ``sys_session_create`` threads ``reasoning_effort`` onto the create
-    body, so a self-spawned child starts at the requested effort instead
-    of the harness default — parity with ``sys_session_send``'s
-    create-time override. The server validates the value against the
-    shared effort vocabulary; this path cannot check harness support
-    because it never resolves the child's harness (same as ``model``).
-    """
-    from omnigent.runner.tool_dispatch import execute_tool
-
-    captured: dict[str, Any] = {}
-
-    async def _server_handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "POST" and request.url.path == "/v1/sessions":
-            captured.update(json.loads(request.content))
-            return httpx.Response(
-                201,
-                json={
-                    "id": "conv_child",
-                    "agent_id": "ag_x",
-                    "agent_name": "researcher",
-                    "status": "idle",
-                },
-            )
-        return httpx.Response(404, json={"error": str(request.url)})
-
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(_server_handler),
-        base_url="http://server",
-    ) as server_client:
-        await execute_tool(
-            tool_name="sys_session_create",
-            arguments=json.dumps({"agent_id": "ag_x", "reasoning_effort": "high"}),
-            server_client=server_client,
-            conversation_id="conv_caller",
-        )
-
-    assert captured["reasoning_effort"] == "high"
-
-
-@pytest.mark.asyncio
-async def test_sys_session_create_rejects_reasoning_effort_with_config_path(
-    tmp_path: Path,
-) -> None:
-    """
-    The ``config_path`` create is multipart and carries only the agent
-    bundle, so an effort passed with it could never reach the child.
-    Refuse loudly rather than accept-and-drop.
-    """
-    from omnigent.runner.tool_dispatch import execute_tool
-
-    config = tmp_path / "helper.yaml"
-    config.write_text("spec_version: 1\nname: helper\n", encoding="utf-8")
-
-    posted = False
-
-    async def _server_handler(request: httpx.Request) -> httpx.Response:
-        nonlocal posted
-        posted = True
-        return httpx.Response(404, json={"error": str(request.url)})
-
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(_server_handler),
-        base_url="http://server",
-    ) as server_client:
-        output = await execute_tool(
-            tool_name="sys_session_create",
-            arguments=json.dumps({"config_path": "helper.yaml", "reasoning_effort": "high"}),
-            server_client=server_client,
-            conversation_id="conv_caller",
-            runner_workspace=tmp_path,
-        )
-
-    assert "reasoning_effort" in json.loads(output)["error"]
-    assert not posted, "rejected create must not reach the server"
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "arguments",
     [
@@ -8142,6 +7785,96 @@ async def test_create_session_reinit_preserves_existing_inbox() -> None:
 
 
 # ── approval-event flattening (elicitation-approval hang regression) ──────
+
+
+@pytest.mark.parametrize("second_turn", ["background", "known_harness"])
+@pytest.mark.asyncio
+async def test_unresolvable_sub_agent_warns_again_on_later_turns(
+    caplog: pytest.LogCaptureFixture,
+    second_turn: str,
+) -> None:
+    """A parent kept after a miss must not become a resolved child on turn 2.
+
+    Session creation misses on ``sub_agent_name``, warns, and caches the
+    PARENT spec for the session. Later turns read that cache instead of
+    resolving again, and decide "is this the already-resolved child?" by
+    comparing the cached spec's name against the requested name. A root
+    whose own name equals the requested sub-agent satisfies that equality,
+    so the cached parent answers as though it were the child — and the
+    warning that made turn 1 honest never fires again.
+
+    :param caplog: Pytest log capture, read once per turn.
+    :param second_turn: Which dispatch path drives the turn after create.
+    """
+    conv = f"conv_fallback_second_turn_{second_turn}"
+
+    root_spec = AgentSpec(
+        spec_version=1,
+        name="worker",
+        instructions="Root instructions.",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+    )
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return root_spec
+
+    recorder = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    pm = _FakeProcessManager(recorder)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, pm),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            created = await http.post(
+                "/v1/sessions",
+                json={
+                    "session_id": conv,
+                    "agent_id": "ag_root",
+                    "sub_agent_name": "worker",
+                },
+            )
+        assert created.status_code == 201, created.text
+        assert "did not resolve" in caplog.text
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            if second_turn == "background":
+                bg = await http.post(
+                    f"/v1/sessions/{conv}/events",
+                    json={
+                        "type": "message",
+                        "role": "user",
+                        "agent_id": "ag_root",
+                        "model": "x",
+                        "content": [{"role": "user", "content": "hi"}],
+                    },
+                )
+                assert bg.status_code == 202, bg.text
+                await _await_bg_turn_task(conv)
+                statuses = await _drain_published_statuses(
+                    app.state.session_event_queues, conv, until="idle", timeout=2.0
+                )
+                assert "failed" not in statuses
+            else:
+                streamed = await _post_stream_message(
+                    http,
+                    conv,
+                    agent_id="ag_root",
+                    harness="claude-sdk",
+                    instructions="Caller-supplied instructions.",
+                )
+                assert streamed.status_code == 200, streamed.text
+
+    assert "'worker'" in caplog.text and "did not resolve" in caplog.text, (
+        f"The {second_turn} turn reused a PARENT kept after a miss silently; "
+        f"warnings: {caplog.text!r}."
+    )
+    assert recorder.posted_bodies
+    composed = recorder.posted_bodies[-1].get("instructions")
+    assert isinstance(composed, str) and "Root instructions." in composed
 
 
 @pytest.mark.asyncio
@@ -10464,3 +10197,349 @@ async def test_factor3_new_message_lands_in_real_buffer(
     assert buffered
     assert buffered[-1]["content"] == "second message"
     assert buffered[-1]["conversation_id"] == conv
+
+
+_CONTRACT_PARENT_WITH_CHILD = {
+    "name": "root",
+    "instructions": "Root instructions.",
+    "child": "worker",
+    "child_instructions": "Worker instructions.",
+}
+
+
+def _contract_root_spec(*, with_child: bool) -> AgentSpec:
+    """Build the contract test's parent spec, with or without the child."""
+    return AgentSpec(
+        spec_version=1,
+        name=_CONTRACT_PARENT_WITH_CHILD["name"],
+        instructions=_CONTRACT_PARENT_WITH_CHILD["instructions"],
+        executor=ExecutorSpec(type="omnigent", config={"harness": "hermes"}),
+        sub_agents=(
+            [
+                AgentSpec(
+                    spec_version=1,
+                    name=_CONTRACT_PARENT_WITH_CHILD["child"],
+                    instructions=_CONTRACT_PARENT_WITH_CHILD["child_instructions"],
+                    executor=ExecutorSpec(type="omnigent", config={"harness": "hermes"}),
+                )
+            ]
+            if with_child
+            else []
+        ),
+    )
+
+
+class _ContractSnapshotClient(NullServerClient):
+    """Session snapshot naming the requested sub-agent."""
+
+    def __init__(self, conv: str) -> None:
+        super().__init__()
+        self._conv = conv
+
+    async def get(self, url: str, **kwargs: object) -> NullServerClient._Response:
+        del kwargs
+        _conv = self._conv
+
+        class _Resp(NullServerClient._Response):
+            status_code = 200
+
+            def json(self) -> dict[str, object]:
+                return {"agent_id": "ag_contract_root", "sub_agent_name": "worker"}
+
+        if url.endswith(f"/v1/sessions/{_conv}"):
+            return _Resp()
+        return await super().get(url)
+
+
+_CONTRACT_CALLER_INSTRUCTIONS = "Caller-supplied instructions."
+
+
+async def _contract_run_no_harness(
+    http: httpx.AsyncClient, conv: str, recording: _RecordingHarnessClient
+) -> dict[str, Any]:
+    """Adapter 1: direct ``?stream=true`` with no harness in the body."""
+    resp = await http.post(
+        f"/v1/sessions/{conv}/events?stream=true",
+        json={
+            "type": "message",
+            "role": "user",
+            "agent_id": "ag_contract_root",
+            "model": "x",
+            "content": [],
+        },
+    )
+    return {
+        "status": resp.status_code,
+        "error": (resp.json().get("error") if resp.status_code >= 400 else None),
+        "instructions": (
+            recording.posted_bodies[-1].get("instructions") if recording.posted_bodies else None
+        ),
+    }
+
+
+async def _contract_run_known_harness(
+    http: httpx.AsyncClient, conv: str, recording: _RecordingHarnessClient
+) -> dict[str, Any]:
+    """Adapter 2: direct ``?stream=true`` with the harness already known."""
+    resp = await http.post(
+        f"/v1/sessions/{conv}/events?stream=true",
+        json={
+            "type": "message",
+            "role": "user",
+            "agent_id": "ag_contract_root",
+            "harness": "hermes",
+            "model": "x",
+            "content": [],
+            "instructions": _CONTRACT_CALLER_INSTRUCTIONS,
+        },
+    )
+    return {
+        "status": resp.status_code,
+        "error": (resp.json().get("error") if resp.status_code >= 400 else None),
+        "instructions": (
+            recording.posted_bodies[-1].get("instructions") if recording.posted_bodies else None
+        ),
+    }
+
+
+async def _contract_run_background(
+    http: httpx.AsyncClient, conv: str, recording: _RecordingHarnessClient
+) -> dict[str, Any]:
+    """Adapter 3: background non-stream dispatch."""
+    resp = await http.post(
+        f"/v1/sessions/{conv}/events",
+        json={
+            "type": "message",
+            "role": "user",
+            "agent_id": "ag_contract_root",
+            "model": "x",
+            "content": [{"role": "user", "content": "hi"}],
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    await _await_bg_turn_task(conv)
+    return {
+        "status": resp.status_code,
+        "terminal_status": None,  # populated by the caller with app.state access
+        "instructions": (
+            recording.posted_bodies[-1].get("instructions") if recording.posted_bodies else None
+        ),
+    }
+
+
+_CONTRACT_ADAPTERS = {
+    "no_harness": _contract_run_no_harness,
+    "known_harness": _contract_run_known_harness,
+    "background": _contract_run_background,
+}
+
+
+def _contract_resolver_for(scenario: str, calls: list[str]) -> Any:
+    """Build the scenario's ``spec_resolver``.
+
+    :param scenario: Contract scenario key.
+    :param calls: Mutable list each invocation appends to, so a scenario can
+        assert how many resolutions a path actually performed.
+    :returns: An async resolver matching that scenario's failure mode.
+    """
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec | None:
+        del session_id
+        calls.append(agent_id)
+        if scenario == "resolver_raises":
+            raise RuntimeError("contract: resolver unavailable")
+        if scenario == "resolver_none":
+            return None
+        return _contract_root_spec(with_child=(scenario != "child_missing"))
+
+    return _resolver
+
+
+@pytest.mark.parametrize(
+    "scenario, path, expected",
+    [
+        # child present: all paths select the same child spec.
+        pytest.param(
+            "child_present",
+            "no_harness",
+            {"status": 200, "instructions": "Worker instructions."},
+            id="child_present-no_harness",
+        ),
+        pytest.param(
+            "child_present",
+            "known_harness",
+            # same child; caller text composes additively on top.
+            {
+                "status": 200,
+                "instructions": (f"Worker instructions.\n\n{_CONTRACT_CALLER_INSTRUCTIONS}"),
+            },
+            id="child_present-known_harness",
+        ),
+        pytest.param(
+            "child_present",
+            "background",
+            {"terminal_status": "idle", "instructions": "Worker instructions."},
+            id="child_present-background",
+        ),
+        # child missing: all paths agree — warn, fall back to the parent spec.
+        pytest.param(
+            "child_missing",
+            "no_harness",
+            {"status": 200, "error": None, "instructions": "Root instructions."},
+            id="child_missing-no_harness-parent",
+        ),
+        pytest.param(
+            "child_missing",
+            "known_harness",
+            # same shape as child_present — caller text still composes additively.
+            {
+                "status": 200,
+                "instructions": (f"Root instructions.\n\n{_CONTRACT_CALLER_INSTRUCTIONS}"),
+            },
+            id="child_missing-known_harness-parent",
+        ),
+        pytest.param(
+            "child_missing",
+            "background",
+            {"status": 202, "terminal_status": "idle", "instructions": "Root instructions."},
+            id="child_missing-background-parent",
+        ),
+        # ── Resolver raises: same three-way split, different trigger.
+        pytest.param(
+            "resolver_raises",
+            "no_harness",
+            {"status": 503, "error": "spec_resolver_failed"},
+            id="resolver_raises-no_harness-503",
+        ),
+        pytest.param(
+            "resolver_raises",
+            "known_harness",
+            {"status": 200, "instructions": _CONTRACT_CALLER_INSTRUCTIONS},
+            id="resolver_raises-known_harness-degrades",
+        ),
+        pytest.param(
+            "resolver_raises",
+            "background",
+            {"status": 202, "terminal_status": "failed"},
+            id="resolver_raises-background-async-failure",
+        ),
+        # resolver returns None: treated the same as resolver_raises after #5505.
+        pytest.param(
+            "resolver_none",
+            "no_harness",
+            {"status": 503, "error": "spec_resolver_failed"},
+            id="resolver_none-no_harness-503",
+        ),
+        pytest.param(
+            "resolver_none",
+            "known_harness",
+            {"status": 200, "instructions": _CONTRACT_CALLER_INSTRUCTIONS},
+            id="resolver_none-known_harness-continues-unknown-spec",
+        ),
+        pytest.param(
+            "resolver_none",
+            "background",
+            # resolver called twice: once in bg setup, once in _resolve_harness_config.
+            {
+                "status": 202,
+                "terminal_status": "failed",
+                "resolver_calls": 2,
+            },
+            id="resolver_none-background",
+        ),
+        # cache hit: resolver_calls == 1 is the load-bearing assertion.
+        pytest.param(
+            "cache_holds_child",
+            "background",
+            {
+                "terminal_status": "idle",
+                "instructions": "Worker instructions.",
+                "resolver_calls": 1,
+            },
+            id="cache_holds_child-background-shortcut",
+        ),
+        pytest.param(
+            "cache_holds_child",
+            "known_harness",
+            {
+                "status": 200,
+                "instructions": (f"Worker instructions.\n\n{_CONTRACT_CALLER_INSTRUCTIONS}"),
+                "resolver_calls": 1,
+            },
+            id="cache_holds_child-known_harness-shortcut",
+        ),
+        # no_harness path resolves a second time even with a cached child.
+        pytest.param(
+            "cache_holds_child",
+            "no_harness",
+            {"status": 200, "instructions": "Worker instructions.", "resolver_calls": 2},
+            id="cache_holds_child-no_harness-resolves-again",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_cross_path_resolution_contract(
+    scenario: str,
+    path: str,
+    expected: dict[str, Any],
+) -> None:
+    """Pin the resolution behaviour matrix across all three dispatch paths.
+
+    Reading the table: ``child_present`` and ``child_missing`` are the
+    scenarios where all three paths agree, and for ``child_missing`` the
+    agreement is load-bearing — an unresolvable ``sub_agent_name`` gets one
+    answer (warn, then the parent's spec) no matter which transport asked.
+    The remaining scenarios still record transport-driven differences that
+    are intended: a synchronous 503, graceful degradation preserving the
+    caller's own instructions, and an asynchronous terminal ``failed``
+    against a 202 that has already gone out. Those differences come from
+    what each transport can report, not from differing answers.
+
+    If you change one path and a row here starts failing, that is the point:
+    decide whether the contract moved, do not quietly re-align the table.
+
+    :param scenario: Which resolution outcome the fake resolver produces.
+    :param path: Which dispatch path adapter drives the turn.
+    :param expected: Subset of the adapter's normalized result to assert.
+    """
+    conv = f"conv_contract_{scenario}_{path}"
+    calls: list[str] = []
+    recording = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording)),
+        spec_resolver=_contract_resolver_for(scenario, calls),
+        server_client=_ContractSnapshotClient(conv),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        if scenario == "cache_holds_child":
+            # Session-create resolves "worker" and caches the CHILD spec
+            # directly, which is the common real shape. The dispatch below
+            # must then reuse it rather than resolving again.
+            created = await http.post(
+                "/v1/sessions",
+                json={
+                    "session_id": conv,
+                    "agent_id": "ag_contract_root",
+                    "sub_agent_name": "worker",
+                },
+            )
+            assert created.status_code == 201, created.text
+            assert len(calls) == 1, f"session-create should resolve once, got {calls!r}"
+        result = await _CONTRACT_ADAPTERS[path](http, conv, recording)
+        if path == "background" and result.get("terminal_status") is None:
+            # Background adapter needs the app's queue to drain terminal status.
+            statuses = await _drain_published_statuses(
+                app.state.session_event_queues, conv, until="failed", timeout=2.0
+            )
+            result["terminal_status"] = statuses[-1] if statuses else None
+    result["resolver_calls"] = len(calls)
+
+    for key, want in expected.items():
+        assert result.get(key) == want, (
+            f"cross-path contract drift: scenario={scenario!r} path={path!r} "
+            f"key={key!r} expected {want!r}, got {result.get(key)!r}. "
+            f"Full observed result: {result!r}. If this change is intended, "
+            f"update the matrix deliberately — where paths differ, they differ "
+            f"because their transports report differently, not because they "
+            f"answer the same question differently."
+        )

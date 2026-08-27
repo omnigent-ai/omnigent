@@ -17,6 +17,7 @@ from pathlib import Path
 
 import click
 
+from omnigent.cli_invocation import cli_invocation
 from omnigent.inner import ui
 from omnigent.onboarding.sandboxes import (
     SandboxHostLauncher,
@@ -220,8 +221,8 @@ def sandbox() -> None:
     help=(
         "Server URL the sandbox will register with. Determines the "
         "Databricks workspace the sandbox is created in (same "
-        "inference as `omnigent login`), and the bootstrap finishes "
-        "by logging the sandbox in to it (`omnigent login` inside the "
+        f"inference as `{cli_invocation()} login`), and the bootstrap finishes "
+        f"by logging the sandbox in to it (`{cli_invocation()} login` inside the "
         "sandbox — one browser step)."
     ),
 )
@@ -314,7 +315,7 @@ def sandbox_create(
     required=True,
     help=(
         "Server URL to log the sandbox in to. The in-sandbox "
-        "`omnigent login` infers the fronting Databricks workspace "
+        f"`{cli_invocation()} login` infers the fronting Databricks workspace "
         "from it automatically."
     ),
 )

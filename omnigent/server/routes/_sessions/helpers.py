@@ -124,6 +124,8 @@ from omnigent.server.routes._session_create_validation import (
 # ``__all__`` and the facade's explicit re-exports, preserving its real runtime
 # bindings so a facade-level monkeypatch is honoured in this module too.
 from omnigent.server.routes._sessions.common import (  # noqa: F401
+    _ACP_SUBAGENT_DESCRIPTION_LABEL_KEY,
+    _ACP_SUBAGENT_ID_LABEL_KEY,
     _ANTIGRAVITY_NATIVE_HARNESS,
     _ANTIGRAVITY_NATIVE_SUBAGENT_CASCADE_ID_LABEL_KEY,
     _ANTIGRAVITY_NATIVE_SUBAGENT_DISPLAY_FALLBACK,
@@ -1429,6 +1431,7 @@ def _publish_elicitation_resolved_to_ancestors(
     conv_store: ConversationStore,
     session_id: str,
     elicitation_id: str,
+    action: str | None = None,
 ) -> None:
     """
     Mirror an elicitation-resolved event into each ancestor stream.
@@ -1438,9 +1441,11 @@ def _publish_elicitation_resolved_to_ancestors(
         e.g. ``"conv_child123"``.
     :param elicitation_id: Elicitation correlation id, e.g.
         ``"elicit_abc123"``.
+    :param action: Optional MCP verdict carried through to the
+        mirrors; see :func:`_publish_elicitation_resolved`.
     """
     for ancestor_id in _ancestor_session_ids(conv_store, session_id):
-        _publish_elicitation_resolved(ancestor_id, elicitation_id)
+        _publish_elicitation_resolved(ancestor_id, elicitation_id, action=action)
 
 
 def _descendant_sessions(
@@ -2784,7 +2789,14 @@ def _publish_external_output_reasoning_delta(session_id: str, body: SessionEvent
     session_stream.publish(session_id, event.model_dump(exclude_none=True))
 
 
-def _publish_elicitation_resolved(session_id: str, elicitation_id: str) -> None:
+_VALID_ELICITATION_ACTIONS: tuple[str, ...] = ("accept", "decline", "cancel")
+
+
+def _publish_elicitation_resolved(
+    session_id: str,
+    elicitation_id: str,
+    action: str | None = None,
+) -> None:
     """
     Universal "approval done" signal — single publish drives both
     sidebar (via :func:`pending_elicitations.record_publish` decrement)
@@ -2793,14 +2805,20 @@ def _publish_elicitation_resolved(session_id: str, elicitation_id: str) -> None:
 
     :param session_id: Session id, e.g. ``"conv_abc123"``.
     :param elicitation_id: Correlation id, e.g. ``"elicit_abc123"``.
+    :param action: Optional MCP verdict (``"accept"``/``"decline"``/
+        ``"cancel"``) so downstream consumers — notably the
+        sub-agent block notifier's parent resolution notice — can
+        state how the gate was answered instead of leaving agents to
+        guess. Omitted from the payload when unknown or not one of
+        the three MCP actions.
     """
-    session_stream.publish(
-        session_id,
-        {
-            "type": "response.elicitation_resolved",
-            "elicitation_id": elicitation_id,
-        },
-    )
+    payload: dict[str, Any] = {
+        "type": "response.elicitation_resolved",
+        "elicitation_id": elicitation_id,
+    }
+    if action in _VALID_ELICITATION_ACTIONS:
+        payload["action"] = action
+    session_stream.publish(session_id, payload)
 
 
 async def _forward_approval_to_runner(
@@ -3015,6 +3033,138 @@ def _find_claude_native_subagent_child(
         if not page.has_more or page.last_id is None:
             return None
         after = page.last_id
+
+
+def _find_acp_subagent_child(
+    conversation_store: ConversationStore,
+    parent_id: str,
+    subagent_id: str,
+) -> Conversation | None:
+    """
+    Look up an existing ACP sub-agent child by its harness-side id.
+
+    Mirrors :func:`_find_claude_native_subagent_child` (including its
+    pagination, so a parent with many sub-agents still finds an older row)
+    but keys on :data:`_ACP_SUBAGENT_ID_LABEL_KEY`.
+
+    :param conversation_store: Store to query.
+    :param parent_id: Parent conversation id, e.g. ``"conv_parent987"``.
+    :param subagent_id: The agent's own sub-agent id, e.g. ``"a0ac9364"``.
+    :returns: The matching child :class:`Conversation`, or ``None``.
+    """
+    after: str | None = None
+    while True:
+        page = conversation_store.list_conversations(
+            kind="sub_agent",
+            parent_conversation_id=parent_id,
+            limit=100,
+            after=after,
+        )
+        for child in page.data:
+            if child.labels.get(_ACP_SUBAGENT_ID_LABEL_KEY) == subagent_id:
+                return child
+        if not page.has_more or page.last_id is None:
+            return None
+        after = page.last_id
+
+
+async def _persist_external_acp_subagent_start(
+    parent_id: str,
+    parent_conv: Conversation,
+    body: SessionEventInput,
+    conversation_store: ConversationStore,
+) -> str:
+    """
+    Mint a child :class:`Conversation` for an ACP agent's sub-agent.
+
+    The ACP counterpart of :func:`_persist_external_subagent_start`. An ACP
+    agent (e.g. Devin) runs its sub-agents inside its own single session, so the
+    child is a display row: it inherits the parent's ``agent_id`` and, crucially,
+    carries **no** ``omnigent.wrapper`` value. That absence is load-bearing — a
+    native subagent wrapper value makes the UI label the child with that vendor's
+    name (a Devin sub-agent minted through the claude path renders as "Claude
+    Code"), whereas with none the child's harness resolves through
+    :func:`_resolve_harness_impl` to the parent's (e.g. ``devin``) and the UI
+    labels it from the harness catalog.
+
+    Idempotent: a redelivery with the same ``subagent_id`` returns the existing
+    child id, with a title-collision recovery path matching the native helpers.
+
+    :param parent_id: Parent conversation id, e.g. ``"conv_parent987"``.
+    :param parent_conv: Pre-fetched parent row; its ``agent_id`` / ``runner_id``
+        are copied onto the child.
+    :param body: The POST event body. Required ``data`` keys: ``subagent_id``
+        (the agent's own id) and ``title`` (the row label). Optional:
+        ``description`` (the delegated task).
+    :param conversation_store: Store used to read existing children and create
+        the new row.
+    :returns: The child conversation id, e.g. ``"conv_child456"``.
+    :raises OmnigentError: 400 when a required key is missing or the parent has
+        no ``agent_id``.
+    """
+    subagent_id = body.data.get("subagent_id")
+    title_raw = body.data.get("title")
+    description = body.data.get("description") or ""
+    if not isinstance(subagent_id, str) or not subagent_id:
+        raise OmnigentError(
+            "external_acp_subagent_start requires non-empty data.subagent_id",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if not isinstance(title_raw, str) or not title_raw:
+        raise OmnigentError(
+            "external_acp_subagent_start requires non-empty data.title",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if not isinstance(description, str):
+        raise OmnigentError(
+            "external_acp_subagent_start data.description must be a string",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if parent_conv.agent_id is None:
+        raise OmnigentError(
+            f"parent session {parent_id!r} has no agent_id; cannot create an ACP sub-agent child",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+    existing = await asyncio.to_thread(
+        _find_acp_subagent_child, conversation_store, parent_id, subagent_id
+    )
+    if existing is not None:
+        return existing.id
+
+    labels = {
+        _ACP_SUBAGENT_ID_LABEL_KEY: subagent_id,
+        _ACP_SUBAGENT_DESCRIPTION_LABEL_KEY: description,
+    }
+    # ``(parent_conversation_id, title)`` is unique, and an agent can give two
+    # parallel sub-agents the same label, so the stable id disambiguates. The
+    # rail hides the post-colon half, so the user still reads just the label.
+    title = f"{title_raw}:{subagent_id}"
+    try:
+        child = await asyncio.to_thread(
+            conversation_store.create_conversation,
+            kind="sub_agent",
+            title=title,
+            parent_conversation_id=parent_id,
+            agent_id=parent_conv.agent_id,
+            runner_id=parent_conv.runner_id,
+            sub_agent_name=title_raw,
+        )
+    except NameAlreadyExistsError:
+        # The unique index fired but the label lookup missed — a concurrent POST
+        # won the insert, or an earlier one died before ``set_labels``. Adopt the
+        # row and re-stamp, mirroring the native helpers' recovery.
+        adopted = await asyncio.to_thread(
+            _find_subagent_child_by_title, conversation_store, parent_id, title
+        )
+        if adopted is None:
+            raise
+        await asyncio.to_thread(conversation_store.set_labels, adopted.id, labels)
+        _publish_session_created(parent_id, adopted.id, parent_conv.agent_id)
+        return adopted.id
+    await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
+    _publish_session_created(parent_id, child.id, parent_conv.agent_id)
+    return child.id
 
 
 def _find_subagent_child_by_title(
@@ -8007,6 +8157,8 @@ async def _remove_session_worktree_best_effort(
     delete_branch: bool,
     request: Request,
     reason: str,
+    conversation_store: ConversationStore | None = None,
+    exclude_conversation_id: str | None = None,
 ) -> None:
     """
     Best-effort removal of a session's git worktree.
@@ -8026,12 +8178,21 @@ async def _remove_session_worktree_best_effort(
     :param request: FastAPI request carrying the host registry.
     :param reason: Short label for log lines, e.g.
         ``"create-rollback"`` or ``"session-delete"``.
+    :param conversation_store: Store used to check whether another live
+        session shares this directory. ``None`` skips the check — correct
+        for create-rollback, whose worktree was made moments ago in the
+        same request and cannot be referenced by anything else.
+    :param exclude_conversation_id: The conversation whose delete triggered
+        this removal, excluded from that check. Required with
+        *conversation_store*.
     """
     from omnigent.server.routes._host_worktree import (
         WorktreeProxyError,
         remove_worktree_on_host,
     )
 
+    # Host reachability first: both checks below end in "skip", and this one
+    # is an in-memory lookup, so an unreachable host costs no DB work.
     host_registry = getattr(request.app.state, "host_registry", None)
     if host_registry is None:
         return
@@ -8044,6 +8205,26 @@ async def _remove_session_worktree_best_effort(
             host_id,
         )
         return
+
+    # A fork reusing the source's directory, or several sessions attached to
+    # one existing worktree, all run in the same cwd. Removing it under them
+    # leaves their runners on a deleted directory, so leave a shared worktree
+    # alone and let the last session out clean it up. Only a skip is logged;
+    # the caller still deletes its own row.
+    if conversation_store is not None and exclude_conversation_id is not None:
+        shared = await asyncio.to_thread(
+            conversation_store.has_other_live_session_in_workspace,
+            host_id=host_id,
+            workspace=worktree_path,
+            exclude_conversation_id=exclude_conversation_id,
+        )
+        if shared:
+            _logger.info(
+                "Keeping worktree %s (%s): another live session still runs there",
+                worktree_path,
+                reason,
+            )
+            return
     try:
         await remove_worktree_on_host(
             host_registry=host_registry,
@@ -8117,20 +8298,21 @@ def _require_declared_subagent(
     """
     Reject a ``sub_agent_name`` the parent's spec does not declare.
 
-    ``POST /v1/sessions`` persists ``sub_agent_name`` verbatim, and every
-    downstream site that swaps in the resolved child spec is guarded by
-    ``if ... is not None`` with no ``else`` — so a name that resolves to
-    nothing leaves the parent's spec, workdir, harness and instructions in
-    place and the child silently boots as a full clone of the parent
-    (runaway recursion for an orchestrator). This gate fails the create
-    loud instead, mirroring normal dispatch (``tool_dispatch`` rejects an
-    undeclared ``agent``) and the ``AGENTSPEC.md`` contract that unlisted
-    names are rejected.
+    ``POST /v1/sessions`` persists ``sub_agent_name`` verbatim, and no
+    downstream spec-swap site rejects an unresolvable one: each warns and
+    runs the session against the PARENT spec instead. An undeclared name
+    would therefore be stored once and answered by the parent for the
+    session's whole life, with a warning as the only sign. This gate rejects
+    it up front, before any row is persisted, mirroring normal dispatch
+    (``tool_dispatch`` rejects an undeclared ``agent``) and the
+    ``AGENTSPEC.md`` contract that unlisted names are rejected.
 
-    Only rejects when the bundle loads AND the name is positively absent:
-    a load failure or absent cache cannot prove the negative, so it is
-    left to fail-loud downstream rather than blocking a create we cannot
-    adjudicate here.
+    It narrows, but does not bound, what can reach the downstream fallback.
+    The check runs only when the bundle LOADS and the name is positively
+    absent: with no agent cache, or on any load failure, it returns without
+    adjudicating, so a never-declared name still reaches a swap site by
+    either route. What the gate guarantees is one direction only — a name
+    this check REJECTED never gets persisted.
 
     :param agent: The parent agent row whose bundle declares the
         sub-agents.
@@ -8150,8 +8332,8 @@ def _require_declared_subagent(
         ).spec
     except Exception:  # noqa: BLE001
         # Can't load the bundle -> can't prove the name is undeclared.
-        # Leave it to the runner's fail-loud resolution rather than
-        # rejecting a create we cannot adjudicate.
+        # Leave it to the runner, which warns and runs the session on the
+        # parent spec, rather than rejecting a create we cannot adjudicate.
         return
     if _find_spec_by_name(parent_spec, sub_agent_name) is None:
         raise OmnigentError(

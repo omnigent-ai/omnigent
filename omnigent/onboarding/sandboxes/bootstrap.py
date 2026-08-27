@@ -43,6 +43,8 @@ from urllib.parse import parse_qs, urlparse
 import click
 import httpx
 
+from omnigent.cli_invocation import cli_invocation
+
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
@@ -569,7 +571,7 @@ def _complete_browser_login(
         returncode = login.wait()
         if returncode != 0:
             raise click.ClickException(
-                f"`omnigent login` inside sandbox '{sandbox_id}' exited "
+                f"`{cli_invocation()} login` inside sandbox '{sandbox_id}' exited "
                 f"with code {returncode} before printing a verification "
                 "URL. Run it inside the sandbox manually to debug."
             )
@@ -590,7 +592,8 @@ def _complete_browser_login(
         returncode = login.wait()
         if returncode != 0:
             raise click.ClickException(
-                f"`omnigent login` inside sandbox '{sandbox_id}' exited with code {returncode}."
+                f"`{cli_invocation()} login` inside sandbox '{sandbox_id}' "
+                f"exited with code {returncode}."
             )
 
 
@@ -679,11 +682,11 @@ def connect_sandbox_host(
     # The executed command keeps the wire URL — it must work verbatim in-sandbox.
     if host_name is not None:
         set_sandbox_host_name(launcher, sandbox_id, host_name)
-    click.echo("  → running `omnigent host` in the sandbox (Ctrl-C to detach)")
+    click.echo(f"  → running `{cli_invocation()} host` in the sandbox (Ctrl-C to detach)")
     returncode = launcher.exec_foreground(sandbox_id, f"omnigent host --server {server_url}")
     if returncode != 0:
         raise click.ClickException(
-            f"`omnigent host` on sandbox '{sandbox_id}' exited with code {returncode}."
+            f"`{cli_invocation()} host` on sandbox '{sandbox_id}' exited with code {returncode}."
         )
 
 

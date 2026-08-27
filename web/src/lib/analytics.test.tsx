@@ -10,6 +10,7 @@ import {
   useOmnigentAnalytics,
   useOmnigentPageView,
 } from "@/lib/analytics";
+import { startTimedInteraction } from "@/lib/analyticsEmit";
 
 afterEach(() => {
   // Reset the module-singleton host config between tests. The empty-config
@@ -85,6 +86,86 @@ describe("emitInteractionPhase", () => {
       status: "success",
       durationMs: 1234,
     });
+  });
+});
+
+describe("startTimedInteraction", () => {
+  it("emits start immediately, then complete(success) with duration on complete()", () => {
+    const analytics = vi.fn();
+    setOmnigentHostConfig({ analytics });
+
+    const interaction = startTimedInteraction("get_session", "sess_1");
+    expect(analytics).toHaveBeenCalledExactlyOnceWith({
+      type: "interaction_phase",
+      interactionId: "sess_1",
+      interactionKind: "get_session",
+      phase: "start",
+    });
+
+    interaction.complete();
+    expect(analytics).toHaveBeenLastCalledWith({
+      type: "interaction_phase",
+      interactionId: "sess_1",
+      interactionKind: "get_session",
+      phase: "complete",
+      status: "success",
+      durationMs: expect.any(Number),
+    });
+  });
+
+  it("fail() completes with a failure status", () => {
+    const analytics = vi.fn();
+    setOmnigentHostConfig({ analytics });
+
+    startTimedInteraction("create_session", "sess_2").fail();
+
+    expect(analytics).toHaveBeenLastCalledWith({
+      type: "interaction_phase",
+      interactionId: "sess_2",
+      interactionKind: "create_session",
+      phase: "complete",
+      status: "failure",
+      durationMs: expect.any(Number),
+    });
+  });
+
+  it("is idempotent — only the first settle emits a complete", () => {
+    const analytics = vi.fn();
+    setOmnigentHostConfig({ analytics });
+
+    const interaction = startTimedInteraction("list_sessions", "l1");
+    interaction.complete();
+    interaction.fail(); // ignored
+    interaction.complete(); // ignored
+
+    // Exactly one start + one complete.
+    expect(analytics).toHaveBeenCalledTimes(2);
+    expect(analytics).toHaveBeenLastCalledWith(
+      expect.objectContaining({ phase: "complete", status: "success" }),
+    );
+  });
+
+  it("generates one correlation id shared by start and complete when none is given", () => {
+    const analytics = vi.fn();
+    setOmnigentHostConfig({ analytics });
+
+    startTimedInteraction("list_sessions").complete();
+
+    const phases = analytics.mock.calls.map(
+      (c) => c[0] as { interactionId: string; phase: string },
+    );
+    expect(phases[0]?.interactionId).toBe(phases[1]?.interactionId);
+    expect(phases[0]?.interactionId).toEqual(expect.any(String));
+  });
+
+  it("never throws even when the host sink throws (telemetry can't break the caller)", () => {
+    setOmnigentHostConfig({
+      analytics: () => {
+        throw new Error("host sink blew up");
+      },
+    });
+
+    expect(() => startTimedInteraction("get_session", "s").complete()).not.toThrow();
   });
 });
 

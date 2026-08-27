@@ -1622,6 +1622,24 @@
       "ElicitationResolvedEvent": {
         "description": "Signal that a previously-published elicitation is no longer\noutstanding, even though no UI `approval` verdict was\ndelivered through `POST /v1/sessions/{id}/events`.\n\nEmitted by the runner when its own `_pending_approvals`\nFuture is popped without a verdict (the runner's wait timed\nout, the turn was cancelled, the harness exited) so the AP\nserver's `omnigent.runtime.pending_elicitations`\nindex can decrement the sidebar badge in lockstep with the\nunderlying awaiter's lifecycle. Without this signal, the AP\nserver has no way to learn that the prompt is dead and the\nbadge stays stuck.\n\nIdempotent on the consumer side: the Omnigent server's index\ndecrement is a no-op when the id isn't tracked, so the\nrunner can fire-and-forget on every Future cleanup.",
         "properties": {
+          "action": {
+            "anyOf": [
+              {
+                "enum": [
+                  "accept",
+                  "decline",
+                  "cancel"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional MCP verdict recorded when the resolution carried a human decision (`\"accept\"` / `\"decline\"` / `\"cancel\"`). `None` for resolutions without a verdict \u2014 timeout, severed wait, or a runner that predates verdict carriage \u2014 so consumers can say \"no verdict was recorded\" rather than guessing one.",
+            "title": "Action"
+          },
           "elicitation_id": {
             "description": "Correlation id of the elicitation being cleared, e.g. `\"elicit_abc123\"`. Must match the id of a prior `ElicitationRequestEvent`.",
             "title": "Elicitation Id",
@@ -2233,6 +2251,18 @@
             "title": "Source",
             "type": "string"
           },
+          "title": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
           "workspace": {
             "anyOf": [
               {
@@ -2277,6 +2307,31 @@
           "item_count"
         ],
         "title": "ImportSessionResponse",
+        "type": "object"
+      },
+      "ImportedSessionRef": {
+        "description": "One freshly imported session: its new id plus display title.\n\n`title` is `None` when the session has no native title and no first user\nmessage to synthesize from; the UI falls back to a placeholder.",
+        "properties": {
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "title": "ImportedSessionRef",
         "type": "object"
       },
       "InProgressEvent": {
@@ -2390,6 +2445,81 @@
           "workspace"
         ],
         "title": "LaunchRunnerRequest",
+        "type": "object"
+      },
+      "LocalImportRequest": {
+        "description": "Request to import the caller's recent local harness sessions from a host.\n\nUnlike `/imports` (the CLI posts already-normalized items), the server\nasks the chosen host to read + normalize its own transcripts over the\ntunnel \u2014 the transcripts live on the caller's machine, not the server.",
+        "properties": {
+          "host_id": {
+            "title": "Host Id",
+            "type": "string"
+          },
+          "limit": {
+            "default": 10,
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "enum": [
+                  "claude",
+                  "codex",
+                  "kimi",
+                  "kiro",
+                  "opencode",
+                  "pi",
+                  "qwen"
+                ],
+                "type": "string"
+              },
+              {
+                "const": "all",
+                "type": "string"
+              }
+            ],
+            "title": "Source"
+          }
+        },
+        "required": [
+          "host_id",
+          "source"
+        ],
+        "title": "LocalImportRequest",
+        "type": "object"
+      },
+      "LocalImportResponse": {
+        "description": "Batch result for `POST /v1/imports/local`.",
+        "properties": {
+          "already_imported": {
+            "title": "Already Imported",
+            "type": "integer"
+          },
+          "failed": {
+            "title": "Failed",
+            "type": "integer"
+          },
+          "imported": {
+            "title": "Imported",
+            "type": "integer"
+          },
+          "sessions": {
+            "items": {
+              "$ref": "#/components/schemas/ImportedSessionRef"
+            },
+            "title": "Sessions",
+            "type": "array"
+          }
+        },
+        "required": [
+          "imported",
+          "already_imported",
+          "failed",
+          "sessions"
+        ],
+        "title": "LocalImportResponse",
         "type": "object"
       },
       "MCPServerSummary": {
@@ -3421,7 +3551,7 @@
               }
             ],
             "default": null,
-            "description": "Per-request system instructions override, or `None`.",
+            "description": "Per-request system instructions composed additively with the agent's own, or `None`.",
             "title": "Instructions"
           },
           "model": {
@@ -8730,6 +8860,48 @@
           }
         },
         "summary": "Import Session",
+        "tags": [
+          "imports"
+        ]
+      }
+    },
+    "/v1/imports/local": {
+      "post": {
+        "description": "Import the caller's recent local transcripts from a chosen host.\n\nThe transcripts live on the caller's machine, so the read happens on\nthe connected host over its tunnel \u2014 the server can't see them. The\nhost enumerates + normalizes the most recent sessions; the server\nimports those not already imported. Drives the web \"Import sessions\"\nbutton.\n\nNot atomic: each session is persisted as its frame arrives. If the host\ndrops mid-stream this raises after the sessions read so far are already\ncommitted; a retry is idempotent (they come back as already-imported).",
+        "operationId": "import_local_sessions_v1_imports_local_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LocalImportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LocalImportResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Import Local Sessions",
         "tags": [
           "imports"
         ]

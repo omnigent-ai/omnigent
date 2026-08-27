@@ -950,8 +950,11 @@ class CreateResponseRequest(BaseModel):
         background and the caller may poll for results.
     :param store: Must be ``True`` (persisted responses). The
         server rejects ``False``.
-    :param instructions: Per-request system instructions that
-        override the agent's default instructions.
+    :param instructions: Per-request system instructions. Composed
+        ADDITIVELY with the agent's own instructions rather than
+        replacing them — appended after the agent's text, matching how
+        ``omnigent/runtime/prompt.py`` assembles the system prompt and
+        what ``docs/AGENT_YAML_SPEC.md`` documents.
     :param previous_response_id: ID of the prior response in the
         conversation thread, e.g. ``"resp_abc123"``. Enables
         multi-turn continuation and steering.
@@ -1080,8 +1083,8 @@ class ResponseObject(BaseModel):
     :param previous_response_id: ID of the prior response in
         the conversation thread, or ``None`` for the first turn.
     :param conversation: Reference to the owning conversation.
-    :param instructions: Per-request system instructions
-        override, or ``None``.
+    :param instructions: Per-request system instructions composed
+        additively with the agent's own, or ``None``.
     :param reasoning: Reasoning configuration,
         e.g. ``{"effort": "medium"}``.
     :param error: Error details if the response failed.
@@ -3889,10 +3892,17 @@ class ElicitationResolvedEvent(_SSEEventBase):
     :param elicitation_id: Correlation id of the elicitation
         being cleared, e.g. ``"elicit_abc123"``. Must match the
         id of a prior :class:`ElicitationRequestEvent`.
+    :param action: Optional MCP verdict recorded when the
+        resolution carried a human decision (``"accept"`` /
+        ``"decline"`` / ``"cancel"``). ``None`` for resolutions
+        without a verdict — timeout, severed wait, or a runner
+        that predates verdict carriage — so consumers can say "no
+        verdict was recorded" rather than guessing one.
     """
 
     type: Literal["response.elicitation_resolved"]
     elicitation_id: str
+    action: Literal["accept", "decline", "cancel"] | None = None
 
 
 class PolicyDeniedEvent(_SSEEventBase):
@@ -4533,7 +4543,86 @@ class PolicyEvaluationRequestEvent(_SSEEventBase):
     data: dict[str, Any]
 
 
-HarnessStreamEvent = ServerStreamEvent | InjectionConsumedEvent | PolicyEvaluationRequestEvent
+class SubagentStartedEvent(_SSEEventBase):
+    """
+    Runner-internal marker: the harness agent spawned a sub-agent.
+
+    ACP agents that delegate report it in their own dialect (see
+    :mod:`omnigent.inner.acp_subagents`); the executor normalizes that to a
+    :class:`~omnigent.inner.executor.SubAgentStarted`, which the adapter emits as
+    this event. The runner intercepts it in ``proxy_stream`` and POSTs
+    ``external_subagent_start`` to the Omnigent server, minting a child session so
+    the web "Subagents" panel lists one row per child. **Never** relayed to
+    external clients — the client learns of the child via ``session.created``.
+
+    :param type: Always ``"subagent.started"``.
+    :param child_key: Stable, per-turn-unique id for the sub-agent — the
+        idempotency key when the child is minted and the correlation key for the
+        later :class:`SubagentCompletedEvent`.
+    :param title: Short human label for the row, e.g. ``"mathutils"``.
+    :param task: The instruction the sub-agent was given.
+    """
+
+    type: Literal["subagent.started"]
+    child_key: str
+    title: str
+    task: str = ""
+
+
+class SubagentCompletedEvent(_SSEEventBase):
+    """
+    Runner-internal marker: a previously-announced sub-agent finished.
+
+    Emitted by the adapter from a
+    :class:`~omnigent.inner.executor.SubAgentCompleted`. The runner records the
+    outcome on the child session minted for the matching ``child_key`` (status +
+    the summary as its output). **Never** relayed to external clients.
+
+    :param type: Always ``"subagent.completed"``.
+    :param child_key: Matches the :attr:`SubagentStartedEvent.child_key`.
+    :param ok: Whether the sub-agent reported success.
+    :param summary: The sub-agent's closing summary.
+    """
+
+    type: Literal["subagent.completed"]
+    child_key: str
+    ok: bool = True
+    summary: str = ""
+
+
+class SubagentToolCallEvent(_SSEEventBase):
+    """
+    Runner-internal marker: an ACP sub-agent ran a tool call.
+
+    Emitted by the adapter from a
+    :class:`~omnigent.inner.executor.SubAgentToolCall` — a call the sub-agent
+    made inside its delegated work, which belongs in the child's transcript, not
+    the parent stream. The runner appends it as a ``function_call`` conversation
+    item on the child session minted for the matching ``child_key``. **Never**
+    relayed to external clients.
+
+    :param type: Always ``"subagent.tool_call"``.
+    :param child_key: Matches the :attr:`SubagentStartedEvent.child_key`.
+    :param call_id: The tool call's id, used as the child item's ``call_id``.
+    :param name: Human tool label for the card, e.g. ``"Wrote mathutils.py"``.
+    :param arguments: JSON-encoded arguments string (the tool's raw input).
+    """
+
+    type: Literal["subagent.tool_call"]
+    child_key: str
+    call_id: str
+    name: str
+    arguments: str = ""
+
+
+HarnessStreamEvent = (
+    ServerStreamEvent
+    | InjectionConsumedEvent
+    | PolicyEvaluationRequestEvent
+    | SubagentStartedEvent
+    | SubagentCompletedEvent
+    | SubagentToolCallEvent
+)
 
 
 # ── Projects ──────────────────────────────────────────────────────

@@ -474,6 +474,20 @@ describe("ChatHeader — floating mobile controls", () => {
     expect(toggle).toHaveClass("size-10");
   });
 
+  it("insets the pill's leading edge for the Chat/Terminal track", () => {
+    // The track paints its own background to its edge, so with the pill's
+    // zero padding it sat flush against the border while an icon-only
+    // neighbour cleared it by the slack in its 40px box. The inset is
+    // conditional: a lone kebab must stay the 40px circle asserted above.
+    isMobileMock.mockReturnValue(true);
+    renderHeaderWithSession(makeTerminalFirstCtx());
+
+    const cluster = screen.getByTestId("view-mode-toggle").parentElement;
+    expect(cluster).toHaveClass("max-md:has-data-[slot=view-mode-toggle]:pl-1.5");
+    // The guard keys off the track's own data-slot, so it has to be present.
+    expect(screen.getByTestId("view-mode-toggle")).toHaveAttribute("data-slot", "view-mode-toggle");
+  });
+
   it("rounds the kebab's own background so no square shows inside the pill", () => {
     // The ghost button paints `aria-expanded:bg-muted` at its rounded-lg
     // radius, which showed as a square behind the round pill once open.

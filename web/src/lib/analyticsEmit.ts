@@ -57,6 +57,63 @@ export function emitInteractionPhase(args: InteractionPhaseArgs): void {
   emitOmnigentAnalytics({ type: "interaction_phase", ...args });
 }
 
+// A random correlation id for a timed interaction that has no natural subject id
+// (creating a session, loading the list). Guarded so a missing `crypto.randomUUID`
+// can never throw into the wrapped operation.
+function newInteractionId(): string {
+  try {
+    if (typeof crypto !== "undefined" && "randomUUID" in crypto) return crypto.randomUUID();
+  } catch {
+    // fall through to the timestamp fallback
+  }
+  return `iid-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/** Handle for an in-flight timed interaction opened by `startTimedInteraction`. */
+export interface TimedInteraction {
+  /**
+   * Report the terminal outcome and elapsed `durationMs` (defaults to
+   * "success"). Idempotent: only the first settle emits, so a double-settle
+   * (e.g. a catch after a partial success) can never double-count.
+   */
+  complete: (status?: OmnigentInteractionStatus) => void;
+  /** Shorthand for `complete("failure")`. */
+  fail: () => void;
+}
+
+/**
+ * Begin a timed interaction: emit its `start` phase now and return a handle
+ * whose `complete()` / `fail()` emits the `complete` phase with the elapsed
+ * `durationMs`. Detached — `start` and the terminal call may live in different
+ * scopes, and the caller keeps control of its own operation (the handle never
+ * wraps or touches it). Emitting never throws (`emitInteractionPhase` no-ops
+ * with no host sink and swallows sink errors). Pass an `interactionId` for a
+ * natural subject (e.g. a session id); omit it for a generated correlation id.
+ *
+ *   const interaction = startTimedInteraction("get_session", sessionId);
+ *   try { await load(); interaction.complete(); } catch (e) { interaction.fail(); throw e; }
+ */
+export function startTimedInteraction(
+  interactionKind: OmnigentInteractionKind,
+  interactionId: string = newInteractionId(),
+): TimedInteraction {
+  const startedAt = Date.now();
+  let settled = false;
+  emitInteractionPhase({ interactionId, interactionKind, phase: "start" });
+  const complete = (status: OmnigentInteractionStatus = "success"): void => {
+    if (settled) return;
+    settled = true;
+    emitInteractionPhase({
+      interactionId,
+      interactionKind,
+      phase: "complete",
+      status,
+      durationMs: Date.now() - startedAt,
+    });
+  };
+  return { complete, fail: () => complete("failure") };
+}
+
 export interface TrackValueChangeOptions {
   /**
    * Set true ONLY when the value is known non-PII (e.g. a selection from a

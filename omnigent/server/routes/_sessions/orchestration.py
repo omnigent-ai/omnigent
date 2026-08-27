@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import math
 import secrets
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -23,6 +24,7 @@ from fastapi import (
 from fastapi.responses import Response
 from pydantic import ValidationError
 
+from omnigent.cli_invocation import cli_invocation
 from omnigent.db.utils import generate_agent_id, generate_task_id
 from omnigent.debug_logging import debug_event
 from omnigent.entities import (
@@ -430,6 +432,9 @@ async def _publish_and_wait_for_harness_elicitation(
     # severed wait instead defers the clear so a hook retry can re-park.
     published_request = False
     settled = False
+    # MCP verdict when a real web verdict settles the wait, so the
+    # finally's resolved fan-out carries it (None = severed / terminal).
+    settled_action: str | None = None
     try:
         tombstone = _consume_pre_resolved_harness_elicitation(session_id, elicitation_id)
         if tombstone is not None:
@@ -494,7 +499,9 @@ async def _publish_and_wait_for_harness_elicitation(
         # honoring a verdict that lands in the same tick as a disconnect.
         if future in done and future.exception() is None:
             settled = True
-            return future.result()
+            verdict = future.result()
+            settled_action = getattr(verdict, "action", None)
+            return verdict
         settled = parked.resolved_elsewhere.is_set()
         return None
     finally:
@@ -514,13 +521,14 @@ async def _publish_and_wait_for_harness_elicitation(
                 conversation_store,
             )
         elif published_request:
-            _publish_elicitation_resolved(session_id, elicitation_id)
+            _publish_elicitation_resolved(session_id, elicitation_id, action=settled_action)
             if conversation_store is not None:
                 await asyncio.to_thread(
                     _publish_elicitation_resolved_to_ancestors,
                     conversation_store,
                     session_id,
                     elicitation_id,
+                    settled_action,
                 )
 
 
@@ -1240,7 +1248,11 @@ def _accumulate_session_usage(
         )
     )
     if llm_model:
-        if isinstance(provider_cost, (int, float)):
+        if (
+            isinstance(provider_cost, (int, float))
+            and math.isfinite(provider_cost)
+            and provider_cost >= 0
+        ):
             cost_delta = float(provider_cost)
             priced = True
         else:
@@ -1783,14 +1795,17 @@ async def _resolve_elicitation(
     # Fan-out for every other subscribed client (other tabs, REPL
     # TUI). Idempotent vs. the runner's own ``wait_for_user_approval``
     # finally / harness hook finally — those also publish for the id.
+    # The verdict rides along so the parent-side resolution notice
+    # states how the gate was answered instead of a bare "resolved".
     if isinstance(elicitation_id, str) and elicitation_id:
-        _publish_elicitation_resolved(session_id, elicitation_id)
+        _publish_elicitation_resolved(session_id, elicitation_id, action=data.get("action"))
         if conversation_store is not None:
             await asyncio.to_thread(
                 _publish_elicitation_resolved_to_ancestors,
                 conversation_store,
                 session_id,
                 elicitation_id,
+                data.get("action"),
             )
     # Runner-side elicitations (policy approvals, scaffold dispatch)
     # resolve when the canonical approval event reaches the runner.
@@ -3986,7 +4001,8 @@ async def _persist_host_launch_failure_turn(
             # the code, but the banner must stay actionable if a
             # third-party host omits it.
             else (
-                "the agent's harness is not configured on the selected host — run `omnigent setup`"
+                f"the agent's harness is not configured on the selected host — "
+                f"run `{cli_invocation()} setup`"
             )
         ),
     )
@@ -6416,6 +6432,7 @@ async def _relay_runner_stream_once(
                                 conversation_store,
                                 session_id,
                                 elicitation_id,
+                                event.get("action"),
                             )
                         continue
                     session_stream.publish(session_id, event)
@@ -7299,7 +7316,7 @@ def _ungatewayed_auto_routing_error(ungatewayed: Sequence[str]) -> str:
         f"{verb} not AI-Gateway-backed, so the workspace router's picks would not be "
         "reachable, and this server has no built-in routing model to fall back on. Pick a "
         "harness directly, configure a server `llm:` block, or point the harness at the "
-        "workspace AI Gateway (`omnigent configure harnesses`)."
+        f"workspace AI Gateway (`{cli_invocation()} configure harnesses`)."
     )
 
 
@@ -7318,7 +7335,7 @@ def _ungatewayed_model_routing_error(harness: str) -> str:
         "picks would not be reachable from the pane, and this server has no built-in routing "
         'model to fall back on. Create the session without cost_control_mode_override="on", '
         "configure a server `llm:` block, or point the harness at the workspace AI Gateway "
-        "(`omnigent configure harnesses`)."
+        f"(`{cli_invocation()} configure harnesses`)."
     )
 
 
@@ -7956,10 +7973,12 @@ async def _create_session_from_existing_agent(
         )
 
     # Reject an undeclared sub-agent before persisting the row. Downstream
-    # spec swaps are all guarded by ``if ... is not None`` with no
-    # ``else``, so a name the parent's spec never declares would leave the
-    # parent spec/workdir/harness/instructions in place and boot the child
-    # as a parent clone. Fail loud here instead.
+    # spec swaps warn and keep the parent on a miss, which is right for a
+    # name that once resolved and has since been renamed or removed — but
+    # for a name the parent's spec NEVER declared it would boot the child as
+    # a parent clone for the session's whole life, off a request that was
+    # wrong when it arrived. Reject it while the caller is still here to be
+    # told, and leave the parent-fallback to the cases it fits.
     if body.sub_agent_name:
         await asyncio.to_thread(
             _require_declared_subagent,
@@ -9406,43 +9425,37 @@ async def _get_session_snapshot(
                         agent.bundle_location,
                         expand_env=agent.session_id is None,
                     )
-                    spec = loaded.spec
+                    resolved_spec: AgentSpec | None = loaded.spec
                     if conv.sub_agent_name:
-                        child_spec = _find_spec_by_name(spec, conv.sub_agent_name)
-                        if child_spec is not None:
-                            spec = child_spec
-                    # Prefer the spec's name over the agent row's: a
-                    # switch-created session-scoped clone is named
-                    # "<builtin> (switch ag_…)" for row disambiguation,
-                    # but clients display agent_name verbatim — the spec
-                    # carries the clean identity (e.g. "claude-native-ui").
-                    if spec.name:
-                        agent_name = spec.name
-                    llm_model = spec.executor.model
+                        _sub_spec = _find_spec_by_name(loaded.spec, conv.sub_agent_name)
+                        if _sub_spec is None:
+                            # Unresolvable sub_agent_name — fall back to parent spec.
+                            _logger.warning(
+                                "Sub-agent %r for session %s did not resolve in the parent "
+                                "spec; snapshot reports the parent's identity. Likely a "
+                                "renamed/removed sub-agent or stale session metadata.",
+                                conv.sub_agent_name,
+                                session_id,
+                            )
+                        else:
+                            resolved_spec = _sub_spec
+                    if resolved_spec is not None:
+                        # Prefer the spec's name over the agent row's: a
+                        # switch-created session-scoped clone is named
+                        # "<builtin> (switch ag_…)" for row disambiguation,
+                        # but clients display agent_name verbatim — the spec
+                        # carries the clean identity (e.g. "claude-native-ui").
+                        if resolved_spec.name:
+                            agent_name = resolved_spec.name
+                        llm_model = resolved_spec.executor.model
 
-                    # Size the context ring against whatever the next turn will
-                    # actually run, using the SAME resolver the runner uses to
-                    # budget compaction. That makes the UI ring and the runner's
-                    # compaction trigger a single source of truth — computed by
-                    # one function — so they can't drift even though they run in
-                    # different processes at different times. (They previously
-                    # each inlined this rule and silently fell out of step;
-                    # sharing the function removes the manual
-                    # sync.) spec.executor.context_window describes only the spec
-                    # model, so an active override bypasses it — the resolver
-                    # makes that decision from the spec model + override.
-                    #
-                    # Offload to a worker thread: an active override (or an
-                    # undeclared window) can trigger a cache-cold provider
-                    # catalog fetch (blocking HTTP / CPU-bound litellm) inside
-                    # the resolver, which would otherwise stall the single-worker
-                    # event loop and serialize every concurrent snapshot.
-                    context_window = await asyncio.to_thread(
-                        resolve_effective_context_window,
-                        spec.executor.context_window,
-                        llm_model,
-                        model_override=conv.model_override,
-                    )
+                        # Offload: may fetch a provider catalog (blocking IO).
+                        context_window = await asyncio.to_thread(
+                            resolve_effective_context_window,
+                            resolved_spec.executor.context_window,
+                            llm_model,
+                            model_override=conv.model_override,
+                        )
         except Exception:  # noqa: BLE001
             pass
     # The harness's own report is the display authority: when a session has

@@ -2040,6 +2040,119 @@ def _result_text(result: CodexToolResult) -> str:
         return str(result)
 
 
+def _codex_builtin_tool_request(
+    item: CodexParams,
+    *,
+    completed: bool = False,
+) -> ToolCallRequest | None:
+    """Translate a structured Codex built-in item into an observed tool request.
+
+    Codex executes these tools itself, so the request is observational: the
+    adapter must display and persist it without dispatching it back to Codex.
+    ``completed`` distinguishes the live start from the durable lifecycle
+    update emitted alongside the result. Malformed items return ``None``.
+
+    :param item: Codex ``commandExecution`` or ``fileChange`` item.
+    :param completed: Whether Codex has completed the item.
+    :returns: A correlated observed request, or ``None`` for an invalid item.
+    """
+
+    call_id = item.get("id")
+    item_type = item.get("type")
+    if not isinstance(call_id, str) or not call_id:
+        return None
+    if item_type == "commandExecution":
+        command = item.get("command")
+        if not isinstance(command, str) or not command:
+            return None
+        args: ToolArgs = {"command": command}
+        cwd = item.get("cwd")
+        if isinstance(cwd, str) and cwd:
+            args["cwd"] = cwd
+        return ToolCallRequest(
+            name="shell",
+            args=args,
+            metadata={
+                "call_id": call_id,
+                "internally_executed": True,
+                "observed_call_completed": completed,
+            },
+        )
+    if item_type == "fileChange":
+        changes = item.get("changes")
+        if not isinstance(changes, list) or not changes:
+            return None
+        paths = [
+            change.get("path")
+            for change in changes
+            if isinstance(change, dict) and isinstance(change.get("path"), str)
+        ]
+        if not paths:
+            return None
+        return ToolCallRequest(
+            name="apply_patch",
+            # Match codex-native: retain every structured change, including
+            # diffs, so consumers can render more than the first changed path.
+            args={"changes": changes},
+            metadata={
+                "call_id": call_id,
+                "internally_executed": True,
+                "observed_call_completed": completed,
+            },
+        )
+    return None
+
+
+def _codex_builtin_tool_completion(item: CodexParams) -> ToolCallComplete | None:
+    """Translate a completed Codex built-in item into a correlated result.
+
+    :param item: Completed Codex ``commandExecution`` or ``fileChange`` item.
+    :returns: The observed result, or ``None`` for an invalid item.
+    """
+
+    request = _codex_builtin_tool_request(item, completed=True)
+    if request is None:
+        return None
+    status = ToolCallStatus.SUCCESS
+    error: str | None = None
+    result = ""
+    if item.get("type") == "commandExecution":
+        output = item.get("aggregatedOutput")
+        result = output if isinstance(output, str) else ""
+        exit_code = item.get("exitCode")
+        if isinstance(exit_code, int) and exit_code != 0:
+            status = ToolCallStatus.ERROR
+            error = f"Command exited with status {exit_code}."
+            suffix = f"[exit code: {exit_code}]"
+            result = f"{result}\n{suffix}" if result else suffix
+    else:
+        changes = item.get("changes")
+        assert isinstance(changes, list)
+        summaries: list[str] = []
+        for change in changes:
+            if not isinstance(change, dict):
+                continue
+            path = change.get("path")
+            kind = change.get("kind")
+            kind_type = kind.get("type") if isinstance(kind, dict) else None
+            if isinstance(path, str):
+                label = kind_type if isinstance(kind_type, str) and kind_type else "change"
+                summaries.append(f"{label} {path}")
+        result = "\n".join(summaries)
+        if item.get("status") in {"failed", "declined"}:
+            status = ToolCallStatus.ERROR
+            error = f"File change ended with status {item['status']}."
+    duration = item.get("durationMs")
+    return ToolCallComplete(
+        name=request.name,
+        status=status,
+        result=result,
+        error=error,
+        duration_ms=float(duration) if isinstance(duration, (int, float)) else 0.0,
+        metadata=request.metadata,
+    )
+
+
 def _dynamic_tool_result_payload(result: CodexToolResult) -> CodexParams:
     classification = classify_tool_result(result)
     return {
@@ -2541,6 +2654,8 @@ class _CodexAppServerSession:
 
         message_buffers: dict[str, str] = {}
         pending_tool_results: dict[str, _PendingToolResult] = {}
+        observed_builtin_tool_ids: set[str] = set()
+        completed_builtin_tool_ids: set[str] = set()
         final_response = ""
         observed_turn_id: str | None = None
 
@@ -2656,6 +2771,20 @@ class _CodexAppServerSession:
                 method: str | None = raw_method if isinstance(raw_method, str) else None
                 params = message.get("params", {})
 
+                if method == "item/started":
+                    if not _event_turn_matches(params):
+                        continue
+                    item = params.get("item", {})
+                    if not isinstance(item, dict):
+                        continue
+                    request = _codex_builtin_tool_request(item)
+                    if request is not None:
+                        call_id = request.metadata["call_id"]
+                        if isinstance(call_id, str) and call_id not in observed_builtin_tool_ids:
+                            observed_builtin_tool_ids.add(call_id)
+                            yield request
+                    continue
+
                 if method == "item/tool/call":
                     if not _event_turn_matches(params):
                         continue
@@ -2746,6 +2875,21 @@ class _CodexAppServerSession:
                     item_type: str | None = (
                         raw_item_type if isinstance(raw_item_type, str) else None
                     )
+                    builtin_completion = _codex_builtin_tool_completion(item)
+                    if builtin_completion is not None:
+                        call_id = builtin_completion.metadata["call_id"]
+                        if not isinstance(call_id, str) or call_id in completed_builtin_tool_ids:
+                            continue
+                        completed_builtin_tool_ids.add(call_id)
+                        # The start remains a live in-progress observation. Re-emit
+                        # its completed form here because the relay deliberately
+                        # persists only completed function calls.
+                        request = _codex_builtin_tool_request(item, completed=True)
+                        if request is not None:
+                            observed_builtin_tool_ids.add(call_id)
+                            yield request
+                        yield builtin_completion
+                        continue
                     if item_type == "agentMessage":
                         raw_completed_id = item.get("id")
                         if not isinstance(raw_completed_id, str):

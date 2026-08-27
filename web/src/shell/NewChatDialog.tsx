@@ -103,8 +103,9 @@ import {
 } from "@/components/SlashCommandMenu";
 import { setPendingInitialPrompt } from "@/store/chatStore";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
+import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
-import { CliCommandBlock } from "./CliCommandBlock";
+import { CliCommandBlock, renderTextWithInlineCode } from "./CliCommandBlock";
 import { WorkspacePicker, isNavigablePath } from "./WorkspacePicker";
 import {
   initialPrefillState,
@@ -126,6 +127,7 @@ import {
 import { readLastHarness, writeLastHarness } from "@/lib/harnessPreferences";
 import { readHideUnconfiguredHarnesses } from "@/lib/harnessVisibilityPreferences";
 import { readDefaultBaseBranch } from "@/lib/baseBranchPreferences";
+import { readAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
 import { readHarnessOptions, writeHarnessOption, type HarnessOptions } from "@/lib/modePreferences";
 import {
   AUTO_HARNESS_DESCRIPTION,
@@ -192,6 +194,7 @@ import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation } from "@/hooks/useConversations";
 import type { NativeModelOption } from "@/lib/types";
 import {
+  useConversations,
   useProjectConfig,
   useProjects,
   moveConversationToProject,
@@ -222,7 +225,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { AgentRowTooltip } from "@/components/AgentHoverCard";
 import { CreateAgentDialog } from "./CreateAgentDialog";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
-import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
+import { createBundledSession, importLocalSessions, launchRunner } from "@/lib/sessionsApi";
 
 // Hidden from the new-session picker only. `nessie` is superseded by polly.
 // `kimi` / `kimi-code` are the headless SDK harness (kept for sub-agent / `run
@@ -2078,6 +2081,7 @@ interface LandingDraft {
   sandboxRepoBranch: string;
   workspace: string;
   branchName: string;
+  autoSeededBranch: string;
   prefilledBranch: string;
   permissionMode: string;
   approvalMode: string;
@@ -2099,11 +2103,16 @@ export function resetLandingDraft(): void {
   landingDraft = null;
 }
 
+// Sessions the empty-landing one-click import pulls (most recent, across all
+// harnesses). Named in the button so the count is explicit before clicking.
+const LANDING_QUICK_IMPORT_LIMIT = 25;
+
 export function NewChatLandingScreen() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const queryClient = useQueryClient();
   const isMobileViewport = useIsMobileViewport();
+  const isCoarsePointer = useIsCoarsePointer();
   // Single send-telemetry point (see handleCreate). Emitting there rather than
   // via the Start button's componentId covers Enter-key sends too, which never
   // submit the form and would otherwise bypass the Button entirely.
@@ -2129,11 +2138,30 @@ export function NewChatLandingScreen() {
   const { data: agents } = useAvailableAgents();
   // refetchOnFocus: returning from a terminal `omni setup` must clear the
   // readiness badge even if the live push was missed while the tab was hidden.
-  const {
-    data: hosts,
-    isLoading: hostsLoading,
-    isFetching: hostsFetching,
-  } = useHosts({ refetchOnFocus: true });
+  const { data: hosts, isLoading: hostsLoading } = useHosts({ refetchOnFocus: true });
+
+  // Offer an import affordance on the empty landing: a brand-new user with no
+  // Omnigent sessions can pull in their existing local CLI history. Same query
+  // key ChatPage already holds, so this reuses the cache. Wait for data before
+  // deciding so the button doesn't flash for returning users.
+  const { data: conversationsData } = useConversations("", true);
+  const hasNoSessions =
+    conversationsData !== undefined &&
+    conversationsData.pages.every((page) => page.data.length === 0);
+  // One-click quick import for the empty landing: pull the recent sessions
+  // across every harness on the caller's online machine.
+  const [quickImporting, setQuickImporting] = useState(false);
+  const [quickImportError, setQuickImportError] = useState<string | null>(null);
+  const [quickImportedCount, setQuickImportedCount] = useState<number | null>(null);
+  // The server persists each session as its frame arrives, so refresh the
+  // sidebar list every 5s while importing — sessions show up as they land.
+  useEffect(() => {
+    if (!quickImporting) return;
+    const id = setInterval(() => {
+      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+    }, 5000);
+    return () => clearInterval(id);
+  }, [quickImporting, queryClient]);
 
   const agentList = useMemo(
     () =>
@@ -2386,6 +2414,12 @@ export function NewChatLandingScreen() {
   );
   const [workspace, setWorkspace] = useState<string>(() => landingDraft?.workspace ?? "");
   const [branchName, setBranchName] = useState<string>(() => landingDraft?.branchName ?? "");
+  // Branch the worktree-default effect auto-seeded (empty = none), so it can
+  // retract its own seed when the default turns off. In the preserved draft so
+  // it survives the composer unmounting (e.g. a trip to Settings) and remounting.
+  const [autoSeededBranch, setAutoSeededBranch] = useState<string>(
+    () => landingDraft?.autoSeededBranch ?? "",
+  );
   // The base branch auto-fills from the configured default (Settings › Git)
   // when the user names a worktree branch, and is left alone once the user
   // touches it — clearing the branch name re-arms the auto-fill (see the effect
@@ -2517,6 +2551,7 @@ export function NewChatLandingScreen() {
     sandboxRepoBranch,
     workspace,
     branchName,
+    autoSeededBranch,
     prefilledBranch,
     permissionMode,
     approvalMode,
@@ -2665,6 +2700,7 @@ export function NewChatLandingScreen() {
     setPickedAgentId(projectParam !== "" ? null : readLastAgentId());
     setWorkspace("");
     setBranchName("");
+    setAutoSeededBranch("");
     seededHostRef.current = null;
     worktreeSeededForRef.current = null;
     seededConfigSigRef.current = prefillConfigSig;
@@ -2720,11 +2756,9 @@ export function NewChatLandingScreen() {
         setSelectedHostId(stored.host_id);
         return;
       }
-      // Cached data can omit the remembered host while a fresh list is already
-      // in flight. Let that refresh settle before using the normal fallback.
-      if (hostsFetching) return;
-      // The fresh list confirms the stored host is gone or offline — fall
-      // through to the default.
+      // A transient host-list gap must not replace the saved VM with the local
+      // or sandbox default. Leave the slot empty until it returns or the user picks again.
+      return;
     }
 
     if (managedSandboxesEnabled) {
@@ -2737,7 +2771,6 @@ export function NewChatLandingScreen() {
   }, [
     hosts,
     hostsLoading,
-    hostsFetching,
     selectedHostId,
     sandboxSelected,
     managedSandboxesEnabled,
@@ -2771,7 +2804,9 @@ export function NewChatLandingScreen() {
   // dir/branch readable (worktree-1a2b3c4d).
   const generateBranchName = useCallback(() => {
     const suffix = crypto.randomUUID().replace(/-/g, "").slice(0, 8);
-    setBranchName(`worktree-${suffix}`);
+    const name = `worktree-${suffix}`;
+    setBranchName(name);
+    return name;
   }, []);
   // The project's stored default base branch (Project settings), trimmed. Wins
   // over the user-global default (Settings › Git); an unset project default
@@ -2862,6 +2897,9 @@ export function NewChatLandingScreen() {
       // name one here to fork fresh off the project default. Store the ref in
       // the raw representation that effect compares against (workspaceTrimmed).
       worktreeSeededForRef.current = candidate;
+      // Not tracked as a retractable auto-seed: this fork-fresh branch is driven
+      // by the project's base_branch (to fork off it), independent of the
+      // worktree default, so it must survive the default being toggled off.
       generateBranchName();
     }
   }, [
@@ -2913,6 +2951,30 @@ export function NewChatLandingScreen() {
   // model / effort), which are harness-specific. null for non-native agents,
   // which have no knobs to remember.
   const selectedHost = allHosts.find((h) => h.host_id === selectedHostId);
+
+  // Empty-landing one-click: import the last LANDING_QUICK_IMPORT_LIMIT sessions
+  // across all harnesses from the caller's online machine (prefer the selected
+  // one). With no online
+  // host there's nothing to read from, so send them to the Settings import
+  // section for the granular picker + its "start a host" guidance.
+  const handleQuickImport = async (): Promise<void> => {
+    const host = selectedHost?.status === "online" ? selectedHost : onlineHosts[0];
+    if (host === undefined) {
+      navigate("/settings/import");
+      return;
+    }
+    setQuickImporting(true);
+    setQuickImportError(null);
+    try {
+      const result = await importLocalSessions(host.host_id, "all", LANDING_QUICK_IMPORT_LIMIT);
+      setQuickImportedCount(result.imported);
+      await queryClient.invalidateQueries({ queryKey: ["conversations"] });
+    } catch (e) {
+      setQuickImportError(e instanceof Error ? e.message : "Import failed. Try again.");
+    } finally {
+      setQuickImporting(false);
+    }
+  };
   // Warn-only readiness signal for the agent picker: only meaningful when
   // a connected host is selected (a sandbox provisions its own tooling).
   // Selection stays allowed — the host re-checks at launch and the create
@@ -3484,16 +3546,12 @@ export function NewChatLandingScreen() {
     defaultSandboxProvider,
   ]);
 
-  // Opt-in worktree from the project's stored config. The inference machine
-  // settles a config-driven location without touching the branch, so this
-  // effect creates the fresh worktree once the workspace is fully in place —
-  // whether it came from the config's own workspace or the composer's
-  // home-fallback (which runs after the machine settles). Fires at most once
-  // per settled workspace (ref-guarded) and only into an empty branch, so a
-  // typed branch / existing-worktree prefill is never clobbered.
+  // Seed a fresh worktree branch once the workspace settles, from the effective
+  // default (project `use_worktree` wins, else the user-global setting).
+  // Ref-guarded to fire once per workspace and only into an empty branch.
   useEffect(() => {
-    if (prefillConfig?.useWorktree !== true) return;
     if (prefill.project !== projectParam || !prefillDone(prefill)) return;
+    if ((prefillConfig?.useWorktree ?? readAlwaysUseWorktree()) !== true) return;
     if (sandboxSelected || selectedHostId === null || workspaceTrimmed === "") return;
     if (branchName !== "" || prefilledBranch !== "") return;
     if (worktreeSeededForRef.current === workspaceTrimmed) return;
@@ -3501,7 +3559,7 @@ export function NewChatLandingScreen() {
     // anti-flicker placeholder from a previous path).
     if (hostWorktreesArePlaceholder || hostWorktrees === undefined) return;
     worktreeSeededForRef.current = workspaceTrimmed;
-    if (hostWorktrees.some((w) => w.is_main)) generateBranchName();
+    if (hostWorktrees.some((w) => w.is_main)) setAutoSeededBranch(generateBranchName());
   }, [
     prefillConfig,
     prefill,
@@ -3515,6 +3573,18 @@ export function NewChatLandingScreen() {
     hostWorktreesArePlaceholder,
     generateBranchName,
   ]);
+
+  // Retract our own auto-seeded branch when the effective default is now off
+  // (the seed effect only fills, never clears) — e.g. after flipping the global
+  // default off in Settings. Only clears while the field still holds OUR seed.
+  useEffect(() => {
+    if (autoSeededBranch === "" || branchName !== autoSeededBranch) return;
+    if ((prefillConfig?.useWorktree ?? readAlwaysUseWorktree()) === true) return;
+    setBranchName("");
+    setAutoSeededBranch("");
+    // Re-arm the seed guard so flipping the default back on can seed again.
+    worktreeSeededForRef.current = null;
+  }, [prefillConfig, branchName, autoSeededBranch]);
 
   // Sandbox repo inputs are valid when blank (empty workspace), or when
   // the URL passes the shape check; a branch without a URL is dangling.
@@ -4414,8 +4484,11 @@ export function NewChatLandingScreen() {
                       return;
                     }
                   }
-                  // Enter sends; Shift+Enter inserts a newline.
-                  if (e.key === "Enter" && !e.shiftKey) {
+                  // Enter sends; Shift+Enter inserts a newline. On touch-primary
+                  // devices there is no practical Shift+Enter and an accidental
+                  // submit is unrecoverable, so Enter only inserts a newline and
+                  // sending stays an explicit tap on the send button.
+                  if (e.key === "Enter" && !e.shiftKey && !isCoarsePointer) {
                     e.preventDefault();
                     // The mention menu is briefly closed while its listing loads;
                     // swallow Enter so the in-progress "@dir/" token isn't sent.
@@ -5279,10 +5352,10 @@ export function NewChatLandingScreen() {
 
           {connectError && (
             <p
-              className="flex flex-wrap items-center gap-x-1.5 text-sm text-destructive"
+              className="flex flex-wrap items-center gap-x-1.5 text-sm text-destructive select-text"
               data-testid="new-chat-landing-connect-error"
             >
-              <span>{connectError}</span>
+              <span>{renderTextWithInlineCode(connectError)}</span>
               <button
                 type="button"
                 className="underline underline-offset-2 hover:no-underline disabled:opacity-60"
@@ -5295,6 +5368,39 @@ export function NewChatLandingScreen() {
             </p>
           )}
         </div>
+        {hasNoSessions ? (
+          <div className="flex flex-col items-center gap-2">
+            <Button
+              variant="outline"
+              loading={quickImporting}
+              onClick={() => void handleQuickImport()}
+              data-testid="landing-quick-import"
+            >
+              Import your {LANDING_QUICK_IMPORT_LIMIT} most recent sessions
+            </Button>
+            {quickImportedCount !== null ? (
+              <p
+                className="text-sm text-muted-foreground"
+                data-testid="landing-quick-import-result"
+              >
+                Imported {quickImportedCount} session{quickImportedCount === 1 ? "" : "s"}.
+              </p>
+            ) : quickImportError !== null ? (
+              <p className="text-sm text-destructive" data-testid="landing-quick-import-error">
+                {quickImportError}
+              </p>
+            ) : (
+              <button
+                type="button"
+                onClick={() => navigate("/settings/import")}
+                className="text-xs text-muted-foreground underline underline-offset-2 transition-colors hover:text-foreground hover:no-underline"
+                data-testid="landing-import-sessions"
+              >
+                Choose what to import
+              </button>
+            )}
+          </div>
+        ) : null}
       </div>
 
       {poweredBy ? (

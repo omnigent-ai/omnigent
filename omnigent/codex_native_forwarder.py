@@ -36,10 +36,12 @@ from omnigent.codex_native_bridge import (
     MCP_STARTUP_STARTING,
     MCP_STARTUP_STATES,
     CodexNativeBridgeState,
+    DeveloperInstructionsReadState,
     clear_active_turn_id_if_matches,
     codex_home_for_bridge_dir,
     pending_mcp_servers,
     read_bridge_state,
+    read_codex_config_developer_instructions_state,
     read_codex_config_model,
     read_mcp_startup,
     settle_pending_mcp_startup,
@@ -320,6 +322,11 @@ class _CodexForwarderState:
         the resume/startup model so the spawn default is not echoed back as
         a change; only a later in-TUI ``/model`` switch is mirrored. ``None``
         until seeded.
+    :param developer_instructions: Last known value from config.toml.
+        ``None`` is ambiguous — see :attr:`developer_instructions_known`.
+    :param developer_instructions_known: ``True`` once a PRESENT/ABSENT
+        read has been confirmed; ``False`` means never yet read (guards
+        against sending ``null`` before the first successful config read).
     :param effort: Latest known Codex reasoning effort for this thread, e.g.
         ``"medium"``. ``None`` means Codex is using its model/default effort.
     :param posted_effort: Last reasoning effort already mirrored to Omnigent
@@ -392,6 +399,8 @@ class _CodexForwarderState:
     # The config.toml model as of the last _refresh_model_from_config read,
     # so the refresh can tell an unchanged file from a rewritten one.
     last_config_model: str | None = None
+    developer_instructions: str | None = None
+    developer_instructions_known: bool = False
     effort: str | None = None
     posted_effort: str | None = None
     posted_effort_known: bool = False
@@ -470,6 +479,7 @@ class _CodexForwarderState:
         settings = params.get("threadSettings")
         if isinstance(settings, dict):
             self._note_model_fields(settings)
+            self._note_developer_instructions_fields(settings)
             self._note_effort_fields(settings)
             self._note_collaboration_mode_fields(settings)
             self._note_approval_mode_fields(settings)
@@ -802,6 +812,34 @@ class _CodexForwarderState:
         model = payload.get("model")
         if isinstance(model, str) and model:
             self.model = model
+
+    def _note_developer_instructions_fields(self, payload: _JsonObject) -> None:
+        """
+        Record ``developer_instructions`` from a Codex settings-like payload.
+
+        :param payload: Settings payload; checks both flat and nested
+            ``collaborationMode.settings.developer_instructions`` shapes.
+        """
+        # Bare truthiness on a whitespace-only string is True, which broke
+        # this two ways: (1) a whitespace-only FLAT value would short-circuit
+        # the nested-shape check below even though it carries no real
+        # content, hiding a genuine nested value; (2) a whitespace-only
+        # value (flat or nested) would be stored and marked confirmed —
+        # the same malformed-shape class the config.toml tri-state reader
+        # already treats as UNREADABLE (not a real read), not PRESENT.
+        # ``.strip()`` everywhere below matches that contract.
+        instructions = payload.get("developer_instructions")
+        if not (isinstance(instructions, str) and instructions.strip()):
+            raw_mode = payload.get("collaborationMode")
+            if not isinstance(raw_mode, dict):
+                raw_mode = payload.get("collaboration_mode")
+            if isinstance(raw_mode, dict):
+                nested_settings = raw_mode.get("settings")
+                if isinstance(nested_settings, dict):
+                    instructions = nested_settings.get("developer_instructions")
+        if isinstance(instructions, str) and instructions.strip():
+            self.developer_instructions = instructions
+            self.developer_instructions_known = True
 
     def _note_effort_fields(self, payload: _JsonObject) -> None:
         """
@@ -2219,6 +2257,7 @@ async def _subscribe_until_ready(
             # the first tool call, not a turn later. Falls back to the resume
             # response's model when config.toml has none.
             _refresh_model_from_config(bridge_dir, forwarder_state)
+            _refresh_developer_instructions_from_config(bridge_dir, forwarder_state)
             await _sync_model_change(
                 ap_client, session_id=session_id, forwarder_state=forwarder_state
             )
@@ -2852,6 +2891,28 @@ def _refresh_model_from_config(bridge_dir: Path, forwarder_state: _CodexForwarde
         forwarder_state.model = config_model
 
 
+def _refresh_developer_instructions_from_config(
+    bridge_dir: Path, forwarder_state: _CodexForwarderState
+) -> None:
+    """
+    Update the forwarder's known ``developer_instructions`` from ``config.toml``.
+
+    Read ``developer_instructions`` from config.toml and update ``forwarder_state``.
+    PRESENT sets, ABSENT clears, UNREADABLE is a no-op (preserves prior value).
+
+    :param bridge_dir: The session's native-Codex bridge directory.
+    :param forwarder_state: Updated in place.
+    """
+    result = read_codex_config_developer_instructions_state(bridge_dir)
+    if result.state is DeveloperInstructionsReadState.PRESENT:
+        forwarder_state.developer_instructions = result.value
+        forwarder_state.developer_instructions_known = True
+    elif result.state is DeveloperInstructionsReadState.ABSENT:
+        forwarder_state.developer_instructions = None
+        forwarder_state.developer_instructions_known = True
+    # UNREADABLE: no-op — preserve prior value.
+
+
 async def _sync_model_change(
     client: httpx.AsyncClient,
     *,
@@ -3050,6 +3111,7 @@ async def _maybe_handle_turn_event(
             # start so a switch made since the last turn lands ``model_override``
             # on Omnigent before this turn's first tool call reaches the cost gate.
             _refresh_model_from_config(bridge_dir, forwarder_state)
+            _refresh_developer_instructions_from_config(bridge_dir, forwarder_state)
             await _sync_model_change(
                 client, session_id=session_id, forwarder_state=forwarder_state
             )
@@ -4057,7 +4119,10 @@ async def _start_plan_implementation_turn(
     """
     collaboration_mode = _default_collaboration_mode(forwarder_state)
     if collaboration_mode is None:
-        _logger.warning("Codex plan implementation skipped: current model is unknown")
+        _logger.warning(
+            "Codex plan implementation skipped: current model or "
+            "developer_instructions state is unknown"
+        )
         return
     response = await codex_client.request(
         "turn/start",
@@ -4090,9 +4155,11 @@ async def _start_clear_context_plan_implementation_turn(
     :param forwarder_state: Mutable state with the current model.
     :returns: None.
     """
-    if not forwarder_state.model:
+    # Gate before creating the new thread — a gate failure after switch leaves an orphaned thread.
+    if _default_collaboration_mode(forwarder_state) is None:
         _logger.warning(
-            "Codex clear-context plan implementation skipped: current model is unknown"
+            "Codex clear-context plan implementation skipped: current model or "
+            "developer_instructions state is unknown"
         )
         return
     thread_response = await codex_client.request(
@@ -4122,21 +4189,19 @@ def _default_collaboration_mode(
     """
     Build Codex's Default collaboration mode for ``turn/start``.
 
-    ``developer_instructions: null`` deliberately asks Codex
-    app-server to fill in the built-in Default-mode instructions via
-    its own normalization path.
-
-    :param forwarder_state: Mutable state with the current model.
-    :returns: Codex ``CollaborationMode`` JSON object, or ``None``.
+    :returns: Codex ``CollaborationMode`` JSON object, or ``None`` when the
+        model or developer-instructions state is not yet confirmed.
     """
     if not forwarder_state.model:
+        return None
+    if not forwarder_state.developer_instructions_known:
         return None
     return {
         "mode": "default",
         "settings": {
             "model": forwarder_state.model,
             "reasoning_effort": None,
-            "developer_instructions": None,
+            "developer_instructions": forwarder_state.developer_instructions,
         },
     }
 

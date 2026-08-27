@@ -44,6 +44,7 @@ import json
 import re
 from urllib.parse import urlparse
 
+import pytest
 from playwright.sync_api import Page, Request, WebSocketRoute, expect
 
 from tests.e2e_ui.conftest import fetch_with_retry
@@ -253,6 +254,7 @@ def test_hosts_changed_frame_updates_host_badge(
     )
 
 
+@pytest.mark.nightly
 def test_host_badge_not_polled_frequently(
     page: Page,
     seeded_session: tuple[str, str],

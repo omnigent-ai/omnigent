@@ -49,6 +49,7 @@ import os
 from dataclasses import dataclass, field, replace
 from typing import Literal
 
+from omnigent.cli_invocation import cli_invocation
 from omnigent.env_credentials import (
     _ENV_REF_RE,
     env_names_with_omnigent_prefix,
@@ -520,7 +521,7 @@ def resolve_secret(ref: str) -> str:
         if value is None:
             raise OmnigentError(
                 f"no stored secret named {name!r}; run "
-                "`omnigent setup --no-internal-beta` to set it.",
+                f"`{cli_invocation()} setup --no-internal-beta` to set it.",
                 code=ErrorCode.INVALID_INPUT,
             )
         return value

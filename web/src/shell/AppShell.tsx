@@ -273,12 +273,6 @@ export function AppShell() {
   // Reads the same module-level store Sidebar drives, so the rail's ceiling
   // tracks the live sidebar width (including a drag) rather than a guess.
   const { width: sidebarWidth } = useResizableSidebar();
-  const { panelWidth: inlinePanelWidth, handleProps: inlinePanelHandleProps } =
-    useResizableInlinePanel(
-      conversationId ?? null,
-      inlinePanelMinWidth,
-      sidebarOpen ? sidebarWidth : 0,
-    );
   // ?sidebar=open surfaces the session list on phone-width shells where the
   // sidebar is closed by default — the destination for a "N sessions need
   // your attention" notification tap, which would otherwise land on a bare
@@ -672,12 +666,16 @@ export function AppShell() {
   const stickyRootRef = useRef<string | null>(null);
   const queryClient = useQueryClient();
   const walkedRoot = useRootSessionId(conversationId ?? null, activeSession?.parentSessionId);
-  const rootSessionId = useMemo(() => {
-    if (!conversationId) return null;
+  const { rootSessionId, rootSessionResolved } = useMemo(() => {
+    if (!conversationId) return { rootSessionId: null, rootSessionResolved: false };
     // Snapshot resolved for a top-level session → it is its own root.
-    if (activeSession && activeSession.parentSessionId == null) return conversationId;
+    if (activeSession && activeSession.parentSessionId == null) {
+      return { rootSessionId: conversationId, rootSessionResolved: true };
+    }
     // Snapshot resolved for a descendant + walk complete → authoritative.
-    if (activeSession && walkedRoot) return walkedRoot;
+    if (activeSession && walkedRoot) {
+      return { rootSessionId: walkedRoot, rootSessionResolved: true };
+    }
     // Snapshot or walk still loading → hold the last root while the target
     // is that root itself or a known member of its cached tree.
     const sticky = stickyRootRef.current;
@@ -686,11 +684,14 @@ export function AppShell() {
       (sticky === conversationId ||
         cachedTreeContains(queryClient, sticky, conversationId, MAX_TREE_DEPTH))
     ) {
-      return sticky;
+      return { rootSessionId: sticky, rootSessionResolved: true };
     }
     // No sticky context (e.g. a deep link straight into a sub-agent):
     // fall back one hop until the walk resolves the true root.
-    return activeSession?.parentSessionId ?? conversationId;
+    return {
+      rootSessionId: activeSession?.parentSessionId ?? conversationId,
+      rootSessionResolved: false,
+    };
   }, [conversationId, activeSession, walkedRoot, queryClient]);
   // One-shot fetch (no polling) for the Subagents tab's count badge.
   // SubagentsPanel mounts its own polling usage of the hook against
@@ -699,8 +700,15 @@ export function AppShell() {
   // Remember the resolved root so a later click into one of its tree
   // members can hold it steady (see ``rootSessionId`` above).
   useEffect(() => {
-    stickyRootRef.current = rootSessionId;
-  }, [rootSessionId]);
+    if (rootSessionResolved) stickyRootRef.current = rootSessionId;
+  }, [rootSessionId, rootSessionResolved]);
+  const { panelWidth: inlinePanelWidth, handleProps: inlinePanelHandleProps } =
+    useResizableInlinePanel(
+      rootSessionId,
+      inlinePanelMinWidth,
+      sidebarOpen ? sidebarWidth : 0,
+      rootSessionResolved,
+    );
   // How many children are actively working — surfaced in the tab badge so
   // "something's happening" is visible without opening the panel.
   const subagentsWorking = childSessions.filter((c) => c.busy).length;
@@ -1304,11 +1312,12 @@ export function AppShell() {
     onToggleRight: toggleRightPanel,
   });
 
-  // ⌘K (Ctrl+K) toggles the command palette. Disabled embedded, where ⌘K is the
-  // host page's. Bound here where the palette's open-state lives.
+  // ⌘K (Ctrl+K) toggles the command palette. Bound capture-phase, so in the
+  // embedded build we claim the chord ahead of any host-page ⌘K listener.
+  // Bound here where the palette's open-state lives.
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const isEmbedded = useIsEmbedded();
-  useCommandPaletteHotkey(() => setCommandPaletteOpen((prev) => !prev), !isEmbedded);
+  useCommandPaletteHotkey(() => setCommandPaletteOpen((prev) => !prev));
   useNewSessionHotkey(!isEmbedded);
 
   // Mobile back button: close the open file and return to the files/changes

@@ -53,6 +53,10 @@ class OpenCodeNativeExecutor(NativeServerHarness):
             build_prompt=self._build_prompt_with_model_override,
         )
 
+    def _gate_system_prompt(self, system_prompt: str) -> str | None:
+        """Attach the runner's composed instructions to this turn; ``None`` omits the field."""
+        return system_prompt or None
+
     def _build_prompt_with_model_override(self, content: object) -> NativePrompt | None:
         """
         Build a prompt, pinning the resolved model so it governs from turn one.

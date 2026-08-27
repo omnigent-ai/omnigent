@@ -52,6 +52,11 @@ async def test_interrupt_inserts_cancellation_items_in_history() -> None:
 
     async with _runner_client(app) as client:
         conv_id = "85b147537400967b1fb8542367423306"
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_int_test"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
 
         # Start the turn — it blocks after the first function_call
         # frame, before the second one and response.completed.
@@ -159,6 +164,11 @@ async def test_interrupt_cancel_floor_finalizes_stuck_turn() -> None:
 
     async with _runner_client(app) as client:
         conv_id = "97d2b96d733e685433e2b3864eb97652"
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_int_test"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
         resp = await client.post(
             f"/v1/sessions/{conv_id}/events",
             json={
@@ -209,6 +219,11 @@ async def test_stop_session_cancels_inprocess_turn() -> None:
 
     async with _runner_client(app) as client:
         conv_id = "422963919abf3c166633d99ea20f2b8e"
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_int_test"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
         resp = await client.post(
             f"/v1/sessions/{conv_id}/events",
             json={
@@ -357,6 +372,11 @@ async def test_interrupt_marker_instructs_model_to_disregard_abandoned_request()
 
     async with _runner_client(app) as client:
         conv_id = "86ba5bc9053ae8771fdb988e882f04b5"
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_int_test"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
         resp = await client.post(
             f"/v1/sessions/{conv_id}/events",
             json={

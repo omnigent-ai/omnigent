@@ -559,6 +559,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     agent_spec = AgentSpec(
         spec_version=1,
         name="codex",
+        instructions="Be a concise, careful coding assistant.",
         executor=ExecutorSpec(
             type="omnigent",
             config={"harness": "codex-native", "model": "gpt-5-default"},
@@ -586,7 +587,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert build_calls[0]["model"] == "gpt-5.4-mini"
     assert build_calls[0]["cwd"] == tmp_path / "workspace"
     assert build_calls[0]["trust_project"] is True
-    assert "developer_instructions" not in build_calls[0]
+    assert build_calls[0]["developer_instructions"] == "Be a concise, careful coding assistant."
     assert len(launched_specs) == 1
     launched = launched_specs[0]
     assert launched.command == "/opt/codex/bin/codex"
@@ -1378,6 +1379,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
         spec=AgentSpec(
             spec_version=1,
             name="codex",
+            instructions="Be a concise, careful coding assistant.",
             executor=ExecutorSpec(
                 type="omnigent",
                 config={"harness": "codex-native", "model": "gpt-5-default"},
@@ -1411,7 +1413,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
         "mean the session snapshot workspace was ignored."
     )
     assert build_calls[0]["cwd"] != bundle_dir.resolve()  # never the spec-bundle dir
-    assert "developer_instructions" not in build_calls[0]
+    assert build_calls[0]["developer_instructions"] == "Be a concise, careful coding assistant."
 
     # Sandbox-override regression: the launched Codex terminal must inherit
     # the agent's sandbox: none rather than falling back to the platform

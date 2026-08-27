@@ -115,6 +115,9 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   // Empty projects list → no ?project= name resolves to an id, so the project
   // prefill stays inert and the generic host/workspace defaults under test apply.
   useProjects: () => ({ data: [] }),
+  // The landing reads useConversations for hasNoSessions; stub it so it doesn't
+  // fire an authenticatedFetch that skews create-POST call assertions.
+  useConversations: () => ({ data: undefined }),
 }));
 // The harness-label catalog is not under test here. Keep it synchronous so
 // create-session fetch assertions only observe the POST/PATCH calls they own.
@@ -987,13 +990,23 @@ describe("NewChatLandingScreen", () => {
     await waitFor(() => expect(chip).toHaveTextContent("machine-2"));
   });
 
-  it("falls back after a fresh host list confirms the remembered host is gone", async () => {
+  it("does not silently replace an unavailable remembered host", async () => {
     localStorage.setItem("omnigent:last-host-choice", "host_2");
     mockHosts([host("online", 1)], { isFetching: false });
     renderLanding();
 
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip")).not.toHaveTextContent("Choose host"),
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveTextContent("Choose host"),
+    );
+  });
+
+  it("does not replace an unavailable remembered host with the managed sandbox", async () => {
+    localStorage.setItem("omnigent:last-host-choice", "host_2");
+    mockHosts([host("online", 1)], { isFetching: false });
+    renderLanding({ managed_sandboxes_enabled: true });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveTextContent("Choose host"),
     );
   });
 

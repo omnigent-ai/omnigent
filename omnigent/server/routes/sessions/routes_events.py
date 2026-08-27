@@ -78,6 +78,7 @@ from omnigent.server.routes._sessions.common import (
     _ALLOWED_EVENT_TYPES,
     _APPROVAL_TYPE,
     _COMPACT_TYPE,
+    _EXTERNAL_ACP_SUBAGENT_START_TYPE,
     _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE,
     _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
     _EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE,
@@ -137,6 +138,7 @@ from omnigent.server.routes._sessions.helpers import (
     _is_codex_native_subagent,
     _launch_runner_on_host,
     _parse_background_tasks,
+    _persist_external_acp_subagent_start,
     _persist_external_assistant_message,
     _persist_external_codex_approval_mode_change,
     _persist_external_codex_collaboration_mode_change,
@@ -548,6 +550,7 @@ def register_events_routes(
             _EXTERNAL_SESSION_TITLE_TYPE,
             _EXTERNAL_SESSION_TODOS_TYPE,
             _EXTERNAL_SUBAGENT_START_TYPE,
+            _EXTERNAL_ACP_SUBAGENT_START_TYPE,
             _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
             _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE,
             _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
@@ -1460,6 +1463,16 @@ def register_events_routes(
                 conversation_store,
             )
             return {"queued": False, "child_session_id": child_id}
+        if body.type == _EXTERNAL_ACP_SUBAGENT_START_TYPE:
+            child_id = await _persist_external_acp_subagent_start(
+                session_id,
+                conv,
+                body,
+                conversation_store,
+            )
+            # Returned to the runner so it can address the sub-agent's transcript
+            # items and its completion status to the child id.
+            return {"queued": False, "child_session_id": child_id}
         if body.type == "function_call_output":
             # A client-side tool's result tunneling back to a parked turn.
             # The harness scaffold resolves the parked tool Future on a
@@ -2209,7 +2222,7 @@ def register_events_routes(
         if runner_client is not None:
             try:
                 await runner_client.delete(
-                    f"/v1/sessions/{session_id}/resources",
+                    f"/v1/sessions/{session_id}",
                     timeout=10.0,
                 )
             except (httpx.HTTPError, ConnectionError):
@@ -2247,6 +2260,8 @@ def register_events_routes(
                 delete_branch=True,
                 request=request,
                 reason="session-delete",
+                conversation_store=conversation_store,
+                exclude_conversation_id=conv.id,
             )
         _interrupt_fenced_sessions.discard(session_id)
         _intentional_stop_sessions.discard(session_id)

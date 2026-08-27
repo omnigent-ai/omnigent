@@ -1129,6 +1129,35 @@ def test_inline_family_passes_non_mechanical_override_through() -> None:
     assert cfg["providers"]["omnigent"]["models"] == [{"id": "zai-org/GLM-4.7"}]
 
 
+def test_inline_family_configured_gateway_default_survives_verbatim() -> None:
+    """A configured ``databricks-`` family default is not rewritten.
+
+    A protocol-translating proxy (a LiteLLM / AI-Gateway-shaped ``/anthropic``
+    passthrough) is addressed by serving-endpoint name, so stripping the prefix
+    the user configured yields an id the endpoint answers ``ENDPOINT_NOT_FOUND``
+    for. Only a session override is normalized for a vendor-direct endpoint.
+    """
+    config = {
+        "providers": {
+            "translating-proxy": {
+                "kind": "gateway",
+                "default": ["pi"],
+                "anthropic": {
+                    "base_url": "http://127.0.0.1:8399/ai-gateway/anthropic",
+                    "api_key": "local",
+                    "models": {"default": "databricks-claude-opus-4-8"},
+                },
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+    assert provider is not None
+    assert provider.api == "anthropic-messages"
+    assert provider.model == "databricks-claude-opus-4-8"
+    cfg = provider.to_models_config()
+    assert cfg["providers"]["omnigent"]["models"][0]["id"] == "databricks-claude-opus-4-8"
+
+
 def test_databricks_profile_registers_gpt_provider(monkeypatch: pytest.MonkeyPatch) -> None:
     """A Databricks profile provider includes an OpenAI Completions provider for GPT models.
 

@@ -68,6 +68,7 @@ from rich.console import RenderableType
 from rich.markup import escape
 from rich.text import Text
 
+from omnigent.cli_invocation import cli_invocation
 from omnigent.spec.types import SkillSpec
 
 if TYPE_CHECKING:
@@ -1890,12 +1891,12 @@ class _SessionsChatReplAdapter:
                     # online runners at create time and found none.
                     raise RuntimeError(
                         "This server has no online runner to run the turn. Start one "
-                        "against it with `omnigent host --server <url>` (or run the "
-                        "agent locally with `omnigent run <agent.yaml>`), then retry."
+                        f"against it with `{cli_invocation()} host --server <url>` (or run the "
+                        f"agent locally with `{cli_invocation()} run <agent.yaml>`), then retry."
                     )
                 raise RuntimeError(
                     "Sessions API dispatch requires a registered runner id. "
-                    "Start through `omnigent run <agent>` or pass --server so the CLI "
+                    f"Start through `{cli_invocation()} run <agent>` or pass --server so the CLI "
                     "can launch and bind a runner."
                 )
             if self._bound_runner_id == self._runner_id:
@@ -5024,7 +5025,8 @@ def _build_model_readout_lines(
         else:
             lines.append("Active:  None  ·  None")
             lines.append(
-                "no model configured — run `omnigent setup --no-internal-beta` to add one"
+                f"no model configured — run `{cli_invocation()} setup --no-internal-beta` "
+                "to add one"
             )
         lines.append("usage: /model <name> · /model default | off | reset to clear")
         return lines
@@ -5266,7 +5268,7 @@ async def _cmd_model(
         host.output(
             Text.from_markup(
                 f"  [{fmt.muted}]Active provider: {active_label}. To use {target_label}, run "
-                f"`omnigent setup --no-internal-beta` and select it as the "
+                f"`{cli_invocation()} setup --no-internal-beta` and select it as the "
                 f"default, then restart. "
                 f"(You can still change the model within {active_label}: /model <model-name>.)"
                 f"[/{fmt.muted}]"

@@ -1808,8 +1808,9 @@ def augment_claude_args(
         / ``"none"`` / list of skill names), mapped to
         ``--setting-sources`` exactly as the SDK executor maps it onto
         ``setting_sources``. Defaults to ``"all"``.
-    :param append_system_prompt: Optional framework-owned instructions to
-        append through Claude Code's native ``--append-system-prompt`` flag.
+    :param append_system_prompt: Optional raw ``AgentSpec.instructions``
+        (author-supplied, not framework-composed) to append through Claude
+        Code's native ``--append-system-prompt`` flag.
     :param allowed_tools: Optional narrowly scoped Claude tool names to merge
         into ``--allowedTools`` without replacing the user's allowlist.
     :param subagent_router_dir: Directory advertising the runner's
