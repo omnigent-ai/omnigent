@@ -1732,6 +1732,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     "cost_usd": float(row.cost_usd),
                     "ask_approved_usd": float(row.ask_approved_usd or 0.0),
                     "day_utc": row.day_utc,
+                    "user_id": row.user_id,
                     "harness": None if row.harness == CROSS_HARNESS_SENTINEL else row.harness,
                 }
                 for row in rows

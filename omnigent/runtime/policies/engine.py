@@ -785,7 +785,17 @@ class PolicyEngine:
         """
         if self._user_daily_cost is None:
             return ctx
-        return replace(ctx, user_daily_cost=[dict(d) for d in self._user_daily_cost])
+        # Cast needed: dict(d) produces dict[str, object] but the runtime value
+        # is actually dict[str, float | str | None] from DailyCostState
+        from typing import cast
+
+        return replace(
+            ctx,
+            user_daily_cost=cast(
+                "list[dict[str, float | str | None]]",
+                [dict(d) for d in self._user_daily_cost],
+            ),
+        )
 
     def _inject_model(self, ctx: EvaluationContext) -> EvaluationContext:
         """
