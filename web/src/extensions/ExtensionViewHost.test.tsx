@@ -197,6 +197,42 @@ describe("ExtensionViewHost", () => {
     );
   });
 
+  it("caps concurrent host requests per extension frame", async () => {
+    const pending = vi.fn(() => new Promise<void>(() => {}));
+    render(
+      <ExtensionViewHost
+        extension={extension}
+        page={page}
+        refresh={refresh}
+        methods={{ "test.pending": pending }}
+      />,
+    );
+    await screen.findByTitle("Dashboard");
+    await waitFor(() => expect(FakeMessageChannel.latest).not.toBeNull());
+
+    act(() => {
+      for (let index = 0; index < 33; index += 1) {
+        FakeMessageChannel.latest!.port1.onmessage?.({
+          data: {
+            ...identity,
+            source: EXTENSION_RPC_SOURCE,
+            type: "request",
+            requestId: `request-${index}`,
+            method: "test.pending",
+            params: {},
+          },
+        } as MessageEvent<unknown>);
+      }
+    });
+
+    expect(FakeMessageChannel.latest!.port1.postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        requestId: "request-32",
+        error: { code: "Busy", message: "Too many extension host requests" },
+      }),
+    );
+  });
+
   it("cancels outstanding host calls and sends dispose on unmount", async () => {
     const captured: { signal?: AbortSignal } = {};
     const pending = vi.fn((_params: unknown, signal: AbortSignal) => {

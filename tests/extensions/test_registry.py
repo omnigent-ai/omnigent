@@ -143,6 +143,17 @@ def test_modern_entry_point_discovery_selects_extension_group(
     assert registry._entry_points() == (expected,)
 
 
+def test_extension_permission_values_include_read_only_sessions() -> None:
+    assert {permission.value for permission in ExtensionPermission} == {
+        "navigation",
+        "sessions.read",
+        "storage.user",
+    }
+    registry.validate_manifest(
+        replace(_manifest(), permissions=frozenset({ExtensionPermission.SESSIONS_READ}))
+    )
+
+
 def test_discovers_and_caches_valid_manifest(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = 0
 

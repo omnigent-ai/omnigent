@@ -14,6 +14,7 @@ import { ExtensionHostServiceError } from "./services/errors";
 
 const ACTIVATION_TIMEOUT_MS = 10_000;
 const REQUEST_TIMEOUT_MS = 10_000;
+const MAX_PENDING_HOST_REQUESTS = 32;
 
 type HostMethod = (params: unknown, signal: AbortSignal) => unknown | Promise<unknown>;
 const NO_HOST_METHODS: Readonly<Record<string, HostMethod>> = {};
@@ -198,6 +199,11 @@ export function ExtensionViewHost({
       }
       if (pendingRef.current.has(message.requestId)) {
         response.error = { code: "DuplicateRequest", message: "Request ID is already active" };
+        channel.port1.postMessage(response);
+        return;
+      }
+      if (pendingRef.current.size >= MAX_PENDING_HOST_REQUESTS) {
+        response.error = { code: "Busy", message: "Too many extension host requests" };
         channel.port1.postMessage(response);
         return;
       }

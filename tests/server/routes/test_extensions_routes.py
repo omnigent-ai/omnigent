@@ -45,7 +45,13 @@ def _manifest(extension_id: str = "acme.review") -> ExtensionManifest:
             browser="dist/extension.js",
             browser_css="dist/extension.css",
         ),
-        permissions=frozenset({ExtensionPermission.NAVIGATION, ExtensionPermission.STORAGE_USER}),
+        permissions=frozenset(
+            {
+                ExtensionPermission.NAVIGATION,
+                ExtensionPermission.SESSIONS_READ,
+                ExtensionPermission.STORAGE_USER,
+            }
+        ),
         pages=(
             PageContribution(
                 id=page_id,
@@ -137,7 +143,7 @@ async def test_catalog_serializes_only_public_v1_contributions(catalog_app: Fast
                 "version": "1.2.0",
                 "extension_api": 1,
                 "status": "unavailable",
-                "permissions": ["navigation", "storage.user"],
+                "permissions": ["navigation", "sessions.read", "storage.user"],
                 "pages": [],
                 "primary_navigation": [],
                 "browser": {

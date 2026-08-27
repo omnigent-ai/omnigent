@@ -6,6 +6,7 @@ import { useNavigate } from "@/lib/routing";
 import type { ExtensionCatalogItem } from "../types";
 import { ExtensionHostServiceError } from "./errors";
 import { grantedHostMethods } from "./registry";
+import { listSessionPage, SessionReadLimiter } from "./sessions";
 import {
   ExtensionStorageError,
   ExtensionStorageWriteLimiter,
@@ -68,6 +69,7 @@ export function useExtensionHostServices(extension: ExtensionCatalogItem) {
   const { resolvedTheme } = useTheme();
   const theme = resolvedTheme === "dark" ? "dark" : "light";
   const writeLimiter = useMemo(() => new ExtensionStorageWriteLimiter(), []);
+  const sessionReadLimiter = useMemo(() => new SessionReadLimiter(), []);
 
   const methods = useMemo(() => {
     const implementations = {
@@ -128,9 +130,11 @@ export function useExtensionHostServices(extension: ExtensionCatalogItem) {
           await mapStorageErrors(() => storage.delete(objectParams(params).key, signal));
           return null;
         }),
+      "sessions.listPage": (params: unknown, signal: AbortSignal) =>
+        sessionReadLimiter.run(signal, () => listSessionPage(params, signal)),
     };
     return grantedHostMethods(extension, implementations);
-  }, [extension, navigate, theme, writeLimiter]);
+  }, [extension, navigate, sessionReadLimiter, theme, writeLimiter]);
   const events = useMemo(() => ({ "theme.changed": { theme } }), [theme]);
   return { methods, events };
 }

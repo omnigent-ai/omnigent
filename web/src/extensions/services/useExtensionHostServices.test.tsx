@@ -5,13 +5,17 @@ import type { ExtensionCatalogItem } from "../types";
 import { HOST_METHOD_PERMISSIONS } from "./registry";
 import { resetExtensionStorageForTests } from "./storage";
 
-const { navigate, identityRef, serverRef } = vi.hoisted(() => ({
+const { navigate, identityRef, serverRef, authenticatedFetchMock } = vi.hoisted(() => ({
   navigate: vi.fn(),
+  authenticatedFetchMock: vi.fn(),
   identityRef: { current: "user@example.com" as string | null },
   serverRef: { current: "server-a" as string | null },
 }));
 vi.mock("@/lib/routing", () => ({ useNavigate: () => navigate }));
-vi.mock("@/lib/identity", () => ({ resolveIdentity: async () => identityRef.current }));
+vi.mock("@/lib/identity", () => ({
+  authenticatedFetch: authenticatedFetchMock,
+  resolveIdentity: async () => identityRef.current,
+}));
 vi.mock("@/lib/host", () => ({ getOmnigentServerIdentity: () => serverRef.current }));
 vi.mock("next-themes", () => ({ useTheme: () => ({ resolvedTheme: "dark" }) }));
 
@@ -25,7 +29,7 @@ const extension: ExtensionCatalogItem = {
   version: "1.0.0",
   extension_api: 1,
   status: "enabled",
-  permissions: ["navigation", "storage.user"],
+  permissions: ["navigation", "sessions.read", "storage.user"],
   pages: [
     {
       id: "acme.review.dashboard",
@@ -47,6 +51,7 @@ const signal = () => new AbortController().signal;
 
 beforeEach(async () => {
   navigate.mockReset();
+  authenticatedFetchMock.mockReset();
   identityRef.current = "user@example.com";
   serverRef.current = "server-a";
   await resetExtensionStorageForTests();
@@ -94,6 +99,54 @@ describe("useExtensionHostServices", () => {
 
     expect(result.current.methods["theme.getCurrent"]?.({}, signal())).toEqual({ theme: "dark" });
     expect(result.current.events).toEqual({ "theme.changed": { theme: "dark" } });
+  });
+
+  it("lists only the projected session summary through the host method", async () => {
+    authenticatedFetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          data: [
+            {
+              id: "conv_1",
+              title: "One",
+              status: "idle",
+              workspace: "/workspace",
+              created_at: 1,
+              updated_at: 2,
+              owner: "hidden",
+            },
+          ],
+          has_more: false,
+          last_id: "conv_1",
+        }),
+        { status: 200 },
+      ),
+    );
+    const { result } = renderHook(() => useExtensionHostServices(extension));
+
+    await expect(result.current.methods["sessions.listPage"]?.({}, signal())).resolves.toEqual({
+      sessions: [
+        {
+          id: "conv_1",
+          title: "One",
+          status: "idle",
+          workspace: "/workspace",
+          createdAt: 1,
+          updatedAt: 2,
+        },
+      ],
+      nextCursor: null,
+      hasMore: false,
+    });
+  });
+
+  it("keeps sessions methods absent for existing extension permissions", () => {
+    const existing = { ...extension, permissions: ["navigation", "storage.user"] };
+    const { result } = renderHook(() => useExtensionHostServices(existing));
+
+    expect(result.current.methods["sessions.listPage"]).toBeUndefined();
+    expect(result.current.methods["navigation.openSession"]).toBeDefined();
+    expect(result.current.methods["storage.user.get"]).toBeDefined();
   });
 
   it("omits methods whose permissions were not granted", () => {
