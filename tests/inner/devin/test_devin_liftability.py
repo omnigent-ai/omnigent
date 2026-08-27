@@ -31,6 +31,7 @@ _ALLOWED_CORE_IMPORTS = frozenset(
         "omnigent.inner.acp_extension",
         "omnigent.inner.acp_harness",
         "omnigent.inner.acp_subagents",
+        "omnigent.inner.acp_toolnames",
         "omnigent.inner.executor",
         "omnigent.runtime.harnesses._executor_adapter",
     }
@@ -42,6 +43,7 @@ _GENERIC_ACP_MODULES = (
     _OMNIGENT_ROOT / "inner" / "acp_extension.py",
     _OMNIGENT_ROOT / "inner" / "acp_harness.py",
     _OMNIGENT_ROOT / "inner" / "acp_subagents.py",
+    _OMNIGENT_ROOT / "inner" / "acp_toolnames.py",
 )
 
 
@@ -112,8 +114,11 @@ def test_generic_acp_layer_does_not_import_a_vendor() -> None:
     to contain is back in the shared path, so every ACP agent pays for it and
     lifting the vendor out breaks core.
     """
+    vendors = ("devin", "goose")
     offenders = {
-        path.name: sorted(n for n in _imported_modules(path) if "devin" in n)
+        path.name: sorted(
+            n for n in _imported_modules(path) if any(vendor in n for vendor in vendors)
+        )
         for path in _GENERIC_ACP_MODULES
     }
     offenders = {name: found for name, found in offenders.items() if found}

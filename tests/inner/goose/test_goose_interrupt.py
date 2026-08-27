@@ -1,4 +1,4 @@
-"""Focused tests for GooseExecutor.interrupt_session (#1748).
+"""Focused tests for the Goose executor's interrupt_session (#1748).
 
 Verifies that the web Stop button (interrupt_session) correctly:
 1. Returns False when there is no live process.
@@ -11,12 +11,13 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from omnigent.inner.goose_executor import GooseExecutor
+from omnigent.inner.acp_executor import AcpExecutor
+from omnigent.inner.goose import build_goose_executor
 
 
-def _make_executor() -> GooseExecutor:
-    """Return a GooseExecutor with no real subprocess wired."""
-    return GooseExecutor(cwd="/tmp", goose_path="/usr/bin/goose")
+def _make_executor() -> AcpExecutor:
+    """Return a Goose-configured executor with no real subprocess wired."""
+    return build_goose_executor(cwd="/tmp", goose_path="/usr/bin/goose")
 
 
 def _live_proc(returncode: int | None = None) -> MagicMock:

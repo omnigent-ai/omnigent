@@ -1707,3 +1707,266 @@ def test_startup_error_names_the_exception_type_when_str_is_empty() -> None:
     """No stderr and an empty ``str(exc)`` still yields something actionable."""
     ex = AcpExecutor(AcpAgentConfig(command="x", name="A"))
     assert "TimeoutError" in ex._startup_error_message(TimeoutError())
+
+
+# ---------------------------------------------------------------------------
+# Per-agent spawn env / sandbox roots (vendor knobs on AcpAgentConfig)
+# ---------------------------------------------------------------------------
+
+
+def test_config_env_prefix_family_and_forced_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An agent's declared prefix family reaches it; ``spawn_env`` beats the host.
+
+    A vendor whose whole ``VENDOR_*`` family is its configuration surface names
+    the prefix rather than every variable. ``spawn_env`` is applied last so a
+    value Omnigent pins (an approval mode a policy gate depends on) cannot be
+    switched off by an ambient variable.
+    """
+    monkeypatch.setenv("VENDOR_TOKEN", "keep-me")
+    monkeypatch.setenv("VENDOR_MODE", "auto")
+    monkeypatch.setenv("UNRELATED_SECRET", "leak-me")
+    ex = AcpExecutor(
+        AcpAgentConfig(
+            command="x",
+            env_allow_prefixes=("VENDOR_",),
+            spawn_env={"VENDOR_MODE": "pinned"},
+        )
+    )
+    env = ex._build_spawn_env()
+    assert env["VENDOR_TOKEN"] == "keep-me"
+    assert env["VENDOR_MODE"] == "pinned"
+    assert "UNRELATED_SECRET" not in env
+
+
+def test_config_sandbox_roots_are_added_to_the_policy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``sandbox_*_roots`` reach the launcher, so a vendor CLI can start jailed.
+
+    Beyond the cwd and the binary's own dir the executor cannot know which paths
+    an arbitrary agent needs; a CLI that cannot write its own config/state dirs
+    dies inside the sandbox, so the config's roots must be honored.
+    """
+    from omnigent.inner import sandbox as sandbox_mod
+    from omnigent.inner.sandbox import SandboxPolicy
+
+    captured: dict = {}
+
+    def _fake_resolve(_os_env, cwd) -> SandboxPolicy:
+        return SandboxPolicy(
+            backend_type="linux_bwrap",
+            active=True,
+            read_roots=[cwd.resolve(strict=False)],
+            write_roots=[cwd.resolve(strict=False)],
+            write_files=[],
+            allow_network=True,
+        )
+
+    def _fake_launcher(target: str, sandbox: SandboxPolicy) -> str:
+        captured["policy"] = sandbox
+        return "/l"
+
+    monkeypatch.setattr(sandbox_mod, "resolve_sandbox", _fake_resolve)
+    monkeypatch.setattr(sandbox_mod, "create_exec_launcher", _fake_launcher)
+    ex = AcpExecutor(
+        AcpAgentConfig(
+            command="/usr/bin/vend acp",
+            sandbox_read_roots=(tmp_path / "cfg",),
+            sandbox_write_roots=(tmp_path / "cfg", tmp_path / "state"),
+        ),
+        cwd=str(tmp_path),
+        os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+    )
+    launch_path, argv = ex._sandbox_launch(("PATH",))
+
+    assert launch_path == "/l"
+    assert argv == ["acp"]
+    policy = captured["policy"]
+    assert (tmp_path / "cfg") in policy.read_roots
+    assert (tmp_path / "cfg") in policy.write_roots
+    assert (tmp_path / "state") in policy.write_roots
+    assert Path("/tmp") in policy.write_roots
+
+
+# ---------------------------------------------------------------------------
+# Delegated fs ops: policy gate + tool cards
+# ---------------------------------------------------------------------------
+
+
+class _FakeOsEnv:
+    """Stand-in for :class:`OSEnvironment` recording what reached the filesystem.
+
+    The real helper runs in a subprocess; these tests are about the policy gate
+    and the tool-card records around it, so the effect is observed here instead.
+    """
+
+    def __init__(self, content: str = "hello") -> None:
+        self.content = content
+        self.writes: list[tuple[str, str]] = []
+
+    async def read(self, path: str, *, offset: int = 1, limit: int | None = None) -> dict:
+        del path, offset, limit
+        return {"content": self.content, "encoding": "utf-8"}
+
+    async def write(self, path: str, content: str) -> dict:
+        self.writes.append((path, content))
+        return {"ok": True}
+
+
+def _fs_executor(env: _FakeOsEnv) -> AcpExecutor:
+    """An executor whose fs delegation is backed by *env*."""
+    ex = AcpExecutor(
+        AcpAgentConfig(command="x"),
+        cwd="/tmp",
+        os_env=OSEnvSpec(type="caller_process", cwd="/tmp"),
+    )
+    ex._os_environment = env  # type: ignore[assignment]
+    return ex
+
+
+def test_inline_text_file_data_variants() -> None:
+    """``file_data`` inlines only text data URIs; binary becomes a marker."""
+    inline = acp_executor_module._inline_text_file_data
+    assert inline("plain text") == "plain text"  # non-data-URI passthrough
+    assert inline("") == ""
+    assert inline(123) == ""  # non-str
+    assert inline("data:image/png;base64,AAA=") == ""  # binary → not inlined
+    assert inline("data:text/plain;base64,aGk=") == "hi"  # text decoded
+
+
+@pytest.mark.asyncio
+async def test_fs_read_is_gated_and_recorded() -> None:
+    """A delegated read runs through policy and lands on the turn stream.
+
+    fs delegation is a tool path: an agent that routes its file I/O back to us
+    must be gated on it, or delegation would be the one side-effect channel
+    policy never sees.
+    """
+    ex = _fs_executor(_FakeOsEnv("hello"))
+
+    out = await ex._handle_fs_read({"path": "/tmp/a.txt"})
+    assert out == {"content": "hello"}
+    request, complete = ex._fs_events
+    assert isinstance(request, ToolCallRequest) and request.name == "read_text_file"
+    assert isinstance(complete, ToolCallComplete)
+    assert complete.status is ToolCallStatus.SUCCESS
+    # Paired by call_id so the card opens and closes as one tool.
+    assert request.metadata["call_id"] == complete.metadata["call_id"]
+
+
+@pytest.mark.asyncio
+async def test_fs_write_denied_by_call_phase_policy_never_writes() -> None:
+    """A DENY blocks the write before the side effect and records it BLOCKED."""
+    env = _FakeOsEnv()
+    ex = _fs_executor(env)
+    ex._policy_evaluator = AsyncMock(  # type: ignore[attr-defined]
+        return_value=type("V", (), {"action": "POLICY_ACTION_DENY"})()
+    )
+
+    with pytest.raises(acp_executor_module._AcpRequestError, match="blocked by policy"):
+        await ex._handle_fs_write({"path": "/tmp/victim.txt", "content": "x"})
+    assert env.writes == []
+    assert ex._fs_events[1].status is ToolCallStatus.BLOCKED
+
+
+@pytest.mark.asyncio
+async def test_fs_call_phase_policy_error_fails_closed() -> None:
+    """A policy engine that errors must not let an ungated write through."""
+    env = _FakeOsEnv()
+    ex = _fs_executor(env)
+
+    async def _boom(*_a: object) -> object:
+        raise RuntimeError("policy backend down")
+
+    ex._policy_evaluator = _boom  # type: ignore[attr-defined]
+    with pytest.raises(acp_executor_module._AcpRequestError):
+        await ex._handle_fs_write({"path": "/tmp/victim.txt", "content": "x"})
+    assert env.writes == []
+
+
+@pytest.mark.asyncio
+async def test_fs_read_result_phase_denial_withholds_content() -> None:
+    """Result-phase DENY refuses the content even though the read succeeded."""
+    ex = _fs_executor(_FakeOsEnv("token"))
+    calls: list[str] = []
+
+    async def _evaluator(phase: str, _data: object) -> object:
+        calls.append(phase)
+        action = "POLICY_ACTION_DENY" if phase == "PHASE_TOOL_RESULT" else "POLICY_ACTION_ALLOW"
+        return type("V", (), {"action": action})()
+
+    ex._policy_evaluator = _evaluator  # type: ignore[attr-defined]
+    with pytest.raises(acp_executor_module._AcpRequestError, match="blocked by content policy"):
+        await ex._handle_fs_read({"path": "/tmp/secret.txt"})
+    assert calls == ["PHASE_TOOL_CALL", "PHASE_TOOL_RESULT"]
+
+
+# ---------------------------------------------------------------------------
+# Extension: vendor tool-name resolution
+# ---------------------------------------------------------------------------
+
+
+def test_extension_tool_name_source_wins_over_the_portable_title() -> None:
+    """A vendor dialect's name beats ACP's ``title``, which is a human label.
+
+    Omnigent's TOOL_CALL policies match on the tool name, so an agent that
+    dispatches by ``developer__shell`` while reporting ``title: "shell"`` would be
+    ungated by any rule naming the real tool.
+    """
+    from omnigent.inner.acp_extension import AcpExtension
+
+    class _Source:
+        def read(self, tool_call: dict) -> str | None:
+            meta = tool_call.get("_meta") or {}
+            return meta.get("realName")
+
+    ex = AcpExecutor(
+        AcpAgentConfig(command="x"),
+        extension=AcpExtension(name="vend", tool_name_sources=(_Source(),)),
+    )
+    name, args = ex._extract_tool_call(
+        {
+            "toolCall": {
+                "title": "shell",
+                "rawInput": {"command": "ls"},
+                "_meta": {"realName": "developer__shell"},
+            }
+        }
+    )
+    assert name == "developer__shell"
+    assert args == {"command": "ls"}
+
+
+def test_extension_tool_name_source_falls_back_to_the_portable_fields() -> None:
+    """An unrecognized frame keeps the inherited ``title`` → ``kind`` → cache chain."""
+    from omnigent.inner.acp_extension import AcpExtension
+
+    class _NeverMatches:
+        def read(self, tool_call: dict) -> str | None:
+            return None
+
+    ex = AcpExecutor(
+        AcpAgentConfig(command="x"),
+        extension=AcpExtension(name="vend", tool_name_sources=(_NeverMatches(),)),
+    )
+    assert ex._extract_tool_call({"toolCall": {"title": "shell"}})[0] == "shell"
+    assert ex._extract_tool_call({"toolCall": {"kind": "execute"}})[0] == "execute"
+    assert ex._extract_tool_call({})[0] == "tool"
+
+
+def test_no_extension_ignores_vendor_meta_entirely() -> None:
+    """The generic ACP path reads no vendor field, exactly as before the seam.
+
+    Guards the pattern: a builtin ACP row that declares no dialect must not start
+    picking names out of some other vendor's ``_meta``.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    name, _ = ex._extract_tool_call(
+        {
+            "toolCall": {
+                "title": "shell",
+                "_meta": {"goose": {"toolCall": {"toolName": "developer__shell"}}},
+            }
+        }
+    )
+    assert name == "shell"

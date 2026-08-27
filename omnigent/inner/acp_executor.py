@@ -8,11 +8,12 @@ whole premise is that the *client* need not know which agent it drives — Goose
 (``@zed-industries/claude-code-acp``) and any in-house agent all speak the same
 wire.
 
-This executor is the **generic** counterpart to the vendor-specific
-:class:`~omnigent.inner.goose_executor.GooseExecutor` /
-:class:`~omnigent.inner.qwen_executor.QwenExecutor`: it spawns whatever command a
-user configured (:class:`AcpAgentConfig.command`) and speaks ACP against it. The
-handful of things those two hardcode become config knobs here:
+This executor is the **base** every ACP harness builds on: it spawns whatever
+command its :class:`AcpAgentConfig` names and speaks ACP against it. A vendor
+composes onto it rather than subclassing it: launch quirks are values on
+:class:`AcpAgentConfig`, behavior arrives through an
+:class:`~omnigent.inner.acp_extension.AcpExtension` (see
+:mod:`omnigent.inner.devin` and :mod:`omnigent.inner.goose`). The knobs:
 
 * ``command``            — the argv to launch (``shlex``-split; never a shell).
 * ``session_id_mode``    — ``"server"`` (agent assigns the id, Goose-style) or
@@ -36,7 +37,7 @@ internally. This executor translates the ACP event stream into Omnigent
 :class:`ExecutorEvent`s and routes the agent's permission requests through
 Omnigent's TOOL_CALL policy + human-consent elicitation.
 
-Vs. the Goose executor this generalizes, it additionally: renders the agent's
+Beyond the raw protocol it: renders the agent's
 tool calls as Omnigent tool cards (``tool_call`` → ``ToolCallRequest``,
 ``tool_call_update`` → ``ToolCallComplete``), forwards reasoning
 (``agent_thought_chunk`` → ``ReasoningChunk``), and honors interrupts via the ACP
@@ -54,14 +55,15 @@ import os
 import secrets
 import shlex
 from collections import deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
 from omnigent.inner.acp_extension import NO_ACP_EXTENSION, AcpExtension
 from omnigent.inner.acp_subagents import SubAgentActivity, SubAgentStart, read_subagent_events
+from omnigent.inner.acp_toolnames import read_tool_name
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
@@ -200,6 +202,24 @@ class AcpAgentConfig:
         it skips the human approval card for a request no policy had an opinion
         on, matching claude-sdk's ``can_use_tool`` gate. Policy still runs in
         every mode, so a DENY still blocks and an explicit ASK still prompts.
+    :param env_allow_prefixes: Environment variable *name prefixes* the agent may
+        read at spawn, e.g. ``("GOOSE_",)``. Complements ``env_passthrough``
+        (exact names) for a vendor whose whole ``VENDOR_*`` family is its own
+        configuration surface.
+    :param spawn_env: Variables forced into the spawn environment, applied last so
+        they beat the host's, e.g. ``{"GOOSE_MODE": "smart_approve"}``. Use for a
+        value Omnigent must pin rather than inherit. An approval mode the policy
+        gate depends on must not be switchable by an ambient variable.
+
+        ponytail: a dict here reads better at every call site than a tuple of
+        pairs, at the cost of making this frozen config unhashable. Nothing hashes
+        it; switch to ``tuple[tuple[str, str], ...]`` if something ever needs to.
+    :param sandbox_read_roots: Extra paths the agent may read under a sandbox,
+        e.g. its config dir. Beyond the cwd and the binary's own directory, this
+        executor cannot know which paths a given vendor CLI needs.
+    :param sandbox_write_roots: Extra paths the agent may write under a sandbox,
+        e.g. its config / state dirs. A vendor CLI that cannot write these fails
+        to start inside the jail, so an agent needing them must name them here.
     :param inject_system_prompt: Fold the Omnigent system prompt into the first
         ACP turn (ACP has no dedicated system-prompt field). On by default. Set
         to ``False`` for agents like Pi forks (``omp``) that fully own their own
@@ -219,6 +239,10 @@ class AcpAgentConfig:
     send_model_in_session_new: bool = False
     omnigent_mcp: bool = True
     env_passthrough: tuple[str, ...] = ()
+    env_allow_prefixes: tuple[str, ...] = ()
+    spawn_env: Mapping[str, str] = field(default_factory=dict)
+    sandbox_read_roots: tuple[Path, ...] = ()
+    sandbox_write_roots: tuple[Path, ...] = ()
     permission_mode: str = "auto"
     inject_system_prompt: bool = True
 
@@ -393,9 +417,25 @@ class AcpExecutor(Executor):
         self._mcp = OmnigentAcpMcp(label=config.name)
         self._omnigent_tools: list[ToolSpec] = []
 
+        # ToolCall records for delegated fs ops; run_turn drains them onto the
+        # turn stream so the agent's file I/O shows in history like any tool.
+        self._fs_events: list[ExecutorEvent] = []
+
     # ------------------------------------------------------------------
     # Low-level ACP transport
     # ------------------------------------------------------------------
+
+    def _reset_process_state(self) -> None:
+        """Clear the state owned by one ACP subprocess.
+
+        Called on spawn and after signalling the process dead, so the next turn
+        re-handshakes and replays the system prompt + history into the fresh
+        process instead of prompting a session that no longer exists.
+        """
+        self._session_id = None
+        self._system_prompt_sent = False
+        self._initialized = False
+        self._image_supported = False
 
     async def _start_process(self) -> None:
         """Start the configured ACP agent as an asyncio subprocess.
@@ -403,10 +443,9 @@ class AcpExecutor(Executor):
         The StreamReader limit is raised to 16 MiB so a large ``session/new``
         response or tool-output line can't hit the default 64 KiB per-line cap.
         """
-        # Reset handshake state: this may be a restart after the previous
-        # subprocess died. ``_initialized`` is a one-way latch.
-        self._initialized = False
-        self._image_supported = False
+        # This may be a restart after the previous subprocess died: a new process
+        # holds no session and has not been sent the system prompt.
+        self._reset_process_state()
         env = self._build_spawn_env()
         launch_path, argv = self._sandbox_launch(tuple(env.keys()))
         _STREAM_LIMIT = 16 * 1024 * 1024
@@ -431,11 +470,10 @@ class AcpExecutor(Executor):
         spec's read/write roots. Falls back to the bare binary (never blocks
         startup) when no sandbox is requested or the backend is unavailable.
 
-        ponytail: a sandboxed *generic* agent gets only its binary dir (read),
-        the cwd, and ``/tmp`` (write) — we can't know an arbitrary agent's config
-        dir. An agent that must write its own config under a sandbox needs
-        ``sandbox: none`` (the default) for now; per-agent write roots is a
-        documented follow-up.
+        Every agent gets its binary's directory (read), the cwd, and ``/tmp``
+        (write). A vendor CLI that also needs its own config / state dirs names
+        them in ``sandbox_read_roots`` / ``sandbox_write_roots``, since this
+        executor cannot infer them for an arbitrary agent.
         """
         binary = self._argv[0]
         rest = self._argv[1:]
@@ -461,7 +499,12 @@ class AcpExecutor(Executor):
             resolved_bin = Path(binary)
             if resolved_bin.parent != Path(".") and resolved_bin.exists():
                 sandbox = with_additional_read_roots(sandbox, [resolved_bin.resolve().parent])
-            sandbox = with_additional_write_roots(sandbox, [Path("/tmp")])
+            read_roots = list(self._config.sandbox_read_roots)
+            if read_roots:
+                sandbox = with_additional_read_roots(sandbox, read_roots)
+            sandbox = with_additional_write_roots(
+                sandbox, [Path("/tmp"), *self._config.sandbox_write_roots]
+            )
             sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
             return create_exec_launcher(binary, sandbox), rest
         except (OSError, ImportError, NotImplementedError) as exc:
@@ -607,11 +650,16 @@ class AcpExecutor(Executor):
     def _build_spawn_env(self) -> dict[str, str]:
         """The env handed to the generic ACP subprocess.
 
-        Deny-by-default: base + the names declared by the agent's own config and
-        by the spec's ``os_env.sandbox.env_passthrough``. No prefix family is
-        added because the executor cannot know which vendor an arbitrary ACP
-        agent belongs to; an agent that authenticates from a variable names it
-        instead, which keeps every *other* provider's secret out.
+        Deny-by-default: base + the names and prefix families the agent's own
+        config declares, plus the spec's ``os_env.sandbox.env_passthrough``.
+        Nothing is added on the executor's own initiative, because it cannot know which
+        vendor an arbitrary ACP agent belongs to, so an agent that authenticates
+        from a variable names it (or its family) in its config, which keeps every
+        *other* provider's secret out.
+
+        ``config.spawn_env`` is applied last so a value Omnigent pins beats the
+        host's: an approval mode a policy gate depends on must not be switchable
+        by an ambient variable.
 
         Kept as a named builder so the spawn-env canary can drive the real thing
         rather than a hand-copied prefix list. The canary constructs a bare
@@ -619,13 +667,15 @@ class AcpExecutor(Executor):
         read defensively rather than assumed present.
         """
         config = getattr(self, "_config", None)
-        return clean_agent_env(
-            allow_prefixes=(),
+        env = clean_agent_env(
+            allow_prefixes=tuple(getattr(config, "env_allow_prefixes", ())),
             extra_allowed=(
                 *getattr(config, "env_passthrough", ()),
                 *declared_passthrough(self._os_env),
             ),
         )
+        env.update(getattr(config, "spawn_env", None) or {})
+        return env
 
     def _warn_initialize_failed(self, reason: str) -> None:
         """Point a failed handshake at the env allowlist.
@@ -788,11 +838,82 @@ class AcpExecutor(Executor):
             self._os_environment = env
         return self._os_environment
 
+    async def _fs_call_policy_denies(self, tool_name: str, args: _AcpJsonObject) -> bool:
+        """Call-phase gate for a delegated fs side effect, evaluated before it runs.
+
+        Fails CLOSED: a policy engine that errors must not let an ungated write
+        through, so an exception denies. ASK also denies here, because a delegated fs op
+        is answered inside a JSON-RPC reply with no elicitation channel of its
+        own, so there is nowhere to park a human decision.
+        """
+        policy_eval = getattr(self, "_policy_evaluator", None)
+        if policy_eval is None:
+            return False
+        try:
+            verdict = await policy_eval("PHASE_TOOL_CALL", {"name": tool_name, "arguments": args})
+        except Exception as exc:  # noqa: BLE001 (call phase fails closed for side effects)
+            logger.warning(
+                "acp[%s] TOOL_CALL policy eval failed for %s: %s",
+                self._config.name,
+                tool_name,
+                exc,
+            )
+            return True
+        return getattr(verdict, "action", None) in ("POLICY_ACTION_DENY", "POLICY_ACTION_ASK")
+
+    async def _fs_result_policy_denies(self, tool_name: str, result: Any) -> bool:
+        """Result-phase check on a delegated fs result before it reaches the agent.
+
+        Fails OPEN: the side effect (or read) already happened, so an engine error
+        must not also destroy the result the agent is waiting on.
+        """
+        policy_eval = getattr(self, "_policy_evaluator", None)
+        if policy_eval is None:
+            return False
+        try:
+            verdict = await policy_eval("PHASE_TOOL_RESULT", {"result": result})
+        except Exception as exc:  # noqa: BLE001 (result phase fails open)
+            logger.warning(
+                "acp[%s] TOOL_RESULT policy eval failed for %s: %s",
+                self._config.name,
+                tool_name,
+                exc,
+            )
+            return False
+        return getattr(verdict, "action", None) == "POLICY_ACTION_DENY"
+
+    def _record_fs_op(
+        self,
+        tool_name: str,
+        args: _AcpJsonObject,
+        *,
+        status: ToolCallStatus,
+        result: Any = None,
+        error: str | None = None,
+    ) -> None:
+        """Buffer a paired ToolCallRequest + ToolCallComplete for a delegated fs op."""
+        call_id = f"fsacp_{secrets.token_hex(8)}"
+        self._fs_events.append(
+            ToolCallRequest(name=tool_name, args=args, metadata={"call_id": call_id})
+        )
+        self._fs_events.append(
+            ToolCallComplete(
+                name=tool_name,
+                status=status,
+                result=result,
+                error=error,
+                metadata={"call_id": call_id},
+            )
+        )
+
     async def _handle_fs_read(self, params: _AcpJsonObject) -> _AcpJsonObject:
         """Serve an ACP ``fs/read_text_file`` by reading through the OSEnvironment.
 
         ACP params ``{path, line?, limit?}`` (1-based start line, max line count;
-        both optional → whole file) map onto :meth:`OSEnvironment.read`.
+        both optional → whole file) map onto :meth:`OSEnvironment.read`. The op is
+        recorded onto the turn stream; call-phase policy gates the read by path
+        before it runs, and the content runs through result-phase policy before it
+        reaches the agent.
         """
         path = params.get("path")
         if not isinstance(path, str) or not path:
@@ -801,22 +922,57 @@ class AcpExecutor(Executor):
         limit = params.get("limit")
         offset = line if isinstance(line, int) and line >= 1 else 1
         read_limit = limit if isinstance(limit, int) and limit >= 1 else None
+        args: _AcpJsonObject = {"path": path}
+        if line is not None:
+            args["line"] = line
+        if limit is not None:
+            args["limit"] = limit
 
-        env = await self._ensure_os_environment()
-        result = await env.read(path, offset=offset, limit=read_limit)
-        if "error" in result:
-            message = str(result["error"])
-            code = _ACP_RESOURCE_NOT_FOUND_CODE if _looks_like_missing_file(message) else -32603
-            raise _AcpRequestError(code, message)
-        if result.get("encoding") != "utf-8":
-            raise _AcpRequestError(-32603, f"{path}: not a UTF-8 text file")
-        return {"content": result.get("content", "")}
+        if await self._fs_call_policy_denies("read_text_file", args):
+            self._record_fs_op(
+                "read_text_file", args, status=ToolCallStatus.BLOCKED, error="blocked by policy"
+            )
+            raise _AcpRequestError(-32603, f"{path}: blocked by policy")
+
+        try:
+            env = await self._ensure_os_environment()
+            result = await env.read(path, offset=offset, limit=read_limit)
+            if "error" in result:
+                message = str(result["error"])
+                code = (
+                    _ACP_RESOURCE_NOT_FOUND_CODE if _looks_like_missing_file(message) else -32603
+                )
+                raise _AcpRequestError(code, message)
+            if result.get("encoding") != "utf-8":
+                raise _AcpRequestError(-32603, f"{path}: not a UTF-8 text file")
+        except _AcpRequestError as exc:
+            self._record_fs_op(
+                "read_text_file", args, status=ToolCallStatus.ERROR, error=exc.message
+            )
+            raise
+
+        content = result.get("content", "")
+        if await self._fs_result_policy_denies("read_text_file", content):
+            self._record_fs_op(
+                "read_text_file",
+                args,
+                status=ToolCallStatus.BLOCKED,
+                error="blocked by content policy",
+            )
+            raise _AcpRequestError(-32603, f"{path}: blocked by content policy")
+        self._record_fs_op(
+            "read_text_file", args, status=ToolCallStatus.SUCCESS, result={"content": content}
+        )
+        return {"content": content}
 
     async def _handle_fs_write(self, params: _AcpJsonObject) -> _AcpJsonObject:
         """Serve an ACP ``fs/write_text_file`` by writing through the OSEnvironment.
 
         ACP params ``{path, content}``; the write goes through the helper so the
-        spec's sandbox write roots are enforced at the Python layer.
+        spec's sandbox write roots are enforced at the Python layer. The op is
+        recorded onto the turn stream, and call-phase policy gates the write
+        before it runs. Result-phase policy evaluates the outcome after the side
+        effect; a denial refuses the response without undoing the write.
         """
         path = params.get("path")
         content = params.get("content")
@@ -824,11 +980,34 @@ class AcpExecutor(Executor):
             raise _AcpRequestError(-32602, "fs/write_text_file requires a string 'path'")
         if not isinstance(content, str):
             raise _AcpRequestError(-32602, "fs/write_text_file requires string 'content'")
+        args: _AcpJsonObject = {"path": path, "content": content}
 
-        env = await self._ensure_os_environment()
-        result = await env.write(path, content)
-        if "error" in result:
-            raise _AcpRequestError(-32603, str(result["error"]))
+        if await self._fs_call_policy_denies("write_text_file", args):
+            self._record_fs_op(
+                "write_text_file", args, status=ToolCallStatus.BLOCKED, error="blocked by policy"
+            )
+            raise _AcpRequestError(-32603, f"{path}: blocked by policy")
+
+        try:
+            env = await self._ensure_os_environment()
+            result = await env.write(path, content)
+            if "error" in result:
+                raise _AcpRequestError(-32603, str(result["error"]))
+        except _AcpRequestError as exc:
+            self._record_fs_op(
+                "write_text_file", args, status=ToolCallStatus.ERROR, error=exc.message
+            )
+            raise
+
+        if await self._fs_result_policy_denies("write_text_file", result):
+            self._record_fs_op(
+                "write_text_file",
+                args,
+                status=ToolCallStatus.BLOCKED,
+                error="blocked by content policy",
+            )
+            raise _AcpRequestError(-32603, f"{path}: blocked by content policy")
+        self._record_fs_op("write_text_file", args, status=ToolCallStatus.SUCCESS, result=result)
         return {}
 
     # ------------------------------------------------------------------
@@ -847,15 +1026,20 @@ class AcpExecutor(Executor):
         card cannot say what is about to run and no TOOL_CALL policy rule can
         match it (rules gate on the tool name, then read its arguments).
 
-        (Vendor-specific ``_meta`` tool names — e.g. Goose's
-        ``_meta.goose.toolCall.toolName`` — are not read here; ``title`` is the
-        portable name and ``toolCallId`` the portable correlation.)
+        An agent whose own tool identifier differs from that label contributes a
+        dialect through its extension's
+        :attr:`~omnigent.inner.acp_extension.AcpExtension.tool_name_sources`,
+        which wins over ``title``: policy rules match the name the agent actually
+        dispatches by, and a friendly label is a name no rule can gate. Agents
+        with no such dialect (the generic ``acp`` harness and every builtin ACP
+        row) resolve exactly as before.
         """
         tool_call = params.get("toolCall") or {}
         call_id = tool_call.get("toolCallId")
         call_id = call_id if isinstance(call_id, str) else None
         name = (
-            tool_call.get("title")
+            read_tool_name(tool_call, self._extension.tool_name_sources)
+            or tool_call.get("title")
             or tool_call.get("kind")
             or (self._tool_names.get(call_id) if call_id else None)
             or "tool"
@@ -1459,6 +1643,11 @@ class AcpExecutor(Executor):
             if isinstance(stale, dict) and stale.get("id") is not None and stale.get("method"):
                 await self._respond_to_agent_request(stale)
 
+        # Answering a stale request above can run real fs I/O, so emit its ToolCall
+        # audit events into history rather than dropping them.
+        while self._fs_events:
+            yield self._fs_events.pop(0)
+
         self._rpc_id += 1
         req_id = self._rpc_id
         loop = asyncio.get_event_loop()
@@ -1526,6 +1715,10 @@ class AcpExecutor(Executor):
                 # Server-initiated request (session/request_permission / fs/*):
                 # routes through policy + elicitation. Blocks while the human decides.
                 await self._respond_to_agent_request(notification)
+                # Surface any fs ToolCall events the handler buffered so the
+                # delegated I/O shows in history.
+                while self._fs_events:
+                    yield self._fs_events.pop(0)
 
             # Inbound message = progress; reset the idle deadline.
             deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
@@ -1535,22 +1728,52 @@ class AcpExecutor(Executor):
 
         The agent responds by ending the in-flight ``session/prompt`` with a
         ``cancelled`` stop reason, which the ``run_turn`` loop then surfaces.
-        Best-effort: a no-op (returns ``False``) if there's no live session.
+
+        Falls back to SIGTERM when there is no session to cancel yet (the turn is
+        still in the initialize / session-new handshake) or the notification
+        cannot be sent, so Stop always terminates the turn rather than silently
+        doing nothing.
+
+        :returns: ``True`` when an interrupt was issued (cancel sent or process
+            signalled), ``False`` when there is no live process to interrupt.
         """
-        if self._proc is None or self._proc.returncode is not None or self._session_id is None:
+        proc = self._proc
+        if proc is None or proc.returncode is not None:
+            return False
+
+        if self._session_id is not None:
+            try:
+                await self._send(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": _CLIENT_NOTIFICATION_SESSION_CANCEL,
+                        "params": {"sessionId": self._session_id},
+                    }
+                )
+                return True
+            except Exception as exc:  # noqa: BLE001 (fall through to SIGTERM)
+                logger.warning(
+                    "acp[%s] session/cancel failed (%s); falling back to SIGTERM",
+                    self._config.name,
+                    exc,
+                )
+        return self._interrupt_proc()
+
+    def _interrupt_proc(self) -> bool:
+        """SIGTERM the agent subprocess, returning ``True`` if it was signalled.
+
+        Safe to call at any time; no-ops when the process has already exited.
+        """
+        proc = self._proc
+        if proc is None or proc.returncode is not None:
             return False
         try:
-            await self._send(
-                {
-                    "jsonrpc": "2.0",
-                    "method": _CLIENT_NOTIFICATION_SESSION_CANCEL,
-                    "params": {"sessionId": self._session_id},
-                }
-            )
-            return True
-        except Exception as exc:  # noqa: BLE001 — interrupt is best-effort
-            logger.debug("acp[%s] session/cancel failed: %s", self._config.name, exc)
+            proc.terminate()
+        except ProcessLookupError:
+            self._reset_process_state()
             return False
+        self._reset_process_state()
+        return True
 
     async def close_session(self, session_key: str) -> None:
         """Close a named session (no-op; the ACP session is per-process)."""

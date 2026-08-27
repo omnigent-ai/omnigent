@@ -1,17 +1,17 @@
-"""``harness: goose`` wrap (the Goose ACP harness).
+"""``harness: goose`` wrap.
 
-Thin module exposing :func:`create_app` — the entry point the shared
-:mod:`omnigent.runtime.harnesses._runner` invokes after the parent process
-resolves ``"goose"`` to this module via
-:data:`omnigent.runtime.harnesses._HARNESS_MODULES`.
+The entry point :mod:`omnigent.runtime.harnesses._runner` invokes after the
+plugin registry resolves ``"goose"`` to this module. Goose speaks ACP, so this
+adds no protocol code: it builds Goose's launch config and injects
+:data:`~omnigent.inner.goose.GOOSE_ACP_EXTENSION`, which together are the only
+things that distinguish a Goose harness process from a generic ``acp`` one.
 
-Wraps a :class:`omnigent.inner.goose_executor.GooseExecutor`, which drives
-``goose acp`` over the Agent Client Protocol. This is the only Goose harness:
-the retired ``goose-native`` TUI wrap could not gate tool calls through
-Omnigent policy (Goose exposes no pre-tool hook), so its spellings now
-canonicalize here. Goose's mid-turn tool approvals surface as web elicitation
-cards (via Omnigent's TOOL_CALL policy + ``ctx.elicit`` bridges the
-:class:`ExecutorAdapter` installs), mirroring the qwen wrap.
+Unlike :mod:`omnigent.inner.devin.harness`, this does not delegate to
+:func:`omnigent.inner.acp_harness.create_app`: that reads the agent's launch from
+``HARNESS_ACP_*``, and Goose's four launch quirks (forced approval mode, its
+``GOOSE_`` env family, and its two sandbox roots) have no spelling there. The env
+contract below is therefore Goose's own and unchanged from before Goose moved onto
+the generic executor.
 
 Auth is Goose's own configuration (``goose configure`` → keyring /
 ``~/.config/goose/config.yaml``); Omnigent stores no Goose credential. A spec
@@ -26,9 +26,8 @@ Env vars read at startup:
 - ``HARNESS_GOOSE_PROVIDER``: optional ``GOOSE_PROVIDER`` override.
 - ``HARNESS_GOOSE_CWD``: working directory for the goose subprocess. ``None``
   falls back to ``OMNIGENT_RUNNER_WORKSPACE`` then the inherited cwd.
-- ``OMNIGENT_GOOSE_PATH``: absolute path to a ``goose`` CLI binary.
-  ``None`` searches ``PATH``. (Legacy ``HARNESS_GOOSE_PATH`` still honored,
-  deprecated.)
+- ``OMNIGENT_GOOSE_PATH``: absolute path to a ``goose`` CLI binary. ``None``
+  searches ``PATH``. (Legacy ``HARNESS_GOOSE_PATH`` still honored, deprecated.)
 - ``HARNESS_GOOSE_BUILTINS``: comma-separated Goose builtin extensions to load
   (``--with-builtin``). ``None`` defaults to ``developer`` (shell + editor).
 - ``HARNESS_GOOSE_OS_ENV``: JSON-encoded :class:`OSEnvSpec`. When unset, falls
@@ -46,7 +45,7 @@ from fastapi import FastAPI
 from omnigent.harness_startup_config import resolve_harness_path
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import Executor
-from omnigent.inner.goose_executor import GooseExecutor
+from omnigent.inner.goose import build_goose_executor
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 
 _logger = logging.getLogger(__name__)
@@ -54,10 +53,6 @@ _logger = logging.getLogger(__name__)
 _ENV_MODEL = "HARNESS_GOOSE_MODEL"
 _ENV_PROVIDER = "HARNESS_GOOSE_PROVIDER"
 _ENV_CWD = "HARNESS_GOOSE_CWD"
-_ENV_GOOSE_PATH = "OMNIGENT_GOOSE_PATH"
-# Deprecated alias — read via resolve_harness_path() which warns on use.
-# Remove this constant and the HARNESS_GOOSE_PATH read in v0.8.0.
-_LEGACY_ENV_GOOSE_PATH = "HARNESS_GOOSE_PATH"
 _ENV_BUILTINS = "HARNESS_GOOSE_BUILTINS"
 _ENV_OS_ENV = "HARNESS_GOOSE_OS_ENV"
 
@@ -97,36 +92,32 @@ def _resolve_os_env() -> OSEnvSpec:
     )
 
 
-def _build_goose_executor() -> Executor:
-    """Construct a :class:`GooseExecutor` from env-var config (lazily, on first turn)."""
-    cwd_raw = os.environ.get(_ENV_CWD) or os.environ.get("OMNIGENT_RUNNER_WORKSPACE")
-    cwd = cwd_raw or None
-    model = os.environ.get(_ENV_MODEL, "").strip() or None
-    provider = os.environ.get(_ENV_PROVIDER, "").strip() or None
-    goose_path = resolve_harness_path("goose")
+def _build_executor() -> Executor:
+    """Assemble Goose's executor from env-var config (lazily, on first turn)."""
+    cwd = os.environ.get(_ENV_CWD) or os.environ.get("OMNIGENT_RUNNER_WORKSPACE") or None
     builtins_raw = os.environ.get(_ENV_BUILTINS, "").strip()
     builtins = (
         tuple(part.strip() for part in builtins_raw.split(",") if part.strip())
         if builtins_raw
         else None
     )
-
-    return GooseExecutor(
+    return build_goose_executor(
         cwd=cwd,
         os_env=_resolve_os_env(),
-        model=model,
-        provider=provider,
-        goose_path=goose_path,
+        model=os.environ.get(_ENV_MODEL, "").strip() or None,
+        provider=os.environ.get(_ENV_PROVIDER, "").strip() or None,
+        goose_path=resolve_harness_path("goose"),
         builtins=builtins,
     )
 
 
 def create_app() -> FastAPI:
-    """Build the goose harness's FastAPI app (required entry point).
+    """Build the Goose harness's FastAPI app (required entry point).
 
-    The wrapped :class:`GooseExecutor` is constructed lazily on the first turn,
-    so an absent ``goose`` CLI surfaces as a request-time error rather than an
-    app-boot crash.
+    The executor is constructed lazily on the first turn, so an absent ``goose``
+    CLI surfaces as a request-time error rather than an app-boot crash.
+
+    :returns: The app the runner serves for a ``harness: goose`` session.
     """
-    adapter = ExecutorAdapter(executor_factory=_build_goose_executor, harness_label="Goose")
+    adapter = ExecutorAdapter(executor_factory=_build_executor, harness_label="Goose")
     return adapter.build()

@@ -32,10 +32,12 @@ transcript on the client opting in with
 nested updates via ``_meta.claudeCode.parentToolUseId``. Supporting that dialect
 therefore needs an extension to contribute handshake fields, not just read
 frames — an ``initialize`` capability contribution alongside
-:attr:`AcpExtension.subagent_sources`. Others: filtering which permission
-options reach the approval card (an agent may offer "switch to bypass mode"),
-resolving a vendor ``_meta`` tool name when the protocol's ``title`` is absent,
-and vendor-specific tool-gating hooks.
+:attr:`AcpExtension.subagent_sources`.
+
+Resolving a vendor ``_meta`` tool name is the second shipped field
+(:attr:`AcpExtension.tool_name_sources`, added for Goose). Others: filtering
+which permission options reach the approval card (an agent may offer "switch to
+bypass mode"), and vendor-specific tool-gating hooks.
 """
 
 from __future__ import annotations
@@ -43,6 +45,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from omnigent.inner.acp_subagents import AcpSubAgentSource
+from omnigent.inner.acp_toolnames import AcpToolNameSource
 
 
 @dataclass(frozen=True)
@@ -55,10 +58,16 @@ class AcpExtension:
     :param subagent_sources: Dialects that recognize this vendor's sub-agent
         lifecycle reporting (see :mod:`omnigent.inner.acp_subagents`). Empty —
         the default — means the executor does no sub-agent scanning at all.
+    :param tool_name_sources: Dialects that resolve this vendor's own tool
+        identifier from a ``toolCall`` (see :mod:`omnigent.inner.acp_toolnames`).
+        Empty — the default — leaves ACP's portable ``title`` / ``kind``
+        authoritative, which is correct for any agent that dispatches by the name
+        it reports.
     """
 
     name: str
     subagent_sources: tuple[AcpSubAgentSource, ...] = field(default=())
+    tool_name_sources: tuple[AcpToolNameSource, ...] = field(default=())
 
     @property
     def surfaces_subagents(self) -> bool:

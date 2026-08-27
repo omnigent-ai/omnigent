@@ -95,7 +95,7 @@ KIRO_KEY = "kiro"
 # - qwen: ``--input-file`` / ``--json-file`` bridge verified on v0.18.1
 #   (``omnigent/qwen_native_forwarder.py`` / ``docs/QWEN_NATIVE_DESIGN.md``).
 # - goose: ACP protocol + ``result.usage`` shape verified on Goose 1.38.0
-#   (``omnigent/inner/goose_executor.py``).
+#   (``omnigent/inner/goose/``).
 # - hermes: parent_session_id schema introduced in v0.17.0
 #   (``omnigent/hermes_native_forwarder.py``).
 # - kiro: MCP config schema (``{"mcpServers": ...}``) verified on kiro-cli 2.10.0

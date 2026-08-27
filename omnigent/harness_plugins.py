@@ -683,7 +683,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "copilot": "omnigent.inner.copilot_harness",
         "cursor": "omnigent.inner.cursor_harness",
         "cursor-native": "omnigent.inner.cursor_native_harness",
-        "goose": "omnigent.inner.goose_harness",
+        "goose": "omnigent.inner.goose.harness",
         "hermes": "omnigent.inner.hermes_harness",
         "hermes-native": "omnigent.inner.hermes_native_harness",
         "kimi": "omnigent.inner.kimi_harness",

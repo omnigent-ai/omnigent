@@ -2,7 +2,7 @@
 
 The live suite for Omnigent's only Goose harness, which runs Block's Goose over
 the Agent Client Protocol (``goose acp``):
-:class:`omnigent.inner.goose_executor.GooseExecutor` spawns the subprocess,
+:func:`omnigent.inner.goose.build_goose_executor` spawns the subprocess,
 streams ``agent_message_chunk`` updates as chat text, and routes Goose's mid-turn
 ``session/request_permission`` through Omnigent's TOOL_CALL policy + human-consent
 elicitation (the same bridges the runner's ExecutorAdapter installs). This test
@@ -34,7 +34,7 @@ from pathlib import Path
 import pytest
 
 from omnigent.inner.executor import ExecutorError, TextChunk, TurnComplete
-from omnigent.inner.goose_executor import GooseExecutor
+from omnigent.inner.goose import build_goose_executor
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("OMNIGENT_E2E_GOOSE") != "1"
@@ -76,7 +76,7 @@ def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 @pytest.mark.asyncio
 async def test_goose_acp_streams_and_completes(isolated_home: Path) -> None:
     """A plain prose turn streams agent text and completes with token usage."""
-    executor = GooseExecutor(
+    executor = build_goose_executor(
         provider=os.environ["GOOSE_PROVIDER"],
         model=os.environ["GOOSE_MODEL"],
         builtins=("developer",),
@@ -120,7 +120,7 @@ async def test_goose_acp_tool_call_surfaces_elicitation(isolated_home: Path) -> 
         elicited.append((tool_name, tool_input))
         return True  # user approves
 
-    executor = GooseExecutor(
+    executor = build_goose_executor(
         provider=os.environ["GOOSE_PROVIDER"],
         model=os.environ["GOOSE_MODEL"],
         builtins=("developer",),

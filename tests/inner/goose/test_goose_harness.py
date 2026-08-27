@@ -1,10 +1,13 @@
-"""Unit tests for GooseExecutor (headless Goose ACP / JSON-RPC 2.0 mode).
+"""Unit tests for the Goose harness (``goose acp`` over ACP).
 
-Covers construction defaults, provider-env overrides, tool-call extraction and
-permission-outcome mapping from Goose's ACP ``session/request_permission`` shape,
-usage mapping, prompt-block folding, the permission → policy/elicitation
-round-trip, run_turn streaming, and the harness wrap. Protocol shapes match a
-verified Goose 1.38 ``goose acp`` session.
+Goose is :class:`~omnigent.inner.acp_executor.AcpExecutor` plus a Goose-shaped
+config, so this file covers what *Goose* adds: its config contract, its
+``_meta`` tool-name mapping, its sandbox roots, and the harness wrap, plus
+integration-level checks that a real Goose session drives the inherited wire
+(permission round-trip, run_turn streaming, usage). The generic protocol surface
+is owned by ``tests/inner/test_acp_executor.py``; duplicating it here is what let
+the two implementations drift. Protocol shapes match a verified Goose 1.38
+``goose acp`` session.
 """
 
 from __future__ import annotations
@@ -12,10 +15,13 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from omnigent.inner.acp_executor import AcpExecutor
 from omnigent.inner.executor import (
     ExecutorError,
     TextChunk,
@@ -24,19 +30,15 @@ from omnigent.inner.executor import (
     ToolCallStatus,
     TurnComplete,
 )
-from omnigent.inner.goose_executor import GooseExecutor
+from omnigent.inner.goose import GOOSE_ACP_EXTENSION, build_goose_executor
 
 # ---------------------------------------------------------------------------
 # Construction / attribute defaults
 # ---------------------------------------------------------------------------
 
 
-def test_executor_default_attributes() -> None:
-    executor = GooseExecutor(goose_path="goose")
-    assert executor._goose_path == "goose"
-    assert executor._model is None
-    assert executor._provider is None
-    assert executor._builtins == ("developer",)
+def test_executor_starts_unspawned_with_no_session() -> None:
+    executor = build_goose_executor(goose_path="goose")
     assert executor._proc is None
     assert executor._session_id is None
     assert executor._initialized is False
@@ -44,28 +46,18 @@ def test_executor_default_attributes() -> None:
     assert executor.max_context_tokens() is None
 
 
-def test_executor_custom_model_provider_builtins() -> None:
-    executor = GooseExecutor(
-        model="claude-x", provider="anthropic", builtins=("developer", "computercontroller")
-    )
-    assert executor._model == "claude-x"
-    assert executor._provider == "anthropic"
-    assert executor._builtins == ("developer", "computercontroller")
-
-
 def test_executor_cwd_defaults_and_explicit() -> None:
-    assert GooseExecutor()._cwd == os.getcwd()
-    assert GooseExecutor(cwd="/tmp")._cwd == "/tmp"
+    assert build_goose_executor()._cwd == os.getcwd()
+    assert build_goose_executor(cwd="/tmp")._cwd == "/tmp"
 
 
-def test_provider_env_only_sets_when_present() -> None:
-    assert GooseExecutor()._provider_env() == {}
-    assert GooseExecutor(provider="anthropic")._provider_env() == {"GOOSE_PROVIDER": "anthropic"}
-    assert GooseExecutor(model="claude-x")._provider_env() == {"GOOSE_MODEL": "claude-x"}
-    assert GooseExecutor(provider="anthropic", model="claude-x")._provider_env() == {
-        "GOOSE_PROVIDER": "anthropic",
-        "GOOSE_MODEL": "claude-x",
-    }
+def test_provider_env_only_sets_what_was_named() -> None:
+    """An unnamed provider/model leaves Goose's own configuration untouched."""
+    from omnigent.inner.goose import goose_provider_env
+
+    assert goose_provider_env(None, None) == {}
+    assert goose_provider_env("anthropic", None) == {"GOOSE_PROVIDER": "anthropic"}
+    assert goose_provider_env(None, "claude-x") == {"GOOSE_MODEL": "claude-x"}
 
 
 def test_spawn_env_forces_an_approval_mode(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -77,7 +69,79 @@ def test_spawn_env_forces_an_approval_mode(monkeypatch: pytest.MonkeyPatch) -> N
     not be able to switch enforcement back off.
     """
     monkeypatch.setenv("GOOSE_MODE", "auto")
-    assert GooseExecutor()._build_spawn_env()["GOOSE_MODE"] == "smart_approve"
+    assert build_goose_executor()._build_spawn_env()["GOOSE_MODE"] == "smart_approve"
+
+
+def test_goose_agent_config_carries_every_goose_quirk() -> None:
+    """The Goose config is the whole vendor contract; pin it as one shape.
+
+    Each field here is a Goose behavior the generic ACP executor cannot infer,
+    and each one silently breaks something if dropped: no ``acp`` subcommand and
+    it speaks the wrong protocol; no ``--with-builtin`` and Goose has no tools;
+    no ``GOOSE_MODE`` and the TOOL_CALL policy gate never fires; no ``GOOSE_``
+    prefix and Goose cannot read its own configuration; no config/state roots and
+    it cannot start inside a sandbox.
+    """
+    from omnigent.inner.goose import goose_agent_config
+
+    config = goose_agent_config(
+        goose_path="/usr/bin/goose", provider="anthropic", model="claude-x"
+    )
+
+    assert shlex.split(config.command) == [
+        "/usr/bin/goose",
+        "acp",
+        "--with-builtin",
+        "developer",
+    ]
+    assert config.name == "Goose"
+    # Goose assigns the session id itself and has no session/new model field.
+    assert config.session_id_mode == "server"
+    assert config.send_model_in_session_new is False
+    assert config.env_allow_prefixes == ("GOOSE_",)
+    assert dict(config.spawn_env) == {
+        "GOOSE_MODE": "smart_approve",
+        "GOOSE_PROVIDER": "anthropic",
+        "GOOSE_MODEL": "claude-x",
+    }
+    assert config.sandbox_write_roots == (
+        Path.home() / ".config" / "goose",
+        Path.home() / ".local" / "share" / "goose",
+    )
+    assert config.sandbox_read_roots == (Path.home() / ".config" / "goose",)
+
+
+def test_goose_agent_config_builtins_override() -> None:
+    """``HARNESS_GOOSE_BUILTINS`` reaches the argv as repeated flags."""
+    from omnigent.inner.goose import goose_agent_config
+
+    config = goose_agent_config(builtins=("developer", "computercontroller"))
+    assert shlex.split(config.command) == [
+        "goose",
+        "acp",
+        "--with-builtin",
+        "developer",
+        "--with-builtin",
+        "computercontroller",
+    ]
+
+
+def test_goose_composes_onto_the_generic_acp_wire() -> None:
+    """Goose IS the generic ACP executor: a config plus an extension, no subclass.
+
+    Guards the pattern's point. A Goose-only subclass would mean the protocol code
+    had been forked again, so every ACP fix would need applying twice; and a
+    subclass is not liftable the way a package plus an extension is.
+    """
+    executor = build_goose_executor()
+
+    assert type(executor) is AcpExecutor, "Goose must not subclass the wire"
+    assert executor._extension is GOOSE_ACP_EXTENSION
+    assert executor._extension.name == "goose"
+    # Streaming + its own tool loop come from the base and match the declared
+    # capability row, which goose-native's executor contradicted.
+    assert executor.supports_streaming() is True
+    assert executor.handles_tools_internally() is True
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +159,7 @@ def test_extract_tool_call_uses_title_and_raw_input() -> None:
             "rawInput": {"command": "echo hi"},
         }
     }
-    name, args = GooseExecutor._extract_tool_call(params)
+    name, args = build_goose_executor()._extract_tool_call(params)
     assert name == "shell"
     assert args == {"command": "echo hi"}
 
@@ -110,47 +174,15 @@ def test_extract_tool_call_prefers_meta_tool_name() -> None:
             "_meta": {"goose": {"toolCall": {"toolName": "developer__shell"}}},
         }
     }
-    name, args = GooseExecutor._extract_tool_call(params)
+    name, args = build_goose_executor()._extract_tool_call(params)
     assert name == "developer__shell"
     assert args == {"command": "echo hi"}
 
 
 def test_extract_tool_call_falls_back_to_kind_then_tool() -> None:
-    assert GooseExecutor._extract_tool_call({"toolCall": {"kind": "execute"}}) == ("execute", {})
-    assert GooseExecutor._extract_tool_call({}) == ("tool", {})
-
-
-# ---------------------------------------------------------------------------
-# Permission outcome mapping (Goose option kinds)
-# ---------------------------------------------------------------------------
-
-_GOOSE_OPTIONS = [
-    {"optionId": "allow_always", "name": "allow_always", "kind": "allow_always"},
-    {"optionId": "allow_once", "name": "allow_once", "kind": "allow_once"},
-    {"optionId": "reject_once", "name": "reject_once", "kind": "reject_once"},
-    {"optionId": "reject_always", "name": "reject_always", "kind": "reject_always"},
-]
-
-
-def test_permission_outcome_allow_prefers_once() -> None:
-    out = GooseExecutor._permission_outcome({"options": _GOOSE_OPTIONS}, allow=True)
-    assert out == {"outcome": "selected", "optionId": "allow_once"}
-
-
-def test_permission_outcome_deny_prefers_reject_once() -> None:
-    out = GooseExecutor._permission_outcome({"options": _GOOSE_OPTIONS}, allow=False)
-    assert out == {"outcome": "selected", "optionId": "reject_once"}
-
-
-def test_permission_outcome_cancels_when_no_matching_option() -> None:
-    # allow requested but only reject options offered → cancelled (fail-safe).
-    only_reject = [{"optionId": "r", "kind": "reject_once"}]
-    assert GooseExecutor._permission_outcome({"options": only_reject}, allow=True) == {
-        "outcome": "cancelled"
-    }
-    assert GooseExecutor._permission_outcome({"options": []}, allow=False) == {
-        "outcome": "cancelled"
-    }
+    executor = build_goose_executor()
+    assert executor._extract_tool_call({"toolCall": {"kind": "execute"}}) == ("execute", {})
+    assert executor._extract_tool_call({}) == ("tool", {})
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +195,7 @@ def test_usage_from_result_maps_goose_keys() -> None:
         "stopReason": "end_turn",
         "usage": {"totalTokens": 100, "inputTokens": 80, "outputTokens": 20},
     }
-    assert GooseExecutor._usage_from_result(result) == {
+    assert AcpExecutor._usage_from_result(result) == {
         "input_tokens": 80,
         "output_tokens": 20,
         "total_tokens": 100,
@@ -171,8 +203,8 @@ def test_usage_from_result_maps_goose_keys() -> None:
 
 
 def test_usage_from_result_none_when_absent() -> None:
-    assert GooseExecutor._usage_from_result({"stopReason": "end_turn"}) is None
-    assert GooseExecutor._usage_from_result({"usage": "nope"}) is None
+    assert AcpExecutor._usage_from_result({"stopReason": "end_turn"}) is None
+    assert AcpExecutor._usage_from_result({"usage": "nope"}) is None
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +222,7 @@ def test_text_from_blocks_text_and_file() -> None:
             "file_data": "data:application/pdf;base64,AAA=",
         },
     ]
-    text = GooseExecutor._text_from_blocks(blocks)
+    text = AcpExecutor._text_from_blocks(blocks)
     assert "do the thing" in text
     assert "--- attached file: a.txt ---\nhi\n--- end of a.txt ---" in text
     assert "[attached file: b.pdf]" in text  # binary → marker, not inlined
@@ -199,6 +231,15 @@ def test_text_from_blocks_text_and_file() -> None:
 # ---------------------------------------------------------------------------
 # Permission round-trip (agent → client request)
 # ---------------------------------------------------------------------------
+
+
+# The four option kinds Goose offers on a permission request.
+_GOOSE_OPTIONS = [
+    {"optionId": "allow_always", "name": "allow_always", "kind": "allow_always"},
+    {"optionId": "allow_once", "name": "allow_once", "kind": "allow_once"},
+    {"optionId": "reject_once", "name": "reject_once", "kind": "reject_once"},
+    {"optionId": "reject_always", "name": "reject_always", "kind": "reject_always"},
+]
 
 
 def _perm_request(req_id: int = 9) -> dict:
@@ -221,7 +262,7 @@ def _perm_request(req_id: int = 9) -> dict:
 
 @pytest.mark.asyncio
 async def test_respond_to_permission_allows_when_no_gates_wired() -> None:
-    executor = GooseExecutor()
+    executor = build_goose_executor()
     sent: list[dict] = []
     executor._send = AsyncMock(side_effect=lambda m: sent.append(m))  # type: ignore[method-assign]
     await executor._respond_to_agent_request(_perm_request())
@@ -230,7 +271,7 @@ async def test_respond_to_permission_allows_when_no_gates_wired() -> None:
 
 @pytest.mark.asyncio
 async def test_respond_to_permission_denied_by_policy() -> None:
-    executor = GooseExecutor()
+    executor = build_goose_executor()
     executor._policy_evaluator = AsyncMock(  # type: ignore[attr-defined]
         return_value=MagicMock(action="POLICY_ACTION_DENY")
     )
@@ -250,7 +291,7 @@ async def test_respond_to_permission_denied_by_policy() -> None:
 @pytest.mark.asyncio
 async def test_respond_to_permission_elicitation_allow_and_deny() -> None:
     # Accept → allow_once.
-    allow_exec = GooseExecutor()
+    allow_exec = build_goose_executor()
     allow_exec._elicitation_handler = AsyncMock(return_value=True)  # type: ignore[attr-defined]
     sent_a: list[dict] = []
     allow_exec._send = AsyncMock(side_effect=lambda m: sent_a.append(m))  # type: ignore[method-assign]
@@ -261,7 +302,7 @@ async def test_respond_to_permission_elicitation_allow_and_deny() -> None:
     )
 
     # Deny → reject_once.
-    deny_exec = GooseExecutor()
+    deny_exec = build_goose_executor()
     deny_exec._elicitation_handler = AsyncMock(return_value=False)  # type: ignore[attr-defined]
     sent_d: list[dict] = []
     deny_exec._send = AsyncMock(side_effect=lambda m: sent_d.append(m))  # type: ignore[method-assign]
@@ -271,7 +312,7 @@ async def test_respond_to_permission_elicitation_allow_and_deny() -> None:
 
 @pytest.mark.asyncio
 async def test_respond_to_unknown_method_returns_jsonrpc_error() -> None:
-    executor = GooseExecutor()
+    executor = build_goose_executor()
     sent: list[dict] = []
     executor._send = AsyncMock(side_effect=lambda m: sent.append(m))  # type: ignore[method-assign]
     await executor._respond_to_agent_request(
@@ -311,10 +352,11 @@ def test_fs_delegation_flag_tracks_os_env() -> None:
     """Delegation is on with an os_env, off without one or for a fork env."""
     from omnigent.inner.datamodel import OSEnvSpec
 
-    assert GooseExecutor()._fs_delegation is False
-    assert GooseExecutor(os_env=OSEnvSpec(type="caller_process"))._fs_delegation is True
+    assert build_goose_executor()._fs_delegation is False
+    assert build_goose_executor(os_env=OSEnvSpec(type="caller_process"))._fs_delegation is True
     assert (
-        GooseExecutor(os_env=OSEnvSpec(type="caller_process", fork=True))._fs_delegation is False
+        build_goose_executor(os_env=OSEnvSpec(type="caller_process", fork=True))._fs_delegation
+        is False
     )
 
 
@@ -325,7 +367,7 @@ async def test_initialize_advertises_fs_capability_per_delegation() -> None:
 
     init_result = {"result": {"agentCapabilities": {"promptCapabilities": {}}}}
 
-    on = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
+    on = build_goose_executor(os_env=OSEnvSpec(type="caller_process"))
     on._rpc = AsyncMock(return_value=init_result)  # type: ignore[method-assign]
     await on._ensure_initialized()
     assert on._rpc.call_args.args[1]["clientCapabilities"]["fs"] == {
@@ -333,7 +375,7 @@ async def test_initialize_advertises_fs_capability_per_delegation() -> None:
         "writeTextFile": True,
     }
 
-    off = GooseExecutor()
+    off = build_goose_executor()
     off._rpc = AsyncMock(return_value=init_result)  # type: ignore[method-assign]
     await off._ensure_initialized()
     assert off._rpc.call_args.args[1]["clientCapabilities"]["fs"] == {
@@ -347,7 +389,7 @@ async def test_fs_read_returns_content_and_maps_window() -> None:
     """fs/read_text_file reads through the OSEnvironment; line/limit → offset/limit."""
     from omnigent.inner.datamodel import OSEnvSpec
 
-    executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor = build_goose_executor(os_env=OSEnvSpec(type="caller_process"))
     fake = _FakeOSEnv(read_result={"content": "hi\n", "encoding": "utf-8"})
     executor._os_environment = fake  # type: ignore[assignment]
     sent: list[dict] = []
@@ -371,7 +413,7 @@ async def test_fs_read_missing_file_maps_to_enoent() -> None:
     """A 'no such file' read error maps to the ENOENT code (-32002)."""
     from omnigent.inner.datamodel import OSEnvSpec
 
-    executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor = build_goose_executor(os_env=OSEnvSpec(type="caller_process"))
     executor._os_environment = _FakeOSEnv(  # type: ignore[assignment]
         read_result={"error": "[Errno 2] No such file or directory: 'gone.txt'"}
     )
@@ -390,7 +432,7 @@ async def test_fs_read_binary_file_is_rejected() -> None:
     """A non-utf-8 (binary) file is refused rather than returned as bytes."""
     from omnigent.inner.datamodel import OSEnvSpec
 
-    executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor = build_goose_executor(os_env=OSEnvSpec(type="caller_process"))
     executor._os_environment = _FakeOSEnv(  # type: ignore[assignment]
         read_result={"content": "AAAA", "encoding": "base64"}
     )
@@ -409,7 +451,7 @@ async def test_fs_write_writes_through_os_env() -> None:
     """fs/write_text_file writes via the OSEnvironment and returns an empty result."""
     from omnigent.inner.datamodel import OSEnvSpec
 
-    executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor = build_goose_executor(os_env=OSEnvSpec(type="caller_process"))
     fake = _FakeOSEnv(write_result={"path": "out.txt"})
     executor._os_environment = fake  # type: ignore[assignment]
     sent: list[dict] = []
@@ -431,7 +473,7 @@ async def test_fs_write_writes_through_os_env() -> None:
 @pytest.mark.asyncio
 async def test_fs_unsupported_when_delegation_off() -> None:
     """Without an os_env, fs/* is method-not-found (delegation not advertised)."""
-    executor = GooseExecutor()  # no os_env
+    executor = build_goose_executor()  # no os_env
     assert executor._fs_delegation is False
     sent: list[dict] = []
     executor._send = AsyncMock(side_effect=lambda m: sent.append(m))  # type: ignore[method-assign]
@@ -453,7 +495,7 @@ async def test_fs_read_records_tool_call_events() -> None:
     """A delegated read buffers a paired ToolCallRequest + ToolCallComplete."""
     from omnigent.inner.datamodel import OSEnvSpec
 
-    executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor = build_goose_executor(os_env=OSEnvSpec(type="caller_process"))
     executor._os_environment = _FakeOSEnv(  # type: ignore[assignment]
         read_result={"content": "hello", "encoding": "utf-8"}
     )
@@ -479,7 +521,7 @@ async def test_fs_write_records_tool_call_events() -> None:
     from omnigent.inner.datamodel import OSEnvSpec
 
     write_result = {"bytes": 3}
-    executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor = build_goose_executor(os_env=OSEnvSpec(type="caller_process"))
     executor._os_environment = _FakeOSEnv(write_result=write_result)  # type: ignore[assignment]
     executor._send = AsyncMock()  # type: ignore[method-assign]
 
@@ -505,7 +547,7 @@ async def test_fs_read_blocked_by_call_policy() -> None:
     """A TOOL_CALL-phase DENY refuses the read by path before it runs."""
     from omnigent.inner.datamodel import OSEnvSpec
 
-    executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor = build_goose_executor(os_env=OSEnvSpec(type="caller_process"))
     fake = _FakeOSEnv(read_result={"content": "secret", "encoding": "utf-8"})
     executor._os_environment = fake  # type: ignore[assignment]
     policy = AsyncMock(return_value=MagicMock(action="POLICY_ACTION_DENY"))
@@ -531,7 +573,7 @@ async def test_fs_read_blocked_by_result_policy() -> None:
     """A TOOL_RESULT-phase DENY on read content refuses delivery and records BLOCKED."""
     from omnigent.inner.datamodel import OSEnvSpec
 
-    executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor = build_goose_executor(os_env=OSEnvSpec(type="caller_process"))
     executor._os_environment = _FakeOSEnv(  # type: ignore[assignment]
         read_result={"content": "secret", "encoding": "utf-8"}
     )
@@ -561,7 +603,7 @@ async def test_fs_write_blocked_by_result_policy() -> None:
     from omnigent.inner.datamodel import OSEnvSpec
 
     write_result = {"path": "out.txt", "bytes": 3, "marker": "actual"}
-    executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor = build_goose_executor(os_env=OSEnvSpec(type="caller_process"))
     executor._os_environment = _FakeOSEnv(write_result=write_result)  # type: ignore[attr-defined]
 
     async def _policy(phase: str, data: dict) -> MagicMock:  # type: ignore[type-arg]
@@ -592,7 +634,7 @@ async def test_fs_write_blocked_by_call_policy_prevents_write() -> None:
     """A TOOL_CALL-phase DENY (path + content) prevents the write."""
     from omnigent.inner.datamodel import OSEnvSpec
 
-    executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor = build_goose_executor(os_env=OSEnvSpec(type="caller_process"))
     fake = _FakeOSEnv(write_result={})
     executor._os_environment = fake  # type: ignore[assignment]
     policy = AsyncMock(return_value=MagicMock(action="POLICY_ACTION_DENY"))
@@ -623,7 +665,7 @@ async def test_fs_write_call_policy_fails_closed() -> None:
     """A TOOL_CALL-phase eval error prevents the write (fail closed for side effects)."""
     from omnigent.inner.datamodel import OSEnvSpec
 
-    executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor = build_goose_executor(os_env=OSEnvSpec(type="caller_process"))
     fake = _FakeOSEnv(write_result={})
     executor._os_environment = fake  # type: ignore[assignment]
     executor._policy_evaluator = AsyncMock(  # type: ignore[attr-defined]
@@ -651,7 +693,7 @@ async def test_fs_write_call_policy_ask_blocks() -> None:
     """A TOOL_CALL-phase ASK blocks the write (delegated fs has no elicitation path)."""
     from omnigent.inner.datamodel import OSEnvSpec
 
-    executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor = build_goose_executor(os_env=OSEnvSpec(type="caller_process"))
     fake = _FakeOSEnv(write_result={})
     executor._os_environment = fake  # type: ignore[assignment]
     executor._policy_evaluator = AsyncMock(  # type: ignore[attr-defined]
@@ -677,7 +719,7 @@ async def test_run_turn_surfaces_delegated_fs_ops() -> None:
     """run_turn drains recorded fs ops onto the turn stream as ToolCall events."""
     from omnigent.inner.datamodel import OSEnvSpec
 
-    executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor = build_goose_executor(os_env=OSEnvSpec(type="caller_process"))
     executor._initialized = True
     executor._session_id = "s"
     executor._proc = MagicMock()
@@ -723,7 +765,7 @@ async def test_run_turn_records_stale_fs_op_from_prior_turn() -> None:
     """A stale server fs request answered at turn start is still audited, not dropped."""
     from omnigent.inner.datamodel import OSEnvSpec
 
-    executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor = build_goose_executor(os_env=OSEnvSpec(type="caller_process"))
     executor._initialized = True
     executor._session_id = "s"
     executor._proc = MagicMock()
@@ -767,7 +809,7 @@ async def test_close_releases_fs_os_environment() -> None:
     """close() tears down a lazily-created fs-delegation OSEnvironment."""
     from omnigent.inner.datamodel import OSEnvSpec
 
-    executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor = build_goose_executor(os_env=OSEnvSpec(type="caller_process"))
     fake = _FakeOSEnv()
     executor._os_environment = fake  # type: ignore[assignment]
 
@@ -786,7 +828,7 @@ async def test_close_releases_fs_os_environment() -> None:
 async def test_run_turn_streams_text_and_usage() -> None:
     """run_turn yields TextChunk for agent_message_chunk and a TurnComplete with
     usage parsed from the final session/prompt result."""
-    executor = GooseExecutor()
+    executor = build_goose_executor()
     executor._initialized = True
     executor._session_id = "20260623_1"
     executor._proc = MagicMock()
@@ -845,7 +887,7 @@ def test_history_prefix_serializes_prior_turns() -> None:
         {"role": "user", "content": "what is 2+2"},
         {"role": "assistant", "content": [{"type": "output_text", "text": "4"}]},
     ]
-    out = GooseExecutor._history_prefix(prior)
+    out = AcpExecutor._history_prefix(prior)
     assert out.startswith("Conversation so far:")
     assert "user: what is 2+2" in out
     assert "assistant: 4" in out
@@ -860,7 +902,7 @@ async def test_run_turn_replays_history_on_fresh_session() -> None:
     that would drop everything before the switch, so the first turn replays
     the transcript to keep context.
     """
-    executor = GooseExecutor()
+    executor = build_goose_executor()
     executor._initialized = True
     executor._session_id = "20260623_fresh"
     executor._proc = MagicMock()
@@ -904,7 +946,7 @@ async def test_run_turn_replays_history_on_fresh_session() -> None:
 @pytest.mark.asyncio
 async def test_run_turn_no_replay_on_continuing_session() -> None:
     """A continuing Goose session sends only the latest turn (it retains context)."""
-    executor = GooseExecutor()
+    executor = build_goose_executor()
     executor._initialized = True
     executor._session_id = "20260623_cont"
     executor._system_prompt_sent = True  # not a fresh session
@@ -943,7 +985,7 @@ async def test_run_turn_no_replay_on_continuing_session() -> None:
 
 @pytest.mark.asyncio
 async def test_close_with_no_process_is_a_noop() -> None:
-    await GooseExecutor().close()  # must not raise
+    await build_goose_executor().close()  # must not raise
 
 
 # ---------------------------------------------------------------------------
@@ -953,7 +995,7 @@ async def test_close_with_no_process_is_a_noop() -> None:
 
 @pytest.mark.asyncio
 async def test_close_terminates_process() -> None:
-    executor = GooseExecutor()
+    executor = build_goose_executor()
     mock_proc = MagicMock()
     mock_proc.stdin = MagicMock()
     mock_proc.returncode = None
@@ -970,7 +1012,7 @@ async def test_close_terminates_process() -> None:
 
 @pytest.mark.asyncio
 async def test_close_kills_when_terminate_raises() -> None:
-    executor = GooseExecutor()
+    executor = build_goose_executor()
     mock_proc = MagicMock()
     mock_proc.stdin = MagicMock()
     mock_proc.terminate.side_effect = OSError("gone")
@@ -987,7 +1029,7 @@ async def test_close_kills_when_terminate_raises() -> None:
 
 @pytest.mark.asyncio
 async def test_rpc_id_increments_monotonically() -> None:
-    executor = GooseExecutor()
+    executor = build_goose_executor()
     sent: list[dict] = []
 
     async def fake_send(msg: dict) -> None:
@@ -1015,7 +1057,7 @@ def _stdout_proc(*lines: str) -> MagicMock:
 
 @pytest.mark.asyncio
 async def test_read_stdout_resolves_pending_future() -> None:
-    executor = GooseExecutor()
+    executor = build_goose_executor()
     fut: asyncio.Future = asyncio.get_event_loop().create_future()
     executor._pending[42] = fut
     executor._proc = _stdout_proc(json.dumps({"jsonrpc": "2.0", "id": 42, "result": {"ok": True}}))
@@ -1025,7 +1067,7 @@ async def test_read_stdout_resolves_pending_future() -> None:
 
 @pytest.mark.asyncio
 async def test_read_stdout_puts_notifications_on_queue() -> None:
-    executor = GooseExecutor()
+    executor = build_goose_executor()
     executor._proc = _stdout_proc(
         json.dumps(
             {
@@ -1043,7 +1085,7 @@ async def test_read_stdout_puts_notifications_on_queue() -> None:
 async def test_read_stdout_colliding_request_is_queued_not_resolved() -> None:
     """A server request (has ``method``) whose id collides with a pending _rpc
     routes to the queue, never resolving our future with a result."""
-    executor = GooseExecutor()
+    executor = build_goose_executor()
     fut: asyncio.Future = asyncio.get_event_loop().create_future()
     executor._pending[2] = fut
     executor._proc = _stdout_proc(
@@ -1059,7 +1101,7 @@ async def test_read_stdout_colliding_request_is_queued_not_resolved() -> None:
 
 @pytest.mark.asyncio
 async def test_read_stdout_wakes_pending_futures_on_eof() -> None:
-    executor = GooseExecutor()
+    executor = build_goose_executor()
     fut: asyncio.Future = asyncio.get_event_loop().create_future()
     executor._pending[7] = fut
     executor._proc = _stdout_proc()  # immediate EOF
@@ -1069,7 +1111,7 @@ async def test_read_stdout_wakes_pending_futures_on_eof() -> None:
 
 @pytest.mark.asyncio
 async def test_read_stderr_drains_without_raising() -> None:
-    executor = GooseExecutor()
+    executor = build_goose_executor()
     mock_stderr = AsyncMock()
     mock_stderr.readline = AsyncMock(side_effect=[b"goose: warming up\n", b""])
     proc = MagicMock()
@@ -1085,7 +1127,7 @@ async def test_read_stderr_drains_without_raising() -> None:
 
 @pytest.mark.asyncio
 async def test_ensure_initialized_learns_image_capability() -> None:
-    executor = GooseExecutor()
+    executor = build_goose_executor()
     executor._rpc = AsyncMock(  # type: ignore[method-assign]
         return_value={"result": {"agentCapabilities": {"promptCapabilities": {"image": True}}}}
     )
@@ -1100,7 +1142,7 @@ async def test_ensure_initialized_learns_image_capability() -> None:
 
 @pytest.mark.asyncio
 async def test_ensure_session_uses_server_assigned_id_and_caches() -> None:
-    executor = GooseExecutor()
+    executor = build_goose_executor()
     executor._rpc = AsyncMock(return_value={"result": {"sessionId": "20260623_7"}})  # type: ignore[method-assign]
     sid = await executor._ensure_session()
     assert sid == "20260623_7" and executor._session_id == "20260623_7"
@@ -1111,7 +1153,7 @@ async def test_ensure_session_uses_server_assigned_id_and_caches() -> None:
 
 @pytest.mark.asyncio
 async def test_ensure_session_raises_on_missing_session_id() -> None:
-    executor = GooseExecutor()
+    executor = build_goose_executor()
     executor._rpc = AsyncMock(return_value={"result": {}})  # type: ignore[method-assign]
     with pytest.raises(RuntimeError, match="session/new"):
         await executor._ensure_session()
@@ -1126,17 +1168,17 @@ def test_sandbox_launch_path_bare_when_no_sandbox() -> None:
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
     # os_env=None → bare binary.
-    assert GooseExecutor(goose_path="goose")._sandbox_launch_path(()) == "goose"
+    assert build_goose_executor(goose_path="goose")._sandbox_launch(())[0] == "goose"
     # os_env present but sandbox explicitly disabled → bare binary.
-    disabled = GooseExecutor(
+    disabled = build_goose_executor(
         goose_path="/usr/bin/goose", os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none"))
     )
-    assert disabled._sandbox_launch_path(("PATH",)) == "/usr/bin/goose"
+    assert disabled._sandbox_launch(("PATH",))[0] == "/usr/bin/goose"
 
 
 def test_sandbox_launch_path_wraps_active_policy(monkeypatch, tmp_path) -> None:
-    """An active sandbox wraps goose in a launcher with its config/state dirs as
-    write roots and our spawn env names allowlisted."""
+    """An active sandbox wraps goose in a launcher with the config/state dirs from
+    :func:`goose_agent_config` as write roots and our spawn env names allowlisted."""
     from omnigent.inner import sandbox as sandbox_mod
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.inner.sandbox import SandboxPolicy
@@ -1161,15 +1203,17 @@ def test_sandbox_launch_path_wraps_active_policy(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(sandbox_mod, "resolve_sandbox", _fake_resolve)
     monkeypatch.setattr(sandbox_mod, "create_exec_launcher", _fake_launcher)
 
-    executor = GooseExecutor(
+    executor = build_goose_executor(
         cwd=str(tmp_path),
         goose_path="/usr/bin/goose",
         os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
     )
-    path = executor._sandbox_launch_path(("PATH", "GOOSE_PROVIDER"))
+    path, argv = executor._sandbox_launch(("PATH", "GOOSE_PROVIDER"))
 
     assert path == "/fake/launcher"
     assert captured["target"] == "/usr/bin/goose"
+    # The binary is replaced by the launcher; goose's own argv rides after it.
+    assert argv == ["acp", "--with-builtin", "developer"]
     policy = captured["policy"]
     # goose's config dir is a write root so it can start inside the jail.
     assert any(str(p).endswith(".config/goose") for p in policy.write_roots)
@@ -1187,18 +1231,18 @@ def test_sandbox_launch_path_falls_back_when_backend_unavailable(monkeypatch, tm
         raise NotImplementedError("no bwrap here")
 
     monkeypatch.setattr(sandbox_mod, "resolve_sandbox", _boom)
-    executor = GooseExecutor(
+    executor = build_goose_executor(
         cwd=str(tmp_path),
         goose_path="/usr/bin/goose",
         os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
     )
-    assert executor._sandbox_launch_path(("PATH",)) == "/usr/bin/goose"
+    assert executor._sandbox_launch(("PATH",))[0] == "/usr/bin/goose"
 
 
 @pytest.mark.asyncio
 async def test_start_process_resets_handshake_state(monkeypatch) -> None:
     """A (re)start clears the one-way handshake latch and spawns goose acp."""
-    executor = GooseExecutor(goose_path="goose", builtins=("developer",))
+    executor = build_goose_executor(goose_path="goose", builtins=("developer",))
     executor._initialized = True
     executor._image_supported = True
 
@@ -1225,7 +1269,7 @@ async def test_start_process_resets_handshake_state(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_run_turn_boot_failure_yields_error(monkeypatch) -> None:
-    executor = GooseExecutor()
+    executor = build_goose_executor()
 
     async def boom() -> None:
         raise FileNotFoundError("goose not found")
@@ -1240,7 +1284,7 @@ async def test_run_turn_boot_failure_yields_error(monkeypatch) -> None:
 async def test_run_turn_acp_error_resets_session(monkeypatch) -> None:
     """An ACP ``Session not found`` error resets the session and yields a
     retryable error (next turn re-creates the session + re-sends system prompt)."""
-    executor = GooseExecutor()
+    executor = build_goose_executor()
     executor._initialized = True
     executor._session_id = "stale"
     executor._system_prompt_sent = True
@@ -1266,7 +1310,7 @@ async def test_run_turn_acp_error_resets_session(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_run_turn_tracks_context_window_from_usage_update() -> None:
-    executor = GooseExecutor()
+    executor = build_goose_executor()
     executor._initialized = True
     executor._session_id = "s"
     executor._proc = MagicMock()
@@ -1301,41 +1345,31 @@ async def test_run_turn_tracks_context_window_from_usage_update() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_inline_text_file_data_variants() -> None:
-    from omnigent.inner.goose_executor import _inline_text_file_data
-
-    assert _inline_text_file_data("plain text") == "plain text"  # non-data-URI passthrough
-    assert _inline_text_file_data("") == ""
-    assert _inline_text_file_data(123) == ""  # non-str
-    assert _inline_text_file_data("data:image/png;base64,AAA=") == ""  # binary → not inlined
-    assert _inline_text_file_data("data:text/plain;base64,aGk=") == "hi"  # text decoded
-
-
 def test_image_blocks_from_content_parses_and_skips() -> None:
     blocks = [
         {"type": "input_text", "text": "ignore"},
         {"type": "input_image", "image_url": "data:image/png;base64,AAAB"},
         {"type": "input_image", "image_url": "https://x/y.png"},  # external → skipped (SSRF)
     ]
-    assert GooseExecutor._image_blocks_from_content(blocks) == [
+    assert AcpExecutor._image_blocks_from_content(blocks) == [
         {"type": "image", "mimeType": "image/png", "data": "AAAB"}
     ]
-    assert GooseExecutor._image_blocks_from_content("not a list") == []
+    assert AcpExecutor._image_blocks_from_content("not a list") == []
 
 
 def test_text_from_blocks_image_marker_toggle() -> None:
     blocks = [{"type": "input_image", "filename": "pic.png"}]
-    assert "[attached image: pic.png]" in GooseExecutor._text_from_blocks(
+    assert "[attached image: pic.png]" in AcpExecutor._text_from_blocks(
         blocks, emit_image_marker=True
     )
-    assert GooseExecutor._text_from_blocks(blocks, emit_image_marker=False) == ""
+    assert AcpExecutor._text_from_blocks(blocks, emit_image_marker=False) == ""
 
 
 @pytest.mark.asyncio
 async def test_run_turn_forwards_image_block_when_supported() -> None:
     """With image capability on, an input_image is sent as a real ACP image block
     alongside the text block."""
-    executor = GooseExecutor()
+    executor = build_goose_executor()
     executor._initialized = True
     executor._session_id = "s"
     executor._image_supported = True
@@ -1365,40 +1399,9 @@ async def test_run_turn_forwards_image_block_when_supported() -> None:
     assert any(b.get("type") == "text" for b in prompt)
 
 
-# ---------------------------------------------------------------------------
-# _decide_permission branch coverage
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_decide_permission_no_gates_allows() -> None:
-    assert await GooseExecutor()._decide_permission(_perm_request()["params"]) is True
-
-
-@pytest.mark.asyncio
-async def test_decide_permission_policy_ask_without_handler_denies() -> None:
-    executor = GooseExecutor()
-    executor._policy_evaluator = AsyncMock(  # type: ignore[attr-defined]
-        return_value=MagicMock(action="POLICY_ACTION_ASK")
-    )  # no elicitation handler wired → fail closed
-    assert await executor._decide_permission(_perm_request()["params"]) is False
-
-
-@pytest.mark.asyncio
-async def test_decide_permission_policy_exception_falls_through_to_elicit() -> None:
-    executor = GooseExecutor()
-
-    async def _boom(*_a) -> object:
-        raise RuntimeError("policy backend down")
-
-    executor._policy_evaluator = _boom  # type: ignore[attr-defined]
-    executor._elicitation_handler = AsyncMock(return_value=True)  # type: ignore[attr-defined]
-    assert await executor._decide_permission(_perm_request()["params"]) is True
-
-
 @pytest.mark.asyncio
 async def test_respond_to_agent_request_exception_yields_error_reply() -> None:
-    executor = GooseExecutor()
+    executor = build_goose_executor()
 
     async def _boom(_params) -> bool:
         raise RuntimeError("kaboom")
@@ -1416,7 +1419,7 @@ async def test_respond_to_agent_request_exception_yields_error_reply() -> None:
 
 
 def test_resolve_os_env_default(monkeypatch) -> None:
-    from omnigent.inner import goose_harness
+    from omnigent.inner.goose import harness as goose_harness
 
     monkeypatch.delenv("HARNESS_GOOSE_OS_ENV", raising=False)
     spec = goose_harness._resolve_os_env()
@@ -1425,7 +1428,7 @@ def test_resolve_os_env_default(monkeypatch) -> None:
 
 
 def test_resolve_os_env_from_json(monkeypatch) -> None:
-    from omnigent.inner import goose_harness
+    from omnigent.inner.goose import harness as goose_harness
 
     monkeypatch.setenv(
         "HARNESS_GOOSE_OS_ENV",
@@ -1445,7 +1448,7 @@ def test_resolve_os_env_from_json(monkeypatch) -> None:
 
 
 def test_resolve_os_env_malformed_json_falls_back(monkeypatch) -> None:
-    from omnigent.inner import goose_harness
+    from omnigent.inner.goose import harness as goose_harness
 
     monkeypatch.setenv("HARNESS_GOOSE_OS_ENV", "{not valid json")
     spec = goose_harness._resolve_os_env()
@@ -1454,7 +1457,7 @@ def test_resolve_os_env_malformed_json_falls_back(monkeypatch) -> None:
 
 
 def test_build_goose_executor_reads_env(monkeypatch) -> None:
-    from omnigent.inner import goose_harness
+    from omnigent.inner.goose import harness as goose_harness
 
     monkeypatch.setenv("HARNESS_GOOSE_MODEL", "claude-x")
     monkeypatch.setenv("HARNESS_GOOSE_PROVIDER", "anthropic")
@@ -1463,16 +1466,25 @@ def test_build_goose_executor_reads_env(monkeypatch) -> None:
     monkeypatch.delenv("OMNIGENT_GOOSE_PATH", raising=False)
     monkeypatch.setenv("HARNESS_GOOSE_BUILTINS", "developer, computercontroller")
     monkeypatch.delenv("HARNESS_GOOSE_OS_ENV", raising=False)
-    ex = goose_harness._build_goose_executor()
-    assert ex._model == "claude-x"
-    assert ex._provider == "anthropic"
+    ex = goose_harness._build_executor()
+    # Asserted on the config, which is where those env values actually land and
+    # what the spawn reads; an intermediate attribute could agree and still not
+    # reach the subprocess.
     assert ex._cwd == "/work"
-    assert ex._goose_path == "/bin/goose"
-    assert ex._builtins == ("developer", "computercontroller")
+    assert ex._config.model == "claude-x"
+    assert ex._config.spawn_env["GOOSE_PROVIDER"] == "anthropic"
+    assert shlex.split(ex._config.command) == [
+        "/bin/goose",
+        "acp",
+        "--with-builtin",
+        "developer",
+        "--with-builtin",
+        "computercontroller",
+    ]
 
 
 def test_build_goose_executor_defaults(monkeypatch) -> None:
-    from omnigent.inner import goose_harness
+    from omnigent.inner.goose import harness as goose_harness
 
     for var in (
         "HARNESS_GOOSE_MODEL",
@@ -1484,15 +1496,15 @@ def test_build_goose_executor_defaults(monkeypatch) -> None:
         "OMNIGENT_GOOSE_PATH",
     ):
         monkeypatch.delenv(var, raising=False)
-    ex = goose_harness._build_goose_executor()
-    assert ex._model is None and ex._provider is None
-    assert ex._goose_path == "goose"
-    assert ex._builtins == ("developer",)
+    ex = goose_harness._build_executor()
+    assert ex._config.model is None
+    assert "GOOSE_PROVIDER" not in ex._config.spawn_env
+    assert shlex.split(ex._config.command) == ["goose", "acp", "--with-builtin", "developer"]
 
 
 def test_create_app_returns_fastapi() -> None:
     from fastapi import FastAPI
 
-    from omnigent.inner import goose_harness
+    from omnigent.inner.goose import harness as goose_harness
 
     assert isinstance(goose_harness.create_app(), FastAPI)

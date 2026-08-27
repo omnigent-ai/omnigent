@@ -91,11 +91,18 @@ def _acp_spawn_env():
 
 
 def _goose_spawn_env():
-    from omnigent.inner.goose_executor import GooseExecutor
+    from dataclasses import replace
 
-    # Provider/gateway overrides are deliberate additions layered on top of the
-    # filtered base, not leaks; stub them so this asserts the filtering alone.
-    return _bare(GooseExecutor, _provider_env=dict)._build_spawn_env()
+    from omnigent.inner.acp_executor import AcpExecutor
+    from omnigent.inner.goose import goose_agent_config
+
+    # Carry goose's REAL config so the ``GOOSE_`` prefix family this canary
+    # guards is the one the harness actually allows. ``spawn_env`` is cleared:
+    # its forced approval mode and provider/model overrides are deliberate
+    # additions layered on top of the filtered base, not leaks, so dropping
+    # them leaves this asserting the filtering alone.
+    config = replace(goose_agent_config(), spawn_env={})
+    return _bare(AcpExecutor, _config=config)._build_spawn_env()
 
 
 def _qwen_spawn_env():

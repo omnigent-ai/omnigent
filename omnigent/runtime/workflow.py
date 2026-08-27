@@ -1481,7 +1481,7 @@ def _build_goose_spawn_env(
     Build the env-var dict the headless goose harness wrap reads.
 
     Maps spec.executor fields → the ``HARNESS_GOOSE_*`` env vars defined in
-    ``omnigent/inner/goose_harness.py``. Unlike the SDK harnesses, Goose owns its
+    ``omnigent/inner/goose/harness.py``. Unlike the SDK harnesses, Goose owns its
     own auth via ``goose configure`` (keyring / ``~/.config/goose/config.yaml``),
     so this builder wires **no** provider/gateway credential — it forwards only an
     optional model override and the os_env/sandbox spec. A ``databricks-*`` model
