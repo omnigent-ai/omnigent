@@ -391,10 +391,6 @@ def _unwrap_spec_entry(entry: _SpecEntry | None) -> AgentSpec | None:
 
 _NO_BODY_STATUS_CODES = {204, 304}
 _SUBAGENT_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
-# Outcome priority: higher value wins when an undelivered entry already carries
-# a terminal status. A stop_session-driven "cancelled" must not downgrade an
-# already-set "completed" or "failed" report that is pending delivery.
-_SUBAGENT_STATUS_PRIORITY: dict[str, int] = {"cancelled": 0, "failed": 1, "completed": 1}
 _SUBAGENT_DELIVERY_DELIVERED = "delivered"
 _SUBAGENT_DELIVERY_ALREADY_DELIVERED = "already_delivered"
 _SUBAGENT_DELIVERY_UNTRACKED = "untracked"
@@ -1727,13 +1723,9 @@ def mark_subagent_work_terminal(
                 delivered_now=False,
                 reason=_SUBAGENT_DELIVERY_ALREADY_DELIVERED,
             )
-        # Only overwrite the pending terminal status when the incoming report
-        # has equal or higher priority. This prevents a stop_session-driven
-        # "cancelled" from downgrading an already-recorded "completed" or
-        # "failed" that is still awaiting inbox delivery.
-        if _SUBAGENT_STATUS_PRIORITY.get(status, 0) >= _SUBAGENT_STATUS_PRIORITY.get(
-            entry.status, 0
-        ):
+        # A late stop_session-driven "cancelled" must not downgrade an
+        # already-recorded "completed"/"failed" still awaiting delivery.
+        if status != "cancelled" or entry.status == "cancelled":
             entry.status = status
             entry.output = output
             entry.completed_at = time.time()
