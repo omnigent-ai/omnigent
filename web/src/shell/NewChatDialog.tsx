@@ -105,7 +105,7 @@ import { setPendingInitialPrompt } from "@/store/chatStore";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
-import { CliCommandBlock } from "./CliCommandBlock";
+import { CliCommandBlock, renderTextWithInlineCode } from "./CliCommandBlock";
 import { WorkspacePicker, isNavigablePath } from "./WorkspacePicker";
 import {
   initialPrefillState,
@@ -5352,10 +5352,10 @@ export function NewChatLandingScreen() {
 
           {connectError && (
             <p
-              className="flex flex-wrap items-center gap-x-1.5 text-sm text-destructive"
+              className="flex flex-wrap items-center gap-x-1.5 text-sm text-destructive select-text"
               data-testid="new-chat-landing-connect-error"
             >
-              <span>{connectError}</span>
+              <span>{renderTextWithInlineCode(connectError)}</span>
               <button
                 type="button"
                 className="underline underline-offset-2 hover:no-underline disabled:opacity-60"
