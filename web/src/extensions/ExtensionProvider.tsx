@@ -1,10 +1,18 @@
-import { createContext, useContext, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useMemo, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { EXTENSIONS_QUERY_KEY, fetchExtensionCatalog } from "./catalog";
 import type { ExtensionCatalogItem } from "./types";
 
 const EMPTY_EXTENSIONS: ExtensionCatalogItem[] = [];
-const ExtensionContext = createContext<ExtensionCatalogItem[]>(EMPTY_EXTENSIONS);
+const NOOP_REFRESH = async () => EMPTY_EXTENSIONS;
+interface ExtensionContextValue {
+  extensions: ExtensionCatalogItem[];
+  refresh: () => Promise<ExtensionCatalogItem[]>;
+}
+const ExtensionContext = createContext<ExtensionContextValue>({
+  extensions: EMPTY_EXTENSIONS,
+  refresh: NOOP_REFRESH,
+});
 
 export async function loadExtensionCatalog(
   signal?: AbortSignal,
@@ -25,7 +33,11 @@ export function ExtensionCatalogProvider({
   extensions: ExtensionCatalogItem[];
   children: ReactNode;
 }) {
-  return <ExtensionContext.Provider value={extensions}>{children}</ExtensionContext.Provider>;
+  const value = useMemo<ExtensionContextValue>(
+    () => ({ extensions, refresh: async () => extensions }),
+    [extensions],
+  );
+  return <ExtensionContext.Provider value={value}>{children}</ExtensionContext.Provider>;
 }
 
 export function ExtensionProvider({ children }: { children: ReactNode }) {
@@ -36,13 +48,17 @@ export function ExtensionProvider({ children }: { children: ReactNode }) {
     staleTime: Infinity,
   });
 
-  return (
-    <ExtensionContext.Provider value={query.data ?? EMPTY_EXTENSIONS}>
-      {children}
-    </ExtensionContext.Provider>
-  );
+  const extensions = query.data ?? EMPTY_EXTENSIONS;
+  const { refetch } = query;
+  const refresh = useCallback(async () => (await refetch()).data ?? EMPTY_EXTENSIONS, [refetch]);
+  const value = useMemo(() => ({ extensions, refresh }), [extensions, refresh]);
+  return <ExtensionContext.Provider value={value}>{children}</ExtensionContext.Provider>;
 }
 
 export function useExtensions(): ExtensionCatalogItem[] {
-  return useContext(ExtensionContext);
+  return useContext(ExtensionContext).extensions;
+}
+
+export function useRefreshExtensions(): () => Promise<ExtensionCatalogItem[]> {
+  return useContext(ExtensionContext).refresh;
 }

@@ -88,6 +88,13 @@ repos:
         files: ^(editors/vscode/.*\.[cm]?[jt]sx?|editors/vscode/tsconfig\.json|editors/vscode/package\.json|pnpm-(?:lock|workspace)\.yaml)$
         pass_filenames: false
 
+      - id: web-extension-sdk-tsc
+        name: Web extension SDK TypeScript type check
+        language: system
+        entry: bash -c 'test -x sdks/web-extension/node_modules/.bin/tsc && cd sdks/web-extension && node_modules/.bin/tsc --noEmit'
+        files: ^(sdks/web-extension/.*\.[cm]?[jt]sx?|sdks/web-extension/tsconfig\.json|sdks/web-extension/package\.json|pnpm-(?:lock|workspace)\.yaml)$
+        pass_filenames: false
+
       # Android Kotlin formatting + linting via ktlint (config:
       # web/android/.editorconfig). The wrapper no-ops when ktlint is absent,
       # so local machines without ktlint installed skip cleanly. CI installs
