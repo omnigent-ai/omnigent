@@ -6,7 +6,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypedDict
 
 from omnigent.entities import (
     Agent,
@@ -90,6 +90,23 @@ CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox"
 # is the store layer; the SQLAlchemy store and the server route both import it,
 # and the web client mirrors the literal as ``PROJECT_LABEL_KEY``.
 PROJECT_LABEL_KEY = "omni_project"
+
+class DailyCostState(TypedDict):
+    """Daily cost state record returned by list_daily_cost_states.
+
+    :param cost_usd: Cumulative spend for this user on this day.
+    :param ask_approved_usd: Highest soft-limit checkpoint the user approved.
+    :param day_utc: The UTC day as "YYYY-MM-DD".
+    :param user_id: The user this record belongs to.
+    :param harness: Harness this spending applies to, or "__all__" for cross-harness.
+    """
+
+    cost_usd: float
+    ask_approved_usd: float
+    day_utc: str
+    user_id: str
+    harness: str | None
+
 
 # Reserved label-key PREFIX that records whether a session is "pinned" in the
 # sidebar. Pins are PER-USER: the stored key is ``omnigent.pinned.<user_id>``
