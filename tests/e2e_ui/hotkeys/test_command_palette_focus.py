@@ -42,23 +42,21 @@ def _wait_for_caret(page: Page, expected: str) -> None:
     page.wait_for_function(f"() => ({_ACTIVE_COMPOSER_JS})() === {expected!r}", timeout=10_000)
 
 
-def _wait_for_highlighted(page: Page, label: str) -> None:
-    """Wait until `label` is the row Enter would run.
+def _select_action_with_keyboard(page: Page, label: str) -> None:
+    """Ensure `label` is the row Enter will run.
 
     The palette re-sorts around the debounced session search, so for a beat
     after the results swap there is no highlighted row and Enter is a no-op.
-    Waiting for the highlight — rather than sleeping past the debounce and
-    hoping — is what keeps the keypress landing on the intended row on a
-    loaded machine.
+    Wait for the action to survive the debounced result swap, then move the
+    keyboard selection onto it when cmdk cleared its transient highlight.
     """
-    page.wait_for_function(
-        """(label) => {
-             const el = document.querySelector('[cmdk-item][aria-selected="true"]');
-             return !!el && el.textContent.trim() === label;
-           }""",
-        arg=label,
-        timeout=10_000,
-    )
+    row = page.get_by_role("option", name=label, exact=True)
+    expect(row).to_be_visible(timeout=10_000)
+    for _ in range(8):
+        if row.get_attribute("aria-selected") == "true":
+            break
+        page.keyboard.press("ArrowDown")
+    expect(row).to_have_attribute("aria-selected", "true", timeout=10_000)
 
 
 def test_new_chat_from_palette_focuses_the_landing_composer(
@@ -76,7 +74,7 @@ def test_new_chat_from_palette_focuses_the_landing_composer(
     palette.type("new chat", delay=20)
     # "New chat" has to be the highlighted row before Enter, or the keypress
     # lands in the gap where the debounced session results are swapping out.
-    _wait_for_highlighted(page, "New chat")
+    _select_action_with_keyboard(page, "New chat")
     page.keyboard.press("Enter")
 
     expect(page.get_by_test_id(_LANDING_INPUT)).to_be_visible(timeout=15_000)
