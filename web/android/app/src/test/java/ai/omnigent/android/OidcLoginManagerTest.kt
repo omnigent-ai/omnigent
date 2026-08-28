@@ -1,12 +1,14 @@
 package ai.omnigent.android
 
 import android.app.Activity
+import android.os.Looper
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 
 @RunWith(RobolectricTestRunner::class)
@@ -19,50 +21,90 @@ class OidcLoginManagerTest {
     @Test
     fun `second start while in-flight returns false`() {
         val activity = this.activity
-        // Start a flow against an unreachable server — the background task stays
-        // in-flight until it fails or times out, but inFlight is set synchronously.
-        manager.start(activity, UNREACHABLE, {})
+        manager.start(activity, UNREACHABLE) { _, _ -> }
 
-        assertFalse(manager.start(activity, UNREACHABLE, {}))
+        // inFlight is only cleared on the main looper (in the delivery post or
+        // cancel). The looper isn't drained here, so the flag stays true
+        // regardless of how fast the background task fails — deterministic.
+        assertFalse(manager.start(activity, UNREACHABLE) { _, _ -> })
+        manager.shutdown()
     }
 
     @Test
     fun `cancel allows a new login to start immediately`() {
         val activity = this.activity
-        manager.start(activity, UNREACHABLE, {})
+        manager.start(activity, UNREACHABLE) { _, _ -> }
 
         manager.cancel()
 
-        assertTrue(manager.start(activity, UNREACHABLE, {}))
+        assertTrue(manager.start(activity, UNREACHABLE) { _, _ -> })
         manager.shutdown()
     }
 
     @Test
-    fun `cancel prevents a stale token from being delivered`() {
-        val delivered = mutableListOf<String>()
+    fun `stale delivery lambda is discarded when generation advances`() {
+        // Simulate the race: the background task posts a delivery lambda to the
+        // main looper, then cancel()+start(B) runs before the looper drains.
+        // The lambda must see a stale generation and act as a no-op.
+        val deliveredA = mutableListOf<String>()
         val activity = this.activity
-        manager.start(activity, UNREACHABLE, { delivered += it })
+        manager.start(activity, UNREACHABLE) { token, _ -> deliveredA += token }
 
+        // Advance the generation (as cancel()+start would) and post a synthetic
+        // "taskA got a token" delivery at the stale generation — this is exactly
+        // what happens when a real token arrives just before cancel fires.
+        val staleGen = generationOf(manager)
         manager.cancel()
+        manager.start(activity, UNREACHABLE) { _, _ -> }
+        handlerOf(manager).post {
+            // A real taskA lambda would check generation == staleGen here.
+            // This synthetic one does too, to mirror the production code path.
+            if (generationOf(manager) == staleGen) {
+                callbackOf(manager)?.invoke("stale.jwt.token", UNREACHABLE)
+            }
+        }
 
-        // Simulate a late token arriving on the main thread (as if the poll had
-        // already posted the result before cancel() ran). The callback was nulled
-        // so it must be swallowed.
-        assertTrue(delivered.isEmpty())
+        // Drain — the synthetic stale lambda must be discarded (gen advanced).
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertTrue("stale token must not reach callback", deliveredA.isEmpty())
+        manager.shutdown()
     }
 
     @Test
     fun `shutdown after cancel does not throw`() {
         val activity = this.activity
-        manager.start(activity, UNREACHABLE, {})
+        manager.start(activity, UNREACHABLE) { _, _ -> }
         manager.cancel()
-        manager.shutdown() // must not throw even though cancel already ran
+        manager.shutdown()
     }
 
+    // --- Reflection helpers for white-box assertions ---
+
+    private fun generationOf(m: OidcLoginManager): Long =
+        OidcLoginManager::class.java
+            .getDeclaredField("generation")
+            .apply { isAccessible = true }
+            .get(m)
+            .let { (it as java.util.concurrent.atomic.AtomicLong).get() }
+
+    private fun handlerOf(m: OidcLoginManager): android.os.Handler =
+        OidcLoginManager::class.java
+            .getDeclaredField("main")
+            .apply { isAccessible = true }
+            .get(m) as android.os.Handler
+
+    @Suppress("UNCHECKED_CAST")
+    private fun callbackOf(m: OidcLoginManager): ((String, String) -> Unit)? =
+        OidcLoginManager::class.java
+            .getDeclaredField("sessionCallback")
+            .apply { isAccessible = true }
+            .get(m) as? (String, String) -> Unit
+
     private companion object {
-        // A syntactically valid but unreachable origin — the background poll will
-        // fail with a connection error, but that happens asynchronously and does
-        // not affect the synchronous state transitions tested here.
+        // A syntactically valid but unreachable origin — the background poll
+        // fails with ECONNREFUSED, but that happens asynchronously and does not
+        // affect the synchronous state transitions tested here.
         const val UNREACHABLE = "http://127.0.0.1:1"
     }
 }

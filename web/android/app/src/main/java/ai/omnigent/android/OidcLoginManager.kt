@@ -11,6 +11,7 @@ import java.net.URL
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Drives the RFC 8252 login flow for the shell: authenticate in the system
@@ -35,17 +36,23 @@ class OidcLoginManager {
     private val main = Handler(Looper.getMainLooper())
     private val inFlight = AtomicBoolean(false)
 
+    // Incremented by [cancel] to invalidate any in-flight task's pending
+    // delivery. Each task captures the generation at start time and checks it
+    // before acting — a stale task (cancelled, superseded) sees a mismatch and
+    // drops both the inFlight reset and the token delivery.
+    private val generation = AtomicLong(0)
+
     // Held only for the duration of a login; nulled by [cancel]/[shutdown] so a
     // poll that finishes after a server switch or host destroy can neither inject
     // a stale token nor invoke into a dead Activity.
-    @Volatile private var sessionCallback: ((String) -> Unit)? = null
+    @Volatile private var sessionCallback: ((token: String, loginOrigin: String) -> Unit)? = null
 
     @Volatile private var currentTask: Future<*>? = null
 
     /**
      * Begin a login against [origin] (the pinned server). Opens the browser and
      * polls in the background; [onSession] is invoked on the main thread with the
-     * session JWT once the browser flow completes.
+     * session JWT and the origin that produced it once the browser flow completes.
      *
      * Returns true if this call started a flow, or false if one was already in
      * flight (a second concurrent call is ignored). The caller uses the result so
@@ -54,10 +61,11 @@ class OidcLoginManager {
     fun start(
         activity: Activity,
         origin: String,
-        onSession: (String) -> Unit,
+        onSession: (token: String, loginOrigin: String) -> Unit,
     ): Boolean {
         if (!inFlight.compareAndSet(false, true)) return false
         sessionCallback = onSession
+        val myGen = generation.get()
         currentTask =
             io.submit {
                 var token: String? = null
@@ -72,30 +80,39 @@ class OidcLoginManager {
                         )
                     }
                 } catch (_: InterruptedException) {
-                    // shutdown() interrupted the poll — the host is going away; drop.
+                    // cancel() interrupted the poll — inFlight was already reset by
+                    // cancel(); skip the delivery post entirely.
+                    return@submit
                 } catch (t: Throwable) {
                     authLog("login flow error: ${t.javaClass.simpleName}")
-                } finally {
-                    inFlight.set(false)
                 }
                 val result = token
-                // sessionCallback is null once shutdown() ran — never invoke into a
-                // destroyed host.
-                if (result != null) main.post { sessionCallback?.invoke(result) }
+                // Deliver and reset inFlight together on the main thread, guarded
+                // by the generation. This means:
+                //   - cancel() → generation++ → our gen check fails → no-op
+                //   - cancel() + start(B) → gen mismatch → B's inFlight is safe
+                //   - normal completion → gen matches → reset + optional delivery
+                // NOT done in a `finally` block: an unconditional finally would
+                // clear inFlight even after cancel()+start(B), defeating the guard.
+                main.post {
+                    if (generation.get() != myGen) return@post
+                    inFlight.set(false)
+                    if (result != null) sessionCallback?.invoke(result, origin)
+                }
             }
         return true
     }
 
     /**
      * Cancel an in-flight login without tearing down the executor. Safe to call
-     * when switching servers: nulls the callback (so a late-arriving token is
-     * never injected), resets [inFlight] (so a new login can start immediately),
-     * and interrupts the polling thread (stops wasted network I/O). Both this and
-     * the token-delivery lambda run on the main thread, so the null is always
-     * visible before the lambda can fire.
+     * when switching servers: increments the generation (so any queued delivery
+     * lambda is discarded), nulls the callback, resets [inFlight] (so a new
+     * login can start immediately), and interrupts the polling thread (stops
+     * wasted network I/O).
      */
     fun cancel() {
         sessionCallback = null
+        generation.incrementAndGet()
         inFlight.set(false)
         currentTask?.cancel(true) // interrupts the polling sleep
         currentTask = null

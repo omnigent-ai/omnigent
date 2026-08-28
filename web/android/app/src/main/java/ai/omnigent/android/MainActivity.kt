@@ -383,7 +383,10 @@ class MainActivity : AppCompatActivity() {
      * rules, so we both attempt a reorder-to-front (works within the grace
      * period) AND post a "tap to return" notification as the reliable path back.
      */
-    private fun onSessionToken(token: String) {
+    private fun onSessionToken(
+        token: String,
+        loginOrigin: String,
+    ) {
         // The poll can land after the activity is gone (it ran on a background
         // thread up to 5 min) — never touch a destroyed WebView.
         if (isDestroyed || isFinishing || !::webView.isInitialized) return
@@ -396,7 +399,14 @@ class MainActivity : AppCompatActivity() {
             authLog("onSessionToken: token not JWT-shaped — rejecting")
             return
         }
-        val origin = pinnedOrigin ?: return
+        // loginOrigin is bound at poll time by OidcLoginManager; the generation
+        // check there guarantees it equals pinnedOrigin, but verify as a
+        // second, independent defence against cross-origin injection.
+        if (loginOrigin != pinnedOrigin) {
+            authLog("onSessionToken: origin mismatch — rejecting stale token")
+            return
+        }
+        val origin = loginOrigin
         val secure = origin.startsWith("https://")
         // Matches the server's session_cookie_name: __Host- prefix on HTTPS.
         val name = if (secure) "__Host-ap_session" else "ap_session"
