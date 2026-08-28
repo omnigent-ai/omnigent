@@ -317,6 +317,48 @@ def test_the_claude_spawn_env_never_carries_the_codex_catalog_flag(
     assert CODEX_EXTENDED_CATALOG_ENV_VAR not in env
 
 
+def test_routed_databricks_model_switches_codex_to_the_named_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A selected allowlisted endpoint is dispatched via Databricks, not OpenAI."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    (tmp_path / "config.yaml").write_text(
+        "providers:\n"
+        "  openai:\n"
+        "    kind: key\n"
+        "    default: true\n"
+        "    openai:\n"
+        "      base_url: https://api.openai.com/v1\n"
+        "      api_key: $OPENAI_API_KEY\n"
+        "      models:\n"
+        "        default: gpt-5-4\n"
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        name="x",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex"}),
+    )
+    routing_class = SessionRoutingClass(routing_enabled=True, databricks_routing_enabled=True)
+    subagent_routing.remember_session_routing_class("conv_databricks", routing_class)
+    try:
+        env = _build_spawn_env_from_spec(
+            spec,
+            "codex",
+            model_override="databricks-kimi-k2-6",
+            session_id="conv_databricks",
+        )
+    finally:
+        subagent_routing.forget_session_routing_class("conv_databricks")
+
+    assert env is not None
+    assert env["HARNESS_CODEX_GATEWAY"] == "true"
+    assert env["HARNESS_CODEX_DATABRICKS_PROFILE"] == "produ2m"
+    assert env["HARNESS_CODEX_MODEL"] == "databricks-kimi-k2-6"
+    assert "HARNESS_CODEX_MODEL_PROVIDER" not in env
+
+
 async def test_router_env_is_scoped_to_the_launching_harness(tmp_path: Path) -> None:
     """A codex spawn beneath a claude session must not see the codex vars.
 

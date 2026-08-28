@@ -356,7 +356,7 @@ export interface ConversationState {
    * on bind and written through `setSubagentRouting`.
    */
   subagentRoutingOverride: "on" | "off" | null;
-  /** Opt-in state for configured Databricks Kimi on this session. */
+  /** Opt-in state for configured Databricks endpoint routing on this session. */
   databricksKimiRoutingEnabled: boolean;
   /**
    * Per-session Codex collaboration-mode flag. Hydrated from

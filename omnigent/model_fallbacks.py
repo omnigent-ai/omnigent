@@ -173,6 +173,12 @@ _SMART_ROUTING_FALLBACKS: dict[str, StaticModelFallback] = {
         provenance="codex's own bundled catalog slug for the cheapest current arm",
         discovery_gap="codex's bundled catalog carries no entry for a gateway-only arm to clone",
     ),
+    "databricks_routing_default": StaticModelFallback(
+        model_ids=("databricks-kimi-k2-6",),
+        owner="Smart Routing Databricks allowlist",
+        provenance="local default for the explicitly opt-in Databricks routing source",
+        discovery_gap="the named Databricks profile is checked live after startup",
+    ),
 }
 
 #: Claude serving endpoints the router ranks, cheapest → most powerful.
@@ -204,3 +210,8 @@ SMART_ROUTING_PI_EXCLUDED = _SMART_ROUTING_FALLBACKS["pi_excluded"].model_ids
 CODEX_CATALOG_CLONE_SOURCE_SLUG = _SMART_ROUTING_FALLBACKS["codex_catalog_clone_source"].model_ids[
     0
 ]
+
+#: Default endpoint for the explicitly opt-in Databricks Smart Routing source.
+DATABRICKS_ROUTING_DEFAULT_MODELS = _SMART_ROUTING_FALLBACKS[
+    "databricks_routing_default"
+].model_ids

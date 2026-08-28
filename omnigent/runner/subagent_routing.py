@@ -99,6 +99,10 @@ HOOK_REQUEST_TIMEOUT_S = 15.0
 #: a new column or a transcript scan.
 ROUTING_DECISION_LABEL_KEY = "omnigent.routing.decision_id"
 
+#: Conversation label recording whether Smart Routing may select a configured
+#: Databricks endpoint for this session.
+DATABRICKS_ROUTING_LABEL_KEY = "omnigent.routing.databricks_kimi"
+
 #: Conversation label fingerprinting the prompt a create-time route scored.
 #: A native Smart Routing create routes the prompt the user typed on the
 #: landing screen, and that same prompt is then submitted inside the harness —
@@ -241,6 +245,7 @@ class SessionRoutingClass:
     routing_enabled: bool = False
     auto_harness: bool = False
     turn_routing: bool = False
+    databricks_routing_enabled: bool = False
 
 
 #: The class a session with no recorded routing state is treated as. Read by
@@ -283,6 +288,9 @@ def routing_class_from_snapshot(
         routing_enabled=routes,
         auto_harness=auto,
         turn_routing=routes and not already_routed,
+        databricks_routing_enabled=(
+            labels is not None and labels.get(DATABRICKS_ROUTING_LABEL_KEY) == "on"
+        ),
     )
 
 

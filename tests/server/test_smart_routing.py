@@ -118,20 +118,18 @@ async def test_databricks_kimi_is_only_selected_for_conservative_work() -> None:
 
 @pytest.mark.asyncio
 async def test_route_turn_kimi_toggle_filters_or_uses_explicit_configuration() -> None:
-    """Off is Codex-only; on admits Kimi only after explicit provider configuration."""
-    from types import SimpleNamespace
+    """Off is Codex-only; on restricts routing to profile-verified endpoints."""
 
     client = CodexSubscriptionRoutingClient()
     caps = FakeCaps(routing_client=client, routing_backends=RoutingBackends(local=client))
-    provider = SimpleNamespace(kind="databricks")
     patches = (
-        patch("omnigent.onboarding.provider_config.load_config", return_value={}),
         patch(
-            "omnigent.onboarding.provider_config.load_providers", return_value={"dbx": provider}
+            "omnigent.server.smart_routing.configured_databricks_routing_models",
+            new=AsyncMock(return_value=(["databricks-kimi-k2-6"], None)),
         ),
         patch("omnigent.runtime._globals._caps", new=caps),
     )
-    with patches[0], patches[1], patches[2]:
+    with patches[0], patches[1]:
         off_model, _ = await route_turn(
             "codex-native",
             "Quick edit",
@@ -153,13 +151,128 @@ async def test_route_turn_kimi_toggle_filters_or_uses_explicit_configuration() -
 
 
 @pytest.mark.asyncio
-async def test_route_turn_kimi_missing_config_falls_open_with_status() -> None:
-    """An opt-in without a provider keeps the Codex choice and explains why."""
+async def test_session_routing_applies_the_kimi_toggle_to_the_first_decision() -> None:
+    """A Smart Routing session uses Kimi only when this task opted in."""
+
     client = CodexSubscriptionRoutingClient()
     caps = FakeCaps(routing_client=client, routing_backends=RoutingBackends(local=client))
     with (
-        patch("omnigent.onboarding.provider_config.load_config", return_value={}),
-        patch("omnigent.onboarding.provider_config.load_providers", return_value={}),
+        patch(
+            "omnigent.server.smart_routing.configured_databricks_routing_models",
+            new=AsyncMock(return_value=(["databricks-kimi-k2-6"], None)),
+        ),
+        patch("omnigent.runtime._globals._caps", new=caps),
+    ):
+        _off_harness, off_model, _off_verdict, _off_error = await route_session_harness(
+            "Quick edit",
+            harness_candidates=("codex-native",),
+            catalog={"codex-native": ["databricks-kimi-k2-6", "gpt-5.6-luna"]},
+            gateway_backed=False,
+            allow_static_fallback=False,
+        )
+        _on_harness, on_model, on_verdict, _on_error = await route_session_harness(
+            "Quick edit",
+            harness_candidates=("codex-native",),
+            catalog={"codex-native": ["databricks-kimi-k2-6", "gpt-5.6-luna"]},
+            gateway_backed=False,
+            allow_static_fallback=False,
+            allow_databricks_kimi=True,
+        )
+    assert off_model == "gpt-5.6-luna"
+    assert on_model == "databricks-kimi-k2-6"
+    assert on_verdict is not None
+
+
+@pytest.mark.asyncio
+async def test_session_routing_adds_profile_backed_kimi_beside_codex_catalog() -> None:
+    """Kimi remains a routable source when Codex lists subscription models only."""
+    client = CodexSubscriptionRoutingClient()
+    caps = FakeCaps(routing_client=client, routing_backends=RoutingBackends(local=client))
+    with (
+        patch(
+            "omnigent.server.smart_routing.configured_databricks_routing_models",
+            new=AsyncMock(return_value=(["databricks-kimi-k2-6"], None)),
+        ) as configured,
+        patch("omnigent.runtime._globals._caps", new=caps),
+    ):
+        harness, model, verdict, error = await route_session_harness(
+            "Quick edit",
+            harness_candidates=("codex",),
+            catalog={"codex": ["gpt-5.6-luna"]},
+            gateway_backed=False,
+            allow_static_fallback=False,
+            allow_databricks_kimi=True,
+        )
+    configured.assert_awaited_once_with()
+    assert (harness, model, error) == ("codex", "databricks-kimi-k2-6", None)
+    assert verdict is not None
+
+
+@pytest.mark.asyncio
+async def test_databricks_routing_intersects_profile_listing_task_catalog_and_allowlist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The routing environment is a strict, profile-verified task allowlist."""
+    from types import SimpleNamespace
+
+    from omnigent.server.smart_routing import configured_databricks_routing_models
+
+    monkeypatch.setenv("OMNIGENT_DATABRICKS_ROUTING_PROFILE", "adminu2m")
+    monkeypatch.setenv(
+        "OMNIGENT_DATABRICKS_ROUTING_MODELS",
+        "databricks-kimi-k2-6, databricks-gpt-5-6,databricks-missing",
+    )
+    listing = SimpleNamespace(
+        models=(
+            SimpleNamespace(id="databricks-kimi-k2-6"),
+            SimpleNamespace(id="databricks-gpt-5-6"),
+            SimpleNamespace(id="databricks-other"),
+        )
+    )
+    with patch(
+        "omnigent.model_catalog.list_databricks_profile_models", return_value=listing
+    ) as get:
+        models, status = await configured_databricks_routing_models(
+            ["databricks-kimi-k2-6", "databricks-other", "gpt-5.6-luna"]
+        )
+    assert models == ["databricks-kimi-k2-6"]
+    assert status is None
+    get.assert_called_once_with("adminu2m")
+
+
+def test_databricks_routing_environment_defaults_and_manual_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Local defaults are used only when the operator has not set either value."""
+    from omnigent.server.smart_routing import _configured_databricks_routing_model_ids
+
+    monkeypatch.delenv("OMNIGENT_DATABRICKS_ROUTING_PROFILE", raising=False)
+    monkeypatch.delenv("OMNIGENT_DATABRICKS_ROUTING_MODELS", raising=False)
+    assert _configured_databricks_routing_model_ids() == (
+        "produ2m",
+        ("databricks-kimi-k2-6",),
+    )
+
+    monkeypatch.setenv("OMNIGENT_DATABRICKS_ROUTING_PROFILE", "adminu2m")
+    monkeypatch.setenv(
+        "OMNIGENT_DATABRICKS_ROUTING_MODELS", "databricks-gpt-5-6,databricks-kimi-k2-6"
+    )
+    assert _configured_databricks_routing_model_ids() == (
+        "adminu2m",
+        ("databricks-gpt-5-6", "databricks-kimi-k2-6"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_route_turn_kimi_missing_config_falls_open_with_status() -> None:
+    """An opt-in without an allowlist keeps the Codex choice and explains why."""
+    client = CodexSubscriptionRoutingClient()
+    caps = FakeCaps(routing_client=client, routing_backends=RoutingBackends(local=client))
+    with (
+        patch(
+            "omnigent.server.smart_routing.configured_databricks_routing_models",
+            new=AsyncMock(return_value=([], "Databricks routing is unavailable: set allowlist.")),
+        ),
         patch("omnigent.runtime._globals._caps", new=caps),
     ):
         model, verdict = await route_turn(
@@ -172,7 +285,7 @@ async def test_route_turn_kimi_missing_config_falls_open_with_status() -> None:
         )
     assert model == "gpt-5.6-luna"
     assert verdict is not None
-    assert "no Databricks provider is explicitly configured" in verdict["rationale"]
+    assert "set allowlist" in verdict["rationale"]
 
 
 @pytest.mark.asyncio

@@ -9765,6 +9765,39 @@ def _build_spawn_env_from_spec(
     except ImportError:
         return None
 
+    # A Databricks arm chosen by Smart Routing is not a Codex subscription
+    # model. Its endpoint is validated by the server-side allowlist, then the
+    # SDK harness is switched to that session's named Databricks profile here.
+    # This happens after the regular builder because a Codex subscription is
+    # normally its default provider and would otherwise mask the routed arm.
+    if (
+        env is not None
+        and harness == "codex"
+        and model_override is not None
+        and session_id is not None
+        and session_routing_class(session_id).databricks_routing_enabled
+    ):
+        from omnigent.onboarding.provider_config import DATABRICKS_KIND, ProviderEntry
+        from omnigent.runtime.workflow import configure_agent_harness_with_provider
+        from omnigent.server.smart_routing import (
+            databricks_routing_profile,
+            is_configured_databricks_routing_model,
+        )
+
+        if is_configured_databricks_routing_model(model_override):
+            # Gateway transport and a pinned Codex CLI provider are mutually
+            # exclusive. The subscription builder may have set the latter.
+            env.pop("HARNESS_CODEX_MODEL_PROVIDER", None)
+            configure_agent_harness_with_provider(
+                env,
+                ProviderEntry(
+                    name="smart-routing-databricks",
+                    kind=DATABRICKS_KIND,
+                    profile=databricks_routing_profile(),
+                ),
+                harness_type="codex",
+            )
+
     # Point the harness process at this session's subagent-routing endpoint
     # when one is running (started at session init). Scoped to *harness* so a
     # codex executor beneath a claude session never sees the codex router vars

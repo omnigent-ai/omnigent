@@ -46,6 +46,7 @@ import {
 } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Switch } from "@/components/ui/switch";
 import {
   Command,
   CommandEmpty,
@@ -1498,6 +1499,8 @@ function HarnessConfigModal({
   pickedEffort,
   pickedHarness,
   costControlMode,
+  gpt56SolRoutingEnabled,
+  databricksKimiRoutingEnabled,
   setPermissionMode,
   setApprovalMode,
   setCursorExecMode,
@@ -1507,6 +1510,8 @@ function HarnessConfigModal({
   setPickedEffort,
   setPickedHarness,
   setCostControlMode,
+  setGpt56SolRoutingEnabled,
+  setDatabricksKimiRoutingEnabled,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -1530,6 +1535,8 @@ function HarnessConfigModal({
   pickedEffort: string;
   pickedHarness: string | null;
   costControlMode: CostControlMode;
+  gpt56SolRoutingEnabled: boolean;
+  databricksKimiRoutingEnabled: boolean;
   setPermissionMode: (mode: string) => void;
   setApprovalMode: (mode: string) => void;
   setCursorExecMode: (mode: string) => void;
@@ -1539,6 +1546,8 @@ function HarnessConfigModal({
   setPickedEffort: (effort: string) => void;
   setPickedHarness: (harness: string | null, agentId?: string) => void;
   setCostControlMode: (mode: CostControlMode) => void;
+  setGpt56SolRoutingEnabled: (enabled: boolean) => void;
+  setDatabricksKimiRoutingEnabled: (enabled: boolean) => void;
 }) {
   const info = useServerInfo();
   // Feature ON → single "needs setup" badge; OFF → per-reason original text.
@@ -1564,6 +1573,11 @@ function HarnessConfigModal({
   const [draftBypass, setDraftBypass] = useState(bypassSandbox);
   const [draftHarness, setDraftHarness] = useState<string | null>(pickedHarness);
   const [draftRouting, setDraftRouting] = useState<CostControlMode>(costControlMode);
+  const [draftGpt56SolRoutingEnabled, setDraftGpt56SolRoutingEnabled] =
+    useState(gpt56SolRoutingEnabled);
+  const [draftDatabricksKimiRoutingEnabled, setDraftDatabricksKimiRoutingEnabled] = useState(
+    databricksKimiRoutingEnabled,
+  );
 
   useEffect(() => {
     if (!open) return;
@@ -1576,6 +1590,8 @@ function HarnessConfigModal({
     setDraftBypass(bypassSandbox);
     setDraftHarness(pickedHarness);
     setDraftRouting(costControlMode);
+    setDraftGpt56SolRoutingEnabled(gpt56SolRoutingEnabled);
+    setDraftDatabricksKimiRoutingEnabled(databricksKimiRoutingEnabled);
     // Seed once per open from the current live values.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
@@ -1631,6 +1647,8 @@ function HarnessConfigModal({
     // placeholder wrapper's model/mode drafts would leak its knobs into the
     // create call.
     if (autoNative) {
+      setGpt56SolRoutingEnabled(draftGpt56SolRoutingEnabled);
+      setDatabricksKimiRoutingEnabled(draftDatabricksKimiRoutingEnabled);
       onOpenChange(false);
       return;
     }
@@ -1689,6 +1707,10 @@ function HarnessConfigModal({
           routing: draftRouting === "on" ? "on" : "off",
           ...(draftRouting === "on" ? { model: "", effort: "" } : {}),
         });
+    }
+    if (autoRouting) {
+      setGpt56SolRoutingEnabled(draftGpt56SolRoutingEnabled);
+      setDatabricksKimiRoutingEnabled(draftDatabricksKimiRoutingEnabled);
     }
     onOpenChange(false);
   };
@@ -1957,6 +1979,32 @@ function HarnessConfigModal({
               />
             </ConfigRow>
           )}
+          {autoRouting && (
+            <>
+              <ConfigRow
+                label="Allow GPT-5.6 Sol"
+                description="Let Smart Routing use Sol for demanding tasks"
+              >
+                <Switch
+                  checked={draftGpt56SolRoutingEnabled}
+                  onCheckedChange={setDraftGpt56SolRoutingEnabled}
+                  aria-label="Allow GPT-5.6 Sol"
+                  data-testid="new-chat-landing-config-gpt-5-6-sol-routing"
+                />
+              </ConfigRow>
+              <ConfigRow
+                label="Use configured Databricks models"
+                description="Let Smart Routing choose between the Databricks allowlist and Codex subscription models"
+              >
+                <Switch
+                  checked={draftDatabricksKimiRoutingEnabled}
+                  onCheckedChange={setDraftDatabricksKimiRoutingEnabled}
+                  aria-label="Use configured Databricks models"
+                  data-testid="new-chat-landing-config-databricks-kimi-routing"
+                />
+              </ConfigRow>
+            </>
+          )}
         </div>
 
         <DialogFooter className="border-t-0 bg-transparent">
@@ -2003,6 +2051,8 @@ interface LandingDraft {
   pickedModel: string;
   pickedEffort: string;
   costControlMode: CostControlMode;
+  gpt56SolRoutingEnabled: boolean;
+  databricksKimiRoutingEnabled: boolean;
 }
 
 let landingDraft: LandingDraft | null = null;
@@ -2355,6 +2405,12 @@ export function NewChatLandingScreen() {
   const [costControlMode, _setCostControlMode] = useState<CostControlMode>(
     () => landingDraft?.costControlMode ?? null,
   );
+  const [gpt56SolRoutingEnabled, setGpt56SolRoutingEnabled] = useState(
+    () => landingDraft?.gpt56SolRoutingEnabled ?? false,
+  );
+  const [databricksKimiRoutingEnabled, setDatabricksKimiRoutingEnabled] = useState(
+    () => landingDraft?.databricksKimiRoutingEnabled ?? false,
+  );
   // Model selection and smart routing are mutually exclusive: enabling
   // routing clears the explicit model pick, and picking a model turns
   // routing off.
@@ -2415,6 +2471,8 @@ export function NewChatLandingScreen() {
     pickedModel,
     pickedEffort,
     costControlMode,
+    gpt56SolRoutingEnabled,
+    databricksKimiRoutingEnabled,
   };
   useEffect(() => {
     // Re-set on setup so StrictMode's setup→cleanup→setup double-invoke
@@ -3946,6 +4004,8 @@ export function NewChatLandingScreen() {
                 ? pickedEffort
                 : undefined,
             cost_control_mode_override: costControlOverride,
+            gpt_5_6_sol_routing_enabled: routingOwnsModel && gpt56SolRoutingEnabled,
+            databricks_kimi_routing_enabled: routingOwnsModel && databricksKimiRoutingEnabled,
             // Top-level Smart Routing sends the same "auto" sentinel the bundle
             // path does; the server tells them apart by the bound agent being a
             // native wrapper, and routes at create time (the terminal launches
@@ -4513,6 +4573,8 @@ export function NewChatLandingScreen() {
                     pickedEffort={pickedEffort}
                     pickedHarness={pickedHarness}
                     costControlMode={costControlMode}
+                    gpt56SolRoutingEnabled={gpt56SolRoutingEnabled}
+                    databricksKimiRoutingEnabled={databricksKimiRoutingEnabled}
                     setPermissionMode={setPermissionMode}
                     setApprovalMode={setApprovalMode}
                     setCursorExecMode={setCursorExecMode}
@@ -4522,6 +4584,8 @@ export function NewChatLandingScreen() {
                     setPickedEffort={setPickedEffort}
                     setPickedHarness={handleSetPickedHarness}
                     setCostControlMode={setCostControlMode}
+                    setGpt56SolRoutingEnabled={setGpt56SolRoutingEnabled}
+                    setDatabricksKimiRoutingEnabled={setDatabricksKimiRoutingEnabled}
                   />
                 )}
                 {/* Routing is not a standalone composer toggle — it folds into

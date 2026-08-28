@@ -4835,6 +4835,24 @@ describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
     },
   );
 
+  it("shows and persists the Sol and Kimi routing choices for a Smart Routing task", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_bundle_route_preferences" }),
+    } as unknown as Response);
+    renderLanding({ smart_routing_enabled: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    draftSmartRouting("ag_polly");
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-gpt-5-6-sol-routing"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-databricks-kimi-routing"));
+    saveConfig();
+    const { body } = await submitAndReadBody();
+    expect(body.gpt_5_6_sol_routing_enabled).toBe(true);
+    expect(body.databricks_kimi_routing_enabled).toBe(true);
+  });
+
   it("sends the explicit brain with no routing once the pick moves off Smart Routing", async () => {
     authenticatedFetchMock.mockResolvedValue({
       ok: true,
