@@ -225,6 +225,55 @@ async def _drive_smart_routing_harness(base_url: str, session_id: str) -> None:
             await browser.close()
 
 
+def test_start_session_smart_routing_persists_candidate_controls(
+    seeded_session: tuple[str, str],
+) -> None:
+    """Top-level routing sends the candidate controls selected in its gear modal."""
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_smart_routing_candidate_controls(base_url, session_id))
+
+
+async def _drive_smart_routing_candidate_controls(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_routing_routes(
+                page, created_session_id=session_id, create_bodies=create_bodies
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+            await page.get_by_test_id("new-chat-landing-agent-select").click()
+            await page.get_by_test_id("new-chat-landing-harness-smart-routing").click()
+
+            await page.get_by_test_id("new-chat-landing-config-gear").click()
+            sol = page.get_by_test_id("new-chat-landing-config-gpt-5-6-sol-routing")
+            databricks = page.get_by_test_id("new-chat-landing-config-databricks-kimi-routing")
+            codex = page.get_by_test_id("new-chat-landing-config-codex-subscription-routing")
+            await expect(sol).to_be_visible()
+            await expect(databricks).to_be_visible()
+            await expect(codex).to_be_visible()
+            await sol.check()
+            await databricks.check()
+            await codex.uncheck()
+            await _save_config(page)
+
+            await page.get_by_test_id("new-chat-landing-input").fill("review the routing policy")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["gpt_5_6_sol_routing_enabled"] is True, body
+            assert body["databricks_kimi_routing_enabled"] is True, body
+            assert body["codex_subscription_routing_enabled"] is False, body
+        finally:
+            await browser.close()
+
+
 def test_start_session_smart_routing_model_option(seeded_session: tuple[str, str]) -> None:
     """Smart Routing is also a Model choice on a routable native harness.
 
