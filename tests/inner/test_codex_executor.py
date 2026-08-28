@@ -2652,6 +2652,41 @@ def test_populate_codex_home_config_symlinks_remote_mcp_oauth(tmp_path: Path) ->
     assert (target / "mcp-oauth-locks" / "file-store.lock").is_file()
 
 
+def test_populate_codex_home_config_symlinks_memories(tmp_path: Path) -> None:
+    """``memories_1.sqlite``, ``memories/``, and ``rules/`` are symlinked.
+
+    Codex stores memories in ``memories_1.sqlite`` and ``memories/``, and
+    user-defined rules in ``rules/``. Without symlinking them a private home
+    starts with no memories and ignores the user's rules.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "auth.json").write_text('{"auth_mode": "chatgpt"}')
+    (source / "config.toml").write_text("[default]\n")
+    (source / "memories_1.sqlite").write_bytes(b"SQLite format 3\x00fake")
+    (source / "memories").mkdir()
+    (source / "memories" / "mem.md").write_text("# memory")
+    (source / "rules").mkdir()
+    (source / "rules" / "default.rules").write_text(
+        'prefix_rule(pattern=["git"], decision="allow")'
+    )
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    assert (target / "memories_1.sqlite").is_symlink()
+    assert (target / "memories_1.sqlite").read_bytes() == b"SQLite format 3\x00fake"
+    assert (target / "memories").is_symlink()
+    assert (target / "memories" / "mem.md").read_text() == "# memory"
+    assert (target / "rules").is_symlink()
+    assert (
+        target / "rules" / "default.rules"
+    ).read_text() == 'prefix_rule(pattern=["git"], decision="allow")'
+
+
 def test_populate_codex_home_config_symlinks_plugins_cache(tmp_path: Path) -> None:
     """``plugins/cache`` is symlinked to the shared home to dedupe it.
 
