@@ -18,6 +18,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -155,10 +156,39 @@ def _coerce_int(value: object) -> int:
     return int(cast(str | bytes | bytearray | SupportsInt | SupportsIndex, value))
 
 
-# Binary appearance is cheap to probe, so new CLI installs surface quickly.
+# Quick-probe cadence. Binary appearance itself is not cheap to probe on
+# every wakeup: a shutil.which miss walks the whole PATH, and on hosts where
+# each stat is expensive (long PATH, endpoint-security filter drivers) a 5s
+# cadence over several uninstalled harnesses burns a sustained CPU core while
+# the daemon is idle — hence the TTL verdict cache below.
 HARNESS_READINESS_REFRESH_INTERVAL_S = 5.0
 # Auth changes and removals need the full, potentially expensive readiness map.
 HARNESS_READINESS_FULL_REFRESH_INTERVAL_S = 60.0
+# How long a quick-probe verdict stays cached. New-CLI installs surface within
+# this window (a minute of badge staleness is invisible); the quick probe's
+# 5s cadence re-uses the cached verdict for free. Matches the full-refresh
+# cadence so quick-probe staleness never exceeds a full-refresh window.
+HARNESS_READINESS_QUICK_PROBE_CACHE_TTL_S = 60.0
+_quick_probe_cache: dict[str, float] = {}
+_quick_probe_cached: dict[str, bool] = {}
+
+
+def _invalidate_quick_probe_cache() -> None:
+    """Drop cached quick-probe verdicts (tests; installs refilled within TTL)."""
+    _quick_probe_cache.clear()
+    _quick_probe_cached.clear()
+
+
+def _harness_now_configured(harness: str) -> bool:
+    """harness_is_configured through the quick-probe TTL cache."""
+    now = time.monotonic()
+    stamp = _quick_probe_cache.get(harness)
+    if stamp is not None and now - stamp < HARNESS_READINESS_QUICK_PROBE_CACHE_TTL_S:
+        return _quick_probe_cached[harness]
+    verdict = harness_is_configured(harness)
+    _quick_probe_cache[harness] = now
+    _quick_probe_cached[harness] = verdict
+    return verdict
 
 
 def _unavailable_harness_became_ready(
@@ -167,7 +197,7 @@ def _unavailable_harness_became_ready(
     """Detect newly available binaries; auth changes wait for the full refresh."""
     return any(
         (availability is False or availability == HARNESS_BINARY_MISSING)
-        and harness_is_configured(harness)
+        and _harness_now_configured(harness)
         for harness, availability in previous.items()
     )
 

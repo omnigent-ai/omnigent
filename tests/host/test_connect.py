@@ -799,6 +799,60 @@ async def _cancel(task: asyncio.Task[None]) -> None:
         await task
 
 
+def test_unavailable_harness_quick_probe_is_ttl_cached(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The quick probe resolves each unavailable harness once per TTL.
+
+    The readiness loop wakes every 5s; re-probing every unavailable
+    harness with a full shutil.which PATH scan on each wakeup burns a
+    sustained CPU core on hosts where each PATH stat is expensive. Within
+    the TTL the cached verdict serves the cadence; expiry re-probes so a
+    new install still surfaces.
+    """
+    from omnigent.host import connect as connect_mod
+
+    calls: list[str] = []
+    monkeypatch.setattr(connect_mod, "harness_is_configured", lambda h: calls.append(h) or False)
+    connect_mod._invalidate_quick_probe_cache()
+    try:
+        previous = {"goose-native": False, "qwen-native": False}
+
+        # Burst of quick probes well inside the TTL.
+        for _ in range(12):
+            assert connect_mod._unavailable_harness_became_ready(previous) is False
+        # Each harness resolved exactly ONCE — the cadence served from cache.
+        assert sorted(calls) == ["goose-native", "qwen-native"]
+
+        # A harness that becomes configured is seen once the verdict expires.
+        monkeypatch.setattr(connect_mod, "harness_is_configured", lambda h: h == "goose-native")
+        monkeypatch.setattr(connect_mod, "HARNESS_READINESS_QUICK_PROBE_CACHE_TTL_S", 0.0)
+        assert connect_mod._unavailable_harness_became_ready(previous) is True
+    finally:
+        connect_mod._invalidate_quick_probe_cache()
+        monkeypatch.undo()
+
+
+def test_quick_probe_cache_survives_configured_flip_within_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Within the TTL a cached miss is authoritative — an external install
+    surfaces on the next expiry, not the next 5s tick."""
+    from omnigent.host import connect as connect_mod
+
+    state = {"configured": False}
+    monkeypatch.setattr(connect_mod, "harness_is_configured", lambda _h: state["configured"])
+    connect_mod._invalidate_quick_probe_cache()
+    try:
+        assert connect_mod._unavailable_harness_became_ready({"goose-native": False}) is False
+        state["configured"] = True
+        # Still inside the TTL: cached miss wins.
+        assert connect_mod._unavailable_harness_became_ready({"goose-native": False}) is False
+        # Expiry re-probes and sees the install.
+        monkeypatch.setattr(connect_mod, "HARNESS_READINESS_QUICK_PROBE_CACHE_TTL_S", 0.0)
+        assert connect_mod._unavailable_harness_became_ready({"goose-native": False}) is True
+    finally:
+        connect_mod._invalidate_quick_probe_cache()
+
+
 async def test_live_host_refreshes_harness_readiness_without_reconnect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
