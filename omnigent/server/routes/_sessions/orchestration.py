@@ -3179,19 +3179,22 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
     ):
         return False
 
-    # The stale tunnel and its relay are intentionally replaced during a
-    # managed wake. Mark the handoff before deregistration so those expected
-    # disconnects do not become a user-visible task failure.
-    _managed_wake_sessions.add(session_id)
+    # Suppress only the stale-tunnel handoff here. A newly kicked wake owns its
+    # longer-lived marker in ``_kick_managed_wake_impl``; keeping this temporary
+    # marker through tracker rendezvous can leak it when another launch is
+    # already unsettled and no new wake task is created.
+    already_waking = session_id in _managed_wake_sessions
+    if not already_waking:
+        _managed_wake_sessions.add(session_id)
     try:
         await _retire_runner_relay_for_managed_wake(session_id)
         if host_registry is not None:
             host_registry.deregister(conv.host_id)
         if tunnel_registry is not None and conv.runner_id is not None:
             tunnel_registry.deregister(conv.runner_id)
-    except BaseException:
-        _managed_wake_sessions.discard(session_id)
-        raise
+    finally:
+        if not already_waking:
+            _managed_wake_sessions.discard(session_id)
 
     _logger.info(
         "Managed host %s for session %s needs wake before reusing tunnels "
@@ -3205,19 +3208,12 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
         runner_tunnel_stale,
         extra={"session_id": session_id},
     )
-    try:
-        started = await _maybe_relaunch_managed_sandbox(
-            session_id=session_id,
-            conv=conv,
-            app_state=app_state,
-            conversation_store=conversation_store,
-        )
-    except BaseException:
-        _managed_wake_sessions.discard(session_id)
-        raise
-    if not started:
-        _managed_wake_sessions.discard(session_id)
-    return started
+    return await _maybe_relaunch_managed_sandbox(
+        session_id=session_id,
+        conv=conv,
+        app_state=app_state,
+        conversation_store=conversation_store,
+    )
 
 
 async def _retire_runner_relay_for_managed_wake(session_id: str) -> None:
@@ -3665,6 +3661,9 @@ async def _run_managed_wake(
         _publish_sandbox_status(session_id, stage)
 
     try:
+        # Idempotent by design: stale-tunnel detection may retire this relay
+        # before kicking the wake, while a direct host-asleep wake first
+        # reaches the relay here.
         await _retire_runner_relay_for_managed_wake(session_id)
         # Wake the same sandbox in place; resume_managed_host is single-flight
         # per host and a no-op if it's already online.
@@ -5966,6 +5965,9 @@ async def _relay_runner_stream(
                     "Relay: suppressing expected managed-wake disconnect for session=%s",
                     session_id,
                 )
+                # Managed wakes are message-triggered. The parked dispatch
+                # resumes after the wake tracker settles and establishes the
+                # replacement relay; this obsolete relay must not race it.
                 return
             # An attempt that streamed longer than the grace was a live
             # tunnel dropping anew — give the new outage a fresh window.
