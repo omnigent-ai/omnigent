@@ -132,3 +132,72 @@ async def test_ensure_catalog_stale_refresh_failure_keeps_serving() -> None:
     # The stale rows keep serving; nothing crashed and nothing was clobbered.
     assert store.read_catalog("claude-native", "abc123") == _ROWS
     assert await store.ensure_catalog("claude-native", "abc123", _probe) == _ROWS
+
+
+# ── binary_identity ──────────────────────────────────────
+
+
+def test_binary_identity_is_none_without_a_resolvable_command() -> None:
+    """An unresolvable binary keys exactly as it did before this facet.
+
+    Returning ``None`` keeps the fingerprint stable, so a probe that
+    cannot name its executable never invalidates a stored catalog.
+    """
+    assert store.binary_identity(None) is None
+    assert store.binary_identity("") is None
+    assert store.binary_identity("/nonexistent/claude") is None
+
+
+def test_binary_identity_follows_a_version_symlink_to_its_target(tmp_path: Path) -> None:
+    """Two links to one release share an identity; a new release does not.
+
+    Claude Code keeps each release in its own directory and moves a
+    symlink, so the resolved target is what changes on upgrade.
+    """
+    old_release = tmp_path / "2.1.247"
+    new_release = tmp_path / "2.1.250"
+    old_release.write_text("old")
+    new_release.write_text("newer build")
+    link = tmp_path / "claude"
+    link.symlink_to(old_release)
+
+    before = store.binary_identity(str(link))
+    assert before is not None
+    assert before[0] == str(old_release.resolve())
+
+    link.unlink()
+    link.symlink_to(new_release)
+    after = store.binary_identity(str(link))
+
+    assert after is not None
+    assert after != before
+
+
+def test_binary_identity_notices_a_binary_replaced_in_place(tmp_path: Path) -> None:
+    """Installs that overwrite one path still register as a new binary."""
+    binary = tmp_path / "claude"
+    binary.write_text("old")
+    before = store.binary_identity(str(binary))
+
+    binary.write_text("a longer, newer build")
+    os.utime(binary, (0, 0))
+    after = store.binary_identity(str(binary))
+
+    assert before is not None
+    assert after is not None
+    assert after != before
+
+
+def test_binary_identity_resolves_a_bare_name_through_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bare name is looked up on PATH, the way a launch spawns it."""
+    binary = tmp_path / "claude"
+    binary.write_text("build")
+    binary.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    identity = store.binary_identity("claude")
+
+    assert identity is not None
+    assert identity[0] == str(binary.resolve())

@@ -9848,3 +9848,62 @@ def test_claude_catalog_serves_model(
     assert (
         claude_native.claude_catalog_serves_model(_subscription_catalog(), model, config) is served
     )
+
+
+# ── catalog fingerprint keys on the CLI binary ───────────
+
+
+def _point_claude_at(monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
+    """Make the fingerprint resolve the Claude binary to *path*."""
+    monkeypatch.setattr(
+        "omnigent.claude_launcher.resolve_claude_launch",
+        lambda command, args: (str(path), list(args)),
+    )
+
+
+def test_catalog_fingerprint_changes_when_the_cli_is_upgraded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An upgraded Claude Code misses the catalog its predecessor wrote.
+
+    The catalog stores the model names one binary printed. Without the
+    binary in the key, an upgrade keeps serving the old names until the
+    entry ages out, which hides models a release adds or renames.
+    """
+    old_release = tmp_path / "2.1.247"
+    new_release = tmp_path / "2.1.250"
+    old_release.write_text("old")
+    new_release.write_text("newer build")
+    link = tmp_path / "claude"
+    link.symlink_to(old_release)
+    _point_claude_at(monkeypatch, link)
+
+    before = claude_native.claude_catalog_fingerprint(None)
+
+    link.unlink()
+    link.symlink_to(new_release)
+    after = claude_native.claude_catalog_fingerprint(None)
+
+    assert before != after
+
+
+def test_catalog_fingerprint_is_stable_for_one_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unchanged binary keeps its catalog, so no probe is repaid."""
+    binary = tmp_path / "claude"
+    binary.write_text("build")
+    _point_claude_at(monkeypatch, binary)
+
+    assert claude_native.claude_catalog_fingerprint(None) == (
+        claude_native.claude_catalog_fingerprint(None)
+    )
+
+
+def test_catalog_fingerprint_survives_a_missing_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A binary the resolver cannot find still yields a usable key."""
+    _point_claude_at(monkeypatch, tmp_path / "absent")
+
+    assert isinstance(claude_native.claude_catalog_fingerprint(None), str)
