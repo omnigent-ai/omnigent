@@ -26,9 +26,11 @@ function extractHeadings(container: HTMLElement | null): TocItem[] {
     const id = el.id;
     if (!id) continue; // Skip headings without IDs
 
-    // `textContent` is the rendered, sanitized visible text, so headings like
-    // `# <T> API` come through as plain text — no unrendered HTML to guard.
-    const text = el.textContent?.trim() ?? "";
+    // Get text content, filtering out any raw HTML that wasn't properly rendered
+    let text = el.textContent?.trim() ?? "";
+
+    // If the text starts with '<', it's likely unrendered HTML - skip it
+    if (text.startsWith("<")) continue;
 
     const level = parseInt(el.tagName[1], 10); // H1 -> 1, H2 -> 2, etc.
 
@@ -179,7 +181,7 @@ export function MarkdownTableOfContents({
   return (
     <nav
       className={cn(
-        "sticky top-0 h-full border-l border-border bg-card flex flex-col overflow-hidden",
+        "sticky top-0 h-screen border-l border-border bg-card flex flex-col overflow-hidden",
       )}
       aria-label="Table of contents"
     >

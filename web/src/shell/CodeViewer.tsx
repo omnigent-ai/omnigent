@@ -118,11 +118,8 @@ const ALERT_TITLE_CLASS = /^markdown-alert-title$/;
 // title) only for those exact tokens. Everything else — <script>, event
 // handlers, javascript: URLs, arbitrary classes — is still stripped, so raw
 // HTML in a .md file stays safe to render inline.
-// Keep hast-util-sanitize's default `clobberPrefix: "user-content-"`: heading
-// IDs come from untrusted markdown (via rehype-slug) and the prefix keeps them
-// from clobbering named DOM access or app-owned ids. The TOC reads `el.id` off
-// the rendered DOM and queries with the same value, so it works regardless of
-// the prefix.
+// Set clobberPrefix to empty string so rehype-slug's IDs are preserved without
+// the user-content- prefix, matching the TOC's slug algorithm.
 // Allow common img attributes (alt, width, height, align, valign) that GitHub supports.
 const MARKDOWN_SANITIZE_SCHEMA = {
   ...defaultSchema,
@@ -132,6 +129,7 @@ const MARKDOWN_SANITIZE_SCHEMA = {
     p: [...(defaultSchema.attributes?.p ?? []), ["className", ALERT_TITLE_CLASS]],
     img: [...(defaultSchema.attributes?.img ?? []), "alt", "width", "height", "align", "valign"],
   },
+  clobberPrefix: "",
 };
 
 // Markdown files routinely embed raw HTML that GitHub renders — <details>,
