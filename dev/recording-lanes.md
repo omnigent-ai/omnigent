@@ -57,11 +57,14 @@ like an environment failure but is really the build starving the boot. So
 **always build the SPA first as its own step**, then run the recorder.
 
 When you are yourself running inside a server-spawned runner (the `--server`
-path), also **strip the ambient runner/host env vars** so the fixture's own runner
-starts clean. Those vars (`OMNIGENT_RUNNER_ZYGOTE*` FDs, `OMNIGENT_RUNNER_ID`,
-tunnel/host tokens) leak into the spawned child, make it take the zygote-fork path
-and block on control FDs it doesn't have, so it hangs with an empty `runner.log`
-and stays `online: false`. Strip them with `env -u`:
+path — check with `echo "$OMNIGENT_RUNNER_ID"`, which is set there), you **must
+strip the ambient runner/host env vars** so the fixture's own runner starts clean.
+This is not optional: those vars (`OMNIGENT_RUNNER_ZYGOTE*` FDs,
+`OMNIGENT_RUNNER_ID`, tunnel/host tokens) leak into the spawned child, make it take
+the zygote-fork path and block on control FDs it doesn't have, so it hangs with an
+empty `runner.log` and stays `online: false`. A bare `pytest`/`uv run pytest` with
+`OMNIGENT_RUNNER_ID` still set is the single most common way the after-clip
+silently fails to record. Strip them with `env -u`:
 
 ```bash
 # Point npm/pnpm at the Databricks registry proxy first (see
@@ -77,13 +80,18 @@ env -u OMNIGENT_RUNNER_ID -u OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN \
     pytest <test_path> --screenshot on --output recordings/<slug>
 ```
 
-If the spawned runner still doesn't reach `online: true` within the fixture's
-timeout *after* the SPA is built and the env is stripped, capture the tail of the
-fixture's `runner.log`, treat that lane as genuinely unreachable here, keep
-`recordings: []` for it, and say plainly **"recorder's test server did not come
-online in time"** with the `runner.log` tail — noting whether the log was empty
-(the leaked-env/zygote hang) or showed a later failure, so the cause is named from
-what you observed rather than guessed.
+Only *after* the SPA is built and the env is stripped is an `online: false` a
+real environment limit. If you see `online: false` and you have **not** stripped
+the leaked vars (`OMNIGENT_RUNNER_ID` was set in your shell), that failure is your
+own un-stripped env, not the harness — re-run with the `env -u` prefix before
+concluding anything; do **not** file it as an environmental blocker or a "runner
+not coming online" env problem. Once the SPA is built, the env is stripped, and the
+spawned runner still doesn't reach `online: true` within the fixture's timeout,
+capture the tail of the fixture's `runner.log`, treat that lane as genuinely
+unreachable here, keep `recordings: []` for it, and say plainly **"recorder's test
+server did not come online in time"** with the `runner.log` tail — noting whether
+the log was empty (the leaked-env/zygote hang) or showed a later failure, so the
+cause is named from what you observed rather than guessed.
 
 ## `web` facets
 
