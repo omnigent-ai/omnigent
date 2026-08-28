@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy.exc import StatementError
@@ -195,6 +195,13 @@ _WEB_UI_HTML_CACHE_CONTROL = "no-cache"
 _WEB_UI_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
 _WEB_UI_STATIC_CACHE_CONTROL = "public, max-age=3600"
 _WEB_UI_API_FALLBACK_PREFIXES = frozenset({"api", "auth", "health", "v1", ".well-known"})
+# Auth namespaces owned by the hosting platform's front door (e.g. the
+# Databricks Apps proxy, which runs the Okta login flow under ``/oidc/`` and
+# receives its callback at ``/.auth/callback``). When such a path leaks
+# through to the app — an expired session replaying the callback, a bookmark
+# to the login URL — it must redirect to the Omnigent page, not render the
+# bare SPA shell.
+_WEB_UI_AUTH_REDIRECT_PREFIXES = frozenset({".auth", "oidc"})
 
 # Envelope version of GET /.well-known/omnigent.json (see the route for the
 # full contract). Bump ONLY for a change a client cannot absorb by ignoring
@@ -3023,6 +3030,8 @@ class _SPAStaticFiles(StaticFiles):
                         }
                     },
                 )
+            if exc.status_code == 404 and _is_web_ui_auth_redirect_path(path):
+                return RedirectResponse(url="/", status_code=302)
             if exc.status_code == 404 and "." not in path.rsplit("/", 1)[-1]:
                 served_path = "index.html"
                 response = await super().get_response("index.html", scope)
@@ -3046,6 +3055,23 @@ def _is_web_ui_api_fallback_path(path: str) -> bool:
     """
     first_segment = path.lstrip("/").split("/", 1)[0]
     return first_segment in _WEB_UI_API_FALLBACK_PREFIXES
+
+
+def _is_web_ui_auth_redirect_path(path: str) -> bool:
+    """
+    Return whether an unmatched static path belongs to the platform auth namespace.
+
+    A request for ``/.auth/*`` or ``/oidc/*`` that reaches the app has escaped
+    the front-door proxy that owns those paths. Serving the SPA shell there
+    leaves the browser on an auth URL showing a bare page; redirecting to
+    ``/`` sends the user back to the Omnigent page, where the proxy can
+    restart its login flow if the session is still unauthenticated.
+
+    :param path: Static mount-relative path, e.g. ``".auth/callback"``.
+    :returns: True for paths that should redirect to ``/``.
+    """
+    first_segment = path.lstrip("/").split("/", 1)[0]
+    return first_segment in _WEB_UI_AUTH_REDIRECT_PREFIXES
 
 
 class _RangeAwareGZipMiddleware(GZipMiddleware):

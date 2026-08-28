@@ -132,6 +132,30 @@ def test_well_known_prefix_is_not_spa_fallback() -> None:
     assert not server_app._is_web_ui_api_fallback_path("c/conv_abc123")
 
 
+def test_hosted_auth_prefix_is_auth_redirect() -> None:
+    """Front-door auth paths classify as redirect-to-app, not SPA fallback."""
+    assert server_app._is_web_ui_auth_redirect_path(".auth/callback")
+    assert server_app._is_web_ui_auth_redirect_path("oidc/oauth2/v2.0/authorize")
+    # A real client route must NOT redirect — it still falls back to the SPA.
+    assert not server_app._is_web_ui_auth_redirect_path("c/conv_abc123")
+
+
+@pytest.mark.asyncio
+async def test_hosted_auth_paths_redirect_to_app(client: httpx.AsyncClient) -> None:
+    """``/.auth/*`` and ``/oidc/*`` redirect to ``/`` instead of serving the SPA.
+
+    The Databricks Apps front door owns these paths (the Okta login flow and
+    its callback). One that leaks through to the app — e.g. an expired
+    session replaying ``/.auth/callback`` — must send the user back to the
+    Omnigent page rather than leaving them on an auth URL showing the bare
+    SPA shell.
+    """
+    for path in ("/.auth/callback", "/oidc/oauth2/v2.0/authorize"):
+        resp = await client.get(path)
+        assert resp.status_code == 302, path
+        assert resp.headers["location"] == "/", path
+
+
 class _StubWebSocket:
     """
     Minimal real ``WebSocketLike`` for registering a runner tunnel.
