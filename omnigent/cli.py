@@ -10459,9 +10459,23 @@ def setup(internal_beta: bool) -> None:
         )
         return
 
-    # --no-internal-beta: the standard model/credential picker. It warns
-    # about missing Node/tmux itself, configures providers/defaults, and
-    # returns; the user then starts a session with ``omnigent run``.
+    # --no-internal-beta: validate existing providers before entering the
+    # picker so malformed user config is reported as an actionable CLI error,
+    # not an application crash from the picker's ambient-adoption step.
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.onboarding.provider_config import load_providers
+
+    try:
+        load_providers(_load_global_config())
+    except OmnigentError as exc:
+        if exc.code != ErrorCode.INVALID_INPUT:
+            raise
+        path = _display_config_path(_effective_global_config_path())
+        raise click.ClickException(f"Invalid provider configuration in {path}: {exc}") from None
+
+    # The picker warns about missing Node/tmux itself, configures
+    # providers/defaults, and returns; the user then starts a session with
+    # ``omnigent run``.
     _run_configure_harnesses_interactive()
 
 

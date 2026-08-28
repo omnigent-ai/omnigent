@@ -5594,6 +5594,39 @@ def test_unknown_command_reports_no_such_command(
     assert "ad-hoc chat was removed" not in combined
 
 
+def test_setup_invalid_provider_is_a_user_error_not_a_crash(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Malformed provider config exits actionably without crash reporting."""
+    from omnigent import cli as cli_module
+    from omnigent import crash_handler
+
+    message = (
+        "provider 'example-proxy' (kind 'gateway') configures no "
+        "'anthropic', 'openai', or 'gemini' family."
+    )
+    config = {"providers": {"example-proxy": {"kind": "gateway"}}}
+    crashes: list[Exception] = []
+    configure_flow = Mock()
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["omnigent", "setup"])
+    monkeypatch.setattr(cli_module, "_load_global_config", lambda: config)
+    monkeypatch.setattr(cli_module, "_run_configure_harnesses_interactive", configure_flow)
+    monkeypatch.setattr(crash_handler, "handle_crash", lambda exc: crashes.append(exc))
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_module.main()
+
+    assert exc_info.value.code == 1
+    terminal = capsys.readouterr()
+    assert f"Invalid provider configuration in {tmp_path / 'config.yaml'}" in terminal.err
+    assert message in terminal.err
+    configure_flow.assert_not_called()
+    assert crashes == []
+
+
 def test_setup_command_replaces_wizard(monkeypatch: pytest.MonkeyPatch) -> None:
     """``omnigent setup`` is the visible standard setup flow command."""
     configure_flow = Mock()
