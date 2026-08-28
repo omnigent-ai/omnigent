@@ -32,7 +32,7 @@ from __future__ import annotations
 import httpx
 from playwright.sync_api import Page, expect
 
-_COMPOSER = "Ask the agent anything…"
+_COMPOSER = "Send a message…"
 
 
 def _set_title(base_url: str, session_id: str, title: str) -> None:

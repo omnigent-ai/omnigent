@@ -116,10 +116,10 @@ import { getCurrentAuthorId } from "@/lib/identity";
 import { getOmnigentHostConfig, type OmnigentInteractionStatus } from "@/lib/host";
 // Routing-free emit primitive (not "@/lib/analytics", which pulls in useLocation
 // and would form a routing↔store import cycle).
-import { emitInteractionPhase } from "@/lib/analyticsEmit";
+import { emitInteractionPhase, startTimedInteraction } from "@/lib/analyticsEmit";
 import { getSessionHost } from "@/lib/sessionHost";
 import { isSystemUserContent } from "@/lib/systemMessage";
-import { isNativeWrapper } from "@/lib/nativeCodingAgents";
+import { isNativeTerminalSession as isNativeTerminalSessionFn } from "@/lib/nativeCodingAgents";
 
 export interface SendOptions {
   /**
@@ -2016,8 +2016,20 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
 
     // Cold entry: bind its stream and hydrate history. `hydratePending` replays
     // the snapshot's un-consumed native messages — correct here because a fresh
-    // entry has no live optimistic bubbles to overwrite.
-    await bindStream(conversationId, entrySetter(entry), entryGetter(entry), true);
+    // entry has no live optimistic bubbles to overwrite. This is the only path
+    // that loads a session on switch (a live/current one paints instantly and
+    // returned above), so time it as the get_session CUJ.
+    const getInteraction = startTimedInteraction("get_session", conversationId);
+    try {
+      await bindStream(conversationId, entrySetter(entry), entryGetter(entry), true);
+      // bindStream catches a snapshot failure into `conversationLoadError`
+      // instead of throwing, so read it to report the real outcome.
+      if (entry.getState().conversationLoadError !== null) getInteraction.fail();
+      else getInteraction.complete();
+    } catch (error) {
+      getInteraction.fail();
+      throw error;
+    }
   },
 
   submitApproval: async (elicitationId, action, content) => {
@@ -2754,7 +2766,15 @@ async function ensureBoundSession(
     // initial_items dispatch synchronously inside create_session,
     // before we can subscribe to /stream, so early events can be
     // missed). Bind the stream FIRST, then post the first message.
-    const session = await createSession(agentId, []);
+    const createInteraction = startTimedInteraction("create_session");
+    let session: Session;
+    try {
+      session = await createSession(agentId, []);
+      createInteraction.complete();
+    } catch (error) {
+      createInteraction.fail();
+      throw error;
+    }
     sessionId = session.id;
     // Claim the send chain for this id NOW, while it is still private to this
     // call. Everything below publishes it (the store write, the navigate
@@ -2938,14 +2958,13 @@ function sessionBindingPatch(
   | "sandboxStatus"
   | "mcpStartup"
 > {
-  const wrapper = session.labels?.["omnigent.wrapper"];
   return {
-    isNativeTerminalSession: isNativeWrapper(wrapper),
+    isNativeTerminalSession: isNativeTerminalSessionFn(session),
     // Native wrapper whose model lives in the vendor TUI (no Omnigent picker):
     // qwen/goose/cursor/pi/opencode. nativeModelFamilyForSession is non-null
     // only for claude-/codex-native, which keep the composer model label.
     nativeVendorOwnsModel:
-      isNativeWrapper(wrapper) && nativeModelFamilyForSession(session) === null,
+      isNativeTerminalSessionFn(session) && nativeModelFamilyForSession(session) === null,
     boundAgentId: session.agentId,
     boundAgentName: session.agentName,
     llmModel: session.llmModel ?? null,
@@ -2956,7 +2975,7 @@ function sessionBindingPatch(
     costControlModeOverride: session.costControlModeOverride ?? null,
     subagentRoutingOverride: session.subagentRoutingOverride ?? null,
     codexPlanMode: codexPlanModeFromSession(session),
-    claudePermissionMode: isNativeWrapper(wrapper)
+    claudePermissionMode: isNativeTerminalSessionFn(session)
       ? (claudePermissionModeFromSession(session) ?? "")
       : "",
     contextWindow: session.contextWindow ?? null,

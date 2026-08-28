@@ -612,8 +612,8 @@ def _migrate_legacy_state_dir() -> None:
 # Resolved at call time so tests can control cwd.
 _LOCAL_CONFIG_RELPATH: Path = Path(".omnigent") / "config.yaml"
 
-# Keys that ``omnigent config`` accepts.  Mirrors the option names in
-# the ``run`` command so the mapping is explicit and auditable.
+# User-facing keys that ``omnigent config`` accepts. Most mirror ``run``
+# options; session-title guidance configures server-owned metadata generation.
 _AUTO_OPEN_CONVERSATION_CONFIG_KEY = "auto_open_conversation"
 _GLOBAL_CONFIG_KEYS: frozenset[str] = frozenset(
     {
@@ -624,9 +624,11 @@ _GLOBAL_CONFIG_KEYS: frozenset[str] = frozenset(
         # ``omni opencode`` TUI launches on; set via `omni setup` → OpenCode.
         "opencode_model",
         "server",
+        "session_title_instructions",
         _AUTO_OPEN_CONVERSATION_CONFIG_KEY,
     }
 )
+_USER_LEVEL_ONLY_CONFIG_KEYS: frozenset[str] = frozenset({"session_title_instructions"})
 _BOOLEAN_CONFIG_KEYS: frozenset[str] = frozenset({_AUTO_OPEN_CONVERSATION_CONFIG_KEY})
 _CONFIG_TRUE_VALUES: frozenset[str] = frozenset({"1", "true", "yes", "on"})
 _CONFIG_FALSE_VALUES: frozenset[str] = frozenset({"0", "false", "no", "off"})
@@ -3386,7 +3388,10 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
             f"HTTP {probe.status_code}). Run `{login_cmd}` and retry."
         )
     click.echo(f"Not signed in to {display} — running `{login_cmd}` first.")
-    _databricks_login(server, workspace_host, org_id=org_id)
+    # Login selector comes from the URL, not the stored org_id used above: on a
+    # single-tenant host a replayed ?o= makes `databricks auth login --host` skip
+    # workspace_id resolution, so the grant isn't workspace-bound (matches `login`).
+    _databricks_login(server, workspace_host, org_id=_org_id_from_url(server))
 
 
 def _ensure_backend(server: str | None) -> str:
@@ -4000,7 +4005,10 @@ def server(
     )
     from omnigent.server.app import create_app
     from omnigent.server.auth import create_auth_provider
-    from omnigent.server.server_config import config_str_list
+    from omnigent.server.server_config import (
+        SESSION_TITLE_INSTRUCTIONS_KEY,
+        config_str_list,
+    )
     from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
     from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
     from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -4010,6 +4018,15 @@ def server(
     from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
 
     cfg = _load_config(config_path)
+    title_server_config = cfg
+    if config_path is None:
+        global_cfg = _load_global_config()
+        title_instructions = global_cfg.get(SESSION_TITLE_INSTRUCTIONS_KEY)
+        title_server_config = (
+            {SESSION_TITLE_INSTRUCTIONS_KEY: title_instructions}
+            if title_instructions is not None
+            else {}
+        )
 
     # Let the server-config reader (branding) see the same ``-c`` file.
     if config_path:
@@ -4197,7 +4214,7 @@ def server(
         admins=config_str_list(cfg.get("admins")),
         allowed_domains=config_str_list(cfg.get("allowed_domains")),
         sandbox_config=sandbox_config,
-        server_config=cfg,
+        server_config=title_server_config,
     )
 
     click.echo(f"Starting omnigent server on {host}:{port}")
@@ -9851,6 +9868,19 @@ def _harness_deep_merge_keys(
     return ()
 
 
+def _validate_config_set_scope(settings: Mapping[str, object], *, is_global: bool) -> None:
+    """Reject project-local writes for settings owned by the shared server."""
+    if is_global:
+        return
+    user_only = sorted(settings.keys() & _USER_LEVEL_ONLY_CONFIG_KEYS)
+    if user_only:
+        names = ", ".join(repr(key) for key in user_only)
+        raise click.ClickException(
+            f"Config key(s) {names} can only be set with --global because they "
+            "configure the shared local server."
+        )
+
+
 def _validate_unset_keys(unset_keys: tuple[str, ...]) -> list[str]:
     """
     Validate keys passed to ``--unset`` against ``_GLOBAL_CONFIG_KEYS``.
@@ -9945,31 +9975,46 @@ def _print_config_defaults() -> None:
 
     :returns: None. Side effect: writes to stdout.
     """
-    # Only the user-facing run defaults (the keys ``config set`` accepts).
+    # Only user-facing defaults (the keys ``config set`` accepts).
     # Internal blocks (``providers``, ``host``, ``tui``) are omitted — the
     # ``providers`` block is shown in the credentials-by-harness section.
     global_cfg = {k: v for k, v in _load_global_config().items() if k in _GLOBAL_CONFIG_KEYS}
-    local_cfg = {k: v for k, v in _load_local_config().items() if k in _GLOBAL_CONFIG_KEYS}
-    if not global_cfg and not local_cfg:
+    raw_local_cfg = {k: v for k, v in _load_local_config().items() if k in _GLOBAL_CONFIG_KEYS}
+    global_path = _effective_global_config_path()
+    local_path = Path.cwd() / _LOCAL_CONFIG_RELPATH
+    local_is_global = bool(raw_local_cfg) and local_path.resolve() == global_path.resolve()
+    ignored_local_keys = (
+        [] if local_is_global else sorted(raw_local_cfg.keys() & _USER_LEVEL_ONLY_CONFIG_KEYS)
+    )
+    local_cfg = {
+        k: v
+        for k, v in raw_local_cfg.items()
+        if local_is_global or k not in _USER_LEVEL_ONLY_CONFIG_KEYS
+    }
+    if not global_cfg and not local_cfg and not ignored_local_keys:
         click.echo(
             f"  (none set — `{cli_invocation()} config set key=value` for project,\n"
             f"   or `{cli_invocation()} config set --global key=value` for user-level)"
         )
         return
-    global_path = _effective_global_config_path()
-    local_path = Path.cwd() / _LOCAL_CONFIG_RELPATH
     # When the cwd IS the home directory, the project-level path
     # (``cwd/.omnigent/config.yaml``) resolves to the SAME file as the
     # user-level path (``~/.omnigent/config.yaml``). Dedup on the resolved
     # absolute path so the one file is shown once, not twice under two
     # spellings. ``resolve()`` collapses ``~`` and symlinks for the compare.
-    local_is_global = local_cfg and local_path.resolve() == global_path.resolve()
     if global_cfg:
         click.echo(f"  # {_display_config_path(global_path)}")
         _print_config_default_rows(global_cfg)
     if local_cfg and not local_is_global:
         click.echo(f"  # {local_path}")
         _print_config_default_rows(local_cfg)
+    if ignored_local_keys:
+        if not local_cfg:
+            click.echo(f"  # {local_path}")
+        click.echo(
+            "  # ignored user-level-only setting(s): "
+            f"{', '.join(ignored_local_keys)} (set with --global)"
+        )
 
 
 class _ConfigGroup(click.Group):
@@ -10268,7 +10313,8 @@ def config_set(is_global: bool, settings: tuple[str, ...]) -> None:
     ``~/.gitconfig``). Project values take precedence.
 
     Supported keys: auto_open_conversation, default_agent, harness,
-    model, server.
+    model, server, session_title_instructions. Session title instructions
+    configure the shared local server and require ``--global``.
 
     :param is_global: When ``True``, write to ``~/.omnigent/config.yaml``;
         when ``False``, to ``.omnigent/config.yaml`` in cwd.
@@ -10280,14 +10326,13 @@ def config_set(is_global: bool, settings: tuple[str, ...]) -> None:
       omnigent config set default_agent=examples/hello_world.yaml
       omnigent config set --global server=https://<app>.databricksapps.com
     """
+    parsed = _parse_config_settings(settings, resolve_paths=is_global)
+    _validate_config_set_scope(parsed, is_global=is_global)
+    deep_keys = _harness_deep_merge_keys(parsed)
     if is_global:
-        parsed = _parse_config_settings(settings, resolve_paths=True)
-        deep_keys = _harness_deep_merge_keys(parsed)
         _save_global_config(parsed, (), deep_keys)
         config_path: Path = _effective_global_config_path()
     else:
-        parsed = _parse_config_settings(settings, resolve_paths=False)
-        deep_keys = _harness_deep_merge_keys(parsed)
         _save_local_config(parsed, (), deep_keys)
         config_path = Path.cwd() / _LOCAL_CONFIG_RELPATH
     click.echo(f"Set {len(parsed)} key(s) in {config_path}")

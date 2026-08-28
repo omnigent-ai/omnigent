@@ -433,6 +433,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         admins=config_str_list(cfg.get("admins")),
         allowed_domains=config_str_list(cfg.get("allowed_domains")),
         sandbox_config=sandbox_config,
+        server_config=cfg,
     )
 
     return _BuiltApp(app=app, host=resolved_config.host, port=resolved_config.port)

@@ -3236,3 +3236,64 @@ def test_refresh_developer_instructions_from_config_reads_current_value(
     fwd._refresh_developer_instructions_from_config(tmp_path, state)
 
     assert state.developer_instructions == "Be a concise coding assistant."
+
+
+# ---------------------------------------------------------------------------
+# _thread_started_is_ephemeral
+# ---------------------------------------------------------------------------
+
+
+def _make_thread_started(thread: dict) -> dict:
+    """Wrap a thread dict in a ``thread/started`` envelope."""
+    return {"method": "thread/started", "params": {"thread": thread}}
+
+
+def test_thread_started_is_ephemeral_true_for_ephemeral_system_thread() -> None:
+    """The exact 0.150.1 ephemeral system event is classified as ephemeral."""
+    event = _make_thread_started(
+        {
+            "id": "0195aaaa-system",
+            "ephemeral": True,
+            "path": None,
+            "threadSource": "system",
+            "source": "vscode",
+        }
+    )
+    assert fwd._thread_started_is_ephemeral(event) is True
+
+
+def test_thread_started_is_ephemeral_false_for_persistent_clear_thread() -> None:
+    """A real ``/clear`` thread (``ephemeral=false``) is not ephemeral."""
+    event = _make_thread_started(
+        {
+            "id": "0195bbbb-user-clear",
+            "ephemeral": False,
+            "path": "/rollout/0195bbbb.jsonl",
+            "threadSource": "user",
+        }
+    )
+    assert fwd._thread_started_is_ephemeral(event) is False
+
+
+def test_thread_started_is_ephemeral_false_when_ephemeral_absent() -> None:
+    """Missing ``ephemeral`` key is treated as non-ephemeral (safe default)."""
+    event = _make_thread_started({"id": "0195cccc-no-ephemeral-key"})
+    assert fwd._thread_started_is_ephemeral(event) is False
+
+
+def test_thread_started_is_ephemeral_false_for_wrong_method() -> None:
+    """Non-``thread/started`` events never count as ephemeral."""
+    event = {"method": "thread/updated", "params": {"thread": {"id": "t", "ephemeral": True}}}
+    assert fwd._thread_started_is_ephemeral(event) is False
+
+
+def test_thread_started_is_ephemeral_false_for_missing_params() -> None:
+    """Event with no params is not ephemeral."""
+    event = {"method": "thread/started"}
+    assert fwd._thread_started_is_ephemeral(event) is False
+
+
+def test_thread_started_is_ephemeral_false_for_missing_thread() -> None:
+    """Event with params but no thread is not ephemeral."""
+    event = {"method": "thread/started", "params": {}}
+    assert fwd._thread_started_is_ephemeral(event) is False

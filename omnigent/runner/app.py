@@ -1723,9 +1723,12 @@ def mark_subagent_work_terminal(
                 delivered_now=False,
                 reason=_SUBAGENT_DELIVERY_ALREADY_DELIVERED,
             )
-        entry.status = status
-        entry.output = output
-        entry.completed_at = time.time()
+        # A late stop_session-driven "cancelled" must not downgrade an
+        # already-recorded "completed"/"failed" still awaiting delivery.
+        if status != "cancelled" or entry.status == "cancelled":
+            entry.status = status
+            entry.output = output
+            entry.completed_at = time.time()
         return _deliver_subagent_completion(entry)
     entry.status = status
     entry.output = output
@@ -3143,6 +3146,7 @@ def create_runner_app(
             cwd=resolver_cwd,
             model_override=body.model_override,
             session_spec=_unwrap_spec_entry(_session_spec_cache.get(conversation_id)),
+            additional_instructions=body.additional_instructions,
         )
         try:
             title = await run_background_title(context)

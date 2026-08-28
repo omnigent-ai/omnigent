@@ -616,6 +616,7 @@ async def _best_effort_stop(
             "Best-effort stop failed for %s; proceeding anyway",
             session_id,
             exc_info=True,
+            extra={"session_id": session_id},
         )
         return
 
@@ -636,6 +637,7 @@ async def _best_effort_stop(
                 "Best-effort stop failed for %s; proceeding anyway",
                 target_id,
                 exc_info=True,
+                extra={"session_id": target_id},
             )
 
     if own_status == "running" or has_background_tasks:
@@ -687,6 +689,7 @@ async def _archive_stop(
             "Archive host-runner teardown lookup failed for %s",
             session_id,
             exc_info=True,
+            extra={"session_id": session_id},
         )
         return
     if conv is None or not conv.host_id or not conv.runner_id:
@@ -706,6 +709,7 @@ async def _archive_stop(
             "Archive host-runner teardown failed for %s",
             session_id,
             exc_info=True,
+            extra={"session_id": session_id},
         )
         delivered = False
     if not delivered:
@@ -1163,6 +1167,32 @@ def _build_session_response(
     )
 
 
+def _sane_relay_token_count(value: object) -> int:
+    """
+    Coerce a runner-reported token count to a trusted non-negative int.
+
+    Relay usage frames are POSTed under the session owner's own bearer
+    token, so a forged negative or non-finite count must never reach the
+    additive :meth:`ConversationStore.increment_session_usage` delta: a
+    negative would claw back the session's cumulative ``total_cost_usd``
+    (the figure the relay cost-budget gate reads, since relay sessions
+    never post ``policy_cost_usd``) and a ``NaN`` / ``inf`` would poison
+    every downstream sum. Anything that is not a finite, non-negative,
+    non-bool number collapses to ``0``; the turn is then priced on
+    whatever counts survive.
+
+    :param value: Raw ``usage`` field from the harness response, e.g.
+        ``1200``, ``-1``, or ``float("nan")``.
+    :returns: The value as a non-negative ``int``, or ``0`` when it is
+        missing / the wrong type / negative / non-finite.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    if not math.isfinite(value) or value < 0:
+        return 0
+    return int(value)
+
+
 def _accumulate_session_usage(
     resp_obj: dict[str, Any],
     session_id: str,
@@ -1205,14 +1235,19 @@ def _accumulate_session_usage(
     usage_obj = resp_obj.get("usage")
     if not isinstance(usage_obj, dict):
         return None
-    input_tokens = usage_obj.get("input_tokens", 0)
-    output_tokens = usage_obj.get("output_tokens", 0)
-    total_tokens = usage_obj.get("total_tokens", 0)
+    # Sanitize every runner-reported count: a forged negative / non-finite
+    # value here would otherwise flow into both the additive token counters
+    # and (via the catalog-pricing branch below) the additive cost delta.
+    input_tokens = _sane_relay_token_count(usage_obj.get("input_tokens", 0))
+    output_tokens = _sane_relay_token_count(usage_obj.get("output_tokens", 0))
+    total_tokens = _sane_relay_token_count(usage_obj.get("total_tokens", 0))
     if not any((input_tokens, output_tokens, total_tokens)):
         return None
 
-    cache_read_input_tokens = usage_obj.get("cache_read_input_tokens", 0)
-    cache_creation_input_tokens = usage_obj.get("cache_creation_input_tokens", 0)
+    cache_read_input_tokens = _sane_relay_token_count(usage_obj.get("cache_read_input_tokens", 0))
+    cache_creation_input_tokens = _sane_relay_token_count(
+        usage_obj.get("cache_creation_input_tokens", 0)
+    )
 
     # Load conversation metadata for pricing only (NOT for reading session_usage —
     # the atomic increment_session_usage call below handles that separately to
@@ -1271,10 +1306,20 @@ def _accumulate_session_usage(
             )
             priced = pricing is not None
             if pricing is not None:
-                # Cache-aware: usage_obj carries cache_read/cache_creation
-                # token counts when the harness reports them; compute_llm_cost
-                # prices them at their own (cheaper read / pricier write) rates.
-                cost_delta = compute_llm_cost(usage_obj, pricing)
+                # Cache-aware: price the sanitized cache-read / cache-creation
+                # token counts at their own (cheaper read / pricier write)
+                # rates. Pass the validated locals, not the raw response usage
+                # — a forged negative / non-finite count must not reach the
+                # cost sum (compute_llm_cost multiplies without a lower bound).
+                cost_delta = compute_llm_cost(
+                    {
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "cache_read_input_tokens": cache_read_input_tokens,
+                        "cache_creation_input_tokens": cache_creation_input_tokens,
+                    },
+                    pricing,
+                )
 
     # Build the delta dict and atomically apply it to the persisted
     # session_usage in a single DB transaction (SELECT FOR UPDATE on
@@ -2873,6 +2918,7 @@ async def _bind_and_launch_managed_runner(
             "terminating fresh sandbox on host %s",
             session_id,
             managed.host_id,
+            extra={"session_id": session_id},
         )
         host = await asyncio.to_thread(host_store.get_host, managed.host_id)
         if host is not None:
@@ -3114,6 +3160,7 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
         sandbox_running,
         host_tunnel_stale,
         runner_tunnel_stale,
+        extra={"session_id": session_id},
     )
     return await _maybe_relaunch_managed_sandbox(
         session_id=session_id,
@@ -3367,11 +3414,13 @@ def _kick_managed_relaunch(
                 session_id,
                 MANAGED_REPO_LABEL_KEY,
                 raw_repo,
+                extra={"session_id": session_id},
             )
     _logger.info(
         "Managed sandbox for session %s (host %s) is gone; relaunching a new generation",
         session_id,
         conv.host_id,
+        extra={"session_id": session_id},
     )
     tracker.begin(session_id)
     # Seed the relaunch's progress indicator immediately — the user is
@@ -3382,6 +3431,7 @@ def _kick_managed_relaunch(
         _logger.warning(
             "session %s: relaunch has no agent store; runner stays unclassified",
             session_id,
+            extra={"session_id": session_id},
         )
     relaunch_task = asyncio.create_task(
         _run_managed_launch(
@@ -3464,6 +3514,7 @@ def _kick_managed_wake_impl(
         "Managed host %s (session %s) is dormant but resumable; waking in background",
         conv.host_id,
         session_id,
+        extra={"session_id": session_id},
     )
     tracker.begin(session_id)
     # Seed the progress indicator immediately — the user is watching the
@@ -3744,6 +3795,7 @@ async def _ensure_runner_session_initialized(
             "forwarding the message anyway",
             session_id,
             exc_info=True,
+            extra={"session_id": session_id},
         )
         if require_success:
             raise OmnigentError(
@@ -5881,6 +5933,7 @@ async def _relay_runner_stream(
                     "Relay: transport lost during server shutdown for session=%s; "
                     "not failing the turn",
                     session_id,
+                    extra={"session_id": session_id},
                 )
             elif not await _runner_drop_interrupted_turn(session_id, conversation_store):
                 # The runner went away while this session sat idle (host
@@ -9383,6 +9436,7 @@ async def _get_session_snapshot(
                 _logger.debug(
                     "Runner status query failed for %s",
                     session_id,
+                    extra={"session_id": session_id},
                 )
     # last_total_tokens and last_task_error come from the context-tokens
     # label written by the forwarder (tasks table has been removed).
@@ -9436,6 +9490,7 @@ async def _get_session_snapshot(
                                 "renamed/removed sub-agent or stale session metadata.",
                                 conv.sub_agent_name,
                                 session_id,
+                                extra={"session_id": session_id},
                             )
                         else:
                             resolved_spec = _sub_spec

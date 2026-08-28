@@ -16,6 +16,8 @@ const mocks = vi.hoisted(() => ({
   theme: "system" as string,
   archiveMutate: vi.fn(),
   deleteMutate: vi.fn(),
+  bulkArchiveMutate: vi.fn(),
+  bulkDeleteMutate: vi.fn(),
   accountsEnabled: true,
   // login_url: non-null for any sign-in mode (accounts OR OIDC), null in
   // header mode. Gates the Account section.
@@ -55,6 +57,7 @@ vi.mock("@/lib/accountsApi", () => ({
 vi.mock("@/lib/identity", () => ({
   resolveIdentity: () => Promise.resolve(mocks.me?.id ?? null),
   getCurrentIsAdmin: () => mocks.me?.is_admin ?? false,
+  getCurrentUserId: () => mocks.me?.id ?? null,
 }));
 vi.mock("@/hooks/useConversations", async () => {
   // A stateful mock that emulates useInfiniteQuery pagination: it tracks how
@@ -104,6 +107,16 @@ vi.mock("@/hooks/useConversations", async () => {
       isPending: false,
     }),
     useStopAndDeleteConversation: () => ({ mutate: mocks.deleteMutate, isPending: false }),
+    useBulkArchiveConversations: () => ({
+      mutate: mocks.bulkArchiveMutate,
+      isPending: false,
+      isError: false,
+    }),
+    useBulkDeleteConversations: () => ({
+      mutate: mocks.bulkDeleteMutate,
+      isPending: false,
+      isError: false,
+    }),
   };
 });
 // Radix Select uses a portal + pointer events jsdom can't drive; stub it to a
@@ -193,6 +206,8 @@ beforeEach(() => {
   mocks.setTheme.mockReset();
   mocks.archiveMutate.mockReset();
   mocks.deleteMutate.mockReset();
+  mocks.bulkArchiveMutate.mockReset();
+  mocks.bulkDeleteMutate.mockReset();
   mocks.fetchNextPage.mockReset();
   mocks.theme = "system";
   mocks.accountsEnabled = true;
@@ -1081,5 +1096,98 @@ describe("SettingsPage", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("enters selection mode and selects rows via click", () => {
+    mocks.conversations = [
+      conv("a1", { archived: true, title: "Chat A" }),
+      conv("a2", { archived: true, title: "Chat B" }),
+    ];
+    renderPage("/settings/archived");
+
+    fireEvent.click(screen.getByTestId("archived-toggle-selection"));
+    const rows = screen.getAllByTestId("archived-row");
+    expect(rows).toHaveLength(2);
+
+    // Clicking a row in selection mode toggles its checkbox.
+    fireEvent.click(rows[0]);
+    expect(screen.getByText("1 selected")).toBeInTheDocument();
+
+    fireEvent.click(rows[1]);
+    expect(screen.getByText("2 selected")).toBeInTheDocument();
+
+    // Clicking again deselects.
+    fireEvent.click(rows[0]);
+    expect(screen.getByText("1 selected")).toBeInTheDocument();
+  });
+
+  it("bulk-deletes selected archived sessions after confirming", () => {
+    mocks.conversations = [
+      conv("a1", { archived: true, title: "Chat A" }),
+      conv("a2", { archived: true, title: "Chat B" }),
+    ];
+    renderPage("/settings/archived");
+
+    fireEvent.click(screen.getByTestId("archived-toggle-selection"));
+    const rows = screen.getAllByTestId("archived-row");
+    fireEvent.click(rows[0]);
+    fireEvent.click(rows[1]);
+
+    fireEvent.click(screen.getByTestId("archived-bulk-delete"));
+    fireEvent.click(screen.getByRole("button", { name: /Delete 2 session/ }));
+    expect(mocks.bulkDeleteMutate).toHaveBeenCalledWith({ ids: ["a1", "a2"] }, expect.anything());
+  });
+
+  it("bulk-unarchives selected archived sessions", () => {
+    mocks.conversations = [
+      conv("a1", { archived: true, title: "Chat A" }),
+      conv("a2", { archived: true, title: "Chat B" }),
+    ];
+    renderPage("/settings/archived");
+
+    fireEvent.click(screen.getByTestId("archived-toggle-selection"));
+    fireEvent.click(screen.getAllByTestId("archived-row")[0]);
+
+    fireEvent.click(screen.getByTestId("archived-bulk-unarchive"));
+    expect(mocks.bulkArchiveMutate).toHaveBeenCalledWith(
+      { ids: ["a1"], archived: false },
+      expect.anything(),
+    );
+  });
+
+  it("exits selection mode and clears selection", () => {
+    mocks.conversations = [conv("a1", { archived: true, title: "Chat A" })];
+    renderPage("/settings/archived");
+
+    fireEvent.click(screen.getByTestId("archived-toggle-selection"));
+    fireEvent.click(screen.getAllByTestId("archived-row")[0]);
+    expect(screen.getByText("1 selected")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("archived-exit-selection"));
+    expect(screen.queryByText("1 selected")).toBeNull();
+    expect(screen.queryByTestId("archived-bulk-delete")).toBeNull();
+  });
+
+  it("select-all picks every visible archived row", () => {
+    mocks.conversations = [
+      conv("a1", { archived: true, title: "Chat A" }),
+      conv("a2", { archived: true, title: "Chat B" }),
+      conv("a3", { archived: true, title: "Chat C" }),
+    ];
+    renderPage("/settings/archived");
+
+    fireEvent.click(screen.getByTestId("archived-toggle-selection"));
+    fireEvent.click(screen.getByRole("button", { name: "Select all" }));
+    expect(screen.getByText("3 selected")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Deselect all" }));
+    expect(screen.getByText("None selected")).toBeInTheDocument();
+  });
+
+  it("hides the Select button when there are no archived sessions", () => {
+    mocks.conversations = [conv("conv_active")];
+    renderPage("/settings/archived");
+
+    expect(screen.queryByTestId("archived-toggle-selection")).toBeNull();
   });
 });

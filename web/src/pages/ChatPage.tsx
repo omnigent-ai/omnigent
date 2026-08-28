@@ -2051,7 +2051,6 @@ function MainAgentSurface({
           <ConnectionIndicator
             liveness={liveness}
             onShowReconnectHelp={onShowReconnectHelp}
-            onAttach={isActive && !entry.readOnly ? handleTerminalResume : undefined}
             surfaceFrontmost={surfaceFrontmost}
           />
         )}
@@ -2291,8 +2290,6 @@ function MainAgentSurface({
             showPollyCodexGoalControl={showPollyCodexGoalControl}
             isTerminalFirst={isTerminalFirst}
             isNativeWrapper={isNativeWrapper}
-            reconnectHint={liveness.kind === "runner_asleep" || liveness.kind === "host_asleep"}
-            sandboxAsleepHint={liveness.kind === "host_asleep"}
             unreachable={
               !sandboxLaunching &&
               (liveness.kind === "host_offline" || liveness.kind === "local_stranded")
@@ -2310,7 +2307,6 @@ function MainAgentSurface({
           <ConnectionIndicator
             liveness={liveness}
             onShowReconnectHelp={onShowReconnectHelp}
-            onAttach={terminalReadOnly ? undefined : handleTerminalResume}
             surfaceFrontmost={surfaceFrontmost}
           />
         </>
@@ -3703,21 +3699,6 @@ interface ComposerProps {
    */
   isNativeWrapper?: boolean;
   /**
-   * The session's runner is asleep but its host is online (`runner_asleep`):
-   * the composer stays enabled and the placeholder nudges the user to send a
-   * message, which relaunches the runner on the live host. Ignored while a
-   * turn is streaming (the follow-up placeholder wins).
-   */
-  reconnectHint?: boolean;
-  /**
-   * The session is host-bound to a dormant resumable managed host that is
-   * offline (`host_asleep`): the composer stays enabled, and the placeholder
-   * tells the user their next message will resume the sandbox host (which can
-   * take a few minutes) so the wake latency is expected, not surprising.
-   * Ignored once a turn is streaming.
-   */
-  sandboxAsleepHint?: boolean;
-  /**
    * The session is unreachable (`host_offline` / `local_stranded`): a message
    * can't wake it. The composer is blocked (disabled) and the reconnect
    * banner below is the only affordance.
@@ -4295,8 +4276,6 @@ export function Composer({
   showPollyCodexGoalControl = false,
   isTerminalFirst = false,
   isNativeWrapper = false,
-  reconnectHint = false,
-  sandboxAsleepHint = false,
   unreachable = false,
   onShowReconnectHelp,
   costRoutingEligible = false,
@@ -5348,11 +5327,7 @@ export function Composer({
                         ? "Waiting for agents…"
                         : isStreaming
                           ? "Send a follow-up (queued) — Esc to stop"
-                          : sandboxAsleepHint
-                            ? "Current session's host is offline. Next message will resume the sandbox host which can take minutes"
-                            : reconnectHint
-                              ? "Send a message to reconnect this session"
-                              : "Ask the agent anything…"
+                          : "Send a message…"
             }
             rows={1}
             disabled={disabled || isReadOnly || unreachable || hasPendingElicitation}

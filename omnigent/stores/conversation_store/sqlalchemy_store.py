@@ -3438,6 +3438,14 @@ class SqlAlchemyConversationStore(ConversationStore):
         cloned_agent_description: str | None = None,
         copy_model_settings: bool = True,
         copy_terminal_launch_args: bool = True,
+        override_model_override: str | None = None,
+        override_model_override_set: bool = False,
+        override_reasoning_effort: str | None = None,
+        override_reasoning_effort_set: bool = False,
+        override_terminal_launch_args: list[str] | None = None,
+        override_terminal_launch_args_set: bool = False,
+        dropped_label_keys: frozenset[str] = frozenset(),
+        extra_labels: dict[str, str] | None = None,
         carry_history_into_native: bool = False,
         resume_source_native_session: bool = True,
         presentation_labels: dict[str, str] | None = None,
@@ -3494,6 +3502,39 @@ class SqlAlchemyConversationStore(ConversationStore):
             the bound agent's defaults — used when the fork switches to
             an agent in a different provider family, where the source's
             model id is meaningless (a model is provider-bound).
+        :param override_model_override: Explicit ``model_override`` for the
+            fork, applied only when ``override_model_override_set`` is
+            ``True`` — then it supersedes the ``copy_model_settings`` copy
+            (a value pins that model; ``None`` clears to the agent default).
+        :param override_model_override_set: Whether the caller chose an
+            explicit ``model_override`` (the fork dialog's model picker).
+            ``False`` (default) inherits per ``copy_model_settings``.
+        :param override_reasoning_effort: Explicit ``reasoning_effort`` for
+            the fork, applied only when ``override_reasoning_effort_set`` is
+            ``True``.
+        :param override_reasoning_effort_set: Whether the caller chose an
+            explicit ``reasoning_effort``. ``False`` (default) inherits per
+            ``copy_model_settings``.
+        :param override_terminal_launch_args: Explicit
+            ``terminal_launch_args`` for the fork (e.g. the permission-mode
+            selector's ``["--permission-mode", "auto"]``), applied only when
+            ``override_terminal_launch_args_set`` is ``True`` — then it
+            supersedes the ``copy_terminal_launch_args`` copy (``[]`` clears
+            them, ``None`` also clears).
+        :param override_terminal_launch_args_set: Whether the caller chose
+            explicit launch args. ``False`` (default) inherits per
+            ``copy_terminal_launch_args``.
+        :param dropped_label_keys: Source labels to NOT copy onto the fork,
+            beyond the always-dropped instance-scoped set. The fork route
+            passes the permission-mode / codex-bypass label keys here when
+            the dialog picks explicit launch args, so the stale copied label
+            can't shadow the freshly chosen mode.
+        :param extra_labels: Labels to stamp on the fork AFTER the copy /
+            drop / presentation-label logic, so a deliberate opt-in wins over
+            the always-drop rule. The fork route passes the DANGEROUS
+            ``codex_native.bypass_sandbox`` label here when the dialog's
+            approval selector explicitly re-arms bypass — the only path that
+            sets it, since the source's own bypass label is always dropped.
         :param carry_history_into_native: When ``True``, stamp
             :data:`FORK_CARRY_HISTORY_LABEL_KEY` on the fork so a native
             target harness rebuilds its transcript instead of starting
@@ -3545,6 +3586,14 @@ class SqlAlchemyConversationStore(ConversationStore):
             cloned_agent_description=cloned_agent_description,
             copy_model_settings=copy_model_settings,
             copy_terminal_launch_args=copy_terminal_launch_args,
+            override_model_override=override_model_override,
+            override_model_override_set=override_model_override_set,
+            override_reasoning_effort=override_reasoning_effort,
+            override_reasoning_effort_set=override_reasoning_effort_set,
+            override_terminal_launch_args=override_terminal_launch_args,
+            override_terminal_launch_args_set=override_terminal_launch_args_set,
+            dropped_label_keys=dropped_label_keys,
+            extra_labels=extra_labels,
             carry_history_into_native=carry_history_into_native,
             resume_source_native_session=resume_source_native_session,
             presentation_labels=presentation_labels,
@@ -3564,6 +3613,14 @@ class SqlAlchemyConversationStore(ConversationStore):
         cloned_agent_description: str | None = None,
         copy_model_settings: bool = True,
         copy_terminal_launch_args: bool = True,
+        override_model_override: str | None = None,
+        override_model_override_set: bool = False,
+        override_reasoning_effort: str | None = None,
+        override_reasoning_effort_set: bool = False,
+        override_terminal_launch_args: list[str] | None = None,
+        override_terminal_launch_args_set: bool = False,
+        dropped_label_keys: frozenset[str] = frozenset(),
+        extra_labels: dict[str, str] | None = None,
         carry_history_into_native: bool = False,
         resume_source_native_session: bool = True,
         presentation_labels: dict[str, str] | None = None,
@@ -3604,14 +3661,23 @@ class SqlAlchemyConversationStore(ConversationStore):
             # — same gate — harness_override) copy only when copy_model_settings.
             # The routing switches (cost_control_mode_override,
             # subagent_routing_override) are intentionally never carried onto a fork.
+            # An explicit dialog pick (override_*_set) supersedes the inherited
+            # value — the fork dialog seeds the picker from the source, so an
+            # untouched picker sends nothing and inheritance stands.
+            fork_effort = (
+                override_reasoning_effort
+                if override_reasoning_effort_set
+                else (source_overrides["reasoning_effort"] if copy_model_settings else None)
+            )
+            fork_model = (
+                override_model_override
+                if override_model_override_set
+                else (source_overrides["model_override"] if copy_model_settings else None)
+            )
             fork_overrides = _encode_session_overrides(
                 {
-                    "reasoning_effort": (
-                        source_overrides["reasoning_effort"] if copy_model_settings else None
-                    ),
-                    "model_override": (
-                        source_overrides["model_override"] if copy_model_settings else None
-                    ),
+                    "reasoning_effort": fork_effort,
+                    "model_override": fork_model,
                     "harness_override": (
                         source_overrides["harness_override"] if copy_model_settings else None
                     ),
@@ -3755,7 +3821,12 @@ class SqlAlchemyConversationStore(ConversationStore):
             fork_labels = {
                 key: value
                 for key, value in _fetch_labels(session, source_conversation_id).items()
-                if key not in (_INSTANCE_SCOPED_LABEL_KEYS | _FORK_ONLY_DROPPED_LABEL_KEYS)
+                if key
+                not in (
+                    _INSTANCE_SCOPED_LABEL_KEYS
+                    | _FORK_ONLY_DROPPED_LABEL_KEYS
+                    | dropped_label_keys
+                )
                 and not key.startswith(f"{PINNED_LABEL_KEY}.")
             }
             source_workspace = source_meta_ref.workspace if source_meta_ref else None
@@ -3766,10 +3837,24 @@ class SqlAlchemyConversationStore(ConversationStore):
             # CLI — Claude Code's ``--permission-mode auto`` makes ``pi`` exit 1
             # at launch (unknown option), which surfaces as
             # ``required_terminal_exited``. Drop them on a switching fork.
+            # An explicit dialog pick (the permission-/approval-mode selector)
+            # supersedes the inherited launch args; an untouched picker sends
+            # nothing, so the same-agent copy / switch-drop rule stands. The
+            # metadata column stores the JSON-encoded string, so the copy path
+            # reuses the source's already-encoded value while an override list
+            # is encoded here (matching create_conversation).
             source_terminal_args = (
-                source_meta_ref.terminal_launch_args
-                if source_meta_ref and copy_terminal_launch_args
-                else None
+                (
+                    json.dumps(override_terminal_launch_args)
+                    if override_terminal_launch_args is not None
+                    else None
+                )
+                if override_terminal_launch_args_set
+                else (
+                    source_meta_ref.terminal_launch_args
+                    if source_meta_ref and copy_terminal_launch_args
+                    else None
+                )
             )
             if source_workspace is not None:
                 fork_labels[FORK_SOURCE_LABEL_KEY] = source_conversation_id
@@ -3803,6 +3888,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                 for _pkey in (UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY):
                     fork_labels.pop(_pkey, None)
                 fork_labels.update(presentation_labels)
+            # Caller-supplied labels stamped LAST so a deliberate opt-in beats
+            # both the copy and the always-drop rules — e.g. the fork dialog
+            # re-arming the DANGEROUS codex bypass. The source's own bypass
+            # label was already dropped (it's instance-scoped), so this is the
+            # only path that sets it, and only from an explicit request field.
+            if extra_labels:
+                fork_labels.update(extra_labels)
             if fork_labels:
                 _upsert_labels(session, new_conv.id, fork_labels, now)
 

@@ -1443,6 +1443,12 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
         ``tools/python/`` and ``tools/typescript/``.
     :param sub_agents: Recursively parsed child agents from
         ``agents/<dir>/``.
+    :param pass_history: Whether a parent session passes its current
+        history when launching this agent as a sub-agent tool.
+    :param pass_histories: Named parent histories passed when launching
+        this agent as a sub-agent tool.
+    :param max_sessions: Maximum concurrent sessions when this agent is
+        exposed as a sub-agent tool. ``None`` means unlimited.
     :param executor: Executor configuration (type, task timeout,
         max iterations). ``executor.type`` is the
         discriminator for the entire spec's validity.
@@ -1570,6 +1576,9 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     mcp_servers: list[MCPServerConfig] = field(default_factory=list)
     local_tools: list[LocalToolInfo] = field(default_factory=list)
     sub_agents: list[AgentSpec] = field(default_factory=list)
+    pass_history: bool = False
+    pass_histories: list[str] | None = None
+    max_sessions: int | None = None
     executor: ExecutorSpec = field(default_factory=ExecutorSpec)
     compaction: CompactionConfig | None = None
     guardrails: GuardrailsSpec | None = None

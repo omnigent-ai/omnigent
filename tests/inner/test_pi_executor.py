@@ -4607,3 +4607,62 @@ def test_unsupported_effort_value_fails_the_turn() -> None:
     assert isinstance(events[0], ExecutorError)
     assert events[0].retryable is False
     assert "not supported by pi" in events[0].message
+
+
+def test_run_turn_prompt_command_includes_streaming_behavior():
+    """run_turn must include streamingBehavior='followUp' in the RPC prompt command.
+
+    Without it, a residual race against a still-alive Pi process (e.g. after an
+    interrupt where the reap races the slice) surfaces Pi's raw
+    'Agent is already processing' protocol error instead of queuing the prompt.
+    """
+    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        executor = PiExecutor()
+
+    fake_rpc = _PiRpcSession()
+    fake_rpc._line_queue = asyncio.Queue()
+    fake_rpc.process = MagicMock()
+    fake_rpc.process.returncode = None
+    stdin = _FakeStreamWriter()
+    fake_rpc.process.stdin = stdin
+    fake_rpc._stderr_lines = []
+
+    for line in [
+        json.dumps({"type": "response", "success": True}),
+        json.dumps(
+            {
+                "type": "message_update",
+                "assistantMessageEvent": {"type": "text_delta", "delta": "hi"},
+            }
+        ),
+        json.dumps({"type": "agent_end", "messages": []}),
+    ]:
+        fake_rpc._line_queue.put_nowait(line)
+
+    async def fake_ensure_rpc(*args, **kwargs):
+        return fake_rpc
+
+    executor._ensure_rpc = fake_ensure_rpc
+
+    async def _test():
+        return [
+            e
+            async for e in executor.run_turn([{"role": "user", "content": "hello"}], [], "system")
+        ]
+
+    events = _run(_test())
+
+    turn_complete = [e for e in events if isinstance(e, TurnComplete)]
+    assert len(turn_complete) == 1
+
+    written = b"".join(stdin.data).decode()
+    commands = [json.loads(line) for line in written.splitlines() if line.strip()]
+    prompts = [c for c in commands if c.get("type") == "prompt"]
+    assert prompts, "expected run_turn to emit a prompt command"
+
+    cmd = prompts[0]
+    assert cmd.get("streamingBehavior") == "followUp", (
+        "RPC prompt command must include streamingBehavior='followUp' so a "
+        "residual race against a still-alive Pi process queues instead of "
+        f"surfacing the raw protocol error; got {cmd!r}"
+    )

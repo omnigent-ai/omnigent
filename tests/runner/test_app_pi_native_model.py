@@ -20,7 +20,7 @@ import httpx
 import pytest
 
 from omnigent.entities.session_resources import SessionResourceView
-from omnigent.runner.app import (
+from omnigent.runner.native.orchestration import (
     ResolvedSpec,
     _auto_create_pi_terminal,
     _pi_native_model_from_spec,
@@ -299,3 +299,96 @@ async def test_auto_create_pi_terminal_no_spec_model_uses_provider_default(
     assert models["providers"]["omnigent"]["models"] == [
         {"id": "claude-sonnet-4-6", "reasoning": True}
     ]
+
+
+@pytest.mark.asyncio
+async def test_auto_create_pi_terminal_bakes_tunnel_token_into_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Launch bakes the runner tunnel token into the extension config.
+
+    On a guest-on-shared-host runner there is no Databricks bearer, so the
+    extension authenticates its out-of-process posts with the tunnel binding
+    token. It must land in ``config.json``'s ``authHeaders`` at launch — the
+    per-turn refresh runs env-scrubbed and can only preserve it, never mint it.
+    """
+    import omnigent.pi_native_bridge as pi_bridge
+    import omnigent.pi_native_credentials as creds
+    from omnigent.runner.identity import (
+        RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
+        RUNNER_TUNNEL_TOKEN_HEADER,
+    )
+
+    session_id = "conv_pi_tunnel_token"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setattr(pi_bridge, "_BRIDGE_ROOT", tmp_path / "pi-native")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    # No Databricks bearer (guest-on-shared-host), but a tunnel binding token.
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    monkeypatch.setenv(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, "tok-abc")
+    monkeypatch.setattr("omnigent.pi_native.resolve_pi_executable", lambda: "/usr/bin/pi")
+
+    real_resolve = creds.resolve_pi_native_provider
+
+    def _resolve_with_test_config(*, model: str | None = None, config_loader: Any = None):
+        return real_resolve(model=model, config_loader=_key_provider_config)
+
+    monkeypatch.setattr(creds, "resolve_pi_native_provider", _resolve_with_test_config)
+
+    class _SnapshotClient:
+        async def get(self, url: str, *, timeout: float) -> httpx.Response:
+            del url, timeout
+            return httpx.Response(
+                200,
+                json={
+                    "workspace": str(workspace),
+                    "terminal_launch_args": None,
+                    "external_session_id": None,
+                },
+                request=httpx.Request("GET", f"/v1/sessions/{session_id}"),
+            )
+
+    class _FakeResourceRegistry:
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            *,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            del terminal_name, session_key, resource_role, parent_os_env, spec
+            return SessionResourceView(
+                id="terminal_pi_main",
+                type="terminal",
+                session_id=session_id,
+                name="pi",
+            )
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="pi-tunnel-token",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "pi-native"}),
+    )
+
+    await _auto_create_pi_terminal(
+        session_id,
+        _FakeResourceRegistry(),  # type: ignore[arg-type]
+        lambda _sid, _event: None,
+        server_client=_SnapshotClient(),  # type: ignore[arg-type]
+        agent_spec=spec,
+    )
+
+    config = json.loads(
+        pi_bridge.config_path(pi_bridge.bridge_dir_for_session_id(session_id)).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert config["authHeaders"][RUNNER_TUNNEL_TOKEN_HEADER] == "tok-abc"

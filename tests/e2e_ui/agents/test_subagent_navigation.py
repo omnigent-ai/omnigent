@@ -34,7 +34,7 @@ from playwright.sync_api import Page, expect
 from tests.e2e_ui.agents.conftest import JokeSubagentsSession
 from tests.e2e_ui.conftest import open_right_rail
 
-_COMPOSER = "Ask the agent anything…"
+_COMPOSER = "Send a message…"
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _SUBAGENT_ROW = '[data-testid="subagent-row"]'
 _SUBAGENT_STATUS_DOT = '[data-testid="subagent-status-dot"]'

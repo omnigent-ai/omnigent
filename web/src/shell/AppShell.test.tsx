@@ -2,6 +2,7 @@ import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseConversationsModule from "@/hooks/useConversations";
+import type * as RunnerHealthModule from "@/hooks/RunnerHealthProvider";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
@@ -19,6 +20,18 @@ import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
+
+const runnerHealthState = vi.hoisted(() => ({
+  runnerOnline: undefined as boolean | undefined,
+}));
+
+vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
+  // Keep the real provider component — only the per-session readers are
+  // replaced so tests can pin runner/host liveness directly.
+  ...(await importOriginal<typeof RunnerHealthModule>()),
+  useSessionRunnerOnline: () => runnerHealthState.runnerOnline,
+  useSessionHostOnline: () => true,
+}));
 
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   // Keep the real module (PROJECT_LABEL_KEY, the mutation hooks) — only the
@@ -438,6 +451,7 @@ function mockConversations(
     host_id?: string | null;
     runner_id?: string | null;
     workspace?: string | null;
+    created_at?: number;
   }[],
 ) {
   useConvMock.mockReturnValue({
@@ -448,7 +462,7 @@ function mockConversations(
             id: c.id,
             object: "conversation" as const,
             title: null,
-            created_at: 0,
+            created_at: c.created_at ?? 0,
             updated_at: 0,
             labels: c.labels ?? {},
             permission_level: c.permission_level,
@@ -484,6 +498,7 @@ function withWindowOrigin(origin: string, run: () => void) {
 }
 
 beforeEach(() => {
+  runnerHealthState.runnerOnline = undefined;
   useConvMock.mockReset();
   useTerminalsMock.mockReset();
   useTerminalsMock.mockReturnValue({
@@ -752,6 +767,8 @@ describe("AppShell header", () => {
     mockConversations([
       { id: "conv_terminal", permission_level: null, labels: { "omnigent.ui": "terminal" } },
     ]);
+    // terminalPending is only ever emitted by a live runner — model it.
+    runnerHealthState.runnerOnline = true;
     useChatStore.setState({ terminalPending: true, sessionStatus: "running" });
 
     renderShell("/c/conv_terminal");
@@ -783,11 +800,235 @@ describe("AppShell header", () => {
     mockConversations([
       { id: "conv_terminal", permission_level: null, labels: { "omnigent.ui": "terminal" } },
     ]);
+    runnerHealthState.runnerOnline = true;
     useChatStore.setState({ terminalPending: true, sessionStatus: "failed", status: "streaming" });
 
     renderShell("/c/conv_terminal");
 
     expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "true");
+  });
+
+  it("treats an unhydrated session row as startup so a fresh session never looks stopped", () => {
+    // Before the sidebar list or snapshot hydrates, a brand-new session is
+    // indistinguishable from a stopped one; the spinner must cover that
+    // gap or the Terminal view flashes Resume during startup.
+    useConvMock.mockReturnValue({
+      data: undefined,
+      isLoading: true,
+    } as unknown as ReturnType<typeof useConversations>);
+    useSessionMock.mockReturnValue({ session: null, isLoading: true, error: null });
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const makeTree = () => (
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/c/conv_fresh"]}>
+            <Routes>
+              <Route element={<AppShell />}>
+                <Route
+                  path="c/:conversationId"
+                  element={
+                    <>
+                      <TerminalFirstViewProbe />
+                      <LocationDisplay />
+                    </>
+                  }
+                />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>
+    );
+    const { rerender } = render(makeTree());
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "true");
+
+    // Partial hydration: the snapshot resolved (terminal_pending=true,
+    // fresh row) but the store bind hasn't applied pending and the list
+    // is still loading. The bridged snapshot pending must hold startup.
+    runnerHealthState.runnerOnline = false;
+    useSessionMock.mockReturnValue({
+      session: {
+        id: "conv_fresh",
+        agentId: "ag_fresh",
+        agentName: "developer",
+        runnerId: null,
+        status: "idle",
+        createdAt: Math.floor(Date.now() / 1000),
+        title: "Fresh session",
+        labels: { "omnigent.ui": "terminal" },
+        items: [],
+        pendingElicitations: [],
+        permissionLevel: null,
+        parentSessionId: null,
+        subAgentName: null,
+        kind: "default",
+        terminalPending: true,
+      },
+      isLoading: false,
+      error: null,
+    });
+    rerender(makeTree());
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "true");
+  });
+
+  it("does not spin for a hydrated stopped session — it stays resumable", () => {
+    // The genuine-stop-after-reload shape: fresh created_at, runner down,
+    // and NO terminal_pending — the stopped UI must own Resume here; the
+    // liveness cold-boot grace alone must not read it as startup.
+    runnerHealthState.runnerOnline = false;
+    mockConversations([
+      {
+        id: "conv_stopped",
+        permission_level: null,
+        labels: { "omnigent.ui": "terminal" },
+        created_at: Math.floor(Date.now() / 1000),
+      },
+    ]);
+
+    renderShell("/c/conv_stopped");
+
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "false");
+  });
+
+  it("holds startup while an online terminal-first runner's PTY is still arriving", () => {
+    // The runner can register online before its auto-created PTY reaches
+    // the inventory; a terminal-first session inside its cold-boot grace
+    // must keep the startup state (never Resume) through that gap.
+    runnerHealthState.runnerOnline = true;
+    const created = Math.floor(Date.now() / 1000);
+    mockConversations([
+      {
+        id: "conv_fresh_online",
+        permission_level: null,
+        labels: { "omnigent.ui": "terminal" },
+        created_at: created,
+      },
+    ]);
+
+    renderShell("/c/conv_fresh_online");
+
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "true");
+  });
+
+  it("releases startup when a fresh session's PTY disappears mid-mount", () => {
+    // A PTY present this mount and then vanished is a stop, not a startup
+    // gap: the grace must not pin the spinner over the Resume affordance.
+    runnerHealthState.runnerOnline = true;
+    const created = Math.floor(Date.now() / 1000);
+    mockConversations([
+      {
+        id: "conv_fresh_deleted",
+        permission_level: null,
+        labels: { "omnigent.ui": "terminal" },
+        created_at: created,
+      },
+    ]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_tui_main", name: "tui", session: "main", running: true }],
+      isLoading: false,
+      error: null,
+    });
+
+    // Stable QueryClient + fresh element per render so the rerender reads
+    // the updated mock (React bails on an identical element reference).
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const makeTree = () => (
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/c/conv_fresh_deleted"]}>
+            <Routes>
+              <Route element={<AppShell />}>
+                <Route
+                  path="c/:conversationId"
+                  element={
+                    <>
+                      <TerminalFirstViewProbe />
+                      <LocationDisplay />
+                    </>
+                  }
+                />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>
+    );
+    const { rerender } = render(makeTree());
+
+    // The PTY disappears (runner stopped / terminal deleted): startup
+    // must release so the stopped UI can offer Resume.
+    useTerminalsMock.mockReturnValue({ terminals: [], isLoading: false, error: null });
+    rerender(makeTree());
+
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "false");
+  });
+
+  it("holds startup on a cross-session switch to a fresh terminal-first session", () => {
+    // Switching from a session WITH an agent PTY to a fresh terminal-first
+    // session must not leak the prior PTY observation into the grace.
+    runnerHealthState.runnerOnline = true;
+    const created = Math.floor(Date.now() / 1000);
+    mockConversations([
+      {
+        id: "conv_lived",
+        permission_level: null,
+        labels: { "omnigent.ui": "terminal" },
+        created_at: created - 3600,
+      },
+      {
+        id: "conv_new",
+        permission_level: null,
+        labels: { "omnigent.ui": "terminal" },
+        created_at: created,
+      },
+    ]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_tui_main", name: "tui", session: "main", running: true }],
+      isLoading: false,
+      error: null,
+    });
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/c/conv_lived"]}>
+            <Routes>
+              <Route element={<AppShell />}>
+                <Route
+                  path="c/:conversationId"
+                  element={
+                    <>
+                      <TerminalFirstViewProbe />
+                      <SessionNavButton to="/c/conv_new" />
+                    </>
+                  }
+                />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
+
+    // Switch to the fresh session whose PTY has not arrived yet.
+    useTerminalsMock.mockReturnValue({ terminals: [], isLoading: false, error: null });
+    fireEvent.click(screen.getByTestId("nav-session"));
+
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "true");
+  });
+
+  it("does not hold startup for a fresh chat-first session with an online runner", () => {
+    // Same shape minus the terminal-first label: the grace is scoped to
+    // terminal-first sessions, so chat-first behavior is unchanged.
+    runnerHealthState.runnerOnline = true;
+    const created = Math.floor(Date.now() / 1000);
+    mockConversations([{ id: "conv_chat_fresh", permission_level: null, created_at: created }]);
+
+    renderShell("/c/conv_chat_fresh");
+
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "false");
   });
 });
 
@@ -1079,6 +1320,7 @@ describe("TerminalFirstContext", () => {
     ]);
     // terminalPending + a non-failed status makes terminalStartingUp true once
     // the list empties (see the startup-spinner tests above).
+    runnerHealthState.runnerOnline = true;
     useChatStore.setState({ terminalPending: true, sessionStatus: "running" });
     useTerminalsMock.mockReturnValue({
       terminals: [{ id: "terminal_claude_main", name: "claude", session: "main", running: true }],

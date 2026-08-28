@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -278,6 +279,43 @@ def test_increment_session_usage(store: SqlAlchemyConversationStore) -> None:
     assert result["input_tokens"] == 100
     result2 = store.increment_session_usage(conv.id, {"input_tokens": 50})
     assert result2["input_tokens"] == 150
+
+
+def test_apply_session_usage_delta_drops_negative_and_non_finite_increments() -> None:
+    """A forged usage frame can't drive a cumulative counter backwards or poison it.
+
+    ``apply_session_usage_delta`` is the single merge point for the relay
+    ``increment_session_usage`` path, whose totals the cost-budget gate
+    enforces on. Negative and non-finite increments — flat or nested under
+    ``by_model`` — are dropped rather than applied; well-formed non-negative
+    increments still merge.
+    """
+    from omnigent.stores.conversation_store import apply_session_usage_delta
+
+    current: dict[str, Any] = {
+        "input_tokens": 100,
+        "total_cost_usd": 1.0,
+        "by_model": {"m": {"input_tokens": 100, "total_cost_usd": 1.0}},
+    }
+    apply_session_usage_delta(
+        current,
+        {
+            "input_tokens": -1_000_000,
+            "output_tokens": float("nan"),
+            "total_cost_usd": float("-inf"),
+            "by_model": {"m": {"input_tokens": -50, "total_cost_usd": float("inf")}},
+        },
+    )
+    assert current["input_tokens"] == 100
+    assert "output_tokens" not in current
+    assert current["total_cost_usd"] == 1.0
+    assert current["by_model"]["m"] == {"input_tokens": 100, "total_cost_usd": 1.0}
+
+    apply_session_usage_delta(
+        current, {"input_tokens": 25, "by_model": {"m": {"input_tokens": 25}}}
+    )
+    assert current["input_tokens"] == 125
+    assert current["by_model"]["m"]["input_tokens"] == 125
 
 
 def test_set_external_session_id(store: SqlAlchemyConversationStore) -> None:
