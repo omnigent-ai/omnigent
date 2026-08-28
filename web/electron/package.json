@@ -63,6 +63,7 @@
       "src/**/*",
       "setup/**/*",
       "find/**/*",
+      "return-banner/**/*",
       "icons/**/*",
       "overlay/**/*"
     ],

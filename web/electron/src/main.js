@@ -47,6 +47,8 @@ const {
 const { parseOmnigentDeepLink, chooseDeepLinkStrategy } = require("./deepLink");
 const { registerWorkspaceChromeHide } = require("./workspace-chrome");
 const { registerWorkspaceRootBounce } = require("./workspace-root-bounce");
+const { registerServerAwayWatch, AWAY_BANNER_DELAY_MS } = require("./away_banner");
+const { createReturnBanner } = require("./return_banner");
 const { createBrowserViewRegistry } = require("./browserViewRegistry");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { registerBrowserIpc } = require("./browserIpc");
@@ -128,6 +130,9 @@ function managedServerUrls() {
  */
 let quitCleanupTimeoutMs = 10000;
 let quitInstallFallbackMs = 3000;
+// Away-banner delay, `let` for the same reason: wiring tests shrink it via
+// testApi.setAwayBannerDelayMs instead of waiting out the real delay.
+let awayBannerDelayMs = AWAY_BANNER_DELAY_MS;
 
 /**
  * Permissions the SPA legitimately needs and we auto-grant. The dictation
@@ -759,6 +764,22 @@ const updateOverlay = createUpdateOverlay({
   preloadPath: path.join(__dirname, "update_overlay_preload.js"),
 });
 
+// Shell-owned "return to your server?" banner: offered when a window has sat
+// on a foreign page (e.g. an SSO login) instead of its pinned server — see
+// away_banner.js. Like the update overlay it ships with the desktop app so it
+// works against any server bundle (and against foreign pages, which get an
+// inert bridge).
+const returnBanner = createReturnBanner({
+  BrowserWindow,
+  ipcMain,
+  bannerPage: path.join(__dirname, "..", "return-banner", "index.html"),
+  preloadPath: path.join(__dirname, "return_banner_preload.js"),
+  onGoBack: (win) => awayWatches.get(win)?.reset(),
+});
+
+/** Per-window away-watch handles (win → {reset, dispose}); see away_banner.js. */
+const awayWatches = new Map();
+
 // ---------------------------------------------------------------------------
 // Persisted settings (the saved server URL and the recently-connected server
 // list), stored as JSON in the per-user app data dir (Electron's `userData`
@@ -1235,6 +1256,19 @@ function createWindow(targetUrl, opts = {}) {
     browserRegistry: createBrowserRegistryForWindow(win),
   });
   registerWorkspaceRootBounce(win.webContents, () => pinnedOrigin(win));
+  // Show the return banner when the window navigates away from its server
+  // (e.g. SSO) and stays away. The watch's on-away URL is the last committed
+  // page on the server — subpage, mount path, and query args included.
+  awayWatches.set(
+    win,
+    registerServerAwayWatch(win.webContents, {
+      getPinnedOrigin: () => pinnedOrigin(win),
+      delayMs: awayBannerDelayMs,
+      debugLog: (message) => console.warn(`[omnigent] ${message}`),
+      onAway: (returnUrl) => returnBanner.show(win, returnUrl ?? windows.get(win)?.serverUrl),
+      onReturn: () => returnBanner.hide(win),
+    }),
+  );
   if (destination) {
     // Learn the server's version alongside the load. Every window that opens
     // straight onto a server (normal app launch with a saved URL, a deep link,
@@ -1334,6 +1368,8 @@ function createWindow(targetUrl, opts = {}) {
     } catch {
       /* registry already torn down */
     }
+    awayWatches.get(win)?.dispose();
+    awayWatches.delete(win);
     windows.delete(win);
     updateBadge(); // drop this window's contribution from the app-wide badge
   });
@@ -2602,6 +2638,7 @@ function registerIpc() {
   // The module owns the handlers and their trusted-sender + consent gates.
   updater.registerIpc();
   updateOverlay.registerIpc();
+  returnBanner.registerIpc();
 
   // Mirror the web app's in-app theme onto the native side so the update
   // overlay, native dialogs, and menus track the theme switcher (not just the
