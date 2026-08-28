@@ -844,7 +844,7 @@ describe("mobile in-place project picker", () => {
     // actions are gone, and the picker (search + project list) plus a Back
     // control are shown.
     fireEvent.click(moveItem);
-    expect(screen.getByPlaceholderText("Search projects")).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("Search or create project")).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: /Sprint 42/ })).toBeInTheDocument();
     expect(screen.getByTestId("project-picker-back")).toBeInTheDocument();
     // The main actions are no longer rendered — the body was replaced, not
@@ -857,7 +857,7 @@ describe("mobile in-place project picker", () => {
     fireEvent.click(screen.getByTestId("project-picker-back"));
     expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
     expect(screen.getByTestId("delete-conversation")).toBeInTheDocument();
-    expect(screen.queryByPlaceholderText("Search projects")).toBeNull();
+    expect(screen.queryByPlaceholderText("Search or create project")).toBeNull();
   });
 
   it("moves the session into a picked project just like desktop", () => {
@@ -874,6 +874,41 @@ describe("mobile in-place project picker", () => {
       id: "conv_1",
       project: "Sprint 42",
     });
+  });
+
+  it("creates a project from a typed name that matches nothing", () => {
+    mocks.isMobile = true;
+    mocks.projects = ["Sprint 42"];
+    renderSidebar();
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    fireEvent.click(screen.getByTestId("move-to-project"));
+
+    fireEvent.change(screen.getByPlaceholderText("Search or create project"), {
+      target: { value: "Roadmap" },
+    });
+    fireEvent.click(screen.getByRole("menuitem", { name: /Create Roadmap/ }));
+
+    // The move resolves-or-creates the project id server-side, so filing into a
+    // brand-new name uses the same mutation contract as picking an existing one.
+    expect(mocks.moveToProject.mutate).toHaveBeenCalledWith({
+      id: "conv_1",
+      project: "Roadmap",
+    });
+  });
+
+  it("offers no create row when the typed name already exists", () => {
+    mocks.isMobile = true;
+    mocks.projects = ["Sprint 42"];
+    renderSidebar();
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    fireEvent.click(screen.getByTestId("move-to-project"));
+
+    fireEvent.change(screen.getByPlaceholderText("Search or create project"), {
+      target: { value: "sprint 42" },
+    });
+    expect(screen.queryByRole("menuitem", { name: /Create/ })).toBeNull();
   });
 
   it("keeps the desktop side-flyout submenu (no in-place swap)", () => {

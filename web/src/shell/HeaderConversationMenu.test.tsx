@@ -108,15 +108,17 @@ describe("HeaderConversationMenu", () => {
     expect(trigger.querySelector("svg")).toHaveClass("lucide-ellipsis");
 
     openMenu();
+    // Desktop drops "Move to project" from the kebab — the breadcrumb folder
+    // tag owns that shortcut (see ChatHeader / HeaderProjectTag).
     expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
       "Pin",
       "Share",
       "Rename",
       "Mark as unread",
-      "Add to project",
       "Archive",
       "Delete",
     ]);
+    expect(screen.queryByTestId("header-move-to-project")).toBeNull();
   });
 
   it("opens from the keyboard and focuses the first action", () => {
@@ -170,6 +172,9 @@ describe("HeaderConversationMenu", () => {
   });
 
   it("labels project actions for filed and unfiled sessions", () => {
+    // Move to project is mobile-only in this menu now (desktop moved it to the
+    // breadcrumb folder tag).
+    mocks.isMobile = true;
     const view = renderMenu();
     openMenu();
     expect(screen.getByTestId("header-move-to-project")).toHaveTextContent("Add to project");
@@ -191,7 +196,7 @@ describe("HeaderConversationMenu", () => {
 
     expect(screen.getByTestId("header-project-picker-back")).toBeInTheDocument();
     expect(screen.queryByTestId("header-rename-conversation")).toBeNull();
-    expect(screen.getByRole("textbox", { name: "Search projects" })).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Search or create project" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("menuitem", { name: "Sprint 42" }));
     expect(mocks.moveToProject).toHaveBeenCalledWith({ id: "conv-1", project: "Sprint 42" });
   });

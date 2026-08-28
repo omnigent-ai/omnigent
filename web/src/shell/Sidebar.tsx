@@ -41,6 +41,7 @@ import {
   PencilIcon,
   PinIcon,
   PinOffIcon,
+  PlusIcon,
   SearchIcon,
   Settings2Icon,
   ShareIcon,
@@ -4462,9 +4463,13 @@ function ProjectPickerMenu({
   const { data: projects = [] } = useProjects();
   const [search, setSearch] = useState("");
 
-  const filtered = search
-    ? projects.filter((p) => p.name.toLowerCase().includes(search.toLowerCase()))
+  const trimmed = search.trim();
+  const filtered = trimmed
+    ? projects.filter((p) => p.name.toLowerCase().includes(trimmed.toLowerCase()))
     : projects;
+  // Offer create only when the typed name isn't already an exact project.
+  const canCreate =
+    trimmed.length > 0 && !projects.some((p) => p.name.toLowerCase() === trimmed.toLowerCase());
 
   // Keep keystrokes inside the inputs from reaching the menu's typeahead /
   // navigation handlers (which would otherwise steal letters and arrows).
@@ -4478,7 +4483,7 @@ function ProjectPickerMenu({
         <SearchIcon className="size-3.5 shrink-0 text-muted-foreground" />
         <input
           className="w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
-          placeholder="Search projects"
+          placeholder="Search or create project"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           onKeyDown={swallowKeys}
@@ -4493,10 +4498,21 @@ function ProjectPickerMenu({
             )}
           </C.Item>
         ))}
-        {filtered.length === 0 && (
+        {filtered.length === 0 && !canCreate && (
           <p className="px-2 py-1.5 text-sm text-muted-foreground">No projects yet.</p>
         )}
       </div>
+      {canCreate && (
+        <div className="border-t pt-1">
+          <C.Item className="px-2 py-1" onSelect={() => onSelect(trimmed)}>
+            <PlusIcon className="size-3.5 shrink-0 text-muted-foreground" />
+            Create{" "}
+            <span className="truncate rounded bg-muted px-1 py-0.5 font-mono text-[0.95em]">
+              {trimmed}
+            </span>
+          </C.Item>
+        </div>
+      )}
       {currentProject && (
         <div className="border-t pt-1">
           <C.Item className="px-2 py-1" onSelect={() => onSelect("")}>
