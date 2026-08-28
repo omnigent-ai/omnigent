@@ -699,6 +699,15 @@ function FileViewerBody({
     initialCommentIdRef.current ? path : null,
   );
 
+  // Switch a markdown file to the rich-text editor — the surface where text-
+  // selection commenting works. Used by the preview's "switch to edit mode"
+  // hint. Coming from preview/source there are no edits to guard, so it applies
+  // directly (mirrors the toolbar's switchTo for the non-editor case).
+  const handleRequestEditMode = useCallback(() => {
+    setDeepLinkBiasPath(null);
+    setPreviewableViewMode("editor");
+  }, []);
+
   // Persist the global view preferences so they survive a refresh. commentsOpen
   // is intentionally excluded — it's contextual (per-open), not a sticky
   // preference. Idempotent on mount (writes back the seeded values).
@@ -1468,6 +1477,7 @@ function FileViewerBody({
               viewMode={viewMode}
               tocOpen={tocOpen}
               onTocToggle={() => setTocOpen((prev) => !prev)}
+              onRequestEditMode={lang === "markdown" ? handleRequestEditMode : undefined}
             />
           )}
         </div>

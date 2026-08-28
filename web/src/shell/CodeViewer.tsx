@@ -73,6 +73,7 @@ import { useScrollRestore } from "./useScrollRestore";
 import { PreviewSearchBar } from "./PreviewSearchBar";
 import { renderLineTokens } from "./codeViewerRendering";
 import { HtmlCommentViewer } from "./HtmlCommentViewer";
+import { PreviewCommentBanner } from "./PreviewCommentBanner";
 import { TruncatedBanner } from "./TruncatedBanner";
 import { useLightbox } from "@/components/ImageLightbox";
 import { getEmbedRoot } from "@/lib/host";
@@ -250,6 +251,7 @@ function PreviewWithSearch({
   scrollReady,
   tocOpen,
   onTocOpenChange,
+  commentHint,
 }: {
   content: string;
   isNotebook: boolean;
@@ -263,6 +265,12 @@ function PreviewWithSearch({
   scrollReady: boolean;
   tocOpen: boolean;
   onTocOpenChange: (open: boolean) => void;
+  /**
+   * When present, shows a banner pointing users at the editor for commenting
+   * (the rendered preview can't anchor text-selection comments). Omitted for
+   * notebooks, which have no comment surface.
+   */
+  commentHint?: { conversationId: string; onSwitchToEdit: () => void };
 }) {
   const previewRef = useRef<HTMLDivElement>(null);
   // The preview div (not the FileViewer content area) is the real scroller
@@ -294,6 +302,14 @@ function PreviewWithSearch({
     <div className="flex h-full flex-col">
       {bar}
       {truncated && <TruncatedBanner />}
+      {/* A truncated file can't be edited (or commented on) in the editor
+          either, so the hint would send the user to a dead end — suppress it. */}
+      {commentHint && !truncated && (
+        <PreviewCommentBanner
+          conversationId={commentHint.conversationId}
+          onSwitchToEdit={commentHint.onSwitchToEdit}
+        />
+      )}
       <div className="min-h-0 flex-1">{preview}</div>
     </div>
   );
@@ -409,6 +425,12 @@ export interface CodeViewerProps {
   tocOpen?: boolean;
   /** Callback to toggle TOC panel. */
   onTocToggle?: () => void;
+  /**
+   * Switches a markdown file to the rich-text editor. When set, the rendered
+   * preview shows a banner pointing users there for commenting (the preview
+   * itself can't anchor text-selection comments).
+   */
+  onRequestEditMode?: () => void;
 }
 
 export function CodeViewer({
@@ -429,6 +451,7 @@ export function CodeViewer({
   pendingBodyRef,
   tocOpen = false,
   onTocToggle,
+  onRequestEditMode,
 }: CodeViewerProps) {
   const canEdit = useCanEdit(conversationId);
   const activeCommentId = activeSelection?.comment_id;
@@ -804,10 +827,11 @@ export function CodeViewer({
   }
 
   if (viewMode === "preview" && (lang === "markdown" || isNotebookPath(path))) {
+    const isNotebook = isNotebookPath(path);
     return (
       <PreviewWithSearch
         content={content}
-        isNotebook={isNotebookPath(path)}
+        isNotebook={isNotebook}
         truncated={truncated}
         searchOpen={searchOpen}
         onSearchHandled={handleSearchHandled}
@@ -816,6 +840,11 @@ export function CodeViewer({
         scrollReady={fileQuery.data !== undefined}
         tocOpen={tocOpen}
         onTocOpenChange={(open) => !open && onTocToggle?.()}
+        commentHint={
+          !isNotebook && onRequestEditMode
+            ? { conversationId, onSwitchToEdit: onRequestEditMode }
+            : undefined
+        }
       />
     );
   }
