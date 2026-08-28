@@ -183,6 +183,20 @@ def test_subscription_default_returns_none() -> None:
     assert creds.resolve_pi_native_provider(config_loader=lambda: config) is None
 
 
+def test_pi_native_subscription_returns_none() -> None:
+    """A pi subscription as the pi-surface default returns None.
+
+    ``kind="subscription", cli="pi"`` signals "use Pi's own native auth".
+    When it is configured as the pi-surface default,
+    ``resolve_pi_native_provider`` returns ``None`` so Pi reads from its
+    own ``~/.pi/agent`` without an Omnigent-managed ``models.json``.
+    """
+    config = {
+        "providers": {"pi-subscription": {"kind": "subscription", "cli": "pi", "default": "pi"}}
+    }
+    assert creds.resolve_pi_native_provider(config_loader=lambda: config) is None
+
+
 def test_no_providers_returns_none() -> None:
     """No configured providers → None (Pi uses its own login)."""
     assert creds.resolve_pi_native_provider(config_loader=dict) is None

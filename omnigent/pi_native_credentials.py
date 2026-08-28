@@ -47,6 +47,7 @@ from omnigent.onboarding.provider_config import (
     KEY_KIND,
     LOCAL_KIND,
     PI_SURFACE,
+    SUBSCRIPTION_KIND,
     ProviderEntry,
     default_provider_for_harness,
     load_config,
@@ -1155,14 +1156,23 @@ def resolve_pi_native_provider(
         elif entry.kind in (KEY_KIND, GATEWAY_KIND, LOCAL_KIND):
             resolved = _inline_family_pi_provider(entry, model=model)
         else:
-            # subscription (a CLI's own login can't be reused outside that CLI):
-            # let Pi use its own login.
-            _LOGGER.info(
-                "pi-native: configured provider %r (kind %r) cannot drive Pi; "
-                "Pi will use its own login.",
-                entry.name,
-                entry.kind,
-            )
+            if entry.kind == SUBSCRIPTION_KIND and entry.cli == "pi":
+                # Explicitly configured to use Pi's own native auth — skip the
+                # managed models.json so Pi reads its own ~/.pi/agent config.
+                _LOGGER.info(
+                    "pi-native: provider %r is a pi-native subscription; "
+                    "Pi will use its own login.",
+                    entry.name,
+                )
+            else:
+                # subscription (a CLI's own login can't be reused outside that CLI):
+                # let Pi use its own login.
+                _LOGGER.info(
+                    "pi-native: configured provider %r (kind %r) cannot drive Pi; "
+                    "Pi will use its own login.",
+                    entry.name,
+                    entry.kind,
+                )
             return None
         if resolved is None:
             # The provider matched a translatable kind but its details could not
