@@ -2938,7 +2938,6 @@ function sessionBindingPatch(
   | "sandboxStatus"
   | "mcpStartup"
 > {
-  const wrapper = session.labels?.["omnigent.wrapper"];
   return {
     isNativeTerminalSession: isNativeTerminalSessionFn(session),
     // Native wrapper whose model lives in the vendor TUI (no Omnigent picker):
