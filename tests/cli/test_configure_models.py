@@ -585,7 +585,7 @@ def test_add_menu_options_ordering() -> None:
         "Gemini — API key",
         "ChatGPT — subscription",
         "Claude — subscription (Pro/Max)",
-        "Pi — use own login",
+        "Pi — original auth",
         "Gateway — custom base URL + key",
         "OpenRouter — API key",
         "Databricks — workspace",
@@ -2341,7 +2341,7 @@ def test_pi_add_menu_offers_keys_gateway_databricks_but_no_subscription() -> Non
 
     options = add_menu_options_for_family(PI_SURFACE)
     kinds = {o.kind for o in options}
-    # The pi subscription ("Pi — use own login") IS offered for pi — it lets
+    # The pi subscription ("Pi — original auth") IS offered for pi — it lets
     # users bypass Omnigent-managed auth and use Pi's own credentials.
     assert any(o.kind == "subscription" and o.cli == "pi" for o in options)
     # claude/codex subscriptions must NOT appear — a CLI login is unusable

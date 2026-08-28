@@ -457,8 +457,8 @@ def add_menu_options() -> list[AddOption]:
             cli="claude",
         ),
         _opt(
-            "Pi — use own login",
-            "Let Pi use its own login (~/.pi/agent) instead of an Omnigent-managed provider.",
+            "Pi — original auth",
+            "Use Pi's own auth (~/.pi/agent) as-is, without Omnigent managing the provider.",
             SUBSCRIPTION_KIND,
             cli="pi",
         ),
