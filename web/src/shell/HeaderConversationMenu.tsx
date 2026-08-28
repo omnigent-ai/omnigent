@@ -56,6 +56,7 @@ import { markConversationUnread } from "@/hooks/useUnseenConversations";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { Link, useNavigate } from "@/lib/routing";
+import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { showToast } from "@/components/ui/toast";
 import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
@@ -423,6 +424,7 @@ export function HeaderConversationMenu({
               autoFocus
               aria-label="Session name"
               data-testid="header-rename-conversation-input"
+              maxLength={USER_SESSION_TITLE_MAX_CHARS}
               value={renameTitle}
               onChange={(event) => setRenameTitle(event.target.value)}
               onKeyDown={(event: KeyboardEvent<HTMLInputElement>) => {

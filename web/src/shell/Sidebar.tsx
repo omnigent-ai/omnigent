@@ -135,6 +135,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled, isSingleUserMode, sandboxOptionLabel } from "@/lib/capabilities";
 import { useBranding } from "@/lib/branding";
 import { relativeTime } from "@/lib/relativeTime";
+import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { showToast } from "@/components/ui/toast";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
@@ -4571,6 +4572,7 @@ function ConversationEditRow({ initialTitle, onCommit, onCancel }: ConversationE
       <input
         ref={inputRef}
         type="text"
+        maxLength={USER_SESSION_TITLE_MAX_CHARS}
         value={value}
         onChange={(e) => setValue(e.target.value)}
         onCompositionStart={() => {

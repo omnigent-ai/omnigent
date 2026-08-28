@@ -15,6 +15,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import type * as IdentityModule from "@/lib/identity";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 
 // Controllable rename mutation so the double-click test can assert the
 // committed title was forwarded to the PATCH. `isMobile` toggles the mocked
@@ -1009,6 +1010,7 @@ describe("right-click context menu", () => {
     fireEvent.contextMenu(links[0]);
     fireEvent.click(screen.getByTestId("rename-conversation"));
     const input = screen.getByTestId("rename-conversation-input") as HTMLInputElement;
+    expect(input).toHaveAttribute("maxLength", String(USER_SESSION_TITLE_MAX_CHARS));
     fireEvent.change(input, { target: { value: "Renamed A" } });
     fireEvent.keyDown(input, { key: "Enter" });
     expect(mocks.rename.mutate).toHaveBeenCalledWith({ id: "conv_a", title: "Renamed A" });

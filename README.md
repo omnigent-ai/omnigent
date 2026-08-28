@@ -361,11 +361,12 @@ omnigent config set --global \
 The title generator receives the current date as `YYYY-MM-DD`, then applies
 these requirements to the first user message. The setting is server-owned and
 does not alter an agent's portable instructions. Default generated titles are
-limited to 60 characters; custom title requirements may use up to 150.
-Default titles over 60 characters are rejected, leaving the first-message
-fallback title in place. Custom titles over 150 characters are truncated with
-a trailing ellipsis. The setting applies to new sessions after the local
-Omnigent server restarts.
+limited to 100 characters; custom title requirements may use up to 200.
+Default titles over 100 characters are rejected, leaving the first-message
+fallback title in place. Custom titles over 200 characters are truncated with
+a trailing ellipsis. Manually assigned titles are also limited to 200
+characters. The setting applies to new sessions after the local Omnigent
+server restarts.
 For longer instructions, edit `~/.omnigent/config.yaml` directly and use a YAML
 block scalar:
 

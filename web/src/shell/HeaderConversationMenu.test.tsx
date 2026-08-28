@@ -5,6 +5,7 @@ import type { Conversation } from "@/hooks/useConversations";
 import type * as ConversationsModule from "@/hooks/useConversations";
 import type * as UnseenConversationsModule from "@/hooks/useUnseenConversations";
 import { setOmnigentHostConfig } from "@/lib/host";
+import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
 
@@ -142,6 +143,7 @@ describe("HeaderConversationMenu", () => {
     openMenu();
     fireEvent.click(screen.getByRole("menuitem", { name: "Rename" }));
     const input = screen.getByRole("textbox", { name: "Session name" });
+    expect(input).toHaveAttribute("maxLength", String(USER_SESSION_TITLE_MAX_CHARS));
     fireEvent.change(input, { target: { value: "Roadmap planning" } });
     fireEvent.click(screen.getByRole("button", { name: "Rename" }));
     expect(mocks.rename).toHaveBeenCalledWith({ id: "conv-1", title: "Roadmap planning" });

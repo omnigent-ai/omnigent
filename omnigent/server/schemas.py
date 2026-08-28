@@ -16,7 +16,11 @@ from typing import Annotated, Any, Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, Strict, field_validator, model_validator
 
-from omnigent.entities import ConversationItem
+from omnigent.entities import (
+    DEFAULT_GENERATED_TITLE_MAX_CHARS,
+    USER_SESSION_TITLE_MAX_CHARS,
+    ConversationItem,
+)
 
 # ── Shared ──────────────────────────────────────────────────────
 
@@ -1433,7 +1437,7 @@ class SessionCreateRequest(BaseModel):
 
     agent_id: str
     initial_items: list[SessionEventInput] = Field(default_factory=list)
-    title: str | None = None
+    title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     labels: dict[str, str] = Field(default_factory=dict)
     parent_session_id: str | None = None
     sub_agent_name: str | None = None
@@ -1575,7 +1579,7 @@ class SessionCreateMetadata(BaseModel):
         valid with ``host_type: "managed"``.
     """
 
-    title: str | None = None
+    title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     labels: dict[str, str] = Field(default_factory=dict)
     reasoning_effort: str | None = None
     host_id: str | None = None
@@ -2184,7 +2188,7 @@ class UpdateSessionRequest(BaseModel):
     """
 
     runner_id: str | None = None
-    title: str | None = None
+    title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     labels: dict[str, str] | None = None
     reasoning_effort: str | None = None
     model_override: str | None = None
@@ -2204,7 +2208,7 @@ class UpdateSessionRequest(BaseModel):
 class AutomaticSessionRenameRequest(BaseModel):
     """Request body for the current-agent automatic rename endpoint."""
 
-    title: str = Field(min_length=2, max_length=60)
+    title: str = Field(min_length=2, max_length=DEFAULT_GENERATED_TITLE_MAX_CHARS)
 
     model_config = ConfigDict(extra="forbid")
 
@@ -2355,7 +2359,7 @@ class SessionForkRequest(BaseModel):
         is copied.
     """
 
-    title: str | None = None
+    title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     agent_id: str | None = None
     up_to_response_id: str | None = None
 

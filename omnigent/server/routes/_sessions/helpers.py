@@ -44,6 +44,7 @@ from omnigent.cost_plan import (
 )
 from omnigent.db.utils import generate_task_id
 from omnigent.entities import (
+    USER_SESSION_TITLE_MAX_CHARS,
     Agent,
     Conversation,
     ConversationItem,
@@ -2241,7 +2242,8 @@ async def _persist_external_session_title(
     :param body: External title event body. ``data.title`` must be a
         non-empty single-line string, e.g. ``"auth-refactor"``.
     :param conversation_store: Store used to upsert ``title``.
-    :raises OmnigentError: If ``data.title`` is not a non-empty single line.
+    :raises OmnigentError: If ``data.title`` is not a non-empty single line
+        within the user title length limit.
     """
     raw_title = body.data.get("title")
     # Newlines are rejected outright rather than folded into spaces — a
@@ -2256,6 +2258,12 @@ async def _persist_external_session_title(
     if not title:
         raise OmnigentError(
             "external_session_title requires data.title to be non-empty",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if len(title) > USER_SESSION_TITLE_MAX_CHARS:
+        raise OmnigentError(
+            f"external_session_title requires data.title to be at most "
+            f"{USER_SESSION_TITLE_MAX_CHARS} characters",
             code=ErrorCode.INVALID_INPUT,
         )
     if conv.parent_conversation_id is not None:

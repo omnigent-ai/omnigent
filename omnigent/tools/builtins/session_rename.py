@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from omnigent.entities import DEFAULT_GENERATED_TITLE_MAX_CHARS
 from omnigent.tools.base import Tool
 
 
@@ -42,7 +43,7 @@ class SysSessionRenameTool(Tool):
                                 "example 'Debug authentication timeout'."
                             ),
                             "minLength": 2,
-                            "maxLength": 60,
+                            "maxLength": DEFAULT_GENERATED_TITLE_MAX_CHARS,
                         }
                     },
                     "required": ["title"],

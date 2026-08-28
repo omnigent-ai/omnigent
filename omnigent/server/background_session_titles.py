@@ -10,7 +10,11 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from omnigent.entities.conversation import synthesize_conversation_title
+from omnigent.entities.conversation import (
+    DEFAULT_GENERATED_TITLE_MAX_CHARS,
+    USER_SESSION_TITLE_MAX_CHARS,
+    synthesize_conversation_title,
+)
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_plugins import background_title_generators
 from omnigent.stores.conversation_store import ConversationStore
@@ -48,8 +52,8 @@ BackgroundTitleGenerator = Callable[[BackgroundTitleRequest], Awaitable[str | No
 
 _TITLE_WRAPPERS = "'\"`“”‘’"
 _TRAILING_PUNCTUATION = re.compile(r"[.!?;:,]+$")
-BACKGROUND_TITLE_MAX_CHARS = 60
-CUSTOM_BACKGROUND_TITLE_MAX_CHARS = 150
+BACKGROUND_TITLE_MAX_CHARS = DEFAULT_GENERATED_TITLE_MAX_CHARS
+CUSTOM_BACKGROUND_TITLE_MAX_CHARS = USER_SESSION_TITLE_MAX_CHARS
 
 
 def normalize_background_title(
