@@ -435,6 +435,10 @@ def _build_routing_backends(
             )
         else:
             local = subscription_router
+        # Keep the named Databricks workspace router available for the
+        # per-session OMNIGENT_SMART_ROUTING_JUDGE=databricks choice. It is
+        # not selected automatically for a subscription session.
+        external = _build_default_databricks_routing_client(cfg, settings)
     if provider == "external":
         external = _build_external_routing_client(routing_cfg, settings, cfg)
     elif not isinstance(routing_cfg, dict):

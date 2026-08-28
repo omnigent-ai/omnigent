@@ -351,6 +351,20 @@ async def test_route_with_fallback_prefers_the_external_router() -> None:
     assert local.calls == 0
 
 
+async def test_strict_allowlist_rejects_a_judge_pick_outside_the_candidates() -> None:
+    """A judge can never escape the exact execution list it was given."""
+    external = _Recording(RoutingResult(model="databricks-not-allowed", rationale="no"))
+    call = await route_with_fallback(
+        RoutingBackends(external=external),
+        "hi",
+        {"codex": ["databricks-kimi-k2-6"]},
+        gateway_backed=True,
+        strict_candidate_allowlist=True,
+    )
+    assert call is not None
+    assert call.result is None
+
+
 async def test_route_with_fallback_asks_the_judge_when_the_router_declines() -> None:
     external = _Recording(None, last_error="router returned HTTP 404: not enabled")
     local = _Recording(_VERDICT)

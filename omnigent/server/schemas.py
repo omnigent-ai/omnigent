@@ -1455,6 +1455,7 @@ class SessionCreateRequest(BaseModel):
     # Both default off so existing sessions retain the conservative policy.
     gpt_5_6_sol_routing_enabled: bool = False
     databricks_kimi_routing_enabled: bool = False
+    codex_subscription_routing_enabled: bool = True
     harness_override: str | None = None
     smart_routing_message: str | None = None
 
@@ -2063,6 +2064,7 @@ class SessionResponse(BaseModel):
     # a routing preference.  False is the safe compatibility default.
     gpt_5_6_sol_routing_enabled: bool = False
     databricks_kimi_routing_enabled: bool = False
+    codex_subscription_routing_enabled: bool = True
     context_window: int | None = None
     last_total_tokens: int | None = None
     total_cost_usd: float | None = None
@@ -2206,6 +2208,7 @@ class UpdateSessionRequest(BaseModel):
     subagent_routing_override: str | None = None
     gpt_5_6_sol_routing_enabled: bool | None = None
     databricks_kimi_routing_enabled: bool | None = None
+    codex_subscription_routing_enabled: bool | None = None
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
     archived: bool | None = None

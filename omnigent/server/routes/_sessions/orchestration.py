@@ -1103,6 +1103,9 @@ def _build_session_response(
         subagent_routing_override=conv.subagent_routing_override,
         gpt_5_6_sol_routing_enabled=labels.get("omnigent.routing.gpt_5_6_sol") == "on",
         databricks_kimi_routing_enabled=labels.get("omnigent.routing.databricks_kimi") == "on",
+        codex_subscription_routing_enabled=(
+            labels.get("omnigent.routing.codex_subscription") != "off"
+        ),
         context_window=context_window,
         last_total_tokens=last_total_tokens,
         # Seed the client's cost indicator on resume. Uses the SUBTREE
@@ -4981,6 +4984,9 @@ async def _forward_event_to_runner(
                     conv.labels.get("omnigent.routing.databricks_kimi") == "on"
                 ),
                 allow_gpt_5_6_sol=(conv.labels.get("omnigent.routing.gpt_5_6_sol") == "on"),
+                allow_codex_subscription_models=(
+                    conv.labels.get("omnigent.routing.codex_subscription") != "off"
+                ),
             )
             try:
                 # Always clear the "auto" sentinel even when routing
@@ -5144,6 +5150,9 @@ async def _forward_event_to_runner(
                         conv.labels.get("omnigent.routing.databricks_kimi") == "on"
                     ),
                     allow_gpt_5_6_sol=(conv.labels.get("omnigent.routing.gpt_5_6_sol") == "on"),
+                    allow_codex_subscription_models=(
+                        conv.labels.get("omnigent.routing.codex_subscription") != "off"
+                    ),
                 )
                 if _routed_model is not None:
                     effective_runner_override = _routed_model
@@ -5212,6 +5221,9 @@ async def _forward_event_to_runner(
                         conv.labels.get("omnigent.routing.databricks_kimi") == "on"
                     ),
                     allow_gpt_5_6_sol=(conv.labels.get("omnigent.routing.gpt_5_6_sol") == "on"),
+                    allow_codex_subscription_models=(
+                        conv.labels.get("omnigent.routing.codex_subscription") != "off"
+                    ),
                 )
                 if _turn_route_err is not None:
                     # Not routed, and visibly so — the turn runs on the
@@ -5730,6 +5742,9 @@ async def _dispatch_session_event_to_runner_impl(
                         conv.labels.get("omnigent.routing.databricks_kimi") == "on"
                     ),
                     allow_gpt_5_6_sol=(conv.labels.get("omnigent.routing.gpt_5_6_sol") == "on"),
+                    allow_codex_subscription_models=(
+                        conv.labels.get("omnigent.routing.codex_subscription") != "off"
+                    ),
                 )
                 if _native_route_err is not None:
                     _native_routed_model, _native_verdict = _unavailable_routing_card(
@@ -7826,6 +7841,7 @@ async def _resolve_fixed_native_model_routing(
         allow_static_fallback=backed,
         allow_databricks_kimi=body.databricks_kimi_routing_enabled,
         allow_gpt_5_6_sol=body.gpt_5_6_sol_routing_enabled,
+        allow_codex_subscription_models=body.codex_subscription_routing_enabled,
     )
     if model is None or verdict is None:
         return None, None, error or "Routing unavailable; using the harness default model."
@@ -7915,6 +7931,7 @@ async def _resolve_native_smart_routing(
         allow_static_fallback=backed,
         allow_databricks_kimi=body.databricks_kimi_routing_enabled,
         allow_gpt_5_6_sol=body.gpt_5_6_sol_routing_enabled,
+        allow_codex_subscription_models=body.codex_subscription_routing_enabled,
     )
     if judge_only:
         kept = native_coding_agent_for_harness(candidates[0])
@@ -8510,6 +8527,9 @@ async def _create_session_from_existing_agent(
         "omnigent.routing.gpt_5_6_sol": "on" if body.gpt_5_6_sol_routing_enabled else "off",
         "omnigent.routing.databricks_kimi": "on"
         if body.databricks_kimi_routing_enabled
+        else "off",
+        "omnigent.routing.codex_subscription": "on"
+        if body.codex_subscription_routing_enabled
         else "off",
     }
     await asyncio.to_thread(conversation_store.set_labels, conv.id, _routing_preferences)

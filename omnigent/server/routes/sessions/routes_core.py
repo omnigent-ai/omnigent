@@ -1778,6 +1778,10 @@ def register_core_routes(
             labels_to_set["omnigent.routing.databricks_kimi"] = (
                 "on" if body.databricks_kimi_routing_enabled else "off"
             )
+        if "codex_subscription_routing_enabled" in body.model_fields_set:
+            labels_to_set["omnigent.routing.codex_subscription"] = (
+                "on" if body.codex_subscription_routing_enabled else "off"
+            )
 
         # Native-terminal pass-through args: ``None`` leaves them
         # unchanged; a provided list (including ``[]``) replaces the
