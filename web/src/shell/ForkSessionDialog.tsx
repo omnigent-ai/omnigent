@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useNavigate } from "@/lib/routing";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -61,7 +61,6 @@ import {
 } from "@/lib/nativeHarnessModes";
 import {
   CLAUDE_NATIVE_EFFORTS,
-  ConfigRow,
   DescribedSelect,
   EFFORT_SELECT_NONE,
   MODEL_SELECT_DEFAULT,
@@ -145,6 +144,22 @@ function splitWorktreePath(workspace: string): { repo: string; branchDir: string
 function defaultForkTitle(sourceTitle: string | null | undefined): string {
   const trimmed = sourceTitle?.trim();
   return trimmed ? `Fork of ${trimmed}` : "";
+}
+
+/**
+ * A run-config field row that matches the dialog's "Agent" field: a stacked
+ * `text-sm` muted label above a full-width control. Deliberately NOT the
+ * `ConfigRow` used inside the "Configure …" modal (bigger `text-ui` label +
+ * side-by-side sub-description) — those rows would read visually inconsistent
+ * next to the Agent select in this same form.
+ */
+function ForkConfigRow({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="flex flex-col gap-1.5">
+      <span className="text-sm font-medium text-muted-foreground">{label}</span>
+      {children}
+    </div>
+  );
 }
 
 /**
@@ -432,7 +447,7 @@ function ForkRunConfig({
   return (
     <div className="flex flex-col gap-4" data-testid="fork-session-run-config">
       {showModel && (
-        <ConfigRow label="Model" description="Underlying LLM">
+        <ForkConfigRow label="Model">
           <RoutingModelSelect
             value={model}
             onValueChange={changeModel}
@@ -451,12 +466,12 @@ function ForkRunConfig({
               </div>
             )}
           </RoutingModelSelect>
-        </ConfigRow>
+        </ForkConfigRow>
       )}
 
       {hasPermission && (
         <>
-          <ConfigRow label="Effort" description="Reasoning depth vs. speed">
+          <ForkConfigRow label="Effort">
             <Select
               value={effort}
               onValueChange={changeEffort}
@@ -479,9 +494,9 @@ function ForkRunConfig({
                 ))}
               </SelectContent>
             </Select>
-          </ConfigRow>
+          </ForkConfigRow>
 
-          <ConfigRow label="Permissions" description="What the agent can do without asking">
+          <ForkConfigRow label="Permissions">
             <DescribedSelect
               value={permission}
               onValueChange={changePermission}
@@ -490,13 +505,13 @@ function ForkRunConfig({
               ariaLabel="Permissions"
               componentId="fork_session.config.permission"
             />
-          </ConfigRow>
+          </ForkConfigRow>
         </>
       )}
 
       {hasApproval && (
         <>
-          <ConfigRow label="Approval" description="What the agent can do without asking">
+          <ForkConfigRow label="Approval">
             <DescribedSelect
               value={mode}
               onValueChange={changeMode}
@@ -513,7 +528,7 @@ function ForkRunConfig({
               ariaLabel="Approval"
               componentId="fork_session.config.approval"
             />
-          </ConfigRow>
+          </ForkConfigRow>
           {isCodex && mode === CODEX_NATIVE_BYPASS_APPROVAL_VALUE && (
             <div
               role="alert"
@@ -531,7 +546,7 @@ function ForkRunConfig({
       )}
 
       {hasCursor && (
-        <ConfigRow label="Mode" description="How Cursor runs commands">
+        <ForkConfigRow label="Mode">
           <DescribedSelect
             value={mode}
             onValueChange={changeMode}
@@ -540,12 +555,12 @@ function ForkRunConfig({
             ariaLabel="Mode"
             componentId="fork_session.config.cursor_mode"
           />
-        </ConfigRow>
+        </ForkConfigRow>
       )}
 
       {hasAgySkip && (
         <>
-          <ConfigRow label="Permissions" description="What the agent can do without asking">
+          <ForkConfigRow label="Permissions">
             <DescribedSelect
               value={mode}
               onValueChange={changeMode}
@@ -554,7 +569,7 @@ function ForkRunConfig({
               ariaLabel="Permissions"
               componentId="fork_session.config.permission"
             />
-          </ConfigRow>
+          </ForkConfigRow>
           {mode === AGY_NATIVE_SKIP_VALUE && (
             <div
               role="alert"
