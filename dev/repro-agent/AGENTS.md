@@ -13,6 +13,12 @@ against** — the local server `omnigent run` spins up, or a server passed with
 reproduce in — reproducing on the running app **is** the reproduction. Your
 whole session is browsable in that app afterward.
 
+**Environment note:** when you run under `--server` you're inside a
+Databricks-network session where the public npm/PyPI registries are blocked —
+point package installs at the internal proxies. See
+[`dev/agent-environment.md`](../agent-environment.md) before running any
+`npm`/`pnpm`/`pip`/`uv` install.
+
 You do **not** fix the bug. Finding the root cause and implementing a fix — and
 proving the fix with a before/after test transition — is a separate step; it
 consumes your session (the reconstructed journey, the e2e test, and your notes)

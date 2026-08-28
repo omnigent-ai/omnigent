@@ -23,6 +23,12 @@ against**. Your working directory is an `omnigent-ai/omnigent` checkout — the
 product repo where the bug lives, the code you may change, and where the tests
 belong.
 
+**Environment note:** when you run under `--server` you're inside a
+Databricks-network session where the public npm/PyPI registries are blocked —
+point package installs at the internal proxies. See
+[`dev/agent-environment.md`](../agent-environment.md) before running any
+`npm`/`pnpm`/`pip`/`uv` install.
+
 ## Input contract
 
 You are invoked with a **pointer to a completed repro run** — not the bug report
