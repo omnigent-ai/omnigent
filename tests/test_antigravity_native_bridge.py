@@ -1915,6 +1915,52 @@ def test_ensure_agy_feedback_survey_disabled_creates_missing_settings(tmp_path: 
     }
 
 
+def test_ensure_agy_settings_selects_gemini_for_api_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The isolated settings activate agy's direct Gemini API-key provider."""
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-key")
+    ensure_agy_feedback_survey_disabled(tmp_path)
+    assert json.loads(_agy_settings_path(tmp_path).read_text(encoding="utf-8")) == {
+        "modelProvider": "gemini",
+        "showFeedbackSurvey": False,
+    }
+
+
+def test_ensure_agy_settings_clears_gemini_provider_when_api_key_disappears(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A resumed OAuth session is not trapped on stale API-key configuration."""
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-key")
+    ensure_agy_feedback_survey_disabled(tmp_path)
+    monkeypatch.delenv("GEMINI_API_KEY")
+
+    ensure_agy_feedback_survey_disabled(tmp_path)
+
+    assert json.loads(_agy_settings_path(tmp_path).read_text(encoding="utf-8")) == {
+        "showFeedbackSurvey": False
+    }
+
+
+def test_ensure_agy_settings_preserves_non_gemini_provider_without_api_key(
+    tmp_path: Path,
+) -> None:
+    """Provider cleanup does not overwrite another explicitly selected backend."""
+    settings = _agy_settings_path(tmp_path)
+    settings.parent.mkdir(parents=True)
+    settings.write_text(
+        json.dumps({"modelProvider": "vertex", "showFeedbackSurvey": False}),
+        encoding="utf-8",
+    )
+
+    ensure_agy_feedback_survey_disabled(tmp_path)
+
+    assert json.loads(settings.read_text(encoding="utf-8")) == {
+        "modelProvider": "vertex",
+        "showFeedbackSurvey": False,
+    }
+
+
 def test_ensure_agy_feedback_survey_disabled_merges_preserving_keys(tmp_path: Path) -> None:
     """The user's other settings (model/trustedWorkspaces/…) survive the merge."""
     settings = _agy_settings_path(tmp_path)

@@ -73,7 +73,7 @@ from omnigent.onboarding.provider_config import (
 # / ``agents_sdk``) and the ``claude`` alias normalize onto these first.
 # ``antigravity`` is the in-process Gemini SDK harness (its key resolves at
 # runtime), distinct from the CLI-wrapping ``antigravity-native`` (``agy``)
-# harness gated below on its binary plus a file-based OAuth credential.
+# harness gated below on its binary plus an API key or OAuth credential.
 _logger = logging.getLogger(__name__)
 
 _SDK_HARNESSES: frozenset[str] = frozenset(
@@ -83,15 +83,16 @@ _SDK_HARNESSES: frozenset[str] = frozenset(
 # Families/harnesses whose CLIs authenticate via file-based credentials rather
 # than a CLI login-status command. For these, ``harness_is_configured`` checks
 # BOTH the binary (via ``harness_cli_installed``) AND the credential (via the
-# callable here). ``agy`` writes an OAuth token on its first interactive run;
-# ``kimi login`` writes ``~/.kimi-code/credentials/kimi-code.json``, and
-# pay-per-use users instead set an API key in ``~/.kimi-code/config.toml`` (kimi
-# has no login-status probe) — ``kimi_auth_configured`` accepts either. The
-# ``anthropic`` / ``openai`` families authenticate via subscription provider
-# config and do not appear here. Each lambda resolves through its module at call
-# time so a test can monkeypatch ``…gemini_auth.gemini_login_detected`` /
-# ``…kimi_auth.kimi_auth_configured`` and have the patch take effect without
-# this dict caching the old function object.
+# callable here). ``agy`` accepts ``GEMINI_API_KEY`` or writes an OAuth token on
+# its first interactive run; ``kimi login`` writes
+# ``~/.kimi-code/credentials/kimi-code.json``, and pay-per-use users instead set
+# an API key in ``~/.kimi-code/config.toml`` (kimi has no login-status probe) —
+# ``kimi_auth_configured`` accepts either. The ``anthropic`` / ``openai``
+# families authenticate via subscription provider config and do not appear here.
+# Each lambda resolves through its module at call time so a test can monkeypatch
+# ``…gemini_auth.gemini_login_detected`` / ``…kimi_auth.kimi_auth_configured``
+# and have the patch take effect without this dict caching the old function
+# object.
 _FAMILY_CREDENTIAL_CHECK: dict[str, Callable[[], bool]] = {
     GEMINI_FAMILY: lambda: _gemini_auth.gemini_login_detected(),
     KIMI_KEY: lambda: _kimi_auth.kimi_auth_configured(),

@@ -651,6 +651,7 @@ def _link_into_isolated_gemini_dir(real: Path, link: Path) -> None:
 # writes exactly ``"showFeedbackSurvey": false`` here (``disableFeedback`` is an
 # unrelated internal proto field, NOT a settings key — it would be ignored).
 _AGY_FEEDBACK_SURVEY_SETTING = "showFeedbackSurvey"
+_AGY_MODEL_PROVIDER_SETTING = "modelProvider"
 
 
 def ensure_agy_feedback_survey_disabled(home: Path) -> None:
@@ -666,10 +667,11 @@ def ensure_agy_feedback_survey_disabled(home: Path) -> None:
     the survey itself would be brittle to agy wording changes).
 
     Merge-only + idempotent: existing keys (``model``, ``trustedWorkspaces``,
-    ``enableTelemetry``, …) are preserved; a missing file is created with just
-    this key; a malformed / non-object file is left UNTOUCHED rather than
-    clobbered. Best-effort — a read/write failure is logged and the launch
-    proceeds (the survey is a degradation, not a hard blocker).
+    ``enableTelemetry``, …) are preserved. When ``GEMINI_API_KEY`` is present,
+    ``modelProvider`` is set to ``"gemini"``; when the key disappears that
+    bridge-owned value is removed so OAuth can take over on resume. A malformed
+    / non-object file is left UNTOUCHED rather than clobbered. Best-effort — a
+    read/write failure is logged and the launch proceeds.
 
     :param home: The HOME agy launches under (the per-session isolated home, or
         the real home when the harness runs agy under it). Settings live at
@@ -723,9 +725,17 @@ def ensure_agy_feedback_survey_disabled(home: Path) -> None:
             )
             return
         data = loaded
-    if data.get(_AGY_FEEDBACK_SURVEY_SETTING) is False:
+    desired: dict[str, object] = {_AGY_FEEDBACK_SURVEY_SETTING: False}
+    if (os.environ.get("GEMINI_API_KEY") or "").strip():
+        desired[_AGY_MODEL_PROVIDER_SETTING] = "gemini"
+    provider_removed = False
+    current_provider = data.get(_AGY_MODEL_PROVIDER_SETTING)
+    if _AGY_MODEL_PROVIDER_SETTING not in desired and current_provider == "gemini":
+        del data[_AGY_MODEL_PROVIDER_SETTING]
+        provider_removed = True
+    if not provider_removed and all(data.get(key) == value for key, value in desired.items()):
         return  # already disabled — avoid a needless rewrite
-    data[_AGY_FEEDBACK_SURVEY_SETTING] = False
+    data.update(desired)
     # The write is atomic (mkstemp + os.replace) so a concurrent reader/writer never
     # sees a torn file. Both launch paths pass the per-session isolated agy dir, so
     # the only writer that can race here is the session's own agy; the idempotent

@@ -269,6 +269,9 @@ omnigent hermes                      # Hermes Agent (Nous Research)
 omnigent pi                          # Pi
 ```
 
+`omnigent agy` requires agy 1.1.13 or newer. When `GEMINI_API_KEY` is set,
+direct Gemini API authentication takes precedence over agy's saved OAuth login.
+
 Using OpenClaw? See the [OpenClaw integration guide](docs/openclaw.md) to import
 its coding agents or drive a live OpenClaw Gateway session over ACP.
 
