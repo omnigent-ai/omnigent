@@ -1344,6 +1344,8 @@ def _credential_label(name: str, entry: ProviderEntry) -> str:
         gateway = _claude_managed_gateway_label()
         if gateway is not None:
             return gateway
+    if entry.kind == SUBSCRIPTION_KIND and entry.cli == "pi":
+        return "Pi original auth"
     return credential_label(
         entry.kind, name, profile=entry.profile, display_name=entry.display_name
     )
