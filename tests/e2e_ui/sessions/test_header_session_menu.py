@@ -49,13 +49,15 @@ def test_header_session_menu_renames_owner_and_hides_for_subagent(
         expect(trigger).to_be_visible(timeout=30_000)
         trigger.click()
 
+        # Desktop drops "Add to project" from the kebab — the breadcrumb's
+        # folder tag owns that shortcut now (see HeaderProjectTag). It stays in
+        # this menu only on mobile, where the native shells hide the breadcrumb.
         menu_items = page.get_by_role("menuitem")
-        expect(menu_items).to_have_count(6)
+        expect(menu_items).to_have_count(5)
         assert menu_items.all_inner_texts() == [
             "Pin",
             "Rename",
             "Mark as unread",
-            "Add to project",
             "Archive",
             "Delete",
         ]
