@@ -1,225 +1,173 @@
-// Client interaction telemetry, DERIVED from the store's authoritative,
-// reconnect-reconciled per-conversation state — not hooked onto raw SSE blocks.
+// Live interaction telemetry, emitted from the pump's SSE reduce-loop in
+// chatStore.ts — the one place that sees each stream frame ONCE, live, in order.
+// It is NOT derived from committed conversation state: that state is built for
+// rendering and erases what telemetry needs (live-vs-history, an edge vs. a
+// revived level transition, a real outcome), which mismeasured on every
+// reconnect / revive / reopen. History hydration takes the `reduceSync` path,
+// not this loop, so reopening a conversation never re-emits.
 //
-// One subscriber owns the whole lifecycle for every live conversation:
-//   - agent_run      — from `activeResponse.state` (streaming → terminal).
-//   - tool_call      — from `tool_group` / `tool_result` blocks in the transcript.
-//   - create_session — a brand-new session's "created → first AI activity",
-//     registered by the create sites via `markSessionCreated` (they alone know
-//     the host kind); completed on first assistant activity, failed if the first
-//     turn ends without any.
+//   - agent_run      — onResponseStart / onResponseEnd (mapped terminal status).
+//                      Revive reopens a turn via `set()` and emits neither block,
+//                      so it never double-opens a run.
+//   - tool_call      — onLiveBlock: start on a live tool_group; complete (NO
+//                      status — none is reliable) on its result or when its run ends.
+//   - create_session — markSessionCreated (create sites; they alone know the host
+//                      kind) → onLiveBlock on first activity, else onResponseEnd fail.
 //
-// Why derive from state instead of hooking blocks: `blocks` and `activeResponse`
-// are the committed, deduplicated, snapshot-reconciled truth the UI renders, so
-// they survive reconnects and dropped stream frames (a lost `response_start` /
-// `response_end` / tool block does not). And it keeps every emit in ONE testable
-// place rather than scattered through the pump, where each un-handled block type
-// (error, user-echo, …) was a fresh mis-attribution bug. `approval` stays a direct
-// emit on the user action (chatStore.submitApproval) — it has no stream lifecycle.
+// Spans still open when a conversation is disposed are settled by
+// onConversationDisposed (wired to the registry's dispose notification).
 
 import { startTimedInteraction, type TimedInteraction } from "@/lib/analyticsEmit";
+import type { AnyBlock } from "@/lib/blocks";
 import { conversationRegistry } from "./conversationRegistry";
 
 type HostKind = "sandbox" | "computer";
 
-interface ConvTracking {
-  create?: { handle: TimedInteraction; settled: boolean };
+interface ConvSpans {
+  create?: TimedInteraction;
   run?: { responseId: string; handle: TimedInteraction };
+  /** Open tool calls by callId (removed on their result). */
   tools: Map<string, TimedInteraction>;
-  toolSeen: Set<string>;
-  toolDone: Set<string>;
-  // Ref of the last-scanned blocks array, so a state change that didn't touch
-  // the transcript (e.g. an activeResponse-only update) skips the block scan.
-  lastBlocks?: unknown;
 }
 
-const tracked = new Map<string, ConvTracking>();
+const spans = new Map<string, ConvSpans>();
 
-/**
- * Drop all in-flight tracking without settling. Test-only: the projector is a
- * module singleton, so tests that drive shared state must reset it between cases
- * or one case's open spans leak into the next.
- */
-export function resetInteractionTelemetryForTests(): void {
-  tracked.clear();
-}
-
-function trackingFor(id: string): ConvTracking {
-  let t = tracked.get(id);
-  if (t === undefined) {
-    t = { tools: new Map(), toolSeen: new Set(), toolDone: new Set() };
-    tracked.set(id, t);
+function spansFor(id: string): ConvSpans {
+  let s = spans.get(id);
+  if (s === undefined) {
+    s = { tools: new Map() };
+    spans.set(id, s);
   }
-  return t;
+  return s;
 }
 
-/**
- * Register a brand-new session for create_session timing. Called by the create
- * sites (the send/landing path and the New Chat dialog) — the only places that
- * know the host kind. Opens the span now; the subscriber completes it on the
- * session's first AI activity, or fails it if the first turn ends without any.
- * Idempotent per session id.
- */
-export function markSessionCreated(sessionId: string, hostKind: HostKind): void {
-  const t = trackingFor(sessionId);
-  if (t.create !== undefined) return;
-  t.create = {
-    handle: startTimedInteraction(
-      hostKind === "sandbox" ? "create_session_sandbox" : "create_session_computer",
-      sessionId,
-    ),
-    settled: false,
-  };
-}
+// Map a response's terminal status to an interaction outcome.
+const TERMINAL_OUTCOME: Record<string, "success" | "failure" | "cancelled"> = {
+  completed: "success",
+  failed: "failure",
+  cancelled: "cancelled",
+  incomplete: "cancelled", // interrupted / hit a limit
+};
 
-const TERMINAL_STATES = new Set(["completed", "failed", "cancelled", "incomplete"]);
-
-function runStatus(state: string): "success" | "failure" | "cancelled" {
-  if (state === "completed") return "success";
-  if (state === "failed") return "failure";
-  return "cancelled"; // cancelled / incomplete (interrupted)
-}
-
-// "First AI activity" = the first assistant output the user perceives, in either
-// its streaming or its committed/hydrated form: the native-harness path (the
-// common new-chat case) commits assistant text as `text_done` — never
-// `text_chunk` — and reasoning as `reasoning_block`, so matching only the
-// streaming chunk types would record a successful text-first session as a
-// failure. NOT the `user_message` echo or an `error` block — those aren't
-// assistant activity and must not complete the span.
-const ACTIVITY_BLOCKS = new Set([
+// The first assistant output the user perceives — in streaming or committed
+// form (the native-harness path commits text as `text_done`, reasoning as
+// `reasoning_block`). NOT the `user_message` echo or an `error` block.
+const ACTIVITY_TYPES = new Set([
   "text_chunk",
   "text_done",
   "reasoning_chunk",
   "reasoning_block",
   "tool_group",
   "native_tool",
+  "file",
 ]);
-function isActivityBlock(type: string): boolean {
-  return ACTIVITY_BLOCKS.has(type);
+
+/**
+ * Register a brand-new session for create_session timing. Called by the create
+ * sites (the send/landing path and the New Chat dialog) — the only places that
+ * know the host kind. Opens the span now; the pump completes it on the session's
+ * first assistant activity, or settles it if the first turn fails without any.
+ * Idempotent per session id.
+ */
+export function markSessionCreated(sessionId: string, hostKind: HostKind): void {
+  const s = spansFor(sessionId);
+  if (s.create !== undefined) return;
+  s.create = startTimedInteraction(
+    hostKind === "sandbox" ? "create_session_sandbox" : "create_session_computer",
+    sessionId,
+  );
 }
 
-function process(id: string): void {
-  const entry = conversationRegistry.peek(id);
-  if (entry === undefined || entry.disposed) {
-    const existing = tracked.get(id);
-    if (existing !== undefined) settleDead(id, existing);
+/** A response turn started (the `response_start` block). Opens an agent_run. */
+export function onResponseStart(conversationId: string, responseId: string): void {
+  const s = spansFor(conversationId);
+  if (s.run !== undefined) {
+    if (s.run.responseId === responseId) return; // re-delivered response.created on reconnect
+    s.run.handle.complete("cancelled"); // a prior run never saw its terminal
+  }
+  s.run = { responseId, handle: startTimedInteraction("agent_run", responseId) };
+}
+
+/**
+ * A response turn reached a terminal (the `response_end` block). Completes its
+ * agent_run and closes any tool left open by it. Settles a pending
+ * create_session only on a genuine failure terminal: a `completed` edge can be a
+ * stray idle that `reviveStrayCompletedResponse` reopens, and late content would
+ * then complete the span correctly — failing on it would misreport a healthy
+ * session as a failed create.
+ */
+export function onResponseEnd(conversationId: string, responseId: string, status: string): void {
+  const s = spans.get(conversationId);
+  if (s === undefined) return;
+  const outcome = TERMINAL_OUTCOME[status] ?? "cancelled";
+
+  if (s.run !== undefined && s.run.responseId === responseId) {
+    s.run.handle.complete(outcome);
+    s.run = undefined;
+  }
+  // A tool that never delivered a result before its run ended was abandoned by
+  // that turn — close it (no status) rather than leak it.
+  for (const handle of s.tools.values()) handle.complete(null);
+  s.tools.clear();
+  if (s.create !== undefined && outcome !== "success") {
+    s.create.complete(outcome);
+    s.create = undefined;
+  }
+}
+
+/**
+ * A block committed live to the transcript. Drives tool_call boundaries and
+ * completes a pending create_session on the first assistant activity.
+ */
+export function onLiveBlock(conversationId: string, block: AnyBlock): void {
+  if (block.type === "tool_group") {
+    const s = spansFor(conversationId);
+    for (const ex of block.executions) {
+      if (ex.callId && !s.tools.has(ex.callId)) {
+        s.tools.set(ex.callId, startTimedInteraction("tool_call", ex.callId, ex.name));
+      }
+    }
+    completeCreateIfOpen(s); // a tool call is first activity too
     return;
   }
-  const t = trackingFor(id);
-  const state = entry.getState();
-  const ar = state.activeResponse;
 
-  // agent_run — from the active response lifecycle (at most one at a time).
-  // `runSettled` records that a response for this session just ended (terminal or
-  // superseded), which also bounds the create_session span below.
-  let runSettled = false;
-  if (ar !== null && ar.state === "streaming") {
-    if (t.run === undefined || t.run.responseId !== ar.responseId) {
-      if (t.run !== undefined) {
-        t.run.handle.complete("cancelled"); // superseded before a terminal
-        runSettled = true;
-      }
-      t.run = {
-        responseId: ar.responseId,
-        handle: startTimedInteraction("agent_run", ar.responseId),
-      };
-    }
-  } else if (t.run !== undefined) {
-    if (ar !== null && ar.responseId === t.run.responseId && TERMINAL_STATES.has(ar.state)) {
-      t.run.handle.complete(runStatus(ar.state));
-    } else {
-      t.run.handle.complete("cancelled"); // cleared or replaced without a matching terminal
-    }
-    t.run = undefined;
-    runSettled = true;
-  }
+  const s = spans.get(conversationId);
+  if (s === undefined) return;
 
-  // tool_call — from the committed transcript. Re-scan only when it changed; the
-  // seen/done sets make it emit once per callId across scans. A call whose result
-  // is ALREADY present the first time we see it was hydrated from history or
-  // reconnect-reconciled (its `tool_group` and `tool_result` arrive together in
-  // one snapshot), never observed executing live — so record it settled WITHOUT
-  // emitting. Otherwise reopening a past conversation would replay a phantom
-  // ~0ms start+complete for every historical tool call.
-  if (state.blocks !== t.lastBlocks) {
-    t.lastBlocks = state.blocks;
-    const haveResult = new Set<string>();
-    for (const block of state.blocks) {
-      if (block.type === "tool_result") haveResult.add(block.callId);
+  if (block.type === "tool_result") {
+    const open = s.tools.get(block.callId);
+    if (open !== undefined) {
+      s.tools.delete(block.callId);
+      open.complete(null); // no reliable success/failure signal on a tool result
     }
-    for (const block of state.blocks) {
-      if (block.type === "tool_group") {
-        for (const ex of block.executions) {
-          if (ex.callId && !t.toolSeen.has(ex.callId)) {
-            t.toolSeen.add(ex.callId);
-            if (haveResult.has(ex.callId)) {
-              t.toolDone.add(ex.callId); // already complete on first sight → hydrated
-            } else {
-              t.tools.set(ex.callId, startTimedInteraction("tool_call", ex.callId, ex.name));
-            }
-          }
-        }
-      } else if (block.type === "tool_result") {
-        const open = t.tools.get(block.callId);
-        if (open !== undefined && !t.toolDone.has(block.callId)) {
-          t.toolDone.add(block.callId);
-          t.tools.delete(block.callId);
-          open.complete();
-        }
-      }
-    }
+    return;
   }
-
-  // create_session — first assistant activity completes it. Otherwise it's failed
-  // once its first response ends without any (`runSettled`, or a terminal
-  // activeResponse) — bounding the span to the first turn so a *later* turn's
-  // activity can never complete a stale span as an inflated success.
-  const create = t.create;
-  if (create !== undefined && !create.settled) {
-    if (state.blocks.some((b) => isActivityBlock(b.type))) {
-      create.handle.complete("success");
-      create.settled = true;
-    } else if (runSettled || (ar !== null && TERMINAL_STATES.has(ar.state))) {
-      create.handle.fail();
-      create.settled = true;
-    }
-  }
+  if (ACTIVITY_TYPES.has(block.type)) completeCreateIfOpen(s);
 }
 
-// A conversation that went away (evicted / released / switched-away-and-disposed)
-// never delivers more state, so settle whatever it left open and drop tracking.
-function settleDead(id: string, t: ConvTracking): void {
-  if (t.run !== undefined) {
-    t.run.handle.complete("cancelled");
-    t.run = undefined;
-  }
-  for (const handle of t.tools.values()) handle.complete("cancelled");
-  t.tools.clear();
-  if (t.create !== undefined && !t.create.settled) {
-    t.create.handle.fail();
-    t.create.settled = true;
-  }
-  tracked.delete(id);
+function completeCreateIfOpen(s: ConvSpans): void {
+  if (s.create === undefined) return;
+  s.create.complete("success");
+  s.create = undefined;
 }
 
-// Subscribe once. `subscribe` fires on every entry state change (with the changed
-// id) but NOT on dispose, so after handling the change also sweep tracked
-// conversations whose entry is now gone/disposed.
-conversationRegistry.subscribe((id) => {
-  try {
-    process(id);
-  } catch {
-    // Telemetry must never break the app.
-  }
-  for (const [tid, t] of [...tracked]) {
-    const entry = conversationRegistry.peek(tid);
-    if (entry === undefined || entry.disposed) {
-      try {
-        settleDead(tid, t);
-      } catch {
-        // ignore
-      }
-    }
-  }
-});
+// A disposed conversation delivers no more frames, so settle whatever it left
+// open. Wired to the registry's dispose notification (release / evict / clear).
+function onConversationDisposed(conversationId: string): void {
+  const s = spans.get(conversationId);
+  if (s === undefined) return;
+  spans.delete(conversationId);
+  if (s.run !== undefined) s.run.handle.complete("cancelled");
+  for (const handle of s.tools.values()) handle.complete(null);
+  if (s.create !== undefined) s.create.complete("cancelled");
+}
+
+conversationRegistry.subscribeDisposed(onConversationDisposed);
+
+/**
+ * Drop all in-flight tracking. Test-only: the span map is a module singleton, so
+ * tests that drive the pump must reset it between cases.
+ */
+export function resetInteractionTelemetryForTests(): void {
+  spans.clear();
+}

@@ -117,7 +117,12 @@ import { getOmnigentHostConfig } from "@/lib/host";
 // Routing-free emit primitive (not "@/lib/analytics", which pulls in useLocation
 // and would form a routing↔store import cycle).
 import { emitInteractionPhase, startTimedInteraction } from "@/lib/analyticsEmit";
-import { markSessionCreated } from "./interactionTelemetry";
+import {
+  markSessionCreated,
+  onLiveBlock,
+  onResponseEnd,
+  onResponseStart,
+} from "./interactionTelemetry";
 import { getSessionHost } from "@/lib/sessionHost";
 import { isSystemUserContent } from "@/lib/systemMessage";
 import { isNativeWrapper } from "@/lib/nativeCodingAgents";
@@ -4548,11 +4553,11 @@ function revivePendingElicitationBlock(set: Setter, elicitationId: string): void
   });
 }
 
-// agent_run / tool_call / create_session telemetry is DERIVED from committed
-// conversation state by the projector in `interactionTelemetry.ts` (subscribed to
-// `conversationRegistry`), not emitted from this pump. Create sites call
-// `markSessionCreated`; the projector owns the rest. `approval` above stays a
-// direct emit — it has no stream lifecycle to derive.
+// agent_run / tool_call / create_session telemetry is emitted from this pump's
+// live reduce-loop (see `onResponseStart` / `onResponseEnd` / `onLiveBlock` in
+// `interactionTelemetry.ts`) — the one place each stream frame is seen once,
+// live, in order. Create sites call `markSessionCreated`. `approval` above stays
+// a direct emit — it has no stream lifecycle.
 
 export async function pumpStreamEvents(
   id: string,
@@ -4637,9 +4642,10 @@ export async function pumpStreamEvents(
       if (block.type === "response_start") {
         // New response: force-flush whatever is buffered, then land the
         // marker + lifecycle in one commit. Reset the first-paint latch.
-        // (agent_run / create_session telemetry is derived from this
-        // activeResponse transition by interactionTelemetry.ts, not emitted here.)
         paintedFirstContent = false;
+        // agent_run start. This is the live turn edge — a revive reopens the
+        // turn via `set()` and emits no `response_start`, so it never double-opens.
+        onResponseStart(id, block.responseId);
         flush(block, {
           activeResponse: { responseId: block.responseId, state: "streaming", error: null },
           status: "streaming",
@@ -4785,8 +4791,9 @@ export async function pumpStreamEvents(
           const errorMsg = block.response?.error?.message ?? null;
           finalizeActive(set, block.status as ActiveResponse["state"], errorMsg);
         }
-        // agent_run complete + create_session settle are derived from the
-        // finalized activeResponse by interactionTelemetry.ts, not emitted here.
+        // agent_run complete + create_session settle. Read the finalized state so
+        // a `session.interrupted` cancelled (kept above) wins over block.status.
+        onResponseEnd(id, endedId, get().activeResponse?.state ?? block.status);
         // Turn over: drop any provisional preview never finalized by a
         // committed item (e.g. an interrupt where the partial item lands
         // after this event, or a stream drop). Normal messages already
@@ -4811,8 +4818,10 @@ export async function pumpStreamEvents(
         continue;
       }
 
-      // tool_call telemetry is derived from tool_group / tool_result blocks in
-      // the committed transcript by interactionTelemetry.ts, not emitted here.
+      // tool_call boundaries + create_session first-activity, from live blocks.
+      // Only fresh (non-deduped) blocks reach here, so each is observed once;
+      // history hydration takes the `reduceSync` path and never runs this loop.
+      onLiveBlock(id, block);
       buffer.push(block);
       if (!paintedFirstContent) {
         // First content of the response — paint it immediately so the
